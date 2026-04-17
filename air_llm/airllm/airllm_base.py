@@ -133,7 +133,21 @@ class AirLLMBaseModel(GenerationMixin):
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
-        # Comprehensive config auto-patching for experimental/missing models
+        # Probe exact physical vocab/hidden dimensions from extracted shard metadata to prevent PyTorch embedding mismatches
+        embed_path = Path(self.checkpoint_path) / f"{self.layer_names_dict['embed']}.safetensors"
+        if os.path.exists(embed_path):
+            import safetensors.torch
+            try:
+                with safetensors.torch.safe_open(embed_path, framework="pt", device="cpu") as f:
+                    real_embed_key = f"{self.layer_names_dict['embed']}.weight"
+                    if real_embed_key in f.keys():
+                        real_shape = f.get_slice(real_embed_key).get_shape()
+                        self.config.vocab_size = real_shape[0]
+                        self.config.hidden_size = real_shape[1]
+            except Exception:
+                pass
+
+        # Native fallback if probe failed
         if not hasattr(self.config, "vocab_size"):
             if hasattr(self.tokenizer, "vocab_size"):
                 self.config.vocab_size = self.tokenizer.vocab_size
