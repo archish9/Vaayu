@@ -507,8 +507,12 @@ class AirLLMBaseModel(GenerationMixin):
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
         if self.get_rotary_emb() is not None:
             self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+            if self._full_position_embeddings is not None:
+                _c, _s = self._full_position_embeddings
+                print(f"[dbg] _full_position_embeddings: cos={_c.shape}, sin={_s.shape}")
         else:
             self._full_position_embeddings = None
+            print("[dbg] get_rotary_emb() returned None — position_embeddings will NOT be injected")
 
         kv_cache_list = [] if use_cache else None
         if use_cache:
@@ -644,6 +648,13 @@ class AirLLMBaseModel(GenerationMixin):
                                           }
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
+                                # --- diagnostic: remove once root cause is confirmed ---
+                                _pe = kwargs.get('position_embeddings')
+                                print(f"[dbg] layer={layer_name} seq={seq.shape} "
+                                      f"pe_cos={_pe[0].shape if _pe else None} "
+                                      f"pe_sin={_pe[1].shape if _pe else None} "
+                                      f"pos_ids={kwargs.get('position_ids', torch.tensor([])).shape}")
+                                # --------------------------------------------------------
 
                                 new_seq = layer(seq, **kwargs)[0]
                             else:
