@@ -149,6 +149,15 @@ class AirLLMBaseModel(GenerationMixin):
                 self.config.hidden_size = self.config.n_emb
             elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "hidden_size"):
                 self.config.hidden_size = self.config.text_config.hidden_size
+                
+        if not hasattr(self.config, "pad_token_id"):
+            self.config.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else (self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0)
+
+        if not hasattr(self.config, "eos_token_id"):
+            self.config.eos_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        if not hasattr(self.config, "bos_token_id"):
+            self.config.bos_token_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else 1
 
         self.init_model()
 
