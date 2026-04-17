@@ -301,7 +301,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         if not single_file_loaded:
             # Optionnally load next shard
             # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-            shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
+            shards = [int(v.split('-')[1]) for k, v in index.items() if layer in k and '-' in v and len(v.split('-')) > 1]
             if len(shards) > 0:
                 if max(shards) > shard:
                     # optinoally delete original file
@@ -333,7 +333,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                         state_dict.update(load_file(to_load, device='cpu'))
 
             else:
-                shards = [v for k, v in index.items() if k.startswith(layer)]
+                shards = [v for k, v in index.items() if layer in k]
                 if len(shards) == 0:
                     # No weights for this layer in index, skip it
                     continue
@@ -349,8 +349,14 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 else:
                     state_dict.update(load_file(to_load, device='cpu'))
 
-        # Get layer state dict
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+        # Get layer state dict and strip unknown architectural prefixes to standardize map for AirLLM Base
+        layer_state_dict = {}
+        for k, v in state_dict.items():
+            if layer in k:
+                # Strip everything preceding the canonical layer ID string map
+                idx = k.find(layer)
+                normalized_k = k[idx:]
+                layer_state_dict[normalized_k] = v
 
         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
 
