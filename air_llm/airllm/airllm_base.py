@@ -133,35 +133,59 @@ class AirLLMBaseModel(GenerationMixin):
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
-        # Sanitize config for broken or experimental models
+        # Comprehensive config auto-patching for experimental/missing models
         if not hasattr(self.config, "vocab_size"):
             if hasattr(self.tokenizer, "vocab_size"):
                 self.config.vocab_size = self.tokenizer.vocab_size
             else:
                 self.config.vocab_size = len(self.tokenizer)
-        
-        if not hasattr(self.config, "hidden_size"):
-            if hasattr(self.config, "d_model"):
-                self.config.hidden_size = self.config.d_model
-            elif hasattr(self.config, "n_embd"):
-                self.config.hidden_size = self.config.n_embd
-            elif hasattr(self.config, "n_emb"):
-                self.config.hidden_size = self.config.n_emb
-            elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "hidden_size"):
-                self.config.hidden_size = self.config.text_config.hidden_size
-                
+
+        # Pull everything from nested configurations if this is a VLM wrapper
+        if hasattr(self.config, "text_config"):
+            for k in dir(self.config.text_config):
+                if not k.startswith("_") and not hasattr(self.config, k):
+                    setattr(self.config, k, getattr(self.config.text_config, k))
+
+        # Dynamically map custom aliases
+        fallback_mappings = {
+            "hidden_size": ["d_model", "n_embd", "n_emb"],
+            "num_hidden_layers": ["num_layers", "n_layer", "n_layers"],
+            "num_attention_heads": ["num_heads", "n_head", "n_heads"],
+            "num_key_value_heads": ["num_kv_heads", "n_kv_head", "num_attention_heads"],
+            "intermediate_size": ["ffn_dim", "inner_dim"],
+            "rms_norm_eps": ["layer_norm_eps", "norm_eps"],
+            "max_position_embeddings": ["n_positions", "max_seq_len", "seq_length"],
+            "rope_theta": ["rotary_emb_base"],
+            "hidden_act": ["activation_function"],
+        }
+
+        for target_key, fallbacks in fallback_mappings.items():
+            if not hasattr(self.config, target_key):
+                for fb in fallbacks:
+                    if hasattr(self.config, fb):
+                        setattr(self.config, target_key, getattr(self.config, fb))
+                        break
+
+        # Token bounds protection
         if not hasattr(self.config, "pad_token_id"):
+            self.config.pad_token_id = None
+        if getattr(self.config, "pad_token_id", None) is not None and getattr(self.config, "vocab_size", 0) <= self.config.pad_token_id:
             self.config.pad_token_id = None
 
         if not hasattr(self.config, "eos_token_id"):
             self.config.eos_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
-
         if not hasattr(self.config, "bos_token_id"):
             self.config.bos_token_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else 1
 
-        # Prevent nn.Embedding crash stringently if fallbacks caused pad_idx to exceed dummy vocab limits
-        if getattr(self.config, "pad_token_id", None) is not None and getattr(self.config, "vocab_size", 0) <= self.config.pad_token_id:
-            self.config.pad_token_id = None
+        # Hard generic defaults to blindly satisfy transformers instantiation for totally blank models
+        if not hasattr(self.config, "num_hidden_layers"): self.config.num_hidden_layers = 24
+        if not hasattr(self.config, "num_attention_heads"): self.config.num_attention_heads = 16
+        if not hasattr(self.config, "num_key_value_heads"): self.config.num_key_value_heads = getattr(self.config, "num_attention_heads", 16)
+        if not hasattr(self.config, "intermediate_size"): self.config.intermediate_size = getattr(self.config, "hidden_size", 4096) * 4
+        if not hasattr(self.config, "rms_norm_eps"): self.config.rms_norm_eps = 1e-5
+        if not hasattr(self.config, "max_position_embeddings"): self.config.max_position_embeddings = 8192
+        if not hasattr(self.config, "hidden_act"): self.config.hidden_act = "silu"
+        if not hasattr(self.config, "rope_theta"): self.config.rope_theta = 10000.0
 
         self.init_model()
 
