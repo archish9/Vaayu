@@ -316,10 +316,17 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                     shard += 1
                     print(f'Loading shard {shard}/{n_shards}')
 
-                    if not safetensors_format:
-                        to_load = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
+                    # Dynamically find the real filename from the index map instead of rigidly string formatting
+                    matching_files = [val for val in set(index.values()) if '-' in val and len(val.split('-')) > 1 and int(val.split('-')[1]) == shard]
+                    
+                    if len(matching_files) > 0:
+                        to_load = checkpoint_path / matching_files[0]
                     else:
-                        to_load = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
+                        # Defensive fallback
+                        if not safetensors_format:
+                            to_load = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
+                        else:
+                            to_load = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
 
                     # check if to_load exist, if not downloaad it...
                     if not os.path.exists(to_load):
