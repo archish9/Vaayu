@@ -335,7 +335,12 @@ class AirLLMBaseModel(GenerationMixin):
             self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         if past_key_values is not None:
-            past_length = self.get_past_key_values_cache_seq_len(past_key_values) #[0][0].shape[2]
+            # Normalize DynamicCache -> None so AirLLM's layer-by-layer forward
+            # (which manages its own KV cache) is not confused by the HF cache object
+            if cache_utils_installed and isinstance(past_key_values, Cache):
+                past_key_values = None
+            if past_key_values is not None:
+                past_length = self.get_past_key_values_cache_seq_len(past_key_values)
 
             # Some generation methods already pass only the last input ID
             if input_ids.shape[1] > past_length:
@@ -374,6 +379,9 @@ class AirLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
+        # transformers >= 4.36 returns a DynamicCache object instead of a tuple-of-tuples
+        if cache_utils_installed and isinstance(past_key_values, Cache):
+            return past_key_values.get_seq_length()
         return past_key_values[0][0].shape[2]
     def get_sequence_len(self, seq):
         return seq.shape[1]
