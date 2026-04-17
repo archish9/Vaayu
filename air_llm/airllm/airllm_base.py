@@ -391,7 +391,25 @@ class AirLLMBaseModel(GenerationMixin):
     def get_sequence_len(self, seq):
         return seq.shape[1]
 
+    def get_rotary_emb(self):
+        """Return the model-level rotary embedding module if the architecture exposes one.
+
+        Transformers >= 4.45 computes RoPE once in the top-level model forward and passes
+        position_embeddings=(cos, sin) to every decoder layer.  For models that follow this
+        pattern the module lives at model.model.rotary_emb.
+        """
+        try:
+            return self.model.model.rotary_emb
+        except AttributeError:
+            return None
+
     def get_pos_emb_args(self, len_p, len_s):
+        # If position_embeddings were pre-computed for the full sequence (new transformers API),
+        # slice out just the tokens being processed in this call.
+        pos_emb = getattr(self, '_full_position_embeddings', None)
+        if pos_emb is not None:
+            cos, sin = pos_emb
+            return {'position_embeddings': (cos[:, len_p:len_p + len_s], sin[:, len_p:len_p + len_s])}
         return {}
 
     def get_past_key_value_args(self, k_cache, v_cache):
@@ -448,6 +466,18 @@ class AirLLMBaseModel(GenerationMixin):
         attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
         attention_mask = attention_mask.to(self.running_device)
         position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
+
+        # Pre-compute RoPE position embeddings for the full sequence length.
+        # Transformers >= 4.45 moved this computation to the top-level model forward;
+        # each decoder layer now receives position_embeddings=(cos, sin) rather than
+        # recomputing them internally.  rotary_emb only uses the input tensor for
+        # dtype/device, so a zero-element scalar is sufficient.
+        _rotary_emb = self.get_rotary_emb()
+        if _rotary_emb is not None:
+            _x_for_rope = torch.empty(1, device=self.running_device, dtype=self.running_dtype)
+            self._full_position_embeddings = _rotary_emb(_x_for_rope, position_ids)
+        else:
+            self._full_position_embeddings = None
 
         kv_cache_list = [] if use_cache else None
         if use_cache:
