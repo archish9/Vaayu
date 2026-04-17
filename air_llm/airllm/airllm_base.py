@@ -133,6 +133,12 @@ class AirLLMBaseModel(GenerationMixin):
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
+        # Sanitize config for broken or experimental models
+        if not hasattr(self.config, "vocab_size"):
+            if hasattr(self.tokenizer, "vocab_size"):
+                self.config.vocab_size = self.tokenizer.vocab_size
+            else:
+                self.config.vocab_size = len(self.tokenizer)
 
         self.init_model()
 
