@@ -275,7 +275,34 @@ class AirLLMBaseModel(GenerationMixin):
 
         t = time.time()
 
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
+        try:
+            load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
+        except Exception as e:
+            # For models with tied weights, lm_head.safetensors might not be generated
+            # because it's implicitly tied to embed_tokens. Safely fallback to embed_tokens.
+            if layer_name == self.layer_names_dict['lm_head'] + ".":
+                print(f"Failed to load {layer_name}, attempting to use tied weights from {self.layer_names_dict['embed']}. (original error: {repr(e)})")
+                embed_layer_name = self.layer_names_dict['embed'] + "."
+                load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
+                
+                # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
+                if self.profiling_mode:
+                    state_dict, compression_time = load_layer_output
+                else:
+                    state_dict = load_layer_output
+                
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_k = k.replace(self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
+                    new_state_dict[new_k] = v
+                
+                if self.profiling_mode:
+                    load_layer_output = (new_state_dict, compression_time)
+                else:
+                    load_layer_output = new_state_dict
+            else:
+                raise e
+
         elapsed_time = time.time() - t
 
         if self.profiling_mode:
