@@ -139,6 +139,16 @@ class AirLLMBaseModel(GenerationMixin):
                 self.config.vocab_size = self.tokenizer.vocab_size
             else:
                 self.config.vocab_size = len(self.tokenizer)
+        
+        if not hasattr(self.config, "hidden_size"):
+            if hasattr(self.config, "d_model"):
+                self.config.hidden_size = self.config.d_model
+            elif hasattr(self.config, "n_embd"):
+                self.config.hidden_size = self.config.n_embd
+            elif hasattr(self.config, "n_emb"):
+                self.config.hidden_size = self.config.n_emb
+            elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "hidden_size"):
+                self.config.hidden_size = self.config.text_config.hidden_size
 
         self.init_model()
 
