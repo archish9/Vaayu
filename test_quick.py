@@ -33,6 +33,7 @@ input_tokens = model.tokenizer(
 )
            
 print("Generating output...")
+print(input_tokens['input_ids'].cuda())
 generation_output = model.generate(
     input_tokens['input_ids'].cuda(), 
     max_new_tokens=20,
