@@ -2,7 +2,7 @@
 # Install with: pip install -r requirements-latest.txt
 
 # Use latest transformers from git for newest models
-transformers @ git+https://github.com/huggingface/transformers.git
+transformers==5.5.4
 
 # Core dependencies
 torch>=2.1.0
