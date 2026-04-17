@@ -24,7 +24,7 @@ model = AutoModel.from_pretrained("Qwen/Qwen2.5-3B")
 input_text = ['What is the capital of United States?']
 
 input_tokens = model.tokenizer(
-    input_text,
+    "What is the capital of United States?",
     return_tensors="pt", 
     return_attention_mask=False, 
     truncation=True, 
