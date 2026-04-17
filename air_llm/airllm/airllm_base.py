@@ -403,6 +403,34 @@ class AirLLMBaseModel(GenerationMixin):
         except AttributeError:
             return None
 
+    def _compute_full_position_embeddings(self, position_ids):
+        """Compute RoPE (cos, sin) for all positions directly from model config.
+
+        Avoids using the meta-initialized rotary_emb module whose inv_freq buffer
+        contains uninitialized CUDA memory after init_empty_weights, which would
+        produce garbage / overflowed values and corrupt the hidden states.
+        """
+        try:
+            head_dim = getattr(self.config, 'head_dim',
+                               self.config.hidden_size // self.config.num_attention_heads)
+            rope_theta = float(getattr(self.config, 'rope_theta', 10000.0))
+        except AttributeError:
+            return None
+
+        inv_freq = 1.0 / (rope_theta ** (
+            torch.arange(0, head_dim, 2, dtype=torch.float32, device=position_ids.device) / head_dim
+        ))
+
+        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        with torch.no_grad():
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded).transpose(1, 2)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            cos = emb.cos().to(dtype=self.running_dtype)
+            sin = emb.sin().to(dtype=self.running_dtype)
+        return cos, sin
+
     def get_pos_emb_args(self, len_p, len_s):
         # If position_embeddings were pre-computed for the full sequence (new transformers API),
         # slice out just the tokens being processed in this call.
@@ -470,12 +498,15 @@ class AirLLMBaseModel(GenerationMixin):
         # Pre-compute RoPE position embeddings for the full sequence length.
         # Transformers >= 4.45 moved this computation to the top-level model forward;
         # each decoder layer now receives position_embeddings=(cos, sin) rather than
-        # recomputing them internally.  rotary_emb only uses the input tensor for
-        # dtype/device, so a zero-element scalar is sufficient.
-        _rotary_emb = self.get_rotary_emb()
-        if _rotary_emb is not None:
-            _x_for_rope = torch.empty(1, device=self.running_device, dtype=self.running_dtype)
-            self._full_position_embeddings = _rotary_emb(_x_for_rope, position_ids)
+        # recomputing them internally.
+        #
+        # We gate on whether the architecture exposes a top-level rotary_emb (the
+        # signal that it uses this new API), but compute the values from the model
+        # config rather than calling the meta-initialized module.  After
+        # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
+        # (garbage values) which would produce NaN/overflow and corrupt hidden states.
+        if self.get_rotary_emb() is not None:
+            self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
         else:
             self._full_position_embeddings = None
 
