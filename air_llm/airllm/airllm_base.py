@@ -276,9 +276,7 @@ class AirLLMBaseModel(GenerationMixin):
         t = time.time()
 
         try:
-            print(f"[AirLLM Debug] Attempting to load layer: '{layer_name}'")
             load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
-            print(f"[AirLLM Debug] Successfully loaded layer: '{layer_name}'")
         except Exception as e:
             # For models with tied weights, lm_head.safetensors might not be generated
             # because it's implicitly tied to embed_tokens. Safely fallback to embed_tokens.
@@ -291,7 +289,6 @@ class AirLLMBaseModel(GenerationMixin):
                 load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
                 
                 # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
-                print(f"[AirLLM Debug] Successfully fetched tied weights for '{embed_layer_name}'. Mapping keys to '{self.layer_names_dict['lm_head']}'...")
                 if self.profiling_mode:
                     state_dict, compression_time = load_layer_output
                 else:
@@ -307,7 +304,6 @@ class AirLLMBaseModel(GenerationMixin):
                 else:
                     load_layer_output = new_state_dict
             else:
-                print(f"[AirLLM Debug] CRITICAL ERROR: Failed to load '{layer_name}'. Exception: {e}")
                 raise e
 
         elapsed_time = time.time() - t
