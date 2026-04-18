@@ -42,6 +42,8 @@ class AutoModel:
             return "airllm", "AirLLMMistral"
         elif "Mixtral" in config.architectures[0]:
             return "airllm", "AirLLMMixtral"
+        elif "Gemma" in config.architectures[0]:
+            return "airllm", "AirLLMLlama2"
         elif "Llama" in config.architectures[0]:
             return "airllm", "AirLLMLlama2"
         else:

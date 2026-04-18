@@ -298,6 +298,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.model.eval()
         self.model.tie_weights()
 
+        self.auto_detect_layer_names()
         self.set_layers_from_layer_names()
 
         # Move buffers to device (not that much GPU memory used)
@@ -308,6 +309,38 @@ class AirLLMBaseModel(GenerationMixin):
         if 'rotary_pos_emb' in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
+
+    def auto_detect_layer_names(self):
+        import torch
+        text_prefix = ""
+        for name, _ in self.model.named_children():
+            if "language_model" in name or "text_model" in name:
+                text_prefix = name + "."
+                break
+                
+        found_embed = None
+        found_layers = None
+        found_norm = None
+        found_lm_head = None
+
+        for name, module in self.model.named_modules():
+            if text_prefix and not name.startswith(text_prefix) and 'lm_head' not in name:
+                continue
+                
+            if name.endswith('embed_tokens') and not found_embed:
+                found_embed = name
+            elif (name.endswith('layers') or name.endswith('blocks')) and isinstance(module, torch.nn.ModuleList) and not found_layers:
+                found_layers = name
+            elif (name.endswith('norm') or name.endswith('ln_f')) and 'layers' not in name and 'blocks' not in name:
+                found_norm = name
+            elif (name.endswith('lm_head') or name.endswith('embed_out')) and not found_lm_head:
+                found_lm_head = name
+
+        if found_embed: self.layer_names_dict['embed'] = found_embed
+        if found_layers: self.layer_names_dict['layer_prefix'] = found_layers
+        if found_norm: self.layer_names_dict['norm'] = found_norm
+        if found_lm_head: self.layer_names_dict['lm_head'] = found_lm_head
+        print(f"Auto-detected layer names: {self.layer_names_dict}")
 
     def set_layers_from_layer_names(self):
 
