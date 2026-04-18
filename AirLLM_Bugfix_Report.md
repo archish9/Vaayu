@@ -83,3 +83,39 @@ If passing a completely unmapped or breaking experimental model into AirLLM, fut
 3. **Trace The Output Graph Returns Continuously:** New variants of architectures frequently change final pooling implementations out of `decoder_layers` (transitioning abruptly from dict returns to tensors objects or altering nested depth). Subclass variations must rigorously apply Python `isinstance` logic blocks wrapping final index unpacking arrays to prevent dimensionality deletions. 
 4. **SafeTensor Index Slicing**: When modifying extraction formats within `utils.py`, never assume zero-indexed character string padding. Always recursively strip strings logically employing dynamic delimiter targets inherently natively via `.find()` indexing protocols.
 5. **Always Sandbox `rotary_pos_emb` Locally**: If `transformers` updates embedding computations fundamentally again, fallback strictly on pushing matrix evaluation directly backwards into pre-initialization calculations internally mapped inside `airllm_base.py`'s external loop hooks, subsequently injecting raw physical payload targets independently bypassing abstract Hugging Face framework kwargs logic completely.
+
+---
+
+## Part 5: Single-File Caching & VLM Parameter Path Mapping (Gemma4 / Multi-Modal architectures)
+
+### 9. Single-File Model SafeTensors Download Exclusion
+* **Model Context**: Experimental/unsharded models (e.g., `Qwen/Qwen3-0.6B`, small variants under 2GB)
+* **Error Trigger**: `FileNotFoundError: No model files found in {...}. Expected one of: pytorch_model.bin.index.json, model.safetensors.index.json, model.safetensors, or pytorch_model.bin`
+* **Root Cause Diagnostics**: To aggressively optimize bandwidth, `AirLLM` actively stripped large binary files (`*.safetensors`, `*.bin`) during the initial `huggingface_hub.snapshot_download` phase. It exclusively targeted the `index.json` manifests to evaluate layer maps before pulling heavy weights. However, Single-File Architectures (by definition) do not generate or host `index.json` mappings. By excluding physical binaries and expecting an index, the initial cache pull returned completely empty directories, starving `split_and_save_layers` immediately.
+* **Structural Solution Applied (`utils.py`)**: 
+  - Integrated dynamic index detection post-fetch. If `huggingface_hub` executes but neither `model.safetensors.index.json` nor `pytorch_model.bin.index.json` populate locally within the cache, the script gracefully infers it must be a single-file configuration.
+  - It subsequently executes a rapid forced secondary download targeting precisely `['*.safetensors', '*.bin']`, allowing the native monolithic `load_file()` extractor to split the single bin into standard AirLLM shards.
+
+### 10. AutoModel Framework Fallbacks (`auto_model.py`)
+* **Model Context**: Unmapped variants (e.g., `Qwen3ForCausalLM`, `Gemma4ForConditionalGeneration`)
+* **Error Trigger**: `unknown artichitecture: Gemma4ForConditionalGeneration, try to use Llama2...`
+* **Root Cause Diagnostics**: `auto_model.py` maps strings into specific handler modules (`AirLLMQWen2`, `AirLLMLlama2`). Missing classes forced highly experimental pipelines to abruptly fail over to `AirLLMLlama2`. This collapsed runtime execution graphs because Llama initializes structures with completely different parameter topologies (missing tied embeddings, different norm structures) compared to targets like Gemma.
+* **Structural Solution Applied**: 
+  - Sequentially hard-mapped string searches for `Qwen3ForCausalLM` mapping transparently directly to `AirLLMQWen2`.
+  - Added native string mapping for `Gemma` tracking identically to `AirLLMLlama2` to safely suppress `try to use Llama2` cascade failures while natively invoking `AirLLMBaseModel` cleanly.
+
+### 11. Dynamic Multi-Modal PyTorch Parameter Traversal & Injection 
+* **Model Context**: Complex/Wrapper Architectures and Vision-Language Models (e.g., `google/gemma-4-E2B`)
+* **Error Trigger**: `AttributeError: 'Gemma4Model' object has no attribute 'embed_tokens'` & subsequent `FileNotFoundError: No such file or directory: model.language_model.embed_tokens.safetensors`
+* **Root Cause Diagnostics**: This was an extremely deceptive bug caused by a critical disconnect between **physical cache filenames** and **virtual PyTorch module paths**.
+  1. **Phase 1 (Disk Caching)**: `split_and_save_layers()` evaluates literal substrings. Because `"model.embed_tokens"` intrinsically matches inside `"model.language_model.embed_tokens.weight"`, the original caching script unknowingly succeeded. Crucially, it generated physical shard files named using the unmodified default dictionary: `model.embed_tokens.safetensors`.
+  2. **Phase 2 (Instantiation)**: Modern generative frameworks wrap their core Transformer within wrapper nodes during initialization (e.g., `Gemma4ForConditionalGeneration` nests text logic inside `model.language_model.embed_tokens`). 
+  3. **The Collision (Injection)**: When AirLLM attempted to inject physical weights loaded from `model.embed_tokens.weight` back into the PyTorch layout mapped at `model.embed_tokens`, it hard-crashed with `AttributeError` because the Pytorch element was nested below `.language_model`.
+* **The Failed Experiment (Warning to Future Agents)**: 
+  - **DO NOT** globally mutate or "auto-detect" `self.layer_names_dict` to align with the PyTorch hierarchy. If an agent loops over `self.model.named_modules()` and permanently updates `layer_names_dict['embed'] = "model.language_model.embed_tokens"`, the system enters an unrecoverable state!
+  - It will force `load_layer_to_cpu` to blindly search for `model.language_model...safetensors` on disk. Thise files do not exist because Phase 1 (Caching) evaluates strictly via the legacy dictionary, permanently locking physical files to standard shortcode prefixes.
+
+* **The Failsafe Structural Solution Applied (`airllm_base.py`)**: 
+  - **Dynamic `_resolve_and_map_path()` Module Mapping:** Substituted strictly rigid `getattr()` indexing strings with a decoupled dual-path logic. The system leaves `layer_names_dict` globally untouched (preserving caching workflows completely). During instantiation, if a generic lookup (e.g. `hasattr(model, 'embed_tokens')`) fails, it executes a complete systematic crawl over `self.model.named_modules()`. 
+  - The crawler dynamically isolates terminal structures functionally (e.g. searching out endpoints named `embed_tokens` while exclusively filtering out decoys containing `audio` or `vision`), and registers the divergence inside a new mapping dictionary: `self._path_remappings`.
+  - **Pre-Transfer Memory Translators:** Immediately before parameter injection in `move_layer_to_device()`, the system traps the loaded raw `state_dict` from disk. It runs an interception loop across `_path_remappings`, gracefully upgrading legacy keys back into PyTorch's required wrapper contexts natively (e.g., actively translating `"model.embed_tokens.weight"` seamlessly localized into `"model.language_model.embed_tokens.weight"`). This guarantees parameter injection works synchronously across *any* multi-modal nesting wrapper without ever disrupting physical disk-caching mechanisms.
