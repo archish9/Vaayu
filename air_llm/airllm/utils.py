@@ -428,6 +428,12 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token,
         #allow_patterns= ["model.safetensors.index.json", 'pytorch_model.bin.index.json'],
         ignore_patterns=['*.safetensors', '*.bin'])
+        
+    if not (os.path.exists(Path(hf_cache_path) / 'model.safetensors.index.json') or 
+            os.path.exists(Path(hf_cache_path) / 'pytorch_model.bin.index.json')):
+        print(f"No index file found in cache, possibly a single file model. Attempting to download single file model weights...")
+        hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token,
+             allow_patterns=['*.safetensors', '*.bin'])
 
 
     # check if there's safetensors saved, if so, exclude torch saves

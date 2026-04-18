@@ -28,6 +28,8 @@ class AutoModel:
             return "airllm", "AirLLMQWen2"
         elif "Qwen2_5ForCausalLM" in config.architectures[0]:
             return "airllm", "AirLLMQWen2"
+        elif "Qwen3ForCausalLM" in config.architectures[0]:
+            return "airllm", "AirLLMQWen2"
         elif "QWen" in config.architectures[0]:
             return "airllm", "AirLLMQWen"
         elif "Baichuan" in config.architectures[0]:
