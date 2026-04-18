@@ -298,7 +298,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.model.eval()
         self.model.tie_weights()
 
-        self.auto_detect_layer_names()
+        self._path_remappings = {}
         self.set_layers_from_layer_names()
 
         # Move buffers to device (not that much GPU memory used)
@@ -307,65 +307,56 @@ class AirLLMBaseModel(GenerationMixin):
                                         dtype=self.running_dtype)
 
         if 'rotary_pos_emb' in self.layer_names_dict:
-            # for glm keep rotary_pos_emb in gpu
-            self.load_rotary_pos_emb_to_device()
-
-    def auto_detect_layer_names(self):
+    def _resolve_and_map_path(self, target_path):
         import torch
-        text_prefix = ""
-        for name, _ in self.model.named_children():
-            if "language_model" in name or "text_model" in name:
-                text_prefix = name + "."
+        attr = self.model
+        parts = target_path.split(".")
+        current_path = ""
+        resolved_full_path = ""
+
+        # Attempt standard traversal
+        success = True
+        for part in parts:
+            if hasattr(attr, part):
+                attr = getattr(attr, part)
+                current_path += ("." if current_path else "") + part
+            else:
+                success = False
                 break
                 
-        found_embed = None
-        found_layers = None
-        found_norm = None
-        found_lm_head = None
+        if success:
+            return attr
 
-        for name, module in self.model.named_modules():
-            if text_prefix and not name.startswith(text_prefix) and 'lm_head' not in name:
-                continue
+        # If it failed, search the model tree for the final node (e.g. embed_tokens, layers, norm, lm_head)
+        target_tail = parts[-1]
+        for name, mod in self.model.named_modules():
+            if name.endswith(target_tail):
+                # Ensure we avoid picking an audio/vision component arbitrarily if language is present
+                if "audio" in name or "vision" in name:
+                    continue
+                # For layers, ensure it's a ModuleList
+                if target_tail in ("layers", "blocks") and not isinstance(mod, torch.nn.ModuleList):
+                    continue
                 
-            if name.endswith('embed_tokens') and not found_embed:
-                found_embed = name
-            elif (name.endswith('layers') or name.endswith('blocks')) and isinstance(module, torch.nn.ModuleList) and not found_layers:
-                found_layers = name
-            elif (name.endswith('norm') or name.endswith('ln_f')) and 'layers' not in name and 'blocks' not in name:
-                found_norm = name
-            elif (name.endswith('lm_head') or name.endswith('embed_out')) and not found_lm_head:
-                found_lm_head = name
-
-        if found_embed: self.layer_names_dict['embed'] = found_embed
-        if found_layers: self.layer_names_dict['layer_prefix'] = found_layers
-        if found_norm: self.layer_names_dict['norm'] = found_norm
-        if found_lm_head: self.layer_names_dict['lm_head'] = found_lm_head
-        print(f"Auto-detected layer names: {self.layer_names_dict}")
+                # Found a replacement! Map it so parameter injection succeeds later
+                self._path_remappings[target_path] = name
+                return mod
+                
+        # If absolute failure, return original root (will likely crash later, but preserves legacy fallback)
+        return self.model
 
     def set_layers_from_layer_names(self):
-
         self.layers = []
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["embed"]))
+        
+        layer_list = self._resolve_and_map_path(self.layer_names_dict["layer_prefix"])
+        if isinstance(layer_list, (list, tuple, torch.nn.ModuleList)):
+            self.layers.extend(list(layer_list))
+        else:
+            self.layers.append(layer_list)
 
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["embed"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-
-        self.layers.extend(list(model_attr))
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["norm"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["lm_head"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["norm"]))
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["lm_head"]))
 
     def load_rotary_pos_emb_to_device(self):
         state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
@@ -436,7 +427,19 @@ class AirLLMBaseModel(GenerationMixin):
 
     def move_layer_to_device(self, state_dict):
         layers = []
-        for param_name, param in state_dict.items():
+        
+        # Apply path remappings to state dict keys so parameter injection succeeds 
+        # on architectures heavily wrapped in VLMs (e.g., Gemma4)
+        remapped_state_dict = {}
+        for param_name, param_tensor in state_dict.items():
+            new_param_name = param_name
+            for old_path, new_path in getattr(self, "_path_remappings", {}).items():
+                if param_name.startswith(old_path):
+                    new_param_name = param_name.replace(old_path, new_path, 1)
+                    break
+            remapped_state_dict[new_param_name] = param_tensor
+
+        for param_name, param in remapped_state_dict.items():
             if self.hf_quantizer is None:
                 layers.append(param_name)
             else:
@@ -449,12 +452,12 @@ class AirLLMBaseModel(GenerationMixin):
             if (self.hf_quantizer is None or
                 not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
                ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
+                set_module_tensor_to_device(self.model, param_name, self.running_device, value=remapped_state_dict[param_name],
                                             dtype=self.running_dtype,
                                             )
             else:
                 torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
+                self.hf_quantizer.create_quantized_param(self.model, remapped_state_dict[param_name], param_name, self.running_device, remapped_state_dict)
         return layers
 
     # make GenerationMixin happy
