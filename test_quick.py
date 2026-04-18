@@ -19,7 +19,7 @@ from airllm import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("Qwen/Qwen3-0.6B")
+model = AutoModel.from_pretrained("google/gemma-4-E2B")
 
 input_text = ['What is the capital of United States?']
 
