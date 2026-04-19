@@ -307,6 +307,9 @@ class AirLLMBaseModel(GenerationMixin):
                                         dtype=self.running_dtype)
 
         if 'rotary_pos_emb' in self.layer_names_dict:
+            # for glm keep rotary_pos_emb in gpu
+            self.load_rotary_pos_emb_to_device()
+
     def _resolve_and_map_path(self, target_path):
         import torch
         attr = self.model
