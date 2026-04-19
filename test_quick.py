@@ -19,7 +19,7 @@ from airllm import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("google/gemma-4-E2B")
+model = AutoModel.from_pretrained("/media/a/MyPassport/AI-ML/LLM-models/gpt-oss-20b")
 
 input_text = ['What is the capital of United States?']
 

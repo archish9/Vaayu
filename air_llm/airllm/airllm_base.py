@@ -271,22 +271,39 @@ class AirLLMBaseModel(GenerationMixin):
             # try way 2 - use sdpa attention
             try:
                 print(f"Using sdpa attention implementation...")
+                orig_attn = getattr(self.config, "attn_implementation", None)
                 self.config.attn_implementation = "sdpa"
 
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
                 print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
 
-            except (TypeError, Exception) as ve:
-                del self.model
+            except (TypeError, ValueError, Exception) as ve:
+                if self.model is not None:
+                    del self.model
                 clean_memory()
                 self.model = None
+                if orig_attn is None:
+                    if hasattr(self.config, "attn_implementation"):
+                        delattr(self.config, "attn_implementation")
+                else:
+                    self.config.attn_implementation = orig_attn
 
         # fallback to original way
         if self.model is None:
-            print(f"Creating model with default attention implementation")
-            with init_empty_weights():
-                self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+            try:
+                print(f"Creating model with default attention implementation")
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+            except (TypeError, ValueError, Exception) as ve:
+                print(f"Default attention failed, falling back to 'eager' attention implementation.")
+                if self.model is not None:
+                    del self.model
+                clean_memory()
+                self.model = None
+                self.config.attn_implementation = "eager"
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="eager", trust_remote_code=True)
 
         quantization_config = getattr(self.config, "quantization_config", None)
 
@@ -450,17 +467,32 @@ class AirLLMBaseModel(GenerationMixin):
                     layer_name = param_name[:param_name.index(".weight") + len(".weight")]
                     if layer_name not in layers:
                         layers.append(layer_name)
+                else:
+                    if param_name not in layers:
+                        layers.append(param_name)
 
+        standard_params = {}
         for param_name in layers:
-            if (self.hf_quantizer is None or
-                not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-               ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=remapped_state_dict[param_name],
-                                            dtype=self.running_dtype,
-                                            )
+            is_quantized = False
+            if self.hf_quantizer is not None:
+                if hasattr(self.hf_quantizer, "check_quantized_param"):
+                    is_quantized = self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
+
+            if not is_quantized:
+                standard_params[param_name] = remapped_state_dict[param_name].to(self.running_device, dtype=self.running_dtype)
             else:
                 torch_dtype = self.hf_quantizer.update_torch_dtype(None)
                 self.hf_quantizer.create_quantized_param(self.model, remapped_state_dict[param_name], param_name, self.running_device, remapped_state_dict)
+
+        if len(standard_params) > 0:
+            try:
+                self.model.load_state_dict(standard_params, strict=False, assign=True)
+            except Exception as e:
+                for param_name, tensor in standard_params.items():
+                    try:
+                        set_module_tensor_to_device(self.model, param_name, self.running_device, value=tensor, dtype=self.running_dtype)
+                    except Exception as fallback_e:
+                        print(f"Warning: Could not inject {param_name} natively: {fallback_e}")
         return layers
 
     # make GenerationMixin happy
@@ -642,7 +674,20 @@ class AirLLMBaseModel(GenerationMixin):
         # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
         if self.get_rotary_emb() is not None:
-            self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+            try:
+                # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
+                # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
+                rotary_emb_cls = type(self.get_rotary_emb())
+                real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+                
+                # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
+                dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+                dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+                
+                self._full_position_embeddings = real_rotary(dummy_x, position_ids)
+            except Exception as e:
+                print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+                self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
         else:
             self._full_position_embeddings = None
 
