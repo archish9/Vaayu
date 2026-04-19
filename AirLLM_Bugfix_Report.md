@@ -119,3 +119,44 @@ If passing a completely unmapped or breaking experimental model into AirLLM, fut
   - **Dynamic `_resolve_and_map_path()` Module Mapping:** Substituted strictly rigid `getattr()` indexing strings with a decoupled dual-path logic. The system leaves `layer_names_dict` globally untouched (preserving caching workflows completely). During instantiation, if a generic lookup (e.g. `hasattr(model, 'embed_tokens')`) fails, it executes a complete systematic crawl over `self.model.named_modules()`. 
   - The crawler dynamically isolates terminal structures functionally (e.g. searching out endpoints named `embed_tokens` while exclusively filtering out decoys containing `audio` or `vision`), and registers the divergence inside a new mapping dictionary: `self._path_remappings`.
   - **Pre-Transfer Memory Translators:** Immediately before parameter injection in `move_layer_to_device()`, the system traps the loaded raw `state_dict` from disk. It runs an interception loop across `_path_remappings`, gracefully upgrading legacy keys back into PyTorch's required wrapper contexts natively (e.g., actively translating `"model.embed_tokens.weight"` seamlessly localized into `"model.language_model.embed_tokens.weight"`). This guarantees parameter injection works synchronously across *any* multi-modal nesting wrapper without ever disrupting physical disk-caching mechanisms.
+
+---
+
+## Part 6: Subclass Tensor Injectors & JIT Compilation Limits (`gpt-oss-20b` / `mxfp4`)
+
+### 12. Non-Sequential SafeTensor Shard Caching
+* **Model Context**: `gpt-oss-20b` (And generalized experimental models)
+* **Error Trigger**: `RuntimeError: Tensor on device cuda:0 is not on the expected device meta!` (Caused downstream by `model.layers.0.` fetching 16-byte empty shard files).
+* **Root Cause Diagnostics**: 
+  - Standard models publish strictly 1-indexed, monotonically increasing layer shards (e.g., `model-00001-of-00003`, where `embed` is chunk 1, `layer 0` is chunk 1, etc.).
+  - `gpt-oss-20b` thoroughly broke these rules: Its shards were 0-indexed (`model-00000-of-00002.safetensors`), and its mappings looped non-monotonically (e.g. `embed` was in chunk 2, but `layer 0` was in chunk 1). 
+  - AirLLM's `split_and_save_layers` logic rigidly relied on `if max(shards) > shard: shard += 1`, entirely bypassing the 0-indexed chunk and abandoning massive weight payloads.
+* **Structural Solution Applied (`utils.py`)**:
+  - Restructured caching to initiate at an un-indexed state (`shard = -1`), inherently recognizing `0` as an acceptable target bound.
+  - Dynamically leapfrogs active trackers using `target_shard = max(shards)` and validates via `if target_shard != shard`, ensuring logically sound downloading for chaotic experimental padding sequences.
+
+### 13. PyTorch 2.x Tensor Subclasses & Advanced MXFP4 Quantizer Hooks 
+* **Model Context**: `gpt-oss-20b` / Experimental `mxfp4` implementations natively leveraging custom subclasses.
+* **Error Trigger**: `ValueError: Mxfp4GptOssExperts() does not have a parameter or a buffer named down_proj_blocks.`
+* **Root Cause Diagnostics**:
+  - Legacy quantization tools (like `bitsandbytes`) required dynamic wrappers traversing raw tensors. `AirLLM` previously expected to intercept these by rigorously mapping `accelerate.set_module_tensor_to_device()` individually to identically matched leaf strings.
+  - Modern architectures like `MXFP4` dynamically bundle parameter mappings (via PyTorch Tensor Subclasses handling `__tensor_unflatten__`). For example, the disk file index held `.down_proj_blocks`, but the PyTorch `Mxfp4GptOssExperts` layer node only legally owned parameter `.down_proj`. The module natively relied on the internal implementation of `_load_from_state_dict` to structurally unflatten and route block slices down. `accelerate` rigidly mapping explicitly string-to-string natively crashed!
+* **Structural Solution Applied (`airllm_base.py`)**:
+  - Bypassed the rigid `accelerate.set_module_tensor_to_device` 1:1 mapping loop. 
+  - Bundled mapped structures neatly and invoked `self.model.load_state_dict(standard_params, strict=False, assign=True)` dynamically wrapping graceful exceptions. This effectively delegates complex state injection rules sequentially back to native PyTorch implementations seamlessly traversing abstract architectures natively.
+
+### 14. Triton JIT C-Compiler Dependency (Missing `Python.h`)
+* **Environment Context**: Deploying dynamic JIT architectures (`mxfp4`, `FlashAttention`, `Deepspeed`) directly on OS environments.
+* **Error Trigger**: `subprocess.CalledProcessError: Command '['/usr/bin/gcc', ... 'cuda_utils.c']' returned non-zero exit status 1` culminating in `fatal error: Python.h: No such file or directory`.
+* **Root Cause Diagnostics**: 
+  - Unlike pre-compiled packages (e.g. standard `torch` or `bitsandbytes`), experimental quantizers heavily utilize Triton to synthesize GPU Math Kernels code 'on-the-fly' right at inference time. Triton relies heavily on native GPU Host toolchains, and seamlessly spins up `/usr/bin/gcc` locally to build extensions.
+  - It intrinsically requires C Development Headers to process python bindings successfully. Standard python installs simply omit `.h` libraries out-of-the-box on linux.
+* **Workarounds & Repository Management Deployment**:
+  - **Prerequisites Requirements (Standard Approach)**: Any GitHub repository distributing modules dependent on Triton dynamic engines strongly needs the prerequisite formally outlined on PyPI / Readme headers.
+  
+  > [!IMPORTANT]
+  > **Recommended README Prerequisite Notice**
+  > "Since this model utilizes Triton for ultra-fast, dynamic kernel generation, end-users executing on native Linux environments must possess Python developer headers locally: 
+  > Execute before deploying wrappers: `sudo apt-get install python3-dev`"
+  
+  - **The Conda Alternative Framework Workaround**: If modifying the native OS via `apt-get` is locked or dangerous, explicitly directing infrastructure creation inside isolated `miniconda` or `anaconda` namespaces inherently cures this permanently. Conda intrinsically packs and seals localized `Python.h` binaries internally within its environments, protecting dependencies from local machine variants effortlessly.
