@@ -272,7 +272,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
 
-    shard = 0
+    shard = -1
     n_shards = len(set(index.values()))
     state_dict = {}
     single_file_loaded = False
@@ -303,9 +303,10 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
             shards = [int(v.split('-')[1]) for k, v in index.items() if layer in k and '-' in v and len(v.split('-')) > 1]
             if len(shards) > 0:
-                if max(shards) > shard:
+                target_shard = max(shards)
+                if target_shard != shard:
                     # optinoally delete original file
-                    if delete_original and shard != 0:
+                    if delete_original and shard != -1:
                         if not safetensors_format:
                             to_delete = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
                         else:
@@ -313,7 +314,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
                         print(f"deleting original file: {to_delete}")
                         remove_real_and_linked_file(to_delete)
-                    shard += 1
+                    shard = target_shard
                     print(f'Loading shard {shard}/{n_shards}')
 
                     # Dynamically find the real filename from the index map instead of rigidly string formatting
@@ -428,6 +429,12 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token,
         #allow_patterns= ["model.safetensors.index.json", 'pytorch_model.bin.index.json'],
         ignore_patterns=['*.safetensors', '*.bin'])
+        
+    if not (os.path.exists(Path(hf_cache_path) / 'model.safetensors.index.json') or 
+            os.path.exists(Path(hf_cache_path) / 'pytorch_model.bin.index.json')):
+        print(f"No index file found in cache, possibly a single file model. Attempting to download single file model weights...")
+        hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token,
+             allow_patterns=['*.safetensors', '*.bin'])
 
 
     # check if there's safetensors saved, if so, exclude torch saves

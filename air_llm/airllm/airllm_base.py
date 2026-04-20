@@ -271,22 +271,39 @@ class AirLLMBaseModel(GenerationMixin):
             # try way 2 - use sdpa attention
             try:
                 print(f"Using sdpa attention implementation...")
+                orig_attn = getattr(self.config, "attn_implementation", None)
                 self.config.attn_implementation = "sdpa"
 
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
                 print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
 
-            except (TypeError, Exception) as ve:
-                del self.model
+            except (TypeError, ValueError, Exception) as ve:
+                if self.model is not None:
+                    del self.model
                 clean_memory()
                 self.model = None
+                if orig_attn is None:
+                    if hasattr(self.config, "attn_implementation"):
+                        delattr(self.config, "attn_implementation")
+                else:
+                    self.config.attn_implementation = orig_attn
 
         # fallback to original way
         if self.model is None:
-            print(f"Creating model with default attention implementation")
-            with init_empty_weights():
-                self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+            try:
+                print(f"Creating model with default attention implementation")
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+            except (TypeError, ValueError, Exception) as ve:
+                print(f"Default attention failed, falling back to 'eager' attention implementation.")
+                if self.model is not None:
+                    del self.model
+                clean_memory()
+                self.model = None
+                self.config.attn_implementation = "eager"
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="eager", trust_remote_code=True)
 
         quantization_config = getattr(self.config, "quantization_config", None)
 
@@ -298,6 +315,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.model.eval()
         self.model.tie_weights()
 
+        self._path_remappings = {}
         self.set_layers_from_layer_names()
 
         # Move buffers to device (not that much GPU memory used)
@@ -309,30 +327,56 @@ class AirLLMBaseModel(GenerationMixin):
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
 
+    def _resolve_and_map_path(self, target_path):
+        import torch
+        attr = self.model
+        parts = target_path.split(".")
+        current_path = ""
+        resolved_full_path = ""
+
+        # Attempt standard traversal
+        success = True
+        for part in parts:
+            if hasattr(attr, part):
+                attr = getattr(attr, part)
+                current_path += ("." if current_path else "") + part
+            else:
+                success = False
+                break
+                
+        if success:
+            return attr
+
+        # If it failed, search the model tree for the final node (e.g. embed_tokens, layers, norm, lm_head)
+        target_tail = parts[-1]
+        for name, mod in self.model.named_modules():
+            if name.endswith(target_tail):
+                # Ensure we avoid picking an audio/vision component arbitrarily if language is present
+                if "audio" in name or "vision" in name:
+                    continue
+                # For layers, ensure it's a ModuleList
+                if target_tail in ("layers", "blocks") and not isinstance(mod, torch.nn.ModuleList):
+                    continue
+                
+                # Found a replacement! Map it so parameter injection succeeds later
+                self._path_remappings[target_path] = name
+                return mod
+                
+        # If absolute failure, return original root (will likely crash later, but preserves legacy fallback)
+        return self.model
+
     def set_layers_from_layer_names(self):
-
         self.layers = []
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["embed"]))
+        
+        layer_list = self._resolve_and_map_path(self.layer_names_dict["layer_prefix"])
+        if isinstance(layer_list, (list, tuple, torch.nn.ModuleList)):
+            self.layers.extend(list(layer_list))
+        else:
+            self.layers.append(layer_list)
 
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["embed"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-
-        self.layers.extend(list(model_attr))
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["norm"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["lm_head"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["norm"]))
+        self.layers.append(self._resolve_and_map_path(self.layer_names_dict["lm_head"]))
 
     def load_rotary_pos_emb_to_device(self):
         state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
@@ -403,7 +447,19 @@ class AirLLMBaseModel(GenerationMixin):
 
     def move_layer_to_device(self, state_dict):
         layers = []
-        for param_name, param in state_dict.items():
+        
+        # Apply path remappings to state dict keys so parameter injection succeeds 
+        # on architectures heavily wrapped in VLMs (e.g., Gemma4)
+        remapped_state_dict = {}
+        for param_name, param_tensor in state_dict.items():
+            new_param_name = param_name
+            for old_path, new_path in getattr(self, "_path_remappings", {}).items():
+                if param_name.startswith(old_path):
+                    new_param_name = param_name.replace(old_path, new_path, 1)
+                    break
+            remapped_state_dict[new_param_name] = param_tensor
+
+        for param_name, param in remapped_state_dict.items():
             if self.hf_quantizer is None:
                 layers.append(param_name)
             else:
@@ -411,17 +467,32 @@ class AirLLMBaseModel(GenerationMixin):
                     layer_name = param_name[:param_name.index(".weight") + len(".weight")]
                     if layer_name not in layers:
                         layers.append(layer_name)
+                else:
+                    if param_name not in layers:
+                        layers.append(param_name)
 
+        standard_params = {}
         for param_name in layers:
-            if (self.hf_quantizer is None or
-                not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-               ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
-                                            dtype=self.running_dtype,
-                                            )
+            is_quantized = False
+            if self.hf_quantizer is not None:
+                if hasattr(self.hf_quantizer, "check_quantized_param"):
+                    is_quantized = self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
+
+            if not is_quantized:
+                standard_params[param_name] = remapped_state_dict[param_name].to(self.running_device, dtype=self.running_dtype)
             else:
                 torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
+                self.hf_quantizer.create_quantized_param(self.model, remapped_state_dict[param_name], param_name, self.running_device, remapped_state_dict)
+
+        if len(standard_params) > 0:
+            try:
+                self.model.load_state_dict(standard_params, strict=False, assign=True)
+            except Exception as e:
+                for param_name, tensor in standard_params.items():
+                    try:
+                        set_module_tensor_to_device(self.model, param_name, self.running_device, value=tensor, dtype=self.running_dtype)
+                    except Exception as fallback_e:
+                        print(f"Warning: Could not inject {param_name} natively: {fallback_e}")
         return layers
 
     # make GenerationMixin happy
@@ -603,7 +674,20 @@ class AirLLMBaseModel(GenerationMixin):
         # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
         if self.get_rotary_emb() is not None:
-            self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+            try:
+                # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
+                # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
+                rotary_emb_cls = type(self.get_rotary_emb())
+                real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+                
+                # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
+                dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+                dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+                
+                self._full_position_embeddings = real_rotary(dummy_x, position_ids)
+            except Exception as e:
+                print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+                self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
         else:
             self._full_position_embeddings = None
 
