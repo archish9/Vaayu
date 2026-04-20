@@ -5,5 +5,5 @@ airllm.egg-info
 build
 dist
 __pycache__
-airllm
+airllm-original
 venv
