@@ -18,7 +18,7 @@ from vaayu import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("/media/a/MyPassport/AI-ML/LLM-models/gpt-oss-20b")
+model = AutoModel.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 input_text = ['What is the capital of United States?']
 
