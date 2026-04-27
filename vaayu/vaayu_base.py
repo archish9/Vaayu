@@ -1,4 +1,4 @@
-import os
+﻿import os
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
@@ -49,7 +49,7 @@ except ImportError:
 
 
 
-class AirLLMBaseModel(GenerationMixin):
+class VaayuBaseModel(GenerationMixin):
 
     # customize layer names here
     def set_layer_names_dict(self):
@@ -504,11 +504,11 @@ class AirLLMBaseModel(GenerationMixin):
     ):
         if past_key_values is not None:
             # Capture past length BEFORE normalizing the cache object to None,
-            # because AirLLM manages its own KV cache layer-by-layer and does not
+            # because Vaayu manages its own KV cache layer-by-layer and does not
             # consume the HF DynamicCache directly.
             past_length = self.get_past_key_values_cache_seq_len(past_key_values)
 
-            # Drop the HF cache object so AirLLM's forward is not confused by it.
+            # Drop the HF cache object so Vaayu's forward is not confused by it.
             if cache_utils_installed and isinstance(past_key_values, Cache):
                 past_key_values = None
 

@@ -1,19 +1,19 @@
-
+﻿
 from transformers import GenerationConfig
 
 from .tokenization_baichuan import BaichuanTokenizer
 
-from .airllm_base import AirLLMBaseModel
+from .vaayu_base import VaayuBaseModel
 
 
 
-class AirLLMBaichuan(AirLLMBaseModel):
+class VaayuBaichuan(VaayuBaseModel):
 
 
     def __init__(self, *args, **kwargs):
 
 
-        super(AirLLMBaichuan, self).__init__(*args, **kwargs)
+        super(VaayuBaichuan, self).__init__(*args, **kwargs)
 
     def get_use_better_transformer(self):
         return False

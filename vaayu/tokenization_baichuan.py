@@ -1,4 +1,4 @@
-# Copyright 2023 Baichuan Inc. All Rights Reserved.
+﻿# Copyright 2023 Baichuan Inc. All Rights Reserved.
 
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #

@@ -1,4 +1,4 @@
-
+﻿
 import argparse
 import json
 import time
@@ -182,7 +182,7 @@ def sample(logits, temperature=0):
     else:
         return mx.random.categorical(logits * (1 / temperature))
 
-class AirLLMLlamaMlx:
+class VaayuLlamaMlx:
 
     # customize layer names here
     def set_layer_names_dict(self):

@@ -1,17 +1,17 @@
-
+﻿
 from transformers import GenerationConfig
 
-from .airllm_base import AirLLMBaseModel
+from .vaayu_base import VaayuBaseModel
 
 
 
-class AirLLMQWen(AirLLMBaseModel):
+class VaayuQWen(VaayuBaseModel):
 
 
     def __init__(self, *args, **kwargs):
 
 
-        super(AirLLMQWen, self).__init__(*args, **kwargs)
+        super(VaayuQWen, self).__init__(*args, **kwargs)
 
     def get_use_better_transformer(self):
         return False

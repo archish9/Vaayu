@@ -1,9 +1,9 @@
 """
-Test script for local AirLLM development
+Test script for local Vaayu development
 Run this after installing in editable mode
 """
 
-from airllm import AutoModel
+from vaayu import AutoModel
 
 MAX_LENGTH = 128
 

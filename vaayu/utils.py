@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import json
 import os
 import ctypes
@@ -357,7 +357,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 else:
                     state_dict.update(load_file(to_load, device='cpu'))
 
-        # Get layer state dict and strip unknown architectural prefixes to standardize map for AirLLM Base
+        # Get layer state dict and strip unknown architectural prefixes to standardize map for Vaayu Base
         layer_state_dict = {}
         for k, v in state_dict.items():
             if layer in k:
