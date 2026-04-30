@@ -12,7 +12,7 @@ class VaayuQWen2(VaayuBaseModel):
     def __init__(self, *args, **kwargs):
 
 
-        super(VaayuQWen2, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def get_use_better_transformer(self):
         return False

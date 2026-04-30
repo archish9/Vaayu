@@ -62,7 +62,8 @@ class VaayuBaseModel(GenerationMixin):
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False,
+                 use_torch_compile=False):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -119,8 +120,32 @@ class VaayuBaseModel(GenerationMixin):
                                                                                          delete_original=delete_original)
         self.running_device = device
         self.device = torch.device(self.running_device)
-        self.running_dtype = dtype
+        if dtype == torch.float16 and device.startswith("cuda"):
+            try:
+                cc = torch.cuda.get_device_capability()
+                if cc[0] >= 8:
+                    self.running_dtype = torch.bfloat16
+                    print(f"✅ GPU supports BF16 (compute capability {cc[0]}.{cc[1]}). Using bfloat16 for better stability.")
+                else:
+                    self.running_dtype = dtype
+                    print(f"ℹ️ GPU compute capability {cc[0]}.{cc[1]} — using float16.")
+            except Exception:
+                self.running_dtype = dtype
+        else:
+            self.running_dtype = dtype
         self.dtype = self.running_dtype
+
+        self.use_torch_compile = use_torch_compile
+        self._compiled_layer_fn = None
+        if use_torch_compile:
+            if not hasattr(torch, 'compile'):
+                print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
+                self.use_torch_compile = False
+            elif not device.startswith("cuda"):
+                print("⚠️ torch.compile is most effective on CUDA. Disabling for CPU.")
+                self.use_torch_compile = False
+            else:
+                print("✅ torch.compile enabled for layer forward passes")
 
         # Create model
         if hf_token is not None:
@@ -252,58 +277,54 @@ class VaayuBaseModel(GenerationMixin):
         return True
 
     def init_model(self):
-
-        # try way 1 better transformers...
-        # Load meta model (no memory used)
         self.model = None
+        self._active_attn_impl = None
+
+        attn_candidates = []
+        try:
+            import flash_attn
+            attn_candidates.append("flash_attention_2")
+        except ImportError:
+            pass
+        attn_candidates.extend(["sdpa", "eager"])
 
         if self.get_use_better_transformer() and better_transformer_available:
             try:
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
-                    self.model = BetterTransformer.transform(self.model)  # enable flash attention
-            except (ValueError, Exception) as ve:
+                    self.model = BetterTransformer.transform(self.model)
+                self._active_attn_impl = "BetterTransformer"
+            except Exception:
                 del self.model
                 clean_memory()
                 self.model = None
 
         if self.model is None:
-            # try way 2 - use sdpa attention
-            try:
-                print(f"Using sdpa attention implementation...")
-                orig_attn = getattr(self.config, "attn_implementation", None)
-                self.config.attn_implementation = "sdpa"
+            for attn_impl in attn_candidates:
+                try:
+                    with init_empty_weights():
+                        self.model = AutoModelForCausalLM.from_config(
+                            self.config, attn_implementation=attn_impl, trust_remote_code=True
+                        )
+                    self._active_attn_impl = attn_impl
+                    break
+                except Exception:
+                    if self.model is not None:
+                        del self.model
+                    clean_memory()
+                    self.model = None
 
-                with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
-                print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
-
-            except (TypeError, ValueError, Exception) as ve:
-                if self.model is not None:
-                    del self.model
-                clean_memory()
-                self.model = None
-                if orig_attn is None:
-                    if hasattr(self.config, "attn_implementation"):
-                        delattr(self.config, "attn_implementation")
-                else:
-                    self.config.attn_implementation = orig_attn
-
-        # fallback to original way
         if self.model is None:
-            try:
-                print(f"Creating model with default attention implementation")
-                with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
-            except (TypeError, ValueError, Exception) as ve:
-                print(f"Default attention failed, falling back to 'eager' attention implementation.")
-                if self.model is not None:
-                    del self.model
-                clean_memory()
-                self.model = None
-                self.config.attn_implementation = "eager"
-                with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="eager", trust_remote_code=True)
+            raise RuntimeError("Failed to create model with any attention implementation")
+
+        print(f"✅ Attention implementation: {self._active_attn_impl}")
+        try:
+            for mod in self.model.modules():
+                if 'Attention' in type(mod).__name__:
+                    print(f"   Attention module type: {type(mod).__name__}")
+                    break
+        except Exception:
+            pass
 
         quantization_config = getattr(self.config, "quantization_config", None)
 
@@ -326,6 +347,15 @@ class VaayuBaseModel(GenerationMixin):
         if 'rotary_pos_emb' in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
+
+    def diagnose_attention(self):
+        print(f"Configured attention: {self._active_attn_impl}")
+        if torch.cuda.is_available():
+            print(f"Flash SDP available: {torch.backends.cuda.flash_sdp_enabled()}")
+            print(f"Memory-efficient SDP available: {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+            print(f"Math SDP available: {torch.backends.cuda.math_sdp_enabled()}")
+            print(f"GPU: {torch.cuda.get_device_name()}")
+            print(f"Compute capability: {torch.cuda.get_device_capability()}")
 
     def _resolve_and_map_path(self, target_path):
         import torch
@@ -612,6 +642,8 @@ class VaayuBaseModel(GenerationMixin):
         return {'past_key_value': (k_cache, v_cache)}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
+        if full_attention_mask is None:
+            return {}
         return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
@@ -639,6 +671,9 @@ class VaayuBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        _exec_start = time.time()
+        print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
+
         if cache_utils_installed:
             # we don't support kv cache for new version yet
             use_cache = False
@@ -653,14 +688,18 @@ class VaayuBaseModel(GenerationMixin):
         del self.model
         clean_memory()
         self.init_model()
+        self._compiled_layer_fn = None
 
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
 
         # Create attention mask for the largest input, and position ids to use KV cache
-        attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
-        attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-        attention_mask = attention_mask.to(self.running_device)
+        if self._active_attn_impl in ("flash_attention_2", "sdpa"):
+            attention_mask = None
+        else:
+            attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
+            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
+            attention_mask = attention_mask.to(self.running_device)
         position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
 
         # Pre-compute RoPE position embeddings for the full sequence length.
@@ -792,9 +831,16 @@ class VaayuBaseModel(GenerationMixin):
                                       **position_ids_args}
 
 
-                            layer_outputs = layer(seq,
-                                                  **kwargs
-                                                  )
+                            if self.use_torch_compile:
+                                if self._compiled_layer_fn is None:
+                                    self._compiled_layer_fn = torch.compile(
+                                        lambda m, x, **kw: m(x, **kw),
+                                        mode="reduce-overhead",
+                                        fullgraph=False,
+                                    )
+                                layer_outputs = self._compiled_layer_fn(layer, seq, **kwargs)
+                            else:
+                                layer_outputs = layer(seq, **kwargs)
                             new_seq = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
                             if output_attentions:
@@ -820,21 +866,39 @@ class VaayuBaseModel(GenerationMixin):
 
                             if not use_cache:
 
-                                kwargs = {'use_cache': False,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
+                                kwargs = {'use_cache': False}
+                                if attention_mask is not None:
+                                    kwargs['attention_mask'] = attention_mask[:, :, -len_seq:, -len_seq:]
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
-                                layer_out = layer(seq, **kwargs)
+                                if self.use_torch_compile:
+                                    if self._compiled_layer_fn is None:
+                                        self._compiled_layer_fn = torch.compile(
+                                            lambda m, x, **kw: m(x, **kw),
+                                            mode="reduce-overhead",
+                                            fullgraph=False,
+                                        )
+                                    layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
+                                else:
+                                    layer_out = layer(seq, **kwargs)
                                 new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                             else:
 
-                                kwargs = {'use_cache': True,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
+                                kwargs = {'use_cache': True}
+                                if attention_mask is not None:
+                                    kwargs['attention_mask'] = attention_mask[:, :, -len_seq:, -len_seq:]
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
-                                layer_out = layer(seq, **kwargs)
+                                if self.use_torch_compile:
+                                    if self._compiled_layer_fn is None:
+                                        self._compiled_layer_fn = torch.compile(
+                                            lambda m, x, **kw: m(x, **kw),
+                                            mode="reduce-overhead",
+                                            fullgraph=False,
+                                        )
+                                    layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
+                                else:
+                                    layer_out = layer(seq, **kwargs)
 
                                 # TODO: adopt Cache mechanism in 4.36
                                 new_seq, (k_cache, v_cache) = layer_out
@@ -876,6 +940,10 @@ class VaayuBaseModel(GenerationMixin):
             all_hidden_states = all_hidden_states[0:-2]
             for i in range(len(all_hidden_states)):
                 all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
+
+        _exec_end = time.time()
+        print(f"[Vaayu] inference end:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_end))}")
+        print(f"[Vaayu] total execution time: {_exec_end - _exec_start:.3f}s")
 
         if not return_dict:
             return tuple(v for v in [logits,

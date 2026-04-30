@@ -60,7 +60,7 @@ class MlxModelPersister(ModelPersister):
     def __init__(self, *args, **kwargs):
 
 
-        super(MlxModelPersister, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
 
     def model_persist_exist(self, layer_name, saving_path):
