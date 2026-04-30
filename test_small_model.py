@@ -4,12 +4,17 @@ Test script with smaller model first
 
 import sys
 import os
+import torch
 
 # Add project root to path
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 print(f"Using vaayu from: {project_root}")
+
+# Device selection: GPU by default, falls back to CPU if no GPU available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
 
 from vaayu import AutoModel
 
@@ -18,7 +23,7 @@ MAX_LENGTH = 128
 # Start with a very small model to test
 print("Testing with Qwen2.5-0.5B (smallest model)...")
 try:
-    model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B")
+    model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B", device=DEVICE)
 
     input_text = ['What is the capital of United States?']
 
@@ -33,7 +38,7 @@ try:
 
     print("Generating output...")
     generation_output = model.generate(
-        input_tokens['input_ids'].cuda(),
+        input_tokens['input_ids'].to(DEVICE),
         max_new_tokens=20,
         use_cache=True,
         return_dict_in_generate=True

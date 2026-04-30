@@ -3,12 +3,17 @@ Test script for local Vaayu development
 Run this after installing in editable mode
 """
 
+import torch
 from vaayu import AutoModel
+
+# Device selection: GPU by default, falls back to CPU if no GPU available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
 
 MAX_LENGTH = 128
 
 # Test with Qwen 3.5
-model = AutoModel.from_pretrained("Qwen/Qwen2.5-3B")  # Start with 2.5 first
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-3B", device=DEVICE)  # Start with 2.5 first
 
 input_text = [
     'What is the capital of United States?',
@@ -16,15 +21,15 @@ input_text = [
 
 input_tokens = model.tokenizer(
     input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH, 
+    return_tensors="pt",
+    return_attention_mask=False,
+    truncation=True,
+    max_length=MAX_LENGTH,
     padding=False
 )
-           
+
 generation_output = model.generate(
-    input_tokens['input_ids'].cuda(), 
+    input_tokens['input_ids'].to(DEVICE),
     max_new_tokens=20,
     use_cache=True,
     return_dict_in_generate=True

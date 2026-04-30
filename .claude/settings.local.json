@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile vaayu/utils.py vaayu/vaayu_base.py vaayu/profiler.py)",
+      "Bash(python *)"
+    ]
+  }
+}

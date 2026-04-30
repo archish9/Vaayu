@@ -79,7 +79,8 @@ def clean_memory():
     except Exception as ex:
         # maybe platform
         pass
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def uncompress_layer_state_dict(layer_state_dict):

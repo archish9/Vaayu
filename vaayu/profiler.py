@@ -17,9 +17,16 @@ class LayeredProfiler:
         self.profiling_time_dict[item].append(time)
 
         if self.print_memory:
-            free_mem = torch.cuda.mem_get_info()[0]
-            self.min_free_mem = min(self.min_free_mem, free_mem)
-            print(f"free vmem @{item}: {free_mem/1024/1024/1024:.02f}GB, min free: {self.min_free_mem/1024/1024/1024:.02f}GB")
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.mem_get_info()[0]
+                self.min_free_mem = min(self.min_free_mem, free_mem)
+                print(f"free vmem @{item}: {free_mem/1024/1024/1024:.02f}GB, min free: {self.min_free_mem/1024/1024/1024:.02f}GB")
+            else:
+                import psutil
+                mem = psutil.virtual_memory()
+                free_ram = mem.available
+                self.min_free_mem = min(self.min_free_mem, free_ram)
+                print(f"free RAM @{item}: {free_ram/1024/1024/1024:.02f}GB, min free: {self.min_free_mem/1024/1024/1024:.02f}GB")
 
     def clear_profiling_time(self):
         for item in self.profiling_time_dict.keys():

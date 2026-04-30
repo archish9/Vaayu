@@ -102,6 +102,12 @@ class VaayuBaseModel(GenerationMixin):
         if compression is not None:
             if not bitsandbytes_installed:
                 raise ImportError('WARNING: bitsandbytes not found. Compression needs bitsandbytes. To use compression, please install bitsandbytes: `pip install bitsandbytes`')
+            if not device.startswith("cuda"):
+                raise ValueError(
+                    "Compression (4bit/8bit) currently requires a CUDA GPU. "
+                    "For CPU-only mode, use compression=None. "
+                    "CPU compression support is planned for a future release."
+                )
 
 
         self.compression = compression
@@ -131,6 +137,10 @@ class VaayuBaseModel(GenerationMixin):
                     print(f"ℹ️ GPU compute capability {cc[0]}.{cc[1]} — using float16.")
             except Exception:
                 self.running_dtype = dtype
+        elif not device.startswith("cuda") and dtype == torch.float16:
+            # CPU lacks native float16 ALUs — float32 is 10-50x faster on x86/ARM
+            self.running_dtype = torch.float32
+            print("ℹ️ CPU mode: using float32 (float16 is very slow on CPU).")
         else:
             self.running_dtype = dtype
         self.dtype = self.running_dtype

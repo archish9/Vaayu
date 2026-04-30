@@ -157,6 +157,25 @@ When initialize the model, we support the following configurations:
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
+## CPU-Only Mode
+
+Vaayu supports running models on CPU for machines without a GPU:
+
+```python
+model = AutoModel.from_pretrained("model-name", device="cpu")
+```
+
+**Requirements:**
+- Recommended: 32GB RAM for 8B models
+- Peak memory: ~1-2GB (only one layer loaded at a time)
+- Speed: ~2-10 seconds per token depending on CPU
+
+**Limitations:**
+- Compression (4bit/8bit) is not yet supported on CPU
+- float16 is auto-upgraded to float32 for performance
+
+---
+
 ## MacOS
 
 Just install airllm and run the code the same as on linux. See more in [Quick Start](#quickstart).

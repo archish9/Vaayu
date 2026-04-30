@@ -5,6 +5,7 @@ This adds the local path to Python's import system
 
 import sys
 import os
+import torch
 
 # Add project root to path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -12,13 +13,17 @@ sys.path.insert(0, project_root)
 
 print(f"Using vaayu from: {project_root}")
 
+# Device selection: GPU by default, falls back to CPU if no GPU available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
+
 # Now import and test
 from vaayu import AutoModel
 
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+model = AutoModel.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", device=DEVICE)
 
 input_text = ['What is the capital of United States?']
 
@@ -32,9 +37,9 @@ input_tokens = model.tokenizer(
 )
 
 print("Generating output...")
-print(input_tokens['input_ids'].cuda())
+print(input_tokens['input_ids'].to(DEVICE))
 generation_output = model.generate(
-    input_tokens['input_ids'].cuda(),
+    input_tokens['input_ids'].to(DEVICE),
     max_new_tokens=20,
     use_cache=True,
     return_dict_in_generate=True
