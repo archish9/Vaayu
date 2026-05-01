@@ -147,14 +147,6 @@ class VaayuBaseModel(GenerationMixin):
 
         self.use_torch_compile = use_torch_compile
         self._compiled_layer_fn = None
-        self._forward_call_count = 0
-        # DIAG: SDP backend availability (Phase 3 verification)
-        if torch.cuda.is_available():
-            print(f"[VAAYU-DIAG] Flash SDP available:          {torch.backends.cuda.flash_sdp_enabled()}")
-            print(f"[VAAYU-DIAG] Mem-efficient SDP available:  {torch.backends.cuda.mem_efficient_sdp_enabled()}")
-            print(f"[VAAYU-DIAG] Math SDP available (slow):    {torch.backends.cuda.math_sdp_enabled()}")
-        else:
-            print("[VAAYU-DIAG] CPU mode — SDP backends not applicable")
         if use_torch_compile:
             if not hasattr(torch, 'compile'):
                 print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
@@ -477,20 +469,6 @@ class VaayuBaseModel(GenerationMixin):
         else:
             state_dict = load_layer_output
 
-        # pin memory:
-        if self.prefetching:
-            t = time.time()
-            if torch.cuda.is_available():  # Check if CUDA is available
-                for k in state_dict.keys():
-                    state_dict[k].pin_memory()
-            else:
-                # For CPU, no action is needed, but you could optionally add a log or message
-                print("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
-
-            elapsed_time = time.time() - t
-            if self.profiling_mode:
-                self.profiler.add_profiling_time('pin_memory_to_trigger_load', elapsed_time)
-
         return state_dict
 
     def move_layer_to_device(self, state_dict):
@@ -555,9 +533,6 @@ class VaayuBaseModel(GenerationMixin):
             # because Vaayu manages its own KV cache layer-by-layer and does not
             # consume the HF DynamicCache directly.
             past_length = self.get_past_key_values_cache_seq_len(past_key_values)
-
-            # Pass DynamicCache through to forward() — it is updated in-place by each layer.
-            print(f"[VAAYU-DIAG] prepare_inputs: passing DynamicCache through (past_length={past_length})")
 
             # Some generation methods already pass only the last input ID
             if input_ids.shape[1] > past_length:
@@ -689,13 +664,7 @@ class VaayuBaseModel(GenerationMixin):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         _exec_start = time.time()
-        self._forward_call_count += 1
-        _token_num = self._forward_call_count
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
-        print(f"[VAAYU-DIAG] ===== forward() call #{_token_num} =====")
-        print(f"[VAAYU-DIAG] past_key_values incoming: type={type(past_key_values).__name__}, is_none={past_key_values is None}")
-
-        print(f"[VAAYU-DIAG] use_cache: {use_cache}")
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
@@ -726,7 +695,6 @@ class VaayuBaseModel(GenerationMixin):
         # config rather than calling the meta-initialized module.  After
         # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
-        _rope_already_cached = getattr(self, '_full_position_embeddings', None) is not None
         if self.get_rotary_emb() is not None:
             try:
                 # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
@@ -742,22 +710,22 @@ class VaayuBaseModel(GenerationMixin):
             except Exception as e:
                 print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
                 self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
-            print(f"[VAAYU-DIAG] RoPE: {'reused cached' if _rope_already_cached else 'recomputed from scratch  <-- PHASE-1 ISSUE: wasted per token'}")
         else:
             self._full_position_embeddings = None
-            print("[VAAYU-DIAG] RoPE: not used by this architecture")
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
         all_hidden_states = [] * len(self.layers) if output_hidden_states else None
         all_self_attns = [] * len(self.layers) if output_attentions else None
 
+        _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
+        _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
+        _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
+
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
 
             # Load first layer
             if self.prefetching:
-                #with torch.cuda.stream(self.stream):
-                #state_dict = self.load_layer_to_cpu(self.layer_names[0])
                 future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
 
 
@@ -768,43 +736,39 @@ class VaayuBaseModel(GenerationMixin):
                 if self.prefetching:
                     if self.profiling_mode:
                         t = time.time()
-                    # Load current layer and prepare next layer
+                    _t = time.time()
                     state_dict = future.result()
-                    #torch.cuda.current_stream().wait_stream(self.stream)
+                    _io_wait_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
 
-                    #for param_name, param in state_dict.items():
-                    #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
                     if self.profiling_mode:
                         t = time.time()
+                    _t = time.time()
                     moved_layers = self.move_layer_to_device(state_dict)
+                    _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
 
-                    # kick off next layer loading
-
                     if (i + 1) < len(self.layer_names):
-                        #with torch.cuda.stream(self.stream):
-                        #state_dict = self.load_layer_to_cpu(self.layer_names[i + 1])
                         if self.profiling_mode:
                             t = time.time()
                         future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
-                        #for param_name, param in state_dict.items():
-                        #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
                         if self.profiling_mode:
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
 
                 else:
+                    _t = time.time()
                     state_dict = self.load_layer_to_cpu(layer_name)
+                    _io_wait_s += time.time() - _t
                     if self.profiling_mode:
                         t = time.time()
+                    _t = time.time()
                     moved_layers = self.move_layer_to_device(state_dict)
+                    _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
@@ -846,9 +810,9 @@ class VaayuBaseModel(GenerationMixin):
                                     mode="reduce-overhead",
                                     fullgraph=False,
                                 )
-                            layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
+                            _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t
                         else:
-                            layer_out = layer(seq, **kwargs)
+                            _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t
                         new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                         if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
@@ -883,8 +847,10 @@ class VaayuBaseModel(GenerationMixin):
                 all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
 
         _exec_end = time.time()
+        _total = _exec_end - _exec_start
         print(f"[Vaayu] inference end:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_end))}")
-        print(f"[Vaayu] total execution time: {_exec_end - _exec_start:.3f}s")
+        print(f"[Vaayu] total execution time: {_total:.3f}s")
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s")
 
         if not return_dict:
             return tuple(v for v in [logits,
