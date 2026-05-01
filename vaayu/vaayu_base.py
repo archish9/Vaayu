@@ -1,4 +1,4 @@
-﻿import os
+import os
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
@@ -96,7 +96,7 @@ class VaayuBaseModel(GenerationMixin):
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
         self.total_compression_overhead_time = None
-        self._supports_cache_class = False
+        self._supports_cache_class = True
         self.hf_quantizer = None
 
         if compression is not None:
@@ -147,6 +147,14 @@ class VaayuBaseModel(GenerationMixin):
 
         self.use_torch_compile = use_torch_compile
         self._compiled_layer_fn = None
+        self._forward_call_count = 0
+        # DIAG: SDP backend availability (Phase 3 verification)
+        if torch.cuda.is_available():
+            print(f"[VAAYU-DIAG] Flash SDP available:          {torch.backends.cuda.flash_sdp_enabled()}")
+            print(f"[VAAYU-DIAG] Mem-efficient SDP available:  {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+            print(f"[VAAYU-DIAG] Math SDP available (slow):    {torch.backends.cuda.math_sdp_enabled()}")
+        else:
+            print("[VAAYU-DIAG] CPU mode — SDP backends not applicable")
         if use_torch_compile:
             if not hasattr(torch, 'compile'):
                 print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
@@ -548,9 +556,8 @@ class VaayuBaseModel(GenerationMixin):
             # consume the HF DynamicCache directly.
             past_length = self.get_past_key_values_cache_seq_len(past_key_values)
 
-            # Drop the HF cache object so Vaayu's forward is not confused by it.
-            if cache_utils_installed and isinstance(past_key_values, Cache):
-                past_key_values = None
+            # Pass DynamicCache through to forward() — it is updated in-place by each layer.
+            print(f"[VAAYU-DIAG] prepare_inputs: passing DynamicCache through (past_length={past_length})")
 
             # Some generation methods already pass only the last input ID
             if input_ids.shape[1] > past_length:
@@ -648,8 +655,8 @@ class VaayuBaseModel(GenerationMixin):
             return {'position_embeddings': (cos[:, len_p:len_p + len_s], sin[:, len_p:len_p + len_s])}
         return {}
 
-    def get_past_key_value_args(self, k_cache, v_cache):
-        return {'past_key_value': (k_cache, v_cache)}
+    def get_past_key_value_args(self, past_key_values):
+        return {'past_key_values': past_key_values}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         if full_attention_mask is None:
@@ -682,11 +689,13 @@ class VaayuBaseModel(GenerationMixin):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         _exec_start = time.time()
+        self._forward_call_count += 1
+        _token_num = self._forward_call_count
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
+        print(f"[VAAYU-DIAG] ===== forward() call #{_token_num} =====")
+        print(f"[VAAYU-DIAG] past_key_values incoming: type={type(past_key_values).__name__}, is_none={past_key_values is None}")
 
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
-            use_cache = False
+        print(f"[VAAYU-DIAG] use_cache: {use_cache}")
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
@@ -694,11 +703,6 @@ class VaayuBaseModel(GenerationMixin):
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
-        # Reboot the model to make sure buffers are loaded and memory is clean
-        del self.model
-        clean_memory()
-        self.init_model()
-        self._compiled_layer_fn = None
 
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
@@ -722,28 +726,29 @@ class VaayuBaseModel(GenerationMixin):
         # config rather than calling the meta-initialized module.  After
         # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
+        _rope_already_cached = getattr(self, '_full_position_embeddings', None) is not None
         if self.get_rotary_emb() is not None:
             try:
                 # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
                 # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
                 rotary_emb_cls = type(self.get_rotary_emb())
                 real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
-                
+
                 # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
                 dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
                 dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
-                
+
                 self._full_position_embeddings = real_rotary(dummy_x, position_ids)
             except Exception as e:
                 print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
                 self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+            print(f"[VAAYU-DIAG] RoPE: {'reused cached' if _rope_already_cached else 'recomputed from scratch  <-- PHASE-1 ISSUE: wasted per token'}")
         else:
             self._full_position_embeddings = None
+            print("[VAAYU-DIAG] RoPE: not used by this architecture")
 
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
-            for x in self.layers:
-                kv_cache_list.append(([], []))
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
         all_hidden_states = [] * len(self.layers) if output_hidden_states else None
         all_self_attns = [] * len(self.layers) if output_attentions else None
 
@@ -823,99 +828,31 @@ class VaayuBaseModel(GenerationMixin):
                         if output_attentions:
                             all_hidden_states[i].append(new_seq)
 
-                        if past_key_values is not None:
-                            # join past kv
-                            k_cache, v_cache = past_key_values[i - 1]
-                            len_p = self.get_past_key_values_cache_seq_len(past_key_values)
-                            len_s = self.get_sequence_len(seq)
+                        len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
+                        len_s = self.get_sequence_len(seq)
 
-                            position_ids_args = self.get_position_ids_args(position_ids, len_p, len_s)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, len_p, len_s)
-                            past_key_value_args = self.get_past_key_value_args(k_cache, v_cache)
+                        kwargs = {
+                            'use_cache': use_cache,
+                            **self.get_past_key_value_args(past_key_values),
+                            **self.get_pos_emb_args(len_p, len_s),
+                            **self.get_attention_mask_args(attention_mask, len_p, len_s),
+                            **self.get_position_ids_args(position_ids, len_p, len_s),
+                        }
 
-                            kwargs = {'use_cache':True,
-                                      }
-
-                            pos_embed_args = self.get_pos_emb_args(len_p, len_s)
-                            kwargs = {**kwargs, **past_key_value_args, **pos_embed_args, **attention_mask_args,
-                                      **position_ids_args}
-
-
-                            if self.use_torch_compile:
-                                if self._compiled_layer_fn is None:
-                                    self._compiled_layer_fn = torch.compile(
-                                        lambda m, x, **kw: m(x, **kw),
-                                        mode="reduce-overhead",
-                                        fullgraph=False,
-                                    )
-                                layer_outputs = self._compiled_layer_fn(layer, seq, **kwargs)
-                            else:
-                                layer_outputs = layer(seq, **kwargs)
-                            new_seq = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-
-                            if output_attentions:
-                                all_self_attns[i].append(layer_outputs[1])
-
-                            if use_cache:
-                                (k_cache, v_cache) = layer_outputs[2 if output_attentions else 1]
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
-
+                        if self.use_torch_compile:
+                            if self._compiled_layer_fn is None:
+                                self._compiled_layer_fn = torch.compile(
+                                    lambda m, x, **kw: m(x, **kw),
+                                    mode="reduce-overhead",
+                                    fullgraph=False,
+                                )
+                            layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
                         else:
-                            len_seq = self.get_sequence_len(seq)
+                            layer_out = layer(seq, **kwargs)
+                        new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-
-
-                            pos_embed_args = self.get_pos_emb_args(0, len_seq)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, 0, len_seq)
-                            position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
-
-
-
-
-                            if not use_cache:
-
-                                kwargs = {'use_cache': False}
-                                if attention_mask is not None:
-                                    kwargs['attention_mask'] = attention_mask[:, :, -len_seq:, -len_seq:]
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-
-                                if self.use_torch_compile:
-                                    if self._compiled_layer_fn is None:
-                                        self._compiled_layer_fn = torch.compile(
-                                            lambda m, x, **kw: m(x, **kw),
-                                            mode="reduce-overhead",
-                                            fullgraph=False,
-                                        )
-                                    layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
-                                else:
-                                    layer_out = layer(seq, **kwargs)
-                                new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-                            else:
-
-                                kwargs = {'use_cache': True}
-                                if attention_mask is not None:
-                                    kwargs['attention_mask'] = attention_mask[:, :, -len_seq:, -len_seq:]
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-
-                                if self.use_torch_compile:
-                                    if self._compiled_layer_fn is None:
-                                        self._compiled_layer_fn = torch.compile(
-                                            lambda m, x, **kw: m(x, **kw),
-                                            mode="reduce-overhead",
-                                            fullgraph=False,
-                                        )
-                                    layer_out = self._compiled_layer_fn(layer, seq, **kwargs)
-                                else:
-                                    layer_out = layer(seq, **kwargs)
-
-                                # TODO: adopt Cache mechanism in 4.36
-                                new_seq, (k_cache, v_cache) = layer_out
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
-                                # print(f"k_cache sizes: {[len(x[1]) for x in kv_cache_list]}")
+                        if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
+                            all_self_attns[i].append(layer_out[1])
 
                         batch[j] = new_seq
 
@@ -934,12 +871,6 @@ class VaayuBaseModel(GenerationMixin):
                 clean_memory()  # proposed by CPMP
 
         logits = torch.cat(batch, 0)
-        if use_cache:
-            kv_cache_list = kv_cache_list[1:-2]
-            for i in range(len(kv_cache_list)):
-                # print(f"{i} - {kv_cache_list[i][0].shape}")
-                kv_cache_list[i] = (torch.cat(kv_cache_list[i][0], 0), torch.cat(kv_cache_list[i][1], 0))
-            #print(f"returning kvcache size: {kv_cache_list[0][0].shape}")
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
@@ -957,7 +888,7 @@ class VaayuBaseModel(GenerationMixin):
 
         if not return_dict:
             return tuple(v for v in [logits,
-                                     tuple(kv_cache_list) if kv_cache_list is not None else None,
+                                     past_key_values if use_cache else None,
                                      tuple(all_hidden_states) if all_hidden_states is not None else None,
                                      tuple(all_self_attns) if all_self_attns is not None else None] if v is not None)
         if self.profiling_mode:
@@ -975,7 +906,7 @@ class VaayuBaseModel(GenerationMixin):
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
-            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
+            past_key_values=past_key_values if use_cache else None,
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
-            attentions=tuple(all_self_attns) if all_hidden_states is not None else None,
+            attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )

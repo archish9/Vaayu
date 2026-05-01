@@ -23,7 +23,7 @@ from vaayu import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", device=DEVICE)
+model = AutoModel.from_pretrained("/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct", device=DEVICE)
 
 input_text = ['What is the capital of United States?']
 

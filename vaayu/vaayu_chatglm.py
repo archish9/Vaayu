@@ -42,8 +42,9 @@ class VaayuChatGLM(VaayuBaseModel):
 
         return {'rotary_pos_emb': rotary_pos_emb}
 
-    def get_past_key_value_args(self, k_cache, v_cache):
-        return {'kv_cache': (k_cache, v_cache)}
+    def get_past_key_value_args(self, past_key_values):
+        # ChatGLM legacy attention expects (k, v) tuple; DynamicCache not supported yet
+        return {'kv_cache': None}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         return {'attention_mask': None}
