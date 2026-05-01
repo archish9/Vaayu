@@ -1,254 +1,304 @@
-# GPU Speed Optimization — Remove Per-Token Waste & Enable KV Cache
+# Rust I/O Acceleration for Vaayu
 
 ## Background
 
-Vaayu running Llama 3.3 70B currently takes **~54 seconds per token** and generates 20 tokens in ~18 minutes. Two critical issues cause unnecessary work on every single token:
+Vaayu's per-token inference for Llama 3.3 70B takes **~80 seconds**, of which **~95% is disk I/O** — loading 83 layer files (each ~1.6 GB, totaling ~132 GB) from NVMe to CPU to GPU on every single token.
 
-1. **Model reinit every token**: `forward()` calls `del self.model; clean_memory(); init_model()` on every forward pass (lines 697-701), destroying and recreating the model shell (~2-3s wasted per token).
-2. **KV cache disabled**: `use_cache` is hardcoded to `False` (lines 687-689), forcing the model to reprocess the **entire input sequence** through all 83 layers on every token, instead of just the new token.
+### Current Hot Path (Per Token)
 
-Both fixes are **mathematically lossless** — they produce bit-identical output.
+```
+for each of 83 layers:
+  1. load_layer_to_cpu()        → safetensors.torch.load_file(path, device="cpu")
+  2. pin_memory()               → state_dict[k].pin_memory()
+  3. move_layer_to_device()     → state_dict → remap keys → .to(cuda) or set_module_tensor_to_device()
+  4. layer.forward(seq)         → actual GPU compute (~50ms per layer)
+  5. layer.to("meta")           → evict weights
+  6. clean_memory()             → gc + cuda.empty_cache()
+```
 
-> [!IMPORTANT]
-> I/O bottleneck (disk→CPU→GPU weight loading) is explicitly **out of scope** — it will be addressed later with Rust.
+Steps 1-3 take **~950ms per layer** (×83 = ~79s). Step 4 takes **~50ms per layer** (×83 = ~4s). The GPU is idle **95% of the time**.
 
----
+### Hardware
 
-## KV Cache Memory Scaling
+| Component | Spec | Theoretical Max |
+|---|---|---|
+| Storage | Samsung 990 PRO 1TB NVMe | 7.0 GB/s seq read |
+| CPU | Intel i5-14600K (14 cores) | PCIe 5.0 ×16 |
+| GPU | RTX 5060 Ti 16GB | PCIe 5.0 ×8 (~32 GB/s) |
+| RAM | (assumed 32-64 GB DDR5) | ~50 GB/s |
 
-KV cache size scales linearly with sequence length. The DynamicCache will automatically place tensors on whatever device the computation runs on — no hardcoded device assumptions.
+The NVMe can read at 7 GB/s. At 1.6 GB per layer, theoretical minimum is **~230ms per layer** if we eliminate all Python overhead. Current is **~950ms** — that's a **4× gap** caused by:
 
-**Formula per token per layer**: `2 (K+V) × num_kv_heads × head_dim × dtype_bytes`
-
-**Example: Llama 3.3 70B (GQA, 8 KV heads, 80 layers, bf16):**
-
-| Sequence Length | KV Cache Size |
-|---|---|
-| 128 tokens | 40 MB |
-| 512 tokens | 160 MB |
-| 2,048 tokens | 640 MB |
-| 8,192 tokens | 2.5 GB |
-| 131,072 (full context) | 40 GB |
-
-For short sequences the cache is trivial. For very long sequences, CPU offloading can be added later — DynamicCache supports this natively.
-
----
-
-## Subclass Audit
-
-All changes must apply across every supported architecture. Here's what each subclass overrides for cache handling:
-
-| Subclass | Overrides `get_past_key_value_args`? | KV arg name | Overrides `get_past_key_values_cache_seq_len`? | Notes |
-|---|---|---|---|---|
-| **VaayuLlama2** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuQWen2** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuMistral** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuMixtral** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuInternLM** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuBaichuan** | ❌ (uses base) | `past_key_value` | ❌ (uses base) | Modern arch, DynamicCache compatible |
-| **VaayuQWen** (v1) | ✅ → `layer_past` | `layer_past` | ✅ → `shape[1]` | Legacy arch, uses custom tuple format |
-| **VaayuChatGLM** | ✅ → `kv_cache` | `kv_cache` | ✅ → `shape[0]` | Legacy arch, uses custom tuple format + custom `get_sequence_len` |
-
-**Strategy**: The 6 modern architectures (Llama, Qwen2, Mistral, Mixtral, InternLM, Baichuan) all use the base class defaults and are fully DynamicCache-compatible with transformers 5.5.4. The 2 legacy architectures (QWen v1, ChatGLM) use custom KV argument names — these will get a compatibility bridge in the base class that detects whether the subclass overrides `get_past_key_value_args` and falls back to the legacy tuple path when needed.
+1. Python `safetensors` wrapper overhead (dict construction, GIL)
+2. `read()` syscall → copy to Python buffer → copy to torch tensor (double buffering)
+3. No overlap between disk read and GPU compute (prefetching exists but limited by GIL)
+4. `pin_memory()` as a separate step instead of direct pinned allocation
 
 ---
 
 ## Proposed Changes
 
-### Phase 1: Remove Per-Token Model Reinit
+### Phase 1: `vaayu_rust` — mmap-based Safetensor Loader (P0, Highest Impact)
 
-#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py)
+This replaces the Python `safetensors.torch.load_file()` with a zero-copy Rust implementation.
 
-**Problem**: Lines 697-701 destroy and rebuild the entire model on every forward call:
-```python
-# Reboot the model to make sure buffers are loaded and memory is clean
-del self.model
-clean_memory()
-self.init_model()
-self._compiled_layer_fn = None
+#### [NEW] `vaayu_rust/` — PyO3 Extension Module
+
+```
+Vaayu/
+├── vaayu/                   # existing Python code (unchanged)
+├── vaayu_rust/              # NEW Rust crate
+│   ├── Cargo.toml
+│   ├── pyproject.toml
+│   └── src/
+│       └── lib.rs           # PyO3 module with fast_load()
+└── test_quick.py            # unchanged
 ```
 
-The per-layer cleanup at lines 927-934 already handles memory correctly — each layer is moved to `"meta"` device after use, and `clean_memory()` is called. The model shell (module hierarchy, config, tied weights) doesn't need rebuilding.
+##### [NEW] [Cargo.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/Cargo.toml)
 
-**Changes**:
-1. **Remove lines 697-701** entirely. The model shell from `__init__` persists between forward calls. Layer weights are loaded/unloaded per layer as before.
-2. **Cache RoPE computation** (lines 725-741): Currently recomputed every forward(). Move to a lazy-init pattern — compute once on first forward, store in `self._full_position_embeddings`, reuse on subsequent calls. The RoPE values only depend on `max_seq_len` and config, which don't change.
+Dependencies:
+- `pyo3` — Python bindings
+- `memmap2` — memory-mapped file I/O
+- `safetensors` — Rust-native safetensor parsing (the `safetensors` crate, same one HuggingFace uses internally)
+- `numpy` (via pyo3) — return tensors as numpy arrays that PyTorch can wrap zero-copy
 
-**Expected impact**: Saves ~2-3 seconds per token (model reconstruction + RoPE recomputation overhead).
+##### [NEW] [src/lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
+
+**Core function: `fast_load(path: str) -> Dict[str, torch.Tensor]`**
+
+```
+Current Python path:
+  open(file) → read() → Python bytes → safetensors parse → Dict[str, Tensor]
+
+Rust mmap path:
+  mmap(file) → safetensors parse header only → Dict[str, zero-copy view into mmap]
+```
+
+Implementation strategy:
+1. `mmap` the `.safetensors` file (read-only, `MAP_POPULATE` to hint kernel to pre-fault pages)
+2. Parse the safetensor JSON header (offsets + dtypes for each tensor) — this is ~1KB regardless of file size
+3. For each tensor, create a numpy array that **points directly into the mmap region** (zero-copy)
+4. Return `Dict[str, numpy.ndarray]` — PyTorch wraps these via `torch.from_numpy()` with no copy
+5. Keep the mmap handle alive (attached to the returned arrays) so the backing memory persists
+
+**Why this is faster:**
+- **Zero copy**: No `read()` syscall, no Python buffer, no copy to tensor. The tensor IS the file.
+- **Kernel-managed paging**: The OS loads pages on-demand from NVMe, with its own readahead and caching. On Linux with a 990 PRO, this can saturate the 7 GB/s bandwidth.
+- **No GIL**: The mmap and header parsing happen in Rust without holding the GIL, enabling true parallelism with Python's prefetch thread.
+- **MAP_POPULATE**: Hints the kernel to fault all pages immediately in the background, overlapping with other work.
+
+**Expected per-layer time reduction:**
+
+| Step | Current (Python) | After (Rust mmap) |
+|---|---|---|
+| File open + read to CPU | ~600ms | ~0ms (mmap is instant) |
+| Safetensor header parse | ~10ms | ~1ms |
+| Dict construction | ~50ms | ~10ms (Rust HashMap) |
+| Page faults (actual I/O) | (included above) | ~230ms (amortized by readahead) |
+| **Total** | **~950ms** | **~250-350ms** |
+
+##### [NEW] [pyproject.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/pyproject.toml)
+
+Standard maturin config for building the `.so` module.
 
 ---
 
-### Phase 2: Enable KV Cache with DynamicCache
+#### [MODIFY] [safetensor_model_persister.py](file:///home/a/code/ai-ml/Vaayu/vaayu/persist/safetensor_model_persister.py)
 
-This is the highest-impact change. With KV cache, token 2+ only processes **1 token** through all 83 layers instead of reprocessing the growing sequence.
+Integration point — the only file that calls `safetensors.torch.load_file()`. Change to:
 
-#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py)
-
-**Change 1 — Enable cache class support** (line 99):
-```diff
-- self._supports_cache_class = False
-+ self._supports_cache_class = True
-```
-This tells transformers 5.5.4's `generate()` to use `DynamicCache` natively. DynamicCache automatically places KV tensors on whatever device the computation runs on — no hardcoded device assumptions.
-
-**Change 2 — Remove use_cache override** (lines 687-689):
-```diff
-- if cache_utils_installed:
--     # we don't support kv cache for new version yet
--     use_cache = False
-```
-
-**Change 3 — Fix `prepare_inputs_for_generation`** (lines 545-553):
-
-Currently drops the DynamicCache object:
 ```python
-if cache_utils_installed and isinstance(past_key_values, Cache):
-    past_key_values = None  # ← drops it!
+class SafetensorModelPersister(ModelPersister):
+    def load_model(self, layer_name, path):
+        try:
+            import vaayu_rust
+            # Returns Dict[str, numpy.ndarray] — zero-copy mmap views
+            np_dict = vaayu_rust.fast_load(str(Path(path) / (layer_name + ".safetensors")))
+            # Convert numpy views to torch tensors (zero-copy)
+            return {k: torch.from_numpy(v) for k, v in np_dict.items()}
+        except ImportError:
+            # Fallback to pure Python if Rust module not built
+            return load_file(Path(path) / (layer_name + ".safetensors"), device="cpu")
 ```
 
-Change to pass DynamicCache through to forward:
+> [!IMPORTANT]
+> The fallback ensures the project works even without the Rust module compiled. Users who don't have Rust installed can still use the pure-Python path.
+
+---
+
+#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py) — `load_layer_to_cpu()` (lines 433-494)
+
+Minor changes:
+1. **Remove separate `pin_memory()` step** (lines 481-492): With mmap, tensors are in kernel-managed memory. Pinning mmap'd pages is a no-op or counterproductive. For the GPU transfer, `move_layer_to_device()` already calls `.to(cuda)` which handles DMA.
+2. **Add diagnostic logging**: Print whether Rust loader or Python fallback is being used (one-time on first layer).
+
+---
+
+### Phase 2: Double-Buffered Prefetch with io_uring (P1)
+
+> [!NOTE]
+> Phase 2 builds on Phase 1. Only start this after Phase 1 is verified.
+
+Currently, the prefetch thread calls `load_layer_to_cpu()` in a `ThreadPoolExecutor`. With the Rust mmap loader, we can do better:
+
+#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
+
+Add `prefetch_layer(path: str)` function that:
+1. **Pre-mmaps** the next layer's file and calls `madvise(MADV_WILLNEED)` to trigger kernel readahead
+2. On Linux, optionally uses **io_uring** for fully async page fault resolution
+3. Returns a handle that `fast_load()` can use to skip the mmap step
+
+#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py) — prefetch loop (lines 755-801)
+
+Replace `executor.submit(self.load_layer_to_cpu, ...)` with:
 ```python
-if past_key_values is not None:
-    past_length = self.get_past_key_values_cache_seq_len(past_key_values)
-    # Keep the cache object — pass it through to forward()
-    if input_ids.shape[1] > past_length:
-        remove_prefix_length = past_length
-    else:
-        remove_prefix_length = input_ids.shape[1] - 1
-    input_ids = input_ids[:, remove_prefix_length:]
+# Kick off Rust-side prefetch (mmap + madvise in background)
+vaayu_rust.prefetch_layer(next_layer_path)
 ```
 
-**Change 4 — Adapt decoder layer loop to use DynamicCache** (lines 826-920):
+This ensures the next layer's pages are being loaded from NVMe into kernel page cache **while the current layer's forward pass runs on GPU**. True double-buffering.
 
-In transformers 5.5.4, decoder layers expect `past_key_value=<DynamicCache>` (the whole cache object, not a per-layer tuple). Each layer internally uses `self.layer_idx` to access its own KV slice via `cache.update(key, value, self.layer_idx)`.
+**Expected improvement**: If GPU forward is ~50ms and disk read is ~230ms, we can pipeline 4-5 layers of readahead, potentially hiding all I/O latency.
 
-The base class forward loop changes to:
+---
+
+### Phase 3: CPU-side Dequantization in Rust+SIMD (P1)
+
+#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
+
+Add `dequantize_nf4(data: bytes, quant_state: dict) -> numpy.ndarray` function:
+1. Parse NF4 quantization state from dict
+2. Dequantize using **AVX2/AVX-512** SIMD on the i5-14600K (supports AVX2)
+3. Return as `float16` numpy array
+
+This eliminates the dependency on `bitsandbytes` for dequantization and runs on CPU without needing CUDA for the dequant step.
+
+#### [MODIFY] [utils.py](file:///home/a/code/ai-ml/Vaayu/vaayu/utils.py) — `uncompress_layer_state_dict()` (lines 86-114)
+
 ```python
-# At forward start:
-if use_cache and past_key_values is None:
-    past_key_values = DynamicCache()
-
-# For each decoder layer:
-has_cache = (past_key_values is not None 
-             and hasattr(past_key_values, 'get_seq_length') 
-             and past_key_values.get_seq_length() > 0)
-len_p = past_key_values.get_seq_length() if has_cache else 0
-len_s = self.get_sequence_len(seq)
-
-kwargs = {
-    'use_cache': use_cache,
-    **self.get_past_key_value_args(past_key_values),  # passes full cache
-    **self.get_pos_emb_args(len_p, len_s),
-    **self.get_attention_mask_args(attention_mask, len_p, len_s),
-    **self.get_position_ids_args(position_ids, len_p, len_s),
-}
-layer_out = layer(seq, **kwargs)
-new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-```
-
-DynamicCache is updated **in-place** by each layer — no manual cache list management needed.
-
-**Change 5 — Update `get_past_key_value_args`** (line 651-652):
-
-The base class method passes the full DynamicCache object:
-```diff
-- def get_past_key_value_args(self, k_cache, v_cache):
--     return {'past_key_value': (k_cache, v_cache)}
-+ def get_past_key_value_args(self, past_key_values):
-+     return {'past_key_value': past_key_values}
-```
-
-**Change 6 — Update `get_past_key_values_cache_seq_len`** (lines 591-598):
-
-Simplify to always use DynamicCache's API:
-```python
-def get_past_key_values_cache_seq_len(self, past_key_values):
-    if hasattr(past_key_values, 'get_seq_length'):
-        return past_key_values.get_seq_length()
-    # Legacy tuple fallback for QWen v1 / ChatGLM
-    return past_key_values[0][0].shape[2]
-```
-
-**Change 7 — Remove legacy cache list code** (lines 743-746, 937-941):
-
-Remove the `kv_cache_list` initialization and post-processing. Return the DynamicCache directly:
-```python
-return CausalLMOutputWithPast(
-    logits=logits,
-    past_key_values=past_key_values,  # DynamicCache object
-    ...
-)
+def uncompress_layer_state_dict(layer_state_dict):
+    try:
+        import vaayu_rust
+        return vaayu_rust.dequantize_state_dict(layer_state_dict)
+    except ImportError:
+        # Existing bitsandbytes path
+        ...
 ```
 
 ---
 
-#### [MODIFY] [vaayu_qwen.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_qwen.py)
+### Phase 4: Parallel Model Splitting with rayon (P2)
 
-QWen v1 uses a legacy `layer_past` argument name and custom cache tensor shapes. Two options:
+#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
 
-- **Option A (preferred)**: Update `get_past_key_value_args` to accept a DynamicCache and extract the per-layer tuple from it, converting to the `layer_past` kwarg name that the QWen v1 layer expects. This preserves backward compatibility with the older layer code.
-- **Option B**: If QWen v1 in transformers 5.5.4 has been updated to use DynamicCache natively, simply remove the override.
+Add `split_model_shards(checkpoint_path: str, output_path: str, layer_names: list)` function:
+1. Parse the model index JSON
+2. mmap all shard files
+3. Use **rayon** for parallel extraction of per-layer tensors
+4. Write individual `.safetensors` files using the Rust safetensors crate
 
-The `get_past_key_values_cache_seq_len` override (shape[1]) becomes unnecessary since DynamicCache has `.get_seq_length()`.
+This replaces the Python `split_and_save_layers()` function which currently takes 10-30 minutes for 70B models.
 
-#### [MODIFY] [vaayu_chatglm.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_chatglm.py)
+#### [MODIFY] [utils.py](file:///home/a/code/ai-ml/Vaayu/vaayu/utils.py) — `split_and_save_layers()` (lines 189-391)
 
-Same approach as QWen v1 above. ChatGLM uses `kv_cache` as its kwarg name and shape[0] for seq length. The override adapts DynamicCache to the legacy format the ChatGLM layer expects.
-
-#### No changes needed for: [vaayu_qwen2.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_qwen2.py), [vaayu_mistral.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_mistral.py), [vaayu_mixtral.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_mixtral.py), [vaayu_internlm.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_internlm.py), [vaayu_baichuan.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_baichuan.py)
-
-These all use base class defaults and are DynamicCache-compatible out of the box.
-
----
-
-### Phase 3: SDP Backend Verification Diagnostic
-
-#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py)
-
-Add a one-time diagnostic in `__init__` to confirm which SDP backend is actually available:
-
-```python
-if torch.cuda.is_available():
-    print(f"  Flash SDP available: {torch.backends.cuda.flash_sdp_enabled()}")
-    print(f"  Mem-efficient SDP:   {torch.backends.cuda.mem_efficient_sdp_enabled()}")
-    print(f"  Math SDP (slow):     {torch.backends.cuda.math_sdp_enabled()}")
-```
-
-Logging-only change, no behavioral impact.
+Add Rust fast-path with Python fallback, similar to Phase 1.
 
 ---
 
-### Phase 4: Enable `torch.compile` (Optional / Lower Priority)
+## Build & Install Workflow
 
-#### [MODIFY] [test_quick.py](file:///home/a/code/ai-ml/Vaayu/test_quick.py)
+### One-Time Setup
 
-Document how to enable `torch.compile`:
-```python
-model = AutoModel.from_pretrained("...", device=DEVICE, use_torch_compile=True)
+```bash
+# Install Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# Install maturin (Python ↔ Rust build tool)
+pip install maturin
+
+# Build and install the Rust module into the venv
+cd /home/a/code/ai-ml/Vaayu/vaayu_rust
+maturin develop --release
 ```
+
+### Development Cycle
+
+```bash
+# After any Rust code changes:
+cd vaayu_rust && maturin develop --release
+
+# Run tests (unchanged):
+cd /home/a/code/ai-ml/Vaayu && python3 test_quick.py
+```
+
+> [!IMPORTANT]
+> Rust is only needed to **build**. The compiled `.so` is a standalone binary. Once built, `python3 test_quick.py` works without Rust installed.
+
+---
+
+## Integration Architecture
+
+```
+test_quick.py → vaayu.AutoModel → VaayuBaseModel.forward()
+                                       │
+                                       ▼
+                            load_layer_to_cpu()
+                                       │
+                                       ▼
+                       SafetensorModelPersister.load_model()
+                                       │
+                          ┌─────────────┴─────────────┐
+                          ▼                           ▼
+                   try: vaayu_rust.fast_load()   except: safetensors.load_file()
+                          │                           │
+                          ▼                           ▼
+                   mmap + zero-copy              read() + copy
+                   (~250ms per layer)            (~950ms per layer)
+```
+
+The Rust module is **surgically targeted** at the single hottest function. All other Python code stays unchanged. The fallback ensures backward compatibility.
+
+---
+
+## Expected Performance Impact
+
+### Per-Token Time (Llama 3.3 70B, 83 layers)
+
+| Phase | Per-Layer I/O | Per-Token Total | Speedup |
+|---|---|---|---|
+| **Current (Python)** | ~950ms | ~80s | baseline |
+| **Phase 1 (mmap)** | ~250-350ms | ~25-30s | **2.5-3×** |
+| **Phase 1+2 (mmap + prefetch)** | ~50ms (hidden) | ~8-12s | **7-10×** |
+| **Theoretical limit** | 0ms (fully pipelined) | ~4s (GPU only) | 20× |
 
 > [!WARNING]
-> `torch.compile` has a significant **warmup cost** on the first forward call (30-60s compilation). It pays off only for longer generations (50+ tokens). For short tests, leave it disabled.
-
-Phase 1 (removing model reinit) is a **prerequisite** for torch.compile to work, since the current code resets `self._compiled_layer_fn = None` every forward call, nullifying any compilation benefit.
+> Phase 1+2 estimates assume the NVMe can sustain 7 GB/s under repeated sequential reads of 1.6 GB files. Real-world performance depends on filesystem caching, IOMMU overhead, and thermal throttling. The 990 PRO has a SLC cache that covers ~50 GB — after that, sustained write drops. Reads should be fine.
 
 ---
 
 ## Verification Plan
 
-### Automated Tests
+### Phase 1 Verification
 
-1. **Correctness test**: Run `test_quick.py` with the same prompt before and after changes. Compare the output text — it must be **identical** (both fixes are lossless).
-2. **Performance test**: Compare per-token times:
-   - Before: ~54s/token (all tokens equal)
-   - After: Token 1 should be ~54s (full prompt), tokens 2+ should be **significantly faster** (only 1 token through layers)
-3. **Memory test**: Monitor GPU VRAM during generation to confirm KV cache doesn't cause OOM.
+1. **Correctness**: Compare output of `vaayu_rust.fast_load(path)` vs `safetensors.torch.load_file(path)` for all 83 layer files. Tensors must be bit-identical.
+2. **Performance**: Add per-layer timing to `load_layer_to_cpu()` and compare Python vs Rust path.
+3. **Memory**: Monitor RSS and VRAM to confirm mmap doesn't cause memory bloat (kernel should reclaim pages after use).
+4. **End-to-end**: Run `test_quick.py` and compare:
+   - Output text must match
+   - Per-token time should drop from ~80s to ~25-30s
 
-### Manual Verification
+### Benchmarking Script
 
-Run the test and confirm:
-- [ ] Output text matches pre-change output
-- [ ] Token 1 time ≈ previous per-token time
-- [ ] Token 2+ times are measurably faster
-- [ ] No `✅ Attention implementation: sdpa` repeated every token (model no longer reinited)
-- [ ] SDP diagnostic shows Flash or Memory-efficient SDP, not just Math SDP
+```bash
+# Quick layer-load benchmark (no full inference):
+python3 -c "
+import time, vaayu_rust
+path = '/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct/splitted_model/model.layers.0.safetensors'
+t = time.time(); d = vaayu_rust.fast_load(path); print(f'Rust: {time.time()-t:.3f}s')
+
+from safetensors.torch import load_file
+t = time.time(); d = load_file(path, device='cpu'); print(f'Python: {time.time()-t:.3f}s')
+"
+```
