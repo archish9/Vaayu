@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python3 *)",
-      "Bash(cargo --version)"
+      "Bash(cargo --version)",
+      "Bash(pip --version)",
+      "Bash(rustup --version)"
     ]
   }
 }
