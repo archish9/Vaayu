@@ -1,6 +1,6 @@
 [package]
 name = "vaayu_rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -8,10 +8,9 @@ name = "vaayu_rust"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3    = { version = "0.21", features = ["extension-module", "abi3-py38"] }
-memmap2 = "0.9"
-safetensors = "0.4"
-numpy   = "0.21"
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+io-uring = "0.7"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

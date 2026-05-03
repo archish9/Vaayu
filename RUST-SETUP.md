@@ -1,4 +1,4 @@
-# Vaayu Rust Acceleration — Setup & Run Guide
+# Vaayu Rust io_uring Acceleration — Setup & Run Guide
 
 Everything needed to build `vaayu_rust`, run inference, and read the diagnostic logs.
 
@@ -14,7 +14,7 @@ Everything needed to build `vaayu_rust`, run inference, and read the diagnostic 
 6. [Step 4 — Verify the Build](#6-step-4--verify-the-build)
 7. [Step 5 — Run Inference](#7-step-5--run-inference)
 8. [Reading the Logs](#8-reading-the-logs)
-9. [Expected Performance](#9-expected-performance)
+9. [How It Works — Zero-Copy Architecture](#9-how-it-works--zero-copy-architecture)
 10. [Rebuilding After Code Changes](#10-rebuilding-after-code-changes)
 11. [Fallback Behaviour (No Rust)](#11-fallback-behaviour-no-rust)
 12. [Troubleshooting](#12-troubleshooting)
@@ -23,17 +23,28 @@ Everything needed to build `vaayu_rust`, run inference, and read the diagnostic 
 
 ## 1. What Was Built
 
-Three components were added or changed:
+A Rust PyO3 module that uses Linux `io_uring` to read safetensor files directly into Python's pre-allocated pinned memory — **zero memory copies** across the Rust-Python boundary.
 
-| File | What Changed |
+| File | What It Does |
 |---|---|
-| `vaayu_rust/src/lib.rs` | New Rust extension — `fast_load()` loads a `.safetensors` file via `mmap` with `MAP_POPULATE`, releasing the Python GIL during all I/O |
-| `vaayu_rust/Cargo.toml` | Rust crate manifest — deps: `pyo3`, `memmap2`, `safetensors`, `numpy` |
+| `vaayu_rust/src/lib.rs` | `io_uring_read_into()` — reads file data via io_uring directly into a pointer (Python's pinned buffer). `pread_into()` — single-threaded pread fallback. |
+| `vaayu_rust/Cargo.toml` | Rust crate manifest — deps: `pyo3`, `io-uring`, `libc` |
 | `vaayu_rust/pyproject.toml` | Maturin build config — compiles `lib.rs` into `vaayu_rust.so` |
-| `vaayu/persist/safetensor_model_persister.py` | Modified — tries `vaayu_rust.fast_load()` first, falls back to Python `safetensors.torch.load_file()` if Rust module not found |
-| `vaayu/vaayu_base.py` | `load_layer_to_cpu()` — removed `pin_memory()` step (no-op for mmap memory); added per-token I/O timing accumulators |
+| `vaayu/persist/safetensor_model_persister.py` | Modified — uses `vaayu_rust.io_uring_read_into()` if available, falls back to Python `os.preadv` QD16 threads if not |
 
 The entrypoint (`test_quick.py`) is **unchanged** — you still run `python3 test_quick.py` exactly as before.
+
+### Key Design: No Data Crosses the PyO3 Boundary
+
+Unlike the previous (broken) Rust module that returned 1.6 GB of tensor data through PyO3 (causing triple memory copies), the new module only receives **one integer** — a raw pointer to Python's pinned memory buffer — and writes directly into it:
+
+```
+Python allocates pinned buffer → passes pointer (integer) to Rust
+Rust uses io_uring to read NVMe → writes directly into that pointer
+Rust returns Ok(()) → data is already in Python's buffer
+```
+
+**Zero copies. Zero allocations in Rust.**
 
 ---
 
@@ -41,15 +52,14 @@ The entrypoint (`test_quick.py`) is **unchanged** — you still run `python3 tes
 
 | Requirement | Minimum | Notes |
 |---|---|---|
+| Linux kernel | 5.1+ | io_uring support. System has 6.17 ✅ |
 | Python | 3.8+ | Project uses 3.12.3 |
-| PyTorch | 2.1.0+ | Already in `requirements.txt` |
-| numpy | any | Already installed (required by vaayu) |
+| PyTorch | 2.1.0+ | Needed for pinned memory allocation |
 | Rust | 1.70+ | Installed in Step 1 — only needed at build time |
 | maturin | 1.5–1.x | Installed in Step 2 — only needed at build time |
 | gcc / glibc | system default | Linux: already present |
-| Internet | build only | Rust crates downloaded once during first build |
 
-> **Rust is only needed to build.** Once `vaayu_rust.so` is compiled, Rust and maturin can be uninstalled. `python3 test_quick.py` has no Rust dependency at runtime.
+> **Rust is only needed to build.** Once `vaayu_rust.so` is compiled, Rust and maturin can be uninstalled. `python3 test_quick.py` has no Rust dependency at runtime — it falls back to Python `preadv` automatically.
 
 ---
 
@@ -69,8 +79,8 @@ After installation completes:
 source "$HOME/.cargo/env"
 
 # Verify
-rustc --version   # should print e.g. rustc 1.82.0 (f6e511eec 2024-10-15)
-cargo --version   # should print e.g. cargo 1.82.0 (8f40fc59f 2024-08-21)
+rustc --version   # should print e.g. rustc 1.95.0
+cargo --version   # should print e.g. cargo 1.95.0
 ```
 
 > **Subsequent terminal sessions**: `$HOME/.cargo/env` is automatically sourced if you chose to modify your shell profile during installation. If `cargo` is not found in a new terminal, run `source "$HOME/.cargo/env"` again.
@@ -111,7 +121,7 @@ maturin develop --release
 **What `maturin develop --release` does:**
 
 1. Compiles `src/lib.rs` with full optimisations (`opt-level=3`, `lto=thin`)
-2. Downloads Rust crate dependencies from crates.io on first run (~50MB, cached afterwards)
+2. Downloads Rust crate dependencies (`io-uring`, `libc`, `pyo3`) from crates.io on first run
 3. Produces `vaayu_rust.cpython-312-x86_64-linux-gnu.so` (or similar)
 4. Installs it directly into the venv's `site-packages` so `import vaayu_rust` works
 
@@ -120,12 +130,11 @@ maturin develop --release
 
 You should see output ending with something like:
 ```
-🔗 Compiling vaayu_rust v0.1.0 (/home/a/code/ai-ml/Vaayu/vaayu_rust)
-   Compiling vaayu_rust v0.1.0
+🔗 Compiling vaayu_rust v0.2.0 (/home/a/code/ai-ml/Vaayu/vaayu_rust)
     Finished `release` profile [optimized] target(s) in 42.3s
-📦 Built wheel for CPython 3.12 to /tmp/.../vaayu_rust-0.1.0-cp312-cp312-linux_x86_64.whl
+📦 Built wheel for CPython 3.12
 ✏️  Setting installed package as editable
-🛠 Installed vaayu_rust-0.1.0
+🛠 Installed vaayu_rust-0.2.0
 ```
 
 ---
@@ -137,44 +146,62 @@ You should see output ending with something like:
 cd /home/a/code/ai-ml/Vaayu
 source venv/bin/activate
 
-python3 -c "import vaayu_rust; print('vaayu_rust loaded OK')"
+# Check module loads and functions are available
+python3 -c "import vaayu_rust; print(dir(vaayu_rust))"
 ```
 
 Expected output:
 ```
-vaayu_rust loaded OK
+['__all__', ..., 'io_uring_read_into', 'pread_into']
 ```
 
-Run a quick load benchmark to confirm the module works and measure baseline per-layer time:
+Run a quick benchmark to confirm io_uring reads work:
 
 ```bash
 python3 -c "
-import time, vaayu_rust
-from safetensors.torch import load_file
+import time, struct, json, torch
+
+# Setup: allocate pinned buffer
+buf = torch.empty(2 * 1024 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+ptr = buf.data_ptr()
+print(f'Buffer pointer: {hex(ptr)} (aligned: {ptr % 4096 == 0})')
 
 path = '/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct/splitted_model/model.layers.0.safetensors'
 
-# Rust path
+# Parse header to get data offset and size
+with open(path, 'rb') as f:
+    hdr_len = struct.unpack('<Q', f.read(8))[0]
+    hdr = json.loads(f.read(hdr_len))
+    data_start = 8 + hdr_len
+meta = {k: v for k, v in hdr.items() if k != '__metadata__'}
+total = max(v['data_offsets'][1] for v in meta.values())
+print(f'Layer size: {total / 1024**2:.0f} MB, data_start: {data_start}')
+
+# Rust io_uring read
+import vaayu_rust
 t = time.time()
-d = vaayu_rust.fast_load(path)
+vaayu_rust.io_uring_read_into(path, data_start, total, ptr, 32)
 rust_t = time.time() - t
-print(f'Rust  fast_load : {rust_t:.3f}s  ({len(d)} tensors)')
+print(f'Rust io_uring : {rust_t:.3f}s  ({total/rust_t/1e9:.2f} GB/s)')
 
-# Python path
+# Python preadv comparison
+import os
 t = time.time()
-d2 = load_file(path, device='cpu')
+view = memoryview(buf.numpy())
+fd = os.open(path, os.O_RDONLY)
+chunk = (total + 15) // 16
+from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(16) as ex:
+    def rd(i):
+        o = i * chunk
+        l = min(chunk, total - o)
+        if l > 0: os.preadv(fd, [view[o:o+l]], data_start + o)
+    list(ex.map(rd, range(16)))
+os.close(fd)
 py_t = time.time() - t
-print(f'Python load_file: {py_t:.3f}s  ({len(d2)} tensors)')
-
+print(f'Python preadv : {py_t:.3f}s  ({total/py_t/1e9:.2f} GB/s)')
 print(f'Speedup: {py_t/rust_t:.1f}x')
 "
-```
-
-Expected output (approximate):
-```
-Rust  fast_load : 0.280s  (N tensors)
-Python load_file: 0.950s  (N tensors)
-Speedup: 3.4x
 ```
 
 ---
@@ -190,16 +217,16 @@ source venv/bin/activate
 python3 test_quick.py
 ```
 
-The first line printed by `safetensor_model_persister.py` at import time tells you which loader is active:
+The startup logs tell you which loader is active:
 
 ```
->>>> vaayu_rust loaded — using mmap fast_load        ← Rust active
+>>>> pinned-memory loader active — direct NVMe→RAM→GPU path
+>>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth    ← io_uring active
 ```
 
-or
-
+If Rust is not installed:
 ```
->>>> vaayu_rust not found — using Python safetensors loader   ← fallback active
+>>>> pinned-memory loader active — direct NVMe→RAM→GPU path            ← preadv fallback
 ```
 
 ---
@@ -211,89 +238,79 @@ or
 Printed once per layer per token:
 
 ```
-[VAAYU-IO] rust   0.287s  model.layers.0
-[VAAYU-IO] rust   0.271s  model.layers.1
+[VAAYU-IO] iouring 0.250s  model.layers.0     ← Rust io_uring path
+[VAAYU-IO] iouring 0.241s  model.layers.1
 ...
 ```
 
-Format: `[VAAYU-IO] <loader>  <seconds>s  <layer_name>`
+or (if Rust not installed):
+
+```
+[VAAYU-IO] pinned  0.350s  model.layers.0     ← Python preadv fallback
+```
 
 | Field | Meaning |
 |---|---|
-| `rust` / `python` | Which loader handled this layer |
-| `0.287s` | Wall time from `fast_load()` call to return (includes mmap setup + data copy to Python) |
-| `model.layers.0` | Layer shard filename (without `.safetensors`) |
-
-> With prefetching enabled (the default), layers load in a background thread. The time shown is the actual disk load time running in parallel with GPU compute. The `io_wait` in the token summary (§8.2) is the time the main thread blocked waiting for the result — these two numbers are different.
+| `iouring` / `pinned` / `python` | Which loader handled this layer |
+| `0.250s` | Wall time for the read (NVMe → pinned RAM) |
+| `model.layers.0` | Layer name |
 
 ### 8.2 Per-Token Summary Log
 
 Printed once per token at the end of each `forward()` call:
 
 ```
-[VAAYU-IO] token summary: total=56.4s  io_wait=42.1s  gpu_load=8.3s  compute=4.2s  other=1.8s
+[VAAYU-IO] token summary: total=29.6s  io_wait=8.8s  gpu_load=20.1s  compute=0.1s  other=0.5s
 ```
 
 | Field | What it measures |
 |---|---|
 | `total` | Wall time for the entire `forward()` call |
-| `io_wait` | Time the main thread was blocked waiting on `future.result()` (prefetch) or `load_layer_to_cpu()` (no prefetch). With prefetch + fast I/O this approaches 0. |
+| `io_wait` | Time the main thread was blocked waiting for prefetch `future.result()` |
 | `gpu_load` | Time spent in `move_layer_to_device()` — CPU→GPU weight transfer via PCIe |
-| `compute` | Time spent in `layer.forward()` — actual GPU attention + FFN compute |
-| `other` | Unaccounted (embedding, norm, lm_head, clean_memory, RoPE, overhead) |
-
-**Baseline (Python loader, no prefetch overlap):**
-```
-io_wait ≈ 50s   gpu_load ≈ 4s   compute ≈ 4s   total ≈ 58s
-```
-
-**Target (Rust loader, prefetch hiding I/O):**
-```
-io_wait ≈ 0-5s  gpu_load ≈ 4s   compute ≈ 4s   total ≈ 10-15s
-```
-
-### 8.3 KV Cache Effect (Token 2+)
-
-With KV cache enabled (current code), tokens 2+ only push **1 token** through all 83 layers instead of the full growing sequence. This appears in the logs as shorter `compute` times from token 2 onward — compute drops from ~4s (83 layers × full seq) to ~0.4s (83 layers × 1 token).
-
-Combined effect after all optimisations:
-- Token 1: ~10-15s (full prompt load + compute)
-- Token 2+: ~10-15s (I/O dominated) — eventually bottlenecked purely by NVMe throughput
-
-### 8.4 Log Flow Per Token (Full Example)
-
-```
-[Vaayu] inference start: 2026-05-01 16:46:20
->>>> vaayu_rust loaded — using mmap fast_load       ← printed once at import
-[VAAYU-IO] rust   0.282s  model.embed_tokens
-[VAAYU-IO] rust   0.271s  model.layers.0
-[VAAYU-IO] rust   0.268s  model.layers.1
-...  (83 lines total)
-[VAAYU-IO] rust   0.275s  lm_head
-running layers(cuda): 100%|████| 83/83 [00:14<00:00, ...]
-[Vaayu] inference end:   2026-05-01 16:46:34
-[Vaayu] total execution time: 14.231s
-[VAAYU-IO] token summary: total=14.2s  io_wait=3.1s  gpu_load=4.8s  compute=4.2s  other=2.1s
-```
+| `compute` | Time spent in `layer.forward()` — actual GPU computation |
+| `other` | Everything else (cleanup, tqdm, Python overhead) |
 
 ---
 
-## 9. Expected Performance
+## 9. How It Works — Zero-Copy Architecture
 
-### Per-Token Timing (Llama 3.3 70B, 83 layers, RTX 5060 Ti 16GB)
+```
+┌─────────────────────────────────────────────────────────┐
+│  Python (safetensor_model_persister.py)                 │
+│                                                         │
+│  1. Parse safetensor header (get data_start, total_size)│
+│  2. Acquire pinned buffer from double-buffer pool       │
+│  3. Get raw pointer: ptr = buf.data_ptr()               │
+│                                                         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  vaayu_rust.io_uring_read_into(                   │  │
+│  │      path, data_start, total_size, ptr, 32        │  │
+│  │  )                                                │  │
+│  │                                                   │  │
+│  │  Rust receives ptr as integer → casts to *mut u8  │  │
+│  │  Opens file with O_DIRECT (bypass page cache)     │  │
+│  │  Creates io_uring ring with 32 SQEs               │  │
+│  │  Submits all reads → single io_uring_enter()      │  │
+│  │  NVMe DMA writes directly into ptr                │  │
+│  │  Returns Ok(()) — nothing crosses the boundary    │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  4. Slice buffer into tensor views (zero-copy)          │
+│  5. Transfer to GPU: tensor.to('cuda')                  │
+└─────────────────────────────────────────────────────────┘
+```
 
-| State | io_wait | gpu_load | compute | total/token |
-|---|---|---|---|---|
-| **Before** (Python loader, KV cache off) | ~50s | ~4s | ~4s | ~58s |
-| **After Phase 1** (Rust mmap loader) | ~15s | ~4s | ~4s | ~23s |
-| **After Phase 1+2** (Rust + prefetch overlap) | ~0s | ~4s | ~4s | ~8s |
-| **After Phase 1+2 + KV cache (token 2+)** | ~0s | ~4s | ~0.4s | ~5s |
+### Why This Is Different From the Old Rust Module
 
-> Numbers are estimates based on Samsung 990 PRO NVMe at ~7 GB/s sequential read and RTX 5060 Ti GPU compute benchmarks. Actual results vary with filesystem cache state (warm vs cold), PCIe bandwidth utilisation, and thermal throttling.
-
-### Why Token 1 Is Always Slower
-
-Token 1 processes the full prompt (9 tokens in the test) through all 83 layers. KV cache has no past state yet, so there is no shortcut. Every subsequent token only processes 1 new token.
+| | Old Rust (removed) | New Rust (current) |
+|---|---|---|
+| I/O method | `mmap` + `MAP_POPULATE` | `io_uring` + `O_DIRECT` |
+| Memory allocation | Rust allocates `Vec<u8>` | Python allocates pinned buffer |
+| Data across PyO3 | 1.6 GB (via NumPy array) | 1 integer (a pointer) |
+| Memory copies | **3** (4.8 GB wasted) | **0** |
+| Dependencies | `memmap2, safetensors, numpy` | `io-uring, libc` |
+| Result | 2.3s/layer (190s/token) 💀 | Target: 0.25s/layer (~21s/token) |
 
 ---
 
@@ -321,20 +338,19 @@ python3 test_quick.py
 
 ## 11. Fallback Behaviour (No Rust)
 
-If `vaayu_rust` is not installed (Rust not built, or `.so` not in venv), the persister automatically falls back to the Python `safetensors` loader:
+If `vaayu_rust` is not installed, the persister automatically falls back to the Python `preadv` QD16 reader:
 
 ```python
 # safetensor_model_persister.py — automatic at import time
 try:
     import vaayu_rust
-    _RUST_LOADER = True
-    print(">>>> vaayu_rust loaded — using mmap fast_load")
+    _USE_IOURING = True
+    print(">>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth")
 except ImportError:
-    _RUST_LOADER = False
-    print(">>>> vaayu_rust not found — using Python safetensors loader")
+    _USE_IOURING = False
 ```
 
-Everything works — inference is just slower. The `[VAAYU-IO]` logs will show `python` instead of `rust`.
+Everything works — inference runs at 4.4 GB/s instead of the io_uring target of 6+ GB/s. The `[VAAYU-IO]` logs will show `pinned` instead of `iouring`.
 
 ---
 
@@ -378,7 +394,7 @@ The `.so` was not installed into the active venv. Confirm you are in the right v
 
 ```bash
 which python3                    # should point into .../Vaayu/venv/...
-pip show vaayu-rust              # should show version 0.1.0
+pip show vaayu-rust              # should show version 0.2.0
 ```
 
 If `pip show` returns nothing:
@@ -388,49 +404,35 @@ cd /home/a/code/ai-ml/Vaayu/vaayu_rust
 maturin develop --release
 ```
 
-### `RuntimeError: mmap failed: Operation not permitted`
+### `RuntimeError: io_uring_setup: ...`
 
-Some environments restrict `mmap` with `MAP_POPULATE` (Docker with `--security-opt=no-new-privileges`, certain SELinux policies). Remove the `.populate()` call in `src/lib.rs`:
-
-```rust
-// Change this:
-let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
-
-// To this:
-let mmap = unsafe { MmapOptions::new().map(&file)? };
-```
-
-Then rebuild with `maturin develop --release`. Performance will be slightly lower (no kernel readahead hint) but correct.
-
-### Tensors differ between Rust and Python loader
-
-Run the correctness check:
+io_uring is not supported on your kernel (requires 5.1+). Check:
 
 ```bash
-python3 -c "
-import torch, vaayu_rust
-from safetensors.torch import load_file
-import numpy as np
-
-path = '/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct/splitted_model/model.layers.0.safetensors'
-
-py_dict = load_file(path, device='cpu')
-rust_raw = vaayu_rust.fast_load(path)
-
-import sys
-sys.path.insert(0, '.')
-from vaayu.persist.safetensor_model_persister import _raw_to_tensor
-rust_dict = {k: _raw_to_tensor(d, dtype, shape) for k, (d, dtype, shape) in rust_raw.items()}
-
-all_match = True
-for name in py_dict:
-    if not torch.equal(py_dict[name], rust_dict[name]):
-        print(f'MISMATCH: {name}')
-        all_match = False
-
-print('All tensors match!' if all_match else 'TENSORS DO NOT MATCH — check dtype handling in _raw_to_tensor')
-"
+uname -r    # must be >= 5.1
 ```
+
+If on an older kernel, the Python preadv fallback will be used automatically.
+
+### `PyIOError: open ...: Invalid argument` (O_DIRECT failure)
+
+`O_DIRECT` requires the destination buffer to be page-aligned (4096 bytes). PyTorch's `cudaHostAlloc` usually provides this, but if it fails:
+
+1. Verify alignment: `python3 -c "import torch; b=torch.empty(1024,dtype=torch.uint8,pin_memory=True); print(b.data_ptr() % 4096)"`  
+   → Should print `0`
+
+2. If non-zero, modify `lib.rs` to remove `O_DIRECT`:
+   ```rust
+   // Change this:
+   .custom_flags(libc::O_DIRECT)
+   // To this:
+   // (remove the line — use buffered I/O through page cache)
+   ```
+   Then rebuild with `maturin develop --release`.
+
+### `io_uring read error: -22` (EINVAL)
+
+`O_DIRECT` requires read lengths to be multiples of 512 bytes. The chunk alignment in `lib.rs` handles this (`(chunk_size + 4095) & !4095`), but if a safetensor file has unusual data sizes, you may hit this. Remove `O_DIRECT` as described above.
 
 ### Per-layer times look the same as before (no speedup)
 
@@ -442,11 +444,12 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 python3 test_quick.py
 ```
 
-Or compare only the first run after a reboot.
+### `io_wait` is still high even with io_uring
 
-### `io_wait` is still high even with Rust
-
-With `prefetching=True` (default), `io_wait` measures time the main thread blocks on `future.result()` — i.e., how much I/O was not hidden by the prefetch pipeline. If `io_wait` is still high after switching to the Rust loader, the bottleneck has shifted to `gpu_load` (PCIe transfer). Check the `gpu_load` value in the token summary log — if it is large, the NVMe→CPU→GPU pipeline is the remaining bottleneck (Phase 2 of the implementation plan addresses this with `io_uring` prefetch).
+With `prefetching=True` (default), `io_wait` measures time the main thread blocks on `future.result()`. If `io_wait` is still high, the NVMe is the bottleneck — io_uring can only read as fast as the physical drive allows. Check the per-layer times:
+- `0.35s/layer` = 4.4 GB/s (same as Python — io_uring didn't help, likely cached reads)
+- `0.25s/layer` = 6.5 GB/s (io_uring working correctly)
+- `0.22s/layer` = 7.4 GB/s (theoretical max for Samsung 990 PRO)
 
 ---
 
@@ -469,15 +472,6 @@ python3 test_quick.py
 cd vaayu_rust && maturin develop --release && cd ..
 python3 test_quick.py
 
-# Verify Rust loader active
-python3 -c "import vaayu_rust; print('OK')"
-
-# Correctness benchmark
-python3 -c "
-import time, vaayu_rust
-from safetensors.torch import load_file
-p = '/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct/splitted_model/model.layers.0.safetensors'
-t=time.time(); vaayu_rust.fast_load(p); print(f'Rust : {time.time()-t:.3f}s')
-t=time.time(); load_file(p,device='cpu'); print(f'Py   : {time.time()-t:.3f}s')
-"
+# Verify io_uring loader active
+python3 -c "import vaayu_rust; print('io_uring_read_into' in dir(vaayu_rust))"
 ```

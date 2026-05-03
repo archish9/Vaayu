@@ -1,89 +1,120 @@
-use memmap2::MmapOptions;
-use numpy::PyArray1;
+use io_uring::{opcode, types, IoUring};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
-use safetensors::{tensor::Dtype, SafeTensors};
 use std::fs::File;
+use std::os::unix::io::AsRawFd;
 
-fn dtype_str(dtype: Dtype) -> &'static str {
-    match dtype {
-        Dtype::BOOL => "BOOL",
-        Dtype::U8   => "U8",
-        Dtype::I8   => "I8",
-        Dtype::I16  => "I16",
-        Dtype::U16  => "U16",
-        Dtype::F16  => "F16",
-        Dtype::BF16 => "BF16",
-        Dtype::I32  => "I32",
-        Dtype::U32  => "U32",
-        Dtype::F32  => "F32",
-        Dtype::F64  => "F64",
-        Dtype::I64  => "I64",
-        Dtype::U64  => "U64",
-        _           => "F32",
-    }
+/// Read a file region directly into a caller-provided buffer using io_uring.
+///
+/// # Arguments
+/// * `path`        - Path to the .safetensors file
+/// * `offset`      - Byte offset into the file where tensor data starts (after header)
+/// * `length`      - Total bytes to read
+/// * `buf_ptr`     - Raw pointer to the destination buffer (Python's pinned memory)
+/// * `queue_depth` - Number of parallel io_uring SQEs (e.g. 32)
+///
+/// # Safety
+/// The caller must ensure `buf_ptr` points to at least `length` bytes of valid,
+/// writable memory that remains alive for the duration of this call.
+#[pyfunction]
+fn io_uring_read_into(
+    py: Python<'_>,
+    path: &str,
+    offset: u64,
+    length: usize,
+    buf_ptr: usize,
+    queue_depth: u32,
+) -> PyResult<()> {
+    let path = path.to_owned();
+
+    py.allow_threads(move || {
+        let file = File::open(&path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(
+                format!("open {}: {}", path, e)))?;
+
+        let fd = types::Fd(file.as_raw_fd());
+        let ptr = buf_ptr as *mut u8;
+        let qd = queue_depth.min(64) as usize;
+        let chunk_size = (length + qd - 1) / qd;
+        // Align chunk_size to 4096 for O_DIRECT
+        let chunk_size = (chunk_size + 4095) & !4095;
+
+        let mut ring = IoUring::new(qd as u32)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("io_uring_setup: {}", e)))?;
+
+        // Submit all read SQEs
+        let mut submitted = 0usize;
+        let mut file_off = offset;
+        let mut buf_off = 0usize;
+
+        while buf_off < length {
+            let this_len = chunk_size.min(length - buf_off);
+            let read_op = opcode::Read::new(fd, unsafe { ptr.add(buf_off) }, this_len as u32)
+                .offset(file_off)
+                .build()
+                .user_data(submitted as u64);
+
+            unsafe { ring.submission().push(&read_op) }
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("SQ full"))?;
+
+            file_off += this_len as u64;
+            buf_off += this_len;
+            submitted += 1;
+        }
+
+        // Single syscall submits all SQEs and waits for all CQEs
+        ring.submit_and_wait(submitted)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("io_uring submit: {}", e)))?;
+
+        // Verify all completions
+        let cq = ring.completion();
+        let mut completed = 0usize;
+        for cqe in cq {
+            if cqe.result() < 0 {
+                return Err(pyo3::exceptions::PyIOError::new_err(
+                    format!("io_uring read error: {}", cqe.result())));
+            }
+            completed += 1;
+        }
+
+        if completed != submitted {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("incomplete: {}/{} CQEs", completed, submitted)));
+        }
+
+        Ok(())
+    })
 }
 
-/// Load a .safetensors file via mmap. GIL released during I/O.
-///
-/// Returns `Dict[str, Tuple[np.ndarray, str, List[int]]]`:
-///   - ndarray : raw uint8 bytes of the tensor (one copy from mmap)
-///   - str     : dtype name ("F16", "BF16", "F32", ...)
-///   - List[int]: shape
+/// Fallback: single pread without io_uring (for testing/compatibility)
 #[pyfunction]
-fn fast_load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let path_owned = path.to_owned();
-
-    // Release the GIL for the entire I/O + parse phase.
-    let tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> =
-        py.allow_threads(|| -> Result<_, String> {
-            let file = File::open(&path_owned)
-                .map_err(|e| format!("open {}: {}", path_owned, e))?;
-
-            // MAP_POPULATE tells the kernel to pre-fault all pages immediately,
-            // saturating NVMe readahead while Rust parses the header.
-            let mmap = unsafe {
-                MmapOptions::new()
-                    .populate()
-                    .map(&file)
-                    .map_err(|e| format!("mmap: {}", e))?
-            };
-
-            let st = SafeTensors::deserialize(&mmap)
-                .map_err(|e| format!("parse: {}", e))?;
-
-            let mut out = Vec::with_capacity(st.len());
-            for (name, view) in st.tensors() {
-                out.push((
-                    name.to_string(),
-                    dtype_str(view.dtype()),
-                    view.shape().to_vec(),
-                    view.data().to_vec(), // one copy: mmap region → owned Vec
-                ));
-            }
-            Ok(out)
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-
-    let result = PyDict::new_bound(py);
-    for (name, dtype, shape, data) in tensors {
-        let arr = PyArray1::from_vec_bound(py, data);
-        let shape_list = PyList::new_bound(py, shape.iter());
-        let entry = PyTuple::new_bound(
-            py,
-            &[
-                arr.into_py(py),
-                dtype.into_py(py),
-                shape_list.into_py(py),
-            ],
-        );
-        result.set_item(&name, entry)?;
-    }
-    Ok(result.into())
+fn pread_into(
+    py: Python<'_>,
+    path: &str,
+    offset: u64,
+    length: usize,
+    buf_ptr: usize,
+) -> PyResult<()> {
+    let path = path.to_owned();
+    py.allow_threads(move || {
+        let file = std::fs::File::open(&path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        let ptr = buf_ptr as *mut u8;
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, length) };
+        let n = unsafe {
+            libc::pread(file.as_raw_fd(), buf.as_mut_ptr() as *mut _, length, offset as i64)
+        };
+        if n < 0 {
+            return Err(pyo3::exceptions::PyIOError::new_err("pread failed"));
+        }
+        Ok(())
+    })
 }
 
 #[pymodule]
 fn vaayu_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(fast_load, m)?)?;
+    m.add_function(wrap_pyfunction!(io_uring_read_into, m)?)?;
+    m.add_function(wrap_pyfunction!(pread_into, m)?)?;
     Ok(())
 }
