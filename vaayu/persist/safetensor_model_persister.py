@@ -25,13 +25,20 @@ _DTYPE_MAP = {
 
 _USE_PINNED = torch.cuda.is_available()
 if _USE_PINNED:
-    print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path (QD16)")
+    print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path")
 else:
     print(">>>> CUDA not available — using Python safetensors loader")
 
-# ── Global state for the ultra-fast loader ──────────────────────────
-_NUM_IO_THREADS = 16            # QD16 = sweet spot for Samsung 990 PRO
-_EXECUTOR = None                # Lazily initialized ThreadPoolExecutor
+try:
+    import vaayu_rust
+    _USE_IOURING = True
+    print(">>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth")
+except ImportError:
+    _USE_IOURING = False
+
+# ── Global state for the loader ──────────────────────────────────────
+_NUM_IO_THREADS = 16            # QD16 = sweet spot for Samsung 990 PRO (preadv fallback)
+_EXECUTOR = None                # Lazily initialized ThreadPoolExecutor (preadv fallback)
 _PINNED_BUFS = [None, None]     # Double buffer (A/B)
 _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
@@ -45,7 +52,6 @@ def _ensure_executor():
 
 def _load_pinned(file_path: str) -> dict:
     global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
-    _ensure_executor()
 
     # ── 1. Parse safetensors header ─────────────────────────────────
     with open(file_path, 'rb') as f:
@@ -70,23 +76,34 @@ def _load_pinned(file_path: str) -> dict:
         _PINNED_SIZES[buf_idx] = alloc_size
 
     buf = _PINNED_BUFS[buf_idx]
-    view = memoryview(buf.numpy())
 
-    # ── 3. Multi-threaded parallel read (QD16) ──────────────────────
-    fd = os.open(file_path, os.O_RDONLY)
-    try:
-        chunk_size = (total_size + _NUM_IO_THREADS - 1) // _NUM_IO_THREADS
+    if _USE_IOURING:
+        # ── 3a. Rust io_uring read (zero-copy into pinned buffer) ───
+        vaayu_rust.io_uring_read_into(
+            file_path,
+            data_start,
+            total_size,
+            buf.data_ptr(),
+            32,                 # queue depth (SQEs)
+        )
+    else:
+        # ── 3b. Fallback: Python preadv (QD16) ──────────────────────
+        _ensure_executor()
+        view = memoryview(buf.numpy())
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            chunk_size = (total_size + _NUM_IO_THREADS - 1) // _NUM_IO_THREADS
 
-        def _read_chunk(i):
-            offset = i * chunk_size
-            length = min(chunk_size, total_size - offset)
-            if length > 0:
-                os.preadv(fd, [view[offset:offset + length]],
-                          data_start + offset)
+            def _read_chunk(i):
+                offset = i * chunk_size
+                length = min(chunk_size, total_size - offset)
+                if length > 0:
+                    os.preadv(fd, [view[offset:offset + length]],
+                              data_start + offset)
 
-        list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
-    finally:
-        os.close(fd)
+            list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
+        finally:
+            os.close(fd)
 
     # ── 4. Reconstruct tensors as zero-copy views ───────────────────
     result = {}
@@ -120,7 +137,8 @@ class SafetensorModelPersister(ModelPersister):
             t = time.time()
             result = _load_pinned(file_path)
             elapsed = time.time() - t
-            print(f"[VAAYU-IO] pinned {elapsed:.3f}s  {layer_name}")
+            tag = "iouring" if _USE_IOURING else "pinned"
+            print(f"[VAAYU-IO] {tag} {elapsed:.3f}s  {layer_name}")
             return result
         else:
             t = time.time()
