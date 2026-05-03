@@ -1,304 +1,379 @@
-# Rust I/O Acceleration for Vaayu
+# Rust io_uring Zero-Copy NVMe Reader
+
+Replace the Python `os.preadv` + `ThreadPoolExecutor` I/O path with a Rust io_uring reader that writes directly into Python's pre-allocated pinned memory buffer. **Zero memory copies across the PyO3 boundary.**
 
 ## Background
 
-Vaayu's per-token inference for Llama 3.3 70B takes **~80 seconds**, of which **~95% is disk I/O** — loading 83 layer files (each ~1.6 GB, totaling ~132 GB) from NVMe to CPU to GPU on every single token.
-
-### Current Hot Path (Per Token)
-
-```
-for each of 83 layers:
-  1. load_layer_to_cpu()        → safetensors.torch.load_file(path, device="cpu")
-  2. pin_memory()               → state_dict[k].pin_memory()
-  3. move_layer_to_device()     → state_dict → remap keys → .to(cuda) or set_module_tensor_to_device()
-  4. layer.forward(seq)         → actual GPU compute (~50ms per layer)
-  5. layer.to("meta")           → evict weights
-  6. clean_memory()             → gc + cuda.empty_cache()
-```
-
-Steps 1-3 take **~950ms per layer** (×83 = ~79s). Step 4 takes **~50ms per layer** (×83 = ~4s). The GPU is idle **95% of the time**.
-
-### Hardware
-
-| Component | Spec | Theoretical Max |
+| | Old Rust module (broken, removed) | New Rust module (this plan) |
 |---|---|---|
-| Storage | Samsung 990 PRO 1TB NVMe | 7.0 GB/s seq read |
-| CPU | Intel i5-14600K (14 cores) | PCIe 5.0 ×16 |
-| GPU | RTX 5060 Ti 16GB | PCIe 5.0 ×8 (~32 GB/s) |
-| RAM | (assumed 32-64 GB DDR5) | ~50 GB/s |
+| Who allocates memory? | Rust (`Vec<u8>`) | Python (pinned `torch` buffer) |
+| What crosses PyO3 boundary? | 1.6 GB of data (3 copies) | One integer (a pointer) |
+| I/O mechanism | `mmap` + `MAP_POPULATE` | `io_uring` submission ring |
+| Memory copies | 3 (4.8 GB wasted) | **0** |
+| Expected bandwidth | 1.7 GB/s (measured) | **6-7 GB/s** (target) |
 
-The NVMe can read at 7 GB/s. At 1.6 GB per layer, theoretical minimum is **~230ms per layer** if we eliminate all Python overhead. Current is **~950ms** — that's a **4× gap** caused by:
+### Why io_uring over preadv threads
 
-1. Python `safetensors` wrapper overhead (dict construction, GIL)
-2. `read()` syscall → copy to Python buffer → copy to torch tensor (double buffering)
-3. No overlap between disk read and GPU compute (prefetching exists but limited by GIL)
-4. `pin_memory()` as a separate step instead of direct pinned allocation
+| | Python preadv (current) | Rust io_uring (proposed) |
+|---|---|---|
+| Syscalls per layer | 16 (one per thread) | 1 (`io_uring_enter`) |
+| Thread overhead | 16 threads created/scheduled | Single thread, no scheduling |
+| GIL interaction | Released per-thread, reacquired on completion | Released once for entire read |
+| Measured bandwidth | 4.4 GB/s | Target: 6-7 GB/s |
+| Context switches | ~32 per layer | ~1 per layer |
 
----
+## Prerequisites
+
+> [!IMPORTANT]
+> - **Linux kernel 5.1+** for io_uring support (system has 6.17 ✅)
+> - **Rust 1.95** installed (system has 1.95 ✅)
+> - **maturin** for building PyO3 modules (`pip install maturin`)
+> - GPU should be moved to **PCI_E1** first for maximum benefit
 
 ## Proposed Changes
 
-### Phase 1: `vaayu_rust` — mmap-based Safetensor Loader (P0, Highest Impact)
+---
 
-This replaces the Python `safetensors.torch.load_file()` with a zero-copy Rust implementation.
+### Rust Crate: `vaayu_rust/`
 
-#### [NEW] `vaayu_rust/` — PyO3 Extension Module
+#### [MODIFY] [Cargo.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/Cargo.toml)
 
-```
-Vaayu/
-├── vaayu/                   # existing Python code (unchanged)
-├── vaayu_rust/              # NEW Rust crate
-│   ├── Cargo.toml
-│   ├── pyproject.toml
-│   └── src/
-│       └── lib.rs           # PyO3 module with fast_load()
-└── test_quick.py            # unchanged
-```
+Replace all dependencies. Remove `memmap2`, `safetensors`, `numpy` (no longer needed). Add `io-uring` crate.
 
-##### [NEW] [Cargo.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/Cargo.toml)
+```toml
+[package]
+name = "vaayu_rust"
+version = "0.2.0"
+edition = "2021"
 
-Dependencies:
-- `pyo3` — Python bindings
-- `memmap2` — memory-mapped file I/O
-- `safetensors` — Rust-native safetensor parsing (the `safetensors` crate, same one HuggingFace uses internally)
-- `numpy` (via pyo3) — return tensors as numpy arrays that PyTorch can wrap zero-copy
+[lib]
+name = "vaayu_rust"
+crate-type = ["cdylib"]
 
-##### [NEW] [src/lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+io-uring = "0.7"
 
-**Core function: `fast_load(path: str) -> Dict[str, torch.Tensor]`**
-
-```
-Current Python path:
-  open(file) → read() → Python bytes → safetensors parse → Dict[str, Tensor]
-
-Rust mmap path:
-  mmap(file) → safetensors parse header only → Dict[str, zero-copy view into mmap]
+[profile.release]
+opt-level = 3
+lto = "thin"
 ```
 
-Implementation strategy:
-1. `mmap` the `.safetensors` file (read-only, `MAP_POPULATE` to hint kernel to pre-fault pages)
-2. Parse the safetensor JSON header (offsets + dtypes for each tensor) — this is ~1KB regardless of file size
-3. For each tensor, create a numpy array that **points directly into the mmap region** (zero-copy)
-4. Return `Dict[str, numpy.ndarray]` — PyTorch wraps these via `torch.from_numpy()` with no copy
-5. Keep the mmap handle alive (attached to the returned arrays) so the backing memory persists
+> [!NOTE]
+> The `io-uring` crate is a pure Rust wrapper around the kernel's io_uring interface. Unlike the Python `liburing` package (which crashed with "Illegal Instruction" due to Zig compilation), this crate compiles natively with `rustc` using the correct CPU instruction set.
 
-**Why this is faster:**
-- **Zero copy**: No `read()` syscall, no Python buffer, no copy to tensor. The tensor IS the file.
-- **Kernel-managed paging**: The OS loads pages on-demand from NVMe, with its own readahead and caching. On Linux with a 990 PRO, this can saturate the 7 GB/s bandwidth.
-- **No GIL**: The mmap and header parsing happen in Rust without holding the GIL, enabling true parallelism with Python's prefetch thread.
-- **MAP_POPULATE**: Hints the kernel to fault all pages immediately in the background, overlapping with other work.
+#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
 
-**Expected per-layer time reduction:**
+Complete rewrite. The old `fast_load` function (mmap + triple copy) is deleted entirely. New function: `io_uring_read_into`.
 
-| Step | Current (Python) | After (Rust mmap) |
-|---|---|---|
-| File open + read to CPU | ~600ms | ~0ms (mmap is instant) |
-| Safetensor header parse | ~10ms | ~1ms |
-| Dict construction | ~50ms | ~10ms (Rust HashMap) |
-| Page faults (actual I/O) | (included above) | ~230ms (amortized by readahead) |
-| **Total** | **~950ms** | **~250-350ms** |
+**Design:**
+1. Python passes: file path, data offset, total bytes, destination pointer, number of SQEs (queue depth)
+2. Rust opens the file with `O_DIRECT` (bypass page cache, DMA straight to pinned memory)
+3. Rust creates an io_uring instance and submits `QD` read operations as `ReadFixed` SQEs
+4. Each SQE reads a chunk of the file into `ptr + offset`
+5. Rust waits for all CQEs (completions)
+6. Returns `Ok(())` — data is already in Python's buffer
 
-##### [NEW] [pyproject.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/pyproject.toml)
+```rust
+use io_uring::{opcode, types, IoUring};
+use pyo3::prelude::*;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 
-Standard maturin config for building the `.so` module.
+/// Read a file region directly into a caller-provided buffer using io_uring.
+///
+/// # Arguments
+/// * `path`       - Path to the .safetensors file
+/// * `offset`     - Byte offset into the file where tensor data starts (after header)
+/// * `length`     - Total bytes to read
+/// * `buf_ptr`    - Raw pointer to the destination buffer (Python's pinned memory)
+/// * `queue_depth` - Number of parallel io_uring SQEs (e.g. 32)
+///
+/// # Safety
+/// The caller must ensure `buf_ptr` points to at least `length` bytes of valid,
+/// writable memory that remains alive for the duration of this call.
+#[pyfunction]
+fn io_uring_read_into(
+    py: Python<'_>,
+    path: &str,
+    offset: u64,
+    length: usize,
+    buf_ptr: usize,
+    queue_depth: u32,
+) -> PyResult<()> {
+    let path = path.to_owned();
+
+    py.allow_threads(move || {
+        // Open with O_DIRECT to bypass page cache (DMA straight to pinned mem)
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(
+                format!("open {}: {}", path, e)))?;
+
+        let fd = types::Fd(file.as_raw_fd());
+        let ptr = buf_ptr as *mut u8;
+        let qd = queue_depth.min(64) as usize;
+        let chunk_size = (length + qd - 1) / qd;
+        // Align chunk_size to 4096 for O_DIRECT
+        let chunk_size = (chunk_size + 4095) & !4095;
+
+        let mut ring = IoUring::new(qd as u32)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("io_uring_setup: {}", e)))?;
+
+        // Submit all read SQEs
+        let mut submitted = 0;
+        let mut file_off = offset;
+        let mut buf_off = 0usize;
+
+        while buf_off < length {
+            let this_len = chunk_size.min(length - buf_off);
+            let read_op = opcode::Read::new(fd, unsafe { ptr.add(buf_off) }, this_len as u32)
+                .offset(file_off)
+                .build()
+                .user_data(submitted as u64);
+
+            unsafe { ring.submission().push(&read_op) }
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("SQ full"))?;
+
+            file_off += this_len as u64;
+            buf_off += this_len;
+            submitted += 1;
+        }
+
+        // Submit all at once — single syscall
+        ring.submit_and_wait(submitted)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("io_uring submit: {}", e)))?;
+
+        // Verify all completions
+        let cq = ring.completion();
+        let mut completed = 0;
+        for cqe in cq {
+            if cqe.result() < 0 {
+                return Err(pyo3::exceptions::PyIOError::new_err(
+                    format!("io_uring read error: {}", cqe.result())));
+            }
+            completed += 1;
+        }
+
+        if completed != submitted {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("incomplete: {}/{} CQEs", completed, submitted)));
+        }
+
+        Ok(())
+    })
+}
+
+/// Fallback: simple pread without io_uring (for testing/compatibility)
+#[pyfunction]
+fn pread_into(
+    py: Python<'_>,
+    path: &str,
+    offset: u64,
+    length: usize,
+    buf_ptr: usize,
+) -> PyResult<()> {
+    let path = path.to_owned();
+    py.allow_threads(move || {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        let ptr = buf_ptr as *mut u8;
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, length) };
+        let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr() as *mut _, length, offset as i64) };
+        if n < 0 {
+            return Err(pyo3::exceptions::PyIOError::new_err("pread failed"));
+        }
+        Ok(())
+    })
+}
+
+#[pymodule]
+fn vaayu_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(io_uring_read_into, m)?)?;
+    m.add_function(wrap_pyfunction!(pread_into, m)?)?;
+    Ok(())
+}
+```
+
+> [!WARNING]
+> **`O_DIRECT` requirement:** The destination buffer MUST be page-aligned (4096 bytes). PyTorch's `pin_memory=True` allocates via `cudaHostAlloc` which returns page-aligned memory, so this should work. We'll verify this in the benchmark phase. If alignment issues arise, we fall back to non-`O_DIRECT` reads.
+
+> [!IMPORTANT]
+> **`libc` crate dependency:** The code uses `libc::O_DIRECT` and `libc::pread`. Add `libc = "0.2"` to Cargo.toml dependencies.
+
+Updated Cargo.toml dependencies:
+```toml
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+io-uring = "0.7"
+libc = "0.2"
+```
 
 ---
+
+### Python Integration: `vaayu/persist/safetensor_model_persister.py`
 
 #### [MODIFY] [safetensor_model_persister.py](file:///home/a/code/ai-ml/Vaayu/vaayu/persist/safetensor_model_persister.py)
 
-Integration point — the only file that calls `safetensors.torch.load_file()`. Change to:
+Modify `_load_pinned()` to use the Rust io_uring reader instead of the Python ThreadPoolExecutor. **Keep the Python preadv path as a fallback.**
+
+Changes:
+1. At module level: try `import vaayu_rust`, set a flag
+2. Replace the "Multi-threaded parallel read" section (lines 76-88) with a single `vaayu_rust.io_uring_read_into()` call
+3. Keep the ThreadPoolExecutor path as fallback if `vaayu_rust` is not installed
 
 ```python
-class SafetensorModelPersister(ModelPersister):
-    def load_model(self, layer_name, path):
+# At top of file, after existing imports:
+try:
+    import vaayu_rust
+    _USE_IOURING = True
+    print(">>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth")
+except ImportError:
+    _USE_IOURING = False
+
+# Inside _load_pinned(), replace the parallel read section:
+def _load_pinned(file_path: str) -> dict:
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
+    # ... (header parsing stays the same — lines 50-60) ...
+    # ... (buffer acquisition stays the same — lines 62-73) ...
+
+    if _USE_IOURING:
+        # ── 3a. Rust io_uring read (zero-copy into pinned buffer) ───
+        vaayu_rust.io_uring_read_into(
+            file_path,
+            data_start,         # offset past safetensor header
+            total_size,         # bytes to read
+            buf.data_ptr(),     # raw pointer to pinned memory
+            32,                 # queue depth (SQEs)
+        )
+    else:
+        # ── 3b. Fallback: Python preadv (existing code) ─────────────
+        fd = os.open(file_path, os.O_RDONLY)
         try:
-            import vaayu_rust
-            # Returns Dict[str, numpy.ndarray] — zero-copy mmap views
-            np_dict = vaayu_rust.fast_load(str(Path(path) / (layer_name + ".safetensors")))
-            # Convert numpy views to torch tensors (zero-copy)
-            return {k: torch.from_numpy(v) for k, v in np_dict.items()}
-        except ImportError:
-            # Fallback to pure Python if Rust module not built
-            return load_file(Path(path) / (layer_name + ".safetensors"), device="cpu")
+            chunk_size = (total_size + _NUM_IO_THREADS - 1) // _NUM_IO_THREADS
+            def _read_chunk(i):
+                offset = i * chunk_size
+                length = min(chunk_size, total_size - offset)
+                if length > 0:
+                    os.preadv(fd, [view[offset:offset + length]],
+                              data_start + offset)
+            list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
+        finally:
+            os.close(fd)
+
+    # ── 4. Reconstruct tensors (stays exactly the same) ─────────
+    # ...
 ```
-
-> [!IMPORTANT]
-> The fallback ensures the project works even without the Rust module compiled. Users who don't have Rust installed can still use the pure-Python path.
-
----
-
-#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py) — `load_layer_to_cpu()` (lines 433-494)
-
-Minor changes:
-1. **Remove separate `pin_memory()` step** (lines 481-492): With mmap, tensors are in kernel-managed memory. Pinning mmap'd pages is a no-op or counterproductive. For the GPU transfer, `move_layer_to_device()` already calls `.to(cuda)` which handles DMA.
-2. **Add diagnostic logging**: Print whether Rust loader or Python fallback is being used (one-time on first layer).
-
----
-
-### Phase 2: Double-Buffered Prefetch with io_uring (P1)
 
 > [!NOTE]
-> Phase 2 builds on Phase 1. Only start this after Phase 1 is verified.
-
-Currently, the prefetch thread calls `load_layer_to_cpu()` in a `ThreadPoolExecutor`. With the Rust mmap loader, we can do better:
-
-#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
-
-Add `prefetch_layer(path: str)` function that:
-1. **Pre-mmaps** the next layer's file and calls `madvise(MADV_WILLNEED)` to trigger kernel readahead
-2. On Linux, optionally uses **io_uring** for fully async page fault resolution
-3. Returns a handle that `fast_load()` can use to skip the mmap step
-
-#### [MODIFY] [vaayu_base.py](file:///home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py) — prefetch loop (lines 755-801)
-
-Replace `executor.submit(self.load_layer_to_cpu, ...)` with:
-```python
-# Kick off Rust-side prefetch (mmap + madvise in background)
-vaayu_rust.prefetch_layer(next_layer_path)
-```
-
-This ensures the next layer's pages are being loaded from NVMe into kernel page cache **while the current layer's forward pass runs on GPU**. True double-buffering.
-
-**Expected improvement**: If GPU forward is ~50ms and disk read is ~230ms, we can pipeline 4-5 layers of readahead, potentially hiding all I/O latency.
+> The `memoryview(buf.numpy())` line (current line 73) is only needed for the Python preadv fallback. The Rust path uses `buf.data_ptr()` directly. We keep both paths.
 
 ---
 
-### Phase 3: CPU-side Dequantization in Rust+SIMD (P1)
+## Open Questions
 
-#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
+> [!IMPORTANT]
+> **O_DIRECT + pinned memory alignment:** `O_DIRECT` requires the destination buffer to be 512-byte or 4096-byte aligned. PyTorch's `cudaHostAlloc` (used by `pin_memory=True`) typically returns page-aligned memory, but this needs verification. If it fails, we have two options:
+> 1. Drop `O_DIRECT` (still use io_uring but through page cache — less benefit)
+> 2. Allocate aligned memory manually with `posix_memalign` in Rust and copy once (still 1 copy vs 3 copies before)
 
-Add `dequantize_nf4(data: bytes, quant_state: dict) -> numpy.ndarray` function:
-1. Parse NF4 quantization state from dict
-2. Dequantize using **AVX2/AVX-512** SIMD on the i5-14600K (supports AVX2)
-3. Return as `float16` numpy array
+> [!IMPORTANT]
+> **O_DIRECT and read length alignment:** `O_DIRECT` also requires read lengths to be multiples of 512 bytes. Safetensor data sizes should be aligned (tensor sizes are always multiples of element size), but we need to handle the last chunk carefully by rounding up and truncating.
 
-This eliminates the dependency on `bitsandbytes` for dequantization and runs on CPU without needing CUDA for the dequant step.
-
-#### [MODIFY] [utils.py](file:///home/a/code/ai-ml/Vaayu/vaayu/utils.py) — `uncompress_layer_state_dict()` (lines 86-114)
-
-```python
-def uncompress_layer_state_dict(layer_state_dict):
-    try:
-        import vaayu_rust
-        return vaayu_rust.dequantize_state_dict(layer_state_dict)
-    except ImportError:
-        # Existing bitsandbytes path
-        ...
-```
-
----
-
-### Phase 4: Parallel Model Splitting with rayon (P2)
-
-#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
-
-Add `split_model_shards(checkpoint_path: str, output_path: str, layer_names: list)` function:
-1. Parse the model index JSON
-2. mmap all shard files
-3. Use **rayon** for parallel extraction of per-layer tensors
-4. Write individual `.safetensors` files using the Rust safetensors crate
-
-This replaces the Python `split_and_save_layers()` function which currently takes 10-30 minutes for 70B models.
-
-#### [MODIFY] [utils.py](file:///home/a/code/ai-ml/Vaayu/vaayu/utils.py) — `split_and_save_layers()` (lines 189-391)
-
-Add Rust fast-path with Python fallback, similar to Phase 1.
-
----
+> [!IMPORTANT]
+> **io_uring queue depth tuning:** The optimal QD for io_uring may differ from the thread-based QD16. We should benchmark QD 8, 16, 32, 64 to find the sweet spot. Starting with QD32 as default.
 
 ## Build & Install Workflow
 
-### One-Time Setup
-
 ```bash
-# Install Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+# From the Vaayu project root:
+cd vaayu_rust
 
-# Install maturin (Python ↔ Rust build tool)
+# Install maturin if not already installed
 pip install maturin
 
-# Build and install the Rust module into the venv
-cd /home/a/code/ai-ml/Vaayu/vaayu_rust
+# Build and install the Rust module into the active venv
 maturin develop --release
+
+# Verify it loads
+python -c "import vaayu_rust; print('io_uring reader loaded')"
+
+# Run inference — should auto-detect and use io_uring
+cd ..
+python test_quick.py
 ```
-
-### Development Cycle
-
-```bash
-# After any Rust code changes:
-cd vaayu_rust && maturin develop --release
-
-# Run tests (unchanged):
-cd /home/a/code/ai-ml/Vaayu && python3 test_quick.py
-```
-
-> [!IMPORTANT]
-> Rust is only needed to **build**. The compiled `.so` is a standalone binary. Once built, `python3 test_quick.py` works without Rust installed.
-
----
-
-## Integration Architecture
-
-```
-test_quick.py → vaayu.AutoModel → VaayuBaseModel.forward()
-                                       │
-                                       ▼
-                            load_layer_to_cpu()
-                                       │
-                                       ▼
-                       SafetensorModelPersister.load_model()
-                                       │
-                          ┌─────────────┴─────────────┐
-                          ▼                           ▼
-                   try: vaayu_rust.fast_load()   except: safetensors.load_file()
-                          │                           │
-                          ▼                           ▼
-                   mmap + zero-copy              read() + copy
-                   (~250ms per layer)            (~950ms per layer)
-```
-
-The Rust module is **surgically targeted** at the single hottest function. All other Python code stays unchanged. The fallback ensures backward compatibility.
-
----
-
-## Expected Performance Impact
-
-### Per-Token Time (Llama 3.3 70B, 83 layers)
-
-| Phase | Per-Layer I/O | Per-Token Total | Speedup |
-|---|---|---|---|
-| **Current (Python)** | ~950ms | ~80s | baseline |
-| **Phase 1 (mmap)** | ~250-350ms | ~25-30s | **2.5-3×** |
-| **Phase 1+2 (mmap + prefetch)** | ~50ms (hidden) | ~8-12s | **7-10×** |
-| **Theoretical limit** | 0ms (fully pipelined) | ~4s (GPU only) | 20× |
-
-> [!WARNING]
-> Phase 1+2 estimates assume the NVMe can sustain 7 GB/s under repeated sequential reads of 1.6 GB files. Real-world performance depends on filesystem caching, IOMMU overhead, and thermal throttling. The 990 PRO has a SLC cache that covers ~50 GB — after that, sustained write drops. Reads should be fine.
-
----
 
 ## Verification Plan
 
-### Phase 1 Verification
+### Phase 1: Build Verification
+```bash
+cd vaayu_rust && maturin develop --release
+python -c "import vaayu_rust; print(dir(vaayu_rust))"
+```
+Expected: Module loads, `io_uring_read_into` and `pread_into` functions visible.
 
-1. **Correctness**: Compare output of `vaayu_rust.fast_load(path)` vs `safetensors.torch.load_file(path)` for all 83 layer files. Tensors must be bit-identical.
-2. **Performance**: Add per-layer timing to `load_layer_to_cpu()` and compare Python vs Rust path.
-3. **Memory**: Monitor RSS and VRAM to confirm mmap doesn't cause memory bloat (kernel should reclaim pages after use).
-4. **End-to-end**: Run `test_quick.py` and compare:
-   - Output text must match
-   - Per-token time should drop from ~80s to ~25-30s
+### Phase 2: Standalone Benchmark
+Create a quick benchmark script that reads a single layer file using:
+1. Python `os.preadv` (current — baseline)
+2. Rust `io_uring_read_into` (new)
+3. Rust `pread_into` (fallback)
 
-### Benchmarking Script
+Compare bandwidth (GB/s) and latency (ms per layer) for each.
 
 ```bash
-# Quick layer-load benchmark (no full inference):
-python3 -c "
-import time, vaayu_rust
-path = '/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct/splitted_model/model.layers.0.safetensors'
-t = time.time(); d = vaayu_rust.fast_load(path); print(f'Rust: {time.time()-t:.3f}s')
-
-from safetensors.torch import load_file
-t = time.time(); d = load_file(path, device='cpu'); print(f'Python: {time.time()-t:.3f}s')
-"
+python benchmark_rust_io.py
 ```
+
+Expected results:
+| Method | Bandwidth | Per-Layer Time |
+|---|---|---|
+| Python preadv QD16 | 4.4 GB/s | 0.35s |
+| Rust io_uring QD32 | ~6-7 GB/s | ~0.24s |
+| Rust pread (single) | ~2.8 GB/s | ~0.58s |
+
+### Phase 3: Full Inference Test
+```bash
+python test_quick.py
+```
+Compare token summary line:
+- Before: `total=29.6s  io_wait=8.8s  gpu_load=20.1s`
+- After (x4 GPU): `total=~25s  io_wait=~4s  gpu_load=20.1s`
+- After (x16 GPU): `total=~21s  io_wait=~15s  gpu_load=~5.4s`
+
+### Phase 4: QD Sweep
+Test io_uring with QD 8, 16, 32, 64 to find the optimal queue depth:
+```bash
+for qd in 8 16 32 64; do
+    python benchmark_rust_io.py --qd $qd
+done
+```
+
+## Risk Mitigation
+
+| Risk | Mitigation |
+|---|---|
+| io_uring kernel support issues | `pread_into` fallback function included |
+| O_DIRECT alignment failure | Remove `O_DIRECT` flag, use buffered io_uring |
+| Rust module fails to build | Python preadv path preserved, no regression |
+| Pinned memory pointer invalid | Assertion check: verify `data_ptr() % 4096 == 0` before calling Rust |
+| io_uring crate "Illegal Instruction" | Unlike Python liburing (Zig-compiled), this is pure Rust compiled with `rustc` — should not happen |
+
+## Summary
+
+| Component | Change |
+|---|---|
+| `vaayu_rust/Cargo.toml` | Replace deps: remove `memmap2/safetensors/numpy`, add `io-uring/libc` |
+| `vaayu_rust/src/lib.rs` | Complete rewrite: `io_uring_read_into()` + `pread_into()` fallback |
+| `safetensor_model_persister.py` | Add `try: import vaayu_rust` + conditional io_uring path |
+| `pyproject.toml` | No changes needed |
+| `vaayu_base.py` | **No changes** — prefetch pipeline stays exactly the same |
+
+**Estimated time:** ~1 day (build + benchmark + integrate + QD tuning)
+**Risk level:** Low — Python fallback preserved, no changes to inference logic
+**Expected gain:** Disk bandwidth 4.4 → 6+ GB/s → saves ~5-8s per token
