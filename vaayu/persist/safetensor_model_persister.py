@@ -1,4 +1,8 @@
+import json
+import os
+import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -6,16 +10,6 @@ from safetensors.torch import load_file, save_file
 
 from .model_persister import ModelPersister
 
-try:
-    import numpy as np
-    import vaayu_rust
-    _RUST_LOADER = True
-    print(">>>> vaayu_rust loaded — using mmap fast_load")
-except ImportError:
-    _RUST_LOADER = False
-    print(">>>> vaayu_rust not found — using Python safetensors loader")
-
-# Maps safetensors dtype strings to torch dtypes.
 _DTYPE_MAP = {
     "F16":  torch.float16,
     "BF16": torch.bfloat16,
@@ -29,20 +23,85 @@ _DTYPE_MAP = {
     "BOOL": torch.bool,
 }
 
+_USE_PINNED = torch.cuda.is_available()
+if _USE_PINNED:
+    print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path (QD16)")
+else:
+    print(">>>> CUDA not available — using Python safetensors loader")
 
-def _raw_to_tensor(data, dtype_str: str, shape: list) -> torch.Tensor:
-    """Convert uint8 numpy array + metadata from Rust into a typed torch tensor."""
-    torch_dtype = _DTYPE_MAP.get(dtype_str, torch.float32)
-    # frombuffer reinterprets the raw bytes as the target dtype (zero-copy until clone).
-    tensor = torch.frombuffer(data, dtype=torch.uint8)
-    return tensor.view(torch_dtype).reshape(shape).clone()
+# ── Global state for the ultra-fast loader ──────────────────────────
+_NUM_IO_THREADS = 16            # QD16 = sweet spot for Samsung 990 PRO
+_EXECUTOR = None                # Lazily initialized ThreadPoolExecutor
+_PINNED_BUFS = [None, None]     # Double buffer (A/B)
+_PINNED_SIZES = [0, 0]          # Allocated size of each buffer
+_BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
+
+
+def _ensure_executor():
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(max_workers=_NUM_IO_THREADS)
+
+
+def _load_pinned(file_path: str) -> dict:
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
+    _ensure_executor()
+
+    # ── 1. Parse safetensors header ─────────────────────────────────
+    with open(file_path, 'rb') as f:
+        hdr_len = struct.unpack('<Q', f.read(8))[0]
+        hdr = json.loads(f.read(hdr_len))
+        data_start = 8 + hdr_len
+
+    tensors_meta = {k: v for k, v in hdr.items() if k != '__metadata__'}
+    if not tensors_meta:
+        return {}
+
+    total_size = max(v['data_offsets'][1] for v in tensors_meta.values())
+
+    # ── 2. Acquire pinned buffer (double-buffer swap) ───────────────
+    buf_idx = _BUF_IDX
+    _BUF_IDX = 1 - _BUF_IDX
+
+    if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
+        alloc_size = total_size + (100 * 1024 * 1024)   # pad +100 MB
+        _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
+                                            pin_memory=True)
+        _PINNED_SIZES[buf_idx] = alloc_size
+
+    buf = _PINNED_BUFS[buf_idx]
+    view = memoryview(buf.numpy())
+
+    # ── 3. Multi-threaded parallel read (QD16) ──────────────────────
+    fd = os.open(file_path, os.O_RDONLY)
+    try:
+        chunk_size = (total_size + _NUM_IO_THREADS - 1) // _NUM_IO_THREADS
+
+        def _read_chunk(i):
+            offset = i * chunk_size
+            length = min(chunk_size, total_size - offset)
+            if length > 0:
+                os.preadv(fd, [view[offset:offset + length]],
+                          data_start + offset)
+
+        list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
+    finally:
+        os.close(fd)
+
+    # ── 4. Reconstruct tensors as zero-copy views ───────────────────
+    result = {}
+    for name, meta in tensors_meta.items():
+        dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
+        start, end = meta['data_offsets']
+        result[name] = buf[start:end].view(dtype).reshape(meta['shape'])
+
+    return result
 
 
 class SafetensorModelPersister(ModelPersister):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._io_log_header_printed = False
 
     def model_persist_exist(self, layer_name, saving_path):
         safetensor_exists = Path(saving_path / (layer_name + 'safetensors')).exists()
@@ -57,13 +116,12 @@ class SafetensorModelPersister(ModelPersister):
     def load_model(self, layer_name, path):
         file_path = str(Path(path) / (layer_name + ".safetensors"))
 
-        if _RUST_LOADER:
+        if _USE_PINNED:
             t = time.time()
-            raw = vaayu_rust.fast_load(file_path)
+            result = _load_pinned(file_path)
             elapsed = time.time() - t
-            print(f"[VAAYU-IO] rust   {elapsed:.3f}s  {layer_name}")
-            return {name: _raw_to_tensor(data, dtype, shape)
-                    for name, (data, dtype, shape) in raw.items()}
+            print(f"[VAAYU-IO] pinned {elapsed:.3f}s  {layer_name}")
+            return result
         else:
             t = time.time()
             result = load_file(file_path, device="cpu")

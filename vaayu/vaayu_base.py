@@ -505,7 +505,7 @@ class VaayuBaseModel(GenerationMixin):
                     is_quantized = self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
 
             if not is_quantized:
-                standard_params[param_name] = remapped_state_dict[param_name].to(self.running_device, dtype=self.running_dtype)
+                standard_params[param_name] = remapped_state_dict[param_name].to(self.running_device, dtype=self.running_dtype, non_blocking=True)
             else:
                 torch_dtype = self.hf_quantizer.update_torch_dtype(None)
                 self.hf_quantizer.create_quantized_param(self.model, remapped_state_dict[param_name], param_name, self.running_device, remapped_state_dict)
@@ -519,6 +519,8 @@ class VaayuBaseModel(GenerationMixin):
                         set_module_tensor_to_device(self.model, param_name, self.running_device, value=tensor, dtype=self.running_dtype)
                     except Exception as fallback_e:
                         print(f"Warning: Could not inject {param_name} natively: {fallback_e}")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         return layers
 
     # make GenerationMixin happy
@@ -743,6 +745,15 @@ class VaayuBaseModel(GenerationMixin):
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
 
+                    # Submit next load BEFORE GPU transfer so disk read and GPU transfer overlap.
+                    if (i + 1) < len(self.layer_names):
+                        if self.profiling_mode:
+                            t = time.time()
+                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
+
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
@@ -751,14 +762,6 @@ class VaayuBaseModel(GenerationMixin):
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
-
-                    if (i + 1) < len(self.layer_names):
-                        if self.profiling_mode:
-                            t = time.time()
-                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
-                        if self.profiling_mode:
-                            elapsed_time = time.time() - t
-                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
 
                 else:
                     _t = time.time()
@@ -831,8 +834,8 @@ class VaayuBaseModel(GenerationMixin):
                 else:
                     layer.to("meta")
 
-                layer.to("meta")
-                clean_memory()  # proposed by CPMP
+                if i % 20 == 19:
+                    clean_memory()
 
         logits = torch.cat(batch, 0)
 
