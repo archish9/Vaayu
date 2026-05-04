@@ -27,11 +27,18 @@ fn io_uring_read_into(
     let path = path.to_owned();
 
     py.allow_threads(move || {
-        let file = File::open(&path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(
-                format!("open {}: {}", path, e)))?;
+        let c_path = std::ffi::CString::new(path.clone())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+        let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+        if raw_fd < 0 {
+            return Err(pyo3::exceptions::PyIOError::new_err(
+                format!("open O_DIRECT {}: errno {}", path, std::io::Error::last_os_error())
+            ));
+        }
+        // Wrap raw_fd in File so it gets automatically closed when dropped
+        let file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
 
-        eprintln!("[vaayu_rust] open buffered  path={}  offset={}  length={}", path, offset, length);  // → O_DIRECT after impl
+        eprintln!("[vaayu_rust] open O_DIRECT  path={}  offset={}  length={}", path, offset, length);
 
         let fd = types::Fd(file.as_raw_fd());
         let ptr = buf_ptr as *mut u8;
