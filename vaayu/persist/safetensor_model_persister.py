@@ -23,6 +23,15 @@ _DTYPE_MAP = {
     "BOOL": torch.bool,
 }
 
+_ALIGN = 4096  # O_DIRECT sector-alignment requirement
+
+def _align_down(x: int) -> int:
+    return x & ~(_ALIGN - 1)
+
+def _align_up(x: int) -> int:
+    return (x + _ALIGN - 1) & ~(_ALIGN - 1)
+
+
 _USE_PINNED = torch.cuda.is_available()
 if _USE_PINNED:
     print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path")
@@ -32,9 +41,10 @@ else:
 try:
     import vaayu_rust
     _USE_IOURING = True
-    print(">>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth")
+    print(">>>> Rust io_uring reader loaded  mode=buffered  O_DIRECT=pending")
 except ImportError:
     _USE_IOURING = False
+    print(">>>> Rust io_uring NOT available — preadv QD16 fallback active")
 
 # ── Global state for the loader ──────────────────────────────────────
 _NUM_IO_THREADS = 16            # QD16 = sweet spot for Samsung 990 PRO (preadv fallback)
@@ -64,6 +74,7 @@ def _load_pinned(file_path: str) -> dict:
         return {}
 
     total_size = max(v['data_offsets'][1] for v in tensors_meta.values())
+    file_size = os.path.getsize(file_path)
 
     # ── 2. Acquire pinned buffer (double-buffer swap) ───────────────
     buf_idx = _BUF_IDX
@@ -74,20 +85,31 @@ def _load_pinned(file_path: str) -> dict:
         _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
                                             pin_memory=True)
         _PINNED_SIZES[buf_idx] = alloc_size
+        print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB")
 
     buf = _PINNED_BUFS[buf_idx]
 
     if _USE_IOURING:
         # ── 3a. Rust io_uring read (zero-copy into pinned buffer) ───
+        aligned_offset = _align_down(data_start)
+        prefix_pad = data_start - aligned_offset
+        aligned_length = _align_up(total_size + prefix_pad)
+        print(f"[VAAYU-IO] io  file={os.path.basename(file_path)}"
+              f"  data_start={data_start}  total={total_size}  file_size={file_size}")
+        print(f"[VAAYU-IO] align  raw_off={data_start}→aligned_off={aligned_offset}"
+              f"  pad={prefix_pad}  raw_len={total_size}→aligned_len={aligned_length}"
+              f"  (O_DIRECT pending — reading raw)")
         vaayu_rust.io_uring_read_into(
             file_path,
-            data_start,
-            total_size,
+            data_start,          # → aligned_offset after O_DIRECT impl
+            total_size,          # → aligned_length after O_DIRECT impl
             buf.data_ptr(),
-            32,                 # queue depth (SQEs)
+            32,
         )
     else:
         # ── 3b. Fallback: Python preadv (QD16) ──────────────────────
+        print(f"[VAAYU-IO] preadv  file={os.path.basename(file_path)}"
+              f"  data_start={data_start}  total={total_size}  threads={_NUM_IO_THREADS}")
         _ensure_executor()
         view = memoryview(buf.numpy())
         fd = os.open(file_path, os.O_RDONLY)
@@ -138,11 +160,15 @@ class SafetensorModelPersister(ModelPersister):
             result = _load_pinned(file_path)
             elapsed = time.time() - t
             tag = "iouring" if _USE_IOURING else "pinned"
-            print(f"[VAAYU-IO] {tag} {elapsed:.3f}s  {layer_name}")
+            size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+            gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
+            print(f"[VAAYU-IO] {tag}  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result
         else:
             t = time.time()
             result = load_file(file_path, device="cpu")
             elapsed = time.time() - t
-            print(f"[VAAYU-IO] python {elapsed:.3f}s  {layer_name}")
+            size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+            gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
+            print(f"[VAAYU-IO] python  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result
