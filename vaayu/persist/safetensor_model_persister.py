@@ -81,7 +81,7 @@ def _load_pinned(file_path: str) -> dict:
     _BUF_IDX = 1 - _BUF_IDX
 
     if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
-        alloc_size = total_size + (100 * 1024 * 1024)   # pad +100 MB
+        alloc_size = total_size + (100 * 1024 * 1024) + _ALIGN  # pad +100 MB + O_DIRECT padding
         _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
                                             pin_memory=True)
         _PINNED_SIZES[buf_idx] = alloc_size
@@ -97,15 +97,15 @@ def _load_pinned(file_path: str) -> dict:
         print(f"[VAAYU-IO] io  file={os.path.basename(file_path)}"
               f"  data_start={data_start}  total={total_size}  file_size={file_size}")
         print(f"[VAAYU-IO] align  raw_off={data_start}→aligned_off={aligned_offset}"
-              f"  pad={prefix_pad}  raw_len={total_size}→aligned_len={aligned_length}"
-              f"  (O_DIRECT pending — reading raw)")
+              f"  pad={prefix_pad}  raw_len={total_size}→aligned_len={aligned_length}")
         vaayu_rust.io_uring_read_into(
             file_path,
-            data_start,          # → aligned_offset after O_DIRECT impl
-            total_size,          # → aligned_length after O_DIRECT impl
+            aligned_offset,
+            aligned_length,
             buf.data_ptr(),
             32,
         )
+        buf_view = buf[prefix_pad:]
     else:
         # ── 3b. Fallback: Python preadv (QD16) ──────────────────────
         print(f"[VAAYU-IO] preadv  file={os.path.basename(file_path)}"
@@ -129,10 +129,11 @@ def _load_pinned(file_path: str) -> dict:
 
     # ── 4. Reconstruct tensors as zero-copy views ───────────────────
     result = {}
+    source_buf = buf_view if _USE_IOURING else buf
     for name, meta in tensors_meta.items():
         dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
         start, end = meta['data_offsets']
-        result[name] = buf[start:end].view(dtype).reshape(meta['shape'])
+        result[name] = source_buf[start:end].view(dtype).reshape(meta['shape'])
 
     return result
 
