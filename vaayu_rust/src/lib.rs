@@ -31,12 +31,15 @@ fn io_uring_read_into(
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(
                 format!("open {}: {}", path, e)))?;
 
+        eprintln!("[vaayu_rust] open buffered  path={}  offset={}  length={}", path, offset, length);  // → O_DIRECT after impl
+
         let fd = types::Fd(file.as_raw_fd());
         let ptr = buf_ptr as *mut u8;
         let qd = queue_depth.min(64) as usize;
         let chunk_size = (length + qd - 1) / qd;
-        // Align chunk_size to 4096 for O_DIRECT
         let chunk_size = (chunk_size + 4095) & !4095;
+        let total_chunks = (length + chunk_size - 1) / chunk_size;
+        eprintln!("[vaayu_rust] qd={}  chunk_size={}  total_chunks={}  total_bytes={}", qd, chunk_size, total_chunks, length);
 
         let mut ring = IoUring::new(qd as u32)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
@@ -62,21 +65,26 @@ fn io_uring_read_into(
             submitted += 1;
         }
 
-        // Single syscall submits all SQEs and waits for all CQEs
+        eprintln!("[vaayu_rust] submitted {} SQEs", submitted);
+
         ring.submit_and_wait(submitted)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("io_uring submit: {}", e)))?;
 
-        // Verify all completions
         let cq = ring.completion();
         let mut completed = 0usize;
         for cqe in cq {
             if cqe.result() < 0 {
+                eprintln!("[vaayu_rust] CQE error  idx={}  result={}  errno={}",
+                          cqe.user_data(), cqe.result(), -cqe.result());
                 return Err(pyo3::exceptions::PyIOError::new_err(
-                    format!("io_uring read error: {}", cqe.result())));
+                    format!("io_uring read error  CQE[{}]  result={}  errno={}",
+                            cqe.user_data(), cqe.result(), -cqe.result())));
             }
             completed += 1;
         }
+
+        eprintln!("[vaayu_rust] done {}/{} CQEs ok", completed, submitted);
 
         if completed != submitted {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(

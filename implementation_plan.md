@@ -1,379 +1,165 @@
-# Rust io_uring Zero-Copy NVMe Reader
+# O_DIRECT io_uring Integration — Implementation Plan
 
-Replace the Python `os.preadv` + `ThreadPoolExecutor` I/O path with a Rust io_uring reader that writes directly into Python's pre-allocated pinned memory buffer. **Zero memory copies across the PyO3 boundary.**
-
-## Background
-
-| | Old Rust module (broken, removed) | New Rust module (this plan) |
-|---|---|---|
-| Who allocates memory? | Rust (`Vec<u8>`) | Python (pinned `torch` buffer) |
-| What crosses PyO3 boundary? | 1.6 GB of data (3 copies) | One integer (a pointer) |
-| I/O mechanism | `mmap` + `MAP_POPULATE` | `io_uring` submission ring |
-| Memory copies | 3 (4.8 GB wasted) | **0** |
-| Expected bandwidth | 1.7 GB/s (measured) | **6-7 GB/s** (target) |
-
-### Why io_uring over preadv threads
-
-| | Python preadv (current) | Rust io_uring (proposed) |
-|---|---|---|
-| Syscalls per layer | 16 (one per thread) | 1 (`io_uring_enter`) |
-| Thread overhead | 16 threads created/scheduled | Single thread, no scheduling |
-| GIL interaction | Released per-thread, reacquired on completion | Released once for entire read |
-| Measured bandwidth | 4.4 GB/s | Target: 6-7 GB/s |
-| Context switches | ~32 per layer | ~1 per layer |
-
-## Prerequisites
-
-> [!IMPORTANT]
-> - **Linux kernel 5.1+** for io_uring support (system has 6.17 ✅)
-> - **Rust 1.95** installed (system has 1.95 ✅)
-> - **maturin** for building PyO3 modules (`pip install maturin`)
-> - GPU should be moved to **PCI_E1** first for maximum benefit
+Enable true page-cache bypass for NVMe reads by opening layer files with `O_DIRECT` in the Rust `io_uring` module, and implementing the "Read Wide, Slice Narrow" alignment strategy on the Python side.
 
 ## Proposed Changes
 
----
+### Rust Module — `vaayu_rust`
 
-### Rust Crate: `vaayu_rust/`
+#### [MODIFY] [lib.rs](file:///c:/laragon/www/AI-ML/Vaayu/vaayu_rust/src/lib.rs)
 
-#### [MODIFY] [Cargo.toml](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/Cargo.toml)
+The `io_uring_read_into` function currently opens files with `File::open()` (standard buffered I/O). This must change to `libc::open()` with `O_RDONLY | O_DIRECT` to bypass the Linux page cache entirely.
 
-Replace all dependencies. Remove `memmap2`, `safetensors`, `numpy` (no longer needed). Add `io-uring` crate.
-
-```toml
-[package]
-name = "vaayu_rust"
-version = "0.2.0"
-edition = "2021"
-
-[lib]
-name = "vaayu_rust"
-crate-type = ["cdylib"]
-
-[dependencies]
-pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
-io-uring = "0.7"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-```
-
-> [!NOTE]
-> The `io-uring` crate is a pure Rust wrapper around the kernel's io_uring interface. Unlike the Python `liburing` package (which crashed with "Illegal Instruction" due to Zig compilation), this crate compiles natively with `rustc` using the correct CPU instruction set.
-
-#### [MODIFY] [lib.rs](file:///home/a/code/ai-ml/Vaayu/vaayu_rust/src/lib.rs)
-
-Complete rewrite. The old `fast_load` function (mmap + triple copy) is deleted entirely. New function: `io_uring_read_into`.
-
-**Design:**
-1. Python passes: file path, data offset, total bytes, destination pointer, number of SQEs (queue depth)
-2. Rust opens the file with `O_DIRECT` (bypass page cache, DMA straight to pinned memory)
-3. Rust creates an io_uring instance and submits `QD` read operations as `ReadFixed` SQEs
-4. Each SQE reads a chunk of the file into `ptr + offset`
-5. Rust waits for all CQEs (completions)
-6. Returns `Ok(())` — data is already in Python's buffer
-
+**Current code (line 30–32):**
 ```rust
-use io_uring::{opcode, types, IoUring};
-use pyo3::prelude::*;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
+let file = File::open(&path)
+    .map_err(|e| pyo3::exceptions::PyIOError::new_err(
+        format!("open {}: {}", path, e)))?;
+```
 
-/// Read a file region directly into a caller-provided buffer using io_uring.
-///
-/// # Arguments
-/// * `path`       - Path to the .safetensors file
-/// * `offset`     - Byte offset into the file where tensor data starts (after header)
-/// * `length`     - Total bytes to read
-/// * `buf_ptr`    - Raw pointer to the destination buffer (Python's pinned memory)
-/// * `queue_depth` - Number of parallel io_uring SQEs (e.g. 32)
-///
-/// # Safety
-/// The caller must ensure `buf_ptr` points to at least `length` bytes of valid,
-/// writable memory that remains alive for the duration of this call.
-#[pyfunction]
-fn io_uring_read_into(
-    py: Python<'_>,
-    path: &str,
-    offset: u64,
-    length: usize,
-    buf_ptr: usize,
-    queue_depth: u32,
-) -> PyResult<()> {
-    let path = path.to_owned();
-
-    py.allow_threads(move || {
-        // Open with O_DIRECT to bypass page cache (DMA straight to pinned mem)
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(
-                format!("open {}: {}", path, e)))?;
-
-        let fd = types::Fd(file.as_raw_fd());
-        let ptr = buf_ptr as *mut u8;
-        let qd = queue_depth.min(64) as usize;
-        let chunk_size = (length + qd - 1) / qd;
-        // Align chunk_size to 4096 for O_DIRECT
-        let chunk_size = (chunk_size + 4095) & !4095;
-
-        let mut ring = IoUring::new(qd as u32)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("io_uring_setup: {}", e)))?;
-
-        // Submit all read SQEs
-        let mut submitted = 0;
-        let mut file_off = offset;
-        let mut buf_off = 0usize;
-
-        while buf_off < length {
-            let this_len = chunk_size.min(length - buf_off);
-            let read_op = opcode::Read::new(fd, unsafe { ptr.add(buf_off) }, this_len as u32)
-                .offset(file_off)
-                .build()
-                .user_data(submitted as u64);
-
-            unsafe { ring.submission().push(&read_op) }
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("SQ full"))?;
-
-            file_off += this_len as u64;
-            buf_off += this_len;
-            submitted += 1;
-        }
-
-        // Submit all at once — single syscall
-        ring.submit_and_wait(submitted)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("io_uring submit: {}", e)))?;
-
-        // Verify all completions
-        let cq = ring.completion();
-        let mut completed = 0;
-        for cqe in cq {
-            if cqe.result() < 0 {
-                return Err(pyo3::exceptions::PyIOError::new_err(
-                    format!("io_uring read error: {}", cqe.result())));
-            }
-            completed += 1;
-        }
-
-        if completed != submitted {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                format!("incomplete: {}/{} CQEs", completed, submitted)));
-        }
-
-        Ok(())
-    })
-}
-
-/// Fallback: simple pread without io_uring (for testing/compatibility)
-#[pyfunction]
-fn pread_into(
-    py: Python<'_>,
-    path: &str,
-    offset: u64,
-    length: usize,
-    buf_ptr: usize,
-) -> PyResult<()> {
-    let path = path.to_owned();
-    py.allow_threads(move || {
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::File::open(&path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-        let ptr = buf_ptr as *mut u8;
-        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, length) };
-        let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr() as *mut _, length, offset as i64) };
-        if n < 0 {
-            return Err(pyo3::exceptions::PyIOError::new_err("pread failed"));
-        }
-        Ok(())
-    })
-}
-
-#[pymodule]
-fn vaayu_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(io_uring_read_into, m)?)?;
-    m.add_function(wrap_pyfunction!(pread_into, m)?)?;
-    Ok(())
+**New code:**
+```rust
+let c_path = std::ffi::CString::new(path.as_str())
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+if raw_fd < 0 {
+    return Err(pyo3::exceptions::PyIOError::new_err(
+        format!("open O_DIRECT {}: errno {}", path,
+                std::io::Error::last_os_error())));
 }
 ```
 
-> [!WARNING]
-> **`O_DIRECT` requirement:** The destination buffer MUST be page-aligned (4096 bytes). PyTorch's `pin_memory=True` allocates via `cudaHostAlloc` which returns page-aligned memory, so this should work. We'll verify this in the benchmark phase. If alignment issues arise, we fall back to non-`O_DIRECT` reads.
+Additional changes in `io_uring_read_into`:
+- Use `raw_fd` directly with `types::Fd(raw_fd)` instead of `file.as_raw_fd()`
+- Add `unsafe { libc::close(raw_fd); }` at the end of the function (before `Ok(())`) to clean up the file descriptor, wrapped in a scope guard pattern to ensure it closes even on error
+- The chunk alignment logic on line 39 (`(chunk_size + 4095) & !4095`) is already correct and stays as-is
 
-> [!IMPORTANT]
-> **`libc` crate dependency:** The code uses `libc::O_DIRECT` and `libc::pread`. Add `libc = "0.2"` to Cargo.toml dependencies.
+The `pread_into` fallback function remains unchanged — it does not use `O_DIRECT` and serves as a safe fallback.
 
-Updated Cargo.toml dependencies:
-```toml
-[dependencies]
-pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
-io-uring = "0.7"
-libc = "0.2"
-```
+No changes to function signatures. The Rust module stays "dumb" — it receives pre-aligned offset/length from Python and just executes the read.
 
 ---
 
-### Python Integration: `vaayu/persist/safetensor_model_persister.py`
+### Python Integration — `safetensor_model_persister.py`
 
-#### [MODIFY] [safetensor_model_persister.py](file:///home/a/code/ai-ml/Vaayu/vaayu/persist/safetensor_model_persister.py)
+#### [MODIFY] [safetensor_model_persister.py](file:///c:/laragon/www/AI-ML/Vaayu/vaayu/persist/safetensor_model_persister.py)
 
-Modify `_load_pinned()` to use the Rust io_uring reader instead of the Python ThreadPoolExecutor. **Keep the Python preadv path as a fallback.**
-
-Changes:
-1. At module level: try `import vaayu_rust`, set a flag
-2. Replace the "Multi-threaded parallel read" section (lines 76-88) with a single `vaayu_rust.io_uring_read_into()` call
-3. Keep the ThreadPoolExecutor path as fallback if `vaayu_rust` is not installed
+**Change 1: Add alignment constants and helper (after line 24)**
 
 ```python
-# At top of file, after existing imports:
-try:
-    import vaayu_rust
-    _USE_IOURING = True
-    print(">>>> Rust io_uring reader loaded — targeting 6+ GB/s NVMe bandwidth")
-except ImportError:
-    _USE_IOURING = False
+_ALIGN = 4096  # O_DIRECT requires sector-aligned offset, length, and buffer
 
-# Inside _load_pinned(), replace the parallel read section:
-def _load_pinned(file_path: str) -> dict:
-    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
-    # ... (header parsing stays the same — lines 50-60) ...
-    # ... (buffer acquisition stays the same — lines 62-73) ...
+def _align_down(x):
+    """Round x down to nearest _ALIGN boundary."""
+    return x & ~(_ALIGN - 1)
 
-    if _USE_IOURING:
-        # ── 3a. Rust io_uring read (zero-copy into pinned buffer) ───
-        vaayu_rust.io_uring_read_into(
-            file_path,
-            data_start,         # offset past safetensor header
-            total_size,         # bytes to read
-            buf.data_ptr(),     # raw pointer to pinned memory
-            32,                 # queue depth (SQEs)
-        )
-    else:
-        # ── 3b. Fallback: Python preadv (existing code) ─────────────
-        fd = os.open(file_path, os.O_RDONLY)
-        try:
-            chunk_size = (total_size + _NUM_IO_THREADS - 1) // _NUM_IO_THREADS
-            def _read_chunk(i):
-                offset = i * chunk_size
-                length = min(chunk_size, total_size - offset)
-                if length > 0:
-                    os.preadv(fd, [view[offset:offset + length]],
-                              data_start + offset)
-            list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
-        finally:
-            os.close(fd)
-
-    # ── 4. Reconstruct tensors (stays exactly the same) ─────────
-    # ...
+def _align_up(x):
+    """Round x up to nearest _ALIGN boundary."""
+    return (x + _ALIGN - 1) & ~(_ALIGN - 1)
 ```
+
+**Change 2: Implement "Read Wide, Slice Narrow" in the io_uring path (lines 80–88)**
+
+Current code passes raw `data_start` and `total_size` to Rust:
+```python
+vaayu_rust.io_uring_read_into(
+    file_path, data_start, total_size, buf.data_ptr(), 32,
+)
+```
+
+New code computes aligned boundaries and adjusts the buffer view:
+```python
+# "Read Wide, Slice Narrow" — pad offset/length to 4096 boundaries
+aligned_offset = _align_down(data_start)
+prefix_pad = data_start - aligned_offset          # bytes of junk before real data
+aligned_length = _align_up(total_size + prefix_pad)
+
+vaayu_rust.io_uring_read_into(
+    file_path,
+    aligned_offset,     # ← 4096-aligned file offset
+    aligned_length,     # ← 4096-aligned read length
+    buf.data_ptr(),     # ← already page-aligned (pin_memory=True)
+    32,                 # QD32
+)
+
+# Slide the view past the alignment prefix so tensor offsets are correct
+buf_view = buf[prefix_pad:]
+```
+
+**Change 3: Update buffer allocation to account for alignment padding (line 73)**
+
+Current:
+```python
+alloc_size = total_size + (100 * 1024 * 1024)   # pad +100 MB
+```
+
+New:
+```python
+alloc_size = total_size + (100 * 1024 * 1024) + _ALIGN  # +4096 for O_DIRECT padding
+```
+
+The extra 4096 bytes accounts for the worst-case alignment padding. This is negligible relative to the 100 MB headroom already allocated.
+
+**Change 4: Use `buf_view` instead of `buf` for tensor slicing (line 113)**
+
+Current:
+```python
+result[name] = buf[start:end].view(dtype).reshape(meta['shape'])
+```
+
+New — only when io_uring path was used:
+```python
+source = buf_view if _USE_IOURING else buf
+result[name] = source[start:end].view(dtype).reshape(meta['shape'])
+```
+
+This ensures the tensor offsets from the safetensors header (which are relative to `data_start`, not `aligned_offset`) map correctly to the buffer contents.
 
 > [!NOTE]
-> The `memoryview(buf.numpy())` line (current line 73) is only needed for the Python preadv fallback. The Rust path uses `buf.data_ptr()` directly. We keep both paths.
+> The Python `preadv` fallback path (lines 89–106) does **not** use `O_DIRECT` and does **not** need alignment changes. It continues to work with raw `data_start` and `total_size` as before.
 
 ---
-
-## Open Questions
-
-> [!IMPORTANT]
-> **O_DIRECT + pinned memory alignment:** `O_DIRECT` requires the destination buffer to be 512-byte or 4096-byte aligned. PyTorch's `cudaHostAlloc` (used by `pin_memory=True`) typically returns page-aligned memory, but this needs verification. If it fails, we have two options:
-> 1. Drop `O_DIRECT` (still use io_uring but through page cache — less benefit)
-> 2. Allocate aligned memory manually with `posix_memalign` in Rust and copy once (still 1 copy vs 3 copies before)
-
-> [!IMPORTANT]
-> **O_DIRECT and read length alignment:** `O_DIRECT` also requires read lengths to be multiples of 512 bytes. Safetensor data sizes should be aligned (tensor sizes are always multiples of element size), but we need to handle the last chunk carefully by rounding up and truncating.
-
-> [!IMPORTANT]
-> **io_uring queue depth tuning:** The optimal QD for io_uring may differ from the thread-based QD16. We should benchmark QD 8, 16, 32, 64 to find the sweet spot. Starting with QD32 as default.
-
-## Build & Install Workflow
-
-```bash
-# From the Vaayu project root:
-cd vaayu_rust
-
-# Install maturin if not already installed
-pip install maturin
-
-# Build and install the Rust module into the active venv
-maturin develop --release
-
-# Verify it loads
-python -c "import vaayu_rust; print('io_uring reader loaded')"
-
-# Run inference — should auto-detect and use io_uring
-cd ..
-python test_quick.py
-```
 
 ## Verification Plan
 
-### Phase 1: Build Verification
+### Automated Tests
+
+**Step 1:** Rebuild the Rust module on the Linux dev machine:
 ```bash
-cd vaayu_rust && maturin develop --release
-python -c "import vaayu_rust; print(dir(vaayu_rust))"
-```
-Expected: Module loads, `io_uring_read_into` and `pread_into` functions visible.
-
-### Phase 2: Standalone Benchmark
-Create a quick benchmark script that reads a single layer file using:
-1. Python `os.preadv` (current — baseline)
-2. Rust `io_uring_read_into` (new)
-3. Rust `pread_into` (fallback)
-
-Compare bandwidth (GB/s) and latency (ms per layer) for each.
-
-```bash
-python benchmark_rust_io.py
+cd /home/a/code/ai-ml/Vaayu/vaayu_rust
+maturin develop --release
+python3 -c "import vaayu_rust; print('✓ Rust module loaded')"
 ```
 
-Expected results:
-| Method | Bandwidth | Per-Layer Time |
-|---|---|---|
-| Python preadv QD16 | 4.4 GB/s | 0.35s |
-| Rust io_uring QD32 | ~6-7 GB/s | ~0.24s |
-| Rust pread (single) | ~2.8 GB/s | ~0.58s |
-
-### Phase 3: Full Inference Test
+**Step 2:** Run the standard inference test and confirm no `EINVAL` errors:
 ```bash
-python test_quick.py
+python3 test_quick.py 2>&1 | head -30
 ```
-Compare token summary line:
-- Before: `total=29.6s  io_wait=8.8s  gpu_load=20.1s`
-- After (x4 GPU): `total=~25s  io_wait=~4s  gpu_load=20.1s`
-- After (x16 GPU): `total=~21s  io_wait=~15s  gpu_load=~5.4s`
+- Should see `>>>> Rust io_uring reader loaded` in startup
+- Should see `[VAAYU-IO] iouring 0.XXXs` per layer (not `pinned`)
+- No `io_uring read error` or `PyIOError` exceptions
 
-### Phase 4: QD Sweep
-Test io_uring with QD 8, 16, 32, 64 to find the optimal queue depth:
+**Step 3:** Compare per-layer times against the Python QD16 baseline:
 ```bash
-for qd in 8 16 32 64; do
-    python benchmark_rust_io.py --qd $qd
-done
+# Drop caches first for fair comparison
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+python3 test_quick.py 2>&1 | grep "VAAYU-IO"
 ```
+- Python QD16 baseline: ~0.36s per layer
+- Expected with io_uring + O_DIRECT: **~0.24–0.28s per layer**
+- If times are *worse* than 0.36s, `O_DIRECT` alignment is likely wrong — check `dmesg` for kernel errors
 
-## Risk Mitigation
+**Step 4:** Verify page cache bypass:
+```bash
+# Clear caches
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+# Run one token
+python3 test_quick.py 2>&1 | grep "token summary"
+# Check that io_wait does NOT decrease dramatically on token 2
+# (if O_DIRECT works, there's no page cache warming — every token reads from NVMe)
+```
+With `O_DIRECT`, token 2 should have similar `io_wait` to token 1 (no page cache benefit). This confirms the bypass is working.
 
-| Risk | Mitigation |
-|---|---|
-| io_uring kernel support issues | `pread_into` fallback function included |
-| O_DIRECT alignment failure | Remove `O_DIRECT` flag, use buffered io_uring |
-| Rust module fails to build | Python preadv path preserved, no regression |
-| Pinned memory pointer invalid | Assertion check: verify `data_ptr() % 4096 == 0` before calling Rust |
-| io_uring crate "Illegal Instruction" | Unlike Python liburing (Zig-compiled), this is pure Rust compiled with `rustc` — should not happen |
+### Manual Verification
 
-## Summary
-
-| Component | Change |
-|---|---|
-| `vaayu_rust/Cargo.toml` | Replace deps: remove `memmap2/safetensors/numpy`, add `io-uring/libc` |
-| `vaayu_rust/src/lib.rs` | Complete rewrite: `io_uring_read_into()` + `pread_into()` fallback |
-| `safetensor_model_persister.py` | Add `try: import vaayu_rust` + conditional io_uring path |
-| `pyproject.toml` | No changes needed |
-| `vaayu_base.py` | **No changes** — prefetch pipeline stays exactly the same |
-
-**Estimated time:** ~1 day (build + benchmark + integrate + QD tuning)
-**Risk level:** Low — Python fallback preserved, no changes to inference logic
-**Expected gain:** Disk bandwidth 4.4 → 6+ GB/s → saves ~5-8s per token
+- After GPU is physically moved to PCI_E1, re-run `test_quick.py` and compare against the Era 4/5 projections in the Project Bible Part 4
