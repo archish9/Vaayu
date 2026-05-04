@@ -41,7 +41,7 @@ else:
 try:
     import vaayu_rust
     _USE_IOURING = True
-    print(">>>> Rust io_uring reader loaded  mode=buffered  O_DIRECT=pending")
+    print(">>>> Rust io_uring reader loaded — O_DIRECT page-cache bypass active (QD32)")
 except ImportError:
     _USE_IOURING = False
     print(">>>> Rust io_uring NOT available — preadv QD16 fallback active")

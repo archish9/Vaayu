@@ -1,7 +1,7 @@
 use io_uring::{opcode, types, IoUring};
 use pyo3::prelude::*;
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 /// Read a file region directly into a caller-provided buffer using io_uring.
 ///
