@@ -324,3 +324,46 @@ However, since you are operating on a strict 16GB VRAM budget with a 70B model, 
 By adding Medusa heads, 4-bit KV caching, and chunked prefilling to your EXL3 streaming pipeline, you eliminate the hidden VRAM traps that would otherwise break the system. 
 
 Are you planning to write the Python-to-C++ bindings for ExLlamaV3 entirely from scratch using PyBind11, or are you looking to heavily modify the existing ExLlama Python API to force it to accept streamed VRAM pointers?
+
+---------------------
+
+
+MORE IMPLEMENTATION LIKE "O_DIRECT"
+
+Searched web: "Linux NVMe io_uring advanced optimizations SQPOLL registered buffers fixed files maximum throughput"
+Searched web: "Linux NVMe tuning maximum sequential read throughput io scheduler none polling huge pages"
+Searched web: "io_uring IORING_SETUP_SQPOLL IORING_REGISTER_BUFFERS performance improvement NVMe benchmark"
+Searched web: "NVMe passthrough io_uring OP_URING_CMD bypass block layer Samsung 990 PRO throughput improvement"
+Searched web: "Linux disable NVMe APST power management nvme_core.default_ps_max_latency_us performance impact latency"
+Searched web: "io_uring registered buffers fixed files Rust crate performance example zero syscall overhead"
+
+Now let me check the current Rust lib.rs to understand what's already implemented and what can be added:
+
+Viewed Cargo.toml:1-18
+
+Now I have everything I need. Let me create a comprehensive research artifact:
+
+Edited nvme_optimizations_research.md
+
+Here's what I found — **7 optimizations** you can implement, similar to O_DIRECT:
+
+## Quick Summary
+
+### Free wins (zero code changes, just system config):
+1. **I/O Scheduler → `none`** — your NVMe is probably using `mq-deadline` which wastes CPU reordering requests that the NVMe controller handles internally. One command: `echo none | sudo tee /sys/block/nvme0n1/queue/scheduler`
+2. **Disable APST power management** — prevents the 990 PRO from sleeping between layers. Add `nvme_core.default_ps_max_latency_us=0` to GRUB.
+
+### Small Rust changes (~20 lines total):
+3. **Registered Buffers** — pre-map your pinned buffer with the kernel once, so every io_uring read skips per-I/O page table walks. Uses `ReadFixed` instead of `Read`. **5-15% gain.**
+4. **Fixed File Descriptors** — pre-register the fd so the kernel skips fd table lookup on every SQE. **3-8% gain.**
+
+### The nuclear option:
+5. **NVMe Passthrough (`OP_URING_CMD`)** — bypasses the entire Linux block layer (scheduler, bio, request queue). Sends raw NVMe commands to hardware. **16-40% gain** but requires mapping filesystem offsets to raw disk sectors or storing the model on a raw partition.
+
+### Combined projected impact of #1-4:
+```
+Current:  4.4 GB/s → ~5.3-5.5 GB/s
+Per-token: ~29s → ~24-25s  (saves ~4-5s)
+```
+
+**I'd recommend starting with #1 and #2 (zero risk, 30 seconds to apply), then #3 and #4 (small Rust changes).** The full research with code examples is in the artifact. Want me to implement any of these?
