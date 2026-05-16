@@ -14,6 +14,7 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
+from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
 
 # BetterTransformer is deprecated in newer optimum versions
 try:
@@ -236,6 +237,11 @@ class VaayuBaseModel(GenerationMixin):
         if not hasattr(self.config, "hidden_act"): self.config.hidden_act = "silu"
         if not hasattr(self.config, "rope_theta"): self.config.rope_theta = 10000.0
 
+        # Build loader strategy (auto-detects EXL3 vs standard safetensors)
+        self.loader_strategy: LoaderStrategy = build_loader_strategy(
+            str(self.checkpoint_path), self
+        )
+
         self.init_model()
 
         # get layer count:
@@ -266,6 +272,21 @@ class VaayuBaseModel(GenerationMixin):
             self.stream = torch.cuda.Stream()
         else:
             self.stream = None
+
+        # MoE detection — must happen before pinning so setup_model has correct context
+        self._detect_moe()
+
+        # Pin shared layers (embed, norm, lm_head) permanently in VRAM.
+        # Skips load/inject/free in forward() for these layers every token.
+        self.pinned_layer_names: set = set()
+        if device.startswith("cuda"):
+            self._init_pinned_layers()
+
+        # Let strategy do one-time model-level setup (e.g. EXL3: swap nn.Linear)
+        self.loader_strategy.setup_model(
+            self.model, self.config, self.running_device, self.running_dtype,
+            pinned_layer_names=self.pinned_layer_names,
+        )
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -421,6 +442,108 @@ class VaayuBaseModel(GenerationMixin):
     def load_rotary_pos_emb_to_device(self):
         state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
         self.move_layer_to_device(state_dict)
+
+    # ── MoE detection ────────────────────────────────────────────────────────
+
+    def _detect_moe(self) -> None:
+        """Detect Mixture-of-Experts architecture from model config."""
+        arch = (getattr(self.config, "architectures", None) or [""])[0]
+        self.is_moe = (
+            hasattr(self.config, "num_local_experts")
+            or hasattr(self.config, "num_experts")
+            or "Moe" in arch
+            or "MoE" in arch
+            or "Mixtral" in arch
+        )
+        if self.is_moe:
+            self.moe_num_experts = getattr(
+                self.config, "num_local_experts",
+                getattr(self.config, "num_experts", 8)
+            )
+            self.moe_top_k = getattr(
+                self.config, "num_experts_per_tok",
+                getattr(self.config, "top_k", 2)
+            )
+            print(
+                f"[Vaayu] MoE detected: {self.moe_num_experts} experts, "
+                f"top-{self.moe_top_k} active per token"
+            )
+            print(
+                "[Vaayu] Expert-aware streaming (Phase 3): pending — "
+                "currently streams full MoE layer (conservative baseline)"
+            )
+        else:
+            self.moe_num_experts = 0
+            self.moe_top_k = 0
+
+    # ── VRAM pinning ─────────────────────────────────────────────────────────
+
+    def _get_vram_pinning_budget(self) -> int:
+        """
+        VRAM budget available for permanently pinned layers.
+        Reserves 4 GB for KV cache + io_uring double-buffers (~2 × largest layer).
+        Formula is conservative; tune if KV cache overflows for long contexts.
+
+        KV cache size = n_layers × 2 × n_kv_heads × head_dim × seq_len × dtype_bytes
+        For Llama-70B @ 512 tok BF16: 80 × 2 × 8 × 128 × 512 × 2 ≈ 1.3 GB.
+        For Qwen3-480B MoE the active KV is much smaller due to sparse routing.
+        """
+        if not torch.cuda.is_available():
+            return 0
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        reserve = 4 * 1024 ** 3  # 4 GB
+        return max(0, total - reserve)
+
+    def _init_pinned_layers(self) -> None:
+        """
+        Pre-load shared layers (embed, norm, lm_head) into VRAM once.
+        forward() will skip load/inject/free for these layers every token,
+        saving one full NVMe read per token for ~2–3 GB of shared weights.
+        """
+        budget = self._get_vram_pinning_budget()
+        if budget <= 0:
+            return
+
+        candidates = [
+            self.layer_names_dict["embed"],
+            self.layer_names_dict["norm"],
+            self.layer_names_dict["lm_head"],
+        ]
+
+        used = 0
+        for layer_name in candidates:
+            try:
+                tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                size = sum(t.nbytes for t in tensors.values())
+                if used + size > budget:
+                    print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted")
+                    continue
+                self.loader_strategy.inject_to_gpu(
+                    self.model, layer_name, tensors,
+                    self.running_device, self.running_dtype,
+                    self.hf_quantizer, getattr(self, "_path_remappings", {}),
+                )
+                self.pinned_layer_names.add(layer_name)
+                used += size
+                print(
+                    f"[Vaayu-Pin] pinned {layer_name}: "
+                    f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)"
+                )
+            except Exception as e:
+                # lm_head may fail if weights are tied; forward() handles that via
+                # the existing tied-weights fallback in load_layer_to_cpu.
+                print(f"[Vaayu-Pin] skip {layer_name}: {e}")
+
+        print(
+            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned, "
+            f"{used / 1e9:.2f} GB reserved"
+        )
+
+    # ── Strategy helper ───────────────────────────────────────────────────────
+
+    def _load_from_strategy(self, layer_name: str) -> dict:
+        """Thin wrapper so ThreadPoolExecutor can call the strategy load."""
+        return self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
 
     def load_layer_to_cpu(self, layer_name):
 
@@ -726,16 +849,31 @@ class VaayuBaseModel(GenerationMixin):
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
 
-            # Load first layer
+            # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
+            future = None
             if self.prefetching:
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-
+                for _seed_name in self.layer_names:
+                    if _seed_name not in self.pinned_layer_names:
+                        future = executor.submit(self._load_from_strategy, _seed_name)
+                        break
 
             for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
                                                desc=f'running layers({self.running_device})',
                                                total=len(self.layers)):
 
-                if self.prefetching:
+                if layer_name in self.pinned_layer_names:
+                    # ── Pinned: already in VRAM — zero disk/transfer cost ────
+                    moved_layers = []
+                    # If no future is outstanding, kick off the next non-pinned load
+                    # so disk read overlaps with this layer's GPU compute.
+                    if self.prefetching and future is None:
+                        for _n in self.layer_names[i + 1:]:
+                            if _n not in self.pinned_layer_names:
+                                future = executor.submit(self._load_from_strategy, _n)
+                                break
+
+                elif self.prefetching:
+                    # ── Non-pinned, prefetching ──────────────────────────────
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
@@ -745,14 +883,18 @@ class VaayuBaseModel(GenerationMixin):
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
 
-                    # Submit next load BEFORE GPU transfer so disk read and GPU transfer overlap.
-                    if (i + 1) < len(self.layer_names):
-                        if self.profiling_mode:
-                            t = time.time()
-                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
-                        if self.profiling_mode:
-                            elapsed_time = time.time() - t
-                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
+                    # Submit next non-pinned layer's load BEFORE GPU transfer
+                    # so disk read and GPU H2D transfer overlap.
+                    future = None
+                    if self.profiling_mode:
+                        t = time.time()
+                    for _n in self.layer_names[i + 1:]:
+                        if _n not in self.pinned_layer_names:
+                            future = executor.submit(self._load_from_strategy, _n)
+                            break
+                    if self.profiling_mode:
+                        elapsed_time = time.time() - t
+                        self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
 
                     if self.profiling_mode:
                         t = time.time()
@@ -764,6 +906,7 @@ class VaayuBaseModel(GenerationMixin):
                         self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
 
                 else:
+                    # ── Non-pinned, no prefetch ──────────────────────────────
                     _t = time.time()
                     state_dict = self.load_layer_to_cpu(layer_name)
                     _io_wait_s += time.time() - _t
@@ -826,13 +969,11 @@ class VaayuBaseModel(GenerationMixin):
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
 
-                # Remove previous layer from memory (including buffers)
-
-                if self.hf_quantizer is not None:
-                    for param_name in moved_layers:#param_name, param in state_dict.items():
-                        set_module_tensor_to_device(self.model, param_name,'meta')
-                else:
-                    layer.to("meta")
+                # Reclaim VRAM — skip for pinned layers (they stay resident)
+                if layer_name not in self.pinned_layer_names:
+                    self.loader_strategy.free_from_gpu(
+                        self.model, layer, moved_layers, self.hf_quantizer
+                    )
 
                 if i % 20 == 19:
                     clean_memory()

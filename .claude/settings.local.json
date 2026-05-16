@@ -10,7 +10,9 @@
       "Bash(lsblk -no pkname /dev/nvme0n1p2)",
       "Read(//sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/nvme/nvme0/nvme0n1/queue/**)",
       "Read(//sys/devices/pci0000:00/0000:00:06.0/0000:02:00.0/nvme/nvme0/**)",
-      "Read(//sys/class/nvme/**)"
+      "Read(//sys/class/nvme/**)",
+      "Bash(python *)",
+      "Bash(xxd vaayu/persist/__init__.py)"
     ]
   }
 }

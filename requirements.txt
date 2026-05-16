@@ -1,18 +1,29 @@
-# Requirements for latest models including Qwen 3.5
-# Install with: pip install -r requirements-latest.txt
+# Requirements for Vaayu — universal layer-streaming inference engine
+# Install with: pip install -r requirements.txt
 
-# Use latest transformers from git for newest models
+# Use latest transformers for newest model support
 transformers==5.5.4
 
 # Core dependencies
-torch>=2.1.0
+torch>=2.6.0
 accelerate>=0.28.0
 safetensors>=0.4.0
 optimum>=1.17.0
 huggingface-hub>=0.20.0
 
-# Quantization support
+# Quantization support (BnB 4-bit/8-bit)
 bitsandbytes>=0.43.0
+
+# EXL3 strategy: ExLlamaV3 4-bit quantized inference
+# Requires CUDA Toolkit 12.x and gcc/g++ build tools.
+# If compile fails due to memory: MAX_JOBS=4 pip install exllamav3
+# ninja is required for fast C++ extension compilation
+ninja
+exllamav3>=0.0.18  # uncomment when using EXL3 quantized models
+
+# Optional attention backends (improves throughput on supported GPUs)
+# flash-attn>=2.7.4   # install separately: pip install flash-attn --no-build-isolation
+# xformers            # uncomment for memory-efficient attention (Gemma, etc.)
 
 # Additional utilities
 tqdm>=4.65.0
@@ -28,6 +39,6 @@ wandb>=0.16.0
 
 # VLM and specialized model kernels
 kernels>=0.13.0
-tqdm==4.67.3
 
+# Rust extension build tool (for vaayu_rust io_uring module)
 maturin
