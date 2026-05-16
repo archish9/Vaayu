@@ -443,10 +443,11 @@ You run this once before using Vaayu. It compresses the original model and write
 ```bash
 pip install exllamav3 ninja
 
-python -m exllamav3.convert \
-  --input  /models/llama-70b-bf16 \
-  --output /models/llama-70b-exl3-4.5bpw \
-  --bits   4.5
+python -m exllamav3.conversion.convert_model \
+  --in_dir   /models/llama-70b-bf16 \
+  --out_dir  /models/llama-70b-exl3-4.5bpw \
+  --work_dir /models/llama-70b-exl3-work \
+  --bits     4.5
 ```
 
 This takes several hours. The `--bits` flag is where you choose compression level (4.0, 4.5, 5.0, etc.). Higher bpw = larger file + better quality. 4.5 bpw is a good balance for coding tasks.

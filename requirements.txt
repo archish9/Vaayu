@@ -42,3 +42,5 @@ kernels>=0.13.0
 
 # Rust extension build tool (for vaayu_rust io_uring module)
 maturin
+
+Pillow
