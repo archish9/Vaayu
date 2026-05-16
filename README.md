@@ -353,3 +353,67 @@ Welcomed contributions, ideas and discussions!
 If you find it useful, please ⭐ or buy me a coffee! 🙏
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://bmc.link/lyogavinQ)
+
+---
+
+## NVMe Performance Optimization (Linux)
+
+Vaayu streams large model weights (100GB+) directly from NVMe SSD to GPU on every token generation. Two Linux kernel settings can recover **2–8% throughput** with zero code changes.
+
+Vaayu checks these settings automatically at startup and warns you if the machine is unoptimized:
+
+```
+[Vaayu Warning] nvme0n1 I/O scheduler is not optimized (current: mq-deadline).
+  You are losing ~5% NVMe throughput.
+  Fix (once): sudo bash scripts/vaayu_optimize_os.sh /path/to/model  # one-time per machine
+
+[Vaayu Warning] nvme0 APST (power management) is active (ps_max_latency_us=25000).
+  Drive enters micro-sleep during GPU compute phases — latency spikes over 80+ layers.
+  Fix (once): sudo bash scripts/vaayu_optimize_os.sh /path/to/model  # one-time per machine
+```
+
+### What the script does
+
+Run it once per machine after cloning the repo. It auto-detects the NVMe device from your model path — you do **not** need to re-run it when switching models, unless the new model lives on a different NVMe drive.
+
+```bash
+sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
+```
+
+#### Optimization 1: I/O Scheduler → `none`
+
+The Linux kernel's default scheduler (`mq-deadline`) attempts to merge and reorder I/O requests before sending them to the drive. This wastes CPU cycles because modern NVMe controllers handle request ordering internally and do it better. Setting the scheduler to `none` removes this unnecessary software layer.
+
+- **Gain:** 2–5% throughput improvement
+- **Persistence:** The script installs a udev rule (`/etc/udev/rules.d/60-vaayu-nvme.rules`) that applies `none` to all NVMe devices on every boot automatically. No further action required.
+
+#### Optimization 2: Disable APST (Autonomous Power State Transition)
+
+NVMe drives can enter low-power sleep states when briefly idle. During Vaayu's inference loop, the GPU compute phase creates short idle gaps between layer reads — the drive micro-sleeps, then takes 50–500μs to wake up on the next read. Across 80+ layers per token, these wakeup penalties add up.
+
+- **Gain:** 1–3% reduction in per-layer latency jitter
+- **Persistence:** The sysfs write (`/sys/class/nvme/nvme0/power/ps_max_latency_us`) resets on reboot. For a permanent fix, add the following to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub` and run `sudo update-grub`:
+  ```
+  nvme_core.default_ps_max_latency_us=0
+  ```
+
+### Verifying the settings
+
+After running the script, confirm both settings are applied:
+
+```bash
+# I/O Scheduler — should output [none]
+cat /sys/block/nvme0n1/queue/scheduler
+
+# APST — should output 0
+cat /sys/module/nvme_core/parameters/default_ps_max_latency_us
+```
+
+Replace `nvme0n1` / `nvme0` with your actual device name. If unsure, run:
+
+```bash
+df --output=source /path/to/your/model | tail -1   # shows partition e.g. /dev/nvme0n1p2
+lsblk -no pkname /dev/nvme0n1p2                    # shows parent device e.g. nvme0n1
+```
+
+> **Note:** These optimizations apply to Linux only. macOS and Windows are unaffected.
