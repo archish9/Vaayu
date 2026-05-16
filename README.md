@@ -72,11 +72,16 @@
 
 ### 1. Install package
 
-First, install the airllm pip package.
-
 ```bash
-pip install airllm
+git clone <repo>
+cd Vaayu
+python -m venv venv && source venv/bin/activate
+bash install.sh
 ```
+
+`install.sh` installs in the correct order: torch first, then `flash-attn` (compiles CUDA kernels, takes 5–15 min), then `exllamav3`. Running `pip install -r requirements.txt` directly fails because `flash-attn` needs `torch` present during its build — the script handles this.
+
+**System requirements:** CUDA Toolkit 12.x + `gcc`/`g++`. If `exllamav3` compile OOMs, rerun with `MAX_JOBS=4 pip install exllamav3`.
 
 ### 2. Inference
 
@@ -417,3 +422,87 @@ lsblk -no pkname /dev/nvme0n1p2                    # shows parent device e.g. nv
 ```
 
 > **Note:** These optimizations apply to Linux only. macOS and Windows are unaffected.
+
+---
+
+## EXL3 Quantization — Faster Inference via Smaller Payload
+
+Vaayu's bottleneck is how much data crosses the PCIe bus every token. A standard BF16 Llama 70B model is 135 GB — Vaayu must stream all of it per token. EXL3 (ExLlamaV3) quantization compresses each weight from 16 bits down to ~4.5 bits, shrinking the model to ~38 GB. Less data to stream = faster tokens.
+
+| Format | Model size | Approx. speed (single NVMe) |
+|--------|-----------|---------------------------|
+| BF16 (default) | 135 GB | ~18–23 s/token |
+| EXL3 4.5 bpw | ~38 GB | ~5–6 s/token |
+
+### How it works — two separate steps
+
+**Step 1: Quantize the model (one-time, offline)**
+
+You run this once before using Vaayu. It compresses the original model and writes new `.safetensors` files with quantized tensors.
+
+```bash
+pip install exllamav3 ninja
+
+python -m exllamav3.convert \
+  --input  /models/llama-70b-bf16 \
+  --output /models/llama-70b-exl3-4.5bpw \
+  --bits   4.5
+```
+
+This takes several hours. The `--bits` flag is where you choose compression level (4.0, 4.5, 5.0, etc.). Higher bpw = larger file + better quality. 4.5 bpw is a good balance for coding tasks.
+
+**Step 2: Run Vaayu as normal**
+
+Point Vaayu at the quantized model path. Format is auto-detected — no code changes needed.
+
+```python
+from vaayu import AutoModel
+
+model = AutoModel.from_pretrained("/models/llama-70b-exl3-4.5bpw")
+```
+
+Vaayu detects the `q_weight` tensors in the safetensors headers and automatically activates `EXL3LoaderStrategy`.
+
+### Dependencies
+
+Use `bash install.sh` for fresh setup — it handles build order automatically.
+
+If installing manually (e.g. adding to existing env):
+
+```bash
+# flash-attn must be installed BEFORE exllamav3 (exllamav3 depends on it)
+# --no-build-isolation lets the build see your already-installed torch
+pip install flash-attn --no-build-isolation
+
+# Then exllamav3 (if compile OOMs: MAX_JOBS=4 pip install exllamav3)
+pip install ninja exllamav3
+```
+
+### Disk space: the splitted_model folder
+
+Vaayu always splits the model into one `.safetensors` file per layer before first inference. This is required for layer-by-layer streaming and happens automatically.
+
+```
+EXL3 model (downloaded):    ~38 GB   ← your quantized model
+splitted_model/ (created):  ~38 GB   ← Vaayu's per-layer split
+─────────────────────────────────────
+Peak disk needed:           ~76 GB
+Permanent (after split):    ~38 GB   ← if delete_original=True
+```
+
+To avoid keeping both copies:
+
+```python
+model = AutoModel.from_pretrained(
+    "/models/llama-70b-exl3-4.5bpw",
+    delete_original=True   # deletes original shards after splitting
+)
+```
+
+> **Warning:** `delete_original=True` permanently removes the original HuggingFace shard files. Only use this if you are comfortable re-downloading or re-quantizing if needed.
+
+Once `splitted_model/` exists, subsequent runs skip the split step entirely.
+
+### bpw is set at quantization time, not in Vaayu
+
+The `--bits` value is baked into the model files during quantization. Vaayu's loader is bpw-agnostic — it reads whatever was quantized (4.0, 4.5, 5.0, etc.) without any configuration change. Think of bpw like JPEG quality: you choose it when saving the file, not when opening it.
