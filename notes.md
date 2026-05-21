@@ -367,3 +367,75 @@ Per-token: ~29s → ~24-25s  (saves ~4-5s)
 ```
 
 **I'd recommend starting with #1 and #2 (zero risk, 30 seconds to apply), then #3 and #4 (small Rust changes).** The full research with code examples is in the artifact. Want me to implement any of these?
+
+
+
+
+
+-===========================
+============================
+============================
+
+
+The subclasses override these hook methods on VaayuBaseModel:
+
+  ┌───────────────────────────┬──────────────────────────────────────────────┐
+  │           Hook            │                   Purpose                    │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ set_layer_names_dict()    │ Layer path names (embed/layers/norm/lm_head) │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_pos_emb_args()        │ RoPE kwargs per layer                        │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_past_key_value_args() │ KV cache format                              │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_attention_mask_args() │ Attention mask shape                         │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_tokenizer()           │ Custom tokenizer (Baichuan)                  │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_generation_config()   │ Custom gen config                            │
+  └───────────────────────────┴──────────────────────────────────────────────┘
+
+  But look at the actual subclasses:
+  
+  - VaayuQWen2 — literally empty. Just overrides get_use_better_transformer().
+  Qwen2 uses standard Llama names.
+  - VaayuBaichuan — only overrides get_tokenizer(). Standard layer names.
+  - VaayuMistral — probably just generation config.
+  - VaayuChatGLM — genuinely different: different layer names + different
+  get_pos_emb_args() + different get_past_key_value_args() because ChatGLM's
+  attention API uses rotary_pos_emb + kv_cache instead of standard HF kwargs.
+
+  Is it the best approach? No — for vaayu-apple's target use case.
+
+  The subclass pattern made sense in 2023 when HF models had wildly different
+  internal APIs. But post-transformers 4.45, all modern models (Llama3.x,
+  Qwen2.5, Phi-4, Gemma2, Mistral) converged on the same interface. The
+  subclasses that exist in Linux Vaayu are almost all empty because there's
+  nothing to override.
+
+  For vaayu-apple's coding agent target (Llama3.3-70B, Qwen2.5-72B, Phi-4,
+  Deepseek) — every single one uses standard names. The layer_names_dict kwarg
+  override is the right call: zero friction for 100% of realistic targets,
+  escape hatch for the rare outlier.
+  
+  The one thing Linux Vaayu does that vaayu-apple currently doesn't: auto-detect
+   layer names from model structure. That's worth adding — walk
+  model.named_modules() to find the nn.ModuleList decoder stack if the hardcoded
+   names don't exist. Covers future architectures automatically without any user
+   action.
+
+
+
+===================
+
+
+
+ Yes — actually better than Vaayu for model breadth.
+  
+  Vaayu-apple uses _auto_detect_layer_names() to probe any HuggingFace model's
+  structure automatically. Vaayu Linux requires a hardcoded subclass per
+  architecture (VaayuQWen2, VaayuMixtral, etc.). Vaayu-apple covers all of them
+  generically + any new architecture you throw at it.
+
+  Constraint: Model must have numbered decoder layers (model.layers.0,
+  model.layers.1, ...). Every mainstream transformer does.
