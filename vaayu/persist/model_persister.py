@@ -1,6 +1,7 @@
+import threading
 
-
-model_persister = None
+_model_persister = None
+_model_persister_lock = threading.Lock()
 
 class ModelPersister:
     def __init__(self):
@@ -8,13 +9,14 @@ class ModelPersister:
 
     @classmethod
     def get_model_persister(cls):
-        global model_persister
-        if model_persister is not None:
-            return model_persister
-
-        from .safetensor_model_persister import SafetensorModelPersister
-        model_persister = SafetensorModelPersister()
-        return model_persister
+        global _model_persister
+        if _model_persister is not None:
+            return _model_persister
+        with _model_persister_lock:
+            if _model_persister is None:
+                from .safetensor_model_persister import SafetensorModelPersister
+                _model_persister = SafetensorModelPersister()
+        return _model_persister
 
     def model_persist_exist(self, layer_name, saving_path):
         pass

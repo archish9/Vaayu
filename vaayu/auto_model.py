@@ -71,7 +71,11 @@ class AutoModel:
                 pretrained_model_name_or_path, trust_remote_code=True
             )
 
-        arch = config.architectures[0]
+        architectures = getattr(config, "architectures", None) or []
+        if not architectures:
+            print(f"no architectures field in config for {pretrained_model_name_or_path}, using VaayuBaseModel with auto-detect...")
+            return VaayuBaseModel, {}
+        arch = architectures[0]
 
         if "Qwen2ForCausalLM" in arch or "Qwen2_5ForCausalLM" in arch or "Qwen3ForCausalLM" in arch:
             return VaayuBaseModel, {}

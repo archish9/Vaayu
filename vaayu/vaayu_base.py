@@ -56,9 +56,9 @@ def _layer_path_exists(model: nn.Module, path: str) -> bool:
         return False
     obj = model
     for part in path.split("."):
-        obj = getattr(obj, part, None)
-        if obj is None:
+        if not hasattr(obj, part):
             return False
+        obj = getattr(obj, part)
     return True
 
 
@@ -989,13 +989,13 @@ class VaayuBaseModel(GenerationMixin):
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
 
-                        if output_attentions:
+                        if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
                     elif layer_name == self.layer_names_dict['lm_head']:
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
 
-                        if output_attentions:
+                        if output_hidden_states:
                             all_hidden_states[i].append(seq)
 
                         len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
