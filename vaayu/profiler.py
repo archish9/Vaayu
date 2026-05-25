@@ -11,7 +11,7 @@ class LayeredProfiler:
 
     def add_profiling_time(self, item, time):
 
-        if not item in self.profiling_time_dict:
+        if item not in self.profiling_time_dict:
             self.profiling_time_dict[item] = []
 
         self.profiling_time_dict[item].append(time)
