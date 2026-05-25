@@ -1,24 +1,19 @@
 from sys import platform
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
+is_on_mac_os = platform == "darwin"
 
 if is_on_mac_os:
     try:
         from .vaayu_llama_mlx import VaayuLlamaMlx
     except Exception:
         pass
-    from .auto_model import AutoModel
-    from .vaayu_base import VaayuBaseModel
-    from .vaayu_chatglm import VaayuChatGLM
-    from .vaayu_qwen import VaayuQWen
-else:
+
+from .auto_model import AutoModel
+from .vaayu_base import VaayuBaseModel
+from .vaayu_chatglm import VaayuChatGLM
+from .vaayu_qwen import VaayuQWen
+
+if not is_on_mac_os:
     from .vaayu import VaayuLlama2
-    from .vaayu_chatglm import VaayuChatGLM
-    from .vaayu_qwen import VaayuQWen
-    from .vaayu_base import VaayuBaseModel
-    from .auto_model import AutoModel
     from .utils import split_and_save_layers
     from .utils import NotEnoughSpaceException
