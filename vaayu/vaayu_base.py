@@ -297,7 +297,7 @@ class VaayuBaseModel(GenerationMixin):
         # fill in any layer name keys that don't resolve on this model (unknown architectures)
         _detected = _auto_detect_layer_names(self.model)
         for key, val in _detected.items():
-            if val and not _layer_path_exists(self.model, self.layer_names_dict.get(key, "")):
+            if val and (key not in self.layer_names_dict or not _layer_path_exists(self.model, self.layer_names_dict[key])):
                 self.layer_names_dict[key] = val
 
         # get layer count:
@@ -356,9 +356,10 @@ class VaayuBaseModel(GenerationMixin):
     # a chance to customize tokenizer
     def get_tokenizer(self, hf_token=None):
         if self._tokenizer_class is not None:
-            return self._tokenizer_class.from_pretrained(
-                self.model_local_path, use_fast=False, trust_remote_code=True
-            )
+            tok_kwargs = {"use_fast": False, "trust_remote_code": True}
+            if hf_token is not None:
+                tok_kwargs["token"] = hf_token
+            return self._tokenizer_class.from_pretrained(self.model_local_path, **tok_kwargs)
         if hf_token is not None:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
