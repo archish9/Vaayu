@@ -144,14 +144,14 @@ class SafetensorModelPersister(ModelPersister):
         super().__init__(*args, **kwargs)
 
     def model_persist_exist(self, layer_name, saving_path):
-        safetensor_exists = Path(saving_path / (layer_name + 'safetensors')).exists()
-        done_marker_exists = Path(saving_path / (layer_name + 'safetensors.done')).exists()
+        safetensor_exists = Path(saving_path / (layer_name + '.safetensors')).exists()
+        done_marker_exists = Path(saving_path / (layer_name + '.safetensors.done')).exists()
         return safetensor_exists and done_marker_exists
 
     def persist_model(self, state_dict, layer_name, saving_path):
-        save_file(state_dict, saving_path / (layer_name + 'safetensors'))
-        print(f"saved as: {saving_path / (layer_name + 'safetensors')}")
-        (saving_path / (layer_name + 'safetensors.done')).touch()
+        save_file(state_dict, saving_path / (layer_name + '.safetensors'))
+        print(f"saved as: {saving_path / (layer_name + '.safetensors')}")
+        (saving_path / (layer_name + '.safetensors.done')).touch()
 
     def load_model(self, layer_name, path):
         file_path = str(Path(path) / (layer_name + ".safetensors"))

@@ -900,8 +900,8 @@ class VaayuBaseModel(GenerationMixin):
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
+        all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
+        all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
@@ -996,7 +996,7 @@ class VaayuBaseModel(GenerationMixin):
                     else:
 
                         if output_attentions:
-                            all_hidden_states[i].append(new_seq)
+                            all_hidden_states[i].append(seq)
 
                         len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
                         len_s = self.get_sequence_len(seq)
