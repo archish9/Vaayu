@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 360" width="300" height="360">
+
+  <!-- ── Background ──────────────────────────────────────────────── -->
+  <rect width="300" height="360" fill="white"/>
+
+  <!-- ── Main circle ────────────────────────────────────────────── -->
+  <!-- Sky blue fill: #0EA5E9 -->
+  <circle cx="150" cy="148" r="128" fill="#0EA5E9"/>
+
+  <!-- ── Mandala ring: 8 dots at 45° intervals (r = 128) ─────────── -->
+  <!-- Right     0°  --> <circle cx="278" cy="148" r="4.5" fill="white" opacity="0.6"/>
+  <!-- Upper-R  45°  --> <circle cx="241" cy="57"  r="4.5" fill="white" opacity="0.6"/>
+  <!-- Top      90°  --> <circle cx="150" cy="20"  r="4.5" fill="white" opacity="0.6"/>
+  <!-- Upper-L 135°  --> <circle cx="59"  cy="57"  r="4.5" fill="white" opacity="0.6"/>
+  <!-- Left    180°  --> <circle cx="22"  cy="148" r="4.5" fill="white" opacity="0.6"/>
+  <!-- Lower-L 225°  --> <circle cx="59"  cy="239" r="4.5" fill="white" opacity="0.6"/>
+  <!-- Bottom  270°  --> <circle cx="150" cy="276" r="4.5" fill="white" opacity="0.6"/>
+  <!-- Lower-R 315°  --> <circle cx="241" cy="239" r="4.5" fill="white" opacity="0.6"/>
+
+  <!-- Thin inner ring connecting the dots -->
+  <circle cx="150" cy="148" r="118" fill="none" stroke="white" stroke-width="1" opacity="0.22"/>
+
+  <!-- ── Wind whorl: three concentric 270° clockwise arcs ──────────
+       Each starts at the top of its ring and ends at the left-middle.
+       This gives the visual of a spinning air vortex (Vayu-chakra).
+
+       Arc formula: start = (cx, cy - r)  →  end = (cx - r, cy)
+       SVG: A r,r 0 1(large) 1(clockwise) end_x,end_y
+  -->
+
+  <!-- Outer arc  r=108 : (150,40) → (42,148)  — thickest, most opaque -->
+  <path d="M 150,40 A 108,108 0 1 1 42,148"
+        stroke="white" stroke-width="9" fill="none"
+        stroke-linecap="round" opacity="0.95"/>
+
+  <!-- Middle arc r=93  : (150,55) → (57,148)  — medium -->
+  <path d="M 150,55 A 93,93 0 1 1 57,148"
+        stroke="white" stroke-width="5" fill="none"
+        stroke-linecap="round" opacity="0.52"/>
+
+  <!-- Inner arc  r=78  : (150,70) → (72,148)  — faintest -->
+  <path d="M 150,70 A 78,78 0 1 1 72,148"
+        stroke="white" stroke-width="2.5" fill="none"
+        stroke-linecap="round" opacity="0.28"/>
+
+  <!-- Tail of outer arc: a small filled circle at (42,148) -->
+  <circle cx="42" cy="148" r="6.5" fill="white" opacity="0.88"/>
+
+  <!-- ── Central disc ───────────────────────────────────────────── -->
+  <circle cx="150" cy="148" r="44" fill="white"/>
+  <!-- Subtle ring around disc -->
+  <circle cx="150" cy="148" r="44" fill="none" stroke="#0EA5E9" stroke-width="1.5" opacity="0.4"/>
+
+  <!-- Devanagari बीज अक्षर  व  — bija syllable of Vayu (wind) -->
+  <text x="150" y="168"
+        font-family="'Noto Sans Devanagari', 'Mangal', 'Aparajita', 'Arial Unicode MS', serif"
+        font-size="46" font-weight="700"
+        text-anchor="middle"
+        fill="#0EA5E9">व</text>
+
+  <!-- ── Wordmark ────────────────────────────────────────────────── -->
+  <text x="150" y="323"
+        font-family="'Trajan Pro', 'Palatino Linotype', 'Book Antiqua', 'Georgia', serif"
+        font-size="28" font-weight="bold"
+        text-anchor="middle"
+        fill="#0EA5E9"
+        letter-spacing="10">VAAYU</text>
+
+  <!-- Thin rule under wordmark -->
+  <line x1="82" y1="332" x2="218" y2="332"
+        stroke="#7DD3FC" stroke-width="1"/>
+
+  <!-- वायु in Devanagari -->
+  <text x="150" y="350"
+        font-family="'Noto Sans Devanagari', 'Mangal', 'Aparajita', sans-serif"
+        font-size="14" text-anchor="middle"
+        fill="#38BDF8"
+        letter-spacing="4">वायु</text>
+
+</svg>

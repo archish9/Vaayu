@@ -16,7 +16,8 @@
       "Bash(grep -E \"\\\\.py$|^d\")",
       "Bash(curl -s \"https://api.github.com/repos/turboderp-org/exllamav3/contents/exllamav3/conversion/standard_cal_data\")",
       "Bash(grep -E \"\\\\.py$\")",
-      "Bash([ -f \"/Users/archish/Documents/ai-ml/Vaayu-veriants/Vaayu/vaayu/$file\" ])"
+      "Bash([ -f \"/Users/archish/Documents/ai-ml/Vaayu-veriants/Vaayu/vaayu/$file\" ])",
+      "Bash(open *)"
     ]
   }
 }

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="vaayu_logo.svg" alt="Vaayu Logo" width="200"/>
+</p>
+
 # 🌪️ Vaayu: The Layer-Streaming LLM Inference Engine
 
 Welcome to **Vaayu**—the high-performance, local-first inference engine designed to break through the physical boundaries of consumer hardware. 
