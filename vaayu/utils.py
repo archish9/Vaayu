@@ -234,6 +234,11 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     # Safely parse layer indices regardless of where the prefix appears in the key
     n_layers = len(set([int(k.split(prefix + '.')[1].split('.')[0]) for k in index.keys() if prefix + '.' in k]))
+    if n_layers == 0:
+        raise ValueError(
+            f"No decoder layers found under prefix '{prefix}' in model index. "
+            f"Check layer_names['layer_prefix'] matches the model's actual weight key structure."
+        )
 
     if layer_names is None:
         layers = ['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)] + ['model.norm.', 'lm_head.']

@@ -33,6 +33,7 @@ class VaayuChatGLM(VaayuBaseModel):
                        'norm': 'transformer.encoder.final_layernorm',
                        'lm_head': 'transformer.output_layer',
                        'rotary_pos_emb': 'transformer.rotary_pos_emb'}
+        self.layer_names_dict.update(self._layer_names_override)
 
     def get_pos_emb_args(self, len_p, len_s):
         # Rotary positional embeddings
