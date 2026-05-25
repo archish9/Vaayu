@@ -88,6 +88,13 @@ def test_llama_returns_vaayullama2():
     assert kwargs == {}
 
 
+def test_gemma_returns_vaayullama2():
+    from vaayu.vaayu import VaayuLlama2
+    cls, kwargs = _dispatch("GemmaForCausalLM")
+    assert cls is VaayuLlama2
+    assert kwargs == {}
+
+
 def test_unknown_arch_returns_base():
     from vaayu.vaayu_base import VaayuBaseModel
     cls, kwargs = _dispatch("FutureMysteryModel")
