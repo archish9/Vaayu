@@ -82,7 +82,7 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
         leaf = name.rsplit(".", 1)[-1] if "." in name else name
         if embed_path is None and leaf in EMBED and isinstance(mod, nn.Embedding):
             embed_path = name
-        if norm_path is None and leaf in NORM:
+        if norm_path is None and leaf in NORM and not isinstance(mod, (nn.Embedding, nn.Linear, nn.ModuleList)):
             norm_path = name
         if lm_head_path is None and leaf in HEAD and isinstance(mod, nn.Linear):
             lm_head_path = name
