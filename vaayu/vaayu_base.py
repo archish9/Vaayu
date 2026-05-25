@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate import init_empty_weights
@@ -48,6 +49,50 @@ except ImportError:
 
 
 
+
+
+def _layer_path_exists(model: nn.Module, path: str) -> bool:
+    if not path:
+        return False
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return False
+    return True
+
+
+def _auto_detect_layer_names(model: nn.Module) -> dict:
+    EMBED = {"embed_tokens", "word_embeddings", "wte", "embed", "token_embeddings"}
+    NORM = {"norm", "final_layernorm", "ln_f", "final_norm", "layer_norm", "ln_out"}
+    HEAD = {"lm_head", "output_layer", "embed_out", "output", "head"}
+
+    best_path, best_len = "", 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.ModuleList) and len(mod) > best_len:
+            best_len, best_path = len(mod), name
+
+    if not best_path:
+        return {}
+
+    embed_path = norm_path = lm_head_path = None
+    for name, mod in model.named_modules():
+        if name.startswith(best_path + "."):
+            continue
+        leaf = name.rsplit(".", 1)[-1] if "." in name else name
+        if embed_path is None and leaf in EMBED and isinstance(mod, nn.Embedding):
+            embed_path = name
+        if norm_path is None and leaf in NORM:
+            norm_path = name
+        if lm_head_path is None and leaf in HEAD and isinstance(mod, nn.Linear):
+            lm_head_path = name
+
+    return {
+        "embed": embed_path,
+        "layer_prefix": best_path,
+        "norm": norm_path,
+        "lm_head": lm_head_path,
+    }
 
 
 class VaayuBaseModel(GenerationMixin):
