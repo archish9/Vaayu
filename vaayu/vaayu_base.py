@@ -97,19 +97,23 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
 
 class VaayuBaseModel(GenerationMixin):
 
-    # customize layer names here
+    # customize layer names here; subclasses or layer_names_dict kwarg override
     def set_layer_names_dict(self):
-        self.layer_names_dict = {'embed': 'model.embed_tokens',
-                       'layer_prefix': 'model.layers',
-                       'norm': 'model.norm',
-                       'lm_head': 'lm_head',}
+        self.layer_names_dict = {
+            'embed': 'model.embed_tokens',
+            'layer_prefix': 'model.layers',
+            'norm': 'model.norm',
+            'lm_head': 'lm_head',
+        }
+        self.layer_names_dict.update(self._layer_names_override)
 
 
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
-                 use_torch_compile=False):
+                 use_torch_compile=False,
+                 layer_names_dict=None, tokenizer_class=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -160,7 +164,8 @@ class VaayuBaseModel(GenerationMixin):
         self.hf_token = hf_token
 
         # Save parameters
-
+        self._layer_names_override = layer_names_dict or {}
+        self._tokenizer_class = tokenizer_class
         self.set_layer_names_dict()
 
 
@@ -289,6 +294,12 @@ class VaayuBaseModel(GenerationMixin):
 
         self.init_model()
 
+        # fill in any layer name keys that don't resolve on this model (unknown architectures)
+        _detected = _auto_detect_layer_names(self.model)
+        for key, val in _detected.items():
+            if val and not _layer_path_exists(self.model, self.layer_names_dict.get(key, "")):
+                self.layer_names_dict[key] = val
+
         # get layer count:
         model_attr = self.model
         for attr_name in self.layer_names_dict["layer_prefix"].split("."):
@@ -344,13 +355,16 @@ class VaayuBaseModel(GenerationMixin):
 
     # a chance to customize tokenizer
     def get_tokenizer(self, hf_token=None):
+        if self._tokenizer_class is not None:
+            return self._tokenizer_class.from_pretrained(
+                self.model_local_path, use_fast=False, trust_remote_code=True
+            )
         if hf_token is not None:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
-        else:
-            return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+        return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
     def get_use_better_transformer(self):
-        return True
+        return False
 
     def init_model(self):
         self.model = None
