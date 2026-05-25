@@ -10,7 +10,10 @@ if platform == "darwin":
     is_on_mac_os = True
 
 if is_on_mac_os:
-    from vaayu import VaayuLlamaMlx
+    try:
+        from .vaayu_llama_mlx import VaayuLlamaMlx
+    except Exception:
+        VaayuLlamaMlx = None
 
 def _check_nvme_scheduler(model_path: str) -> None:
     if not pathlib.Path(model_path).exists():

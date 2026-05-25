@@ -6,8 +6,14 @@ if platform == "darwin":
     is_on_mac_os = True
 
 if is_on_mac_os:
-    from .vaayu_llama_mlx import VaayuLlamaMlx
+    try:
+        from .vaayu_llama_mlx import VaayuLlamaMlx
+    except Exception:
+        pass
     from .auto_model import AutoModel
+    from .vaayu_base import VaayuBaseModel
+    from .vaayu_chatglm import VaayuChatGLM
+    from .vaayu_qwen import VaayuQWen
 else:
     from .vaayu import VaayuLlama2
     from .vaayu_chatglm import VaayuChatGLM
