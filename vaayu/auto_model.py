@@ -1,15 +1,6 @@
 import pathlib
 import subprocess
 from transformers import AutoConfig
-from sys import platform
-
-is_on_mac_os = platform == "darwin"
-
-if is_on_mac_os:
-    try:
-        from .vaayu_llama_mlx import VaayuLlamaMlx
-    except Exception:
-        VaayuLlamaMlx = None
 
 
 def _check_nvme_scheduler(model_path: str) -> None:
@@ -100,13 +91,7 @@ class AutoModel:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        if not is_on_mac_os:
-            _check_nvme_scheduler(pretrained_model_name_or_path)
-
-        if is_on_mac_os:
-            if VaayuLlamaMlx is None:
-                raise ImportError("mlx is required for macOS inference. Install with: pip install mlx")
-            return VaayuLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)
+        _check_nvme_scheduler(pretrained_model_name_or_path)
 
         model_cls, extra_kwargs = AutoModel.get_module_class(
             pretrained_model_name_or_path, *inputs, **kwargs

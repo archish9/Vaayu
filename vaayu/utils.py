@@ -10,13 +10,6 @@ import time
 
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
-from sys import platform
-
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
-
 
 import torch
 import torch.nn as nn
