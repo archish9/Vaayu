@@ -292,7 +292,7 @@ Start by writing the C++ bindings for ExLlamaV3. Once you can stream and execute
 
 ------------------
 
-MORE THINGHS TO DO ANFETR IMPLEMENTING  EXL3 Quantization  and Speculative Decoding
+MORE THINGHS TO DO ANFETR IMPLEMENTING  EXL3 Quantization  and Speculative Decoding => check Medusa-EAGLE-RND.md
 
 
 Archish, combining those two approaches is exactly how you build a weaponized, local-first engine. Merging the raw bandwidth reduction of EXL3 with the architectural cheat-code of Speculative Decoding is the absolute bleeding edge of consumer hardware inference right now. 
@@ -328,7 +328,7 @@ Are you planning to write the Python-to-C++ bindings for ExLlamaV3 entirely from
 ---------------------
 
 
-MORE IMPLEMENTATION LIKE "O_DIRECT"
+MORE IMPLEMENTATION LIKE "O_DIRECT" => check nvme_optimizations_research.md
 
 Searched web: "Linux NVMe io_uring advanced optimizations SQPOLL registered buffers fixed files maximum throughput"
 Searched web: "Linux NVMe tuning maximum sequential read throughput io scheduler none polling huge pages"
