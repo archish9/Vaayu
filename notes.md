@@ -580,3 +580,49 @@ When implementing speculative decoding (whether standard Plan C or Medusa/EAGLE)
 
 ### Summary
 The small model is just a **drafting clerk** writing as fast as possible. The large model is the **chief editor** who reviews, corrects, and approves every single character before it is finalized. The final product is purely 70B-tier (or 480B-tier) genius, produced at 8B-tier speeds.
+
+
+
+
+
+---------------------------
+
+
+
+Searched web: "MSI Z790 GAMING PLUS WIFI lane sharing M.2 PCI_E1"
+Ran command: `nvidia-smi -q -d Pci`
+
+If your graphics card is physically restricted to x8 (which is very common with cards like the RTX 4060 or 4060 Ti), then moving it to the top `PCI_E1` slot will allow it to run at its maximum possible speed: **PCIe Gen 4.0 x8**. 
+
+At Gen 4.0 x8, the theoretical maximum bandwidth is **~15.7 GB/s**. While you won't hit the ~32 GB/s of an x16 card, ~15.7 GB/s is still a massive upgrade from the ~6.4 GB/s you were getting in the bottom slot.
+
+If you are not seeing speeds close to 14–15 GB/s, there is no lane sharing issue (your motherboard's M.2 slots do not steal lanes from the top GPU slot). However, you likely have **critical BIOS configurations that are bottlenecking the speed**. 
+
+Here is exactly what you need to change in your MSI motherboard BIOS:
+
+### 1. Enable Re-Size BAR and Above 4G Decoding (Crucial)
+If this is disabled, your CPU is forced to send data to the GPU in tiny 256 MB chunks. This completely ruins data transfer speeds for AI workloads, regardless of how fast your PCIe slot is.
+* **How to fix it:**
+  1. Restart your computer and press **Delete** to enter the MSI BIOS.
+  2. Press **F7** to enter Advanced Mode.
+  3. Go to **Settings** -> **Advanced** -> **PCIe/PCI Subsystem Settings**.
+  4. Find **Above 4G memory/Crypto Currency mining** and set it to **[Enabled]**.
+  5. Find **Re-Size BAR Support** and set it to **[Enabled]**.
+  6. Press **F10** to save and exit.
+
+### 2. Force PCIe Gen 4 Speed
+Sometimes, motherboards mistakenly negotiate a slower speed (like PCIe Gen 3) for x8 cards, which would immediately cut your speed down to ~7.8 GB/s. 
+* **How to fix it:**
+  1. In the MSI BIOS, go to **Settings** -> **Advanced** -> **PCIe/PCI Subsystem Settings**.
+  2. Look for the setting controlling the `PCI_E1` slot generation (often called **CPU PCIe Lanes Configuration** or **PCI_E1 Gen Switch**).
+  3. Change it from `[Auto]` to **[Gen 4]**.
+
+### How to verify it worked on your other computer:
+Once you boot into Linux or Windows on that machine, run this command in your terminal/command prompt:
+```bash
+nvidia-smi -q -d Pci
+```
+Look for these two lines:
+* `Max Link Width` (should say `8x`)
+* `Max Link Gen` (should say `4`)
+* `Current Link Gen` (should say `4` when the GPU is under load; it may drop to `1` when idle to save power).
