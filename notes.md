@@ -626,3 +626,44 @@ Look for these two lines:
 * `Max Link Width` (should say `8x`)
 * `Max Link Gen` (should say `4`)
 * `Current Link Gen` (should say `4` when the GPU is under load; it may drop to `1` when idle to save power).
+
+
+
+---------------------
+---------------------
+---------------------
+
+IMPORTANT THING ABOUT **O_DIRECT**
+
+Yes, you're correct. I can confirm it from the code I already read earlier.
+
+In [lib.rs](file:///c:/laragon/www/Vaayu/vaayu_rust/src/lib.rs#L32), line 32:
+
+```rust
+let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+```
+
+**`O_DIRECT`** is the Linux kernel flag that completely bypasses the page cache. Data goes straight from the NVMe flash chips → kernel DMA → your pinned memory buffer, without ever touching the page cache.
+
+### However — this has a major consequence you should be aware of
+
+**`O_DIRECT` makes my "add more RAM" suggestion completely useless for the Rust path.**
+
+Here's why:
+
+| Path | Page Cache Used? | Effect of Adding RAM |
+|---|---|---|
+| **Rust io_uring** (`O_DIRECT`) | ❌ No | Zero benefit — every token re-reads every layer from physical NVMe |
+| **Python preadv fallback** (`os.O_RDONLY`) | ✅ Yes | More layers stay cached in RAM → faster subsequent tokens |
+
+Remember from the chat log:
+- **Warm cache** (layers in page cache): `io_wait = 0.9s`, total ~31s
+- **Cold cache** (layers evicted): `io_wait = 8.8s`, total ~29.6s
+
+With `O_DIRECT`, you are **permanently locked into the cold-cache scenario**. Even if you had 256 GB of RAM, the Rust path would still read every byte from the physical NVMe every single time because `O_DIRECT` tells the kernel: *"don't cache this, don't even look at the cache."*
+
+### So which path are you actually using?
+
+If the Rust module (`vaayu_rust`) is compiled and importable on your Linux machine, then [safetensor_model_persister.py](file:///c:/laragon/www/Vaayu/vaayu/persist/safetensor_model_persister.py#L41-L47) will use the `O_DIRECT` io_uring path. If it's not compiled, it falls back to the Python preadv path (which *does* benefit from page cache).
+
+**Bottom line:** If you ever add more RAM, you'd actually want to **drop `O_DIRECT`** from the Rust code (just use `O_RDONLY`) so the page cache can do its job. `O_DIRECT` only makes sense when you know the data will never be re-read, but in Vaayu you re-read the same 83 layers on every single token.
