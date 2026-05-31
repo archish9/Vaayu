@@ -12,19 +12,25 @@ def detect_speculative_type(model_dir: str) -> str:
         return "none"
 
     with open(config_path) as f:
-        config = json.load(f)
+        try:
+            config = json.load(f)
+        except json.JSONDecodeError:
+            return "none"
 
     # Medusa (checked first — more specific markers)
     if "medusa_num_heads" in config or "medusa_num_layers" in config:
         return "medusa"
-    for fname in os.listdir(model_dir):
-        if fname.startswith("medusa_lm_head"):
-            return "medusa"
+    try:
+        for fname in os.listdir(model_dir):
+            if fname.startswith("medusa_lm_head"):
+                return "medusa"
+    except OSError:
+        pass
 
     # EAGLE
     if "speculators_config" in config:
         method = config["speculators_config"].get("method", "")
-        if "eagle" in method.lower():
+        if method.lower().startswith("eagle"):
             return "eagle"
     if "eagle_config" in config:
         return "eagle"
