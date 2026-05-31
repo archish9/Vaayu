@@ -169,3 +169,13 @@ def test_vram_budget_fp8_reserves_less_than_fp16():
         budget_fp16 = m_fp16._get_vram_pinning_budget()
 
     assert budget_fp8 > budget_fp16
+
+
+def test_max_pinned_layers_default_is_zero():
+    m = _make_base()
+    assert m.max_pinned_layers == 0
+
+
+def test_max_pinned_layers_stored():
+    m = _make_base({"max_pinned_layers": -1})
+    assert m.max_pinned_layers == -1

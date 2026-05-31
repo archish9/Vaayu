@@ -161,7 +161,7 @@ class VaayuBaseModel(GenerationMixin):
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
-                 use_torch_compile=False, kv_cache_mode="auto",
+                 use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
                  layer_names_dict=None, tokenizer_class=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
@@ -247,6 +247,7 @@ class VaayuBaseModel(GenerationMixin):
 
         self.use_torch_compile = use_torch_compile
         self.kv_cache_mode = kv_cache_mode
+        self.max_pinned_layers = max_pinned_layers
         self._compiled_layer_fn = None
         if use_torch_compile:
             if not hasattr(torch, 'compile'):
