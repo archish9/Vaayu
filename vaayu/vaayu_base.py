@@ -47,6 +47,55 @@ except ImportError:
     cache_utils_installed = False
 
 
+class FP8DynamicCache(DynamicCache):
+    """
+    DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
+
+    Per-head per-token scales (shape [B, H, S, 1]) are stored alongside
+    the FP8 data so decode steps are O(1): only new tokens are quantized.
+    Full cache is dequantized to BF16/FP16 before returning to attention.
+
+    Note: this class manages its own key_cache / value_cache lists directly
+    rather than delegating to the parent's layer-based storage, so that FP8
+    tensors (and their companion scale tensors) are stored contiguously and
+    can be concatenated cheaply across decode steps.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Override parent's layer-based storage with flat lists of FP8 tensors.
+        self.key_cache: list = []
+        self.value_cache: list = []
+        self._key_scales: list = []
+        self._value_scales: list = []
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):  # cache_kwargs intentionally unused
+        k_scale = key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
+        v_scale = value_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
+
+        k_fp8 = (key_states / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        v_fp8 = (value_states / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+        if layer_idx < len(self.key_cache):
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_fp8], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_fp8], dim=-2)
+            self._key_scales[layer_idx] = torch.cat([self._key_scales[layer_idx], k_scale], dim=-2)
+            self._value_scales[layer_idx] = torch.cat([self._value_scales[layer_idx], v_scale], dim=-2)
+        else:
+            self.key_cache.append(k_fp8)
+            self.value_cache.append(v_fp8)
+            self._key_scales.append(k_scale)
+            self._value_scales.append(v_scale)
+
+        k_out = self.key_cache[layer_idx].to(key_states.dtype) * self._key_scales[layer_idx]
+        v_out = self.value_cache[layer_idx].to(value_states.dtype) * self._value_scales[layer_idx]
+        return k_out, v_out
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Returns the sequence length of the cached states for the given layer."""
+        if layer_idx >= len(self.key_cache):
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
 
 
 
