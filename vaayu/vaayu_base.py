@@ -992,7 +992,7 @@ class VaayuBaseModel(GenerationMixin):
                 input_ids=chunk_ids,
                 attention_mask=chunk_mask,
                 past_key_values=past_key_values,
-                use_cache=True,
+                use_cache=True,  # must accumulate KV cache across chunks regardless of caller's use_cache
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=True,
@@ -1011,6 +1011,8 @@ class VaayuBaseModel(GenerationMixin):
                 output.hidden_states,
                 output.attentions,
             ] if v is not None)
+        if not use_cache:
+            output.past_key_values = None
         return output
 
     def forward(
