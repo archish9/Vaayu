@@ -654,28 +654,23 @@ class VaayuBaseModel(GenerationMixin):
         return FP8DynamicCache()
 
     def _init_pinned_layers(self) -> None:
-        """
-        Pre-load shared layers (embed, norm, lm_head) into VRAM once.
-        forward() will skip load/inject/free for these layers every token,
-        saving one full NVMe read per token for ~2–3 GB of shared weights.
-        """
         budget = self._get_vram_pinning_budget()
         if budget <= 0:
             return
 
-        candidates = [
-            self.layer_names_dict["embed"],
-            self.layer_names_dict["norm"],
-            self.layer_names_dict["lm_head"],
-        ]
+        layer_prefix = self.layer_names_dict["layer_prefix"]
 
+        # Phase 1: shared layers — continue on budget miss (each has independent size)
         used = 0
-        for layer_name in candidates:
+        for layer_name in [self.layer_names_dict["embed"],
+                           self.layer_names_dict["norm"],
+                           self.layer_names_dict["lm_head"]]:
             try:
                 tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
-                    print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted")
+                    print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
+                          f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
                     continue
                 self.loader_strategy.inject_to_gpu(
                     self.model, layer_name, tensors,
@@ -684,17 +679,47 @@ class VaayuBaseModel(GenerationMixin):
                 )
                 self.pinned_layer_names.add(layer_name)
                 used += size
-                print(
-                    f"[Vaayu-Pin] pinned {layer_name}: "
-                    f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)"
-                )
+                print(f"[Vaayu-Pin] pinned {layer_name}: "
+                      f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)")
             except Exception as e:
-                # lm_head may fail if weights are tied; forward() handles that via
-                # the existing tied-weights fallback in load_layer_to_cpu.
                 print(f"[Vaayu-Pin] skip {layer_name}: {e}")
 
+        # Phase 2: transformer layers — break on budget miss (homogeneous size)
+        if self.max_pinned_layers != 0:
+            model_attr = self.model
+            for attr_name in layer_prefix.split("."):
+                model_attr = getattr(model_attr, attr_name)
+            total_layers = len(model_attr)
+
+            for i in range(total_layers):
+                if self.max_pinned_layers > 0 and i >= self.max_pinned_layers:
+                    break
+                layer_name = f"{layer_prefix}.{i}"
+                try:
+                    tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                    size = sum(t.nbytes for t in tensors.values())
+                    if used + size > budget:
+                        print(f"[Vaayu-Pin] budget exhausted at {layer_name} "
+                              f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
+                        break
+                    self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, tensors,
+                        self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {}),
+                    )
+                    self.pinned_layer_names.add(layer_name)
+                    used += size
+                    print(f"[Vaayu-Pin] pinned {layer_name}: "
+                          f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)")
+                except Exception as e:
+                    print(f"[Vaayu-Pin] skip {layer_name}: {e}")
+
+        pinned_xformer = sum(1 for n in self.pinned_layer_names
+                             if n.startswith(layer_prefix + "."))
+        pinned_shared = len(self.pinned_layer_names) - pinned_xformer
         print(
-            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned, "
+            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned "
+            f"({pinned_xformer} transformer + {pinned_shared} shared), "
             f"{used / 1e9:.2f} GB reserved"
         )
 
