@@ -15,6 +15,7 @@ Parameters:
                         N  = pin shared + first N transformer layers (budget-capped)
     MAX_NEW_TOKENS    — number of tokens to generate
     MAX_LENGTH        — max prompt token length before truncation
+                        set > PREFILL_CHUNK_SIZE to exercise chunked prefill
 """
 
 import sys
@@ -27,8 +28,8 @@ import torch
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
 MAX_PINNED_LAYERS = -1       # 0=shared only, -1=auto fill VRAM budget, N=first N layers
-MAX_NEW_TOKENS    = 20
-MAX_LENGTH        = 128
+MAX_NEW_TOKENS    = 3        # keep small for chunked-prefill test; bump for real use
+MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,8 +52,19 @@ model = AutoModel.from_pretrained(
     prefill_chunk_size=PREFILL_CHUNK_SIZE,
 )
 
+# Long prompt — designed to exceed PREFILL_CHUNK_SIZE tokens so chunked prefill fires.
+# The repeated paragraph brings the total well past 512 tokens.
+_repeated = (
+    "You are reviewing a performance-critical Python function that streams large language "
+    "model weights from NVMe SSD into GPU VRAM using io_uring with O_DIRECT. The function "
+    "must handle pinned memory buffers, prefetching via a ThreadPoolExecutor, layer-by-layer "
+    "weight injection, and KV cache management across 80 transformer layers. It also needs to "
+    "support asymmetric layer pinning where the first N layers stay resident in VRAM while the "
+    "remaining layers are streamed per token. Provide a concise code review. "
+) * 5  # ~600 tokens after chat template
+
 messages = [
-    {"role": "user", "content": "What is the capital of United States?"}
+    {"role": "user", "content": _repeated}
 ]
 formatted_prompt = model.tokenizer.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
@@ -67,8 +79,10 @@ input_tokens = model.tokenizer(
     padding=False
 )
 
+n_tokens = input_tokens['input_ids'].shape[1]
+print(f"Prompt tokens: {n_tokens}  (chunk_size={PREFILL_CHUNK_SIZE}, "
+      f"chunking={'ON' if n_tokens > PREFILL_CHUNK_SIZE > 0 else 'OFF'})")
 print("Generating output...")
-print(input_tokens['input_ids'].to(DEVICE))
 start_time = time.time()
 generation_output = model.generate(
     input_tokens['input_ids'].to(DEVICE),
