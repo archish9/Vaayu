@@ -602,18 +602,55 @@ class VaayuBaseModel(GenerationMixin):
     def _get_vram_pinning_budget(self) -> int:
         """
         VRAM budget available for permanently pinned layers.
-        Reserves 4 GB for KV cache + io_uring double-buffers (~2 × largest layer).
-        Formula is conservative; tune if KV cache overflows for long contexts.
 
-        KV cache size = n_layers × 2 × n_kv_heads × head_dim × seq_len × dtype_bytes
-        For Llama-70B @ 512 tok BF16: 80 × 2 × 8 × 128 × 512 × 2 ≈ 1.3 GB.
-        For Qwen3-480B MoE the active KV is much smaller due to sparse routing.
+        Reserves space for KV cache (sized by kv_cache_mode) + 1.5 GB overhead
+        (CUDA context + streaming double-buffer).
+
+        KV cache formulas:
+          BF16: n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 2 bytes
+          FP8:  n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 1 byte
+                (per-head scales are negligible vs 1.5 GB overhead and absorbed there)
         """
         if not torch.cuda.is_available():
             return 0
+        if not str(self.device).startswith("cuda"):
+            return 0
         total = torch.cuda.get_device_properties(self.device).total_memory
-        reserve = 4 * 1024 ** 3  # 4 GB
-        return max(0, total - reserve)
+
+        n_layers = getattr(self.config, 'num_hidden_layers', 80)
+        n_kv_heads = getattr(self.config, 'num_key_value_heads', 8)
+        _head_dim_attr = getattr(self.config, 'head_dim', None)
+        if isinstance(_head_dim_attr, int):
+            head_dim = _head_dim_attr
+        else:
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        mode = getattr(self, 'kv_cache_mode', 'fp16')
+        if mode == 'fp8':
+            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len
+        else:
+            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len * 2
+
+        overhead = int(1.5 * 1024 ** 3)
+        return max(0, total - kv_bytes - overhead)
+
+    def _create_kv_cache(self):
+        """Return a KV cache instance sized and typed for the configured kv_cache_mode."""
+        mode = self.kv_cache_mode
+
+        if mode == "auto":
+            from .persist.loader_strategy import EXL3LoaderStrategy
+            mode = "fp8" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
+
+        if mode == "fp16":
+            return DynamicCache()
+
+        if not hasattr(torch, "float8_e4m3fn"):
+            print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
+            return DynamicCache()
+
+        print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
+        return FP8DynamicCache()
 
     def _init_pinned_layers(self) -> None:
         """

@@ -121,3 +121,51 @@ def test_kv_cache_mode_fp16_stored():
 def test_kv_cache_mode_fp8_stored():
     m = _make_base({"kv_cache_mode": "fp8"})
     assert m.kv_cache_mode == "fp8"
+
+
+def test_create_kv_cache_fp16_returns_dynamic_cache():
+    from transformers.cache_utils import DynamicCache
+    m = _make_base({"kv_cache_mode": "fp16"})
+    cache = m._create_kv_cache()
+    assert isinstance(cache, DynamicCache)
+
+
+def test_create_kv_cache_fp8_returns_fp8_cache():
+    import torch
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("FP8 not available")
+    from vaayu.vaayu_base import FP8DynamicCache
+    m = _make_base({"kv_cache_mode": "fp8"})
+    cache = m._create_kv_cache()
+    assert isinstance(cache, FP8DynamicCache)
+
+
+def test_create_kv_cache_auto_fp16_for_standard_strategy():
+    """auto mode with non-EXL3 strategy → FP16 DynamicCache."""
+    from transformers.cache_utils import DynamicCache
+    m = _make_base({"kv_cache_mode": "auto"})
+    # _make_base patches build_loader_strategy to return MagicMock (not EXL3LoaderStrategy)
+    cache = m._create_kv_cache()
+    assert isinstance(cache, DynamicCache)
+
+
+def test_vram_budget_fp8_reserves_less_than_fp16():
+    """FP8 formula reserves less VRAM than BF16 formula (mocks GPU, no real hardware needed)."""
+    from unittest.mock import patch, MagicMock
+    import torch
+
+    m_fp8 = _make_base({"kv_cache_mode": "fp8"})
+    m_fp16 = _make_base({"kv_cache_mode": "fp16"})
+
+    # Simulate a 24 GB GPU regardless of test machine
+    m_fp8.device = torch.device("cuda:0")
+    m_fp16.device = torch.device("cuda:0")
+    fake_props = MagicMock()
+    fake_props.total_memory = 24 * 1024 ** 3
+
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.get_device_properties", return_value=fake_props):
+        budget_fp8 = m_fp8._get_vram_pinning_budget()
+        budget_fp16 = m_fp16._get_vram_pinning_budget()
+
+    assert budget_fp8 > budget_fp16
