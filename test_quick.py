@@ -26,9 +26,10 @@ import torch
 
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = 0        # 0=shared only, -1=auto fill VRAM budget, N=first N layers
+MAX_PINNED_LAYERS = -1       # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 20
 MAX_LENGTH        = 128
+PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ model = AutoModel.from_pretrained(
     device=DEVICE,
     kv_cache_mode=KV_CACHE_MODE,
     max_pinned_layers=MAX_PINNED_LAYERS,
+    prefill_chunk_size=PREFILL_CHUNK_SIZE,
 )
 
 messages = [
