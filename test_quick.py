@@ -32,6 +32,10 @@ MAX_NEW_TOKENS    = 3        # keep small for chunked-prefill test; bump for rea
 MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
+# ── Speculative Decoding (Phase H) ───────────────────────────────────────────
+EAGLE_HEAD_PATH    = None   # e.g. "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
+DRAFTER_MODEL_PATH = None   # e.g. "/path/to/Qwen2.5-0.5B"
+DRAFT_TOKENS       = 5      # candidate tokens per speculative iteration
 # ─────────────────────────────────────────────────────────────────────────────
 
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +54,9 @@ model = AutoModel.from_pretrained(
     kv_cache_mode=KV_CACHE_MODE,
     max_pinned_layers=MAX_PINNED_LAYERS,
     prefill_chunk_size=PREFILL_CHUNK_SIZE,
+    eagle_head_path=EAGLE_HEAD_PATH,
+    drafter_model_path=DRAFTER_MODEL_PATH,
+    draft_tokens=DRAFT_TOKENS,
 )
 
 # Long prompt — designed to exceed PREFILL_CHUNK_SIZE tokens so chunked prefill fires.
@@ -84,14 +91,24 @@ print(f"Prompt tokens: {n_tokens}  (chunk_size={PREFILL_CHUNK_SIZE}, "
       f"chunking={'ON' if n_tokens > PREFILL_CHUNK_SIZE > 0 else 'OFF'})")
 print("Generating output...")
 start_time = time.time()
-generation_output = model.generate(
-    input_tokens['input_ids'].to(DEVICE),
-    max_new_tokens=MAX_NEW_TOKENS,
-    use_cache=True,
-    return_dict_in_generate=True
-)
-elapsed_minutes = (time.time() - start_time) / 60.0
 
-output = model.tokenizer.decode(generation_output.sequences[0])
+if getattr(model, 'speculator', None) is not None:
+    spec_name = type(model.speculator).__name__
+    print(f"[Vaayu] Speculative decoding active: {spec_name} (draft_tokens={DRAFT_TOKENS})")
+    output_ids = model.speculative_generate(
+        input_tokens['input_ids'].to(DEVICE),
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+    output = model.tokenizer.decode(output_ids[0])
+else:
+    generation_output = model.generate(
+        input_tokens['input_ids'].to(DEVICE),
+        max_new_tokens=MAX_NEW_TOKENS,
+        use_cache=True,
+        return_dict_in_generate=True
+    )
+    output = model.tokenizer.decode(generation_output.sequences[0])
+
+elapsed_minutes = (time.time() - start_time) / 60.0
 print(f"\nOutput: {output}")
 print(f"Total generation time: {elapsed_minutes:.2f} minutes")
