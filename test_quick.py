@@ -17,6 +17,8 @@ parser = argparse.ArgumentParser(description="Vaayu quick test")
 parser.add_argument("--kv_cache_mode", type=str, default="auto",
                     choices=["fp16", "fp8", "auto"],
                     help="KV cache precision: fp16, fp8 (~50%% VRAM savings), auto")
+parser.add_argument("--max_pinned_layers", type=int, default=0,
+                    help="0=shared only (default), -1=auto fill VRAM budget, N=first N transformer layers")
 args = parser.parse_args()
 
 print(f"Using vaayu from: {project_root}")
@@ -35,6 +37,7 @@ model = AutoModel.from_pretrained(
     "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
     device=DEVICE,
     kv_cache_mode=args.kv_cache_mode,
+    max_pinned_layers=args.max_pinned_layers,
 )
 
 messages = [
