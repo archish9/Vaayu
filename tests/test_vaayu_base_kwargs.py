@@ -106,3 +106,18 @@ def test_tokenizer_class_kwarg_used():
     mock_tok_cls.from_pretrained.return_value = MagicMock()
     m = _make_base({"tokenizer_class": mock_tok_cls})
     mock_tok_cls.from_pretrained.assert_called_once()
+
+
+def test_kv_cache_mode_default_is_auto():
+    m = _make_base()
+    assert m.kv_cache_mode == "auto"
+
+
+def test_kv_cache_mode_fp16_stored():
+    m = _make_base({"kv_cache_mode": "fp16"})
+    assert m.kv_cache_mode == "fp16"
+
+
+def test_kv_cache_mode_fp8_stored():
+    m = _make_base({"kv_cache_mode": "fp8"})
+    assert m.kv_cache_mode == "fp8"
