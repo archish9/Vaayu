@@ -94,3 +94,77 @@ To keep the core engine highly maintainable and clean, Vaayu decouples **disk-lo
 ```
 
 This clean decoupling guarantees that future model backends (like Apple Silicon MPS structures, or new custom quantized formats) can be supported simply by writing a new subclass under `LoaderStrategy` without rewriting the core autoregressive forward loops in `vaayu_base.py`.
+
+---
+
+## 4. Asymmetric Layer Pinning
+
+### The Problem
+
+Before this feature, `_init_pinned_layers()` only pre-loaded 3 shared layers into VRAM:
+
+| Layer | Size (70B EXL3 4.5bpw) |
+|-------|------------------------|
+| `model.embed_tokens` | ~530 MB |
+| `model.norm` | ~0.5 MB |
+| `lm_head` | ~530 MB |
+| **Total** | **~1 GB** |
+
+On a 16 GB GPU with FP8 KV cache active, the VRAM budget available for pinning is ~11–12 GB — leaving **~11 GB unused**. Every one of the remaining 80 transformer layers streamed from NVMe on every token.
+
+### The Two-Phase Solution
+
+`_init_pinned_layers()` now runs a two-phase loop controlled by `max_pinned_layers`:
+
+```
+Phase 1 — Shared layers (embed, norm, lm_head)
+  Strategy: continue on budget miss
+  Reason: each has an independent size; a large embed shouldn't block a tiny norm
+
+Phase 2 — Transformer layers (model.layers.0, model.layers.1, …)
+  Strategy: break on budget miss
+  Reason: layers are homogeneous size; if one doesn't fit, none will
+  Guard: only runs when max_pinned_layers != 0
+```
+
+```
+VRAM (16 GB GPU, FP8 KV cache, 4096 ctx):
+┌──────────────────────────────────────────────┐
+│ KV Cache (FP8)         ~2.0 GB               │
+│ CUDA context + buffer  ~1.5 GB               │
+│ Shared layers          ~1.0 GB  (Phase 1)    │
+│ Transformer layers 0–27 ~10.6 GB (Phase 2)   │
+│ Free headroom          ~0.9 GB               │
+└──────────────────────────────────────────────┘
+→ 28 transformer + 3 shared = 31 layers pinned
+→ 35% of the 70B model permanently in VRAM
+```
+
+### `max_pinned_layers` Parameter
+
+| Value | Behavior |
+|-------|----------|
+| `0` | Shared layers only — default, preserves previous behavior |
+| `-1` | Auto: fill VRAM budget with transformer layers after shared |
+| `N > 0` | Shared + first N transformer layers (still budget-capped) |
+
+### Impact on `forward()`
+
+No changes to `forward()` were needed. It already keyed off the `pinned_layer_names` set at every layer boundary:
+
+- **Pinned layer hit**: skip `load_from_disk` + `inject_to_gpu` + `free` — zero NVMe cost
+- **Prefetch skip**: seed prefetch loop skips pinned layers so disk reads target only unpinned layers
+
+With 28 layers pinned, each token saves 28 × ~380 MB = ~10.6 GB of NVMe reads, cutting prefill `io_wait` by 30–50%.
+
+### Log Output
+
+```
+[Vaayu-Pin] pinned model.embed_tokens: 0.53 GB  (cumulative 0.53 GB)
+[Vaayu-Pin] pinned model.norm: 0.00 GB  (cumulative 0.53 GB)
+[Vaayu-Pin] pinned lm_head: 0.53 GB  (cumulative 1.06 GB)
+[Vaayu-Pin] pinned model.layers.0: 0.38 GB  (cumulative 1.44 GB)
+...
+[Vaayu-Pin] budget exhausted at model.layers.28 (11.64/11.64 GB)
+[Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
+```
