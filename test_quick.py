@@ -24,7 +24,7 @@ from vaayu import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct", device=DEVICE)
+model = AutoModel.from_pretrained("/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw", device=DEVICE)
 
 messages = [
     {"role": "user", "content": "What is the capital of United States?"}

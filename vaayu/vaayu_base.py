@@ -279,14 +279,16 @@ class VaayuBaseModel(GenerationMixin):
         # Pin shared layers (embed, norm, lm_head) permanently in VRAM.
         # Skips load/inject/free in forward() for these layers every token.
         self.pinned_layer_names: set = set()
-        if device.startswith("cuda"):
-            self._init_pinned_layers()
-
-        # Let strategy do one-time model-level setup (e.g. EXL3: swap nn.Linear)
         self.loader_strategy.setup_model(
             self.model, self.config, self.running_device, self.running_dtype,
             pinned_layer_names=self.pinned_layer_names,
         )
+        
+        # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
+        self.set_layers_from_layer_names()
+
+        if device.startswith("cuda"):
+            self._init_pinned_layers()
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -360,9 +362,18 @@ class VaayuBaseModel(GenerationMixin):
         quantization_config = getattr(self.config, "quantization_config", None)
 
         if quantization_config is not None:
-            self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
-            device_map = self.hf_quantizer.update_device_map(None)
-            self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
+            quant_method = None
+            if isinstance(quantization_config, dict):
+                quant_method = quantization_config.get("quant_method")
+            else:
+                quant_method = getattr(quantization_config, "quant_method", None)
+                
+            if quant_method == "exl3":
+                print("[Vaayu] Skipping AutoHfQuantizer for exl3 (managed by LoaderStrategy)")
+            else:
+                self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
+                device_map = self.hf_quantizer.update_device_map(None)
+                self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()
         self.model.tie_weights()
@@ -899,7 +910,10 @@ class VaayuBaseModel(GenerationMixin):
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
+                    moved_layers = self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {})
+                    )
                     _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
@@ -913,7 +927,10 @@ class VaayuBaseModel(GenerationMixin):
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
+                    moved_layers = self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {})
+                    )
                     _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
