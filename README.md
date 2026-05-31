@@ -104,11 +104,12 @@ We have structured the entire architectural knowledge, installation guides, and 
 
 ## 📌 Enabling Asymmetric Layer Pinning
 
-> **This feature is OFF by default.** You must pass `max_pinned_layers` explicitly. Without it, Vaayu pins only the 3 shared layers (~1 GB) as before.
+> **This feature is OFF by default.** `MAX_PINNED_LAYERS = 0` in `test_quick.py`. Change it to `-1` to activate. Without it, Vaayu pins only the 3 shared layers (~1 GB) as before.
 
-**Recommended setup (16 GB GPU + EXL3 model):**
-```bash
-python test_quick.py --kv_cache_mode fp8 --max_pinned_layers -1
+**Recommended setup (16 GB GPU + EXL3 model)** — edit `test_quick.py`:
+```python
+KV_CACHE_MODE     = "fp8"   # ~50% KV cache VRAM savings
+MAX_PINNED_LAYERS = -1      # auto-fill remaining VRAM with transformer layers
 ```
 This combines FP8 KV cache (frees ~1.3 GB) with asymmetric pinning (fills the freed budget with transformer layers). On a 16 GB GPU running Llama-70B EXL3 4.5bpw, expect ~28 transformer layers pinned on top of the 3 shared layers.
 
@@ -127,25 +128,24 @@ This combines FP8 KV cache (frees ~1.3 GB) with asymmetric pinning (fills the fr
 ...
 [Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
 ```
-If you only see 3 layers pinned, you forgot `--max_pinned_layers -1`.
+If you only see 3 layers pinned, `MAX_PINNED_LAYERS` is still `0` in `test_quick.py`.
 
 ---
 
 ## 🏃 Quickstart Inference Test
 
-Verify your installation by running our CLI text generation entrypoint:
+Edit the `CONFIG` block at the top of `test_quick.py`, then run:
 ```bash
-# FP8 KV cache (default for EXL3 models, ~50% VRAM savings)
-python test_quick.py --kv_cache_mode auto
+source venv/bin/activate
+python test_quick.py
+```
 
-# Force FP16 KV cache (baseline, full precision)
-python test_quick.py --kv_cache_mode fp16
-
-# Asymmetric pinning: auto-fill VRAM with transformer layers (~28 layers on 16 GB GPU)
-python test_quick.py --kv_cache_mode fp8 --max_pinned_layers -1
-
-# Pin exactly N transformer layers (e.g., first 10)
-python test_quick.py --kv_cache_mode fp8 --max_pinned_layers 10
+Key config options:
+```python
+MODEL_PATH        = "/path/to/your/model"
+KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
+MAX_PINNED_LAYERS = 0        # 0=shared only | -1=auto fill VRAM | N=first N layers
+MAX_NEW_TOKENS    = 20
 ```
 
 *Example API usage:*
