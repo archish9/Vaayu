@@ -78,8 +78,8 @@ The remaining phases follow a strict dependency chain. Each one unlocks the next
 **E — FP8 KV Cache** ✅ done: ~1.3 GB freed at 8k context (see Engineering Victories above).  
 **F — Asymmetric Layer Pinning** ✅ done: First 28 transformer layers permanently pinned in VRAM (not just embed/norm/lm_head), delivering **15–25% faster prefill**. See [Architecture: Asymmetric Layer Pinning](documentation/architecture.md#4-asymmetric-layer-pinning).
 
-### Phase G: Chunked Prefill
-Large code file ingestion (4,000+ tokens) causes VRAM spikes that OOM. Processing prompts in 512-token chunks flattens the spike, making long-context use reliable. Depends on E+F being stable.
+### ✅ Phase G: Chunked Prefill
+**Done.** Large code file ingestion (4,000+ tokens) caused VRAM spikes that OOM. Processing prompts in 512-token chunks flattens the spike, making long-context use reliable. Controlled via `PREFILL_CHUNK_SIZE` in `test_quick.py` (default 512 tokens; set to 0 to disable).
 
 ### ✅ Phase H: Speculative Decoding
 Implemented. Vaayu acts as the **Verifier** — a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or any small HuggingFace model) guesses N tokens; Vaayu verifies all N in **one forward pass**. ExLlamaV3 native EAGLE bridge tried first; manual weight loader fallback. Configure in `test_quick.py`:
@@ -149,23 +149,27 @@ python test_quick.py
 
 Key config options:
 ```python
-MODEL_PATH        = "/path/to/your/model"
-KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = 0        # 0=shared only | -1=auto fill VRAM | N=first N layers
-MAX_NEW_TOKENS    = 20
+MODEL_PATH         = "/path/to/your/model"
+KV_CACHE_MODE      = "auto"   # "auto" | "fp8" | "fp16"
+MAX_PINNED_LAYERS  = 0        # 0=shared only | -1=auto fill VRAM | N=first N layers
+MAX_NEW_TOKENS     = 20
+PREFILL_CHUNK_SIZE = 512      # 0=disabled | N=chunk long prompts into N-token pieces
+EAGLE_HEAD_PATH    = None     # path to EAGLE-3 head checkpoint (optional)
+DRAFTER_MODEL_PATH = None     # path to small HF drafter model (optional)
+DRAFT_TOKENS       = 5        # candidate tokens per speculative iteration
 ```
 
 *Example API usage:*
 ```python
 from vaayu import AutoModel
 
-# Vaayu automatically peeks headers to detect the strategy (Standard vs EXL3)
-# kv_cache_mode="auto" selects FP8 for EXL3 models, FP16 otherwise
-# max_pinned_layers=-1 auto-fills remaining VRAM budget with transformer layers
 model = AutoModel.from_pretrained(
     "/path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
-    kv_cache_mode="auto",       # or "fp8" / "fp16"
-    max_pinned_layers=-1,       # 0=shared only (default), -1=auto fill, N=first N layers
+    kv_cache_mode="auto",        # "auto" selects FP8 for EXL3, FP16 otherwise
+    max_pinned_layers=-1,        # auto-fill remaining VRAM with transformer layers
+    prefill_chunk_size=512,      # chunk long prompts to avoid VRAM spikes
+    drafter_model_path=None,     # set to enable speculative decoding
+    draft_tokens=5,
 )
 
 input_tokens = model.tokenizer(
@@ -174,11 +178,15 @@ input_tokens = model.tokenizer(
     padding=False
 )
 
+# Standard generation (no speculator set):
 generation_output = model.generate(
     input_tokens['input_ids'].cuda(),
     max_new_tokens=20,
     use_cache=True,
 )
-
 print(model.tokenizer.decode(generation_output.sequences[0]))
+
+# Speculative generation (when drafter_model_path is set):
+# output_ids = model.speculative_generate(input_tokens['input_ids'].cuda(), max_new_tokens=20)
+# print(model.tokenizer.decode(output_ids[0]))
 ```

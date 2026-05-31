@@ -43,44 +43,16 @@ See `documentation/architecture.md` Section 5 for the complete design.
 
 ---
 
-# Speculative Decoding & MoE Expert Routing Roadmap
-
-Generating code autoregressively requires streaming the entire model weight footprint from disk *for every single token generated*. At physical NVMe ceilings (~7.4 GB/s), standard generation loops are capped by hardware limits.
-
-To bypass this hardware boundary and hit rapid, interactive text generation speeds, Vaayu is shifting toward two game-changing software innovations: **Speculative Decoding** and **Expert-Aware MoE Routing**.
+# Vaayu: Speculative Decoding (Implemented) & MoE Roadmap
 
 ---
 
-## 1. Speculative Decoding (The Modular Verifier Pivot)
+## Speculative Decoding — ✅ Implemented (Phase H)
 
-Standard generation requires 10 full sequential layer streams to write 10 words. Speculative decoding changes this math by separating the process into two cooperative models:
+> See the "As Built" documentation at the top of this file and `documentation/architecture.md` Section 5 for the full design.
+> Source: `vaayu/speculative/`
 
-```
-                            Speculative Decoding Loop
-                            
-Step 1: Drafter (1.5B in VRAM)  ──► Fast-guesses 10 tokens in milliseconds (FP16/BF16)
-                                               │
-                                               ▼
-Step 2: Vaayu (70B SSD Stream) ──► Reads layers ONCE to verify all 10 tokens in parallel
-                                               │
-                                               ▼
-Step 3: Verification Check     ──► Accepts 6 tokens, corrects token 7, discards rest
-                                   (Effective speed: 6x boost for 1x stream cost!)
-```
-
-### 1. The Drafter (Small & Fast)
-We load a very small, highly capable coding model (like `Qwen2.5-Coder-1.5B`) permanently into the GPU's 16 GB VRAM. Because it is small, it resides entirely in memory.
-* When the user prompts the agent, the Drafter instantly guesses the next, say, 10 tokens of code. Since it lives in VRAM, generating these 10 tokens takes milliseconds.
-
-### 2. The Verifier (Vaayu 70B SSD Stream)
-Instead of asking the massive 70B model to generate tokens from scratch, we hand the 10 drafted tokens to Vaayu and ask it: *"Are these 10 tokens correct?"*
-* **The Magic**: A Transformer can verify multiple tokens simultaneously in a single forward pass.
-* Vaayu streams its layers from the NVMe SSD **exactly once** to compute the probabilities of all 10 tokens in parallel.
-
-### 3. The Math
-* If the 70B model agrees with all 10 tokens, we get **10 tokens in 1 stream pass** (an effective 10x speedup).
-* If the 70B model agrees with the first 4, corrections are applied at token 5, and the rest are discarded. We get **5 tokens in 1 stream pass** (a 5x speedup).
-* Standard predictable code structures (e.g. `def __init__(self):`) yield high draft accuracy, making speculative decoding the ultimate latency turbocharger.
+Speculative decoding is **live**. Vaayu acts as the Verifier. A resident drafter (EAGLE-3 head ~0.1 GB, or any small HuggingFace model) guesses K tokens; Vaayu verifies all K in one forward pass and accepts the correct prefix. Configure via `EAGLE_HEAD_PATH` / `DRAFTER_MODEL_PATH` in `test_quick.py`.
 
 ---
 
