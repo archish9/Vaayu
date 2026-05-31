@@ -6,11 +6,18 @@ This adds the local path to Python's import system
 import sys
 import os
 import time
+import argparse
 import torch
 
 # Add project root to path
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
+
+parser = argparse.ArgumentParser(description="Vaayu quick test")
+parser.add_argument("--kv_cache_mode", type=str, default="auto",
+                    choices=["fp16", "fp8", "auto"],
+                    help="KV cache precision: fp16, fp8 (~50%% VRAM savings), auto")
+args = parser.parse_args()
 
 print(f"Using vaayu from: {project_root}")
 
@@ -24,7 +31,11 @@ from vaayu import AutoModel
 MAX_LENGTH = 128
 
 print("Loading model...")
-model = AutoModel.from_pretrained("/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw", device=DEVICE)
+model = AutoModel.from_pretrained(
+    "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
+    device=DEVICE,
+    kv_cache_mode=args.kv_cache_mode,
+)
 
 messages = [
     {"role": "user", "content": "What is the capital of United States?"}
