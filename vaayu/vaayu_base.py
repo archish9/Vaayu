@@ -1102,6 +1102,13 @@ class VaayuBaseModel(GenerationMixin):
         all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
         all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
+        # Capture KV length once before the layer loop. len_p stays constant for the
+        # full forward pass — all layers process the same positions. Re-querying
+        # get_seq_length() inside the loop would return a growing value as each layer
+        # appends its K/V to the cache, causing cos/sin slices to walk off the end of
+        # _full_position_embeddings and produce empty tensors (silent position corruption).
+        _len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
+
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
@@ -1203,15 +1210,14 @@ class VaayuBaseModel(GenerationMixin):
                         if output_hidden_states:
                             all_hidden_states[i].append(seq)
 
-                        len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
                         len_s = self.get_sequence_len(seq)
 
                         kwargs = {
                             'use_cache': use_cache,
                             **self.get_past_key_value_args(past_key_values),
-                            **self.get_pos_emb_args(len_p, len_s),
-                            **self.get_attention_mask_args(attention_mask, len_p, len_s),
-                            **self.get_position_ids_args(position_ids, len_p, len_s),
+                            **self.get_pos_emb_args(_len_p, len_s),
+                            **self.get_attention_mask_args(attention_mask, _len_p, len_s),
+                            **self.get_position_ids_args(position_ids, _len_p, len_s),
                         }
 
                         if self.use_torch_compile:
