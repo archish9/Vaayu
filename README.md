@@ -102,6 +102,35 @@ We have structured the entire architectural knowledge, installation guides, and 
 
 ---
 
+## 📌 Enabling Asymmetric Layer Pinning
+
+> **This feature is OFF by default.** You must pass `max_pinned_layers` explicitly. Without it, Vaayu pins only the 3 shared layers (~1 GB) as before.
+
+**Recommended setup (16 GB GPU + EXL3 model):**
+```bash
+python test_quick.py --kv_cache_mode fp8 --max_pinned_layers -1
+```
+This combines FP8 KV cache (frees ~1.3 GB) with asymmetric pinning (fills the freed budget with transformer layers). On a 16 GB GPU running Llama-70B EXL3 4.5bpw, expect ~28 transformer layers pinned on top of the 3 shared layers.
+
+**Parameter reference:**
+
+| `max_pinned_layers` | Behavior |
+|---------------------|----------|
+| `0` | Shared only — embed, norm, lm_head (~1 GB). **Default.** |
+| `-1` | Auto — fill remaining VRAM budget with transformer layers |
+| `N` | Shared + first N transformer layers (still budget-capped) |
+
+**Verify it's working** — look for these lines in startup logs:
+```
+[Vaayu-Pin] pinned model.embed_tokens: 0.53 GB  (cumulative 0.53 GB)
+[Vaayu-Pin] pinned model.layers.0: 0.38 GB  (cumulative 1.44 GB)
+...
+[Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
+```
+If you only see 3 layers pinned, you forgot `--max_pinned_layers -1`.
+
+---
+
 ## 🏃 Quickstart Inference Test
 
 Verify your installation by running our CLI text generation entrypoint:
