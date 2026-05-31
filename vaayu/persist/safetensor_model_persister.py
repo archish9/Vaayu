@@ -84,8 +84,9 @@ def _load_pinned(file_path: str) -> dict:
 
     if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
         alloc_size = total_size + (100 * 1024 * 1024) + _ALIGN  # pad +100 MB + O_DIRECT padding
-        _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
-                                            pin_memory=True)
+        buf_new = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
+        buf_new.zero_()  # pre-fault all pages so io_uring writes hit no page faults
+        _PINNED_BUFS[buf_idx] = buf_new
         _PINNED_SIZES[buf_idx] = alloc_size
         print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB")
 
