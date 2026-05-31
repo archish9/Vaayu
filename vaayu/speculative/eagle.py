@@ -134,12 +134,12 @@ class EAGLEDecoder(SpeculativeDecoder):
         with torch.inference_mode():
             for _ in range(num_tokens):
                 if self._fc is not None:
-                    # Fuse token embedding with current hidden state
+                    # Fuse last hidden state with token embedding
                     token_embed = self.base_model.layers[0](input_ids[:, -1:])
-                    fused = self._fc(torch.cat([hidden, token_embed], dim=-1))
+                    fused = self._fc(torch.cat([hidden[:, -1:, :], token_embed], dim=-1))
                     layer_input = fused
                 else:
-                    layer_input = hidden
+                    layer_input = hidden[:, -1:, :]
 
                 layer_out = self._eagle_layer(layer_input)
                 next_hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
