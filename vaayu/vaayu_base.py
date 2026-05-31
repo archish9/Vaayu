@@ -997,7 +997,7 @@ class VaayuBaseModel(GenerationMixin):
             self._full_position_embeddings = None
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = self._create_kv_cache()
         all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
         all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
