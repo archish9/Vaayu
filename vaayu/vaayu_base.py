@@ -654,6 +654,13 @@ class VaayuBaseModel(GenerationMixin):
         return FP8DynamicCache()
 
     def _init_pinned_layers(self) -> None:
+        """
+        Pre-load layers into VRAM using two-phase asymmetric pinning.
+
+        Phase 1 pins shared layers (embed, norm, lm_head) with continue on budget miss.
+        Phase 2 pins transformer layers 0…N with break on budget miss; only runs when
+        max_pinned_layers != 0 (0 = shared-only, -1 = fill budget, N = first N layers).
+        """
         budget = self._get_vram_pinning_budget()
         if budget <= 0:
             return
