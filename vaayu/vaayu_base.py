@@ -1038,6 +1038,20 @@ class VaayuBaseModel(GenerationMixin):
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
+        if (self.prefill_chunk_size > 0
+                and input_ids is not None
+                and input_ids.shape[1] > self.prefill_chunk_size):
+            _past_kv_len = (self.get_past_key_values_cache_seq_len(past_key_values)
+                            if past_key_values is not None else 0)
+            if _past_kv_len == 0:
+                return self._chunked_prefill(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
 
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])

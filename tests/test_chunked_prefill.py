@@ -24,6 +24,7 @@ def test_prefill_chunk_size_zero_stored():
 
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.cache_utils import DynamicCache
 
 
 def _fake_kv(seq_len):
@@ -176,3 +177,68 @@ def test_chunked_prefill_non_dict_return():
 
     assert isinstance(result, tuple)
     assert isinstance(result[0], torch.Tensor)  # logits first
+
+
+def test_forward_routes_to_chunked_prefill_for_long_prompt():
+    """Prompt longer than chunk_size, no prior KV → _chunked_prefill called."""
+    m = _make_base({"prefill_chunk_size": 4})
+    input_ids = torch.randint(0, 100, (1, 8))  # 8 > 4
+
+    sentinel = CausalLMOutputWithPast(
+        logits=torch.zeros(1, 4, 100),
+        past_key_values=DynamicCache(),
+    )
+    with patch.object(m, "_chunked_prefill", return_value=sentinel) as mock_cp:
+        result = m.forward(input_ids=input_ids, past_key_values=None,
+                           use_cache=True, return_dict=True)
+
+    mock_cp.assert_called_once()
+    assert result is sentinel
+
+
+def test_forward_skips_chunked_prefill_when_disabled():
+    """chunk_size=0 → _chunked_prefill never called, even for long prompts."""
+    m = _make_base({"prefill_chunk_size": 0})
+    m._active_attn_impl = "eager"
+
+    with patch.object(m, "_chunked_prefill") as mock_cp:
+        try:
+            m.forward(input_ids=torch.randint(0, 100, (1, 8)),
+                      use_cache=False, return_dict=True)
+        except Exception:
+            pass  # layer loop will fail without real weights; we only need the routing check
+
+    mock_cp.assert_not_called()
+
+
+def test_forward_skips_chunked_prefill_when_seq_not_exceeds_chunk():
+    """Prompt exactly equal to chunk_size → no chunking."""
+    m = _make_base({"prefill_chunk_size": 8})
+    m._active_attn_impl = "eager"
+
+    with patch.object(m, "_chunked_prefill") as mock_cp:
+        try:
+            m.forward(input_ids=torch.randint(0, 100, (1, 8)),
+                      use_cache=False, return_dict=True)
+        except Exception:
+            pass
+
+    mock_cp.assert_not_called()
+
+
+def test_forward_skips_chunked_prefill_when_past_kv_exists():
+    """Decode step (past_kv_len > 0) → no chunking even for 'long' seq."""
+    m = _make_base({"prefill_chunk_size": 4})
+    m._active_attn_impl = "eager"
+
+    past_kv = MagicMock()
+    past_kv.get_seq_length.return_value = 4  # non-zero past
+
+    with patch.object(m, "_chunked_prefill") as mock_cp:
+        try:
+            m.forward(input_ids=torch.randint(0, 100, (1, 8)),
+                      past_key_values=past_kv, use_cache=True, return_dict=True)
+        except Exception:
+            pass
+
+    mock_cp.assert_not_called()
