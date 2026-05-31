@@ -242,3 +242,27 @@ def test_forward_skips_chunked_prefill_when_past_kv_exists():
             pass
 
     mock_cp.assert_not_called()
+
+
+def test_position_id_slice_is_empty_when_past_exceeds_max_seq_len():
+    """Demonstrate the OLD bug: position_ids of max_seq_len size returns empty slice for past+seq."""
+    m = _make_base()
+    m.max_seq_len = 4
+    # Old behavior: position_ids = arange(4) → only 4 elements
+    old_pos_ids = torch.arange(4)[None, :]
+    result = m.get_position_ids_args(old_pos_ids, len_p=4, len_s=4)
+    # PyTorch slice [4:8] on a 4-element dim returns empty tensor — silent corruption
+    assert result["position_ids"].shape[1] == 0  # BUG: should be 4
+
+
+def test_position_id_slice_correct_with_dynamic_range():
+    """NEW behavior: pos_range = max(max_seq_len, past+seq) → slice is [past : past+seq]."""
+    m = _make_base()
+    m.max_seq_len = 4
+    past_len, seq_len = 4, 4
+    pos_range = max(m.max_seq_len, past_len + seq_len)  # = 8
+    new_pos_ids = torch.arange(pos_range)[None, :]
+    result = m.get_position_ids_args(new_pos_ids, len_p=past_len, len_s=seq_len)
+    assert result["position_ids"].shape == (1, 4)
+    assert result["position_ids"][0, 0].item() == 4    # starts at past_len
+    assert result["position_ids"][0, -1].item() == 7   # ends at past_len + seq_len - 1

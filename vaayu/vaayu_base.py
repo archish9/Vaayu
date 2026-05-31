@@ -1063,7 +1063,11 @@ class VaayuBaseModel(GenerationMixin):
             attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
             attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
             attention_mask = attention_mask.to(self.running_device)
-        position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
+        _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
+                             if past_key_values is not None else 0)
+        _cur_len_for_pos  = input_ids.shape[1] if input_ids is not None else 0
+        _pos_range        = max(self.max_seq_len, _past_len_for_pos + _cur_len_for_pos)
+        position_ids      = torch.arange(_pos_range, dtype=torch.long, device=self.running_device)[None, :]
 
         # Pre-compute RoPE position embeddings for the full sequence length.
         # Transformers >= 4.45 moved this computation to the top-level model forward;
