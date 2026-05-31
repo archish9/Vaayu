@@ -370,54 +370,300 @@ Per-token: ~29s → ~24-25s  (saves ~4-5s)
 
 
 
-+++++++++++++++++++++++++++++++++
 
 
-Ran command: `source venv/bin/activate`
-Ran command: `python3 test_quick.py`
-Viewed vaayu_base.py:1-800
-Viewed loader_strategy.py:1-469
-Ran command: `cat /home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw/config.json | grep -A 5 quantization_config`
-Searched for "quantization_config"
-Edited vaayu_base.py
-Ran command: `source venv/bin/activate && python3 test_quick.py`
-Ran command: `python3 -c "from vaayu.persist.loader_strategy import _is_exl3_checkpoint; print(_is_exl3_checkpoint('/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw/splitted_model'))"`
-Ran command: `source venv/bin/activate && python3 -c "import struct, json; f=open('/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw/splitted_model/model.layers.0.safetensors', 'rb'); hdr_len = struct.unpack('<Q', f.read(8))[0]; hdr = json.loads(f.read(hdr_len)); keys = {k.rsplit('.', 1)[-1] for k in hdr if k != '__metadata__'}; print(keys)"`
+-===========================
+============================
+============================
 
-The reason you are getting this error is because `vaayu_base.py` is passing the model's quantization configuration (`"quant_method": "exl3"`) directly to the Hugging Face `transformers` library via `AutoHfQuantizer`. 
 
-The `transformers` library does not natively support `exl3` quantization (it only supports methods like `awq`, `gptq`, `bitsandbytes_4bit`, etc.). As a result, when it tries to parse the config, it throws a `ValueError`.
+The subclasses override these hook methods on VaayuBaseModel:
 
-Since Vaayu is designed to handle EXL3 quantization using its own custom `EXL3LoaderStrategy`, it should bypass the Hugging Face quantizer initialization completely for `exl3` models. 
+  ┌───────────────────────────┬──────────────────────────────────────────────┐
+  │           Hook            │                   Purpose                    │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ set_layer_names_dict()    │ Layer path names (embed/layers/norm/lm_head) │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_pos_emb_args()        │ RoPE kwargs per layer                        │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_past_key_value_args() │ KV cache format                              │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_attention_mask_args() │ Attention mask shape                         │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_tokenizer()           │ Custom tokenizer (Baichuan)                  │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ get_generation_config()   │ Custom gen config                            │
+  └───────────────────────────┴──────────────────────────────────────────────┘
 
-### What I fixed
-I've updated `/home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py` to check for `exl3` and skip the `AutoHfQuantizer` initialization:
-```python
-        quantization_config = getattr(self.config, "quantization_config", None)
+  But look at the actual subclasses:
+  
+  - VaayuQWen2 — literally empty. Just overrides get_use_better_transformer().
+  Qwen2 uses standard Llama names.
+  - VaayuBaichuan — only overrides get_tokenizer(). Standard layer names.
+  - VaayuMistral — probably just generation config.
+  - VaayuChatGLM — genuinely different: different layer names + different
+  get_pos_emb_args() + different get_past_key_value_args() because ChatGLM's
+  attention API uses rotary_pos_emb + kv_cache instead of standard HF kwargs.
 
-        if quantization_config is not None:
-            quant_method = None
-            if isinstance(quantization_config, dict):
-                quant_method = quantization_config.get("quant_method")
-            else:
-                quant_method = getattr(quantization_config, "quant_method", None)
-                
-            if quant_method == "exl3":
-                print("[Vaayu] Skipping AutoHfQuantizer for exl3 (managed by LoaderStrategy)")
-            else:
-                # Fallback to standard transformers quantizer for other types
-                self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
-                # ...
+  Is it the best approach? No — for vaayu-apple's target use case.
+
+  The subclass pattern made sense in 2023 when HF models had wildly different
+  internal APIs. But post-transformers 4.45, all modern models (Llama3.x,
+  Qwen2.5, Phi-4, Gemma2, Mistral) converged on the same interface. The
+  subclasses that exist in Linux Vaayu are almost all empty because there's
+  nothing to override.
+
+  For vaayu-apple's coding agent target (Llama3.3-70B, Qwen2.5-72B, Phi-4,
+  Deepseek) — every single one uses standard names. The layer_names_dict kwarg
+  override is the right call: zero friction for 100% of realistic targets,
+  escape hatch for the rare outlier.
+  
+  The one thing Linux Vaayu does that vaayu-apple currently doesn't: auto-detect
+   layer names from model structure. That's worth adding — walk
+  model.named_modules() to find the nn.ModuleList decoder stack if the hardcoded
+   names don't exist. Covers future architectures automatically without any user
+   action.
+
+
+
+===================
+
+
+
+ Yes — actually better than Vaayu for model breadth.
+  
+  Vaayu-apple uses _auto_detect_layer_names() to probe any HuggingFace model's
+  structure automatically. Vaayu Linux requires a hardcoded subclass per
+  architecture (VaayuQWen2, VaayuMixtral, etc.). Vaayu-apple covers all of them
+  generically + any new architecture you throw at it.
+
+  Constraint: Model must have numbered decoder layers (model.layers.0,
+  model.layers.1, ...). Every mainstream transformer does.
+
+
+
+  ------------------------------------
+
+HOW **Medusa** and **EAGLE** WORKS.
+
+To help you understand how to integrate these concepts into a high-performance inference engine like **Vaayu**, let's break down **Medusa** and **EAGLE** conceptually, how they work mechanically, and why they are game-changers compared to standard speculative decoding.
+
+---
+
+### The Core Problem: Autoregressive Bottleneck
+In a standard LLM, generation is **autoregressive (token-by-token)**:
+1. You pass a prompt to the model.
+2. The model outputs **one** token.
+3. You append that token to the input and run the *entire* model again to get the next token.
+
+Because LLMs are massive, the GPU spends almost all its time moving billions of weights from VRAM to SRAM just to process **one** token. This makes LLM generation extremely **memory-bandwidth bound**.
+
+---
+
+### 1. Standard Speculative Decoding (The Baseline)
+To solve this, standard speculative decoding uses two models:
+*   **Draft Model (Small & Fast):** e.g., a 1.5B parameter model. It quickly generates, say, 5 candidate tokens ($t_1, t_2, t_3, t_4, t_5$).
+*   **Target Model (Large & Slow):** e.g., a 70B parameter model. It takes all 5 candidate tokens and processes them **in a single forward pass** (which is incredibly fast due to batching).
+*   **Verification:** The target model checks the draft tokens. If it agrees with the first 3 but disagrees on the 4th, it accepts $t_1, t_2, t_3$, discards the rest, generates its own 4th token, and starts the loop again.
+
+**The Catch:** You have to keep two entirely separate models, two separate active KV-caches, and run two separate inference loops in VRAM.
+
+---
+
+### 2. Medusa: Parallel Multi-Token Prediction Heads
+**Medusa** does away with the second model entirely. Instead of a separate drafter, it adds **multiple lightweight, independent output heads** directly on top of the base model's final hidden states.
+
+```mermaid
+graph TD
+    subgraph Base Model
+        L[Transformer Layers] --> HS[Final Hidden State]
+    end
+    HS --> Head0["Base Head (Predicts t+1)"]
+    HS --> Head1["Medusa Head 1 (Predicts t+2)"]
+    HS --> Head2["Medusa Head 2 (Predicts t+3)"]
+    HS --> Head3["Medusa Head 3 (Predicts t+4)"]
 ```
 
-### Next Issue (CUDA Error)
-After applying this fix, the code bypasses the original crash but encounters a new issue during inference: it triggers a `CUDA error: device-side assert triggered`. 
+#### How Medusa Works Mechanically:
+1. **Single Forward Pass:** When the target model processes a token, the base LM head predicts the next token $t+1$. Simultaneously, Medusa Head 1 predicts $t+2$, Medusa Head 2 predicts $t+3$, and Medusa Head 3 predicts $t+4$.
+2. **Drafting (Tree of Candidates):** Since these heads are predicting into the future without knowing the actual choices of the previous heads, they output a **probability distribution**. Medusa takes the top-k predictions from each head and constructs a **tree of candidate paths** (e.g., a tree of 10-20 possible token sequences).
+3. **Verification (Tree Attention):** In the next single forward pass, the base model processes this tree of candidates in parallel using a special **Tree Attention mask**. It validates the paths and accepts the longest matching valid sequence.
+4. **Zero VRAM Waste:** The Medusa heads are just simple single-layer feed-forward networks (FFNs) representing less than 1% of the base model's size. They require practically zero extra VRAM.
 
-**The reason for this next error:**
-Your `vaayu/persist/loader_strategy.py` tries to auto-detect if a model is EXL3 by checking the keys inside the safetensors file:
-```python
-_EXL3_QTENSOR_KEYS = {"q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm"}
+---
+
+### 3. EAGLE: Speculative Decoding via Feature Extrapolation
+While Medusa is great, it has a limitation: **independent heads struggle with long-range dependency**. Because Medusa Head 3 tries to predict $t+4$ directly from the hidden state of $t$ without knowing what Head 1 and Head 2 chose, its accuracy drops off rapidly the further out it predicts.
+
+**EAGLE (Extrapolation Algorithms for Efficient LLM Generation)** solves this by introducing a **recurrent, auto-regressive drafting loop at the feature (hidden state) level** rather than the token level.
+
+```mermaid
+graph TD
+    subgraph EAGLE Draft Loop
+        HS[Hidden State t] --> Feat["Lightweight Transformer Layer (1-2 layers)"]
+        Feat --> NextHS["Predicted Hidden State t+1"]
+        NextHS --> LM["Base LM Head"] --> Token["Token Prediction"]
+        NextHS --> Loop["Feed back into Lightweight Layer"]
+    end
 ```
-However, the shards for your `Llama-3.3-70B-Instruct-exl3-4.5bpw` model contain different keys (`trellis`, `mcg`, `weight`, `suh`, `svh`). Because these keys don't match, `LoaderStrategy` incorrectly falls back to `StandardSafetensorsStrategy`, which attempts to load the 4-bit compressed tensors as standard `float16` and ultimately crashes the GPU. 
 
-To fully fix the EXL3 inference, you'll need to update `_EXL3_QTENSOR_KEYS` (and the logic in `EXL3LoaderStrategy`) to support these new `trellis` / `mcg` / `suh` tensor keys.
+#### How EAGLE Works Mechanically:
+1. **Hidden State Extrapolation:** Instead of predicting tokens directly, EAGLE trains a highly optimized, extremely lightweight plugin (usually a single Transformer layer) that takes the target model's hidden state at step $t$ and **extrapolates the hidden state at step $t+1$**.
+2. **Feature Regression:** It passes the predicted hidden state $t+1$ into the target model's *existing* LM head to get a token prediction, and simultaneously feeds that hidden state back into the lightweight plugin to predict hidden state $t+2$.
+3. **High Acceptance Rate:** Because EAGLE propagates the hidden features step-by-step auto-regressively (similar to a real model, but vastly faster because it only computes a single layer instead of 80 layers), its predictions are **much more coherent** than Medusa's.
+4. **EAGLE-2 and EAGLE-3:** Newer versions incorporate dynamic draft trees and drafting models that adapt to the target model's confidence, pushing acceptance rates and acceleration even higher.
+
+---
+
+### Summary of Differences
+
+| Feature | Standard Speculation (Plan C) | Medusa | EAGLE |
+| :--- | :--- | :--- | :--- |
+| **Draft Mechanism** | Separate small LLM (e.g., 1.5B) | Parallel MLP heads on base model | Recurrent lightweight feature-level loop |
+| **VRAM Footprint** | **High** (1.5GB to 3GB for draft model + KV-cache) | **Near Zero** (<1% of base model size) | **Extremely Low** (A single transformer layer) |
+| **Accuracy / Acceptance** | Medium-High (depends on draft model fit) | Moderate (decays quickly for far-future tokens) | **Very High** (retains strong context coherence) |
+| **Dependency** | None. Can pair any small model with any large model. | **Highly Specific.** Heads must be trained on the exact target model. | **Highly Specific.** Plugin must be trained on the exact target model. |
+
+### Implications for Vaayu
+
+Because **Vaayu** aims to support massive models (even 480B+ models):
+1. **Medusa/EAGLE** are mathematically superior because they save precious VRAM on your system (especially on your 16GB VRAM limit).
+2. **However, they rely on pre-trained heads.** If a user wants to run an arbitrary 480B model that doesn't have pre-trained EAGLE/Medusa weights on Hugging Face, they cannot use self-speculation.
+3. **The Best Strategy:** 
+   * If a Medusa/EAGLE head is detected in the model directory, auto-enable self-speculation.
+   * If no head exists, fall back to standard speculative decoding (Plan C) using a generic, highly-quantized draft model (like a Llama-3-8B-Instruct-EXL2) if the user has enough VRAM headroom.
+
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+
+
+ 
+### **No! The small model is NOT the main brain.** 
+
+The **Target Model (the Large Model)** remains the absolute and only "main brain." The small model is purely a fast, cheap **guesser (or pathfinder)**, while the large model acts as the **ultimate judge**.
+
+Here is why you can safely use this for complex coding tasks without losing any intelligence:
+
+---
+
+### 1. The Large Model Has Absolute Veto Power
+In speculative decoding, **every single token** generated by the small model is verified mathematically by the large model. 
+* If the small model tries to write a complex algorithms or logical statements, and makes a tiny syntax or logical error, the large model **instantly catches it and corrects it** during the verification step.
+* The output you see is **100% mathematically identical** to the output you would have gotten if you had run the large model alone, word-for-word. There is zero loss in quality, intelligence, or coding capability.
+
+---
+
+### 2. Why Does a Dumb Model Speed Up Smart Code?
+You might think: *"If a 1.5B model is dumb, won't the 70B model reject everything it writes, making it even slower?"*
+
+Actually, even in complex coding tasks, a massive portion of the code is highly predictable (boilerplate, structure, common syntax, indentations).
+* **Boilerplate/Syntax:** When writing code, sequences like `def __init__(self, `, `import torch`, or `for i in range(len(` are incredibly easy to predict. The 1.5B model can guess these 5-10 tokens at a time with near-100% accuracy.
+* **The "Thought" Tokens:** When the code reaches a highly complex logical decision or a specific mathematical formula, the 1.5B model will likely guess wrong. 
+  * The Large Model will reject the wrong guess.
+  * The Large Model then outputs the correct token in that same step.
+  * The draft loop resets and starts guessing from there.
+
+**Result:** Instead of running the slow 70B model 10 times to write `public static void main(String[] args) {`, the 1.5B model guesses it in a millisecond, the 70B verifies it in a single pass, and you get a **3x to 4x speedup** on predictable sections, while maintaining 70B-grade intelligence on the complex sections!
+
+---
+
+### 3. How to Use It for Complex Coding Tasks in Vaayu
+
+When implementing speculative decoding (whether standard Plan C or Medusa/EAGLE) in **Vaayu** for coding, you don't have to do anything special to "tune" it for coding:
+1. **Ensure Tokenizer Compatibility:** In standard speculative decoding, the small and large models *must* share the exact same tokenizer (e.g., Llama-3-8B-Instruct as a drafter for Llama-3-70B-Instruct).
+2. **Draft Length (K-parameter):** You typically set the model to guess $K$ tokens ahead (usually 4 to 6 tokens). For coding, a higher $K$ (like 6) works exceptionally well on boilerplate code, while a smaller $K$ (like 3 or 4) is better for highly dense math where the drafter is likely to fail often.
+
+### Summary
+The small model is just a **drafting clerk** writing as fast as possible. The large model is the **chief editor** who reviews, corrects, and approves every single character before it is finalized. The final product is purely 70B-tier (or 480B-tier) genius, produced at 8B-tier speeds.
+
+
+
+
+
+---------------------------
+
+
+
+Searched web: "MSI Z790 GAMING PLUS WIFI lane sharing M.2 PCI_E1"
+Ran command: `nvidia-smi -q -d Pci`
+
+If your graphics card is physically restricted to x8 (which is very common with cards like the RTX 4060 or 4060 Ti), then moving it to the top `PCI_E1` slot will allow it to run at its maximum possible speed: **PCIe Gen 4.0 x8**. 
+
+At Gen 4.0 x8, the theoretical maximum bandwidth is **~15.7 GB/s**. While you won't hit the ~32 GB/s of an x16 card, ~15.7 GB/s is still a massive upgrade from the ~6.4 GB/s you were getting in the bottom slot.
+
+If you are not seeing speeds close to 14–15 GB/s, there is no lane sharing issue (your motherboard's M.2 slots do not steal lanes from the top GPU slot). However, you likely have **critical BIOS configurations that are bottlenecking the speed**. 
+
+Here is exactly what you need to change in your MSI motherboard BIOS:
+
+### 1. Enable Re-Size BAR and Above 4G Decoding (Crucial)
+If this is disabled, your CPU is forced to send data to the GPU in tiny 256 MB chunks. This completely ruins data transfer speeds for AI workloads, regardless of how fast your PCIe slot is.
+* **How to fix it:**
+  1. Restart your computer and press **Delete** to enter the MSI BIOS.
+  2. Press **F7** to enter Advanced Mode.
+  3. Go to **Settings** -> **Advanced** -> **PCIe/PCI Subsystem Settings**.
+  4. Find **Above 4G memory/Crypto Currency mining** and set it to **[Enabled]**.
+  5. Find **Re-Size BAR Support** and set it to **[Enabled]**.
+  6. Press **F10** to save and exit.
+
+### 2. Force PCIe Gen 4 Speed
+Sometimes, motherboards mistakenly negotiate a slower speed (like PCIe Gen 3) for x8 cards, which would immediately cut your speed down to ~7.8 GB/s. 
+* **How to fix it:**
+  1. In the MSI BIOS, go to **Settings** -> **Advanced** -> **PCIe/PCI Subsystem Settings**.
+  2. Look for the setting controlling the `PCI_E1` slot generation (often called **CPU PCIe Lanes Configuration** or **PCI_E1 Gen Switch**).
+  3. Change it from `[Auto]` to **[Gen 4]**.
+
+### How to verify it worked on your other computer:
+Once you boot into Linux or Windows on that machine, run this command in your terminal/command prompt:
+```bash
+nvidia-smi -q -d Pci
+```
+Look for these two lines:
+* `Max Link Width` (should say `8x`)
+* `Max Link Gen` (should say `4`)
+* `Current Link Gen` (should say `4` when the GPU is under load; it may drop to `1` when idle to save power).
+
+
+
+---------------------
+---------------------
+---------------------
+
+IMPORTANT THING ABOUT **O_DIRECT**
+
+Yes, you're correct. I can confirm it from the code I already read earlier.
+
+In [lib.rs](file:///c:/laragon/www/Vaayu/vaayu_rust/src/lib.rs#L32), line 32:
+
+```rust
+let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+```
+
+**`O_DIRECT`** is the Linux kernel flag that completely bypasses the page cache. Data goes straight from the NVMe flash chips → kernel DMA → your pinned memory buffer, without ever touching the page cache.
+
+### However — this has a major consequence you should be aware of
+
+**`O_DIRECT` makes my "add more RAM" suggestion completely useless for the Rust path.**
+
+Here's why:
+
+| Path | Page Cache Used? | Effect of Adding RAM |
+|---|---|---|
+| **Rust io_uring** (`O_DIRECT`) | ❌ No | Zero benefit — every token re-reads every layer from physical NVMe |
+| **Python preadv fallback** (`os.O_RDONLY`) | ✅ Yes | More layers stay cached in RAM → faster subsequent tokens |
+
+Remember from the chat log:
+- **Warm cache** (layers in page cache): `io_wait = 0.9s`, total ~31s
+- **Cold cache** (layers evicted): `io_wait = 8.8s`, total ~29.6s
+
+With `O_DIRECT`, you are **permanently locked into the cold-cache scenario**. Even if you had 256 GB of RAM, the Rust path would still read every byte from the physical NVMe every single time because `O_DIRECT` tells the kernel: *"don't cache this, don't even look at the cache."*
+
+### So which path are you actually using?
+
+If the Rust module (`vaayu_rust`) is compiled and importable on your Linux machine, then [safetensor_model_persister.py](file:///c:/laragon/www/Vaayu/vaayu/persist/safetensor_model_persister.py#L41-L47) will use the `O_DIRECT` io_uring path. If it's not compiled, it falls back to the Python preadv path (which *does* benefit from page cache).
+
+**Bottom line:** If you ever add more RAM, you'd actually want to **drop `O_DIRECT`** from the Rust code (just use `O_RDONLY`) so the page cache can do its job. `O_DIRECT` only makes sense when you know the data will never be re-read, but in Vaayu you re-read the same 83 layers on every single token.
