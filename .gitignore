@@ -8,3 +8,4 @@ __pycache__
 airllm-original
 venv
 vaayu_rust/target
+.claude
