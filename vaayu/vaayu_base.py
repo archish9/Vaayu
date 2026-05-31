@@ -1327,6 +1327,7 @@ class VaayuBaseModel(GenerationMixin):
                     cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
 
+    @torch.no_grad()
     def speculative_generate(
         self,
         input_ids: torch.LongTensor,
@@ -1396,13 +1397,17 @@ class VaayuBaseModel(GenerationMixin):
             # Step 6: Sync drafter cache to match accepted length
             self.speculator.rollback_cache(draft_state, num_accepted)
 
-            # Step 7: Extend generated sequence
+            # Step 7: Extend generated sequence (cap at max_new_tokens)
+            remaining = max_new_tokens - tokens_generated
+            if num_accepted > remaining:
+                accepted_ids = accepted_ids[:, :remaining]
+                num_accepted = remaining
             generated = torch.cat([generated, accepted_ids], dim=1)
             tokens_generated += num_accepted
 
             print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
                   f"total_new={tokens_generated}/{max_new_tokens} "
-                  f"accept_rate={num_accepted / (k + 1):.0%}")
+                  f"accept_rate={num_accepted / k:.0%}")
 
             if accepted_ids[0, -1].item() in eos_set:
                 break
