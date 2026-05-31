@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate import init_empty_weights
@@ -50,21 +51,69 @@ except ImportError:
 
 
 
+def _layer_path_exists(model: nn.Module, path: str) -> bool:
+    if not path:
+        return False
+    obj = model
+    for part in path.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _auto_detect_layer_names(model: nn.Module) -> dict:
+    EMBED = {"embed_tokens", "word_embeddings", "wte", "embed", "token_embeddings"}
+    NORM = {"norm", "final_layernorm", "ln_f", "final_norm", "layer_norm", "ln_out"}
+    HEAD = {"lm_head", "output_layer", "embed_out", "output", "head"}
+
+    best_path, best_len = "", 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.ModuleList) and len(mod) > best_len:
+            best_len, best_path = len(mod), name
+
+    if not best_path:
+        return {}
+
+    embed_path = norm_path = lm_head_path = None
+    for name, mod in model.named_modules():
+        if name.startswith(best_path + "."):
+            continue
+        leaf = name.rsplit(".", 1)[-1] if "." in name else name
+        if embed_path is None and leaf in EMBED and isinstance(mod, nn.Embedding):
+            embed_path = name
+        if norm_path is None and leaf in NORM and not isinstance(mod, (nn.Embedding, nn.Linear, nn.ModuleList)):
+            norm_path = name
+        if lm_head_path is None and leaf in HEAD and isinstance(mod, nn.Linear):
+            lm_head_path = name
+
+    return {
+        "embed": embed_path,
+        "layer_prefix": best_path,
+        "norm": norm_path,
+        "lm_head": lm_head_path,
+    }
+
+
 class VaayuBaseModel(GenerationMixin):
 
-    # customize layer names here
+    # customize layer names here; subclasses or layer_names_dict kwarg override
     def set_layer_names_dict(self):
-        self.layer_names_dict = {'embed': 'model.embed_tokens',
-                       'layer_prefix': 'model.layers',
-                       'norm': 'model.norm',
-                       'lm_head': 'lm_head',}
+        self.layer_names_dict = {
+            'embed': 'model.embed_tokens',
+            'layer_prefix': 'model.layers',
+            'norm': 'model.norm',
+            'lm_head': 'lm_head',
+        }
+        self.layer_names_dict.update(self._layer_names_override)
 
 
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
-                 use_torch_compile=False):
+                 use_torch_compile=False,
+                 layer_names_dict=None, tokenizer_class=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -115,7 +164,8 @@ class VaayuBaseModel(GenerationMixin):
         self.hf_token = hf_token
 
         # Save parameters
-
+        self._layer_names_override = layer_names_dict or {}
+        self._tokenizer_class = tokenizer_class
         self.set_layer_names_dict()
 
 
@@ -244,6 +294,12 @@ class VaayuBaseModel(GenerationMixin):
 
         self.init_model()
 
+        # fill in any layer name keys that don't resolve on this model (unknown architectures)
+        _detected = _auto_detect_layer_names(self.model)
+        for key, val in _detected.items():
+            if val and (key not in self.layer_names_dict or not _layer_path_exists(self.model, self.layer_names_dict[key])):
+                self.layer_names_dict[key] = val
+
         # get layer count:
         model_attr = self.model
         for attr_name in self.layer_names_dict["layer_prefix"].split("."):
@@ -301,13 +357,17 @@ class VaayuBaseModel(GenerationMixin):
 
     # a chance to customize tokenizer
     def get_tokenizer(self, hf_token=None):
+        if self._tokenizer_class is not None:
+            tok_kwargs = {"use_fast": False, "trust_remote_code": True}
+            if hf_token is not None:
+                tok_kwargs["token"] = hf_token
+            return self._tokenizer_class.from_pretrained(self.model_local_path, **tok_kwargs)
         if hf_token is not None:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
-        else:
-            return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+        return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
     def get_use_better_transformer(self):
-        return True
+        return False
 
     def init_model(self):
         self.model = None
@@ -851,8 +911,8 @@ class VaayuBaseModel(GenerationMixin):
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
+        all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
+        all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
@@ -946,14 +1006,14 @@ class VaayuBaseModel(GenerationMixin):
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
 
-                        if output_attentions:
+                        if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
                     elif layer_name == self.layer_names_dict['lm_head']:
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
 
-                        if output_attentions:
-                            all_hidden_states[i].append(new_seq)
+                        if output_hidden_states:
+                            all_hidden_states[i].append(seq)
 
                         len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
                         len_s = self.get_sequence_len(seq)

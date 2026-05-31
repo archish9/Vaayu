@@ -52,6 +52,7 @@ _EXECUTOR = None                # Lazily initialized ThreadPoolExecutor (preadv 
 _PINNED_BUFS = [None, None]     # Double buffer (A/B)
 _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
+_BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
 
 
 def _ensure_executor():
@@ -77,8 +78,9 @@ def _load_pinned(file_path: str) -> dict:
     file_size = os.path.getsize(file_path)
 
     # ── 2. Acquire pinned buffer (double-buffer swap) ───────────────
-    buf_idx = _BUF_IDX
-    _BUF_IDX = 1 - _BUF_IDX
+    with _BUF_LOCK:
+        buf_idx = _BUF_IDX
+        _BUF_IDX = 1 - _BUF_IDX
 
     if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
         alloc_size = total_size + (100 * 1024 * 1024) + _ALIGN  # pad +100 MB + O_DIRECT padding
@@ -144,14 +146,14 @@ class SafetensorModelPersister(ModelPersister):
         super().__init__(*args, **kwargs)
 
     def model_persist_exist(self, layer_name, saving_path):
-        safetensor_exists = Path(saving_path / (layer_name + 'safetensors')).exists()
-        done_marker_exists = Path(saving_path / (layer_name + 'safetensors.done')).exists()
+        safetensor_exists = Path(saving_path / (layer_name + '.safetensors')).exists()
+        done_marker_exists = Path(saving_path / (layer_name + '.safetensors.done')).exists()
         return safetensor_exists and done_marker_exists
 
     def persist_model(self, state_dict, layer_name, saving_path):
-        save_file(state_dict, saving_path / (layer_name + 'safetensors'))
-        print(f"saved as: {saving_path / (layer_name + 'safetensors')}")
-        (saving_path / (layer_name + 'safetensors.done')).touch()
+        save_file(state_dict, saving_path / (layer_name + '.safetensors'))
+        print(f"saved as: {saving_path / (layer_name + '.safetensors')}")
+        (saving_path / (layer_name + '.safetensors.done')).touch()
 
     def load_model(self, layer_name, path):
         file_path = str(Path(path) / (layer_name + ".safetensors"))

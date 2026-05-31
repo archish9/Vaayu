@@ -10,13 +10,6 @@ import time
 
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
-from sys import platform
-
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
-
 
 import torch
 import torch.nn as nn
@@ -177,12 +170,13 @@ def compress_layer_state_dict(layer_state_dict, compression=None):
     return compressed_layer_state_dict if compressed_layer_state_dict is not None else layer_state_dict
 
 def remove_real_and_linked_file(to_delete):
-    if (os.path.realpath(to_delete) != to_delete):
+    targetpath = None
+    if os.path.realpath(to_delete) != to_delete:
         targetpath = os.path.realpath(to_delete)
 
     os.remove(to_delete)
-    if (targetpath):
-         os.remove(targetpath)
+    if targetpath:
+        os.remove(targetpath)
 
 
 
@@ -240,6 +234,11 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     # Safely parse layer indices regardless of where the prefix appears in the key
     n_layers = len(set([int(k.split(prefix + '.')[1].split('.')[0]) for k in index.keys() if prefix + '.' in k]))
+    if n_layers == 0:
+        raise ValueError(
+            f"No decoder layers found under prefix '{prefix}' in model index. "
+            f"Check layer_names['layer_prefix'] matches the model's actual weight key structure."
+        )
 
     if layer_names is None:
         layers = ['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)] + ['model.norm.', 'lm_head.']

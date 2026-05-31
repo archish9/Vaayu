@@ -1,16 +1,7 @@
-﻿import importlib
 import pathlib
 import subprocess
 from transformers import AutoConfig
-from sys import platform
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
-
-if is_on_mac_os:
-    from vaayu import VaayuLlamaMlx
 
 def _check_nvme_scheduler(model_path: str) -> None:
     if not pathlib.Path(model_path).exists():
@@ -38,8 +29,8 @@ def _check_nvme_scheduler(model_path: str) -> None:
             print(f"[Vaayu] {nvme} I/O scheduler: optimized (none)")
 
         apst_candidates = [
-            pathlib.Path("/sys/module/nvme_core/parameters/default_ps_max_latency_us"),  # kernel 6.x
-            pathlib.Path(f"/sys/class/nvme/{nvme_char}/power/ps_max_latency_us"),        # kernel 4.x/5.x
+            pathlib.Path("/sys/module/nvme_core/parameters/default_ps_max_latency_us"),
+            pathlib.Path(f"/sys/class/nvme/{nvme_char}/power/ps_max_latency_us"),
         ]
         apst_path = next((p for p in apst_candidates if p.exists()), None)
         if apst_path:
@@ -61,49 +52,53 @@ class AutoModel:
             "AutoModel is designed to be instantiated "
             "using the `AutoModel.from_pretrained(pretrained_model_name_or_path)` method."
         )
+
     @classmethod
     def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        if 'hf_token' in kwargs:
-            print(f"using hf_token")
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, token=kwargs['hf_token'])
-        else:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+        """Return (model_class, extra_kwargs) for the given model path/repo."""
+        from .vaayu_base import VaayuBaseModel
+        from .vaayu import VaayuLlama2
+        from .vaayu_chatglm import VaayuChatGLM
+        from .vaayu_qwen import VaayuQWen
+        from .tokenization_baichuan import BaichuanTokenizer
 
-        if "Qwen2ForCausalLM" in config.architectures[0]:
-            return "vaayu", "VaayuQWen2"
-        elif "Qwen2_5ForCausalLM" in config.architectures[0]:
-            return "vaayu", "VaayuQWen2"
-        elif "Qwen3ForCausalLM" in config.architectures[0]:
-            return "vaayu", "VaayuQWen2"
-        elif "QWen" in config.architectures[0]:
-            return "vaayu", "VaayuQWen"
-        elif "Baichuan" in config.architectures[0]:
-            return "vaayu", "VaayuBaichuan"
-        elif "ChatGLM" in config.architectures[0]:
-            return "vaayu", "VaayuChatGLM"
-        elif "InternLM" in config.architectures[0]:
-            return "vaayu", "VaayuInternLM"
-        elif "Mistral" in config.architectures[0]:
-            return "vaayu", "VaayuMistral"
-        elif "Mixtral" in config.architectures[0]:
-            return "vaayu", "VaayuMixtral"
-        elif "Gemma" in config.architectures[0]:
-            return "vaayu", "VaayuLlama2"
-        elif "Llama" in config.architectures[0]:
-            return "vaayu", "VaayuLlama2"
+        if 'hf_token' in kwargs:
+            config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path, trust_remote_code=True, token=kwargs['hf_token']
+            )
         else:
-            print(f"unknown artichitecture: {config.architectures[0]}, try to use Llama2...")
-            return "vaayu", "VaayuLlama2"
+            config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path, trust_remote_code=True
+            )
+
+        architectures = getattr(config, "architectures", None) or []
+        if not architectures:
+            print(f"no architectures field in config for {pretrained_model_name_or_path}, using VaayuBaseModel with auto-detect...")
+            return VaayuBaseModel, {}
+        arch = architectures[0]
+
+        if "Qwen2ForCausalLM" in arch or "Qwen2_5ForCausalLM" in arch or "Qwen3ForCausalLM" in arch:
+            return VaayuBaseModel, {}
+        elif "QWen" in arch:
+            return VaayuQWen, {}
+        elif "Baichuan" in arch:
+            return VaayuBaseModel, {"tokenizer_class": BaichuanTokenizer}
+        elif "ChatGLM" in arch:
+            return VaayuChatGLM, {}
+        elif "InternLM" in arch or "Mistral" in arch or "Mixtral" in arch:
+            return VaayuBaseModel, {}
+        elif "Gemma" in arch or "Llama" in arch:
+            return VaayuLlama2, {}
+        else:
+            print(f"unknown architecture: {arch}, using VaayuBaseModel with auto-detect...")
+            return VaayuBaseModel, {}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        if not is_on_mac_os:
-            _check_nvme_scheduler(pretrained_model_name_or_path)
+        _check_nvme_scheduler(pretrained_model_name_or_path)
 
-        if is_on_mac_os:
-            return VaayuLlamaMlx(pretrained_model_name_or_path, *inputs, ** kwargs)
-
-        module, cls = AutoModel.get_module_class(pretrained_model_name_or_path, *inputs, **kwargs)
-        module = importlib.import_module(module)
-        class_ = getattr(module, cls)
-        return class_(pretrained_model_name_or_path, *inputs, ** kwargs)
+        model_cls, extra_kwargs = AutoModel.get_module_class(
+            pretrained_model_name_or_path, *inputs, **kwargs
+        )
+        # user-supplied kwargs win over architecture defaults
+        return model_cls(pretrained_model_name_or_path, *inputs, **{**extra_kwargs, **kwargs})

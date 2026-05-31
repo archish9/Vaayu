@@ -29,6 +29,7 @@ class VaayuQWen(VaayuBaseModel):
                        'layer_prefix': 'transformer.h',
                        'norm': 'transformer.ln_f',
                        'lm_head': 'lm_head',}
+        self.layer_names_dict.update(self._layer_names_override)
 
     def get_pos_emb_args(self, len_p, len_s):
         # Rotary positional embeddings
