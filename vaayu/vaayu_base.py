@@ -966,6 +966,53 @@ class VaayuBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def _chunked_prefill(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ):
+        chunk_size = self.prefill_chunk_size
+        total_len  = input_ids.shape[1]
+        n_chunks   = (total_len + chunk_size - 1) // chunk_size
+        print(f"[Vaayu] Chunked prefill: {total_len} tokens → {n_chunks} chunks of {chunk_size}")
+
+        past_key_values = None
+        output = None
+
+        for start in range(0, total_len, chunk_size):
+            end        = min(start + chunk_size, total_len)
+            chunk_ids  = input_ids[:, start:end]
+            chunk_mask = attention_mask[:, :end] if attention_mask is not None else None
+
+            output = self.forward(
+                input_ids=chunk_ids,
+                attention_mask=chunk_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
+            past_key_values = output.past_key_values
+
+            if torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[Vaayu] Chunk [{start}:{end}] done — peak VRAM: {peak:.2f} GB")
+                torch.cuda.reset_peak_memory_stats()
+
+        if not return_dict:
+            return tuple(v for v in [
+                output.logits,
+                output.past_key_values if use_cache else None,
+                output.hidden_states,
+                output.attentions,
+            ] if v is not None)
+        return output
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
