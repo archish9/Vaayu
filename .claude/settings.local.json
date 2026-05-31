@@ -17,7 +17,20 @@
       "Bash(curl -s \"https://api.github.com/repos/turboderp-org/exllamav3/contents/exllamav3/conversion/standard_cal_data\")",
       "Bash(grep -E \"\\\\.py$\")",
       "Bash([ -f \"/Users/archish/Documents/ai-ml/Vaayu-veriants/Vaayu/vaayu/$file\" ])",
-      "Bash(open *)"
+      "Bash(open *)",
+      "Bash(pip show *)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -c ' *)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/pip show *)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -c 'import torch; print\\(torch.__version__\\); print\\(hasattr\\(torch, '\\\\''float8_e4m3fn'\\\\''\\)\\)')",
+      "Bash(venv/bin/pytest tests/test_fp8_cache.py -v)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/pytest tests/test_fp8_cache.py -v)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -m pytest --version)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -m pip install pytest)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -m pytest tests/test_fp8_cache.py -v)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python -m pytest tests/test_fp8_cache.py::test_update_stores_fp8 -v --tb=short)",
+      "Bash(/home/a/code/ai-ml/Vaayu/venv/bin/python *)",
+      "Bash(venv/bin/pytest tests/test_fp8_cache.py tests/test_vaayu_base_kwargs.py tests/test_auto_model_dispatch.py tests/test_layer_detection.py -v)",
+      "Bash(venv/bin/pytest tests/ -v)"
     ]
   }
 }
