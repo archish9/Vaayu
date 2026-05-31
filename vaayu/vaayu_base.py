@@ -162,7 +162,8 @@ class VaayuBaseModel(GenerationMixin):
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
-                 layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512):
+                 layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
+                 eagle_head_path=None, drafter_model_path=None, draft_tokens=5):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -395,8 +396,24 @@ class VaayuBaseModel(GenerationMixin):
         # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
         self.set_layers_from_layer_names()
 
+        # Speculative decoding — must come after set_layers_from_layer_names()
+        # so self.layers[-1] (lm_head) is resolved.
+        self._last_hidden_state = None
+        self._lm_head_layer = self.layers[-1]
+        self.draft_tokens = draft_tokens
+
         if device.startswith("cuda"):
             self._init_pinned_layers()
+
+        self.speculator = None
+        if eagle_head_path or drafter_model_path:
+            from .speculative import build_speculator
+            self.speculator = build_speculator(
+                eagle_head_path=eagle_head_path,
+                drafter_model_path=drafter_model_path,
+                base_model=self,
+                device=device,
+            )
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -1200,6 +1217,8 @@ class VaayuBaseModel(GenerationMixin):
                     elif layer_name == self.layer_names_dict['norm']:
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
+                        # Store post-norm hidden state for EAGLE drafter (last token position)
+                        self._last_hidden_state = batch[j][:, -1:, :].detach()
 
                         if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
@@ -1291,3 +1310,101 @@ class VaayuBaseModel(GenerationMixin):
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
             attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )
+
+    def _trim_kv_cache(self, cache, target_seq_len: int) -> None:
+        """Trim KV cache tensors in-place to target_seq_len tokens."""
+        if cache is None:
+            return
+        if isinstance(cache, FP8DynamicCache):
+            for i in range(len(cache.key_cache)):
+                cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
+                cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+                cache._key_scales[i] = cache._key_scales[i][:, :, :target_seq_len, :]
+                cache._value_scales[i] = cache._value_scales[i][:, :, :target_seq_len, :]
+        elif hasattr(cache, 'key_cache'):
+            for i in range(len(cache.key_cache)):
+                if len(cache.key_cache[i].shape) >= 3:
+                    cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
+                    cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+
+    def speculative_generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 20,
+    ) -> torch.LongTensor:
+        """
+        Custom generation loop using speculative decoding.
+
+        Replaces model.generate() when self.speculator is set.
+        The drafter guesses DRAFT_TOKENS candidates; Vaayu verifies all in one
+        forward pass and accepts the longest correct prefix.
+
+        Returns:
+            generated: (1, prompt_len + new_tokens) tensor of all token IDs
+        """
+        assert self.speculator is not None, "speculative_generate called with no speculator"
+
+        # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
+        prefill_out = self.forward(
+            input_ids=input_ids,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = prefill_out.past_key_values
+        # Seed the first new token from prefill logits
+        first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
+        generated = torch.cat([input_ids, first_token], dim=1)
+        tokens_generated = 1
+
+        eos_ids = self.config.eos_token_id
+        if isinstance(eos_ids, int):
+            eos_ids = [eos_ids]
+        eos_set = set(eos_ids) if eos_ids else set()
+
+        if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+            return generated
+
+        while tokens_generated < max_new_tokens:
+            # Step 2: Draft K tokens
+            draft_ids, draft_state = self.speculator.draft(
+                generated, past_key_values, num_tokens=self.draft_tokens
+            )
+            k = draft_ids.shape[1]
+
+            # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
+            # past_key_values has prompt+accepted tokens; verify adds k+1 more
+            past_len_before = past_key_values.get_seq_length()
+            verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
+            verify_out = self.forward(
+                input_ids=verify_input,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
+            past_key_values = verify_out.past_key_values
+
+            # Step 4: Accept/reject longest correct prefix
+            accepted_ids, num_accepted = self.speculator.verify_and_accept(
+                generated, draft_ids, verifier_logits, draft_state
+            )
+
+            # Step 5: Trim verifier KV back to past_len + num_accepted
+            # (verify pass grew cache by k+1; we only keep num_accepted new positions)
+            self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
+
+            # Step 6: Sync drafter cache to match accepted length
+            self.speculator.rollback_cache(draft_state, num_accepted)
+
+            # Step 7: Extend generated sequence
+            generated = torch.cat([generated, accepted_ids], dim=1)
+            tokens_generated += num_accepted
+
+            print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
+                  f"total_new={tokens_generated}/{max_new_tokens} "
+                  f"accept_rate={num_accepted / (k + 1):.0%}")
+
+            if accepted_ids[0, -1].item() in eos_set:
+                break
+
+        return generated
