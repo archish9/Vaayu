@@ -1,3 +1,48 @@
+# Speculative Decoding — As Built (Phase H)
+
+> Implementation complete. For the original blueprint, see `plans/schedule_plan_h_speculative_decoding_part1.md` and `part2.md`.
+
+## Status: Implemented
+
+See `vaayu/speculative/` for the full source.
+
+## How to Enable
+
+In `test_quick.py`, set one or both:
+
+```python
+# Option A: EAGLE-3 head (near-zero VRAM, highest quality)
+EAGLE_HEAD_PATH = "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
+
+# Option B: Standard HF drafter (any small model)
+DRAFTER_MODEL_PATH = "/path/to/Qwen2.5-0.5B"
+
+DRAFT_TOKENS = 5
+```
+
+When both are set, EAGLE takes priority. Falls back to standard drafter if EAGLE checkpoint has no EAGLE markers or fails to load.
+
+## Monitoring
+
+The generation loop logs one line per speculative step:
+```
+[Vaayu-Spec] drafted=5 accepted=4 total_new=4/20 accept_rate=80%
+```
+
+## Acceptance Rate Tuning
+
+| accept_rate | Action |
+|-------------|--------|
+| > 70% | Raise `DRAFT_TOKENS` to 7–10 |
+| 40–70% | Current setting is fine |
+| < 40% | Lower `DRAFT_TOKENS` to 3, or try a better-matched drafter |
+
+## Architecture
+
+See `documentation/architecture.md` Section 5 for the complete design.
+
+---
+
 # Speculative Decoding & MoE Expert Routing Roadmap
 
 Generating code autoregressively requires streaming the entire model weight footprint from disk *for every single token generated*. At physical NVMe ceilings (~7.4 GB/s), standard generation loops are capped by hardware limits.

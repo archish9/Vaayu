@@ -168,3 +168,67 @@ With 28 layers pinned, each token saves 28 × ~380 MB = ~10.6 GB of NVMe reads, 
 [Vaayu-Pin] budget exhausted at model.layers.28 (11.64/11.64 GB)
 [Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
 ```
+
+## 5. Speculative Decoding
+
+### Problem
+
+Standard generation streams all 80 layers from NVMe once per token (~5 s/token). Even with EXL3 quantization and asymmetric pinning, each token requires a full model pass.
+
+### Solution: Drafter-Verifier Loop
+
+```
+Standard:     [80-layer pass] → 1 token → [80-layer pass] → 1 token → …
+Speculative:  draft 5 tokens (< 1 ms) → [80-layer pass, verifies all 5] → accept 3–5 → …
+```
+
+Vaayu acts as the **Verifier**. A resident drafter generates K candidates; the verifier processes them all in one pass and accepts the longest correct prefix.
+
+### Package: `vaayu/speculative/`
+
+| File | Responsibility |
+|------|----------------|
+| `base.py` | `SpeculativeDecoder` ABC: `draft()`, `verify_and_accept()`, `rollback_cache()`, `vram_usage_bytes()` |
+| `detection.py` | `detect_speculative_type(dir)` → `'eagle'`/`'medusa'`/`'none'` |
+| `eagle.py` | `EAGLEDecoder`: ExLlamaV3 bridge first, manual weight loader fallback |
+| `standard.py` | `StandardDrafterDecoder`: any `AutoModelForCausalLM` resident in VRAM |
+| `__init__.py` | `build_speculator()` factory: EAGLE > StandardDrafter > None |
+
+### Key VaayuBaseModel Changes
+
+**Hidden state capture:** After `run_norm()` in `forward()`, `self._last_hidden_state = batch[j][:, -1:, :].detach()` stores the post-norm hidden state of the last token. The EAGLE decoder reads this during drafting.
+
+**`_lm_head_layer`:** Resolved after `set_layers_from_layer_names()` as `self.layers[-1]`. EAGLE calls `run_lm_head(self._lm_head_layer, next_hidden)` to produce token logits.
+
+**`_trim_kv_cache(cache, target_len)`:** Trims both `DynamicCache` and `FP8DynamicCache` in-place after each verify pass. KV grows by `k+1` during verify; we trim back to `past_len + num_accepted`.
+
+**`speculative_generate()` flow:**
+1. Prefill: `forward(input_ids)` → `past_key_values`, first token
+2. Loop until `max_new_tokens` or EOS:
+   - Draft K tokens via `speculator.draft()`
+   - Record `past_len_before`
+   - Verify: `forward([last_token, d_0, …, d_{K-1}])` with past KV → logits shape `(1, K+1, vocab)`
+   - Accept: `speculator.verify_and_accept()` → `accepted_ids`, `num_accepted`
+   - Trim KV to `past_len_before + num_accepted`
+   - Rollback drafter: `speculator.rollback_cache()`
+   - Append `accepted_ids` to `generated`
+
+### VRAM Budget (16 GB GPU, post Plans E+F)
+
+| Component | VRAM |
+|-----------|------|
+| Pinned transformer layers | ~12.0 GB |
+| FP8 KV cache | ~0.6 GB |
+| CUDA context | ~0.8 GB |
+| Streaming buffer | ~0.5 GB |
+| **Free for drafter** | **~2.1 GB** |
+| EAGLE-3 head | 0.1–0.2 GB ✅ |
+| Qwen2.5-0.5B | ~0.3 GB ✅ |
+| Qwen2.5-1.5B | ~1.0 GB ✅ |
+| 3B fp16 | ~6 GB ❌ |
+
+### Tuning
+
+`DRAFT_TOKENS` (default 5) trades off NVMe waste on rejection vs throughput on acceptance:
+- `accept_rate` > 70%: raise to 7–10
+- `accept_rate` < 40%: drop to 3 or switch to better-matched drafter

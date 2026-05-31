@@ -24,6 +24,7 @@ Through months of hardware-software co-design, we have systematically targeted a
 * **🧹 CPU Cleanse (Saves 1.4s/token)**: We stripped defensive garbage collection sweeps (`gc.collect()`) and configured CUDA Host-to-Device memory copies to run asynchronously (`non_blocking=True`), completely flattening CPU latency spikes.
 * **🔥 FP8 KV Cache Quantization (~50% VRAM savings)**: The KV cache accumulates at full BF16 precision during generation—2.68 GB for Llama-70B at 8k context, silently eating VRAM that should go to layer pinning and speculative decoding. We implemented `FP8DynamicCache`, a drop-in replacement storing K/V tensors in `torch.float8_e4m3fn` with per-head per-token scales. Pure PyTorch, zero new dependencies. KV footprint drops from **2.68 GB → 1.38 GB** at 8k context, freeing ~1.3 GB for the phases ahead.
 * **📌 Asymmetric Layer Pinning (15–25% Faster Prefill)**: Previously only 3 shared layers (embed, norm, lm_head, ~1 GB) were pre-loaded into VRAM, leaving ~11 GB of available budget unused. We rewrote `_init_pinned_layers()` with topology-aware two-phase pinning: Phase 1 pins shared layers; Phase 2 fills the remaining VRAM budget with the first N transformer layers in order, using `break` on budget exhaustion (homogeneous layer sizes mean if one doesn't fit, none will). On a 16 GB GPU with FP8 KV cache, this permanently eliminates **~35% of all NVMe reads per token**—delivering faster prefill on long prompts and more stable streaming throughput. Pass `max_pinned_layers=-1` to auto-fill, or `max_pinned_layers=N` to pin exactly N transformer layers.
+* **🔮 Phase H: Speculative Decoding (2–4× Tokens/Second)**: Standard generation streams 80 layers once per token (~5 s/token). Speculative Decoding inserts a **resident drafter** (EAGLE-3 self-speculation ~0.1 GB VRAM, or any small HuggingFace model like Qwen2.5-0.5B) that guesses 5 tokens instantly, then Vaayu verifies all 5 in **one forward pass** and accepts the correct prefix. A 60–80% acceptance rate yields **2–4× effective throughput**. Configure via `EAGLE_HEAD_PATH` or `DRAFTER_MODEL_PATH` in `test_quick.py`.
 
 ---
 
@@ -80,8 +81,14 @@ The remaining phases follow a strict dependency chain. Each one unlocks the next
 ### Phase G: Chunked Prefill
 Large code file ingestion (4,000+ tokens) causes VRAM spikes that OOM. Processing prompts in 512-token chunks flattens the spike, making long-context use reliable. Depends on E+F being stable.
 
-### Phase H: Speculative Decoding (The Speed Multiplier)
-Standard generation streams the full 38 GB model once per token. Speculative Decoding turns Vaayu into a **Verifier**—a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or a small resident model) guesses N tokens, Vaayu verifies all N in **one forward pass**. Target: **2–4× effective tokens/second**. Requires VRAM freed by Phase E.
+### ✅ Phase H: Speculative Decoding
+Implemented. Vaayu acts as the **Verifier** — a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or any small HuggingFace model) guesses N tokens; Vaayu verifies all N in **one forward pass**. ExLlamaV3 native EAGLE bridge tried first; manual weight loader fallback. Configure in `test_quick.py`:
+
+```python
+EAGLE_HEAD_PATH    = "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
+DRAFTER_MODEL_PATH = "/path/to/Qwen2.5-0.5B"   # fallback or standalone
+DRAFT_TOKENS       = 5
+```
 
 ### Phase D: Rust `io_uring` Polish (Final)
 Update `vaayu_rust` with `IORING_REGISTER_BUFFERS` and fixed file descriptors for the final 10–15% NVMe throughput squeeze. Done last because access patterns finalize only after EXL3 + speculative decoding are locked in.
