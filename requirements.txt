@@ -19,7 +19,7 @@ bitsandbytes>=0.43.0
 # If compile fails due to memory: MAX_JOBS=4 pip install exllamav3
 # ninja is required for fast C++ extension compilation
 ninja
-exllamav3>=0.0.18  # uncomment when using EXL3 quantized models
+exllamav3>=0.0.18
 
 # Optional attention backends (improves throughput on supported GPUs)
 # flash-attn>=2.7.4   # install separately: pip install flash-attn --no-build-isolation

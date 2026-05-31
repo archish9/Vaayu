@@ -22,6 +22,7 @@ Through months of hardware-software co-design, we have systematically targeted a
 * **📦 The Double-Buffering Victory (Saves 41.5s/token)**: Allocating pinned memory host buffers dynamically inside the layer loop forced the OS kernel to lock contiguous pages on every call, costing ~0.5s per layer. We replaced this with **two static global pinned memory double-buffers** allocated once at startup, reducing dynamic allocation overhead to **0.0 seconds**.
 * **🧠 The KV Cache Resurrection**: We tracked down and squashed a critical legacy cache bug where the engine was silently recomputing the entire prompt history on every step. By patching cache subscripts, subsequent tokens only evaluate the single new token, saving massive computation time.
 * **🧹 CPU Cleanse (Saves 1.4s/token)**: We stripped defensive garbage collection sweeps (`gc.collect()`) and configured CUDA Host-to-Device memory copies to run asynchronously (`non_blocking=True`), completely flattening CPU latency spikes.
+* **🔥 FP8 KV Cache Quantization (~50% VRAM savings)**: The KV cache accumulates at full BF16 precision during generation—2.68 GB for Llama-70B at 8k context, silently eating VRAM that should go to layer pinning and speculative decoding. We implemented `FP8DynamicCache`, a drop-in replacement storing K/V tensors in `torch.float8_e4m3fn` with per-head per-token scales. Pure PyTorch, zero new dependencies. KV footprint drops from **2.68 GB → 1.38 GB** at 8k context, freeing ~1.3 GB for the phases ahead.
 
 ---
 
@@ -69,16 +70,20 @@ sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
 
 ## 🗺️ Next Frontiers: Roadmaps to Interactive Speeds
 
-### Phase 2: Speculative Decoding (The Verifier Pivot)
-Standard generation reads 132 GB from disk 10 times to write 10 words. Speculative Decoding turns Vaayu into a **Verifier**. A tiny coding model (like a 1.5B parameter model) is loaded permanently in VRAM, instantly guessing 10 tokens. Vaayu streams its layers **exactly once** to verify all 10 tokens simultaneously in a single forward pass—multiplying effective generation speeds by **5x to 10x**!
-* Read the roadmap: [Speculative Decoding & MoE Roadmap](documentation/speculative_decoding_and_moe.md)
+The remaining phases follow a strict dependency chain. Each one unlocks the next.
 
-### Phase 3: Expert-Aware MoE Routing (~4.3 Tokens/Sec)
-By choosing a Mixture-of-Experts (MoE) model like **Qwen3-Coder-480B-A35B**, we only need to activate **35 Billion parameters** per token. By calculating the MoE routing paths first, Vaayu-MoE will perform targeted `io_uring` reads on **only the active expert byte-offsets** from disk. 
-* Total data to stream drops to **~8 GB**.
-* Total NVMe stream time falls to **~1.1 seconds**.
-* Combined with speculative decoding, this delivers a jaw-dropping **~4.3 Tokens/Second** on a single consumer GPU!
-* Read the roadmap: [Speculative Decoding & MoE Roadmap](documentation/speculative_decoding_and_moe.md)
+### ✅ Phase E + F: VRAM Reclamation (In Progress)
+**E — FP8 KV Cache** ✅ done: ~1.3 GB freed at 8k context (see Engineering Victories above).  
+**F — Asymmetric Layer Pinning**: Pin the first 28 transformer layers permanently in VRAM (not just embed/norm/lm_head), delivering **15–25% faster prefill** with zero extra disk I/O for those layers.
+
+### Phase G: Chunked Prefill
+Large code file ingestion (4,000+ tokens) causes VRAM spikes that OOM. Processing prompts in 512-token chunks flattens the spike, making long-context use reliable. Depends on E+F being stable.
+
+### Phase H: Speculative Decoding (The Speed Multiplier)
+Standard generation streams the full 38 GB model once per token. Speculative Decoding turns Vaayu into a **Verifier**—a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or a small resident model) guesses N tokens, Vaayu verifies all N in **one forward pass**. Target: **2–4× effective tokens/second**. Requires VRAM freed by Phase E.
+
+### Phase D: Rust `io_uring` Polish (Final)
+Update `vaayu_rust` with `IORING_REGISTER_BUFFERS` and fixed file descriptors for the final 10–15% NVMe throughput squeeze. Done last because access patterns finalize only after EXL3 + speculative decoding are locked in.
 
 ---
 
@@ -99,27 +104,35 @@ We have structured the entire architectural knowledge, installation guides, and 
 ## 🏃 Quickstart Inference Test
 
 Verify your installation by running our CLI text generation entrypoint:
-```python
-# Run the quick inference test
-python test_quick.py
+```bash
+# FP8 KV cache (default for EXL3 models, ~50% VRAM savings)
+python test_quick.py --kv_cache_mode auto
+
+# Force FP16 KV cache (baseline, full precision)
+python test_quick.py --kv_cache_mode fp16
 ```
 
-*Example script:*
+*Example API usage:*
 ```python
 from vaayu import AutoModel
 
 # Vaayu automatically peeks headers to detect the strategy (Standard vs EXL3)
-model = AutoModel.from_pretrained("/path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw")
+# kv_cache_mode="auto" selects FP8 for EXL3 models, FP16 otherwise
+model = AutoModel.from_pretrained(
+    "/path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
+    kv_cache_mode="auto",  # or "fp8" / "fp16"
+)
 
 input_tokens = model.tokenizer(
-    ["What is the capital of India?"],
+    "What is the capital of India?",
     return_tensors="pt",
     padding=False
 )
 
 generation_output = model.generate(
     input_tokens['input_ids'].cuda(),
-    max_new_tokens=20
+    max_new_tokens=20,
+    use_cache=True,
 )
 
 print(model.tokenizer.decode(generation_output.sequences[0]))
