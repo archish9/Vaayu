@@ -27,14 +27,14 @@ import torch
 
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = 5       # 0=shared only, -1=auto fill VRAM budget, N=first N layers
+MAX_PINNED_LAYERS = -1       # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 3        # keep small for chunked-prefill test; bump for real use
 MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ── Speculative Decoding (Phase H) ───────────────────────────────────────────
 EAGLE_HEAD_PATH    = None   # e.g. "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
-DRAFTER_MODEL_PATH = None   # Disabled: Qwen 1.5B has 20% accept rate with Llama 70B (no speedup)
+DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"   # Disabled: Qwen 1.5B has 20% accept rate with Llama 70B (no speedup)
 DRAFT_TOKENS       = 5      # candidate tokens per speculative iteration
 # ─────────────────────────────────────────────────────────────────────────────
 
