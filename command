@@ -14,3 +14,6 @@
     --resume > /home/a/code/ai-ml/Vaayu/quantize.log 2>&1 &
 
 claude --resume 23c6b129-7a65-4cbe-a5d3-f1c8ba24bcab
+
+
+nvidia-smi -q | grep -A 10 "Link Width"

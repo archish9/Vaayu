@@ -1265,7 +1265,7 @@ class VaayuBaseModel(GenerationMixin):
                         self.model, layer, moved_layers, self.hf_quantizer
                     )
 
-                if i % 20 == 19:
+                if i % 40 == 39:
                     clean_memory()
 
         logits = torch.cat(batch, 0)

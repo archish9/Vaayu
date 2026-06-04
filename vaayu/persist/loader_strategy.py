@@ -182,14 +182,18 @@ class ExLlamaV3Linear(nn.Module):
         try:
             x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
             x_in = x_in.contiguous()
-            
+
             shape = x_in.shape
             x_flat = x_in.view(-1, self.in_features)
-            rows = x_flat.shape[0]
-            
-            if rows == 1:
-                out = self.bc.run_alloc(x_in, self.out_features, False)
-            else:
+
+            # Try batched call first (single CUDA kernel for all rows).
+            # Falls back to row-by-row only if the C++ backend rejects the batch.
+            try:
+                out = self.bc.run_alloc(x_flat, self.out_features, False)
+                out = out.view(*shape[:-1], self.out_features)
+            except Exception:
+                # Fallback: row-by-row (slow but safe for all matrix configs)
+                rows = x_flat.shape[0]
                 out_flat = torch.empty((rows, self.out_features), dtype=torch.float16, device=x.device)
                 for i in range(rows):
                     out_flat[i:i+1] = self.bc.run_alloc(x_flat[i:i+1].contiguous(), self.out_features, False)
@@ -197,7 +201,7 @@ class ExLlamaV3Linear(nn.Module):
 
             if out.dtype != x.dtype:
                 out = out.to(x.dtype)
-                
+
             return out
         except ImportError:
             raise RuntimeError("exllamav3 not installed. Cannot run ExLlamaV3Linear.forward().")
@@ -426,8 +430,6 @@ class EXL3LoaderStrategy(LoaderStrategy):
                     pass
 
         layer_module.to("meta")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
