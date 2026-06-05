@@ -55,7 +55,6 @@ _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
 _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
-_BUFS_REGISTERED  = False   # True after register_buffers() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
 
 
@@ -90,7 +89,7 @@ def _register_iouring_files(model_dir: str) -> bool:
 
 
 def _load_pinned(file_path: str) -> dict:
-    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX, _BUFS_REGISTERED
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
 
     # ── 1. Parse safetensors header ─────────────────────────────────
     with open(file_path, 'rb') as f:
@@ -124,10 +123,8 @@ def _load_pinned(file_path: str) -> dict:
                     _PINNED_BUFS[0].data_ptr(), _PINNED_SIZES[0],
                     _PINNED_BUFS[1].data_ptr(), _PINNED_SIZES[1],
                 )
-                _BUFS_REGISTERED = True
             except Exception as e:
                 print(f"[VAAYU-IO] reregister_buffers failed: {e}")
-                _BUFS_REGISTERED = False
 
     buf = _PINNED_BUFS[buf_idx]
 
