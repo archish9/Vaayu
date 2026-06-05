@@ -54,6 +54,10 @@ _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
 _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
 
+_RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
+_BUFS_REGISTERED  = False   # True after register_buffers() succeeds
+_FILES_REGISTERED = False   # True after register_files() succeeds
+
 
 def _ensure_executor():
     global _EXECUTOR
@@ -61,8 +65,32 @@ def _ensure_executor():
         _EXECUTOR = ThreadPoolExecutor(max_workers=_NUM_IO_THREADS)
 
 
+def _init_iouring_ring(queue_depth: int = 32) -> bool:
+    try:
+        vaayu_rust.init_ring(queue_depth)
+        print(f"[VAAYU-IO] persistent ring initialized  qd={queue_depth}")
+        return True
+    except Exception as e:
+        print(f"[VAAYU-IO] init_ring failed: {e} — per-call ring fallback active")
+        return False
+
+
+def _register_iouring_files(model_dir: str) -> bool:
+    try:
+        paths = [str(p) for p in Path(model_dir).glob("*.safetensors")]
+        if not paths:
+            print(f"[VAAYU-IO] no .safetensors files in {model_dir} — file registration skipped")
+            return False
+        vaayu_rust.register_files(paths)
+        print(f"[VAAYU-IO] {len(paths)} files registered with io_uring")
+        return True
+    except Exception as e:
+        print(f"[VAAYU-IO] register_files failed: {e} — fd registration disabled")
+        return False
+
+
 def _load_pinned(file_path: str) -> dict:
-    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX, _BUFS_REGISTERED
 
     # ── 1. Parse safetensors header ─────────────────────────────────
     with open(file_path, 'rb') as f:
@@ -88,6 +116,18 @@ def _load_pinned(file_path: str) -> dict:
                                             pin_memory=True)
         _PINNED_SIZES[buf_idx] = alloc_size
         print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB")
+        # Re-register buffers with io_uring after alloc (only when both buffers are allocated)
+        if (_USE_IOURING and _RING_INITIALIZED
+                and _PINNED_BUFS[0] is not None and _PINNED_BUFS[1] is not None):
+            try:
+                vaayu_rust.reregister_buffers(
+                    _PINNED_BUFS[0].data_ptr(), _PINNED_SIZES[0],
+                    _PINNED_BUFS[1].data_ptr(), _PINNED_SIZES[1],
+                )
+                _BUFS_REGISTERED = True
+            except Exception as e:
+                print(f"[VAAYU-IO] reregister_buffers failed: {e}")
+                _BUFS_REGISTERED = False
 
     buf = _PINNED_BUFS[buf_idx]
 
@@ -156,6 +196,18 @@ class SafetensorModelPersister(ModelPersister):
         (saving_path / (layer_name + '.safetensors.done')).touch()
 
     def load_model(self, layer_name, path):
+        global _RING_INITIALIZED, _FILES_REGISTERED
+        if _USE_IOURING and not _RING_INITIALIZED:
+            try:
+                _RING_INITIALIZED = _init_iouring_ring(32)
+            except Exception as e:
+                print(f"[VAAYU-IO] init_ring failed: {e} — falling back to per-call ring")
+        if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
+            try:
+                _FILES_REGISTERED = _register_iouring_files(str(path))
+            except Exception as e:
+                print(f"[VAAYU-IO] register_files failed: {e} — fd registration disabled")
+
         file_path = str(Path(path) / (layer_name + ".safetensors"))
 
         if _USE_PINNED:
