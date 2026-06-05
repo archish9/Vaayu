@@ -21,6 +21,23 @@ def test_init_ring():
     vaayu_rust.init_ring(32)
     print("init_ring: ok")
 
+def test_register_buffers():
+    import torch
+    vaayu_rust.init_ring(32)
+    buf0 = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+    buf1 = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+    vaayu_rust.register_buffers(
+        buf0.data_ptr(), buf0.nbytes,
+        buf1.data_ptr(), buf1.nbytes,
+    )
+    # reregister after simulated realloc
+    buf0b = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+    vaayu_rust.reregister_buffers(
+        buf0b.data_ptr(), buf0b.nbytes,
+        buf1.data_ptr(), buf1.nbytes,
+    )
+    print("register_buffers / reregister_buffers: ok")
+
 if __name__ == "__main__":
     test_init_ring_exists()
     test_register_buffers_exists()
@@ -29,3 +46,4 @@ if __name__ == "__main__":
     test_unregister_files_exists()
     print("all attribute checks passed")
     test_init_ring()
+    test_register_buffers()
