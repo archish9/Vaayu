@@ -138,16 +138,17 @@ class StandardSafetensorsStrategy(LoaderStrategy):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # EXL3 quantized tensors use these specific key names inside safetensors files.
-_EXL3_QTENSOR_KEYS = {"q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm"}
+_EXL3_QTENSOR_KEYS = {"trellis", "mcg", "suh", "svh", "su", "sv", "mul1"}
 
 # Required dtypes — ExLlamaV3 C++ kernels are strict about these.
 _EXL3_DTYPE_MAP = {
-    "q_weight":    torch.int32,
-    "q_invperm":   torch.int32,
-    "q_scale":     torch.float16,
-    "q_scale_max": torch.float16,
-    "q_groups":    torch.int16,
-    "q_perm":      torch.int16,
+    "trellis": torch.int16,
+    "mcg":     torch.int32,
+    "suh":     torch.float16,
+    "svh":     torch.float16,
+    "su":      torch.int16,
+    "sv":      torch.int16,
+    "mul1":    torch.int32,
 }
 
 
@@ -165,7 +166,7 @@ class ExLlamaV3Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.q_matrix = None  # set by inject_to_gpu
+        self.bc = None  # set by inject_to_gpu
 
         if bias:
             self.bias_param = nn.Parameter(torch.empty(out_features))
@@ -173,19 +174,34 @@ class ExLlamaV3Linear(nn.Module):
             self.register_parameter("bias_param", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.q_matrix is None:
+        if self.bc is None:
             raise RuntimeError(
-                f"ExLlamaV3Linear (out={self.out_features}): q_matrix not set. "
+                f"ExLlamaV3Linear (out={self.out_features}): bc not set. "
                 "inject_to_gpu() must be called before forward()."
             )
         try:
-            from exllamav3 import ext as exl3_ext
-            # ExLlamaV3 gemm: input (fp16) × q_matrix → output (fp16)
-            # TODO: verify exact API signature when exllamav3 is available:
-            #   exl3_ext.gemm_half_q_half(x, self.q_matrix, self.out_features, False)
-            out = exl3_ext.gemm_half_q_half(x, self.q_matrix, self.out_features, False)
-            if self.bias_param is not None:
-                out = out + self.bias_param
+            x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+            x_in = x_in.contiguous()
+
+            shape = x_in.shape
+            x_flat = x_in.view(-1, self.in_features)
+
+            # Try batched call first (single CUDA kernel for all rows).
+            # Falls back to row-by-row only if the C++ backend rejects the batch.
+            try:
+                out = self.bc.run_alloc(x_flat, self.out_features, False)
+                out = out.view(*shape[:-1], self.out_features)
+            except Exception:
+                # Fallback: row-by-row (slow but safe for all matrix configs)
+                rows = x_flat.shape[0]
+                out_flat = torch.empty((rows, self.out_features), dtype=torch.float16, device=x.device)
+                for i in range(rows):
+                    out_flat[i:i+1] = self.bc.run_alloc(x_flat[i:i+1].contiguous(), self.out_features, False)
+                out = out_flat.view(*shape[:-1], self.out_features)
+
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
+
             return out
         except ImportError:
             raise RuntimeError("exllamav3 not installed. Cannot run ExLlamaV3Linear.forward().")
@@ -208,8 +224,6 @@ class EXL3LoaderStrategy(LoaderStrategy):
 
     def __init__(self):
         _require_exllamav3()
-        # Maps (layer_name, param_path) → QMatrix object for explicit destruction.
-        self._active_qmatrices: dict[str, list] = {}
 
     # ── one-time init ────────────────────────────────────────────────────────
 
@@ -233,12 +247,10 @@ class EXL3LoaderStrategy(LoaderStrategy):
             # Skip non-Linear modules
             if not isinstance(module, nn.Linear):
                 continue
-            # Skip lm_head — may be weight-tied to embed_tokens; handle separately
-            if module_name.endswith("lm_head"):
-                continue
-            # Skip anything in a pinned layer (they stay as standard tensors)
-            if any(module_name.startswith(p) for p in pinned):
-                continue
+            # For ExLlamaV3, lm_head is typically quantized. If tied weights are used, 
+            # it might not be, but in this checkpoint it is.
+            # Pinned layers (like lm_head) should still be quantized if they are nn.Linear
+            # They will simply not be freed from GPU during streaming.
 
             # Build replacement
             has_bias = module.bias is not None
@@ -322,8 +334,11 @@ class EXL3LoaderStrategy(LoaderStrategy):
             try:
                 mod = model
                 for part in mod_path.split("."):
-                    mod = getattr(mod, part)
-            except AttributeError:
+                    if part.isdigit():
+                        mod = mod[int(part)]
+                    else:
+                        mod = getattr(mod, part)
+            except (AttributeError, KeyError, IndexError, TypeError):
                 mod = None
 
             if isinstance(mod, ExLlamaV3Linear) and any(
@@ -332,28 +347,41 @@ class EXL3LoaderStrategy(LoaderStrategy):
                 # ── EXL3 quantized linear: build QMatrix ──────────────────
                 gpu_tensors = {}
                 param_names_moved = []
+                print(f"Resolving mod_path: {mod_path}, mod type: {type(mod)}")
                 for base, (full_name, tensor) in params.items():
                     gpu_tensors[base] = tensor.to(device, non_blocking=True)
                     param_names_moved.append(full_name)
                     moved.append(full_name)
 
-                # Construct QMatrix from q_* tensors.
-                # TODO: verify exact signature with installed exllamav3 version:
-                #   make_q_matrix(q_weight, q_invperm, q_scale, q_scale_max, q_groups, q_perm, device_idx)
-                device_idx = 0 if device == "cuda" else int(device.split(":")[-1])
-                q_matrix = exl3_ext.make_q_matrix(
-                    gpu_tensors.get("q_weight"),
-                    gpu_tensors.get("q_invperm"),
-                    gpu_tensors.get("q_scale"),
-                    gpu_tensors.get("q_scale_max"),
-                    gpu_tensors.get("q_groups"),
-                    gpu_tensors.get("q_perm"),
-                    device_idx,
-                )
-                mod.q_matrix = q_matrix
-                qmatrices_this_layer.append((mod_path, q_matrix))
+                trellis = gpu_tensors.get("trellis")
+                suh = gpu_tensors.get("suh")
+                svh = gpu_tensors.get("svh")
+                mcg_tensor = gpu_tensors.get("mcg")
+                mul1_tensor = gpu_tensors.get("mul1")
 
-                # Free the intermediate GPU tensors — QMatrix owns the memory now
+                # TODO: add fallback if su/sv packed weights are present
+                if suh is None and "su" in gpu_tensors:
+                    raise NotImplementedError("su packed weight detected, please unpack to suh")
+
+                K = trellis.shape[-1] // 16 if trellis is not None else 0
+
+                from exllamav3.util.tensor import g_tensor_cache
+                bsz1_xh_args = (device, (1, mod.in_features), torch.float16)
+                xh = g_tensor_cache.get(*bsz1_xh_args)
+
+                mod.bc = exl3_ext.exllamav3_ext.BC_LinearEXL3(
+                    trellis,
+                    suh,
+                    svh,
+                    K,
+                    mod.bias_param,
+                    mcg_tensor is not None,
+                    mul1_tensor is not None,
+                    xh
+                )
+                qmatrices_this_layer.append((mod_path, mod.bc))
+
+                # Free the intermediate GPU tensors
                 del gpu_tensors
 
             else:
@@ -367,7 +395,6 @@ class EXL3LoaderStrategy(LoaderStrategy):
                     except Exception as e:
                         print(f"[Vaayu-EXL3] warn: could not inject {full_name}: {e}")
 
-        self._active_qmatrices[layer_name] = qmatrices_this_layer
         return moved
 
     def free_from_gpu(
@@ -387,17 +414,11 @@ class EXL3LoaderStrategy(LoaderStrategy):
         except ImportError:
             pass
         else:
-            # Walk ExLlamaV3Linear modules in this layer and clear QMatrix
+            # Walk ExLlamaV3Linear modules in this layer and clear bc
             for sub_module in layer_module.modules():
-                if isinstance(sub_module, ExLlamaV3Linear) and sub_module.q_matrix is not None:
-                    # TODO: verify explicit destructor API — may be:
-                    #   exl3_ext.free_q_matrix(sub_module.q_matrix)
-                    #   or simply: del sub_module.q_matrix  if Python refcount handles it
-                    try:
-                        exl3_ext.free_q_matrix(sub_module.q_matrix)
-                    except AttributeError:
-                        pass  # fallback: Python refcount
-                    sub_module.q_matrix = None
+                if isinstance(sub_module, ExLlamaV3Linear) and sub_module.bc is not None:
+                    # Rely on pybind11 refcount to free C++ memory
+                    sub_module.bc = None
 
         # Move non-quantized parameters back to meta
         for param_name in moved_layers:
@@ -409,8 +430,6 @@ class EXL3LoaderStrategy(LoaderStrategy):
                     pass
 
         layer_module.to("meta")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate import init_empty_weights
@@ -46,25 +47,123 @@ except ImportError:
     cache_utils_installed = False
 
 
+class FP8DynamicCache(DynamicCache):
+    """
+    DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
+
+    Per-head per-token scales (shape [B, H, S, 1]) are stored alongside
+    the FP8 data so decode steps are O(1): only new tokens are quantized.
+    Full cache is dequantized to BF16/FP16 before returning to attention.
+
+    Note: this class manages its own key_cache / value_cache lists directly
+    rather than delegating to the parent's layer-based storage, so that FP8
+    tensors (and their companion scale tensors) are stored contiguously and
+    can be concatenated cheaply across decode steps.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Override parent's layer-based storage with flat lists of FP8 tensors.
+        self.key_cache: list = []
+        self.value_cache: list = []
+        self._key_scales: list = []
+        self._value_scales: list = []
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):  # cache_kwargs intentionally unused
+        k_scale = key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
+        v_scale = value_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
+
+        k_fp8 = (key_states / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        v_fp8 = (value_states / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+        if layer_idx < len(self.key_cache):
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_fp8], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_fp8], dim=-2)
+            self._key_scales[layer_idx] = torch.cat([self._key_scales[layer_idx], k_scale], dim=-2)
+            self._value_scales[layer_idx] = torch.cat([self._value_scales[layer_idx], v_scale], dim=-2)
+        else:
+            self.key_cache.append(k_fp8)
+            self.value_cache.append(v_fp8)
+            self._key_scales.append(k_scale)
+            self._value_scales.append(v_scale)
+
+        k_out = self.key_cache[layer_idx].to(key_states.dtype) * self._key_scales[layer_idx]
+        v_out = self.value_cache[layer_idx].to(value_states.dtype) * self._value_scales[layer_idx]
+        return k_out, v_out
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Returns the sequence length of the cached states for the given layer."""
+        if layer_idx >= len(self.key_cache):
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
 
 
+
+
+def _layer_path_exists(model: nn.Module, path: str) -> bool:
+    if not path:
+        return False
+    obj = model
+    for part in path.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _auto_detect_layer_names(model: nn.Module) -> dict:
+    EMBED = {"embed_tokens", "word_embeddings", "wte", "embed", "token_embeddings"}
+    NORM = {"norm", "final_layernorm", "ln_f", "final_norm", "layer_norm", "ln_out"}
+    HEAD = {"lm_head", "output_layer", "embed_out", "output", "head"}
+
+    best_path, best_len = "", 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.ModuleList) and len(mod) > best_len:
+            best_len, best_path = len(mod), name
+
+    if not best_path:
+        return {}
+
+    embed_path = norm_path = lm_head_path = None
+    for name, mod in model.named_modules():
+        if name.startswith(best_path + "."):
+            continue
+        leaf = name.rsplit(".", 1)[-1] if "." in name else name
+        if embed_path is None and leaf in EMBED and isinstance(mod, nn.Embedding):
+            embed_path = name
+        if norm_path is None and leaf in NORM and not isinstance(mod, (nn.Embedding, nn.Linear, nn.ModuleList)):
+            norm_path = name
+        if lm_head_path is None and leaf in HEAD and isinstance(mod, nn.Linear):
+            lm_head_path = name
+
+    return {
+        "embed": embed_path,
+        "layer_prefix": best_path,
+        "norm": norm_path,
+        "lm_head": lm_head_path,
+    }
 
 
 class VaayuBaseModel(GenerationMixin):
 
-    # customize layer names here
+    # customize layer names here; subclasses or layer_names_dict kwarg override
     def set_layer_names_dict(self):
-        self.layer_names_dict = {'embed': 'model.embed_tokens',
-                       'layer_prefix': 'model.layers',
-                       'norm': 'model.norm',
-                       'lm_head': 'lm_head',}
+        self.layer_names_dict = {
+            'embed': 'model.embed_tokens',
+            'layer_prefix': 'model.layers',
+            'norm': 'model.norm',
+            'lm_head': 'lm_head',
+        }
+        self.layer_names_dict.update(self._layer_names_override)
 
 
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
-                 use_torch_compile=False):
+                 use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
+                 layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
+                 eagle_head_path=None, drafter_model_path=None, draft_tokens=5):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -115,7 +214,8 @@ class VaayuBaseModel(GenerationMixin):
         self.hf_token = hf_token
 
         # Save parameters
-
+        self._layer_names_override = layer_names_dict or {}
+        self._tokenizer_class = tokenizer_class
         self.set_layer_names_dict()
 
 
@@ -147,6 +247,9 @@ class VaayuBaseModel(GenerationMixin):
         self.dtype = self.running_dtype
 
         self.use_torch_compile = use_torch_compile
+        self.kv_cache_mode = kv_cache_mode
+        self.max_pinned_layers = max_pinned_layers
+        self.prefill_chunk_size = prefill_chunk_size
         self._compiled_layer_fn = None
         if use_torch_compile:
             if not hasattr(torch, 'compile'):
@@ -244,6 +347,12 @@ class VaayuBaseModel(GenerationMixin):
 
         self.init_model()
 
+        # fill in any layer name keys that don't resolve on this model (unknown architectures)
+        _detected = _auto_detect_layer_names(self.model)
+        for key, val in _detected.items():
+            if val and (key not in self.layer_names_dict or not _layer_path_exists(self.model, self.layer_names_dict[key])):
+                self.layer_names_dict[key] = val
+
         # get layer count:
         model_attr = self.model
         for attr_name in self.layer_names_dict["layer_prefix"].split("."):
@@ -279,14 +388,32 @@ class VaayuBaseModel(GenerationMixin):
         # Pin shared layers (embed, norm, lm_head) permanently in VRAM.
         # Skips load/inject/free in forward() for these layers every token.
         self.pinned_layer_names: set = set()
-        if device.startswith("cuda"):
-            self._init_pinned_layers()
-
-        # Let strategy do one-time model-level setup (e.g. EXL3: swap nn.Linear)
         self.loader_strategy.setup_model(
             self.model, self.config, self.running_device, self.running_dtype,
             pinned_layer_names=self.pinned_layer_names,
         )
+        
+        # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
+        self.set_layers_from_layer_names()
+
+        # Speculative decoding — must come after set_layers_from_layer_names()
+        # so self.layers[-1] (lm_head) is resolved.
+        self._last_hidden_state = None
+        self._lm_head_layer = self.layers[-1]
+        self.draft_tokens = draft_tokens
+
+        if device.startswith("cuda"):
+            self._init_pinned_layers()
+
+        self.speculator = None
+        if eagle_head_path or drafter_model_path:
+            from .speculative import build_speculator
+            self.speculator = build_speculator(
+                eagle_head_path=eagle_head_path,
+                drafter_model_path=drafter_model_path,
+                base_model=self,
+                device=device,
+            )
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -299,13 +426,17 @@ class VaayuBaseModel(GenerationMixin):
 
     # a chance to customize tokenizer
     def get_tokenizer(self, hf_token=None):
+        if self._tokenizer_class is not None:
+            tok_kwargs = {"use_fast": False, "trust_remote_code": True}
+            if hf_token is not None:
+                tok_kwargs["token"] = hf_token
+            return self._tokenizer_class.from_pretrained(self.model_local_path, **tok_kwargs)
         if hf_token is not None:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
-        else:
-            return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+        return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
     def get_use_better_transformer(self):
-        return True
+        return False
 
     def init_model(self):
         self.model = None
@@ -360,9 +491,18 @@ class VaayuBaseModel(GenerationMixin):
         quantization_config = getattr(self.config, "quantization_config", None)
 
         if quantization_config is not None:
-            self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
-            device_map = self.hf_quantizer.update_device_map(None)
-            self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
+            quant_method = None
+            if isinstance(quantization_config, dict):
+                quant_method = quantization_config.get("quant_method")
+            else:
+                quant_method = getattr(quantization_config, "quant_method", None)
+                
+            if quant_method == "exl3":
+                print("[Vaayu] Skipping AutoHfQuantizer for exl3 (managed by LoaderStrategy)")
+            else:
+                self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
+                device_map = self.hf_quantizer.update_device_map(None)
+                self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()
         self.model.tie_weights()
@@ -481,42 +621,81 @@ class VaayuBaseModel(GenerationMixin):
     def _get_vram_pinning_budget(self) -> int:
         """
         VRAM budget available for permanently pinned layers.
-        Reserves 4 GB for KV cache + io_uring double-buffers (~2 × largest layer).
-        Formula is conservative; tune if KV cache overflows for long contexts.
 
-        KV cache size = n_layers × 2 × n_kv_heads × head_dim × seq_len × dtype_bytes
-        For Llama-70B @ 512 tok BF16: 80 × 2 × 8 × 128 × 512 × 2 ≈ 1.3 GB.
-        For Qwen3-480B MoE the active KV is much smaller due to sparse routing.
+        Reserves space for KV cache (sized by kv_cache_mode) + 1.5 GB overhead
+        (CUDA context + streaming double-buffer).
+
+        KV cache formulas:
+          BF16: n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 2 bytes
+          FP8:  n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 1 byte
+                (per-head scales are negligible vs 1.5 GB overhead and absorbed there)
         """
         if not torch.cuda.is_available():
             return 0
+        if not str(self.device).startswith("cuda"):
+            return 0
         total = torch.cuda.get_device_properties(self.device).total_memory
-        reserve = 4 * 1024 ** 3  # 4 GB
-        return max(0, total - reserve)
+
+        n_layers = getattr(self.config, 'num_hidden_layers', 80)
+        n_kv_heads = getattr(self.config, 'num_key_value_heads', 8)
+        _head_dim_attr = getattr(self.config, 'head_dim', None)
+        if isinstance(_head_dim_attr, int):
+            head_dim = _head_dim_attr
+        else:
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        mode = getattr(self, 'kv_cache_mode', 'fp16')
+        if mode == 'fp8':
+            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len
+        else:
+            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len * 2
+
+        overhead = int(1.5 * 1024 ** 3)
+        return max(0, total - kv_bytes - overhead)
+
+    def _create_kv_cache(self):
+        """Return a KV cache instance sized and typed for the configured kv_cache_mode."""
+        mode = self.kv_cache_mode
+
+        if mode == "auto":
+            from .persist.loader_strategy import EXL3LoaderStrategy
+            mode = "fp8" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
+
+        if mode == "fp16":
+            return DynamicCache()
+
+        if not hasattr(torch, "float8_e4m3fn"):
+            print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
+            return DynamicCache()
+
+        print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
+        return FP8DynamicCache()
 
     def _init_pinned_layers(self) -> None:
         """
-        Pre-load shared layers (embed, norm, lm_head) into VRAM once.
-        forward() will skip load/inject/free for these layers every token,
-        saving one full NVMe read per token for ~2–3 GB of shared weights.
+        Pre-load layers into VRAM using two-phase asymmetric pinning.
+
+        Phase 1 pins shared layers (embed, norm, lm_head) with continue on budget miss.
+        Phase 2 pins transformer layers 0…N with break on budget miss; only runs when
+        max_pinned_layers != 0 (0 = shared-only, -1 = fill budget, N = first N layers).
         """
         budget = self._get_vram_pinning_budget()
         if budget <= 0:
             return
 
-        candidates = [
-            self.layer_names_dict["embed"],
-            self.layer_names_dict["norm"],
-            self.layer_names_dict["lm_head"],
-        ]
+        layer_prefix = self.layer_names_dict["layer_prefix"]
 
+        # Phase 1: shared layers — continue on budget miss (each has independent size)
         used = 0
-        for layer_name in candidates:
+        for layer_name in [self.layer_names_dict["embed"],
+                           self.layer_names_dict["norm"],
+                           self.layer_names_dict["lm_head"]]:
             try:
                 tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
-                    print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted")
+                    print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
+                          f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
                     continue
                 self.loader_strategy.inject_to_gpu(
                     self.model, layer_name, tensors,
@@ -525,17 +704,47 @@ class VaayuBaseModel(GenerationMixin):
                 )
                 self.pinned_layer_names.add(layer_name)
                 used += size
-                print(
-                    f"[Vaayu-Pin] pinned {layer_name}: "
-                    f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)"
-                )
+                print(f"[Vaayu-Pin] pinned {layer_name}: "
+                      f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)")
             except Exception as e:
-                # lm_head may fail if weights are tied; forward() handles that via
-                # the existing tied-weights fallback in load_layer_to_cpu.
                 print(f"[Vaayu-Pin] skip {layer_name}: {e}")
 
+        # Phase 2: transformer layers — break on budget miss (homogeneous size)
+        if self.max_pinned_layers != 0:
+            model_attr = self.model
+            for attr_name in layer_prefix.split("."):
+                model_attr = getattr(model_attr, attr_name)
+            total_layers = len(model_attr)
+
+            for i in range(total_layers):
+                if self.max_pinned_layers > 0 and i >= self.max_pinned_layers:
+                    break
+                layer_name = f"{layer_prefix}.{i}"
+                try:
+                    tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                    size = sum(t.nbytes for t in tensors.values())
+                    if used + size > budget:
+                        print(f"[Vaayu-Pin] budget exhausted at {layer_name} "
+                              f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
+                        break
+                    self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, tensors,
+                        self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {}),
+                    )
+                    self.pinned_layer_names.add(layer_name)
+                    used += size
+                    print(f"[Vaayu-Pin] pinned {layer_name}: "
+                          f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)")
+                except Exception as e:
+                    print(f"[Vaayu-Pin] skip {layer_name}: {e}")
+
+        pinned_xformer = sum(1 for n in self.pinned_layer_names
+                             if n.startswith(layer_prefix + "."))
+        pinned_shared = len(self.pinned_layer_names) - pinned_xformer
         print(
-            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned, "
+            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned "
+            f"({pinned_xformer} transformer + {pinned_shared} shared), "
             f"{used / 1e9:.2f} GB reserved"
         )
 
@@ -774,6 +983,55 @@ class VaayuBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def _chunked_prefill(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ):
+        chunk_size = self.prefill_chunk_size
+        total_len  = input_ids.shape[1]
+        n_chunks   = (total_len + chunk_size - 1) // chunk_size
+        print(f"[Vaayu] Chunked prefill: {total_len} tokens → {n_chunks} chunks of {chunk_size}")
+
+        past_key_values = None
+        output = None
+
+        for start in range(0, total_len, chunk_size):
+            end        = min(start + chunk_size, total_len)
+            chunk_ids  = input_ids[:, start:end]
+            chunk_mask = attention_mask[:, :end] if attention_mask is not None else None
+
+            output = self.forward(
+                input_ids=chunk_ids,
+                attention_mask=chunk_mask,
+                past_key_values=past_key_values,
+                use_cache=True,  # must accumulate KV cache across chunks regardless of caller's use_cache
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
+            past_key_values = output.past_key_values
+
+            if torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[Vaayu] Chunk [{start}:{end}] done — peak VRAM: {peak:.2f} GB")
+                torch.cuda.reset_peak_memory_stats()
+
+        if not return_dict:
+            return tuple(v for v in [
+                output.logits,
+                output.past_key_values if use_cache else None,
+                output.hidden_states,
+                output.attentions,
+            ] if v is not None)
+        if not use_cache:
+            output.past_key_values = None
+        return output
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -797,6 +1055,20 @@ class VaayuBaseModel(GenerationMixin):
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
+        if (self.prefill_chunk_size > 0
+                and input_ids is not None
+                and input_ids.shape[1] > self.prefill_chunk_size):
+            _past_kv_len = (self.get_past_key_values_cache_seq_len(past_key_values)
+                            if past_key_values is not None else 0)
+            if _past_kv_len == 0:
+                return self._chunked_prefill(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
 
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
@@ -808,7 +1080,11 @@ class VaayuBaseModel(GenerationMixin):
             attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
             attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
             attention_mask = attention_mask.to(self.running_device)
-        position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
+        _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
+                             if past_key_values is not None else 0)
+        _cur_len_for_pos  = input_ids.shape[1] if input_ids is not None else 0
+        _pos_range        = max(self.max_seq_len, _past_len_for_pos + _cur_len_for_pos)
+        position_ids      = torch.arange(_pos_range, dtype=torch.long, device=self.running_device)[None, :]
 
         # Pre-compute RoPE position embeddings for the full sequence length.
         # Transformers >= 4.45 moved this computation to the top-level model forward;
@@ -839,9 +1115,16 @@ class VaayuBaseModel(GenerationMixin):
             self._full_position_embeddings = None
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
+            past_key_values = self._create_kv_cache()
+        all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
+        all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
+
+        # Capture KV length once before the layer loop. len_p stays constant for the
+        # full forward pass — all layers process the same positions. Re-querying
+        # get_seq_length() inside the loop would return a growing value as each layer
+        # appends its K/V to the cache, causing cos/sin slices to walk off the end of
+        # _full_position_embeddings and produce empty tensors (silent position corruption).
+        _len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
@@ -899,7 +1182,10 @@ class VaayuBaseModel(GenerationMixin):
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
+                    moved_layers = self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {})
+                    )
                     _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
@@ -913,7 +1199,10 @@ class VaayuBaseModel(GenerationMixin):
                     if self.profiling_mode:
                         t = time.time()
                     _t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
+                    moved_layers = self.loader_strategy.inject_to_gpu(
+                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {})
+                    )
                     _gpu_load_s += time.time() - _t
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
@@ -928,25 +1217,26 @@ class VaayuBaseModel(GenerationMixin):
                     elif layer_name == self.layer_names_dict['norm']:
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
+                        # Store post-norm hidden state for EAGLE drafter (last token position)
+                        self._last_hidden_state = batch[j][:, -1:, :].detach()
 
-                        if output_attentions:
+                        if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
                     elif layer_name == self.layer_names_dict['lm_head']:
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
 
-                        if output_attentions:
-                            all_hidden_states[i].append(new_seq)
+                        if output_hidden_states:
+                            all_hidden_states[i].append(seq)
 
-                        len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
                         len_s = self.get_sequence_len(seq)
 
                         kwargs = {
                             'use_cache': use_cache,
                             **self.get_past_key_value_args(past_key_values),
-                            **self.get_pos_emb_args(len_p, len_s),
-                            **self.get_attention_mask_args(attention_mask, len_p, len_s),
-                            **self.get_position_ids_args(position_ids, len_p, len_s),
+                            **self.get_pos_emb_args(_len_p, len_s),
+                            **self.get_attention_mask_args(attention_mask, _len_p, len_s),
+                            **self.get_position_ids_args(position_ids, _len_p, len_s),
                         }
 
                         if self.use_torch_compile:
@@ -975,7 +1265,7 @@ class VaayuBaseModel(GenerationMixin):
                         self.model, layer, moved_layers, self.hf_quantizer
                     )
 
-                if i % 20 == 19:
+                if i % 40 == 39:
                     clean_memory()
 
         logits = torch.cat(batch, 0)
@@ -1020,3 +1310,106 @@ class VaayuBaseModel(GenerationMixin):
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
             attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )
+
+    def _trim_kv_cache(self, cache, target_seq_len: int) -> None:
+        """Trim KV cache tensors in-place to target_seq_len tokens."""
+        if cache is None:
+            return
+        if isinstance(cache, FP8DynamicCache):
+            for i in range(len(cache.key_cache)):
+                cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
+                cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+                cache._key_scales[i] = cache._key_scales[i][:, :, :target_seq_len, :]
+                cache._value_scales[i] = cache._value_scales[i][:, :, :target_seq_len, :]
+        elif hasattr(cache, 'key_cache'):
+            for i in range(len(cache.key_cache)):
+                if len(cache.key_cache[i].shape) >= 3:
+                    cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
+                    cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+
+    @torch.no_grad()
+    def speculative_generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 20,
+    ) -> torch.LongTensor:
+        """
+        Custom generation loop using speculative decoding.
+
+        Replaces model.generate() when self.speculator is set.
+        The drafter guesses DRAFT_TOKENS candidates; Vaayu verifies all in one
+        forward pass and accepts the longest correct prefix.
+
+        Returns:
+            generated: (1, prompt_len + new_tokens) tensor of all token IDs
+        """
+        assert self.speculator is not None, "speculative_generate called with no speculator"
+
+        # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
+        prefill_out = self.forward(
+            input_ids=input_ids,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = prefill_out.past_key_values
+        # Seed the first new token from prefill logits
+        first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
+        generated = torch.cat([input_ids, first_token], dim=1)
+        tokens_generated = 1
+
+        eos_ids = self.config.eos_token_id
+        if isinstance(eos_ids, int):
+            eos_ids = [eos_ids]
+        eos_set = set(eos_ids) if eos_ids else set()
+
+        if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+            return generated
+
+        while tokens_generated < max_new_tokens:
+            # Step 2: Draft K tokens
+            draft_ids, draft_state = self.speculator.draft(
+                generated, past_key_values, num_tokens=self.draft_tokens
+            )
+            k = draft_ids.shape[1]
+
+            # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
+            # past_key_values has prompt+accepted tokens; verify adds k+1 more
+            past_len_before = past_key_values.get_seq_length()
+            verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
+            verify_out = self.forward(
+                input_ids=verify_input,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
+            past_key_values = verify_out.past_key_values
+
+            # Step 4: Accept/reject longest correct prefix
+            accepted_ids, num_accepted = self.speculator.verify_and_accept(
+                generated, draft_ids, verifier_logits, draft_state
+            )
+
+            # Step 5: Trim verifier KV back to past_len + num_accepted
+            # (verify pass grew cache by k+1; we only keep num_accepted new positions)
+            self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
+
+            # Step 6: Sync drafter cache to match accepted length
+            self.speculator.rollback_cache(draft_state, num_accepted)
+
+            # Step 7: Extend generated sequence (cap at max_new_tokens)
+            remaining = max_new_tokens - tokens_generated
+            if num_accepted > remaining:
+                accepted_ids = accepted_ids[:, :remaining]
+                num_accepted = remaining
+            generated = torch.cat([generated, accepted_ids], dim=1)
+            tokens_generated += num_accepted
+
+            print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
+                  f"total_new={tokens_generated}/{max_new_tokens} "
+                  f"accept_rate={num_accepted / k:.0%}")
+
+            if accepted_ids[0, -1].item() in eos_set:
+                break
+
+        return generated
