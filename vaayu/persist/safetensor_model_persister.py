@@ -198,15 +198,9 @@ class SafetensorModelPersister(ModelPersister):
     def load_model(self, layer_name, path):
         global _RING_INITIALIZED, _FILES_REGISTERED
         if _USE_IOURING and not _RING_INITIALIZED:
-            try:
-                _RING_INITIALIZED = _init_iouring_ring(32)
-            except Exception as e:
-                print(f"[VAAYU-IO] init_ring failed: {e} — falling back to per-call ring")
+            _RING_INITIALIZED = _init_iouring_ring(32)
         if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
-            try:
-                _FILES_REGISTERED = _register_iouring_files(str(path))
-            except Exception as e:
-                print(f"[VAAYU-IO] register_files failed: {e} — fd registration disabled")
+            _FILES_REGISTERED = _register_iouring_files(str(path))
 
         file_path = str(Path(path) / (layer_name + ".safetensors"))
 
