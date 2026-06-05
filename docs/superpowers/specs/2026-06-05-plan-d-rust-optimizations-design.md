@@ -77,8 +77,9 @@ The `queue_depth` argument to `io_uring_read_into` is retained for API compatibi
 ### New module-level globals
 
 ```python
-_RING_INITIALIZED = False
-_FILES_REGISTERED = False
+_RING_INITIALIZED = False   # True after init_ring() succeeds
+_BUFS_REGISTERED  = False   # True after register_buffers() succeeds
+_FILES_REGISTERED = False   # True after register_files() succeeds
 ```
 
 ### New init helpers
@@ -98,11 +99,17 @@ def _register_iouring_files(model_dir: str):
 def load_model(self, layer_name, path):
     global _RING_INITIALIZED, _FILES_REGISTERED
     if _USE_IOURING and not _RING_INITIALIZED:
-        _init_iouring_ring(32)
-        _RING_INITIALIZED = True
-    if _USE_IOURING and not _FILES_REGISTERED:
-        _register_iouring_files(str(path))
-        _FILES_REGISTERED = True
+        try:
+            _init_iouring_ring(32)
+            _RING_INITIALIZED = True
+        except Exception as e:
+            print(f"[VAAYU-IO] init_ring failed: {e} — falling back to per-call ring")
+    if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
+        try:
+            _register_iouring_files(str(path))
+            _FILES_REGISTERED = True
+        except Exception as e:
+            print(f"[VAAYU-IO] register_files failed: {e} — fd registration disabled")
     # ... existing logic unchanged
 ```
 
@@ -111,12 +118,21 @@ def load_model(self, layer_name, path):
 After the buffer realloc block (current lines 85-90), add:
 
 ```python
-if _USE_IOURING and _RING_INITIALIZED:
-    vaayu_rust.reregister_buffers(
-        _PINNED_BUFS[0].data_ptr(), _PINNED_SIZES[0],
-        _PINNED_BUFS[1].data_ptr(), _PINNED_SIZES[1],
-    )
+# Only reregister when BOTH buffers are allocated (second buf may still be None on first call)
+if _USE_IOURING and _RING_INITIALIZED and _PINNED_BUFS[0] is not None and _PINNED_BUFS[1] is not None:
+    try:
+        vaayu_rust.reregister_buffers(
+            _PINNED_BUFS[0].data_ptr(), _PINNED_SIZES[0],
+            _PINNED_BUFS[1].data_ptr(), _PINNED_SIZES[1],
+        )
+        global _BUFS_REGISTERED
+        _BUFS_REGISTERED = True
+    except Exception as e:
+        print(f"[VAAYU-IO] reregister_buffers failed: {e}")
+        _BUFS_REGISTERED = False
 ```
+
+`register_buffers` (initial registration, before any realloc) is called similarly after BOTH bufs first become non-None. `_BUFS_REGISTERED` tracks current registration validity for the dispatch logic.
 
 No changes to the `io_uring_read_into` call site — dispatch is transparent inside Rust.
 
@@ -126,7 +142,7 @@ No changes to the `io_uring_read_into` call site — dispatch is transparent ins
 
 | Scenario | Behavior |
 |----------|---------|
-| `register_buffers` returns `EINVAL`/`EFAULT` | Python catches `PyRuntimeError`, sets `_RING_INITIALIZED = False`, falls back to old path. Logged to stderr. |
+| `register_buffers` returns `EINVAL`/`EFAULT` | Python catches `PyRuntimeError`, sets `_BUFS_REGISTERED = False`. Ring still alive; dispatch falls to `Read` + fresh `Fd` path. Logged to stderr. |
 | `register_files` returns error | Python catches, sets `_FILES_REGISTERED = False`. Ring still usable with buffer registration only. |
 | `buf_ptr` out of registered range at read time | Rust detects via range check, silently uses `Read` + fresh `Fd` for that call. Covers realloc race window. |
 | `unregister_files` not called on exit | Kernel reclaims fds on process exit. Acceptable. |
