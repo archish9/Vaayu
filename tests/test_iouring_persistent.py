@@ -28,3 +28,4 @@ if __name__ == "__main__":
     test_register_files_exists()
     test_unregister_files_exists()
     print("all attribute checks passed")
+    test_init_ring()
