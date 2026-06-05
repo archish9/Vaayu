@@ -782,3 +782,11 @@ With a perfectly stable engine and a highly optimized memory hierarchy, it's tim
 
 **Recommendation for your prompt to the coding agent:**
 Hand the coding agent your `notes.md` context and tell them: *"Please begin by implementing **Chunked Prefill** and **KV Cache Quantization** to guarantee VRAM safety. Once those are stable, we will move on to Layer Pinning and the RAM cache."*
+
+
+---
+
+
+Vaayu is designed to support any arbitrary model loaded dynamically by the user, then EAGLE-3 (or Medusa) cannot be the primary or only speculation path.
+
+Since EAGLE-3 requires specialized pre-trained speculator weights for every specific checkpoint, it cannot run universally.
