@@ -1,8 +1,10 @@
 # What To Implement Next — New Items Only
 
-> **Scope Rule:** Every item in this document was verified to NOT exist in any current `.md` file, plan, or source code in the Vaayu project as of 2026-06-04. If something is already documented in `notes.md`, the Project Bible, `master_plan.md`, the schedule plans (A/B/C/D), `nvme_optimizations_research.md`, `Medusa-EAGLE-RND.md`, `feedback_gguf_layer_streaming.md`, or any other existing document — it is **not** listed here.
+> [!NOTE]
+> **Code Audit & Verification (Last Updated: 2026-06-05)**: Every item in this document has been systematically audited against the active Vaayu Python (`vaayu/`) and Rust (`vaayu_rust/`) codebase. None of the 8 listed features are implemented in the current source files. They represent the immediate backlog of outstanding high-priority enhancements.
 
 ---
+
 
 ## Priority 1: Persistent io_uring Ring & Lifecycle Management
 
