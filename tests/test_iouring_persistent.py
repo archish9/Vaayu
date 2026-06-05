@@ -1,3 +1,46 @@
+"""
+Plan D integration tests — persistent io_uring ring with IORING_REGISTER_BUFFERS and IORING_REGISTER_FILES.
+
+Run on the Linux target machine (requires io_uring + CUDA + PyTorch pin_memory):
+    python tests/test_iouring_persistent.py
+
+Benchmark (substitute real model layer path):
+    # Before (per-call ring, no registrations):
+    python -c "
+    import time, vaayu_rust, torch
+    buf = torch.zeros(4 * 1024**3, dtype=torch.uint8, pin_memory=True)
+    path = '/path/to/model/layer0.safetensors'
+    import os; size = os.path.getsize(path)
+    t = time.perf_counter()
+    for _ in range(5):
+        vaayu_rust.io_uring_read_into(path, 0, size, buf.data_ptr(), 32)
+    print(f'per-call ring: {(time.perf_counter()-t)/5*1000:.1f}ms avg')
+    "
+
+    # After (persistent ring + registered buffers + registered files):
+    python -c "
+    import time, vaayu_rust, torch
+    vaayu_rust.init_ring(32)
+    buf0 = torch.zeros(4 * 1024**3, dtype=torch.uint8, pin_memory=True)
+    buf1 = torch.zeros(4 * 1024**3, dtype=torch.uint8, pin_memory=True)
+    vaayu_rust.register_buffers(buf0.data_ptr(), buf0.nbytes, buf1.data_ptr(), buf1.nbytes)
+    path = '/path/to/model/layer0.safetensors'
+    vaayu_rust.register_files([path])
+    import os; size = os.path.getsize(path)
+    t = time.perf_counter()
+    for _ in range(5):
+        vaayu_rust.io_uring_read_into(path, 0, size, buf0.data_ptr(), 32)
+    print(f'persistent ring: {(time.perf_counter()-t)/5*1000:.1f}ms avg')
+    "
+
+Expected: 10-15% reduction in avg ms (CPU overhead; NVMe wall-clock may vary).
+
+Error reference:
+    CQE result -22 (EINVAL): offset or length not sector-aligned (must be multiples of 4096 for O_DIRECT)
+    CQE result  -9 (EBADF):  fixed fd index out of range — check register_files was called
+    CQE result -14 (EFAULT): buf ptr outside registered buffer range — check register_buffers sizes
+    EINVAL from register_buffers: check kernel >= 5.1 (uname -r)
+"""
 import vaayu_rust
 
 def test_init_ring_exists():
@@ -119,6 +162,7 @@ def test_fallback_when_path_not_registered():
 
 
 if __name__ == "__main__":
+    print("=== Plan D integration tests ===")
     test_init_ring_exists()
     test_register_buffers_exists()
     test_reregister_buffers_exists()
@@ -130,3 +174,4 @@ if __name__ == "__main__":
     test_register_files()
     test_persistent_read_correctness()
     test_fallback_when_path_not_registered()
+    print("=== all tests passed ===")
