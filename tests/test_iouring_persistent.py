@@ -38,6 +38,24 @@ def test_register_buffers():
     )
     print("register_buffers / reregister_buffers: ok")
 
+def test_register_files():
+    import os, tempfile
+    vaayu_rust.init_ring(32)
+    # Create two small test files
+    files = []
+    for i in range(2):
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors")
+        f.write(b"\x00" * 4096)  # 4KB aligned
+        f.close()
+        files.append(f.name)
+    try:
+        vaayu_rust.register_files(files)
+        vaayu_rust.unregister_files()
+        print("register_files / unregister_files: ok")
+    finally:
+        for p in files:
+            os.unlink(p)
+
 if __name__ == "__main__":
     test_init_ring_exists()
     test_register_buffers_exists()
@@ -47,3 +65,4 @@ if __name__ == "__main__":
     print("all attribute checks passed")
     test_init_ring()
     test_register_buffers()
+    test_register_files()
