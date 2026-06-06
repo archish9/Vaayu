@@ -145,10 +145,17 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
     }
 
 
-def _check_pcie_topology():
+_pcie_topology_checked: set = set()
+
+def _check_pcie_topology(gpu_index: int = 0):
+    global _pcie_topology_checked
+    if gpu_index in _pcie_topology_checked:
+        return
+    _pcie_topology_checked.add(gpu_index)
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
+            ["nvidia-smi", f"-i={gpu_index}",
+             "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5
         )
@@ -281,7 +288,8 @@ class VaayuBaseModel(GenerationMixin):
         self.dtype = self.running_dtype
 
         if device.startswith("cuda"):
-            _check_pcie_topology()
+            gpu_index = int(device.split(":")[-1]) if ":" in device else 0
+            _check_pcie_topology(gpu_index)
 
         self.use_torch_compile = use_torch_compile
         self.kv_cache_mode = kv_cache_mode

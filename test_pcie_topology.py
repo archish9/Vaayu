@@ -1,5 +1,14 @@
 """Unit tests for _check_pcie_topology in vaayu/vaayu_base.py."""
+import pytest
 from unittest.mock import patch, MagicMock
+import vaayu.vaayu_base as _vb
+
+
+@pytest.fixture(autouse=True)
+def reset_pcie_sentinel():
+    _vb._pcie_topology_checked = set()
+    yield
+    _vb._pcie_topology_checked = set()
 
 
 def _import_fn():
@@ -81,9 +90,11 @@ def test_unknown_pcie_combo_prints_warning_no_crash(capsys):
 
 def test_multi_gpu_parses_first_gpu_only(capsys):
     fn = _import_fn()
-    # nvidia-smi returns one line per GPU on multi-GPU machines
-    with patch("subprocess.run", return_value=_make_result("16, 4\n16, 4\n")):
-        fn()
+    with patch("subprocess.run", return_value=_make_result("16, 4\n")) as mock_run:
+        fn(gpu_index=1)
     out = capsys.readouterr().out
     assert "✅" in out
     assert "Gen4 x16" in out
+    # Verify -i=1 was passed to nvidia-smi
+    call_args = mock_run.call_args[0][0]
+    assert "-i=1" in call_args
