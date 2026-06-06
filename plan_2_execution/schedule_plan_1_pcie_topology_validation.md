@@ -42,18 +42,25 @@ def _check_pcie_topology():
         gen = int(parts[1])
         
         # Calculate theoretical max bandwidth in GB/s
+        # Bandwidth table covers Gen3/4/5 at x4/x8/x16
         bandwidth_gbps = {
+            (3, 4): 3.9, (3, 8): 7.9, (3, 16): 15.8,
             (4, 4): 6.4, (4, 8): 12.8, (4, 16): 25.6,
             (5, 4): 12.6, (5, 8): 25.2, (5, 16): 50.4,
         }.get((gen, width), 0)
-        
-        if width <= 8:
-            print(f"⚠️  [Vaayu-Warning] GPU is running at PCIe Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
-            if bandwidth_gbps > 0:
-                print(f"   This limits gpu_load speed to ~{132/bandwidth_gbps:.0f}s per token for 132GB models.")
-            print(f"   Consider moving the GPU to the primary PCI_E1 slot for full x16 bandwidth.")
+
+        # Warn only when bandwidth is meaningfully below the Gen4 x16 baseline.
+        # x8 slots (e.g. PCI_E1 on many consumer boards) are still common and worth
+        # flagging — 12.8 GB/s vs 25.6 GB/s is a real 2x penalty on gpu_load.
+        # Only suppress the warning at x16 (optimal).
+        if width < 16:
+            bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
+            penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
+            print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
+            print(f"   gpu_load limited to {penalty} for 132GB models.")
+            print(f"   Moving GPU to primary x16 slot doubles bandwidth.")
         else:
-            print(f"✅ [Vaayu] GPU PCIe link optimal: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
+            print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
             
     except Exception as e:
         # Silently pass if nvidia-smi is unavailable or parsing fails

@@ -107,9 +107,13 @@ def build_loader_strategy(checkpoint_path: str, vaayu_base_ref, ram_cache=None):
 
 **File to modify:** `vaayu/vaayu_base.py`
 
-In `__init__()`, before building the loader strategy:
+> [!IMPORTANT]
+> Call `auto_detect_cache_budget()` **after** `_init_pinned_layers()` completes, not at the top of `__init__`. The pinned embed/norm/lm_head layers consume ~3.4 GB of RAM during init. If the budget is measured before that allocation, the cache will be over-budgeted by ~3.4 GB and may cause OOM.
+
+Place the cache init after the `_init_pinned_layers()` call:
 
 ```python
+# After _init_pinned_layers() call:
 from .persist.ram_cache import LayerRAMCache, auto_detect_cache_budget
 
 if device.startswith("cuda"):

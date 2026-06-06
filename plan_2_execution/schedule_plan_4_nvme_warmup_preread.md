@@ -50,8 +50,15 @@ import os
                 try:
                     file_size = os.path.getsize(path)
                     if has_rust:
-                        # Depending on Plan 3's implementation, you may need the direct_io boolean here
-                        vaayu_rust.io_uring_read_into(path, 0, file_size, buf.data_ptr(), True)
+                        # Always use O_DIRECT=True for warmup: goal is to prime the NVMe
+                        # controller's internal DRAM cache, not fill the Linux page cache.
+                        # Signature: (path, offset, length, buf_ptr, queue_depth, use_direct_io)
+                        # After Plan 5 adds use_direct_io param; before Plan 5, use 5-arg form.
+                        try:
+                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf.data_ptr(), 32, True)
+                        except TypeError:
+                            # Plan 5 not yet applied — fall back to 5-arg form
+                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf.data_ptr(), 32)
                     else:
                         with open(path, 'rb') as f:
                             f.readinto(buf.numpy())

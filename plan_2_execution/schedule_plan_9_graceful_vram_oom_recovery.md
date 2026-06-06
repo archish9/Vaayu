@@ -14,25 +14,32 @@ The layer forward pass happens in the hot loop inside `vaayu_base.py`. We need t
 
 ## Implementation Steps
 
-### Step 1: Implement the Retry Loop
+### Step 1: Add `_trim_kv_cache_front` helper
 
 **File to modify:** `vaayu/vaayu_base.py`
 
-In `forward()`, locate the section where the decoder layer is called (around line 770+):
+The existing `_trim_kv_cache(cache, target_seq_len)` (line ~1307) trims from the **end** — it's used for speculative decoding rollback. OOM recovery needs to trim from the **front** (forget oldest tokens). Add a separate method:
 
 ```python
-        # Locate the layer execution block:
-        # layer_outputs = layer(
-        #     seq,
-        #     attention_mask=attention_mask,
-        #     position_ids=position_ids,
-        #     past_key_value=past_key_value,
-        #     output_attentions=output_attentions,
-        #     use_cache=use_cache,
-        # )
+def _trim_kv_cache_front(self, cache, target_seq_len: int) -> None:
+    """Removes the OLDEST tokens from the KV cache to free VRAM."""
+    for i in range(len(cache.key_cache)):
+        if cache.key_cache[i] is not None:
+            cache.key_cache[i] = cache.key_cache[i][:, :, -target_seq_len:, :]
+        if cache.value_cache[i] is not None:
+            cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 ```
 
-Wrap it in a recovery mechanism:
+### Step 2: Implement the Retry Loop
+
+**File to modify:** `vaayu/vaayu_base.py`
+
+In `forward()`, locate the decoder layer call (around line 1220+). The variable is `past_key_values` (plural — that is the name used throughout `vaayu_base.py`).
+
+> [!CAUTION]
+> Do NOT modify `seq`, `position_ids`, or `attention_mask` inside the OOM handler.
+> At the point of the decoder layer call, `seq` holds **hidden states** (shape `[batch, 1, hidden_dim]`), not input token IDs. Its shape is determined by the model architecture and cannot be safely changed mid-forward-pass without corrupting all subsequent layers.
+> Only the **KV cache** can be safely trimmed on OOM — it is the only VRAM structure that scales with context length at this point.
 
 ```python
         MAX_OOM_RETRIES = 2
@@ -44,7 +51,7 @@ Wrap it in a recovery mechanism:
                     seq,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_value,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
@@ -52,54 +59,26 @@ Wrap it in a recovery mechanism:
             except torch.cuda.OutOfMemoryError:
                 if retry == MAX_OOM_RETRIES:
                     print(f"[Vaayu] ❌ Fatal OOM on {layer_name}. Recovery failed.")
-                    raise  # exhausted retries, propagate the crash
-                
+                    raise  # exhausted retries — propagate
+
                 print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {retry+1}/{MAX_OOM_RETRIES}). "
                       f"Clearing cache and retrying...")
-                
-                # 1. Emergency Cleanup
+
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
-                
-                # 2. Context Truncation (Nuclear Option)
-                # If we still OOM'd, the KV cache is likely too large. 
-                # We slice the first 50% of tokens off the cache.
-                if past_key_value is not None:
+
+                # Trim KV cache only — never touch hidden states (seq) mid-loop.
+                if past_key_values is not None:
                     try:
-                        seq_len = past_key_value.get_seq_length()
+                        seq_len = self.get_past_key_values_cache_seq_len(past_key_values)
                         if seq_len > 512:
                             target_len = seq_len // 2
-                            print(f"[Vaayu] 🔪 Truncating KV cache from {seq_len} to {target_len} tokens")
-                            self._trim_kv_cache(past_key_value, target_len)
-                            
-                            # Also trim sequence and position_ids to match
-                            if seq.size(1) > 1: # Only if we are in prefill
-                                seq = seq[:, -target_len:, :]
-                            if position_ids is not None:
-                                position_ids = position_ids[:, -target_len:]
-                            if attention_mask is not None:
-                                attention_mask = attention_mask[:, :, -target_len:, -target_len:]
+                            print(f"[Vaayu] 🔪 Truncating KV cache: {seq_len} → {target_len} tokens")
+                            self._trim_kv_cache_front(past_key_values, target_len)
                     except Exception as e:
                         print(f"[Vaayu] Cache truncation failed: {e}")
 ```
-
-### Step 2: Ensure `_trim_kv_cache` Exists
-
-If `_trim_kv_cache` isn't fully robust for this use case (e.g. trimming from the *front* instead of the *back*), you may need to implement a front-trimming variant. `_trim_kv_cache` currently trims from the *end* (used for rolling back speculative decoding drafts). 
-
-To trim from the front (forgetting oldest history):
-```python
-    def _trim_kv_cache_front(self, cache, target_seq_len: int) -> None:
-        """Removes the OLDEST tokens from the cache to free VRAM."""
-        for i in range(len(cache.key_cache)):
-            if cache.key_cache[i] is not None:
-                cache.key_cache[i] = cache.key_cache[i][:, :, -target_seq_len:, :]
-            if cache.value_cache[i] is not None:
-                cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
-```
-
-Update the try/catch block to use `_trim_kv_cache_front` instead.
 
 ## Verification Plan
 1. In `test_quick.py`, artificially lower the VRAM budget (or pass a massive 15,000 token prompt).

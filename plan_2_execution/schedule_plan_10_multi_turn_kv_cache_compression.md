@@ -42,15 +42,19 @@ class KVCacheManager:
 
     def save_snapshot(self, past_key_values: DynamicCache):
         """Clones the active cache into system RAM, optionally compressing to INT8."""
+        # NOTE: When compress_kv=True, we directly append tuples to .key_cache / .value_cache
+        # instead of calling .update(). This bypasses DynamicCache's internal validation but
+        # is safe here because this snapshot is never passed back to a model forward pass in
+        # compressed form — it is always decompressed via load_snapshot() first.
         new_cache = DynamicCache()
         for layer_idx in range(len(past_key_values.key_cache)):
             k = past_key_values.key_cache[layer_idx]
             v = past_key_values.value_cache[layer_idx]
-            
+
             # Move to CPU
             k_cpu = k.cpu()
             v_cpu = v.cpu()
-            
+
             if self.compress_kv:
                 new_cache.key_cache.append(('int8', *_quantize_tensor(k_cpu), k_cpu.dtype))
                 new_cache.value_cache.append(('int8', *_quantize_tensor(v_cpu), v_cpu.dtype))
