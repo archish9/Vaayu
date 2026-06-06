@@ -163,7 +163,7 @@ class VaayuBaseModel(GenerationMixin):
                  hf_token=None, prefetching=True, delete_original=False,
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
-                 eagle_head_path=None, drafter_model_path=None, draft_tokens=5):
+                 drafter_model_path=None, draft_tokens=5):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -396,20 +396,15 @@ class VaayuBaseModel(GenerationMixin):
         # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
         self.set_layers_from_layer_names()
 
-        # Speculative decoding — must come after set_layers_from_layer_names()
-        # so self.layers[-1] (lm_head) is resolved.
-        self._last_hidden_state = None
-        self._lm_head_layer = self.layers[-1]
         self.draft_tokens = draft_tokens
 
         if device.startswith("cuda"):
             self._init_pinned_layers()
 
         self.speculator = None
-        if eagle_head_path or drafter_model_path:
+        if drafter_model_path:
             from .speculative import build_speculator
             self.speculator = build_speculator(
-                eagle_head_path=eagle_head_path,
                 drafter_model_path=drafter_model_path,
                 base_model=self,
                 device=device,
@@ -1217,8 +1212,6 @@ class VaayuBaseModel(GenerationMixin):
                     elif layer_name == self.layer_names_dict['norm']:
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
-                        # Store post-norm hidden state for EAGLE drafter (last token position)
-                        self._last_hidden_state = batch[j][:, -1:, :].detach()
 
                         if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
