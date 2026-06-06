@@ -280,6 +280,9 @@ class VaayuBaseModel(GenerationMixin):
             self.running_dtype = dtype
         self.dtype = self.running_dtype
 
+        if device.startswith("cuda"):
+            _check_pcie_topology()
+
         self.use_torch_compile = use_torch_compile
         self.kv_cache_mode = kv_cache_mode
         self.max_pinned_layers = max_pinned_layers
