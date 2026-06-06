@@ -1,4 +1,5 @@
 import os
+import subprocess
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
@@ -142,6 +143,39 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
         "norm": norm_path,
         "lm_head": lm_head_path,
     }
+
+
+def _check_pcie_topology():
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return
+
+        parts = result.stdout.strip().split(", ")
+        width = int(parts[0])
+        gen = int(parts[1])
+
+        bandwidth_gbps = {
+            (3, 4): 3.9, (3, 8): 7.9, (3, 16): 15.8,
+            (4, 4): 6.4, (4, 8): 12.8, (4, 16): 25.6,
+            (5, 4): 12.6, (5, 8): 25.2, (5, 16): 50.4,
+        }.get((gen, width), 0)
+
+        if width < 16:
+            bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
+            penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
+            print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
+            print(f"   gpu_load limited to {penalty} for 132GB models.")
+            print(f"   Moving GPU to primary x16 slot doubles bandwidth.")
+        else:
+            print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
+
+    except Exception:
+        pass
 
 
 class VaayuBaseModel(GenerationMixin):
