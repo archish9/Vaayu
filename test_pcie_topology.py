@@ -1,5 +1,4 @@
 """Unit tests for _check_pcie_topology in vaayu/vaayu_base.py."""
-import subprocess
 from unittest.mock import patch, MagicMock
 
 
@@ -57,6 +56,14 @@ def test_nvidia_smi_nonzero_returncode_silent(capsys):
 def test_subprocess_exception_silent(capsys):
     fn = _import_fn()
     with patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi not found")):
+        fn()
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_oserror_silent(capsys):
+    fn = _import_fn()
+    with patch("subprocess.run", side_effect=OSError("permission denied")):
         fn()
     out = capsys.readouterr().out
     assert out == ""
