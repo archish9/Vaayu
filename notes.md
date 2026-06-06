@@ -803,3 +803,51 @@ Make APST permanent (so it survives reboots) — even though APST isn't causing 
 # Add to GRUB so APST stays disabled permanently
 sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 nvme_core.default_ps_max_latency_us=0"/' /etc/default/grub
 sudo update-grub
+
+
+
+---
+
+
+
+Edited test_quick.py
+Viewed test_quick.py:28-47
+Listed directory plans_2
+Viewed next_implementations.md:1-544
+Viewed Application-Level%20RAM%20Layer%20Cache-implementation_plan.md:1-414
+Viewed MoE%20Expert-Aware%20Streaming.md:1-203
+Viewed Prompt%20Lookup%20decoding:1-288
+Viewed kv-cache-int-note.md:1-119
+Viewed plan-7-int8-kv-cache.md:1-198
+
+I have thoroughly reviewed all the documentation and plans in the `plans_2/` directory, and I now have a deep, holistic understanding of the upcoming roadmap for Vaayu.
+
+Here is a summary of my understanding of the features you plan to implement:
+
+### 1. Application-Level RAM Layer Cache
+You plan to utilize unused system RAM (~24 GB on a 32 GB system) to keep a clone of frequently accessed layer tensors (around 15 layers) in memory. This acts as an LRU cache. When a cached layer is hit during the forward pass, Vaayu will skip the `0.28s` NVMe read and instead copy the tensors from regular RAM to the pinned buffer. This is projected to cut ~4 seconds off the per-token `io_wait` time, bringing generation down to ~19s per token.
+
+### 2. Prompt Lookup Decoding (PLD)
+Since we just removed EAGLE-3, we need a universal speculation path that works for models with custom tokenizers and huge vocabularies (like the 160K vocab in Kimi-K2.6) where standard drafter models don't exist. PLD is a brilliant solution: it requires 0 MB of VRAM and uses CPU-based n-gram sliding window matching on the context history to propose draft candidates. It fits perfectly into the existing `SpeculativeDecoder` abstraction.
+
+### 3. MoE Expert-Aware Streaming
+Running massive MoE models (like 1T Kimi-K2.6) requires streaming only the active experts rather than the entire 594 GB model. However, knowing which experts to fetch requires executing the router gate first, which breaks Vaayu's current producer-consumer overlap (where layer $N+1$ is prefetched while layer $N$ computes). The recommended solution is to apply an **Expert RAM Cache** (leveraging temporal locality since tokens tend to reuse the same experts 70–90% of the time), and eventually layer **Speculative Prefetching** (guessing the next experts based on history) to restore the pipeline overlap.
+
+### 4. The Top 8 Core Enhancements (`next_implementations.md`)
+These are crucial pipeline, telemetry, and UX upgrades:
+1. **Persistent `io_uring` Lifecycle**: Moving from per-layer ring creation to a persistent ring to enable registered buffers and fixed files.
+2. **Adaptive `O_DIRECT`**: Automatically disabling `O_DIRECT` if the machine has enough RAM (e.g., 64GB+) to let the Linux page cache naturally hold the model.
+3. **Telemetry System**: Building a granular per-layer JSON telemetry logger to identify exact bottlenecks (NVMe vs. PCIe vs. Overhead).
+4. **NVMe Warm-Up**: Pre-reading layers during init to prime the SSD's internal DRAM cache and speed up the very first token.
+5. **Token Streaming**: Emitting tokens asynchronously (via Hugging Face's `TextIteratorStreamer`) so the UI can display them as they arrive, vastly improving perceived UX.
+6. **PCIe Topology Check**: Automatically warning the user if the GPU is in an x8 or x4 slot, which cripples `gpu_load` speeds.
+7. **Graceful OOM Recovery**: Catching VRAM spikes and aggressively truncating/clearing context instead of completely crashing the engine.
+8. **Multi-Query Batching**: Allowing multiple requests to piggyback on a single 132 GB disk read cycle.
+
+### 5. Multi-Turn KV Cache Compression (INT8 vs FP8)
+The documents clarify a critical distinction: Vaayu Linux will keep using **Dynamic FP8 Cache** during the active forward pass (for speed and hardware support). However, if we build a persistent chat wrapper (like the Mac `KVCacheManager`), we will snapshot the KV cache into **INT8** when idle in system RAM to halve the memory footprint between user messages, bypassing the need to re-prefill on every conversation turn.
+
+---
+I am fully calibrated on the architecture, the math behind the latency savings, and exactly how these systems slot into the existing `vaayu_base.py`, `loader_strategy.py`, and `safetensor_model_persister.py` pipeline. 
+
+Whenever you are ready, let me know which of these plans you would like to begin implementing!

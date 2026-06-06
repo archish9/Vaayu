@@ -33,7 +33,7 @@ MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ── Speculative Decoding ─────────────────────────────────────────────────────
-DRAFTER_MODEL_PATH = None   # e.g. "/path/to/Qwen2.5-0.5B" — any small model sharing vocabulary
+DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"   # e.g. "/path/to/Qwen2.5-0.5B" — any small model sharing vocabulary
 DRAFT_TOKENS       = 5      # candidate tokens per speculative iteration
 # ─────────────────────────────────────────────────────────────────────────────
 
