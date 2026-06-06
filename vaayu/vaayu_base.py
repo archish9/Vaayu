@@ -155,7 +155,7 @@ def _check_pcie_topology():
         if result.returncode != 0:
             return
 
-        parts = result.stdout.strip().split(", ")
+        parts = result.stdout.strip().splitlines()[0].split(", ")
         width = int(parts[0])
         gen = int(parts[1])
 
@@ -170,7 +170,7 @@ def _check_pcie_topology():
             penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
             print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
             print(f"   gpu_load limited to {penalty} for 132GB models.")
-            print(f"   Moving GPU to primary x16 slot doubles bandwidth.")
+            print(f"   Moving GPU to a primary x16 slot maximizes bandwidth.")
         else:
             print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
 

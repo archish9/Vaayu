@@ -77,3 +77,13 @@ def test_unknown_pcie_combo_prints_warning_no_crash(capsys):
     out = capsys.readouterr().out
     assert "⚠️" in out
     assert "unknown bandwidth" in out
+
+
+def test_multi_gpu_parses_first_gpu_only(capsys):
+    fn = _import_fn()
+    # nvidia-smi returns one line per GPU on multi-GPU machines
+    with patch("subprocess.run", return_value=_make_result("16, 4\n16, 4\n")):
+        fn()
+    out = capsys.readouterr().out
+    assert "✅" in out
+    assert "Gen4 x16" in out
