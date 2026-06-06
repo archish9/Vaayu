@@ -162,7 +162,7 @@ In `__init__()`, after `checkpoint_path` is resolved and before building the loa
 
 ```python
 from .persist.safetensor_model_persister import init_model_io
-from .persist.ram_cache import _should_use_direct_io  # Plan 3 heuristic
+from .persist.safetensor_model_persister import _should_use_direct_io  # Plan 3 heuristic
 
 if device.startswith("cuda"):
     use_direct = _should_use_direct_io(str(self.checkpoint_path))

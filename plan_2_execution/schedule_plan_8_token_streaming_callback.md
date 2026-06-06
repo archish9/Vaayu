@@ -77,20 +77,30 @@ def stream_generate(
 If `speculative_generate` is called, ensure it processes the `streamer` object. 
 In `speculative_generate`, near where tokens are appended to the sequence:
 
+The current `speculative_generate` signature is `(self, input_ids, max_new_tokens=20)` — it has **no `streamer` param and no `**kwargs`**. Both must be added explicitly.
+
 ```python
-def speculative_generate(self, input_ids, max_new_tokens=128, streamer=None, **kwargs):
-    # ... inside the loop where accepted_ids are added:
+def speculative_generate(
+    self,
+    input_ids: torch.LongTensor,
+    max_new_tokens: int = 20,
+    streamer=None,           # NEW
+    temperature: float = 0.0,
+    **kwargs,
+) -> torch.LongTensor:
+    # ... inside the loop where accepted_ids are appended (after line ~1398):
     if streamer is not None:
-        # streamer.put() accepts a 1D tensor of newly generated tokens
-        # Since speculative decoding can accept multiple tokens, pass them all
+        # TextIteratorStreamer.put() expects a 1D or 2D tensor of token IDs.
+        # Speculative decoding can accept multiple tokens at once — pass them all.
         streamer.put(accepted_ids[0].cpu())
-        
-    # ... at the very end of the function:
+
+    # ... at the very end, before return:
     if streamer is not None:
         streamer.end()
 ```
 
-*(You must ensure the same `streamer.put()` logic exists if overriding the standard `generate` loop, though `transformers` handles it natively if calling `super().generate`)*.
+> [!NOTE]
+> Vaayu does NOT have a custom `generate()` loop — it inherits HuggingFace's `GenerationMixin.generate()`, which natively handles `TextIteratorStreamer`. Only `speculative_generate` needs manual instrumentation.
 
 ### Step 3: Implement in `test_quick.py`
 

@@ -81,7 +81,7 @@ Since some sequences will finish generating before others, Hugging Face `generat
         seq,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_value=past_key_value,
+        past_key_values=past_key_values,
         output_attentions=output_attentions,
         use_cache=use_cache,
     )

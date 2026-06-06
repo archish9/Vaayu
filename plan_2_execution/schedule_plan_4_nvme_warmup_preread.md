@@ -31,22 +31,31 @@ import os
         internal DRAM cache and read-ahead logic. This reduces Token 1 latency.
         Reads are thrown away — the purpose is to prime the NVMe hardware.
         """
-        if not hasattr(self, '_layer_paths') or not self._layer_paths:
+        # self._layer_paths does NOT exist. Vaayu stores logical layer names in
+        # self.layer_names (e.g. "model.layers.0"), not file paths.
+        # Convert: path = str(Path(self.checkpoint_path) / (name + ".safetensors"))
+        if not hasattr(self, 'layer_names') or not self.layer_names:
             return
-            
+
         def _do_warmup():
-            warmup_layers = min(10, len(self._layer_paths))
-            # Allocate a temporary pinned buffer large enough for 1 layer (~1.7 GB max)
-            buf = torch.empty(1700 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
-            
+            from pathlib import Path
+            warmup_count = min(10, len(self.layer_names))
+            warmup_names = self.layer_names[:warmup_count]
+
+            # Allocate a plain (non-pinned) buffer for the fallback path.
+            # pin_memory=True tensors cannot be .numpy()'d on CUDA systems.
+            buf_plain = torch.empty(1700 * 1024 * 1024, dtype=torch.uint8)
+            # Pinned buffer for the io_uring path (uses data_ptr, no numpy)
+            buf_pinned = torch.empty(1700 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+
             try:
                 import vaayu_rust
                 has_rust = hasattr(vaayu_rust, 'io_uring_read_into')
             except ImportError:
                 has_rust = False
-            
-            for i in range(warmup_layers):
-                path = self._layer_paths[i]
+
+            for name in warmup_names:
+                path = str(Path(self.checkpoint_path) / (name + ".safetensors"))
                 try:
                     file_size = os.path.getsize(path)
                     if has_rust:
@@ -55,16 +64,19 @@ import os
                         # Signature: (path, offset, length, buf_ptr, queue_depth, use_direct_io)
                         # After Plan 5 adds use_direct_io param; before Plan 5, use 5-arg form.
                         try:
-                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf.data_ptr(), 32, True)
+                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf_pinned.data_ptr(), 32, True)
                         except TypeError:
                             # Plan 5 not yet applied — fall back to 5-arg form
-                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf.data_ptr(), 32)
+                            vaayu_rust.io_uring_read_into(path, 0, file_size, buf_pinned.data_ptr(), 32)
                     else:
                         with open(path, 'rb') as f:
-                            f.readinto(buf.numpy())
+                            # Use non-pinned buffer here — pin_memory tensors can't be numpy()'d on CUDA
+                            f.readinto(buf_plain.numpy())
                 except Exception as e:
-                    print(f"[Vaayu] Warm-up aborted on layer {i}: {e}")
+                    print(f"[Vaayu] Warm-up aborted on layer {name}: {e}")
                     break  # warmup is best-effort
+
+            del buf_plain, buf_pinned
             
             del buf
             print(f"[Vaayu] NVMe warm-up complete ({warmup_layers} layers pre-read)")

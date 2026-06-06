@@ -87,6 +87,14 @@ Pass `self._use_direct_io` to `init_model_io()` in Plan 5.
 > [!NOTE]
 > The Rust changes (adding `use_direct_io: bool` param to `persistent_read`, `legacy_read`, `register_files`, and `io_uring_read_into`) are described in **Plan 5 Step 1**. Do not duplicate them here.
 
+## Dependency
+
+`psutil` is not yet in `requirements.txt`. Add it before implementing:
+```
+psutil>=5.9
+```
+Plan 6 also uses `psutil` — add once, covers both.
+
 ## Verification Plan
 1. Run `python test_quick.py`.
 2. On a 32GB machine: `[Vaayu] Limited RAM (...) Using O_DIRECT` should appear at startup.

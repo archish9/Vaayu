@@ -95,9 +95,15 @@ class VaayuTelemetry:
 
 **File to modify:** `vaayu/vaayu_base.py`
 
-1.  In `__init__`, instantiate `self.telemetry = VaayuTelemetry()`.
-2.  At the start of `forward()`, add `self.telemetry.begin_token(self._token_count)` (assuming you track token index).
-3.  Modify `self.move_layer_to_device(state_dict)` to return the time it took (or instrument the transfer directly in the forward loop).
+1.  In `__init__`, instantiate `self.telemetry = VaayuTelemetry()` and `self._token_count = 0`.
+    `_token_count` does not exist yet — it must be created here and incremented at the end of each `generate()` / `speculative_generate()` call (or at the top of the generation loop for each new token emitted).
+2.  At the start of `forward()`, add `self.telemetry.begin_token(self._token_count)`.
+3.  **Do NOT modify `move_layer_to_device`'s return type** — it currently returns a list of param names (used by callers at lines 1180 and 1197). Instead, wrap the call site in `forward()` with a timer:
+    ```python
+    _t0 = time.perf_counter()
+    moved_layers = self.move_layer_to_device(state_dict)
+    gpu_transfer_us = int((time.perf_counter() - _t0) * 1e6)
+    ```
 4.  Wrap `layer(seq)` with a timer to get `compute_us`.
 5.  In `safetensor_model_persister.py`, modify `_load_pinned()` to return a dictionary of timings (`header_parse_us`, `io_submit_us`, `io_wait_us`, `tensor_reconstruct_us`) along with the tensor dictionary.
 6.  Assemble these timings into a `LayerTiming` object and call `self.telemetry.record_layer(timing)`.

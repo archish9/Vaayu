@@ -23,16 +23,33 @@ Modify `_init_pinned_layers` to permanently pin all MoE router/gate linear layer
 ```python
     def _init_pinned_layers(self):
         # ... existing embed/norm/lm_head pinning ...
-        
-        # New: Pin all router gates
-        for layer_name in self.layer_names:
-            if "gate" in layer_name or "router" in layer_name:
-                self._pinned_layers[layer_name] = self.loader_strategy.load_from_disk(
-                    layer_name, str(self.checkpoint_path)
-                )
-                self._pinned_layers[layer_name] = self.move_layer_to_device(
-                    self._pinned_layers[layer_name]
-                )
+
+        # New: Pin all router/gate layers for MoE models.
+        #
+        # IMPORTANT: self.layer_names contains HIGH-LEVEL shard names like
+        # "model.layers.0" — NOT sub-tensor names like "model.layers.0.mlp.gate".
+        # Gate detection requires parsing the safetensors header keys, not self.layer_names.
+        #
+        # Each shard's header lists all tensor keys it contains. A gate tensor key
+        # typically matches "gate_proj" or "router" in MoE architectures (e.g. Kimi, Mixtral).
+        if self._is_moe:
+            from pathlib import Path
+            import json, struct
+            for shard_name in self.layer_names:
+                shard_path = str(Path(self.checkpoint_path) / (shard_name + ".safetensors"))
+                try:
+                    with open(shard_path, 'rb') as f:
+                        hdr_len = struct.unpack('<Q', f.read(8))[0]
+                        hdr = json.loads(f.read(hdr_len))
+                    gate_keys = [k for k in hdr if k != '__metadata__'
+                                 and ('gate' in k or 'router' in k)
+                                 and 'expert' not in k]  # exclude per-expert weights
+                    if gate_keys:
+                        tensors = self.loader_strategy.load_from_disk(shard_name, str(self.checkpoint_path))
+                        gate_tensors = {k: v for k, v in tensors.items() if k in gate_keys}
+                        self._pinned_layers[shard_name + ".gate"] = self.move_layer_to_device(gate_tensors)
+                except Exception as e:
+                    print(f"[Vaayu-MoE] Gate pin failed for {shard_name}: {e}")
 ```
 
 ### Step 2: Implement the Expert RAM Cache

@@ -22,65 +22,81 @@ Create a wrapper class to handle snapshotting.
 import torch
 from transformers import DynamicCache
 
-def _quantize_tensor(t):
-    """Symmetric per-tensor INT8 quantization. Returns (int8_tensor, float_scale)."""
-    scale = t.abs().max().item() / 127.0
+def _quantize_tensor(t: torch.Tensor):
+    """
+    Symmetric per-tensor INT8 quantization.
+    Input must be a float tensor (BF16, FP16, FP32).
+    FP8DynamicCache stores FP8 tensors — dequantize those first before calling this.
+    Returns (int8_tensor, float_scale).
+    """
+    # Upcast to float32 for safe abs/max — handles BF16, FP16, FP32
+    t_f32 = t.to(torch.float32)
+    scale = t_f32.abs().max().item() / 127.0
     if scale == 0.0:
-        return t.to(torch.int8), 1.0
-    q = (t / scale).round().clamp(-128, 127).to(torch.int8)
+        return t_f32.to(torch.int8), 1.0
+    q = (t_f32 / scale).round().clamp(-128, 127).to(torch.int8)
     return q, scale
 
 def _dequantize_tensor(q, scale, dtype):
     """Restore INT8 tensor to original dtype."""
-    return q.to(dtype) * scale
+    return q.to(torch.float32).mul_(scale).to(dtype)
+
+def _extract_kv_as_bf16(cache, layer_idx: int):
+    """
+    Extract key/value tensors from cache as BF16 CPU tensors.
+    Handles both FP8DynamicCache (needs dequantization) and standard DynamicCache.
+    """
+    from vaayu.vaayu_base import FP8DynamicCache
+    k = cache.key_cache[layer_idx]
+    v = cache.value_cache[layer_idx]
+    if isinstance(cache, FP8DynamicCache):
+        # FP8DynamicCache stores FP8 tensors + separate scales.
+        # abs().max() fails on float8 — must dequantize to BF16 first.
+        ks = cache._key_scales[layer_idx]
+        vs = cache._value_scales[layer_idx]
+        k = k.to(torch.bfloat16) * ks
+        v = v.to(torch.bfloat16) * vs
+    return k.cpu(), v.cpu()
 
 class KVCacheManager:
     def __init__(self, model, compress_kv: bool = True):
         self.model = model
         self.compress_kv = compress_kv
-        self._cached_kv_snapshot = None
+        # Use a plain dict for the snapshot — more robust than mutating DynamicCache internals.
+        # Schema: {layer_idx: {'k': tensor, 'v': tensor}}
+        # or compressed: {layer_idx: {'k_q': int8, 'k_s': float, 'v_q': int8, 'v_s': float, 'dtype': dtype}}
+        self._snapshot: dict | None = None
 
-    def save_snapshot(self, past_key_values: DynamicCache):
+    def save_snapshot(self, past_key_values):
         """Clones the active cache into system RAM, optionally compressing to INT8."""
-        # NOTE: When compress_kv=True, we directly append tuples to .key_cache / .value_cache
-        # instead of calling .update(). This bypasses DynamicCache's internal validation but
-        # is safe here because this snapshot is never passed back to a model forward pass in
-        # compressed form — it is always decompressed via load_snapshot() first.
-        new_cache = DynamicCache()
+        snap = {}
         for layer_idx in range(len(past_key_values.key_cache)):
-            k = past_key_values.key_cache[layer_idx]
-            v = past_key_values.value_cache[layer_idx]
-
-            # Move to CPU
-            k_cpu = k.cpu()
-            v_cpu = v.cpu()
+            k_cpu, v_cpu = _extract_kv_as_bf16(past_key_values, layer_idx)
+            orig_dtype = k_cpu.dtype
 
             if self.compress_kv:
-                new_cache.key_cache.append(('int8', *_quantize_tensor(k_cpu), k_cpu.dtype))
-                new_cache.value_cache.append(('int8', *_quantize_tensor(v_cpu), v_cpu.dtype))
+                q_k, s_k = _quantize_tensor(k_cpu)
+                q_v, s_v = _quantize_tensor(v_cpu)
+                snap[layer_idx] = {'k_q': q_k, 'k_s': s_k, 'v_q': q_v, 'v_s': s_v, 'dtype': orig_dtype}
             else:
-                new_cache.update(k_cpu, v_cpu, layer_idx)
-                
-        self._cached_kv_snapshot = new_cache
+                snap[layer_idx] = {'k': k_cpu, 'v': v_cpu}
+
+        self._snapshot = snap
 
     def load_snapshot(self, device="cuda") -> DynamicCache:
-        """Restores the snapshot back to the GPU for the next generation turn."""
-        if self._cached_kv_snapshot is None:
+        """Restores the snapshot back to the GPU as a standard DynamicCache."""
+        if self._snapshot is None:
             return None
-            
+
         out = DynamicCache()
-        for layer_idx, (k_entry, v_entry) in enumerate(
-            zip(self._cached_kv_snapshot.key_cache, self._cached_kv_snapshot.value_cache)
-        ):
-            if isinstance(k_entry, tuple) and k_entry[0] == 'int8':
-                _, q_k, scale_k, dtype_k = k_entry
-                _, q_v, scale_v, dtype_v = v_entry
-                k = _dequantize_tensor(q_k, scale_k, dtype_k).to(device)
-                v = _dequantize_tensor(q_v, scale_v, dtype_v).to(device)
+        for layer_idx in sorted(self._snapshot.keys()):
+            entry = self._snapshot[layer_idx]
+            if 'k_q' in entry:
+                k = _dequantize_tensor(entry['k_q'], entry['k_s'], entry['dtype']).to(device)
+                v = _dequantize_tensor(entry['v_q'], entry['v_s'], entry['dtype']).to(device)
             else:
-                k = k_entry.to(device)
-                v = v_entry.to(device)
-                
+                k = entry['k'].to(device)
+                v = entry['v'].to(device)
             out.update(k, v, layer_idx)
         return out
 ```

@@ -18,16 +18,25 @@ The layer forward pass happens in the hot loop inside `vaayu_base.py`. We need t
 
 **File to modify:** `vaayu/vaayu_base.py`
 
-The existing `_trim_kv_cache(cache, target_seq_len)` (line ~1307) trims from the **end** — it's used for speculative decoding rollback. OOM recovery needs to trim from the **front** (forget oldest tokens). Add a separate method:
+The existing `_trim_kv_cache(cache, target_seq_len)` (line ~1307) trims from the **end** — it's used for speculative decoding rollback. OOM recovery needs to trim from the **front** (forget oldest tokens). It also handles `FP8DynamicCache` scales. Mirror that pattern:
 
 ```python
 def _trim_kv_cache_front(self, cache, target_seq_len: int) -> None:
     """Removes the OLDEST tokens from the KV cache to free VRAM."""
-    for i in range(len(cache.key_cache)):
-        if cache.key_cache[i] is not None:
-            cache.key_cache[i] = cache.key_cache[i][:, :, -target_seq_len:, :]
-        if cache.value_cache[i] is not None:
-            cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
+    if cache is None:
+        return
+    if isinstance(cache, FP8DynamicCache):
+        # FP8DynamicCache stores separate scale tensors — must trim them too.
+        for i in range(len(cache.key_cache)):
+            cache.key_cache[i]    = cache.key_cache[i][:, :, -target_seq_len:, :]
+            cache.value_cache[i]  = cache.value_cache[i][:, :, -target_seq_len:, :]
+            cache._key_scales[i]  = cache._key_scales[i][:, :, -target_seq_len:, :]
+            cache._value_scales[i] = cache._value_scales[i][:, :, -target_seq_len:, :]
+    elif hasattr(cache, 'key_cache'):
+        for i in range(len(cache.key_cache)):
+            if cache.key_cache[i] is not None and len(cache.key_cache[i].shape) >= 3:
+                cache.key_cache[i]   = cache.key_cache[i][:, :, -target_seq_len:, :]
+                cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 ```
 
 ### Step 2: Implement the Retry Loop

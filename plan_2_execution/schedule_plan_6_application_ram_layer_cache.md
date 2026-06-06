@@ -110,23 +110,29 @@ def build_loader_strategy(checkpoint_path: str, vaayu_base_ref, ram_cache=None):
 > [!IMPORTANT]
 > Call `auto_detect_cache_budget()` **after** `_init_pinned_layers()` completes, not at the top of `__init__`. The pinned embed/norm/lm_head layers consume ~3.4 GB of RAM during init. If the budget is measured before that allocation, the cache will be over-budgeted by ~3.4 GB and may cause OOM.
 
-Place the cache init after the `_init_pinned_layers()` call:
+**Ordering constraint:** `self.loader_strategy` is created at line ~344, *before* `_init_pinned_layers()` at line ~402. And `_init_pinned_layers()` itself calls `self.loader_strategy.load_from_disk()` — so the strategy must exist before pinning. The cache cannot be created before pinning (RAM not yet consumed). The solution: create strategy first without cache, then attach cache after pinning.
 
 ```python
-# After _init_pinned_layers() call:
+# Line ~344: create strategy WITHOUT cache (existing call, unchanged)
+self.loader_strategy = build_loader_strategy(str(self.checkpoint_path), self)
+
+# ... (existing _init_pinned_layers() call at line ~402) ...
+self._init_pinned_layers()
+
+# AFTER _init_pinned_layers() — pinned layers now consuming ~3.4 GB:
 from .persist.ram_cache import LayerRAMCache, auto_detect_cache_budget
 
 if device.startswith("cuda"):
     cache_budget = auto_detect_cache_budget()
     self.ram_cache = LayerRAMCache(cache_budget)
+    # Attach cache to the already-created strategy
+    self.loader_strategy._cache = self.ram_cache
     print(f"[Vaayu-Cache] RAM layer cache: {cache_budget / 1e9:.1f} GB budget")
 else:
     self.ram_cache = None
-
-self.loader_strategy = build_loader_strategy(
-    str(self.checkpoint_path), self, ram_cache=self.ram_cache
-)
 ```
+
+`build_loader_strategy` does **not** need a `ram_cache` param — the cache is attached directly to the strategy instance after the fact. Remove the `ram_cache` param from Step 2's `build_loader_strategy` signature.
 
 Finally, in `forward()`, add `self.ram_cache.stats()` to the token summary print statement so we can visually verify the hits.
 
