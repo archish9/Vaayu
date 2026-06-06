@@ -98,3 +98,11 @@ def test_multi_gpu_parses_first_gpu_only(capsys):
     # Verify -i=1 was passed to nvidia-smi
     call_args = mock_run.call_args[0][0]
     assert "-i=1" in call_args
+
+
+def test_sentinel_prevents_duplicate_nvidia_smi_calls(capsys):
+    fn = _import_fn()
+    with patch("subprocess.run", return_value=_make_result("16, 4\n")) as mock_run:
+        fn(gpu_index=0)
+        fn(gpu_index=0)
+    assert mock_run.call_count == 1

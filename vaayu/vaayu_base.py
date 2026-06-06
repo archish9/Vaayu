@@ -148,7 +148,6 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
 _pcie_topology_checked: set = set()
 
 def _check_pcie_topology(gpu_index: int = 0):
-    global _pcie_topology_checked
     if gpu_index in _pcie_topology_checked:
         return
     _pcie_topology_checked.add(gpu_index)
@@ -176,7 +175,7 @@ def _check_pcie_topology(gpu_index: int = 0):
             bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
             penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
             print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
-            print(f"   gpu_load limited to {penalty} for 132GB models.")
+            print(f"   Inference may be bandwidth-limited to {penalty} for 132GB models.")
             print(f"   Moving GPU to a primary x16 slot maximizes bandwidth.")
         else:
             print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
