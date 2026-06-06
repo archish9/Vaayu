@@ -56,6 +56,11 @@ _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concu
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
+_BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
+                            # incompatible with IORING_REGISTER_BUFFERS (the kernel's
+                            # get_user_pages_fast() fails on NVIDIA-managed pages).
+                            # Reads still work via IORING_OP_READ; only the minor
+                            # IORING_OP_READ_FIXED zero-copy path is lost.
 
 
 def _ensure_executor():
@@ -89,7 +94,7 @@ def _register_iouring_files(model_dir: str) -> bool:
 
 
 def _load_pinned(file_path: str) -> dict:
-    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX, _BUFREG_DISABLED
 
     # ── 1. Parse safetensors header ─────────────────────────────────
     with open(file_path, 'rb') as f:
@@ -116,7 +121,10 @@ def _load_pinned(file_path: str) -> dict:
         _PINNED_SIZES[buf_idx] = alloc_size
         print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB")
         # Re-register buffers with io_uring after alloc (only when both buffers are allocated)
-        if (_USE_IOURING and _RING_INITIALIZED
+        # NOTE: CUDA-pinned memory (pin_memory=True) is incompatible with
+        # IORING_REGISTER_BUFFERS — kernel get_user_pages_fast() returns EFAULT.
+        # After the first failure we permanently disable to avoid log spam.
+        if (_USE_IOURING and _RING_INITIALIZED and not _BUFREG_DISABLED
                 and _PINNED_BUFS[0] is not None and _PINNED_BUFS[1] is not None):
             try:
                 vaayu_rust.reregister_buffers(
@@ -124,7 +132,10 @@ def _load_pinned(file_path: str) -> dict:
                     _PINNED_BUFS[1].data_ptr(), _PINNED_SIZES[1],
                 )
             except Exception as e:
-                print(f"[VAAYU-IO] reregister_buffers failed: {e}")
+                _BUFREG_DISABLED = True
+                print(f"[VAAYU-IO] buffer registration disabled: CUDA-pinned memory "
+                      f"incompatible with IORING_REGISTER_BUFFERS ({e}). "
+                      f"Using IORING_OP_READ (no perf impact for large reads).")
 
     buf = _PINNED_BUFS[buf_idx]
 

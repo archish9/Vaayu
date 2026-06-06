@@ -790,3 +790,16 @@ Hand the coding agent your `notes.md` context and tell them: *"Please begin by i
 Vaayu is designed to support any arbitrary model loaded dynamically by the user, then EAGLE-3 (or Medusa) cannot be the primary or only speculation path.
 
 Since EAGLE-3 requires specialized pre-trained speculator weights for every specific checkpoint, it cannot run universally.
+
+
+
+
+---
+
+
+Make APST permanent (so it survives reboots) — even though APST isn't causing the spikes, you should still persist the setting:
+
+
+# Add to GRUB so APST stays disabled permanently
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 nvme_core.default_ps_max_latency_us=0"/' /etc/default/grub
+sudo update-grub
