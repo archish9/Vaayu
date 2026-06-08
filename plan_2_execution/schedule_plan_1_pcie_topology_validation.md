@@ -23,21 +23,22 @@ Add the following helper function outside the class or as a private static metho
 ```python
 import subprocess
 
-def _check_pcie_topology():
+def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
     """
     Warns the user if the GPU is in a bandwidth-limited PCIe slot.
     Reads current link width and generation using nvidia-smi.
     """
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
+            ["nvidia-smi", f"-i={gpu_index}",
+             "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return
         
-        parts = result.stdout.strip().split(", ")
+        parts = result.stdout.strip().splitlines()[0].split(", ")
         width = int(parts[0])
         gen = int(parts[1])
         
@@ -55,10 +56,10 @@ def _check_pcie_topology():
         # Only suppress the warning at x16 (optimal).
         if width < 16:
             bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
-            penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
+            penalty = f"~{model_size_gb/bandwidth_gbps:.1f}s per token" if bandwidth_gbps > 0 else "unknown"
             print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
-            print(f"   gpu_load limited to {penalty} for 132GB models.")
-            print(f"   Moving GPU to primary x16 slot doubles bandwidth.")
+            print(f"   Inference may be bandwidth-limited to {penalty} for {model_size_gb:.1f}GB models.")
+            print(f"   Moving GPU to a primary x16 slot maximizes bandwidth.")
         else:
             print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
             
@@ -75,7 +76,17 @@ Inside the `VaayuBaseModel.__init__()` method (around line 166-200), shortly aft
 
 ```python
         if device.startswith("cuda"):
-            _check_pcie_topology()
+            gpu_index = int(device.split(":")[-1]) if ":" in device else 0
+            try:
+                model_size_bytes = sum(
+                    os.path.getsize(p) for p in Path(self.checkpoint_path).glob("*.safetensors")
+                )
+                model_size_gb = model_size_bytes / (1024 ** 3)
+                if model_size_gb == 0:
+                    model_size_gb = 132.0
+            except Exception:
+                model_size_gb = 132.0
+            _check_pcie_topology(gpu_index, model_size_gb)
 ```
 
 ## Verification Plan

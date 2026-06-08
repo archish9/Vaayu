@@ -147,7 +147,7 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
 
 _pcie_topology_checked: set = set()
 
-def _check_pcie_topology(gpu_index: int = 0):
+def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
     if gpu_index in _pcie_topology_checked:
         return
     _pcie_topology_checked.add(gpu_index)
@@ -173,9 +173,9 @@ def _check_pcie_topology(gpu_index: int = 0):
 
         if width < 16:
             bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
-            penalty = f"~{132/bandwidth_gbps:.0f}s per token" if bandwidth_gbps > 0 else "unknown"
+            penalty = f"~{model_size_gb/bandwidth_gbps:.1f}s per token" if bandwidth_gbps > 0 else "unknown"
             print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
-            print(f"   Inference may be bandwidth-limited to {penalty} for 132GB models.")
+            print(f"   Inference may be bandwidth-limited to {penalty} for {model_size_gb:.1f}GB models.")
             print(f"   Moving GPU to a primary x16 slot maximizes bandwidth.")
         else:
             print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
@@ -288,7 +288,16 @@ class VaayuBaseModel(GenerationMixin):
 
         if device.startswith("cuda"):
             gpu_index = int(device.split(":")[-1]) if ":" in device else 0
-            _check_pcie_topology(gpu_index)
+            try:
+                model_size_bytes = sum(
+                    os.path.getsize(p) for p in Path(self.checkpoint_path).glob("*.safetensors")
+                )
+                model_size_gb = model_size_bytes / (1024 ** 3)
+                if model_size_gb == 0:
+                    model_size_gb = 132.0
+            except Exception:
+                model_size_gb = 132.0
+            _check_pcie_topology(gpu_index, model_size_gb)
 
         self.use_torch_compile = use_torch_compile
         self.kv_cache_mode = kv_cache_mode
