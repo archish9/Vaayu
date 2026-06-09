@@ -27,14 +27,23 @@ import torch
 
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = 10       # 0=shared only, -1=auto fill VRAM budget, N=first N layers
-MAX_NEW_TOKENS    = 3        # keep small for chunked-prefill test; bump for real use
+MAX_PINNED_LAYERS = 10      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
+MAX_NEW_TOKENS    = 20       # enough tokens for PLD to show multi-token drafting gains
 MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ── Speculative Decoding ─────────────────────────────────────────────────────
-DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"   # e.g. "/path/to/Qwen2.5-0.5B" — any small model sharing vocabulary
-DRAFT_TOKENS       = 5      # candidate tokens per speculative iteration
+# Mode A — Standard Drafter: instruction/chat/novel responses. Costs VRAM (~0.3–1 GB).
+DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
+USE_PROMPT_LOOKUP  = False
+
+# Mode B — Prompt Lookup Decoding: code completion, repetitive text. Zero VRAM.
+#   Switch to PLD: set DRAFTER_MODEL_PATH = None and USE_PROMPT_LOOKUP = True
+#   Avoid for instruction→response — novel outputs yield 0 match rate (no speedup).
+# DRAFTER_MODEL_PATH = None
+# USE_PROMPT_LOOKUP  = True
+
+DRAFT_TOKENS = 15
 # ─────────────────────────────────────────────────────────────────────────────
 
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -53,23 +62,20 @@ model = AutoModel.from_pretrained(
     kv_cache_mode=KV_CACHE_MODE,
     max_pinned_layers=MAX_PINNED_LAYERS,
     prefill_chunk_size=PREFILL_CHUNK_SIZE,
-    drafter_model_path=DRAFTER_MODEL_PATH,
+    drafter_model_path=DRAFTER_MODEL_PATH or None,
+    use_prompt_lookup=USE_PROMPT_LOOKUP,
     draft_tokens=DRAFT_TOKENS,
 )
 
-# Long prompt — designed to exceed PREFILL_CHUNK_SIZE tokens so chunked prefill fires.
-# The repeated paragraph brings the total well past 512 tokens.
-_repeated = (
-    "You are reviewing a performance-critical Python function that streams large language "
-    "model weights from NVMe SSD into GPU VRAM using io_uring with O_DIRECT. The function "
-    "must handle pinned memory buffers, prefetching via a ThreadPoolExecutor, layer-by-layer "
-    "weight injection, and KV cache management across 80 transformer layers. It also needs to "
-    "support asymmetric layer pinning where the first N layers stay resident in VRAM while the "
-    "remaining layers are streamed per token. Provide a concise code review. "
-) * 5  # ~600 tokens after chat template
+# Completion-style prompt — model continues the repetitive pattern verbatim.
+# PLD finds n-gram matches (e.g., "load_layer" → predicts " path name") and
+# drafts multiple tokens per step instead of decoding one at a time.
+# Also exceeds PREFILL_CHUNK_SIZE to exercise chunked prefill.
+_pattern = "load_layer(path, name) -> load_layer(path, name) -> load_layer(path, name) -> "
+_repeated = _pattern * 15  # ~600 tokens; model will continue the -> load_layer pattern
 
 messages = [
-    {"role": "user", "content": _repeated}
+    {"role": "user", "content": f"Continue this exact pattern without explanation:\n{_repeated}"}
 ]
 formatted_prompt = model.tokenizer.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True

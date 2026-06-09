@@ -205,7 +205,7 @@ class VaayuBaseModel(GenerationMixin):
                  hf_token=None, prefetching=True, delete_original=False,
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
-                 drafter_model_path=None, draft_tokens=5):
+                 drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -460,7 +460,7 @@ class VaayuBaseModel(GenerationMixin):
         # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
         self.set_layers_from_layer_names()
 
-        self.draft_tokens = draft_tokens
+        self.draft_tokens = draft_tokens if draft_tokens is not None else 5
 
         if device.startswith("cuda"):
             self._init_pinned_layers()
@@ -478,12 +478,13 @@ class VaayuBaseModel(GenerationMixin):
             self.ram_cache = None
 
         self.speculator = None
-        if drafter_model_path:
+        if drafter_model_path or use_prompt_lookup:
             from .speculative import build_speculator
             self.speculator = build_speculator(
                 drafter_model_path=drafter_model_path,
                 base_model=self,
                 device=device,
+                use_prompt_lookup=use_prompt_lookup,
             )
 
         if device.startswith("cuda"):
@@ -724,7 +725,17 @@ class VaayuBaseModel(GenerationMixin):
         else:
             kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len * 2
 
-        overhead = int(1.5 * 1024 ** 3)
+        # Reserve one transformer layer's worth of VRAM as a streaming buffer.
+        # Without this slack, auto-fill pinning leaves <200 MB free, causing
+        # H2D transfers to serialize instead of pipeline during short compute
+        # windows (e.g., the final small prefill chunk with only a few tokens).
+        layer0_path = Path(self.checkpoint_path) / f"{self.layer_names_dict['layer_prefix']}.0.safetensors"
+        try:
+            layer_slack = layer0_path.stat().st_size
+        except Exception:
+            layer_slack = int(0.6 * 1024 ** 3)  # 600 MB conservative fallback
+
+        overhead = int(1.5 * 1024 ** 3) + layer_slack
         return max(0, total - kv_bytes - overhead)
 
     def _create_kv_cache(self):
@@ -1608,9 +1619,10 @@ class VaayuBaseModel(GenerationMixin):
             generated = torch.cat([generated, accepted_ids], dim=1)
             tokens_generated += num_accepted
 
+            accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
             print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
                   f"total_new={tokens_generated}/{max_new_tokens} "
-                  f"accept_rate={num_accepted / k:.0%}")
+                  f"accept_rate={accept_rate_str}")
 
             if accepted_ids[0, -1].item() in eos_set:
                 break
