@@ -121,18 +121,40 @@ def _init_iouring_ring(queue_depth: int = 32) -> bool:
         return False
 
 
-def _register_iouring_files(model_dir: str) -> bool:
+def _register_iouring_files(model_dir: str, use_direct_io: bool = True) -> bool:
     try:
         paths = [str(p) for p in Path(model_dir).glob("*.safetensors")]
         if not paths:
             print(f"[VAAYU-IO] no .safetensors files in {model_dir} — file registration skipped")
             return False
-        vaayu_rust.register_files(paths)
+        vaayu_rust.register_files(paths, use_direct_io)
         print(f"[VAAYU-IO] {len(paths)} files registered with io_uring")
         return True
     except Exception as e:
         print(f"[VAAYU-IO] register_files failed: {e} — fd registration disabled")
         return False
+
+
+def init_model_io(model_dir: str, use_direct_io: bool) -> None:
+    """Called once at model load. Initializes ring and registers files explicitly."""
+    global _RING_INITIALIZED, _FILES_REGISTERED, _USE_DIRECT_IO
+    _USE_DIRECT_IO = use_direct_io
+    if _USE_IOURING and not _RING_INITIALIZED:
+        _RING_INITIALIZED = _init_iouring_ring(32)
+    if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
+        _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
+
+
+import atexit
+
+def _shutdown_io() -> None:
+    if _USE_IOURING and _FILES_REGISTERED:
+        try:
+            vaayu_rust.unregister_files()
+        except Exception:
+            pass
+
+atexit.register(_shutdown_io)
 
 
 def _load_pinned(file_path: str) -> dict:
@@ -201,6 +223,7 @@ def _load_pinned(file_path: str) -> dict:
             aligned_length,
             buf.data_ptr(),
             32,
+            _USE_DIRECT_IO,
         )
         _io_wait_us = int((time.perf_counter() - _t_io) * 1e6)
         buf_view = buf[prefix_pad:]
@@ -264,12 +287,6 @@ class SafetensorModelPersister(ModelPersister):
         (saving_path / (layer_name + '.safetensors.done')).touch()
 
     def load_model(self, layer_name, path):
-        global _RING_INITIALIZED, _FILES_REGISTERED
-        if _USE_IOURING and not _RING_INITIALIZED:
-            _RING_INITIALIZED = _init_iouring_ring(32)
-        if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
-            _FILES_REGISTERED = _register_iouring_files(str(path))
-
         file_path = str(Path(path) / (layer_name + ".safetensors"))
 
         if _USE_PINNED:

@@ -398,8 +398,9 @@ class VaayuBaseModel(GenerationMixin):
         if not hasattr(self.config, "rope_theta"): self.config.rope_theta = 10000.0
 
         if device.startswith("cuda"):
-            from .persist.safetensor_model_persister import _should_use_direct_io
+            from .persist.safetensor_model_persister import _should_use_direct_io, init_model_io
             self._use_direct_io = _should_use_direct_io(str(self.checkpoint_path))
+            init_model_io(str(self.checkpoint_path), use_direct_io=self._use_direct_io)
         else:
             self._use_direct_io = False
 
@@ -463,6 +464,18 @@ class VaayuBaseModel(GenerationMixin):
 
         if device.startswith("cuda"):
             self._init_pinned_layers()
+
+        # RAM layer cache — measured AFTER _init_pinned_layers so pinned-layer RAM
+        # consumption is already reflected in available memory, preventing over-budget.
+        if device.startswith("cuda"):
+            from .persist.ram_cache import LayerRAMCache, auto_detect_cache_budget
+            _cache_budget = auto_detect_cache_budget()
+            self.ram_cache = LayerRAMCache(_cache_budget)
+            print(f"[Vaayu-Cache] RAM layer cache: {_cache_budget / 1e9:.1f} GB budget")
+            self._prepopulate_ram_cache()
+            self.loader_strategy._cache = self.ram_cache
+        else:
+            self.ram_cache = None
 
         self.speculator = None
         if drafter_model_path:
@@ -808,6 +821,48 @@ class VaayuBaseModel(GenerationMixin):
             f"({pinned_xformer} transformer + {pinned_shared} shared), "
             f"{used / 1e9:.2f} GB reserved"
         )
+
+    def _prepopulate_ram_cache(self) -> None:
+        """Load cacheable layers from NVMe into RAM before the first inference token.
+
+        Runs synchronously in __init__ (no inference, no DDR4 contention). Temporarily
+        disconnects the async cache path on loader_strategy so load_from_disk returns
+        plain tensors; put_sync() clones them inline and stores in the cache. Reconnects
+        after all layers are loaded. Token 1 then gets pure cache hits with no clone
+        overhead and no pinned-buffer race.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        # Transformer layers not already pinned to VRAM
+        prefix = self.layer_names_dict["layer_prefix"]
+        cacheable = [
+            name for name in self.layer_names
+            if name not in self.pinned_layer_names and name.startswith(prefix)
+        ]
+
+        # Disable async cache path so load_from_disk returns raw tensors without
+        # submitting background clones that would race with put_sync below.
+        self.loader_strategy._cache = None
+        n_cached = 0
+
+        for layer_name in cacheable:
+            if self.ram_cache.current_usage >= self.ram_cache.budget_bytes:
+                break
+            try:
+                tensors = self.loader_strategy.load_from_disk(
+                    layer_name, str(self.checkpoint_path))
+            except Exception as e:
+                print(f"[Vaayu-Cache] pre-pop skip {layer_name}: {e}")
+                continue
+            if self.ram_cache.put_sync(layer_name, tensors):
+                n_cached += 1
+
+        elapsed = _time.perf_counter() - t0
+        cached_gb = self.ram_cache.current_usage / 1e9
+        print(f"[Vaayu-Cache] pre-populated {n_cached} layers "
+              f"({cached_gb:.1f} GB) in {elapsed:.1f}s")
+        # loader_strategy._cache is reconnected by the caller immediately after return
 
     def _warmup_nvme(self) -> None:
         import threading
@@ -1426,7 +1481,8 @@ class VaayuBaseModel(GenerationMixin):
         _total = _exec_end - _exec_start
         print(f"[Vaayu] inference end:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_end))}")
         print(f"[Vaayu] total execution time: {_total:.3f}s")
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s")
+        _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}")
 
         if not return_dict:
             return tuple(v for v in [logits,

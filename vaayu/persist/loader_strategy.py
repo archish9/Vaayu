@@ -102,8 +102,19 @@ class StandardSafetensorsStrategy(LoaderStrategy):
         self._base = vaayu_base_ref
 
     def load_from_disk(self, layer_name: str, checkpoint_path: str) -> dict:
+        cache = getattr(self, '_cache', None)
+        if cache is not None:
+            cached = cache.get(layer_name)
+            if cached is not None:
+                return cached
+
         from ..utils import load_layer
-        return load_layer(checkpoint_path, layer_name)
+        tensors = load_layer(checkpoint_path, layer_name)
+
+        if cache is not None:
+            cache.put(layer_name, tensors)
+
+        return tensors
 
     def inject_to_gpu(
         self,
@@ -273,7 +284,14 @@ class EXL3LoaderStrategy(LoaderStrategy):
         Reads EXL3 q_* tensors from disk using the existing io_uring/preadv path.
         Enforces the strict dtype requirements of ExLlamaV3's C++ kernels.
         Non-quantized tensors (bias, norm weights) pass through unchanged.
+        Cache stores post-dtype-correction tensors so hits skip correction too.
         """
+        cache = getattr(self, '_cache', None)
+        if cache is not None:
+            cached = cache.get(layer_name)
+            if cached is not None:
+                return cached
+
         from ..utils import load_layer
         raw: dict = load_layer(checkpoint_path, layer_name)
 
@@ -284,6 +302,10 @@ class EXL3LoaderStrategy(LoaderStrategy):
                 corrected[key] = tensor.to(_EXL3_DTYPE_MAP[param_base])
             else:
                 corrected[key] = tensor
+
+        if cache is not None:
+            cache.put(layer_name, corrected)
+
         return corrected
 
     def inject_to_gpu(
