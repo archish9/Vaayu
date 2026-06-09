@@ -9,3 +9,6 @@ airllm-original
 venv
 vaayu_rust/target
 .claude
+
+
+vaayu_telemetry.json

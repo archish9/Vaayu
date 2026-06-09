@@ -1,6 +1,7 @@
 import json
 import os
 import struct
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -62,6 +63,14 @@ _BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
                             # Reads still work via IORING_OP_READ; only the minor
                             # IORING_OP_READ_FIXED zero-copy path is lost.
 
+_LAST_PINNED_TIMINGS: dict = {}
+_PINNED_TIMINGS_LOCK = threading.Lock()
+
+
+def get_and_clear_pinned_timings(file_path: str) -> dict:
+    with _PINNED_TIMINGS_LOCK:
+        return _LAST_PINNED_TIMINGS.pop(file_path, {})
+
 
 def _ensure_executor():
     global _EXECUTOR
@@ -97,14 +106,18 @@ def _load_pinned(file_path: str) -> dict:
     global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX, _BUFREG_DISABLED
 
     # ── 1. Parse safetensors header ─────────────────────────────────
+    _t_hdr = time.perf_counter()
     with open(file_path, 'rb') as f:
         hdr_len = struct.unpack('<Q', f.read(8))[0]
         hdr = json.loads(f.read(hdr_len))
         data_start = 8 + hdr_len
+    _header_parse_us = int((time.perf_counter() - _t_hdr) * 1e6)
 
     tensors_meta = {k: v for k, v in hdr.items() if k != '__metadata__'}
     if not tensors_meta:
         return {}
+    _io_wait_us = 0
+    _io_submit_us = 0
 
     total_size = max(v['data_offsets'][1] for v in tensors_meta.values())
     file_size = os.path.getsize(file_path)
@@ -148,6 +161,7 @@ def _load_pinned(file_path: str) -> dict:
               f"  data_start={data_start}  total={total_size}  file_size={file_size}")
         print(f"[VAAYU-IO] align  raw_off={data_start}→aligned_off={aligned_offset}"
               f"  pad={prefix_pad}  raw_len={total_size}→aligned_len={aligned_length}")
+        _t_io = time.perf_counter()
         vaayu_rust.io_uring_read_into(
             file_path,
             aligned_offset,
@@ -155,6 +169,7 @@ def _load_pinned(file_path: str) -> dict:
             buf.data_ptr(),
             32,
         )
+        _io_wait_us = int((time.perf_counter() - _t_io) * 1e6)
         buf_view = buf[prefix_pad:]
     else:
         # ── 3b. Fallback: Python preadv (QD16) ──────────────────────
@@ -173,17 +188,29 @@ def _load_pinned(file_path: str) -> dict:
                     os.preadv(fd, [view[offset:offset + length]],
                               data_start + offset)
 
+            _t_io = time.perf_counter()
             list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
+            _io_wait_us = int((time.perf_counter() - _t_io) * 1e6)
         finally:
             os.close(fd)
 
     # ── 4. Reconstruct tensors as zero-copy views ───────────────────
+    _t_recon = time.perf_counter()
     result = {}
     source_buf = buf_view if _USE_IOURING else buf
     for name, meta in tensors_meta.items():
         dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
         start, end = meta['data_offsets']
         result[name] = source_buf[start:end].view(dtype).reshape(meta['shape'])
+    _tensor_reconstruct_us = int((time.perf_counter() - _t_recon) * 1e6)
+
+    with _PINNED_TIMINGS_LOCK:
+        _LAST_PINNED_TIMINGS[file_path] = {
+            "header_parse_us": _header_parse_us,
+            "io_submit_us": _io_submit_us,
+            "io_wait_us": _io_wait_us,
+            "tensor_reconstruct_us": _tensor_reconstruct_us,
+        }
 
     return result
 

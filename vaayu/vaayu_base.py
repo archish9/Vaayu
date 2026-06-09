@@ -17,6 +17,8 @@ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
 from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
+from .telemetry import VaayuTelemetry, LayerTiming
+from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 
 # BetterTransformer is deprecated in newer optimum versions
 try:
@@ -232,6 +234,8 @@ class VaayuBaseModel(GenerationMixin):
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
+        self.telemetry = VaayuTelemetry()
+        self._token_count = 0
 
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
@@ -1096,6 +1100,7 @@ class VaayuBaseModel(GenerationMixin):
 
         _exec_start = time.time()
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
+        self.telemetry.begin_token(self._token_count)
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
@@ -1192,8 +1197,18 @@ class VaayuBaseModel(GenerationMixin):
                                                desc=f'running layers({self.running_device})',
                                                total=len(self.layers)):
 
+                _lt_file_bytes = 0
+                _lt_cache_hit = False
+                _lt_header_parse_us = 0
+                _lt_io_submit_us = 0
+                _lt_io_wait_us = 0
+                _lt_tensor_reconstruct_us = 0
+                _lt_gpu_transfer_us = 0
+                _lt_compute_us = 0
+
                 if layer_name in self.pinned_layer_names:
                     # ── Pinned: already in VRAM — zero disk/transfer cost ────
+                    _lt_cache_hit = True
                     moved_layers = []
                     # If no future is outstanding, kick off the next non-pinned load
                     # so disk read overlaps with this layer's GPU compute.
@@ -1207,12 +1222,21 @@ class VaayuBaseModel(GenerationMixin):
                     # ── Non-pinned, prefetching ──────────────────────────────
                     if self.profiling_mode:
                         t = time.time()
+                    _tl = time.perf_counter()
                     _t = time.time()
                     state_dict = future.result()
                     _io_wait_s += time.time() - _t
+                    _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
+                    _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
+                    _lt_disk = _get_layer_disk_timings(_lt_fpath)
+                    _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
+                    _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
+                    _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
+                    _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
+                    _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
 
                     # Submit next non-pinned layer's load BEFORE GPU transfer
                     # so disk read and GPU H2D transfer overlap.
@@ -1229,29 +1253,42 @@ class VaayuBaseModel(GenerationMixin):
 
                     if self.profiling_mode:
                         t = time.time()
+                    _tl = time.perf_counter()
                     _t = time.time()
                     moved_layers = self.loader_strategy.inject_to_gpu(
                         self.model, layer_name, state_dict, self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {})
                     )
                     _gpu_load_s += time.time() - _t
+                    _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
 
                 else:
                     # ── Non-pinned, no prefetch ──────────────────────────────
+                    _tl = time.perf_counter()
                     _t = time.time()
                     state_dict = self.load_layer_to_cpu(layer_name)
                     _io_wait_s += time.time() - _t
+                    _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
+                    _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
+                    _lt_disk = _get_layer_disk_timings(_lt_fpath)
+                    _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
+                    _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
+                    _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
+                    _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
+                    _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
                     if self.profiling_mode:
                         t = time.time()
+                    _tl = time.perf_counter()
                     _t = time.time()
                     moved_layers = self.loader_strategy.inject_to_gpu(
                         self.model, layer_name, state_dict, self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {})
                     )
                     _gpu_load_s += time.time() - _t
+                    _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
@@ -1261,15 +1298,21 @@ class VaayuBaseModel(GenerationMixin):
                 for j, seq in enumerate(batch):
 
                     if layer_name == self.layer_names_dict['embed']:
+                        _tl = time.perf_counter()
                         batch[j] = layer(seq)
+                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                     elif layer_name == self.layer_names_dict['norm']:
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
+                        _tl = time.perf_counter()
                         batch[j] = self.run_norm(layer, seq)
+                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
 
                         if output_hidden_states:
                             all_hidden_states[i].append(batch[j])
                     elif layer_name == self.layer_names_dict['lm_head']:
+                        _tl = time.perf_counter()
                         batch[j] = self.run_lm_head(layer, seq)
+                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                     else:
 
                         if output_hidden_states:
@@ -1292,9 +1335,9 @@ class VaayuBaseModel(GenerationMixin):
                                     mode="reduce-overhead",
                                     fullgraph=False,
                                 )
-                            _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t
+                            _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                         else:
-                            _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t
+                            _tl = time.perf_counter(); _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                         new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                         if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
@@ -1311,9 +1354,23 @@ class VaayuBaseModel(GenerationMixin):
                         self.model, layer, moved_layers, self.hf_quantizer
                     )
 
+                self.telemetry.record_layer(LayerTiming(
+                    layer_name=layer_name,
+                    file_bytes=_lt_file_bytes,
+                    header_parse_us=_lt_header_parse_us,
+                    io_submit_us=_lt_io_submit_us,
+                    io_wait_us=_lt_io_wait_us,
+                    tensor_reconstruct_us=_lt_tensor_reconstruct_us,
+                    gpu_transfer_us=_lt_gpu_transfer_us,
+                    compute_us=_lt_compute_us,
+                    cache_hit=_lt_cache_hit,
+                ))
+
                 if i % 40 == 39:
                     clean_memory()
 
+        self.telemetry.end_token()
+        self._token_count += 1
         logits = torch.cat(batch, 0)
 
         if output_attentions:
@@ -1372,6 +1429,11 @@ class VaayuBaseModel(GenerationMixin):
                 if len(cache.key_cache[i].shape) >= 3:
                     cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+
+    def generate(self, *args, **kwargs):
+        result = super().generate(*args, **kwargs)
+        self.telemetry.dump_json("vaayu_telemetry.json")
+        return result
 
     @torch.no_grad()
     def speculative_generate(
@@ -1458,4 +1520,5 @@ class VaayuBaseModel(GenerationMixin):
             if accepted_ids[0, -1].item() in eos_set:
                 break
 
+        self.telemetry.dump_json("vaayu_telemetry.json")
         return generated
