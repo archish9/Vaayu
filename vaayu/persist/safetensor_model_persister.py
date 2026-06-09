@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import psutil
+
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -65,6 +67,37 @@ _BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
 
 _LAST_PINNED_TIMINGS: dict = {}
 _PINNED_TIMINGS_LOCK = threading.Lock()
+
+_USE_DIRECT_IO: bool = True  # safe default; overridden by init_model_io() (Plan 5)
+
+
+def _should_use_direct_io(model_dir: str) -> bool:
+    """
+    O_DIRECT wins when the page cache can't meaningfully cache the model.
+    The crossover point is ~40% cacheable (empirically validated).
+    """
+    try:
+        paths = list(Path(model_dir).glob("*.safetensors"))
+        model_total_bytes = sum(os.path.getsize(p) for p in paths)
+        mem = psutil.virtual_memory()
+
+        # Reserve 8GB for OS + PyTorch + pinned buffers
+        available_for_cache = max(0, mem.available - (8 * 1024**3))
+        cacheable_fraction = available_for_cache / max(1, model_total_bytes)
+
+        use_direct = cacheable_fraction < 0.40
+
+        if not use_direct:
+            print(f"[Vaayu] Sufficient RAM detected ({mem.available / 1024**3:.1f} GB free). "
+                  f"Disabling O_DIRECT to leverage page cache for {cacheable_fraction*100:.0f}% of model.")
+        else:
+            print(f"[Vaayu] Limited RAM ({mem.available / 1024**3:.1f} GB free). "
+                  f"Using O_DIRECT to avoid wasteful page cache copies.")
+
+        return use_direct
+    except Exception as e:
+        print(f"[Vaayu] Failed to detect RAM ({e}), defaulting to O_DIRECT = True")
+        return True
 
 
 def get_and_clear_pinned_timings(file_path: str) -> dict:

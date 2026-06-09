@@ -397,6 +397,12 @@ class VaayuBaseModel(GenerationMixin):
         if not hasattr(self.config, "hidden_act"): self.config.hidden_act = "silu"
         if not hasattr(self.config, "rope_theta"): self.config.rope_theta = 10000.0
 
+        if device.startswith("cuda"):
+            from .persist.safetensor_model_persister import _should_use_direct_io
+            self._use_direct_io = _should_use_direct_io(str(self.checkpoint_path))
+        else:
+            self._use_direct_io = False
+
         # Build loader strategy (auto-detects EXL3 vs standard safetensors)
         self.loader_strategy: LoaderStrategy = build_loader_strategy(
             str(self.checkpoint_path), self

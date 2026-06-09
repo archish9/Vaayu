@@ -26,6 +26,7 @@ exllamav3>=0.0.18
 # xformers            # uncomment for memory-efficient attention (Gemma, etc.)
 
 # Additional utilities
+psutil>=5.9
 tqdm>=4.65.0
 einops>=0.7.0
 scipy>=1.11.0
