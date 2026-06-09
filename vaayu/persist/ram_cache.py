@@ -3,7 +3,6 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import psutil
-import torch
 
 
 def auto_detect_cache_budget() -> int:
@@ -11,22 +10,8 @@ def auto_detect_cache_budget() -> int:
     return max(0, mem.available - (8 * 1024 ** 3))
 
 
-def _pin_tensors(tensors: dict) -> dict:
-    """Copy tensors into pinned (page-locked) CPU memory for fast H2D DMA.
-
-    Uses torch.empty(..., pin_memory=True) + copy_() — one allocation, one copy,
-    no intermediate. Falls back to regular clone() per-tensor if pinned alloc fails
-    (e.g. CUDA not available, or ulimit -l too small).
-    """
-    result = {}
-    for k, v in tensors.items():
-        try:
-            t = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
-            t.copy_(v)
-            result[k] = t
-        except RuntimeError:
-            result[k] = v.clone().detach()
-    return result
+def _clone_tensors(tensors: dict) -> dict:
+    return {k: v.clone().detach() for k, v in tensors.items()}
 
 
 class LayerRAMCache:
@@ -70,7 +55,7 @@ class LayerRAMCache:
             self.current_usage += raw_size  # reserve budget before releasing lock
 
         def _clone_and_store(name: str = layer_name, src: dict = tensors) -> None:
-            cached = _pin_tensors(src)
+            cached = _clone_tensors(src)
             with self.lock:
                 self._pending.discard(name)
                 self.cache[name] = cached
@@ -80,8 +65,8 @@ class LayerRAMCache:
     def put_sync(self, layer_name: str, tensors: dict) -> bool:
         """Synchronous put for use at init time (pre-population).
 
-        Stores in pinned memory for fast H2D DMA during inference. Safe because no
-        inference is running, so no DDR4 contention and no pinned-buffer race.
+        Clones inline — safe because no inference is running (no DDR4 contention with
+        H2D, no risk of pinned buffer being reused mid-clone).
         Returns True if stored, False if skipped (over budget or already cached).
         """
         with self.lock:
@@ -90,7 +75,7 @@ class LayerRAMCache:
             raw_size = sum(t.nbytes for t in tensors.values())
             if self.current_usage + raw_size > self.budget_bytes:
                 return False
-            cached = _pin_tensors(tensors)
+            cached = _clone_tensors(tensors)
             self.cache[layer_name] = cached
             self.current_usage += raw_size
             return True
