@@ -473,6 +473,9 @@ class VaayuBaseModel(GenerationMixin):
                 device=device,
             )
 
+        if device.startswith("cuda"):
+            self._warmup_nvme()
+
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
         # protective on generation config
@@ -805,6 +808,36 @@ class VaayuBaseModel(GenerationMixin):
             f"({pinned_xformer} transformer + {pinned_shared} shared), "
             f"{used / 1e9:.2f} GB reserved"
         )
+
+    def _warmup_nvme(self) -> None:
+        import threading
+
+        def _do_warmup():
+            warmup_count = min(10, len(self.layer_names))
+            warmup_names = self.layer_names[:warmup_count]
+
+            # Use plain file reads — NOT io_uring_read_into.
+            # The persistent io_uring ring is not thread-safe for concurrent SQE
+            # submission; using it here races with inference and corrupts CQE counts.
+            # Plain reads still touch NVMe blocks and prime the controller's internal
+            # DRAM cache, which is the only goal.
+            buf = torch.empty(1700 * 1024 * 1024, dtype=torch.uint8)
+
+            for name in warmup_names:
+                path = str(Path(self.checkpoint_path) / (name + ".safetensors"))
+                try:
+                    with open(path, 'rb') as f:
+                        f.readinto(buf.numpy())
+                except Exception as e:
+                    print(f"[Vaayu] Warm-up aborted on layer {name}: {e}")
+                    break
+
+            del buf
+            print(f"[Vaayu] NVMe warm-up complete ({warmup_count} layers pre-read)")
+
+        t = threading.Thread(target=_do_warmup, daemon=True)
+        t.start()
+        self._warmup_thread = t
 
     # ── Strategy helper ───────────────────────────────────────────────────────
 
