@@ -884,4 +884,45 @@ This means Vaayu only pays the NVMe streaming latency penalty once every ~4-5 to
 ### Summary
 `llama.cpp` is an amazing piece of software, but it is fundamentally designed to hold models statically in RAM/VRAM. When you push it past your hardware's limits, it degrades to CPU compute and OS-level swap thrashing. 
 
+
+
+----------------
+
+
+
+Viewed schedule_plan_6_application_ram_layer_cache.md:11-32
+
+This is another fantastic comparison. KTransformers is genuinely brilliant software and represents the absolute bleeding edge of local LLM inference—but it solves the problem for a *different hardware profile* and a *different model architecture* than Vaayu.
+
+Here is the exact breakdown of why you would build/use Vaayu instead of KTransformers:
+
+### 1. The System RAM Wall vs. The NVMe Floor
+The most critical sentence in the text you provided is: *"leaves the massive army of MoE Experts... inside your 32GB system RAM."* 
+
+* **KTransformers requires huge RAM:** KTransformers relies on having enough System RAM to hold the entire offloaded portion of the model. If you want to run a 130GB dense model (like Llama-3-70B in FP16), or a massive MoE, **you must have 130GB of System RAM**. If you only have 32GB of RAM, KTransformers simply cannot run it.
+* **Vaayu frees your RAM for work:** Vaayu streams from your NVMe drive. It uses a tiny ~200MB "pinned" buffer in your System RAM as a pass-through. If you are a developer running an Agentic workflow, you need your 32GB of RAM for your IDE, Docker containers, language servers, and web browser. **Vaayu lets you run a 130GB model while using almost zero System RAM**, keeping your development environment perfectly responsive. 
+
+### 2. Dense Models vs. MoE Models
+* **KTransformers is an MoE specialist:** KTransformers achieves its incredible speed because MiniMax (and DeepSeek) are Mixture-of-Experts models. For a 230B MoE, only ~10B parameters are active per token. KTransformers computes those 10B parameters using your CPU's memory bandwidth. It works beautifully for MoE. But if you try to run a **Dense Model** (like Llama 3 70B or Qwen 72B) on KTransformers, it has to compute all 70B parameters on the CPU for every token, and performance immediately falls off a cliff.
+* **Vaayu is a universal GPU engine:** Vaayu streams the weights straight to the GPU and does 100% of the computation on the GPU's CUDA cores. This means Vaayu can run massive **Dense Models** (Llama-70B) significantly faster than CPU-bound engines because it harnesses the massive parallel compute of the GPU, rather than relying on the CPU to crunch matrices.
+
+### 3. Compute Location (CPU Math vs. GPU Math)
+* **KTransformers computes on the CPU:** For the offloaded experts, KTransformers uses SGLang/llama.cpp kernels to perform the matrix multiplications on your CPU. Even with AVX-512, CPUs peak at maybe 1-2 TFLOPS.
+* **Vaayu computes on the GPU:** Vaayu's philosophy is "always feed the beast." It uses `io_uring` to stream weights from the SSD to the VRAM just in time, allowing your GPU (which has 20 to 80+ TFLOPS of compute) to do all the math. 
+
+### Summary: Which should you use?
+
+You should absolutely use **KTransformers** if:
+1. You are running an **MoE model** (like DeepSeek or MiniMax).
+2. You have a **massive amount of System RAM** (64GB to 128GB+) available.
+3. You have a powerful, modern CPU (AVX-512 capable).
+
+You should develop and use **Vaayu** if:
+1. You want to run massive **Dense models** (Llama 3 70B, Qwen 72B).
+2. You have **limited System RAM** (16GB or 32GB) and need to keep it free for your development environment / Docker / IDE.
+3. You want 100% of the heavy math to happen on your GPU.
+4. You have a fast NVMe SSD (PCIe Gen 4 or Gen 5) that can act as pseudo-VRAM.
+
+Vaayu is built for the developer who has a standard gaming rig (16GB VRAM, 32GB RAM, fast NVMe) who wants to run a 70B dense model at high precision alongside their normal workflow. For that specific (and very common) hardware profile, KTransformers will either OOM or swap-thrash, while Vaayu will stream flawlessly.
+
 **Vaayu is a purpose-built asynchronous streaming engine.** It treats your NVMe SSD as if it were VRAM, using Rust `io_uring` to pipeline disk reads identically to how a video game engine streams textures. This allows you to run vastly smarter, higher-precision models than `llama.cpp` could ever fit on the same hardware, and uses the GPU for 100% of the math.
