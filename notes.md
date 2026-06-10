@@ -926,3 +926,89 @@ You should develop and use **Vaayu** if:
 Vaayu is built for the developer who has a standard gaming rig (16GB VRAM, 32GB RAM, fast NVMe) who wants to run a 70B dense model at high precision alongside their normal workflow. For that specific (and very common) hardware profile, KTransformers will either OOM or swap-thrash, while Vaayu will stream flawlessly.
 
 **Vaayu is a purpose-built asynchronous streaming engine.** It treats your NVMe SSD as if it were VRAM, using Rust `io_uring` to pipeline disk reads identically to how a video game engine streams textures. This allows you to run vastly smarter, higher-precision models than `llama.cpp` could ever fit on the same hardware, and uses the GPU for 100% of the math.
+
+
+
+
+
+
+----------
+
+
+Viewed ram_cache.py:1-88
+
+I have confirmed this by directly inspecting the active implementation in `vaayu/persist/ram_cache.py`. My previous explanation was mostly correct, but the actual code behaves slightly differently than the original plan document suggested regarding *eviction*.
+
+Here is exactly what the code does:
+
+### 1. The Budget Calculation
+The code uses the exact formula from the plan:
+```python
+def auto_detect_cache_budget() -> int:
+    mem = psutil.virtual_memory()
+    return max(0, mem.available - (8 * 1024 ** 3))
+```
+*   **On 8 GB RAM:** `mem.available` is around 4-6GB. `4GB - 8GB` is negative, so the budget becomes **0 bytes**.
+*   **On 16 GB RAM:** `mem.available` is around 10-12GB. `10GB - 8GB` is roughly **2 to 4 GB**.
+
+### 2. The Cache Behavior (The Missing LRU)
+When we look at the actual `LayerRAMCache.put()` and `put_sync()` methods, they do **not** contain the LRU eviction loop that was proposed in the plan. Instead, they just do a hard cutoff:
+
+```python
+    def put(self, layer_name: str, tensors: dict) -> None:
+        with self.lock:
+            if layer_name in self.cache or layer_name in self._pending:
+                return
+            raw_size = sum(t.nbytes for t in tensors.values())
+            # If adding this layer exceeds the budget, silently return (ignore it)
+            if self.current_usage + raw_size > self.budget_bytes:
+                return
+            self._pending.add(layer_name)
+            self.current_usage += raw_size  # reserve budget
+```
+
+### Conclusion for 8 GB & 16 GB Users:
+1.  **8 GB RAM:** The budget is exactly `0`. Because `0 + raw_size > 0` is always true, the `put` method will instantly `return`. **Zero layers will be cached.** The engine falls back entirely to NVMe streaming without crashing.
+2.  **16 GB RAM:** The budget is ~2-4 GB. The first 1 or 2 layers (assuming standard ~1.6 GB layers) will successfully pass the `current_usage + raw_size <= budget_bytes` check and get cached. Because there is no eviction logic written in the code, once those first 2 layers fill the cache, **it will simply ignore all subsequent layers.** It will serve those first 2 layers from RAM instantly, and read the remaining 81 layers from NVMe.
+
+The safety mechanism (preventing OOM crashes) is perfectly intact, but it is a "fill and freeze" cache rather than an LRU cache.
+
+
+----
+
+is "fill and freeze" better than LRU
+
+
+
+
+
+In this specific engine, **"Fill and Freeze" is actually vastly superior to LRU.**
+
+While omitting the LRU logic may have looked like an oversight compared to the plan document, it turns out to be a brilliant optimization (whether accidental or intentional) due to how layer streaming works.
+
+Here is why:
+
+### The Problem with LRU in Layer Streaming
+Vaayu accesses its layers in a strictly repeating, cyclical sequence. For every single token generated, it accesses the layers in exact order: 
+`Layer 0 → Layer 1 → ... → Layer 79`
+
+Let's say your cache can hold **15 layers**:
+If you used **LRU**, the cache would experience **100% cache misses**. 
+1. By the time it reaches `Layer 15`, the cache is full.
+2. To load `Layer 15`, LRU evicts the oldest layer: `Layer 0`.
+3. It keeps rolling like this until the end of the token. By the time it reaches `Layer 79`, the cache only holds layers `65 through 79`.
+4. On the next token, it asks for `Layer 0`. But `Layer 0` was evicted! It's a cache miss. To load `Layer 0`, it evicts `Layer 65`. 
+5. It asks for `Layer 1` — miss. Evicts `Layer 66`. 
+
+Because the loop (80 layers) is larger than the cache (15 layers), **LRU guarantees that the exact layer you are about to need has already been evicted.** This phenomenon is called *cache thrashing*.
+
+### Why "Fill and Freeze" Wins
+With the current "Fill and Freeze" code:
+1. On the first token, it caches `Layer 0` through `Layer 14`. Then the cache locks up.
+2. On the next token, `Layer 0` through `Layer 14` are requested. Because they were never evicted, **they are all 100% Cache Hits.** 
+3. `Layer 15` through `Layer 79` are read from the NVMe.
+4. On every subsequent token, you are guaranteed exactly 15 cache hits. 
+
+By freezing the cache, you permanently eliminate 15 NVMe reads per token, shaving ~4 seconds off the generation time. 
+
+So, omitting the LRU eviction was mathematically the best possible thing to do for sequential layer streaming!
