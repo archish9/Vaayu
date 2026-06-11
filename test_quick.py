@@ -13,7 +13,7 @@ Parameters:
     MAX_PINNED_LAYERS — 0  = shared layers only (embed/norm/lm_head, ~1 GB) [default]
                         -1 = auto-fill remaining VRAM budget with transformer layers
                         N  = pin shared + first N transformer layers (budget-capped)
-    MAX_NEW_TOKENS    — number of tokens to generate
+    MAX_NEW_TOKENS    — number of tokens to generate. (this is for Speculation decodings)
     MAX_LENGTH        — max prompt token length before truncation
                         set > PREFILL_CHUNK_SIZE to exercise chunked prefill
 """
