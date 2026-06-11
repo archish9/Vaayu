@@ -28,8 +28,8 @@ import torch
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
 MAX_PINNED_LAYERS = 10      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
-MAX_NEW_TOKENS    = 20       # enough tokens for PLD to show multi-token drafting gains
-MAX_LENGTH        = 1024     # must be > PREFILL_CHUNK_SIZE to trigger chunking
+MAX_NEW_TOKENS    = 512      # coding agent response needs room for real code output
+MAX_LENGTH        = 2048     # coding agent context is long; must be > PREFILL_CHUNK_SIZE
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ── Speculative Decoding ─────────────────────────────────────────────────────
@@ -67,15 +67,70 @@ model = AutoModel.from_pretrained(
     draft_tokens=DRAFT_TOKENS,
 )
 
-# Completion-style prompt — model continues the repetitive pattern verbatim.
-# PLD finds n-gram matches (e.g., "load_layer" → predicts " path name") and
-# drafts multiple tokens per step instead of decoding one at a time.
-# Also exceeds PREFILL_CHUNK_SIZE to exercise chunked prefill.
-_pattern = "load_layer(path, name) -> load_layer(path, name) -> load_layer(path, name) -> "
-_repeated = _pattern * 15  # ~600 tokens; model will continue the -> load_layer pattern
+# Coding-agent prompt — realistic multi-part programming task.
+#
+# WHY THIS PROMPT:
+#   1. Long system + user context (>512 tokens) → exercises chunked prefill.
+#   2. Code output is n-gram rich ("async def", "await", "try:", "except",
+#      identical variable names recur) → PLD finds real matches in generated code.
+#   3. With a standard drafter, the drafter's coding priors align well with the
+#      verifier, so acceptance rates are high.
+#   4. The task is genuinely complex — this is a real stress test of generation
+#      quality, not just throughput.
+
+_SYSTEM = """\
+You are an expert Python software engineer acting as an autonomous coding agent.
+You write clean, production-quality code with full type hints, docstrings, and \
+error handling.
+You always:
+- Use Python 3.11+ idioms (match/case, tomllib, asyncio.TaskGroup, etc.)
+- Add comprehensive docstrings (Google style)
+- Handle all edge cases with explicit exceptions and clear error messages
+- Write self-contained, immediately runnable code
+- Add a `if __name__ == "__main__":` block with a working CLI using argparse
+Respond ONLY with the complete Python source file. No explanation, no markdown \
+fences.
+"""
+
+_TASK = """\
+Implement a production-grade asynchronous file-system watcher in a single Python \
+file: `async_watcher.py`.
+
+Requirements:
+
+1. Class `AsyncFileWatcher`:
+   - `__init__(self, paths: list[str | Path], recursive: bool = True,
+     debounce_ms: int = 100)` — watch one or more root paths.
+   - `async def start(self) -> None` — begin watching; run until cancelled.
+   - `async def stop(self) -> None` — graceful shutdown, cancel internal tasks.
+   - `def on_created(self, path: Path) -> None` — override in subclass.
+   - `def on_modified(self, path: Path) -> None` — override in subclass.
+   - `def on_deleted(self, path: Path) -> None` — override in subclass.
+   - Internally poll with `asyncio.sleep` (no external deps like watchdog).
+   - Maintain a snapshot dict `{Path: (mtime, size)}` and diff on each poll.
+   - Debounce rapid successive events (fire callback only after `debounce_ms`
+     quiet period).
+   - Handle `PermissionError`, `FileNotFoundError` gracefully per-path.
+
+2. Class `LoggingFileWatcher(AsyncFileWatcher)`:
+   - Overrides all three callbacks to log events via `logging.getLogger(__name__)`.
+   - Log level: INFO for created/modified, WARNING for deleted.
+
+3. Context manager support (`async with AsyncFileWatcher(...) as w:`).
+
+4. CLI (`argparse`):
+   - `--path` (repeatable, required) — paths to watch.
+   - `--recursive` / `--no-recursive` — default True.
+   - `--debounce` — milliseconds, default 100.
+   - `--poll-interval` — seconds between snapshots, default 0.5.
+   On SIGINT/SIGTERM: stop watcher cleanly and print a summary of event counts.
+
+5. Type hints everywhere. No third-party imports.
+"""
 
 messages = [
-    {"role": "user", "content": f"Continue this exact pattern without explanation:\n{_repeated}"}
+    {"role": "system", "content": _SYSTEM},
+    {"role": "user",   "content": _TASK},
 ]
 formatted_prompt = model.tokenizer.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
