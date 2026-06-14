@@ -25,6 +25,11 @@ _DTYPE_MAP = {
     "U8":   torch.uint8,
     "BOOL": torch.bool,
 }
+# FP8 dtypes added in PyTorch 2.1 — add if available
+if hasattr(torch, "float8_e4m3fn"):
+    _DTYPE_MAP["F8_E4M3"] = torch.float8_e4m3fn
+if hasattr(torch, "float8_e5m2"):
+    _DTYPE_MAP["F8_E5M2"] = torch.float8_e5m2
 
 _ALIGN = 4096  # O_DIRECT sector-alignment requirement
 

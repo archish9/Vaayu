@@ -1034,3 +1034,12 @@ So, omitting the LRU eviction was mathematically the best possible thing to do f
   tested with a dedicated script like:
 
   results = batch_generate(model, ["prompt A", "prompt B", "prompt C"])
+
+
+--------------------
+
+
+        modified:   vaayu/moe_patch.py
+        modified:   vaayu/persist/safetensor_model_persister.py
+        modified:   vaayu/utils.py
+        modified:   vaayu/vaayu_base.py

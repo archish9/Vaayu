@@ -25,9 +25,9 @@ import torch
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
+MODEL_PATH        = "/home/a/code/ai-ml/models/MiniMaxAI--MiniMax-M2.7"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = -1      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
+MAX_PINNED_LAYERS = 5      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 512      # coding agent response needs room for real code output
 MAX_LENGTH        = 2048     # coding agent context is long; must be > PREFILL_CHUNK_SIZE
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
@@ -41,7 +41,7 @@ PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 #   Switch to PLD: set DRAFTER_MODEL_PATH = None and USE_PROMPT_LOOKUP = True
 #   Avoid for instruction→response — novel outputs yield 0 match rate (no speedup).
 DRAFTER_MODEL_PATH = None
-USE_PROMPT_LOOKUP  = True
+USE_PROMPT_LOOKUP  = False
 
 DRAFT_TOKENS = 15
 # ─────────────────────────────────────────────────────────────────────────────

@@ -258,7 +258,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         found_layers = {}
         for layer in layers:
-            found_layers[layer] = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+            found_layers[layer] = ModelPersister.get_model_persister().model_persist_exist(layer.rstrip('.'), saving_path)
 
         print(f"found_layers:{found_layers}")
         if all(found_layers.values()):
@@ -370,9 +370,9 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         # Save layer state dict as using safetensors
 
-        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer.rstrip('.'), saving_path)
         if not marker_exists:
-            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer.rstrip('.'), saving_path)
 
         # Free memory
         for k in layer_state_dict.keys():

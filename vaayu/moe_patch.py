@@ -198,7 +198,7 @@ def _make_sparse_moe_forward(
     top_k, device, dtype, vaayu_ref.
 
     Called as: moe_block.forward(hidden_states, **kwargs)
-    Returns:   hidden_states tensor of same shape as input
+    Returns:   (hidden_states, router_logits) matching standard MoE forward signature
     """
     from .persist.safetensor_model_persister import load_expert_sparse
 
@@ -273,6 +273,7 @@ def _make_sparse_moe_forward(
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
-        return final_hidden
+        # Return tuple matching original MoE forward signature: (hidden_states, router_logits)
+        return final_hidden, router_logits
 
     return sparse_forward

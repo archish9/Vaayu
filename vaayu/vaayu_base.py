@@ -616,6 +616,85 @@ class VaayuBaseModel(GenerationMixin):
         except Exception:
             pass
 
+    def _patch_fp8_quantizer_compat(self, quantization_config):
+        """
+        Fix FP8 quantizer incompatibilities for models with custom expert containers
+        (e.g. MiniMax-M2's MiniMaxM2Experts). Applied in-process before preprocess_model().
+
+        Problem: replace_with_fp8_linear tries to replace the whole experts ModuleList
+        with FP8Experts (a batched-weight module). MiniMax-M2's expert structure is
+        incompatible with that replacement — both structurally and for Vaayu's per-expert
+        weight loading.
+
+        Fix: add "experts" to modules_to_not_convert so the container is preserved.
+        Individual nn.Linear inside each expert (w1/w2/w3) are still converted to
+        FP8Linear, matching the per-tensor weight_scale_inv keys already on disk.
+
+        Also adds num_experts config alias if missing (some quantizer code accesses
+        config.num_experts but MiniMax uses num_local_experts).
+        """
+        # 1. Preserve expert containers — only replace individual Linear layers inside.
+        # We replace the attribute entirely (list() coercion handles tuple/None) rather
+        # than appending, to survive both tuple and Pydantic-style config objects.
+        try:
+            mnc = getattr(quantization_config, "modules_to_not_convert", None)
+            if mnc is None:
+                quantization_config.modules_to_not_convert = ["experts"]
+                print("[Vaayu] FP8 compat: set modules_to_not_convert = ['experts']")
+            elif "experts" not in mnc:
+                quantization_config.modules_to_not_convert = list(mnc) + ["experts"]
+                print(f"[Vaayu] FP8 compat: added 'experts' to modules_to_not_convert → {quantization_config.modules_to_not_convert}")
+        except Exception as _e:
+            print(f"[Vaayu] FP8 compat: FAILED to update modules_to_not_convert: {_e}")
+
+        # 2. Config alias: some FP8 code accesses config.num_experts; MiniMax uses num_local_experts
+        try:
+            cfg = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
+            if not hasattr(cfg, "num_experts") and hasattr(cfg, "num_local_experts"):
+                cfg.num_experts = cfg.num_local_experts
+        except Exception:
+            pass
+
+        # 3. deep-gemm v1 fails with "Unknown recipe" on some GPUs (e.g. Blackwell) for
+        #    certain matrix shapes. Wrap w8a8_fp8_matmul to catch and fall back to Triton.
+        self._patch_fp8_deepgemm_fallback()
+
+    def _patch_fp8_deepgemm_fallback(self):
+        """
+        Patch w8a8_fp8_matmul to catch deep-gemm 'Unknown recipe' RuntimeErrors and
+        automatically fall back to the Triton FP8 path. deep-gemm loads successfully on
+        SM90+ (passes the capability check) but may have no compiled kernel recipe for
+        the model's specific weight tile shapes (seen on Blackwell with deep-gemm v1).
+        """
+        try:
+            import transformers.integrations.finegrained_fp8 as _fp8_mod
+            
+            # Proactively disable deep-gemm on Blackwell (SM120+) where deep-gemm v1
+            # loads successfully but lacks compiled kernel recipes for matrix shapes.
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12:
+                print("[Vaayu] FP8 compat: Blackwell GPU detected. Proactively disabling deep-gemm v1 to avoid 'Unknown recipe' crashes.")
+                _fp8_mod._deepgemm_available = False
+                _fp8_mod.deepgemm_fp8_matmul = None
+                return
+
+            _orig_w8a8 = _fp8_mod.w8a8_fp8_matmul
+
+            def _w8a8_with_deepgemm_fallback(A, B, As, Bs, block_size, output_dtype=torch.float32):
+                try:
+                    return _orig_w8a8(A, B, As, Bs, block_size, output_dtype)
+                except RuntimeError as e:
+                    if "Unknown recipe" in str(e):
+                        print("[Vaayu] deep-gemm 'Unknown recipe' — disabling deep-gemm, retrying with Triton")
+                        _fp8_mod._deepgemm_available = False
+                        _fp8_mod.deepgemm_fp8_matmul = None
+                        return _orig_w8a8(A, B, As, Bs, block_size, output_dtype)
+                    raise
+
+            _fp8_mod.w8a8_fp8_matmul = _w8a8_with_deepgemm_fallback
+            print("[Vaayu] FP8 compat: patched w8a8_fp8_matmul with deep-gemm 'Unknown recipe' fallback")
+        except Exception as e:
+            print(f"[Vaayu] FP8 compat: deepgemm fallback patch failed: {e}")
+
     def init_model(self):
         self._apply_transformers_compat_patches()
         self.model = None
@@ -686,6 +765,7 @@ class VaayuBaseModel(GenerationMixin):
             else:
                 self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
                 device_map = self.hf_quantizer.update_device_map(None)
+                self._patch_fp8_quantizer_compat(self.hf_quantizer.quantization_config)
                 self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()
@@ -1165,42 +1245,40 @@ class VaayuBaseModel(GenerationMixin):
                     break
             remapped_state_dict[new_param_name] = param_tensor
 
-        for param_name, param in remapped_state_dict.items():
-            if self.hf_quantizer is None:
-                layers.append(param_name)
-            else:
-                if '.weight' in param_name:
-                    layer_name = param_name[:param_name.index(".weight") + len(".weight")]
-                    if layer_name not in layers:
-                        layers.append(layer_name)
-                else:
-                    if param_name not in layers:
-                        layers.append(param_name)
+        for param_name in remapped_state_dict:
+            layers.append(param_name)
 
-        standard_params = {}
-        for param_name in layers:
-            is_quantized = False
-            if self.hf_quantizer is not None:
-                if hasattr(self.hf_quantizer, "check_quantized_param"):
-                    is_quantized = self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-
-            if not is_quantized:
-                standard_params[param_name] = remapped_state_dict[param_name].to(self.running_device, dtype=self.running_dtype, non_blocking=True)
-            else:
-                torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, remapped_state_dict[param_name], param_name, self.running_device, remapped_state_dict)
-
-        if len(standard_params) > 0:
+        _fp8_available = False
+        if self.hf_quantizer is not None:
             try:
-                self.model.load_state_dict(standard_params, strict=False, assign=True)
+                from transformers.quantizers.quantizers_utils import get_module_from_name
+                from transformers.integrations.finegrained_fp8 import FP8Linear
+                _fp8_available = True
+            except ImportError:
+                pass
+
+        for param_name in layers:
+            tensor = remapped_state_dict[param_name]
+            if self.hf_quantizer is not None and _fp8_available:
+                try:
+                    module, _ = get_module_from_name(self.model, param_name)
+                    is_fp8_module = isinstance(module, FP8Linear)
+                except Exception:
+                    is_fp8_module = False
+                target = tensor.to(self.running_device, non_blocking=True) if is_fp8_module \
+                    else tensor.to(self.running_device, dtype=self.running_dtype, non_blocking=True)
+            else:
+                target = tensor.to(self.running_device, dtype=self.running_dtype, non_blocking=True)
+
+            try:
+                set_module_tensor_to_device(self.model, param_name, self.running_device, value=target)
+                if "input_layernorm" in param_name:
+                    print(f"[Vaayu-Debug] injected {param_name} to {self.running_device}", flush=True)
             except Exception as e:
-                for param_name, tensor in standard_params.items():
-                    try:
-                        set_module_tensor_to_device(self.model, param_name, self.running_device, value=tensor, dtype=self.running_dtype)
-                    except Exception as fallback_e:
-                        print(f"Warning: Could not inject {param_name} natively: {fallback_e}")
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                print(f"[Vaayu] Warning: could not inject {param_name}: {e}")
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         return layers
 
     # make GenerationMixin happy
@@ -1380,6 +1458,7 @@ class VaayuBaseModel(GenerationMixin):
             output.past_key_values = None
         return output
 
+    @torch.no_grad()
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -1394,6 +1473,7 @@ class VaayuBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        print(f"[Vaayu-Debug] forward input_ids device: {input_ids.device}")
         _exec_start = time.time()
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
         self.telemetry.begin_token(self._token_count)
@@ -1464,7 +1544,12 @@ class VaayuBaseModel(GenerationMixin):
                 self._full_position_embeddings = real_rotary(dummy_x, position_ids)
             except Exception as e:
                 print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
-                self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+                try:
+                    self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+                except Exception as e2:
+                    print(f"Manual RoPE fallback also failed ({e2}). RoPE will be computed per-layer.")
+                    torch.cuda.empty_cache()
+                    self._full_position_embeddings = None
         else:
             self._full_position_embeddings = None
 
@@ -1536,7 +1621,7 @@ class VaayuBaseModel(GenerationMixin):
                         t = time.time()
                     _tl = time.perf_counter()
                     _t = time.time()
-                    state_dict = future.result()
+                    state_dict = future.result(); print(f"[Vaayu-Debug] layer {layer_name} loaded keys: {list(state_dict.keys())}", flush=True)
                     _io_wait_s += time.time() - _t
                     _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
                     if self.profiling_mode:
@@ -1640,6 +1725,7 @@ class VaayuBaseModel(GenerationMixin):
 
                         len_s = self.get_sequence_len(seq)
 
+                        print(f"seq device: {seq.device}", flush=True)
                         kwargs = {
                             'use_cache': use_cache,
                             **self.get_past_key_value_args(past_key_values),
@@ -1661,7 +1747,13 @@ class VaayuBaseModel(GenerationMixin):
                                         )
                                     _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                                 else:
-                                    _tl = time.perf_counter(); _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                    _tl = time.perf_counter()
+                                    _t = time.time()
+                                    if hasattr(layer, "input_layernorm"):
+                                        print(f"[{layer_name}] weight device: {layer.input_layernorm.weight.device}, dtype: {layer.input_layernorm.weight.dtype}, shape: {layer.input_layernorm.weight.shape}")
+                                    layer_out = layer(seq, **kwargs)
+                                    _compute_s += time.time() - _t
+                                    _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                                 break
                             except torch.cuda.OutOfMemoryError:
                                 if _oom_retry == _MAX_OOM_RETRIES:
