@@ -7,11 +7,6 @@ from pathlib import Path
 
 _EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')
 
-_DTYPE_SIZE = {
-    "F16": 2, "BF16": 2, "F32": 4, "F64": 8,
-    "I8": 1, "I16": 2, "I32": 4, "I64": 8, "U8": 1, "BOOL": 1,
-}
-
 
 @dataclass
 class ExpertTensorMeta:
@@ -93,8 +88,8 @@ class ExpertOffsetIndex:
         shards = list(self.checkpoint_path.glob("*.safetensors"))
         if not shards:
             return False
-        oldest_shard_mtime = min(s.stat().st_mtime for s in shards)
-        if cache_path.stat().st_mtime < oldest_shard_mtime:
+        newest_shard_mtime = max(s.stat().st_mtime for s in shards)
+        if cache_path.stat().st_mtime < newest_shard_mtime:
             return False
         with open(cache_path) as f:
             raw = json.load(f)

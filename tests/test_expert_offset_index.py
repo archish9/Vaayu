@@ -1,5 +1,4 @@
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -51,7 +50,7 @@ def test_non_expert_tensors_excluded(tmp_path):
     # Gate weights should not appear in expert offsets
     for eidx_tensors in idx.index.get("model.layers.0", {}).values():
         for key in eidx_tensors:
-            assert ".gate." not in key or ".experts." in key
+            assert ".gate." not in key
 
 
 def test_moe_layer_names(tmp_path):
@@ -83,7 +82,13 @@ def test_load_cached(tmp_path):
     idx2 = ExpertOffsetIndex(str(tmp_path))
     loaded = idx2.load_cached()
     assert loaded is True
-    assert idx2.get_expert_offsets("model.layers.0", 0) is not None
+    offsets = idx2.get_expert_offsets("model.layers.0", 0)
+    assert offsets is not None
+    meta = list(offsets.values())[0]
+    assert meta.file_offset > 0
+    assert meta.byte_length > 0
+    assert meta.shape == [8, 8]
+    assert meta.dtype == "F32"
 
 
 def test_stale_cache_triggers_rebuild(tmp_path):
@@ -111,3 +116,13 @@ def test_missing_expert_returns_none(tmp_path):
     assert idx.get_expert_offsets("model.layers.0", 99) is None
     # Layer that doesn't exist
     assert idx.get_expert_offsets("model.layers.99", 0) is None
+
+
+def test_build_or_load_twice(tmp_path):
+    make_synthetic_moe_shard(tmp_path, "model.layers.0", num_experts=2)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build_or_load()  # first call: builds and caches
+
+    idx2 = ExpertOffsetIndex(str(tmp_path))
+    idx2.build_or_load()  # second call: should load from cache
+    assert idx2.get_expert_offsets("model.layers.0", 0) is not None
