@@ -27,7 +27,7 @@ class ExpertRAMCache:
             if key in self.cache:
                 self.cache.move_to_end(key)
                 self.hits += 1
-                return self.cache[key]
+                return dict(self.cache[key])
             self.misses += 1
             return None
 

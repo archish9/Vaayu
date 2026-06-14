@@ -89,3 +89,13 @@ def test_hit_miss_counters():
     cache.get(0, 99)
     assert cache.hits == 2
     assert cache.misses == 1
+
+
+def test_get_returns_copy_not_reference():
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    t = {"w1": torch.ones(10)}
+    cache.put(0, 0, t)
+    result = cache.get(0, 0)
+    result["new_key"] = torch.zeros(5)  # mutate returned dict
+    result2 = cache.get(0, 0)
+    assert "new_key" not in result2  # cache unaffected
