@@ -306,3 +306,90 @@ class SafetensorModelPersister(ModelPersister):
             gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
             print(f"[VAAYU-IO] python  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result
+
+
+def load_expert_sparse(
+    file_path: str,
+    expert_metas: dict,
+    use_direct_io: bool | None = None,
+) -> dict:
+    """
+    Load only the specified expert tensor byte ranges from a safetensors shard.
+
+    Groups contiguous byte ranges (gap < _ALIGN) into a single io_uring call
+    to minimise syscall overhead. Falls back to preadv when io_uring unavailable.
+
+    Args:
+        file_path: absolute path to the .safetensors shard
+        expert_metas: {tensor_key: ExpertTensorMeta} from ExpertOffsetIndex
+        use_direct_io: O_DIRECT flag; None = use global _USE_DIRECT_IO
+
+    Returns:
+        {tensor_key: cpu_tensor} — cloned tensors safe to hold beyond buffer reuse
+    """
+    global _PINNED_BUFS, _PINNED_SIZES
+
+    if not expert_metas:
+        return {}
+
+    if use_direct_io is None:
+        use_direct_io = _USE_DIRECT_IO
+
+    # Sort by file offset to enable contiguity detection
+    sorted_metas = sorted(expert_metas.items(), key=lambda x: x[1].file_offset)
+
+    # Group contiguous ranges (gap <= _ALIGN → merge into one read)
+    groups: list[list] = []
+    current_group = [sorted_metas[0]]
+    for key, meta in sorted_metas[1:]:
+        prev_meta = current_group[-1][1]
+        prev_end = prev_meta.file_offset + prev_meta.byte_length
+        if meta.file_offset - prev_end <= _ALIGN:
+            current_group.append((key, meta))
+        else:
+            groups.append(current_group)
+            current_group = [(key, meta)]
+    groups.append(current_group)
+
+    result = {}
+
+    for group in groups:
+        group_start = group[0][1].file_offset
+        last_meta = group[-1][1]
+        group_end = last_meta.file_offset + last_meta.byte_length
+        read_len = group_end - group_start
+
+        aligned_offset = _align_down(group_start)
+        prefix_pad = group_start - aligned_offset
+        aligned_length = _align_up(read_len + prefix_pad)
+
+        # Acquire buffer slot (use buf 0 for expert reads — small, synchronous)
+        if _PINNED_BUFS[0] is None or _PINNED_SIZES[0] < aligned_length:
+            alloc_size = aligned_length + _ALIGN + (16 * 1024 * 1024)  # +16 MB headroom
+            _PINNED_BUFS[0] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=_USE_PINNED)
+            _PINNED_SIZES[0] = alloc_size
+
+        buf = _PINNED_BUFS[0]
+
+        if _USE_IOURING:
+            vaayu_rust.io_uring_read_into(
+                file_path, aligned_offset, aligned_length,
+                buf.data_ptr(), 8, use_direct_io,
+            )
+            data_buf = buf[prefix_pad:]
+        else:
+            fd = os.open(file_path, os.O_RDONLY)
+            try:
+                view = memoryview(buf.numpy())
+                os.preadv(fd, [view[:aligned_length]], aligned_offset)
+            finally:
+                os.close(fd)
+            data_buf = buf[prefix_pad:]
+
+        for key, meta in group:
+            rel_start = meta.file_offset - group_start
+            rel_end = rel_start + meta.byte_length
+            dtype = _DTYPE_MAP.get(meta.dtype, torch.float32)
+            result[key] = data_buf[rel_start:rel_end].view(dtype).reshape(meta.shape).clone()
+
+    return result
