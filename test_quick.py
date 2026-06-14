@@ -27,21 +27,21 @@ import torch
 
 MODEL_PATH        = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
-MAX_PINNED_LAYERS = 10      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
+MAX_PINNED_LAYERS = -1      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 512      # coding agent response needs room for real code output
 MAX_LENGTH        = 2048     # coding agent context is long; must be > PREFILL_CHUNK_SIZE
 PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 
 # ── Speculative Decoding ─────────────────────────────────────────────────────
 # Mode A — Standard Drafter: instruction/chat/novel responses. Costs VRAM (~0.3–1 GB).
-DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
-USE_PROMPT_LOOKUP  = False
+#DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
+#USE_PROMPT_LOOKUP  = False
 
 # Mode B — Prompt Lookup Decoding: code completion, repetitive text. Zero VRAM.
 #   Switch to PLD: set DRAFTER_MODEL_PATH = None and USE_PROMPT_LOOKUP = True
 #   Avoid for instruction→response — novel outputs yield 0 match rate (no speedup).
-# DRAFTER_MODEL_PATH = None
-# USE_PROMPT_LOOKUP  = True
+DRAFTER_MODEL_PATH = None
+USE_PROMPT_LOOKUP  = True
 
 DRAFT_TOKENS = 15
 # ─────────────────────────────────────────────────────────────────────────────
