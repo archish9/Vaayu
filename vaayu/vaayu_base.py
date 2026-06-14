@@ -1,3 +1,4 @@
+import gc
 import os
 import subprocess
 from typing import List, Optional, Tuple, Union
@@ -1433,16 +1434,38 @@ class VaayuBaseModel(GenerationMixin):
                             **self.get_position_ids_args(position_ids, _len_p, len_s),
                         }
 
-                        if self.use_torch_compile:
-                            if self._compiled_layer_fn is None:
-                                self._compiled_layer_fn = torch.compile(
-                                    lambda m, x, **kw: m(x, **kw),
-                                    mode="reduce-overhead",
-                                    fullgraph=False,
-                                )
-                            _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                        else:
-                            _tl = time.perf_counter(); _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                        _MAX_OOM_RETRIES = 2
+                        layer_out = None
+                        for _oom_retry in range(_MAX_OOM_RETRIES + 1):
+                            try:
+                                if self.use_torch_compile:
+                                    if self._compiled_layer_fn is None:
+                                        self._compiled_layer_fn = torch.compile(
+                                            lambda m, x, **kw: m(x, **kw),
+                                            mode="reduce-overhead",
+                                            fullgraph=False,
+                                        )
+                                    _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                else:
+                                    _tl = time.perf_counter(); _t = time.time(); layer_out = layer(seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                break
+                            except torch.cuda.OutOfMemoryError:
+                                if _oom_retry == _MAX_OOM_RETRIES:
+                                    print(f"[Vaayu] ❌ Fatal OOM on {layer_name}. Recovery failed.")
+                                    raise
+                                print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {_oom_retry + 1}/{_MAX_OOM_RETRIES}). "
+                                      f"Clearing cache and retrying...")
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                if past_key_values is not None:
+                                    try:
+                                        _oom_seq_len = self.get_past_key_values_cache_seq_len(past_key_values)
+                                        if _oom_seq_len > 512:
+                                            _oom_target = _oom_seq_len // 2
+                                            print(f"[Vaayu] \U0001f52a Truncating KV cache: {_oom_seq_len} → {_oom_target} tokens")
+                                            self._trim_kv_cache_front(past_key_values, _oom_target)
+                                    except Exception as _oom_e:
+                                        print(f"[Vaayu] Cache truncation failed: {_oom_e}")
                         new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                         if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
@@ -1535,6 +1558,22 @@ class VaayuBaseModel(GenerationMixin):
                 if len(cache.key_cache[i].shape) >= 3:
                     cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+
+    def _trim_kv_cache_front(self, cache, target_seq_len: int) -> None:
+        """Remove the oldest tokens from the KV cache to free VRAM."""
+        if cache is None:
+            return
+        if isinstance(cache, FP8DynamicCache):
+            for i in range(len(cache.key_cache)):
+                cache.key_cache[i]     = cache.key_cache[i][:, :, -target_seq_len:, :]
+                cache.value_cache[i]   = cache.value_cache[i][:, :, -target_seq_len:, :]
+                cache._key_scales[i]   = cache._key_scales[i][:, :, -target_seq_len:, :]
+                cache._value_scales[i] = cache._value_scales[i][:, :, -target_seq_len:, :]
+        elif hasattr(cache, 'key_cache'):
+            for i in range(len(cache.key_cache)):
+                if cache.key_cache[i] is not None and len(cache.key_cache[i].shape) >= 3:
+                    cache.key_cache[i]   = cache.key_cache[i][:, :, -target_seq_len:, :]
+                    cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 
     def generate(self, *args, **kwargs):
         result = super().generate(*args, **kwargs)
