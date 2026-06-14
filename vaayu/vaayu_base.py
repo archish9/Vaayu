@@ -482,6 +482,7 @@ class VaayuBaseModel(GenerationMixin):
         self._expert_history: dict[int, list[int]] = {}
         self._expert_cache = None
         self._expert_offset_index = None
+        self._moe_blocks: list = []
         if self.running_device.startswith("cuda") and self.is_moe:
             from .persist.expert_offset_index import ExpertOffsetIndex
             from .persist.expert_cache import ExpertRAMCache
@@ -491,10 +492,9 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
             self._expert_offset_index.build_or_load()
 
-            # Budget: available RAM minus LayerRAMCache allocation minus 8 GB reserve
+            # Budget: available RAM minus 8 GB reserve
             _mem = _psutil.virtual_memory()
-            _layer_cache_usage = self.ram_cache.current_usage if self.ram_cache else 0
-            _expert_budget = max(0, _mem.available - _layer_cache_usage - (8 * 1024 ** 3))
+            _expert_budget = max(0, _mem.available - (8 * 1024 ** 3))
             self._expert_cache = ExpertRAMCache(_expert_budget)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget")
 
@@ -509,6 +509,9 @@ class VaayuBaseModel(GenerationMixin):
                 vaayu_ref=self,
             )
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
+        elif self.is_moe:
+            print("[Vaayu-MoE] MoE model on non-CUDA device — expert-aware streaming disabled, "
+                  "falling back to full-layer loading")
 
         self.speculator = None
         if drafter_model_path or use_prompt_lookup:
