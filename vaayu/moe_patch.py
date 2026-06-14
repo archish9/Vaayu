@@ -13,15 +13,13 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import torch
 import torch.nn as nn
-from accelerate.utils.modeling import set_module_tensor_to_device
 
 if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
     from .persist.expert_offset_index import ExpertOffsetIndex
 
-_ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights", "gate_up_proj"}
+_ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights"}
 _MIN_EXPERTS = 4  # ModuleList must have > this many children to be an expert list
 
 
@@ -51,11 +49,20 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
         experts_attr: str | None = None
         router_attr: str | None = None
 
+        _found_expert_lists: list[str] = []
         for child_name, child in mod.named_children():
             if isinstance(child, nn.ModuleList) and len(child) > _MIN_EXPERTS:
-                experts_attr = child_name
+                _found_expert_lists.append(child_name)
             elif isinstance(child, nn.Linear) and child_name in _ROUTER_NAMES:
                 router_attr = child_name
+        if len(_found_expert_lists) == 1:
+            experts_attr = _found_expert_lists[0]
+        elif len(_found_expert_lists) > 1:
+            # Prefer "experts" over other names; log warning for ambiguous cases
+            preferred = next((n for n in _found_expert_lists if n == "experts"), None)
+            experts_attr = preferred or _found_expert_lists[0]
+            print(f"[Vaayu-MoE] warn: multiple expert lists at {mod_path}: "
+                  f"{_found_expert_lists}, using '{experts_attr}'")
 
         if experts_attr is None or router_attr is None:
             continue

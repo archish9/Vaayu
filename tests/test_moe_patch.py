@@ -96,7 +96,8 @@ def test_detect_moe_blocks_layer_name():
     model = MockModel(num_layers=2)
     blocks = detect_moe_blocks(model)
     layer_names = {b.layer_name for b in blocks}
-    assert "layers.0" in layer_names or any("0" in n for n in layer_names)
+    assert "layers.0" in layer_names
+    assert "layers.1" in layer_names
 
 
 def test_detect_dense_model_finds_no_moe():
@@ -111,3 +112,19 @@ def test_detect_moe_blocks_module_refs_live():
     assert blocks[0].moe_module is not None
     assert isinstance(getattr(blocks[0].moe_module, "gate"), nn.Linear)
     assert isinstance(getattr(blocks[0].moe_module, "experts"), nn.ModuleList)
+
+
+def test_detect_small_module_list_not_moe():
+    """ModuleList with exactly _MIN_EXPERTS children should NOT be detected as experts."""
+    class FakeGatedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(8, 4, bias=False)
+            # Exactly _MIN_EXPERTS=4 children — should NOT trigger detection
+            self.small_list = nn.ModuleList([nn.Linear(8, 8) for _ in range(4)])
+        def forward(self, x):
+            return x
+
+    model = FakeGatedModel()
+    blocks = detect_moe_blocks(model)
+    assert blocks == []
