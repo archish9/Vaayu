@@ -478,6 +478,38 @@ class VaayuBaseModel(GenerationMixin):
         else:
             self.ram_cache = None
 
+        # MoE Expert-Aware Streaming: build offset index, expert cache, patch forwards
+        self._expert_history: dict[int, list[int]] = {}
+        self._expert_cache = None
+        self._expert_offset_index = None
+        if self.running_device.startswith("cuda") and self.is_moe:
+            from .persist.expert_offset_index import ExpertOffsetIndex
+            from .persist.expert_cache import ExpertRAMCache
+            from .moe_patch import patch_moe_blocks
+            import psutil as _psutil
+
+            self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
+            self._expert_offset_index.build_or_load()
+
+            # Budget: available RAM minus LayerRAMCache allocation minus 8 GB reserve
+            _mem = _psutil.virtual_memory()
+            _layer_cache_usage = self.ram_cache.current_usage if self.ram_cache else 0
+            _expert_budget = max(0, _mem.available - _layer_cache_usage - (8 * 1024 ** 3))
+            self._expert_cache = ExpertRAMCache(_expert_budget)
+            print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget")
+
+            self._moe_blocks = patch_moe_blocks(
+                model=self.model,
+                expert_cache=self._expert_cache,
+                offset_index=self._expert_offset_index,
+                checkpoint_path=str(self.checkpoint_path),
+                top_k=self.moe_top_k,
+                device=self.running_device,
+                dtype=self.running_dtype,
+                vaayu_ref=self,
+            )
+            print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
+
         self.speculator = None
         if drafter_model_path or use_prompt_lookup:
             from .speculative import build_speculator
