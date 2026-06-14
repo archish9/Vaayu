@@ -232,3 +232,19 @@ Vaayu acts as the **Verifier**. A resident drafter generates K candidates; the v
 `DRAFT_TOKENS` (default 5) trades off NVMe waste on rejection vs throughput on acceptance:
 - `accept_rate` > 70%: raise to 7–10
 - `accept_rate` < 40%: drop to 3 or switch to better-matched drafter
+
+---
+
+## 6. MoE Expert-Aware Streaming
+
+For Mixture-of-Experts (MoE) models, default layer-streaming loads all expert weights
+per token (99.2% wasted for Kimi-K2.6). Expert-aware streaming reduces this to only
+the top-k active experts per token via three layers of optimization:
+
+1. **ExpertRAMCache** (`vaayu/persist/expert_cache.py`) — LRU RAM cache keyed by `(layer_idx, expert_idx)`. 70–90% of tokens reuse the same experts.
+2. **Speculative prefetch** — After each MoE layer, current token's routing history predicts next layer's experts. Prefetch fires in background, overlapping with attention compute.
+3. **Sparse io_uring** (`load_expert_sparse` in safetensor_model_persister.py) — On cache miss, precise byte-range read for only the active expert bytes.
+
+Implementation uses monkey-patch (`vaayu/moe_patch.py`): replace each MoE block's `forward()` at init time. Generic detection via `detect_moe_blocks()` covers Mixtral, DeepSeek, Kimi, Qwen MoE. Dense models unaffected (`is_moe=False`).
+
+See `documentation/moe_expert_aware_streaming.md` for full technical reference.

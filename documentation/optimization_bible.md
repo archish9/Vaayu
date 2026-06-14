@@ -105,3 +105,15 @@ Era 6 (Pending):  █ 0.2s (IO) █ 2.0s (PCIe x16 Slot)  █ 5.8s (Other)      
 * **Action**: Utilize `IORING_REGISTER_BUFFERS` and `IORING_REGISTER_FILES` inside `vaayu_rust` to map host pinned memory and file descriptors in kernel memory once at startup.
 * **Math**: Skips per-I/O page table lookup and fd locking, reducing CPU system overhead to absolute zero. NVMe reads reach **7.0+ GB/s**.
 * **Projected Speed**: **~8.0 seconds per token**.
+
+### Era 7: MoE Expert-Aware Streaming (2026-06-14)
+* **Code State**: Added `ExpertRAMCache`, `ExpertOffsetIndex`, `load_expert_sparse()`, and `moe_patch.py`. MoE block forwards monkey-patched at init. Router gates pinned permanently in VRAM via `safetensors.safe_open`. Speculative expert prefetch from per-layer routing history via existing `ThreadPoolExecutor`.
+* **Impact (MoE models only):** Per-token NVMe reads drop from 100% of expert weights to only top-k active experts. ExpertRAMCache eliminates 70–90% of even those reads. Projected latency for Kimi-K2.6: **91s/token → ~2.5s/token**.
+* **Impact (dense models):** Zero. All new code gates on `self.is_moe = True`.
+* **Key Bugs Fixed During Implementation:**
+  - `min()` → `max()` for staleness check (cache invalidated when ANY shard is newer, not all)
+  - Local buffer in `load_expert_sparse` to avoid race with prefetch pipeline
+  - `__get__` binding removed (direct instance attribute assignment)
+  - Routing weight normalization (topk weights divided by sum to equal 1.0)
+  - `_expert_history[current_idx]` not `[next_idx]` for speculative prefetch
+  - `safetensors.safe_open` for gate loading (not `load_from_disk` which reads full shard)
