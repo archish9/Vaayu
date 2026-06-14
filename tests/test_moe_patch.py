@@ -259,3 +259,28 @@ def test_sparse_forward_output_shape(tmp_path):
     hidden = torch.randn(1, 3, 8)
     out = model.layers[0].block_sparse_moe.forward(hidden)
     assert out.shape == (1, 3, 8)
+
+
+def test_sparse_forward_batch_size_2(tmp_path):
+    model = MockModel(num_layers=1, hidden=8)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+
+    hidden = torch.randn(2, 3, 8)  # B=2
+    out = model.layers[0].block_sparse_moe.forward(hidden)
+    assert out.shape == (2, 3, 8)

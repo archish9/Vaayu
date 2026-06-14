@@ -9,6 +9,7 @@ Design rationale: see docs/superpowers/specs/2026-06-14-moe-expert-aware-streami
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
 
 _ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights"}
 _MIN_EXPERTS = 4  # ModuleList must have > this many children to be an expert list
+_EXPERT_PREFIX_RE = re.compile(r'^.*?\.experts\.\d+\.')
+
+_log = logging.getLogger("vaayu.moe_patch")
 
 
 @dataclass
@@ -94,6 +98,42 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
     return results
 
 
+def _inject_expert_weights(
+    expert_mod: nn.Module,
+    raw: dict,
+    expert_idx: int,
+    layer_name: str,
+    device: str,
+    dtype,
+) -> bool:
+    """
+    Inject expert tensor weights into expert_mod for inference.
+    Returns True if all weights injected, False if any failed (expert skipped).
+
+    Uses regex to strip the full key prefix generically:
+        "layers.0.block_sparse_moe.experts.0.w1.weight" → "w1.weight"
+    Works for Mixtral, DeepSeek, Kimi, Qwen MoE without hardcoding architecture names.
+    """
+    for param_key, tensor in raw.items():
+        m = _EXPERT_PREFIX_RE.match(param_key)
+        if m is None:
+            continue  # not an expert tensor (shouldn't happen but be safe)
+        local_key = param_key[m.end():]  # e.g. "w1.weight"
+        local_parts = local_key.split(".")
+        try:
+            submod = expert_mod
+            for part in local_parts[:-1]:
+                submod = getattr(submod, part)
+            t = tensor.to(device, dtype=dtype, non_blocking=True)
+            setattr(submod, local_parts[-1], nn.Parameter(t, requires_grad=False))
+        except Exception as e:
+            _log.warning(
+                f"Expert weight inject failed: {param_key} → {local_key}: {e}"
+            )
+            return False
+    return True
+
+
 def patch_moe_blocks(
     model: nn.Module,
     expert_cache: "ExpertRAMCache",
@@ -130,9 +170,8 @@ def patch_moe_blocks(
             dtype=dtype,
             vaayu_ref=vaayu_ref,
         )
-        block_info.moe_module.forward = sparse_fwd.__get__(
-            block_info.moe_module, type(block_info.moe_module)
-        )
+        # Fix 1: direct assignment — no __get__ binding needed
+        block_info.moe_module.forward = sparse_fwd
         n_experts = len(getattr(block_info.moe_module, block_info.experts_attr))
         print(
             f"[Vaayu-MoE] patched {block_info.module_path} "
@@ -166,17 +205,17 @@ def _make_sparse_moe_forward(
     layer_name = block_info.layer_name
     layer_idx  = block_info.layer_idx
 
-    def sparse_forward(self_or_hidden, hidden_states=None, **kwargs):
-        # Support both bound-method call (self, hidden_states) and plain call (hidden_states)
-        if hidden_states is None:
-            hidden_states = self_or_hidden
-
+    # Fix 2: simple signature — no bound-method dual-mode needed
+    def sparse_forward(hidden_states, **kwargs):
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         router = getattr(block_info.moe_module, block_info.router_attr)
         router_logits = router(hidden_states)
         routing_weights, expert_indices = torch.topk(
             router_logits.float().softmax(dim=-1), top_k, dim=-1
         )
+        # Fix 3: normalize routing weights so they sum to 1 (matches actual MoE behavior)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
 
         # 2. Load missing experts: ExpertRAMCache → sparse io_uring
@@ -200,47 +239,37 @@ def _make_sparse_moe_forward(
         B, S, H = hidden_states.shape
         final_hidden = torch.zeros_like(hidden_states)
 
-        # prefix to strip from tensor keys to get local path within expert_mod
-        # e.g. "layers.0.block_sparse_moe.experts.{eidx}." → "w1.weight"
+        # Fix 4 + Fix 5: Phase A — inject all unique experts before token loop
+        injected_experts: set[int] = set()
+        for eidx in unique_experts:
+            raw = expert_tensors.get(eidx)
+            if raw is None:
+                continue
+            expert_mod = experts_list[eidx]
+            # Fix 5: use _inject_expert_weights helper; skip expert if any weight fails
+            ok = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
+            if ok:
+                injected_experts.add(eidx)
+
+        # Fix 4: Phase B — token × top_k accumulation with correct batch handling
         for s in range(S):
             for k in range(top_k):
-                eidx = int(expert_indices[0, s, k].item())
-                weight = routing_weights[0, s, k]
-                raw = expert_tensors.get(eidx)
-                if raw is None:
-                    continue
-                expert_mod = experts_list[eidx]
-
-                # Inject: strip the known full-path prefix, walk local path on expert_mod
-                prefix = f"{layer_name}.block_sparse_moe.experts.{eidx}."
-                for param_key, tensor in raw.items():
-                    if param_key.startswith(prefix):
-                        local_key = param_key[len(prefix):]  # e.g. "w1.weight"
-                    else:
-                        # Fallback: use the last two parts (submod.attr)
-                        parts = param_key.split(".")
-                        local_key = ".".join(parts[-2:])
-
-                    local_parts = local_key.split(".")
-                    try:
-                        submod = expert_mod
-                        for part in local_parts[:-1]:
-                            submod = getattr(submod, part)
-                        attr_name = local_parts[-1]
-                        t = tensor.to(device, dtype=dtype, non_blocking=True)
-                        setattr(submod, attr_name, nn.Parameter(t, requires_grad=False))
-                    except Exception as e:
-                        print(f"[Vaayu-MoE] inject failed {param_key}: {e}")
+                # expert_indices shape: (B, S, top_k)
+                for b in range(B):
+                    eidx = int(expert_indices[b, s, k].item())
+                    if eidx not in injected_experts:
                         continue
+                    weight = routing_weights[b, s, k]
+                    expert_mod = experts_list[eidx]
+                    expert_out = expert_mod(hidden_states[b:b+1, s, :])  # (1, H)
+                    final_hidden[b, s, :] += weight * expert_out.squeeze(0)
 
-                expert_out = expert_mod(hidden_states[:, s, :])  # (B, H)
-                final_hidden[:, s, :] += weight * expert_out
-
-                # Unload back to meta to reclaim VRAM
-                try:
-                    expert_mod.to("meta")
-                except Exception:
-                    pass  # meta move may fail for some module types
+        # Fix 4: Phase C — unload all injected experts back to meta
+        for eidx in injected_experts:
+            try:
+                experts_list[eidx].to("meta")
+            except Exception as e:
+                _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
