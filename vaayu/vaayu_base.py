@@ -549,7 +549,75 @@ class VaayuBaseModel(GenerationMixin):
     def get_use_better_transformer(self):
         return False
 
+    @staticmethod
+    def _apply_transformers_compat_patches():
+        """
+        Apply in-process shims for trust_remote_code models targeting a newer/different
+        transformers API than the installed version. Never touches model files on disk.
+        """
+        # 1. OutputRecorder: some models import from utils.generic but it lives in
+        #    utils.output_capturing in transformers ≥5.6.
+        try:
+            import transformers.utils.generic as _tf_generic
+            if not hasattr(_tf_generic, "OutputRecorder"):
+                from transformers.utils.output_capturing import OutputRecorder as _OR
+                _tf_generic.OutputRecorder = _OR
+        except Exception:
+            pass
+
+        # 2. ROPE 'default' type: removed from ROPE_INIT_FUNCTIONS in transformers ≥5.6.
+        #    Standard RoPE (no scaling, attention_scaling=1.0).
+        try:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            if "default" not in ROPE_INIT_FUNCTIONS:
+                def _rope_default(config, device=None, seq_len=None, layer_type=None, **_kw):
+                    import torch as _torch
+                    base = getattr(config, "rope_theta", 10000.0)
+                    head_dim = (getattr(config, "head_dim", None)
+                                or config.hidden_size // config.num_attention_heads)
+                    inv_freq = 1.0 / (base ** (
+                        _torch.arange(0, head_dim, 2, dtype=_torch.int64)
+                        .to(device=device, dtype=_torch.float) / head_dim
+                    ))
+                    return inv_freq, 1.0
+                ROPE_INIT_FUNCTIONS["default"] = _rope_default
+        except Exception:
+            pass
+
+        # 3. compute_default_rope_parameters: transformers ≥5.6 _init_weights calls this on
+        #    any RotaryEmbedding with rope_type='default'. Patch PreTrainedModel._init_weights
+        #    to inject the method if missing, rather than failing.
+        try:
+            from transformers.modeling_utils import PreTrainedModel
+            import torch as _torch
+
+            _orig_init_weights = PreTrainedModel._init_weights  # plain function in Python 3
+
+            def _patched_init_weights(self_model, module):
+                if (
+                    "RotaryEmbedding" in type(module).__name__
+                    and hasattr(module, "original_inv_freq")
+                    and getattr(module, "rope_type", None) == "default"
+                    and not hasattr(module, "compute_default_rope_parameters")
+                ):
+                    def _cdrp(config=None, _m=module):
+                        cfg = config if config is not None else _m.config
+                        base = getattr(cfg, "rope_theta", 10000.0)
+                        head_dim = (getattr(cfg, "head_dim", None)
+                                    or cfg.hidden_size // cfg.num_attention_heads)
+                        inv_freq = 1.0 / (base ** (
+                            _torch.arange(0, head_dim, 2, dtype=_torch.int64).float() / head_dim
+                        ))
+                        return inv_freq, 1.0
+                    module.compute_default_rope_parameters = _cdrp
+                return _orig_init_weights(self_model, module)
+
+            PreTrainedModel._init_weights = _patched_init_weights
+        except Exception:
+            pass
+
     def init_model(self):
+        self._apply_transformers_compat_patches()
         self.model = None
         self._active_attn_impl = None
 
@@ -573,6 +641,7 @@ class VaayuBaseModel(GenerationMixin):
                 self.model = None
 
         if self.model is None:
+            _last_exc = None
             for attn_impl in attn_candidates:
                 try:
                     with init_empty_weights():
@@ -581,14 +650,18 @@ class VaayuBaseModel(GenerationMixin):
                         )
                     self._active_attn_impl = attn_impl
                     break
-                except Exception:
+                except Exception as _e:
+                    print(f"[Vaayu] attn_impl={attn_impl!r} failed: {_e}")
+                    _last_exc = _e
                     if self.model is not None:
                         del self.model
                     clean_memory()
                     self.model = None
 
         if self.model is None:
-            raise RuntimeError("Failed to create model with any attention implementation")
+            raise RuntimeError(
+                "Failed to create model with any attention implementation"
+            ) from _last_exc
 
         print(f"✅ Attention implementation: {self._active_attn_impl}")
         try:
