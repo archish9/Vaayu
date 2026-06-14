@@ -798,12 +798,12 @@ class VaayuBaseModel(GenerationMixin):
         # Phase 1.5: Pin MoE router gates permanently in VRAM (MoE models only).
         # Gates are tiny (< 4 MB per layer) but must be in VRAM before the patched
         # MoE forward() can run the router. Detection is header-driven: any tensor
-        # key matching r'\.(gate|router)\b' but NOT containing 'experts.' is a router.
+        # key matching r'\.(gate|router)\.weight$' but NOT containing 'experts.' is
+        # a router weight. The tighter regex avoids matching gate_proj (MLP projection).
         if self.is_moe:
             import re as _re
-            import json as _json
             import struct as _struct
-            _gate_re = _re.compile(r'\.(gate|router)\b')
+            _gate_re = _re.compile(r'\.(gate|router)\.weight$')
             for shard_name in self.layer_names:
                 if not shard_name.startswith(layer_prefix + "."):
                     continue
@@ -813,7 +813,7 @@ class VaayuBaseModel(GenerationMixin):
                 try:
                     with open(shard_path, "rb") as _f:
                         _hdr_len = _struct.unpack("<Q", _f.read(8))[0]
-                        _hdr = _json.loads(_f.read(_hdr_len))
+                        _hdr = json.loads(_f.read(_hdr_len))
                     gate_keys = {
                         k for k in _hdr
                         if k != "__metadata__"
@@ -822,10 +822,14 @@ class VaayuBaseModel(GenerationMixin):
                     }
                     if not gate_keys:
                         continue
-                    all_tensors = self.loader_strategy.load_from_disk(
-                        shard_name, self.checkpoint_path
-                    )
-                    gate_tensors = {k: v for k, v in all_tensors.items() if k in gate_keys}
+                    from safetensors import safe_open
+                    gate_tensors = {}
+                    with safe_open(str(shard_path), framework="pt", device="cpu") as sf:
+                        for k in gate_keys:
+                            if k in sf.keys():
+                                gate_tensors[k] = sf.get_tensor(k)
+                    if not gate_tensors:
+                        continue
                     size = sum(t.nbytes for t in gate_tensors.values())
                     if used + size > budget:
                         print(f"[Vaayu-Pin] skip gate {shard_name}: budget exhausted")
@@ -835,8 +839,9 @@ class VaayuBaseModel(GenerationMixin):
                         self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {}),
                     )
-                    gate_pin_name = shard_name + ".gate"
-                    self.pinned_layer_names.add(gate_pin_name)
+                    if not hasattr(self, '_moe_gate_pinned'):
+                        self._moe_gate_pinned = set()
+                    self._moe_gate_pinned.add(shard_name)
                     used += size
                     print(f"[Vaayu-Pin] pinned gate {shard_name}: "
                           f"{size / 1e6:.1f} MB  (cumulative {used / 1e9:.2f} GB)")
