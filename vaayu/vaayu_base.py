@@ -1603,7 +1603,7 @@ class VaayuBaseModel(GenerationMixin):
                             _current_layer_idx = int(layer_name[len(_layer_prefix) + 1:])
                             if _current_layer_idx in self._expert_history:
                                 _next_layer_idx = _current_layer_idx + 1
-                                _pred = self._expert_history.get(_next_layer_idx, [])
+                                _pred = self._expert_history[_current_layer_idx]
                                 if _pred:
                                     executor.submit(self._prefetch_experts, _next_layer_idx, _pred)
                         except (ValueError, IndexError):
