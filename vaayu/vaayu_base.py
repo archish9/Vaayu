@@ -994,6 +994,34 @@ class VaayuBaseModel(GenerationMixin):
         t.start()
         self._warmup_thread = t
 
+    # ── MoE speculative prefetch ──────────────────────────────────────────────
+
+    def _prefetch_experts(self, layer_idx: int, predicted_experts: list) -> None:
+        """
+        Background task: load predicted expert tensors into ExpertRAMCache.
+
+        Called by the forward() loop after each MoE layer via ThreadPoolExecutor.
+        Overlaps with next layer's shared attention compute to hide expert-load stall.
+        """
+        if self._expert_cache is None or self._expert_offset_index is None:
+            return
+        from .persist.safetensor_model_persister import load_expert_sparse
+        layer_name = f"{self.layer_names_dict['layer_prefix']}.{layer_idx}"
+        shard_file = str(Path(self.checkpoint_path) / f"{layer_name}.safetensors")
+        if not Path(shard_file).exists():
+            return
+        for eidx in predicted_experts:
+            if self._expert_cache.has(layer_idx, eidx):
+                continue
+            metas = self._expert_offset_index.get_expert_offsets(layer_name, eidx)
+            if metas is None:
+                continue
+            try:
+                raw = load_expert_sparse(shard_file, metas)
+                self._expert_cache.put(layer_idx, eidx, raw)
+            except Exception as e:
+                print(f"[Vaayu-MoE] prefetch failed layer={layer_idx} expert={eidx}: {e}")
+
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
@@ -1296,6 +1324,11 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
         self.telemetry.begin_token(self._token_count)
 
+        # Clear per-token routing history so stale entries from the previous token
+        # don't interfere with speculative prefetch scheduling for the current token.
+        if self.is_moe:
+            self._expert_history.clear()
+
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
 
@@ -1561,6 +1594,21 @@ class VaayuBaseModel(GenerationMixin):
 
                         batch[j] = new_seq
 
+                # MoE speculative prefetch: after MoE layer writes _expert_history,
+                # prefetch predicted experts for the next MoE layer in background.
+                if self.is_moe and self._expert_cache is not None:
+                    _layer_prefix = self.layer_names_dict["layer_prefix"]
+                    if layer_name.startswith(_layer_prefix + "."):
+                        try:
+                            _current_layer_idx = int(layer_name[len(_layer_prefix) + 1:])
+                            if _current_layer_idx in self._expert_history:
+                                _next_layer_idx = _current_layer_idx + 1
+                                _pred = self._expert_history.get(_next_layer_idx, [])
+                                if _pred:
+                                    executor.submit(self._prefetch_experts, _next_layer_idx, _pred)
+                        except (ValueError, IndexError):
+                            pass
+
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
 
@@ -1604,7 +1652,8 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[Vaayu] inference end:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_end))}")
         print(f"[Vaayu] total execution time: {_total:.3f}s")
         _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}")
+        _expert_cache_stats = self._expert_cache.stats() if self._expert_cache is not None else "n/a"
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}")
 
         if not return_dict:
             return tuple(v for v in [logits,
