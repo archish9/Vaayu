@@ -1012,3 +1012,25 @@ With the current "Fill and Freeze" code:
 By freezing the cache, you permanently eliminate 15 NVMe reads per token, shaving ~4 seconds off the generation time. 
 
 So, omitting the LRU eviction was mathematically the best possible thing to do for sequential layer streaming!
+
+
+
+---------------
+
+
+
+ Q2: Why is batch.py not used anywhere?
+  
+  Because Plan 11 is Phase 4 / Priority Low — designed for a future multi-user API server that doesn't exist yet. Plan 10
+  (KVCacheManager) is the same — also not wired up anywhere.
+
+  These are libraries, not entry points. You wire them in when you build the API server:
+
+  # future: api_server.py or main.py
+  from vaayu.batch import batch_generate
+  from vaayu.kv_cache_manager import KVCacheManager
+
+  test_quick.py is single-query. Batch mode makes no sense there — it would process one prompt the same as before. Should be
+  tested with a dedicated script like:
+
+  results = batch_generate(model, ["prompt A", "prompt B", "prompt C"])
