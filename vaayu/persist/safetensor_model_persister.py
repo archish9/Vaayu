@@ -316,7 +316,7 @@ def load_expert_sparse(
     """
     Load only the specified expert tensor byte ranges from a safetensors shard.
 
-    Groups contiguous byte ranges (gap < _ALIGN) into a single io_uring call
+    Groups contiguous byte ranges (gap ≤ _ALIGN) into a single io_uring call
     to minimise syscall overhead. Falls back to preadv when io_uring unavailable.
 
     Args:
@@ -327,8 +327,6 @@ def load_expert_sparse(
     Returns:
         {tensor_key: cpu_tensor} — cloned tensors safe to hold beyond buffer reuse
     """
-    global _PINNED_BUFS, _PINNED_SIZES
-
     if not expert_metas:
         return {}
 
@@ -363,13 +361,7 @@ def load_expert_sparse(
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
 
-        # Acquire buffer slot (use buf 0 for expert reads — small, synchronous)
-        if _PINNED_BUFS[0] is None or _PINNED_SIZES[0] < aligned_length:
-            alloc_size = aligned_length + _ALIGN + (16 * 1024 * 1024)  # +16 MB headroom
-            _PINNED_BUFS[0] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=_USE_PINNED)
-            _PINNED_SIZES[0] = alloc_size
-
-        buf = _PINNED_BUFS[0]
+        buf = torch.empty(aligned_length, dtype=torch.uint8, pin_memory=_USE_PINNED)
 
         if _USE_IOURING:
             vaayu_rust.io_uring_read_into(
