@@ -836,6 +836,7 @@ class VaayuBaseModel(GenerationMixin):
         # key matching r'\.(gate|router)\.weight$' but NOT containing 'experts.' is
         # a router weight. The tighter regex avoids matching gate_proj (MLP projection).
         if self.is_moe:
+            import json as _json
             import re as _re
             import struct as _struct
             _gate_re = _re.compile(r'\.(gate|router)\.weight$')
@@ -848,7 +849,7 @@ class VaayuBaseModel(GenerationMixin):
                 try:
                     with open(shard_path, "rb") as _f:
                         _hdr_len = _struct.unpack("<Q", _f.read(8))[0]
-                        _hdr = json.loads(_f.read(_hdr_len))
+                        _hdr = _json.loads(_f.read(_hdr_len))
                     gate_keys = {
                         k for k in _hdr
                         if k != "__metadata__"
@@ -1410,6 +1411,17 @@ class VaayuBaseModel(GenerationMixin):
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
 
+        # MoE: precompute set of shard names that contain MoE experts so we can
+        # filter expert tensors out of inject_to_gpu. sparse_forward handles experts.
+        _moe_shard_names: set[str] = (
+            {b.layer_name for b in self._moe_blocks} if self._moe_blocks else set()
+        )
+        if _moe_shard_names:
+            import re as _re_fwd
+            _expert_tensor_re = _re_fwd.compile(r'\.experts\.\d+\.')
+        else:
+            _expert_tensor_re = None
+
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
 
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
@@ -1482,8 +1494,12 @@ class VaayuBaseModel(GenerationMixin):
                         t = time.time()
                     _tl = time.perf_counter()
                     _t = time.time()
+                    _sd = state_dict
+                    if _expert_tensor_re is not None and layer_name in _moe_shard_names:
+                        _sd = {k: v for k, v in state_dict.items()
+                               if not _expert_tensor_re.search(k)}
                     moved_layers = self.loader_strategy.inject_to_gpu(
-                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.model, layer_name, _sd, self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {})
                     )
                     _gpu_load_s += time.time() - _t
@@ -1510,8 +1526,12 @@ class VaayuBaseModel(GenerationMixin):
                         t = time.time()
                     _tl = time.perf_counter()
                     _t = time.time()
+                    _sd = state_dict
+                    if _expert_tensor_re is not None and layer_name in _moe_shard_names:
+                        _sd = {k: v for k, v in state_dict.items()
+                               if not _expert_tensor_re.search(k)}
                     moved_layers = self.loader_strategy.inject_to_gpu(
-                        self.model, layer_name, state_dict, self.running_device, self.running_dtype,
+                        self.model, layer_name, _sd, self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {})
                     )
                     _gpu_load_s += time.time() - _t
