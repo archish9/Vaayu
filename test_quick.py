@@ -54,6 +54,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
 from vaayu import AutoModel
+from vaayu.streaming import stream_generate
 
 print("Loading model...")
 model = AutoModel.from_pretrained(
@@ -154,20 +155,15 @@ start_time = time.time()
 if getattr(model, 'speculator', None) is not None:
     spec_name = type(model.speculator).__name__
     print(f"[Vaayu] Speculative decoding active: {spec_name} (draft_tokens={DRAFT_TOKENS})")
-    output_ids = model.speculative_generate(
-        input_tokens['input_ids'].to(DEVICE),
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
-    output = model.tokenizer.decode(output_ids[0])
-else:
-    generation_output = model.generate(
-        input_tokens['input_ids'].to(DEVICE),
-        max_new_tokens=MAX_NEW_TOKENS,
-        use_cache=True,
-        return_dict_in_generate=True
-    )
-    output = model.tokenizer.decode(generation_output.sequences[0])
+
+print("\nOutput: ", end="", flush=True)
+for chunk in stream_generate(
+    model,
+    input_tokens['input_ids'].to(DEVICE),
+    max_new_tokens=MAX_NEW_TOKENS,
+):
+    print(chunk, end="", flush=True)
+print()
 
 elapsed_minutes = (time.time() - start_time) / 60.0
-print(f"\nOutput: {output}")
 print(f"Total generation time: {elapsed_minutes:.2f} minutes")

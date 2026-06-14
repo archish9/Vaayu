@@ -1546,6 +1546,9 @@ class VaayuBaseModel(GenerationMixin):
         self,
         input_ids: torch.LongTensor,
         max_new_tokens: int = 20,
+        streamer=None,
+        temperature: float = 0.0,
+        **kwargs,
     ) -> torch.LongTensor:
         """
         Custom generation loop using speculative decoding.
@@ -1571,12 +1574,17 @@ class VaayuBaseModel(GenerationMixin):
         generated = torch.cat([input_ids, first_token], dim=1)
         tokens_generated = 1
 
+        if streamer is not None:
+            streamer.put(first_token.cpu())
+
         eos_ids = self.config.eos_token_id
         if isinstance(eos_ids, int):
             eos_ids = [eos_ids]
         eos_set = set(eos_ids) if eos_ids else set()
 
         if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+            if streamer is not None:
+                streamer.end()
             return generated
 
         while tokens_generated < max_new_tokens:
@@ -1619,6 +1627,9 @@ class VaayuBaseModel(GenerationMixin):
             generated = torch.cat([generated, accepted_ids], dim=1)
             tokens_generated += num_accepted
 
+            if streamer is not None:
+                streamer.put(accepted_ids.cpu())
+
             accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
             print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
                   f"total_new={tokens_generated}/{max_new_tokens} "
@@ -1627,5 +1638,7 @@ class VaayuBaseModel(GenerationMixin):
             if accepted_ids[0, -1].item() in eos_set:
                 break
 
+        if streamer is not None:
+            streamer.end()
         self.telemetry.dump_json("vaayu_telemetry.json")
         return generated
