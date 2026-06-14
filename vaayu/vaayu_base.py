@@ -795,6 +795,54 @@ class VaayuBaseModel(GenerationMixin):
             except Exception as e:
                 print(f"[Vaayu-Pin] skip {layer_name}: {e}")
 
+        # Phase 1.5: Pin MoE router gates permanently in VRAM (MoE models only).
+        # Gates are tiny (< 4 MB per layer) but must be in VRAM before the patched
+        # MoE forward() can run the router. Detection is header-driven: any tensor
+        # key matching r'\.(gate|router)\b' but NOT containing 'experts.' is a router.
+        if self.is_moe:
+            import re as _re
+            import json as _json
+            import struct as _struct
+            _gate_re = _re.compile(r'\.(gate|router)\b')
+            for shard_name in self.layer_names:
+                if not shard_name.startswith(layer_prefix + "."):
+                    continue
+                shard_path = Path(self.checkpoint_path) / (shard_name + ".safetensors")
+                if not shard_path.exists():
+                    continue
+                try:
+                    with open(shard_path, "rb") as _f:
+                        _hdr_len = _struct.unpack("<Q", _f.read(8))[0]
+                        _hdr = _json.loads(_f.read(_hdr_len))
+                    gate_keys = {
+                        k for k in _hdr
+                        if k != "__metadata__"
+                        and _gate_re.search(k)
+                        and "experts." not in k
+                    }
+                    if not gate_keys:
+                        continue
+                    all_tensors = self.loader_strategy.load_from_disk(
+                        shard_name, self.checkpoint_path
+                    )
+                    gate_tensors = {k: v for k, v in all_tensors.items() if k in gate_keys}
+                    size = sum(t.nbytes for t in gate_tensors.values())
+                    if used + size > budget:
+                        print(f"[Vaayu-Pin] skip gate {shard_name}: budget exhausted")
+                        continue
+                    self.loader_strategy.inject_to_gpu(
+                        self.model, shard_name, gate_tensors,
+                        self.running_device, self.running_dtype,
+                        self.hf_quantizer, getattr(self, "_path_remappings", {}),
+                    )
+                    gate_pin_name = shard_name + ".gate"
+                    self.pinned_layer_names.add(gate_pin_name)
+                    used += size
+                    print(f"[Vaayu-Pin] pinned gate {shard_name}: "
+                          f"{size / 1e6:.1f} MB  (cumulative {used / 1e9:.2f} GB)")
+                except Exception as e:
+                    print(f"[Vaayu-Pin] gate pin failed for {shard_name}: {e}")
+
         # Phase 2: transformer layers — break on budget miss (homogeneous size)
         if self.max_pinned_layers != 0:
             model_attr = self.model
