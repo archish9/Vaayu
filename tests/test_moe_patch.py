@@ -128,3 +128,134 @@ def test_detect_small_module_list_not_moe():
     model = FakeGatedModel()
     blocks = detect_moe_blocks(model)
     assert blocks == []
+
+
+# ── Patching tests (require ExpertRAMCache + ExpertOffsetIndex) ───────────────
+
+import tempfile
+from pathlib import Path
+from safetensors.torch import save_file
+from vaayu.moe_patch import patch_moe_blocks
+from vaayu.persist.expert_cache import ExpertRAMCache
+from vaayu.persist.expert_offset_index import ExpertOffsetIndex
+
+
+def _make_checkpoint(tmp_path: Path, model) -> None:
+    """Write model weights as safetensors shards so ExpertOffsetIndex can scan them."""
+    for layer_idx, layer in enumerate(model.layers):
+        layer_name = f"layers.{layer_idx}"
+        tensors = {}
+        moe = layer.block_sparse_moe
+        tensors[f"{layer_name}.block_sparse_moe.gate.weight"] = moe.gate.weight.detach().clone()
+        for eidx, expert in enumerate(moe.experts):
+            tensors[f"{layer_name}.block_sparse_moe.experts.{eidx}.w1.weight"] = expert.w1.weight.detach().clone()
+            tensors[f"{layer_name}.block_sparse_moe.experts.{eidx}.w2.weight"] = expert.w2.weight.detach().clone()
+        save_file(tensors, str(tmp_path / f"{layer_name}.safetensors"))
+
+
+class MockVaayuRef:
+    """Minimal stand-in for VaayuBaseModel to receive routing history writes."""
+    def __init__(self):
+        self._expert_history: dict[int, list[int]] = {}
+
+
+def test_patch_moe_blocks_replaces_forward(tmp_path):
+    model = MockModel(num_layers=1)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patched = patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    assert len(patched) == 1
+
+
+def test_sparse_forward_writes_history(tmp_path):
+    model = MockModel(num_layers=1, hidden=8)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+
+    hidden = torch.randn(1, 2, 8)  # (B=1, S=2, H=8)
+    moe_block = model.layers[0].block_sparse_moe
+    _ = moe_block.forward(hidden)
+    # After forward(), vaayu_ref._expert_history[0] should be set
+    assert 0 in vaayu_ref._expert_history
+    assert isinstance(vaayu_ref._expert_history[0], list)
+
+
+def test_sparse_forward_caches_experts(tmp_path):
+    model = MockModel(num_layers=1, hidden=8)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+
+    hidden = torch.randn(1, 1, 8)
+    model.layers[0].block_sparse_moe.forward(hidden)
+    # Some experts must now be in the cache
+    found = any(cache.has(0, eidx) for eidx in range(8))
+    assert found, "No experts cached after forward pass"
+
+
+def test_sparse_forward_output_shape(tmp_path):
+    model = MockModel(num_layers=1, hidden=8)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+
+    hidden = torch.randn(1, 3, 8)
+    out = model.layers[0].block_sparse_moe.forward(hidden)
+    assert out.shape == (1, 3, 8)
