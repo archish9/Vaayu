@@ -533,7 +533,7 @@ def test_exl3_forward_calls_bc_run_alloc(tmp_path):
 
     # Mock the BC_LinearEXL3 to return zeros (avoids needing real exllamav3 kernels)
     mock_bc = MagicMock()
-    mock_bc.run_alloc.return_value = torch.zeros(1, 16, dtype=torch.float16)
+    mock_bc.run_alloc.side_effect = lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16)
 
     from pathlib import Path
     with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", return_value=mock_bc):
