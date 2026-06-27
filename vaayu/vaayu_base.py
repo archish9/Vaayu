@@ -516,6 +516,7 @@ class VaayuBaseModel(GenerationMixin):
                 device=self.running_device,
                 dtype=self.running_dtype,
                 vaayu_ref=self,
+                loader_strategy=self.loader_strategy,
             )
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
         elif self.is_moe:

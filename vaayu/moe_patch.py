@@ -360,42 +360,39 @@ def _make_fused_sparse_forward(
     device: str,
     dtype: torch.dtype,
     vaayu_ref,
+    compute_device: str = "cpu",
 ):
+    import torch.nn.functional as F
     from .persist.safetensor_model_persister import load_expert_sparse
-    
+
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
-    
+
     def sparse_forward(hidden_states, **kwargs):
         moe_mod = block_info.moe_module
         router = getattr(moe_mod, block_info.router_attr)
         experts_mod = getattr(moe_mod, block_info.experts_attr)
-        act_fn = experts_mod.act_fn  # SiLU activation
-        
-        # 1. Run router (pinned in VRAM)
-        B_S, S, H = hidden_states.shape
+        act_fn = experts_mod.act_fn
+
+        B, S, H = hidden_states.shape
         flat_hidden = hidden_states.view(-1, H)
-        
-        # Direct call: gate returns (logits, top_k_weights, top_k_index)
-        # MixtralTopKRouter.forward signature is (hidden_states) -> (logits, weights, indices)
-        # Actually, MixtralTopKRouter returns a tuple. Let's unpack.
+
+        # Router runs on GPU (pinned in VRAM)
         router_res = router(flat_hidden)
         if isinstance(router_res, tuple) and len(router_res) >= 3:
-            # Matches MixtralTopKRouter
             router_logits, routing_weights, expert_indices = router_res[:3]
         else:
-            # Fallback for generic router
             router_logits = router_res
             routing_weights, expert_indices = torch.topk(
                 router_logits.float().softmax(dim=-1), top_k, dim=-1
             )
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        
-        unique_experts = expert_indices.flatten().unique().tolist()
-        
-        # 2. Load active expert weights from disk/cache
+
+        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+
+        # Load active expert weights: cache → sparse io_uring fallback
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
-        expert_tensors = {}
+        expert_tensors: dict[int, dict] = {}
         for eidx in unique_experts:
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
@@ -407,54 +404,79 @@ def _make_fused_sparse_forward(
                 raw = load_expert_sparse(shard_file, metas)
                 expert_cache.put(layer_idx, eidx, raw)
                 expert_tensors[eidx] = raw
-        
-        # 3. Compute sparse MoE manually (no inject needed, raw tensor math)
-        final_hidden = torch.zeros_like(flat_hidden)
-        
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(
-                expert_indices, num_classes=experts_mod.num_experts
-            )
-            expert_mask = expert_mask.permute(2, 1, 0)
-        
-        for eidx in unique_experts:
-            raw = expert_tensors.get(eidx)
-            if raw is None:
-                continue
-            
-            top_k_pos, token_idx = torch.where(expert_mask[eidx])
-            if token_idx.numel() == 0:
-                continue
-            
-            current_state = flat_hidden[token_idx]
-            
-            # Find w1, w2, w3 tensors from the loaded per-expert dict
-            w1 = w2 = w3 = None
-            for k, v in raw.items():
-                if ".w1." in k: w1 = v.to(device, dtype=dtype, non_blocking=True)
-                elif ".w2." in k: w2 = v.to(device, dtype=dtype, non_blocking=True)
-                elif ".w3." in k: w3 = v.to(device, dtype=dtype, non_blocking=True)
-            
-            if w1 is None or w2 is None or w3 is None:
-                continue
-            
-            # Compute: gate = act(x @ w1.T), up = x @ w3.T, out = (gate * up) @ w2.T
-            gate = act_fn(torch.nn.functional.linear(current_state, w1))
-            up = torch.nn.functional.linear(current_state, w3)
-            current_hidden = torch.nn.functional.linear(gate * up, w2)
-            
-            # Apply routing weights
-            current_hidden = current_hidden * routing_weights[token_idx, top_k_pos, None]
-            final_hidden.index_add_(0, token_idx, current_hidden.to(final_hidden.dtype))
-            
-            # Free GPU tensors immediately
-            del w1, w2, w3
-        
-        # 4. Write routing history for speculative prefetch
+
+        # Expert mask on CPU (avoids PCIe for index tensors)
+        expert_indices_cpu = expert_indices.cpu()
+        expert_mask = F.one_hot(
+            expert_indices_cpu, num_classes=experts_mod.num_experts
+        ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+
+        if compute_device == "cpu":
+            # ── CPU FFN: zero PCIe cost for expert weights ─────────────────
+            # Only hidden state crosses PCIe (8 KB decode, 4 MB prefill-512)
+            cpu_hidden = flat_hidden.cpu()
+            cpu_routing_weights = routing_weights.cpu()
+            final_cpu = torch.zeros(flat_hidden.shape[0], H, dtype=cpu_hidden.dtype)
+
+            for eidx in unique_experts:
+                raw = expert_tensors.get(eidx)
+                if raw is None:
+                    continue
+
+                w_gate, w_down, w_up = _classify_expert_tensors(raw)
+                if w_gate is None or w_down is None or w_up is None:
+                    _log.warning(f"[Vaayu-MoE] layer {layer_idx} expert {eidx}: missing weights, skipping")
+                    continue
+
+                top_k_pos, token_idx = torch.where(expert_mask[eidx])
+                if token_idx.numel() == 0:
+                    continue
+
+                x = cpu_hidden[token_idx]
+                gate_out = act_fn(F.linear(x, w_gate))
+                up_out = F.linear(x, w_up)
+                out = F.linear(gate_out * up_out, w_down)
+                out = out * cpu_routing_weights[token_idx, top_k_pos, None]
+                final_cpu.index_add_(0, token_idx, out)
+
+            result = final_cpu.to(device, dtype=dtype)
+
+        else:
+            # ── GPU path (used for EXL3 or explicit cuda override) ──────────
+            final_hidden = torch.zeros_like(flat_hidden)
+
+            for eidx in unique_experts:
+                raw = expert_tensors.get(eidx)
+                if raw is None:
+                    continue
+
+                w_gate, w_down, w_up = _classify_expert_tensors(raw)
+                if w_gate is None or w_down is None or w_up is None:
+                    continue
+
+                top_k_pos, token_idx = torch.where(expert_mask[eidx])
+                if token_idx.numel() == 0:
+                    continue
+
+                token_idx_gpu = token_idx.to(device)
+                current_state = flat_hidden[token_idx_gpu]
+
+                w_gate_gpu = w_gate.to(device, dtype=dtype, non_blocking=True)
+                w_down_gpu = w_down.to(device, dtype=dtype, non_blocking=True)
+                w_up_gpu   = w_up.to(device, dtype=dtype, non_blocking=True)
+
+                gate_out = act_fn(F.linear(current_state, w_gate_gpu))
+                up_out = F.linear(current_state, w_up_gpu)
+                out = F.linear(gate_out * up_out, w_down_gpu)
+                out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+                final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
+
+                del w_gate_gpu, w_down_gpu, w_up_gpu
+
+            result = final_hidden
+
         vaayu_ref._expert_history[layer_idx] = unique_experts
-        
-        # Return single tensor matching MixtralSparseMoeBlock.forward signature
-        return final_hidden.view(B_S, S, H)
-    
+        return result.view(B, S, H)
+
     return sparse_forward
 

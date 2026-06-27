@@ -382,3 +382,96 @@ def test_detect_fused_moe_no_gate_warning():
         assert b.experts_attr == "experts"
         assert b.router_attr == "gate"
         assert b.expert_style == "fused"
+
+
+# ── CPU FFN path tests ────────────────────────────────────────────────────────
+
+from safetensors.torch import save_file as _save_file
+
+
+def _make_fused_checkpoint(tmp_path, num_layers=1, hidden=8, intermediate=16, num_experts=8):
+    """Write per-expert w1/w2/w3 tensors as safetensors for ExpertOffsetIndex."""
+    for layer_idx in range(num_layers):
+        layer_name = f"layers.{layer_idx}"
+        tensors = {}
+        for eidx in range(num_experts):
+            tensors[f"{layer_name}.mlp.experts.{eidx}.w1.weight"] = torch.randn(intermediate, hidden)
+            tensors[f"{layer_name}.mlp.experts.{eidx}.w2.weight"] = torch.randn(hidden, intermediate)
+            tensors[f"{layer_name}.mlp.experts.{eidx}.w3.weight"] = torch.randn(intermediate, hidden)
+        tensors[f"{layer_name}.mlp.gate.weight"] = torch.randn(num_experts, hidden)
+        _save_file(tensors, str(tmp_path / f"{layer_name}.safetensors"))
+
+
+def test_cpu_ffn_output_shape(tmp_path):
+    """CPU FFN path returns correct output shape (B, S, H)."""
+    from pathlib import Path
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=8, intermediate=16)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patched = patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+        loader_strategy=None,  # None → CPU FFN path
+    )
+    assert len(patched) == 1
+
+    hidden_states = torch.randn(1, 3, 8)
+    out = model.layers[0].mlp.forward(hidden_states)
+    assert out.shape == (1, 3, 8), f"Expected (1,3,8), got {out.shape}"
+
+
+def test_cpu_ffn_writes_expert_history(tmp_path):
+    """CPU FFN path records active experts in vaayu_ref._expert_history."""
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=8, intermediate=16)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+        loader_strategy=None,
+    )
+
+    model.layers[0].mlp.forward(torch.randn(1, 1, 8))
+    assert 0 in vaayu_ref._expert_history
+    assert len(vaayu_ref._expert_history[0]) <= 8
+
+
+def test_cpu_ffn_caches_experts(tmp_path):
+    """CPU FFN path populates ExpertRAMCache on first call."""
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=8, intermediate=16)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    patch_moe_blocks(
+        model=model, expert_cache=cache, offset_index=idx,
+        checkpoint_path=str(tmp_path), top_k=2, device="cpu",
+        dtype=torch.float32, vaayu_ref=vaayu_ref, loader_strategy=None,
+    )
+    model.layers[0].mlp.forward(torch.randn(1, 1, 8))
+    assert any(cache.has(0, eidx) for eidx in range(8)), "No experts in cache after forward"
