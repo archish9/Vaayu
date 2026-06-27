@@ -22,6 +22,36 @@ if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
     from .persist.expert_offset_index import ExpertOffsetIndex
 
+# Maps checkpoint key substrings to logical roles used in CPU FFN path.
+# To support a new MoE architecture: add 3 lines here, nothing else changes.
+_EXPERT_WEIGHT_ROLES: list[tuple[str, str]] = [
+    # Mixtral old format
+    (".w1.", "gate"),
+    (".w2.", "down"),
+    (".w3.", "up"),
+    # DeepSeek, Qwen, Kimi, LLaMA-MoE
+    (".gate_proj.", "gate"),
+    (".down_proj.", "down"),
+    (".up_proj.",   "up"),
+]
+
+
+def _classify_expert_tensors(
+    raw: dict,
+) -> "tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]":
+    """Returns (w_gate, w_down, w_up) tensors from a raw per-expert tensor dict.
+
+    Works with any MoE checkpoint key format listed in _EXPERT_WEIGHT_ROLES.
+    Returns None for any role not found in raw.
+    """
+    roles: dict[str, "torch.Tensor | None"] = {"gate": None, "down": None, "up": None}
+    for key, tensor in raw.items():
+        for pattern, role in _EXPERT_WEIGHT_ROLES:
+            if pattern in key and roles[role] is None:
+                roles[role] = tensor
+                break
+    return roles["gate"], roles["down"], roles["up"]
+
 _ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights"}
 _MIN_EXPERTS = 4  # ModuleList must have > this many children to be an expert list
 _EXPERT_PREFIX_RE = re.compile(r'^.*?\.experts\.\d+\.')

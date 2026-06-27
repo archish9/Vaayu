@@ -76,6 +76,44 @@ class MockDenseModel(nn.Module):
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+from vaayu.moe_patch import _classify_expert_tensors
+
+
+def test_classify_mixtral_w1w2w3():
+    """Mixtral old-format keys: w1=gate, w2=down, w3=up."""
+    raw = {
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.randn(16, 8),
+        "model.layers.0.block_sparse_moe.experts.0.w2.weight": torch.randn(8, 16),
+        "model.layers.0.block_sparse_moe.experts.0.w3.weight": torch.randn(16, 8),
+    }
+    w_gate, w_down, w_up = _classify_expert_tensors(raw)
+    assert w_gate is not None and w_gate.shape == (16, 8)
+    assert w_down is not None and w_down.shape == (8, 16)
+    assert w_up is not None and w_up.shape == (16, 8)
+
+
+def test_classify_deepseek_gate_up_down():
+    """DeepSeek/Qwen format: gate_proj=gate, up_proj=up, down_proj=down."""
+    raw = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(16, 8),
+        "model.layers.0.mlp.experts.0.up_proj.weight":   torch.randn(16, 8),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(8, 16),
+    }
+    w_gate, w_down, w_up = _classify_expert_tensors(raw)
+    assert w_gate is not None and w_gate.shape == (16, 8)
+    assert w_up is not None and w_up.shape == (16, 8)
+    assert w_down is not None and w_down.shape == (8, 16)
+
+
+def test_classify_missing_keys_returns_none():
+    """Incomplete raw dict: missing roles return None."""
+    raw = {"model.layers.0.experts.0.w1.weight": torch.randn(16, 8)}
+    w_gate, w_down, w_up = _classify_expert_tensors(raw)
+    assert w_gate is not None
+    assert w_down is None
+    assert w_up is None
+
+
 def test_detect_moe_blocks_finds_all_layers():
     model = MockModel(num_layers=3)
     blocks = detect_moe_blocks(model)
