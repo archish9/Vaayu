@@ -1,7 +1,7 @@
 ● source venv/bin/activate && python quantize.py \
-    --in_dir   /home/a/code/ai-ml/models/Llama-3.3-70B-Instruct \
-    --out_dir  /home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw \
-    --work_dir /home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-work \
+    --in_dir   /home/a/code/ai-ml/models/MiniMaxAI--MiniMax-M2.7 \
+    --out_dir  /home/a/code/ai-ml/models/MiniMaxAI--MiniMax-M2.7-exl3-4.5bpw \
+    --work_dir /home/a/code/ai-ml/models/MiniMaxAI--MiniMax-M2.7-exl3-work \
     --bits     4.5 \
     --resume
 

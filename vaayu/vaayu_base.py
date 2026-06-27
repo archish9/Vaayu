@@ -1592,7 +1592,8 @@ class VaayuBaseModel(GenerationMixin):
 
             for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
                                                desc=f'running layers({self.running_device})',
-                                               total=len(self.layers)):
+                                               total=len(self.layers),
+                                               disable=(self._token_count > 0)):
 
                 _lt_file_bytes = 0
                 _lt_cache_hit = False
