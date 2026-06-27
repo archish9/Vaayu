@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 # Maps checkpoint key substrings to logical roles used in CPU FFN path.
 # To support a new MoE architecture: add 3 lines here, nothing else changes.
 _EXPERT_WEIGHT_ROLES: list[tuple[str, str]] = [
-    # Mixtral old format
+    # Mixtral format
     (".w1.", "gate"),
     (".w2.", "down"),
     (".w3.", "up"),
@@ -51,6 +51,7 @@ def _classify_expert_tensors(
                 roles[role] = tensor
                 break
     return roles["gate"], roles["down"], roles["up"]
+
 
 _ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights"}
 _MIN_EXPERTS = 4  # ModuleList must have > this many children to be an expert list
@@ -192,6 +193,7 @@ def patch_moe_blocks(
     device: str,
     dtype: torch.dtype,
     vaayu_ref,
+    loader_strategy=None,
 ) -> list[MoEBlockInfo]:
     """
     Detect all MoE blocks in model and replace their forward() with a sparse version.
@@ -207,6 +209,13 @@ def patch_moe_blocks(
 
     Returns list of patched MoEBlockInfo for logging.
     """
+    try:
+        from .persist.loader_strategy import EXL3LoaderStrategy
+        is_exl3 = isinstance(loader_strategy, EXL3LoaderStrategy)
+    except ImportError:
+        is_exl3 = False
+    compute_device = "cuda" if is_exl3 else "cpu"
+
     blocks = detect_moe_blocks(model)
     for block_info in blocks:
         sparse_fwd = _make_sparse_moe_forward(
@@ -218,6 +227,7 @@ def patch_moe_blocks(
             device=device,
             dtype=dtype,
             vaayu_ref=vaayu_ref,
+            compute_device=compute_device,
         )
         # Fix 1: direct assignment — no __get__ binding needed
         block_info.moe_module.forward = sparse_fwd
@@ -244,13 +254,15 @@ def _make_sparse_moe_forward(
     device: str,
     dtype: torch.dtype,
     vaayu_ref,
+    compute_device: str = "cpu",
 ):
     """
     Returns a replacement forward() for the MoE block, dispatching based on expert_style.
     """
     if block_info.expert_style == "fused":
         return _make_fused_sparse_forward(
-            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
+            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
+            compute_device=compute_device,
         )
     else:
         return _make_modulelist_sparse_forward(
