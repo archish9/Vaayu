@@ -284,3 +284,63 @@ def test_sparse_forward_batch_size_2(tmp_path):
     hidden = torch.randn(2, 3, 8)  # B=2
     out = model.layers[0].block_sparse_moe.forward(hidden)
     assert out.shape == (2, 3, 8)
+
+
+# ── Fused MoE (Mixtral-style) mock classes ────────────────────────────────────
+
+class MockFusedRouter(nn.Module):
+    """Mimics MixtralTopKRouter: has num_experts attr + .weight + is in _ROUTER_NAMES."""
+    def __init__(self, hidden=8, num_experts=8):
+        super().__init__()
+        self._gate = nn.Linear(hidden, num_experts, bias=False)
+        self.num_experts = num_experts  # <-- this triggers the bug
+        self.weight = self._gate.weight  # has .weight attr
+
+    def forward(self, x):
+        logits = self._gate(x)
+        w, idx = logits.float().softmax(-1).topk(2, dim=-1)
+        return logits, w / w.sum(-1, keepdim=True), idx
+
+
+class MockFusedExperts(nn.Module):
+    def __init__(self, hidden=8, num_experts=8):
+        super().__init__()
+        self.num_experts = num_experts
+        self.act_fn = nn.SiLU()
+
+
+class MockFusedMoEBlock(nn.Module):
+    def __init__(self, hidden=8, num_experts=8):
+        super().__init__()
+        self.gate = MockFusedRouter(hidden, num_experts)
+        self.experts = MockFusedExperts(hidden, num_experts)
+
+
+class MockFusedLayer(nn.Module):
+    def __init__(self, hidden=8):
+        super().__init__()
+        self.self_attn = nn.Linear(hidden, hidden)
+        self.mlp = MockFusedMoEBlock(hidden)
+
+
+class MockFusedModel(nn.Module):
+    def __init__(self, num_layers=2, hidden=8):
+        super().__init__()
+        self.layers = nn.ModuleList([MockFusedLayer(hidden) for _ in range(num_layers)])
+
+
+def test_detect_fused_moe_no_gate_warning():
+    """detect_moe_blocks() must not classify the router (gate) as an expert list."""
+    import io, sys
+    model = MockFusedModel(num_layers=2)
+    captured = io.StringIO()
+    sys.stdout = captured
+    blocks = detect_moe_blocks(model)
+    sys.stdout = sys.__stdout__
+    output = captured.getvalue()
+    assert "multiple expert lists" not in output, f"Spurious warning: {output}"
+    assert len(blocks) == 2
+    for b in blocks:
+        assert b.experts_attr == "experts"
+        assert b.router_attr == "gate"
+        assert b.expert_style == "fused"

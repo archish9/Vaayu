@@ -63,9 +63,11 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
                 _found_expert_lists.append(child_name)
                 expert_style = "module_list"
             # New style: any module with a num_experts attribute > 4 (and not nn.Linear)
-            elif (hasattr(child, 'num_experts') 
+            # Skip router-named modules — MixtralTopKRouter has num_experts but is NOT an expert list
+            elif (hasattr(child, 'num_experts')
                   and getattr(child, 'num_experts', 0) > _MIN_EXPERTS
-                  and not isinstance(child, nn.Linear)):
+                  and not isinstance(child, nn.Linear)
+                  and child_name not in _ROUTER_NAMES):
                 _found_expert_lists.append(child_name)
                 expert_style = "fused"
 
