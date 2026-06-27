@@ -221,11 +221,51 @@ model init
 
 ---
 
+## Component 6: Architecture-Agnostic Expert Weight Key Detection
+
+CPU FFN branch must not hardcode Mixtral's `w1/w2/w3` key names. Different MoE architectures use different checkpoint key patterns for the same logical weight roles.
+
+Add `_EXPERT_WEIGHT_ROLES` lookup table in `vaayu/moe_patch.py`:
+
+```python
+# Maps checkpoint key substrings to logical roles: gate, up, down
+_EXPERT_WEIGHT_ROLES: list[tuple[str, str]] = [
+    # Mixtral old format
+    (".w1.", "gate"),
+    (".w2.", "down"),
+    (".w3.", "up"),
+    # DeepSeek, Qwen, Kimi, LLaMA-MoE
+    (".gate_proj.", "gate"),
+    (".down_proj.", "down"),
+    (".up_proj.",   "up"),
+]
+```
+
+Add helper `_classify_expert_tensors(raw: dict) -> tuple[Tensor | None, Tensor | None, Tensor | None]`:
+
+```python
+def _classify_expert_tensors(raw: dict):
+    """Returns (w_gate, w_down, w_up) from a raw expert tensor dict."""
+    roles = {"gate": None, "down": None, "up": None}
+    for key, tensor in raw.items():
+        for pattern, role in _EXPERT_WEIGHT_ROLES:
+            if pattern in key and roles[role] is None:
+                roles[role] = tensor
+                break
+    return roles["gate"], roles["down"], roles["up"]
+```
+
+CPU FFN branch calls `_classify_expert_tensors(raw)` instead of inline string matching.
+
+To add a new architecture later: add 3 lines to `_EXPERT_WEIGHT_ROLES`. No other changes needed.
+
+---
+
 ## Files Modified
 
 | File | Changes |
 |---|---|
-| `vaayu/moe_patch.py` | `patch_moe_blocks()` gains `loader_strategy` param; `_make_fused_sparse_forward()` gains `compute_device` param + CPU branch; new `_make_fused_sparse_forward_exl3()`; gate warning fix in `detect_moe_blocks()` |
+| `vaayu/moe_patch.py` | `patch_moe_blocks()` gains `loader_strategy` param; `_make_fused_sparse_forward()` gains `compute_device` param + CPU branch; new `_make_fused_sparse_forward_exl3()`; gate warning fix in `detect_moe_blocks()`; add `_EXPERT_WEIGHT_ROLES` + `_classify_expert_tensors()` |
 | `vaayu/vaayu_base.py` | Pass `loader_strategy` to `patch_moe_blocks()`; replace RAM budget formula |
 
 **No changes to:** `expert_cache.py`, `expert_offset_index.py`, `safetensor_model_persister.py`, `loader_strategy.py`.
@@ -235,8 +275,7 @@ model init
 ## Out of Scope
 
 - Non-MoE dense models: unaffected (CPU/GPU FFN path only activates inside `sparse_forward`)
-- Other MoE architectures (DeepSeek, Kimi, Qwen): detection is generic, but CPU FFN branch assumes `w1/w2/w3` key patterns; EXL3 branch is Mixtral-specific in its tensor key mapping
-- Prefill batching optimization: prefill already hits full GEMM throughput on CPU; further optimization (e.g., chunked expert batching) is future work
+- Prefill batching optimization: prefill already hits full GEMM throughput on CPU; chunked expert batching is future work
 - Model parallelism / multi-GPU: out of scope
 
 ---
