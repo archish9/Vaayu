@@ -475,3 +475,80 @@ def test_cpu_ffn_caches_experts(tmp_path):
     )
     model.layers[0].mlp.forward(torch.randn(1, 1, 8))
     assert any(cache.has(0, eidx) for eidx in range(8)), "No experts in cache after forward"
+
+
+# ── EXL3 GPU sparse forward tests ─────────────────────────────────────────────
+
+from unittest.mock import MagicMock, patch as mock_patch
+
+
+def _make_mock_exl3_raw(layer_name: str, eidx: int, in_dim: int = 8, out_dim: int = 16):
+    """Synthetic EXL3 key structure (correct names, random values) for one expert."""
+    prefix = f"{layer_name}.mlp.experts.{eidx}"
+    raw = {}
+    for wname in ("w1", "w2", "w3"):
+        raw[f"{prefix}.{wname}.trellis"] = torch.zeros(out_dim, in_dim, dtype=torch.int16)
+        raw[f"{prefix}.{wname}.suh"]     = torch.zeros(1, in_dim, dtype=torch.float16)
+        raw[f"{prefix}.{wname}.svh"]     = torch.zeros(1, out_dim, dtype=torch.float16)
+        raw[f"{prefix}.{wname}.mcg"]     = torch.zeros(out_dim, dtype=torch.int32)
+        raw[f"{prefix}.{wname}.mul1"]    = torch.zeros(out_dim, dtype=torch.int32)
+    return raw
+
+
+def test_group_exl3_tensors_by_weight():
+    """_group_exl3_tensors_by_weight groups EXL3 components by logical role."""
+    from vaayu.moe_patch import _group_exl3_tensors_by_weight
+    raw = _make_mock_exl3_raw("layers.0", 0, in_dim=8, out_dim=16)
+    groups = _group_exl3_tensors_by_weight(raw)
+    assert set(groups.keys()) == {"gate", "down", "up"}
+    for role in ("gate", "down", "up"):
+        assert "trellis" in groups[role], f"trellis missing for {role}"
+        assert "suh" in groups[role], f"suh missing for {role}"
+        assert "svh" in groups[role], f"svh missing for {role}"
+
+
+def test_exl3_forward_calls_bc_run_alloc(tmp_path):
+    """_make_fused_sparse_forward_exl3 calls BC_LinearEXL3 and accumulates output."""
+    from vaayu.moe_patch import _make_fused_sparse_forward_exl3, _group_exl3_tensors_by_weight, MoEBlockInfo
+
+    # Mock model structures
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=8, intermediate=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    # Detect block info
+    from vaayu.moe_patch import detect_moe_blocks
+    blocks = detect_moe_blocks(model)
+    assert len(blocks) == 1
+    block_info = blocks[0]
+
+    # Inject mock EXL3 expert data into cache
+    raw = _make_mock_exl3_raw("layers.0", 0, in_dim=8, out_dim=16)
+    cache.put(0, 0, raw)
+    raw1 = _make_mock_exl3_raw("layers.0", 1, in_dim=8, out_dim=16)
+    cache.put(0, 1, raw1)
+
+    # Mock the BC_LinearEXL3 to return zeros (avoids needing real exllamav3 kernels)
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.return_value = torch.zeros(1, 16, dtype=torch.float16)
+
+    from pathlib import Path
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", return_value=mock_bc):
+        fwd = _make_fused_sparse_forward_exl3(
+            block_info=block_info,
+            expert_cache=cache,
+            offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)),
+            top_k=2,
+            device="cpu",
+            dtype=torch.float32,
+            vaayu_ref=vaayu_ref,
+        )
+        block_info.moe_module.forward = fwd
+        out = model.layers[0].mlp.forward(torch.randn(1, 1, 8))
+
+    assert out.shape == (1, 1, 8), f"Expected (1,1,8) got {out.shape}"
+    assert 0 in vaayu_ref._expert_history

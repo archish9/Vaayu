@@ -53,6 +53,64 @@ def _classify_expert_tensors(
     return roles["gate"], roles["down"], roles["up"]
 
 
+def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:
+    """Groups EXL3 checkpoint tensors by weight role and component.
+
+    Returns {"gate": {"trellis": t, ...}, "down": {...}, "up": {...}}.
+    """
+    _EXL3_COMPONENT_KEYS = {"trellis", "mcg", "suh", "svh", "su", "sv", "mul1"}
+    result: dict[str, dict[str, "torch.Tensor"]] = {"gate": {}, "down": {}, "up": {}}
+    for key, tensor in raw.items():
+        role = None
+        for pattern, r in _EXPERT_WEIGHT_ROLES:
+            if pattern in key:
+                role = r
+                break
+        if role is None:
+            continue
+        component = key.rsplit(".", 1)[-1]
+        if component in _EXL3_COMPONENT_KEYS:
+            result[role][component] = tensor
+    return result
+
+
+def _make_bc_linear_exl3(
+    gpu_components: "dict[str, torch.Tensor]",
+    in_features: int,
+    out_features: int,
+    device: str,
+):
+    """Build a temporary BC_LinearEXL3 C++ object from pre-moved GPU tensors.
+
+    Caller must set result to None when done — PyTorch GC does not manage C++ heap.
+    """
+    from exllamav3 import ext as exl3_ext
+    from exllamav3.util.tensor import g_tensor_cache
+
+    trellis = gpu_components.get("trellis")
+    suh = gpu_components.get("suh") or gpu_components.get("su")
+    svh = gpu_components.get("svh") or gpu_components.get("sv")
+    mcg = gpu_components.get("mcg")
+    mul1 = gpu_components.get("mul1")
+
+    if trellis is None or suh is None or svh is None:
+        raise ValueError(
+            f"EXL3 expert missing required tensors (trellis/suh/svh); "
+            f"got: {list(gpu_components.keys())}"
+        )
+
+    K = trellis.shape[-1] // 16
+    xh = g_tensor_cache.get(device, (1, in_features), torch.float16)
+
+    return exl3_ext.exllamav3_ext.BC_LinearEXL3(
+        trellis, suh, svh, K,
+        None,
+        mcg is not None,
+        mul1 is not None,
+        xh,
+    )
+
+
 _ROUTER_NAMES = {"gate", "router", "w_gate", "router_weights"}
 _MIN_EXPERTS = 4  # ModuleList must have > this many children to be an expert list
 _EXPERT_PREFIX_RE = re.compile(r'^.*?\.experts\.\d+\.')
@@ -260,6 +318,10 @@ def _make_sparse_moe_forward(
     Returns a replacement forward() for the MoE block, dispatching based on expert_style.
     """
     if block_info.expert_style == "fused":
+        if compute_device == "cuda":
+            return _make_fused_sparse_forward_exl3(
+                block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
+            )
         return _make_fused_sparse_forward(
             block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
             compute_device=compute_device,
@@ -477,6 +539,133 @@ def _make_fused_sparse_forward(
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return result.view(B, S, H)
+
+    return sparse_forward
+
+
+def _make_fused_sparse_forward_exl3(
+    block_info: MoEBlockInfo,
+    expert_cache: "ExpertRAMCache",
+    offset_index: "ExpertOffsetIndex",
+    checkpoint_path: Path,
+    top_k: int,
+    device: str,
+    dtype: torch.dtype,
+    vaayu_ref,
+):
+    """Sparse forward for EXL3 quantized MoE.
+
+    Loads ~88 MB quantized tensors per expert, builds a temporary BC_LinearEXL3,
+    runs ExLlamaV3 CUDA kernel, frees immediately.
+    PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
+    """
+    import torch.nn.functional as F
+    from .persist.safetensor_model_persister import load_expert_sparse
+
+    layer_name = block_info.layer_name
+    layer_idx = block_info.layer_idx
+
+    def sparse_forward(hidden_states, **kwargs):
+        moe_mod = block_info.moe_module
+        router = getattr(moe_mod, block_info.router_attr)
+        experts_mod = getattr(moe_mod, block_info.experts_attr)
+        act_fn = experts_mod.act_fn
+
+        B, S, H = hidden_states.shape
+        flat_hidden = hidden_states.view(-1, H)
+
+        # Router on GPU (pinned)
+        router_res = router(flat_hidden)
+        if isinstance(router_res, tuple) and len(router_res) >= 3:
+            router_logits, routing_weights, expert_indices = router_res[:3]
+        else:
+            router_logits = router_res
+            routing_weights, expert_indices = torch.topk(
+                router_logits.float().softmax(dim=-1), top_k, dim=-1
+            )
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+
+        shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+        expert_tensors: dict[int, dict] = {}
+        for eidx in unique_experts:
+            cached = expert_cache.get(layer_idx, eidx)
+            if cached is not None:
+                expert_tensors[eidx] = cached
+            else:
+                metas = offset_index.get_expert_offsets(layer_name, eidx)
+                if metas is None:
+                    continue
+                raw = load_expert_sparse(shard_file, metas)
+                expert_cache.put(layer_idx, eidx, raw)
+                expert_tensors[eidx] = raw
+
+        expert_indices_cpu = expert_indices.cpu()
+        expert_mask = F.one_hot(
+            expert_indices_cpu, num_classes=experts_mod.num_experts
+        ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+
+        # Infer intermediate_size from first available expert's gate trellis
+        intermediate_size = None
+        for eidx in unique_experts:
+            raw = expert_tensors.get(eidx)
+            if raw is not None:
+                groups = _group_exl3_tensors_by_weight(raw)
+                t = groups.get("gate", {}).get("trellis")
+                if t is not None:
+                    intermediate_size = t.shape[0]
+                    break
+        if intermediate_size is None:
+            _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")
+            vaayu_ref._expert_history[layer_idx] = unique_experts
+            return flat_hidden.view(B, S, H)
+
+        final_hidden = torch.zeros_like(flat_hidden)
+
+        for eidx in unique_experts:
+            raw = expert_tensors.get(eidx)
+            if raw is None:
+                continue
+
+            groups = _group_exl3_tensors_by_weight(raw)
+            if not groups["gate"] or not groups["down"] or not groups["up"]:
+                _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
+                continue
+
+            top_k_pos, token_idx = torch.where(expert_mask[eidx])
+            if token_idx.numel() == 0:
+                continue
+            token_idx_gpu = token_idx.to(device)
+            current_state = flat_hidden[token_idx_gpu]
+            if current_state.dtype != torch.float16:
+                current_state = current_state.to(torch.float16)
+
+            gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
+            gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
+            gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
+
+            bc_gate = bc_down = bc_up = None
+            try:
+                bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
+                bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
+                bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
+
+                x_flat = current_state.view(-1, H)
+                gate_out = act_fn(bc_gate.run_alloc(x_flat, intermediate_size, False))
+                up_out   = bc_up.run_alloc(x_flat, intermediate_size, False)
+                hidden   = bc_down.run_alloc((gate_out * up_out).contiguous(), H, False)
+
+                weights_slice = routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+                hidden = hidden * weights_slice
+                final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
+            finally:
+                # CRITICAL: free C++ QMatrix objects — Python GC cannot manage them
+                bc_gate = bc_down = bc_up = None
+                del gpu_gate, gpu_down, gpu_up
+
+        vaayu_ref._expert_history[layer_idx] = unique_experts
+        return final_hidden.view(B, S, H)
 
     return sparse_forward
 
