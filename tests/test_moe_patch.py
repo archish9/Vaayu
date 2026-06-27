@@ -525,11 +525,9 @@ def test_exl3_forward_calls_bc_run_alloc(tmp_path):
     assert len(blocks) == 1
     block_info = blocks[0]
 
-    # Inject mock EXL3 expert data into cache
-    raw = _make_mock_exl3_raw("layers.0", 0, in_dim=8, out_dim=16)
-    cache.put(0, 0, raw)
-    raw1 = _make_mock_exl3_raw("layers.0", 1, in_dim=8, out_dim=16)
-    cache.put(0, 1, raw1)
+    # Inject mock EXL3 expert data for all experts so any router selection hits the EXL3 path
+    for eidx in range(8):
+        cache.put(0, eidx, _make_mock_exl3_raw("layers.0", eidx, in_dim=8, out_dim=16))
 
     # Mock the BC_LinearEXL3 to return zeros (avoids needing real exllamav3 kernels)
     mock_bc = MagicMock()
@@ -551,4 +549,5 @@ def test_exl3_forward_calls_bc_run_alloc(tmp_path):
         out = model.layers[0].mlp.forward(torch.randn(1, 1, 8))
 
     assert out.shape == (1, 1, 8), f"Expected (1,1,8) got {out.shape}"
-    assert 0 in vaayu_ref._expert_history
+    assert mock_bc.run_alloc.called, "BC_LinearEXL3 run_alloc was never called — EXL3 path did not execute"
+    assert len(vaayu_ref._expert_history) > 0

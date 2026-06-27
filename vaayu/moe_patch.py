@@ -53,12 +53,14 @@ def _classify_expert_tensors(
     return roles["gate"], roles["down"], roles["up"]
 
 
+_EXL3_COMPONENT_KEYS = {"trellis", "mcg", "suh", "svh", "su", "sv", "mul1"}
+
+
 def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:
     """Groups EXL3 checkpoint tensors by weight role and component.
 
     Returns {"gate": {"trellis": t, ...}, "down": {...}, "up": {...}}.
     """
-    _EXL3_COMPONENT_KEYS = {"trellis", "mcg", "suh", "svh", "su", "sv", "mul1"}
     result: dict[str, dict[str, "torch.Tensor"]] = {"gate": {}, "down": {}, "up": {}}
     for key, tensor in raw.items():
         role = None
@@ -88,8 +90,8 @@ def _make_bc_linear_exl3(
     from exllamav3.util.tensor import g_tensor_cache
 
     trellis = gpu_components.get("trellis")
-    suh = gpu_components.get("suh") or gpu_components.get("su")
-    svh = gpu_components.get("svh") or gpu_components.get("sv")
+    suh = gpu_components["suh"] if "suh" in gpu_components else gpu_components.get("su")
+    svh = gpu_components["svh"] if "svh" in gpu_components else gpu_components.get("sv")
     mcg = gpu_components.get("mcg")
     mul1 = gpu_components.get("mul1")
 
