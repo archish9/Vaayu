@@ -501,8 +501,6 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
             self._expert_offset_index.build_or_load()
 
-            # Budget: available RAM minus 8 GB reserve, floor at 2 GB
-            # so cache is never zero on machines with limited free RAM.
             _mem = _psutil.virtual_memory()
             _expert_budget = int(_mem.total * 0.35)
             self._expert_cache = ExpertRAMCache(_expert_budget)
