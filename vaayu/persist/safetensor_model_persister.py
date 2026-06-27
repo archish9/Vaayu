@@ -366,12 +366,16 @@ def load_expert_sparse(
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
 
+        # Permanent fix: We use pinned memory for fast GPU DMA, but force use_direct_io=False.
+        # Direct IO (O_DIRECT) dynamically pins user pages in the kernel (get_user_pages_fast).
+        # Since we already have 5.4GB of pinned buffers (_PINNED_BUFS), dynamic O_DIRECT
+        # allocations can hit RLIMIT_MEMLOCK limits and fail with EFAULT. Buffered IO avoids this.
         buf = torch.empty(aligned_length, dtype=torch.uint8, pin_memory=_USE_PINNED)
 
         if _USE_IOURING:
             vaayu_rust.io_uring_read_into(
                 file_path, aligned_offset, aligned_length,
-                buf.data_ptr(), 8, use_direct_io,
+                buf.data_ptr(), 8, False, # Force buffered IO
             )
             data_buf = buf[prefix_pad:]
         else:

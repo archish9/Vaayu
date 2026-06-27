@@ -450,6 +450,15 @@ class VaayuBaseModel(GenerationMixin):
         # MoE detection — must happen before pinning so setup_model has correct context
         self._detect_moe()
 
+        # Build MoE key remapper (one-time, before any weight loading)
+        if self.is_moe:
+            from .moe_key_remap import build_moe_key_remap
+            self._moe_key_remapper = build_moe_key_remap(
+                self.model, str(self.checkpoint_path), self.layer_names_dict
+            )
+        else:
+            self._moe_key_remapper = None
+
         # Pin shared layers (embed, norm, lm_head) permanently in VRAM.
         # Skips load/inject/free in forward() for these layers every token.
         self.pinned_layer_names: set = set()
@@ -1023,6 +1032,10 @@ class VaayuBaseModel(GenerationMixin):
                     if used + size > budget:
                         print(f"[Vaayu-Pin] skip gate {shard_name}: budget exhausted")
                         continue
+                    
+                    if getattr(self, "_moe_key_remapper", None) is not None:
+                        gate_tensors = self._moe_key_remapper.remap_state_dict(gate_tensors)
+                        
                     self.loader_strategy.inject_to_gpu(
                         self.model, shard_name, gate_tensors,
                         self.running_device, self.running_dtype,
@@ -1233,6 +1246,10 @@ class VaayuBaseModel(GenerationMixin):
 
     def move_layer_to_device(self, state_dict):
         layers = []
+        
+        # Apply MoE key remapping (checkpoint format -> live model format)
+        if getattr(self, "_moe_key_remapper", None) is not None:
+            state_dict = self._moe_key_remapper.remap_state_dict(state_dict)
         
         # Apply path remappings to state dict keys so parameter injection succeeds 
         # on architectures heavily wrapped in VLMs (e.g., Gemma4)

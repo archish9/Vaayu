@@ -37,16 +37,16 @@ class MoEBlockInfo:
     moe_module: nn.Module
     router_attr: str       # attribute on moe_module holding the gate Linear
     experts_attr: str      # attribute on moe_module holding the experts ModuleList
+    expert_style: str      # "module_list" or "fused"
 
 
 def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
     """
     Generic MoE block detector. Finds any module that directly contains:
       1. An nn.ModuleList with > _MIN_EXPERTS children  (the expert FFN list)
+         OR a fused expert module (e.g. MixtralExperts) with num_experts > _MIN_EXPERTS
       2. A sibling nn.Linear whose attribute name is in _ROUTER_NAMES  (the gate)
-
-    Works across Mixtral (block_sparse_moe), DeepSeek (mlp), Qwen MoE (mlp),
-    and any future architecture following the same structural pattern.
+         OR a router module (e.g. MixtralTopKRouter) with a .weight parameter
     """
     results: list[MoEBlockInfo] = []
     seen_paths: set[str] = set()
@@ -54,13 +54,29 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
     for mod_path, mod in model.named_modules():
         experts_attr: str | None = None
         router_attr: str | None = None
+        expert_style: str | None = None
 
         _found_expert_lists: list[str] = []
         for child_name, child in mod.named_children():
+            # Old style: nn.ModuleList with > 4 children
             if isinstance(child, nn.ModuleList) and len(child) > _MIN_EXPERTS:
                 _found_expert_lists.append(child_name)
-            elif isinstance(child, nn.Linear) and child_name in _ROUTER_NAMES:
+                expert_style = "module_list"
+            # New style: any module with a num_experts attribute > 4 (and not nn.Linear)
+            elif (hasattr(child, 'num_experts') 
+                  and getattr(child, 'num_experts', 0) > _MIN_EXPERTS
+                  and not isinstance(child, nn.Linear)):
+                _found_expert_lists.append(child_name)
+                expert_style = "fused"
+
+            # Router check
+            if isinstance(child, nn.Linear) and child_name in _ROUTER_NAMES:
                 router_attr = child_name
+            elif (child_name in _ROUTER_NAMES 
+                  and hasattr(child, 'weight') 
+                  and isinstance(getattr(child, 'weight', None), (nn.Parameter, torch.Tensor))):
+                router_attr = child_name
+
         if len(_found_expert_lists) == 1:
             experts_attr = _found_expert_lists[0]
         elif len(_found_expert_lists) > 1:
@@ -75,7 +91,7 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
         if mod_path in seen_paths:
             continue
 
-        # Extract layer index from path (e.g. "model.layers.3.block_sparse_moe" → 3)
+        # Extract layer index from path (e.g. "model.layers.3.block_sparse_moe" -> 3)
         m = re.search(r'\.?(\d+)\.', mod_path + ".")
         if m is None:
             continue
@@ -93,6 +109,7 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
             moe_module=mod,
             router_attr=router_attr,
             experts_attr=experts_attr,
+            expert_style=expert_style,
         ))
 
     return results
@@ -172,7 +189,12 @@ def patch_moe_blocks(
         )
         # Fix 1: direct assignment — no __get__ binding needed
         block_info.moe_module.forward = sparse_fwd
-        n_experts = len(getattr(block_info.moe_module, block_info.experts_attr))
+        experts_mod = getattr(block_info.moe_module, block_info.experts_attr)
+        if hasattr(experts_mod, 'num_experts'):
+            n_experts = experts_mod.num_experts
+        else:
+            n_experts = len(experts_mod)
+            
         print(
             f"[Vaayu-MoE] patched {block_info.module_path} "
             f"(router={block_info.router_attr}, experts={block_info.experts_attr}, "
@@ -192,20 +214,33 @@ def _make_sparse_moe_forward(
     vaayu_ref,
 ):
     """
-    Returns a replacement forward() for the MoE block.
-
-    Closure captures: block_info, expert_cache, offset_index, checkpoint_path,
-    top_k, device, dtype, vaayu_ref.
-
-    Called as: moe_block.forward(hidden_states, **kwargs)
-    Returns:   (hidden_states, router_logits) matching standard MoE forward signature
+    Returns a replacement forward() for the MoE block, dispatching based on expert_style.
     """
+    if block_info.expert_style == "fused":
+        return _make_fused_sparse_forward(
+            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
+        )
+    else:
+        return _make_modulelist_sparse_forward(
+            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
+        )
+
+
+def _make_modulelist_sparse_forward(
+    block_info: MoEBlockInfo,
+    expert_cache: "ExpertRAMCache",
+    offset_index: "ExpertOffsetIndex",
+    checkpoint_path: Path,
+    top_k: int,
+    device: str,
+    dtype: torch.dtype,
+    vaayu_ref,
+):
     from .persist.safetensor_model_persister import load_expert_sparse
 
     layer_name = block_info.layer_name
     layer_idx  = block_info.layer_idx
 
-    # Fix 2: simple signature — no bound-method dual-mode needed
     def sparse_forward(hidden_states, **kwargs):
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         router = getattr(block_info.moe_module, block_info.router_attr)
@@ -213,7 +248,6 @@ def _make_sparse_moe_forward(
         routing_weights, expert_indices = torch.topk(
             router_logits.float().softmax(dim=-1), top_k, dim=-1
         )
-        # Fix 3: normalize routing weights so they sum to 1 (matches actual MoE behavior)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -239,22 +273,18 @@ def _make_sparse_moe_forward(
         B, S, H = hidden_states.shape
         final_hidden = torch.zeros_like(hidden_states)
 
-        # Fix 4 + Fix 5: Phase A — inject all unique experts before token loop
         injected_experts: set[int] = set()
         for eidx in unique_experts:
             raw = expert_tensors.get(eidx)
             if raw is None:
                 continue
             expert_mod = experts_list[eidx]
-            # Fix 5: use _inject_expert_weights helper; skip expert if any weight fails
             ok = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
             if ok:
                 injected_experts.add(eidx)
 
-        # Fix 4: Phase B — token × top_k accumulation with correct batch handling
         for s in range(S):
             for k in range(top_k):
-                # expert_indices shape: (B, S, top_k)
                 for b in range(B):
                     eidx = int(expert_indices[b, s, k].item())
                     if eidx not in injected_experts:
@@ -264,7 +294,6 @@ def _make_sparse_moe_forward(
                     expert_out = expert_mod(hidden_states[b:b+1, s, :])  # (1, H)
                     final_hidden[b, s, :] += weight * expert_out.squeeze(0)
 
-        # Fix 4: Phase C — unload all injected experts back to meta
         for eidx in injected_experts:
             try:
                 experts_list[eidx].to("meta")
@@ -273,7 +302,115 @@ def _make_sparse_moe_forward(
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
-        # Return tuple matching original MoE forward signature: (hidden_states, router_logits)
         return final_hidden, router_logits
 
     return sparse_forward
+
+
+def _make_fused_sparse_forward(
+    block_info: MoEBlockInfo,
+    expert_cache: "ExpertRAMCache",
+    offset_index: "ExpertOffsetIndex",
+    checkpoint_path: Path,
+    top_k: int,
+    device: str,
+    dtype: torch.dtype,
+    vaayu_ref,
+):
+    from .persist.safetensor_model_persister import load_expert_sparse
+    
+    layer_name = block_info.layer_name
+    layer_idx = block_info.layer_idx
+    
+    def sparse_forward(hidden_states, **kwargs):
+        moe_mod = block_info.moe_module
+        router = getattr(moe_mod, block_info.router_attr)
+        experts_mod = getattr(moe_mod, block_info.experts_attr)
+        act_fn = experts_mod.act_fn  # SiLU activation
+        
+        # 1. Run router (pinned in VRAM)
+        B_S, S, H = hidden_states.shape
+        flat_hidden = hidden_states.view(-1, H)
+        
+        # Direct call: gate returns (logits, top_k_weights, top_k_index)
+        # MixtralTopKRouter.forward signature is (hidden_states) -> (logits, weights, indices)
+        # Actually, MixtralTopKRouter returns a tuple. Let's unpack.
+        router_res = router(flat_hidden)
+        if isinstance(router_res, tuple) and len(router_res) >= 3:
+            # Matches MixtralTopKRouter
+            router_logits, routing_weights, expert_indices = router_res[:3]
+        else:
+            # Fallback for generic router
+            router_logits = router_res
+            routing_weights, expert_indices = torch.topk(
+                router_logits.float().softmax(dim=-1), top_k, dim=-1
+            )
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        
+        unique_experts = expert_indices.flatten().unique().tolist()
+        
+        # 2. Load active expert weights from disk/cache
+        shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+        expert_tensors = {}
+        for eidx in unique_experts:
+            cached = expert_cache.get(layer_idx, eidx)
+            if cached is not None:
+                expert_tensors[eidx] = cached
+            else:
+                metas = offset_index.get_expert_offsets(layer_name, eidx)
+                if metas is None:
+                    continue
+                raw = load_expert_sparse(shard_file, metas)
+                expert_cache.put(layer_idx, eidx, raw)
+                expert_tensors[eidx] = raw
+        
+        # 3. Compute sparse MoE manually (no inject needed, raw tensor math)
+        final_hidden = torch.zeros_like(flat_hidden)
+        
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(
+                expert_indices, num_classes=experts_mod.num_experts
+            )
+            expert_mask = expert_mask.permute(2, 1, 0)
+        
+        for eidx in unique_experts:
+            raw = expert_tensors.get(eidx)
+            if raw is None:
+                continue
+            
+            top_k_pos, token_idx = torch.where(expert_mask[eidx])
+            if token_idx.numel() == 0:
+                continue
+            
+            current_state = flat_hidden[token_idx]
+            
+            # Find w1, w2, w3 tensors from the loaded per-expert dict
+            w1 = w2 = w3 = None
+            for k, v in raw.items():
+                if ".w1." in k: w1 = v.to(device, dtype=dtype, non_blocking=True)
+                elif ".w2." in k: w2 = v.to(device, dtype=dtype, non_blocking=True)
+                elif ".w3." in k: w3 = v.to(device, dtype=dtype, non_blocking=True)
+            
+            if w1 is None or w2 is None or w3 is None:
+                continue
+            
+            # Compute: gate = act(x @ w1.T), up = x @ w3.T, out = (gate * up) @ w2.T
+            gate = act_fn(torch.nn.functional.linear(current_state, w1))
+            up = torch.nn.functional.linear(current_state, w3)
+            current_hidden = torch.nn.functional.linear(gate * up, w2)
+            
+            # Apply routing weights
+            current_hidden = current_hidden * routing_weights[token_idx, top_k_pos, None]
+            final_hidden.index_add_(0, token_idx, current_hidden.to(final_hidden.dtype))
+            
+            # Free GPU tensors immediately
+            del w1, w2, w3
+        
+        # 4. Write routing history for speculative prefetch
+        vaayu_ref._expert_history[layer_idx] = unique_experts
+        
+        # Return single tensor matching MixtralSparseMoeBlock.forward signature
+        return final_hidden.view(B_S, S, H)
+    
+    return sparse_forward
+
