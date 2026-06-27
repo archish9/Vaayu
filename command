@@ -23,3 +23,7 @@ nvidia-smi -q | grep -A 10 "Link Width"
 MAX_PINNED_LAYERS = 20       # Leaves ~2-3 GB of headroom to be safe
 EAGLE_HEAD_PATH = None
 DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
+
+
+
+python -u test_quick.py > run.log 2>&1

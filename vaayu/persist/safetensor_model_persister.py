@@ -62,9 +62,10 @@ _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
 _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
 
-_EXPERT_PINNED_BUF = None
+import queue as _queue
+_EXPERT_BUF_POOL: "_queue.Queue[torch.Tensor]" = _queue.Queue()
 _EXPERT_PINNED_SIZE = 0
-_EXPERT_BUF_LOCK = __import__("threading").Lock()
+_EXPERT_POOL_N = 8  # one buffer per worker; matches ThreadPoolExecutor max_workers in moe_patch.py
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
@@ -153,11 +154,29 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
         _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
 
-    global _EXPERT_PINNED_BUF, _EXPERT_PINNED_SIZE
-    if _USE_PINNED and _EXPERT_PINNED_BUF is None:
+    global _EXPERT_PINNED_SIZE
+    if _USE_PINNED and _EXPERT_BUF_POOL.empty():
         _EXPERT_PINNED_SIZE = 512 * 1024 * 1024  # 512 MB per expert buffer
-        _EXPERT_PINNED_BUF = torch.empty(_EXPERT_PINNED_SIZE, dtype=torch.uint8, pin_memory=True)
-        print(f"[VAAYU-IO] alloc expert buffer  size={_EXPERT_PINNED_SIZE / (1024**2):.1f}MB")
+
+        # Budget pool size against available RAM. Reserve 27 GB for: layer load
+        # double-buffer (~6 GB), expert RAM cache (~16.5 GB), non-expert tensor
+        # cache (~2.5 GB), CUDA/Python overhead (~2 GB). Pool gets the remainder,
+        # capped at _EXPERT_POOL_N. On tight machines this yields 1-2 buffers
+        # (still parallel vs the old single-locked buffer); on 64+ GB machines 8.
+        _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+        _pool_budget_gb = max(0.5, _avail_gb - 27.0)
+        _n_bufs = max(1, min(_EXPERT_POOL_N, int(_pool_budget_gb * 1024 / 512)))
+
+        for _ in range(_n_bufs):
+            _EXPERT_BUF_POOL.put(
+                torch.empty(_EXPERT_PINNED_SIZE, dtype=torch.uint8, pin_memory=True)
+            )
+        total_mb = _n_bufs * _EXPERT_PINNED_SIZE / (1024 ** 2)
+        print(
+            f"[VAAYU-IO] alloc expert buffer pool"
+            f"  n={_n_bufs}  size={_EXPERT_PINNED_SIZE / (1024**2):.1f}MB each"
+            f"  total={total_mb:.1f}MB  (avail={_avail_gb:.1f}GB)"
+        )
 
 
 import atexit
@@ -438,7 +457,6 @@ def load_expert_sparse(
     file_path: str,
     expert_metas: dict,
     use_direct_io: bool | None = None,
-    use_pinned_buf: bool = True,
 ) -> dict:
     """
     Load only the specified expert tensor byte ranges from a safetensors shard.
@@ -446,14 +464,15 @@ def load_expert_sparse(
     Groups contiguous byte ranges (gap ≤ _ALIGN) into a single io_uring call
     to minimise syscall overhead. Falls back to preadv when io_uring unavailable.
 
+    Uses a pool of pinned buffers (_EXPERT_BUF_POOL) — each concurrent caller
+    gets its own pinned buffer via blocking queue.get(). Pool size = max_workers
+    in the ThreadPoolExecutor that calls this, so no starvation. Pinned memory
+    ensures O_DIRECT-compatible alignment and fast PCIe DMA to GPU.
+
     Args:
         file_path: absolute path to the .safetensors shard
         expert_metas: {tensor_key: ExpertTensorMeta} from ExpertOffsetIndex
         use_direct_io: O_DIRECT flag; None = use global _USE_DIRECT_IO
-        use_pinned_buf: if True (default), use the shared _EXPERT_PINNED_BUF staging
-            buffer (requires _EXPERT_BUF_LOCK, serializes concurrent calls). Pass
-            False to allocate a fresh per-call buffer — allows concurrent calls from
-            ThreadPoolExecutor without lock contention.
 
     Returns:
         {tensor_key: cpu_tensor} — cloned tensors safe to hold beyond buffer reuse
@@ -492,18 +511,22 @@ def load_expert_sparse(
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
 
-        global _EXPERT_PINNED_BUF, _EXPERT_PINNED_SIZE, _EXPERT_BUF_LOCK
-
-        _using_shared_buf = use_pinned_buf and _USE_PINNED and _EXPERT_PINNED_BUF is not None
-        if _using_shared_buf:
+        # Acquire a pinned buffer from the pool (blocks until one is available).
+        # Pool has _EXPERT_POOL_N buffers = max_workers, so no starvation.
+        # Falls back to unpinned + buffered IO only if pool was never initialized.
+        _pool_buf = None
+        if _USE_PINNED and _EXPERT_PINNED_SIZE > 0:
+            _pool_buf = _EXPERT_BUF_POOL.get()
             if aligned_length > _EXPERT_PINNED_SIZE:
-                raise RuntimeError(f"Expert size {aligned_length} exceeds buffer size {_EXPERT_PINNED_SIZE}")
-            _EXPERT_BUF_LOCK.acquire()
-            buf = _EXPERT_PINNED_BUF[:aligned_length]
+                _EXPERT_BUF_POOL.put(_pool_buf)
+                raise RuntimeError(
+                    f"Expert size {aligned_length} exceeds buffer size {_EXPERT_PINNED_SIZE}"
+                )
+            buf = _pool_buf[:aligned_length]
         else:
-            # Fresh buffer: no lock needed — safe for concurrent ThreadPoolExecutor calls.
-            # torch.empty is malloc-aligned (16 bytes), not sector-aligned (512 bytes).
-            # O_DIRECT requires sector-aligned buffer addresses → force buffered IO here.
+            # Pool not initialized (CUDA unavailable or init_model_io not called yet).
+            # torch.empty is malloc-aligned (16 bytes), not 512-byte sector-aligned.
+            # O_DIRECT requires sector-aligned addresses → force buffered IO.
             buf = torch.empty(aligned_length, dtype=torch.uint8)
             use_direct_io = False
 
@@ -533,7 +556,7 @@ def load_expert_sparse(
                 result[key] = tensor.clone()
 
         finally:
-            if _using_shared_buf:
-                _EXPERT_BUF_LOCK.release()
+            if _pool_buf is not None:
+                _EXPERT_BUF_POOL.put(_pool_buf)
                 
     return result

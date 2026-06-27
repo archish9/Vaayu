@@ -3,7 +3,7 @@ Quick inference test — no installation required.
 
 Configure parameters in the CONFIG block below, then run:
     source venv/bin/activate
-    python test_quick.py
+    python -u test_quick.py > run.log 2>&1
 
 Parameters:
     MODEL_PATH        — local path to the model checkpoint directory
@@ -21,7 +21,17 @@ Parameters:
 import sys
 import os
 import time
+import logging
 import torch
+
+# Redirect all logging to stdout so `python test_quick.py > run.log` captures everything.
+# Without this, logging.warning/info/debug go to stderr and are lost when redirecting stdout.
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -41,7 +51,7 @@ PREFILL_CHUNK_SIZE = 512     # 0 = disabled; tokens per prefill chunk
 #   Switch to PLD: set DRAFTER_MODEL_PATH = None and USE_PROMPT_LOOKUP = True
 #   Avoid for instruction→response — novel outputs yield 0 match rate (no speedup).
 DRAFTER_MODEL_PATH = None
-USE_PROMPT_LOOKUP  = True
+USE_PROMPT_LOOKUP  = False
 
 DRAFT_TOKENS = 15
 # ─────────────────────────────────────────────────────────────────────────────

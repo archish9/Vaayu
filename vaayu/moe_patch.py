@@ -472,10 +472,7 @@ def _make_fused_sparse_forward(
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
                     return eidx, None
-                # use_pinned_buf=False: fresh buffer per call, no lock → concurrent reads.
-                # GIL released inside vaayu_rust.io_uring_read_into (py.allow_threads),
-                # so N workers genuinely overlap NVMe reads in parallel.
-                raw = load_expert_sparse(shard_file, metas, use_pinned_buf=False)
+                raw = load_expert_sparse(shard_file, metas)
                 expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 

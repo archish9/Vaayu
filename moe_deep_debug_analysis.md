@@ -149,3 +149,24 @@ graph TD
 ```
 
 The fundamental issue is that the `transformers` library changed the internal Mixtral module structure from individual `nn.ModuleList` experts to a **fused `MixtralExperts`** module, and from `block_sparse_moe` to `mlp` as the attribute name. The design spec and implementation were written against the old structure.
+
+---
+
+## Addendum: The `io_uring` EFAULT Crash
+
+After resolving the structural mismatches, a secondary deep OS-level issue was discovered that causes speculative generation threads to crash with:
+`OSError: io_uring read error CQE[0] result=-14 errno=14` (which translates to `EFAULT` - Bad Address).
+
+### Why the Kernel returns `EFAULT`
+The issue arises from a collision between Linux kernel `O_DIRECT` direct memory access rules and how `vaayu_rust` handles file descriptors:
+
+1. During `init_model_io()`, Vaayu calls `vaayu_rust.register_files(paths, use_direct_io=True)`. This opens all the `.safetensors` files using `O_DIRECT` flags and permanently binds these file descriptors to the `io_uring` ring.
+2. In `load_expert_sparse()`, we dynamically allocate a pinned buffer using `torch.empty(..., pin_memory=True)` and attempt to read directly into it using `vaayu_rust.io_uring_read_into(..., use_direct_io=False)`.
+3. **The Trap:** The Rust backend sees that the file is already registered and uses the existing registered file descriptor. Because this descriptor was opened with `O_DIRECT`, the read is **forced** to be a direct IO read, completely ignoring the `use_direct_io=False` flag!
+4. **The Crash:** `O_DIRECT` reads require the kernel to dynamically pin user pages (`get_user_pages_fast`). Since `_PINNED_BUFS` already consumed 5.4 GB of system pinned memory, dynamically allocating and requesting the kernel to pin *more* memory on the fly exceeds `RLIMIT_MEMLOCK` or encounters mapping limitations from the NVIDIA driver's `cudaHostAlloc`. The kernel refuses, returning `-EFAULT`, which bubbles up to Python as `errno=14`.
+
+### The Solution Pathway
+To solve this permanently without losing zero-copy pinned memory performance, we must avoid triggering `get_user_pages_fast` inside the `O_DIRECT` kernel path for dynamically allocated expert buffers. 
+This can be achieved by:
+- Pre-allocating a persistent `_EXPERT_PINNED_BUF` alongside `_PINNED_BUFS` during initialization, so it registers properly and doesn't hit dynamic allocation limits during generation.
+- **OR** Modifying the Rust `io_uring_read_into` to explicitly fallback to a fresh non-`O_DIRECT` file descriptor (bypassing the registered one) if `use_direct_io=False` is requested.
