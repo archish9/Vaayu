@@ -499,7 +499,7 @@ def _make_fused_sparse_forward(
                 up_out = F.linear(x, w_up)
                 out = F.linear(gate_out * up_out, w_down)
                 out = out * cpu_routing_weights[token_idx, top_k_pos, None]
-                final_cpu.index_add_(0, token_idx, out)
+                final_cpu.index_add_(0, token_idx, out.to(final_cpu.dtype))
 
             result = final_cpu.to(device, dtype=dtype)
 
