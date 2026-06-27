@@ -501,11 +501,13 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
             self._expert_offset_index.build_or_load()
 
-            # Budget: available RAM minus 8 GB reserve
+            # Budget: available RAM minus 8 GB reserve, floor at 2 GB
+            # so cache is never zero on machines with limited free RAM.
             _mem = _psutil.virtual_memory()
-            _expert_budget = max(0, _mem.available - (8 * 1024 ** 3))
+            _expert_budget = int(_mem.total * 0.35)
             self._expert_cache = ExpertRAMCache(_expert_budget)
-            print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget")
+            print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
+                  f"(35% of {_mem.total / 1e9:.0f} GB total RAM)")
 
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
@@ -1195,6 +1197,13 @@ class VaayuBaseModel(GenerationMixin):
         """Thin wrapper so ThreadPoolExecutor can call the strategy load."""
         return self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
 
+    def _load_non_expert_strategy(self, layer_name: str) -> dict:
+        """For MoE layers: load only non-expert tensors (~170 MB instead of 2.77 GB)."""
+        from .persist.safetensor_model_persister import load_non_expert_tensors
+        from pathlib import Path as _Path
+        file_path = str(_Path(self.checkpoint_path) / (layer_name + ".safetensors"))
+        return load_non_expert_tensors(file_path, layer_name, self._expert_offset_index)
+
     def load_layer_to_cpu(self, layer_name):
 
         t = time.time()
@@ -1593,7 +1602,7 @@ class VaayuBaseModel(GenerationMixin):
         )
         if _moe_shard_names:
             import re as _re_fwd
-            _expert_tensor_re = _re_fwd.compile(r'\.experts\.\d+\.')
+            _expert_tensor_re = _re_fwd.compile(r'\.experts\.')
         else:
             _expert_tensor_re = None
 
@@ -1604,7 +1613,10 @@ class VaayuBaseModel(GenerationMixin):
             if self.prefetching:
                 for _seed_name in self.layer_names:
                     if _seed_name not in self.pinned_layer_names:
-                        future = executor.submit(self._load_from_strategy, _seed_name)
+                        if _seed_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                            future = executor.submit(self._load_non_expert_strategy, _seed_name)
+                        else:
+                            future = executor.submit(self._load_from_strategy, _seed_name)
                         break
 
             for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
@@ -1630,7 +1642,10 @@ class VaayuBaseModel(GenerationMixin):
                     if self.prefetching and future is None:
                         for _n in self.layer_names[i + 1:]:
                             if _n not in self.pinned_layer_names:
-                                future = executor.submit(self._load_from_strategy, _n)
+                                if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                                    future = executor.submit(self._load_non_expert_strategy, _n)
+                                else:
+                                    future = executor.submit(self._load_from_strategy, _n)
                                 break
 
                 elif self.prefetching:
@@ -1660,7 +1675,10 @@ class VaayuBaseModel(GenerationMixin):
                         t = time.time()
                     for _n in self.layer_names[i + 1:]:
                         if _n not in self.pinned_layer_names:
-                            future = executor.submit(self._load_from_strategy, _n)
+                            if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                                future = executor.submit(self._load_non_expert_strategy, _n)
+                            else:
+                                future = executor.submit(self._load_from_strategy, _n)
                             break
                     if self.profiling_mode:
                         elapsed_time = time.time() - t
@@ -1688,7 +1706,10 @@ class VaayuBaseModel(GenerationMixin):
                     # ── Non-pinned, no prefetch ──────────────────────────────
                     _tl = time.perf_counter()
                     _t = time.time()
-                    state_dict = self.load_layer_to_cpu(layer_name)
+                    if layer_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                        state_dict = self._load_non_expert_strategy(layer_name)
+                    else:
+                        state_dict = self.load_layer_to_cpu(layer_name)
                     _io_wait_s += time.time() - _t
                     _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
                     _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
