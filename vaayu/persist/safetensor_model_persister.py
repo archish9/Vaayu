@@ -62,6 +62,10 @@ _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
 _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
 
+_EXPERT_PINNED_BUF = None
+_EXPERT_PINNED_SIZE = 0
+_EXPERT_BUF_LOCK = __import__("threading").Lock()
+
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
 _BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
@@ -148,6 +152,12 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
         _RING_INITIALIZED = _init_iouring_ring(32)
     if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
         _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
+
+    global _EXPERT_PINNED_BUF, _EXPERT_PINNED_SIZE
+    if _USE_PINNED and _EXPERT_PINNED_BUF is None:
+        _EXPERT_PINNED_SIZE = 512 * 1024 * 1024  # 512 MB per expert buffer
+        _EXPERT_PINNED_BUF = torch.empty(_EXPERT_PINNED_SIZE, dtype=torch.uint8, pin_memory=True)
+        print(f"[VAAYU-IO] alloc expert buffer  size={_EXPERT_PINNED_SIZE / (1024**2):.1f}MB")
 
 
 import atexit
@@ -276,6 +286,117 @@ def _load_pinned(file_path: str) -> dict:
     return result
 
 
+def load_non_expert_tensors(
+    file_path: str,
+    layer_name: str,
+    offset_index,
+) -> dict:
+    """
+    Load only non-expert tensors from a MoE layer shard via targeted byte-range reads.
+
+    Skips all expert tensor byte ranges in the file, reading only attention weights,
+    norms, and the router gate (~170 MB instead of 2.77 GB per Mixtral layer).
+
+    Args:
+        file_path: absolute path to the .safetensors shard
+        layer_name: shard stem used as key in offset_index (e.g. "model.layers.3")
+        offset_index: ExpertOffsetIndex instance (or None → falls back to full load)
+
+    Returns:
+        {tensor_key: cpu_tensor} for non-expert tensors only
+    """
+    if offset_index is None:
+        return _load_pinned(file_path)
+
+    with open(file_path, 'rb') as f:
+        hdr_len = struct.unpack('<Q', f.read(8))[0]
+        hdr = json.loads(f.read(hdr_len))
+    data_start = 8 + hdr_len
+
+    # Collect disk-format expert tensor keys from offset_index
+    expert_keys: set[str] = set()
+    layer_experts = offset_index.index.get(layer_name, {})
+    for _eidx, expert_metas in layer_experts.items():
+        expert_keys.update(expert_metas.keys())
+
+    # Build list of non-expert (key, hdr_meta, abs_file_offset, byte_len)
+    non_expert: list[tuple] = []
+    for key, meta in hdr.items():
+        if key == '__metadata__':
+            continue
+        if key in expert_keys:
+            continue
+        start, end = meta['data_offsets']
+        non_expert.append((key, meta, data_start + start, end - start))
+
+    if not non_expert:
+        return {}
+
+    non_expert.sort(key=lambda x: x[2])
+
+    # Group contiguous ranges (gap <= _ALIGN) to minimise io_uring calls
+    groups: list[list] = []
+    current_group = [non_expert[0]]
+    for item in non_expert[1:]:
+        prev_end = current_group[-1][2] + current_group[-1][3]
+        if item[2] - prev_end <= _ALIGN:
+            current_group.append(item)
+        else:
+            groups.append(current_group)
+            current_group = [item]
+    groups.append(current_group)
+
+    result: dict = {}
+    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
+
+    for group in groups:
+        group_start = group[0][2]
+        group_end = group[-1][2] + group[-1][3]
+        read_len = group_end - group_start
+
+        aligned_offset = _align_down(group_start)
+        prefix_pad = group_start - aligned_offset
+        aligned_length = _align_up(read_len + prefix_pad)
+
+        with _BUF_LOCK:
+            buf_idx = _BUF_IDX
+            _BUF_IDX = 1 - _BUF_IDX
+
+        if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < aligned_length:
+            alloc_size = aligned_length + (4 * 1024 * 1024)
+            _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
+            _PINNED_SIZES[buf_idx] = alloc_size
+            print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB (non-expert)")
+
+        buf = _PINNED_BUFS[buf_idx]
+
+        if _USE_IOURING:
+            vaayu_rust.io_uring_read_into(
+                file_path, aligned_offset, aligned_length,
+                buf.data_ptr(), 8, _USE_DIRECT_IO,
+            )
+            data_buf = buf[prefix_pad:]
+        else:
+            fd = os.open(file_path, os.O_RDONLY)
+            try:
+                view = memoryview(buf.numpy())
+                os.preadv(fd, [view[:aligned_length]], aligned_offset)
+            finally:
+                os.close(fd)
+            data_buf = buf[prefix_pad:]
+
+        for key, meta, file_offset, byte_len in group:
+            rel_start = file_offset - group_start
+            rel_end = rel_start + byte_len
+            dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
+            tensor = data_buf[rel_start:rel_end].view(dtype).reshape(meta['shape'])
+            result[key] = tensor.clone()
+
+    size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+    print(f"[VAAYU-IO] non-expert  {size_mb:.1f}MB  {layer_name}")
+    return result
+
+
 class SafetensorModelPersister(ModelPersister):
 
     def __init__(self, *args, **kwargs):
@@ -317,6 +438,7 @@ def load_expert_sparse(
     file_path: str,
     expert_metas: dict,
     use_direct_io: bool | None = None,
+    use_pinned_buf: bool = True,
 ) -> dict:
     """
     Load only the specified expert tensor byte ranges from a safetensors shard.
@@ -328,6 +450,10 @@ def load_expert_sparse(
         file_path: absolute path to the .safetensors shard
         expert_metas: {tensor_key: ExpertTensorMeta} from ExpertOffsetIndex
         use_direct_io: O_DIRECT flag; None = use global _USE_DIRECT_IO
+        use_pinned_buf: if True (default), use the shared _EXPERT_PINNED_BUF staging
+            buffer (requires _EXPERT_BUF_LOCK, serializes concurrent calls). Pass
+            False to allocate a fresh per-call buffer — allows concurrent calls from
+            ThreadPoolExecutor without lock contention.
 
     Returns:
         {tensor_key: cpu_tensor} — cloned tensors safe to hold beyond buffer reuse
@@ -366,31 +492,48 @@ def load_expert_sparse(
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
 
-        # Permanent fix: We use pinned memory for fast GPU DMA, but force use_direct_io=False.
-        # Direct IO (O_DIRECT) dynamically pins user pages in the kernel (get_user_pages_fast).
-        # Since we already have 5.4GB of pinned buffers (_PINNED_BUFS), dynamic O_DIRECT
-        # allocations can hit RLIMIT_MEMLOCK limits and fail with EFAULT. Buffered IO avoids this.
-        buf = torch.empty(aligned_length, dtype=torch.uint8, pin_memory=_USE_PINNED)
+        global _EXPERT_PINNED_BUF, _EXPERT_PINNED_SIZE, _EXPERT_BUF_LOCK
 
-        if _USE_IOURING:
-            vaayu_rust.io_uring_read_into(
-                file_path, aligned_offset, aligned_length,
-                buf.data_ptr(), 8, False, # Force buffered IO
-            )
-            data_buf = buf[prefix_pad:]
+        _using_shared_buf = use_pinned_buf and _USE_PINNED and _EXPERT_PINNED_BUF is not None
+        if _using_shared_buf:
+            if aligned_length > _EXPERT_PINNED_SIZE:
+                raise RuntimeError(f"Expert size {aligned_length} exceeds buffer size {_EXPERT_PINNED_SIZE}")
+            _EXPERT_BUF_LOCK.acquire()
+            buf = _EXPERT_PINNED_BUF[:aligned_length]
         else:
-            fd = os.open(file_path, os.O_RDONLY)
-            try:
-                view = memoryview(buf.numpy())
-                os.preadv(fd, [view[:aligned_length]], aligned_offset)
-            finally:
-                os.close(fd)
-            data_buf = buf[prefix_pad:]
+            # Fresh buffer: no lock needed — safe for concurrent ThreadPoolExecutor calls.
+            # torch.empty is malloc-aligned (16 bytes), not sector-aligned (512 bytes).
+            # O_DIRECT requires sector-aligned buffer addresses → force buffered IO here.
+            buf = torch.empty(aligned_length, dtype=torch.uint8)
+            use_direct_io = False
 
-        for key, meta in group:
-            rel_start = meta.file_offset - group_start
-            rel_end = rel_start + meta.byte_length
-            dtype = _DTYPE_MAP.get(meta.dtype, torch.float32)
-            result[key] = data_buf[rel_start:rel_end].view(dtype).reshape(meta.shape).clone()
+        try:
+            if _USE_IOURING:
+                vaayu_rust.io_uring_read_into(
+                    file_path, aligned_offset, aligned_length,
+                    buf.data_ptr(), 8, use_direct_io,
+                )
+                data_buf = buf[prefix_pad:]
+            else:
+                fd = os.open(file_path, os.O_RDONLY)
+                try:
+                    view = memoryview(buf.numpy())
+                    os.preadv(fd, [view[:aligned_length]], aligned_offset)
+                finally:
+                    os.close(fd)
+                data_buf = buf[prefix_pad:]
 
+            for key, meta in group:
+                rel_start = meta.file_offset - group_start
+                rel_end = rel_start + meta.byte_length
+                shape = meta.shape
+                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+
+                tensor = data_buf[rel_start:rel_end].view(dt).view(shape)
+                result[key] = tensor.clone()
+
+        finally:
+            if _using_shared_buf:
+                _EXPERT_BUF_LOCK.release()
+                
     return result

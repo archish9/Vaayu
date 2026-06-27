@@ -454,20 +454,37 @@ def _make_fused_sparse_forward(
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
 
-        # Load active expert weights: cache → sparse io_uring fallback
+        # Load active expert weights: cache → parallel sparse io_uring for misses
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         expert_tensors: dict[int, dict] = {}
+        misses: list[int] = []
         for eidx in unique_experts:
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
                 expert_tensors[eidx] = cached
             else:
+                misses.append(eidx)
+
+        if misses:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+
+            def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
-                    continue
-                raw = load_expert_sparse(shard_file, metas)
+                    return eidx, None
+                # use_pinned_buf=False: fresh buffer per call, no lock → concurrent reads.
+                # GIL released inside vaayu_rust.io_uring_read_into (py.allow_threads),
+                # so N workers genuinely overlap NVMe reads in parallel.
+                raw = load_expert_sparse(shard_file, metas, use_pinned_buf=False)
                 expert_cache.put(layer_idx, eidx, raw)
-                expert_tensors[eidx] = raw
+                return eidx, raw
+
+            # Up to 8 concurrent reads: amortizes NVMe APST wake-up latency (~100ms)
+            # over all misses instead of paying it once per expert serially.
+            with _TPE(max_workers=min(len(misses), 8)) as _ex:
+                for eidx, raw in _ex.map(_load_one, misses):
+                    if raw is not None:
+                        expert_tensors[eidx] = raw
 
         # Expert mask on CPU (avoids PCIe for index tensors)
         expert_indices_cpu = expert_indices.cpu()

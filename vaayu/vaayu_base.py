@@ -492,6 +492,9 @@ class VaayuBaseModel(GenerationMixin):
         self._expert_cache = None
         self._expert_offset_index = None
         self._moe_blocks: list = []
+        # Non-expert tensor dict cache: avoids re-reading 80 MB per non-pinned MoE layer
+        # per token. Populated lazily on first access, cleared on del. ~2.5 GB total.
+        self._non_expert_tensor_cache: dict[str, dict] = {}
         if self.running_device.startswith("cuda") and self.is_moe:
             from .persist.expert_offset_index import ExpertOffsetIndex
             from .persist.expert_cache import ExpertRAMCache
@@ -502,10 +505,14 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_offset_index.build_or_load()
 
             _mem = _psutil.virtual_memory()
-            _expert_budget = int(_mem.total * 0.35)
+            # 50% of total RAM: frees budget from skipped MoE pre-population (Fix A).
+            # 33 GB × 0.50 = 16.5 GB → 46 expert slots (vs 33 at 0.35).
+            # Budget sanity: 16.5 GB expert + 0 GB pre-pop + 10.6 GB RAM cache + 6 GB OS/CUDA
+            # = ~33 GB — fits on 33 GB machines. Adjust down if OOM observed.
+            _expert_budget = int(_mem.total * 0.50)
             self._expert_cache = ExpertRAMCache(_expert_budget)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
-                  f"(35% of {_mem.total / 1e9:.0f} GB total RAM)")
+                  f"(50% of {_mem.total / 1e9:.0f} GB total RAM)")
 
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
@@ -1098,7 +1105,16 @@ class VaayuBaseModel(GenerationMixin):
         plain tensors; put_sync() clones them inline and stores in the cache. Reconnects
         after all layers are loaded. Token 1 then gets pure cache hits with no clone
         overhead and no pinned-buffer race.
+
+        For MoE models: skipped entirely. MoE inference uses _load_non_expert_strategy
+        (80 MB per layer) which bypasses this cache, so pre-loading full 2.9 GB shards
+        wastes ~84 GB of disk reads and ~8.7 GB of RAM with data never accessed.
         """
+        if getattr(self, 'is_moe', False):
+            print("[Vaayu-Cache] MoE model: skipping RAM cache pre-population "
+                  "(expert cache handles active weights; non-expert tensors loaded on-demand)")
+            return
+
         import time as _time
         t0 = _time.perf_counter()
 
@@ -1125,6 +1141,9 @@ class VaayuBaseModel(GenerationMixin):
                 continue
             if self.ram_cache.put_sync(layer_name, tensors):
                 n_cached += 1
+            else:
+                # put_sync failed = cache full; all remaining layers same size, stop loading.
+                break
 
         elapsed = _time.perf_counter() - t0
         cached_gb = self.ram_cache.current_usage / 1e9
@@ -1197,11 +1216,22 @@ class VaayuBaseModel(GenerationMixin):
         return self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
 
     def _load_non_expert_strategy(self, layer_name: str) -> dict:
-        """For MoE layers: load only non-expert tensors (~170 MB instead of 2.77 GB)."""
+        """For MoE layers: load only non-expert tensors (~80 MB instead of 2.77 GB).
+
+        Results cached in _non_expert_tensor_cache (simple dict, ~2.5 GB total for
+        32 Mixtral layers). After the first token, all non-expert reads are O(1)
+        dict lookups with no disk I/O.
+        """
+        cache = getattr(self, '_non_expert_tensor_cache', None)
+        if cache is not None and layer_name in cache:
+            return cache[layer_name]
         from .persist.safetensor_model_persister import load_non_expert_tensors
         from pathlib import Path as _Path
         file_path = str(_Path(self.checkpoint_path) / (layer_name + ".safetensors"))
-        return load_non_expert_tensors(file_path, layer_name, self._expert_offset_index)
+        result = load_non_expert_tensors(file_path, layer_name, self._expert_offset_index)
+        if cache is not None:
+            cache[layer_name] = result
+        return result
 
     def load_layer_to_cpu(self, layer_name):
 
