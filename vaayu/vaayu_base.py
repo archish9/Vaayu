@@ -1340,6 +1340,12 @@ class VaayuBaseModel(GenerationMixin):
     def can_generate(self):
         return True
 
+    def set_experts_implementation(self, experts_implementation) -> None:
+        # Transformers calls this to switch Mixtral between "grouped_mm" / "batched_mm"
+        # expert dispatch during decode. Vaayu handles expert dispatch via moe_patch.py,
+        # so this is intentionally a no-op.
+        pass
+
     def prepare_inputs_for_generation(
             self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
