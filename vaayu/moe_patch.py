@@ -274,10 +274,11 @@ def patch_moe_blocks(
         is_exl3 = isinstance(loader_strategy, EXL3LoaderStrategy)
     except ImportError:
         is_exl3 = False
-    compute_device = "cuda" if is_exl3 else "cpu"
+    compute_device = "cuda" if (is_exl3 or device.startswith("cuda")) else "cpu"
 
     blocks = detect_moe_blocks(model)
     for block_info in blocks:
+        original_forward = block_info.moe_module.forward
         sparse_fwd = _make_sparse_moe_forward(
             block_info=block_info,
             expert_cache=expert_cache,
@@ -288,6 +289,8 @@ def patch_moe_blocks(
             dtype=dtype,
             vaayu_ref=vaayu_ref,
             compute_device=compute_device,
+            original_forward=original_forward,
+            is_exl3=is_exl3,
         )
         # Fix 1: direct assignment — no __get__ binding needed
         block_info.moe_module.forward = sparse_fwd
@@ -315,22 +318,26 @@ def _make_sparse_moe_forward(
     dtype: torch.dtype,
     vaayu_ref,
     compute_device: str = "cpu",
+    original_forward = None,
+    is_exl3: bool = False,
 ):
     """
     Returns a replacement forward() for the MoE block, dispatching based on expert_style.
     """
     if block_info.expert_style == "fused":
-        if compute_device == "cuda":
+        if is_exl3:
             return _make_fused_sparse_forward_exl3(
                 block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
             )
         return _make_fused_sparse_forward(
             block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
             compute_device=compute_device,
+            original_forward=original_forward,
         )
     else:
         return _make_modulelist_sparse_forward(
-            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
+            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
+            original_forward=original_forward,
         )
 
 
@@ -343,6 +350,7 @@ def _make_modulelist_sparse_forward(
     device: str,
     dtype: torch.dtype,
     vaayu_ref,
+    original_forward = None,
 ):
     from .persist.safetensor_model_persister import load_expert_sparse
 
@@ -350,6 +358,9 @@ def _make_modulelist_sparse_forward(
     layer_idx  = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
+        if layer_name in vaayu_ref.pinned_layer_names:
+            return original_forward(hidden_states, **kwargs)
+
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         router = getattr(block_info.moe_module, block_info.router_attr)
         router_logits = router(hidden_states)
@@ -425,6 +436,7 @@ def _make_fused_sparse_forward(
     dtype: torch.dtype,
     vaayu_ref,
     compute_device: str = "cpu",
+    original_forward = None,
 ):
     import torch.nn.functional as F
     from .persist.safetensor_model_persister import load_expert_sparse
@@ -433,6 +445,9 @@ def _make_fused_sparse_forward(
     layer_idx = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
+        if layer_name in vaayu_ref.pinned_layer_names:
+            return original_forward(hidden_states, **kwargs)
+
         moe_mod = block_info.moe_module
         router = getattr(moe_mod, block_info.router_attr)
         experts_mod = getattr(moe_mod, block_info.experts_attr)
@@ -489,69 +504,38 @@ def _make_fused_sparse_forward(
             expert_indices_cpu, num_classes=experts_mod.num_experts
         ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
 
-        if compute_device == "cpu":
-            # ── CPU FFN: zero PCIe cost for expert weights ─────────────────
-            # Only hidden state crosses PCIe (8 KB decode, 4 MB prefill-512)
-            cpu_hidden = flat_hidden.cpu()
-            cpu_routing_weights = routing_weights.cpu()
-            final_cpu = torch.zeros(flat_hidden.shape[0], H, dtype=cpu_hidden.dtype)
+        # ── Compute FFN on the target device ──────────────────────────────────
+        final_hidden = torch.zeros_like(flat_hidden)
 
-            for eidx in unique_experts:
-                raw = expert_tensors.get(eidx)
-                if raw is None:
-                    continue
+        for eidx in unique_experts:
+            raw = expert_tensors.get(eidx)
+            if raw is None:
+                continue
 
-                w_gate, w_down, w_up = _classify_expert_tensors(raw)
-                if w_gate is None or w_down is None or w_up is None:
-                    _log.warning(f"[Vaayu-MoE] layer {layer_idx} expert {eidx}: missing weights, skipping")
-                    continue
+            w_gate, w_down, w_up = _classify_expert_tensors(raw)
+            if w_gate is None or w_down is None or w_up is None:
+                continue
 
-                top_k_pos, token_idx = torch.where(expert_mask[eidx])
-                if token_idx.numel() == 0:
-                    continue
+            top_k_pos, token_idx = torch.where(expert_mask[eidx])
+            if token_idx.numel() == 0:
+                continue
 
-                x = cpu_hidden[token_idx]
-                gate_out = act_fn(F.linear(x, w_gate))
-                up_out = F.linear(x, w_up)
-                out = F.linear(gate_out * up_out, w_down)
-                out = out * cpu_routing_weights[token_idx, top_k_pos, None]
-                final_cpu.index_add_(0, token_idx, out.to(final_cpu.dtype))
+            token_idx_gpu = token_idx.to(device)
+            current_state = flat_hidden[token_idx_gpu]
 
-            result = final_cpu.to(device, dtype=dtype)
+            w_gate_gpu = w_gate.to(device, dtype=dtype, non_blocking=True)
+            w_down_gpu = w_down.to(device, dtype=dtype, non_blocking=True)
+            w_up_gpu   = w_up.to(device, dtype=dtype, non_blocking=True)
 
-        else:
-            # ── GPU path (used for EXL3 or explicit cuda override) ──────────
-            final_hidden = torch.zeros_like(flat_hidden)
+            gate_out = act_fn(F.linear(current_state, w_gate_gpu))
+            up_out = F.linear(current_state, w_up_gpu)
+            out = F.linear(gate_out * up_out, w_down_gpu)
+            out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+            final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
 
-            for eidx in unique_experts:
-                raw = expert_tensors.get(eidx)
-                if raw is None:
-                    continue
+            del w_gate_gpu, w_down_gpu, w_up_gpu
 
-                w_gate, w_down, w_up = _classify_expert_tensors(raw)
-                if w_gate is None or w_down is None or w_up is None:
-                    continue
-
-                top_k_pos, token_idx = torch.where(expert_mask[eidx])
-                if token_idx.numel() == 0:
-                    continue
-
-                token_idx_gpu = token_idx.to(device)
-                current_state = flat_hidden[token_idx_gpu]
-
-                w_gate_gpu = w_gate.to(device, dtype=dtype, non_blocking=True)
-                w_down_gpu = w_down.to(device, dtype=dtype, non_blocking=True)
-                w_up_gpu   = w_up.to(device, dtype=dtype, non_blocking=True)
-
-                gate_out = act_fn(F.linear(current_state, w_gate_gpu))
-                up_out = F.linear(current_state, w_up_gpu)
-                out = F.linear(gate_out * up_out, w_down_gpu)
-                out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
-                final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
-
-                del w_gate_gpu, w_down_gpu, w_up_gpu
-
-            result = final_hidden
+        result = final_hidden
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return result.view(B, S, H)

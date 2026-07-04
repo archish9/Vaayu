@@ -1539,11 +1539,6 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
         self.telemetry.begin_token(self._token_count)
 
-        # Clear per-token routing history so stale entries from the previous token
-        # don't interfere with speculative prefetch scheduling for the current token.
-        if self.is_moe:
-            self._expert_history.clear()
-
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
 
@@ -1860,11 +1855,10 @@ class VaayuBaseModel(GenerationMixin):
                     if layer_name.startswith(_layer_prefix + "."):
                         try:
                             _current_layer_idx = int(layer_name[len(_layer_prefix) + 1:])
-                            if _current_layer_idx in self._expert_history:
-                                _next_layer_idx = _current_layer_idx + 1
-                                _pred = self._expert_history[_current_layer_idx]
-                                if _pred:
-                                    executor.submit(self._prefetch_experts, _next_layer_idx, _pred)
+                            _next_layer_idx = _current_layer_idx + 1
+                            _pred = self._expert_history.get(_next_layer_idx, [])
+                            if _pred:
+                                executor.submit(self._prefetch_experts, _next_layer_idx, _pred)
                         except (ValueError, IndexError):
                             pass
 
