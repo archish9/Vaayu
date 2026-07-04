@@ -1060,17 +1060,21 @@ class VaayuBaseModel(GenerationMixin):
 
         # Phase 2: transformer layers — break on budget miss (homogeneous size)
         if self.max_pinned_layers != 0:
+            effective_max_pinned = -1 if self.is_moe else self.max_pinned_layers
             model_attr = self.model
             for attr_name in layer_prefix.split("."):
                 model_attr = getattr(model_attr, attr_name)
             total_layers = len(model_attr)
 
             for i in range(total_layers):
-                if self.max_pinned_layers > 0 and i >= self.max_pinned_layers:
+                if not self.is_moe and effective_max_pinned > 0 and i >= effective_max_pinned:
                     break
                 layer_name = f"{layer_prefix}.{i}"
                 try:
-                    tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                    if self.is_moe and getattr(self, "_expert_offset_index", None) is not None:
+                        tensors = self._load_non_expert_strategy(layer_name)
+                    else:
+                        tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
                     size = sum(t.nbytes for t in tensors.values())
                     if used + size > budget:
                         print(f"[Vaayu-Pin] budget exhausted at {layer_name} "

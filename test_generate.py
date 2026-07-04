@@ -39,8 +39,8 @@ PREFILL_CHUNK_SIZE = 512
 
 # PLD OFF — novel code generation, zero n-gram match with prompt.
 DRAFTER_MODEL_PATH = None
-USE_PROMPT_LOOKUP  = True
-DRAFT_TOKENS       = 15
+USE_PROMPT_LOOKUP  = False
+DRAFT_TOKENS       = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 
