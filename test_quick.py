@@ -35,7 +35,7 @@ logging.basicConfig(
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_PATH        = "/home/a/code/ai-ml/models/mistralai--Mixtral-8x7B-v0.1"
+MODEL_PATH        = "/home/a/code/ai-ml/models/mistralai--Mixtral-8x7B-Instruct-v0.1"
 KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
 MAX_PINNED_LAYERS = 10      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 512      # coding agent response needs room for real code output

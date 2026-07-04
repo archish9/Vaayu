@@ -30,7 +30,7 @@ logging.basicConfig(
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MODEL_PATH         = "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
+MODEL_PATH         = "/home/a/code/ai-ml/models/mistralai--Mixtral-8x7B-Instruct-v0.1"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 MAX_NEW_TOKENS     = 512
@@ -39,7 +39,7 @@ PREFILL_CHUNK_SIZE = 512
 
 # PLD OFF — novel code generation, zero n-gram match with prompt.
 DRAFTER_MODEL_PATH = None
-USE_PROMPT_LOOKUP  = False
+USE_PROMPT_LOOKUP  = True
 DRAFT_TOKENS       = 15
 
 # ──────────────────────────────────────────────────────────────────────────────
