@@ -103,3 +103,62 @@ def test_expert_budget_greater_than_old_formula():
     _os_reserve = 6 * 1024**3
     new_budget = max(int(mem.total * 0.50), int(mem.total - _os_reserve))
     assert new_budget >= old_budget
+
+
+# ── Per-layer LRU tests ──────────────────────────────────────────────────────
+
+class TestPerLayerLRU:
+    def test_per_layer_evicts_within_layer_not_across(self):
+        """Adding a 3rd expert to a max_per_layer=2 cache evicts from that layer only."""
+        import torch
+        from vaayu.persist.expert_cache import ExpertRAMCache
+        cache = ExpertRAMCache(budget_bytes=10 * 1024**3, max_per_layer=2)
+        t = lambda: {"w": torch.zeros(1)}
+        cache.put(0, 0, t())
+        cache.put(0, 1, t())
+        cache.put(1, 0, t())  # different layer — no eviction in layer 0
+        # layer 0 full; add layer 0 expert 2 → evicts layer 0 expert 0 (LRU)
+        cache.put(0, 2, t())
+        assert not cache.has(0, 0)   # evicted
+        assert cache.has(0, 1)       # kept
+        assert cache.has(0, 2)       # newly added
+        assert cache.has(1, 0)       # different layer — untouched
+
+    def test_per_layer_no_cross_layer_eviction(self):
+        """Filling one layer to cap does not evict experts from other layers."""
+        import torch
+        from vaayu.persist.expert_cache import ExpertRAMCache
+        cache = ExpertRAMCache(budget_bytes=10 * 1024**3, max_per_layer=2)
+        t = lambda: {"w": torch.zeros(1)}
+        cache.put(0, 0, t())
+        cache.put(0, 1, t())
+        cache.put(1, 0, t())
+        cache.put(1, 1, t())
+        # both layers full — all 4 experts should be present
+        assert cache.has(0, 0) and cache.has(0, 1)
+        assert cache.has(1, 0) and cache.has(1, 1)
+
+    def test_clear_resets_usage_and_entries(self):
+        """clear() removes all entries and resets current_usage to 0."""
+        import torch
+        from vaayu.persist.expert_cache import ExpertRAMCache
+        cache = ExpertRAMCache(budget_bytes=10 * 1024**3, max_per_layer=2)
+        t = lambda: {"w": torch.zeros(100)}
+        cache.put(0, 0, t())
+        cache.put(1, 0, t())
+        assert cache.current_usage > 0
+        cache.clear()
+        assert cache.current_usage == 0
+        assert not cache.has(0, 0)
+        assert not cache.has(1, 0)
+
+    def test_clear_global_lru_mode(self):
+        """clear() works for global LRU mode (max_per_layer=0) too."""
+        import torch
+        from vaayu.persist.expert_cache import ExpertRAMCache
+        cache = ExpertRAMCache(budget_bytes=10 * 1024**3, max_per_layer=0)
+        t = lambda: {"w": torch.zeros(100)}
+        cache.put(0, 0, t())
+        cache.clear()
+        assert cache.current_usage == 0
+        assert not cache.has(0, 0)

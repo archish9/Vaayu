@@ -525,7 +525,7 @@ class VaayuBaseModel(GenerationMixin):
                 max(int(_mem.total * 0.50), int(_mem.total - _os_reserve)),
                 _decode_wset,
             )
-            self._expert_cache = ExpertRAMCache(_expert_budget)
+            self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=self.moe_top_k)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
                   f"({_expert_budget // (352 * 1024 * 1024)} expert slots on this machine)")
 
@@ -1683,6 +1683,11 @@ class VaayuBaseModel(GenerationMixin):
         # Default workers (cpu_count+4) × 2 experts × 352 MB = RAM spike on 33 GB machines.
         _exec_workers = 2 if self.is_moe else None
         with torch.inference_mode(), ThreadPoolExecutor(max_workers=_exec_workers) as executor:
+
+            # Clear prefill-polluted cache on first decode token so the per-layer LRU
+            # warms from decode routing rather than prefill routing.
+            if self.is_moe and self._token_count == 0 and input_ids.shape[1] == 1 and self._expert_cache is not None:
+                self._expert_cache.clear()
 
             # ── Pre-token batch prefetch: submit all layers using prev token's routing ──
             if self.is_moe and self._token_count > 0:
