@@ -28,4 +28,4 @@ DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
 
 python -u test_quick.py > run.log 2>&1
 
-python -u test_generate > run.log 2>&1
+python3 test_generate.py > run.log 2>&1
