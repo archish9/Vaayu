@@ -1230,6 +1230,21 @@ class VaayuBaseModel(GenerationMixin):
             except Exception as e:
                 print(f"[Vaayu-MoE] prefetch failed layer={layer_idx} expert={eidx}: {e}")
 
+    def _prefetch_all_predicted_experts(self, executor) -> None:
+        """Submit prefetch tasks for all layers using previous token's routing history.
+
+        Called once at the start of each forward pass (token N). Later layers get
+        the compute time of all earlier layers as a prefetch window. Only submits
+        tasks for experts not already in cache.
+        """
+        if not self._expert_history or self._expert_cache is None:
+            return
+        for layer_idx, expert_list in self._expert_history.items():
+            uncached = [e for e in expert_list
+                        if not self._expert_cache.has(layer_idx, e)]
+            if uncached:
+                executor.submit(self._prefetch_experts, layer_idx, uncached)
+
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
@@ -1658,6 +1673,10 @@ class VaayuBaseModel(GenerationMixin):
             _expert_tensor_re = None
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
+
+            # ── Pre-token batch prefetch: submit all layers using prev token's routing ──
+            if self.is_moe and self._token_count > 0:
+                self._prefetch_all_predicted_experts(executor)
 
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
