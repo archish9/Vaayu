@@ -509,25 +509,29 @@ class VaayuBaseModel(GenerationMixin):
         if self.running_device.startswith("cuda") and self.is_moe:
             from .persist.expert_cache import ExpertRAMCache
             from .moe_patch import patch_moe_blocks
+            from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
 
+            _is_exl3 = isinstance(self.loader_strategy, EXL3LoaderStrategy)
             _mem = _psutil.virtual_memory()
-            # Budget = max(50% floor, total - 6 GB OS reserve).
-            # 33 GB machine: max(16.5, 27) = 27 GB cap → ~77 expert slots.
-            # Per-token working set = 64 experts × 352 MB = 22.5 GB.
-            # Budget is a cap, not pre-allocation: cache grows to ~22.5 GB and stops.
             _os_reserve = 6 * 1024 ** 3
-            # Cap at decode working set: 64 experts × 352 MB = ~22.5 GB.
-            # Using total RAM overfills during long-prompt prefill (all 8 experts/layer active),
-            # exhausting available memory. LRU handles prefill overflow safely within this cap.
-            _decode_wset = 64 * 352 * 1024 * 1024
+            # BF16: expert ~352 MB, decode working set = top_k * layers * 352 MB.
+            # EXL3 4.5bpw: expert ~88 MB — all moe_num_experts * layers fit in budget,
+            # so cap at the full per-layer-all-experts working set instead.
+            _expert_mb = 88 if _is_exl3 else 352
+            _decode_wset = self.moe_num_experts * _expert_mb * 1024 * 1024 * len(self.layers) if _is_exl3 \
+                else self.moe_top_k * 32 * 352 * 1024 * 1024
             _expert_budget = min(
                 max(int(_mem.total * 0.50), int(_mem.total - _os_reserve)),
                 _decode_wset,
             )
-            self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=self.moe_top_k)
+            # EXL3: all experts per layer fit in budget → max_per_layer = moe_num_experts (8).
+            # BF16: budget tight → max_per_layer = moe_top_k (2), keep only actively-used experts.
+            _max_per_layer = self.moe_num_experts if _is_exl3 else self.moe_top_k
+            self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
-                  f"({_expert_budget // (352 * 1024 * 1024)} expert slots on this machine)")
+                  f"({_expert_budget // (_expert_mb * 1024 * 1024)} expert slots, "
+                  f"max {_max_per_layer}/layer, {'EXL3' if _is_exl3 else 'BF16'})")
 
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
