@@ -462,6 +462,7 @@ class VaayuBaseModel(GenerationMixin):
         # Pin shared layers (embed, norm, lm_head) permanently in VRAM.
         # Skips load/inject/free in forward() for these layers every token.
         self.pinned_layer_names: set = set()
+        self.non_expert_pinned_layer_names: set = set()
         self.loader_strategy.setup_model(
             self.model, self.config, self.running_device, self.running_dtype,
             pinned_layer_names=self.pinned_layer_names,
@@ -471,6 +472,14 @@ class VaayuBaseModel(GenerationMixin):
         self.set_layers_from_layer_names()
 
         self.draft_tokens = draft_tokens if draft_tokens is not None else 5
+
+        # Build offset index BEFORE _init_pinned_layers so Phase 2 can use
+        # _load_non_expert_strategy (80 MB) instead of full layer load (2.9 GB).
+        self._expert_offset_index = None
+        if device.startswith("cuda") and self.is_moe:
+            from .persist.expert_offset_index import ExpertOffsetIndex
+            self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
+            self._expert_offset_index.build_or_load()
 
         if device.startswith("cuda"):
             self._init_pinned_layers()
@@ -487,22 +496,18 @@ class VaayuBaseModel(GenerationMixin):
         else:
             self.ram_cache = None
 
-        # MoE Expert-Aware Streaming: build offset index, expert cache, patch forwards
+        # MoE Expert-Aware Streaming: expert cache and patched forwards.
+        # _expert_offset_index is initialized above (before _init_pinned_layers).
         self._expert_history: dict[int, list[int]] = {}
         self._expert_cache = None
-        self._expert_offset_index = None
         self._moe_blocks: list = []
         # Non-expert tensor dict cache: avoids re-reading 80 MB per non-pinned MoE layer
         # per token. Populated lazily on first access, cleared on del. ~2.5 GB total.
         self._non_expert_tensor_cache: dict[str, dict] = {}
         if self.running_device.startswith("cuda") and self.is_moe:
-            from .persist.expert_offset_index import ExpertOffsetIndex
             from .persist.expert_cache import ExpertRAMCache
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil
-
-            self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
-            self._expert_offset_index.build_or_load()
 
             _mem = _psutil.virtual_memory()
             # 50% of total RAM: frees budget from skipped MoE pre-population (Fix A).
@@ -1085,9 +1090,16 @@ class VaayuBaseModel(GenerationMixin):
                         self.running_device, self.running_dtype,
                         self.hf_quantizer, getattr(self, "_path_remappings", {}),
                     )
-                    self.pinned_layer_names.add(layer_name)
+                    _is_non_expert_pin = (
+                        self.is_moe and getattr(self, "_expert_offset_index", None) is not None
+                    )
+                    if _is_non_expert_pin:
+                        self.non_expert_pinned_layer_names.add(layer_name)
+                    else:
+                        self.pinned_layer_names.add(layer_name)
                     used += size
-                    print(f"[Vaayu-Pin] pinned {layer_name}: "
+                    _pin_label = "non-expert-pinned" if _is_non_expert_pin else "pinned"
+                    print(f"[Vaayu-Pin] {_pin_label} {layer_name}: "
                           f"{size / 1e9:.2f} GB  (cumulative {used / 1e9:.2f} GB)")
                 except Exception as e:
                     print(f"[Vaayu-Pin] skip {layer_name}: {e}")
@@ -1095,9 +1107,11 @@ class VaayuBaseModel(GenerationMixin):
         pinned_xformer = sum(1 for n in self.pinned_layer_names
                              if n.startswith(layer_prefix + "."))
         pinned_shared = len(self.pinned_layer_names) - pinned_xformer
+        non_expert_xformer = len(self.non_expert_pinned_layer_names)
         print(
-            f"[Vaayu-Pin] {len(self.pinned_layer_names)} layers pinned "
+            f"[Vaayu-Pin] {len(self.pinned_layer_names)} fully-pinned "
             f"({pinned_xformer} transformer + {pinned_shared} shared), "
+            f"{non_expert_xformer} non-expert-pinned transformer, "
             f"{used / 1e9:.2f} GB reserved"
         )
 
@@ -1645,8 +1659,9 @@ class VaayuBaseModel(GenerationMixin):
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
             if self.prefetching:
+                _all_pinned = self.pinned_layer_names | getattr(self, 'non_expert_pinned_layer_names', set())
                 for _seed_name in self.layer_names:
-                    if _seed_name not in self.pinned_layer_names:
+                    if _seed_name not in _all_pinned:
                         if _seed_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
                             future = executor.submit(self._load_non_expert_strategy, _seed_name)
                         else:
@@ -1667,15 +1682,17 @@ class VaayuBaseModel(GenerationMixin):
                 _lt_gpu_transfer_us = 0
                 _lt_compute_us = 0
 
-                if layer_name in self.pinned_layer_names:
-                    # ── Pinned: already in VRAM — zero disk/transfer cost ────
+                _non_expert_pinned = getattr(self, 'non_expert_pinned_layer_names', set())
+                if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
+                    # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
                     _lt_cache_hit = True
                     moved_layers = []
                     # If no future is outstanding, kick off the next non-pinned load
                     # so disk read overlaps with this layer's GPU compute.
                     if self.prefetching and future is None:
+                        _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
                         for _n in self.layer_names[i + 1:]:
-                            if _n not in self.pinned_layer_names:
+                            if _n not in _all_pinned_fwd:
                                 if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
                                     future = executor.submit(self._load_non_expert_strategy, _n)
                                 else:
