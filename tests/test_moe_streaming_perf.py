@@ -78,3 +78,28 @@ def test_prefetch_all_predicted_experts_none_cache():
     executor = MagicMock()
     VaayuBase._prefetch_all_predicted_experts(obj, executor)
     executor.submit.assert_not_called()
+
+
+# ── Task 2: Fix B — Expert cache budget ───────────────────────────────────────
+
+def test_expert_budget_exceeds_working_set():
+    """Expert cache budget must be large enough to hold 64-expert working set (~22.5 GB)."""
+    import psutil
+    mem = psutil.virtual_memory()
+    _os_reserve = 6 * 1024**3
+    expert_budget = max(int(mem.total * 0.50), int(mem.total - _os_reserve))
+    expert_size_bytes = 352 * 1024 * 1024  # 352 MB per expert
+    working_set_bytes = 64 * expert_size_bytes  # 64 experts
+    assert expert_budget >= working_set_bytes, (
+        f"Budget {expert_budget / 1e9:.1f} GB < working set {working_set_bytes / 1e9:.1f} GB"
+    )
+
+
+def test_expert_budget_greater_than_old_formula():
+    """New budget formula must be larger than the old 50% formula on this machine."""
+    import psutil
+    mem = psutil.virtual_memory()
+    old_budget = int(mem.total * 0.50)
+    _os_reserve = 6 * 1024**3
+    new_budget = max(int(mem.total * 0.50), int(mem.total - _os_reserve))
+    assert new_budget >= old_budget

@@ -488,7 +488,9 @@ class VaayuBaseModel(GenerationMixin):
         # consumption is already reflected in available memory, preventing over-budget.
         if device.startswith("cuda"):
             from .persist.ram_cache import LayerRAMCache, auto_detect_cache_budget
-            _cache_budget = auto_detect_cache_budget()
+            # MoE models skip pre-population entirely; the RAM layer cache budget
+            # is wasted allocation. Give that memory to the expert cache instead.
+            _cache_budget = 0 if self.is_moe else auto_detect_cache_budget()
             self.ram_cache = LayerRAMCache(_cache_budget)
             print(f"[Vaayu-Cache] RAM layer cache: {_cache_budget / 1e9:.1f} GB budget")
             self._prepopulate_ram_cache()
@@ -510,14 +512,15 @@ class VaayuBaseModel(GenerationMixin):
             import psutil as _psutil
 
             _mem = _psutil.virtual_memory()
-            # 50% of total RAM: frees budget from skipped MoE pre-population (Fix A).
-            # 33 GB × 0.50 = 16.5 GB → 46 expert slots (vs 33 at 0.35).
-            # Budget sanity: 16.5 GB expert + 0 GB pre-pop + 10.6 GB RAM cache + 6 GB OS/CUDA
-            # = ~33 GB — fits on 33 GB machines. Adjust down if OOM observed.
-            _expert_budget = int(_mem.total * 0.50)
+            # Budget = max(50% floor, total - 6 GB OS reserve).
+            # 33 GB machine: max(16.5, 27) = 27 GB cap → ~77 expert slots.
+            # Per-token working set = 64 experts × 352 MB = 22.5 GB.
+            # Budget is a cap, not pre-allocation: cache grows to ~22.5 GB and stops.
+            _os_reserve = 6 * 1024 ** 3
+            _expert_budget = max(int(_mem.total * 0.50), int(_mem.total - _os_reserve))
             self._expert_cache = ExpertRAMCache(_expert_budget)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
-                  f"(50% of {_mem.total / 1e9:.0f} GB total RAM)")
+                  f"({_expert_budget // (352 * 1024 * 1024)} expert slots on this machine)")
 
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
