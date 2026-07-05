@@ -517,7 +517,14 @@ class VaayuBaseModel(GenerationMixin):
             # Per-token working set = 64 experts × 352 MB = 22.5 GB.
             # Budget is a cap, not pre-allocation: cache grows to ~22.5 GB and stops.
             _os_reserve = 6 * 1024 ** 3
-            _expert_budget = max(int(_mem.total * 0.50), int(_mem.total - _os_reserve))
+            # Cap at decode working set: 64 experts × 352 MB = ~22.5 GB.
+            # Using total RAM overfills during long-prompt prefill (all 8 experts/layer active),
+            # exhausting available memory. LRU handles prefill overflow safely within this cap.
+            _decode_wset = 64 * 352 * 1024 * 1024
+            _expert_budget = min(
+                max(int(_mem.total * 0.50), int(_mem.total - _os_reserve)),
+                _decode_wset,
+            )
             self._expert_cache = ExpertRAMCache(_expert_budget)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
                   f"({_expert_budget // (352 * 1024 * 1024)} expert slots on this machine)")
