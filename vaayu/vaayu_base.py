@@ -1679,7 +1679,10 @@ class VaayuBaseModel(GenerationMixin):
         else:
             _expert_tensor_re = None
 
-        with torch.inference_mode(), ThreadPoolExecutor() as executor:
+        # MoE: cap workers to avoid OOM from concurrent expert prefetch fan-out.
+        # Default workers (cpu_count+4) × 2 experts × 352 MB = RAM spike on 33 GB machines.
+        _exec_workers = 2 if self.is_moe else None
+        with torch.inference_mode(), ThreadPoolExecutor(max_workers=_exec_workers) as executor:
 
             # ── Pre-token batch prefetch: submit all layers using prev token's routing ──
             if self.is_moe and self._token_count > 0:
