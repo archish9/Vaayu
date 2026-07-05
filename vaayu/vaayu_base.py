@@ -1659,7 +1659,7 @@ class VaayuBaseModel(GenerationMixin):
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
             if self.prefetching:
-                _all_pinned = self.pinned_layer_names | getattr(self, 'non_expert_pinned_layer_names', set())
+                _all_pinned = self.pinned_layer_names | self.non_expert_pinned_layer_names
                 for _seed_name in self.layer_names:
                     if _seed_name not in _all_pinned:
                         if _seed_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
@@ -1682,7 +1682,7 @@ class VaayuBaseModel(GenerationMixin):
                 _lt_gpu_transfer_us = 0
                 _lt_compute_us = 0
 
-                _non_expert_pinned = getattr(self, 'non_expert_pinned_layer_names', set())
+                _non_expert_pinned = self.non_expert_pinned_layer_names
                 if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
                     # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
                     _lt_cache_hit = True
@@ -1724,8 +1724,9 @@ class VaayuBaseModel(GenerationMixin):
                     future = None
                     if self.profiling_mode:
                         t = time.time()
+                    _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
                     for _n in self.layer_names[i + 1:]:
-                        if _n not in self.pinned_layer_names:
+                        if _n not in _all_pinned_elif:
                             if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
                                 future = executor.submit(self._load_non_expert_strategy, _n)
                             else:
@@ -1887,7 +1888,7 @@ class VaayuBaseModel(GenerationMixin):
                     all_hidden_states += (torch.cat(batch, 0),)
 
                 # Reclaim VRAM — skip for pinned layers (they stay resident)
-                if layer_name not in self.pinned_layer_names:
+                if layer_name not in self.pinned_layer_names and layer_name not in self.non_expert_pinned_layer_names:
                     self.loader_strategy.free_from_gpu(
                         self.model, layer, moved_layers, self.hf_quantizer
                     )
