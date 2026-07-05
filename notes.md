@@ -1043,3 +1043,25 @@ So, omitting the LRU eviction was mathematically the best possible thing to do f
         modified:   vaayu/persist/safetensor_model_persister.py
         modified:   vaayu/utils.py
         modified:   vaayu/vaayu_base.py
+
+
+
+
+-------------
+
+
+current project is vaayu. Vaayu is local first streaming engin to power autonomous coding agent. Vaayu's main aim is to let user run any model on consumer GPU/low resource machine, which have high-speed NVMe.
+
+I have implemented MoE streaming, so Vaayu stream only active peremeters.
+
+check this files and build deep understanding about things implemented for MoE.
+
+so i belive Vaayu should be lighning fast if MoE streaming is working correctly. but i think in current state vaayu's MoE streaming is not working.
+
+**EVELUTE THIS EVERYTHING AND SHARE A REPORT TELLING ME IF ANYTHIN IS WRONG WITH VAAYU?**
+
+
+------
+
+
+Where Rust could add value (but later, as polish): Extending vaayu_rust to do NVMe → CUDA-pinned-memory → GPU as a single fused pipeline for cache misses. The existing Rust io_uring reader reads into normal RAM, then Python copies to GPU. A Rust pipeline could read directly into pinned memory and kick off DMA without Python touching the data. But this is an optimization for cache misses, which Fix #1 should make rare.
