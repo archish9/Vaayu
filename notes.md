@@ -1065,3 +1065,13 @@ so i belive Vaayu should be lighning fast if MoE streaming is working correctly.
 
 
 Where Rust could add value (but later, as polish): Extending vaayu_rust to do NVMe → CUDA-pinned-memory → GPU as a single fused pipeline for cache misses. The existing Rust io_uring reader reads into normal RAM, then Python copies to GPU. A Rust pipeline could read directly into pinned memory and kick off DMA without Python touching the data. But this is an optimization for cache misses, which Fix #1 should make rare.
+
+
+
+
+---------------
+
+
+My recommendation: Approach 3. Fix C saves less than 1% of original latency at Gen5 and introduces CUDA stream complexity
+  that's hard to debug without telemetry. Fix A + B + D together should get to <0.5s/token. Fix C can always be added later with
+  actual measured numbers to justify it.
