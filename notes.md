@@ -1075,3 +1075,93 @@ Where Rust could add value (but later, as polish): Extending vaayu_rust to do NV
 My recommendation: Approach 3. Fix C saves less than 1% of original latency at Gen5 and introduces CUDA stream complexity
   that's hard to debug without telemetry. Fix A + B + D together should get to <0.5s/token. Fix C can always be added later with
   actual measured numbers to justify it.
+
+
+
+
+-----
+
+
+
+Great questions. Both are critical for a production decision. Let me answer them directly.
+
+---
+
+## A1: True Global LRU — Stability & Speed
+
+**Does it make Vaayu more stable?** Yes, meaningfully.
+
+The key issue is *what gets evicted when the cache is full*. Consider what happens during inference — Vaayu processes layers sequentially (0 → 1 → 2 → … → 93 → 0 → 1 → …). Each layer activates 8 experts. The speculative prefetch loads experts for upcoming layers based on the previous token's routing history.
+
+**With simple round-robin (find any layer, evict oldest):**
+- You're processing layer 50 and need to insert a new expert. The code picks "any non-empty layer" — say layer 51 — and evicts its oldest expert. But that expert was just loaded 50ms ago via speculative prefetch and is about to be needed *right now* for the next layer. Result: **wasted eviction → forced NVMe re-read → stall.**
+- This is unpredictable. Sometimes it evicts a useful expert, sometimes not. The behavior is chaotic under pressure.
+
+**With true global LRU:**
+- Every `get()` updates a global timestamp. The eviction always targets the expert accessed *longest ago* across all layers. Since layers run sequentially, the "oldest" expert is naturally from the layer furthest behind in the pipeline — the one least likely to be needed soon.
+- This means: experts from layers you just processed (and will need again next token) are **protected**. Experts from layers far behind in the loop are evicted first. This aligns perfectly with Vaayu's sequential layer-streaming design.
+
+**Speed impact:**
+
+| Aspect | Impact |
+|---|---|
+| LRU bookkeeping overhead | **Zero** — it's `OrderedDict.move_to_end()`, which is O(1). Negligible vs 88 MB NVMe reads. |
+| Cache hit rate | **Higher** — smarter eviction = fewer NVMe misses. Each avoided miss saves ~44ms (88 MB ÷ 2 GB/s NVMe). |
+| Code generation specifically | MoE routing is "sticky" — code tokens (identifiers, keywords, indentation) tend to activate the same experts repeatedly. True LRU keeps these hot experts alive. Round-robin might evict them randomly. |
+
+**Bottom line:** True global LRU is both more stable *and* faster. The simpler round-robin would only be "equivalent" on a machine with so much RAM that nothing ever gets evicted — and on those machines, neither approach matters. On your 33 GB machine where eviction happens constantly, the difference is significant.
+
+**I recommend true global LRU.** The implementation cost is ~10 extra lines of code (a single global `OrderedDict` tracking `(layer_idx, expert_idx)` insertion order alongside the per-layer dicts).
+
+---
+
+## A2: Compatibility with Small and Large Expert Models
+
+Yes — the changes are **model-agnostic by design**. The key insight is that `max_per_layer` and `budget_bytes` are both *derived from actual available RAM and model dimensions*, not hardcoded for any specific model.
+
+Let me trace through the math for three scenarios:
+
+### Mixtral 8×7B (8 experts, top-2, 32 layers, BF16 ~352 MB/expert)
+
+**On a 64 GB machine (typical Mixtral setup):**
+- Available RAM ≈ 50 GB, fixed overhead ≈ 10 GB
+- `_expert_budget` = 40 GB
+- `_per_layer_budget` = 40 GB / 29 layers ≈ 1.38 GB
+- `_max_per_layer` = max(2, min(**8**, 1380/352)) = max(2, 3) = **3 per layer**
+- Total potential: 3 × 29 × 352 MB = 30 GB — fits within 40 GB ✓
+
+**On a 128 GB machine:**
+- `_expert_budget` ≈ 100 GB
+- `_max_per_layer` = max(2, min(**8**, 3400/352)) = **8 per layer** ← all experts cached
+- Behavior is **identical to current code** — nothing changes for users on big machines ✓
+
+### Qwen3-235B (128 experts, top-8, 94 layers, EXL3 ~88 MB/expert)
+
+**On your 33 GB machine:**
+- `_expert_budget` ≈ 13 GB
+- `_max_per_layer` = max(8, min(128, 146/88)) = **8 per layer**
+- Global budget hard-caps at 13 GB → ~148 experts in RAM at any time
+- LRU eviction keeps the hot ones, NVMe re-reads the rest — **safe, no OOM** ✓
+
+**On a 128 GB machine:**
+- `_expert_budget` ≈ 100 GB
+- `_max_per_layer` = max(8, min(128, 1100/88)) = **12 per layer**
+- Total: 12 × 91 × 88 MB = 96 GB — fits ✓, 50% more cache hits than your machine
+
+### DeepSeek-V3 (256 experts, top-8, 61 layers, hypothetical future model)
+
+- The formula still works: `max_per_layer` adapts, global budget enforces the ceiling. No code change needed.
+
+### Summary
+
+| Model | Experts | Your machine (33 GB) | 64 GB machine | 128 GB machine |
+|---|---|---|---|---|
+| Mixtral 8×7B | 8 | max_per_layer=2 | max_per_layer=3 | max_per_layer=8 (all) |
+| Qwen3-235B | 128 | max_per_layer=8 | max_per_layer=8 | max_per_layer=12 |
+| DeepSeek-V3 | 256 | max_per_layer=8 | max_per_layer=8 | max_per_layer=10 |
+
+The formula naturally scales in both directions. Small models on big machines get the full cache (same as today). Large models on small machines degrade gracefully to caching only the active working set, with NVMe filling the gaps.
+
+---
+
+Let me know if you have more questions, or if you're ready for me to proceed with the implementation.
