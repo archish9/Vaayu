@@ -1372,10 +1372,37 @@ for eidx in unique_experts:
 
 ------------------
 
+1 root cause, confirmed at Rust level: vaayu_rust/src/lib.rs has ONE global IoUring ring behind ONE mutex (RING_STATE: 
+  Mutex<Option<RingState>>, line 30). Held for entire persistent_read() call, not just submission. Result: "8-way" 
+  ThreadPoolExecutor concurrency for loading different experts is fully illusory — only 1 expert loads at a time, process-wide,
+  regardless of pool size. The real (and only real) parallelism in the system is the 32-way SQE fanout inside one expert's own
+  read — cross-expert concurrency doesn't exist.
 
-2. Native Rust Speculative Prefetch Queue
-Impact: Minor / Incremental (maybe 5% to 10% smoother latency). Right now, your 8 prefetch threads are Python threads. Even though PyTorch's tensor.clone() and the io_uring reads release the GIL (Global Interpreter Lock) to do the heavy lifting in C/Rust, the Python threads still have to acquire the GIL for a microsecond to wake up, slice the tensor, and populate the dictionary.
+  This explains everything measured today:
+  - Cold-start throughput: 0.30GB/s vs 3.67GB/s hardware ceiling — 12x gap.
+  - Steady-state throughput: 2.72GB/s vs 3.67GB/s — 74%, "near ceiling" only looked that way because we were comparing against a 
+  single serialized ring, not real hardware limits.
 
-If the main thread is busy doing a heavy matrix multiplication (dispatching EXL3 kernels), it holds the GIL. This can cause "micro-stutters" where a background thread finishes its disk read but has to wait 1-2 milliseconds to hand the data back to Python.
+  #2, structural, no code bug: prefill (439-token prompt = 1 single forward pass, prefill_chunk_size=512) routes top-8-of-128
+  independently per token. Probability any given expert is missed by all 439 tokens ≈ e⁻²⁸ ≈ 0 — essentially the entire model's 
+  expert weights get read from disk once, every prompt, regardless of cache size. Fix C (cache tuning) was structurally never
+  going to help TTFT — confirms that failure wasn't bad luck, it was the wrong lever for that problem. Codebase already
+  half-knows this (clears cache at prefill→decode boundary because prefill fills are known-useless for decode's LRU).
 
-Writing the prefetch queue entirely in Rust would eliminate these micro-stutters and give you perfectly smooth, GIL-free background I/O. However, it is no longer urgent. Since PyTorch drops the GIL during the actual memory copy, Python's threading is already about 90% out of the way.
+  #3, real, unmeasured magnitude, untouched all session: FP8DynamicCache (KV cache) re-cats and fully re-dequantizes the entire 
+  accumulated cache every layer, every token (vaayu_base.py:76-96). O(seq_len) work × 94 layers × every token = O(seq_len²) total
+  waste. Gets worse as generation gets longer — invisible in this session's short 5-60 token samples, would compound visibly in
+  a real 512-token run or long agent conversation.
+
+  #4, real, smaller: RoPE embeddings rebuilt from scratch (new nn.Module + H2D transfer + full forward for up to max_seq_len
+  positions) every single token (vaayu_base.py:1695-1702), not cached.
+
+  Honest big picture: fixing #1 (Rust ring concurrency) could meaningfully cut TTFT (prefill reads ~all experts once — real
+  parallelism helps proportionally) and steady-state decode by up to ~35%. Fixing #3+#4 adds more, especially on long runs. Best
+  case, stacking everything: maybe 0.15-0.26 tok/s → ~0.4-0.5 tok/s. That's a real 2-3x win — and still nowhere near what "engine
+  for an autonomous coding agent" needs (usable range is generally several-to-many tok/s).
+
+  Root constraint no software fix touches: 235B model, 128 experts/layer, top-8 active, on 16GB VRAM/31GB RAM/1 NVMe. Cache can
+  only ever hold a few % of the total expert population — that's architecture math, not a bug. Real levers for "actually usable":
+  a different/smaller model (fewer total experts, more fits resident), more VRAM/RAM, or a second NVMe striped for aggregate
+  bandwidth (hardware ceiling is per-drive; a 2nd drive roughly doubles it).

@@ -68,7 +68,7 @@ _EXPERT_PINNED_SIZE = 0
 _EXPERT_POOL_N = 8  # cap on pool size; actual size is RAM-budgeted, see init_model_io
 _EXPERT_POOL_ACTUAL_N = 1  # actual buffer count allocated, set by init_model_io
 
-_RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
+_RING_INITIALIZED = False   # True after vaayu_rust.init_ring_pool() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
 _BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
                             # incompatible with IORING_REGISTER_BUFFERS (the kernel's
@@ -122,13 +122,14 @@ def _ensure_executor():
         _EXECUTOR = ThreadPoolExecutor(max_workers=_NUM_IO_THREADS)
 
 
-def _init_iouring_ring(queue_depth: int = 32) -> bool:
+def _init_iouring_ring(pool_size: int, queue_depth: int = 32) -> bool:
     try:
-        vaayu_rust.init_ring(queue_depth)
-        print(f"[VAAYU-IO] persistent ring initialized  qd={queue_depth}")
+        n = pool_size
+        vaayu_rust.init_ring_pool(n, queue_depth)
+        print(f"[VAAYU-IO] persistent ring pool initialized  n={n}  qd={queue_depth}")
         return True
     except Exception as e:
-        print(f"[VAAYU-IO] init_ring failed: {e} — per-call ring fallback active")
+        print(f"[VAAYU-IO] init_ring_pool failed: {e} — per-call ring fallback active")
         return False
 
 
@@ -147,13 +148,15 @@ def _register_iouring_files(model_dir: str, use_direct_io: bool = True) -> bool:
 
 
 def init_model_io(model_dir: str, use_direct_io: bool) -> None:
-    """Called once at model load. Initializes ring and registers files explicitly."""
+    """Called once at model load. Initializes ring pool and registers files explicitly.
+
+    Buffer-pool sizing runs BEFORE ring init: the ring pool is sized to match
+    get_expert_pool_size() (real concurrency is capped there regardless, since
+    every load_expert_sparse() call blocks on _EXPERT_BUF_POOL.get() before it
+    ever reaches io_uring_read_into), so that number must be known first.
+    """
     global _RING_INITIALIZED, _FILES_REGISTERED, _USE_DIRECT_IO
     _USE_DIRECT_IO = use_direct_io
-    if _USE_IOURING and not _RING_INITIALIZED:
-        _RING_INITIALIZED = _init_iouring_ring(32)
-    if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
-        _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
 
     global _EXPERT_PINNED_SIZE, _EXPERT_POOL_ACTUAL_N
     if _USE_PINNED and _EXPERT_BUF_POOL.empty():
@@ -191,6 +194,11 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
             f"  n={_n_bufs}  size={_EXPERT_PINNED_SIZE / (1024**2):.1f}MB each"
             f"  total={total_mb:.1f}MB  (avail={_avail_gb:.1f}GB)"
         )
+
+    if _USE_IOURING and not _RING_INITIALIZED:
+        _RING_INITIALIZED = _init_iouring_ring(get_expert_pool_size(), 32)
+    if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
+        _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
 
 
 def get_expert_pool_size() -> int:

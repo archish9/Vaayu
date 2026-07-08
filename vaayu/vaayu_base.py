@@ -72,6 +72,13 @@ class FP8DynamicCache(DynamicCache):
         self.value_cache: list = []
         self._key_scales: list = []
         self._value_scales: list = []
+        # Cached dequantized output. Old positions never change once written, so each
+        # update() only needs to dequantize the *new* slice and append it here, instead
+        # of re-multiplying the entire accumulated key_cache/_key_scales by the full
+        # scale tensor every call (which was previously redone from scratch, every
+        # layer, every token, regardless of how much of the cache was actually new).
+        self._k_out_cache: list = []
+        self._v_out_cache: list = []
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):  # cache_kwargs intentionally unused
         k_scale = key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
@@ -80,20 +87,25 @@ class FP8DynamicCache(DynamicCache):
         k_fp8 = (key_states / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
         v_fp8 = (value_states / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
+        k_new_out = k_fp8.to(key_states.dtype) * k_scale
+        v_new_out = v_fp8.to(value_states.dtype) * v_scale
+
         if layer_idx < len(self.key_cache):
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_fp8], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_fp8], dim=-2)
             self._key_scales[layer_idx] = torch.cat([self._key_scales[layer_idx], k_scale], dim=-2)
             self._value_scales[layer_idx] = torch.cat([self._value_scales[layer_idx], v_scale], dim=-2)
+            self._k_out_cache[layer_idx] = torch.cat([self._k_out_cache[layer_idx], k_new_out], dim=-2)
+            self._v_out_cache[layer_idx] = torch.cat([self._v_out_cache[layer_idx], v_new_out], dim=-2)
         else:
             self.key_cache.append(k_fp8)
             self.value_cache.append(v_fp8)
             self._key_scales.append(k_scale)
             self._value_scales.append(v_scale)
+            self._k_out_cache.append(k_new_out)
+            self._v_out_cache.append(v_new_out)
 
-        k_out = self.key_cache[layer_idx].to(key_states.dtype) * self._key_scales[layer_idx]
-        v_out = self.value_cache[layer_idx].to(value_states.dtype) * self._value_scales[layer_idx]
-        return k_out, v_out
+        return self._k_out_cache[layer_idx], self._v_out_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Returns the sequence length of the cached states for the given layer."""
@@ -1688,28 +1700,37 @@ class VaayuBaseModel(GenerationMixin):
         # config rather than calling the meta-initialized module.  After
         # init_empty_weights(), rotary_emb.inv_freq is an uninitialized CUDA tensor
         # (garbage values) which would produce NaN/overflow and corrupt hidden states.
-        if self.get_rotary_emb() is not None:
-            try:
-                # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
-                # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
-                rotary_emb_cls = type(self.get_rotary_emb())
-                real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
-
-                # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
-                dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
-                dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
-
-                self._full_position_embeddings = real_rotary(dummy_x, position_ids)
-            except Exception as e:
-                print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+        #
+        # _pos_range is constant (== self.max_seq_len) for any generation that doesn't
+        # outgrow max_seq_len, but this block used to recompute from scratch (new module
+        # instance + H2D transfer + full forward) on every single token regardless. Cache
+        # the result keyed on the values it was actually computed from; only recompute
+        # when one of them changes (e.g. the rare case of outgrowing max_seq_len).
+        _rope_cache_key = (_pos_range, self.running_device, self.running_dtype)
+        if getattr(self, '_rope_cache_key', None) != _rope_cache_key:
+            if self.get_rotary_emb() is not None:
                 try:
-                    self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
-                except Exception as e2:
-                    print(f"Manual RoPE fallback also failed ({e2}). RoPE will be computed per-layer.")
-                    torch.cuda.empty_cache()
-                    self._full_position_embeddings = None
-        else:
-            self._full_position_embeddings = None
+                    # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
+                    # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
+                    rotary_emb_cls = type(self.get_rotary_emb())
+                    real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+
+                    # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
+                    dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+                    dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+
+                    self._full_position_embeddings = real_rotary(dummy_x, position_ids)
+                except Exception as e:
+                    print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+                    try:
+                        self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+                    except Exception as e2:
+                        print(f"Manual RoPE fallback also failed ({e2}). RoPE will be computed per-layer.")
+                        torch.cuda.empty_cache()
+                        self._full_position_embeddings = None
+            else:
+                self._full_position_embeddings = None
+            self._rope_cache_key = _rope_cache_key
 
         if use_cache and past_key_values is None:
             past_key_values = self._create_kv_cache()
@@ -2071,6 +2092,8 @@ class VaayuBaseModel(GenerationMixin):
                 cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
                 cache._key_scales[i] = cache._key_scales[i][:, :, :target_seq_len, :]
                 cache._value_scales[i] = cache._value_scales[i][:, :, :target_seq_len, :]
+                cache._k_out_cache[i] = cache._k_out_cache[i][:, :, :target_seq_len, :]
+                cache._v_out_cache[i] = cache._v_out_cache[i][:, :, :target_seq_len, :]
         elif hasattr(cache, 'key_cache'):
             for i in range(len(cache.key_cache)):
                 if len(cache.key_cache[i].shape) >= 3:
@@ -2087,6 +2110,8 @@ class VaayuBaseModel(GenerationMixin):
                 cache.value_cache[i]   = cache.value_cache[i][:, :, -target_seq_len:, :]
                 cache._key_scales[i]   = cache._key_scales[i][:, :, -target_seq_len:, :]
                 cache._value_scales[i] = cache._value_scales[i][:, :, -target_seq_len:, :]
+                cache._k_out_cache[i]  = cache._k_out_cache[i][:, :, -target_seq_len:, :]
+                cache._v_out_cache[i]  = cache._v_out_cache[i][:, :, -target_seq_len:, :]
         elif hasattr(cache, 'key_cache'):
             for i in range(len(cache.key_cache)):
                 if cache.key_cache[i] is not None and len(cache.key_cache[i].shape) >= 3:

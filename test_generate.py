@@ -39,9 +39,9 @@ MAX_LENGTH         = 2048
 PREFILL_CHUNK_SIZE = 512
 
 # PLD OFF — novel code generation, zero n-gram match with prompt.
-DRAFTER_MODEL_PATH = None
+DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
 USE_PROMPT_LOOKUP  = False
-DRAFT_TOKENS       = 0
+DRAFT_TOKENS       = 5
 
 # ──────────────────────────────────────────────────────────────────────────────
 
