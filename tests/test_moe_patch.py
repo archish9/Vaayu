@@ -196,6 +196,12 @@ class MockVaayuRef:
     def __init__(self):
         self._expert_history: dict[int, list[int]] = {}
         self.pinned_layer_names: set = set()
+        # Real persistent executor, matching what vaayu_base.py now creates once
+        # at model init (see vaayu_base.py's self._moe_executor) instead of
+        # per-layer-per-token — sparse_forward's miss path calls
+        # vaayu_ref._moe_executor.map(...) directly.
+        from concurrent.futures import ThreadPoolExecutor
+        self._moe_executor = ThreadPoolExecutor(max_workers=4)
 
 
 def test_patch_moe_blocks_replaces_forward(tmp_path):
@@ -556,3 +562,63 @@ def test_exl3_forward_calls_bc_run_alloc(tmp_path):
     assert out.shape == (1, 1, 8), f"Expected (1,1,8) got {out.shape}"
     assert mock_bc.run_alloc.called, "BC_LinearEXL3 run_alloc was never called — EXL3 path did not execute"
     assert len(vaayu_ref._expert_history) > 0
+
+
+def _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16, num_experts=8):
+    """Write genuine EXL3-shaped (trellis/suh/svh) per-expert tensors to disk, so
+    the cache-miss path's real load_expert_sparse() call has real data to read —
+    unlike _make_fused_checkpoint, which writes plain w1/w2/w3 (BF16-style)
+    tensors that _group_exl3_tensors_by_weight can't parse."""
+    for layer_idx in range(num_layers):
+        layer_name = f"layers.{layer_idx}"
+        tensors = {}
+        for eidx in range(num_experts):
+            tensors.update(_make_mock_exl3_raw(layer_name, eidx, in_dim=hidden, out_dim=out_dim))
+        tensors[f"{layer_name}.mlp.gate.weight"] = torch.randn(num_experts, hidden)
+        _save_file(tensors, str(tmp_path / f"{layer_name}.safetensors"))
+
+
+def test_exl3_forward_handles_cache_miss_via_persistent_executor(tmp_path):
+    """Cache-miss path uses vaayu_ref._moe_executor (persistent) instead of a
+    per-call ThreadPoolExecutor, and correctly loads + caches missed experts."""
+    from vaayu.moe_patch import _make_fused_sparse_forward_exl3
+
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    from vaayu.moe_patch import detect_moe_blocks
+    blocks = detect_moe_blocks(model)
+    block_info = blocks[0]
+
+    # Deliberately do NOT pre-populate the cache — every routed expert is a miss,
+    # forcing the vaayu_ref._moe_executor.map(...) branch to actually run.
+
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.side_effect = lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16)
+
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", return_value=mock_bc):
+        fwd = _make_fused_sparse_forward_exl3(
+            block_info=block_info,
+            expert_cache=cache,
+            offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)),
+            top_k=2,
+            device="cpu",
+            dtype=torch.float32,
+            vaayu_ref=vaayu_ref,
+        )
+        block_info.moe_module.forward = fwd
+        out = model.layers[0].mlp.forward(torch.randn(1, 1, 8))
+
+    assert out.shape == (1, 1, 8), f"Expected (1,1,8) got {out.shape}"
+    assert mock_bc.run_alloc.called, "BC_LinearEXL3 run_alloc was never called on cache-miss path"
+    # Every expert selected by the router should now be cached, proving the
+    # persistent executor's _load_one() ran and populated expert_cache.put().
+    selected = vaayu_ref._expert_history.get(0, [])
+    assert selected, "no experts recorded in routing history"
+    for eidx in selected:
+        assert cache.get(0, eidx) is not None, f"expert {eidx} was not cached after miss-path load"

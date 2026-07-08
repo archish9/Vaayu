@@ -561,7 +561,7 @@ def _make_fused_sparse_forward_exl3(
     PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
     """
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse, get_expert_pool_size
+    from .persist.safetensor_model_persister import load_expert_sparse
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -609,7 +609,6 @@ def _make_fused_sparse_forward_exl3(
         if misses:
             if _prof:
                 _t0 = time.perf_counter()
-            from concurrent.futures import ThreadPoolExecutor as _TPE
 
             def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
@@ -619,18 +618,15 @@ def _make_fused_sparse_forward_exl3(
                 expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 
-            # Cap concurrency at the actual pinned-buffer pool size, not a fixed
-            # constant: load_expert_sparse() blocks on _EXPERT_BUF_POOL.get() when
-            # no buffer is free, so dispatching more workers than there are buffers
-            # buys zero real I/O parallelism — just thread/queue overhead sitting
-            # on top of the same serialized reads (confirmed: max_workers=8 caused
-            # a real OOM-kill on this 31GB-RAM machine where the pool is sized to
-            # only 1 buffer, and max_workers=3 measurably regressed cold-start time
-            # vs the fully serial baseline for the same reason).
-            with _TPE(max_workers=min(len(misses), get_expert_pool_size())) as _ex:
-                for eidx, raw in _ex.map(_load_one, misses):
-                    if raw is not None:
-                        expert_tensors[eidx] = raw
+            # Uses vaayu_ref._moe_executor — a persistent ThreadPoolExecutor created
+            # once at model init (sized to get_expert_pool_size(), fixed for the
+            # model's lifetime), instead of creating/destroying a fresh executor on
+            # every layer of every token. .map() only dispatches len(misses) tasks
+            # regardless of pool size, so this is behaviorally identical to the old
+            # per-call min(len(misses), get_expert_pool_size()) cap.
+            for eidx, raw in vaayu_ref._moe_executor.map(_load_one, misses):
+                if raw is not None:
+                    expert_tensors[eidx] = raw
             if _prof:
                 _mp['disk_load'] += time.perf_counter() - _t0
 

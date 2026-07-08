@@ -1,3 +1,4 @@
+import atexit
 import gc
 import os
 import subprocess
@@ -20,6 +21,7 @@ from .profiler import LayeredProfiler
 from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
 from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
+from .persist.safetensor_model_persister import get_expert_pool_size
 
 # BetterTransformer is deprecated in newer optimum versions
 try:
@@ -597,6 +599,15 @@ class VaayuBaseModel(GenerationMixin):
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
                   f"(~{_expert_budget // (_expert_mb * 1024 * 1024)} expert slots, "
                   f"max {_max_per_layer}/layer, {'EXL3' if _is_exl3 else 'BF16'})")
+
+            # Persistent executor for expert cache-miss loads, created once here instead
+            # of per-layer-per-token inside sparse_forward. get_expert_pool_size() is
+            # fixed for the model's lifetime (set once during init_model_io), so a
+            # pool sized to it behaves identically to the old per-call
+            # min(len(misses), get_expert_pool_size()) cap — .map() only dispatches
+            # as many tasks as there are misses regardless of pool size.
+            self._moe_executor = ThreadPoolExecutor(max_workers=get_expert_pool_size())
+            atexit.register(self._moe_executor.shutdown, wait=False)
 
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
