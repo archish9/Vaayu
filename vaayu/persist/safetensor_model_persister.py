@@ -65,7 +65,8 @@ _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concu
 import queue as _queue
 _EXPERT_BUF_POOL: "_queue.Queue[torch.Tensor]" = _queue.Queue()
 _EXPERT_PINNED_SIZE = 0
-_EXPERT_POOL_N = 8  # one buffer per worker; matches ThreadPoolExecutor max_workers in moe_patch.py
+_EXPERT_POOL_N = 8  # cap on pool size; actual size is RAM-budgeted, see init_model_io
+_EXPERT_POOL_ACTUAL_N = 1  # actual buffer count allocated, set by init_model_io
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
@@ -154,9 +155,20 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
         _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
 
-    global _EXPERT_PINNED_SIZE
+    global _EXPERT_PINNED_SIZE, _EXPERT_POOL_ACTUAL_N
     if _USE_PINNED and _EXPERT_BUF_POOL.empty():
-        _EXPERT_PINNED_SIZE = 512 * 1024 * 1024  # 512 MB per expert buffer
+        # Buffer must fit the largest single contiguous read group per expert, not
+        # a flat guess. EXL3 checkpoints measured ~11.8 MB max group (trellis quant
+        # keeps expert size near-constant); 512 MB was sized for uncompressed BF16
+        # experts and was ~43x oversized for EXL3, starving the pool down to a
+        # single buffer on RAM-constrained machines. Non-EXL3 keeps the original
+        # 512 MB (unverified but unchanged — no evidence it's wrong).
+        try:
+            from .loader_strategy import _is_exl3_checkpoint
+            _is_exl3 = _is_exl3_checkpoint(model_dir)
+        except Exception:
+            _is_exl3 = False
+        _EXPERT_PINNED_SIZE = (32 if _is_exl3 else 512) * 1024 * 1024
 
         # Budget pool size against available RAM. Reserve 27 GB for: layer load
         # double-buffer (~6 GB), expert RAM cache (~16.5 GB), non-expert tensor
@@ -165,18 +177,31 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
         # (still parallel vs the old single-locked buffer); on 64+ GB machines 8.
         _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
         _pool_budget_gb = max(0.5, _avail_gb - 27.0)
-        _n_bufs = max(1, min(_EXPERT_POOL_N, int(_pool_budget_gb * 1024 / 512)))
+        _buf_mb = _EXPERT_PINNED_SIZE / (1024 * 1024)
+        _n_bufs = max(1, min(_EXPERT_POOL_N, int(_pool_budget_gb * 1024 / _buf_mb)))
 
         for _ in range(_n_bufs):
             _EXPERT_BUF_POOL.put(
                 torch.empty(_EXPERT_PINNED_SIZE, dtype=torch.uint8, pin_memory=True)
             )
+        _EXPERT_POOL_ACTUAL_N = _n_bufs
         total_mb = _n_bufs * _EXPERT_PINNED_SIZE / (1024 ** 2)
         print(
             f"[VAAYU-IO] alloc expert buffer pool"
             f"  n={_n_bufs}  size={_EXPERT_PINNED_SIZE / (1024**2):.1f}MB each"
             f"  total={total_mb:.1f}MB  (avail={_avail_gb:.1f}GB)"
         )
+
+
+def get_expert_pool_size() -> int:
+    """Actual pinned-buffer pool size (RAM-budgeted, may be < _EXPERT_POOL_N).
+
+    Concurrent load_expert_sparse() callers beyond this count block on
+    _EXPERT_BUF_POOL.get() rather than gaining real I/O parallelism — callers
+    doing concurrent dispatch (e.g. a ThreadPoolExecutor) should cap their
+    worker count at this value.
+    """
+    return max(1, _EXPERT_POOL_ACTUAL_N)
 
 
 import atexit

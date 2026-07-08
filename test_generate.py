@@ -1,14 +1,15 @@
 """
-Code-generation-from-scratch test.
+Code-generation benchmark.
 
-Model: Qwen2.5-Coder-1.5B (instruction-tuned, ChatML format)
+Model: whatever MODEL_PATH below points to (any vaayu.AutoModel-supported architecture).
 Task:  Generate a complete async file watcher Python module from spec.
 PLD:   OFF — output is novel code, not copied from prompt.
 
-Tests:
-  - Chunked prefill (prompt > PREFILL_CHUNK_SIZE)
-  - Pure decode throughput
-  - Output quality (model should produce runnable Python)
+Reports:
+  - Prompt tokens, output tokens
+  - Time-to-first-token (TTFT)
+  - Decode throughput (tokens/sec, excluding TTFT)
+  - Total generation time
 
 Run:
     source venv/bin/activate
@@ -144,13 +145,27 @@ if getattr(model, 'speculator', None) is not None:
           f"(draft_tokens={DRAFT_TOKENS})")
 
 print("\nOutput:\n", flush=True)
+first_token_time = None
+output_text = ""
 for chunk in stream_generate(
     model,
     input_tokens['input_ids'].to(DEVICE),
     max_new_tokens=MAX_NEW_TOKENS,
 ):
+    if first_token_time is None and chunk:
+        first_token_time = time.time()
+    output_text += chunk
     print(chunk, end="", flush=True)
 print()
 
 elapsed = time.time() - start_time
-print(f"\nTotal generation time: {elapsed:.1f}s ({elapsed / 60:.2f} minutes)")
+ttft = (first_token_time - start_time) if first_token_time is not None else elapsed
+output_tokens = len(model.tokenizer(output_text, add_special_tokens=False)['input_ids'])
+decode_elapsed = elapsed - ttft
+decode_tok_per_s = ((output_tokens - 1) / decode_elapsed) if decode_elapsed > 0 and output_tokens > 1 else 0.0
+
+print(f"\nPrompt tokens: {n_tokens}")
+print(f"Output tokens: {output_tokens}")
+print(f"Time to first token: {ttft:.2f}s")
+print(f"Decode throughput: {decode_tok_per_s:.2f} tokens/sec")
+print(f"Total generation time: {elapsed:.1f}s ({elapsed / 60:.2f} minutes)")

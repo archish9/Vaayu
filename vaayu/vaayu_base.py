@@ -526,15 +526,42 @@ class VaayuBaseModel(GenerationMixin):
             # Expert budget: derived from *available* RAM (which already reflects
             # pinned layer allocations) minus reserves for non-expert cache, OS,
             # CUDA context, and io_uring buffers.
+            #
+            # Per-expert size: measured from the real offset index rather than a
+            # hardcoded guess — quant bpw varies per checkpoint, so a fixed
+            # constant silently mis-sizes cache capacity for any model whose real
+            # expert size differs (measured EXL3 5.0bpw here: ~11.8 MB, not the
+            # previously hardcoded 88 MB — starved max_per_layer by ~7.5x).
             _expert_mb = 88 if _is_exl3 else 352
+            if self._expert_offset_index is not None:
+                for _layer_tensors in self._expert_offset_index.index.values():
+                    for _expert_tensors in _layer_tensors.values():
+                        _real_bytes = sum(t.byte_length for t in _expert_tensors.values())
+                        if _real_bytes > 0:
+                            _expert_mb = _real_bytes / (1024 * 1024)
+                        break
+                    break
+
             _overhead = (
                 2 * 1024**3          # OS + CUDA context margin
                 + _ne_budget         # non-expert tensor cache (just allocated above)
                 + 512 * 1024 * 1024  # io_uring expert buffer pool
             )
-            _expert_budget = max(
-                1 * 1024**3,  # floor: at least 1 GB so decode always works
-                int(_mem.available - _overhead),
+            # Hard cap at 7 GB regardless of the available-RAM formula above. Measured
+            # via isolation test (real OOM-kills, journalctl -k) that this model's
+            # non-cache RAM overhead (layer double-buffers, CUDA context, Python/torch)
+            # is ~17GB+ once loading is underway — the available-at-init-time formula
+            # doesn't see that yet, so a correctly-sized per-expert budget derived from
+            # it was still large enough to OOM once the cache actually reached it (which
+            # it couldn't before, when a wrong 88MB/expert guess silently self-limited
+            # real fill far below the nominal budget). 7GB real cache still beats the
+            # old effective ~2.9GB (243 slots x 11.8MB real) by ~2.4x.
+            _expert_budget = min(
+                7 * 1024**3,
+                max(
+                    1 * 1024**3,  # floor: at least 1 GB so decode always works
+                    int(_mem.available - _overhead),
+                ),
             )
 
             # max_per_layer: derived from available RAM, not hardcoded.
@@ -1692,6 +1719,13 @@ class VaayuBaseModel(GenerationMixin):
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
 
+        # MoE dispatch sub-timing (mask sync / disk load / H2D / object construct / GEMM),
+        # gated behind profiling_mode so it's zero-cost when disabled.
+        self._moe_profile = (
+            {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+            if self.profiling_mode and self.is_moe else None
+        )
+
         # MoE: precompute set of shard names that contain MoE experts so we can
         # filter expert tensors out of inject_to_gpu. sparse_forward handles experts.
         _moe_shard_names: set[str] = (
@@ -1990,6 +2024,9 @@ class VaayuBaseModel(GenerationMixin):
         _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
         _expert_cache_stats = self._expert_cache.stats() if self._expert_cache is not None else "n/a"
         print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}")
+        if self._moe_profile is not None:
+            _mp = self._moe_profile
+            print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")
 
         if not return_dict:
             return tuple(v for v in [logits,

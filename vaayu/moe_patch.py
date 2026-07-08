@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -560,12 +561,15 @@ def _make_fused_sparse_forward_exl3(
     PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
     """
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse
+    from .persist.safetensor_model_persister import load_expert_sparse, get_expert_pool_size
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
+        _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
+        _mp = vaayu_ref._moe_profile if _prof else None
+
         moe_mod = block_info.moe_module
         router = getattr(moe_mod, block_info.router_attr)
         experts_mod = getattr(moe_mod, block_info.experts_attr)
@@ -585,26 +589,58 @@ def _make_fused_sparse_forward_exl3(
             )
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
-        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        if _prof:
+            torch.cuda.synchronize(); _t0 = time.perf_counter()
+        expert_indices_cpu = expert_indices.cpu()
+        unique_experts: list[int] = expert_indices_cpu.flatten().unique().tolist()
+        if _prof:
+            _mp['mask_sync'] += time.perf_counter() - _t0
 
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         expert_tensors: dict[int, dict] = {}
+        misses: list[int] = []
         for eidx in unique_experts:
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
                 expert_tensors[eidx] = cached
             else:
+                misses.append(eidx)
+
+        if misses:
+            if _prof:
+                _t0 = time.perf_counter()
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+
+            def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
-                    continue
+                    return eidx, None
                 raw = load_expert_sparse(shard_file, metas)
                 expert_cache.put(layer_idx, eidx, raw)
-                expert_tensors[eidx] = raw
+                return eidx, raw
 
-        expert_indices_cpu = expert_indices.cpu()
+            # Cap concurrency at the actual pinned-buffer pool size, not a fixed
+            # constant: load_expert_sparse() blocks on _EXPERT_BUF_POOL.get() when
+            # no buffer is free, so dispatching more workers than there are buffers
+            # buys zero real I/O parallelism — just thread/queue overhead sitting
+            # on top of the same serialized reads (confirmed: max_workers=8 caused
+            # a real OOM-kill on this 31GB-RAM machine where the pool is sized to
+            # only 1 buffer, and max_workers=3 measurably regressed cold-start time
+            # vs the fully serial baseline for the same reason).
+            with _TPE(max_workers=min(len(misses), get_expert_pool_size())) as _ex:
+                for eidx, raw in _ex.map(_load_one, misses):
+                    if raw is not None:
+                        expert_tensors[eidx] = raw
+            if _prof:
+                _mp['disk_load'] += time.perf_counter() - _t0
+
+        if _prof:
+            _t0 = time.perf_counter()
         expert_mask = F.one_hot(
             expert_indices_cpu, num_classes=experts_mod.num_experts
         ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+        if _prof:
+            _mp['mask_sync'] += time.perf_counter() - _t0
 
         # Infer intermediate_size from first available expert's gate trellis
         intermediate_size = None
@@ -641,20 +677,32 @@ def _make_fused_sparse_forward_exl3(
             if current_state.dtype != torch.float16:
                 current_state = current_state.to(torch.float16)
 
+            if _prof:
+                torch.cuda.synchronize(); _t0 = time.perf_counter()
             gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
             gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
             gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
+            if _prof:
+                torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
 
             bc_gate = bc_down = bc_up = None
             try:
+                if _prof:
+                    _t0 = time.perf_counter()
                 bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
                 bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
                 bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
+                if _prof:
+                    torch.cuda.synchronize(); _mp['construct'] += time.perf_counter() - _t0
 
+                if _prof:
+                    _t0 = time.perf_counter()
                 x_flat = current_state.view(-1, H)
                 gate_out = act_fn(bc_gate.run_alloc(x_flat, intermediate_size, False))
                 up_out   = bc_up.run_alloc(x_flat, intermediate_size, False)
                 hidden   = bc_down.run_alloc((gate_out * up_out).contiguous(), H, False)
+                if _prof:
+                    torch.cuda.synchronize(); _mp['gemm'] += time.perf_counter() - _t0
 
                 weights_slice = routing_weights[token_idx_gpu, top_k_pos.to(device), None]
                 hidden = hidden * weights_slice
