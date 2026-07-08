@@ -1368,3 +1368,14 @@ for eidx in unique_experts:
 ```
 *   **Why Rust/C++ helps:** Instantiating `BC_LinearEXL3` objects and running them sequentially for 8 active experts in Python introduces significant Python-to-C++ call overhead.
 *   **The Fix:** Bind to ExLlamaV3's `BlocksparseMLP` C++ class directly, or implement a single Rust/C++ dispatch kernel that receives the active expert pointers, runs them in parallel streams, and aggregates the outputs in one call.
+
+
+------------------
+
+
+2. Native Rust Speculative Prefetch Queue
+Impact: Minor / Incremental (maybe 5% to 10% smoother latency). Right now, your 8 prefetch threads are Python threads. Even though PyTorch's tensor.clone() and the io_uring reads release the GIL (Global Interpreter Lock) to do the heavy lifting in C/Rust, the Python threads still have to acquire the GIL for a microsecond to wake up, slice the tensor, and populate the dictionary.
+
+If the main thread is busy doing a heavy matrix multiplication (dispatching EXL3 kernels), it holds the GIL. This can cause "micro-stutters" where a background thread finishes its disk read but has to wait 1-2 milliseconds to hand the data back to Python.
+
+Writing the prefetch queue entirely in Rust would eliminate these micro-stutters and give you perfectly smooth, GIL-free background I/O. However, it is no longer urgent. Since PyTorch drops the GIL during the actual memory copy, Python's threading is already about 90% out of the way.

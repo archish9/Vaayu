@@ -556,6 +556,14 @@ class VaayuBaseModel(GenerationMixin):
             # it couldn't before, when a wrong 88MB/expert guess silently self-limited
             # real fill far below the nominal budget). 7GB real cache still beats the
             # old effective ~2.9GB (243 slots x 11.8MB real) by ~2.4x.
+            # TRIED raising to 10GB after direct RAM-headroom measurement (50-token
+            # steady-state poll showed floor ~7.2GB available) — caused a REAL OOM-kill
+            # on the very next verification run (anon-rss 26.46GB, confirmed via
+            # journalctl -k). The 50-token measurement window wasn't representative
+            # of worst-case system memory pressure (other processes' usage varies
+            # over time, longer runs grow KV cache further). Do not raise this cap
+            # again without a much larger safety margin AND a longer verification
+            # run than the one that produced the headroom estimate.
             _expert_budget = min(
                 7 * 1024**3,
                 max(
