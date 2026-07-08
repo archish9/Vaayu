@@ -9,8 +9,15 @@ class ExpertRAMCache:
     LRU cache for MoE expert weight tensors, keyed by (layer_idx, expert_idx).
 
     Separate from LayerRAMCache (which caches whole layers for dense models).
-    Budget enforced in bytes; LRU eviction keeps hot experts resident in RAM.
     Thread-safe: single lock guards all mutations and reads.
+
+    Two eviction constraints enforced simultaneously:
+      1. Per-layer cap (max_per_layer): prevents a single hot layer from
+         monopolising the cache. Evicts oldest expert *within* that layer.
+      2. Global budget (budget_bytes): hard RAM ceiling. Evicts the
+         globally-oldest expert across *all* layers (true LRU).
+
+    When max_per_layer == 0, falls back to a flat global LRU (original path).
     """
 
     def __init__(self, budget_bytes: int, max_per_layer: int = 0):
@@ -18,6 +25,9 @@ class ExpertRAMCache:
         self.max_per_layer = max_per_layer
         # per-layer mode: {layer_idx: OrderedDict[expert_idx, tensors]}
         self._layer_caches: dict[int, OrderedDict] = {} if max_per_layer > 0 else {}
+        # True global LRU: tracks (layer_idx, expert_idx) insertion/access order
+        # across all layers. Used for cross-layer eviction when budget is exceeded.
+        self._global_lru: OrderedDict = OrderedDict()  # key → None (order-only)
         self.cache: OrderedDict = OrderedDict()  # global LRU (used when max_per_layer == 0)
         self.current_usage = 0
         self.lock = threading.Lock()
@@ -30,6 +40,10 @@ class ExpertRAMCache:
                 lc = self._layer_caches.get(layer_idx)
                 if lc and expert_idx in lc:
                     lc.move_to_end(expert_idx)
+                    # Update global LRU access order
+                    key = (layer_idx, expert_idx)
+                    if key in self._global_lru:
+                        self._global_lru.move_to_end(key)
                     self.hits += 1
                     return dict(lc[expert_idx])
                 self.misses += 1
@@ -57,14 +71,24 @@ class ExpertRAMCache:
                 lc = self._layer_caches.setdefault(layer_idx, OrderedDict())
                 if expert_idx in lc:
                     return
-                # Evict oldest within this layer if at per-layer cap
+
+                # 1. Per-layer fairness: evict oldest within this layer
                 while len(lc) >= self.max_per_layer:
-                    _, evicted = lc.popitem(last=False)
+                    evicted_eidx, evicted = lc.popitem(last=False)
                     self.current_usage -= sum(t.nbytes for t in evicted.values())
+                    self._global_lru.pop((layer_idx, evicted_eidx), None)
+
+                # 2. Global budget enforcement: evict globally-oldest across ALL layers
+                while self.current_usage + raw_size > self.budget_bytes:
+                    if not self._evict_global_oldest():
+                        return  # Can't free anything — refuse insert (OOM guard)
+
                 lc[expert_idx] = cloned
                 self.current_usage += raw_size
+                self._global_lru[(layer_idx, expert_idx)] = None
                 return
-            # Global LRU path (max_per_layer == 0)
+
+            # Global LRU path (max_per_layer == 0) — unchanged
             key = (layer_idx, expert_idx)
             if key in self.cache:
                 return
@@ -76,10 +100,29 @@ class ExpertRAMCache:
             self.cache[key] = cloned
             self.current_usage += raw_size
 
+    def _evict_global_oldest(self) -> bool:
+        """Evict the single oldest expert across all layers (true global LRU).
+
+        Returns False if nothing left to evict.
+        Must be called while self.lock is held.
+        """
+        if not self._global_lru:
+            return False
+        (lid, eidx), _ = self._global_lru.popitem(last=False)
+        lc = self._layer_caches.get(lid)
+        if lc and eidx in lc:
+            evicted = lc.pop(eidx)
+            self.current_usage -= sum(t.nbytes for t in evicted.values())
+            # Clean up empty layer dicts to avoid unbounded key growth
+            if not lc:
+                del self._layer_caches[lid]
+        return True
+
     def clear(self) -> None:
         with self.lock:
             if self.max_per_layer > 0:
                 self._layer_caches.clear()
+                self._global_lru.clear()
             else:
                 self.cache.clear()
             self.current_usage = 0
@@ -94,3 +137,54 @@ class ExpertRAMCache:
                 f"usage={self.current_usage / 1e9:.2f}GB/"
                 f"{self.budget_bytes / 1e9:.2f}GB"
             )
+
+
+class LRUTensorCache:
+    """
+    Byte-budgeted LRU cache for arbitrary tensor dicts, keyed by string.
+
+    Used for non-expert tensor caching (attention weights, norms, router gates)
+    where keys are layer names like "model.layers.3". Prevents the unbounded
+    dict growth that exhausted RAM on large MoE models.
+
+    Thread-safe: single lock guards all mutations and reads.
+    """
+
+    def __init__(self, budget_bytes: int):
+        self.budget_bytes = budget_bytes
+        self._cache: OrderedDict[str, dict] = OrderedDict()
+        self._sizes: dict[str, int] = {}  # key → byte size
+        self.current_usage = 0
+        self.lock = threading.Lock()
+
+    def __contains__(self, key: str) -> bool:
+        with self.lock:
+            return key in self._cache
+
+    def get(self, key: str) -> dict | None:
+        with self.lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
+
+    def put(self, key: str, tensors: dict) -> None:
+        raw_size = sum(t.nbytes for t in tensors.values())
+        with self.lock:
+            if key in self._cache:
+                return
+            # Evict LRU entries until there's room
+            while self.current_usage + raw_size > self.budget_bytes and self._cache:
+                evicted_key, _ = self._cache.popitem(last=False)
+                self.current_usage -= self._sizes.pop(evicted_key, 0)
+            if self.current_usage + raw_size > self.budget_bytes:
+                return  # single entry exceeds budget — refuse
+            self._cache[key] = tensors
+            self._sizes[key] = raw_size
+            self.current_usage += raw_size
+
+    def clear(self) -> None:
+        with self.lock:
+            self._cache.clear()
+            self._sizes.clear()
+            self.current_usage = 0

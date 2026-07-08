@@ -195,6 +195,7 @@ class MockVaayuRef:
     """Minimal stand-in for VaayuBaseModel to receive routing history writes."""
     def __init__(self):
         self._expert_history: dict[int, list[int]] = {}
+        self.pinned_layer_names: set = set()
 
 
 def test_patch_moe_blocks_replaces_forward(tmp_path):
@@ -295,7 +296,9 @@ def test_sparse_forward_output_shape(tmp_path):
     )
 
     hidden = torch.randn(1, 3, 8)
-    out = model.layers[0].block_sparse_moe.forward(hidden)
+    result = model.layers[0].block_sparse_moe.forward(hidden)
+    # modulelist sparse_forward returns (final_hidden, router_logits)
+    out = result[0] if isinstance(result, tuple) else result
     assert out.shape == (1, 3, 8)
 
 
@@ -320,7 +323,9 @@ def test_sparse_forward_batch_size_2(tmp_path):
     )
 
     hidden = torch.randn(2, 3, 8)  # B=2
-    out = model.layers[0].block_sparse_moe.forward(hidden)
+    result = model.layers[0].block_sparse_moe.forward(hidden)
+    # modulelist sparse_forward returns (final_hidden, router_logits)
+    out = result[0] if isinstance(result, tuple) else result
     assert out.shape == (2, 3, 8)
 
 

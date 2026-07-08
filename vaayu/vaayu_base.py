@@ -503,34 +503,52 @@ class VaayuBaseModel(GenerationMixin):
         self._expert_history: dict[int, list[int]] = {}
         self._expert_cache = None
         self._moe_blocks: list = []
-        # Non-expert tensor dict cache: avoids re-reading 80 MB per non-pinned MoE layer
-        # per token. Populated lazily on first access, cleared on del. ~2.5 GB total.
-        self._non_expert_tensor_cache: dict[str, dict] = {}
+        # Non-expert tensor cache: byte-budgeted LRU avoids re-reading ~44 MB per
+        # non-pinned MoE layer per token. Capped to prevent unbounded RAM growth
+        # on large models (e.g. Qwen3-235B with 94 layers).
+        self._non_expert_tensor_cache = None  # initialized below for MoE
         if self.running_device.startswith("cuda") and self.is_moe:
-            from .persist.expert_cache import ExpertRAMCache
+            from .persist.expert_cache import ExpertRAMCache, LRUTensorCache
             from .moe_patch import patch_moe_blocks
             from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
 
             _is_exl3 = isinstance(self.loader_strategy, EXL3LoaderStrategy)
             _mem = _psutil.virtual_memory()
-            _os_reserve = 6 * 1024 ** 3
-            # BF16: expert ~352 MB, decode working set = top_k * layers * 352 MB.
-            # EXL3 4.5bpw: expert ~88 MB — all moe_num_experts * layers fit in budget,
-            # so cap at the full per-layer-all-experts working set instead.
+
+            # Non-expert tensor cache: cap at 2 GB or 1/8 of available RAM.
+            # Sequential layer processing means only one layer is active at a time;
+            # the LRU keeps recently-used layers warm for the next token.
+            _ne_budget = min(2 * 1024**3, int(_mem.available / 8))
+            self._non_expert_tensor_cache = LRUTensorCache(_ne_budget)
+            print(f"[Vaayu-Cache] Non-expert tensor cache: {_ne_budget / 1e9:.1f} GB budget")
+
+            # Expert budget: derived from *available* RAM (which already reflects
+            # pinned layer allocations) minus reserves for non-expert cache, OS,
+            # CUDA context, and io_uring buffers.
             _expert_mb = 88 if _is_exl3 else 352
-            _decode_wset = self.moe_num_experts * _expert_mb * 1024 * 1024 * len(self.layers) if _is_exl3 \
-                else self.moe_top_k * 32 * 352 * 1024 * 1024
-            _expert_budget = min(
-                max(int(_mem.total * 0.50), int(_mem.total - _os_reserve)),
-                _decode_wset,
+            _overhead = (
+                2 * 1024**3          # OS + CUDA context margin
+                + _ne_budget         # non-expert tensor cache (just allocated above)
+                + 512 * 1024 * 1024  # io_uring expert buffer pool
             )
-            # EXL3: all experts per layer fit in budget → max_per_layer = moe_num_experts (8).
-            # BF16: budget tight → max_per_layer = moe_top_k (2), keep only actively-used experts.
-            _max_per_layer = self.moe_num_experts if _is_exl3 else self.moe_top_k
+            _expert_budget = max(
+                1 * 1024**3,  # floor: at least 1 GB so decode always works
+                int(_mem.available - _overhead),
+            )
+
+            # max_per_layer: derived from available RAM, not hardcoded.
+            # Per-layer share = total budget / number of MoE layers.
+            # Clamped: at least top_k (must cache the active set), at most num_experts.
+            _num_moe_layers = max(1, len(self.layers) - 3)  # minus embed, norm, lm_head
+            _per_layer_bytes = _expert_budget // _num_moe_layers
+            _max_per_layer = max(
+                self.moe_top_k,
+                min(self.moe_num_experts, _per_layer_bytes // (_expert_mb * 1024 * 1024)),
+            )
             self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
-                  f"({_expert_budget // (_expert_mb * 1024 * 1024)} expert slots, "
+                  f"(~{_expert_budget // (_expert_mb * 1024 * 1024)} expert slots, "
                   f"max {_max_per_layer}/layer, {'EXL3' if _is_exl3 else 'BF16'})")
 
             self._moe_blocks = patch_moe_blocks(
@@ -1263,21 +1281,23 @@ class VaayuBaseModel(GenerationMixin):
         return self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
 
     def _load_non_expert_strategy(self, layer_name: str) -> dict:
-        """For MoE layers: load only non-expert tensors (~80 MB instead of 2.77 GB).
+        """For MoE layers: load only non-expert tensors (~44 MB instead of full layer).
 
-        Results cached in _non_expert_tensor_cache (simple dict, ~2.5 GB total for
-        32 Mixtral layers). After the first token, all non-expert reads are O(1)
-        dict lookups with no disk I/O.
+        Results cached in _non_expert_tensor_cache (byte-budgeted LRU).
+        After the first token, most non-expert reads are cache hits with no disk I/O.
+        On RAM-constrained machines, LRU eviction keeps the working set warm.
         """
         cache = getattr(self, '_non_expert_tensor_cache', None)
-        if cache is not None and layer_name in cache:
-            return cache[layer_name]
+        if cache is not None:
+            cached = cache.get(layer_name)
+            if cached is not None:
+                return cached
         from .persist.safetensor_model_persister import load_non_expert_tensors
         from pathlib import Path as _Path
         file_path = str(_Path(self.checkpoint_path) / (layer_name + ".safetensors"))
         result = load_non_expert_tensors(file_path, layer_name, self._expert_offset_index)
         if cache is not None:
-            cache[layer_name] = result
+            cache.put(layer_name, result)
         return result
 
     def load_layer_to_cpu(self, layer_name):
