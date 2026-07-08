@@ -30,7 +30,7 @@ logging.basicConfig(
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MODEL_PATH         = "/home/a/code/ai-ml/models/mistralai--Mixtral-8x7B-Instruct-v0.1"
+MODEL_PATH         = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 MAX_NEW_TOKENS     = 512

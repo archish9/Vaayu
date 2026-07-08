@@ -614,7 +614,7 @@ def _make_fused_sparse_forward_exl3(
                 groups = _group_exl3_tensors_by_weight(raw)
                 t = groups.get("gate", {}).get("trellis")
                 if t is not None:
-                    intermediate_size = t.shape[0]
+                    intermediate_size = t.shape[1] * 16
                     break
         if intermediate_size is None:
             _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")
