@@ -25,8 +25,9 @@ expert-load timing **unconditional** and adds it to the summary.
 - Timing must be near-zero cost when nothing is being read (a few
   `time.perf_counter()` calls per layer is fine).
 - Match existing code style (no new dependencies, no refactors).
-- `moe_layers` for this model = 91 (94 − 3). Expert size = 11.28 MB. These are
-  facts, not things to compute at runtime.
+- **Model-agnostic:** this fix times whatever the loader reads — no model numbers
+  involved. It works unchanged for Qwen, M2.5, or any model. (Qwen context: 91 MoE
+  layers, ~11.28 MB experts — cited only to interpret the numbers you'll see.)
 
 ---
 

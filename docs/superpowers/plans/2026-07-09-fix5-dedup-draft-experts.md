@@ -23,7 +23,9 @@ position that routed to it without re-reading.
 ## Global Constraints
 
 - Behavior-preserving on model outputs.
-- top_k = 8, num_experts = 128, expert = 11.28 MB.
+- **Model-agnostic:** the dedup helper operates on the runtime `expert_indices`
+  tensor and tensor shapes — no model constants. Works for Qwen (128 experts) and
+  M2.5 (256) identically. Illustrative Qwen values: top_k 8, 128 experts, ~11.3 MB.
 - The forward may process `B*S` positions where `S` > 1 during speculative
   verification. Dedup is across the flattened `B*S` positions.
 

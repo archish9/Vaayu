@@ -30,7 +30,11 @@ tell if it is working.
   `ExpertRAMCache.lock`. Keep it that way.
 - A prefetched-but-unused expert is not free — it costs a slot. Do not prefetch
   more than the cache can hold, or you re-create thrash.
-- Expert size 11.28 MB, working set 8.02 GB, budget 8.5 GB after Fix #1.
+- **Model-agnostic:** all model numbers come from `self._moe_geometry` (Fix #1
+  Task 0) — `expert_bytes`, `working_set_bytes`. Never hardcode. Qwen values
+  (11.3 MB / 8.02 GB) and M2.5 values (11.3 MB / 5.5 GB) both flow through the
+  same code. **This fix requires `self._moe_geometry` to exist — apply Fix #1
+  Task 0 first (or add the helper from REPORT §1.5).**
 
 ---
 
@@ -295,7 +299,9 @@ with:
         room = prefetch_room_bytes(
             self._expert_cache.current_usage, self._expert_cache.budget_bytes
         )
-        expert_bytes = int(11.28 * 1024 * 1024)  # measured EXL3 expert size
+        # Model-agnostic: expert size comes from _moe_geometry (Fix #1 Task 0),
+        # NOT a hardcoded constant. Qwen ~11.3MB, M2.5 ~11.3MB, other models differ.
+        expert_bytes = max(1, self._moe_geometry["expert_bytes"])
         budget_experts = room // expert_bytes
         submitted = 0
         for layer_idx, expert_list in self._expert_history.items():
@@ -342,10 +348,10 @@ disk reads now overlap compute instead of stalling it.
 - **Order matters.** If run before Fix #1, `prefetch_used` will be ~0/Y and this
   fix looks broken — because it is starved by thrash, not defective. Verify Fix #1
   first.
-- The `11.28 MB` constant is this model's expert size. If a different model is
-  loaded, read it from `self._expert_offset_index` instead of hardcoding (same
-  measurement loop as `compute_expert_budget`). For this model, the constant is
-  correct.
+- Expert size is read from `self._moe_geometry["expert_bytes"]` (Fix #1 Task 0),
+  never hardcoded — so prefetch budgeting is correct for Qwen, M2.5, and any future
+  model. If Fix #1 has not been applied yet, add the `compute_moe_geometry` helper
+  from the REPORT §1.5 first (this fix depends on `self._moe_geometry` existing).
 - Do not prefetch across the prefill→decode boundary: `_expert_history` is cleared
   effectively by the cache clear at first decode token. Existing code already gates
   on `self._token_count > 0`; leave that.

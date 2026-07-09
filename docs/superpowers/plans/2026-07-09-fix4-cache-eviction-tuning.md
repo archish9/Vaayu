@@ -21,8 +21,13 @@ experts are not the first evicted.
 
 ## Global Constraints
 
-- Expert size = 11.28 MB, moe_layers = 91, top_k = 8, num_experts = 128.
-- Working set = 8.02 GB. After Fix #1, budget = 8.5 GB (~772 slots).
+- **Model-agnostic:** all model numbers derived from `_moe_geometry` (Fix #1
+  Task 0). The Qwen instance (11.28 MB / 91 layers / 128 experts / 8.02 GB) is
+  shown only as illustration; the M2.5 instance (11.3 MB / 62 / 256 / 5.5 GB) must
+  work through the same code. Never hardcode.
+- The invariant this fix enforces is dimensionless:
+  `max_per_layer × num_moe_layers × expert_bytes ≤ budget_bytes`. True for any
+  model when `max_per_layer` is clamped by `compute_expert_budget` (Fix #1).
 - Pure caching-policy change. Must not change what `get`/`put`/`has` return.
 - Keep thread safety: all counter/state mutations under `self.lock`.
 - The cache already has `hits`, `misses`, `evictions`, `reset_stats()`,
@@ -63,12 +68,17 @@ Set `max_per_layer` so that `max_per_layer × moe_layers × expert_bytes` is
 budget and the global-budget loop rarely fires), and skip the redundant
 global-eviction pass when the per-layer cap already made room.
 
-For budget 8.5 GB, moe_layers 91, expert 11.28 MB:
-`8.5 GB / 91 / 11.28 MB = 8.4` → `max_per_layer = 8` would give `8×91×11.28MB =
-8.02 GB < 8.5 GB` ✓. So the per-layer cap of 8 is already consistent — the bug is
-that the global-budget loop still runs and evicts *cross-layer* when a transient
-spike (e.g. a step touching 9-10 experts in one layer via speculative draft
-positions, see Fix #5) pushes usage up. Fix #4 makes the two rules cooperate.
+Worked per model (illustration only — code derives these):
+- **Qwen** (budget 8.5 GB, 91 layers, 11.28 MB): `8.5/91/11.28MB = 8.4 → cap 8`,
+  giving `8×91×11.28MB = 8.02 GB < 8.5 GB` ✓.
+- **M2.5** (budget 8.5 GB, 62 layers, 11.3 MB): `8.5/62/11.3MB = 12.1 → cap 12`,
+  giving `12×62×11.3MB = 8.21 GB < 8.5 GB` ✓ (and 12 > top_k 8 → real stickiness
+  headroom, which is why M2.5 barely thrashes).
+
+So the per-layer cap is already budget-consistent for both — the bug is that the
+global-budget loop still runs and evicts *cross-layer* when a transient spike
+(e.g. a step touching more experts in one layer via speculative draft positions,
+see Fix #5) pushes usage up. Fix #4 makes the two rules cooperate for any model.
 
 ---
 
@@ -203,16 +213,25 @@ git commit -m "test: lock per-layer/global LRU cooperation (Fix #4)"
 Add to `tests/test_expert_budget_sizing.py`:
 
 ```python
-def test_max_per_layer_never_exceeds_global_budget():
-    from vaayu.vaayu_base import compute_expert_budget
-    GB = 1024 ** 3
-    MB = 1024 ** 2
+import pytest
+from vaayu.vaayu_base import compute_expert_budget
+GB = 1024 ** 3
+MB = 1024 ** 2
+
+@pytest.mark.parametrize("layers,experts,expert_mb,ws_gb", [
+    (91, 128, 11.28, 8.02),   # Qwen3-235B
+    (62, 256, 11.30, 5.50),   # MiniMax-M2.5
+])
+def test_max_per_layer_never_exceeds_global_budget(layers, experts, expert_mb, ws_gb):
+    expert_bytes = int(expert_mb * MB)
     budget, ne, mpl = compute_expert_budget(
         available_bytes=int(26.5 * GB),
-        num_moe_layers=91, expert_mb=11.28, moe_top_k=8, moe_num_experts=128,
+        working_set_bytes=int(ws_gb * GB),
+        num_moe_layers=layers, expert_bytes=expert_bytes,
+        moe_top_k=8, moe_num_experts=experts,
     )
-    # Collective per-layer capacity must fit within the global budget.
-    collective = mpl * 91 * 11.28 * MB
+    # Collective per-layer capacity must fit within the global budget (any model).
+    collective = mpl * layers * expert_bytes
     assert collective <= budget, (
         f"per-layer caps ({collective/GB:.2f}GB) exceed global budget "
         f"({budget/GB:.2f}GB) → cross-layer thrash"
@@ -222,23 +241,24 @@ def test_max_per_layer_never_exceeds_global_budget():
 
 - [ ] **Step 2: Run to verify**
 
-Run: `source venv/bin/activate && python -m pytest tests/test_expert_budget_sizing.py::test_max_per_layer_never_exceeds_global_budget -v`
-Expected: PASS if Fix #1's `compute_expert_budget` already clamps
-`max_per_layer` via `per_layer_bytes // expert_bytes` (it does:
-`8.5GB/91/11.28MB = 8.4 → 8`, and `8×91×11.28MB = 8.02GB ≤ 8.5GB` ✓). If it
+Run: `source venv/bin/activate && python -m pytest "tests/test_expert_budget_sizing.py::test_max_per_layer_never_exceeds_global_budget" -v`
+Expected: PASS for both parametrized models if Fix #1's `compute_expert_budget`
+clamps `max_per_layer` via `per_layer_bytes // expert_bytes`
+(Qwen: `8.5GB/91/11.28MB = 8.4 → 8`, `8×91×11.28MB = 8.02GB ≤ 8.5GB` ✓;
+M2.5: `8.5GB/62/11.3MB = 12.1 → 12`, `12×62×11.3MB = 8.21GB ≤ 8.5GB` ✓). If it
 FAILS, tighten the clamp in Step 3.
 
 - [ ] **Step 3: (Only if Step 2 failed) tighten the clamp**
 
-In `compute_expert_budget`, ensure:
+In `compute_expert_budget`, ensure (note: `expert_bytes`, not `expert_mb`):
 ```python
     per_layer_bytes = expert_budget // max(1, num_moe_layers)
     max_per_layer = max(
         moe_top_k,
-        min(moe_num_experts, int(per_layer_bytes // (expert_mb * MB))),
+        min(moe_num_experts, int(per_layer_bytes // max(1, expert_bytes))),
     )
     # Guard: collective per-layer capacity must not exceed global budget.
-    while max_per_layer > moe_top_k and (max_per_layer * num_moe_layers * expert_mb * MB) > expert_budget:
+    while max_per_layer > moe_top_k and (max_per_layer * num_moe_layers * expert_bytes) > expert_budget:
         max_per_layer -= 1
 ```
 

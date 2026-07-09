@@ -30,7 +30,10 @@ case and does a single bulk read.
   steps). Decode's small miss sets must keep using the existing per-expert path.
 - Threshold: if `len(misses) >= BULK_THRESHOLD` fraction of experts in the layer.
   Use `BULK_THRESHOLD_RATIO = 0.5` (miss ≥ 50% of the layer's experts → bulk).
-- Expert size 11.28 MB; a full layer's experts ≈ 128 × 11.28 MB ≈ 1.44 GB.
+- **Model-agnostic:** the bulk trigger uses a *ratio* (`len(misses) ≥ 0.5 ×
+  experts_mod.num_experts`) and reads `num_experts` from the running module — no
+  hardcoded expert count. Qwen: a full layer ≈ 128 × 11.28 MB ≈ 1.44 GB; M2.5 ≈
+  256 × 11.3 MB ≈ 2.9 GB. The span read adapts automatically. Do not hardcode 128.
 - Do not break `use_direct_io` / pinned-buffer alignment invariants.
 
 ---
