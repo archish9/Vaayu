@@ -62,4 +62,37 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
+## 5. Model-Agnostic Mandate (Vaayu-specific — NON-NEGOTIABLE)
+
+**Vaayu must run ANY MoE model on low-resource hardware — never one specific model.**
+Current targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5 (62 layers,
+256 experts), selected in `test_generate.py`. More will follow. Any code, plan, or
+fix you produce MUST work for all of them without edits.
+
+**Rules — apply to every change and every plan:**
+- **Never hardcode a model number.** Expert byte-size, layer count, expert count,
+  top_k, hidden size, working-set size, intermediate size — all are DERIVED at load
+  time (from config + the expert offset index), never literals. If you catch
+  yourself typing `11.28`, `88`, `94`, `91`, `128`, `256`, `8.02` in code, stop —
+  read it from `self._moe_geometry` (see `compute_moe_geometry`) or the config.
+- **The only fixed constants are HARDWARE limits** — this box's VRAM (16 GB), RAM
+  (32 GB), the ~8.5 GB expert-cache OOM ceiling, PCIe/NVMe bandwidth. Those are
+  properties of the machine, not the model. They stay literal (and commented as
+  hardware constants).
+- **Detection over assumption.** Find MoE blocks, router names, and expert tensor
+  roles by probing the module tree / checkpoint keys (as `moe_patch.py` already
+  does), not by matching an architecture string.
+- **Test both models.** Any sizing/caching helper gets a test parametrized over at
+  least the Qwen-like and MiniMax-like geometries. A fix that only proves out on
+  Qwen is not done.
+- **When a model genuinely doesn't fit the hardware, warn — don't silently
+  degrade.** (e.g. working set > cache budget → print a WARNING; it's a real limit,
+  not a bug to hide.)
+
+If a plan or request would bake in one model's numbers, say so and derive instead.
+The reference doc is `docs/superpowers/plans/2026-07-09-vaayu-moe-perf-REPORT.md`
+§1.5 (the `_moe_geometry` single-source-of-truth contract).
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

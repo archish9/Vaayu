@@ -232,6 +232,15 @@ the model-agnostic code makes each fix do the right thing per model automaticall
 | 3 | `...-fix3-prefetch-effectiveness.md` | Make prefetch land + cap to headroom (needs #1 on Qwen; helps M2.5 immediately) | MED −3-4 s/step | S | latency hiding |
 | 2 | `...-fix2-sequential-prefill.md` | Bulk-sequential reads when miss set ≥ half a layer (ratio, model-agnostic) | MED-HIGH TTFT 89→~50 s | M | prefill only |
 | 5 | `...-fix5-dedup-draft-experts.md` | Dedup expert reads across speculative draft positions | LOW-MED | M | partial |
+| 7 | `2026-07-10-fix7-vram-expert-cache.md` | VRAM-resident expert cache — hot experts skip per-token CPU→GPU H2D (the ~3 tok/s PCIe floor, unaddressed by #1-#6) | **HIGH** on both models, bigger on M2.5 | M | PCIe floor |
+| 8 | `2026-07-10-fix8-fp8-kv-ring-buffer.md` | FP8 KV cache: pre-allocated ring buffer instead of O(seq²) per-token cat | MED on long runs | M | long-gen scaling |
+
+> #7 and #8 (added 2026-07-10) came out of a full-codebase review. #7 attacks the
+> RAM→GPU floor beneath the NVMe thrash that #1 fixes — even at 100% RAM-cache hit,
+> every token re-copies the whole active set (Qwen ~8 GB, M2.5 ~5.5 GB) CPU→GPU and
+> rebuilds ~thousands of EXL3 kernel objects. #8 kills the quadratic KV-cat that
+> compounds on 512-token agent runs. Both are model-agnostic (derive from
+> `_moe_geometry` / incoming tensor shapes).
 
 ### Recommended execution order
 
