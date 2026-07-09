@@ -1786,6 +1786,9 @@ class VaayuBaseModel(GenerationMixin):
             # warms from decode routing rather than prefill routing.
             if self.is_moe and self._token_count == 0 and input_ids.shape[1] == 1 and self._expert_cache is not None:
                 self._expert_cache.clear()
+                # Reset counters so decode hit-rate is measured clean, without
+                # prefill's ~100%-miss pollution (prefill routes ~all experts once).
+                self._expert_cache.reset_stats()
 
             # ── Pre-token batch prefetch: submit all layers using prev token's routing ──
             if self.is_moe and self._token_count > 0:
@@ -2063,7 +2066,8 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[Vaayu] total execution time: {_total:.3f}s")
         _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
         _expert_cache_stats = self._expert_cache.stats() if self._expert_cache is not None else "n/a"
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}")
+        _expert_cache_delta = self._expert_cache.delta_stats() if self._expert_cache is not None else "n/a"
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")

@@ -33,6 +33,11 @@ class ExpertRAMCache:
         self.lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
+        # Baseline for per-interval delta reporting (see delta_stats).
+        self._last_hits = 0
+        self._last_misses = 0
+        self._last_evictions = 0
 
     def get(self, layer_idx: int, expert_idx: int) -> dict | None:
         with self.lock:
@@ -77,6 +82,7 @@ class ExpertRAMCache:
                     evicted_eidx, evicted = lc.popitem(last=False)
                     self.current_usage -= sum(t.nbytes for t in evicted.values())
                     self._global_lru.pop((layer_idx, evicted_eidx), None)
+                    self.evictions += 1
 
                 # 2. Global budget enforcement: evict globally-oldest across ALL layers
                 while self.current_usage + raw_size > self.budget_bytes:
@@ -95,6 +101,7 @@ class ExpertRAMCache:
             while self.current_usage + raw_size > self.budget_bytes and self.cache:
                 _, evicted = self.cache.popitem(last=False)
                 self.current_usage -= sum(t.nbytes for t in evicted.values())
+                self.evictions += 1
             if self.current_usage + raw_size > self.budget_bytes:
                 return
             self.cache[key] = cloned
@@ -113,6 +120,7 @@ class ExpertRAMCache:
         if lc and eidx in lc:
             evicted = lc.pop(eidx)
             self.current_usage -= sum(t.nbytes for t in evicted.values())
+            self.evictions += 1
             # Clean up empty layer dicts to avoid unbounded key growth
             if not lc:
                 del self._layer_caches[lid]
@@ -127,16 +135,42 @@ class ExpertRAMCache:
                 self.cache.clear()
             self.current_usage = 0
 
+    def reset_stats(self) -> None:
+        """Zero all counters. Called at the prefill→decode boundary so decode
+        hit-rate is measured clean, without prefill's ~100%-miss pollution."""
+        with self.lock:
+            self.hits = 0
+            self.misses = 0
+            self.evictions = 0
+            self._last_hits = 0
+            self._last_misses = 0
+            self._last_evictions = 0
+
     def stats(self) -> str:
         with self.lock:
             total = self.hits + self.misses
             rate = f"{self.hits / total:.0%}" if total > 0 else "n/a"
             return (
-                f"{self.hits}hit/{self.misses}miss "
+                f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
                 f"hit_rate={rate} "
                 f"usage={self.current_usage / 1e9:.2f}GB/"
                 f"{self.budget_bytes / 1e9:.2f}GB"
             )
+
+    def delta_stats(self) -> str:
+        """Hits/misses/evictions since the previous delta_stats() call, plus the
+        per-interval hit rate. Reveals per-token decode behaviour that cumulative
+        stats() hides. Advances the baseline each call."""
+        with self.lock:
+            dh = self.hits - self._last_hits
+            dm = self.misses - self._last_misses
+            de = self.evictions - self._last_evictions
+            self._last_hits = self.hits
+            self._last_misses = self.misses
+            self._last_evictions = self.evictions
+            total = dh + dm
+            rate = f"{dh / total:.0%}" if total > 0 else "n/a"
+            return f"{dh}hit/{dm}miss/{de}evict hit_rate={rate}"
 
 
 class LRUTensorCache:

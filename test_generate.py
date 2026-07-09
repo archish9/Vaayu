@@ -34,7 +34,7 @@ logging.basicConfig(
 MODEL_PATH         = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
-MAX_NEW_TOKENS     = 512
+MAX_NEW_TOKENS     = 25
 MAX_LENGTH         = 2048
 PREFILL_CHUNK_SIZE = 512
 
