@@ -147,6 +147,12 @@ def compute_expert_budget(
     return expert_budget, ne_budget, max_per_layer
 
 
+def prefetch_room_bytes(current_usage: int, budget_bytes: int) -> int:
+    """Bytes of cache headroom available for prefetch without forcing eviction
+    of resident experts. Fix #3: prefetching past this re-creates thrash."""
+    return max(0, int(budget_bytes) - int(current_usage))
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1395,14 +1401,27 @@ class VaayuBaseModel(GenerationMixin):
 
         Called once at the start of each forward pass (token N). Later layers get
         the compute time of all earlier layers as a prefetch window. Only submits
-        tasks for experts not already in cache.
+        tasks for experts not already in cache. Capped to cache headroom (Fix #3)
+        to prevent prefetch from evicting resident experts.
         """
         if not self._expert_history or self._expert_cache is None:
             return
+        room = prefetch_room_bytes(
+            self._expert_cache.current_usage, self._expert_cache.budget_bytes
+        )
+        # Model-agnostic: expert size comes from _moe_geometry (Fix #1 Task 0),
+        # NOT a hardcoded constant. Qwen ~11.3MB, M2.5 ~11.3MB, other models differ.
+        expert_bytes = max(1, self._moe_geometry["expert_bytes"])
+        budget_experts = room // expert_bytes
+        submitted = 0
         for layer_idx, expert_list in self._expert_history.items():
+            if submitted >= budget_experts:
+                break  # no room left; prefetching more would evict resident experts
             uncached = [e for e in expert_list
                         if not self._expert_cache.has(layer_idx, e)]
+            uncached = uncached[: max(0, budget_experts - submitted)]
             if uncached:
+                submitted += len(uncached)
                 executor.submit(self._prefetch_experts, layer_idx, uncached)
 
     # ── Strategy helper ───────────────────────────────────────────────────────

@@ -24,3 +24,13 @@ def test_prefetch_wasted_when_evicted_before_use():
     c.put(0, 6, _expert())  # evicts expert 5 before it was ever used
     assert c.get(0, 5) is None
     assert c.prefetch_hits == 0  # wasted prefetch
+
+
+def test_prefetch_budget_guard_limits_when_full():
+    from vaayu.vaayu_base import prefetch_room_bytes
+    # cache nearly full → little room → small allowance
+    room = prefetch_room_bytes(current_usage=8.4 * 10**9, budget_bytes=8.5 * 10**9)
+    assert 0 <= room <= 0.1 * 10**9 + 1
+    # cache empty → full budget available
+    room2 = prefetch_room_bytes(current_usage=0, budget_bytes=8.5 * 10**9)
+    assert room2 > 8 * 10**9

@@ -42,6 +42,11 @@ def test_prefetch_all_predicted_experts_skips_cached():
     obj._expert_cache = MagicMock()
     # expert (layer=0, idx=0) is already cached; all others are not
     obj._expert_cache.has.side_effect = lambda layer, expert: (layer == 0 and expert == 0)
+    # Mock cache headroom for prefetch budgeting (Fix #3)
+    obj._expert_cache.current_usage = 0
+    obj._expert_cache.budget_bytes = int(10 * 1024 ** 3)  # 10 GB budget
+    # Mock _moe_geometry for model-agnostic expert sizing (Fix #1)
+    obj._moe_geometry = {"expert_bytes": int(11.3 * 1024 ** 2)}  # ~11.3 MB per expert
     obj._prefetch_experts = MagicMock()
 
     executor = MagicMock()
