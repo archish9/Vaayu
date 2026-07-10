@@ -77,6 +77,54 @@ def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_exp
     }
 
 
+# Hardware constant for THIS 32 GB box: max safe expert-cache size before OOM.
+# Model-independent. Raised from the old 7 GB only after shrinking other RAM
+# consumers (below). Do NOT exceed 9 GB — 10 GB caused a confirmed OOM-kill.
+_EXPERT_CACHE_OOM_CEILING = int(8.5 * 1024 ** 3)
+
+
+def compute_expert_budget(
+    available_bytes: int,
+    working_set_bytes: int,
+    num_moe_layers: int,
+    expert_bytes: int,
+    moe_top_k: int,
+    moe_num_experts: int,
+):
+    """Size the expert RAM cache to exceed the DERIVED decode working set, up to
+    the hardware OOM ceiling. Model-agnostic (Fix #1, REPORT §1.5).
+
+    working_set_bytes comes from compute_moe_geometry — never hardcoded. When RAM
+    allows, budget > working_set → no thrash (Qwen: raises to ~8.5 GB; M2.5: its
+    5.5 GB working set already fits). When the model's working set exceeds the
+    achievable budget, the caller warns and proceeds (real hardware limit).
+
+    Returns (expert_budget_bytes, ne_budget_bytes, max_per_layer).
+    """
+    GB = 1024 ** 3
+    MB = 1024 ** 2
+    # Non-expert cache shrunk 2GB -> 0.5GB: all layers are non-expert-pinned, so
+    # this LRU is idle during decode (measured cache=0hit/0miss).
+    ne_budget = min(512 * MB, int(available_bytes / 8))
+    overhead = (
+        int(1.5 * GB)        # OS + CUDA context margin (was 2 GB)
+        + ne_budget          # non-expert tensor cache
+        + 512 * MB           # io_uring expert buffer pool
+    )
+    expert_budget = min(
+        _EXPERT_CACHE_OOM_CEILING,               # hardware ceiling, not a model number
+        max(1 * GB, available_bytes - overhead),
+    )
+    # max_per_layer derived from expert_bytes (any quant/model). Clamped so the
+    # collective per-layer capacity never exceeds the global budget (Fix #4).
+    per_layer_bytes = expert_budget // max(1, num_moe_layers)
+    max_per_layer = max(
+        moe_top_k,
+        min(moe_num_experts, int(per_layer_bytes // max(1, expert_bytes))),
+    )
+    return expert_budget, ne_budget, max_per_layer
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
