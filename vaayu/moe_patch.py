@@ -683,13 +683,26 @@ def _make_fused_sparse_forward_exl3(
             if current_state.dtype != torch.float16:
                 current_state = current_state.to(torch.float16)
 
-            if _prof:
-                torch.cuda.synchronize(); _t0 = time.perf_counter()
-            gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
-            gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
-            gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
-            if _prof:
-                torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
+            _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+            _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
+            if _cached_gpu is not None:
+                gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]
+                _owned_by_cache = True
+            else:
+                if _prof:
+                    torch.cuda.synchronize(); _t0 = time.perf_counter()
+                gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
+                gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
+                gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
+                if _prof:
+                    torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
+                if _vram is not None:
+                    # put() returns True only if the cache actually accepted ownership
+                    # (it can refuse if this exact key raced in, or if a single expert
+                    # is larger than the whole budget) — only then do we skip the free.
+                    _owned_by_cache = _vram.put(layer_idx, eidx, {"gate": gpu_gate, "up": gpu_up, "down": gpu_down})
+                else:
+                    _owned_by_cache = False
 
             bc_gate = bc_down = bc_up = None
             try:
@@ -716,7 +729,12 @@ def _make_fused_sparse_forward_exl3(
             finally:
                 # CRITICAL: free C++ QMatrix objects — Python GC cannot manage them
                 bc_gate = bc_down = bc_up = None
-                del gpu_gate, gpu_down, gpu_up
+                # Only free GPU tensors if the VRAM cache does NOT own them (cache
+                # disabled, or put() refused the insert). If the cache owns them
+                # (hit, or a successful put()), freeing here would leave a dangling
+                # reference in the cache -> use-after-free on the next hit.
+                if not _owned_by_cache:
+                    del gpu_gate, gpu_down, gpu_up
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return final_hidden.view(B, S, H)

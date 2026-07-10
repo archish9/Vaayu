@@ -239,14 +239,16 @@ class ExpertVRAMCache:
             self.misses += 1
             return None
 
-    def put(self, layer_idx: int, expert_idx: int, gpu_groups: dict) -> None:
+    def put(self, layer_idx: int, expert_idx: int, gpu_groups: dict) -> bool:
+        """Insert; returns True if the cache now owns gpu_groups, False if refused
+        (caller keeps ownership and must free it itself)."""
         size = self._group_bytes(gpu_groups)
         with self.lock:
             key = (layer_idx, expert_idx)
             if key in self.cache:
-                return
+                return False
             if size > self.budget_bytes:
-                return  # single expert bigger than whole budget — refuse
+                return False  # single expert bigger than whole budget — refuse
             while self.current_usage + size > self.budget_bytes and self.cache:
                 _, evicted = self.cache.popitem(last=False)
                 self.current_usage -= self._group_bytes(evicted)
@@ -254,6 +256,7 @@ class ExpertVRAMCache:
                 del evicted  # drop GPU references so the allocator can reuse
             self.cache[key] = gpu_groups
             self.current_usage += size
+            return True
 
     def reset_stats(self) -> None:
         with self.lock:
