@@ -3,6 +3,15 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 >
 > **Read `2026-07-09-vaayu-moe-perf-REPORT.md` first. Best applied AFTER Fix #1.**
+>
+> **Outcome (executed 2026-07-10, commits 1190434/f41b63b):** both invariants
+> this fix targets were already satisfied by Fix #1 + earlier 2026-07-09 work —
+> `ExpertRAMCache.get()` already propagated recency to the global LRU, and
+> `compute_expert_budget`'s clamp already kept per-layer caps within the global
+> budget for both target models. This fix landed as **regression tests only**,
+> no production code changed. The measured `evictions ≈ 3× inserts` thrash is
+> **Fix #9's** target (report §2.4, spec-decode working-set multiplier), not
+> this fix's — do not read "no code change" as "skipped."
 
 **Goal:** Stop the two eviction constraints (per-layer cap and global byte
 budget) from fighting each other, which wastes cache capacity and lowers hit
