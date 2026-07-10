@@ -147,6 +147,17 @@ def compute_expert_budget(
     return expert_budget, ne_budget, max_per_layer
 
 
+# Hardware constant: reserve for activations + KV-cache growth on the GPU.
+# Property of the box (16 GB VRAM here), NOT the model.
+_VRAM_RESERVE_BYTES = 2 * 1024 ** 3
+
+
+def compute_vram_expert_budget(free_vram_bytes: int) -> int:
+    """VRAM available to cache resident expert tensors, after reserving headroom
+    for activations/KV growth. Model-agnostic (Fix #7)."""
+    return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
+
+
 def prefetch_room_bytes(current_usage: int, budget_bytes: int) -> int:
     """Bytes of cache headroom available for prefetch without forcing eviction
     of resident experts. Fix #3: prefetching past this re-creates thrash."""
@@ -622,7 +633,7 @@ class VaayuBaseModel(GenerationMixin):
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
         if self.running_device.startswith("cuda") and self.is_moe:
-            from .persist.expert_cache import ExpertRAMCache, LRUTensorCache
+            from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil
 
@@ -648,6 +659,20 @@ class VaayuBaseModel(GenerationMixin):
             self._non_expert_tensor_cache = LRUTensorCache(_ne_budget)
             print(f"[Vaayu-Cache] Non-expert tensor cache: {_ne_budget / 1e9:.1f} GB budget")
             self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
+
+            # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
+            self._expert_vram_cache = None
+            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                _free_vram, _ = torch.cuda.mem_get_info()
+                _vram_budget = compute_vram_expert_budget(_free_vram)
+                if _vram_budget >= self._moe_geometry["expert_bytes"]:
+                    self._expert_vram_cache = ExpertVRAMCache(_vram_budget)
+                    print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
+                          f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
+                          f"experts resident on GPU)")
+                else:
+                    print("[Vaayu-MoE] Expert VRAM cache: disabled (insufficient free VRAM)")
+
             _ws_gb = _geo["working_set_bytes"] / 1e9
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
                   f"(~{int(_expert_budget // max(1, _geo['expert_bytes']))} expert slots, "
