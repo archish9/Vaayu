@@ -632,6 +632,7 @@ class VaayuBaseModel(GenerationMixin):
         # non-pinned MoE layer per token. Capped to prevent unbounded RAM growth
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
+        self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         if self.running_device.startswith("cuda") and self.is_moe:
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache
             from .moe_patch import patch_moe_blocks
@@ -661,7 +662,6 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
 
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
-            self._expert_vram_cache = None
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
                 _free_vram, _ = torch.cuda.mem_get_info()
                 _vram_budget = compute_vram_expert_budget(_free_vram)
