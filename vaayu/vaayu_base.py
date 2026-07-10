@@ -77,6 +77,22 @@ def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_exp
     }
 
 
+def compute_spec_working_set(geometry: dict, verify_positions: int) -> int:
+    """Expert working set of ONE speculative verify pass, in bytes (Fix #9).
+
+    A verify pass routes `verify_positions` tokens through every MoE layer in a
+    single forward; per layer the unique-expert union is bounded by
+    min(num_experts, verify_positions * top_k). Conservative upper bound — cache
+    sizing must not underestimate thrash (REPORT §2.4). verify_positions=1
+    reduces to the single-token working set.
+    """
+    per_layer = min(
+        geometry["num_experts"],
+        max(1, verify_positions) * geometry["top_k"],
+    )
+    return per_layer * geometry["num_moe_layers"] * geometry["expert_bytes"]
+
+
 # Hardware constant for THIS 32 GB box: max safe expert-cache size before OOM.
 # Model-independent. Raised from the old 7 GB only after shrinking other RAM
 # consumers (below). Do NOT exceed 9 GB — 10 GB caused a confirmed OOM-kill.
