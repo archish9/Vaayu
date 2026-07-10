@@ -607,8 +607,9 @@ def _make_fused_sparse_forward_exl3(
                 misses.append(eidx)
 
         if misses:
+            _disk_t0 = time.perf_counter()
             if _prof:
-                _t0 = time.perf_counter()
+                _t0 = _disk_t0
 
             def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
@@ -627,8 +628,10 @@ def _make_fused_sparse_forward_exl3(
             for eidx, raw in vaayu_ref._moe_executor.map(_load_one, misses):
                 if raw is not None:
                     expert_tensors[eidx] = raw
+            _disk_elapsed = time.perf_counter() - _disk_t0
+            vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _disk_elapsed
             if _prof:
-                _mp['disk_load'] += time.perf_counter() - _t0
+                _mp['disk_load'] += _disk_elapsed
 
         if _prof:
             _t0 = time.perf_counter()
