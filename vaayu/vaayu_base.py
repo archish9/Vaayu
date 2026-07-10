@@ -180,51 +180,78 @@ class FP8DynamicCache(DynamicCache):
 
     def __init__(self):
         super().__init__()
-        # Override parent's layer-based storage with flat lists of FP8 tensors.
-        self.key_cache: list = []
-        self.value_cache: list = []
-        self._key_scales: list = []
+        # Capacity buffers (allocated lazily on first update per layer). Each holds
+        # >= _seq_len[layer] valid tokens on the dim=-2 (sequence) axis; the tail is
+        # unused capacity. Fix #8: replaces per-token torch.cat (O(seq^2)) with
+        # in-place writes + geometric doubling (amortized O(1) append).
+        self.key_cache: list = []       # fp8 K, shape [B, H, capacity, D]
+        self.value_cache: list = []     # fp8 V
+        self._key_scales: list = []     # [B, H, capacity, 1]
         self._value_scales: list = []
-        # Cached dequantized output. Old positions never change once written, so each
-        # update() only needs to dequantize the *new* slice and append it here, instead
-        # of re-multiplying the entire accumulated key_cache/_key_scales by the full
-        # scale tensor every call (which was previously redone from scratch, every
-        # layer, every token, regardless of how much of the cache was actually new).
-        self._k_out_cache: list = []
+        self._k_out_cache: list = []    # dequantized K, [B, H, capacity, D]
         self._v_out_cache: list = []
+        self._seq_len: list = []        # per-layer used length
 
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):  # cache_kwargs intentionally unused
+    _GROWTH = 2  # capacity doubling factor (amortized O(1) append)
+
+    def _ensure_capacity(self, layer_idx, needed, template_kv, template_scale):
+        """Grow layer_idx's buffers so capacity >= needed. Copies existing valid
+        tokens once on growth. template_* provide dtype/device/leading dims."""
+        cap = self.key_cache[layer_idx].shape[-2] if layer_idx < len(self.key_cache) else 0
+        if layer_idx < len(self.key_cache) and cap >= needed:
+            return
+        new_cap = max(needed, max(1, cap) * self._GROWTH)
+        B, H, _, D = template_kv.shape
+        dev, kv_dtype = template_kv.device, template_kv.dtype
+        out_dtype = template_scale.dtype  # dequantized output dtype (fp16/bf16)
+
+        def _grow(old_list, last_dim, dtype):
+            buf = torch.zeros((B, H, new_cap, last_dim), dtype=dtype, device=dev)
+            if layer_idx < len(old_list):
+                used = self._seq_len[layer_idx]
+                buf[..., :used, :] = old_list[layer_idx][..., :used, :]
+                old_list[layer_idx] = buf
+            else:
+                old_list.append(buf)
+
+        _grow(self.key_cache,     D, kv_dtype)
+        _grow(self.value_cache,   D, kv_dtype)
+        _grow(self._key_scales,   1, template_scale.dtype)
+        _grow(self._value_scales, 1, template_scale.dtype)
+        _grow(self._k_out_cache,  D, out_dtype)
+        _grow(self._v_out_cache,  D, out_dtype)
+        if layer_idx >= len(self._seq_len):
+            self._seq_len.append(0)
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         k_scale = key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
         v_scale = value_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
-
         k_fp8 = (key_states / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
         v_fp8 = (value_states / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-
         k_new_out = k_fp8.to(key_states.dtype) * k_scale
         v_new_out = v_fp8.to(value_states.dtype) * v_scale
 
-        if layer_idx < len(self.key_cache):
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_fp8], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_fp8], dim=-2)
-            self._key_scales[layer_idx] = torch.cat([self._key_scales[layer_idx], k_scale], dim=-2)
-            self._value_scales[layer_idx] = torch.cat([self._value_scales[layer_idx], v_scale], dim=-2)
-            self._k_out_cache[layer_idx] = torch.cat([self._k_out_cache[layer_idx], k_new_out], dim=-2)
-            self._v_out_cache[layer_idx] = torch.cat([self._v_out_cache[layer_idx], v_new_out], dim=-2)
-        else:
-            self.key_cache.append(k_fp8)
-            self.value_cache.append(v_fp8)
-            self._key_scales.append(k_scale)
-            self._value_scales.append(v_scale)
-            self._k_out_cache.append(k_new_out)
-            self._v_out_cache.append(v_new_out)
+        n_new = key_states.shape[-2]
+        prev = self._seq_len[layer_idx] if layer_idx < len(self._seq_len) else 0
+        self._ensure_capacity(layer_idx, prev + n_new, k_fp8, k_scale)
 
-        return self._k_out_cache[layer_idx], self._v_out_cache[layer_idx]
+        s = slice(prev, prev + n_new)
+        self.key_cache[layer_idx][..., s, :] = k_fp8
+        self.value_cache[layer_idx][..., s, :] = v_fp8
+        self._key_scales[layer_idx][..., s, :] = k_scale
+        self._value_scales[layer_idx][..., s, :] = v_scale
+        self._k_out_cache[layer_idx][..., s, :] = k_new_out
+        self._v_out_cache[layer_idx][..., s, :] = v_new_out
+        self._seq_len[layer_idx] = prev + n_new
+
+        used = self._seq_len[layer_idx]
+        return (self._k_out_cache[layer_idx][..., :used, :],
+                self._v_out_cache[layer_idx][..., :used, :])
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """Returns the sequence length of the cached states for the given layer."""
-        if layer_idx >= len(self.key_cache):
+        if layer_idx >= len(self._seq_len):
             return 0
-        return self.key_cache[layer_idx].shape[-2]
+        return self._seq_len[layer_idx]
 
 
 

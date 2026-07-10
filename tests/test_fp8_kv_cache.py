@@ -8,9 +8,15 @@ def _random_kv(batch=1, heads=2, seq=1, dim=4):
 
 
 def _reference_dequant(cache: FP8DynamicCache, layer_idx: int, dtype: torch.dtype):
-    """What update() used to compute: full re-dequant of the whole accumulated cache."""
-    k_out = cache.key_cache[layer_idx].to(dtype) * cache._key_scales[layer_idx]
-    v_out = cache.value_cache[layer_idx].to(dtype) * cache._value_scales[layer_idx]
+    """What update() used to compute: full re-dequant of the whole accumulated cache.
+
+    Fix #8: key_cache/_key_scales are now capacity buffers (>= seq_len, with unused
+    tail slack from geometric doubling), so slice to the actual used length before
+    dequantizing -- matching what update() itself returns.
+    """
+    n = cache.get_seq_length(layer_idx)
+    k_out = cache.key_cache[layer_idx][..., :n, :].to(dtype) * cache._key_scales[layer_idx][..., :n, :]
+    v_out = cache.value_cache[layer_idx][..., :n, :].to(dtype) * cache._value_scales[layer_idx][..., :n, :]
     return k_out, v_out
 
 
