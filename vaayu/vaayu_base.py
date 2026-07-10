@@ -596,81 +596,40 @@ class VaayuBaseModel(GenerationMixin):
         if self.running_device.startswith("cuda") and self.is_moe:
             from .persist.expert_cache import ExpertRAMCache, LRUTensorCache
             from .moe_patch import patch_moe_blocks
-            from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
 
-            _is_exl3 = isinstance(self.loader_strategy, EXL3LoaderStrategy)
             _mem = _psutil.virtual_memory()
 
-            # Non-expert tensor cache: cap at 2 GB or 1/8 of available RAM.
-            # Sequential layer processing means only one layer is active at a time;
-            # the LRU keeps recently-used layers warm for the next token.
-            _ne_budget = min(2 * 1024**3, int(_mem.available / 8))
+            # Model-agnostic geometry (Task 0) → single source of truth. No Qwen
+            # numbers hardcoded; expert_bytes/num_moe_layers/working_set derived.
+            self._moe_geometry = compute_moe_geometry(
+                self._expert_offset_index,
+                num_layers=len(self.layers),
+                moe_top_k=self.moe_top_k,
+                moe_num_experts=self.moe_num_experts,
+            )
+            _geo = self._moe_geometry
+            _expert_budget, _ne_budget, _max_per_layer = compute_expert_budget(
+                available_bytes=_mem.available,
+                working_set_bytes=_geo["working_set_bytes"],
+                num_moe_layers=_geo["num_moe_layers"],
+                expert_bytes=_geo["expert_bytes"],
+                moe_top_k=_geo["top_k"],
+                moe_num_experts=_geo["num_experts"],
+            )
             self._non_expert_tensor_cache = LRUTensorCache(_ne_budget)
             print(f"[Vaayu-Cache] Non-expert tensor cache: {_ne_budget / 1e9:.1f} GB budget")
-
-            # Expert budget: derived from *available* RAM (which already reflects
-            # pinned layer allocations) minus reserves for non-expert cache, OS,
-            # CUDA context, and io_uring buffers.
-            #
-            # Per-expert size: measured from the real offset index rather than a
-            # hardcoded guess — quant bpw varies per checkpoint, so a fixed
-            # constant silently mis-sizes cache capacity for any model whose real
-            # expert size differs (measured EXL3 5.0bpw here: ~11.8 MB, not the
-            # previously hardcoded 88 MB — starved max_per_layer by ~7.5x).
-            _expert_mb = 88 if _is_exl3 else 352
-            if self._expert_offset_index is not None:
-                for _layer_tensors in self._expert_offset_index.index.values():
-                    for _expert_tensors in _layer_tensors.values():
-                        _real_bytes = sum(t.byte_length for t in _expert_tensors.values())
-                        if _real_bytes > 0:
-                            _expert_mb = _real_bytes / (1024 * 1024)
-                        break
-                    break
-
-            _overhead = (
-                2 * 1024**3          # OS + CUDA context margin
-                + _ne_budget         # non-expert tensor cache (just allocated above)
-                + 512 * 1024 * 1024  # io_uring expert buffer pool
-            )
-            # Hard cap at 7 GB regardless of the available-RAM formula above. Measured
-            # via isolation test (real OOM-kills, journalctl -k) that this model's
-            # non-cache RAM overhead (layer double-buffers, CUDA context, Python/torch)
-            # is ~17GB+ once loading is underway — the available-at-init-time formula
-            # doesn't see that yet, so a correctly-sized per-expert budget derived from
-            # it was still large enough to OOM once the cache actually reached it (which
-            # it couldn't before, when a wrong 88MB/expert guess silently self-limited
-            # real fill far below the nominal budget). 7GB real cache still beats the
-            # old effective ~2.9GB (243 slots x 11.8MB real) by ~2.4x.
-            # TRIED raising to 10GB after direct RAM-headroom measurement (50-token
-            # steady-state poll showed floor ~7.2GB available) — caused a REAL OOM-kill
-            # on the very next verification run (anon-rss 26.46GB, confirmed via
-            # journalctl -k). The 50-token measurement window wasn't representative
-            # of worst-case system memory pressure (other processes' usage varies
-            # over time, longer runs grow KV cache further). Do not raise this cap
-            # again without a much larger safety margin AND a longer verification
-            # run than the one that produced the headroom estimate.
-            _expert_budget = min(
-                7 * 1024**3,
-                max(
-                    1 * 1024**3,  # floor: at least 1 GB so decode always works
-                    int(_mem.available - _overhead),
-                ),
-            )
-
-            # max_per_layer: derived from available RAM, not hardcoded.
-            # Per-layer share = total budget / number of MoE layers.
-            # Clamped: at least top_k (must cache the active set), at most num_experts.
-            _num_moe_layers = max(1, len(self.layers) - 3)  # minus embed, norm, lm_head
-            _per_layer_bytes = _expert_budget // _num_moe_layers
-            _max_per_layer = max(
-                self.moe_top_k,
-                min(self.moe_num_experts, _per_layer_bytes // (_expert_mb * 1024 * 1024)),
-            )
             self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
+            _ws_gb = _geo["working_set_bytes"] / 1e9
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "
-                  f"(~{_expert_budget // (_expert_mb * 1024 * 1024)} expert slots, "
-                  f"max {_max_per_layer}/layer, {'EXL3' if _is_exl3 else 'BF16'})")
+                  f"(~{int(_expert_budget // max(1, _geo['expert_bytes']))} expert slots, "
+                  f"max {_max_per_layer}/layer, "
+                  f"expert={_geo['expert_bytes']/1e6:.1f}MB, working_set={_ws_gb:.2f}GB)")
+            if _geo["working_set_bytes"] > _expert_budget:
+                print(f"[Vaayu-MoE] WARNING: working set {_ws_gb:.2f}GB exceeds cache "
+                      f"budget {_expert_budget/1e9:.2f}GB — decode will thrash. This "
+                      f"model is too large for the expert cache on this hardware; "
+                      f"expect low hit rate (a real limit, not a bug).")
 
             # Persistent executor for expert cache-miss loads, created once here instead
             # of per-layer-per-token inside sparse_forward. get_expert_pool_size() is
