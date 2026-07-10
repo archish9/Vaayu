@@ -253,6 +253,29 @@ class FP8DynamicCache(DynamicCache):
             return 0
         return self._seq_len[layer_idx]
 
+    def crop(self, max_length: int) -> None:
+        """Truncate every layer to max_length tokens (Fix #8: length-only, no copy).
+        Ring buffer retains capacity; the leading [0:max_length) tokens are already
+        the valid data, so trimming the tail is just shrinking the length."""
+        for i in range(len(self._seq_len)):
+            self._seq_len[i] = min(self._seq_len[i], max_length)
+
+    def crop_front(self, keep_len: int) -> None:
+        """Drop the oldest tokens, keeping only the newest keep_len (Fix #8:
+        OOM-pressure path only, so a single copy-shift per layer is acceptable).
+        Ring buffer's valid data starts at index 0, so removing the front
+        requires shifting the retained [used-keep_len:used) window down to
+        [0:keep_len) before shrinking the length."""
+        for i in range(len(self._seq_len)):
+            used = self._seq_len[i]
+            if keep_len >= used:
+                continue
+            start = used - keep_len
+            for buf in (self.key_cache, self.value_cache, self._key_scales,
+                        self._value_scales, self._k_out_cache, self._v_out_cache):
+                buf[i][..., :keep_len, :] = buf[i][..., start:used, :].clone()
+            self._seq_len[i] = keep_len
+
 
 
 
@@ -2254,13 +2277,10 @@ class VaayuBaseModel(GenerationMixin):
         if cache is None:
             return
         if isinstance(cache, FP8DynamicCache):
-            for i in range(len(cache.key_cache)):
-                cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
-                cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
-                cache._key_scales[i] = cache._key_scales[i][:, :, :target_seq_len, :]
-                cache._value_scales[i] = cache._value_scales[i][:, :, :target_seq_len, :]
-                cache._k_out_cache[i] = cache._k_out_cache[i][:, :, :target_seq_len, :]
-                cache._v_out_cache[i] = cache._v_out_cache[i][:, :, :target_seq_len, :]
+            # Ring buffer (Fix #8): the retained [0:target_seq_len) tokens are
+            # already the valid data, so trimming the tail is a length-only
+            # update — no tensor slicing/copy needed.
+            cache.crop(target_seq_len)
         elif hasattr(cache, 'key_cache'):
             for i in range(len(cache.key_cache)):
                 if len(cache.key_cache[i].shape) >= 3:
@@ -2272,13 +2292,11 @@ class VaayuBaseModel(GenerationMixin):
         if cache is None:
             return
         if isinstance(cache, FP8DynamicCache):
-            for i in range(len(cache.key_cache)):
-                cache.key_cache[i]     = cache.key_cache[i][:, :, -target_seq_len:, :]
-                cache.value_cache[i]   = cache.value_cache[i][:, :, -target_seq_len:, :]
-                cache._key_scales[i]   = cache._key_scales[i][:, :, -target_seq_len:, :]
-                cache._value_scales[i] = cache._value_scales[i][:, :, -target_seq_len:, :]
-                cache._k_out_cache[i]  = cache._k_out_cache[i][:, :, -target_seq_len:, :]
-                cache._v_out_cache[i]  = cache._v_out_cache[i][:, :, -target_seq_len:, :]
+            # Ring buffer (Fix #8): valid data starts at index 0, so dropping the
+            # oldest tokens requires shifting the retained window down to the
+            # front before shrinking the length. Rare (OOM path only), so the
+            # one copy-shift here is acceptable.
+            cache.crop_front(target_seq_len)
         elif hasattr(cache, 'key_cache'):
             for i in range(len(cache.key_cache)):
                 if cache.key_cache[i] is not None and len(cache.key_cache[i].shape) >= 3:
