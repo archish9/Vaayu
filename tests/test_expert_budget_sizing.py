@@ -1,5 +1,6 @@
 """Fix #1: budget sizes above the DERIVED working set, up to the hardware ceiling.
 Model-agnostic: tested with both Qwen-like and MiniMax-like geometry."""
+import pytest
 from vaayu.vaayu_base import compute_expert_budget
 
 GB = 1024 ** 3
@@ -40,3 +41,24 @@ def test_budget_floor_on_tiny_ram():
     )
     assert budget >= 1 * GB
     assert max_per_layer >= 8  # never below top_k
+
+
+@pytest.mark.parametrize("layers,experts,expert_mb,ws_gb", [
+    (91, 128, 11.28, 8.02),   # Qwen3-235B
+    (62, 256, 11.30, 5.50),   # MiniMax-M2.5
+])
+def test_max_per_layer_never_exceeds_global_budget(layers, experts, expert_mb, ws_gb):
+    expert_bytes = int(expert_mb * MB)
+    budget, ne, mpl = compute_expert_budget(
+        available_bytes=int(26.5 * GB),
+        working_set_bytes=int(ws_gb * GB),
+        num_moe_layers=layers, expert_bytes=expert_bytes,
+        moe_top_k=8, moe_num_experts=experts,
+    )
+    # Collective per-layer capacity must fit within the global budget (any model).
+    collective = mpl * layers * expert_bytes
+    assert collective <= budget, (
+        f"per-layer caps ({collective/GB:.2f}GB) exceed global budget "
+        f"({budget/GB:.2f}GB) → cross-layer thrash"
+    )
+    assert mpl >= 8  # never below top_k
