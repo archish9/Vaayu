@@ -154,6 +154,7 @@ class ExpertRAMCache:
             else:
                 self.cache.clear()
             self.current_usage = 0
+            self._prefetched.clear()
 
     def reset_stats(self) -> None:
         """Zero all counters. Called at the prefill→decode boundary so decode
