@@ -291,9 +291,17 @@ helper on the class if the pattern appears in multiple places:
 ```
 and call `cache.crop(n)` at the truncation site.
 
-> If Step 1 finds NO truncation touching `key_cache` directly (the existing
-> "Cache truncation failed" log may be for a different `DynamicCache`), this task
-> is a no-op — record that finding and skip. Do not invent a crop path.
+> **CONFIRMED (2026-07-10 review): truncation EXISTS and this task is NOT a
+> no-op.** `vaayu_base.py` has `_trim_kv_cache(cache, target_seq_len)` (tail-trim,
+> called EVERY speculative-decode iteration, Step 5 of `speculative_generate`) and
+> `_trim_kv_cache_front(cache, target_seq_len)` (front-trim on OOM pressure). Both
+> have `isinstance(cache, FP8DynamicCache)` branches that slice all six tensor
+> lists directly — under the ring buffer these slices would desync capacity from
+> `_seq_len`. Rewrite the FP8 branch of `_trim_kv_cache` as a length-only update
+> (`cache._seq_len[i] = min(cache._seq_len[i], target_seq_len)` via the `crop()`
+> helper). `_trim_kv_cache_front` removes OLDEST tokens — with a ring buffer that
+> requires shifting valid data left (one copy) before adjusting `_seq_len`; it is
+> rare (OOM path only), so a simple copy-shift is fine.
 
 - [ ] **Step 3: Run full suite**
 

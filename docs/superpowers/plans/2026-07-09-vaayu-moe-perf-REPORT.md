@@ -177,6 +177,39 @@ double-buffers, KV cache, CUDA context, io_uring buffers, and Python/torch
 overhead. So the cap is genuinely constrained — raising it requires *freeing RAM
 elsewhere first*, not just changing the constant.
 
+### 2.4 Speculative decoding multiplies the working set (found in second review, 2026-07-10)
+
+The measured run had the drafter ENABLED (`DRAFTER_MODEL_PATH` set, draft_tokens=5).
+Each verify pass sends **draft_tokens+1 = 6 positions** through the full MoE
+forward in one pass (`speculative_generate` → `verify_input` of k+1 tokens). Each
+position routes top-8 independently, so the per-layer unique-expert set is ~24
+(observed in run.log), not 8. The *effective* working set per verify pass:
+
+```
+spec working_set = unique_experts_per_layer × num_moe_layers × expert_bytes
+Qwen : ~24 × 91 × 11.28 MB ≈ 24.6 GB   (3× the single-token 8.02 GB)
+M2.5 : ~24 × 62 × 11.3 MB  ≈ 16.8 GB   (3× the single-token 5.5 GB)
+```
+
+**Both exceed any achievable cache budget (8.5 GB hardware ceiling).** Also, ~24
+unique experts/layer > `max_per_layer` (8 on Qwen), so the per-layer cap alone
+forces ~16 evictions per layer per pass — this is exactly the measured
+"evictions ≈ 3× inserts". Consequences:
+
+- **With the drafter on, Fix #1 will NOT stop the thrash** — the verify pass's
+  working set can never fit. Fix #1's expected hit-rate gain (18% → 55-65%) holds
+  for single-token decode only.
+- Spec decode's I/O economics are ~neutral here anyway: a verify pass reads ~3×
+  the experts to accept ~2-3 tokens → bytes-per-accepted-token ≈ the sequential
+  cost, while destroying cache locality.
+- **Recommendation (Fix #9 candidate):** disable the drafter for MoE-streaming
+  models (or set draft_tokens=0), and/or make the geometry's working-set math
+  multiply by verify positions when a speculator is active, so the Fix #1 WARNING
+  fires honestly.
+- Smaller drafter defect, same file: `StandardDrafterDecoder.rollback_cache`
+  resets `_drafter_past = None` on ANY rejection → the drafter re-prefills the
+  entire sequence next draft() → O(seq²) drafter compute over a long generation.
+
 ---
 
 ## 3. The external report's error (for the record)
@@ -234,6 +267,7 @@ the model-agnostic code makes each fix do the right thing per model automaticall
 | 5 | `...-fix5-dedup-draft-experts.md` | Dedup expert reads across speculative draft positions | LOW-MED | M | partial |
 | 7 | `2026-07-10-fix7-vram-expert-cache.md` | VRAM-resident expert cache — hot experts skip per-token CPU→GPU H2D (the ~3 tok/s PCIe floor, unaddressed by #1-#6) | **HIGH** on both models, bigger on M2.5 | M | PCIe floor |
 | 8 | `2026-07-10-fix8-fp8-kv-ring-buffer.md` | FP8 KV cache: pre-allocated ring buffer instead of O(seq²) per-token cat | MED on long runs | M | long-gen scaling |
+| 9 | `2026-07-10-fix9-spec-decode-cache-aware.md` | Cache-aware speculation: derive verify working set from geometry; WARN + disable when it can't fit; incremental drafter rollback (kills O(seq²) re-prefill) | **HIGH** — prerequisite for #1's gains to materialize (§2.4) | S-M | ✅ removes the 3× amplifier |
 
 > #7 and #8 (added 2026-07-10) came out of a full-codebase review. #7 attacks the
 > RAM→GPU floor beneath the NVMe thrash that #1 fixes — even at 100% RAM-cache hit,
@@ -246,6 +280,8 @@ the model-agnostic code makes each fix do the right thing per model automaticall
 
 1. **#6 first** — cheapest, and makes every later fix measurable. Without it,
    `io_wait` reads 0.0 and you cannot see whether a fix helped.
+1.5. **#9 next** — removes the speculative 3× working-set amplifier (§2.4);
+   without it, #1's hit-rate gains cannot materialize while the drafter is on.
 2. **#1** — highest pure-code ROI; directly kills the measured thrash.
 3. **#4** — cheap follow-on to #1, squeezes more hit rate from the same budget.
 4. **#3** — only meaningful once thrash is gone (#1/#4); then prefetch hides

@@ -429,6 +429,13 @@ git commit -m "feat: raise expert cache budget above decode working set (Fix #1)
 
 ## Verification (end-to-end, requires real run — CRITICAL for OOM safety)
 
+> **⚠️ DISABLE THE DRAFTER FOR THIS VERIFICATION** (REPORT §2.4): set
+> `DRAFTER_MODEL_PATH = None` in `test_generate.py` for the verification run.
+> With the drafter on, each verify pass routes ~(draft_tokens+1)×top_k unique
+> experts per layer (~24 observed), a ~3× working set that no achievable budget
+> fits — the hit-rate gain this fix promises is measurable only in single-token
+> decode. Restore the drafter setting afterwards if desired.
+
 - [ ] **Step 1: Confirm the printed budget at startup**
 
 ```bash
