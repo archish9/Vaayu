@@ -486,6 +486,18 @@ class SafetensorModelPersister(ModelPersister):
             return result
 
 
+def _reconstruct_tensor(raw_bytes: torch.Tensor, meta) -> torch.Tensor:
+    """Turn a raw uint8 byte-slice + ExpertTensorMeta into a typed/shaped tensor.
+
+    Shared by load_expert_sparse and load_experts_bulk (Fix #2) so dtype/shape
+    reconstruction can't drift between the two call sites. Works regardless of
+    whether raw_bytes has already been cloned — view() only needs contiguous
+    memory, which a 1-D byte slice (or a clone of one) always is.
+    """
+    dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+    return raw_bytes.view(dt).view(meta.shape)
+
+
 def load_expert_sparse(
     file_path: str,
     expert_metas: dict,
@@ -582,14 +594,71 @@ def load_expert_sparse(
             for key, meta in group:
                 rel_start = meta.file_offset - group_start
                 rel_end = rel_start + meta.byte_length
-                shape = meta.shape
-                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
 
-                tensor = data_buf[rel_start:rel_end].view(dt).view(shape)
+                tensor = _reconstruct_tensor(data_buf[rel_start:rel_end], meta)
                 result[key] = tensor.clone()
 
         finally:
             if _pool_buf is not None:
                 _EXPERT_BUF_POOL.put(_pool_buf)
-                
+
+    return result
+
+
+def load_experts_bulk(
+    file_path: str,
+    experts_metas: dict,
+    use_direct_io: bool | None = None,
+) -> dict:
+    """Fix #2: read many experts' byte ranges in ONE sequential pass.
+
+    experts_metas: {expert_idx: {tensor_key: ExpertTensorMeta}}
+    Returns {expert_idx: {tensor_key: cpu_tensor}}.
+
+    Reads the contiguous file span [min_offset, max_end) covering all requested
+    experts, then slices each tensor out. Far faster than per-expert reads when
+    a large fraction of a layer's experts are needed (prefill), because it is one
+    big sequential read instead of thousands of small scattered ones.
+    """
+    if not experts_metas:
+        return {}
+    if use_direct_io is None:
+        use_direct_io = _USE_DIRECT_IO
+
+    # Flatten to (expert_idx, key, meta), find global span.
+    flat = []
+    for eidx, metas in experts_metas.items():
+        for key, meta in metas.items():
+            flat.append((eidx, key, meta))
+    span_start = min(m.file_offset for _, _, m in flat)
+    span_end = max(m.file_offset + m.byte_length for _, _, m in flat)
+    read_len = span_end - span_start
+
+    aligned_offset = _align_down(span_start)
+    prefix_pad = span_start - aligned_offset
+    aligned_length = _align_up(read_len + prefix_pad)
+
+    # Bulk buffer: this can be large (up to ~1.5 GB for a full layer). Do NOT use
+    # the small pinned pool (sized for single experts). Use a fresh unpinned
+    # buffer + buffered IO — bandwidth here is dominated by sequential throughput,
+    # not pinned-DMA latency, so buffered read is fine and avoids pool starvation.
+    buf = torch.empty(aligned_length, dtype=torch.uint8)
+    if _USE_IOURING:
+        vaayu_rust.io_uring_read_into(
+            file_path, aligned_offset, aligned_length, buf.data_ptr(), 32, False,
+        )
+    else:
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            view = memoryview(buf.numpy())
+            os.preadv(fd, [view[:aligned_length]], aligned_offset)
+        finally:
+            os.close(fd)
+    data = buf[prefix_pad:]  # data[0] corresponds to span_start
+
+    result: dict[int, dict] = {}
+    for eidx, key, meta in flat:
+        local = meta.file_offset - span_start
+        raw = data[local: local + meta.byte_length].clone()
+        result.setdefault(eidx, {})[key] = _reconstruct_tensor(raw, meta)
     return result
