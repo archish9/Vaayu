@@ -38,6 +38,9 @@ class ExpertRAMCache:
         self._last_hits = 0
         self._last_misses = 0
         self._last_evictions = 0
+        self.prefetch_inserts = 0
+        self.prefetch_hits = 0
+        self._prefetched: set = set()  # keys inserted by prefetch, not yet used
 
     def get(self, layer_idx: int, expert_idx: int) -> dict | None:
         with self.lock:
@@ -50,6 +53,9 @@ class ExpertRAMCache:
                     if key in self._global_lru:
                         self._global_lru.move_to_end(key)
                     self.hits += 1
+                    if key in self._prefetched:
+                        self._prefetched.discard(key)
+                        self.prefetch_hits += 1
                     return dict(lc[expert_idx])
                 self.misses += 1
                 return None
@@ -57,6 +63,9 @@ class ExpertRAMCache:
             if key in self.cache:
                 self.cache.move_to_end(key)
                 self.hits += 1
+                if key in self._prefetched:
+                    self._prefetched.discard(key)
+                    self.prefetch_hits += 1
                 return dict(self.cache[key])
             self.misses += 1
             return None
@@ -68,7 +77,7 @@ class ExpertRAMCache:
                 return lc is not None and expert_idx in lc
             return (layer_idx, expert_idx) in self.cache
 
-    def put(self, layer_idx: int, expert_idx: int, tensors: dict) -> None:
+    def put(self, layer_idx: int, expert_idx: int, tensors: dict, *, prefetch: bool = False) -> None:
         cloned = {k: v.clone().detach() for k, v in tensors.items()}
         raw_size = sum(t.nbytes for t in cloned.values())
         with self.lock:
@@ -83,6 +92,7 @@ class ExpertRAMCache:
                     self.current_usage -= sum(t.nbytes for t in evicted.values())
                     self._global_lru.pop((layer_idx, evicted_eidx), None)
                     self.evictions += 1
+                    self._prefetched.discard((layer_idx, evicted_eidx))
 
                 # 2. Global budget enforcement: evict globally-oldest across ALL layers
                 while self.current_usage + raw_size > self.budget_bytes:
@@ -92,6 +102,7 @@ class ExpertRAMCache:
                 lc[expert_idx] = cloned
                 self.current_usage += raw_size
                 self._global_lru[(layer_idx, expert_idx)] = None
+                self._note_prefetch(layer_idx, expert_idx, prefetch)
                 return
 
             # Global LRU path (max_per_layer == 0) — unchanged
@@ -99,13 +110,21 @@ class ExpertRAMCache:
             if key in self.cache:
                 return
             while self.current_usage + raw_size > self.budget_bytes and self.cache:
-                _, evicted = self.cache.popitem(last=False)
+                evicted_key, evicted = self.cache.popitem(last=False)
                 self.current_usage -= sum(t.nbytes for t in evicted.values())
                 self.evictions += 1
+                self._prefetched.discard(evicted_key)
             if self.current_usage + raw_size > self.budget_bytes:
                 return
             self.cache[key] = cloned
             self.current_usage += raw_size
+            self._note_prefetch(layer_idx, expert_idx, prefetch)
+
+    def _note_prefetch(self, layer_idx, expert_idx, prefetch):
+        # Must be called while self.lock is held, after a successful insert.
+        if prefetch:
+            self.prefetch_inserts += 1
+            self._prefetched.add((layer_idx, expert_idx))
 
     def _evict_global_oldest(self) -> bool:
         """Evict the single oldest expert across all layers (true global LRU).
@@ -121,6 +140,7 @@ class ExpertRAMCache:
             evicted = lc.pop(eidx)
             self.current_usage -= sum(t.nbytes for t in evicted.values())
             self.evictions += 1
+            self._prefetched.discard((lid, eidx))
             # Clean up empty layer dicts to avoid unbounded key growth
             if not lc:
                 del self._layer_caches[lid]
@@ -145,14 +165,19 @@ class ExpertRAMCache:
             self._last_hits = 0
             self._last_misses = 0
             self._last_evictions = 0
+            self.prefetch_inserts = 0
+            self.prefetch_hits = 0
+            self._prefetched.clear()
 
     def stats(self) -> str:
         with self.lock:
             total = self.hits + self.misses
             rate = f"{self.hits / total:.0%}" if total > 0 else "n/a"
+            pf = (f"{self.prefetch_hits}/{self.prefetch_inserts}"
+                  if self.prefetch_inserts else "0/0")
             return (
                 f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
-                f"hit_rate={rate} "
+                f"hit_rate={rate} prefetch_used={pf} "
                 f"usage={self.current_usage / 1e9:.2f}GB/"
                 f"{self.budget_bytes / 1e9:.2f}GB"
             )
