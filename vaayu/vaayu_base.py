@@ -93,6 +93,12 @@ def compute_spec_working_set(geometry: dict, verify_positions: int) -> int:
     return per_layer * geometry["num_moe_layers"] * geometry["expert_bytes"]
 
 
+def spec_decode_fits(geometry: dict, draft_tokens: int, budget_bytes: int) -> bool:
+    """True if a speculative verify pass's expert working set fits the expert
+    cache budget (Fix #9). draft_tokens drafts + 1 correction = verify positions."""
+    return compute_spec_working_set(geometry, draft_tokens + 1) <= budget_bytes
+
+
 # Hardware constant for THIS 32 GB box: max safe expert-cache size before OOM.
 # Model-independent. Raised from the old 7 GB only after shrinking other RAM
 # consumers (below). Do NOT exceed 9 GB — 10 GB caused a confirmed OOM-kill.
@@ -681,6 +687,26 @@ class VaayuBaseModel(GenerationMixin):
                 device=device,
                 use_prompt_lookup=use_prompt_lookup,
             )
+
+        # Fix #9 (REPORT §2.4): a verify pass routes (draft_tokens+1) positions
+        # at once — per-layer unique experts ≈ positions × top_k, so the working
+        # set is ~Nx the single-token one. When that cannot fit the expert cache,
+        # speculation guarantees thrash and is ~I/O-neutral per accepted token.
+        # Warn with the derived numbers and disable — loudly, never silently.
+        if (self.speculator is not None and self.is_moe
+                and getattr(self, '_expert_cache', None) is not None
+                and getattr(self, '_moe_geometry', None) is not None):
+            if not spec_decode_fits(self._moe_geometry, self.draft_tokens,
+                                    self._expert_cache.budget_bytes):
+                _sws = compute_spec_working_set(self._moe_geometry, self.draft_tokens + 1)
+                print(f"[Vaayu-Spec] WARNING: speculative verify working set "
+                      f"{_sws / 1e9:.1f} GB ((draft_tokens={self.draft_tokens}+1) positions × "
+                      f"top-{self._moe_geometry['top_k']}) exceeds expert cache budget "
+                      f"{self._expert_cache.budget_bytes / 1e9:.1f} GB — speculation would "
+                      f"thrash the cache and gains ~nothing per accepted token on this "
+                      f"hardware. DISABLING speculative decoding for this MoE model. "
+                      f"(Reduce draft_tokens or use a smaller model to re-enable.)")
+                self.speculator = None
 
         if device.startswith("cuda"):
             self._warmup_nvme()
