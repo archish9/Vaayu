@@ -37,6 +37,13 @@ _EXPERT_WEIGHT_ROLES: list[tuple[str, str]] = [
 ]
 
 
+def unique_expert_indices(expert_indices_cpu) -> list[int]:
+    """Fix #5: unique expert ids across ALL routed positions (flattened B*S x top_k),
+    so each expert is read/loaded at most once per layer per forward pass, even
+    when speculative decoding verifies multiple draft positions at once."""
+    return sorted(int(x) for x in expert_indices_cpu.flatten().unique().tolist())
+
+
 def _classify_expert_tensors(
     raw: dict,
 ) -> "tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]":
@@ -592,7 +599,7 @@ def _make_fused_sparse_forward_exl3(
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
         expert_indices_cpu = expert_indices.cpu()
-        unique_experts: list[int] = expert_indices_cpu.flatten().unique().tolist()
+        unique_experts: list[int] = unique_expert_indices(expert_indices_cpu)
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
 
