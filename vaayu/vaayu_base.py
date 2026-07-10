@@ -53,6 +53,30 @@ except ImportError:
     cache_utils_installed = False
 
 
+def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_experts):
+    """Model-agnostic MoE geometry, derived — never hardcoded (REPORT §1.5).
+
+    Returns dict: expert_bytes, num_moe_layers, top_k, num_experts,
+    working_set_bytes (= top_k * num_moe_layers * expert_bytes, one decode step).
+    """
+    expert_bytes = 0
+    for layer_tensors in expert_offset_index.index.values():
+        for expert_tensors in layer_tensors.values():
+            expert_bytes = sum(t.byte_length for t in expert_tensors.values())
+            break
+        if expert_bytes:
+            break
+    num_moe_layers = len(expert_offset_index.index) or max(1, num_layers - 3)
+    working_set_bytes = moe_top_k * num_moe_layers * expert_bytes
+    return {
+        "expert_bytes": expert_bytes,
+        "num_moe_layers": num_moe_layers,
+        "top_k": moe_top_k,
+        "num_experts": moe_num_experts,
+        "working_set_bytes": working_set_bytes,
+    }
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
