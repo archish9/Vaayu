@@ -1386,7 +1386,7 @@ class VaayuBaseModel(GenerationMixin):
                 continue
             try:
                 raw = load_expert_sparse(shard_file, metas)
-                self._expert_cache.put(layer_idx, eidx, raw)
+                self._expert_cache.put(layer_idx, eidx, raw, prefetch=True)
             except Exception as e:
                 print(f"[Vaayu-MoE] prefetch failed layer={layer_idx} expert={eidx}: {e}")
 
