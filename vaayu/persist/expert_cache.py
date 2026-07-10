@@ -199,6 +199,91 @@ class ExpertRAMCache:
             return f"{dh}hit/{dm}miss/{de}evict hit_rate={rate}"
 
 
+class ExpertVRAMCache:
+    """GPU-resident LRU of per-expert tensor groups, keyed by (layer, expert).
+
+    Fix #7: eliminates per-token host->device copies for hot experts. Stores the
+    already-on-GPU {"gate":{...}, "up":{...}, "down":{...}} dicts. Byte-budgeted
+    (budget derived from free VRAM, a hardware limit — see caller). Thread-safe;
+    a single lock guards all state. Evicted tensors' references are dropped so the
+    torch caching allocator can reuse the memory.
+    """
+
+    def __init__(self, budget_bytes: int):
+        self.budget_bytes = budget_bytes
+        self.cache: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
+        self.current_usage = 0
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self._last_hits = 0
+        self._last_misses = 0
+        self._last_evictions = 0
+
+    @staticmethod
+    def _group_bytes(groups: dict) -> int:
+        total = 0
+        for role in groups.values():
+            for t in role.values():
+                total += t.nbytes
+        return total
+
+    def get(self, layer_idx: int, expert_idx: int):
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                self.hits += 1
+                return self.cache[key]
+            self.misses += 1
+            return None
+
+    def put(self, layer_idx: int, expert_idx: int, gpu_groups: dict) -> None:
+        size = self._group_bytes(gpu_groups)
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            if key in self.cache:
+                return
+            if size > self.budget_bytes:
+                return  # single expert bigger than whole budget — refuse
+            while self.current_usage + size > self.budget_bytes and self.cache:
+                _, evicted = self.cache.popitem(last=False)
+                self.current_usage -= self._group_bytes(evicted)
+                self.evictions += 1
+                del evicted  # drop GPU references so the allocator can reuse
+            self.cache[key] = gpu_groups
+            self.current_usage += size
+
+    def reset_stats(self) -> None:
+        with self.lock:
+            self.hits = self.misses = self.evictions = 0
+            self._last_hits = self._last_misses = self._last_evictions = 0
+
+    def stats(self) -> str:
+        with self.lock:
+            total = self.hits + self.misses
+            rate = f"{self.hits / total:.0%}" if total > 0 else "n/a"
+            return (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
+                    f"hit_rate={rate} "
+                    f"usage={self.current_usage / 1e9:.2f}GB/{self.budget_bytes / 1e9:.2f}GB")
+
+    def delta_stats(self) -> str:
+        with self.lock:
+            dh = self.hits - self._last_hits
+            dm = self.misses - self._last_misses
+            de = self.evictions - self._last_evictions
+            self._last_hits, self._last_misses, self._last_evictions = self.hits, self.misses, self.evictions
+            total = dh + dm
+            rate = f"{dh / total:.0%}" if total > 0 else "n/a"
+            return f"{dh}hit/{dm}miss/{de}evict hit_rate={rate}"
+
+    def clear(self) -> None:
+        with self.lock:
+            self.cache.clear()
+            self.current_usage = 0
+
+
 class LRUTensorCache:
     """
     Byte-budgeted LRU cache for arbitrary tensor dicts, keyed by string.
