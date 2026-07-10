@@ -2069,7 +2069,10 @@ class VaayuBaseModel(GenerationMixin):
         _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
         _expert_cache_stats = self._expert_cache.stats() if self._expert_cache is not None else "n/a"
         _expert_cache_delta = self._expert_cache.delta_stats() if self._expert_cache is not None else "n/a"
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_s:.1f}s  other={_total - _io_wait_s - _gpu_load_s - _compute_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}")
+        _expert_disk_s = getattr(self, '_expert_disk_s', 0.0)
+        _compute_only_s = max(0.0, _compute_s - _expert_disk_s)
+        _other_s = _total - _io_wait_s - _gpu_load_s - _compute_s
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")
