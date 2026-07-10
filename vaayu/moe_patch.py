@@ -561,7 +561,7 @@ def _make_fused_sparse_forward_exl3(
     PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
     """
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse
+    from .persist.safetensor_model_persister import load_expert_sparse, load_experts_bulk
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -608,26 +608,43 @@ def _make_fused_sparse_forward_exl3(
 
         if misses:
             _disk_t0 = time.perf_counter()
-            if _prof:
-                _t0 = _disk_t0
-
-            def _load_one(eidx: int):
-                metas = offset_index.get_expert_offsets(layer_name, eidx)
-                if metas is None:
-                    return eidx, None
-                raw = load_expert_sparse(shard_file, metas)
-                expert_cache.put(layer_idx, eidx, raw)
-                return eidx, raw
-
-            # Uses vaayu_ref._moe_executor — a persistent ThreadPoolExecutor created
-            # once at model init (sized to get_expert_pool_size(), fixed for the
-            # model's lifetime), instead of creating/destroying a fresh executor on
-            # every layer of every token. .map() only dispatches len(misses) tasks
-            # regardless of pool size, so this is behaviorally identical to the old
-            # per-call min(len(misses), get_expert_pool_size()) cap.
-            for eidx, raw in vaayu_ref._moe_executor.map(_load_one, misses):
-                if raw is not None:
+            # Fix #2: model-agnostic ratio threshold — experts_mod.num_experts is
+            # read live from the module (128 for Qwen3-235B, 256 for MiniMax-M2.5,
+            # etc.), never a hardcoded literal.
+            _num_layer_experts = experts_mod.num_experts
+            _bulk = len(misses) >= max(1, int(0.5 * _num_layer_experts))
+            if _bulk:
+                # Prefill / high-miss-ratio: one sequential span read of the
+                # whole layer's needed experts, instead of thousands of small
+                # scattered io_uring calls.
+                _metas = {}
+                for eidx in misses:
+                    m = offset_index.get_expert_offsets(layer_name, eidx)
+                    if m is not None:
+                        _metas[eidx] = m
+                _loaded = load_experts_bulk(shard_file, _metas)
+                for eidx, raw in _loaded.items():
+                    expert_cache.put(layer_idx, eidx, raw)
                     expert_tensors[eidx] = raw
+            else:
+                def _load_one(eidx: int):
+                    metas = offset_index.get_expert_offsets(layer_name, eidx)
+                    if metas is None:
+                        return eidx, None
+                    raw = load_expert_sparse(shard_file, metas)
+                    expert_cache.put(layer_idx, eidx, raw)
+                    return eidx, raw
+
+                # Uses vaayu_ref._moe_executor — a persistent ThreadPoolExecutor
+                # created once at model init (sized to get_expert_pool_size(),
+                # fixed for the model's lifetime), instead of creating/destroying
+                # a fresh executor on every layer of every token. .map() only
+                # dispatches len(misses) tasks regardless of pool size, so this
+                # is behaviorally identical to the old per-call
+                # min(len(misses), get_expert_pool_size()) cap.
+                for eidx, raw in vaayu_ref._moe_executor.map(_load_one, misses):
+                    if raw is not None:
+                        expert_tensors[eidx] = raw
             _disk_elapsed = time.perf_counter() - _disk_t0
             vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _disk_elapsed
             if _prof:
