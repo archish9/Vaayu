@@ -1758,6 +1758,8 @@ class VaayuBaseModel(GenerationMixin):
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
+        self._expert_disk_s = 0.0   # Fix #6: real expert NVMe time this token
+                                    # (accumulated by sparse_forward in moe_patch)
 
         # MoE dispatch sub-timing (mask sync / disk load / H2D / object construct / GEMM),
         # gated behind profiling_mode so it's zero-cost when disabled.
