@@ -59,6 +59,11 @@ class StandardDrafterDecoder(SpeculativeDecoder):
             # reset-to-None + full re-prefill pattern.
             unseen = input_ids if self._drafter_past is None else input_ids[:, self._drafter_seen:]
             if unseen.shape[1] == 0:
+                # Unreachable via generate_speculative's single call site: rollback_cache
+                # always sets self._drafter_seen < input_ids.shape[1] for the next draft()
+                # call, since verify_and_accept guarantees num_accepted >= 1 (Fix #9). If a
+                # future call site can reach num_accepted == 0, this branch under-tracks
+                # self._drafter_seen by 1 token relative to the cache it just fed.
                 unseen = input_ids[:, -1:]
             out = self.drafter(input_ids=unseen, use_cache=True,
                                past_key_values=self._drafter_past)
