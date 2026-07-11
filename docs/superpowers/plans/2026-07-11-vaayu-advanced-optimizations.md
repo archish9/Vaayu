@@ -72,11 +72,15 @@ import torch
 import vaayu_rust
 
 # Load the PyTorch CUDA runtime library dynamically
-try:
-    cudart = ctypes.CDLL('libcudart.so')
-except OSError:
-    # Fallback to standard CUDA path if libcudart is not in the system linker path
-    cudart = ctypes.CDLL('libcudart.so.12')
+from pathlib import Path
+
+# Robustly locate PyTorch's bundled libcudart
+cudart = None
+for lib in Path(torch.__path__[0]).rglob('libcudart.so*'):
+    cudart = ctypes.CDLL(str(lib))
+    break
+if cudart is None:
+    cudart = ctypes.CDLL('libcudart.so.12') # System fallback
 
 # Define cudaHostRegister signatures and flags
 # cudaHostRegisterDefault = 0x0
@@ -144,35 +148,33 @@ fn execute_ffn_cpu(
     hidden_states_ptr: usize,     // Activation pointer from GPU (copied to CPU)
     hidden_dim: usize,
     intermediate_dim: usize,
-    w1_ptr: usize,                // Pointers into the SlabArena RAM
-    w2_ptr: usize,
-    w3_ptr: usize,
+    gate_ptr: usize,              // Pointers into the SlabArena RAM (dynamically passed)
+    down_ptr: usize,
+    up_ptr: usize,
 ) -> PyResult<Vec<f32>> {
     // 1. Wrap raw memory buffers into Candle CPU Tensors
     let device = Device::Cpu;
     
     // Safety: Wrap raw pointers as slices (ensure allocation sizes match dims)
     let hs_slice = unsafe { std::slice::from_raw_parts(hidden_states_ptr as *const f32, hidden_dim) };
-    let w1_slice = unsafe { std::slice::from_raw_parts(w1_ptr as *const f16, hidden_dim * intermediate_dim) };
-    let w2_slice = unsafe { std::slice::from_raw_parts(w2_ptr as *const f16, intermediate_dim * hidden_dim) };
-    let w3_slice = unsafe { std::slice::from_raw_parts(w3_ptr as *const f16, hidden_dim * intermediate_dim) };
+    let gate_slice = unsafe { std::slice::from_raw_parts(gate_ptr as *const f16, hidden_dim * intermediate_dim) };
+    let down_slice = unsafe { std::slice::from_raw_parts(down_ptr as *const f16, intermediate_dim * hidden_dim) };
+    let up_slice = unsafe { std::slice::from_raw_parts(up_ptr as *const f16, hidden_dim * intermediate_dim) };
     
     let hs_tensor = Tensor::from_slice(hs_slice, (1, hidden_dim), &device).unwrap();
-    let w1_tensor = Tensor::from_slice(w1_slice, (hidden_dim, intermediate_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
-    let w2_tensor = Tensor::from_slice(w2_slice, (intermediate_dim, hidden_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
-    let w3_tensor = Tensor::from_slice(w3_slice, (hidden_dim, intermediate_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
+    let gate_tensor = Tensor::from_slice(gate_slice, (hidden_dim, intermediate_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
+    let down_tensor = Tensor::from_slice(down_slice, (intermediate_dim, hidden_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
+    let up_tensor = Tensor::from_slice(up_slice, (hidden_dim, intermediate_dim), &device).unwrap().to_dtype(DType::F32).unwrap();
 
-    // 2. Perform SwiGLU FFN Math (silu(x * w1) * (x * w3)) * w2
-    // w1 and w3 are gate and up projections
-    let x_w1 = hs_tensor.matmul(&w1_tensor).unwrap();
-    let x_w3 = hs_tensor.matmul(&w3_tensor).unwrap();
+    // 2. Perform FFN Math (activation(x * gate) * (x * up)) * down
+    let x_gate = hs_tensor.matmul(&gate_tensor).unwrap();
+    let x_up = hs_tensor.matmul(&up_tensor).unwrap();
     
-    // SiLU activation: x * sigmoid(x)
-    let silu_x_w1 = x_w1.clone().mul(&x_w1.minimum(0.0).unwrap().neg().unwrap().exp().unwrap()).unwrap(); // Simple sigmoid implementation
-    let intermediate = silu_x_w1.mul(&x_w3).unwrap();
+    // Model-agnostic native SiLU activation (candle-core)
+    let act_x_gate = x_gate.silu().unwrap(); 
+    let intermediate = act_x_gate.mul(&x_up).unwrap();
     
-    // w2 is down projection
-    let output = intermediate.matmul(&w2_tensor).unwrap();
+    let output = intermediate.matmul(&down_tensor).unwrap();
     
     // Flatten and return output back to Python
     let out_vec = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -210,32 +212,36 @@ class ProfiledMoEBlock:
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.expert_cache = expert_cache
-        self.routing_history = Counter()
-        self.warmup_tokens = 150
-        self.tokens_tracked = 0
+        self.routing_ema = torch.zeros(num_experts, dtype=torch.float32)
+        self.ema_alpha = 0.05 # Decay factor for rolling window
         self.pinned_experts = set()
 
     def record_routing_and_pin(self, active_expert_indices: torch.Tensor):
-        if len(self.pinned_experts) > 0:
-            return # Already pinned
-            
-        # Record usage
+        # Update Exponential Moving Average (EMA) of expert usage
+        current_usage = torch.zeros(self.num_experts, dtype=torch.float32, device=active_expert_indices.device)
         for idx in active_expert_indices.flatten().tolist():
-            self.routing_history[idx] += 1
+            current_usage[idx] += 1.0
             
-        self.tokens_tracked += 1
+        self.routing_ema = (1 - self.ema_alpha) * self.routing_ema + self.ema_alpha * current_usage.cpu()
         
-        # When warmup completes, lock the top 10% most active experts
-        if self.tokens_tracked >= self.warmup_tokens:
-            top_k_count = max(1, int(self.num_experts * 0.10))
-            most_common = [idx for idx, _ in self.routing_history.most_common(top_k_count)]
-            
-            for exp_idx in most_common:
+        # Lock the top 10% most active experts dynamically
+        top_k_count = max(1, int(self.num_experts * 0.10))
+        _, most_common = torch.topk(self.routing_ema, top_k_count)
+        most_common = most_common.tolist()
+        
+        # Unpin experts that fell out of the top 10%
+        for exp_idx in list(self.pinned_experts):
+            if exp_idx not in most_common:
+                self.pinned_experts.remove(exp_idx)
+                # Unpin expert weight from VRAM to allow LRU eviction
+                # self.expert_cache.unpin_from_vram(self.layer_idx, exp_idx)
+
+        # Pin new heavy-hitters
+        for exp_idx in most_common:
+            if exp_idx not in self.pinned_experts:
                 self.pinned_experts.add(exp_idx)
                 # Pin expert weight in VRAM to prevent LRU eviction
                 self.expert_cache.pin_to_vram(self.layer_idx, exp_idx)
-                
-            print(f"[Vaayu-Profile] Layer {self.layer_idx} locked heavy-hitters: {most_common}")
 ```
 
 ---
@@ -259,14 +265,16 @@ We apply a dynamic bias to the router outputs before the Top-K selection.
 import torch
 import torch.nn.functional as F
 
-def cache_aware_routing(logits: torch.Tensor, resident_mask: torch.Tensor, top_k: int, bias_weight: float = 1.5):
+def cache_aware_routing(logits: torch.Tensor, resident_mask: torch.Tensor, top_k: int, base_bias: float = 0.5):
     """
     logits: [batch_size, num_experts] (output from router)
     resident_mask: [num_experts] (1.0 for cached experts, 0.0 for disk)
-    bias_weight: strength of logit boost for cached experts
+    base_bias: strength of logit boost for cached experts, scaled dynamically
     """
-    # Apply bias only to cached experts
-    biased_logits = logits + (resident_mask.unsqueeze(0) * bias_weight)
+    # Dynamically scale bias by the standard deviation of the router logits
+    # This prevents the bias from overwhelming highly confident routing decisions
+    dynamic_bias = resident_mask.unsqueeze(0) * base_bias * logits.std(dim=-1, keepdim=True)
+    biased_logits = logits + dynamic_bias
     
     # Calculate routing scores
     routing_weights = F.softmax(biased_logits, dim=-1)
