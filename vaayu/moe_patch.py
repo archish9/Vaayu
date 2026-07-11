@@ -639,8 +639,10 @@ def _make_fused_sparse_forward_exl3(
                 return
             raw = load_expert_sparse(shard_file_for(next_layer_name), metas)
             expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning(
+                f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"
+            )
 
     def sparse_forward(hidden_states, **kwargs):
         _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
@@ -696,7 +698,10 @@ def _make_fused_sparse_forward_exl3(
                             if not expert_cache.has(layer_idx + 1, _pe):
                                 vaayu_ref._moe_executor.submit(
                                     _load_predicted_expert, _next_name, layer_idx + 1, _pe)
-                except Exception:
+                except Exception as e:
+                    _log.warning(
+                        f"Lookahead router probe failed for layer {layer_idx + 1}: {e}"
+                    )
                     vaayu_ref._lookahead_pred = None
 
         if _prof:
