@@ -140,6 +140,20 @@ revertable, in the order landed above); revert the offending one and update this
 
 ---
 
+## Final whole-branch review (opus, 0723c49..860d332)
+
+**Ready to merge: Yes** (pending the real-hardware checklist above). No Critical/Important findings.
+The review's primary focus was cross-task composition — six tasks (5, 7, 8, 9, 11, 12) modified
+overlapping regions of the same `sparse_forward` closure sequentially; the review traced the CURRENT
+merged state (not just isolated diffs) to confirm they compose rather than silently interact. All
+four named risks (Task 7 VRAM-cache vs. Task 11 chunk-major retention fighting over ownership;
+Task 8's now-multi-call slab lifecycle vs. Task 9's per-chunk one-copy rebuild; Task 5's dispatch
+locals possibly going stale across chunk-calls; Task 12's lookahead accounting under chunk-major)
+resolved cleanly, primarily because the prefill/decode gate (`_vram` forced `None` during prefill,
+`_chunk_major_gpu`/`_moe_prefill_pass` both false during decode) keeps the dangerous state machines
+mutually exclusive rather than interleaved — verified by reading the live merged function, not the
+diffs in isolation.
+
 ## Open items for final review (not blocking, tracked for the whole-branch review)
 
 - Task 5 reviewer noted `non_blocking=True` on the unpinned CPU `_pair` tensor is a latent no-op
@@ -148,8 +162,25 @@ revertable, in the order landed above); revert the offending one and update this
   executor") that no longer matches the actual test fixture (which does have a real executor) — not
   fixed, purely a comment-accuracy nit.
 - Task 7 reviewer noted non-atomic `"bc"` tuple construction vs. entry assignment under a
-  mid-construction exception — self-healing (next hit rebuilds), not fixed.
+  mid-construction exception — self-healing (next hit rebuilds), not fixed. Reconfirmed by the final
+  review.
 - Task 9 test coverage for multi-byte dtype offsets and the uint8 defensive assertion were both
   fixed in review (see table above) — no open item remains from that task.
+- **No unit test exercises the full stack simultaneously** (chunk-major + slab-staged + GPU
+  retention + BC reuse all at once) — `tests/test_layer_major_prefill.py` covers the retention
+  lifecycle with an empty `_prefill_staged_slabs`, so the specific interaction of a slab-backed
+  `_gpu_blob` being retained across chunks while its CPU slab is released is verified by code
+  inspection only, not by a test. Final reviewer recommends adding this test but rates it Minor/
+  non-blocking since the real-hardware long-prompt parity check below would catch a functional break.
+- **Latent multi-turn VRAM pressure** (Task 7 × Task 11): a second generation's chunk-major prefill
+  allocates fresh per-layer retained GPU tensors on top of whatever VRAM-cache entries the first
+  generation's decode left resident (cache is never cleared between `generate()` calls). Bounded to
+  ~one layer's worth (~1.4GB for Qwen) since retention frees per-layer, not the full budget — the
+  single-prompt `test_generate.py` target never exercises multi-turn, so this is theoretical for the
+  plan's stated scope. Worth a comment or hardware note if multi-turn usage is added later.
+- **Pre-existing stale docstring** (`vaayu/moe_patch.py`, not introduced by this plan): a comment
+  still cites "~88 MB per expert" cost model, contradicting the actual measured 11.28MB (see
+  `moe_perf_rootcause` memory) this whole line of work is built on. Out of scope for surgical-change
+  rules since it predates this branch, but actively misleading — flagged for a future cleanup pass.
 - MiniMax-M2.5 spot check outstanding (see Real-hardware verification above) — same open item
   carried forward from the prior plan's RESULTS doc.
