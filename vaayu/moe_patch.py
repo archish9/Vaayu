@@ -435,16 +435,23 @@ def _make_modulelist_sparse_forward(
             if ok:
                 injected_experts.add(eidx)
 
-        for s in range(S):
-            for k in range(top_k):
-                for b in range(B):
-                    eidx = int(expert_indices[b, s, k].item())
-                    if eidx not in injected_experts:
-                        continue
-                    weight = routing_weights[b, s, k]
-                    expert_mod = experts_list[eidx]
-                    expert_out = expert_mod(hidden_states[b:b+1, s, :])  # (1, H)
-                    final_hidden[b, s, :] += weight * expert_out.squeeze(0)
+        # Vectorized: gather all positions routed to each expert and run the
+        # expert FFN once per expert on the batch of its tokens, instead of a
+        # triple Python loop with a .item() GPU sync per position.
+        _idx_cpu = expert_indices.cpu()
+        for eidx in injected_experts:
+            b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
+            if b_idx.numel() == 0:
+                continue
+            b_gpu = b_idx.to(hidden_states.device)
+            s_gpu = s_idx.to(hidden_states.device)
+            k_gpu = k_idx.to(hidden_states.device)
+            expert_mod = experts_list[eidx]
+            expert_out = expert_mod(hidden_states[b_gpu, s_gpu])          # (M, H)
+            w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
+            final_hidden.index_put_((b_gpu, s_gpu),
+                                    (w * expert_out).to(final_hidden.dtype),
+                                    accumulate=True)
 
         for eidx in injected_experts:
             try:
@@ -514,8 +521,6 @@ def _make_fused_sparse_forward(
                 misses.append(eidx)
 
         if misses:
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-
             def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
@@ -525,12 +530,20 @@ def _make_fused_sparse_forward(
                     expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 
-            # Up to 8 concurrent reads: amortizes NVMe APST wake-up latency (~100ms)
-            # over all misses instead of paying it once per expert serially.
-            with _TPE(max_workers=min(len(misses), 8)) as _ex:
-                for eidx, raw in _ex.map(_load_one, misses):
-                    if raw is not None:
-                        expert_tensors[eidx] = raw
+            # Reuse the persistent MoE executor (created once at model init) —
+            # a fresh ThreadPoolExecutor per layer call paid thread create/join
+            # on every MoE layer. Fallback covers unit tests whose mock
+            # vaayu_ref has no executor.
+            _ex = getattr(vaayu_ref, "_moe_executor", None)
+            if _ex is not None:
+                _results = _ex.map(_load_one, misses)
+            else:
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                with _TPE(max_workers=min(len(misses), 8)) as _tmp_ex:
+                    _results = list(_tmp_ex.map(_load_one, misses))
+            for eidx, raw in _results:
+                if raw is not None:
+                    expert_tensors[eidx] = raw
 
         # Expert mask on CPU (avoids PCIe for index tensors)
         expert_indices_cpu = expert_indices.cpu()
