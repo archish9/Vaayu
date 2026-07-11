@@ -1619,8 +1619,6 @@ class VaayuBaseModel(GenerationMixin):
 
             try:
                 set_module_tensor_to_device(self.model, param_name, self.running_device, value=target)
-                if "input_layernorm" in param_name:
-                    print(f"[Vaayu-Debug] injected {param_name} to {self.running_device}", flush=True)
             except Exception as e:
                 print(f"[Vaayu] Warning: could not inject {param_name}: {e}")
 
@@ -1826,7 +1824,6 @@ class VaayuBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        print(f"[Vaayu-Debug] forward input_ids device: {input_ids.device}")
         _exec_start = time.time()
         print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
         self.telemetry.begin_token(self._token_count)
