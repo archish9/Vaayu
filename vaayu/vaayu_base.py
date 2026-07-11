@@ -1881,10 +1881,16 @@ class VaayuBaseModel(GenerationMixin):
         else:
             _expert_tensor_re = None
 
-        # MoE: cap workers to avoid OOM from concurrent expert prefetch fan-out.
-        # Default workers (cpu_count+4) × 2 experts × 352 MB = RAM spike on 33 GB machines.
-        _exec_workers = 2 if self.is_moe else None
-        with torch.inference_mode(), ThreadPoolExecutor(max_workers=_exec_workers) as executor:
+        # Persistent executor: created once, reused every token. The old per-token
+        # `with ThreadPoolExecutor(...)` paid thread create/join on every forward.
+        # Only layer-weight load futures run here; each is consumed by
+        # future.result() at its own layer, so no cross-token leakage.
+        if getattr(self, "_fwd_executor", None) is None:
+            _exec_workers = 2 if self.is_moe else 4
+            self._fwd_executor = ThreadPoolExecutor(max_workers=_exec_workers)
+            atexit.register(self._fwd_executor.shutdown, wait=False)
+        executor = self._fwd_executor
+        with torch.inference_mode():
 
             # Clear prefill-polluted cache on first decode token so the per-layer LRU
             # warms from decode routing rather than prefill routing.
