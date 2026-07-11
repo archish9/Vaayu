@@ -691,6 +691,16 @@ def _make_fused_sparse_forward_exl3(
                     if _raw is not None:
                         yield _e, _raw
 
+        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+        # Prefill: don't churn the GPU LRU with a whole-model sweep.
+        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
+            _vram = None
+        # Layer-range restriction (Fix #7 follow-up): only layers in the
+        # cacheable prefix use the VRAM cache; None means no restriction.
+        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
+        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
+            _vram = None
+
         for eidx, raw in _iter_experts_hits_then_misses():
             groups = _group_exl3_tensors_by_weight(raw)
             if not groups["gate"] or not groups["down"] or not groups["up"]:
@@ -710,10 +720,6 @@ def _make_fused_sparse_forward_exl3(
             if current_state.dtype != torch.float16:
                 current_state = current_state.to(torch.float16)
 
-            _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-            # Prefill: don't churn the GPU LRU with a whole-model sweep.
-            if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-                _vram = None
             _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
             if _cached_gpu is not None:
                 gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]

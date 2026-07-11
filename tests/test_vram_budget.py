@@ -14,3 +14,39 @@ def test_tiny_free_vram_yields_zero_or_min():
     budget = compute_vram_expert_budget(free_vram_bytes=1 * GB)
     assert budget >= 0
     assert budget <= 1 * GB
+
+
+def test_vram_layer_range_restricts_when_budget_below_working_set():
+    """Qwen-like geometry: budget < working set -> only the first N layers are
+    cacheable, N = budget // (top_k * expert_bytes)."""
+    from vaayu.vaayu_base import compute_vram_layer_range
+
+    mb = 1024 ** 2
+    geo = {"expert_bytes": 11 * mb, "top_k": 8, "num_moe_layers": 91,
+           "num_experts": 128, "working_set_bytes": 8 * 91 * 11 * mb}
+    layer_ids = list(range(3, 94))  # 91 MoE layers, offset like Qwen
+    budget = 7 * 1024 ** 3          # ~7 GiB < ~8 GiB working set
+    allowed = compute_vram_layer_range(budget, geo, layer_ids)
+    assert allowed is not None
+    n_fit = budget // (8 * 11 * mb)
+    assert allowed == set(layer_ids[:n_fit])
+    assert 0 < len(allowed) < len(layer_ids)
+
+
+def test_vram_layer_range_none_when_working_set_fits():
+    """MiniMax-like geometry: working set < budget -> no restriction."""
+    from vaayu.vaayu_base import compute_vram_layer_range
+
+    mb = 1024 ** 2
+    geo = {"expert_bytes": 11 * mb, "top_k": 8, "num_moe_layers": 62,
+           "num_experts": 256, "working_set_bytes": 8 * 62 * 11 * mb}  # ~5.3 GiB
+    allowed = compute_vram_layer_range(7 * 1024 ** 3, geo, list(range(62)))
+    assert allowed is None
+
+
+def test_vram_layer_range_zero_budget():
+    from vaayu.vaayu_base import compute_vram_layer_range
+
+    geo = {"expert_bytes": 11 * 1024 ** 2, "top_k": 8, "num_moe_layers": 91,
+           "num_experts": 128, "working_set_bytes": 8 * 91 * 11 * 1024 ** 2}
+    assert compute_vram_layer_range(0, geo, list(range(91))) == set()

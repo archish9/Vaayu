@@ -158,6 +158,24 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 
+def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
+                             moe_layer_ids: list) -> "set | None":
+    """Fix #7 sizing gap: a single VRAM LRU walked in layer order self-evicts
+    and hits 0% whenever budget < one token's working set (see
+    2026-07-10-fix7-vram-cache-zero-hit-report.md §4). Restrict caching to the
+    FIRST N MoE layers whose per-token insert load (top_k experts each) fits
+    the budget — those entries then survive across tokens and hit at the
+    cross-token routing-overlap rate. Returns None when the whole working set
+    fits (no restriction needed — e.g. MiniMax-M2.5), else the cacheable set.
+    Model-agnostic: all inputs derived from _moe_geometry / detected blocks.
+    """
+    if vram_budget_bytes >= geometry["working_set_bytes"]:
+        return None
+    per_layer_bytes = geometry["top_k"] * geometry["expert_bytes"]
+    n_fit = int(vram_budget_bytes // max(1, per_layer_bytes))
+    return set(sorted(moe_layer_ids)[:n_fit])
+
+
 def compute_prefill_pass(seq_len: int, has_speculator: bool, draft_tokens: int) -> bool:
     """True iff a forward pass of seq_len positions is prompt prefill.
 
@@ -788,6 +806,23 @@ class VaayuBaseModel(GenerationMixin):
                 loader_strategy=self.loader_strategy,
             )
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
+
+            # Fix #7 follow-up: when the VRAM budget can't hold one token's
+            # full working set, an unrestricted LRU deterministically hits 0%
+            # (single-token self-eviction). Restrict to a layer prefix that
+            # fits; WARN honestly (CLAUDE.md §5: warn, don't silently degrade).
+            self._vram_cacheable_layers = None
+            if self._expert_vram_cache is not None and self._moe_blocks:
+                _moe_ids = [b.layer_idx for b in self._moe_blocks]
+                self._vram_cacheable_layers = compute_vram_layer_range(
+                    self._expert_vram_cache.budget_bytes, self._moe_geometry, _moe_ids)
+                if self._vram_cacheable_layers is not None:
+                    print(f"[Vaayu-MoE] WARNING: VRAM cache budget "
+                          f"{self._expert_vram_cache.budget_bytes / 1e9:.1f}GB < per-token "
+                          f"working set {self._moe_geometry['working_set_bytes'] / 1e9:.1f}GB — "
+                          f"an unrestricted LRU would hit 0% (self-eviction). Restricting "
+                          f"VRAM cache to the first {len(self._vram_cacheable_layers)}/"
+                          f"{len(_moe_ids)} MoE layers (partial caching).")
         elif self.is_moe:
             print("[Vaayu-MoE] MoE model on non-CUDA device — expert-aware streaming disabled, "
                   "falling back to full-layer loading")
