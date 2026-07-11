@@ -55,21 +55,31 @@ def test_stage_read_no_arena(tmp_path):
 
 def test_views_from_packed_copy_rebuilds_offsets(tmp_path):
     """Rebuilding views inside a copied buffer must reproduce every tensor
-    byte-exactly at the same relative offsets (CPU stand-in for the GPU copy)."""
+    byte-exactly at the same relative offsets (CPU stand-in for the GPU copy).
+
+    Includes an F16 (multi-byte-itemsize) group at a 2-byte-aligned file
+    offset: an all-U8 test can't exercise PyTorch's `.view(dtype)` storage-
+    offset alignment constraint (itemsize 1 offsets are trivially aligned),
+    but production expert tensors are F16/BF16, where that constraint is the
+    real risk this helper must not silently violate."""
     from vaayu.persist.safetensor_model_persister import (
         expert_span_bytes, load_expert_into_slab, views_from_packed_copy)
 
     payload_a = bytes(range(256)) * 4              # 1024 B
     payload_b = bytes(reversed(range(256))) * 2    # 512 B
+    f16_tensor = torch.tensor([1.5, -2.25, 3.0, 0.125], dtype=torch.float16)
+    payload_c = f16_tensor.numpy().tobytes()       # 8 B, F16
     f = tmp_path / "shard.bin"
     blob = bytearray(600_000)
-    off_a, off_b = 8192, 500_000                   # two far-apart groups
+    off_a, off_b, off_c = 8192, 500_000, 550_000   # three far-apart groups
     blob[off_a:off_a + 1024] = payload_a
     blob[off_b:off_b + 512] = payload_b
+    blob[off_c:off_c + 8] = payload_c
     f.write_bytes(bytes(blob))
     metas = {
         "gate.trellis": _meta(off_a, 1024, [1024]),
         "up.trellis": _meta(off_b, 512, [512]),
+        "down.proj": _meta(off_c, 8, [4], dtype="F16"),
     }
     slab = torch.empty(expert_span_bytes(metas), dtype=torch.uint8)
     views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
@@ -79,5 +89,7 @@ def test_views_from_packed_copy_rebuilds_offsets(tmp_path):
     rebuilt = views_from_packed_copy(views, slab, copied)
     assert bytes(rebuilt["gate.trellis"].numpy().tobytes()) == payload_a
     assert bytes(rebuilt["up.trellis"].numpy().tobytes()) == payload_b
+    assert rebuilt["down.proj"].dtype == torch.float16
+    assert torch.equal(rebuilt["down.proj"], f16_tensor)
     for v in rebuilt.values():
         assert v.data_ptr() >= copied.data_ptr()

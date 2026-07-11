@@ -704,6 +704,8 @@ def views_from_packed_copy(src_views: dict, src_base: "torch.Tensor", dst: "torc
     byte offset relative to src_base; dtype/shape are re-applied. Offset
     alignment is guaranteed by construction: the source views were built by
     load_expert_into_slab with the same arithmetic."""
+    assert src_base.dtype == torch.uint8 and dst.dtype == torch.uint8, \
+        f"views_from_packed_copy requires uint8 buffers (byte-offset arithmetic); got src_base={src_base.dtype}, dst={dst.dtype}"
     base_ptr = src_base.data_ptr()
     out = {}
     for key, v in src_views.items():
