@@ -83,11 +83,17 @@ class KVCacheManager:
         self._snapshot = snap
 
     def load_snapshot(self, device: str = "cuda") -> DynamicCache | None:
-        """Restore the snapshot back to the GPU as a standard DynamicCache."""
+        """Restore the snapshot to `device` using the MODEL's cache class.
+
+        Restoring into a plain DynamicCache silently discards FP8 compression
+        (doubling KV VRAM) when the model runs FP8DynamicCache — its update()
+        quantizes internally, so routing the dequantized BF16 tensors through
+        the model's own factory preserves the compression format."""
         if self._snapshot is None:
             return None
 
-        out = DynamicCache()
+        _factory = getattr(self.model, "_create_kv_cache", None)
+        out = _factory() if callable(_factory) else DynamicCache()
         for layer_idx in sorted(self._snapshot.keys()):
             entry = self._snapshot[layer_idx]
             if 'k_q' in entry:
