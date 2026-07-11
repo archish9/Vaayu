@@ -50,6 +50,10 @@ class TokenTiming:
 
 
 class VaayuTelemetry:
+    MAX_TOKENS = 4096  # ring cap: ~97 LayerTiming objects/token; unbounded growth
+                       # on long-running sessions is pure leak. 4096 tokens covers
+                       # any realistic dump_json() analysis window.
+
     def __init__(self, output_dir: Optional[str] = None):
         self.tokens: List[TokenTiming] = []
         self.output_dir = Path(output_dir) if output_dir else Path(".")
@@ -65,6 +69,8 @@ class VaayuTelemetry:
     def end_token(self):
         if self._current_token:
             self.tokens.append(self._current_token)
+            if len(self.tokens) > self.MAX_TOKENS:
+                del self.tokens[0]
             self._current_token = None
 
     def dump_json(self, path: str):

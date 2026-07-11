@@ -1511,7 +1511,18 @@ class VaayuBaseModel(GenerationMixin):
             # submission; using it here races with inference and corrupts CQE counts.
             # Plain reads still touch NVMe blocks and prime the controller's internal
             # DRAM cache, which is the only goal.
-            buf = torch.empty(1700 * 1024 * 1024, dtype=torch.uint8)
+            # Buffer sized from the actual files being warmed (CLAUDE.md §5: no
+            # hardcoded model sizes), so any model's shards fit.
+            _max_bytes = 0
+            for _n in warmup_names:
+                try:
+                    _max_bytes = max(_max_bytes, os.path.getsize(
+                        str(Path(self.checkpoint_path) / (_n + ".safetensors"))))
+                except OSError:
+                    pass
+            if _max_bytes == 0:
+                return
+            buf = torch.empty(_max_bytes, dtype=torch.uint8)
 
             for name in warmup_names:
                 path = str(Path(self.checkpoint_path) / (name + ".safetensors"))
