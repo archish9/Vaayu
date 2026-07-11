@@ -609,7 +609,26 @@ def _make_fused_sparse_forward_exl3(
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         expert_tensors: dict[int, dict] = {}
         misses: list[int] = []
+
+        # Prefill lookahead: if the stager pre-read this layer, WAIT for it
+        # (that wait IS the disk time — no duplicate reads) and consume it.
+        _staged_layer = None
+        if (getattr(vaayu_ref, "_moe_prefill_pass", False)
+                and getattr(vaayu_ref, "_prefill_stager_active", False)):
+            _ev = vaayu_ref._prefill_stage_events.get(layer_idx)
+            if _ev is not None:
+                _w0 = time.perf_counter()
+                _ev.wait()
+                _stall = time.perf_counter() - _w0
+                vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
+                _staged_layer = vaayu_ref._prefill_staged.pop(layer_idx, None)
+                if _staged_layer is not None:
+                    vaayu_ref._prefill_stage_sem.release()  # free a stage slot
+
         for eidx in unique_experts:
+            if _staged_layer is not None and eidx in _staged_layer:
+                expert_tensors[eidx] = _staged_layer[eidx]
+                continue
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
                 expert_tensors[eidx] = cached

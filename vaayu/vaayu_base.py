@@ -186,6 +186,24 @@ def compute_prefill_pass(seq_len: int, has_speculator: bool, draft_tokens: int) 
     return seq_len > verify_cap
 
 
+def compute_stage_gate(seq_len: int, geometry: dict) -> bool:
+    """Enable prefill expert staging only when the prompt is long enough that
+    routing touches ~all experts per layer (expected coverage >= ~86% at
+    seq_len * top_k == 2 * num_experts). Below that, staging every expert
+    would read more than routing needs. Model-agnostic."""
+    return seq_len * geometry["top_k"] >= 2 * geometry["num_experts"]
+
+
+def compute_stage_depth(expert_budget_bytes: int, geometry: dict) -> int:
+    """How many full layers of experts may be staged ahead during prefill.
+    Bounded by the expert-cache budget (which prefill leaves empty — Task 5
+    skips prefill puts, so staging borrows that RAM) and hard-capped at 2:
+    depth beyond 2 adds RAM risk without TTFT benefit once disk is saturated."""
+    layer_bytes = geometry["num_experts"] * geometry["expert_bytes"]
+    by_budget = int(expert_budget_bytes // max(1, layer_bytes)) - 1
+    return max(1, min(2, by_budget))
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1511,6 +1529,53 @@ class VaayuBaseModel(GenerationMixin):
         t.start()
         self._warmup_thread = t
 
+    # ── Prefill lookahead stager ──────────────────────────────────────────────
+
+    def _prefill_stage_worker(self) -> None:
+        """Background thread (prefill only): reads EVERY expert of each MoE
+        layer, in layer order, at most stage_depth layers ahead of the compute
+        loop. During prefill routing touches ~all experts (P(unused) ≈ e^-27
+        for a long prompt), so layer L+1's disk needs are known without its
+        router — the consumer (sparse_forward) waits on the staged dict instead
+        of issuing its own reads: zero duplicate I/O, disk never idles.
+
+        Publishing protocol: self._prefill_staged[layer_idx] is written COMPLETE,
+        then self._prefill_stage_events[layer_idx].set(). On any failure the
+        event is still set (with a possibly-empty dict) so consumers fall back
+        to their own reads instead of deadlocking.
+        """
+        from concurrent.futures import as_completed
+        from .persist.safetensor_model_persister import load_expert_sparse
+        try:
+            for _block in sorted(self._moe_blocks, key=lambda b: b.layer_idx):
+                if self._prefill_stop.is_set():
+                    return
+                self._prefill_stage_sem.acquire()  # cap layers staged ahead
+                _layer_name = _block.layer_name
+                _shard = str(Path(self.checkpoint_path) / f"{_layer_name}.safetensors")
+                _metas_by_e = self._expert_offset_index.index.get(_layer_name, {})
+                _staged: dict[int, dict] = {}
+                _futs = {
+                    self._moe_executor.submit(load_expert_sparse, _shard, _m): _e
+                    for _e, _m in _metas_by_e.items()
+                }
+                for _f in as_completed(_futs):
+                    if self._prefill_stop.is_set():
+                        for _g in _futs:
+                            _g.cancel()
+                        return
+                    try:
+                        _staged[_futs[_f]] = _f.result()
+                    except Exception as _stage_err:
+                        print(f"[Vaayu-MoE] prefill stage read failed "
+                              f"layer={_block.layer_idx} expert={_futs[_f]}: {_stage_err}")
+                self._prefill_staged[_block.layer_idx] = _staged
+                self._prefill_stage_events[_block.layer_idx].set()
+        finally:
+            # Never leave a consumer blocked on an event that will not arrive.
+            for _ev in self._prefill_stage_events.values():
+                _ev.set()
+
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
@@ -1986,6 +2051,29 @@ class VaayuBaseModel(GenerationMixin):
                 if getattr(self, '_expert_vram_cache', None) is not None:
                     self._expert_vram_cache.reset_stats()
 
+            # Prefill lookahead pipeline: stream upcoming layers' full expert
+            # sets while earlier layers compute. Long prompts only (short ones
+            # don't route all experts — staging would over-read).
+            self._prefill_stager_active = False
+            if (self._moe_prefill_pass and self._moe_blocks
+                    and self._expert_cache is not None
+                    and getattr(self, "_moe_executor", None) is not None
+                    and compute_stage_gate(int(input_ids.shape[1]), self._moe_geometry)):
+                import threading as _threading
+                _depth = compute_stage_depth(
+                    self._expert_cache.budget_bytes, self._moe_geometry)
+                self._prefill_staged = {}
+                self._prefill_stage_events = {
+                    b.layer_idx: _threading.Event() for b in self._moe_blocks}
+                self._prefill_stage_sem = _threading.Semaphore(_depth)
+                self._prefill_stop = _threading.Event()
+                self._prefill_stager_active = True
+                _threading.Thread(
+                    target=self._prefill_stage_worker,
+                    daemon=True, name="vaayu-prefill-stager",
+                ).start()
+                print(f"[Vaayu-MoE] prefill stager: depth={_depth} layers ahead")
+
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
             if self.prefetching:
@@ -1998,230 +2086,236 @@ class VaayuBaseModel(GenerationMixin):
                             future = executor.submit(self._load_from_strategy, _seed_name)
                         break
 
-            for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
-                                               desc=f'running layers({self.running_device})',
-                                               total=len(self.layers),
-                                               disable=(self._token_count > 0)):
+            try:
+                for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
+                                                   desc=f'running layers({self.running_device})',
+                                                   total=len(self.layers),
+                                                   disable=(self._token_count > 0)):
 
-                _lt_file_bytes = 0
-                _lt_cache_hit = False
-                _lt_header_parse_us = 0
-                _lt_io_submit_us = 0
-                _lt_io_wait_us = 0
-                _lt_tensor_reconstruct_us = 0
-                _lt_gpu_transfer_us = 0
-                _lt_compute_us = 0
+                    _lt_file_bytes = 0
+                    _lt_cache_hit = False
+                    _lt_header_parse_us = 0
+                    _lt_io_submit_us = 0
+                    _lt_io_wait_us = 0
+                    _lt_tensor_reconstruct_us = 0
+                    _lt_gpu_transfer_us = 0
+                    _lt_compute_us = 0
 
-                _non_expert_pinned = self.non_expert_pinned_layer_names
-                if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
-                    # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
-                    _lt_cache_hit = True
-                    moved_layers = []
-                    # If no future is outstanding, kick off the next non-pinned load
-                    # so disk read overlaps with this layer's GPU compute.
-                    if self.prefetching and future is None:
-                        _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
+                    _non_expert_pinned = self.non_expert_pinned_layer_names
+                    if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
+                        # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
+                        _lt_cache_hit = True
+                        moved_layers = []
+                        # If no future is outstanding, kick off the next non-pinned load
+                        # so disk read overlaps with this layer's GPU compute.
+                        if self.prefetching and future is None:
+                            _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
+                            for _n in self.layer_names[i + 1:]:
+                                if _n not in _all_pinned_fwd:
+                                    if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                                        future = executor.submit(self._load_non_expert_strategy, _n)
+                                    else:
+                                        future = executor.submit(self._load_from_strategy, _n)
+                                    break
+
+                    elif self.prefetching:
+                        # ── Non-pinned, prefetching ──────────────────────────────
+                        if self.profiling_mode:
+                            t = time.time()
+                        _tl = time.perf_counter()
+                        _t = time.time()
+                        state_dict = future.result()
+                        _io_wait_s += time.time() - _t
+                        _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
+                        _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
+                        _lt_disk = _get_layer_disk_timings(_lt_fpath)
+                        _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
+                        _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
+                        _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
+                        _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
+                        _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
+
+                        # Submit next non-pinned layer's load BEFORE GPU transfer
+                        # so disk read and GPU H2D transfer overlap.
+                        future = None
+                        if self.profiling_mode:
+                            t = time.time()
+                        _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
                         for _n in self.layer_names[i + 1:]:
-                            if _n not in _all_pinned_fwd:
+                            if _n not in _all_pinned_elif:
                                 if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
                                     future = executor.submit(self._load_non_expert_strategy, _n)
                                 else:
                                     future = executor.submit(self._load_from_strategy, _n)
                                 break
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
 
-                elif self.prefetching:
-                    # ── Non-pinned, prefetching ──────────────────────────────
-                    if self.profiling_mode:
-                        t = time.time()
-                    _tl = time.perf_counter()
-                    _t = time.time()
-                    state_dict = future.result()
-                    _io_wait_s += time.time() - _t
-                    _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
-                    _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
-                    _lt_disk = _get_layer_disk_timings(_lt_fpath)
-                    _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
-                    _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
-                    _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
-                    _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                    _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
+                        if self.profiling_mode:
+                            t = time.time()
+                        _tl = time.perf_counter()
+                        _t = time.time()
+                        _sd = state_dict
+                        if _expert_tensor_re is not None and layer_name in _moe_shard_names:
+                            _sd = {k: v for k, v in state_dict.items()
+                                   if not _expert_tensor_re.search(k)}
+                        moved_layers = self.loader_strategy.inject_to_gpu(
+                            self.model, layer_name, _sd, self.running_device, self.running_dtype,
+                            self.hf_quantizer, getattr(self, "_path_remappings", {})
+                        )
+                        _gpu_load_s += time.time() - _t
+                        _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
 
-                    # Submit next non-pinned layer's load BEFORE GPU transfer
-                    # so disk read and GPU H2D transfer overlap.
-                    future = None
-                    if self.profiling_mode:
-                        t = time.time()
-                    _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                    for _n in self.layer_names[i + 1:]:
-                        if _n not in _all_pinned_elif:
-                            if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                future = executor.submit(self._load_non_expert_strategy, _n)
-                            else:
-                                future = executor.submit(self._load_from_strategy, _n)
-                            break
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
-
-                    if self.profiling_mode:
-                        t = time.time()
-                    _tl = time.perf_counter()
-                    _t = time.time()
-                    _sd = state_dict
-                    if _expert_tensor_re is not None and layer_name in _moe_shard_names:
-                        _sd = {k: v for k, v in state_dict.items()
-                               if not _expert_tensor_re.search(k)}
-                    moved_layers = self.loader_strategy.inject_to_gpu(
-                        self.model, layer_name, _sd, self.running_device, self.running_dtype,
-                        self.hf_quantizer, getattr(self, "_path_remappings", {})
-                    )
-                    _gpu_load_s += time.time() - _t
-                    _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
-
-                else:
-                    # ── Non-pinned, no prefetch ──────────────────────────────
-                    _tl = time.perf_counter()
-                    _t = time.time()
-                    if layer_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                        state_dict = self._load_non_expert_strategy(layer_name)
                     else:
-                        state_dict = self.load_layer_to_cpu(layer_name)
-                    _io_wait_s += time.time() - _t
-                    _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
-                    _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
-                    _lt_disk = _get_layer_disk_timings(_lt_fpath)
-                    _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
-                    _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
-                    _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
-                    _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                    _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
-                    if self.profiling_mode:
-                        t = time.time()
-                    _tl = time.perf_counter()
-                    _t = time.time()
-                    _sd = state_dict
-                    if _expert_tensor_re is not None and layer_name in _moe_shard_names:
-                        _sd = {k: v for k, v in state_dict.items()
-                               if not _expert_tensor_re.search(k)}
-                    moved_layers = self.loader_strategy.inject_to_gpu(
-                        self.model, layer_name, _sd, self.running_device, self.running_dtype,
-                        self.hf_quantizer, getattr(self, "_path_remappings", {})
-                    )
-                    _gpu_load_s += time.time() - _t
-                    _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
-
-                # Run layer
-
-                for j, seq in enumerate(batch):
-
-                    if layer_name == self.layer_names_dict['embed']:
+                        # ── Non-pinned, no prefetch ──────────────────────────────
                         _tl = time.perf_counter()
-                        batch[j] = layer(seq)
-                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                    elif layer_name == self.layer_names_dict['norm']:
-                        #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
+                        _t = time.time()
+                        if layer_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                            state_dict = self._load_non_expert_strategy(layer_name)
+                        else:
+                            state_dict = self.load_layer_to_cpu(layer_name)
+                        _io_wait_s += time.time() - _t
+                        _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
+                        _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
+                        _lt_disk = _get_layer_disk_timings(_lt_fpath)
+                        _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
+                        _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
+                        _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
+                        _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
+                        _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
+                        if self.profiling_mode:
+                            t = time.time()
                         _tl = time.perf_counter()
-                        batch[j] = self.run_norm(layer, seq)
-                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                        _t = time.time()
+                        _sd = state_dict
+                        if _expert_tensor_re is not None and layer_name in _moe_shard_names:
+                            _sd = {k: v for k, v in state_dict.items()
+                                   if not _expert_tensor_re.search(k)}
+                        moved_layers = self.loader_strategy.inject_to_gpu(
+                            self.model, layer_name, _sd, self.running_device, self.running_dtype,
+                            self.hf_quantizer, getattr(self, "_path_remappings", {})
+                        )
+                        _gpu_load_s += time.time() - _t
+                        _lt_gpu_transfer_us = int((time.perf_counter() - _tl) * 1e6)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
 
-                        if output_hidden_states:
-                            all_hidden_states[i].append(batch[j])
-                    elif layer_name == self.layer_names_dict['lm_head']:
-                        _tl = time.perf_counter()
-                        batch[j] = self.run_lm_head(layer, seq)
-                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                    else:
+                    # Run layer
 
-                        if output_hidden_states:
-                            all_hidden_states[i].append(seq)
+                    for j, seq in enumerate(batch):
 
-                        len_s = self.get_sequence_len(seq)
+                        if layer_name == self.layer_names_dict['embed']:
+                            _tl = time.perf_counter()
+                            batch[j] = layer(seq)
+                            _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                        elif layer_name == self.layer_names_dict['norm']:
+                            #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
+                            _tl = time.perf_counter()
+                            batch[j] = self.run_norm(layer, seq)
+                            _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
 
-                        kwargs = {
-                            'use_cache': use_cache,
-                            **self.get_past_key_value_args(past_key_values),
-                            **self.get_pos_emb_args(_len_p, len_s),
-                            **self.get_attention_mask_args(attention_mask, _len_p, len_s),
-                            **self.get_position_ids_args(position_ids, _len_p, len_s),
-                        }
+                            if output_hidden_states:
+                                all_hidden_states[i].append(batch[j])
+                        elif layer_name == self.layer_names_dict['lm_head']:
+                            _tl = time.perf_counter()
+                            batch[j] = self.run_lm_head(layer, seq)
+                            _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                        else:
 
-                        _MAX_OOM_RETRIES = 2
-                        layer_out = None
-                        for _oom_retry in range(_MAX_OOM_RETRIES + 1):
-                            try:
-                                if self.use_torch_compile:
-                                    if self._compiled_layer_fn is None:
-                                        self._compiled_layer_fn = torch.compile(
-                                            lambda m, x, **kw: m(x, **kw),
-                                            mode="reduce-overhead",
-                                            fullgraph=False,
-                                        )
-                                    _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                                else:
-                                    _tl = time.perf_counter()
-                                    _t = time.time()
-                                    layer_out = layer(seq, **kwargs)
-                                    _compute_s += time.time() - _t
-                                    _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                                break
-                            except torch.cuda.OutOfMemoryError:
-                                if _oom_retry == _MAX_OOM_RETRIES:
-                                    print(f"[Vaayu] ❌ Fatal OOM on {layer_name}. Recovery failed.")
-                                    raise
-                                print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {_oom_retry + 1}/{_MAX_OOM_RETRIES}). "
-                                      f"Clearing cache and retrying...")
-                                torch.cuda.empty_cache()
-                                gc.collect()
-                                if past_key_values is not None:
-                                    try:
-                                        _oom_seq_len = self.get_past_key_values_cache_seq_len(past_key_values)
-                                        if _oom_seq_len > 512:
-                                            _oom_target = _oom_seq_len // 2
-                                            print(f"[Vaayu] \U0001f52a Truncating KV cache: {_oom_seq_len} → {_oom_target} tokens")
-                                            self._trim_kv_cache_front(past_key_values, _oom_target)
-                                    except Exception as _oom_e:
-                                        print(f"[Vaayu] Cache truncation failed: {_oom_e}")
-                        new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                            if output_hidden_states:
+                                all_hidden_states[i].append(seq)
 
-                        if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
-                            all_self_attns[i].append(layer_out[1])
+                            len_s = self.get_sequence_len(seq)
 
-                        batch[j] = new_seq
+                            kwargs = {
+                                'use_cache': use_cache,
+                                **self.get_past_key_value_args(past_key_values),
+                                **self.get_pos_emb_args(_len_p, len_s),
+                                **self.get_attention_mask_args(attention_mask, _len_p, len_s),
+                                **self.get_position_ids_args(position_ids, _len_p, len_s),
+                            }
 
-                if output_hidden_states:
-                    all_hidden_states += (torch.cat(batch, 0),)
+                            _MAX_OOM_RETRIES = 2
+                            layer_out = None
+                            for _oom_retry in range(_MAX_OOM_RETRIES + 1):
+                                try:
+                                    if self.use_torch_compile:
+                                        if self._compiled_layer_fn is None:
+                                            self._compiled_layer_fn = torch.compile(
+                                                lambda m, x, **kw: m(x, **kw),
+                                                mode="reduce-overhead",
+                                                fullgraph=False,
+                                            )
+                                        _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                    else:
+                                        _tl = time.perf_counter()
+                                        _t = time.time()
+                                        layer_out = layer(seq, **kwargs)
+                                        _compute_s += time.time() - _t
+                                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                    break
+                                except torch.cuda.OutOfMemoryError:
+                                    if _oom_retry == _MAX_OOM_RETRIES:
+                                        print(f"[Vaayu] ❌ Fatal OOM on {layer_name}. Recovery failed.")
+                                        raise
+                                    print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {_oom_retry + 1}/{_MAX_OOM_RETRIES}). "
+                                          f"Clearing cache and retrying...")
+                                    torch.cuda.empty_cache()
+                                    gc.collect()
+                                    if past_key_values is not None:
+                                        try:
+                                            _oom_seq_len = self.get_past_key_values_cache_seq_len(past_key_values)
+                                            if _oom_seq_len > 512:
+                                                _oom_target = _oom_seq_len // 2
+                                                print(f"[Vaayu] \U0001f52a Truncating KV cache: {_oom_seq_len} → {_oom_target} tokens")
+                                                self._trim_kv_cache_front(past_key_values, _oom_target)
+                                        except Exception as _oom_e:
+                                            print(f"[Vaayu] Cache truncation failed: {_oom_e}")
+                            new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-                # Reclaim VRAM — skip for pinned layers (they stay resident)
-                if layer_name not in self.pinned_layer_names and layer_name not in self.non_expert_pinned_layer_names:
-                    self.loader_strategy.free_from_gpu(
-                        self.model, layer, moved_layers, self.hf_quantizer
-                    )
+                            if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
+                                all_self_attns[i].append(layer_out[1])
 
-                self.telemetry.record_layer(LayerTiming(
-                    layer_name=layer_name,
-                    file_bytes=_lt_file_bytes,
-                    header_parse_us=_lt_header_parse_us,
-                    io_submit_us=_lt_io_submit_us,
-                    io_wait_us=_lt_io_wait_us,
-                    tensor_reconstruct_us=_lt_tensor_reconstruct_us,
-                    gpu_transfer_us=_lt_gpu_transfer_us,
-                    compute_us=_lt_compute_us,
-                    cache_hit=_lt_cache_hit,
-                ))
+                            batch[j] = new_seq
 
-                # Prefill only: decode calls this every 32 tokens instead (below) —
-                # per-token empty_cache() defeats the CUDA caching allocator.
-                if self._token_count == 0 and i % 40 == 39:
-                    clean_memory()
+                    if output_hidden_states:
+                        all_hidden_states += (torch.cat(batch, 0),)
+
+                    # Reclaim VRAM — skip for pinned layers (they stay resident)
+                    if layer_name not in self.pinned_layer_names and layer_name not in self.non_expert_pinned_layer_names:
+                        self.loader_strategy.free_from_gpu(
+                            self.model, layer, moved_layers, self.hf_quantizer
+                        )
+
+                    self.telemetry.record_layer(LayerTiming(
+                        layer_name=layer_name,
+                        file_bytes=_lt_file_bytes,
+                        header_parse_us=_lt_header_parse_us,
+                        io_submit_us=_lt_io_submit_us,
+                        io_wait_us=_lt_io_wait_us,
+                        tensor_reconstruct_us=_lt_tensor_reconstruct_us,
+                        gpu_transfer_us=_lt_gpu_transfer_us,
+                        compute_us=_lt_compute_us,
+                        cache_hit=_lt_cache_hit,
+                    ))
+
+                    # Prefill only: decode calls this every 32 tokens instead (below) —
+                    # per-token empty_cache() defeats the CUDA caching allocator.
+                    if self._token_count == 0 and i % 40 == 39:
+                        clean_memory()
+            finally:
+                if getattr(self, "_prefill_stager_active", False):
+                    self._prefill_stop.set()
+                    self._prefill_stage_sem.release()  # unblock a waiting worker
+                    self._prefill_stager_active = False
 
         self.telemetry.end_token()
         self._token_count += 1
