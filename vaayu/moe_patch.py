@@ -392,7 +392,8 @@ def _make_modulelist_sparse_forward(
                     print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
                     continue
                 raw = load_expert_sparse(shard_file, metas)
-                expert_cache.put(layer_idx, eidx, raw)
+                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                    expert_cache.put(layer_idx, eidx, raw)
                 expert_tensors[eidx] = raw
 
         # 3. Temporarily inject active expert weights → device, run FFN, unload
@@ -496,7 +497,8 @@ def _make_fused_sparse_forward(
                 if metas is None:
                     return eidx, None
                 raw = load_expert_sparse(shard_file, metas)
-                expert_cache.put(layer_idx, eidx, raw)
+                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                    expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 
             # Up to 8 concurrent reads: amortizes NVMe APST wake-up latency (~100ms)
@@ -623,7 +625,10 @@ def _make_fused_sparse_forward_exl3(
                 if metas is None:
                     return eidx, None
                 raw = load_expert_sparse(shard_file, metas)
-                expert_cache.put(layer_idx, eidx, raw)
+                # Prefill routes ~all experts once; caching them costs a clone
+                # per expert for content decode immediately replaces. Skip.
+                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                    expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 
             # Uses vaayu_ref._moe_executor — a persistent ThreadPoolExecutor created
@@ -684,6 +689,9 @@ def _make_fused_sparse_forward_exl3(
                 current_state = current_state.to(torch.float16)
 
             _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+            # Prefill: don't churn the GPU LRU with a whole-model sweep.
+            if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
+                _vram = None
             _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
             if _cached_gpu is not None:
                 gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]

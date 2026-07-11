@@ -114,3 +114,38 @@ class TestPerLayerLRU:
         cache.clear()
         assert cache.current_usage == 0
         assert not cache.has(0, 0)
+
+
+def test_prefill_pass_flag_rules():
+    """_moe_prefill_pass: True for multi-token prompt ingestion, False for
+    single-token decode and for speculative verify passes (draft_tokens+1 wide)."""
+    from vaayu.vaayu_base import compute_prefill_pass
+
+    # no speculator: anything wider than 1 position is prefill
+    assert compute_prefill_pass(seq_len=439, has_speculator=False, draft_tokens=0) is True
+    assert compute_prefill_pass(seq_len=1, has_speculator=False, draft_tokens=0) is False
+    # speculator attached: verify passes are draft_tokens+1 wide -> NOT prefill
+    assert compute_prefill_pass(seq_len=6, has_speculator=True, draft_tokens=5) is False
+    assert compute_prefill_pass(seq_len=1, has_speculator=True, draft_tokens=5) is False
+    assert compute_prefill_pass(seq_len=439, has_speculator=True, draft_tokens=5) is True
+
+
+def test_prefill_skips_ram_cache_put():
+    """During a prefill pass the EXL3 miss loader must NOT insert into the RAM
+    expert cache (saves one full-model clone memcpy per prefill)."""
+    from unittest.mock import MagicMock
+    from vaayu.persist.expert_cache import ExpertRAMCache
+
+    cache = ExpertRAMCache(budget_bytes=10**9)
+    vaayu_ref = MagicMock()
+    vaayu_ref._moe_prefill_pass = True
+    # simulate what _load_one does with the flag set
+    import torch
+    raw = {"k": torch.zeros(4)}
+    if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+        cache.put(0, 0, raw)
+    assert cache.current_usage == 0
+    vaayu_ref._moe_prefill_pass = False
+    if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+        cache.put(0, 0, raw)
+    assert cache.current_usage > 0

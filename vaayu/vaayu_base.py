@@ -158,6 +158,16 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 
+def compute_prefill_pass(seq_len: int, has_speculator: bool, draft_tokens: int) -> bool:
+    """True iff a forward pass of seq_len positions is prompt prefill.
+
+    A speculative verify pass is (draft_tokens + 1) positions wide and must be
+    treated as decode (its expert loads should be cached). Model-agnostic.
+    """
+    verify_cap = (draft_tokens + 1) if has_speculator else 1
+    return seq_len > verify_cap
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1892,12 +1902,22 @@ class VaayuBaseModel(GenerationMixin):
         executor = self._fwd_executor
         with torch.inference_mode():
 
-            # Clear prefill-polluted cache on first decode token so the per-layer LRU
-            # warms from decode routing rather than prefill routing.
-            if self.is_moe and self._token_count == 0 and input_ids.shape[1] == 1 and self._expert_cache is not None:
-                self._expert_cache.clear()
-                # Reset counters so decode hit-rate is measured clean, without
-                # prefill's ~100%-miss pollution (prefill routes ~all experts once).
+            # Prefill flag: sparse_forward variants read this to skip cache puts
+            # during prompt ingestion (prefill routes ~all experts once; caching
+            # them is one full-model clone memcpy for content decode replaces).
+            self._moe_prefill_pass = self.is_moe and compute_prefill_pass(
+                seq_len=int(input_ids.shape[1]),
+                has_speculator=self.speculator is not None,
+                draft_tokens=getattr(self, "draft_tokens", 0) or 0,
+            )
+            # First decode pass after prefill: reset cache stats once so decode
+            # hit-rate telemetry excludes prefill's ~100%-miss pollution. (The old
+            # guard here tested `_token_count == 0 and shape[1] == 1`, which is
+            # unsatisfiable after prefill increments _token_count — it never ran.)
+            if (self.is_moe and self._expert_cache is not None
+                    and not self._moe_prefill_pass
+                    and not getattr(self, "_decode_stats_reset", False)):
+                self._decode_stats_reset = True
                 self._expert_cache.reset_stats()
                 if getattr(self, '_expert_vram_cache', None) is not None:
                     self._expert_vram_cache.reset_stats()
