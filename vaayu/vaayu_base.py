@@ -363,6 +363,27 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
     }
 
 
+def stage_read_expert(shard_file: str, metas: dict, arena):
+    """Prefill stager read: into a borrowed pinned arena slab when one is free
+    (zero-clone, async-capable H2D later), else pageable load_expert_sparse
+    fallback. Returns (views_dict, slab_idx_or_None). Caller owns the slab and
+    must release it exactly once (consumer after H2D completes, or the stager/
+    forward cleanup paths for never-consumed layers)."""
+    from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
+    if arena is not None:
+        sidx = arena.acquire()
+        if sidx is not None:
+            slab = arena.tensor(sidx)
+            try:
+                views = load_expert_into_slab(shard_file, metas, slab,
+                                              allow_direct=arena.pin)
+            except Exception:
+                arena.release(sidx)
+                raise
+            return views, sidx
+    return load_expert_sparse(shard_file, metas), None
+
+
 _pcie_topology_checked: set = set()
 
 def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
@@ -1569,7 +1590,6 @@ class VaayuBaseModel(GenerationMixin):
         to their own reads instead of deadlocking.
         """
         from concurrent.futures import as_completed
-        from .persist.safetensor_model_persister import load_expert_sparse
         try:
             for _block in sorted(self._moe_blocks, key=lambda b: b.layer_idx):
                 if self._prefill_stop.is_set():
@@ -1578,22 +1598,46 @@ class VaayuBaseModel(GenerationMixin):
                 _layer_name = _block.layer_name
                 _shard = str(Path(self.checkpoint_path) / f"{_layer_name}.safetensors")
                 _metas_by_e = self._expert_offset_index.index.get(_layer_name, {})
+                _arena = self._expert_cache.arena if self._expert_cache is not None else None
                 _staged: dict[int, dict] = {}
+                _slabs: dict[int, "int | None"] = {}
                 _futs = {
-                    self._moe_executor.submit(load_expert_sparse, _shard, _m): _e
+                    self._moe_executor.submit(stage_read_expert, _shard, _m, _arena): _e
                     for _e, _m in _metas_by_e.items()
                 }
+                _aborted = False
                 for _f in as_completed(_futs):
                     if self._prefill_stop.is_set():
+                        _aborted = True
                         for _g in _futs:
                             _g.cancel()
-                        return
+                        break
                     try:
-                        _staged[_futs[_f]] = _f.result()
+                        _views, _sidx = _f.result()
+                        _staged[_futs[_f]] = _views
+                        _slabs[_futs[_f]] = _sidx
                     except Exception as _stage_err:
                         print(f"[Vaayu-MoE] prefill stage read failed "
                               f"layer={_block.layer_idx} expert={_futs[_f]}: {_stage_err}")
+                if _aborted:
+                    # Drain futures that were already running (cancel() only stops
+                    # queued ones) and give every acquired slab back to the arena.
+                    for _f, _e in _futs.items():
+                        if _e in _slabs:
+                            continue
+                        try:
+                            _views, _sidx = _f.result()
+                            if _sidx is not None and _arena is not None:
+                                _arena.release(_sidx)
+                        except Exception:
+                            pass
+                    if _arena is not None:
+                        for _sidx in _slabs.values():
+                            if _sidx is not None:
+                                _arena.release(_sidx)
+                    return
                 self._prefill_staged[_block.layer_idx] = _staged
+                self._prefill_staged_slabs[_block.layer_idx] = _slabs
                 self._prefill_stage_events[_block.layer_idx].set()
         finally:
             # Never leave a consumer blocked on an event that will not arrive.
@@ -2093,6 +2137,7 @@ class VaayuBaseModel(GenerationMixin):
                 _depth = compute_stage_depth(
                     self._expert_cache.budget_bytes, self._moe_geometry)
                 self._prefill_staged = {}
+                self._prefill_staged_slabs = {}
                 self._prefill_stage_events = {
                     b.layer_idx: _threading.Event() for b in self._moe_blocks}
                 self._prefill_stage_sem = _threading.Semaphore(_depth)
@@ -2346,6 +2391,22 @@ class VaayuBaseModel(GenerationMixin):
                     self._prefill_stop.set()
                     self._prefill_stage_sem.release()  # unblock a waiting worker
                     self._prefill_stager_active = False
+                    # Return every never-consumed staged slab to the arena.
+                    # synchronize() first: in-flight async H2D from a partially
+                    # consumed layer must finish before its pinned slab is reused
+                    # by a CPU-side io_uring write (stream ordering doesn't cover
+                    # that).
+                    _leftover = getattr(self, "_prefill_staged_slabs", None)
+                    if _leftover:
+                        _arena = self._expert_cache.arena if self._expert_cache is not None else None
+                        if _arena is not None:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            for _layer_slabs in _leftover.values():
+                                for _sidx in _layer_slabs.values():
+                                    if _sidx is not None:
+                                        _arena.release(_sidx)
+                        _leftover.clear()
 
         self.telemetry.end_token()
         self._token_count += 1

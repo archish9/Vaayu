@@ -850,6 +850,21 @@ def _make_fused_sparse_forward_exl3(
         if intermediate_size is None:
             _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")
 
+        # Give staged slabs back to the arena once this layer's compute (and
+        # therefore all its H2D copies, which are ordered on the same stream)
+        # has completed. synchronize() is required: the next user of the slab
+        # writes it CPU-side via io_uring, which the CUDA stream can't see.
+        if _staged_layer is not None:
+            _slabs = getattr(vaayu_ref, "_prefill_staged_slabs", {}).pop(layer_idx, None)
+            if _slabs:
+                _arena = expert_cache.arena
+                if _arena is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    for _sidx in _slabs.values():
+                        if _sidx is not None:
+                            _arena.release(_sidx)
+
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return final_hidden.view(B, S, H)
 
