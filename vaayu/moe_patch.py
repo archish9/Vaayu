@@ -607,7 +607,8 @@ def _make_fused_sparse_forward_exl3(
     PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
     """
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
+    from .persist.safetensor_model_persister import (
+        load_expert_sparse, load_expert_into_slab, views_from_packed_copy)
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -649,6 +650,7 @@ def _make_fused_sparse_forward_exl3(
         # Prefill lookahead: if the stager pre-read this layer, WAIT for it
         # (that wait IS the disk time — no duplicate reads) and consume it.
         _staged_layer = None
+        _staged_slabs = {}
         if (getattr(vaayu_ref, "_moe_prefill_pass", False)
                 and getattr(vaayu_ref, "_prefill_stager_active", False)):
             _ev = vaayu_ref._prefill_stage_events.get(layer_idx)
@@ -658,6 +660,7 @@ def _make_fused_sparse_forward_exl3(
                 _stall = time.perf_counter() - _w0
                 vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
                 _staged_layer = vaayu_ref._prefill_staged.pop(layer_idx, None)
+                _staged_slabs = getattr(vaayu_ref, "_prefill_staged_slabs", {}).get(layer_idx, {})
                 if _staged_layer is not None:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
@@ -789,9 +792,22 @@ def _make_fused_sparse_forward_exl3(
             else:
                 if _prof:
                     torch.cuda.synchronize(); _t0 = time.perf_counter()
-                gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
-                gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
-                gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
+                _sidx = _staged_slabs.get(eidx)
+                if _sidx is not None:
+                    # Slab-backed staged expert (prefill): ONE pinned H2D of the
+                    # packed slab prefix, then free GPU re-slicing — replaces 9
+                    # per-component copies (Task 9).
+                    _slab_cpu = expert_cache.arena.tensor(_sidx)
+                    _base = _slab_cpu.data_ptr()
+                    _used = max((v.data_ptr() - _base) + v.nbytes for v in raw.values())
+                    _gpu_blob = _slab_cpu[:_used].to(device, non_blocking=True)
+                    gpu_gate = views_from_packed_copy(groups["gate"], _slab_cpu, _gpu_blob)
+                    gpu_down = views_from_packed_copy(groups["down"], _slab_cpu, _gpu_blob)
+                    gpu_up   = views_from_packed_copy(groups["up"],   _slab_cpu, _gpu_blob)
+                else:
+                    gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
+                    gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
+                    gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
                 if _prof:
                     torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
                 if _vram is not None:

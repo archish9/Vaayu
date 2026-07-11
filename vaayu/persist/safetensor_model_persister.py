@@ -696,3 +696,17 @@ def load_expert_into_slab(
         slab_off += aligned_length
 
     return out
+
+
+def views_from_packed_copy(src_views: dict, src_base: "torch.Tensor", dst: "torch.Tensor") -> dict:
+    """Rebuild {key: view} inside `dst`, a copy of src_base's used prefix
+    (typically a single H2D transfer of a pinned slab). Each view keeps its
+    byte offset relative to src_base; dtype/shape are re-applied. Offset
+    alignment is guaranteed by construction: the source views were built by
+    load_expert_into_slab with the same arithmetic."""
+    base_ptr = src_base.data_ptr()
+    out = {}
+    for key, v in src_views.items():
+        off = v.data_ptr() - base_ptr
+        out[key] = dst[off:off + v.nbytes].view(v.dtype).view(v.shape)
+    return out
