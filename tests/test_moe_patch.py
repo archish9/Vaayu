@@ -709,3 +709,55 @@ def test_permutation_dispatch_matches_one_hot_reference():
         ref = {(int(t), int(k)) for t, k in zip(tok_ref, kpos_ref)}
         assert got == ref, f"expert {e} mismatch"
     assert sum(counts) == n_tok * top_k
+
+
+def test_exl3_vram_hit_reuses_bc_objects(tmp_path):
+    """Second forward pass with identical routing must NOT rebuild
+    BC_LinearEXL3 objects for VRAM-cache-hit experts."""
+    from vaayu.moe_patch import _make_fused_sparse_forward_exl3
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+    vaayu_ref._expert_vram_cache = ExpertVRAMCache(budget_bytes=10**9)
+    vaayu_ref._vram_cacheable_layers = None
+
+    from vaayu.moe_patch import detect_moe_blocks
+    blocks = detect_moe_blocks(model)
+    block_info = blocks[0]
+
+    # Deliberately do NOT pre-populate the cache — every routed expert is a miss,
+    # forcing the vaayu_ref._moe_executor.map(...) branch to actually run.
+
+    bc_factory = MagicMock()
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.side_effect = lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16)
+    bc_factory.return_value = mock_bc
+
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", bc_factory):
+        fwd = _make_fused_sparse_forward_exl3(
+            block_info=block_info,
+            expert_cache=cache,
+            offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)),
+            top_k=2,
+            device="cpu",
+            dtype=torch.float32,
+            vaayu_ref=vaayu_ref,
+        )
+        block_info.moe_module.forward = fwd
+        hidden = torch.randn(1, 1, 8)
+
+        out1 = model.layers[0].mlp.forward(hidden)  # pass 1: builds + caches BC objects
+        n_first = bc_factory.call_count
+        assert n_first > 0
+
+        out2 = model.layers[0].mlp.forward(hidden)  # pass 2: same routing -> VRAM hits
+        assert bc_factory.call_count == n_first, "BC objects rebuilt on VRAM hit"
+
+    assert out1.shape == (1, 1, 8), f"Expected (1,1,8) got {out1.shape}"
+    assert out2.shape == (1, 1, 8), f"Expected (1,1,8) got {out2.shape}"

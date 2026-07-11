@@ -335,7 +335,11 @@ class ExpertVRAMCache:
     @staticmethod
     def _group_bytes(groups: dict) -> int:
         total = 0
-        for role in groups.values():
+        for role_name, role in groups.items():
+            if role_name == "bc":
+                # Cached BC_LinearEXL3 objects (Task 7): C++ wrappers around the
+                # tensors already counted below — no separate byte footprint.
+                continue
             for t in role.values():
                 total += t.nbytes
         return total

@@ -781,9 +781,11 @@ def _make_fused_sparse_forward_exl3(
                 current_state = current_state.to(torch.float16)
 
             _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
+            _entry = None
             if _cached_gpu is not None:
                 gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]
                 _owned_by_cache = True
+                _entry = _cached_gpu
             else:
                 if _prof:
                     torch.cuda.synchronize(); _t0 = time.perf_counter()
@@ -796,19 +798,33 @@ def _make_fused_sparse_forward_exl3(
                     # put() returns True only if the cache actually accepted ownership
                     # (it can refuse if this exact key raced in, or if a single expert
                     # is larger than the whole budget) — only then do we skip the free.
-                    _owned_by_cache = _vram.put(layer_idx, eidx, {"gate": gpu_gate, "up": gpu_up, "down": gpu_down})
+                    _entry = {"gate": gpu_gate, "up": gpu_up, "down": gpu_down}
+                    _owned_by_cache = _vram.put(layer_idx, eidx, _entry)
+                    if not _owned_by_cache:
+                        _entry = None
                 else:
                     _owned_by_cache = False
 
             bc_gate = bc_down = bc_up = None
             try:
-                if _prof:
-                    _t0 = time.perf_counter()
-                bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
-                bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
-                bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
-                if _prof:
-                    torch.cuda.synchronize(); _mp['construct'] += time.perf_counter() - _t0
+                _bc_cached = _entry.get("bc") if _entry is not None else None
+                if _bc_cached is not None:
+                    bc_gate, bc_up, bc_down = _bc_cached
+                else:
+                    if _prof:
+                        _t0 = time.perf_counter()
+                    bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
+                    bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
+                    bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
+                    if _prof:
+                        torch.cuda.synchronize(); _mp['construct'] += time.perf_counter() - _t0
+                    if _entry is not None:
+                        # Cache the BC objects with the entry: they wrap the SAME
+                        # resident GPU tensors, so their lifetime matches; eviction
+                        # drops the tuple and the pybind destructors free the C++
+                        # heap. Mutation outside the cache lock is safe — the decode
+                        # compute loop is the sole consumer of VRAM-cache entries.
+                        _entry["bc"] = (bc_gate, bc_up, bc_down)
 
                 if _prof:
                     _t0 = time.perf_counter()
@@ -823,13 +839,12 @@ def _make_fused_sparse_forward_exl3(
                 hidden = hidden * weights_slice
                 final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
             finally:
-                # CRITICAL: free C++ QMatrix objects — Python GC cannot manage them
-                bc_gate = bc_down = bc_up = None
-                # Only free GPU tensors if the VRAM cache does NOT own them (cache
-                # disabled, or put() refused the insert). If the cache owns them
-                # (hit, or a successful put()), freeing here would leave a dangling
-                # reference in the cache -> use-after-free on the next hit.
+                # Free C++ QMatrix objects ONLY when the cache does not hold them:
+                # cached BC objects (entry["bc"]) live until entry eviction. For
+                # uncached experts the local refs are the only refs — null them so
+                # the pybind destructors run now.
                 if not _owned_by_cache:
+                    bc_gate = bc_down = bc_up = None
                     del gpu_gate, gpu_down, gpu_up
 
         if intermediate_size is None:
