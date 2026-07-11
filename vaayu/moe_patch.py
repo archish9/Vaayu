@@ -651,6 +651,8 @@ def _make_fused_sparse_forward_exl3(
         # (that wait IS the disk time — no duplicate reads) and consume it.
         _staged_layer = None
         _staged_slabs = {}
+        _is_last_call = True
+        _cm_gpu = None
         if (getattr(vaayu_ref, "_moe_prefill_pass", False)
                 and getattr(vaayu_ref, "_prefill_stager_active", False)):
             _ev = vaayu_ref._prefill_stage_events.get(layer_idx)
@@ -659,9 +661,27 @@ def _make_fused_sparse_forward_exl3(
                 _ev.wait()
                 _stall = time.perf_counter() - _w0
                 vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
-                _staged_layer = vaayu_ref._prefill_staged.pop(layer_idx, None)
+                # Chunk-major prefill runs this layer once per chunk: PEEK the
+                # staged dict; pop + release only on the final chunk's call.
+                _n_calls = getattr(vaayu_ref, "_chunk_major_n", None) or 1
+                _cnt = getattr(vaayu_ref, "_staged_consume_count", {})
+                _seen = _cnt.get(layer_idx, 0) + 1
+                _cnt[layer_idx] = _seen
+                _is_last_call = _seen >= _n_calls
+                # Chunk-major H2D retention: keep this layer's GPU expert tensors
+                # alive across its chunk calls (all chunks run back-to-back within
+                # the layer), so each expert uploads once per layer instead of
+                # once per chunk. Freed at the last chunk call (below).
+                if _n_calls > 1:
+                    if _seen == 1:
+                        vaayu_ref._chunk_major_gpu = {}
+                        vaayu_ref._chunk_major_gpu_bytes = 0
+                if _is_last_call:
+                    _staged_layer = vaayu_ref._prefill_staged.pop(layer_idx, None)
+                else:
+                    _staged_layer = vaayu_ref._prefill_staged.get(layer_idx)
                 _staged_slabs = getattr(vaayu_ref, "_prefill_staged_slabs", {}).get(layer_idx, {})
-                if _staged_layer is not None:
+                if _staged_layer is not None and _is_last_call:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
         for eidx in unique_experts:
@@ -784,6 +804,9 @@ def _make_fused_sparse_forward_exl3(
                 current_state = current_state.to(torch.float16)
 
             _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
+            _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
+            if _cached_gpu is None and _cm_gpu is not None:
+                _cached_gpu = _cm_gpu.get(eidx)   # retained from an earlier chunk
             _entry = None
             if _cached_gpu is not None:
                 gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]
@@ -818,6 +841,21 @@ def _make_fused_sparse_forward_exl3(
                     _owned_by_cache = _vram.put(layer_idx, eidx, _entry)
                     if not _owned_by_cache:
                         _entry = None
+                elif _cm_gpu is not None:
+                    # Chunk-major retention (prefill: _vram is gated off). Budget
+                    # bound is the same hardware-derived VRAM cache budget; overflow
+                    # experts simply re-upload on later chunks.
+                    _sz = sum(t.nbytes for d in (gpu_gate, gpu_up, gpu_down)
+                              for t in d.values())
+                    _budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
+                                      "budget_bytes", 0)
+                    if vaayu_ref._chunk_major_gpu_bytes + _sz <= _budget:
+                        _entry = {"gate": gpu_gate, "up": gpu_up, "down": gpu_down}
+                        _cm_gpu[eidx] = _entry
+                        vaayu_ref._chunk_major_gpu_bytes += _sz
+                        _owned_by_cache = True
+                    else:
+                        _owned_by_cache = False
                 else:
                     _owned_by_cache = False
 
@@ -870,7 +908,7 @@ def _make_fused_sparse_forward_exl3(
         # therefore all its H2D copies, which are ordered on the same stream)
         # has completed. synchronize() is required: the next user of the slab
         # writes it CPU-side via io_uring, which the CUDA stream can't see.
-        if _staged_layer is not None:
+        if _staged_layer is not None and _is_last_call:
             _slabs = getattr(vaayu_ref, "_prefill_staged_slabs", {}).pop(layer_idx, None)
             if _slabs:
                 _arena = expert_cache.arena
@@ -880,6 +918,12 @@ def _make_fused_sparse_forward_exl3(
                     for _sidx in _slabs.values():
                         if _sidx is not None:
                             _arena.release(_sidx)
+
+        if _is_last_call and getattr(vaayu_ref, "_chunk_major_gpu", None) is not None:
+            # Drop the retained GPU tensors + BC objects; the CUDA caching
+            # allocator reuses the memory for the next layer's retention dict.
+            vaayu_ref._chunk_major_gpu = None
+            vaayu_ref._chunk_major_gpu_bytes = 0
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return final_hidden.view(B, S, H)

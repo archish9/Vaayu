@@ -204,6 +204,17 @@ def compute_stage_depth(expert_budget_bytes: int, geometry: dict) -> int:
     return max(1, min(2, by_budget))
 
 
+def compute_chunk_past_lens(chunk_lens: list, past0: int) -> list:
+    """Layer-major chunked prefill: batch element j's KV-past length is the
+    initial past plus the lengths of all earlier chunks (they were appended to
+    the same per-layer cache before element j runs). Model-agnostic."""
+    out, acc = [], int(past0)
+    for L in chunk_lens:
+        out.append(acc)
+        acc += int(L)
+    return out
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1919,6 +1930,38 @@ class VaayuBaseModel(GenerationMixin):
         n_chunks   = (total_len + chunk_size - 1) // chunk_size
         print(f"[Vaayu] Chunked prefill: {total_len} tokens → {n_chunks} chunks of {chunk_size}")
 
+        # Layer-major path (MoE): chunks become batch elements of ONE forward, so
+        # every expert is read once per prefill instead of once per chunk (a
+        # chunk-major 4k prompt otherwise re-reads the full expert set 8x).
+        # Falls back to the legacy per-chunk loop for non-MoE, explicit-mask
+        # attention, or hidden-state/attention outputs.
+        if (getattr(self, 'is_moe', False)
+                and self._active_attn_impl in ("flash_attention_2", "sdpa")
+                and not output_attentions and not output_hidden_states):
+            chunks = [input_ids[0, s:min(s + chunk_size, total_len)]
+                      for s in range(0, total_len, chunk_size)]
+            self._chunk_major_lens = [int(c.shape[0]) for c in chunks]
+            self._chunk_major_n = len(chunks)
+            try:
+                output = self.forward(
+                    input_ids=chunks,        # list of 1-D chunk tensors
+                    use_cache=True,
+                    return_dict=True,
+                )
+            finally:
+                self._chunk_major_lens = None
+                self._chunk_major_n = None
+            if not return_dict:
+                return tuple(v for v in [
+                    output.logits,
+                    output.past_key_values if use_cache else None,
+                    output.hidden_states,
+                    output.attentions,
+                ] if v is not None)
+            if not use_cache:
+                output.past_key_values = None
+            return output
+
         past_key_values = None
         output = None
 
@@ -1979,7 +2022,7 @@ class VaayuBaseModel(GenerationMixin):
             forward_start_wall = time.time()
 
         if (self.prefill_chunk_size > 0
-                and input_ids is not None
+                and isinstance(input_ids, torch.Tensor)
                 and input_ids.shape[1] > self.prefill_chunk_size):
             _past_kv_len = (self.get_past_key_values_cache_seq_len(past_key_values)
                             if past_key_values is not None else 0)
@@ -1993,8 +2036,15 @@ class VaayuBaseModel(GenerationMixin):
                     return_dict=return_dict,
                 )
 
+        # Chunk-major prefill (Task 11): input_ids is a LIST of 1-D chunk tensors;
+        # each becomes a batch element. KV appends per element within each layer,
+        # so element j attends over chunks 0..j-1 + itself — same causal semantics
+        # as the legacy per-chunk loop, but each layer's experts load only once.
+        _chunk_lens = getattr(self, "_chunk_major_lens", None)
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
+        _seq_total = (sum(_chunk_lens) if _chunk_lens
+                      else (input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0))
 
         # Create attention mask for the largest input, and position ids to use KV cache
         if self._active_attn_impl in ("flash_attention_2", "sdpa"):
@@ -2069,6 +2119,8 @@ class VaayuBaseModel(GenerationMixin):
         # appends its K/V to the cache, causing cos/sin slices to walk off the end of
         # _full_position_embeddings and produce empty tensors (silent position corruption).
         _len_p = past_key_values.get_seq_length() if past_key_values is not None else 0
+        # Chunk-major: element j's effective past = past0 + lengths of chunks < j.
+        _past_lens = compute_chunk_past_lens(_chunk_lens, _len_p) if _chunk_lens else None
 
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
@@ -2109,7 +2161,7 @@ class VaayuBaseModel(GenerationMixin):
             # during prompt ingestion (prefill routes ~all experts once; caching
             # them is one full-model clone memcpy for content decode replaces).
             self._moe_prefill_pass = self.is_moe and compute_prefill_pass(
-                seq_len=int(input_ids.shape[1]),
+                seq_len=int(_seq_total),
                 has_speculator=self.speculator is not None,
                 draft_tokens=getattr(self, "draft_tokens", 0) or 0,
             )
@@ -2132,7 +2184,7 @@ class VaayuBaseModel(GenerationMixin):
             if (self._moe_prefill_pass and self._moe_blocks
                     and self._expert_cache is not None
                     and getattr(self, "_moe_executor", None) is not None
-                    and compute_stage_gate(int(input_ids.shape[1]), self._moe_geometry)):
+                    and compute_stage_gate(int(_seq_total), self._moe_geometry)):
                 import threading as _threading
                 _depth = compute_stage_depth(
                     self._expert_cache.budget_bytes, self._moe_geometry)
@@ -2143,6 +2195,7 @@ class VaayuBaseModel(GenerationMixin):
                 self._prefill_stage_sem = _threading.Semaphore(_depth)
                 self._prefill_stop = _threading.Event()
                 self._prefill_stager_active = True
+                self._staged_consume_count = {}
                 _threading.Thread(
                     target=self._prefill_stage_worker,
                     daemon=True, name="vaayu-prefill-stager",
@@ -2300,6 +2353,11 @@ class VaayuBaseModel(GenerationMixin):
                             if output_hidden_states:
                                 all_hidden_states[i].append(batch[j])
                         elif layer_name == self.layer_names_dict['lm_head']:
+                            # Chunk-major: only the LAST chunk's logits are consumed
+                            # (generate() reads [:, -1]); skip the vocab projection
+                            # for earlier chunks.
+                            if _chunk_lens is not None and j < len(batch) - 1:
+                                continue
                             _tl = time.perf_counter()
                             batch[j] = self.run_lm_head(layer, seq)
                             _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
@@ -2309,13 +2367,14 @@ class VaayuBaseModel(GenerationMixin):
                                 all_hidden_states[i].append(seq)
 
                             len_s = self.get_sequence_len(seq)
+                            _lp = _past_lens[j] if _past_lens is not None else _len_p
 
                             kwargs = {
                                 'use_cache': use_cache,
                                 **self.get_past_key_value_args(past_key_values),
-                                **self.get_pos_emb_args(_len_p, len_s),
-                                **self.get_attention_mask_args(attention_mask, _len_p, len_s),
-                                **self.get_position_ids_args(position_ids, _len_p, len_s),
+                                **self.get_pos_emb_args(_lp, len_s),
+                                **self.get_attention_mask_args(attention_mask, _lp, len_s),
+                                **self.get_position_ids_args(position_ids, _lp, len_s),
                             }
 
                             _MAX_OOM_RETRIES = 2
@@ -2420,7 +2479,9 @@ class VaayuBaseModel(GenerationMixin):
         # empty_cache() would defeat the CUDA caching allocator (Task 2).
         if self._token_count % 32 == 0:
             clean_memory(cuda=False)
-        logits = torch.cat(batch, 0)
+        # Chunk-major elements have unequal lengths — only the last chunk's
+        # logits exist/matter (see lm_head skip above).
+        logits = batch[-1] if _chunk_lens is not None else torch.cat(batch, 0)
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
