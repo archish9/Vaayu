@@ -3,7 +3,6 @@ Unit tests for MoE streaming performance fixes.
 Tests are designed to run without a real GPU or model checkpoint.
 """
 import pytest
-from unittest.mock import MagicMock, patch, call
 
 
 # ── Task 1: Fix A — non_expert_pinned_layer_names ─────────────────────────────
@@ -31,58 +30,6 @@ def test_non_expert_pinned_excludes_transformer_layer_from_pinned():
     non_expert_pinned = {f"model.layers.{i}" for i in range(32)}
     for layer in non_expert_pinned:
         assert layer not in pinned
-
-
-def test_prefetch_all_predicted_experts_skips_cached():
-    """_prefetch_all_predicted_experts submits tasks only for uncached experts."""
-    from vaayu.vaayu_base import VaayuBaseModel as VaayuBase
-
-    obj = object.__new__(VaayuBase)
-    obj._expert_history = {0: [0, 1, 2], 1: [3, 4]}
-    obj._expert_cache = MagicMock()
-    # expert (layer=0, idx=0) is already cached; all others are not
-    obj._expert_cache.has.side_effect = lambda layer, expert: (layer == 0 and expert == 0)
-    # Mock cache headroom for prefetch budgeting (Fix #3)
-    obj._expert_cache.current_usage = 0
-    obj._expert_cache.budget_bytes = int(10 * 1024 ** 3)  # 10 GB budget
-    # Mock _moe_geometry for model-agnostic expert sizing (Fix #1)
-    obj._moe_geometry = {"expert_bytes": int(11.3 * 1024 ** 2)}  # ~11.3 MB per expert
-    obj._prefetch_experts = MagicMock()
-
-    executor = MagicMock()
-    VaayuBase._prefetch_all_predicted_experts(obj, executor)
-
-    # Layer 0: [0] cached → submit [1, 2]. Layer 1: [3, 4] uncached → submit [3, 4].
-    assert executor.submit.call_count == 2
-    submitted_args = [c.args[1:] for c in executor.submit.call_args_list]  # (layer_idx, uncached)
-    assert (0, [1, 2]) in submitted_args
-    assert (1, [3, 4]) in submitted_args
-
-
-def test_prefetch_all_predicted_experts_empty_history():
-    """_prefetch_all_predicted_experts does nothing when history is empty."""
-    from vaayu.vaayu_base import VaayuBaseModel as VaayuBase
-
-    obj = object.__new__(VaayuBase)
-    obj._expert_history = {}
-    obj._expert_cache = MagicMock()
-
-    executor = MagicMock()
-    VaayuBase._prefetch_all_predicted_experts(obj, executor)
-    executor.submit.assert_not_called()
-
-
-def test_prefetch_all_predicted_experts_none_cache():
-    """_prefetch_all_predicted_experts does nothing when cache is None."""
-    from vaayu.vaayu_base import VaayuBaseModel as VaayuBase
-
-    obj = object.__new__(VaayuBase)
-    obj._expert_history = {0: [0, 1]}
-    obj._expert_cache = None
-
-    executor = MagicMock()
-    VaayuBase._prefetch_all_predicted_experts(obj, executor)
-    executor.submit.assert_not_called()
 
 
 # ── Task 2: Fix B — Expert cache budget ───────────────────────────────────────

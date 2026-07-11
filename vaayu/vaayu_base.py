@@ -158,12 +158,6 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 
-def prefetch_room_bytes(current_usage: int, budget_bytes: int) -> int:
-    """Bytes of cache headroom available for prefetch without forcing eviction
-    of resident experts. Fix #3: prefetching past this re-creates thrash."""
-    return max(0, int(budget_bytes) - int(current_usage))
-
-
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1443,62 +1437,6 @@ class VaayuBaseModel(GenerationMixin):
         t.start()
         self._warmup_thread = t
 
-    # ── MoE speculative prefetch ──────────────────────────────────────────────
-
-    def _prefetch_experts(self, layer_idx: int, predicted_experts: list) -> None:
-        """
-        Background task: load predicted expert tensors into ExpertRAMCache.
-
-        Called by the forward() loop after each MoE layer via ThreadPoolExecutor.
-        Overlaps with next layer's shared attention compute to hide expert-load stall.
-        """
-        if self._expert_cache is None or self._expert_offset_index is None:
-            return
-        from .persist.safetensor_model_persister import load_expert_sparse
-        layer_name = f"{self.layer_names_dict['layer_prefix']}.{layer_idx}"
-        shard_file = str(Path(self.checkpoint_path) / f"{layer_name}.safetensors")
-        if not Path(shard_file).exists():
-            return
-        for eidx in predicted_experts:
-            if self._expert_cache.has(layer_idx, eidx):
-                continue
-            metas = self._expert_offset_index.get_expert_offsets(layer_name, eidx)
-            if metas is None:
-                continue
-            try:
-                raw = load_expert_sparse(shard_file, metas)
-                self._expert_cache.put(layer_idx, eidx, raw, prefetch=True)
-            except Exception as e:
-                print(f"[Vaayu-MoE] prefetch failed layer={layer_idx} expert={eidx}: {e}")
-
-    def _prefetch_all_predicted_experts(self, executor) -> None:
-        """Submit prefetch tasks for all layers using previous token's routing history.
-
-        Called once at the start of each forward pass (token N). Later layers get
-        the compute time of all earlier layers as a prefetch window. Only submits
-        tasks for experts not already in cache. Capped to cache headroom (Fix #3)
-        to prevent prefetch from evicting resident experts.
-        """
-        if not self._expert_history or self._expert_cache is None:
-            return
-        room = prefetch_room_bytes(
-            self._expert_cache.current_usage, self._expert_cache.budget_bytes
-        )
-        # Model-agnostic: expert size comes from _moe_geometry (Fix #1 Task 0),
-        # NOT a hardcoded constant. Qwen ~11.3MB, M2.5 ~11.3MB, other models differ.
-        expert_bytes = max(1, self._moe_geometry["expert_bytes"])
-        budget_experts = room // expert_bytes
-        submitted = 0
-        for layer_idx, expert_list in self._expert_history.items():
-            if submitted >= budget_experts:
-                break  # no room left; prefetching more would evict resident experts
-            uncached = [e for e in expert_list
-                        if not self._expert_cache.has(layer_idx, e)]
-            uncached = uncached[: max(0, budget_experts - submitted)]
-            if uncached:
-                submitted += len(uncached)
-                executor.submit(self._prefetch_experts, layer_idx, uncached)
-
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
@@ -1958,10 +1896,6 @@ class VaayuBaseModel(GenerationMixin):
                 if getattr(self, '_expert_vram_cache', None) is not None:
                     self._expert_vram_cache.reset_stats()
 
-            # ── Pre-token batch prefetch: submit all layers using prev token's routing ──
-            if self.is_moe and self._token_count > 0:
-                self._prefetch_all_predicted_experts(executor)
-
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
             if self.prefetching:
@@ -2172,20 +2106,6 @@ class VaayuBaseModel(GenerationMixin):
                             all_self_attns[i].append(layer_out[1])
 
                         batch[j] = new_seq
-
-                # MoE speculative prefetch: after MoE layer writes _expert_history,
-                # prefetch predicted experts for the next MoE layer in background.
-                if self.is_moe and self._expert_cache is not None:
-                    _layer_prefix = self.layer_names_dict["layer_prefix"]
-                    if layer_name.startswith(_layer_prefix + "."):
-                        try:
-                            _current_layer_idx = int(layer_name[len(_layer_prefix) + 1:])
-                            _next_layer_idx = _current_layer_idx + 1
-                            _pred = self._expert_history.get(_next_layer_idx, [])
-                            if _pred:
-                                executor.submit(self._prefetch_experts, _next_layer_idx, _pred)
-                        except (ValueError, IndexError):
-                            pass
 
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
