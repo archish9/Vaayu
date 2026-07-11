@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, wait as _futures_wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -615,11 +616,8 @@ def _make_fused_sparse_forward_exl3(
             else:
                 misses.append(eidx)
 
+        _miss_futures = []
         if misses:
-            _disk_t0 = time.perf_counter()
-            if _prof:
-                _t0 = _disk_t0
-
             def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
@@ -631,19 +629,10 @@ def _make_fused_sparse_forward_exl3(
                     expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
 
-            # Uses vaayu_ref._moe_executor — a persistent ThreadPoolExecutor created
-            # once at model init (sized to get_expert_pool_size(), fixed for the
-            # model's lifetime), instead of creating/destroying a fresh executor on
-            # every layer of every token. .map() only dispatches len(misses) tasks
-            # regardless of pool size, so this is behaviorally identical to the old
-            # per-call min(len(misses), get_expert_pool_size()) cap.
-            for eidx, raw in vaayu_ref._moe_executor.map(_load_one, misses):
-                if raw is not None:
-                    expert_tensors[eidx] = raw
-            _disk_elapsed = time.perf_counter() - _disk_t0
-            vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _disk_elapsed
-            if _prof:
-                _mp['disk_load'] += _disk_elapsed
+            # Submit misses to the persistent pool and DON'T wait: hit experts
+            # compute below while these reads run. Only the remainder that hasn't
+            # landed when hits are done shows up as disk stall (_expert_disk_s).
+            _miss_futures = [vaayu_ref._moe_executor.submit(_load_one, e) for e in misses]
 
         if _prof:
             _t0 = time.perf_counter()
@@ -653,32 +642,41 @@ def _make_fused_sparse_forward_exl3(
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
 
-        # Infer intermediate_size from first available expert's gate trellis
-        intermediate_size = None
-        for eidx in unique_experts:
-            raw = expert_tensors.get(eidx)
-            if raw is not None:
-                groups = _group_exl3_tensors_by_weight(raw)
-                t = groups.get("gate", {}).get("trellis")
-                if t is not None:
-                    intermediate_size = t.shape[1] * 16
-                    break
-        if intermediate_size is None:
-            _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")
-            vaayu_ref._expert_history[layer_idx] = unique_experts
-            return flat_hidden.view(B, S, H)
-
         final_hidden = torch.zeros_like(flat_hidden)
+        intermediate_size = None  # inferred lazily from the first expert we see
 
-        for eidx in unique_experts:
-            raw = expert_tensors.get(eidx)
-            if raw is None:
-                continue
+        def _iter_experts_hits_then_misses():
+            """Yield (eidx, raw): cache hits immediately (compute overlaps the
+            in-flight miss reads), then misses in completion order. Blocking
+            time in the wait() is the true disk stall and is accumulated into
+            vaayu_ref._expert_disk_s (telemetry: stall, not total read time)."""
+            for _e in unique_experts:
+                _raw = expert_tensors.get(_e)
+                if _raw is not None:
+                    yield _e, _raw
+            _pending = set(_miss_futures)
+            while _pending:
+                _w0 = time.perf_counter()
+                _done, _pending = _futures_wait(_pending, return_when=FIRST_COMPLETED)
+                _stall = time.perf_counter() - _w0
+                vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
+                if _prof:
+                    _mp['disk_load'] += _stall
+                for _f in _done:
+                    _e, _raw = _f.result()
+                    if _raw is not None:
+                        yield _e, _raw
 
+        for eidx, raw in _iter_experts_hits_then_misses():
             groups = _group_exl3_tensors_by_weight(raw)
             if not groups["gate"] or not groups["down"] or not groups["up"]:
                 _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
                 continue
+            if intermediate_size is None:
+                _t_gate = groups.get("gate", {}).get("trellis")
+                if _t_gate is None:
+                    continue
+                intermediate_size = _t_gate.shape[1] * 16
 
             top_k_pos, token_idx = torch.where(expert_mask[eidx])
             if token_idx.numel() == 0:
@@ -743,6 +741,9 @@ def _make_fused_sparse_forward_exl3(
                 # reference in the cache -> use-after-free on the next hit.
                 if not _owned_by_cache:
                     del gpu_gate, gpu_down, gpu_up
+
+        if intermediate_size is None:
+            _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return final_hidden.view(B, S, H)

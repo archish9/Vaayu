@@ -671,3 +671,16 @@ def test_exl3_forward_skips_ram_cache_put_during_prefill(tmp_path):
             f"expert {eidx} was cached despite _moe_prefill_pass=True "
             "(prefill cache-put gate did not skip expert_cache.put)"
         )
+
+
+def test_exl3_forward_source_overlaps_disk_and_compute():
+    """The EXL3 sparse forward must not use the blocking executor.map barrier:
+    misses are submitted as individual futures and consumed via FIRST_COMPLETED
+    waits after hit experts are computed."""
+    import inspect
+    from vaayu import moe_patch
+
+    src = inspect.getsource(moe_patch._make_fused_sparse_forward_exl3)
+    assert "_moe_executor.map(" not in src, "blocking map() barrier reintroduced"
+    assert "_moe_executor.submit(" in src
+    assert "FIRST_COMPLETED" in src
