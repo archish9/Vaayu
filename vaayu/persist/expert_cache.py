@@ -4,6 +4,43 @@ from collections import OrderedDict
 import torch
 
 
+class SlabArena:
+    """Fixed-size slab pool backing the expert RAM cache (zero-clone path).
+
+    One slab holds one expert's full contiguous file span (aligned); io_uring
+    reads land directly in the slab and the cache adopts VIEWS into it — no
+    clones anywhere on the disk→RAM→GPU path. Slab size/count are DERIVED from
+    the model's offset index and the cache budget (CLAUDE.md §5: model numbers
+    are never hardcoded). pin=True allocates CUDA-pinned memory so H2D copies
+    run at pinned bandwidth and non_blocking=True is honored.
+
+    Allocation is ONE backing tensor (a single cudaHostAlloc, not thousands),
+    sliced into slabs; slab_bytes is _ALIGN-aligned so every slab start stays
+    sector-aligned for O_DIRECT.
+    """
+
+    def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
+        self.slab_bytes = int(slab_bytes)
+        self.n_slabs = int(n_slabs)
+        self.pin = bool(pin)
+        self._backing = torch.empty(
+            self.n_slabs * self.slab_bytes, dtype=torch.uint8, pin_memory=self.pin
+        )
+        self._free: list[int] = list(range(self.n_slabs))
+        self._lock = threading.Lock()
+
+    def acquire(self) -> "int | None":
+        with self._lock:
+            return self._free.pop() if self._free else None
+
+    def release(self, idx: int) -> None:
+        with self._lock:
+            self._free.append(idx)
+
+    def tensor(self, idx: int) -> torch.Tensor:
+        return self._backing[idx * self.slab_bytes:(idx + 1) * self.slab_bytes]
+
+
 class ExpertRAMCache:
     """
     LRU cache for MoE expert weight tensors, keyed by (layer_idx, expert_idx).
@@ -20,9 +57,14 @@ class ExpertRAMCache:
     When max_per_layer == 0, falls back to a flat global LRU (original path).
     """
 
-    def __init__(self, budget_bytes: int, max_per_layer: int = 0):
+    def __init__(self, budget_bytes: int, max_per_layer: int = 0,
+                 arena: "SlabArena | None" = None):
         self.budget_bytes = budget_bytes
         self.max_per_layer = max_per_layer
+        # Zero-clone mode: entries adopted via put_slab() are views into arena
+        # slabs; eviction releases the slab back to the arena's freelist.
+        self.arena = arena
+        self._slab_of: dict[tuple, int] = {}  # (layer, expert) -> slab idx
         # per-layer mode: {layer_idx: OrderedDict[expert_idx, tensors]}
         self._layer_caches: dict[int, OrderedDict] = {} if max_per_layer > 0 else {}
         # True global LRU: tracks (layer_idx, expert_idx) insertion/access order
@@ -89,10 +131,7 @@ class ExpertRAMCache:
                 # 1. Per-layer fairness: evict oldest within this layer
                 while len(lc) >= self.max_per_layer:
                     evicted_eidx, evicted = lc.popitem(last=False)
-                    self.current_usage -= sum(t.nbytes for t in evicted.values())
-                    self._global_lru.pop((layer_idx, evicted_eidx), None)
-                    self.evictions += 1
-                    self._prefetched.discard((layer_idx, evicted_eidx))
+                    self._account_evict(layer_idx, evicted_eidx, evicted)
 
                 # 2. Global budget enforcement: evict globally-oldest across ALL layers
                 while self.current_usage + raw_size > self.budget_bytes:
@@ -111,14 +150,77 @@ class ExpertRAMCache:
                 return
             while self.current_usage + raw_size > self.budget_bytes and self.cache:
                 evicted_key, evicted = self.cache.popitem(last=False)
-                self.current_usage -= sum(t.nbytes for t in evicted.values())
-                self.evictions += 1
-                self._prefetched.discard(evicted_key)
+                self._account_evict(evicted_key[0], evicted_key[1], evicted)
             if self.current_usage + raw_size > self.budget_bytes:
                 return
             self.cache[key] = cloned
             self.current_usage += raw_size
             self._note_prefetch(layer_idx, expert_idx, prefetch)
+
+    def acquire_slab(self) -> "int | None":
+        """Free slab index, evicting LRU entries if the arena is exhausted.
+        Returns None when there's no arena or nothing can be evicted (caller
+        falls back to the legacy clone path)."""
+        if self.arena is None:
+            return None
+        idx = self.arena.acquire()
+        while idx is None:
+            with self.lock:
+                if not self._evict_global_oldest():
+                    return None
+            idx = self.arena.acquire()
+        return idx
+
+    def put_slab(self, layer_idx: int, expert_idx: int, views: dict, slab_idx: int) -> None:
+        """Adopt slab-backed tensor views WITHOUT cloning (zero-copy insert).
+        On duplicate key the new slab is released back to the arena. Byte
+        accounting uses slab_bytes — the real resident footprint."""
+        size = self.arena.slab_bytes
+        with self.lock:
+            if self.max_per_layer > 0:
+                lc = self._layer_caches.setdefault(layer_idx, OrderedDict())
+                if expert_idx in lc:
+                    self.arena.release(slab_idx)
+                    return
+                while len(lc) >= self.max_per_layer:
+                    evicted_eidx, evicted = lc.popitem(last=False)
+                    self._account_evict(layer_idx, evicted_eidx, evicted)
+                while self.current_usage + size > self.budget_bytes:
+                    if not self._evict_global_oldest():
+                        self.arena.release(slab_idx)
+                        return
+                lc[expert_idx] = views
+                self.current_usage += size
+                self._global_lru[(layer_idx, expert_idx)] = None
+                self._slab_of[(layer_idx, expert_idx)] = slab_idx
+                return
+            key = (layer_idx, expert_idx)
+            if key in self.cache:
+                self.arena.release(slab_idx)
+                return
+            while self.current_usage + size > self.budget_bytes and self.cache:
+                evicted_key, evicted = self.cache.popitem(last=False)
+                self._account_evict(evicted_key[0], evicted_key[1], evicted)
+            if self.current_usage + size > self.budget_bytes:
+                self.arena.release(slab_idx)
+                return
+            self.cache[key] = views
+            self.current_usage += size
+            self._slab_of[key] = slab_idx
+
+    def _account_evict(self, layer_idx: int, expert_idx: int, evicted: dict) -> None:
+        """Shared eviction bookkeeping: usage, counters, prefetch set, slab release.
+        Must be called while self.lock is held."""
+        key = (layer_idx, expert_idx)
+        slab_idx = self._slab_of.pop(key, None)
+        if slab_idx is not None:
+            self.current_usage -= self.arena.slab_bytes
+            self.arena.release(slab_idx)
+        else:
+            self.current_usage -= sum(t.nbytes for t in evicted.values())
+        self._global_lru.pop(key, None)
+        self.evictions += 1
+        self._prefetched.discard(key)
 
     def _note_prefetch(self, layer_idx, expert_idx, prefetch):
         # Must be called while self.lock is held, after a successful insert.
@@ -132,18 +234,23 @@ class ExpertRAMCache:
         Returns False if nothing left to evict.
         Must be called while self.lock is held.
         """
-        if not self._global_lru:
+        if self.max_per_layer > 0:
+            if not self._global_lru:
+                return False
+            (lid, eidx), _ = self._global_lru.popitem(last=False)
+            lc = self._layer_caches.get(lid)
+            if lc and eidx in lc:
+                evicted = lc.pop(eidx)
+                self._account_evict(lid, eidx, evicted)
+                # Clean up empty layer dicts to avoid unbounded key growth
+                if not lc:
+                    del self._layer_caches[lid]
+            return True
+        # Flat global-LRU mode (max_per_layer == 0): evict oldest from self.cache.
+        if not self.cache:
             return False
-        (lid, eidx), _ = self._global_lru.popitem(last=False)
-        lc = self._layer_caches.get(lid)
-        if lc and eidx in lc:
-            evicted = lc.pop(eidx)
-            self.current_usage -= sum(t.nbytes for t in evicted.values())
-            self.evictions += 1
-            self._prefetched.discard((lid, eidx))
-            # Clean up empty layer dicts to avoid unbounded key growth
-            if not lc:
-                del self._layer_caches[lid]
+        (lid, eidx), evicted = self.cache.popitem(last=False)
+        self._account_evict(lid, eidx, evicted)
         return True
 
     def clear(self) -> None:
@@ -153,6 +260,10 @@ class ExpertRAMCache:
                 self._global_lru.clear()
             else:
                 self.cache.clear()
+            if self.arena is not None:
+                for _slab_idx in self._slab_of.values():
+                    self.arena.release(_slab_idx)
+            self._slab_of.clear()
             self.current_usage = 0
             self._prefetched.clear()
 

@@ -688,7 +688,7 @@ class VaayuBaseModel(GenerationMixin):
         self._non_expert_tensor_cache = None  # initialized below for MoE
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         if self.running_device.startswith("cuda") and self.is_moe:
-            from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache
+            from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil
 
@@ -713,7 +713,36 @@ class VaayuBaseModel(GenerationMixin):
             )
             self._non_expert_tensor_cache = LRUTensorCache(_ne_budget)
             print(f"[Vaayu-Cache] Non-expert tensor cache: {_ne_budget / 1e9:.1f} GB budget")
-            self._expert_cache = ExpertRAMCache(_expert_budget, max_per_layer=_max_per_layer)
+            # Pinned slab arena (zero-clone expert path): the whole cache budget
+            # preallocated as fixed slabs sized to the model's largest expert
+            # span (derived from the offset index — CLAUDE.md §5). +pool_size
+            # extra slabs so in-flight loader threads never starve while the
+            # cache is full. Pinned memory is unswappable — footprint equals
+            # the budget the cache occupied anyway, but WARN for visibility.
+            from .persist.safetensor_model_persister import compute_slab_bytes
+            _slab_bytes = compute_slab_bytes(self._expert_offset_index)
+            _n_slabs = max(1, _expert_budget // max(1, _slab_bytes)) + get_expert_pool_size()
+            _pin = torch.cuda.is_available()
+            self._expert_slab_arena = None
+            if _slab_bytes > 0:
+                try:
+                    self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
+                except RuntimeError as _slab_err:
+                    print(f"[Vaayu-MoE] WARNING: pinned slab alloc failed ({_slab_err}); "
+                          f"retrying pageable (H2D will be slower)")
+                    try:
+                        self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=False)
+                    except RuntimeError:
+                        self._expert_slab_arena = None
+                if self._expert_slab_arena is not None:
+                    print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
+                          f"{_slab_bytes / 1e6:.1f}MB "
+                          f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
+                          f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident)")
+            self._expert_cache = ExpertRAMCache(
+                _expert_budget, max_per_layer=_max_per_layer,
+                arena=self._expert_slab_arena,
+            )
 
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):

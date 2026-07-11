@@ -591,5 +591,74 @@ def load_expert_sparse(
         finally:
             if _pool_buf is not None:
                 _EXPERT_BUF_POOL.put(_pool_buf)
-                
+
     return result
+
+
+def expert_span_bytes(expert_metas: dict) -> int:
+    """Aligned byte length of the contiguous file span covering ALL of one
+    expert's tensors. This is the slab size one expert needs. Model-agnostic:
+    derived from the offset index, never hardcoded."""
+    start = min(m.file_offset for m in expert_metas.values())
+    end = max(m.file_offset + m.byte_length for m in expert_metas.values())
+    return _align_up(end - _align_down(start))
+
+
+def compute_slab_bytes(offset_index) -> int:
+    """Max aligned expert span across the whole model — every slab must fit the
+    largest expert. Scans the in-RAM offset index (cheap: ~10k dict entries)."""
+    worst = 0
+    for layer_experts in offset_index.index.values():
+        for expert_metas in layer_experts.values():
+            worst = max(worst, expert_span_bytes(expert_metas))
+    return worst
+
+
+def load_expert_into_slab(
+    file_path: str,
+    expert_metas: dict,
+    slab: "torch.Tensor",
+    allow_direct: bool,
+) -> dict:
+    """Read one expert's full file span DIRECTLY into `slab` (uint8) and return
+    {tensor_key: view-into-slab}. Zero copies: no clone here, none in the cache
+    (see ExpertRAMCache.put_slab). The returned views are valid until the slab
+    is recycled by cache eviction — consumers must use them within the same
+    layer forward.
+
+    allow_direct: O_DIRECT needs a sector-aligned buffer; pinned arena slabs
+    are (page-aligned backing sliced at _ALIGN multiples), plain torch.empty
+    is not — pass arena.pin here.
+    """
+    start = min(m.file_offset for m in expert_metas.values())
+    end = max(m.file_offset + m.byte_length for m in expert_metas.values())
+    aligned_offset = _align_down(start)
+    prefix_pad = start - aligned_offset
+    aligned_length = _align_up(end - aligned_offset)
+    if aligned_length > slab.nbytes:
+        raise RuntimeError(
+            f"expert span {aligned_length}B exceeds slab {slab.nbytes}B "
+            f"(compute_slab_bytes undersized?)"
+        )
+    use_direct = _USE_DIRECT_IO and allow_direct
+
+    if _USE_IOURING:
+        vaayu_rust.io_uring_read_into(
+            file_path, aligned_offset, aligned_length,
+            slab.data_ptr(), 8, use_direct,
+        )
+    else:
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            view = memoryview(slab.numpy())
+            os.preadv(fd, [view[:aligned_length]], aligned_offset)
+        finally:
+            os.close(fd)
+
+    data = slab[prefix_pad:]
+    out: dict = {}
+    for key, meta in expert_metas.items():
+        rel = meta.file_offset - start
+        dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+        out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
+    return out

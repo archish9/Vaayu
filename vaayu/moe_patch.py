@@ -571,7 +571,7 @@ def _make_fused_sparse_forward_exl3(
     PCIe cost: 88 MB / 2 GB/s = 44 ms per expert (vs 168 ms BF16).
     """
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse
+    from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -622,12 +622,36 @@ def _make_fused_sparse_forward_exl3(
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
                     return eidx, None
-                raw = load_expert_sparse(shard_file, metas)
-                # Prefill routes ~all experts once; caching them costs a clone
-                # per expert for content decode immediately replaces. Skip.
-                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                # Prefill: transient load, never cached (routes ~all experts
+                # once; caching would clone content decode replaces).
+                if getattr(vaayu_ref, "_moe_prefill_pass", False):
+                    return eidx, load_expert_sparse(shard_file, metas)
+                if expert_cache.arena is None:
+                    # No arena (e.g. compute_slab_bytes()==0 or CUDA-less unit
+                    # tests constructing ExpertRAMCache directly) — legacy
+                    # clone path, still cached.
+                    raw = load_expert_sparse(shard_file, metas)
                     expert_cache.put(layer_idx, eidx, raw)
-                return eidx, raw
+                    return eidx, raw
+                # Zero-clone decode path: io_uring reads straight into a pinned
+                # slab; the cache adopts views (no clone anywhere disk→RAM→GPU).
+                slab_idx = expert_cache.acquire_slab()
+                if slab_idx is None:
+                    # arena exhausted and nothing evictable — legacy fallback
+                    raw = load_expert_sparse(shard_file, metas)
+                    expert_cache.put(layer_idx, eidx, raw)
+                    return eidx, raw
+                slab = expert_cache.arena.tensor(slab_idx)
+                try:
+                    views = load_expert_into_slab(
+                        shard_file, metas, slab,
+                        allow_direct=expert_cache.arena.pin,
+                    )
+                except Exception:
+                    expert_cache.arena.release(slab_idx)
+                    raise
+                expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
+                return eidx, views
 
             # Submit misses to the persistent pool and DON'T wait: hit experts
             # compute below while these reads run. Only the remainder that hasn't
