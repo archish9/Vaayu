@@ -2014,7 +2014,7 @@ class VaayuBaseModel(GenerationMixin):
                         t = time.time()
                     _tl = time.perf_counter()
                     _t = time.time()
-                    state_dict = future.result(); print(f"[Vaayu-Debug] layer {layer_name} loaded keys: {list(state_dict.keys())}", flush=True)
+                    state_dict = future.result()
                     _io_wait_s += time.time() - _t
                     _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
                     if self.profiling_mode:
@@ -2125,7 +2125,6 @@ class VaayuBaseModel(GenerationMixin):
 
                         len_s = self.get_sequence_len(seq)
 
-                        print(f"seq device: {seq.device}", flush=True)
                         kwargs = {
                             'use_cache': use_cache,
                             **self.get_past_key_value_args(past_key_values),
@@ -2149,8 +2148,6 @@ class VaayuBaseModel(GenerationMixin):
                                 else:
                                     _tl = time.perf_counter()
                                     _t = time.time()
-                                    if hasattr(layer, "input_layernorm"):
-                                        print(f"[{layer_name}] weight device: {layer.input_layernorm.weight.device}, dtype: {layer.input_layernorm.weight.dtype}, shape: {layer.input_layernorm.weight.shape}")
                                     layer_out = layer(seq, **kwargs)
                                     _compute_s += time.time() - _t
                                     _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
