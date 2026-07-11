@@ -2398,15 +2398,21 @@ class VaayuBaseModel(GenerationMixin):
                     # that).
                     _leftover = getattr(self, "_prefill_staged_slabs", None)
                     if _leftover:
+                        # Rebind to a fresh dict BEFORE iterating (single atomic
+                        # attribute assignment under the GIL) so the worker
+                        # thread's per-layer publish can no longer discover this
+                        # dict via self._prefill_staged_slabs once iteration
+                        # starts — avoids "dict changed size during iteration"
+                        # from a concurrent unlocked publish.
+                        self._prefill_staged_slabs = {}
                         _arena = self._expert_cache.arena if self._expert_cache is not None else None
                         if _arena is not None:
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
-                            for _layer_slabs in _leftover.values():
+                            for _layer_slabs in list(_leftover.values()):
                                 for _sidx in _layer_slabs.values():
                                     if _sidx is not None:
                                         _arena.release(_sidx)
-                        _leftover.clear()
 
         self.telemetry.end_token()
         self._token_count += 1
