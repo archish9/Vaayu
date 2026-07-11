@@ -1951,6 +1951,12 @@ class VaayuBaseModel(GenerationMixin):
             finally:
                 self._chunk_major_lens = None
                 self._chunk_major_n = None
+                # Defensive: if an exception unwound mid-layer, moe_patch.py's
+                # last-chunk teardown never ran, leaving a stale per-eidx GPU
+                # retention dict from an aborted layer. Clear it here too so a
+                # later forward can't mistake it for the current layer's cache.
+                self._chunk_major_gpu = None
+                self._chunk_major_gpu_bytes = 0
             if not return_dict:
                 return tuple(v for v in [
                     output.logits,
