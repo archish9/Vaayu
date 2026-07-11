@@ -366,38 +366,51 @@ def _auto_detect_layer_names(model: nn.Module) -> dict:
 _pcie_topology_checked: set = set()
 
 def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
+    """Measure real H2D bandwidth with a pinned burst copy, then report the
+    uptrained link state. Idle GPUs downtrain to Gen1 (power save), so probing
+    link registers without load produces false warnings; and native-x8 cards
+    (e.g. RTX 5060 Ti) can never show x16 — width alone is not a defect signal.
+    """
     if gpu_index in _pcie_topology_checked:
         return
     _pcie_topology_checked.add(gpu_index)
+    if not torch.cuda.is_available():
+        return
     try:
+        # Burst copy: forces the link to uptrain and gives a measured number.
+        _src = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
+        _dst = torch.empty(256 * 1024 * 1024, dtype=torch.uint8,
+                           device=f"cuda:{gpu_index}")
+        _dst.copy_(_src)
+        torch.cuda.synchronize(gpu_index)
+        _t0 = time.perf_counter()
+        for _ in range(3):
+            _dst.copy_(_src, non_blocking=True)
+        torch.cuda.synchronize(gpu_index)
+        _h2d_gbps = 3 * _src.nbytes / 1e9 / (time.perf_counter() - _t0)
+        del _src, _dst
+
+        _link = "unknown"
         result = subprocess.run(
             ["nvidia-smi", f"-i={gpu_index}",
-             "--query-gpu=pcie.link.width.current,pcie.link.gen.current",
+             "--query-gpu=pcie.link.gen.current,pcie.link.width.current",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5
         )
-        if result.returncode != 0:
-            return
+        if result.returncode == 0:
+            _g, _w = result.stdout.strip().splitlines()[0].split(", ")
+            _link = f"Gen{_g} x{_w}"
 
-        parts = result.stdout.strip().splitlines()[0].split(", ")
-        width = int(parts[0])
-        gen = int(parts[1])
-
-        bandwidth_gbps = {
-            (3, 4): 3.9, (3, 8): 7.9, (3, 16): 15.8,
-            (4, 4): 6.4, (4, 8): 12.8, (4, 16): 25.6,
-            (5, 4): 12.6, (5, 8): 25.2, (5, 16): 50.4,
-        }.get((gen, width), 0)
-
-        if width < 16:
-            bw_str = f"{bandwidth_gbps:.1f} GB/s" if bandwidth_gbps > 0 else "unknown bandwidth"
-            penalty = f"~{model_size_gb/bandwidth_gbps:.1f}s per token" if bandwidth_gbps > 0 else "unknown"
-            print(f"⚠️  [Vaayu-Warning] GPU running at PCIe Gen{gen} x{width} ({bw_str})")
-            print(f"   Inference may be bandwidth-limited to {penalty} for {model_size_gb:.1f}GB models.")
-            print(f"   Moving GPU to a primary x16 slot maximizes bandwidth.")
+        # 8 GB/s ≈ worst acceptable (below Gen3 x16 / Gen4 x8 class) — a real
+        # config problem (wrong slot, riser, BIOS gen cap), not power-save noise.
+        if _h2d_gbps < 8.0:
+            print(f"⚠️  [Vaayu-Warning] Measured pinned H2D only {_h2d_gbps:.1f} GB/s "
+                  f"(link under load: {_link}).")
+            print(f"   Streaming {model_size_gb:.1f}GB models will be PCIe-bound. "
+                  f"Check slot/riser/BIOS PCIe generation settings.")
         else:
-            print(f"✅ [Vaayu] GPU PCIe link: Gen{gen} x{width} ({bandwidth_gbps:.1f} GB/s)")
-
+            print(f"✅ [Vaayu] PCIe measured: {_h2d_gbps:.1f} GB/s pinned H2D "
+                  f"(link under load: {_link})")
     except Exception:
         pass
 
