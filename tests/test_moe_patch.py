@@ -684,3 +684,28 @@ def test_exl3_forward_source_overlaps_disk_and_compute():
     assert "_moe_executor.map(" not in src, "blocking map() barrier reintroduced"
     assert "_moe_executor.submit(" in src
     assert "FIRST_COMPLETED" in src
+
+
+def test_permutation_dispatch_matches_one_hot_reference():
+    """The EXL3 forward's permutation dispatch must select exactly the same
+    (token, top_k_slot) pairs per expert as the old one_hot/where approach."""
+    import torch
+    import torch.nn.functional as F
+    from vaayu.moe_patch import compute_expert_dispatch
+
+    torch.manual_seed(7)
+    num_experts, top_k, n_tok = 16, 4, 37
+    expert_indices_cpu = torch.randint(0, num_experts, (n_tok, top_k))
+
+    pair, starts, counts = compute_expert_dispatch(expert_indices_cpu, num_experts)
+
+    # reference: the old mask
+    mask = F.one_hot(expert_indices_cpu, num_classes=num_experts).permute(2, 1, 0)
+    for e in range(num_experts):
+        kpos_ref, tok_ref = torch.where(mask[e])
+        got = {(int(t), int(k)) for t, k in
+               zip(pair[0, starts[e]:starts[e] + counts[e]],
+                   pair[1, starts[e]:starts[e] + counts[e]])}
+        ref = {(int(t), int(k)) for t, k in zip(tok_ref, kpos_ref)}
+        assert got == ref, f"expert {e} mismatch"
+    assert sum(counts) == n_tok * top_k

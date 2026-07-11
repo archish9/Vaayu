@@ -45,6 +45,29 @@ def unique_expert_indices(expert_indices_cpu) -> list[int]:
     return sorted(int(x) for x in expert_indices_cpu.flatten().unique().tolist())
 
 
+def compute_expert_dispatch(expert_indices_cpu: "torch.Tensor", num_experts: int):
+    """Permutation-based MoE dispatch (CPU side, one pass per layer).
+
+    expert_indices_cpu: (N, top_k) long tensor of routed expert ids.
+    Returns (pair, starts, counts):
+      pair   — (2, N*top_k) long tensor; row 0 = flat token index, row 1 = top-k
+               slot; entries sorted by expert id (stable), so expert e's routed
+               positions are the contiguous slice [starts[e] : starts[e]+counts[e]).
+      starts — list[int] per expert; counts — list[int] per expert.
+    Replaces the per-layer int64 one_hot mask + per-expert torch.where/H2D pair:
+    the caller uploads `pair` to the GPU ONCE and slices per expert (views, free).
+    """
+    n, top_k = expert_indices_cpu.shape
+    eids = expert_indices_cpu.reshape(-1)
+    tok = torch.arange(n).repeat_interleave(top_k)
+    kpos = torch.arange(top_k).repeat(n)
+    order = torch.argsort(eids, stable=True)
+    counts_t = torch.bincount(eids[order], minlength=num_experts)
+    starts_t = counts_t.cumsum(0) - counts_t
+    pair = torch.stack([tok[order], kpos[order]])
+    return pair, starts_t.tolist(), counts_t.tolist()
+
+
 def _classify_expert_tensors(
     raw: dict,
 ) -> "tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]":
@@ -679,9 +702,13 @@ def _make_fused_sparse_forward_exl3(
 
         if _prof:
             _t0 = time.perf_counter()
-        expert_mask = F.one_hot(
-            expert_indices_cpu, num_classes=experts_mod.num_experts
-        ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+        # Permutation dispatch: one CPU argsort + ONE H2D of the index pairs per
+        # layer, replacing the int64 one_hot mask and the two tiny per-expert
+        # .to(device) copies (~1,500 launches/token).
+        _pair, _starts, _counts_l = compute_expert_dispatch(
+            expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
+            experts_mod.num_experts)
+        _pair_gpu = _pair.to(device, non_blocking=True)
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
 
@@ -731,10 +758,11 @@ def _make_fused_sparse_forward_exl3(
                     continue
                 intermediate_size = _t_gate.shape[1] * 16
 
-            top_k_pos, token_idx = torch.where(expert_mask[eidx])
-            if token_idx.numel() == 0:
+            _s, _c = _starts[eidx], _counts_l[eidx]
+            if _c == 0:
                 continue
-            token_idx_gpu = token_idx.to(device)
+            token_idx_gpu = _pair_gpu[0, _s:_s + _c]
+            top_k_pos_gpu = _pair_gpu[1, _s:_s + _c]
             current_state = flat_hidden[token_idx_gpu]
             if current_state.dtype != torch.float16:
                 current_state = current_state.to(torch.float16)
@@ -778,7 +806,7 @@ def _make_fused_sparse_forward_exl3(
                 if _prof:
                     torch.cuda.synchronize(); _mp['gemm'] += time.perf_counter() - _t0
 
-                weights_slice = routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+                weights_slice = routing_weights[token_idx_gpu, top_k_pos_gpu, None]
                 hidden = hidden * weights_slice
                 final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
             finally:
