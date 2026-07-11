@@ -1902,7 +1902,6 @@ class VaayuBaseModel(GenerationMixin):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         _exec_start = time.time()
-        print(f"[Vaayu] inference start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_start))}")
         self.telemetry.begin_token(self._token_count)
 
         if self.profiling_mode:
@@ -1938,9 +1937,16 @@ class VaayuBaseModel(GenerationMixin):
             attention_mask = attention_mask.to(self.running_device)
         _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
                              if past_key_values is not None else 0)
-        _cur_len_for_pos  = input_ids.shape[1] if input_ids is not None else 0
+        _cur_len_for_pos  = input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0
         _pos_range        = max(self.max_seq_len, _past_len_for_pos + _cur_len_for_pos)
-        position_ids      = torch.arange(_pos_range, dtype=torch.long, device=self.running_device)[None, :]
+        # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
+        # allocating a fresh GPU arange every token is pure waste. Cache like the
+        # RoPE block below.
+        if getattr(self, '_position_ids_cache_key', None) != _pos_range:
+            self._position_ids_cache = torch.arange(
+                _pos_range, dtype=torch.long, device=self.running_device)[None, :]
+            self._position_ids_cache_key = _pos_range
+        position_ids = self._position_ids_cache
 
         # Pre-compute RoPE position embeddings for the full sequence length.
         # Transformers >= 4.45 moved this computation to the top-level model forward;
@@ -2336,8 +2342,6 @@ class VaayuBaseModel(GenerationMixin):
 
         _exec_end = time.time()
         _total = _exec_end - _exec_start
-        print(f"[Vaayu] inference end:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_exec_end))}")
-        print(f"[Vaayu] total execution time: {_total:.3f}s")
         _cache_stats = self.ram_cache.stats() if getattr(self, 'ram_cache', None) is not None else "disabled"
         _expert_cache_stats = self._expert_cache.stats() if self._expert_cache is not None else "n/a"
         _expert_cache_delta = self._expert_cache.delta_stats() if self._expert_cache is not None else "n/a"
