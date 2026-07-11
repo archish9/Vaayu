@@ -2208,11 +2208,16 @@ class VaayuBaseModel(GenerationMixin):
                     cache_hit=_lt_cache_hit,
                 ))
 
-                if i % 40 == 39:
+                # Prefill only: decode calls this every 32 tokens instead (below) —
+                # per-token empty_cache() defeats the CUDA caching allocator.
+                if self._token_count == 0 and i % 40 == 39:
                     clean_memory()
 
         self.telemetry.end_token()
         self._token_count += 1
+        # Decode-phase memory hygiene, throttled: every 32 tokens, not every token.
+        if self._token_count % 32 == 0:
+            clean_memory()
         logits = torch.cat(batch, 0)
 
         if output_attentions:
