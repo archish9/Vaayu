@@ -2325,9 +2325,10 @@ class VaayuBaseModel(GenerationMixin):
 
         self.telemetry.end_token()
         self._token_count += 1
-        # Decode-phase memory hygiene, throttled: every 32 tokens, not every token.
+        # Decode-phase memory hygiene, throttled: every 32 tokens, host-only —
+        # empty_cache() would defeat the CUDA caching allocator (Task 2).
         if self._token_count % 32 == 0:
-            clean_memory()
+            clean_memory(cuda=False)
         logits = torch.cat(batch, 0)
 
         if output_attentions:

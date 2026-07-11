@@ -65,14 +65,17 @@ class NotEnoughSpaceException(Exception):
     pass
 
 # Function to clean RAM & vRAM
-def clean_memory():
+def clean_memory(cuda: bool = True):
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception as ex:
         # maybe platform
         pass
-    if torch.cuda.is_available():
+    # cuda=False: host-only hygiene. empty_cache() returns blocks to the driver,
+    # forcing a cudaMalloc storm on the next token's expert H2D — skip it on the
+    # steady-state decode path (callers pass cuda=False there).
+    if cuda and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
