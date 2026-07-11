@@ -622,3 +622,52 @@ def test_exl3_forward_handles_cache_miss_via_persistent_executor(tmp_path):
     assert selected, "no experts recorded in routing history"
     for eidx in selected:
         assert cache.get(0, eidx) is not None, f"expert {eidx} was not cached after miss-path load"
+
+
+def test_exl3_forward_skips_ram_cache_put_during_prefill(tmp_path):
+    """When vaayu_ref._moe_prefill_pass is True, a cache-miss load must still
+    run (forward output is correct) but must NOT populate expert_cache — the
+    Task 5 gate in _make_fused_sparse_forward_exl3's _load_one()."""
+    from vaayu.moe_patch import _make_fused_sparse_forward_exl3
+
+    model = MockFusedModel(num_layers=1, hidden=8)
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+    vaayu_ref._moe_prefill_pass = True
+
+    from vaayu.moe_patch import detect_moe_blocks
+    blocks = detect_moe_blocks(model)
+    block_info = blocks[0]
+
+    # Deliberately do NOT pre-populate the cache — every routed expert is a miss,
+    # forcing the vaayu_ref._moe_executor.map(...) branch to actually run.
+
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.side_effect = lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16)
+
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", return_value=mock_bc):
+        fwd = _make_fused_sparse_forward_exl3(
+            block_info=block_info,
+            expert_cache=cache,
+            offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)),
+            top_k=2,
+            device="cpu",
+            dtype=torch.float32,
+            vaayu_ref=vaayu_ref,
+        )
+        block_info.moe_module.forward = fwd
+        out = model.layers[0].mlp.forward(torch.randn(1, 1, 8))
+
+    assert out.shape == (1, 1, 8), f"Expected (1,1,8) got {out.shape}"
+    assert mock_bc.run_alloc.called, "BC_LinearEXL3 run_alloc was never called on cache-miss path"
+    selected = vaayu_ref._expert_history.get(0, [])
+    assert selected, "no experts recorded in routing history"
+    for eidx in selected:
+        assert cache.get(0, eidx) is None, (
+            f"expert {eidx} was cached despite _moe_prefill_pass=True "
+            "(prefill cache-put gate did not skip expert_cache.put)"
+        )
