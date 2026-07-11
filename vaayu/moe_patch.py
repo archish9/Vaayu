@@ -10,6 +10,7 @@ Design rationale: see docs/superpowers/specs/2026-06-14-moe-expert-aware-streami
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _futures_wait
@@ -66,6 +67,16 @@ def compute_expert_dispatch(expert_indices_cpu: "torch.Tensor", num_experts: int
     starts_t = counts_t.cumsum(0) - counts_t
     pair = torch.stack([tok[order], kpos[order]])
     return pair, starts_t.tolist(), counts_t.tolist()
+
+
+def lookahead_accuracy_update(state: dict, predicted, layer_idx: int, actual: set) -> None:
+    """Phase-A accounting for the lookahead routing predictor: when a stored
+    prediction targets THIS layer, count how many actually-routed experts it
+    covered. state = {"hits": int, "total": int}; accuracy = hits/total."""
+    if predicted is None or predicted[0] != layer_idx:
+        return
+    state["hits"] += len(predicted[1] & actual)
+    state["total"] += len(actual)
 
 
 def _classify_expert_tensors(
@@ -613,6 +624,24 @@ def _make_fused_sparse_forward_exl3(
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
 
+    def shard_file_for(name: str) -> str:
+        return str(checkpoint_path / f"{name}.safetensors")
+
+    def _load_predicted_expert(next_layer_name: str, next_layer_idx: int, eidx: int):
+        """Phase-B prefetch: load a predicted next-layer expert into the RAM
+        cache ahead of its layer. Uses the legacy clone path + prefetch=True so
+        the existing prefetch_used telemetry measures usefulness. Never raises."""
+        try:
+            if expert_cache.has(next_layer_idx, eidx):
+                return
+            metas = offset_index.get_expert_offsets(next_layer_name, eidx)
+            if metas is None:
+                return
+            raw = load_expert_sparse(shard_file_for(next_layer_name), metas)
+            expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+        except Exception:
+            pass
+
     def sparse_forward(hidden_states, **kwargs):
         _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
         _mp = vaayu_ref._moe_profile if _prof else None
@@ -640,10 +669,40 @@ def _make_fused_sparse_forward_exl3(
             torch.cuda.synchronize(); _t0 = time.perf_counter()
         expert_indices_cpu = expert_indices.cpu()
         unique_experts: list[int] = unique_expert_indices(expert_indices_cpu)
+
+        # ── Lookahead routing predictor (Task 12, decode only) ──────────────
+        # Phase A (always on): score the PREVIOUS layer's prediction for this
+        # layer against the actual routing — pure accounting, no behavior change.
+        # Phase B (env VAAYU_LOOKAHEAD=1): prefetch predicted next-layer misses.
+        if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+            _la_state = getattr(vaayu_ref, "_lookahead_state", None)
+            if _la_state is not None:
+                lookahead_accuracy_update(
+                    _la_state, getattr(vaayu_ref, "_lookahead_pred", None),
+                    layer_idx, set(unique_experts))
+            _next_block = getattr(vaayu_ref, "_moe_block_by_idx", {}).get(layer_idx + 1) \
+                if isinstance(getattr(vaayu_ref, "_moe_block_by_idx", None), dict) else None
+            if _next_block is not None:
+                try:
+                    _next_router = getattr(_next_block.moe_module, _next_block.router_attr)
+                    _nr = _next_router(flat_hidden)
+                    _nl = _nr[0] if isinstance(_nr, tuple) else _nr
+                    _, _pred_idx = torch.topk(_nl.float(), top_k, dim=-1)
+                    _pred_set = set(int(x) for x in _pred_idx.flatten().cpu().unique().tolist())
+                    vaayu_ref._lookahead_pred = (layer_idx + 1, _pred_set)
+                    if os.environ.get("VAAYU_LOOKAHEAD") == "1":
+                        _next_name = _next_block.layer_name
+                        for _pe in _pred_set:
+                            if not expert_cache.has(layer_idx + 1, _pe):
+                                vaayu_ref._moe_executor.submit(
+                                    _load_predicted_expert, _next_name, layer_idx + 1, _pe)
+                except Exception:
+                    vaayu_ref._lookahead_pred = None
+
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
 
-        shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+        shard_file = shard_file_for(layer_name)
         expert_tensors: dict[int, dict] = {}
         misses: list[int] = []
 

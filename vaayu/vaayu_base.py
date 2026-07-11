@@ -868,6 +868,9 @@ class VaayuBaseModel(GenerationMixin):
                 vaayu_ref=self,
                 loader_strategy=self.loader_strategy,
             )
+            # Lookahead predictor (Task 12): O(1) next-block lookup by layer idx.
+            self._moe_block_by_idx = {b.layer_idx: b for b in self._moe_blocks}
+            self._lookahead_state = {"hits": 0, "total": 0}
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
 
             # Fix #7 follow-up: when the VRAM budget can't hold one token's
@@ -2508,7 +2511,10 @@ class VaayuBaseModel(GenerationMixin):
         _expert_disk_s = getattr(self, '_expert_disk_s', 0.0)
         _compute_only_s = max(0.0, _compute_s - _expert_disk_s)
         _other_s = _total - _io_wait_s - _gpu_load_s - _compute_s
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}")
+        _la = getattr(self, "_lookahead_state", None)
+        _la_str = (f"  lookahead_acc={_la['hits']}/{_la['total']}"
+                   f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")
