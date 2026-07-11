@@ -486,6 +486,30 @@ class SafetensorModelPersister(ModelPersister):
             return result
 
 
+def _group_contiguous_ranges(expert_metas: dict) -> list:
+    """Sort one expert's tensor metas by file offset and group ranges whose
+    gap is <= _ALIGN into single contiguous reads. Checkpoints may store
+    tensors grouped by weight-type across ALL experts rather than per-expert
+    (confirmed: this EXL3 checkpoint stores every expert's small suh/svh
+    tensors in one block, then every expert's large trellis tensors in a
+    separate block far away) — multiple groups with large gaps between them
+    is the expected case, not an edge case. Never assume one expert's
+    tensors are file-contiguous."""
+    sorted_metas = sorted(expert_metas.items(), key=lambda x: x[1].file_offset)
+    groups: list[list] = []
+    current_group = [sorted_metas[0]]
+    for key, meta in sorted_metas[1:]:
+        prev_meta = current_group[-1][1]
+        prev_end = prev_meta.file_offset + prev_meta.byte_length
+        if meta.file_offset - prev_end <= _ALIGN:
+            current_group.append((key, meta))
+        else:
+            groups.append(current_group)
+            current_group = [(key, meta)]
+    groups.append(current_group)
+    return groups
+
+
 def load_expert_sparse(
     file_path: str,
     expert_metas: dict,
@@ -516,21 +540,7 @@ def load_expert_sparse(
     if use_direct_io is None:
         use_direct_io = _USE_DIRECT_IO
 
-    # Sort by file offset to enable contiguity detection
-    sorted_metas = sorted(expert_metas.items(), key=lambda x: x[1].file_offset)
-
-    # Group contiguous ranges (gap <= _ALIGN → merge into one read)
-    groups: list[list] = []
-    current_group = [sorted_metas[0]]
-    for key, meta in sorted_metas[1:]:
-        prev_meta = current_group[-1][1]
-        prev_end = prev_meta.file_offset + prev_meta.byte_length
-        if meta.file_offset - prev_end <= _ALIGN:
-            current_group.append((key, meta))
-        else:
-            groups.append(current_group)
-            current_group = [(key, meta)]
-    groups.append(current_group)
+    groups = _group_contiguous_ranges(expert_metas)
 
     result = {}
 
@@ -596,12 +606,24 @@ def load_expert_sparse(
 
 
 def expert_span_bytes(expert_metas: dict) -> int:
-    """Aligned byte length of the contiguous file span covering ALL of one
-    expert's tensors. This is the slab size one expert needs. Model-agnostic:
+    """Aligned byte length the slab needs to hold ALL of one expert's
+    tensors. Expert tensors are NOT assumed file-contiguous (see
+    _group_contiguous_ranges) — this is the SUM of each contiguous group's
+    own aligned read length, not the raw span from the first tensor's start
+    to the last tensor's end (that span can be enormous when a checkpoint
+    stores tensors grouped by weight-type across many experts rather than
+    per-expert, e.g. a 128-expert checkpoint whose small metadata tensors
+    and large trellis tensors live in two far-apart blocks). Model-agnostic:
     derived from the offset index, never hardcoded."""
-    start = min(m.file_offset for m in expert_metas.values())
-    end = max(m.file_offset + m.byte_length for m in expert_metas.values())
-    return _align_up(end - _align_down(start))
+    total = 0
+    for group in _group_contiguous_ranges(expert_metas):
+        group_start = group[0][1].file_offset
+        last_meta = group[-1][1]
+        group_end = last_meta.file_offset + last_meta.byte_length
+        aligned_offset = _align_down(group_start)
+        prefix_pad = group_start - aligned_offset
+        total += _align_up(group_end - group_start + prefix_pad)
+    return total
 
 
 def compute_slab_bytes(offset_index) -> int:
@@ -620,45 +642,57 @@ def load_expert_into_slab(
     slab: "torch.Tensor",
     allow_direct: bool,
 ) -> dict:
-    """Read one expert's full file span DIRECTLY into `slab` (uint8) and return
-    {tensor_key: view-into-slab}. Zero copies: no clone here, none in the cache
-    (see ExpertRAMCache.put_slab). The returned views are valid until the slab
-    is recycled by cache eviction — consumers must use them within the same
-    layer forward.
+    """Read one expert's tensors DIRECTLY into `slab` (uint8) and return
+    {tensor_key: view-into-slab}. Zero copies: no clone here, none in the
+    cache (see ExpertRAMCache.put_slab). Expert tensors are NOT assumed
+    file-contiguous (see _group_contiguous_ranges) — this issues ONE read
+    per contiguous group and packs groups back-to-back into the slab (the
+    slab's layout does not mirror the file's layout; slab_bytes already
+    equals the sum of each group's own aligned length, per
+    expert_span_bytes/compute_slab_bytes). The returned views are valid
+    until the slab is recycled by cache eviction — consumers must use them
+    within the same layer forward.
 
     allow_direct: O_DIRECT needs a sector-aligned buffer; pinned arena slabs
-    are (page-aligned backing sliced at _ALIGN multiples), plain torch.empty
+    are page-aligned (backing sliced at _ALIGN multiples), plain torch.empty
     is not — pass arena.pin here.
     """
-    start = min(m.file_offset for m in expert_metas.values())
-    end = max(m.file_offset + m.byte_length for m in expert_metas.values())
-    aligned_offset = _align_down(start)
-    prefix_pad = start - aligned_offset
-    aligned_length = _align_up(end - aligned_offset)
-    if aligned_length > slab.nbytes:
-        raise RuntimeError(
-            f"expert span {aligned_length}B exceeds slab {slab.nbytes}B "
-            f"(compute_slab_bytes undersized?)"
-        )
     use_direct = _USE_DIRECT_IO and allow_direct
-
-    if _USE_IOURING:
-        vaayu_rust.io_uring_read_into(
-            file_path, aligned_offset, aligned_length,
-            slab.data_ptr(), 8, use_direct,
-        )
-    else:
-        fd = os.open(file_path, os.O_RDONLY)
-        try:
-            view = memoryview(slab.numpy())
-            os.preadv(fd, [view[:aligned_length]], aligned_offset)
-        finally:
-            os.close(fd)
-
-    data = slab[prefix_pad:]
     out: dict = {}
-    for key, meta in expert_metas.items():
-        rel = meta.file_offset - start
-        dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
-        out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
+    slab_off = 0
+    for group in _group_contiguous_ranges(expert_metas):
+        group_start = group[0][1].file_offset
+        last_meta = group[-1][1]
+        group_end = last_meta.file_offset + last_meta.byte_length
+        aligned_offset = _align_down(group_start)
+        prefix_pad = group_start - aligned_offset
+        aligned_length = _align_up(group_end - group_start + prefix_pad)
+        if slab_off + aligned_length > slab.nbytes:
+            raise RuntimeError(
+                f"expert span {slab_off + aligned_length}B exceeds slab {slab.nbytes}B "
+                f"(compute_slab_bytes undersized?)"
+            )
+        dest = slab[slab_off:slab_off + aligned_length]
+
+        if _USE_IOURING:
+            vaayu_rust.io_uring_read_into(
+                file_path, aligned_offset, aligned_length,
+                dest.data_ptr(), 8, use_direct,
+            )
+        else:
+            fd = os.open(file_path, os.O_RDONLY)
+            try:
+                view = memoryview(dest.numpy())
+                os.preadv(fd, [view[:aligned_length]], aligned_offset)
+            finally:
+                os.close(fd)
+
+        data = dest[prefix_pad:]
+        for key, meta in group:
+            rel = meta.file_offset - group_start
+            dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+            out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
+
+        slab_off += aligned_length
+
     return out

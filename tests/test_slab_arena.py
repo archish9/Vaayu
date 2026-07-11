@@ -64,6 +64,54 @@ def test_expert_span_bytes_alignment():
     assert span >= (4400 - 4096)
 
 
+def test_expert_span_bytes_multiple_far_apart_groups():
+    """Reproduces the real checkpoint bug: an expert's tensors are NOT
+    file-contiguous (small metadata block, then a large data block far
+    away). expert_span_bytes must sum each group's own aligned size, not
+    the raw span from first-tensor-start to last-tensor-end (which would
+    hugely overcount — this is exactly what caused Task 7's real-hardware
+    regression: a 128x oversized slab, OOM on pinned alloc, and 0% cache
+    hit rate)."""
+    small = _meta(1_000_000, 100, [50])                    # tiny tensor near 1MB mark
+    big = _meta(500_000_000, 4_000_000, [1000])             # 4MB tensor ~500MB away
+    metas = {"small": small, "big": big}
+    span = expert_span_bytes(metas)
+    # Two groups (gap >> _ALIGN): ~4096 (small, aligned) + ~4005888ish (big, aligned).
+    # Must be close to the SUM of the two tensors' own sizes, nowhere near the
+    # ~499MB raw span between them.
+    assert span < 10 * 1024 * 1024          # nowhere near the ~499MB naive span
+    assert span >= small.byte_length + big.byte_length
+    assert span % _ALIGN == 0
+
+
+def test_load_expert_into_slab_handles_far_apart_groups(tmp_path):
+    """Same scenario through the real read path: two groups, packed
+    back-to-back into the slab (slab layout != file layout), each
+    reconstructed correctly."""
+    payload_small = bytes(range(50)) * 2                    # 100B
+    payload_big = bytes(reversed(range(256))) * 16           # 4096B
+    f = tmp_path / "shard.bin"
+    blob = bytearray(600_000)
+    off_small, off_big = 1000, 500_000
+    blob[off_small:off_small + 100] = payload_small
+    blob[off_big:off_big + 4096] = payload_big
+    f.write_bytes(bytes(blob))
+
+    metas = {
+        "small.trellis": _meta(off_small, 100, [100], dtype="U8"),
+        "big.trellis": _meta(off_big, 4096, [4096], dtype="U8"),
+    }
+    slab_bytes = expert_span_bytes(metas)
+    slab = torch.empty(slab_bytes, dtype=torch.uint8)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+    assert bytes(views["small.trellis"].numpy().tobytes()) == payload_small
+    assert bytes(views["big.trellis"].numpy().tobytes()) == payload_big
+    # both views live inside the (much smaller than the file span) slab
+    for v in views.values():
+        assert v.data_ptr() >= slab.data_ptr()
+        assert v.data_ptr() < slab.data_ptr() + slab.nbytes
+
+
 # ── arena mechanics ───────────────────────────────────────────────────────
 
 def test_arena_acquire_release_recycle():
