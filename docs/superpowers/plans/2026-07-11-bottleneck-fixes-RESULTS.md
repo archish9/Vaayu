@@ -56,9 +56,41 @@ faults on a non-16-aligned pointer.
 **Test suite:** 138/138 throughout both commits (1 new test from `5bc5ea8`, none needed for
 `a6aa875`'s pure internal redesign).
 
-**Status:** Ready to merge per final review. **Needs a fresh real-hardware run to confirm the
-crash is actually gone** — everything above was verified by code inspection and arithmetic, not
-by executing CUDA, since no GPU is available in this environment.
+**Second real-hardware run (2026-07-12): crash confirmed gone, but decode throughput regressed.**
+`total generation time` went 48.4s → 66.2s (TTFT 25.52s→30.32s, decode 1.05→0.67 tok/s), uniformly
+across every decode token in the run's telemetry (avg token time ~1.0-1.2s → ~1.56s, `expert_disk`
+0.2-0.9s → 0.4-1.2s) — not a few outliers, a systemic per-call regression.
+
+**Root cause (again found via code inspection + the run's telemetry, no GPU needed):**
+`load_expert_into_slab` has exactly two callers — `stage_read_expert` (prefill stager) and
+`_load_one` (decode's cache-miss path, hit 350-400x/token). `a6aa875`'s scratch-pool repack was
+applied to BOTH unconditionally, but only the prefill stager's output is ever consumed via
+`views_from_packed_copy` (the path needing 16-byte alignment) — decode's cache-miss path populates
+the RAM cache and is always read back later via per-component `.to(device)` copies (Task 7, always
+naturally aligned on a fresh cross-device copy), never touching `views_from_packed_copy`. Applying
+the repack there anyway added `_EXPERT_BUF_POOL` contention (8 shared buffers, now drawn on by
+every decode miss) plus real per-tensor `copy_()` overhead, on a call path hit hundreds of times
+per token.
+
+**Fix (`f05efeb`):** `load_expert_into_slab` gains a required `tensor_align: bool`. `True` (prefill
+staging) keeps the scratch-pool repack unchanged. `False` (decode's cache-miss path) restores the
+exact zero-copy behavior that existed before this whole alignment-fix arc started — raw read lands
+directly in the persistent slab, no pool, no extra copies. `_group_layout`/`expert_span_bytes` now
+size every group by `slab_span = max(raw_aligned_length, packed_span)` so the same shared arena
+stays safely sized for either mode. Opus review (third pass over this exact code) independently
+re-verified all three invariants hold simultaneously: the crash fix (16-byte alignment for
+`tensor_align=True`), the RAM fix (sizing stayed at 11.29 MB, `max()` adds only ~7KB/expert vs the
+theoretical worst case, confirmed against the real checkpoint), and the regression fix (`False`
+branch provably never touches the pool). Two Minor test-hardening findings (a test whose name
+overclaimed what it verified; a partly-circular assertion) were fixed in `c6bbbb2` — the new pool-
+usage test would have caught the original unconditional-repack regression.
+
+**Test suite:** 140/140 (138 → 139 `f05efeb` → 140 `c6bbbb2`).
+
+**Status:** Ready to merge per three independent Opus reviews. **Needs a fourth real-hardware run**
+to confirm decode throughput actually recovers to the ~1.05 tok/s / TTFT ≤~26s range — everything
+above was verified by code inspection, arithmetic, and the run's own telemetry, not by directly
+observing the fix's effect on new CUDA execution, since no GPU is available in this environment.
 
 ## Overview
 
