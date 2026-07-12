@@ -11,6 +11,7 @@ from vaayu.persist.expert_cache import ExpertRAMCache, SlabArena
 from vaayu.persist.expert_offset_index import ExpertTensorMeta
 from vaayu.persist.safetensor_model_persister import (
     _ALIGN,
+    _TENSOR_ALIGN,
     compute_slab_bytes,
     expert_span_bytes,
     load_expert_into_slab,
@@ -40,10 +41,14 @@ def test_compute_slab_bytes_is_max_aligned_span(n_layers, n_experts):
             1: {"a": _meta(base + 5000, 1000, [500]), "b": _meta(base + 7000, 1000, [500])},
         }
     slab = compute_slab_bytes(_FakeIndex(index))
-    # worst span: expert 1 -> [5000, 8000) = 3000B, plus down-alignment of 5000
-    # to 4096 (prefix 904) then up-align -> must be >= 3000 and _ALIGN-multiple
-    assert slab % _ALIGN == 0
-    assert slab >= 3000
+    # worst span: expert 1 -> tensors "a" (1000B) + "b" (1000B) = 2000B of real
+    # tensor data. The persistent slab only needs each tensor individually
+    # _TENSOR_ALIGN-packed (no O_DIRECT/_ALIGN rounding, and no padding for the
+    # 1000B GAP between "a" and "b" within their group -- that gap only exists
+    # in the transient scratch read, see _group_layout) -> must be >= 2000 and
+    # a _TENSOR_ALIGN-multiple.
+    assert slab % _TENSOR_ALIGN == 0
+    assert slab >= 2000
     # NOTE: alignment padding depends on the ABSOLUTE file offset (_align_down),
     # which varies per layer since the 100_000 stride isn't _ALIGN-aligned, so
     # the worst-case span isn't guaranteed to live on layer 0. Recompute the
@@ -59,9 +64,11 @@ def test_compute_slab_bytes_is_max_aligned_span(n_layers, n_experts):
 def test_expert_span_bytes_alignment():
     metas = {"x": _meta(4097, 100, [50]), "y": _meta(4300, 100, [50])}
     span = expert_span_bytes(metas)
-    assert span % _ALIGN == 0
-    # span covers [4096-aligned-down .. 4400-aligned-up)
-    assert span >= (4400 - 4096)
+    assert span % _TENSOR_ALIGN == 0
+    # persistent-slab span is each tensor individually rounded up to
+    # _TENSOR_ALIGN (16), summed -- not the raw file span rounded to _ALIGN
+    # (4096, which only bounds the transient scratch read, see _group_layout)
+    assert span == 2 * ((100 + _TENSOR_ALIGN - 1) // _TENSOR_ALIGN * _TENSOR_ALIGN)
 
 
 def test_expert_span_bytes_multiple_far_apart_groups():
@@ -81,7 +88,7 @@ def test_expert_span_bytes_multiple_far_apart_groups():
     # ~499MB raw span between them.
     assert span < 10 * 1024 * 1024          # nowhere near the ~499MB naive span
     assert span >= small.byte_length + big.byte_length
-    assert span % _ALIGN == 0
+    assert span % _TENSOR_ALIGN == 0
 
 
 def test_load_expert_into_slab_handles_far_apart_groups(tmp_path):

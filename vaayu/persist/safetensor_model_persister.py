@@ -619,26 +619,28 @@ def _group_layout(group: list) -> tuple[int, int, int, int]:
     (reading), so they can't drift apart the way sizing/reading arithmetic
     once did in this codebase (see commit ef24551).
 
-    Returns (aligned_offset, prefix_pad, raw_aligned_length, total_span):
+    Returns (aligned_offset, prefix_pad, raw_aligned_length, packed_span):
       aligned_offset     — file offset to start the O_DIRECT read from
                             (a multiple of _ALIGN).
       prefix_pad         — bytes between aligned_offset and the group's
                             real first byte within the raw read.
       raw_aligned_length — bytes read from disk for this group (O_DIRECT
-                            sector-aligned length).
-      total_span         — bytes this group occupies in the destination
-                            slab: the raw read region PLUS a scratch region
-                            where each tensor is individually re-packed at
-                            a _TENSOR_ALIGN-aligned offset. The raw read's
-                            own per-tensor offsets (prefix_pad + a tensor's
-                            relative position in the file) are only
-                            itemsize-safe — enough for `.view(dtype)` to not
-                            raise — not _TENSOR_ALIGN-safe, which is what
-                            load_expert_into_slab's zero-copy views need
-                            once Task 9's one-copy GPU rebuild reslices them
-                            straight into a CUDA kernel's weight input.
-                            Rounded up to _ALIGN so slab_off stays a valid
-                            O_DIRECT destination offset for the NEXT group.
+                            sector-aligned length), into a TRANSIENT scratch
+                            buffer (see load_expert_into_slab) — never
+                            persisted in the destination slab, so it carries
+                            no _ALIGN rounding cost for the (many, long-lived)
+                            persistent slabs.
+      packed_span         — bytes this group occupies in the PERSISTENT
+                            destination slab: each tensor individually
+                            re-packed at a _TENSOR_ALIGN-aligned offset. A
+                            group's raw read only guarantees each tensor is
+                            itemsize-aligned there (safe for `.view(dtype)`,
+                            not for a CUDA kernel — see load_expert_into_slab's
+                            docstring), and the persistent slab is never an
+                            O_DIRECT read target itself (only the scratch
+                            buffer is), so packed_span needs no _ALIGN
+                            (4096-byte) rounding — only _TENSOR_ALIGN
+                            (16-byte) per tensor.
     """
     group_start = group[0][1].file_offset
     last_meta = group[-1][1]
@@ -647,25 +649,27 @@ def _group_layout(group: list) -> tuple[int, int, int, int]:
     prefix_pad = group_start - aligned_offset
     raw_aligned_length = _align_up(group_end - group_start + prefix_pad)
     packed_span = sum(_align_up_to(meta.byte_length, _TENSOR_ALIGN) for _key, meta in group)
-    total_span = _align_up(raw_aligned_length + packed_span)
-    return aligned_offset, prefix_pad, raw_aligned_length, total_span
+    return aligned_offset, prefix_pad, raw_aligned_length, packed_span
 
 
 def expert_span_bytes(expert_metas: dict) -> int:
-    """Aligned byte length the slab needs to hold ALL of one expert's
-    tensors. Expert tensors are NOT assumed file-contiguous (see
-    _group_contiguous_ranges) — this is the SUM of each contiguous group's
-    own aligned span (raw read + per-tensor alignment repacking, see
-    _group_layout), not the raw span from the first tensor's start to the
-    last tensor's end (that span can be enormous when a checkpoint stores
-    tensors grouped by weight-type across many experts rather than
-    per-expert, e.g. a 128-expert checkpoint whose small metadata tensors
-    and large trellis tensors live in two far-apart blocks). Model-agnostic:
-    derived from the offset index, never hardcoded."""
+    """Byte length the PERSISTENT slab needs to hold ALL of one expert's
+    tensors, individually _TENSOR_ALIGN-repacked (see _group_layout /
+    load_expert_into_slab) — NOT the raw file-read length (that lives in a
+    transient scratch buffer, see load_expert_into_slab, and never counts
+    against slab/cache capacity). Expert tensors are NOT assumed
+    file-contiguous (see _group_contiguous_ranges) — this is the SUM of each
+    contiguous group's own packed span, not the raw span from the first
+    tensor's start to the last tensor's end (that span can be enormous when
+    a checkpoint stores tensors grouped by weight-type across many experts
+    rather than per-expert, e.g. a 128-expert checkpoint whose small
+    metadata tensors and large trellis tensors live in two far-apart
+    blocks). Model-agnostic: derived from the offset index, never
+    hardcoded."""
     total = 0
     for group in _group_contiguous_ranges(expert_metas):
-        _, _, _, span = _group_layout(group)
-        total += span
+        _, _, _, packed_span = _group_layout(group)
+        total += packed_span
     return total
 
 
@@ -690,69 +694,97 @@ def load_expert_into_slab(
     ExpertRAMCache.put_slab). Expert tensors are NOT assumed file-contiguous
     (see _group_contiguous_ranges) — this issues ONE read per contiguous
     group; the slab's layout does not mirror the file's layout (slab_bytes
-    equals the sum of each group's own span, per expert_span_bytes /
+    equals the sum of each group's own packed span, per expert_span_bytes /
     compute_slab_bytes / _group_layout).
 
-    Each tensor is individually re-packed (via one intra-slab copy_, no
-    clone — source and destination never overlap) at a _TENSOR_ALIGN-aligned
-    offset after the raw read, rather than left at its natural file-relative
-    position: a group's raw read only guarantees each tensor is
-    itemsize-aligned (safe for .view(dtype)), not _TENSOR_ALIGN-aligned,
-    since that position is derived from the file's own byte layout and is
-    essentially arbitrary mod _TENSOR_ALIGN. That distinction is invisible
-    on CPU (torch.view doesn't require more than itemsize alignment) but
-    matters once Task 9's one-copy GPU rebuild (views_from_packed_copy)
-    reslices these exact views straight into a CUDA tensor for EXL3's
-    kernel, which dereferences the weight buffer as uint4* — a misaligned
-    slice there faults with cudaErrorMisalignedAddress instead of raising a
-    catchable Python exception. The returned views are valid until the slab
-    is recycled by cache eviction — consumers must use them within the same
-    layer forward.
+    The raw group read lands in a TRANSIENT scratch buffer drawn from
+    _EXPERT_BUF_POOL (the same pinned-buffer pool load_expert_sparse already
+    uses, bounded by the shared _moe_executor's worker count — no
+    oversubscription) — never in `slab` itself. Each tensor is then
+    individually re-packed (via one scratch→slab copy_, no clone — the two
+    buffers are always disjoint) at a _TENSOR_ALIGN-aligned offset, rather
+    than left at its natural file-relative position: a group's raw read
+    only guarantees each tensor is itemsize-aligned (safe for .view(dtype)),
+    not _TENSOR_ALIGN-aligned, since that position is derived from the
+    file's own byte layout and is essentially arbitrary mod _TENSOR_ALIGN.
+    That distinction is invisible on CPU (torch.view doesn't require more
+    than itemsize alignment) but matters once Task 9's one-copy GPU rebuild
+    (views_from_packed_copy) reslices these exact views straight into a
+    CUDA tensor for EXL3's kernel, which dereferences the weight buffer as
+    uint4* — a misaligned slice there faults with cudaErrorMisalignedAddress
+    instead of raising a catchable Python exception. Keeping the raw region
+    OUT of `slab` (rather than repacking in-place) matters because `slab`
+    is a long-lived, cache-capacity-counted buffer (compute_slab_bytes),
+    while the raw region is only ever needed for the duration of this one
+    read — persisting it there would double slab/cache memory for no
+    benefit. The returned views are valid until the slab is recycled by
+    cache eviction — consumers must use them within the same layer forward.
 
-    allow_direct: O_DIRECT needs a sector-aligned buffer; pinned arena slabs
-    are page-aligned (backing sliced at _ALIGN multiples), plain torch.empty
-    is not — pass arena.pin here.
+    allow_direct: whether this call may use O_DIRECT for the scratch read
+    (subject to the scratch buffer actually being pinned — see below).
     """
     use_direct = _USE_DIRECT_IO and allow_direct
     out: dict = {}
     slab_off = 0
     for group in _group_contiguous_ranges(expert_metas):
         group_start = group[0][1].file_offset
-        aligned_offset, prefix_pad, raw_aligned_length, span = _group_layout(group)
-        if slab_off + span > slab.nbytes:
+        aligned_offset, prefix_pad, raw_aligned_length, packed_span = _group_layout(group)
+        if slab_off + packed_span > slab.nbytes:
             raise RuntimeError(
-                f"expert span {slab_off + span}B exceeds slab {slab.nbytes}B "
+                f"expert span {slab_off + packed_span}B exceeds slab {slab.nbytes}B "
                 f"(compute_slab_bytes undersized?)"
             )
-        dest = slab[slab_off:slab_off + span]
-        raw = dest[:raw_aligned_length]
 
-        if _USE_IOURING:
-            vaayu_rust.io_uring_read_into(
-                file_path, aligned_offset, raw_aligned_length,
-                raw.data_ptr(), 8, use_direct,
-            )
+        # Raw read into a transient scratch buffer (same pool as
+        # load_expert_sparse). Pool exhausted/uninitialized falls back to
+        # plain (non-pinned) torch.empty, forcing this read's use_direct
+        # off — O_DIRECT requires a sector-aligned destination, which only
+        # the pinned pool buffers guarantee (mirrors load_expert_sparse).
+        _pool_buf = None
+        _use_direct_this_group = use_direct
+        if _USE_PINNED and _EXPERT_PINNED_SIZE > 0:
+            _pool_buf = _EXPERT_BUF_POOL.get()
+            if raw_aligned_length > _EXPERT_PINNED_SIZE:
+                _EXPERT_BUF_POOL.put(_pool_buf)
+                raise RuntimeError(
+                    f"Expert group size {raw_aligned_length} exceeds scratch "
+                    f"buffer size {_EXPERT_PINNED_SIZE}"
+                )
+            raw = _pool_buf[:raw_aligned_length]
         else:
-            fd = os.open(file_path, os.O_RDONLY)
-            try:
-                view = memoryview(raw.numpy())
-                os.preadv(fd, [view[:raw_aligned_length]], aligned_offset)
-            finally:
-                os.close(fd)
+            raw = torch.empty(raw_aligned_length, dtype=torch.uint8)
+            _use_direct_this_group = False
 
-        data_raw = raw[prefix_pad:]
-        packed = dest[raw_aligned_length:]  # disjoint from `raw` — safe copy_ target
-        packed_off = 0
-        for key, meta in group:
-            rel = meta.file_offset - group_start
-            dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
-            chunk = data_raw[rel:rel + meta.byte_length]
-            dst_slice = packed[packed_off:packed_off + meta.byte_length]
-            dst_slice.copy_(chunk)
-            out[key] = dst_slice.view(dt).view(meta.shape)
-            packed_off += _align_up_to(meta.byte_length, _TENSOR_ALIGN)
+        try:
+            if _USE_IOURING:
+                vaayu_rust.io_uring_read_into(
+                    file_path, aligned_offset, raw_aligned_length,
+                    raw.data_ptr(), 8, _use_direct_this_group,
+                )
+            else:
+                fd = os.open(file_path, os.O_RDONLY)
+                try:
+                    view = memoryview(raw.numpy())
+                    os.preadv(fd, [view[:raw_aligned_length]], aligned_offset)
+                finally:
+                    os.close(fd)
 
-        slab_off += span
+            data_raw = raw[prefix_pad:]
+            packed = slab[slab_off:slab_off + packed_span]
+            packed_off = 0
+            for key, meta in group:
+                rel = meta.file_offset - group_start
+                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+                chunk = data_raw[rel:rel + meta.byte_length]
+                dst_slice = packed[packed_off:packed_off + meta.byte_length]
+                dst_slice.copy_(chunk)
+                out[key] = dst_slice.view(dt).view(meta.shape)
+                packed_off += _align_up_to(meta.byte_length, _TENSOR_ALIGN)
+        finally:
+            if _pool_buf is not None:
+                _EXPERT_BUF_POOL.put(_pool_buf)
+
+        slab_off += packed_span
 
     return out
 
