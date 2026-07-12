@@ -78,6 +78,11 @@ def test_expert_span_bytes_alignment():
     packed_span = 2 * ((100 + _TENSOR_ALIGN - 1) // _TENSOR_ALIGN * _TENSOR_ALIGN)
     raw_aligned_length = _align_up((4400 - 4097) + (4097 - _align_down(4097)))
     assert span == max(packed_span, raw_aligned_length)
+    # Independent ground truth (hand-derived, not the production formula):
+    # prefix_pad = 4097 - 4096 = 1; raw real range = 304B; align_up(304+1)
+    # rounds up to a single 4096B sector; packed = 2*align_up_to(100,16) =
+    # 2*112 = 224. max(4096, 224) = 4096.
+    assert span == 4096
 
 
 def test_expert_span_bytes_multiple_far_apart_groups():
@@ -273,3 +278,41 @@ def test_load_expert_into_slab_tensor_align_false_skips_repack(tmp_path):
     for v in views.values():
         assert v.data_ptr() >= slab.data_ptr()
         assert v.data_ptr() < slab.data_ptr() + slab.nbytes
+
+
+def test_load_expert_into_slab_tensor_align_gates_pool_usage(tmp_path):
+    """Regression guard for the actual claim in the test above's name: with
+    the pinned scratch pool populated (simulating a CUDA machine),
+    tensor_align=False must never draw from _EXPERT_BUF_POOL, while
+    tensor_align=True draws exactly once per contiguous group. Without this,
+    a future change could silently reintroduce the unconditional-repack
+    regression and no test would catch it."""
+    import vaayu.persist.safetensor_model_persister as persister
+    from unittest.mock import patch as mock_patch
+
+    payload = bytes(range(100))
+    f = tmp_path / "shard.bin"
+    blob = bytearray(64 * 1024)
+    off = 8191  # deliberately not 16- or 4096-aligned
+    blob[off:off + 100] = payload
+    f.write_bytes(bytes(blob))
+    metas = {"w": _meta(off, 100, [100], dtype="U8")}
+
+    scratch = torch.empty(1024 * 1024, dtype=torch.uint8)
+    slab = torch.empty(expert_span_bytes(metas), dtype=torch.uint8)
+
+    with mock_patch.object(persister, "_USE_PINNED", True), \
+         mock_patch.object(persister, "_EXPERT_PINNED_SIZE", scratch.nbytes), \
+         mock_patch.object(persister._EXPERT_BUF_POOL, "get",
+                            wraps=persister._EXPERT_BUF_POOL.get) as mock_get:
+        persister._EXPERT_BUF_POOL.put(scratch)  # seed one buffer, drained below
+
+        views_false = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=False)
+        assert mock_get.call_count == 0, "tensor_align=False drew from the scratch pool"
+        assert bytes(views_false["w"].numpy().tobytes()) == payload
+
+        views_true = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=True)
+        assert mock_get.call_count == 1, "tensor_align=True should draw exactly one buffer (one group)"
+        assert bytes(views_true["w"].numpy().tobytes()) == payload
+        # buffer returned to the pool afterward, so it doesn't leak into other tests
+        assert persister._EXPERT_BUF_POOL.qsize() == 1
