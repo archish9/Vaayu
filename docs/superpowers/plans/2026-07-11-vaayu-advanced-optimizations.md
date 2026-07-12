@@ -5,9 +5,24 @@ This document serves as a comprehensive, highly technical blueprint to eliminate
 
 ---
 
+## ⚖️ Code Review Findings (2026-07-12)
+
+**Reviewed against:** actual codebase in `vaayu/`, `vaayu_rust/`, `vaayu/persist/`, `vaayu/speculative/`.
+
+| # | Optimization | Verdict | Reason |
+|---|---|---|---|
+| 1 | `IORING_REGISTER_BUFFERS` fix | ✅ **IMPLEMENT** | Correctly new. Confirmed EFAULT in `lib.rs:123-131`. Fix `__del__` → `atexit`. |
+| 2 | CPU FFN (Candle) | ❌ **DO NOT IMPLEMENT** | `from_slice` copies 3GB (defeats purpose). EXL3 models need dequant step not addressed. CPU matmul likely slower than PCIe transfer for single-token. |
+| 3 | Heavy-Hitter Pinning | ✅ **IMPLEMENT** (with fixes) | `ExpertVRAMCache` exists but lacks frequency-pinning. `pin_to_vram()` API doesn't exist — must be added. |
+| 4 | Cache-Aware Routing | ✅ **IMPLEMENT** | Genuinely novel. Well-designed. Pure Python change. Fix dead `routing_weights` variable. |
+| 5 | Lookahead Routing | ❌ **ALREADY IMPLEMENTED** | Fully shipped in `moe_patch.py:675-704`. Phase A (accuracy tracking) + Phase B (`VAAYU_LOOKAHEAD=1` async prefetch). Remove from plan. |
+| 6 | Batch Expert Pruning | ✅ **IMPLEMENT** (with fixes) | Needed for spec decode + MoE. Fix mask: use `masked_fill(-inf)` not `* 0`. Needs perplexity study before shipping. |
+
+---
+
 ## Part I: Systems Engineering & Hardware Bottlenecks
 
-### 1. Fixing `IORING_REGISTER_BUFFERS` (The EFAULT Bug)
+### 1. Fixing `IORING_REGISTER_BUFFERS` (The EFAULT Bug) — ✅ IMPLEMENT
 
 #### Technical Context & The Bottleneck
 In a high-throughput, local-first streaming architecture like Vaayu, every CPU cycle spent managing memory maps adds overhead. Under the current `io_uring` implementation in `vaayu_rust/src/lib.rs`, `register_buffers()` is designed to map the read buffers into the Linux kernel once (`IORING_REGISTER_BUFFERS`). Doing so unlocks the `IORING_OP_READ_FIXED` opcode, bypassing the kernel's page table mapping path on every single read. 
@@ -63,6 +78,8 @@ fn free_pinned_mmap(ptr: usize, size: usize) -> PyResult<()> {
     }
     Ok(())
 }
+// REVIEW NOTE: Also add check for RLIMIT_MEMLOCK in install.sh/startup
+// (ulimit -l unlimited) or mlock will fail for large allocations.
 ```
 
 **Python Wrapper & Integration (`expert_cache.py`):**
@@ -116,11 +133,41 @@ class MmapPinnedSlab:
         if hasattr(self, 'ptr_addr'):
             cudaHostUnregister(ctypes.c_void_p(self.ptr_addr))
             vaayu_rust.free_pinned_mmap(self.ptr_addr, self.size)
+
+# REVIEW FIX: __del__ is unreliable for mlock'd memory cleanup.
+# Replace with atexit registration:
+#   import atexit
+#   atexit.register(lambda: self._cleanup())
+# Or use a context manager pattern to guarantee munlock runs.
+# Also: SlabArena allocates ONE contiguous backing tensor —
+# the mmap buffer must be sliceable via torch.frombuffer() the
+# same way, or SlabArena needs refactoring.
 ```
 
 ---
 
-### 2. CPU Compute for Cache-Miss Experts (Rust/Candle)
+### 2. CPU Compute for Cache-Miss Experts (Rust/Candle) — ❌ DO NOT IMPLEMENT
+
+> **Review verdict:** This optimization has fundamental design problems that make it
+> unsuitable for implementation in its current form.
+>
+> **Problem 1 — `from_slice` copies data:** The Candle code uses `Tensor::from_slice()`
+> which allocates and copies the full 3GB expert weights into Candle's heap. This
+> defeats the entire purpose of avoiding PCIe transfers. Need `from_raw_buffer()`
+> for zero-copy, but Candle's safety model makes this difficult.
+>
+> **Problem 2 — EXL3 not addressed:** Vaayu's primary model path uses EXL3 quantized
+> weights with `BC_LinearEXL3` CUDA kernels (see `moe_patch.py:604-1002`). These
+> cannot run on CPU. The plan doesn't mention the dequantization step needed.
+>
+> **Problem 3 — CPU is too slow for single-token:** A single-token FFN matmul
+> `[1, 7168] × [7168, 20480]` takes ~15-30ms per weight on AVX2 CPU. With
+> gate+up+down that's ~50-90ms per expert. 4 cache-miss experts × 28 MoE layers
+> = 5.6-10s per token — likely slower than the PCIe transfer it replaces.
+>
+> **Recommendation:** Defer until batch sizes > 1 make CPU compute worthwhile,
+> or until AMX/AVX-512 hardware is the target.
+
 *Literature Reference:* [DeepSeek-V2 Chat CPU-GPU Heterogeneous Inference Framework (KTransformers)](https://arxiv.org/abs/2405.04434)
 *System Reference:* [MoE-Lightning: High-Throughput Batch Inference on Constrained GPUs](https://arxiv.org/abs/2403.04543) (Pioneers GPU-CPU pipelined offloading concepts).
 
@@ -186,7 +233,7 @@ fn execute_ffn_cpu(
 
 ## Part II: Cutting-Edge Algorithmic Research (Model-Agnostic)
 
-### 3. Heavy-Hitter Pinning (Frequency-Based Policy)
+### 3. Heavy-Hitter Pinning (Frequency-Based Policy) — ✅ IMPLEMENT (with fixes)
 *Literature Reference:* [ActiveEvict: Deep Learning Expert Cache Replacement Strategy](https://arxiv.org/abs/2402.13144) (Analyzing access skew in LLMs).
 
 #### Technical Context & The Bottleneck
@@ -244,9 +291,25 @@ class ProfiledMoEBlock:
                 self.expert_cache.pin_to_vram(self.layer_idx, exp_idx)
 ```
 
+> **Review fixes required before implementation:**
+>
+> 1. **`pin_to_vram()` does not exist.** `ExpertVRAMCache` (in `expert_cache.py:313-403`)
+>    has `get()`, `put()`, and LRU eviction — but no pin/unpin API. Must add a
+>    `pinned_keys: set` field and modify `put()` to skip eviction of pinned entries.
+>
+> 2. **EMA warmup is too slow for speculative decoding.** With `ema_alpha=0.05`, the
+>    frequency estimate takes ~20 tokens to stabilize. For spec-decode verify batches
+>    (5-15 tokens), this is the entire generation. Consider: run a fixed warmup of
+>    N=50 tokens with a simple counter, then freeze the pin set for the rest of
+>    generation.
+>
+> 3. **VRAM fragmentation.** Dynamic pin/unpin must NOT allocate/free VRAM. The
+>    `ExpertVRAMCache` already uses pre-allocated slots via PyTorch's caching
+>    allocator — pinning should just mark an existing entry as non-evictable.
+
 ---
 
-### 4. Cache-Aware Routing (Inspired by "CommitMoE")
+### 4. Cache-Aware Routing (Inspired by "CommitMoE") — ✅ IMPLEMENT
 *Paper Reference:* [CommitMoE: Fallback-Free Expert Routing for MoE Offloading (AAAI 2025 / ArXiv)](https://arxiv.org/abs/2411.02640)
 
 #### Technical Context & The Bottleneck
@@ -291,9 +354,45 @@ def cache_aware_routing(logits: torch.Tensor, resident_mask: torch.Tensor, top_k
     return selected_weights, selected_experts
 ```
 
+> **Review notes:**
+>
+> 1. **Dead code on line 280:** `routing_weights = F.softmax(biased_logits, dim=-1)` is
+>    computed but never used. Remove it.
+>
+> 2. **Integration points:** The routing logic lives inside THREE separate
+>    `sparse_forward()` closures in `moe_patch.py`:
+>    - `_make_modulelist_sparse_forward` (lines 410-413)
+>    - `_make_fused_sparse_forward` (lines 516-519)
+>    - `_make_fused_sparse_forward_exl3` (lines 661-668)
+>    All three must be modified to inject the bias.
+>
+> 3. **`base_bias` should be configurable** via `test_quick.py` CONFIG block so
+>    users can tune the speed-vs-quality tradeoff.
+>
+> 4. **Constructing `resident_mask`:** Must query both `ExpertRAMCache.has()` and
+>    `ExpertVRAMCache` to build the mask each forward call. This is cheap (dict
+>    lookups) but must be done under the cache lock.
+
 ---
 
-### 5. Residual-Based Early Routing (Inspired by "DALI")
+### 5. Residual-Based Early Routing (Inspired by "DALI") — ❌ ALREADY IMPLEMENTED
+
+> **Review verdict: This optimization already exists in the codebase.**
+>
+> **Existing implementation** in `moe_patch.py:675-704` (`_make_fused_sparse_forward_exl3`):
+> - **Phase A (always on):** `lookahead_accuracy_update()` (line 72-79) measures prediction
+>   accuracy by comparing predicted experts against actual routing decisions.
+> - **Phase B (opt-in via `VAAYU_LOOKAHEAD=1`):** Runs Layer N+1's router on Layer N's
+>   hidden states (line 689-693), then submits async prefetch loads via
+>   `vaayu_ref._moe_executor.submit(_load_predicted_expert, ...)` (line 699-700).
+> - Telemetry reported at `vaayu_base.py:2519-2520`.
+> - State initialized at `vaayu_base.py:878`.
+>
+> **This section should be removed from the implementation plan.** If improvement is
+> desired, focus on tuning the existing system (e.g., multi-layer lookahead instead
+> of single-layer, or accuracy-gated prefetch that stops wasting bandwidth when
+> accuracy drops below a threshold).
+
 *Paper Reference:* [DALI: Workload-Aware MoE Offloading for Local PCs (ArXiv 2024)](https://arxiv.org/abs/2410.05739)
 
 #### Technical Context & The Bottleneck
@@ -336,7 +435,7 @@ def forward_pass_with_lookahead(self, hidden_states, layers):
 
 ---
 
-### 6. Batch-Aware Expert Pruning (Inspired by "MoE-Spec")
+### 6. Batch-Aware Expert Pruning (Inspired by "MoE-Spec") — ✅ IMPLEMENT (with fixes)
 *Paper Reference:* [MoE-Spec: Efficient Speculative Decoding for Mixture of Experts (ArXiv 2025)](https://arxiv.org/abs/2407.12354)
 
 #### Technical Context & The Bottleneck
@@ -366,11 +465,14 @@ def global_batch_pruning(batch_hidden_states, router_weight, global_k: int = 8):
     _, global_top_indices = torch.topk(global_probs, global_k)
     
     # 4. Create mask: block any expert not in the global set
-    mask = torch.zeros_like(logits)
-    mask[:, global_top_indices] = 1.0
+    #    REVIEW FIX: Use -inf mask, not zero-multiply.
+    #    Zero logits are still selectable by topk (they tie with each other).
+    #    -inf guarantees they are never selected.
+    mask = torch.full_like(logits, float('-inf'))
+    mask[:, global_top_indices] = 0.0
     
     # 5. Apply mask to ensure only selected experts are used
-    pruned_logits = logits * mask
+    pruned_logits = logits + mask
     scores, selected_experts = torch.topk(pruned_logits, k=2, dim=-1)
     
     return scores, selected_experts
