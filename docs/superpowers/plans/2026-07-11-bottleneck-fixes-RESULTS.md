@@ -1,13 +1,64 @@
 # Results: Bottleneck Fixes Plan (2026-07-12)
 
 **Plan:** `docs/superpowers/plans/2026-07-11-bottleneck-fixes.md`
-**Status:** 12/12 code tasks complete, all reviewed, all on `main`. Real-hardware verification
-(Task 13 Steps 3-4) is OUTSTANDING — no GPU was available in this execution environment.
+**Status:** 12/12 code tasks complete, all reviewed, all on `main`. First real-hardware run
+(2026-07-12) surfaced a crash in Task 9's one-copy GPU rebuild — root-caused, fixed, and
+RAM-regression-corrected without a GPU (see "Real-hardware crash + fix" below). Re-verification
+on real hardware is the next required step.
 **Execution:** subagent-driven-development (fresh implementer + independent reviewer per task,
-opus for the highest-risk/architecturally-complex tasks — 8, 11, and their re-reviews — sonnet for
-integration-risk tasks touching the active EXL3 hot path, haiku for mechanical/independent tasks).
+opus for the highest-risk/architecturally-complex tasks — 8, 11, the real-hardware crash fix and
+its RAM-efficiency redesign, and their re-reviews — sonnet for integration-risk tasks touching the
+active EXL3 hot path, haiku for mechanical/independent tasks).
 
 ---
+
+## Real-hardware crash + fix (2026-07-12, post-plan)
+
+User ran `python3 test_generate.py` (Qwen3-235B) and hit `torch.AcceleratorError: CUDA error:
+misaligned address` on the very first prefill MoE layer, inside the EXL3 GEMV kernel's weight read.
+
+**Root cause (found via static analysis + hand-computed offsets against the real checkpoint's
+`vaayu_expert_offsets.json` — no GPU needed to reach this conclusion):** `load_expert_into_slab`
+(Task 8) returned zero-copy views into a CPU slab at file-derived byte offsets guaranteed only
+itemsize-aligned, not aligned to any stronger boundary. This was always true but harmless
+everywhere else (`load_expert_sparse` clones; every per-component `.to(device)` H2D copy always
+allocates a fresh, naturally-aligned GPU destination on cross-device copy). Task 9's one-copy GPU
+rebuild (`views_from_packed_copy`) is the ONE path that reslices sub-views inside a single shared
+GPU buffer without reallocating — the first path where a CPU-side offset propagates directly into
+a GPU tensor's `data_ptr()`. EXL3's GEMV kernel (`exl3_gemv_kernel.cuh:142-143`, confirmed in the
+installed venv) does a raw `uint4*` (16-byte) vectorized load on the weight buffer — exactly what
+faults on a non-16-aligned pointer.
+
+**Fix, two commits:**
+- `5bc5ea8` — `load_expert_into_slab` individually repacks each tensor onto a 16-byte
+  (`_TENSOR_ALIGN`) boundary after the raw read. `expert_span_bytes`/`compute_slab_bytes` share
+  the same `_group_layout` arithmetic as the reader (avoiding a repeat of the `ef24551`
+  sizing/reading-drift class of bug). New adversarial regression test
+  (`test_load_expert_into_slab_views_are_tensor_aligned`) with deliberately non-16-aligned file
+  offsets and an odd byte-length tensor. Opus review: High confidence this resolves the crash —
+  but flagged an Important side effect: keeping BOTH the raw read region and the repacked region
+  co-resident in every persistent slab roughly doubled per-expert slab size, halving decode RAM
+  cache capacity and roughly doubling per-staged-expert prefill H2D volume (a real perf giveback
+  against Tasks 7-9's central goal, though not a new OOM/safety risk since the arena still respects
+  its pre-set budget).
+- `a6aa875` — redesign (human chose "fix now" over "ship and measure"): the raw read now lands in
+  a TRANSIENT buffer drawn from `_EXPERT_BUF_POOL` (the pinned scratch pool `load_expert_sparse`
+  already used, bounded by the same shared `_moe_executor` both loaders were already routed
+  through — no new pool, no oversubscription). Only the 16-byte-repacked tensors persist in the
+  slab. Since the persistent slab is no longer an O_DIRECT read target, it no longer needs the
+  4096-byte sector rounding either — slabs end up marginally SMALLER than even the pre-crash
+  baseline, not just back to parity. Opus re-review confirmed, against the real checkpoint: slab
+  size went 11.29 MB (pre-crash) → 22.57 MB (post-5bc5ea8, the regression) → 11.28 MB (post-a6aa875,
+  fixed) — a clean 2x reversal, both the alignment guarantee and lockstep sizing independently
+  re-verified. Three tests whose assertions encoded the now-retired O_DIRECT-rounding invariant
+  were updated with hand-recomputed expected values.
+
+**Test suite:** 138/138 throughout both commits (1 new test from `5bc5ea8`, none needed for
+`a6aa875`'s pure internal redesign).
+
+**Status:** Ready to merge per final review. **Needs a fresh real-hardware run to confirm the
+crash is actually gone** — everything above was verified by code inspection and arithmetic, not
+by executing CUDA, since no GPU is available in this environment.
 
 ## Overview
 
