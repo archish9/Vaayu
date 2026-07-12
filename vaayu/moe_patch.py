@@ -785,9 +785,16 @@ def _make_fused_sparse_forward_exl3(
                     return eidx, raw
                 slab = expert_cache.arena.tensor(slab_idx)
                 try:
+                    # tensor_align=False: decode's cached experts are only ever
+                    # consumed via the per-component .to(device) copies below
+                    # (always naturally aligned on a fresh cross-device copy),
+                    # never via views_from_packed_copy — skip the scratch-pool
+                    # repack, which regressed decode throughput when applied
+                    # unconditionally (see load_expert_into_slab's docstring).
                     views = load_expert_into_slab(
                         shard_file, metas, slab,
                         allow_direct=expert_cache.arena.pin,
+                        tensor_align=False,
                     )
                 except Exception:
                     expert_cache.arena.release(slab_idx)

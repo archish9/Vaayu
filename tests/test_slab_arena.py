@@ -12,6 +12,8 @@ from vaayu.persist.expert_offset_index import ExpertTensorMeta
 from vaayu.persist.safetensor_model_persister import (
     _ALIGN,
     _TENSOR_ALIGN,
+    _align_down,
+    _align_up,
     compute_slab_bytes,
     expert_span_bytes,
     load_expert_into_slab,
@@ -65,10 +67,17 @@ def test_expert_span_bytes_alignment():
     metas = {"x": _meta(4097, 100, [50]), "y": _meta(4300, 100, [50])}
     span = expert_span_bytes(metas)
     assert span % _TENSOR_ALIGN == 0
-    # persistent-slab span is each tensor individually rounded up to
-    # _TENSOR_ALIGN (16), summed -- not the raw file span rounded to _ALIGN
-    # (4096, which only bounds the transient scratch read, see _group_layout)
-    assert span == 2 * ((100 + _TENSOR_ALIGN - 1) // _TENSOR_ALIGN * _TENSOR_ALIGN)
+    # expert_span_bytes must cover BOTH of load_expert_into_slab's write
+    # modes (tensor_align=True's packed_span, tensor_align=False's
+    # raw_aligned_length) since the same arena slab is shared between
+    # decode (tensor_align=False) and prefill staging (tensor_align=True) —
+    # see _group_layout's slab_span = max(...). For this small a tensor pair
+    # near a 4096-byte O_DIRECT boundary, the raw (O_DIRECT-rounded) mode
+    # dominates: group spans [4097, 4400), aligned down to 4096, giving a
+    # 304-byte real range rounded up to one 4096-byte sector.
+    packed_span = 2 * ((100 + _TENSOR_ALIGN - 1) // _TENSOR_ALIGN * _TENSOR_ALIGN)
+    raw_aligned_length = _align_up((4400 - 4097) + (4097 - _align_down(4097)))
+    assert span == max(packed_span, raw_aligned_length)
 
 
 def test_expert_span_bytes_multiple_far_apart_groups():
@@ -110,13 +119,14 @@ def test_load_expert_into_slab_handles_far_apart_groups(tmp_path):
     }
     slab_bytes = expert_span_bytes(metas)
     slab = torch.empty(slab_bytes, dtype=torch.uint8)
-    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=True)
     assert bytes(views["small.trellis"].numpy().tobytes()) == payload_small
     assert bytes(views["big.trellis"].numpy().tobytes()) == payload_big
     # both views live inside the (much smaller than the file span) slab
     for v in views.values():
         assert v.data_ptr() >= slab.data_ptr()
         assert v.data_ptr() < slab.data_ptr() + slab.nbytes
+        assert v.data_ptr() % _TENSOR_ALIGN == 0
 
 
 # ── arena mechanics ───────────────────────────────────────────────────────
@@ -187,7 +197,7 @@ def test_load_expert_into_slab_reconstructs_bytes(tmp_path):
         "up.trellis": _meta(off_b, 512, [512], dtype="U8"),
     }
     slab = torch.empty(compute_slab_bytes(_FakeIndex({"L": {0: metas}})), dtype=torch.uint8)
-    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=False)
     assert bytes(views["gate.trellis"].numpy().tobytes()) == payload_a
     assert bytes(views["up.trellis"].numpy().tobytes()) == payload_b
     # zero-clone: views live inside the slab buffer
@@ -225,9 +235,41 @@ def test_load_expert_into_slab_views_are_tensor_aligned(tmp_path):
         "up.trellis": _meta(off_b, 768, [768], dtype="U8"),
     }
     slab = torch.empty(compute_slab_bytes(_FakeIndex({"L": {0: metas}})), dtype=torch.uint8)
-    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=True)
 
     assert bytes(views["gate.trellis"].numpy().tobytes()) == payload_a
     assert bytes(views["up.trellis"].numpy().tobytes()) == payload_b
     for v in views.values():
         assert v.data_ptr() % 16 == 0, f"{v.data_ptr()} not 16-byte aligned"
+
+
+def test_load_expert_into_slab_tensor_align_false_skips_repack(tmp_path):
+    """tensor_align=False (decode's cache-miss path) must NOT pay the
+    _EXPERT_BUF_POOL/repack cost tensor_align=True incurs — applying it
+    unconditionally regressed real-hardware decode throughput (avg token
+    time ~1.0-1.2s -> ~1.56s, from added pool contention + per-tensor copy_
+    overhead on a path hit 350-400x/token). This does not assert alignment
+    (none is guaranteed or needed in this mode) -- only that the read still
+    reconstructs correctly and lands directly in `slab` with no scratch
+    buffer involved."""
+    payload_a = bytes(range(13))
+    payload_b = bytes(reversed(range(256))) * 3
+    f = tmp_path / "shard.bin"
+    blob = bytearray(64 * 1024)
+    off_a, off_b = 8191, 8191 + 13 + 7
+    blob[off_a:off_a + 13] = payload_a
+    blob[off_b:off_b + 768] = payload_b
+    f.write_bytes(bytes(blob))
+
+    metas = {
+        "gate.trellis": _meta(off_a, 13, [13], dtype="U8"),
+        "up.trellis": _meta(off_b, 768, [768], dtype="U8"),
+    }
+    slab = torch.empty(compute_slab_bytes(_FakeIndex({"L": {0: metas}})), dtype=torch.uint8)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=False)
+
+    assert bytes(views["gate.trellis"].numpy().tobytes()) == payload_a
+    assert bytes(views["up.trellis"].numpy().tobytes()) == payload_b
+    for v in views.values():
+        assert v.data_ptr() >= slab.data_ptr()
+        assert v.data_ptr() < slab.data_ptr() + slab.nbytes

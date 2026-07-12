@@ -82,7 +82,7 @@ def test_views_from_packed_copy_rebuilds_offsets(tmp_path):
         "down.proj": _meta(off_c, 8, [4], dtype="F16"),
     }
     slab = torch.empty(expert_span_bytes(metas), dtype=torch.uint8)
-    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False, tensor_align=True)
 
     used = max((v.data_ptr() - slab.data_ptr()) + v.nbytes for v in views.values())
     copied = slab[:used].clone()                    # stand-in for the H2D copy

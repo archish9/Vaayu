@@ -386,8 +386,13 @@ def stage_read_expert(shard_file: str, metas: dict, arena):
         if sidx is not None:
             slab = arena.tensor(sidx)
             try:
+                # tensor_align=True: this staged expert will later be
+                # consumed via views_from_packed_copy's one-copy GPU rebuild
+                # (Task 9), which needs every tensor's slab offset to be
+                # _TENSOR_ALIGN-safe for EXL3's uint4* kernel loads.
                 views = load_expert_into_slab(shard_file, metas, slab,
-                                              allow_direct=arena.pin)
+                                              allow_direct=arena.pin,
+                                              tensor_align=True)
             except Exception:
                 arena.release(sidx)
                 raise
