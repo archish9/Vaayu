@@ -34,3 +34,23 @@ https://huggingface.co/models?other=exllamav3&sort=most_params
 
 
 model-agnostic engine
+
+
+
+
+
+How to start each — paste this in a NEW session (on the GPU box)                                                               
+                                                                                                                                 
+  8-task plan:                                                                                                                   
+  Execute the plan at docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md                                         
+  using superpowers:subagent-driven-development. Task-by-task, stop for my review                                                
+  at each task's checkpoint. Qwen only for on-device A/B (no MiniMax checkpoint).                                                
+                                                                                                                                 
+  A1 prefix caching (after 8-task lands):                                                                                        
+  Execute the plan at docs/superpowers/plans/2026-07-12-vaayu-prefix-caching-plan.md                                             
+  using superpowers:executing-plans. Task-by-task with review checkpoints.                                                       
+                                                                                                                                 
+  Feature B (brainstorm, not execute yet):                                                                                       
+  Run superpowers:brainstorming on Feature B (multi-query batched decode) using                                                  
+  docs/superpowers/plans/2026-07-12-vaayu-agent-workload-brainstorm-prep.md.                                                     
+  Read §0-§1 and §3, brainstorm from §3's questions, then write a plan.
