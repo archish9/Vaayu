@@ -4,6 +4,32 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## 0. What Vaayu Is (read first — it shapes priorities)
+
+**Vaayu is a low-resource LLM inference engine that will power an autonomous coding
+agent doing loop-engineering** (repeated agentic iterations). It runs **both MoE and
+dense models — the user selects which model to load** (MoE is the harder,
+expert-streaming path much of the current work targets). Dense must keep working:
+**large streamed-dense performance is a planned FUTURE target**, deferred until the
+MoE path is solid. When that work starts, optimize dense WITHOUT regressing MoE —
+the paths are separated (`is_moe` guards); keep the MoE tests green, and treat any
+change to shared infra (staging, prefix cache, NVMe warmup, io_uring) as touching
+both paths. Until then, MoE changes must not silently break dense — a dense
+load+generate smoke test guards that. It is NOT a plain single-user chatbot backend. Two workload facts follow from that
+and shape which optimizations matter:
+
+- **Parallel fan-out** — the agent runs multiple inference streams concurrently
+  (sub-agents / parallel tool calls). **Aggregate throughput** matters, not just
+  single-stream latency. → multi-query batched decode is a first-class lever.
+- **Heavy context reuse** — loop iterations re-send largely overlapping context
+  (same system prompt + mostly-unchanged files). → cross-turn KV prefix caching
+  (reuse the shared prefix, prefill only the diff) is the top TTFT lever.
+
+When weighing a perf idea, judge it against THIS workload (agentic, prefill-heavy,
+fan-out, repetitive/code output), not generic chat. TTFT and aggregate throughput
+usually beat single-stream token latency. See `docs/superpowers/plans/` for the
+current perf plan and the prefix-caching / batched-decode designs.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
