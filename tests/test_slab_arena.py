@@ -186,3 +186,41 @@ def test_load_expert_into_slab_reconstructs_bytes(tmp_path):
     # zero-clone: views live inside the slab buffer
     assert views["gate.trellis"].data_ptr() >= slab.data_ptr()
     assert views["gate.trellis"].data_ptr() < slab.data_ptr() + slab.nbytes
+
+
+def test_load_expert_into_slab_views_are_tensor_aligned(tmp_path):
+    """Real-hardware regression (2026-07-12): the CUDA-side one-copy GPU
+    rebuild (views_from_packed_copy) reslices these exact CPU views straight
+    into a GPU tensor handed to EXL3's kernel, which dereferences the weight
+    buffer as uint4* (16-byte vector loads). A tensor's natural file-relative
+    position is only itemsize-aligned (safe for .view(dtype), which is all
+    the pre-fix code checked) — not _TENSOR_ALIGN-safe, since that position
+    is derived from the file's own byte layout and is essentially arbitrary
+    mod 16. This crashed with `cudaErrorMisalignedAddress` on real hardware
+    on the very first prefill MoE layer.
+
+    Deliberately adversarial: awkward, non-16-aligned file offsets AND an
+    odd byte-length (13B) tensor whose length itself isn't a multiple of
+    anything convenient — proving the fix doesn't rely on tensor shapes
+    happening to be nicely sized (not guaranteed across MiniMax-like
+    geometries per CLAUDE.md §5), only on the explicit re-packing."""
+    payload_a = bytes(range(13))                    # 13 B — deliberately awkward length
+    payload_b = bytes(reversed(range(256))) * 3      # 768 B
+    f = tmp_path / "shard.bin"
+    blob = bytearray(64 * 1024)
+    off_a, off_b = 8191, 8191 + 13 + 7               # neither offset is 16-aligned
+    blob[off_a:off_a + 13] = payload_a
+    blob[off_b:off_b + 768] = payload_b
+    f.write_bytes(bytes(blob))
+
+    metas = {
+        "gate.trellis": _meta(off_a, 13, [13], dtype="U8"),
+        "up.trellis": _meta(off_b, 768, [768], dtype="U8"),
+    }
+    slab = torch.empty(compute_slab_bytes(_FakeIndex({"L": {0: metas}})), dtype=torch.uint8)
+    views = load_expert_into_slab(str(f), metas, slab, allow_direct=False)
+
+    assert bytes(views["gate.trellis"].numpy().tobytes()) == payload_a
+    assert bytes(views["up.trellis"].numpy().tobytes()) == payload_b
+    for v in views.values():
+        assert v.data_ptr() % 16 == 0, f"{v.data_ptr()} not 16-byte aligned"

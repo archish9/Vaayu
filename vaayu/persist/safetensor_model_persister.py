@@ -32,12 +32,20 @@ if hasattr(torch, "float8_e5m2"):
     _DTYPE_MAP["F8_E5M2"] = torch.float8_e5m2
 
 _ALIGN = 4096  # O_DIRECT sector-alignment requirement
+_TENSOR_ALIGN = 16  # CUDA uint4/float4 vector-load width. EXL3's GEMV kernel
+                    # (exl3_gemv_kernel.cuh) dereferences the weight buffer as
+                    # uint4* for coalesced loads — any GPU tensor whose data_ptr()
+                    # isn't a multiple of 16 faults with cudaErrorMisalignedAddress.
+                    # A CUDA/kernel-contract constant, not a model number.
 
 def _align_down(x: int) -> int:
     return x & ~(_ALIGN - 1)
 
 def _align_up(x: int) -> int:
     return (x + _ALIGN - 1) & ~(_ALIGN - 1)
+
+def _align_up_to(x: int, align: int) -> int:
+    return (x + align - 1) & ~(align - 1)
 
 
 _USE_PINNED = torch.cuda.is_available()
@@ -605,24 +613,59 @@ def load_expert_sparse(
     return result
 
 
+def _group_layout(group: list) -> tuple[int, int, int, int]:
+    """Shared sizing/reading arithmetic for one contiguous tensor group —
+    used by BOTH expert_span_bytes (sizing) and load_expert_into_slab
+    (reading), so they can't drift apart the way sizing/reading arithmetic
+    once did in this codebase (see commit ef24551).
+
+    Returns (aligned_offset, prefix_pad, raw_aligned_length, total_span):
+      aligned_offset     — file offset to start the O_DIRECT read from
+                            (a multiple of _ALIGN).
+      prefix_pad         — bytes between aligned_offset and the group's
+                            real first byte within the raw read.
+      raw_aligned_length — bytes read from disk for this group (O_DIRECT
+                            sector-aligned length).
+      total_span         — bytes this group occupies in the destination
+                            slab: the raw read region PLUS a scratch region
+                            where each tensor is individually re-packed at
+                            a _TENSOR_ALIGN-aligned offset. The raw read's
+                            own per-tensor offsets (prefix_pad + a tensor's
+                            relative position in the file) are only
+                            itemsize-safe — enough for `.view(dtype)` to not
+                            raise — not _TENSOR_ALIGN-safe, which is what
+                            load_expert_into_slab's zero-copy views need
+                            once Task 9's one-copy GPU rebuild reslices them
+                            straight into a CUDA kernel's weight input.
+                            Rounded up to _ALIGN so slab_off stays a valid
+                            O_DIRECT destination offset for the NEXT group.
+    """
+    group_start = group[0][1].file_offset
+    last_meta = group[-1][1]
+    group_end = last_meta.file_offset + last_meta.byte_length
+    aligned_offset = _align_down(group_start)
+    prefix_pad = group_start - aligned_offset
+    raw_aligned_length = _align_up(group_end - group_start + prefix_pad)
+    packed_span = sum(_align_up_to(meta.byte_length, _TENSOR_ALIGN) for _key, meta in group)
+    total_span = _align_up(raw_aligned_length + packed_span)
+    return aligned_offset, prefix_pad, raw_aligned_length, total_span
+
+
 def expert_span_bytes(expert_metas: dict) -> int:
     """Aligned byte length the slab needs to hold ALL of one expert's
     tensors. Expert tensors are NOT assumed file-contiguous (see
     _group_contiguous_ranges) — this is the SUM of each contiguous group's
-    own aligned read length, not the raw span from the first tensor's start
-    to the last tensor's end (that span can be enormous when a checkpoint
-    stores tensors grouped by weight-type across many experts rather than
+    own aligned span (raw read + per-tensor alignment repacking, see
+    _group_layout), not the raw span from the first tensor's start to the
+    last tensor's end (that span can be enormous when a checkpoint stores
+    tensors grouped by weight-type across many experts rather than
     per-expert, e.g. a 128-expert checkpoint whose small metadata tensors
     and large trellis tensors live in two far-apart blocks). Model-agnostic:
     derived from the offset index, never hardcoded."""
     total = 0
     for group in _group_contiguous_ranges(expert_metas):
-        group_start = group[0][1].file_offset
-        last_meta = group[-1][1]
-        group_end = last_meta.file_offset + last_meta.byte_length
-        aligned_offset = _align_down(group_start)
-        prefix_pad = group_start - aligned_offset
-        total += _align_up(group_end - group_start + prefix_pad)
+        _, _, _, span = _group_layout(group)
+        total += span
     return total
 
 
@@ -642,16 +685,29 @@ def load_expert_into_slab(
     slab: "torch.Tensor",
     allow_direct: bool,
 ) -> dict:
-    """Read one expert's tensors DIRECTLY into `slab` (uint8) and return
-    {tensor_key: view-into-slab}. Zero copies: no clone here, none in the
-    cache (see ExpertRAMCache.put_slab). Expert tensors are NOT assumed
-    file-contiguous (see _group_contiguous_ranges) — this issues ONE read
-    per contiguous group and packs groups back-to-back into the slab (the
-    slab's layout does not mirror the file's layout; slab_bytes already
-    equals the sum of each group's own aligned length, per
-    expert_span_bytes/compute_slab_bytes). The returned views are valid
-    until the slab is recycled by cache eviction — consumers must use them
-    within the same layer forward.
+    """Read one expert's tensors into `slab` (uint8) and return
+    {tensor_key: view-into-slab}. No clone in the cache (see
+    ExpertRAMCache.put_slab). Expert tensors are NOT assumed file-contiguous
+    (see _group_contiguous_ranges) — this issues ONE read per contiguous
+    group; the slab's layout does not mirror the file's layout (slab_bytes
+    equals the sum of each group's own span, per expert_span_bytes /
+    compute_slab_bytes / _group_layout).
+
+    Each tensor is individually re-packed (via one intra-slab copy_, no
+    clone — source and destination never overlap) at a _TENSOR_ALIGN-aligned
+    offset after the raw read, rather than left at its natural file-relative
+    position: a group's raw read only guarantees each tensor is
+    itemsize-aligned (safe for .view(dtype)), not _TENSOR_ALIGN-aligned,
+    since that position is derived from the file's own byte layout and is
+    essentially arbitrary mod _TENSOR_ALIGN. That distinction is invisible
+    on CPU (torch.view doesn't require more than itemsize alignment) but
+    matters once Task 9's one-copy GPU rebuild (views_from_packed_copy)
+    reslices these exact views straight into a CUDA tensor for EXL3's
+    kernel, which dereferences the weight buffer as uint4* — a misaligned
+    slice there faults with cudaErrorMisalignedAddress instead of raising a
+    catchable Python exception. The returned views are valid until the slab
+    is recycled by cache eviction — consumers must use them within the same
+    layer forward.
 
     allow_direct: O_DIRECT needs a sector-aligned buffer; pinned arena slabs
     are page-aligned (backing sliced at _ALIGN multiples), plain torch.empty
@@ -662,38 +718,41 @@ def load_expert_into_slab(
     slab_off = 0
     for group in _group_contiguous_ranges(expert_metas):
         group_start = group[0][1].file_offset
-        last_meta = group[-1][1]
-        group_end = last_meta.file_offset + last_meta.byte_length
-        aligned_offset = _align_down(group_start)
-        prefix_pad = group_start - aligned_offset
-        aligned_length = _align_up(group_end - group_start + prefix_pad)
-        if slab_off + aligned_length > slab.nbytes:
+        aligned_offset, prefix_pad, raw_aligned_length, span = _group_layout(group)
+        if slab_off + span > slab.nbytes:
             raise RuntimeError(
-                f"expert span {slab_off + aligned_length}B exceeds slab {slab.nbytes}B "
+                f"expert span {slab_off + span}B exceeds slab {slab.nbytes}B "
                 f"(compute_slab_bytes undersized?)"
             )
-        dest = slab[slab_off:slab_off + aligned_length]
+        dest = slab[slab_off:slab_off + span]
+        raw = dest[:raw_aligned_length]
 
         if _USE_IOURING:
             vaayu_rust.io_uring_read_into(
-                file_path, aligned_offset, aligned_length,
-                dest.data_ptr(), 8, use_direct,
+                file_path, aligned_offset, raw_aligned_length,
+                raw.data_ptr(), 8, use_direct,
             )
         else:
             fd = os.open(file_path, os.O_RDONLY)
             try:
-                view = memoryview(dest.numpy())
-                os.preadv(fd, [view[:aligned_length]], aligned_offset)
+                view = memoryview(raw.numpy())
+                os.preadv(fd, [view[:raw_aligned_length]], aligned_offset)
             finally:
                 os.close(fd)
 
-        data = dest[prefix_pad:]
+        data_raw = raw[prefix_pad:]
+        packed = dest[raw_aligned_length:]  # disjoint from `raw` — safe copy_ target
+        packed_off = 0
         for key, meta in group:
             rel = meta.file_offset - group_start
             dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
-            out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
+            chunk = data_raw[rel:rel + meta.byte_length]
+            dst_slice = packed[packed_off:packed_off + meta.byte_length]
+            dst_slice.copy_(chunk)
+            out[key] = dst_slice.view(dt).view(meta.shape)
+            packed_off += _align_up_to(meta.byte_length, _TENSOR_ALIGN)
 
-        slab_off += aligned_length
+        slab_off += span
 
     return out
 
@@ -701,9 +760,18 @@ def load_expert_into_slab(
 def views_from_packed_copy(src_views: dict, src_base: "torch.Tensor", dst: "torch.Tensor") -> dict:
     """Rebuild {key: view} inside `dst`, a copy of src_base's used prefix
     (typically a single H2D transfer of a pinned slab). Each view keeps its
-    byte offset relative to src_base; dtype/shape are re-applied. Offset
-    alignment is guaranteed by construction: the source views were built by
-    load_expert_into_slab with the same arithmetic."""
+    byte offset relative to src_base; dtype/shape are re-applied.
+
+    _TENSOR_ALIGN-alignment is guaranteed by construction, not just
+    itemsize-alignment: the source views were built by
+    load_expert_into_slab, which individually re-packs each tensor onto a
+    _TENSOR_ALIGN boundary (see its docstring) specifically so that
+    preserving `off` verbatim here keeps every reconstructed view aligned
+    in `dst` too — true as long as dst's own base pointer is at least
+    _TENSOR_ALIGN-aligned, which holds for any CUDA allocation. A weaker
+    (itemsize-only) alignment guarantee here previously produced GPU
+    tensors that crashed EXL3's kernel with cudaErrorMisalignedAddress on
+    real hardware (the kernel dereferences its weight buffer as uint4*)."""
     assert src_base.dtype == torch.uint8 and dst.dtype == torch.uint8, \
         f"views_from_packed_copy requires uint8 buffers (byte-offset arithmetic); got src_base={src_base.dtype}, dst={dst.dtype}"
     base_ptr = src_base.data_ptr()
