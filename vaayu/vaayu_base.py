@@ -59,13 +59,20 @@ def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_exp
     Returns dict: expert_bytes, num_moe_layers, top_k, num_experts,
     working_set_bytes (= top_k * num_moe_layers * expert_bytes, one decode step).
     """
-    expert_bytes = 0
+    # Sample one full layer's experts to derive expert_bytes. Uniform for
+    # trellis-quant checkpoints (constant size); if a future MoE has
+    # non-uniform experts, take the MAX (conservative — never underestimates
+    # the working set) and WARN (CLAUDE.md §5: don't silently degrade).
+    sizes = []
     for layer_tensors in expert_offset_index.index.values():
         for expert_tensors in layer_tensors.values():
-            expert_bytes = sum(t.byte_length for t in expert_tensors.values())
-            break
-        if expert_bytes:
-            break
+            sizes.append(sum(t.byte_length for t in expert_tensors.values()))
+        if sizes:
+            break  # one layer's experts are a sufficient uniformity sample
+    expert_bytes = max(sizes) if sizes else 0
+    if sizes and min(sizes) != max(sizes):
+        print(f"[Vaayu-MoE] WARNING: non-uniform expert sizes "
+              f"(min={min(sizes)} max={max(sizes)}); using max for cache sizing")
     num_moe_layers = len(expert_offset_index.index) or max(1, num_layers - 3)
     working_set_bytes = moe_top_k * num_moe_layers * expert_bytes
     return {

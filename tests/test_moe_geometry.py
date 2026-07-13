@@ -38,3 +38,23 @@ def test_geometry_minimax_like():
     assert g["num_moe_layers"] == 62
     # working set ~ 8 * 62 * 11.3MB ~ 5.5 GB  → fits 7.5GB budget
     assert 5.0e9 < g["working_set_bytes"] < 6.2e9
+
+
+class _NonUniformIndex:
+    """One layer whose experts have DIFFERENT byte sizes (uniformity violated)."""
+    def __init__(self):
+        self.index = {
+            "model.layers.0": {
+                0: {"gate.trellis": _FakeMeta(1000), "up.trellis": _FakeMeta(1000),
+                    "down.trellis": _FakeMeta(1000)},                       # 3000
+                1: {"gate.trellis": _FakeMeta(2000), "up.trellis": _FakeMeta(2000),
+                    "down.trellis": _FakeMeta(2000)},                       # 6000
+            }
+        }
+
+
+def test_geometry_nonuniform_takes_max_and_warns(capsys):
+    g = compute_moe_geometry(_NonUniformIndex(), num_layers=1, moe_top_k=8,
+                             moe_num_experts=2)
+    assert g["expert_bytes"] == 6000                      # max, not first (3000)
+    assert "non-uniform expert sizes" in capsys.readouterr().out
