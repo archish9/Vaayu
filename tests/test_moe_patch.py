@@ -761,3 +761,40 @@ def test_exl3_vram_hit_reuses_bc_objects(tmp_path):
 
     assert out1.shape == (1, 1, 8), f"Expected (1,1,8) got {out1.shape}"
     assert out2.shape == (1, 1, 8), f"Expected (1,1,8) got {out2.shape}"
+
+
+import torch
+from vaayu.moe_patch import cache_aware_topk
+
+
+def test_cache_aware_topk_off_matches_plain():
+    logits = torch.tensor([[3.0, 1.0, 2.5, 0.5]])
+    mask = torch.tensor([0.0, 1.0, 0.0, 1.0])
+    w0, i0 = cache_aware_topk(logits, mask, top_k=2, base_bias=0.0)
+    # base_bias=0 -> identical to plain softmax-topk (feature OFF)
+    pw, pi = torch.topk(logits.float().softmax(-1), 2, dim=-1)
+    pw = pw / pw.sum(-1, keepdim=True)
+    assert torch.equal(i0, pi)
+    assert torch.allclose(w0, pw)
+
+
+def test_cache_aware_topk_flips_near_tie_to_resident():
+    # expert 2 (2.5) barely beats resident expert 1 (2.4). A strong bias on the
+    # resident should flip selection from {0,2} to {0,1}.
+    logits = torch.tensor([[5.0, 2.4, 2.5, 0.1]])
+    mask = torch.tensor([0.0, 1.0, 0.0, 0.0])   # only expert 1 resident
+    _, sel = cache_aware_topk(logits, mask, top_k=2, base_bias=2.0)
+    assert set(sel.flatten().tolist()) == {0, 1}
+
+
+def test_cache_aware_topk_weights_from_original_sum_to_one():
+    logits = torch.tensor([[5.0, 2.4, 2.5, 0.1]])
+    mask = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    w, sel = cache_aware_topk(logits, mask, top_k=2, base_bias=2.0)
+    assert torch.allclose(w.sum(-1), torch.ones(1))
+    # weight for a selected expert must equal its ORIGINAL softmax share,
+    # renormalized over the selected set (NOT the biased share)
+    orig = logits.float().softmax(-1)
+    expected = orig.gather(-1, sel)
+    expected = expected / expected.sum(-1, keepdim=True)
+    assert torch.allclose(w, expected)

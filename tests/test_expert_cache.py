@@ -289,3 +289,17 @@ def test_lru_tensor_cache_clear():
     assert "a" not in cache
     assert "b" not in cache
     assert cache.current_usage == 0
+
+
+def test_ram_cache_resident_set():
+    import torch
+    from vaayu.persist.expert_cache import ExpertRAMCache
+    cache = ExpertRAMCache(budget_bytes=10_000, max_per_layer=4)
+    cache.put(0, 3, {"t": torch.zeros(8, dtype=torch.uint8)})
+    cache.put(0, 5, {"t": torch.zeros(8, dtype=torch.uint8)})
+    cache.put(1, 9, {"t": torch.zeros(8, dtype=torch.uint8)})
+    assert cache.resident_set(0) == {3, 5}
+    assert cache.resident_set(1) == {9}
+    assert cache.resident_set(2) == set()
+    # resident_set must NOT perturb hit/miss stats (non-mutating probe)
+    assert cache.hits == 0 and cache.misses == 0

@@ -931,6 +931,11 @@ class VaayuBaseModel(GenerationMixin):
             # Lookahead predictor (Task 12): O(1) next-block lookup by layer idx.
             self._moe_block_by_idx = {b.layer_idx: b for b in self._moe_blocks}
             self._lookahead_state = {"hits": 0, "total": 0}
+            # Cache-aware routing (advanced-opt #4). Default 0.0 => feature OFF
+            # (output byte-identical to plain routing). >0 biases top-k toward
+            # resident experts to cut NVMe read volume; enable only after a
+            # perplexity A/B (see plan Task 6). Model-agnostic: no geometry here.
+            self._cache_bias = float(os.environ.get("VAAYU_CACHE_BIAS", "0.0"))
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
 
             # Fix #7 follow-up: when the VRAM budget can't hold one token's

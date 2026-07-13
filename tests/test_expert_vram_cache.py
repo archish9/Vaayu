@@ -38,3 +38,15 @@ def test_budget_never_exceeded():
     for e in range(10):
         c.put(0, e, _groups(per // 3))
     assert c.current_usage <= 2 * per
+
+
+def test_vram_cache_has_and_resident_set():
+    import torch
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+    c = ExpertVRAMCache(budget_bytes=10_000)
+    c.put(0, 3, {"gate": {"t": torch.zeros(8, dtype=torch.uint8)}})
+    c.put(0, 5, {"gate": {"t": torch.zeros(8, dtype=torch.uint8)}})
+    assert c.has(0, 3) and not c.has(0, 9)
+    assert c.resident_set(0) == {3, 5}
+    assert c.resident_set(1) == set()
+    assert c.hits == 0 and c.misses == 0     # non-mutating

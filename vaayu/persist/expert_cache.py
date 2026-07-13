@@ -199,6 +199,15 @@ class ExpertRAMCache:
                 return lc is not None and expert_idx in lc
             return (layer_idx, expert_idx) in self.cache
 
+    def resident_set(self, layer_idx: int) -> set:
+        """Experts currently resident for `layer_idx`. Non-mutating (no LRU bump,
+        no stat change) — for cache-aware routing's resident mask. One lock."""
+        with self.lock:
+            if self.max_per_layer > 0:
+                lc = self._layer_caches.get(layer_idx)
+                return set(lc.keys()) if lc else set()
+            return {e for (l, e) in self.cache if l == layer_idx}
+
     def put(self, layer_idx: int, expert_idx: int, tensors: dict, *, prefetch: bool = False) -> None:
         cloned = {k: v.clone().detach() for k, v in tensors.items()}
         raw_size = sum(t.nbytes for t in cloned.values())
@@ -468,6 +477,16 @@ class ExpertVRAMCache:
                 return self.cache[key]
             self.misses += 1
             return None
+
+    def has(self, layer_idx: int, expert_idx: int) -> bool:
+        with self.lock:
+            return (layer_idx, expert_idx) in self.cache
+
+    def resident_set(self, layer_idx: int) -> set:
+        """Experts resident on GPU for `layer_idx`. Non-mutating — for
+        cache-aware routing's resident mask. One lock."""
+        with self.lock:
+            return {e for (l, e) in self.cache if l == layer_idx}
 
     def put(self, layer_idx: int, expert_idx: int, gpu_groups: dict) -> bool:
         """Insert; returns True if the cache now owns gpu_groups, False if refused

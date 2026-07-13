@@ -46,6 +46,46 @@ def unique_expert_indices(expert_indices_cpu) -> list[int]:
     return sorted(int(x) for x in expert_indices_cpu.flatten().unique().tolist())
 
 
+def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
+    """Bias top-k SELECTION toward resident experts; take combination WEIGHTS
+    from the ORIGINAL logits (selection changes, weighting stays faithful —
+    advanced-opt #4). base_bias == 0.0 or resident_mask is None reduces exactly
+    to plain softmax-topk (feature OFF). The bias is scaled by the per-row logit
+    std so it never overwhelms a confident router (large gaps => bias is a small
+    fraction of the gap). resident_mask: [num_experts], 1.0 for cached else 0.0."""
+    logits = logits.float()
+    if base_bias and resident_mask is not None:
+        std = logits.std(dim=-1, keepdim=True)
+        biased = logits + resident_mask.unsqueeze(0) * base_bias * std
+    else:
+        biased = logits
+    _, sel = torch.topk(biased, top_k, dim=-1)
+    orig = logits.softmax(dim=-1)
+    w = torch.gather(orig, -1, sel)
+    w = w / w.sum(dim=-1, keepdim=True)
+    return w, sel
+
+
+def _build_resident_mask(vaayu_ref, expert_cache, layer_idx: int,
+                         num_experts: int, device):
+    """[num_experts] mask of experts resident in RAM ∪ VRAM for `layer_idx`, or
+    None when cache-aware routing is off (bias 0 or prefill) or nothing is
+    resident — so the caller pays nothing in the default (feature-off) case.
+    One lock acquisition per cache (resident_set), non-mutating."""
+    bias = getattr(vaayu_ref, "_cache_bias", 0.0)
+    if not bias or getattr(vaayu_ref, "_moe_prefill_pass", False):
+        return None
+    res = expert_cache.resident_set(layer_idx)
+    _vr = getattr(vaayu_ref, "_expert_vram_cache", None)
+    if _vr is not None:
+        res = res | _vr.resident_set(layer_idx)
+    if not res:
+        return None
+    mask = torch.zeros(num_experts, device=device)
+    mask[torch.tensor(sorted(res), device=device)] = 1.0
+    return mask
+
+
 def compute_expert_dispatch(expert_indices_cpu: "torch.Tensor", num_experts: int):
     """Permutation-based MoE dispatch (CPU side, one pass per layer).
 
@@ -682,10 +722,18 @@ def _make_fused_sparse_forward_exl3(
             router_logits, routing_weights, expert_indices = router_res[:3]
         else:
             router_logits = router_res
-            routing_weights, expert_indices = torch.topk(
-                router_logits.float().softmax(dim=-1), top_k, dim=-1
-            )
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            # Cache-aware routing (advanced-opt #4): bias top-k toward resident
+            # experts. ONLY in this branch — the tuple branch above means the
+            # model returned its OWN top-k (possibly grouped / correction-biased,
+            # e.g. DeepSeek/MiniMax family) and must never be re-routed.
+            # _build_resident_mask returns None when the feature is off, so
+            # cache_aware_topk reduces to plain softmax-topk (no behavior change).
+            _res_mask = _build_resident_mask(
+                vaayu_ref, expert_cache, layer_idx,
+                router_logits.shape[-1], router_logits.device)
+            routing_weights, expert_indices = cache_aware_topk(
+                router_logits, _res_mask, top_k,
+                getattr(vaayu_ref, "_cache_bias", 0.0))
 
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
