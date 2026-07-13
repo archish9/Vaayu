@@ -840,6 +840,29 @@ def load_expert_into_slab(
     return out
 
 
+def gpu_repack_aligned(src_views: dict, device) -> dict:
+    """Copy each src view into ONE fresh contiguous buffer at _TENSOR_ALIGN
+    boundaries, so the result is uint4-safe for EXL3's kernel regardless of the
+    source's alignment. Used by the prefill staged-consume path (B1): staging
+    now reads raw (tensor_align=False, zero CPU copy), whose GPU views land at
+    arbitrary mod-_TENSOR_ALIGN offsets and would fault EXL3's uint4* load; this
+    re-slices them onto aligned offsets in a single allocation. CUDA allocations
+    are >=256-byte aligned, so the buffer base and every packed offset are
+    16-safe by construction. `device` is passed through to torch.empty so unit
+    tests can exercise the byte-exact packing on CPU."""
+    packed_span = sum(_align_up_to(v.nbytes, _TENSOR_ALIGN) for v in src_views.values())
+    dst = torch.empty(packed_span, dtype=torch.uint8, device=device)
+    out = {}
+    off = 0
+    for key, v in src_views.items():
+        nb = v.nbytes
+        typed = dst[off:off + nb].view(v.dtype).view(v.shape)
+        typed.copy_(v)
+        out[key] = typed
+        off += _align_up_to(nb, _TENSOR_ALIGN)
+    return out
+
+
 def views_from_packed_copy(src_views: dict, src_base: "torch.Tensor", dst: "torch.Tensor") -> dict:
     """Rebuild {key: view} inside `dst`, a copy of src_base's used prefix
     (typically a single H2D transfer of a pinned slab). Each view keeps its

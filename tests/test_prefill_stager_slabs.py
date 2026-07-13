@@ -93,3 +93,25 @@ def test_views_from_packed_copy_rebuilds_offsets(tmp_path):
     assert torch.equal(rebuilt["down.proj"], f16_tensor)
     for v in rebuilt.values():
         assert v.data_ptr() >= copied.data_ptr()
+
+
+def test_gpu_repack_aligned_offsets_bytes_dtype():
+    """Repacked buffer: every view 16-byte aligned relative to the buffer base,
+    byte-exact, dtype/shape preserved. CPU stands in for CUDA (device='cpu');
+    the >=256-byte CUDA base alignment is verified on-device separately."""
+    from vaayu.persist.safetensor_model_persister import (
+        gpu_repack_aligned, _TENSOR_ALIGN)
+
+    trellis = torch.arange(10, dtype=torch.float16)      # 20 B -> padded to 32
+    suh = torch.arange(4, dtype=torch.float16)           # 8 B
+    src = {"trellis": trellis, "suh": suh}
+
+    out = gpu_repack_aligned(src, "cpu")
+    base = out["trellis"].data_ptr()                     # first key sits at off 0
+    for v in out.values():
+        assert (v.data_ptr() - base) % _TENSOR_ALIGN == 0
+    assert torch.equal(out["trellis"], trellis)
+    assert torch.equal(out["suh"], suh)
+    assert out["suh"].dtype == torch.float16 and out["suh"].shape == suh.shape
+    # suh must land AFTER trellis's 16-aligned span (20 -> 32), not overlapping
+    assert out["suh"].data_ptr() - base == _TENSOR_ALIGN * 2
