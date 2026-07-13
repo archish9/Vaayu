@@ -840,6 +840,13 @@ class VaayuBaseModel(GenerationMixin):
             # cache/executor/prefetch object is created. See
             # check_lookahead_flag_safe() docstring for the full rationale.
             check_lookahead_flag_safe()
+            # Capture the flag decision ONCE, here, right after the guard above
+            # raises if VAAYU_LOOKAHEAD=1 — so this is always False on this path
+            # today. Read from this captured value at forward time (moe_patch.py),
+            # never re-read os.environ live, so mutating the env var AFTER init
+            # can't re-arm the known-corrupting Phase B prefetch path (final
+            # whole-branch review finding: closes a guard-bypass window).
+            self._lookahead_enabled = os.environ.get("VAAYU_LOOKAHEAD") == "1"
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil

@@ -741,17 +741,16 @@ def _make_fused_sparse_forward_exl3(
         unique_experts: list[int] = unique_expert_indices(expert_indices_cpu)
 
         # ── Lookahead routing predictor (Task 12, decode only) ──────────────
-        # Phase A (always on): score the PREVIOUS layer's prediction for this
-        # layer against the actual routing — pure accounting, no behavior change.
-        # Phase B (env VAAYU_LOOKAHEAD=1): prefetch predicted next-layer misses.
-        # Lookahead subsystem (Phase A accounting + Phase B prefetch) is now
-        # fully gated behind VAAYU_LOOKAHEAD=1 (CR-1): the extra next-layer
-        # router GEMM + _pred_idx.cpu() D2H sync are per-layer/per-token decode
-        # overhead that only Phase B consumes. Default off → steady-state decode
-        # pays nothing. The inner os.environ check on the prefetch submit below
-        # is now redundant but harmless; leave it.
+        # Phase A (accounting) and Phase B (prefetch) are BOTH gated behind
+        # VAAYU_LOOKAHEAD=1 (CR-1): the extra next-layer router GEMM +
+        # _pred_idx.cpu() D2H sync are per-layer/per-token decode overhead
+        # that only Phase B consumes. Default off → steady-state decode
+        # pays nothing. Reads vaayu_ref._lookahead_enabled (captured ONCE at
+        # init, not a live os.environ read) so mutating the env var after
+        # engine construction can't bypass the hard-block guard in
+        # vaayu_base.py — see check_lookahead_flag_safe()'s docstring.
         if (not getattr(vaayu_ref, "_moe_prefill_pass", False)
-                and os.environ.get("VAAYU_LOOKAHEAD") == "1"):
+                and getattr(vaayu_ref, "_lookahead_enabled", False)):
             _la_state = getattr(vaayu_ref, "_lookahead_state", None)
             if _la_state is not None:
                 lookahead_accuracy_update(
@@ -767,7 +766,7 @@ def _make_fused_sparse_forward_exl3(
                     _, _pred_idx = torch.topk(_nl.float(), top_k, dim=-1)
                     _pred_set = set(int(x) for x in _pred_idx.flatten().cpu().unique().tolist())
                     vaayu_ref._lookahead_pred = (layer_idx + 1, _pred_set)
-                    if os.environ.get("VAAYU_LOOKAHEAD") == "1":
+                    if getattr(vaayu_ref, "_lookahead_enabled", False):
                         _next_name = _next_block.layer_name
                         for _pe in _pred_set:
                             if not expert_cache.has(layer_idx + 1, _pe):
