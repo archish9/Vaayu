@@ -1002,7 +1002,17 @@ def _make_fused_sparse_forward_exl3(
                 _arena = expert_cache.arena
                 if _arena is not None:
                     if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                        # Stream-scoped wait, not a full-device drain (CR-3):
+                        # the staged-consume H2Ds that read these slabs are
+                        # already enqueued on the current stream; an event
+                        # recorded here and synchronized blocks the host until
+                        # exactly those complete, so the CPU-side io_uring write
+                        # that reuses a released slab can't race the H2D — WITHOUT
+                        # draining unrelated device work (e.g. the background
+                        # stager's own in-flight copies).
+                        _rel_ev = torch.cuda.Event()
+                        _rel_ev.record()
+                        _rel_ev.synchronize()
                     for _sidx in _slabs.values():
                         if _sidx is not None:
                             _arena.release(_sidx)
