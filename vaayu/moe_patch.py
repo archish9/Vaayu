@@ -676,7 +676,14 @@ def _make_fused_sparse_forward_exl3(
         # Phase A (always on): score the PREVIOUS layer's prediction for this
         # layer against the actual routing — pure accounting, no behavior change.
         # Phase B (env VAAYU_LOOKAHEAD=1): prefetch predicted next-layer misses.
-        if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+        # Lookahead subsystem (Phase A accounting + Phase B prefetch) is now
+        # fully gated behind VAAYU_LOOKAHEAD=1 (CR-1): the extra next-layer
+        # router GEMM + _pred_idx.cpu() D2H sync are per-layer/per-token decode
+        # overhead that only Phase B consumes. Default off → steady-state decode
+        # pays nothing. The inner os.environ check on the prefetch submit below
+        # is now redundant but harmless; leave it.
+        if (not getattr(vaayu_ref, "_moe_prefill_pass", False)
+                and os.environ.get("VAAYU_LOOKAHEAD") == "1"):
             _la_state = getattr(vaayu_ref, "_lookahead_state", None)
             if _la_state is not None:
                 lookahead_accuracy_update(
