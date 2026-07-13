@@ -222,6 +222,40 @@ def compute_chunk_past_lens(chunk_lens: list, past0: int) -> list:
     return out
 
 
+def check_lookahead_flag_safe() -> None:
+    """Hard-block guard (Task 5 follow-up): VAAYU_LOOKAHEAD=1 is confirmed to
+    cause on-device memory corruption (CUDA device-side assert / "probability
+    tensor contains inf, nan") in the lookahead prefetch path. Reproduced
+    across two independent race-fix rounds (SlabArena event-guard, then a
+    pin/refcount mechanism) without resolving the crash — a third, unaudited
+    hazard is suspected: worker-vs-worker races inside the multi-worker
+    _stager_executor's concurrent put_slab()/eviction calls. Needs a
+    stager-pool worker-concurrency audit before re-enabling. See
+    docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md Task 5
+    and .superpowers/sdd/task-5-report.md for details.
+
+    Called from __init__ before any MoE cache/executor/prefetch object is
+    created, so a set flag fails fast and loud at engine construction instead
+    of silently corrupting memory mid-generation. No-op (dead code) when the
+    flag is unset — the default path is unaffected.
+    """
+    if os.environ.get("VAAYU_LOOKAHEAD") == "1":
+        raise RuntimeError(
+            "VAAYU_LOOKAHEAD=1 is disabled: it causes confirmed on-device "
+            "memory corruption (CUDA device-side assert / NaN-Inf routing "
+            "probabilities) in the lookahead prefetch path. Reproduced across "
+            "two independent race-fix rounds (SlabArena event-guard, then a "
+            "pin/refcount mechanism) without resolving the crash — a third, "
+            "unaudited hazard is suspected: worker-vs-worker races inside the "
+            "multi-worker _stager_executor's concurrent put_slab()/eviction "
+            "calls. Needs a stager-pool worker-concurrency audit before "
+            "re-enabling. See "
+            "docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md "
+            "Task 5 and .superpowers/sdd/task-5-report.md for details. Unset "
+            "VAAYU_LOOKAHEAD (or set it to anything other than \"1\") to proceed."
+        )
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -783,6 +817,10 @@ class VaayuBaseModel(GenerationMixin):
         self._non_expert_tensor_cache = None  # initialized below for MoE
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         if self.running_device.startswith("cuda") and self.is_moe:
+            # Hard-block guard (Task 5 follow-up) — must fire before any MoE
+            # cache/executor/prefetch object is created. See
+            # check_lookahead_flag_safe() docstring for the full rationale.
+            check_lookahead_flag_safe()
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil
