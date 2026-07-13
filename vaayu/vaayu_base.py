@@ -871,6 +871,14 @@ class VaayuBaseModel(GenerationMixin):
             self._moe_executor = ThreadPoolExecutor(max_workers=get_expert_pool_size())
             atexit.register(self._moe_executor.shutdown, wait=False)
 
+            # Dedicated executor for lookahead (Phase B) prefetch so predicted
+            # next-layer reads can NEVER preempt on-path decode-miss reads on
+            # _moe_executor (CR-2). Small: prefetch is opportunistic, not
+            # latency-critical. Derived from the expert pool size, capped low.
+            self._stager_executor = ThreadPoolExecutor(
+                max_workers=max(1, get_expert_pool_size() // 4))
+            atexit.register(self._stager_executor.shutdown, wait=False)
+
             self._moe_blocks = patch_moe_blocks(
                 model=self.model,
                 expert_cache=self._expert_cache,

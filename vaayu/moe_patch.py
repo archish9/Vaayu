@@ -630,16 +630,35 @@ def _make_fused_sparse_forward_exl3(
 
     def _load_predicted_expert(next_layer_name: str, next_layer_idx: int, eidx: int):
         """Phase-B prefetch: load a predicted next-layer expert into the RAM
-        cache ahead of its layer. Uses the legacy clone path + prefetch=True so
-        the existing prefetch_used telemetry measures usefulness. Never raises."""
+        cache ahead of its layer via the SAME zero-clone slab path decode's
+        on-path misses use (CR-2 fix: no double-clone). prefetch=True so the
+        prefetch_used telemetry measures usefulness. Never raises."""
         try:
             if expert_cache.has(next_layer_idx, eidx):
                 return
             metas = offset_index.get_expert_offsets(next_layer_name, eidx)
             if metas is None:
                 return
-            raw = load_expert_sparse(shard_file_for(next_layer_name), metas)
-            expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+            _shard = shard_file_for(next_layer_name)
+            if expert_cache.arena is None:
+                # No arena (unit-test / CUDA-less) — legacy clone path.
+                raw = load_expert_sparse(_shard, metas)
+                expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+                return
+            slab_idx = expert_cache.acquire_slab()
+            if slab_idx is None:
+                raw = load_expert_sparse(_shard, metas)
+                expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+                return
+            slab = expert_cache.arena.tensor(slab_idx)
+            try:
+                views = load_expert_into_slab(
+                    _shard, metas, slab,
+                    allow_direct=expert_cache.arena.pin, tensor_align=False)
+            except Exception:
+                expert_cache.arena.release(slab_idx)
+                raise
+            expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx, prefetch=True)
         except Exception as e:
             _log.warning(
                 f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"
@@ -704,7 +723,7 @@ def _make_fused_sparse_forward_exl3(
                         _next_name = _next_block.layer_name
                         for _pe in _pred_set:
                             if not expert_cache.has(layer_idx + 1, _pe):
-                                vaayu_ref._moe_executor.submit(
+                                vaayu_ref._stager_executor.submit(
                                     _load_predicted_expert, _next_name, layer_idx + 1, _pe)
                 except Exception as e:
                     _log.warning(
@@ -718,6 +737,20 @@ def _make_fused_sparse_forward_exl3(
         shard_file = shard_file_for(layer_name)
         expert_tensors: dict[int, dict] = {}
         misses: list[int] = []
+
+        # Pin mechanism (race fix, round 2): a slab-backed cache entry checked out
+        # here (get() hit or put_slab() miss) but not yet H2D-copied must not be
+        # evicted-and-reused by a concurrent evictor — chiefly the VAAYU_LOOKAHEAD
+        # stager, which drives heavy eviction churn — in that window. We refcount-
+        # pin every checked-out key and unpin once its copy is issued (after which
+        # SlabArena.record_read()/acquire() guards the in-flight-copy window). Only
+        # arena-backed (zero-clone) entries carry the race; the legacy clone path
+        # (arena is None) copies independent memory, so pinning is skipped there.
+        # _pinned_keys tracks exactly which keys THIS call pinned, so the finally
+        # below unpins each exactly once even if compute raises partway through.
+        _do_pin = expert_cache.arena is not None and not getattr(
+            vaayu_ref, "_moe_prefill_pass", False)
+        _pinned_keys: set = set()
 
         # Prefill lookahead: if the stager pre-read this layer, WAIT for it
         # (that wait IS the disk time — no duplicate reads) and consume it.
@@ -760,11 +793,24 @@ def _make_fused_sparse_forward_exl3(
             if _staged_layer is not None and eidx in _staged_layer:
                 expert_tensors[eidx] = _staged_layer[eidx]
                 continue
-            cached = expert_cache.get(layer_idx, eidx)
+            cached = expert_cache.get(layer_idx, eidx, pin=_do_pin)
             if cached is not None:
                 expert_tensors[eidx] = cached
+                if _do_pin:
+                    _pinned_keys.add((layer_idx, eidx))
             else:
                 misses.append(eidx)
+
+        # Pin misses BEFORE dispatching their loads: the key isn't cached yet, so
+        # it can't be evicted until put_slab() inserts it — at which point the pin
+        # is already set and the evictor will skip it. pin() on a not-yet-cached
+        # key is valid (it only blocks a future victim selection). Prefetch/legacy
+        # misses (no arena insert) are pinned too but harmlessly — the finally
+        # unpins them and unpin() is a no-op for a key that was never cached.
+        if _do_pin:
+            for _e in misses:
+                expert_cache.pin(layer_idx, _e)
+                _pinned_keys.add((layer_idx, _e))
 
         _miss_futures = []
         if misses:
@@ -862,132 +908,164 @@ def _make_fused_sparse_forward_exl3(
         if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
             _vram = None
 
-        for eidx, raw in _iter_experts_hits_then_misses():
-            groups = _group_exl3_tensors_by_weight(raw)
-            if not groups["gate"] or not groups["down"] or not groups["up"]:
-                _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
-                continue
-            if intermediate_size is None:
-                _t_gate = groups.get("gate", {}).get("trellis")
-                if _t_gate is None:
+        try:
+            for eidx, raw in _iter_experts_hits_then_misses():
+                groups = _group_exl3_tensors_by_weight(raw)
+                if not groups["gate"] or not groups["down"] or not groups["up"]:
+                    _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
                     continue
-                intermediate_size = _t_gate.shape[1] * 16
+                if intermediate_size is None:
+                    _t_gate = groups.get("gate", {}).get("trellis")
+                    if _t_gate is None:
+                        continue
+                    intermediate_size = _t_gate.shape[1] * 16
 
-            _s, _c = _starts[eidx], _counts_l[eidx]
-            if _c == 0:
-                continue
-            token_idx_gpu = _pair_gpu[0, _s:_s + _c]
-            top_k_pos_gpu = _pair_gpu[1, _s:_s + _c]
-            current_state = flat_hidden[token_idx_gpu]
-            if current_state.dtype != torch.float16:
-                current_state = current_state.to(torch.float16)
+                _s, _c = _starts[eidx], _counts_l[eidx]
+                if _c == 0:
+                    continue
+                token_idx_gpu = _pair_gpu[0, _s:_s + _c]
+                top_k_pos_gpu = _pair_gpu[1, _s:_s + _c]
+                current_state = flat_hidden[token_idx_gpu]
+                if current_state.dtype != torch.float16:
+                    current_state = current_state.to(torch.float16)
 
-            _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
-            _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
-            if _cached_gpu is None and _cm_gpu is not None:
-                _cached_gpu = _cm_gpu.get(eidx)   # retained from an earlier chunk
-            _entry = None
-            if _cached_gpu is not None:
-                gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]
-                _owned_by_cache = True
-                _entry = _cached_gpu
-            else:
-                if _prof:
-                    torch.cuda.synchronize(); _t0 = time.perf_counter()
-                _sidx = _staged_slabs.get(eidx)
-                if _sidx is not None:
-                    # Slab-backed staged expert (prefill): ONE pinned H2D of the
-                    # packed slab prefix, then free GPU re-slicing — replaces 9
-                    # per-component copies (Task 9).
-                    _slab_cpu = expert_cache.arena.tensor(_sidx)
-                    _base = _slab_cpu.data_ptr()
-                    _used = max((v.data_ptr() - _base) + v.nbytes for v in raw.values())
-                    # ONE H2D of the raw slab prefix (volume unchanged), then
-                    # views_from_packed_copy reslices the RAW (tensor_align=False)
-                    # layout into GPU views — valid as copy SOURCES (a copy_'s
-                    # source needs only itemsize alignment, which even offsets
-                    # satisfy), NOT as kernel inputs. gpu_repack_aligned then
-                    # packs each role onto 16-aligned CUDA offsets for EXL3 (B1).
-                    _gpu_blob = _slab_cpu[:_used].to(device, non_blocking=True)
-                    gpu_gate = gpu_repack_aligned(
-                        views_from_packed_copy(groups["gate"], _slab_cpu, _gpu_blob), device)
-                    gpu_down = gpu_repack_aligned(
-                        views_from_packed_copy(groups["down"], _slab_cpu, _gpu_blob), device)
-                    gpu_up   = gpu_repack_aligned(
-                        views_from_packed_copy(groups["up"],   _slab_cpu, _gpu_blob), device)
+                _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
+                _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
+                if _cached_gpu is None and _cm_gpu is not None:
+                    _cached_gpu = _cm_gpu.get(eidx)   # retained from an earlier chunk
+                _entry = None
+                if _cached_gpu is not None:
+                    gpu_gate, gpu_up, gpu_down = _cached_gpu["gate"], _cached_gpu["up"], _cached_gpu["down"]
+                    _owned_by_cache = True
+                    _entry = _cached_gpu
                 else:
-                    gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
-                    gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
-                    gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
-                if _prof:
-                    torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
-                if _vram is not None:
-                    # put() returns True only if the cache actually accepted ownership
-                    # (it can refuse if this exact key raced in, or if a single expert
-                    # is larger than the whole budget) — only then do we skip the free.
-                    _entry = {"gate": gpu_gate, "up": gpu_up, "down": gpu_down}
-                    _owned_by_cache = _vram.put(layer_idx, eidx, _entry)
-                    if not _owned_by_cache:
-                        _entry = None
-                elif _cm_gpu is not None:
-                    # Chunk-major retention (prefill: _vram is gated off). Budget
-                    # bound is the same hardware-derived VRAM cache budget; overflow
-                    # experts simply re-upload on later chunks.
-                    _sz = sum(t.nbytes for d in (gpu_gate, gpu_up, gpu_down)
-                              for t in d.values())
-                    _budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
-                                      "budget_bytes", 0)
-                    if vaayu_ref._chunk_major_gpu_bytes + _sz <= _budget:
+                    if _prof:
+                        torch.cuda.synchronize(); _t0 = time.perf_counter()
+                    _sidx = _staged_slabs.get(eidx)
+                    if _sidx is not None:
+                        # Slab-backed staged expert (prefill): ONE pinned H2D of the
+                        # packed slab prefix, then free GPU re-slicing — replaces 9
+                        # per-component copies (Task 9).
+                        _slab_cpu = expert_cache.arena.tensor(_sidx)
+                        _base = _slab_cpu.data_ptr()
+                        _used = max((v.data_ptr() - _base) + v.nbytes for v in raw.values())
+                        # ONE H2D of the raw slab prefix (volume unchanged), then
+                        # views_from_packed_copy reslices the RAW (tensor_align=False)
+                        # layout into GPU views — valid as copy SOURCES (a copy_'s
+                        # source needs only itemsize alignment, which even offsets
+                        # satisfy), NOT as kernel inputs. gpu_repack_aligned then
+                        # packs each role onto 16-aligned CUDA offsets for EXL3 (B1).
+                        _gpu_blob = _slab_cpu[:_used].to(device, non_blocking=True)
+                        # Guard slab reuse against this in-flight async H2D read
+                        # (arena.acquire() will sync on it before rewriting _sidx).
+                        expert_cache.arena.record_read(_sidx)
+                        gpu_gate = gpu_repack_aligned(
+                            views_from_packed_copy(groups["gate"], _slab_cpu, _gpu_blob), device)
+                        gpu_down = gpu_repack_aligned(
+                            views_from_packed_copy(groups["down"], _slab_cpu, _gpu_blob), device)
+                        gpu_up   = gpu_repack_aligned(
+                            views_from_packed_copy(groups["up"],   _slab_cpu, _gpu_blob), device)
+                    else:
+                        gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
+                        gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}
+                        gpu_up   = {k: v.to(device, non_blocking=True) for k, v in groups["up"].items()}
+                        # These copies read FROM slab-backed views (decode cache
+                        # hit/miss). Record a read event against the source slab so a
+                        # concurrent evict→reuse (esp. the lookahead stager) can't
+                        # rewrite it CPU-side before the DMA drains — silent torn-read
+                        # corruption otherwise. Legacy cloned experts aren't in the
+                        # arena → slab_index_of returns None → skipped.
+                        _arena = expert_cache.arena
+                        if _arena is not None:
+                            _rd_slab = _arena.slab_index_of(next(iter(groups["gate"].values())))
+                            if _rd_slab is not None:
+                                _arena.record_read(_rd_slab)
+                        # The async H2D copies for this expert are now issued;
+                        # record_read()/acquire() guards the slab from here on, so the
+                        # pin is no longer needed — release it promptly to keep
+                        # eviction pressure low. The finally below covers any expert
+                        # that never reaches this point (VRAM hit, continue, raise).
+                        _uk = (layer_idx, eidx)
+                        if _uk in _pinned_keys:
+                            expert_cache.unpin(layer_idx, eidx)
+                            _pinned_keys.discard(_uk)
+                    if _prof:
+                        torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
+                    if _vram is not None:
+                        # put() returns True only if the cache actually accepted ownership
+                        # (it can refuse if this exact key raced in, or if a single expert
+                        # is larger than the whole budget) — only then do we skip the free.
                         _entry = {"gate": gpu_gate, "up": gpu_up, "down": gpu_down}
-                        _cm_gpu[eidx] = _entry
-                        vaayu_ref._chunk_major_gpu_bytes += _sz
-                        _owned_by_cache = True
+                        _owned_by_cache = _vram.put(layer_idx, eidx, _entry)
+                        if not _owned_by_cache:
+                            _entry = None
+                    elif _cm_gpu is not None:
+                        # Chunk-major retention (prefill: _vram is gated off). Budget
+                        # bound is the same hardware-derived VRAM cache budget; overflow
+                        # experts simply re-upload on later chunks.
+                        _sz = sum(t.nbytes for d in (gpu_gate, gpu_up, gpu_down)
+                                  for t in d.values())
+                        _budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
+                                          "budget_bytes", 0)
+                        if vaayu_ref._chunk_major_gpu_bytes + _sz <= _budget:
+                            _entry = {"gate": gpu_gate, "up": gpu_up, "down": gpu_down}
+                            _cm_gpu[eidx] = _entry
+                            vaayu_ref._chunk_major_gpu_bytes += _sz
+                            _owned_by_cache = True
+                        else:
+                            _owned_by_cache = False
                     else:
                         _owned_by_cache = False
-                else:
-                    _owned_by_cache = False
 
-            bc_gate = bc_down = bc_up = None
-            try:
-                _bc_cached = _entry.get("bc") if _entry is not None else None
-                if _bc_cached is not None:
-                    bc_gate, bc_up, bc_down = _bc_cached
-                else:
+                bc_gate = bc_down = bc_up = None
+                try:
+                    _bc_cached = _entry.get("bc") if _entry is not None else None
+                    if _bc_cached is not None:
+                        bc_gate, bc_up, bc_down = _bc_cached
+                    else:
+                        if _prof:
+                            _t0 = time.perf_counter()
+                        bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
+                        bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
+                        bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
+                        if _prof:
+                            torch.cuda.synchronize(); _mp['construct'] += time.perf_counter() - _t0
+                        if _entry is not None:
+                            # Cache the BC objects with the entry: they wrap the SAME
+                            # resident GPU tensors, so their lifetime matches; eviction
+                            # drops the tuple and the pybind destructors free the C++
+                            # heap. Mutation outside the cache lock is safe — the decode
+                            # compute loop is the sole consumer of VRAM-cache entries.
+                            _entry["bc"] = (bc_gate, bc_up, bc_down)
+
                     if _prof:
                         _t0 = time.perf_counter()
-                    bc_gate = _make_bc_linear_exl3(gpu_gate, H, intermediate_size, device)
-                    bc_up   = _make_bc_linear_exl3(gpu_up,   H, intermediate_size, device)
-                    bc_down = _make_bc_linear_exl3(gpu_down, intermediate_size, H, device)
+                    x_flat = current_state.view(-1, H)
+                    gate_out = act_fn(bc_gate.run_alloc(x_flat, intermediate_size, False))
+                    up_out   = bc_up.run_alloc(x_flat, intermediate_size, False)
+                    hidden   = bc_down.run_alloc((gate_out * up_out).contiguous(), H, False)
                     if _prof:
-                        torch.cuda.synchronize(); _mp['construct'] += time.perf_counter() - _t0
-                    if _entry is not None:
-                        # Cache the BC objects with the entry: they wrap the SAME
-                        # resident GPU tensors, so their lifetime matches; eviction
-                        # drops the tuple and the pybind destructors free the C++
-                        # heap. Mutation outside the cache lock is safe — the decode
-                        # compute loop is the sole consumer of VRAM-cache entries.
-                        _entry["bc"] = (bc_gate, bc_up, bc_down)
+                        torch.cuda.synchronize(); _mp['gemm'] += time.perf_counter() - _t0
 
-                if _prof:
-                    _t0 = time.perf_counter()
-                x_flat = current_state.view(-1, H)
-                gate_out = act_fn(bc_gate.run_alloc(x_flat, intermediate_size, False))
-                up_out   = bc_up.run_alloc(x_flat, intermediate_size, False)
-                hidden   = bc_down.run_alloc((gate_out * up_out).contiguous(), H, False)
-                if _prof:
-                    torch.cuda.synchronize(); _mp['gemm'] += time.perf_counter() - _t0
-
-                weights_slice = routing_weights[token_idx_gpu, top_k_pos_gpu, None]
-                hidden = hidden * weights_slice
-                final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
-            finally:
-                # Free C++ QMatrix objects ONLY when the cache does not hold them:
-                # cached BC objects (entry["bc"]) live until entry eviction. For
-                # uncached experts the local refs are the only refs — null them so
-                # the pybind destructors run now.
-                if not _owned_by_cache:
-                    bc_gate = bc_down = bc_up = None
-                    del gpu_gate, gpu_down, gpu_up
+                    weights_slice = routing_weights[token_idx_gpu, top_k_pos_gpu, None]
+                    hidden = hidden * weights_slice
+                    final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
+                finally:
+                    # Free C++ QMatrix objects ONLY when the cache does not hold them:
+                    # cached BC objects (entry["bc"]) live until entry eviction. For
+                    # uncached experts the local refs are the only refs — null them so
+                    # the pybind destructors run now.
+                    if not _owned_by_cache:
+                        bc_gate = bc_down = bc_up = None
+                        del gpu_gate, gpu_down, gpu_up
+        finally:
+            # Guarantee every key THIS call pinned is released, even if compute
+            # raised partway through — a leaked pin would permanently block that
+            # key's eviction (a slow cache-capacity leak). Early-unpin above
+            # already released experts whose H2D copy issued; this drains the
+            # rest (VRAM hits, skipped/continued experts, exceptions).
+            for _pk in _pinned_keys:
+                expert_cache.unpin(*_pk)
 
         if intermediate_size is None:
             _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")

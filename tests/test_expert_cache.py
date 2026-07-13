@@ -1,6 +1,6 @@
 import pytest
 import torch
-from vaayu.persist.expert_cache import ExpertRAMCache, LRUTensorCache
+from vaayu.persist.expert_cache import ExpertRAMCache, LRUTensorCache, SlabArena
 
 
 def _make_tensors(size_bytes: int = 1024) -> dict:
@@ -200,6 +200,24 @@ def test_per_layer_hit_miss_counters():
     cache.get(0, 99)  # miss
     assert cache.hits == 2
     assert cache.misses == 1
+
+
+def test_put_slab_prefetch_telemetry(tmp_path):
+    import torch
+    from vaayu.persist.expert_cache import ExpertRAMCache, SlabArena
+    arena = SlabArena(n_slabs=2, slab_bytes=64, pin=False)
+    cache = ExpertRAMCache(budget_bytes=10_000, max_per_layer=4, arena=arena)
+
+    sidx = arena.acquire()
+    views = {"trellis": arena.tensor(sidx)[:32].view(torch.uint8)}
+    cache.put_slab(0, 7, views, sidx, prefetch=True)
+
+    assert cache.has(0, 7)
+    assert cache.prefetch_inserts == 1          # counted as a prefetch insert
+    assert (0, 7) in cache._prefetched
+    # a subsequent real use should register a prefetch hit
+    cache.get(0, 7)
+    assert cache.prefetch_hits == 1
 
 
 # ── LRUTensorCache ───────────────────────────────────────────────────────────

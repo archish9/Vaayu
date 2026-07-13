@@ -169,6 +169,66 @@ def test_put_slab_adopts_without_clone_and_evict_releases():
     arena.release(i2)
 
 
+def test_slab_index_of_maps_views_and_rejects_foreign():
+    arena = SlabArena(n_slabs=3, slab_bytes=_ALIGN, pin=False)
+    for idx in range(3):
+        v = arena.tensor(idx)[:64].view(torch.uint8)
+        assert arena.slab_index_of(v) == idx
+    # a tensor that isn't a view into the arena backing → None (legacy clone)
+    assert arena.slab_index_of(torch.zeros(16, dtype=torch.uint8)) is None
+
+
+def test_acquire_consumes_pending_read_event():
+    """The reuse-race guard bookkeeping: record_read() registers a pending
+    event for a slab; acquire() must consume (pop + synchronize) it before
+    handing the slab back out, so a CPU rewrite can't race an in-flight H2D
+    read. CUDA-only (needs a real event); skipped on CPU-only boxes."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for a real torch.cuda.Event")
+    arena = SlabArena(n_slabs=1, slab_bytes=_ALIGN, pin=True)
+    idx = arena.acquire()
+    assert idx is not None
+    arena.record_read(idx)
+    assert idx in arena._pending_read       # event registered
+    arena.release(idx)
+    assert idx in arena._pending_read       # release does NOT clear it
+    got = arena.acquire()
+    assert got == idx
+    assert idx not in arena._pending_read   # acquire popped + synced the event
+
+
+def test_acquire_syncs_before_slab_reuse():
+    """End-to-end: a large async H2D read from a slab, then release+acquire.
+    acquire() must have synchronized the recorded read, so overwriting the
+    slab CPU-side AFTER acquire cannot corrupt the already-drained GPU copy —
+    i.e. the GPU tensor still reflects the pre-overwrite bytes."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    slab_bytes = 16 * 1024 * 1024  # large enough that the H2D is non-trivial
+    arena = SlabArena(n_slabs=1, slab_bytes=slab_bytes, pin=True)
+    idx = arena.acquire()
+    slab = arena.tensor(idx)
+    slab.fill_(0xAB)                                  # pattern A
+    gpu = slab.to("cuda", non_blocking=True)          # async read of pattern A
+    arena.record_read(idx)
+    arena.release(idx)
+    reused = arena.acquire()                          # must sync the read event
+    assert reused == idx
+    slab.fill_(0xCD)                                  # pattern B (would corrupt if unsynced)
+    assert torch.all(gpu == 0xAB).item()             # GPU copy is pure pattern A
+
+
+def test_record_read_is_noop_without_cuda():
+    from unittest.mock import patch as mock_patch
+    arena = SlabArena(n_slabs=1, slab_bytes=_ALIGN, pin=False)
+    idx = arena.acquire()
+    with mock_patch("torch.cuda.is_available", return_value=False):
+        arena.record_read(idx)
+    assert idx not in arena._pending_read            # no event recorded
+    arena.release(idx)
+    assert arena.acquire() == idx                    # acquire still works (no event to sync)
+
+
 def test_put_slab_duplicate_key_releases_new_slab():
     arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
     cache = ExpertRAMCache(budget_bytes=4 * _ALIGN, arena=arena)

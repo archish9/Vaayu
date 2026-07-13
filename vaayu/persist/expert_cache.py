@@ -28,17 +28,62 @@ class SlabArena:
         )
         self._free: list[int] = list(range(self.n_slabs))
         self._lock = threading.Lock()
+        # slab idx -> CUDA event marking the most recent async (non_blocking)
+        # H2D copy that reads FROM this slab's pinned memory. acquire()
+        # synchronizes on it before handing the slab out for a fresh CPU-side
+        # write, so an io_uring rewrite can't race an in-flight DMA read of the
+        # same bytes (silent torn-read corruption). See record_read().
+        self._pending_read: dict[int, "torch.cuda.Event"] = {}
 
     def acquire(self) -> "int | None":
         with self._lock:
-            return self._free.pop() if self._free else None
+            if not self._free:
+                return None
+            idx = self._free.pop()
+            ev = self._pending_read.pop(idx, None)
+        # Sync OUTSIDE the lock: a previously-enqueued H2D copy sourced from this
+        # slab may still be draining on the CUDA stream. The caller is about to
+        # overwrite the slab CPU-side (io_uring), which the DMA engine cannot
+        # see — block until that read completes so it can't read torn bytes.
+        # Near-zero cost in the common case (the read finished long ago); the
+        # host only actually waits inside the genuine reuse-race window.
+        if ev is not None:
+            ev.synchronize()
+        return idx
 
     def release(self, idx: int) -> None:
+        # NOTE: no event bookkeeping here on purpose — a slab may be released
+        # while an H2D read from it is still in flight (e.g. eviction under
+        # concurrent stager churn). The pending-read event is kept and consumed
+        # by acquire() at the actual point of reuse, which is the only moment
+        # the race matters.
         with self._lock:
             self._free.append(idx)
 
     def tensor(self, idx: int) -> torch.Tensor:
         return self._backing[idx * self.slab_bytes:(idx + 1) * self.slab_bytes]
+
+    def record_read(self, idx: int) -> None:
+        """Mark that an async (non_blocking) H2D copy reading FROM slab `idx`
+        was just enqueued on the current CUDA stream. Records an event now;
+        acquire() will synchronize on it before reusing this slab. No-op when
+        CUDA is unavailable (the race only exists for real async H2D DMA)."""
+        if not torch.cuda.is_available():
+            return
+        ev = torch.cuda.Event()
+        ev.record()  # captures all work enqueued so far on the current stream
+        with self._lock:
+            self._pending_read[idx] = ev
+
+    def slab_index_of(self, tensor: torch.Tensor) -> "int | None":
+        """Return the slab index whose backing span contains `tensor`'s storage,
+        or None if `tensor` is not a view into this arena (e.g. a legacy cloned
+        expert). Pure host-side pointer arithmetic — no CUDA, no lock."""
+        base = self._backing.data_ptr()
+        off = tensor.data_ptr() - base
+        if off < 0 or off >= self.n_slabs * self.slab_bytes:
+            return None
+        return int(off // self.slab_bytes)
 
 
 class ExpertRAMCache:
@@ -83,8 +128,39 @@ class ExpertRAMCache:
         self.prefetch_inserts = 0
         self.prefetch_hits = 0
         self._prefetched: set = set()  # keys inserted by prefetch, not yet used
+        # Pin refcounts: a key with a positive count is CHECKED OUT by a compute
+        # thread (its slab-backed views were handed out by get()/put_slab() but
+        # the H2D copy has not been issued yet) and must NEVER be chosen as an
+        # eviction victim. Without this, a concurrent evictor (esp. the lookahead
+        # stager, which drives heavy eviction churn) can release-and-reuse a slab
+        # whose bytes another thread is about to DMA to GPU — a silent torn read.
+        # The caller unpins once the copy is issued, after which SlabArena's
+        # record_read()/acquire() event-sync guards the in-flight-copy window.
+        # Guarded by self.lock (same lock as all cache mutations — no new lock).
+        self._pinned: dict[tuple, int] = {}
 
-    def get(self, layer_idx: int, expert_idx: int) -> dict | None:
+    def pin(self, layer_idx: int, expert_idx: int) -> None:
+        """Refcount-pin (layer_idx, expert_idx) so eviction skips it. Safe to
+        call for a key not currently in the cache (the pin still blocks a future
+        victim selection until unpinned). Idempotent-safe via refcount."""
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            self._pinned[key] = self._pinned.get(key, 0) + 1
+
+    def unpin(self, layer_idx: int, expert_idx: int) -> None:
+        """Release one pin. No-op if the key isn't pinned (tolerant of double
+        unpin / never-pinned, so callers can unpin defensively in a finally)."""
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            c = self._pinned.get(key)
+            if c is None:
+                return
+            if c <= 1:
+                del self._pinned[key]
+            else:
+                self._pinned[key] = c - 1
+
+    def get(self, layer_idx: int, expert_idx: int, *, pin: bool = False) -> dict | None:
         with self.lock:
             if self.max_per_layer > 0:
                 lc = self._layer_caches.get(layer_idx)
@@ -98,6 +174,8 @@ class ExpertRAMCache:
                     if key in self._prefetched:
                         self._prefetched.discard(key)
                         self.prefetch_hits += 1
+                    if pin:
+                        self._pinned[key] = self._pinned.get(key, 0) + 1
                     return dict(lc[expert_idx])
                 self.misses += 1
                 return None
@@ -108,6 +186,8 @@ class ExpertRAMCache:
                 if key in self._prefetched:
                     self._prefetched.discard(key)
                     self.prefetch_hits += 1
+                if pin:
+                    self._pinned[key] = self._pinned.get(key, 0) + 1
                 return dict(self.cache[key])
             self.misses += 1
             return None
@@ -128,11 +208,10 @@ class ExpertRAMCache:
                 if expert_idx in lc:
                     return
 
-                # 1. Per-layer fairness: evict oldest within this layer
+                # 1. Per-layer fairness: evict oldest UNPINNED within this layer
                 while len(lc) >= self.max_per_layer:
-                    evicted_eidx, evicted = lc.popitem(last=False)
-                    self._account_evict(layer_idx, evicted_eidx, evicted)
-
+                    if not self._evict_layer_oldest(layer_idx, lc):
+                        return  # every entry in this layer is pinned — refuse
                 # 2. Global budget enforcement: evict globally-oldest across ALL layers
                 while self.current_usage + raw_size > self.budget_bytes:
                     if not self._evict_global_oldest():
@@ -148,9 +227,9 @@ class ExpertRAMCache:
             key = (layer_idx, expert_idx)
             if key in self.cache:
                 return
-            while self.current_usage + raw_size > self.budget_bytes and self.cache:
-                evicted_key, evicted = self.cache.popitem(last=False)
-                self._account_evict(evicted_key[0], evicted_key[1], evicted)
+            while self.current_usage + raw_size > self.budget_bytes:
+                if not self._evict_global_oldest():
+                    break
             if self.current_usage + raw_size > self.budget_bytes:
                 return
             self.cache[key] = cloned
@@ -171,10 +250,17 @@ class ExpertRAMCache:
             idx = self.arena.acquire()
         return idx
 
-    def put_slab(self, layer_idx: int, expert_idx: int, views: dict, slab_idx: int) -> None:
+    def put_slab(self, layer_idx: int, expert_idx: int, views: dict, slab_idx: int,
+                 *, prefetch: bool = False) -> None:
         """Adopt slab-backed tensor views WITHOUT cloning (zero-copy insert).
         On duplicate key the new slab is released back to the arena. Byte
-        accounting uses slab_bytes — the real resident footprint."""
+        accounting uses slab_bytes — the real resident footprint.
+
+        NOTE: a caller that intends to DMA this slab to GPU shortly should pin()
+        the key BEFORE the read completes (the decode miss path pins in the main
+        thread before submitting the load) so a concurrent evictor can't
+        reuse the slab in the checked-out-but-not-yet-copied window."""
+        key = (layer_idx, expert_idx)
         size = self.arena.slab_bytes
         with self.lock:
             if self.max_per_layer > 0:
@@ -183,30 +269,32 @@ class ExpertRAMCache:
                     self.arena.release(slab_idx)
                     return
                 while len(lc) >= self.max_per_layer:
-                    evicted_eidx, evicted = lc.popitem(last=False)
-                    self._account_evict(layer_idx, evicted_eidx, evicted)
+                    if not self._evict_layer_oldest(layer_idx, lc):
+                        self.arena.release(slab_idx)
+                        return
                 while self.current_usage + size > self.budget_bytes:
                     if not self._evict_global_oldest():
                         self.arena.release(slab_idx)
                         return
                 lc[expert_idx] = views
                 self.current_usage += size
-                self._global_lru[(layer_idx, expert_idx)] = None
-                self._slab_of[(layer_idx, expert_idx)] = slab_idx
+                self._global_lru[key] = None
+                self._slab_of[key] = slab_idx
+                self._note_prefetch(layer_idx, expert_idx, prefetch)
                 return
-            key = (layer_idx, expert_idx)
             if key in self.cache:
                 self.arena.release(slab_idx)
                 return
-            while self.current_usage + size > self.budget_bytes and self.cache:
-                evicted_key, evicted = self.cache.popitem(last=False)
-                self._account_evict(evicted_key[0], evicted_key[1], evicted)
+            while self.current_usage + size > self.budget_bytes:
+                if not self._evict_global_oldest():
+                    break
             if self.current_usage + size > self.budget_bytes:
                 self.arena.release(slab_idx)
                 return
             self.cache[key] = views
             self.current_usage += size
             self._slab_of[key] = slab_idx
+            self._note_prefetch(layer_idx, expert_idx, prefetch)
 
     def _account_evict(self, layer_idx: int, expert_idx: int, evicted: dict) -> None:
         """Shared eviction bookkeeping: usage, counters, prefetch set, slab release.
@@ -228,16 +316,37 @@ class ExpertRAMCache:
             self.prefetch_inserts += 1
             self._prefetched.add((layer_idx, expert_idx))
 
-    def _evict_global_oldest(self) -> bool:
-        """Evict the single oldest expert across all layers (true global LRU).
+    def _evict_layer_oldest(self, layer_idx: int, lc: OrderedDict) -> bool:
+        """Evict the oldest UNPINNED expert within one layer's cache.
 
-        Returns False if nothing left to evict.
+        Returns False if every entry in the layer is pinned (no valid victim).
         Must be called while self.lock is held.
         """
+        for eidx in lc:  # OrderedDict iterates oldest-first
+            if (layer_idx, eidx) not in self._pinned:
+                evicted = lc.pop(eidx)
+                self._account_evict(layer_idx, eidx, evicted)
+                return True
+        return False
+
+    def _evict_global_oldest(self) -> bool:
+        """Evict the single oldest UNPINNED expert across all layers (true global
+        LRU). Pinned (checked-out) entries are skipped — they are never valid
+        eviction victims.
+
+        Returns False if nothing evictable remains (all remaining entries pinned
+        or cache empty). Must be called while self.lock is held.
+        """
         if self.max_per_layer > 0:
-            if not self._global_lru:
+            victim = None
+            for key in self._global_lru:  # oldest-first
+                if key not in self._pinned:
+                    victim = key
+                    break
+            if victim is None:
                 return False
-            (lid, eidx), _ = self._global_lru.popitem(last=False)
+            del self._global_lru[victim]
+            lid, eidx = victim
             lc = self._layer_caches.get(lid)
             if lc and eidx in lc:
                 evicted = lc.pop(eidx)
@@ -247,10 +356,15 @@ class ExpertRAMCache:
                     del self._layer_caches[lid]
             return True
         # Flat global-LRU mode (max_per_layer == 0): evict oldest from self.cache.
-        if not self.cache:
+        victim = None
+        for key in self.cache:  # oldest-first
+            if key not in self._pinned:
+                victim = key
+                break
+        if victim is None:
             return False
-        (lid, eidx), evicted = self.cache.popitem(last=False)
-        self._account_evict(lid, eidx, evicted)
+        evicted = self.cache.pop(victim)
+        self._account_evict(victim[0], victim[1], evicted)
         return True
 
     def clear(self) -> None:
@@ -266,6 +380,7 @@ class ExpertRAMCache:
             self._slab_of.clear()
             self.current_usage = 0
             self._prefetched.clear()
+            self._pinned.clear()
 
     def reset_stats(self) -> None:
         """Zero all counters. Called at the prefill→decode boundary so decode
