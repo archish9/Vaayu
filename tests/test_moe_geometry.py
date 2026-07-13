@@ -1,4 +1,5 @@
 """Model-agnostic MoE geometry — derived from the offset index, never hardcoded."""
+import pytest
 from vaayu.vaayu_base import compute_moe_geometry
 
 
@@ -41,20 +42,41 @@ def test_geometry_minimax_like():
 
 
 class _NonUniformIndex:
-    """One layer whose experts have DIFFERENT byte sizes (uniformity violated)."""
-    def __init__(self):
+    """Experts with DIFFERENT byte sizes across a layer (uniformity violated)."""
+    def __init__(self, num_layers, num_experts, base_expert_bytes=1000):
+        # Each expert e in each layer has size (e+1) * base_expert_bytes
+        # ensuring non-uniformity and making max = num_experts * base_expert_bytes
         self.index = {
-            "model.layers.0": {
-                0: {"gate.trellis": _FakeMeta(1000), "up.trellis": _FakeMeta(1000),
-                    "down.trellis": _FakeMeta(1000)},                       # 3000
-                1: {"gate.trellis": _FakeMeta(2000), "up.trellis": _FakeMeta(2000),
-                    "down.trellis": _FakeMeta(2000)},                       # 6000
+            f"model.layers.{L}": {
+                e: {
+                    "gate.trellis": _FakeMeta((e + 1) * base_expert_bytes // 3),
+                    "up.trellis": _FakeMeta((e + 1) * base_expert_bytes // 3),
+                    "down.trellis": _FakeMeta(
+                        (e + 1) * base_expert_bytes - 2 * ((e + 1) * base_expert_bytes // 3)
+                    ),
+                }
+                for e in range(num_experts)
             }
+            for L in range(num_layers)
         }
 
 
-def test_geometry_nonuniform_takes_max_and_warns(capsys):
-    g = compute_moe_geometry(_NonUniformIndex(), num_layers=1, moe_top_k=8,
-                             moe_num_experts=2)
-    assert g["expert_bytes"] == 6000                      # max, not first (3000)
+@pytest.mark.parametrize(
+    "num_layers,num_experts,base_bytes",
+    [
+        (91, 128, 1000),     # Qwen-like
+        (62, 256, 1000),     # MiniMax-like
+    ],
+)
+def test_geometry_nonuniform_takes_max_and_warns(
+    capsys, num_layers, num_experts, base_bytes
+):
+    idx = _NonUniformIndex(
+        num_layers=num_layers, num_experts=num_experts, base_expert_bytes=base_bytes
+    )
+    g = compute_moe_geometry(
+        idx, num_layers=num_layers, moe_top_k=8, moe_num_experts=num_experts
+    )
+    max_expert_bytes = num_experts * base_bytes
+    assert g["expert_bytes"] == max_expert_bytes  # max, not first
     assert "non-uniform expert sizes" in capsys.readouterr().out
