@@ -619,7 +619,8 @@ def _make_fused_sparse_forward_exl3(
     """
     import torch.nn.functional as F
     from .persist.safetensor_model_persister import (
-        load_expert_sparse, load_expert_into_slab, views_from_packed_copy)
+        load_expert_sparse, load_expert_into_slab, views_from_packed_copy,
+        gpu_repack_aligned)
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -901,10 +902,19 @@ def _make_fused_sparse_forward_exl3(
                     _slab_cpu = expert_cache.arena.tensor(_sidx)
                     _base = _slab_cpu.data_ptr()
                     _used = max((v.data_ptr() - _base) + v.nbytes for v in raw.values())
+                    # ONE H2D of the raw slab prefix (volume unchanged), then
+                    # views_from_packed_copy reslices the RAW (tensor_align=False)
+                    # layout into GPU views — valid as copy SOURCES (a copy_'s
+                    # source needs only itemsize alignment, which even offsets
+                    # satisfy), NOT as kernel inputs. gpu_repack_aligned then
+                    # packs each role onto 16-aligned CUDA offsets for EXL3 (B1).
                     _gpu_blob = _slab_cpu[:_used].to(device, non_blocking=True)
-                    gpu_gate = views_from_packed_copy(groups["gate"], _slab_cpu, _gpu_blob)
-                    gpu_down = views_from_packed_copy(groups["down"], _slab_cpu, _gpu_blob)
-                    gpu_up   = views_from_packed_copy(groups["up"],   _slab_cpu, _gpu_blob)
+                    gpu_gate = gpu_repack_aligned(
+                        views_from_packed_copy(groups["gate"], _slab_cpu, _gpu_blob), device)
+                    gpu_down = gpu_repack_aligned(
+                        views_from_packed_copy(groups["down"], _slab_cpu, _gpu_blob), device)
+                    gpu_up   = gpu_repack_aligned(
+                        views_from_packed_copy(groups["up"],   _slab_cpu, _gpu_blob), device)
                 else:
                     gpu_gate = {k: v.to(device, non_blocking=True) for k, v in groups["gate"].items()}
                     gpu_down = {k: v.to(device, non_blocking=True) for k, v in groups["down"].items()}

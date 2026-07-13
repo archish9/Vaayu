@@ -393,13 +393,15 @@ def stage_read_expert(shard_file: str, metas: dict, arena):
         if sidx is not None:
             slab = arena.tensor(sidx)
             try:
-                # tensor_align=True: this staged expert will later be
-                # consumed via views_from_packed_copy's one-copy GPU rebuild
-                # (Task 9), which needs every tensor's slab offset to be
-                # _TENSOR_ALIGN-safe for EXL3's uint4* kernel loads.
+                # tensor_align=False (B1): stage RAW — zero CPU copy, exactly
+                # like decode's cache-miss path. The 16-byte alignment EXL3's
+                # uint4* kernel needs is now applied on the GPU by
+                # gpu_repack_aligned in the staged-consume path (moe_patch.py),
+                # off the CPU memory bus the O_DIRECT DMA contends for. This
+                # removes ~142 GB of per-prefill CPU copy_ (+285 GB bus traffic).
                 views = load_expert_into_slab(shard_file, metas, slab,
                                               allow_direct=arena.pin,
-                                              tensor_align=True)
+                                              tensor_align=False)
             except Exception:
                 arena.release(sidx)
                 raise
