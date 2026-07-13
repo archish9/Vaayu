@@ -222,6 +222,25 @@ def compute_chunk_past_lens(chunk_lens: list, past0: int) -> list:
     return out
 
 
+def compute_warmup_ranges(offset_index, checkpoint_path, warm_bytes: int):
+    """Byte ranges to pre-read to prime the NVMe controller's DRAM cache before
+    generation (Task 7). Walks the offset index in order, emitting one
+    (shard_path, file_offset, length) per expert tensor, until the accumulated
+    length reaches warm_bytes. Model-agnostic: derived entirely from the index;
+    warm_bytes is a hardware constant chosen by the caller."""
+    ranges = []
+    total = 0
+    for layer_name, experts in offset_index.index.items():
+        shard = f"{checkpoint_path}/{layer_name}.safetensors"
+        for _eidx, metas in experts.items():
+            for _key, meta in metas.items():
+                ranges.append((shard, meta.file_offset, meta.byte_length))
+                total += meta.byte_length
+                if total >= warm_bytes:
+                    return ranges
+    return ranges
+
+
 def check_lookahead_flag_safe() -> None:
     """Hard-block guard (Task 5 follow-up): VAAYU_LOOKAHEAD=1 is confirmed to
     cause on-device memory corruption (CUDA device-side assert / "probability
@@ -936,6 +955,45 @@ class VaayuBaseModel(GenerationMixin):
             # resident experts to cut NVMe read volume; enable only after a
             # perplexity A/B (see plan Task 6). Model-agnostic: no geometry here.
             self._cache_bias = float(os.environ.get("VAAYU_CACHE_BIAS", "0.0"))
+
+            # NVMe controller warm-up (Task 7): prime the drive's DRAM cache so
+            # token 1 isn't served cold. Fire-and-forget daemon; reads a
+            # hardware-sized budget of the first experts' bytes into a throwaway
+            # buffer and exits. Disabled with VAAYU_NO_WARMUP=1.
+            if (os.environ.get("VAAYU_NO_WARMUP") != "1"
+                    and getattr(self, "_expert_offset_index", None) is not None):
+                # Hardware constant: NVMe controllers cache on the order of
+                # hundreds of MB in on-device DRAM; 512 MB primes it without a
+                # meaningful init delay. Property of the drive, not the model.
+                _WARMUP_BYTES = 512 * 1024 ** 2
+                _warm_ranges = compute_warmup_ranges(
+                    self._expert_offset_index, str(self.checkpoint_path), _WARMUP_BYTES)
+
+                def _nvme_warmup():
+                    _scratch = bytearray(8 * 1024 ** 2)  # reused per read, discarded
+                    _view = memoryview(_scratch)
+                    for _shard, _off, _len in _warm_ranges:
+                        try:
+                            _fd = os.open(_shard, os.O_RDONLY)
+                            try:
+                                _remaining = _len
+                                _pos = _off
+                                while _remaining > 0:
+                                    _chunk = min(_remaining, len(_scratch))
+                                    _n = os.preadv(_fd, [_view[:_chunk]], _pos)
+                                    if _n <= 0:
+                                        break
+                                    _remaining -= _n
+                                    _pos += _n
+                            finally:
+                                os.close(_fd)
+                        except OSError:
+                            continue  # warm-up is best-effort; never fail init
+                    print("[Vaayu-IO] NVMe warm-up complete")
+
+                import threading as _thr
+                _thr.Thread(target=_nvme_warmup, daemon=True).start()
+
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
 
             # Fix #7 follow-up: when the VRAM budget can't hold one token's
@@ -988,7 +1046,15 @@ class VaayuBaseModel(GenerationMixin):
                       f"(Reduce draft_tokens or use a smaller model to re-enable.)")
                 self.speculator = None
 
-        if device.startswith("cuda"):
+        # Dense-only (Task 7 re-scope): MoE now gets the expert-range-scoped
+        # warm-up above (~:938); this whole-layer version stays for dense so
+        # dense keeps a working (if cruder) warm-up path, per CLAUDE.md §0
+        # (dense must keep working; dense perf optimization itself is a
+        # deferred future target, not in scope here). Same VAAYU_NO_WARMUP
+        # flag as the new mechanism so exactly one warm-up path is active per
+        # model type and the flag disables warm-up uniformly.
+        if (device.startswith("cuda") and not self.is_moe
+                and os.environ.get("VAAYU_NO_WARMUP") != "1"):
             self._warmup_nvme()
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
