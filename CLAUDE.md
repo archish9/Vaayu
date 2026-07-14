@@ -7,16 +7,34 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 ## 0. What Vaayu Is (read first — it shapes priorities)
 
 **Vaayu is a low-resource LLM inference engine that will power an autonomous coding
-agent doing loop-engineering** (repeated agentic iterations). It runs **both MoE and
-dense models — the user selects which model to load** (MoE is the harder,
-expert-streaming path much of the current work targets). Dense must keep working:
-**large streamed-dense performance is a planned FUTURE target**, deferred until the
-MoE path is solid. When that work starts, optimize dense WITHOUT regressing MoE —
-the paths are separated (`is_moe` guards); keep the MoE tests green, and treat any
-change to shared infra (staging, prefix cache, NVMe warmup, io_uring) as touching
-both paths. Until then, MoE changes must not silently break dense — a dense
-load+generate smoke test guards that. It is NOT a plain single-user chatbot backend. Two workload facts follow from that
-and shape which optimizations matter:
+agent doing loop-engineering** (repeated agentic iterations). It is **a true
+model-agnostic engine — MoE or dense, EXL3-quantized or not, CUDA or CPU compute
+— the user selects what to load** (see the dispatch table below). MoE-EXL3 on
+CUDA is the actively-tested / perf-tuned path much of the current work targets.
+Dense must keep working: **large streamed-dense performance is a planned FUTURE
+target**, deferred until the MoE path is solid. When that work starts, optimize
+dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
+the MoE tests green, and treat any change to shared infra (staging, prefix
+cache, NVMe warmup, io_uring) as touching both paths. Until then, MoE changes
+must not silently break dense — a dense load+generate smoke test guards that.
+
+**Dispatch table (`vaayu/moe_patch.py:357-424`):**
+
+| Model | Compute | Code path | Status |
+|---|---|---|---|
+| MoE + EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | actively tested |
+| MoE + non-EXL3 (fused) | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | gated in, not perf-tuned |
+| MoE + module-list layout | CUDA or CPU | `_make_modulelist_sparse_forward` | gated in, not perf-tuned |
+| Dense | as configured | non-MoE forward | works, streamed-perf deferred |
+
+The `is_exl3` gate at `moe_patch.py:357` is set from `EXL3LoaderStrategy`
+detection at load time; the `compute_device` gate at `:360` forces CUDA for
+EXL3 (kernel requirement) and honours the requested `device=` otherwise. When
+you touch any of these paths, respect the axis you're on — a "MoE fix" often
+means "MoE-EXL3 fix," not "MoE-in-general fix."
+
+It is NOT a plain single-user chatbot backend. Two workload facts follow from
+that and shape which optimizations matter:
 
 - **Parallel fan-out** — the agent runs multiple inference streams concurrently
   (sub-agents / parallel tool calls). **Aggregate throughput** matters, not just
@@ -90,10 +108,15 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## 5. Model-Agnostic Mandate (Vaayu-specific — NON-NEGOTIABLE)
 
-**Vaayu must run ANY MoE model on low-resource hardware — never one specific model.**
-Current targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5 (62 layers,
-256 experts), selected in `test_generate.py`. More will follow. Any code, plan, or
-fix you produce MUST work for all of them without edits.
+**Vaayu must run ANY model — MoE or dense, EXL3-quantized or not, CUDA or CPU
+compute — on low-resource hardware. Never one specific model, quant format, or
+compute device.** See §0's dispatch table for which code paths currently exist.
+Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5
+(62 layers, 256 experts) — both EXL3-quantized MoE, selected in
+`test_generate.py`. Non-EXL3, dense, and CPU-compute paths are architecturally
+supported (gated by `is_exl3` and the `compute_device` switch) but not actively
+tested on-device today. Any code, plan, or fix you produce MUST work for all of
+them without edits — never assume EXL3, never assume CUDA, never assume MoE.
 
 **Rules — apply to every change and every plan:**
 - **Never hardcode a model number.** Expert byte-size, layer count, expert count,

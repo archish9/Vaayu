@@ -1423,3 +1423,35 @@ for eidx in unique_experts:
   3. Task 5 root cause — cheap to attempt, small upside.
   The suggested diagnostic (force _stager_executor to max_workers=1 and see if the crash signature changes) is a ~10-line code change. If it stops crashing, you've confirmed the worker-vs-worker hypothesis and
    can then decide whether to properly fix it (locks around put_slab/eviction) for a modest +0.1–0.3 tok/s decode win. Low priority — the guard already keeps things safe.
+
+
+------
+
+
+  What Colibri does that Vaayu could steal (interesting)
+
+  Genuinely worth studying for Vaayu:
+
+  1. KV cache persistence (.coli_kv). "Reopen warm via crash-safe file, byte-identical to uninterrupted sessions." Directly adjacent to your prefix-caching plan — this is a shipped implementation of the same
+  idea.
+  2. Learned expert pinning — they keep a .coli_usage histogram of expert access frequency and pin the hot ones. Vaayu's perf review considered this ("heavy-hitter pinning") and deferred it. Colibri
+  implemented it.
+  3. Auto-sized expert cache from MemAvailable at startup with peak-projection headroom to prevent OOM-killer. Vaayu has hardware constants (16 GB VRAM, 8.5 GB expert cache ceiling); dynamic sizing would be
+  more portable.
+  4. CPU AVX2 int4 matmul kernels as a fallback path. Vaayu is EXL3-only, which locks it to CUDA. A CPU fallback would broaden portability significantly.
+
+
+
+  -------
+
+
+  Revised order (my recommendation)
+
+  1. Task 6 A/B — as you planned
+  2. Task 3 diagnostic — as you planned
+  3. ~~Task 5 root cause~~ — skip
+  4. Agent workload brainstorm — moved up; may reprioritize what follows
+  5. Prefix caching + KV persistence (merged) — Colibri #1 folds in here
+  6. Learned expert pinning (Colibri #2) — nicely complements Task 6's routing bias
+  7. Auto-sized expert cache (Colibri #3) — small, easy, do in an odd hour
+  8. CPU AVX2 fallback (Colibri #4) — only if portability is a real requirement; otherwise drop
