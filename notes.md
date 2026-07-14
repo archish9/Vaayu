@@ -1406,3 +1406,20 @@ for eidx in unique_experts:
   only ever hold a few % of the total expert population — that's architecture math, not a bug. Real levers for "actually usable":
   a different/smaller model (fewer total experts, more fits resident), more VRAM/RAM, or a second NVMe striped for aggregate
   bandwidth (hardware ceiling is per-drive; a 2nd drive roughly doubles it).
+-----
+
+
+ Worth completing (real upside)
+
+  1. Task 6 A/B — cheapest and highest expected value.
+  Just three more script runs (~15–30 min total once the model is loaded). Potential 5–10 % decode win, and if none of the biases pass the ppl/miss thresholds you learn that in the same session — no further
+  work needed. This is the clearest "should do."
+
+  2. Task 3 diagnostic — biggest miss on the table.
+  The plan projected TTFT ≈ 19–20 s; you got 27.5 s. That's ~7 s of hoped speedup unaccounted for. This is the largest single lever left in the codebase. But it's a diagnostic task, not a "finish the plan"
+  task — the plan's fix landed correctly; something else in prefill is the real bottleneck. Needs nvidia-smi dmon / on-device profiling to find. If you invest anywhere, invest here — but only when you're on
+  the target machine.
+
+  3. Task 5 root cause — cheap to attempt, small upside.
+  The suggested diagnostic (force _stager_executor to max_workers=1 and see if the crash signature changes) is a ~10-line code change. If it stops crashing, you've confirmed the worker-vs-worker hypothesis and
+   can then decide whether to properly fix it (locks around put_slab/eviction) for a modest +0.1–0.3 tok/s decode win. Low priority — the guard already keeps things safe.
