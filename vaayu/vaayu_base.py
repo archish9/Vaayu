@@ -2214,7 +2214,7 @@ class VaayuBaseModel(GenerationMixin):
 
         # Create attention mask for the largest input, and position ids to use KV cache
         if self._active_attn_impl in ("flash_attention_2", "sdpa"):
-            if _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
+            if getattr(self, '_batch_decode_active', False) and _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
                 from .batch import build_batch_attention_mask
                 _q_len = input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0
                 attention_mask = build_batch_attention_mask(
@@ -2233,7 +2233,7 @@ class VaayuBaseModel(GenerationMixin):
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.
-        if _caller_position_ids is not None:
+        if getattr(self, '_batch_decode_active', False) and _caller_position_ids is not None:
             position_ids = _caller_position_ids.to(self.running_device)
         else:
             if getattr(self, '_position_ids_cache_key', None) != _pos_range:
@@ -2259,7 +2259,7 @@ class VaayuBaseModel(GenerationMixin):
         # the result keyed on the values it was actually computed from; only recompute
         # when one of them changes (e.g. the rare case of outgrowing max_seq_len).
         _rope_cache_key = (_pos_range, self.running_device, self.running_dtype)
-        if _caller_position_ids is not None:
+        if getattr(self, '_batch_decode_active', False) and _caller_position_ids is not None:
             # Per-stream positions: never use the shared-arange cache; compute
             # RoPE directly from [N, S] positions (handles the batch dim natively).
             self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)

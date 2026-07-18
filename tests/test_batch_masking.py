@@ -34,3 +34,9 @@ def test_forward_has_gated_caller_mask_branch():
     assert "_caller_attention_mask" in src
     assert "_caller_position_ids" in src
     assert "build_batch_attention_mask" in src
+    # Guard against the Task-5 bug where plain, non-speculative model.generate()
+    # (which HF auto-populates a 2D attention_mask/position_ids for) silently
+    # activated these batched-decode branches too. The branches must be gated
+    # on an explicit flag that only batched_generate sets, not on raw
+    # parameter identity.
+    assert "_batch_decode_active" in src
