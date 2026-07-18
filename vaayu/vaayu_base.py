@@ -2853,3 +2853,86 @@ class VaayuBaseModel(GenerationMixin):
             streamer.end()
         self.telemetry.dump_json("vaayu_telemetry.json")
         return generated
+
+    @torch.no_grad()
+    def batched_generate(self, requests):
+        """Static multi-query batched decode. Yields (stream_id, token_id) live.
+        requests: list[vaayu.batch.BatchRequest] (already admitted, or pass raw and
+        call plan_batch first). MoE forward is unchanged; batching is this loop
+        plus the gated mask/position path in forward (Task 5)."""
+        from .batch import (sample_step, batch_position_ids)
+        assert self._active_attn_impl == "sdpa", (
+            f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
+        N = len(requests)
+        device = self.running_device
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+
+        max_L = max(len(r.prompt_ids) for r in requests)
+        input_ids = torch.full((N, max_L), pad_id, dtype=torch.long, device=device)
+        pad_mask = torch.zeros((N, max_L), dtype=torch.long, device=device)
+        for i, r in enumerate(requests):
+            L = len(r.prompt_ids)
+            input_ids[i, max_L - L:] = torch.tensor(r.prompt_ids, device=device)
+            pad_mask[i, max_L - L:] = 1
+        position_ids = batch_position_ids(pad_mask)
+
+        eos = self.config.eos_token_id
+        eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
+        stop_sets = [set(r.stop_ids) | eos_set for r in requests]
+        active = [True] * N
+        produced = [0] * N
+
+        # Feature B: only batched_generate ever sets this. It gates the padding
+        # mask / per-stream positions / batched-RoPE branches in forward() (Task
+        # 5) — without it, forward() silently falls through to the single-stream
+        # path on a padded batch, producing wrong results. Must stay True for
+        # every forward() call below (prefill AND decode loop) and must always
+        # be cleared on exit, so it never leaks into a later single-stream call.
+        self._batch_decode_active = True
+        try:
+            # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
+            _saved_chunk = self.prefill_chunk_size
+            self.prefill_chunk_size = 0
+            try:
+                out = self.forward(
+                    input_ids=input_ids, attention_mask=pad_mask,
+                    position_ids=position_ids, use_cache=True, return_dict=True)
+            finally:
+                self.prefill_chunk_size = _saved_chunk
+            past = out.past_key_values
+            logits = out.logits[:, -1, :]           # right edge aligned by left-pad
+
+            next_tokens = torch.empty((N, 1), dtype=torch.long, device=device)
+            for i in range(N):
+                tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
+                next_tokens[i, 0] = tok
+                yield (i, tok)
+                produced[i] = 1
+                if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
+                    active[i] = False
+
+            while any(active):
+                pad_mask = torch.cat(
+                    [pad_mask, torch.ones((N, 1), dtype=torch.long, device=device)], dim=1)
+                position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=1)
+                out = self.forward(
+                    input_ids=next_tokens, past_key_values=past,
+                    attention_mask=pad_mask, position_ids=position_ids,
+                    use_cache=True, return_dict=True)
+                past = out.past_key_values
+                logits = out.logits[:, -1, :]
+                for i in range(N):
+                    if not active[i]:
+                        next_tokens[i, 0] = pad_id      # dead slot, masked; static HoL
+                        continue
+                    tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
+                    next_tokens[i, 0] = tok
+                    yield (i, tok)
+                    produced[i] += 1
+                    if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
+                        active[i] = False
+        finally:
+            self._batch_decode_active = False
+            self.telemetry.dump_json("vaayu_telemetry.json")

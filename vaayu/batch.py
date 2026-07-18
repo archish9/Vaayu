@@ -95,3 +95,42 @@ def build_batch_attention_mask(pad_mask, q_len, dtype, device):
     keep = causal[None, None] & pad_mask.bool()[:, None, None, :]  # [N, 1, q_len, KV]
     mask = torch.zeros(N, 1, q_len, KV, dtype=dtype, device=device)
     return mask.masked_fill(~keep, torch.finfo(dtype).min)
+
+
+def _resolve_kv_elem_bytes(model) -> int:
+    """1 byte (fp8) or 2 (fp16), mirroring VaayuBaseModel._create_kv_cache.
+    Conservative: unknown/auto-non-EXL3 -> 2 (never under-reserves KV)."""
+    mode = getattr(model, "kv_cache_mode", "fp16")
+    if mode == "auto":
+        try:
+            from .persist.loader_strategy import EXL3LoaderStrategy
+            mode = "fp8" if isinstance(getattr(model, "loader_strategy", None),
+                                       EXL3LoaderStrategy) else "fp16"
+        except Exception:
+            mode = "fp16"
+    return 1 if mode == "fp8" else 2
+
+
+def geo_from_model(model) -> tuple:
+    cfg = model.config
+    n_layers = cfg.num_hidden_layers
+    n_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+    head_dim = getattr(cfg, "head_dim", None)
+    if not isinstance(head_dim, int):
+        head_dim = cfg.hidden_size // cfg.num_attention_heads
+    return n_layers, n_kv_heads, head_dim, _resolve_kv_elem_bytes(model)
+
+
+def free_vram_budget(model) -> int:
+    """Live free VRAM minus a hardware safety margin (CUDA context + streaming
+    double-buffer). 1.5 GB is a HARDWARE constant for this box, not a model number."""
+    import torch
+    _SAFETY = int(1.5 * 1024 ** 3)   # hardware constant
+    free, _ = torch.cuda.mem_get_info(model.device)
+    return max(0, free - _SAFETY)
+
+
+def plan_batch(model, requests):
+    n_layers, n_kv_heads, head_dim, elem = geo_from_model(model)
+    return size_batch(requests, free_vram_budget(model),
+                      n_layers, n_kv_heads, head_dim, elem)
