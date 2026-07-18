@@ -77,3 +77,21 @@ def sample_step(logits_row: "torch.Tensor", temperature: float, top_p: float) ->
         choice = torch.multinomial(sorted_probs, 1)
         return int(sorted_idx[choice].item())
     return int(torch.multinomial(probs, 1).item())
+
+
+def batch_position_ids(pad_mask: "torch.Tensor") -> "torch.Tensor":
+    """[N, KV] long positions from a left-pad mask (1=real, 0=pad)."""
+    pos = pad_mask.long().cumsum(-1) - 1
+    return pos.clamp_(min=0)
+
+
+def build_batch_attention_mask(pad_mask, q_len, dtype, device):
+    """Additive float mask [N, 1, q_len, KV] = causal AND key-not-pad.
+    Queries are the LAST q_len positions of KV (right-aligned decode)."""
+    N, KV = pad_mask.shape
+    q_pos = torch.arange(KV - q_len, KV, device=device)[:, None]   # [q_len, 1]
+    k_pos = torch.arange(KV, device=device)[None, :]               # [1, KV]
+    causal = k_pos <= q_pos                                        # [q_len, KV]
+    keep = causal[None, None] & pad_mask.bool()[:, None, None, :]  # [N, 1, q_len, KV]
+    mask = torch.zeros(N, 1, q_len, KV, dtype=dtype, device=device)
+    return mask.masked_fill(~keep, torch.finfo(dtype).min)
