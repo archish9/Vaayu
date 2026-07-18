@@ -27,10 +27,23 @@ flatten to `[B*S, H]`, and `compute_expert_dispatch` (`vaayu/moe_patch.py:89`) b
 permutation over **all** `B*S` routed tokens — one contiguous slice per expert, one
 GEMM per expert over its routed tokens. **No MoE-path change is needed for batching.**
 
-Therefore Feature B is **purely the generation loop, KV management, and VRAM sizing
-around an unchanged forward.** The `self.forward` / MoE sparse-forward closures are not
-touched — which also means the MoE-EXL3 test suite stays green by construction, and the
-dense path keeps working (the loop is model-agnostic; `self.forward` handles both).
+Therefore the **MoE expert-dispatch and GEMM path is unchanged** — the MoE sparse-forward
+closures are not touched, so the MoE-EXL3 suite stays green by construction and the dense
+path keeps working (the loop is model-agnostic).
+
+**One exception — attention masking (discovered during planning, 2026-07-18).** Feature B
+is *not* purely the loop: `forward` for the sdpa/flash path hardcodes `attention_mask=None`
+(`vaayu_base.py:2211`) and builds `position_ids` as a plain `arange` shared across the whole
+batch (`:2224-2227`), **ignoring any caller-supplied mask/positions**. A left-padded batch
+therefore (a) lets real tokens attend to left-pad tokens (no padding mask → pure causal) and
+(b) gives short-prompt streams wrong RoPE positions (pads consume positions 0..P). Both
+corrupt output. So Feature B **adds a gated padding-mask + position_ids path to `forward`**:
+when the caller passes a 2D padding mask and `position_ids`, `forward` builds a 4D
+causal+padding mask (threaded to layers via the existing `get_attention_mask_args` /
+`get_position_ids_args`, which the eager path already uses) and uses the caller's positions;
+when not passed (every existing caller — single-stream, MoE, dense), behavior is
+byte-identical. This is a **gated shared-hot-path change** (~30-50 lines), protected by the
+temp=0 batched==single-stream correctness gate and the MoE-regression + dense-smoke tests.
 
 Two consequences internalized from the prep doc:
 
@@ -141,12 +154,18 @@ model) → WARN and run it alone. Never silently truncate.
 - **Positions / RoPE.** Left-pad aligns the *right* edge, so the current decode column
   is shared across streams and decode is uniform. Real per-stream positions differ
   (shorter prompt = fewer real tokens), so `position_ids` are derived from
-  `attention_mask.cumsum(-1) - 1` and `attention_mask` is passed through **prefill and
-  every decode step** — explicit, because we drive `self.forward` ourselves rather than
-  through HF `generate`.
-- **Attention backend.** Requires **sdpa or flash_attention_2**; eager does not mask
-  left-pad and corrupts output. The entry point asserts the backend — explicit error,
-  never silent degrade.
+  `attention_mask.cumsum(-1) - 1` and both `attention_mask` and `position_ids` are passed
+  through **prefill and every decode step**. **`forward` must be modified to honor them
+  for the sdpa/flash path** (it currently nulls the mask and overrides positions — see §2).
+  The change is gated: only the new mask-supplied branch differs; `None` callers unchanged.
+- **4D mask construction.** When a 2D padding mask `[N, kv_len]` is supplied, `forward`
+  builds a 4D boolean/additive mask `[N, 1, q_len, kv_len]` = causal AND not-pad, sliced by
+  the existing `get_attention_mask_args` (`vaayu_base.py:2057`) and passed to the sdpa
+  layers (which then run with `is_causal=False`). During decode `q_len=1`, `kv_len` grows
+  each step; the mask is rebuilt from the running 2D padding mask (extended by a 1 per step).
+- **Attention backend.** Requires **sdpa or flash_attention_2**; eager builds its own
+  causal-only mask. The entry point asserts the backend — explicit error, never silent
+  degrade.
 - **Pad tokens through MoE.** Pad positions still route and compute in the MoE FFN
   during prefill (extra expert reads), but their hidden states are never attended to
   (masked) → **correct, mildly wasteful.** v1 accepts this; eliding pad routing is a
