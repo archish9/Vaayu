@@ -54,3 +54,8 @@ How to start each — paste this in a NEW session (on the GPU box)
   Run superpowers:brainstorming on Feature B (multi-query batched decode) using                                                  
   docs/superpowers/plans/2026-07-12-vaayu-agent-workload-brainstorm-prep.md.                                                     
   Read §0-§1 and §3, brainstorm from §3's questions, then write a plan.
+
+
+
+
+Execute the plan at docs/superpowers/plans/2026-07-18-vaayu-batched-decode.md using superpowers:subagent-driven-development.
