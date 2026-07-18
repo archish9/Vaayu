@@ -454,6 +454,10 @@ def _make_modulelist_sparse_forward(
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
 
+        if getattr(vaayu_ref, "_batch_n", 1) > 1:
+            vaayu_ref.telemetry.record_batch_overlap(
+                layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
+
         # 2. Load missing experts: ExpertRAMCache → sparse io_uring
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         expert_tensors: dict[int, dict] = {}
@@ -559,6 +563,10 @@ def _make_fused_sparse_forward(
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+
+        if getattr(vaayu_ref, "_batch_n", 1) > 1:
+            vaayu_ref.telemetry.record_batch_overlap(
+                layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
 
         # Load active expert weights: cache → parallel sparse io_uring for misses
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
@@ -739,6 +747,10 @@ def _make_fused_sparse_forward_exl3(
             torch.cuda.synchronize(); _t0 = time.perf_counter()
         expert_indices_cpu = expert_indices.cpu()
         unique_experts: list[int] = unique_expert_indices(expert_indices_cpu)
+
+        if getattr(vaayu_ref, "_batch_n", 1) > 1:
+            vaayu_ref.telemetry.record_batch_overlap(
+                layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
 
         # ── Lookahead routing predictor (Task 12, decode only) ──────────────
         # Phase A (accounting) and Phase B (prefetch) are BOTH gated behind

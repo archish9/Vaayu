@@ -2906,6 +2906,7 @@ class VaayuBaseModel(GenerationMixin):
         # every forward() call below (prefill AND decode loop) and must always
         # be cleared on exit, so it never leaks into a later single-stream call.
         self._batch_decode_active = True
+        self._batch_n = N
         try:
             # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
             _saved_chunk = self.prefill_chunk_size
@@ -2950,4 +2951,5 @@ class VaayuBaseModel(GenerationMixin):
                         active[i] = False
         finally:
             self._batch_decode_active = False
+            self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")

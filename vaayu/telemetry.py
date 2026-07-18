@@ -73,6 +73,17 @@ class VaayuTelemetry:
                 del self.tokens[0]
             self._current_token = None
 
+    def record_batch_overlap(self, layer_idx, union_size, max_possible):
+        if not hasattr(self, "_batch_overlap"):
+            self._batch_overlap = []
+        self._batch_overlap.append((layer_idx, union_size, max_possible))
+
+    def batch_overlap_summary(self):
+        rows = getattr(self, "_batch_overlap", [])
+        ratios = [u / m for _, u, m in rows if m]
+        return {"layers": len(rows),
+                "mean_ratio": (sum(ratios) / len(ratios)) if ratios else 0.0}
+
     def dump_json(self, path: str):
         filepath = self.output_dir / path
         with open(filepath, 'w') as f:
