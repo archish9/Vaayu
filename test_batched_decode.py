@@ -1,26 +1,37 @@
 # test_batched_decode.py
 """On-device: batched decode (Feature B) correctness gate.
 
-Hard requirement (the real regression check): an N>1 batch must run to
-completion without exception -- this exercises the batch-list/mask/position/
-RoPE shape fix (Task 7) and the Task 5/6 gated forward path in general.
+Hard requirement (the ONLY thing this script actually asserts): an N>1
+batch must run to completion without exception -- this exercises the
+batch-list/mask/position/RoPE shape fix (Task 7) and the Task 5/6 gated
+forward path in general. This is a crash regression test, nothing more.
 
-Informational only (NOT asserted): per-step logit-closeness between the
-batched run and a single-stream reference. This stack's greedy decode is NOT
-bit-reproducible run-to-run, even for plain single-stream generation with
-zero batching involved -- confirmed by control_single_stream_repro.py (two
-single-stream calls on the identical prompt diverged at token index 13, a
-~8-12 logit-unit jump, at a rate of ~1 event per 24 steps). Because the
-single-stream "reference" isn't reproducible against itself at a comparable
-magnitude and rate, no per-step logit threshold can distinguish "a batching
-bug" from "the same background nondeterminism sampled more times" (72
-step-comparisons here vs. 24 in the single-stream baseline gives 3x the
-chances to hit the same background event, not evidence of an elevated rate).
-See .superpowers/sdd/task-7-report.md and
+IMPORTANT -- what this script does NOT do: it has NO automated pass/fail
+signal for a non-crashing but functionally WRONG output (e.g. a subtly
+broken mask that runs to completion but attends to the wrong tokens). The
+per-step logit-closeness numbers printed below are diagnostic information
+for a human reader ONLY -- there is no assert on them, and there cannot be,
+per the reasoning below. If you need to catch a silent-wrong-output
+regression, that has to come from code review of the mask/position/RoPE
+math (Tasks 4/5) or a differently-designed test; this script cannot do it.
+
+Why no logit-closeness assert is possible: this stack's greedy decode is NOT
+bit-reproducible run-to-run, even in genuinely pre-existing code with zero
+Feature-B involvement -- confirmed by control_single_stream_repro.py, which
+runs the TRUE legacy path (model.generate(), HF's GenerationMixin, which
+never touches Feature B's _batch_decode_active flag) twice on the identical
+prompt. See that script's own output for the current measured baseline rate
+(SINGLE_STREAM_BASELINE below is kept in sync with it by hand -- rerun the
+control script if you need a fresh number). Because the single-stream
+"reference" isn't reproducible against itself at a comparable magnitude/rate
+even with zero batching code in the picture, no per-step logit threshold can
+distinguish "a batching bug" from "the same background nondeterminism
+sampled more times." See .superpowers/sdd/task-7-report.md and
 docs/superpowers/plans/2026-07-18-decode-nondeterminism-investigation.md for
-the full investigation. The trust anchor for batched-path correctness is the
-code-level mask/position/RoPE math (hand-verified in Tasks 4/5's review) plus
-this script's crash-free completion -- not per-step logit exactness.
+the full investigation and root-cause hypotheses. The trust anchor for
+batched-path correctness is the code-level mask/position/RoPE math
+(hand-verified in Tasks 4/5's review) plus this script's crash-free
+completion -- not per-step logit exactness.
 """
 import torch
 from vaayu import AutoModel
@@ -30,7 +41,9 @@ import vaayu.batch as _batch_mod
 MODEL_PATH = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"  # per test_generate.py
 DEVICE = "cuda"
 TOP1_GAP_REPORT_THRESHOLD = 1.0  # informational bucket line only, see module docstring
-SINGLE_STREAM_BASELINE = "1/24 steps >1.0 gap (control_single_stream_repro.py)"
+SINGLE_STREAM_BASELINE = ("3/24 steps >1.0 top1_gap, max=19.5625 -- TRUE legacy "
+                          "model.generate() path, zero Feature-B code involved "
+                          "(control_single_stream_repro.py)")
 
 model = AutoModel.from_pretrained(MODEL_PATH, device=DEVICE, kv_cache_mode="auto",
                                   prefill_chunk_size=512, attn_implementation="sdpa")

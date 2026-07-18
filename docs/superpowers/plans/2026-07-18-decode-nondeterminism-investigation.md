@@ -13,7 +13,7 @@ Feature B (multi-query batched decode). It does not propose or make a fix.
 
 ## 1. The evidence that triggered this investigation
 
-### 1.1 Control experiment (on-device, `control_single_stream_repro.py`)
+### 1.1 First control experiment attempt — later found flawed (kept for history)
 
 Two single-stream `model.batched_generate([BatchRequest(ids, MAX_NEW)])`
 calls on the *identical* prompt ("Write a Python function that reverses a
@@ -26,8 +26,45 @@ run2=[576, 729, 1265, 1896, 264, 3175, 914, 5693, 323, 470, 279, 27437, 914, 382
 ```
 
 Both greedy (temperature 0). Match through token index 12, diverge at index
-13. Two calls to the exact same code path, same weights, same prompt, same
-process — different output after 13 tokens.
+13.
+
+**CORRECTION:** this was NOT actually an isolating control. `batched_generate`
+**unconditionally sets `self._batch_decode_active = True`, even for a single
+N=1 request** — that flag is what routes `forward()` into Task 5/6's *new*
+explicit additive-mask branch (`build_batch_attention_mask`), not the legacy
+`attention_mask=None`/implicit-causal sdpa path. So this "control" compared
+Feature B's new code against itself twice, not against genuinely
+pre-existing code — it did not actually rule out the new masking path as a
+contributor. See §1.1b for the corrected, genuinely isolating version.
+
+### 1.1b Corrected control experiment: true legacy path (`model.generate()`)
+
+Rewrote `control_single_stream_repro.py` to call `model.generate()` (HF's
+`GenerationMixin.generate` — `vaayu_base.py`'s own `generate()` at line 2765
+is a thin wrapper that just calls `super().generate()`) instead of
+`batched_generate([BatchRequest(...)])`. `model.generate()` never touches
+`_batch_decode_active` at all — this is genuinely pre-existing,
+unmodified-by-this-plan legacy code. Added real per-step logit-gap capture
+via a custom `LogitsProcessor` for a directly comparable `top1_gap` metric
+(matching the method `test_batched_decode.py` uses), instead of an informal
+"diverged at step N" restatement.
+
+Two `model.generate()` calls, identical prompt, zero batching, zero
+Feature-B code:
+
+```
+run1=[576, 729, 1265, 1896, 264, 914, 438, 1946, 323, 470, 279, 27437, 914, 382, 2461, 3110, 11, 421, 279, 1946, 374, 330, 9707, 4337]
+run2=[576, 729, 1265, 1896, 264, 914, 438, 1946, 323, 470, 279, 27437, 914, 382, 2461, 3110, 11, 421, 279, 1946, 914, 374, 330, 9707]
+DIVERGED at index 20.
+legacy model.generate(), true pre-existing code path: 3/24 steps >1.0 top1_gap (max=19.5625)
+```
+
+**3/24 (12.5%)** via the genuine legacy path — the same order of magnitude
+as, and slightly higher than, the batched-vs-single-stream rates measured in
+Task 7 (per-stream: 0/24, 1/24, 3/24; combined 4/72 ≈ 5.6%). This is real,
+solid, *independent* confirmation — not just corroboration of an unrelated
+old note — that the nondeterminism predates Feature B entirely and is not
+attributable to Task 5/6's new explicit-mask sdpa branch.
 
 ### 1.2 Independent prior corroboration (this repo's own history)
 
@@ -99,11 +136,11 @@ layer's forward pass — attention Q/K/V/O projections *and* every MoE
 expert's gate/up/down projections, in every layer, in every forward call,
 whether decode is batched or single-stream, MoE or (hypothetically) dense.
 This is consistent with every piece of evidence in §1: it explains
-divergence in pure single-stream repeated calls (§1.1), it explains why the
-prior, unrelated investigation (§1.2) hit the same wall on a totally
-different code path, and the "long quiet agreement then a sharp jump"
-signature (§1.3) matches a rare, timing-dependent race rather than smooth
-rounding drift.
+divergence in pure single-stream repeated calls through the genuine legacy
+`model.generate()` path (§1.1b), it explains why the prior, unrelated
+investigation (§1.2) hit the same wall on a totally different code path, and
+the "long quiet agreement then a sharp jump" signature (§1.3) matches a
+rare, timing-dependent race rather than smooth rounding drift.
 
 **Caveat:** this is vendored, external CUDA source (`exllamav3` package, not
 part of this repo) — not something this plan can or should patch. `moe_patch.py`'s
