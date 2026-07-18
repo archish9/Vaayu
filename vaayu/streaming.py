@@ -35,14 +35,32 @@ def stream_generate(
         **kwargs
     )
 
-    if getattr(model, 'speculator', None) is not None:
-        thread = Thread(target=model.speculative_generate, kwargs=generation_kwargs)
-    else:
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    target = (model.speculative_generate
+              if getattr(model, 'speculator', None) is not None
+              else model.generate)
 
+    # A background-thread exception (e.g. an io_uring read error) otherwise
+    # only prints via threading's default excepthook and leaves this generator
+    # blocked forever: TextIteratorStreamer's queue.get() has no timeout, and
+    # the stop signal that unblocks it is only pushed by generate()'s own
+    # normal-completion path (on_finalized_text(stream_end=True)), which a
+    # crash never reaches. Catch it, push the stop signal ourselves so the
+    # loop below terminates, then re-raise after join() so the caller sees it.
+    caught: list[BaseException] = []
+
+    def _run():
+        try:
+            target(**generation_kwargs)
+        except BaseException as e:
+            caught.append(e)
+            streamer.text_queue.put(streamer.stop_signal)
+
+    thread = Thread(target=_run)
     thread.start()
 
     for text_chunk in streamer:
         yield text_chunk
 
     thread.join()
+    if caught:
+        raise caught[0]

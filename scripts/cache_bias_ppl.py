@@ -1,10 +1,19 @@
 """
-Full-sequence perplexity + decode-miss A/B for cache-aware routing (Task 6).
+Decode-mode perplexity + RAM-cache-miss A/B for cache-aware routing (Task 6).
 
-Run with VAAYU_CACHE_BIAS unset (baseline) then =0.3, =0.5, =0.8. Compares
-teacher-forcing perplexity on a fixed >=256-token passage, plus RAM-cache
-miss/token during a short decode on the same passage, using the project's
+Run with VAAYU_CACHE_BIAS unset (baseline) then =0.3, =0.5, =0.8. Both metrics
+are measured from the SAME teacher-forced decode loop, using the project's
 existing Qwen model-load path (see test_generate.py).
+
+Why decode mode, not a single full-sequence forward: cache_aware_topk() is
+gated off during prefill (_build_resident_mask returns None whenever
+vaayu_ref._moe_prefill_pass is True — prefill routes ~all experts once, so
+biasing it is a no-op by design). A single `model(ids)` call over the whole
+passage is itself a prefill forward, so VAAYU_CACHE_BIAS can never affect it —
+any such measurement is bias-blind regardless of the bias value. To actually
+exercise the biased routing, the prompt must first be prefilled once, then
+scored one token at a time (each single-token forward is a real decode step,
+same as generation), which is what this script does.
 
 Usage:
     source venv/bin/activate
@@ -19,16 +28,18 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-MODEL_PATH         = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
-KV_CACHE_MODE      = "auto"
-MAX_PINNED_LAYERS  = 10
-PREFILL_CHUNK_SIZE = 512
-MAX_LENGTH         = 2048
-DECODE_TOKENS      = 10  # short decode to sample RAM-miss/token telemetry
+MODEL_PATH          = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
+KV_CACHE_MODE       = "auto"
+MAX_PINNED_LAYERS   = 10
+PREFILL_CHUNK_SIZE  = 512
+MAX_LENGTH          = 2048
+PREFIX_TOKENS       = 48  # real prefill (>1 token) to seed KV cache before scoring
+DECODE_SCORE_TOKENS = 48  # teacher-forced decode steps scored for ppl + miss/token
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -70,35 +81,36 @@ FIXED_TEXT = (
 )
 
 
-def perplexity(model, tokenizer, text, device):
+def decode_mode_eval(model, tokenizer, text, device, prefix_tokens, decode_tokens):
+    """Prefill `prefix_tokens`, then teacher-force `decode_tokens` single-token
+    steps. Each single-token forward is a real decode pass (_moe_prefill_pass
+    False), so cache-aware routing is actually exercised for every scored
+    step. Returns (ppl, ram_miss_per_token_or_None)."""
     ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
-    with torch.no_grad():
-        # forward()'s return_dict defaults to None/falsy -> plain tuple(logits,)
-        # unless explicitly requested; pass return_dict=True for the .logits attr.
-        logits = model(ids, return_dict=True).logits
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = ids[:, 1:].contiguous()
-    loss = torch.nn.functional.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    return math.exp(loss.item())
+    need = prefix_tokens + decode_tokens + 1
+    assert ids.shape[1] >= need, (
+        f"FIXED_TEXT too short: need >= {need} tokens, got {ids.shape[1]}")
 
-
-def miss_per_token(model, tokenizer, text, device, n_tokens):
-    """Short decode on the same passage; returns RAM-cache misses/token delta."""
-    from vaayu.streaming import stream_generate
-    ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
     cache = getattr(model, "_expert_cache", None)
-    if cache is None:
-        return None
-    hits0, misses0 = cache.hits, cache.misses
-    produced = 0
-    for chunk in stream_generate(model, ids, max_new_tokens=n_tokens, temperature=0):
-        if chunk:
-            produced += 1
-    if produced == 0:
-        return None
-    d_miss = cache.misses - misses0
-    return d_miss / produced
+    misses0 = cache.misses if cache is not None else None
+
+    with torch.no_grad():
+        out = model(ids[:, :prefix_tokens], use_cache=True, return_dict=True)
+    past = out.past_key_values
+
+    losses = []
+    for t in range(prefix_tokens, prefix_tokens + decode_tokens):
+        with torch.no_grad():
+            out = model(ids[:, t:t + 1], past_key_values=past,
+                        use_cache=True, return_dict=True)
+        logits_t = out.logits[:, -1, :].float()
+        target = ids[:, t + 1]
+        losses.append(F.cross_entropy(logits_t, target).item())
+        past = out.past_key_values
+
+    ppl = math.exp(sum(losses) / len(losses))
+    mpt = (cache.misses - misses0) / decode_tokens if cache is not None else None
+    return ppl, mpt
 
 
 def main():
@@ -124,14 +136,13 @@ def main():
     assert n_ids >= 256, "FIXED_TEXT must tokenize to >=256 tokens for a stable PPL estimate"
 
     t0 = time.time()
-    ppl = perplexity(model, model.tokenizer, FIXED_TEXT, DEVICE)
-    print(f"[cache_bias_ppl] bias={bias} ppl={ppl:.3f}  (forward took {time.time()-t0:.1f}s)")
-
-    t0 = time.time()
-    mpt = miss_per_token(model, model.tokenizer, FIXED_TEXT, DEVICE, DECODE_TOKENS)
+    ppl, mpt = decode_mode_eval(
+        model, model.tokenizer, FIXED_TEXT, DEVICE, PREFIX_TOKENS, DECODE_SCORE_TOKENS)
+    dt = time.time() - t0
+    print(f"[cache_bias_ppl] bias={bias} ppl={ppl:.3f}  "
+          f"(prefix={PREFIX_TOKENS}, {DECODE_SCORE_TOKENS} decode steps scored, took {dt:.1f}s)")
     if mpt is not None:
-        print(f"[cache_bias_ppl] bias={bias} ram_miss_per_token={mpt:.3f}  "
-              f"(decode of {DECODE_TOKENS} tokens took {time.time()-t0:.1f}s)")
+        print(f"[cache_bias_ppl] bias={bias} ram_miss_per_token={mpt:.3f}")
     else:
         print(f"[cache_bias_ppl] bias={bias} ram_miss_per_token=n/a (no RAM cache on this model)")
 

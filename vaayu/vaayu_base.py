@@ -847,6 +847,13 @@ class VaayuBaseModel(GenerationMixin):
             # can't re-arm the known-corrupting Phase B prefetch path (final
             # whole-branch review finding: closes a guard-bypass window).
             self._lookahead_enabled = os.environ.get("VAAYU_LOOKAHEAD") == "1"
+            # Diagnostic only (Task 3 GIL-contention investigation, not shipped
+            # behavior): when set, logs wall-clock start/end timestamps around
+            # the prefill stager's per-layer reads and the consumer's per-layer
+            # wait/compute, so real overlap can be measured directly instead of
+            # via a ptrace-based profiler (py-spy corrupts this process's
+            # io_uring state — see io_uring_cqe_overflow_bug memory).
+            self._overlap_trace = os.environ.get("VAAYU_OVERLAP_TRACE") == "1"
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
             from .moe_patch import patch_moe_blocks
             import psutil as _psutil
@@ -1753,6 +1760,9 @@ class VaayuBaseModel(GenerationMixin):
                 _arena = self._expert_cache.arena if self._expert_cache is not None else None
                 _staged: dict[int, dict] = {}
                 _slabs: dict[int, "int | None"] = {}
+                if getattr(self, "_overlap_trace", False):
+                    print(f"[VAAYU-OVERLAP] stage_start layer={_block.layer_idx} "
+                          f"t={time.perf_counter():.6f} n_experts={len(_metas_by_e)}")
                 _futs = {
                     self._moe_executor.submit(stage_read_expert, _shard, _m, _arena): _e
                     for _e, _m in _metas_by_e.items()
@@ -1771,6 +1781,9 @@ class VaayuBaseModel(GenerationMixin):
                     except Exception as _stage_err:
                         print(f"[Vaayu-MoE] prefill stage read failed "
                               f"layer={_block.layer_idx} expert={_futs[_f]}: {_stage_err}")
+                if getattr(self, "_overlap_trace", False):
+                    print(f"[VAAYU-OVERLAP] stage_end layer={_block.layer_idx} "
+                          f"t={time.perf_counter():.6f}")
                 if _aborted:
                     # Drain futures that were already running (cancel() only stops
                     # queued ones) and give every acquired slab back to the arena.

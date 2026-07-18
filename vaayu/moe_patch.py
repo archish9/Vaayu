@@ -809,10 +809,17 @@ def _make_fused_sparse_forward_exl3(
                 and getattr(vaayu_ref, "_prefill_stager_active", False)):
             _ev = vaayu_ref._prefill_stage_events.get(layer_idx)
             if _ev is not None:
+                if getattr(vaayu_ref, "_overlap_trace", False):
+                    print(f"[VAAYU-OVERLAP] wait_start layer={layer_idx} "
+                          f"t={time.perf_counter():.6f}")
                 _w0 = time.perf_counter()
                 _ev.wait()
-                _stall = time.perf_counter() - _w0
+                _w1 = time.perf_counter()
+                _stall = _w1 - _w0
                 vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
+                if getattr(vaayu_ref, "_overlap_trace", False):
+                    print(f"[VAAYU-OVERLAP] wait_end layer={layer_idx} "
+                          f"t={_w1:.6f} stall={_stall:.6f}")
                 # Chunk-major prefill runs this layer once per chunk: PEEK the
                 # staged dict; pop + release only on the final chunk's call.
                 _n_calls = getattr(vaayu_ref, "_chunk_major_n", None) or 1
@@ -955,6 +962,9 @@ def _make_fused_sparse_forward_exl3(
         if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
             _vram = None
 
+        if getattr(vaayu_ref, "_overlap_trace", False):
+            print(f"[VAAYU-OVERLAP] compute_start layer={layer_idx} "
+                  f"t={time.perf_counter():.6f} n_experts={len(unique_experts)}")
         try:
             for eidx, raw in _iter_experts_hits_then_misses():
                 groups = _group_exl3_tensors_by_weight(raw)
@@ -1113,6 +1123,10 @@ def _make_fused_sparse_forward_exl3(
             # rest (VRAM hits, skipped/continued experts, exceptions).
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+
+        if getattr(vaayu_ref, "_overlap_trace", False):
+            print(f"[VAAYU-OVERLAP] compute_end layer={layer_idx} "
+                  f"t={time.perf_counter():.6f}")
 
         if intermediate_size is None:
             _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx}: cannot determine intermediate_size, returning zeros")

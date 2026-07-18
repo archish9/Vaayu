@@ -73,7 +73,13 @@ _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concu
 import queue as _queue
 _EXPERT_BUF_POOL: "_queue.Queue[torch.Tensor]" = _queue.Queue()
 _EXPERT_PINNED_SIZE = 0
-_EXPERT_POOL_N = 8  # cap on pool size; actual size is RAM-budgeted, see init_model_io
+_EXPERT_POOL_N = 8  # cap on pool size; actual size is RAM-budgeted, see init_model_io.
+                    # Tried raising to 32 (2026-07-18, matching the ring's QD32) to test
+                    # whether the pool cap was starving the ring: on-device A/B showed
+                    # n=16 (RAM-budget-limited before hitting 32) made TTFT WORSE
+                    # (24.9s->28.9s total, 27.3s->31.4s TTFT) — reverted. Root cause of
+                    # the prefill disk/compute serialization is NOT pool size; see
+                    # moe_perf_rootcause memory for the live investigation.
 _EXPERT_POOL_ACTUAL_N = 1  # actual buffer count allocated, set by init_model_io
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring_pool() succeeds
