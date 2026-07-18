@@ -533,7 +533,8 @@ class VaayuBaseModel(GenerationMixin):
                  hf_token=None, prefetching=True, delete_original=False,
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
-                 drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False):
+                 drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
+                 attn_implementation=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -584,6 +585,7 @@ class VaayuBaseModel(GenerationMixin):
 
         self.compression = compression
         self.hf_token = hf_token
+        self._forced_attn_impl = attn_implementation
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -1245,13 +1247,16 @@ class VaayuBaseModel(GenerationMixin):
         self.model = None
         self._active_attn_impl = None
 
-        attn_candidates = []
-        try:
-            import flash_attn
-            attn_candidates.append("flash_attention_2")
-        except ImportError:
-            pass
-        attn_candidates.extend(["sdpa", "eager"])
+        if getattr(self, "_forced_attn_impl", None):
+            attn_candidates = [self._forced_attn_impl]
+        else:
+            attn_candidates = []
+            try:
+                import flash_attn
+                attn_candidates.append("flash_attention_2")
+            except ImportError:
+                pass
+            attn_candidates.extend(["sdpa", "eager"])
 
         if self.get_use_better_transformer() and better_transformer_available:
             try:
@@ -2207,7 +2212,17 @@ class VaayuBaseModel(GenerationMixin):
         # so element j attends over chunks 0..j-1 + itself — same causal semantics
         # as the legacy per-chunk loop, but each layer's experts load only once.
         _chunk_lens = getattr(self, "_chunk_major_lens", None)
-        batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
+        if getattr(self, '_batch_decode_active', False):
+            # Feature B: input_ids' leading dim is N independent streams (real
+            # batch), not sequential chunks of one sequence — the per-row split
+            # below would call layer() once per stream at batch=1 each, while
+            # Task 5's mask/position tensors keep their real batch-N shape,
+            # silently mismatching inside attention. Keep the whole N-batch
+            # tensor as a single element so layer() is called once with its
+            # true batch dimension intact.
+            batch = [input_ids.to(self.running_device)]
+        else:
+            batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
         _seq_total = (sum(_chunk_lens) if _chunk_lens
                       else (input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0))
