@@ -78,6 +78,9 @@ class VaayuTelemetry:
             self._batch_overlap = []
         self._batch_overlap.append((layer_idx, union_size, max_possible))
 
+    def reset_batch_overlap(self):
+        self._batch_overlap = []
+
     def batch_overlap_summary(self):
         rows = getattr(self, "_batch_overlap", [])
         ratios = [u / m for _, u, m in rows if m]

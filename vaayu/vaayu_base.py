@@ -2763,6 +2763,8 @@ class VaayuBaseModel(GenerationMixin):
                     cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 
     def generate(self, *args, **kwargs):
+        self._batch_decode_active = False
+        self._batch_n = 1
         result = super().generate(*args, **kwargs)
         self.telemetry.dump_json("vaayu_telemetry.json")
         return result
@@ -2787,6 +2789,9 @@ class VaayuBaseModel(GenerationMixin):
             generated: (1, prompt_len + new_tokens) tensor of all token IDs
         """
         assert self.speculator is not None, "speculative_generate called with no speculator"
+
+        self._batch_decode_active = False
+        self._batch_n = 1
 
         # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
         prefill_out = self.forward(
@@ -2874,7 +2879,15 @@ class VaayuBaseModel(GenerationMixin):
         """Static multi-query batched decode. Yields (stream_id, token_id) live.
         requests: list[vaayu.batch.BatchRequest] (already admitted, or pass raw and
         call plan_batch first). MoE forward is unchanged; batching is this loop
-        plus the gated mask/position path in forward (Task 5)."""
+        plus the gated mask/position path in forward (Task 5).
+
+        Contract: callers must fully consume this generator (or explicitly
+        call .close() on it). Abandoning it mid-iteration leaves the model in
+        batched-decode mode (self._batch_decode_active/_batch_n) until Python
+        garbage-collects the generator and runs the finally block below.
+        generate()/speculative_generate() defensively reset both flags at
+        entry so a leaked flag can't corrupt those call paths, but relying on
+        GC timing here is still not clean design."""
         from .batch import (sample_step, batch_position_ids)
         assert self._active_attn_impl == "sdpa", (
             f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
@@ -2907,6 +2920,7 @@ class VaayuBaseModel(GenerationMixin):
         # be cleared on exit, so it never leaks into a later single-stream call.
         self._batch_decode_active = True
         self._batch_n = N
+        self.telemetry.reset_batch_overlap()
         try:
             # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
             _saved_chunk = self.prefill_chunk_size
