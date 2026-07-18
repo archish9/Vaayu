@@ -15,6 +15,11 @@ this stack's greedy decode is not bit-reproducible run-to-run even with zero
 batching involved — treat exact timings as one sample, not a tight bound;
 re-running would show some variance.
 
+## Known Limitations (v1)
+
+- The on-device correctness gate this document reports on provides no automated pass/fail signal for a non-crashing wrong-output regression — only a crash fails it; per-step logit-gap comparison (per the nondeterminism note above) is diagnostic only.
+- On this box+model, `plan_batch` always collapses to N=1 once the expert cache is warm (see §4 summary table) — the 1.31x aggregate throughput win below was measured by bypassing `plan_batch`, so it's a capability demonstration, not a production-realistic number on this specific hardware today.
+
 ---
 
 ## §0. Pre-existing bug found + fixed (out of Feature B, required to run Part 1)
@@ -206,8 +211,8 @@ from `plan_batch`'s decision).
 ```
 model.telemetry.batch_overlap_summary() = {'layers': 2256, 'mean_ratio': 0.9274}
 ```
-`2256 = 94 layers x 24 decode steps` — one overlap sample per MoE layer per
-decode step, as expected. Per the Task 8 design contract
+`2256 = 94 layers x 24 forwards (1 prefill + 23 decode steps)` — one overlap
+sample per MoE layer per forward, as expected. Per the Task 8 design contract
 (`docs/superpowers/plans/2026-07-18-vaayu-batched-decode.md` §Task 8):
 ratio → 1 means divergent routing across streams (small win expected);
 ratio → `top_k / (N*top_k)` = 1/3 ≈ 0.333 means high overlap (near-3x disk

@@ -8,6 +8,11 @@
 
 **Tech Stack:** Python, PyTorch (sdpa attention), pytest. Reference spec: `docs/superpowers/specs/2026-07-18-vaayu-batched-decode-design.md`.
 
+## Known Limitations (v1)
+
+- The on-device correctness gate (`test_batched_decode.py`, Task 7) has no automated pass/fail signal for a non-crashing wrong-output regression — only a crash fails it. Per-step logit-gap comparison is diagnostic/informational only, a deliberate tradeoff after discovering this stack's greedy decode has genuine pre-existing run-to-run nondeterminism unrelated to Feature B (see `docs/superpowers/plans/2026-07-18-decode-nondeterminism-investigation.md`).
+- On the actively-tested box+model (Qwen3-235B EXL3, RTX 5060 Ti 16GB), `plan_batch` always collapses to N=1 once the expert cache is warm (free VRAM below the 1.5GB safety margin). Task 9's measured 1.31x aggregate throughput win was obtained by bypassing `plan_batch`, so it's a capability demonstration, not a production-realistic number on this specific hardware today.
+
 ## Global Constraints
 
 Copied verbatim from the spec / CLAUDE.md §5 — every task implicitly includes these:
