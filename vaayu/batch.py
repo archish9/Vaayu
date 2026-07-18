@@ -6,6 +6,8 @@ All sizing is DERIVED from model geometry — see CLAUDE.md §5.
 import warnings
 from dataclasses import dataclass, field
 
+import torch
+
 
 @dataclass
 class BatchRequest:
@@ -57,3 +59,21 @@ def size_batch(requests, budget_bytes, n_layers, n_kv_heads, head_dim, elem_byte
             "batched decode: context too long to batch — running single-stream",
             UserWarning, stacklevel=2)
     return admitted, deferred
+
+
+def sample_step(logits_row: "torch.Tensor", temperature: float, top_p: float) -> int:
+    """Sample one token id from a 1-D logits row. Greedy when temperature <= 0."""
+    if temperature <= 0.0:
+        return int(logits_row.argmax().item())
+    probs = torch.softmax(logits_row / temperature, dim=-1)
+    if top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cum = torch.cumsum(sorted_probs, dim=-1)
+        drop = cum > top_p
+        drop[..., 1:] = drop[..., :-1].clone()   # keep the first token crossing top_p
+        drop[..., 0] = False
+        sorted_probs = sorted_probs.masked_fill(drop, 0.0)
+        sorted_probs = sorted_probs / sorted_probs.sum()
+        choice = torch.multinomial(sorted_probs, 1)
+        return int(sorted_idx[choice].item())
+    return int(torch.multinomial(probs, 1).item())
