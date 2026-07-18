@@ -2175,6 +2175,12 @@ class VaayuBaseModel(GenerationMixin):
         _exec_start = time.time()
         self.telemetry.begin_token(self._token_count)
 
+        # Feature B: capture caller-supplied batched mask/positions BEFORE the
+        # sdpa branch nulls them. When present, forward builds a per-stream 4D
+        # padding+causal mask and uses per-stream positions (left-padded batch).
+        _caller_attention_mask = attention_mask
+        _caller_position_ids = position_ids
+
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
 
@@ -2208,7 +2214,14 @@ class VaayuBaseModel(GenerationMixin):
 
         # Create attention mask for the largest input, and position ids to use KV cache
         if self._active_attn_impl in ("flash_attention_2", "sdpa"):
-            attention_mask = None
+            if _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
+                from .batch import build_batch_attention_mask
+                _q_len = input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0
+                attention_mask = build_batch_attention_mask(
+                    _caller_attention_mask, _q_len,
+                    dtype=self.running_dtype, device=self.running_device)
+            else:
+                attention_mask = None
         else:
             attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
             attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
@@ -2220,11 +2233,14 @@ class VaayuBaseModel(GenerationMixin):
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.
-        if getattr(self, '_position_ids_cache_key', None) != _pos_range:
-            self._position_ids_cache = torch.arange(
-                _pos_range, dtype=torch.long, device=self.running_device)[None, :]
-            self._position_ids_cache_key = _pos_range
-        position_ids = self._position_ids_cache
+        if _caller_position_ids is not None:
+            position_ids = _caller_position_ids.to(self.running_device)
+        else:
+            if getattr(self, '_position_ids_cache_key', None) != _pos_range:
+                self._position_ids_cache = torch.arange(
+                    _pos_range, dtype=torch.long, device=self.running_device)[None, :]
+                self._position_ids_cache_key = _pos_range
+            position_ids = self._position_ids_cache
 
         # Pre-compute RoPE position embeddings for the full sequence length.
         # Transformers >= 4.45 moved this computation to the top-level model forward;
@@ -2243,7 +2259,12 @@ class VaayuBaseModel(GenerationMixin):
         # the result keyed on the values it was actually computed from; only recompute
         # when one of them changes (e.g. the rare case of outgrowing max_seq_len).
         _rope_cache_key = (_pos_range, self.running_device, self.running_dtype)
-        if getattr(self, '_rope_cache_key', None) != _rope_cache_key:
+        if _caller_position_ids is not None:
+            # Per-stream positions: never use the shared-arange cache; compute
+            # RoPE directly from [N, S] positions (handles the batch dim natively).
+            self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
+            self._rope_cache_key = None
+        elif getattr(self, '_rope_cache_key', None) != _rope_cache_key:
             if self.get_rotary_emb() is not None:
                 try:
                     # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.

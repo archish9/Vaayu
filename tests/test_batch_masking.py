@@ -1,5 +1,7 @@
+import inspect
 import torch
 from vaayu.batch import build_batch_attention_mask, batch_position_ids
+import vaayu.vaayu_base as vb
 
 NEG = torch.finfo(torch.float32).min
 
@@ -23,3 +25,12 @@ def test_decode_mask_single_query():
     assert m.shape == (1, 1, 1, 4)
     # last query attends all real keys, not the pad
     assert m[0, 0, 0].tolist() == [NEG, 0.0, 0.0, 0.0]
+
+def test_forward_has_gated_caller_mask_branch():
+    """Guard: forward must branch on a captured caller mask/position, not
+    unconditionally null them. Prevents a regression that silently reverts
+    left-pad support."""
+    src = inspect.getsource(vb.VaayuBaseModel.forward)
+    assert "_caller_attention_mask" in src
+    assert "_caller_position_ids" in src
+    assert "build_batch_attention_mask" in src
