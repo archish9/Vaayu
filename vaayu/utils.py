@@ -420,7 +420,9 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     # try local model path, if the model exist split and save there
     if os.path.exists(model_local_path_or_repo_id):
         if os.path.exists(Path(model_local_path_or_repo_id) / 'pytorch_model.bin.index.json') or \
-           os.path.exists(Path(model_local_path_or_repo_id) / 'model.safetensors.index.json'):
+           os.path.exists(Path(model_local_path_or_repo_id) / 'model.safetensors.index.json') or \
+           os.path.exists(Path(model_local_path_or_repo_id) / 'model.safetensors') or \
+           os.path.exists(Path(model_local_path_or_repo_id) / 'pytorch_model.bin'):
             print(f"found index file...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
                                                                             compression=compression, layer_names=layer_names, delete_original=delete_original)
