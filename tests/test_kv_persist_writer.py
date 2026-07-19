@@ -1,6 +1,7 @@
 """DiskWriter: append grows nrec, nrec-last crash safety, truncate mirror."""
 import builtins
 import os
+import threading
 import types
 import torch
 import pytest
@@ -69,11 +70,15 @@ def test_truncate_mirror(tmp_path):
 # --- Fix-round regression tests (task-3 reviewer findings #1-#7) ---
 
 
-def test_failed_append_rolls_back_nrec_so_next_append_retries(tmp_path, monkeypatch):
-    """A worker-side append failure must roll back the in-memory nrec so the
-    NEXT append for the same session retries the failed range from scratch,
-    instead of leaving on-disk nrec pointing past a gap of never-written
-    bytes that a reader would trust as real data (finding #1)."""
+def test_failed_append_leaves_nrec_unadvanced_so_next_append_retries(tmp_path, monkeypatch):
+    """A worker-side append failure must leave the in-memory nrec unadvanced so
+    the NEXT append for the same session retries the failed range from scratch,
+    instead of leaving on-disk nrec pointing past a gap of never-written bytes
+    that a reader would trust as real data (finding #1). Under the redesign nrec
+    only ever advances in the worker on a confirmed write, so a failure simply
+    never advances it -- there is nothing to roll back (this test previously
+    asserted a rollback; the observable behavior is identical, the mechanism is
+    now failure-never-advances rather than advance-then-roll-back)."""
     w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
     cfg = types.SimpleNamespace(vocab_size=1000)
     c = _cache(seq=12)
@@ -110,33 +115,42 @@ def test_failed_append_rolls_back_nrec_so_next_append_retries(tmp_path, monkeypa
     assert got_toks == toks[:10]   # every position holds real data, no gap
 
 
-def test_truncate_and_remove_submit_while_holding_lock(tmp_path, monkeypatch):
-    """enqueue_truncate/remove must submit to the worker pool while still
-    holding self._lock (matching enqueue_append's commit section), so the
-    single-worker FIFO queue always processes tasks in the same order their
-    callers committed the corresponding _state change -- not the order calls
-    happen to reach pool.submit() after releasing the lock (finding #2)."""
+def test_truncate_and_remove_submit_while_holding_session_lock(tmp_path, monkeypatch):
+    """enqueue_truncate/remove must submit to the worker pool while still holding
+    the SESSION's lock (st["lock"]) -- the lock that now serializes a session's
+    operations against enqueue_append -- so the single-worker FIFO queue always
+    processes tasks in the same order their callers committed the corresponding
+    _state change, not the order calls happen to reach pool.submit() after
+    releasing a lock (finding #2, re-verified under the per-session-lock redesign).
+    Note self._lock (global) is deliberately NOT held at submit time now: it only
+    guards the _state dict structure, so it must not serialize disk IO."""
     w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
     cfg = types.SimpleNamespace(vocab_size=1000)
     c = _cache(seq=6)
     w.enqueue_append("s1", c, cfg, [1, 2, 3, 4, 5, 6], 6)
     w.drain()
 
-    held_at_submit = []
+    # Capture the session's own lock object -- remove() pops "s1" from _state
+    # before it submits, so we can't look it up via _state at submit time.
+    lock_s1 = w._state["s1"]["lock"]
+    held_session = []
+    held_global = []
     real_submit = w._pool.submit
 
     def spy_submit(fn, *a, **kw):
-        held_at_submit.append(w._lock.locked())
+        held_session.append(lock_s1.locked())
+        held_global.append(w._lock.locked())
         return real_submit(fn, *a, **kw)
 
     monkeypatch.setattr(w._pool, "submit", spy_submit)
-    w.enqueue_truncate("s1", 3)
-    w.remove("s2")
+    w.enqueue_truncate("s1", 3)   # submits _do_truncate while holding st["lock"]
+    w.remove("s1")                # submits _do_remove while holding st["lock"]
     monkeypatch.setattr(w._pool, "submit", real_submit)  # stop spying before drain()
 
     w.drain()
     w.close()
-    assert held_at_submit == [True, True]
+    assert held_session == [True, True]   # both submit under the session lock
+    assert held_global == [False, False]  # and NOT under the global lock
 
 
 def test_enforce_budget_snapshot_taken_under_lock(tmp_path, monkeypatch):
@@ -251,3 +265,105 @@ def test_pack_failure_does_not_propagate_to_caller(tmp_path, capsys):
     w.close()
 
     assert "pack failed" in capsys.readouterr().out
+
+
+# --- Second fix round (redesign) regression tests: Repro A + Repro B ---
+
+
+def test_pipelined_append_after_failed_write_has_no_gap(tmp_path, monkeypatch):
+    """Repro A: turn 2's enqueue_append is issued BEFORE turn 1's failed
+    background write is processed -- no drain() between them, which is the normal
+    pipelined case (turn 2 doesn't wait for turn 1's disk IO). Because nrec now
+    advances only on a CONFIRMED worker success (never optimistically in the
+    caller), turn 2 re-reads the true committed start (0) and re-packs the full
+    range, so the final file has real data at every position -- no zero-byte gap
+    that a reader would trust as valid KV state."""
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    c = _cache(seq=12)
+    toks = list(range(101, 113))   # distinctive, non-zero token ids
+    target = w.path_for("s1")
+
+    real_open = builtins.open
+    fail_box = {"armed": True}
+
+    def flaky_open(file, *a, **kw):
+        # Fail only the FIRST open of the target file (turn 1's worker write).
+        if fail_box["armed"] and file == target:
+            fail_box["armed"] = False
+            raise OSError("simulated disk failure")
+        return real_open(file, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+
+    # Two appends for the SAME session with NO drain() between: turn 1 (len 6)
+    # fails on the worker; turn 2 (len 10) is enqueued before that failure lands.
+    w.enqueue_append("s1", c, cfg, toks[:6], 6)
+    w.enqueue_append("s1", c, cfg, toks[:10], 10)
+    w.drain()
+    w.close()
+
+    with open(target, "rb") as f:
+        h = kp.read_header(f)
+        got_toks, _ = kp.read_records(f, h)
+    assert h.nrec == 10
+    assert got_toks == toks[:10]   # every position holds real data, no gap
+
+
+def test_remove_racing_paused_append_leaves_no_gap(tmp_path, monkeypatch):
+    """Repro B: remove() is issued WHILE an enqueue_append for the same session
+    is paused mid-critical-section (mid-pack). The per-session lock must make
+    remove wait until the append has submitted its write, so on the single-worker
+    FIFO the delete is ordered AFTER the append -- the file ends deleted, never
+    recreated with a leading zero-byte gap from a stale start captured before the
+    remove."""
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    c = _cache(seq=6)
+
+    # Seed a committed prefix so the session has an st entry (and a file).
+    w.enqueue_append("s1", c, cfg, [1, 2, 3, 4], 4)
+    w.drain()
+
+    pack_entered = threading.Event()
+    release_pack = threading.Event()
+    real_pack_record = kp.pack_record
+
+    def blocking_pack_record(*a, **kw):
+        pack_entered.set()          # signal: append is inside its critical section
+        release_pack.wait(5)        # hold the session lock until the test says go
+        return real_pack_record(*a, **kw)
+
+    monkeypatch.setattr(kp, "pack_record", blocking_pack_record)
+
+    # Thread A: a second append that blocks inside packing while holding st["lock"].
+    def do_append():
+        w.enqueue_append("s1", c, cfg, [1, 2, 3, 4, 5, 6], 6)
+
+    ta = threading.Thread(target=do_append)
+    ta.start()
+    assert pack_entered.wait(5)     # append is now paused mid-pack, holding st["lock"]
+
+    # Thread B: remove() must BLOCK on st["lock"] until the append releases it.
+    removed = threading.Event()
+
+    def do_remove():
+        w.remove("s1")
+        removed.set()
+
+    tb = threading.Thread(target=do_remove)
+    tb.start()
+    assert not removed.wait(0.3)    # remove is excluded while append holds st["lock"]
+
+    # Release the append: it finishes packing + submits, then frees st["lock"].
+    release_pack.set()
+    ta.join(5)
+    assert removed.wait(5)          # remove now proceeds, ordered after the append
+
+    monkeypatch.setattr(kp, "pack_record", real_pack_record)
+    w.drain()
+    w.close()
+
+    # FIFO order was append-then-remove -> the file ends deleted (no gapped
+    # recreate). No orphaned file with zero-byte positions can exist.
+    assert not os.path.exists(w.path_for("s1"))

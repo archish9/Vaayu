@@ -169,43 +169,56 @@ class DiskWriter:
         self.sync = sync
         os.makedirs(self.dir, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1)
-        self._lock = threading.Lock()
-        self._state = {}   # sid -> {"header": KvHeader, "nrec": int}
+        self._lock = threading.Lock()   # guards _state dict structure only
+        self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock}
 
     def path_for(self, session_id: str) -> str:
         h = hashlib.sha1(session_id.encode("utf-8")).hexdigest()
         return os.path.join(self.dir, f"{h}.vaayu_kv")
 
     def enqueue_append(self, session_id, cache, config, token_ids, length):
+        # self._lock (global) only guards the _state dict structure: atomically
+        # look up or create this session's entry -- including its per-session
+        # lock -- so two threads can't race to install two different locks for a
+        # new session.
         with self._lock:
             st = self._state.get(session_id)
             if st is None:
-                st = {"header": build_header(cache, config, session_id, 0), "nrec": 0}
+                st = {"header": build_header(cache, config, session_id, 0),
+                      "nrec": 0, "lock": threading.Lock()}
                 self._state[session_id] = st
+        # st["lock"] (per-session) makes read-start / pack / submit one atomic
+        # critical section for THIS session only -- different sessions still pack
+        # fully in parallel (the parallel-fan-out case; pack_record does real
+        # .cpu()/.contiguous() work and never runs under the GLOBAL lock).
+        # nrec is NOT advanced here: it only moves forward in _do_append on a
+        # confirmed write, so a pipelined next turn re-reads the true committed
+        # start and can never leave a zero-byte gap (Repro A).
+        with st["lock"]:
             start = st["nrec"]
             if length <= start:
                 return
             hdr = st["header"]
-        # Pack outside the lock: real CPU/copy work (pack_record does .cpu()/
-        # .contiguous()). The RAM prefix-cache's own documented invariant (one
-        # in-flight request per session id -- see vaayu_base.py generate()'s
-        # comment) means no two calls for the SAME session_id race here.
-        # Different sessions packing concurrently is exactly the
-        # parallel-fan-out case that must not be serialized behind one lock.
-        try:
-            blob = b"".join(pack_record(cache, p, token_ids[p], hdr)
-                            for p in range(start, length))
-        except Exception as e:
-            print(f"[KV] pack failed for {session_id}: {e}")
-            return
-        with self._lock:
-            st["nrec"] = length
+            try:
+                blob = b"".join(pack_record(cache, p, token_ids[p], hdr)
+                                for p in range(start, length))
+            except Exception as e:
+                print(f"[KV] pack failed for {session_id}: {e}")
+                return
             self._pool.submit(self._do_append, session_id, hdr, start, blob, length)
 
     def enqueue_truncate(self, session_id, match_len):
         with self._lock:
             st = self._state.get(session_id)
-            if st is None or match_len >= st["nrec"]:
+        if st is None:
+            return
+        # st["lock"] serializes this truncate against the same session's appends
+        # (Repro B). Unlike append, truncate's nrec update stays optimistic in
+        # the caller: a failed disk truncate just leaves the older, larger-but-
+        # gap-free file, which is within the documented non-sync durability risk
+        # -- not a gap-class bug, so it needs no confirmed-write handshake.
+        with st["lock"]:
+            if match_len >= st["nrec"]:
                 return
             st["nrec"] = match_len
             hdr = st["header"]
@@ -213,7 +226,20 @@ class DiskWriter:
 
     def remove(self, session_id):
         with self._lock:
-            self._state.pop(session_id, None)
+            st = self._state.get(session_id)
+        if st is not None:
+            # Take the session lock BEFORE popping/submitting so a remove can't
+            # interleave with an in-flight append/truncate critical section for
+            # the same session: once we hold st["lock"], any such op has already
+            # submitted, so the delete is ordered after it on the FIFO worker
+            # queue -- no stale-start recreate of a gapped file (Repro B).
+            with st["lock"]:
+                with self._lock:
+                    self._state.pop(session_id, None)
+                self._pool.submit(self._do_remove, session_id)
+        else:
+            # No tracked session (e.g. a stale file from a previous process);
+            # nothing can be mid-critical-section for it, so just delete.
             self._pool.submit(self._do_remove, session_id)
 
     def drain(self):
@@ -241,17 +267,17 @@ class DiskWriter:
                 f.flush()
                 if self.sync:
                     os.fsync(f.fileno())
+            # Advance nrec ONLY now, on a confirmed durable write. The caller
+            # never set it optimistically, so a failure below leaves nrec
+            # untouched -- nothing to roll back, and a pipelined next append
+            # re-covers this range from the true committed start (Repro A).
+            with self._lock:
+                st = self._state.get(sid)
+                if st is not None:
+                    st["nrec"] = new_nrec
             self._enforce_budget()
         except Exception as e:
             print(f"[KV] append failed for {sid}: {e}")
-            # Roll back so the next append for this session naturally retries
-            # the failed range -- but only if no later append has already
-            # advanced nrec past this one (that later write already covers
-            # this range, or is itself in flight; don't clobber it).
-            with self._lock:
-                st = self._state.get(sid)
-                if st is not None and st["nrec"] == new_nrec:
-                    st["nrec"] = start
 
     def _do_truncate(self, sid, hdr, match_len):
         try:
