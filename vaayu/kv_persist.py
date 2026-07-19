@@ -105,3 +105,50 @@ def to_bytes(t: torch.Tensor) -> bytes:
 def from_bytes(buf: bytes, dt: torch.dtype, shape) -> torch.Tensor:
     u = torch.frombuffer(bytearray(buf), dtype=torch.uint8)
     return u.view(dt).reshape(shape)
+
+
+def pack_record(cache, pos: int, token_id: int, h: KvHeader) -> bytes:
+    out = bytearray()
+    out += struct.pack("<i", int(token_id))
+    for L in range(h.num_layers):
+        out += to_bytes(cache.key_cache[L][0, :, pos, :])
+        out += to_bytes(cache.value_cache[L][0, :, pos, :])
+        out += to_bytes(cache._key_scales[L][0, :, pos, :])
+        out += to_bytes(cache._value_scales[L][0, :, pos, :])
+    return bytes(out)
+
+
+def read_records(f, h: KvHeader):
+    H, D, Ln, nrec = h.num_kv_heads, h.head_dim, h.num_layers, h.nrec
+    kdt, sdt = code_dtype(h.kv_dtype_code), code_dtype(h.scale_dtype_code)
+    kb = H * D * _DTYPE_SIZE[kdt]
+    sb = H * 1 * _DTYPE_SIZE[sdt]
+    key = [torch.zeros((1, H, nrec, D), dtype=kdt) for _ in range(Ln)]
+    val = [torch.zeros((1, H, nrec, D), dtype=kdt) for _ in range(Ln)]
+    ks = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)]
+    vs = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)]
+    toks = []
+    for p in range(nrec):
+        toks.append(struct.unpack("<i", f.read(4))[0])
+        for L in range(Ln):
+            key[L][0, :, p, :] = from_bytes(f.read(kb), kdt, (H, D))
+            val[L][0, :, p, :] = from_bytes(f.read(kb), kdt, (H, D))
+            ks[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
+            vs[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
+    return toks, {"key": key, "value": val, "kscale": ks, "vscale": vs}
+
+
+def build_cache(h: KvHeader, buffers: dict):
+    from vaayu.vaayu_base import FP8DynamicCache
+    sdt = code_dtype(h.scale_dtype_code)
+    c = FP8DynamicCache()
+    c.key_cache = buffers["key"]
+    c.value_cache = buffers["value"]
+    c._key_scales = buffers["kscale"]
+    c._value_scales = buffers["vscale"]
+    c._k_out_cache = [buffers["key"][L].to(sdt) * buffers["kscale"][L]
+                      for L in range(h.num_layers)]
+    c._v_out_cache = [buffers["value"][L].to(sdt) * buffers["vscale"][L]
+                      for L in range(h.num_layers)]
+    c._seq_len = [h.nrec] * h.num_layers
+    return c
