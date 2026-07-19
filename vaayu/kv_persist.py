@@ -3,8 +3,12 @@
 Serializes each session's compressed FP8 KV cache to a per-session append-only
 file so the RAM prefix cache survives a process restart. Model-agnostic: every
 size is derived from the live FP8DynamicCache buffers + config (CLAUDE.md §5)."""
+import hashlib
+import os
 import struct
+import threading
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
@@ -152,3 +156,125 @@ def build_cache(h: KvHeader, buffers: dict):
                       for L in range(h.num_layers)]
     c._seq_len = [h.nrec] * h.num_layers
     return c
+
+
+class DiskWriter:
+    """Single-worker background writer. The calling thread packs new positions to
+    bytes (so a later turn cropping/appending the cache cannot corrupt an in-flight
+    write); the worker only does file IO. nrec-last = crash-safe commit."""
+
+    def __init__(self, persist_dir: str, budget_bytes: int, sync: bool = False):
+        self.dir = persist_dir
+        self.budget = budget_bytes
+        self.sync = sync
+        os.makedirs(self.dir, exist_ok=True)
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._lock = threading.Lock()
+        self._state = {}   # sid -> {"header": KvHeader, "nrec": int}
+
+    def path_for(self, session_id: str) -> str:
+        h = hashlib.sha1(session_id.encode("utf-8")).hexdigest()
+        return os.path.join(self.dir, f"{h}.vaayu_kv")
+
+    def enqueue_append(self, session_id, cache, config, token_ids, length):
+        with self._lock:
+            st = self._state.get(session_id)
+            if st is None:
+                st = {"header": build_header(cache, config, session_id, 0), "nrec": 0}
+                self._state[session_id] = st
+            start = st["nrec"]
+            if length <= start:
+                return
+            hdr = st["header"]
+            blob = b"".join(pack_record(cache, p, token_ids[p], hdr)
+                            for p in range(start, length))
+            st["nrec"] = length
+            self._pool.submit(self._do_append, session_id, hdr, start, blob, length)
+
+    def enqueue_truncate(self, session_id, match_len):
+        with self._lock:
+            st = self._state.get(session_id)
+            if st is None or match_len >= st["nrec"]:
+                return
+            st["nrec"] = match_len
+            hdr = st["header"]
+        self._pool.submit(self._do_truncate, session_id, hdr, match_len)
+
+    def remove(self, session_id):
+        with self._lock:
+            self._state.pop(session_id, None)
+        self._pool.submit(self._do_remove, session_id)
+
+    def drain(self):
+        self._pool.submit(lambda: None).result()
+
+    def close(self):
+        self.drain()
+        self._pool.shutdown(wait=True)
+
+    # --- worker side (single thread) ---
+    def _do_append(self, sid, hdr, start, blob, new_nrec):
+        try:
+            path = self.path_for(sid)
+            new_file = not os.path.exists(path)
+            with open(path, "r+b" if not new_file else "w+b") as f:
+                if new_file:
+                    write_header(f, hdr)
+                f.seek(record_start(hdr) + start * record_bytes(hdr))
+                f.write(blob)
+                f.flush()
+                if self.sync:
+                    os.fsync(f.fileno())
+                f.seek(NREC_OFFSET)
+                f.write(struct.pack("<i", new_nrec))
+                f.flush()
+                if self.sync:
+                    os.fsync(f.fileno())
+            self._enforce_budget()
+        except OSError as e:
+            print(f"[KV] append failed for {sid}: {e}")
+
+    def _do_truncate(self, sid, hdr, match_len):
+        try:
+            path = self.path_for(sid)
+            if not os.path.exists(path):
+                return
+            with open(path, "r+b") as f:
+                f.seek(NREC_OFFSET)
+                f.write(struct.pack("<i", match_len))
+                f.flush()
+                f.truncate(record_start(hdr) + match_len * record_bytes(hdr))
+        except OSError as e:
+            print(f"[KV] truncate failed for {sid}: {e}")
+
+    def _do_remove(self, sid):
+        try:
+            os.remove(self.path_for(sid))
+        except OSError:
+            pass
+
+    def _enforce_budget(self):
+        files = []
+        total = 0
+        for name in os.listdir(self.dir):
+            if not name.endswith(".vaayu_kv"):
+                continue
+            fp = os.path.join(self.dir, name)
+            try:
+                stat = os.stat(fp)
+            except OSError:
+                continue
+            files.append((stat.st_mtime, stat.st_size, fp))
+            total += stat.st_size
+        files.sort()  # oldest first
+        active = {self.path_for(s) for s in self._state}
+        for _mtime, size, fp in files:
+            if total <= self.budget:
+                break
+            if fp in active:
+                continue
+            try:
+                os.remove(fp)
+                total -= size
+            except OSError:
+                pass
