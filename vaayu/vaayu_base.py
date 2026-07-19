@@ -165,6 +165,18 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 
+# Hardware constant: RAM to leave for the OS + the expert RAM cache + the
+# io_uring pools when sizing the prefix-cache pool. Property of the 32 GB box,
+# NOT the model. Prefix caching borrows only what's comfortably free.
+_PREFIX_CACHE_RAM_RESERVE = int(12 * 1024 ** 3)
+
+
+def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
+    """RAM bytes the cross-turn prefix-cache pool may hold (A1). Derived from
+    free system memory minus a hardware headroom reserve. Model-agnostic."""
+    return max(0, int(free_ram_bytes) - _PREFIX_CACHE_RAM_RESERVE)
+
+
 def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
                              moe_layer_ids: list) -> "set | None":
     """Fix #7 sizing gap: a single VRAM LRU walked in layer order self-evicts
