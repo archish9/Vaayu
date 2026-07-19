@@ -387,6 +387,35 @@ class FP8DynamicCache(DynamicCache):
                 buf[i][..., :keep_len, :] = buf[i][..., start:used, :].clone()
             self._seq_len[i] = keep_len
 
+    _BUFFER_LISTS = ("key_cache", "value_cache", "_key_scales",
+                     "_value_scales", "_k_out_cache", "_v_out_cache")
+
+    def to_cpu(self) -> None:
+        """Compact each layer to its used length and move all buffers to CPU
+        (pinned when CUDA is available), for RAM-resident prefix-cache storage
+        between turns. Drops the geometric-growth capacity tail."""
+        pin = torch.cuda.is_available()
+        for name in self._BUFFER_LISTS:
+            lst = getattr(self, name)
+            for i in range(len(lst)):
+                used = self._seq_len[i]
+                compact = lst[i][..., :used, :].contiguous().to("cpu")
+                if pin:
+                    compact = compact.pin_memory()
+                lst[i] = compact
+
+    def to_device(self, device) -> None:
+        """Move all buffers to `device` (GPU) for an in-flight request."""
+        for name in self._BUFFER_LISTS:
+            lst = getattr(self, name)
+            for i in range(len(lst)):
+                lst[i] = lst[i].to(device, non_blocking=True)
+
+    def resident_bytes(self) -> int:
+        """Total byte footprint of all resident buffers (for budget sizing)."""
+        return sum(t.nbytes for name in self._BUFFER_LISTS
+                   for t in getattr(self, name))
+
 
 
 
