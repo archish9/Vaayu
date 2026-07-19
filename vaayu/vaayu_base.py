@@ -243,6 +243,16 @@ def compute_chunk_past_lens(chunk_lens: list, past0: int) -> list:
     return out
 
 
+def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
+    """Size of the precomputed RoPE cos/sin cache: must cover every position
+    that will be sliced during this forward pass (existing past + ALL new
+    tokens across every chunk combined, not just max_seq_len or a single
+    chunk's length). seq_total is the TOTAL token count this call will
+    process -- for layer-major chunked prefill (input_ids as a list of chunk
+    tensors) that's the sum of every chunk, not any one chunk's length."""
+    return max(int(max_seq_len), int(past_len) + int(seq_total))
+
+
 def compute_warmup_ranges(offset_index, checkpoint_path, warm_bytes: int):
     """Byte ranges to pre-read to prime the NVMe controller's DRAM cache before
     generation (Task 7). Walks the offset index in order, emitting one
@@ -2308,8 +2318,11 @@ class VaayuBaseModel(GenerationMixin):
             attention_mask = attention_mask.to(self.running_device)
         _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
                              if past_key_values is not None else 0)
-        _cur_len_for_pos  = input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0
-        _pos_range        = max(self.max_seq_len, _past_len_for_pos + _cur_len_for_pos)
+        # Bug fix: must use _seq_total (already correctly sums ALL chunks for
+        # layer-major list-typed input_ids), not re-derive from input_ids.shape
+        # which silently evaluates to 0 for a list, undersizing the RoPE cache
+        # to max_seq_len and crashing later chunks with an empty cos/sin slice.
+        _pos_range        = compute_pos_range(self.max_seq_len, _past_len_for_pos, _seq_total)
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.

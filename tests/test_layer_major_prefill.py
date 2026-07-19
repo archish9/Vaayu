@@ -4,7 +4,7 @@ import threading
 import pytest
 import torch
 
-from vaayu.vaayu_base import compute_chunk_past_lens
+from vaayu.vaayu_base import compute_chunk_past_lens, compute_pos_range
 
 
 def test_chunk_past_lens_basic():
@@ -20,6 +20,25 @@ def test_chunk_past_lens_matches_cumulative_sum():
     for L, o in zip(lens, out):
         assert o == acc
         acc += L
+
+
+def test_pos_range_covers_multi_chunk_total_past_max_seq_len():
+    # Bug repro: a 1896-token prompt chunked into [512, 512, 512, 360] with
+    # max_seq_len=512 (default) must size the RoPE cache to cover all 1896
+    # positions, not just max_seq_len -- else later chunks slice past the end.
+    assert compute_pos_range(max_seq_len=512, past_len=0, seq_total=1896) == 1896
+
+
+def test_pos_range_floor_is_max_seq_len_for_short_sequences():
+    # A short single-chunk prefill (< max_seq_len) must still get a cache sized
+    # to at least max_seq_len (matches prior behavior for the common case).
+    assert compute_pos_range(max_seq_len=512, past_len=0, seq_total=100) == 512
+
+
+def test_pos_range_adds_existing_past():
+    # Reused/decode case: past_len (already-cached tokens) plus this call's
+    # new tokens must both be covered.
+    assert compute_pos_range(max_seq_len=512, past_len=1024, seq_total=1) == 1025
 
 
 def test_staged_layer_survives_all_chunks_and_retains_gpu(tmp_path):
