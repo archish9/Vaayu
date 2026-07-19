@@ -186,8 +186,19 @@ class DiskWriter:
             if length <= start:
                 return
             hdr = st["header"]
+        # Pack outside the lock: real CPU/copy work (pack_record does .cpu()/
+        # .contiguous()). The RAM prefix-cache's own documented invariant (one
+        # in-flight request per session id -- see vaayu_base.py generate()'s
+        # comment) means no two calls for the SAME session_id race here.
+        # Different sessions packing concurrently is exactly the
+        # parallel-fan-out case that must not be serialized behind one lock.
+        try:
             blob = b"".join(pack_record(cache, p, token_ids[p], hdr)
                             for p in range(start, length))
+        except Exception as e:
+            print(f"[KV] pack failed for {session_id}: {e}")
+            return
+        with self._lock:
             st["nrec"] = length
             self._pool.submit(self._do_append, session_id, hdr, start, blob, length)
 
@@ -198,12 +209,12 @@ class DiskWriter:
                 return
             st["nrec"] = match_len
             hdr = st["header"]
-        self._pool.submit(self._do_truncate, session_id, hdr, match_len)
+            self._pool.submit(self._do_truncate, session_id, hdr, match_len)
 
     def remove(self, session_id):
         with self._lock:
             self._state.pop(session_id, None)
-        self._pool.submit(self._do_remove, session_id)
+            self._pool.submit(self._do_remove, session_id)
 
     def drain(self):
         self._pool.submit(lambda: None).result()
@@ -231,8 +242,16 @@ class DiskWriter:
                 if self.sync:
                     os.fsync(f.fileno())
             self._enforce_budget()
-        except OSError as e:
+        except Exception as e:
             print(f"[KV] append failed for {sid}: {e}")
+            # Roll back so the next append for this session naturally retries
+            # the failed range -- but only if no later append has already
+            # advanced nrec past this one (that later write already covers
+            # this range, or is itself in flight; don't clobber it).
+            with self._lock:
+                st = self._state.get(sid)
+                if st is not None and st["nrec"] == new_nrec:
+                    st["nrec"] = start
 
     def _do_truncate(self, sid, hdr, match_len):
         try:
@@ -243,15 +262,21 @@ class DiskWriter:
                 f.seek(NREC_OFFSET)
                 f.write(struct.pack("<i", match_len))
                 f.flush()
+                if self.sync:
+                    os.fsync(f.fileno())
                 f.truncate(record_start(hdr) + match_len * record_bytes(hdr))
-        except OSError as e:
+                if self.sync:
+                    os.fsync(f.fileno())
+        except Exception as e:
             print(f"[KV] truncate failed for {sid}: {e}")
 
     def _do_remove(self, sid):
         try:
             os.remove(self.path_for(sid))
         except OSError:
-            pass
+            pass  # already gone -- remove() is idempotent, this is expected
+        except Exception as e:
+            print(f"[KV] remove failed for {sid}: {e}")
 
     def _enforce_budget(self):
         files = []
@@ -267,7 +292,8 @@ class DiskWriter:
             files.append((stat.st_mtime, stat.st_size, fp))
             total += stat.st_size
         files.sort()  # oldest first
-        active = {self.path_for(s) for s in self._state}
+        with self._lock:
+            active = {self.path_for(s) for s in self._state}
         for _mtime, size, fp in files:
             if total <= self.budget:
                 break
