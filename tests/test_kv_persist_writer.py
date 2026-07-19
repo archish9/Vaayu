@@ -367,3 +367,85 @@ def test_remove_racing_paused_append_leaves_no_gap(tmp_path, monkeypatch):
     # FIFO order was append-then-remove -> the file ends deleted (no gapped
     # recreate). No orphaned file with zero-byte positions can exist.
     assert not os.path.exists(w.path_for("s1"))
+
+
+# --- Third fix round: truncate racing an in-flight append's WORKER execution ---
+
+
+def test_truncate_racing_inflight_append_worker_no_desync_no_gap(tmp_path, monkeypatch):
+    """A truncate must not leave nrec desynced from disk (or a zero-byte gap) when
+    it races an in-flight append's WORKER-side execution.
+
+    Round-2 bug: enqueue_truncate advanced nrec optimistically in the CALLER, while
+    _do_append advanced it in the WORKER. An earlier-submitted append's worker
+    callback could land AFTER the truncate's synchronous caller-side write and
+    overwrite nrec back up -- desyncing it from the disk the truncate had cut. A
+    later append then read a stale start and left a zero-byte gap (reviewer repro:
+    final nrec=20 with a token gap at [3,15)). The fix moves truncate's nrec write
+    into the worker too, so every nrec write happens on the single worker thread in
+    true FIFO order with the disk mutations: append(15) then truncate(3) settles
+    nrec at 3, matching disk.
+
+    This differs from test_remove_racing_paused_append_leaves_no_gap, which pauses
+    PACKING in the caller; here we must pause the WORKER's _do_append, because the
+    bug is specifically the worker's nrec-write landing out of order."""
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    c = _cache(seq=20)
+    toks = list(range(101, 121))   # 20 distinctive, non-zero token ids
+    target = w.path_for("s1")
+
+    # Seed a committed prefix of 5 so a later append can grow it while an even
+    # smaller truncate (to 3) races that append's worker.
+    w.enqueue_append("s1", c, cfg, toks[:5], 5)
+    w.drain()   # disk nrec=5, mem nrec=5
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_do_append = kp.DiskWriter._do_append
+
+    def paused_do_append(self, *a, **kw):
+        entered.set()          # worker is now inside _do_append...
+        release.wait(5)        # ...held here, BEFORE any disk write / nrec update
+        return real_do_append(self, *a, **kw)
+
+    monkeypatch.setattr(kp.DiskWriter, "_do_append", paused_do_append)
+
+    # Growing append 5 -> 15: its worker enters _do_append and pauses before writing.
+    w.enqueue_append("s1", c, cfg, toks[:15], 15)
+    assert entered.wait(5)
+
+    # Race a truncate to 3 while that append's WORKER is paused. In round-2 code the
+    # caller here synchronously set st["nrec"]=3; the paused append's worker callback
+    # (new_nrec=15) then overwrote it back to 15, desyncing mem from disk.
+    w.enqueue_truncate("s1", 3)
+
+    # Release the append: the worker runs _do_append (disk->15, then nrec), then the
+    # queued _do_truncate (disk->3, then nrec). With the fix both nrec writes are
+    # worker-side in FIFO order, so nrec settles at 3 == disk.
+    release.set()
+    w.drain()
+    monkeypatch.setattr(kp.DiskWriter, "_do_append", real_do_append)  # unpause
+
+    # Directly assert the race left NO desync, BEFORE any further append can mask it
+    # (round-2 bug at this point: mem=15 but disk=3).
+    with open(target, "rb") as f:
+        h_mid = kp.read_header(f)
+    assert w._state["s1"]["nrec"] == h_mid.nrec == 3
+
+    # A subsequent append reads st["nrec"] as its start. If the race had left mem=15
+    # it would seek to position 15 over a 3-record file, zero-filling positions
+    # [3,15) -- exactly the reviewer's gap. With the fix start=3, so the append is
+    # contiguous and every position holds real data.
+    w.enqueue_append("s1", c, cfg, toks[:20], 20)
+    w.drain()
+    w.close()
+
+    with open(target, "rb") as f:
+        h = kp.read_header(f)
+        got_toks, _ = kp.read_records(f, h)
+    # (a) in-memory nrec matches the on-disk header (no desync) ...
+    assert w._state["s1"]["nrec"] == h.nrec == 20
+    # ... (b) and every position up to nrec holds real, non-zero token data (no gap).
+    assert got_toks == toks[:20]
+    assert 0 not in got_toks       # belt-and-suspenders: no zero-byte gap anywhere

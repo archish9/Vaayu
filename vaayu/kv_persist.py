@@ -213,14 +213,17 @@ class DiskWriter:
         if st is None:
             return
         # st["lock"] serializes this truncate against the same session's appends
-        # (Repro B). Unlike append, truncate's nrec update stays optimistic in
-        # the caller: a failed disk truncate just leaves the older, larger-but-
-        # gap-free file, which is within the documented non-sync durability risk
-        # -- not a gap-class bug, so it needs no confirmed-write handshake.
+        # (Repro B). nrec is NOT advanced here: like append, it moves ONLY in the
+        # worker (_do_truncate) on a confirmed disk truncate. A caller-side write
+        # would be out of order with the worker's FIFO disk sequence -- an earlier
+        # in-flight append's worker callback could land after it and unconditionally
+        # overwrite nrec back up, desyncing it from disk (gap-class bug). The early-
+        # return guard stays valid: nrec is a worker-confirmed value that can only
+        # LAG true logical length, so match_len >= nrec means disk hasn't reached
+        # match_len yet -- nothing to truncate.
         with st["lock"]:
             if match_len >= st["nrec"]:
                 return
-            st["nrec"] = match_len
             hdr = st["header"]
             self._pool.submit(self._do_truncate, session_id, hdr, match_len)
 
@@ -293,6 +296,15 @@ class DiskWriter:
                 f.truncate(record_start(hdr) + match_len * record_bytes(hdr))
                 if self.sync:
                     os.fsync(f.fileno())
+            # Set nrec ONLY now, worker-side, on a confirmed disk truncate --
+            # same single-writer pattern as _do_append (under self._lock, on this
+            # one worker thread, right after this method's own disk mutation). This
+            # keeps every nrec write in true execution order with the actual disk
+            # writes, so a truncate can never be reordered against an append.
+            with self._lock:
+                st = self._state.get(sid)
+                if st is not None:
+                    st["nrec"] = match_len
         except Exception as e:
             print(f"[KV] truncate failed for {sid}: {e}")
 
