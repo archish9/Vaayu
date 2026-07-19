@@ -22,6 +22,7 @@ from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
 from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
+from .prefix_cache import PrefixCacheStore
 
 # BetterTransformer is deprecated in newer optimum versions
 try:
@@ -51,6 +52,14 @@ try:
     print('>>>> cache_utils installed')
 except ImportError:
     cache_utils_installed = False
+
+
+def _auto_session_id(token_ids: list) -> str:
+    """Stable key for a session the caller didn't name — hash of the first
+    tokens. Lets auto-prefix-match sequences be stored and re-found."""
+    import hashlib
+    head = bytes(str(token_ids[:64]), "utf-8")
+    return "auto:" + hashlib.sha1(head).hexdigest()[:16]
 
 
 def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_experts):
@@ -163,6 +172,18 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     """VRAM available to cache resident expert tensors, after reserving headroom
     for activations/KV growth. Model-agnostic (Fix #7)."""
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
+
+
+# Hardware constant: RAM to leave for the OS + the expert RAM cache + the
+# io_uring pools when sizing the prefix-cache pool. Property of the 32 GB box,
+# NOT the model. Prefix caching borrows only what's comfortably free.
+_PREFIX_CACHE_RAM_RESERVE = int(12 * 1024 ** 3)
+
+
+def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
+    """RAM bytes the cross-turn prefix-cache pool may hold (A1). Derived from
+    free system memory minus a hardware headroom reserve. Model-agnostic."""
+    return max(0, int(free_ram_bytes) - _PREFIX_CACHE_RAM_RESERVE)
 
 
 def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
@@ -387,6 +408,35 @@ class FP8DynamicCache(DynamicCache):
                 buf[i][..., :keep_len, :] = buf[i][..., start:used, :].clone()
             self._seq_len[i] = keep_len
 
+    _BUFFER_LISTS = ("key_cache", "value_cache", "_key_scales",
+                     "_value_scales", "_k_out_cache", "_v_out_cache")
+
+    def to_cpu(self) -> None:
+        """Compact each layer to its used length and move all buffers to CPU
+        (pinned when CUDA is available), for RAM-resident prefix-cache storage
+        between turns. Drops the geometric-growth capacity tail."""
+        pin = torch.cuda.is_available()
+        for name in self._BUFFER_LISTS:
+            lst = getattr(self, name)
+            for i in range(len(lst)):
+                used = self._seq_len[i]
+                compact = lst[i][..., :used, :].contiguous().to("cpu")
+                if pin:
+                    compact = compact.pin_memory()
+                lst[i] = compact
+
+    def to_device(self, device) -> None:
+        """Move all buffers to `device` (GPU) for an in-flight request."""
+        for name in self._BUFFER_LISTS:
+            lst = getattr(self, name)
+            for i in range(len(lst)):
+                lst[i] = lst[i].to(device, non_blocking=True)
+
+    def resident_bytes(self) -> int:
+        """Total byte footprint of all resident buffers (for budget sizing)."""
+        return sum(t.nbytes for name in self._BUFFER_LISTS
+                   for t in getattr(self, name))
+
 
 
 
@@ -534,7 +584,8 @@ class VaayuBaseModel(GenerationMixin):
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
                  drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
-                 attn_implementation=None):
+                 attn_implementation=None, enable_prefix_cache=False,
+                 auto_prefix_match=True):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -586,6 +637,8 @@ class VaayuBaseModel(GenerationMixin):
         self.compression = compression
         self.hf_token = hf_token
         self._forced_attn_impl = attn_implementation
+        self.enable_prefix_cache = enable_prefix_cache
+        self.auto_prefix_match = auto_prefix_match
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -1072,6 +1125,18 @@ class VaayuBaseModel(GenerationMixin):
         if (device.startswith("cuda") and not self.is_moe
                 and os.environ.get("VAAYU_NO_WARMUP") != "1"):
             self._warmup_nvme()
+
+        # Cross-turn KV prefix cache (A1). Default off -> byte-identical to
+        # today. RAM-backed pool sized from free system memory (hardware).
+        # Model-agnostic: applies to MoE and dense alike, so it lives here,
+        # after both branches converge, not inside the is_moe block above.
+        self._prefix_cache = None
+        if getattr(self, "enable_prefix_cache", False):
+            import psutil as _ps
+            self._prefix_cache = PrefixCacheStore(
+                compute_prefix_cache_budget(_ps.virtual_memory().available),
+                auto_prefix_match=getattr(self, "auto_prefix_match", True))
+            print("[Vaayu] cross-turn prefix cache ENABLED")
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -2762,10 +2827,45 @@ class VaayuBaseModel(GenerationMixin):
                     cache.key_cache[i]   = cache.key_cache[i][:, :, -target_seq_len:, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 
-    def generate(self, *args, **kwargs):
+    # A1 cross-turn prefix cache concurrency invariant: one in-flight request
+    # per session id. Two concurrent generate() calls with the SAME session_id
+    # would both check out / mutate the same cache object and corrupt each
+    # other. Parallel fan-out MUST use distinct session ids. PrefixCacheStore
+    # .lookup()'s checkout (Task 4) makes a second concurrent same-id call a
+    # miss (full prefill) rather than a corruption, so the failure mode is a
+    # perf loss, not wrong output.
+    def generate(self, *args, session_id=None, **kwargs):
         self._batch_decode_active = False
         self._batch_n = 1
+
+        pc = getattr(self, "_prefix_cache", None)
+        if pc is None:
+            result = super().generate(*args, **kwargs)
+            self.telemetry.dump_json("vaayu_telemetry.json")
+            return result
+
+        # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
+        # calls with distinct session ids).
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        ids_list = input_ids[0].tolist()
+
+        kv, match_len = pc.lookup(session_id, ids_list)
+        if kv is None:
+            kv = self._create_kv_cache()
+        else:
+            kv.to_device(self.running_device)
+            if match_len >= input_ids.shape[1]:
+                match_len = input_ids.shape[1] - 1   # leave >=1 position to run
+            kv.crop(match_len)
+        kwargs["past_key_values"] = kv
+
         result = super().generate(*args, **kwargs)
+        # `kv` was mutated in place through the forward passes -> holds the full
+        # final KV. Persist it (store() moves it back to RAM).
+        pc.store(session_id if session_id is not None else _auto_session_id(ids_list),
+                 result[0].tolist(), kv)
         self.telemetry.dump_json("vaayu_telemetry.json")
         return result
 
