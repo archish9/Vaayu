@@ -39,21 +39,26 @@ model-agnostic engine
 
 
 
-How to start each — paste this in a NEW session (on the GPU box)                                                               
-                                                                                                                                 
-  8-task plan:                                                                                                                   
-  Execute the plan at docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md                                         
-  using superpowers:subagent-driven-development. Task-by-task, stop for my review                                                
-  at each task's checkpoint. Qwen only for on-device A/B (no MiniMax checkpoint).                                                
-                                                                                                                                 
-  A1 prefix caching (after 8-task lands):                                                                                        
+                                                                                       
   Execute the plan at docs/superpowers/plans/2026-07-12-vaayu-prefix-caching-plan.md                                             
   using superpowers:executing-plans. Task-by-task with review checkpoints.                                                       
-                                                                                                                                 
-  Feature B (brainstorm, not execute yet):                                                                                       
-  Run superpowers:brainstorming on Feature B (multi-query batched decode) using                                                  
-  docs/superpowers/plans/2026-07-12-vaayu-agent-workload-brainstorm-prep.md.                                                     
-  Read §0-§1 and §3, brainstorm from §3's questions, then write a plan.
+
+
+
+  1. RAM prefix cache (2026-07-12-vaayu-prefix-caching-plan.md)
+  - Hard prerequisite for A + top TTFT lever. Must go first.
+
+  2. A — KV disk persistence (2026-07-19-vaayu-kv-persist-plan.md)
+  - Extends the prefix cache you just built (infra warm in head). Tasks 1–4 need nothing; Task 5 needs step 1 done.
+
+  3. B — expert usage histogram (2026-07-19-vaayu-expert-usage-histogram-plan.md)
+  - Independent, medium value (kills cold-start, matches loop-engineering). Biggest + riskiest (touches MoE hot path) → do once A
+  is stable. Internal gate: Phase 1 (Tasks 1–6) → on-device verify (Task 7) → Phase 2 (8–9). Don't start Phase 2 till the gate
+  passes.
+
+  4. C — dynamic RAM ceiling (2026-07-19-vaayu-dynamic-ram-cache-ceiling-plan.md)
+  - Last. Tiny (2 tasks) but lowest/speculative value (portability, only one box today). Flag-gated + needs on-device
+  calibration. Could even defer until a 2nd box exists.
 
 
 
