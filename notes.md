@@ -1455,3 +1455,6 @@ for eidx in unique_experts:
   6. Learned expert pinning (Colibri #2) — nicely complements Task 6's routing bias
   7. Auto-sized expert cache (Colibri #3) — small, easy, do in an odd hour
   8. CPU AVX2 fallback (Colibri #4) — only if portability is a real requirement; otherwise drop
+
+
+  Prefix caching () + KV persistence (merged) 
