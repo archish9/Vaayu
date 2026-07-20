@@ -177,7 +177,13 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
 # Hardware constant: RAM to leave for the OS + the expert RAM cache + the
 # io_uring pools when sizing the prefix-cache pool. Property of the 32 GB box,
 # NOT the model. Prefix caching borrows only what's comfortably free.
-_PREFIX_CACHE_RAM_RESERVE = int(12 * 1024 ** 3)
+# Lowered 12GB->6GB (2026-07-20): on-device Qwen3-235B load left free RAM at
+# or below the 12GB reserve at the exact moment this budget is measured
+# (mid-load, pinned NVMe->RAM->GPU staging buffers active), zeroing the
+# prefix-cache/KV-persist budget every time. If generation-time RAM pressure
+# (expert-cache thrash, OOM) reappears with this lower reserve, raise it back
+# -- this is a live experiment, not a settled re-tuning.
+_PREFIX_CACHE_RAM_RESERVE = int(6 * 1024 ** 3)
 
 
 def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
