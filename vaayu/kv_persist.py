@@ -295,11 +295,24 @@ class DiskWriter:
             self._pool.submit(self._do_remove, session_id)
 
     def drain(self):
-        self._pool.submit(lambda: None).result()
+        try:
+            self._pool.submit(lambda: None).result()
+        except RuntimeError:
+            # Interpreter-shutdown race: concurrent.futures.thread's own atexit
+            # hook (_python_exit) can tear down worker threads before our
+            # atexit.register(self._kv_writer.close) callback runs, depending
+            # on registration order elsewhere in the process. By this point
+            # there is no live worker left to submit to or wait on -- nothing
+            # queued after this can still be flushed, so this is a no-op, not
+            # a lost write.
+            pass
 
     def close(self):
         self.drain()
-        self._pool.shutdown(wait=True)
+        try:
+            self._pool.shutdown(wait=True)
+        except RuntimeError:
+            pass
 
     # --- worker side (single thread) ---
     def _do_append(self, sid, hdr, start, blob, new_nrec):

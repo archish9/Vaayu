@@ -5,11 +5,18 @@ Model: whatever MODEL_PATH below points to (any vaayu.AutoModel-supported archit
 Task:  Generate a complete async file watcher Python module from spec.
 PLD:   OFF — output is novel code, not copied from prompt.
 
+Uses every shipped, on-device-validated optimization: FP8 KV cache (auto), pinned
+layers, layer-major chunked prefill, speculative decoding (draft model), cross-turn
+RAM prefix cache, and disk KV persistence. See the "Shipped optimizations" block
+below for what's deliberately left off and why.
+
 Reports:
   - Prompt tokens, output tokens
   - Time-to-first-token (TTFT)
   - Decode throughput (tokens/sec, excluding TTFT)
-  - Total generation time
+  - Generation time (model already loaded)
+  - Total time: model load start -> full generation done
+  - The full generated code, printed again cleanly at the end
 
 Run:
     source venv/bin/activate
@@ -34,7 +41,14 @@ logging.basicConfig(
 MODEL_PATH         = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
-MAX_NEW_TOKENS     = 25
+# max_new_tokens is a SAFETY CEILING, not a target length — you can't know a
+# generated file's exact token count in advance, so don't try to guess it
+# tightly. The model emits its own EOS token when the response is actually
+# complete (wired in vaayu_base.py via config.eos_token_id) and generation
+# stops there, well before this cap, unless the model runs on. Set this
+# generously above what you expect (a few hundred lines of Python easily
+# fits in ~2000 tokens); it only costs time if the model actually needs it.
+MAX_NEW_TOKENS     = 2048
 MAX_LENGTH         = 2048
 PREFILL_CHUNK_SIZE = 512
 
@@ -42,6 +56,25 @@ PREFILL_CHUNK_SIZE = 512
 DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
 USE_PROMPT_LOOKUP  = False
 DRAFT_TOKENS       = 5
+
+# ── Shipped optimizations ────────────────────────────────────────────────────
+# Cross-turn RAM prefix cache + disk KV persistence (A1 + Subsystem A). This
+# script does one generate() call, so there's no second turn to actually HIT
+# the cache — but both codepaths engage for real: the RAM pool gets populated,
+# and a real .vaayu_kv file gets written to disk (ships-dark features, off by
+# default; explicitly on here to exercise them).
+ENABLE_PREFIX_CACHE = True
+AUTO_PREFIX_MATCH   = True
+ENABLE_KV_PERSIST   = True
+KV_PERSIST_SYNC     = False   # async append (production default) — faster, matches shipped default
+SESSION_ID          = "test-generate-benchmark"
+
+# torch.compile: shipped, but NOT enabled here. This model streams expert
+# weights from NVMe per-token (moe_patch.py) — a dynamic I/O-bound path
+# torch.compile's static-graph tracing isn't validated against on this
+# codebase's actively-tested MoE-EXL3 path. Flip on to experiment; not a
+# default recommendation.
+USE_TORCH_COMPILE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -55,6 +88,8 @@ print(f"Using device: {DEVICE}")
 from vaayu import AutoModel
 from vaayu.streaming import stream_generate
 
+script_start = time.time()   # total = this -> end of generation, incl. model load
+
 print("Loading model...")
 model = AutoModel.from_pretrained(
     MODEL_PATH,
@@ -65,7 +100,14 @@ model = AutoModel.from_pretrained(
     drafter_model_path=DRAFTER_MODEL_PATH or None,
     use_prompt_lookup=USE_PROMPT_LOOKUP,
     draft_tokens=DRAFT_TOKENS,
+    enable_prefix_cache=ENABLE_PREFIX_CACHE,
+    auto_prefix_match=AUTO_PREFIX_MATCH,
+    enable_kv_persist=ENABLE_KV_PERSIST,
+    kv_persist_sync=KV_PERSIST_SYNC,
+    use_torch_compile=USE_TORCH_COMPILE,
 )
+model_load_time = time.time() - script_start
+print(f"Model loaded in {model_load_time:.1f}s")
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 # Instruction-style: model generates complete Python file from spec.
@@ -151,6 +193,7 @@ for chunk in stream_generate(
     model,
     input_tokens['input_ids'].to(DEVICE),
     max_new_tokens=MAX_NEW_TOKENS,
+    session_id=SESSION_ID,
 ):
     if first_token_time is None and chunk:
         first_token_time = time.time()
@@ -159,13 +202,22 @@ for chunk in stream_generate(
 print()
 
 elapsed = time.time() - start_time
+total_elapsed = time.time() - script_start   # model load start -> generation done
 ttft = (first_token_time - start_time) if first_token_time is not None else elapsed
 output_tokens = len(model.tokenizer(output_text, add_special_tokens=False)['input_ids'])
 decode_elapsed = elapsed - ttft
 decode_tok_per_s = ((output_tokens - 1) / decode_elapsed) if decode_elapsed > 0 and output_tokens > 1 else 0.0
 
+print("\n" + "=" * 80)
+print("Generated code:")
+print("=" * 80)
+print(output_text)
+print("=" * 80)
+
 print(f"\nPrompt tokens: {n_tokens}")
 print(f"Output tokens: {output_tokens}")
 print(f"Time to first token: {ttft:.2f}s")
 print(f"Decode throughput: {decode_tok_per_s:.2f} tokens/sec")
-print(f"Total generation time: {elapsed:.1f}s ({elapsed / 60:.2f} minutes)")
+print(f"Generation time: {elapsed:.1f}s (model already loaded)")
+print(f"Model load time: {model_load_time:.1f}s")
+print(f"Total: {total_elapsed:.1f}s ({total_elapsed / 60:.2f} minutes)  [load -> full generation done]")
