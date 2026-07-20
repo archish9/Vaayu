@@ -2907,8 +2907,13 @@ class VaayuBaseModel(GenerationMixin):
         # final KV. Persist it (store() moves it back to RAM).
         pc.store(resolved_sid, result[0].tolist(), kv)
         if self._kv_writer is not None:
+            # kv.get_seq_length(), not len(result[0]): the last sampled token is
+            # never fed back through a forward pass (generation stops right after
+            # sampling it), so it never went through cache.update() -- the cache's
+            # true occupied length is exactly len(result[0]) - 1. Using the longer
+            # value here indexes one position past what the cache actually holds.
             self._kv_writer.enqueue_append(
-                resolved_sid, kv, self.config, result[0].tolist(), len(result[0].tolist()))
+                resolved_sid, kv, self.config, result[0].tolist(), kv.get_seq_length())
         self.telemetry.dump_json("vaayu_telemetry.json")
         return result
 
