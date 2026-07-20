@@ -438,7 +438,12 @@ class KvDiskLoader:
                               f"different model/quant/schema")
                         continue
                     size = record_bytes(h) * h.nrec
-                    if h.nrec < 1 or used + size > ram_budget_bytes:
+                    if h.nrec < 1:
+                        continue
+                    if used + size > ram_budget_bytes:
+                        print(f"[KV] skipping {os.path.basename(fp)}: "
+                              f"{size} bytes would exceed RAM budget "
+                              f"({used} used + {size} > {ram_budget_bytes})")
                         continue
                     f.seek(record_start(h))
                     toks, buffers = read_records(f, h)
