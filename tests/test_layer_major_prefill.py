@@ -1,10 +1,11 @@
 """Layer-major chunked prefill: past-length bookkeeping + staged multi-consume."""
 import threading
+import types
 
 import pytest
 import torch
 
-from vaayu.vaayu_base import compute_chunk_past_lens, compute_pos_range
+from vaayu.vaayu_base import VaayuBaseModel, FP8DynamicCache, compute_chunk_past_lens, compute_pos_range
 
 
 def test_chunk_past_lens_basic():
@@ -120,3 +121,83 @@ def test_staged_layer_survives_all_chunks_and_retains_gpu(tmp_path):
         assert 0 not in vaayu_ref._prefill_staged, "staged dict not popped on last call"
         assert vaayu_ref._chunk_major_gpu is None, "retained GPU experts not freed at last call"
         assert sem.acquire(blocking=False) is True, "semaphore not released on last call"
+
+
+class _FakeSelfForChunkedPrefill:
+    """Minimal stand-in for VaayuBaseModel, providing only what
+    _chunked_prefill's legacy (dense) per-chunk loop reads: prefill_chunk_size
+    and a forward() method. is_moe/_active_attn_impl are intentionally absent
+    -- getattr(self, 'is_moe', False) short-circuits the MoE layer-major
+    branch's `and self._active_attn_impl in (...)` check before it's ever
+    evaluated, so this object correctly forces the legacy loop without
+    needing to fake attention-impl state."""
+
+    def __init__(self, chunk_size):
+        self.prefill_chunk_size = chunk_size
+        self.forward_calls = []  # past_key_values object seen on each chunk call
+
+    def forward(self, input_ids, attention_mask, past_key_values, use_cache,
+                output_attentions, output_hidden_states, return_dict):
+        self.forward_calls.append(past_key_values)
+        # Simulate a real layer-0 KV append (single-layer model) so the cache's
+        # own accumulation logic (FP8DynamicCache.update) runs for real, proving
+        # the object threaded in is genuinely mutated -- not a stand-in.
+        seq_len = input_ids.shape[1]
+        key = torch.randn(1, 1, seq_len, 4)
+        value = torch.randn(1, 1, seq_len, 4)
+        past_key_values.update(key, value, layer_idx=0)
+        return types.SimpleNamespace(
+            logits=torch.zeros(1, seq_len, 10),
+            past_key_values=past_key_values,
+            hidden_states=None,
+            attentions=None,
+        )
+
+
+def test_chunked_prefill_threads_caller_cache_through_legacy_loop():
+    """Bug repro (vaayu_base.py _chunked_prefill): the legacy per-chunk loop
+    used to hardcode `past_key_values = None` as its loop-local starting
+    value, discarding whatever real cache object the caller (generate())
+    passed in via _chunked_prefill's own (newly added) past_key_values
+    parameter. HF's own generation loop still worked (it picks up whatever
+    object forward() returns), but generate()'s `kv` variable -- passed to
+    pc.store() and the session's enqueue_append hook -- stayed bound to the
+    original, empty, never-populated cache. That produced a real crash
+    (IndexError: list index out of range on cache.key_cache[0]) for any
+    cold-start prompt long enough to trigger chunked prefill.
+
+    This test proves the fix: the caller-supplied cache object is (a) the
+    exact object handed to forward() on every chunk -- not None, not a
+    replacement -- and (b) the exact object returned at the end, genuinely
+    mutated with real per-chunk K/V data.
+    """
+    fake_self = _FakeSelfForChunkedPrefill(chunk_size=4)
+    caller_cache = FP8DynamicCache()
+    total_len = 10  # chunk_size=4 -> chunks of [4, 4, 2], 3 iterations
+    input_ids = torch.arange(total_len).unsqueeze(0)
+
+    output = VaayuBaseModel._chunked_prefill(
+        fake_self,
+        input_ids=input_ids,
+        attention_mask=None,
+        use_cache=True,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        past_key_values=caller_cache,
+    )
+
+    assert len(fake_self.forward_calls) == 3
+    # Every chunk -- including the first -- must see the caller's real object,
+    # never None (the bug) and never a fresh replacement.
+    for call_cache in fake_self.forward_calls:
+        assert call_cache is caller_cache
+
+    # Object IDENTITY: what generate() would see as `kv` after this call is
+    # the SAME object it originally created/looked up.
+    assert output.past_key_values is caller_cache
+
+    # And it was genuinely mutated -- the crash-causing symptom was an empty
+    # key_cache despite a "successful" chunked prefill.
+    assert len(caller_cache.key_cache) > 0
+    assert caller_cache.get_seq_length() == total_len

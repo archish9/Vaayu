@@ -2181,6 +2181,7 @@ class VaayuBaseModel(GenerationMixin):
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
+        past_key_values=None,
     ):
         chunk_size = self.prefill_chunk_size
         total_len  = input_ids.shape[1]
@@ -2202,6 +2203,7 @@ class VaayuBaseModel(GenerationMixin):
             try:
                 output = self.forward(
                     input_ids=chunks,        # list of 1-D chunk tensors
+                    past_key_values=past_key_values,
                     use_cache=True,
                     return_dict=True,
                 )
@@ -2225,7 +2227,6 @@ class VaayuBaseModel(GenerationMixin):
                 output.past_key_values = None
             return output
 
-        past_key_values = None
         output = None
 
         for start in range(0, total_len, chunk_size):
@@ -2299,6 +2300,7 @@ class VaayuBaseModel(GenerationMixin):
                 return self._chunked_prefill(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
