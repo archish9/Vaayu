@@ -61,6 +61,11 @@ model-agnostic engine
   calibration. Could even defer until a 2nd box exists.
 
 
+Execute the plan at docs/superpowers/plans/2026-07-19-vaayu-kv-persist-plan.md using superpowers:subagent-driven-development.
 
 
-Execute the plan at docs/superpowers/plans/2026-07-18-vaayu-batched-decode.md using superpowers:subagent-driven-development.
+python -u test_kv_persist_coherence.py --phase run1 > run1.log 2>&1
+python -u test_kv_persist_coherence.py --phase run2 > run2.log 2>&1
+python -u test_kv_persist_coherence.py --phase control > control.log 2>&1
+
+claude --resume 11724729-d32b-4e19-a5ae-1aac73da9ae2

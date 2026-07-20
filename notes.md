@@ -1457,4 +1457,12 @@ for eidx in unique_experts:
   8. CPU AVX2 fallback (Colibri #4) — only if portability is a real requirement; otherwise drop
 
 
-  Prefix caching () + KV persistence (merged) 
+  Prefix caching (docs/superpowers/plans/2026-07-12-vaayu-prefix-caching-plan.md) + KV persistence (merged) - because Colibri KV persistence folds in here.
+
+  once this is done i should steal 
+
+  2. Learned expert pinning — they keep a .coli_usage histogram of expert access frequency and pin the hot ones. Vaayu's perf review considered this ("heavy-hitter pinning") and deferred it. Colibri
+  implemented it.
+  3. Auto-sized expert cache from MemAvailable at startup with peak-projection headroom to prevent OOM-killer. Vaayu has hardware constants (16 GB VRAM, 8.5 GB expert cache ceiling); dynamic sizing would be
+  more portable.
+  4. CPU AVX2 int4 matmul kernels as a fallback path. Vaayu is EXL3-only, which locks it to CUDA. A CPU fallback would broaden portability significantly.
