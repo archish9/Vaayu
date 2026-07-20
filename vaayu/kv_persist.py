@@ -377,3 +377,63 @@ class DiskWriter:
                 total -= size
             except OSError:
                 pass
+
+
+def header_matches(h: KvHeader, config) -> bool:
+    if h.schema_ver != SCHEMA_VER or h.quant_sig != QUANT_SIG:
+        return False
+    nl = getattr(config, "num_hidden_layers", None)
+    if nl is not None and h.num_layers != nl:
+        return False
+    vocab = getattr(config, "vocab_size", None)
+    if vocab is not None and h.vocab != vocab:
+        return False
+    nkv = getattr(config, "num_key_value_heads", None)
+    if nkv is not None and h.num_kv_heads != nkv:
+        return False
+    hd = getattr(config, "head_dim", None)
+    if hd is not None and h.head_dim != hd:
+        return False
+    return True
+
+
+class KvDiskLoader:
+    def __init__(self, persist_dir: str):
+        self.dir = persist_dir
+
+    def load_all(self, store, config, ram_budget_bytes: int) -> int:
+        if not os.path.isdir(self.dir):
+            return 0
+        files = []
+        for name in os.listdir(self.dir):
+            if name.endswith(".vaayu_kv"):
+                fp = os.path.join(self.dir, name)
+                try:
+                    files.append((os.stat(fp).st_mtime, fp))
+                except OSError:
+                    pass
+        files.sort(reverse=True)  # newest first
+        used = 0
+        restored = 0
+        for _mtime, fp in files:
+            try:
+                with open(fp, "rb") as f:
+                    h = read_header(f)
+                    if h is None or not header_matches(h, config):
+                        print(f"[KV] ignoring {os.path.basename(fp)}: "
+                              f"different model/quant/schema")
+                        continue
+                    size = record_bytes(h) * h.nrec
+                    if h.nrec < 1 or used + size > ram_budget_bytes:
+                        continue
+                    f.seek(record_start(h))
+                    toks, buffers = read_records(f, h)
+                kv = build_cache(h, buffers)
+                store.store(h.session_id, toks, kv)
+                used += size
+                restored += 1
+            except Exception as e:
+                print(f"[KV] skipping {os.path.basename(fp)}: {e}")
+        if restored:
+            print(f"[KV] resumed {restored} session(s) from disk (no re-prefill)")
+        return restored
