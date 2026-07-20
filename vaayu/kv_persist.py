@@ -170,7 +170,7 @@ class DiskWriter:
         os.makedirs(self.dir, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.Lock()   # guards _state dict structure only
-        self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock}
+        self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock, "future": Future|None}
 
     def path_for(self, session_id: str) -> str:
         h = hashlib.sha1(session_id.encode("utf-8")).hexdigest()
@@ -185,16 +185,31 @@ class DiskWriter:
             st = self._state.get(session_id)
             if st is None:
                 st = {"header": build_header(cache, config, session_id, 0),
-                      "nrec": 0, "lock": threading.Lock()}
+                      "nrec": 0, "lock": threading.Lock(), "future": None}
                 self._state[session_id] = st
-        # st["lock"] (per-session) makes read-start / pack / submit one atomic
-        # critical section for THIS session only -- different sessions still pack
-        # fully in parallel (the parallel-fan-out case; pack_record does real
-        # .cpu()/.contiguous() work and never runs under the GLOBAL lock).
-        # nrec is NOT advanced here: it only moves forward in _do_append on a
-        # confirmed write, so a pipelined next turn re-reads the true committed
-        # start and can never leave a zero-byte gap (Repro A).
+        # st["lock"] (per-session) makes wait / read-start / pack / submit one
+        # atomic critical section for THIS session only -- different sessions
+        # still pack fully in parallel (the parallel-fan-out case; pack_record
+        # does real .cpu()/.contiguous() work and never runs under the GLOBAL
+        # lock). nrec is NOT advanced here: it only moves forward in _do_append
+        # on a confirmed write.
         with st["lock"]:
+            # Wait for THIS session's own previously-submitted op to finish before
+            # reading nrec. Same-session callers are already serialized by st["lock"]
+            # and the single worker is strictly FIFO, so once the prior future
+            # resolves, nrec reflects every op submitted before us -- there is no
+            # stale-read window in either direction (append-then-truncate or
+            # truncate-then-append, C1). The wait blocks only on a genuinely still-
+            # pending SAME-session op (rare: seconds of generation separate real
+            # truncate/append calls); other sessions are wholly unaffected. Swallow
+            # the exception: the worker already logs any failure, and nrec simply
+            # stays unadvanced on failure (Repro A).
+            prior = st["future"]
+            if prior is not None:
+                try:
+                    prior.result()
+                except Exception:
+                    pass
             start = st["nrec"]
             if length <= start:
                 return
@@ -205,7 +220,8 @@ class DiskWriter:
             except Exception as e:
                 print(f"[KV] pack failed for {session_id}: {e}")
                 return
-            self._pool.submit(self._do_append, session_id, hdr, start, blob, length)
+            st["future"] = self._pool.submit(
+                self._do_append, session_id, hdr, start, blob, length)
 
     def enqueue_truncate(self, session_id, match_len):
         with self._lock:
@@ -214,18 +230,27 @@ class DiskWriter:
             return
         # st["lock"] serializes this truncate against the same session's appends
         # (Repro B). nrec is NOT advanced here: like append, it moves ONLY in the
-        # worker (_do_truncate) on a confirmed disk truncate. A caller-side write
-        # would be out of order with the worker's FIFO disk sequence -- an earlier
-        # in-flight append's worker callback could land after it and unconditionally
-        # overwrite nrec back up, desyncing it from disk (gap-class bug). The early-
-        # return guard stays valid: nrec is a worker-confirmed value that can only
-        # LAG true logical length, so match_len >= nrec means disk hasn't reached
-        # match_len yet -- nothing to truncate.
+        # worker (_do_truncate) on a confirmed disk truncate. But we FIRST wait for
+        # this session's own prior in-flight op to finish, so st["nrec"] read below
+        # is the true post-prior-op value -- an earlier in-flight append's worker
+        # callback can no longer land after this and overwrite nrec back up (round-2
+        # bug), and a following pipelined append will read the post-truncate nrec so
+        # it starts at the truncated boundary rather than skipping over the bytes
+        # this truncate physically removes (C1). The early-return guard stays valid:
+        # after the wait, nrec == true disk length, so match_len >= nrec means there
+        # is nothing at/after match_len to truncate.
         with st["lock"]:
+            prior = st["future"]
+            if prior is not None:
+                try:
+                    prior.result()
+                except Exception:
+                    pass
             if match_len >= st["nrec"]:
                 return
             hdr = st["header"]
-            self._pool.submit(self._do_truncate, session_id, hdr, match_len)
+            st["future"] = self._pool.submit(
+                self._do_truncate, session_id, hdr, match_len)
 
     def remove(self, session_id):
         with self._lock:
@@ -235,8 +260,18 @@ class DiskWriter:
             # interleave with an in-flight append/truncate critical section for
             # the same session: once we hold st["lock"], any such op has already
             # submitted, so the delete is ordered after it on the FIFO worker
-            # queue -- no stale-start recreate of a gapped file (Repro B).
+            # queue -- no stale-start recreate of a gapped file (Repro B). Wait
+            # for any still-pending prior op too, keeping the pattern uniform with
+            # append/truncate (not strictly required -- st["lock"] already excludes
+            # interleaving -- but it makes the delete strictly ordered after any
+            # pending write).
             with st["lock"]:
+                prior = st["future"]
+                if prior is not None:
+                    try:
+                        prior.result()
+                    except Exception:
+                        pass
                 with self._lock:
                     self._state.pop(session_id, None)
                 self._pool.submit(self._do_remove, session_id)

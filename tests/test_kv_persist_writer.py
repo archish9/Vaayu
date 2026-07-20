@@ -374,21 +374,23 @@ def test_remove_racing_paused_append_leaves_no_gap(tmp_path, monkeypatch):
 
 def test_truncate_racing_inflight_append_worker_no_desync_no_gap(tmp_path, monkeypatch):
     """A truncate must not leave nrec desynced from disk (or a zero-byte gap) when
-    it races an in-flight append's WORKER-side execution.
+    a same-session append's WORKER-side execution is still in flight.
 
     Round-2 bug: enqueue_truncate advanced nrec optimistically in the CALLER, while
     _do_append advanced it in the WORKER. An earlier-submitted append's worker
     callback could land AFTER the truncate's synchronous caller-side write and
     overwrite nrec back up -- desyncing it from the disk the truncate had cut. A
     later append then read a stale start and left a zero-byte gap (reviewer repro:
-    final nrec=20 with a token gap at [3,15)). The fix moves truncate's nrec write
-    into the worker too, so every nrec write happens on the single worker thread in
-    true FIFO order with the disk mutations: append(15) then truncate(3) settles
-    nrec at 3, matching disk.
+    final nrec=20 with a token gap at [3,15)).
 
-    This differs from test_remove_racing_paused_append_leaves_no_gap, which pauses
-    PACKING in the caller; here we must pause the WORKER's _do_append, because the
-    bug is specifically the worker's nrec-write landing out of order."""
+    Fourth-round design: enqueue_truncate now WAITS for this session's own prior
+    in-flight future before touching nrec. So it can no longer be interleaved with
+    the append worker at all -- it blocks on the append's future until that append
+    has fully committed (disk + nrec), then reads the true nrec and truncates. This
+    test proves that blocking: the truncate, run on a side thread, is held until the
+    paused append worker is released, and the final state is nrec==disk==3 with no
+    gap. (It differs from test_remove_racing_paused_append_leaves_no_gap, which
+    pauses PACKING in the caller; here we pause the WORKER's _do_append.)"""
     w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
     cfg = types.SimpleNamespace(vocab_size=1000)
     c = _cache(seq=20)
@@ -396,7 +398,7 @@ def test_truncate_racing_inflight_append_worker_no_desync_no_gap(tmp_path, monke
     target = w.path_for("s1")
 
     # Seed a committed prefix of 5 so a later append can grow it while an even
-    # smaller truncate (to 3) races that append's worker.
+    # smaller truncate (to 3) contends with that append's worker.
     w.enqueue_append("s1", c, cfg, toks[:5], 5)
     w.drain()   # disk nrec=5, mem nrec=5
 
@@ -415,20 +417,31 @@ def test_truncate_racing_inflight_append_worker_no_desync_no_gap(tmp_path, monke
     w.enqueue_append("s1", c, cfg, toks[:15], 15)
     assert entered.wait(5)
 
-    # Race a truncate to 3 while that append's WORKER is paused. In round-2 code the
-    # caller here synchronously set st["nrec"]=3; the paused append's worker callback
-    # (new_nrec=15) then overwrote it back to 15, desyncing mem from disk.
-    w.enqueue_truncate("s1", 3)
+    # Issue a truncate to 3 while that append's WORKER is paused. Under the new
+    # design enqueue_truncate must BLOCK on the append's future, so run it on a side
+    # thread and assert it does not complete while the append worker is held.
+    trunc_done = threading.Event()
 
-    # Release the append: the worker runs _do_append (disk->15, then nrec), then the
-    # queued _do_truncate (disk->3, then nrec). With the fix both nrec writes are
-    # worker-side in FIFO order, so nrec settles at 3 == disk.
+    def do_trunc():
+        w.enqueue_truncate("s1", 3)
+        trunc_done.set()
+
+    tt = threading.Thread(target=do_trunc)
+    tt.start()
+    assert not trunc_done.wait(0.3)   # truncate is blocked on the append's future
+
+    # Release the append: the worker runs _do_append (disk->15, then nrec), which
+    # resolves the future the truncate is waiting on. The truncate then unblocks,
+    # reads the true nrec (15), and submits _do_truncate (disk->3, then nrec). Both
+    # nrec writes are worker-side in FIFO order, so nrec settles at 3 == disk.
     release.set()
+    assert trunc_done.wait(5)
+    tt.join(5)
     w.drain()
     monkeypatch.setattr(kp.DiskWriter, "_do_append", real_do_append)  # unpause
 
-    # Directly assert the race left NO desync, BEFORE any further append can mask it
-    # (round-2 bug at this point: mem=15 but disk=3).
+    # Directly assert NO desync, BEFORE any further append can mask it
+    # (round-2 bug at this point would be: mem=15 but disk=3).
     with open(target, "rb") as f:
         h_mid = kp.read_header(f)
     assert w._state["s1"]["nrec"] == h_mid.nrec == 3
@@ -449,3 +462,82 @@ def test_truncate_racing_inflight_append_worker_no_desync_no_gap(tmp_path, monke
     # ... (b) and every position up to nrec holds real, non-zero token data (no gap).
     assert got_toks == toks[:20]
     assert 0 not in got_toks       # belt-and-suspenders: no zero-byte gap anywhere
+
+
+# --- Fourth fix round: pipelined truncate-then-append (C1, the normal case) ---
+
+
+def test_pipelined_truncate_then_append_no_gap(tmp_path, monkeypatch):
+    """C1: a truncate immediately followed by a same-session append with NO drain
+    between them -- the feature's NORMAL crop-to-(L-1)-then-extend continuation
+    pattern. The truncate's WORKER execution is deliberately delayed to force the
+    pipelined condition.
+
+    Round-3 bug: enqueue_truncate no longer lowered nrec synchronously (it moved to
+    the worker), so a pipelined append read a stale-HIGH nrec as its start, skipped
+    the truncated boundary, and -- because the truncate's physical f.truncate() had
+    already removed those bytes -- left a real zero-byte gap (reviewer repro:
+    nrec=15, gap at [3,10)).
+
+    Fourth-round fix: enqueue_append WAITS for this session's own prior future (the
+    truncate) before reading start. So the append blocks until the truncate has
+    committed (disk + nrec), then reads the POST-truncate nrec (3) and packs from the
+    truncated boundary -- contiguous, no gap. We prove the append blocks by pausing
+    the truncate worker and asserting the append (on a side thread) does not complete
+    until the truncate is released."""
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    c = _cache(seq=15)
+    toks = list(range(101, 116))   # 15 distinctive, non-zero token ids
+    target = w.path_for("s1")
+
+    # Seed a committed prefix of 10.
+    w.enqueue_append("s1", c, cfg, toks[:10], 10)
+    w.drain()   # disk nrec=10, mem nrec=10
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_do_truncate = kp.DiskWriter._do_truncate
+
+    def paused_do_truncate(self, *a, **kw):
+        entered.set()          # worker is now inside _do_truncate...
+        release.wait(5)        # ...held BEFORE it writes nrec / physically truncates
+        return real_do_truncate(self, *a, **kw)
+
+    monkeypatch.setattr(kp.DiskWriter, "_do_truncate", paused_do_truncate)
+
+    # Crop to 3: caller submits _do_truncate, whose worker enters and pauses.
+    w.enqueue_truncate("s1", 3)
+    assert entered.wait(5)
+
+    # Extend to 15 with NO drain between -- the pipelined normal case. Under the fix
+    # enqueue_append must BLOCK on the truncate's future, so run it on a side thread
+    # and assert it does not complete while the truncate worker is held.
+    append_done = threading.Event()
+
+    def do_append():
+        w.enqueue_append("s1", c, cfg, toks[:15], 15)
+        append_done.set()
+
+    ta = threading.Thread(target=do_append)
+    ta.start()
+    assert not append_done.wait(0.3)   # append is blocked on the truncate's future
+
+    # Release the truncate worker: it writes disk nrec=3 and physically shrinks the
+    # file to 3 records, then updates mem nrec=3. Its future resolves, unblocking the
+    # append, which reads start=3 (POST-truncate) and packs positions 3..14.
+    release.set()
+    assert append_done.wait(5)
+    ta.join(5)
+    w.drain()
+    monkeypatch.setattr(kp.DiskWriter, "_do_truncate", real_do_truncate)  # unpause
+    w.close()
+
+    with open(target, "rb") as f:
+        h = kp.read_header(f)
+        got_toks, _ = kp.read_records(f, h)
+    # nrec matches reality (no desync) and every position holds real data (no gap
+    # where the truncate physically removed bytes).
+    assert w._state["s1"]["nrec"] == h.nrec == 15
+    assert got_toks == toks[:15]
+    assert 0 not in got_toks
