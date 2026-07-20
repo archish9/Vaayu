@@ -595,7 +595,8 @@ class VaayuBaseModel(GenerationMixin):
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
                  drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
                  attn_implementation=None, enable_prefix_cache=False,
-                 auto_prefix_match=True):
+                 auto_prefix_match=True, enable_kv_persist=False,
+                 kv_persist_dir=None, kv_persist_sync=False):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -649,6 +650,9 @@ class VaayuBaseModel(GenerationMixin):
         self._forced_attn_impl = attn_implementation
         self.enable_prefix_cache = enable_prefix_cache
         self.auto_prefix_match = auto_prefix_match
+        self.enable_kv_persist = enable_kv_persist
+        self.kv_persist_dir = kv_persist_dir
+        self.kv_persist_sync = kv_persist_sync
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -1147,6 +1151,23 @@ class VaayuBaseModel(GenerationMixin):
                 compute_prefix_cache_budget(_ps.virtual_memory().available),
                 auto_prefix_match=getattr(self, "auto_prefix_match", True))
             print("[Vaayu] cross-turn prefix cache ENABLED")
+
+        # --- KV disk persistence tier (Subsystem A; ships dark) ---
+        self._kv_writer = None
+        if getattr(self, "enable_kv_persist", False) and self._prefix_cache is None:
+            print("[KV] enable_kv_persist=True ignored: enable_prefix_cache is False")
+        elif getattr(self, "enable_kv_persist", False):
+            import shutil
+            from vaayu.kv_persist import DiskWriter, KvDiskLoader
+            persist_dir = getattr(self, "kv_persist_dir", None) or os.path.join(
+                os.path.expanduser("~/.cache/vaayu"), "kv")
+            free = shutil.disk_usage(os.path.dirname(persist_dir) or ".").free
+            self._kv_writer = DiskWriter(
+                persist_dir, budget_bytes=free // 2,
+                sync=getattr(self, "kv_persist_sync", False))
+            atexit.register(self._kv_writer.close)
+            KvDiskLoader(persist_dir).load_all(
+                self._prefix_cache, self.config, self._prefix_cache.budget_bytes)
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -2872,13 +2893,18 @@ class VaayuBaseModel(GenerationMixin):
             if match_len >= input_ids.shape[1]:
                 match_len = input_ids.shape[1] - 1   # leave >=1 position to run
             kv.crop(match_len)
+            if self._kv_writer is not None and session_id is not None:
+                self._kv_writer.enqueue_truncate(session_id, match_len)
         kwargs["past_key_values"] = kv
 
         result = super().generate(*args, **kwargs)
+        resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
         # `kv` was mutated in place through the forward passes -> holds the full
         # final KV. Persist it (store() moves it back to RAM).
-        pc.store(session_id if session_id is not None else _auto_session_id(ids_list),
-                 result[0].tolist(), kv)
+        pc.store(resolved_sid, result[0].tolist(), kv)
+        if self._kv_writer is not None:
+            self._kv_writer.enqueue_append(
+                resolved_sid, kv, self.config, result[0].tolist(), len(result[0].tolist()))
         self.telemetry.dump_json("vaayu_telemetry.json")
         return result
 
