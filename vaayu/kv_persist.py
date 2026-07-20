@@ -176,6 +176,20 @@ class DiskWriter:
         h = hashlib.sha1(session_id.encode("utf-8")).hexdigest()
         return os.path.join(self.dir, f"{h}.vaayu_kv")
 
+    def register_existing(self, session_id, header, nrec):
+        """Seed writer state for a session restored from disk at startup, so
+        the first post-restart append/truncate operates on the TRUE committed
+        nrec instead of treating it as brand-new (nrec=0). Without this, the
+        first append after a restart would overwrite the whole file from
+        position 0 under a stale-high on-disk nrec (a crash-safety hole) and
+        rewrite the entire sequence instead of just the new tail."""
+        with self._lock:
+            if session_id not in self._state:
+                self._state[session_id] = {
+                    "header": header, "nrec": nrec,
+                    "lock": threading.Lock(), "future": None,
+                }
+
     def enqueue_append(self, session_id, cache, config, token_ids, length):
         # self._lock (global) only guards the _state dict structure: atomically
         # look up or create this session's entry -- including its per-session
@@ -401,7 +415,7 @@ class KvDiskLoader:
     def __init__(self, persist_dir: str):
         self.dir = persist_dir
 
-    def load_all(self, store, config, ram_budget_bytes: int) -> int:
+    def load_all(self, store, config, ram_budget_bytes: int, writer=None) -> int:
         if not os.path.isdir(self.dir):
             return 0
         files = []
@@ -430,6 +444,8 @@ class KvDiskLoader:
                     toks, buffers = read_records(f, h)
                 kv = build_cache(h, buffers)
                 store.store(h.session_id, toks, kv)
+                if writer is not None:
+                    writer.register_existing(h.session_id, h, h.nrec)
                 used += size
                 restored += 1
             except Exception as e:

@@ -1168,7 +1168,8 @@ class VaayuBaseModel(GenerationMixin):
                 sync=getattr(self, "kv_persist_sync", False))
             atexit.register(self._kv_writer.close)
             KvDiskLoader(persist_dir).load_all(
-                self._prefix_cache, self.config, self._prefix_cache.budget_bytes)
+                self._prefix_cache, self.config, self._prefix_cache.budget_bytes,
+                writer=self._kv_writer)
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
