@@ -59,3 +59,41 @@ def test_load_all_respects_budget(tmp_path):
     store = _Store()
     n = kp.KvDiskLoader(str(tmp_path)).load_all(store, cfg, ram_budget_bytes=1)
     assert n == 0  # budget of 1 byte admits nothing
+
+
+def test_load_all_skips_corrupt_file_and_continues(tmp_path, monkeypatch, capsys):
+    """Any exception during read/reconstruct -- not just OSError/struct.error --
+    must be caught and logged, so a corrupt file doesn't crash the whole startup
+    scan. Proves the deliberate broad except Exception clause works; matches the
+    precedent in test_kv_persist_writer.py::test_non_oserror_worker_exception_is_caught_and_logged."""
+    cfg = types.SimpleNamespace(vocab_size=1000, num_hidden_layers=2,
+                                num_key_value_heads=4, head_dim=16)
+    c = _cache()
+
+    # Write two valid sessions.
+    _write_session(tmp_path, "s1", c, cfg, [1, 2, 3, 4, 5])
+    _write_session(tmp_path, "s2", c, cfg, [6, 7, 8, 9, 10])
+
+    # Monkeypatch build_cache to raise RuntimeError for "s1" only.
+    real_build_cache = kp.build_cache
+
+    def boom(h, buffers):
+        if h.session_id == "s1":
+            raise RuntimeError("simulated corrupt file")
+        return real_build_cache(h, buffers)
+
+    monkeypatch.setattr(kp, "build_cache", boom)
+
+    store = _Store()
+    n = kp.KvDiskLoader(str(tmp_path)).load_all(store, cfg, ram_budget_bytes=10 ** 12)
+
+    # Must not raise; only s2 loads (s1 skipped due to RuntimeError).
+    assert n == 1
+    assert "s2" in store.entries
+    assert "s1" not in store.entries
+    toks, kv = store.entries["s2"]
+    assert toks == [6, 7, 8, 9, 10]
+
+    # Verify the skip message was printed.
+    output = capsys.readouterr().out
+    assert "[KV] skipping" in output
