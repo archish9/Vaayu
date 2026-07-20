@@ -1158,10 +1158,11 @@ class VaayuBaseModel(GenerationMixin):
             print("[KV] enable_kv_persist=True ignored: enable_prefix_cache is False")
         elif getattr(self, "enable_kv_persist", False):
             import shutil
-            from vaayu.kv_persist import DiskWriter, KvDiskLoader
+            from .kv_persist import DiskWriter, KvDiskLoader
             persist_dir = getattr(self, "kv_persist_dir", None) or os.path.join(
                 os.path.expanduser("~/.cache/vaayu"), "kv")
-            free = shutil.disk_usage(os.path.dirname(persist_dir) or ".").free
+            os.makedirs(persist_dir, exist_ok=True)
+            free = shutil.disk_usage(persist_dir).free
             self._kv_writer = DiskWriter(
                 persist_dir, budget_bytes=free // 2,
                 sync=getattr(self, "kv_persist_sync", False))
