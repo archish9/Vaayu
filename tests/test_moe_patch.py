@@ -1412,6 +1412,37 @@ def test_modulelist_accumulates_disk_telemetry(tmp_path, num_experts, top_k):
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_records_disk_load_and_h2d(tmp_path, num_experts, top_k):
+    """When profiling is on, the module-list path must thread the profiling dict
+    through _iter_expert_loads (disk_load) and bracket _inject_expert_weights's
+    H2D copies (h2d) — mirroring the fused-forward profiling breakdown."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref.profiling_mode = True
+    vaayu_ref._moe_profile = {
+        "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+    }
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    assert vaayu_ref._moe_profile["disk_load"] > 0.0, "cold misses recorded zero disk_load"
+    assert vaayu_ref._moe_profile["h2d"] > 0.0, "expert injection recorded zero h2d"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_off_leaves_dict_untouched(tmp_path, num_experts, top_k):
+    """Profiling must be fully gated: with profiling_mode off, the dict (even if
+    present on vaayu_ref) is never written to, so it costs nothing when disabled."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref.profiling_mode = False
+    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+    vaayu_ref._moe_profile = dict(_blank)
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    assert vaayu_ref._moe_profile == _blank
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_gpu_residency_stays_bounded(tmp_path, num_experts, top_k):
     """Async disk loads must not become async GPU injection: at most one uncached
     expert holds real weights at a time."""

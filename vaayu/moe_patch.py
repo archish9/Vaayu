@@ -666,6 +666,9 @@ def _make_modulelist_sparse_forward(
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
+        _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
+        _mp = vaayu_ref._moe_profile if _prof else None
+
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         router = getattr(block_info.moe_module, block_info.router_attr)
         router_logits = router(hidden_states)
@@ -767,8 +770,16 @@ def _make_modulelist_sparse_forward(
             # skipping it would leave those bound tensors off-meta forever.
             expert_mod = experts_list[eidx]
             try:
+                if _prof:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
                 entry = _inject_expert_weights(
                     expert_mod, raw, eidx, layer_name, device, dtype)
+                if _prof:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _mp['h2d'] += time.perf_counter() - _t0
                 if not entry:
                     return
                 if _vram is not None:
@@ -806,7 +817,7 @@ def _make_modulelist_sparse_forward(
                 finally:
                     _detach_expert(eidx, expert_mod)
 
-            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
+            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref, _mp):
                 _load_inject_run(eidx, raw)
 
             if _attach_failed:
@@ -824,7 +835,7 @@ def _make_modulelist_sparse_forward(
                     vaayu_ref=vaayu_ref,
                 )
                 _pinned_keys.update(_fb_pinned)
-                for eidx, raw in _iter_expert_loads(_fb_tensors, _fb_futures, vaayu_ref):
+                for eidx, raw in _iter_expert_loads(_fb_tensors, _fb_futures, vaayu_ref, _mp):
                     _load_inject_run(eidx, raw)
         finally:
             # Release every key THIS call pinned, even if compute raised partway
@@ -1094,7 +1105,19 @@ def _dispatch_expert_misses(
             _tmp_ex = getattr(vaayu_ref, "_moe_fallback_executor", None)
             if _tmp_ex is None:
                 from concurrent.futures import ThreadPoolExecutor as _TPE
-                _tmp_ex = _TPE(max_workers=min(len(misses), 8))
+                # Fixed width, NOT min(len(misses), 8): this pool is cached on
+                # vaayu_ref for the model's lifetime (see above), so sizing it
+                # from the first call's miss count would permanently freeze it
+                # at that width — a later call with more misses would then run
+                # its disk loads serially, defeating _iter_expert_loads'
+                # FIRST_COMPLETED overlap. get_expert_pool_size() mirrors how
+                # the persistent _moe_executor is sized in vaayu_base.py.
+                try:
+                    from .persist.safetensor_model_persister import get_expert_pool_size as _gps
+                    _pool_n = _gps()
+                except ImportError:
+                    _pool_n = 8
+                _tmp_ex = _TPE(max_workers=_pool_n)
                 vaayu_ref._moe_fallback_executor = _tmp_ex
                 atexit.register(_tmp_ex.shutdown, wait=False)
             miss_futures = [_tmp_ex.submit(_load_one, e) for e in misses]
