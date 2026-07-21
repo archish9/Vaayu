@@ -698,6 +698,18 @@ def test_exl3_forward_source_overlaps_disk_and_compute():
     assert "_moe_executor.submit(" in dispatch_src
     assert "FIRST_COMPLETED" in iter_src
 
+    # The above only proves the helpers themselves don't block — it says
+    # nothing about whether the fused forward still calls them. Without this,
+    # the fused forward could stop calling either helper (e.g. reintroduce an
+    # inline `[f.result() for f in futs]` barrier) and the test above would
+    # still pass. Prove the helpers are actually on its execution path.
+    assert "_dispatch_expert_misses(" in fused_src, (
+        "_make_fused_sparse_forward_exl3 no longer calls _dispatch_expert_misses"
+    )
+    assert "_iter_expert_loads(" in fused_src, (
+        "_make_fused_sparse_forward_exl3 no longer calls _iter_expert_loads"
+    )
+
 
 def test_permutation_dispatch_matches_one_hot_reference():
     """The EXL3 forward's permutation dispatch must select exactly the same
@@ -1182,7 +1194,11 @@ def test_modulelist_vram_eviction_reclaims_budget(tmp_path, num_experts, top_k):
 
 
 def test_dispatch_expert_misses_splits_hits_and_misses(tmp_path):
-    """RAM-cached experts come back inline; uncached ones become futures."""
+    """RAM-cached experts come back inline before disk misses (the overlap this
+    refactor most risked breaking via an ordering inversion), only the misses'
+    keys get pinned (this fixture's cache has no arena, so pinning never
+    fires — checked against that reality, not forced), and a cold miss
+    records a genuine positive disk-stall in vaayu_ref._expert_disk_s."""
     from vaayu.moe_patch import _dispatch_expert_misses, _iter_expert_loads
 
     _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
@@ -1203,6 +1219,19 @@ def test_dispatch_expert_misses_splits_hits_and_misses(tmp_path):
     assert 2 not in expert_tensors, "uncached expert should be dispatched as a future"
     assert len(futures) == 1
 
-    seen = dict(_iter_expert_loads(expert_tensors, futures, vaayu_ref))
-    assert set(seen) == {1, 2}
-    assert vaayu_ref._expert_disk_s >= 0.0, "disk stall telemetry not accumulated"
+    # This fixture's ExpertRAMCache has no arena, so _do_pin is False inside
+    # _dispatch_expert_misses and nothing should be pinned. If it ever gains
+    # an arena, this assertion must be revisited to expect {(0, 2)}.
+    assert pinned == set(), f"expected no pins without an arena, got {pinned}"
+
+    baseline = getattr(vaayu_ref, "_expert_disk_s", 0.0)
+    seen_order = list(_iter_expert_loads(expert_tensors, futures, vaayu_ref))
+    assert set(e for e, _ in seen_order) == {1, 2}
+    assert [e for e, _ in seen_order] == [1, 2], (
+        "cache hits must be yielded before disk misses — an inversion here "
+        "loses the disk/compute overlap _iter_expert_loads exists to give"
+    )
+    assert vaayu_ref._expert_disk_s > baseline, (
+        "a cold disk miss must record a strictly positive stall, not just "
+        "a non-negative one"
+    )

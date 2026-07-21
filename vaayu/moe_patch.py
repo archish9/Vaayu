@@ -954,6 +954,17 @@ def _dispatch_expert_misses(
     """
     from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
 
+    # Pin mechanism (race fix, round 2): a slab-backed cache entry checked out
+    # here (get() hit or put_slab() miss) but not yet H2D-copied must not be
+    # evicted-and-reused by a concurrent evictor — chiefly the VAAYU_LOOKAHEAD
+    # stager, which drives heavy eviction churn — in that window. We refcount-
+    # pin every checked-out key and the caller unpins once its copy is issued
+    # (after which SlabArena.record_read()/acquire() guards the in-flight-copy
+    # window). Only arena-backed (zero-clone) entries carry the race; the
+    # legacy clone path (arena is None) copies independent memory, so pinning
+    # is skipped there. pinned_keys tracks exactly which keys THIS call
+    # pinned, so the caller's finally unpins each exactly once even if
+    # compute raises partway through.
     _do_pin = expert_cache.arena is not None and not getattr(
         vaayu_ref, "_moe_prefill_pass", False)
     pinned_keys: set = set()
@@ -1034,8 +1045,12 @@ def _iter_expert_loads(expert_tensors: dict, miss_futures: list, vaayu_ref, mp=N
     miss reads), then misses in completion order. Blocking time in the wait() is
     the true disk stall and is accumulated into vaayu_ref._expert_disk_s
     (telemetry: stall, not total read time)."""
+    # Both branches filter None so a producer that puts an optional value in
+    # expert_tensors (or whose future resolves to a None raw) can't reach the
+    # compute loop and raise deep inside it — it's just skipped instead.
     for _e, _raw in expert_tensors.items():
-        yield _e, _raw
+        if _raw is not None:
+            yield _e, _raw
     _pending = set(miss_futures)
     while _pending:
         _w0 = time.perf_counter()
@@ -1203,19 +1218,6 @@ def _make_fused_sparse_forward_exl3(
             _mp['mask_sync'] += time.perf_counter() - _t0
 
         shard_file = shard_file_for(layer_name)
-        expert_tensors: dict[int, dict] = {}
-
-        # Pin mechanism (race fix, round 2): a slab-backed cache entry checked out
-        # here (get() hit or put_slab() miss) but not yet H2D-copied must not be
-        # evicted-and-reused by a concurrent evictor — chiefly the VAAYU_LOOKAHEAD
-        # stager, which drives heavy eviction churn — in that window. We refcount-
-        # pin every checked-out key and unpin once its copy is issued (after which
-        # SlabArena.record_read()/acquire() guards the in-flight-copy window). Only
-        # arena-backed (zero-clone) entries carry the race; the legacy clone path
-        # (arena is None) copies independent memory, so pinning is skipped there.
-        # _pinned_keys tracks exactly which keys THIS call pinned, so the finally
-        # below unpins each exactly once even if compute raises partway through.
-        _pinned_keys: set = set()
 
         # Prefill lookahead: if the stager pre-read this layer, WAIT for it
         # (that wait IS the disk time — no duplicate reads) and consume it.
