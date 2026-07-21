@@ -507,6 +507,20 @@ class ExpertVRAMCache:
             self.current_usage += size
             return True
 
+    def drop(self, layer_idx: int, expert_idx: int) -> bool:
+        """Remove a key that turned out to be unusable (e.g. a re-attach that
+        failed structurally). NOT counted in self.evictions — that counter
+        tracks budget-pressure evictions only, and this is a correctness
+        removal of a stale/broken entry, not the LRU making room. Returns
+        whether a key was actually removed."""
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            entry = self.cache.pop(key, None)
+            if entry is None:
+                return False
+            self.current_usage -= self._group_bytes(entry)
+            return True
+
     def reset_stats(self) -> None:
         with self.lock:
             self.hits = self.misses = self.evictions = 0

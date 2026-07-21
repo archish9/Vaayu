@@ -1063,3 +1063,107 @@ def test_modulelist_output_unchanged_by_vram_cache(tmp_path, num_experts, top_k)
     out1, _ = moe.forward(hidden)
     out2, _ = moe.forward(hidden)
     assert torch.allclose(out1, out2, atol=1e-6)
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_failed_attach_still_detaches(tmp_path, num_experts, top_k):
+    """Finding 1: a `continue` inside the load path must not skip the per-expert
+    teardown. _attach_cached_expert can re-bind an expert's real submodules and
+    still report a structural mismatch (False); if the subsequent load-path
+    `continue` (offset missing / re-injection failed) then fires, those real
+    tensors must still be detached to meta on the way out — not left bound to
+    experts_list forever.
+
+    Reproduced by wrapping the real _attach_cached_expert (so it performs its
+    real, successful re-bind — the cached entry is structurally identical to
+    the live module) but forcing its report to False, and also forcing the
+    fallback re-injection to fail so the load-path `continue` actually fires.
+    A bare mock that never touches the module wouldn't exercise the bug, since
+    nothing would leave real tensors bound in the first place.
+    """
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                      # pass 1: populate the VRAM cache
+    routed = list(vaayu_ref._expert_history[0])
+    assert routed, "expected at least one routed expert"
+
+    real_attach = mp._attach_cached_expert
+
+    def _attach_but_report_false(mod, entry):
+        real_attach(mod, entry)              # real re-bind succeeds (compatible entry)
+        return False                          # ...but report a structural mismatch anyway
+
+    with mock_patch.object(mp, "_attach_cached_expert", _attach_but_report_false), \
+         mock_patch.object(mp, "_inject_expert_weights", return_value=None):
+        moe.forward(hidden)                   # pass 2: continue-after-failed-attach path
+
+    for eidx in routed:
+        assert moe.experts[eidx].w1.weight.is_meta, (
+            f"expert {eidx} still holds real weights after a failed-attach continue")
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_failed_attach_drops_stale_vram_entry(tmp_path, num_experts, top_k):
+    """Finding 2: a structurally-mismatched cache hit must be dropped from the
+    VRAM cache, not left resident — otherwise ExpertVRAMCache.put() refuses the
+    freshly re-injected entry (key already present) and the broken entry
+    thrashes forever (reports a HIT, fails to attach, on every later token).
+
+    Uses the same forced-failure scenario as the teardown test above (real
+    re-bind + forced-False report, plus forced re-injection failure so nothing
+    re-populates the key within the same pass) to isolate the drop itself:
+    after the pass, the key must be gone and current_usage must reflect it.
+    """
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                      # pass 1: populate the VRAM cache
+    routed = list(vaayu_ref._expert_history[0])
+    assert routed, "expected at least one routed expert"
+    assert vram.current_usage > 0
+
+    real_attach = mp._attach_cached_expert
+
+    def _attach_but_report_false(mod, entry):
+        real_attach(mod, entry)
+        return False
+
+    with mock_patch.object(mp, "_attach_cached_expert", _attach_but_report_false), \
+         mock_patch.object(mp, "_inject_expert_weights", return_value=None):
+        moe.forward(hidden)                   # pass 2: attach forced to fail
+
+    for eidx in routed:
+        assert not vram.has(0, eidx), f"stale entry for expert {eidx} still resident"
+    assert vram.current_usage == 0, "current_usage did not reflect the dropped entries"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_vram_eviction_reclaims_budget(tmp_path, num_experts, top_k):
+    """A budget too small for a whole token's working set must actually evict —
+    every other test in this file uses a 10**9 budget where eviction never
+    fires. The budget is derived from a real entry's measured size (never a
+    hardcoded byte count, per this repo's model-agnostic mandate)."""
+    model, vaayu_ref, probe_vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    probe_moe = model.layers[0].block_sparse_moe
+    probe_moe.forward(torch.randn(1, 1, 8))
+
+    sizes = [probe_vram._group_bytes(entry) for entry in probe_vram.cache.values()]
+    assert sizes, "expected at least one cached expert to measure"
+    one_expert_bytes = max(sizes)
+
+    # Budget for ~1.5 experts: room for one, not for a full top_k working set.
+    small_budget = int(one_expert_bytes * 1.5)
+    model2, vaayu_ref2, vram2 = _patch_modulelist_with_vram(
+        tmp_path, num_experts, top_k, vram_budget=small_budget)
+    moe2 = model2.layers[0].block_sparse_moe
+    moe2.forward(torch.randn(1, 1, 8))
+
+    assert vram2.current_usage <= small_budget
+    assert vram2.evictions > 0

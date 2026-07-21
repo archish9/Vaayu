@@ -50,3 +50,20 @@ def test_vram_cache_has_and_resident_set():
     assert c.resident_set(0) == {3, 5}
     assert c.resident_set(1) == set()
     assert c.hits == 0 and c.misses == 0     # non-mutating
+
+
+def test_drop_removes_entry_and_frees_usage():
+    """drop() removes a resident key and gives its bytes back; dropping an
+    absent key is a tolerant no-op that reports False and leaves current_usage
+    untouched (a Finding-2 fix: a stale un-attachable VRAM entry must be
+    removable so a fresh re-injected entry can take its place)."""
+    c = ExpertVRAMCache(budget_bytes=10 ** 8)
+    c.put(0, 5, _groups(1000))
+    assert c.current_usage > 0
+
+    assert c.drop(0, 5) is True
+    assert c.current_usage == 0
+    assert not c.has(0, 5)
+
+    assert c.drop(0, 5) is False
+    assert c.current_usage == 0

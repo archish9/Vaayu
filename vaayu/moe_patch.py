@@ -711,33 +711,48 @@ def _make_modulelist_sparse_forward(
         for eidx in unique_experts:
             expert_mod = experts_list[eidx]
 
-            entry = _vram.get(layer_idx, eidx) if _vram is not None else None
-            if entry is not None and not _attach_cached_expert(expert_mod, entry):
-                entry = None      # structural mismatch — fall through to a real load
-
-            if entry is None:
-                cached = expert_cache.get(layer_idx, eidx)
-                if cached is not None:
-                    raw = cached
-                else:
-                    metas = offset_index.get_expert_offsets(layer_name, eidx)
-                    if metas is None:
-                        print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
-                        continue
-                    raw = load_expert_sparse(shard_file, metas)
-                    if not getattr(vaayu_ref, "_moe_prefill_pass", False):
-                        expert_cache.put(layer_idx, eidx, raw)
-
-                entry = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
-                if not entry:
-                    continue
-                if _vram is not None:
-                    # Return value deliberately ignored: unlike the fused path there
-                    # is no _owned_by_cache branch here. The teardown below must run
-                    # whether or not the cache accepted the entry — see its comment.
-                    _vram.put(layer_idx, eidx, entry)
-
+            # try/finally wraps the WHOLE loop body (not just the compute
+            # section) so the teardown below runs on every exit path —
+            # normal completion, a `continue` (e.g. missing offset index /
+            # failed injection below), or an exception. A `continue` inside
+            # a try still executes its finally, so this is the only change
+            # needed to make that guarantee hold; nothing else about the
+            # control flow moves.
             try:
+                entry = _vram.get(layer_idx, eidx) if _vram is not None else None
+                if entry is not None and not _attach_cached_expert(expert_mod, entry):
+                    entry = None      # structural mismatch — fall through to a real load
+                    if _vram is not None:
+                        # The partially-attached entry is now unusable AND still
+                        # keyed in the cache — ExpertVRAMCache.put() below would
+                        # refuse to re-insert it (key already present), leaving a
+                        # stale broken entry that reports a HIT and fails to
+                        # attach on every subsequent token forever. Drop it so
+                        # the re-injected entry can be inserted fresh.
+                        _vram.drop(layer_idx, eidx)
+
+                if entry is None:
+                    cached = expert_cache.get(layer_idx, eidx)
+                    if cached is not None:
+                        raw = cached
+                    else:
+                        metas = offset_index.get_expert_offsets(layer_name, eidx)
+                        if metas is None:
+                            print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
+                            continue
+                        raw = load_expert_sparse(shard_file, metas)
+                        if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                            expert_cache.put(layer_idx, eidx, raw)
+
+                    entry = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
+                    if not entry:
+                        continue
+                    if _vram is not None:
+                        # Return value deliberately ignored: unlike the fused path there
+                        # is no _owned_by_cache branch here. The teardown below must run
+                        # whether or not the cache accepted the entry — see its comment.
+                        _vram.put(layer_idx, eidx, entry)
+
                 b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
                 if b_idx.numel() > 0:
                     b_gpu = b_idx.to(hidden_states.device)
