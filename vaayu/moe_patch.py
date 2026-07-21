@@ -495,6 +495,54 @@ def _inject_expert_weights(
     return state
 
 
+def _attach_cached_expert(expert_mod: nn.Module, entry: dict) -> bool:
+    """
+    Re-bind a VRAM-cached expert (an entry built by _inject_expert_weights) onto a
+    live expert module. The inverse of injection, minus the disk read and the H2D
+    copy — that saving is the entire point of the VRAM expert cache.
+
+    Returns True if every role in the entry was attached, False on any structural
+    mismatch (caller falls through to a normal load rather than computing with a
+    half-attached module).
+
+    Layout-agnostic on purpose: it walks whatever submodule paths the entry
+    carries, so it serves EXL3 and non-EXL3 module-list experts alike without
+    knowing anything about w1/w2/w3 or a gated-MLP shape.
+    """
+    from .persist.loader_strategy import ExLlamaV3Linear
+
+    bc_objs = entry.get("bc") or {}
+    for submod_path, tensors in entry.items():
+        if submod_path == "bc":
+            continue
+        try:
+            submod = expert_mod
+            for part in submod_path.split("."):
+                submod = getattr(submod, part)
+
+            bc = bc_objs.get(submod_path)
+            if bc is not None:
+                # EXL3: the QMatrix already wraps the cached GPU tensors, so
+                # re-binding it is the whole attach — no Parameter to restore.
+                submod.bc = bc
+                continue
+
+            for base, t in tensors.items():
+                if isinstance(submod, ExLlamaV3Linear):
+                    if base == "weight":
+                        submod.weight_fallback = t
+                    elif base == "bias":
+                        submod.bias_param = nn.Parameter(t, requires_grad=False)
+                    else:
+                        setattr(submod, base, nn.Parameter(t, requires_grad=False))
+                else:
+                    setattr(submod, base, nn.Parameter(t, requires_grad=False))
+        except Exception as e:
+            _log.warning(f"Cached expert attach failed: {submod_path}: {e}")
+            return False
+    return True
+
+
 def patch_moe_blocks(
     model: nn.Module,
     expert_cache: "ExpertRAMCache",

@@ -867,3 +867,55 @@ def test_inject_expert_weights_collects_bc_objects():
     assert state is not None
     assert state["bc"]["w1"] is sentinel_bc
     assert state["w1"] is gpu_tensors
+
+
+def test_attach_cached_expert_round_trips_non_exl3():
+    """inject -> detach to meta -> attach restores usable weights."""
+    from vaayu.moe_patch import _inject_expert_weights, _attach_cached_expert
+
+    expert = MockExpert(hidden=8)
+    w1 = torch.randn(8, 8)
+    raw = {
+        "layers.0.block_sparse_moe.experts.3.w1.weight": w1,
+        "layers.0.block_sparse_moe.experts.3.w2.weight": torch.randn(8, 8),
+    }
+    entry = _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
+    assert entry is not None
+
+    expert.to("meta")
+    assert expert.w1.weight.is_meta
+
+    assert _attach_cached_expert(expert, entry) is True
+    assert not expert.w1.weight.is_meta
+    assert torch.equal(expert.w1.weight.detach(), w1)
+    # Attaching must not consume the entry — it is reused on every later hit.
+    assert torch.equal(entry["w1"]["weight"], w1)
+
+
+def test_attach_cached_expert_restores_bc():
+    """A cached QMatrix is re-bound to the live submodule."""
+    from vaayu.moe_patch import _attach_cached_expert
+    from vaayu.persist.loader_strategy import ExLlamaV3Linear
+
+    class _FakeEXL3Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = ExLlamaV3Linear.__new__(ExLlamaV3Linear)
+            nn.Module.__init__(self.w1)
+            self.w1.bc = None
+
+    expert = _FakeEXL3Expert()
+    sentinel_bc = object()
+    entry = {"w1": {"trellis": torch.randn(2, 4)}, "bc": {"w1": sentinel_bc}}
+
+    assert _attach_cached_expert(expert, entry) is True
+    assert expert.w1.bc is sentinel_bc
+
+
+def test_attach_cached_expert_returns_false_on_mismatch():
+    """A submodule path absent from the live module is reported, not raised."""
+    from vaayu.moe_patch import _attach_cached_expert
+
+    expert = MockExpert(hidden=8)
+    entry = {"nonexistent": {"weight": torch.randn(8, 8)}}
+    assert _attach_cached_expert(expert, entry) is False
