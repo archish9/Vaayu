@@ -46,6 +46,123 @@ def unique_expert_indices(expert_indices_cpu) -> list[int]:
     return sorted(int(x) for x in expert_indices_cpu.flatten().unique().tolist())
 
 
+_FP16_MAX = 65504.0  # torch.finfo(torch.float16).max — kernel-contract constant
+
+
+def _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod, x_in, expert_out) -> None:
+    """VAAYU_TRACE_EXPERT=<layer_idx> diagnostic: per-expert magnitudes for ONE
+    layer, prefill + first decode step only. Scoped to a single layer because
+    the checks force a device sync per expert (~200/layer) — far too expensive
+    to run model-wide, fine for one.
+
+    Recomputes w1's PRE-ACTIVATION output on purpose. EXL3 kernels run in fp16
+    (`ExLlamaV3Linear.forward` casts bf16 -> fp16), whose max is 65504 while
+    bf16 reaches ~3e38. An overflow there gives -inf, and silu(-inf) =
+    -inf * sigmoid(-inf) = -inf * 0 = NaN — which would present as nan=1/inf=0
+    downstream, exactly the signature seen at the last MoE layer. Reporting the
+    pre-activation absmax against _FP16_MAX confirms or refutes that directly
+    instead of inferring it.
+    """
+    target = getattr(vaayu_ref, "_trace_expert_layer", None)
+    if target is None or target != layer_idx:
+        return
+    if getattr(vaayu_ref, "_token_count", 0) > 1:
+        return
+    bad_out = bool(torch.isnan(expert_out).any().item() or
+                   torch.isinf(expert_out).any().item())
+    pre, pre_err = None, ""
+    try:
+        # No manual cast: ExLlamaV3Linear.forward does its own bf16->fp16
+        # conversion, so replicate the real call exactly rather than a variant
+        # of it. Surface any failure instead of silently reporting nan, which
+        # would be indistinguishable from a genuine overflow.
+        w1 = getattr(expert_mod, "w1", None) or getattr(expert_mod, "gate_proj", None)
+        if w1 is not None:
+            pre = w1(x_in)
+    except Exception as e:
+        pre_err = f" pre_err={type(e).__name__}:{e}"
+    pre_absmax = float(pre.abs().max().item()) if pre is not None else float("nan")
+    pre_bad = bool(pre is not None and (torch.isnan(pre).any().item()
+                                        or torch.isinf(pre).any().item()))
+    # Only print offenders plus a periodic sample, so the log stays readable.
+    if not (bad_out or pre_bad or pre_absmax > 0.1 * _FP16_MAX or eidx % 64 == 0):
+        return
+    print(f"[VAAYU-EXPERT] tok={getattr(vaayu_ref, '_token_count', 0)} "
+          f"layer={layer_idx} e={eidx:>3} rows={x_in.shape[0]} "
+          f"x_absmax={x_in.abs().max().item():.4e} "
+          f"w1pre_absmax={pre_absmax:.4e} "
+          f"(fp16_max={_FP16_MAX:.0f}, frac={pre_absmax / _FP16_MAX:.3f}) "
+          f"pre_bad={int(pre_bad)} out_bad={int(bad_out)} "
+          f"out_absmax={expert_out.abs().max().item():.4e}{pre_err}", flush=True)
+
+
+def _trace_moe_block(vaayu_ref, layer_idx, style, block_in, block_out,
+                     routing_weights, unique_experts) -> None:
+    """VAAYU_TRACE_ACT=1 diagnostic: one line per MoE block, prefill + first
+    decode step only. No-op (one getattr) when the flag is off.
+
+    Reports the expert output's magnitude RELATIVE to the block input, because
+    the transformer adds this as a residual: a ratio near 0 means the experts
+    contributed nothing (weights/QMatrix wrong), while a very large ratio means
+    they are swamping the residual. Routing-weight min/max/sum localizes a
+    routing defect separately from an expert-compute defect — sum should be
+    ~top_k per token when each token's weights are a convex mix.
+    """
+    if not getattr(vaayu_ref, "_trace_act", False):
+        return
+    if getattr(vaayu_ref, "_token_count", 0) > 1:
+        return
+    from .vaayu_base import act_stats
+    w = routing_weights.detach().float()
+    n_tok = max(1, w.numel() // max(1, w.shape[-1]))
+    print(f"[VAAYU-MOE-ACT] tok={getattr(vaayu_ref, '_token_count', 0)} "
+          f"layer={layer_idx:>3} style={style} "
+          f"in[{act_stats(block_in)}] out[{act_stats(block_out)}] "
+          f"w_min={w.min().item():.4f} w_max={w.max().item():.4f} "
+          f"w_sum_per_tok={w.sum().item() / n_tok:.4f} "
+          f"n_experts={len(unique_experts)}", flush=True)
+
+
+def route_experts(moe_module, router_logits, top_k: int):
+    """Combination weights + expert indices for one MoE layer, using the
+    MODEL's own scoring function (CLAUDE.md §5: detection over assumption).
+
+    Delegates to `moe_module.route_tokens_to_experts(router_logits)` when the
+    model defines it — the contract transformers standardizes across 25+ MoE
+    architectures (DeepSeek v2/v3, GLM-MoE, dots1, dbrx, jamba, MiniMax-M2...).
+    Those models do NOT score with softmax. MiniMax-M2 scores with sigmoid and
+    adds an `e_score_correction_bias` that steers SELECTION
+    (`scoring_func: "sigmoid"`, `use_routing_bias: true` in its config), then
+    takes weights from the UNBIASED sigmoid. Normalizing softmax over the top-k
+    instead yields a far peakier mix — for logits [3,2,1] the top expert gets
+    ~0.67 rather than ~0.37 — wrong on every layer, which is what made MiniMax
+    emit incoherent text while loading, patching and streaming perfectly.
+
+    Falls back to plain softmax-topk when no contract method exists, which is
+    what Qwen3-MoE and Mixtral genuinely do — byte-identical to the previous
+    hardcoded expression for them, so the actively-tested path is unchanged.
+
+    Return order is NOT stable across implementors (DeepSeek/GLM/dots1/MiniMax
+    return `(indices, weights)`; dbrx returns `(weights, indices)`), so the two
+    are told apart by dtype — indices are integral, weights floating point —
+    never by position.
+
+    `router_logits` may be (N, E) or (B, S, E). The contract methods only accept
+    2-D (they `gather(1, ...)`), so leading dims are flattened and restored here.
+    Returns (weights, indices), each shaped like router_logits with E -> top_k.
+    """
+    fn = getattr(moe_module, "route_tokens_to_experts", None)
+    if not callable(fn):
+        w, idx = torch.topk(router_logits.float().softmax(dim=-1), top_k, dim=-1)
+        return w / w.sum(dim=-1, keepdim=True), idx
+
+    lead_shape = router_logits.shape[:-1]
+    flat = router_logits.reshape(-1, router_logits.shape[-1])
+    first, second = fn(flat)
+    idx, w = (first, second) if not first.is_floating_point() else (second, first)
+    return w.reshape(*lead_shape, -1), idx.reshape(*lead_shape, -1)
+
+
 def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
     """Bias top-k SELECTION toward resident experts; take combination WEIGHTS
     from the ORIGINAL logits (selection changes, weighting stays faithful —
@@ -221,7 +338,12 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
          OR a fused expert module (e.g. MixtralExperts) with num_experts > _MIN_EXPERTS
       2. A sibling nn.Linear whose attribute name is in _ROUTER_NAMES  (the gate)
          OR a router module (e.g. MixtralTopKRouter) with a .weight parameter
+         OR an ExLlamaV3Linear (a plain nn.Linear router that EXL3LoaderStrategy's
+         setup_model() already swapped, before detection runs — some EXL3
+         checkpoints leave small modules like routers unquantized)
     """
+    from .persist.loader_strategy import ExLlamaV3Linear
+
     results: list[MoEBlockInfo] = []
     seen_paths: set[str] = set()
 
@@ -248,8 +370,10 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
             # Router check
             if isinstance(child, nn.Linear) and child_name in _ROUTER_NAMES:
                 router_attr = child_name
-            elif (child_name in _ROUTER_NAMES 
-                  and hasattr(child, 'weight') 
+            elif isinstance(child, ExLlamaV3Linear) and child_name in _ROUTER_NAMES:
+                router_attr = child_name
+            elif (child_name in _ROUTER_NAMES
+                  and hasattr(child, 'weight')
                   and isinstance(getattr(child, 'weight', None), (nn.Parameter, torch.Tensor))):
                 router_attr = child_name
 
@@ -306,22 +430,56 @@ def _inject_expert_weights(
     Uses regex to strip the full key prefix generically:
         "layers.0.block_sparse_moe.experts.0.w1.weight" → "w1.weight"
     Works for Mixtral, DeepSeek, Kimi, Qwen MoE without hardcoding architecture names.
+
+    Groups tensors by their target submodule first (not injected one-by-one)
+    because an EXL3-quantized submodule (setup_model() may have swapped a
+    module-list expert's w1/w2/w3 to ExLlamaV3Linear) needs all its quant
+    tensors (trellis/suh/svh/...) together to build one QMatrix — see
+    persist.loader_strategy.build_exl3_qmatrix.
     """
+    from .persist.loader_strategy import ExLlamaV3Linear, build_exl3_qmatrix, _EXL3_QTENSOR_KEYS
+
+    groups: dict[str, dict] = {}
     for param_key, tensor in raw.items():
         m = _EXPERT_PREFIX_RE.match(param_key)
         if m is None:
             continue  # not an expert tensor (shouldn't happen but be safe)
-        local_key = param_key[m.end():]  # e.g. "w1.weight"
-        local_parts = local_key.split(".")
+        local_key = param_key[m.end():]  # e.g. "w1.weight" or "w1.trellis"
+        submod_path, _, base = local_key.rpartition(".")
+        groups.setdefault(submod_path, {})[base] = tensor
+
+    for submod_path, bases in groups.items():
         try:
             submod = expert_mod
-            for part in local_parts[:-1]:
+            for part in submod_path.split("."):
                 submod = getattr(submod, part)
-            t = tensor.to(device, dtype=dtype, non_blocking=True)
-            setattr(submod, local_parts[-1], nn.Parameter(t, requires_grad=False))
+
+            if isinstance(submod, ExLlamaV3Linear) and any(
+                b in _EXL3_QTENSOR_KEYS for b in bases
+            ):
+                # non_blocking=False: these tensors come from disk loads /
+                # the RAM cache, not guaranteed page-locked — see
+                # build_exl3_qmatrix's docstring for why async here leaks host RAM.
+                build_exl3_qmatrix(submod, bases, device, non_blocking=False)
+                continue
+
+            for base, tensor in bases.items():
+                t = tensor.to(device, dtype=dtype, non_blocking=False)
+                if isinstance(submod, ExLlamaV3Linear):
+                    # Unquantized weight/bias landing on a module setup_model()
+                    # swapped anyway — ExLlamaV3Linear has no "weight"/"bias"
+                    # attribute of its own, target the real fallback fields.
+                    if base == "weight":
+                        submod.weight_fallback = t
+                    elif base == "bias":
+                        submod.bias_param = nn.Parameter(t, requires_grad=False)
+                    else:
+                        setattr(submod, base, nn.Parameter(t, requires_grad=False))
+                else:
+                    setattr(submod, base, nn.Parameter(t, requires_grad=False))
         except Exception as e:
             _log.warning(
-                f"Expert weight inject failed: {param_key} → {local_key}: {e}"
+                f"Expert weight inject failed: {submod_path} ({list(bases)}): {e}"
             )
             return False
     return True
@@ -337,6 +495,7 @@ def patch_moe_blocks(
     dtype: torch.dtype,
     vaayu_ref,
     loader_strategy=None,
+    blocks=None,
 ) -> list[MoEBlockInfo]:
     """
     Detect all MoE blocks in model and replace their forward() with a sparse version.
@@ -359,7 +518,11 @@ def patch_moe_blocks(
         is_exl3 = False
     compute_device = "cuda" if (is_exl3 or device.startswith("cuda")) else "cpu"
 
-    blocks = detect_moe_blocks(model)
+    # `blocks` lets a caller that already ran detect_moe_blocks (the engine does,
+    # to size the slab arena before this point) pass the result in rather than
+    # walking the module tree a second time. None = detect here, as before.
+    if blocks is None:
+        blocks = detect_moe_blocks(model)
     for block_info in blocks:
         original_forward = block_info.moe_module.forward
         sparse_fwd = _make_sparse_moe_forward(
@@ -436,6 +599,7 @@ def _make_modulelist_sparse_forward(
     original_forward = None,
 ):
     from .persist.safetensor_model_persister import load_expert_sparse
+    from .persist.loader_strategy import ExLlamaV3Linear
 
     layer_name = block_info.layer_name
     layer_idx  = block_info.layer_idx
@@ -447,10 +611,13 @@ def _make_modulelist_sparse_forward(
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         router = getattr(block_info.moe_module, block_info.router_attr)
         router_logits = router(hidden_states)
-        routing_weights, expert_indices = torch.topk(
-            router_logits.float().softmax(dim=-1), top_k, dim=-1
+        # Use the model's OWN scoring function when it defines one — never a
+        # hardcoded softmax. MiniMax-M2 (this layout's on-device target) scores
+        # with sigmoid + e_score_correction_bias; softmax produced a far peakier
+        # mix on every layer and made the model emit incoherent text.
+        routing_weights, expert_indices = route_experts(
+            block_info.moe_module, router_logits, top_k
         )
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
 
@@ -458,13 +625,24 @@ def _make_modulelist_sparse_forward(
             vaayu_ref.telemetry.record_batch_overlap(
                 layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
 
-        # 2. Load missing experts: ExpertRAMCache → sparse io_uring
+        # 2/3. Load -> inject -> compute -> free, ONE expert at a time. Bounds
+        # peak concurrent QMatrix/weight residency to a single expert
+        # regardless of how many experts this token's routing touches in this
+        # layer. An earlier version loaded+injected ALL unique_experts before
+        # computing/freeing any of them — peak residency scaled with
+        # unique_experts count, which spiked hard on wide-routing tokens
+        # (worst case: prefill's whole-prompt chunk) and caused an OOM-kill
+        # that gradual periodic gc.collect()/empty_cache() didn't prevent,
+        # since it was a single-token spike, not a slow leak.
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
-        expert_tensors: dict[int, dict] = {}
+        experts_list = getattr(block_info.moe_module, block_info.experts_attr)
+        final_hidden = torch.zeros_like(hidden_states)
+        _idx_cpu = expert_indices.cpu()
+
         for eidx in unique_experts:
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
-                expert_tensors[eidx] = cached
+                raw = cached
             else:
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
                 if metas is None:
@@ -473,49 +651,46 @@ def _make_modulelist_sparse_forward(
                 raw = load_expert_sparse(shard_file, metas)
                 if not getattr(vaayu_ref, "_moe_prefill_pass", False):
                     expert_cache.put(layer_idx, eidx, raw)
-                expert_tensors[eidx] = raw
 
-        # 3. Temporarily inject active expert weights → device, run FFN, unload
-        experts_list = getattr(block_info.moe_module, block_info.experts_attr)
-        B, S, H = hidden_states.shape
-        final_hidden = torch.zeros_like(hidden_states)
-
-        injected_experts: set[int] = set()
-        for eidx in unique_experts:
-            raw = expert_tensors.get(eidx)
-            if raw is None:
-                continue
             expert_mod = experts_list[eidx]
             ok = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
-            if ok:
-                injected_experts.add(eidx)
-
-        # Vectorized: gather all positions routed to each expert and run the
-        # expert FFN once per expert on the batch of its tokens, instead of a
-        # triple Python loop with a .item() GPU sync per position.
-        _idx_cpu = expert_indices.cpu()
-        for eidx in injected_experts:
-            b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
-            if b_idx.numel() == 0:
+            if not ok:
                 continue
-            b_gpu = b_idx.to(hidden_states.device)
-            s_gpu = s_idx.to(hidden_states.device)
-            k_gpu = k_idx.to(hidden_states.device)
-            expert_mod = experts_list[eidx]
-            expert_out = expert_mod(hidden_states[b_gpu, s_gpu])          # (M, H)
-            w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
-            final_hidden.index_put_((b_gpu, s_gpu),
-                                    (w * expert_out).to(final_hidden.dtype),
-                                    accumulate=True)
 
-        for eidx in injected_experts:
             try:
-                experts_list[eidx].to("meta")
-            except Exception as e:
-                _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
+                b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
+                if b_idx.numel() > 0:
+                    b_gpu = b_idx.to(hidden_states.device)
+                    s_gpu = s_idx.to(hidden_states.device)
+                    k_gpu = k_idx.to(hidden_states.device)
+                    _x_in = hidden_states[b_gpu, s_gpu]
+                    expert_out = expert_mod(_x_in)                               # (M, H)
+                    _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod,
+                                  _x_in, expert_out)
+                    w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
+                    final_hidden.index_put_((b_gpu, s_gpu),
+                                            (w * expert_out).to(final_hidden.dtype),
+                                            accumulate=True)
+            finally:
+                try:
+                    # ExLlamaV3Linear QMatrix (.bc) is a C++ object PyTorch GC
+                    # does not manage — .to("meta") below only clears real
+                    # torch parameters/buffers. Must drop the pybind11 ref
+                    # explicitly or every token leaks VRAM until the 16GB GPU
+                    # OOMs. try/finally so a compute exception still frees
+                    # this expert before the exception propagates.
+                    for submod in expert_mod.modules():
+                        if isinstance(submod, ExLlamaV3Linear):
+                            submod.bc = None
+                            submod.weight_fallback = None
+                    expert_mod.to("meta")
+                except Exception as e:
+                    _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
+        _trace_moe_block(vaayu_ref, layer_idx, "module_list", hidden_states,
+                         final_hidden, routing_weights, unique_experts)
         return final_hidden, router_logits
 
     return sparse_forward
@@ -730,18 +905,26 @@ def _make_fused_sparse_forward_exl3(
             router_logits, routing_weights, expert_indices = router_res[:3]
         else:
             router_logits = router_res
-            # Cache-aware routing (advanced-opt #4): bias top-k toward resident
-            # experts. ONLY in this branch — the tuple branch above means the
-            # model returned its OWN top-k (possibly grouped / correction-biased,
-            # e.g. DeepSeek/MiniMax family) and must never be re-routed.
-            # _build_resident_mask returns None when the feature is off, so
-            # cache_aware_topk reduces to plain softmax-topk (no behavior change).
-            _res_mask = _build_resident_mask(
-                vaayu_ref, expert_cache, layer_idx,
-                router_logits.shape[-1], router_logits.device)
-            routing_weights, expert_indices = cache_aware_topk(
-                router_logits, _res_mask, top_k,
-                getattr(vaayu_ref, "_cache_bias", 0.0))
+            if callable(getattr(moe_mod, "route_tokens_to_experts", None)):
+                # Model defines its own scoring function (sigmoid / correction
+                # bias / group routing — DeepSeek, GLM-MoE, MiniMax family).
+                # It owns routing; cache-aware biasing cannot apply to a scoring
+                # function we don't own, and softmax here would be simply wrong.
+                routing_weights, expert_indices = route_experts(
+                    moe_mod, router_logits, top_k)
+            else:
+                # Cache-aware routing (advanced-opt #4): bias top-k toward resident
+                # experts. ONLY in this branch — the tuple branch above means the
+                # model returned its OWN top-k (possibly grouped / correction-biased,
+                # e.g. DeepSeek/MiniMax family) and must never be re-routed.
+                # _build_resident_mask returns None when the feature is off, so
+                # cache_aware_topk reduces to plain softmax-topk (no behavior change).
+                _res_mask = _build_resident_mask(
+                    vaayu_ref, expert_cache, layer_idx,
+                    router_logits.shape[-1], router_logits.device)
+                routing_weights, expert_indices = cache_aware_topk(
+                    router_logits, _res_mask, top_k,
+                    getattr(vaayu_ref, "_cache_bias", 0.0))
 
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
@@ -1175,6 +1358,8 @@ def _make_fused_sparse_forward_exl3(
             vaayu_ref._chunk_major_gpu_bytes = 0
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
+        _trace_moe_block(vaayu_ref, layer_idx, "fused_exl3", flat_hidden,
+                         final_hidden, routing_weights, unique_experts)
         return final_hidden.view(B, S, H)
 
     return sparse_forward

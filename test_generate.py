@@ -38,7 +38,9 @@ logging.basicConfig(
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MODEL_PATH         = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
+MODEL_PATH         = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
+# Known-good reference on this stack, for VAAYU_TRACE_ACT baselines:
+# MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 # max_new_tokens is a SAFETY CEILING, not a target length — you can't know a
@@ -48,12 +50,12 @@ MAX_PINNED_LAYERS  = 10
 # stops there, well before this cap, unless the model runs on. Set this
 # generously above what you expect (a few hundred lines of Python easily
 # fits in ~2000 tokens); it only costs time if the model actually needs it.
-MAX_NEW_TOKENS     = 2048
+MAX_NEW_TOKENS     = 20
 MAX_LENGTH         = 2048
 PREFILL_CHUNK_SIZE = 512
 
 # PLD OFF — novel code generation, zero n-gram match with prompt.
-DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
+DRAFTER_MODEL_PATH = None # "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
 USE_PROMPT_LOOKUP  = False
 DRAFT_TOKENS       = 5
 
@@ -67,7 +69,10 @@ ENABLE_PREFIX_CACHE = True
 AUTO_PREFIX_MATCH   = True
 ENABLE_KV_PERSIST   = True
 KV_PERSIST_SYNC     = False   # async append (production default) — faster, matches shipped default
-SESSION_ID          = "test-generate-benchmark"
+# Fresh id: earlier MiniMax runs persisted .vaayu_kv under the old id, and that
+# KV was computed with the BROKEN full-width RoPE. Restoring it would poison
+# this run's prefix with corrupt keys and mask the fix.
+SESSION_ID          = "minimax-nan-fix-verify"
 
 # torch.compile: shipped, but NOT enabled here. This model streams expert
 # weights from NVMe per-token (moe_patch.py) — a dynamic I/O-bound path

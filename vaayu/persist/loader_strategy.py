@@ -163,6 +163,47 @@ _EXL3_DTYPE_MAP = {
 }
 
 
+# fp16 ceiling. A CUDA/kernel-contract constant (EXL3 kernels are fp16), not a
+# model number — see CLAUDE.md §5.
+_FP16_MAX = 65504.0
+# Narrow to at most this before the cast, leaving headroom so the GEMM's own
+# accumulation doesn't immediately overflow the fp16 output either.
+_FP16_SAFE = _FP16_MAX / 2.0
+
+
+def fp16_safe_narrow(x: torch.Tensor):
+    """Cast `x` to fp16 without overflowing, returning (x_fp16, scale).
+
+    bf16 carries fp32's exponent range (~3e38) while fp16 tops out at 65504, so
+    a plain `.to(torch.float16)` silently turns large activations into `inf` —
+    which the EXL3 kernel then propagates as `NaN`. Confirmed on-device: MoE
+    `silu(w1(x)) * w3(x)` exceeded 65504 for a high-gain expert, and the `w2`
+    call that consumed it produced NaN (`nan=1, inf=0`) with no crash.
+
+    A linear operator is homogeneous, f(x/s) * s == f(x), so the caller can
+    rescale the OUTPUT by `scale` and recover the true result exactly (to fp16
+    rounding). That is why this rescales rather than clamping, which would
+    silently corrupt magnitudes.
+
+    The division happens BEFORE the narrowing — dividing after the cast would
+    be too late, the `inf` already exists.
+
+    `scale` is returned as a device TENSOR, never a Python float: this runs on a
+    per-expert, per-token hot path (~350-400 calls/token), and `.item()` would
+    force a host sync on every one. Returns scale == 1.0 whenever the input
+    already fits, making the common path byte-identical to a plain cast.
+    """
+    if x.dtype == torch.float16:
+        return x, torch.ones((), dtype=torch.float32, device=x.device)
+    if x.numel() == 0:
+        return x.to(torch.float16), torch.ones((), dtype=torch.float32, device=x.device)
+    amax = x.detach().abs().amax().float()
+    scale = torch.clamp(amax / _FP16_SAFE, min=1.0)
+    if bool(scale.requires_grad):
+        scale = scale.detach()
+    return (x / scale.to(x.dtype)).to(torch.float16), scale
+
+
 class ExLlamaV3Linear(nn.Module):
     """
     Drop-in replacement for nn.Linear that defers computation to ExLlamaV3's
@@ -177,7 +218,13 @@ class ExLlamaV3Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.bc = None  # set by inject_to_gpu
+        self.bc = None  # set by inject_to_gpu (EXL3-quantized weight)
+        # Some EXL3 checkpoints leave select layers unquantized (plain F16/BF16
+        # weight) — e.g. small MoE router gates, kept unquantized for routing
+        # stability. setup_model() swaps every nn.Linear to ExLlamaV3Linear
+        # regardless, so this module must also support a plain-matmul fallback
+        # for tensors inject_to_gpu() finds are NOT EXL3 quant tensors.
+        self.weight_fallback = None  # set by inject_to_gpu (plain weight)
 
         if bias:
             self.bias_param = nn.Parameter(torch.empty(out_features))
@@ -185,13 +232,22 @@ class ExLlamaV3Linear(nn.Module):
             self.register_parameter("bias_param", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.bc is None:
+        if self.bc is None and self.weight_fallback is None:
             raise RuntimeError(
                 f"ExLlamaV3Linear (out={self.out_features}): bc not set. "
                 "inject_to_gpu() must be called before forward()."
             )
+        if self.bc is None:
+            import torch.nn.functional as F
+            bias = self.bias_param if self.bias_param is not None else None
+            return F.linear(x, self.weight_fallback, bias)
         try:
-            x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+            # Overflow-safe narrowing: a plain .to(float16) turns any bf16
+            # activation above 65504 into inf, which this kernel propagates as
+            # NaN. fp16_safe_narrow rescales instead; the output is scaled back
+            # below (valid because a linear op is homogeneous). scale is 1.0 for
+            # in-range input, making the common path byte-identical.
+            x_in, _x_scale = fp16_safe_narrow(x)
             x_in = x_in.contiguous()
 
             shape = x_in.shape
@@ -213,9 +269,70 @@ class ExLlamaV3Linear(nn.Module):
             if out.dtype != x.dtype:
                 out = out.to(x.dtype)
 
-            return out
+            # Undo the input rescale (f(x/s) * s == f(x) for a linear f). Done
+            # AFTER widening back to x's dtype on purpose: multiplying while
+            # still fp16 could push the result straight back over 65504 and
+            # reintroduce the very inf this guard exists to prevent. scale is
+            # 1.0 whenever the input already fit, so this is a no-op then.
+            return out * _x_scale.to(out.dtype)
         except ImportError:
             raise RuntimeError("exllamav3 not installed. Cannot run ExLlamaV3Linear.forward().")
+
+
+def build_exl3_qmatrix(
+    mod: "ExLlamaV3Linear", tensors_by_base: dict, device: str, non_blocking: bool = True
+) -> None:
+    """
+    Build a C++ QMatrix (BC_LinearEXL3) from a group of EXL3 quant tensors
+    (trellis/suh/svh/mcg/mul1, keyed by base name) and attach it to mod.bc.
+
+    Shared by EXL3LoaderStrategy.inject_to_gpu (per-layer, pinned layers) and
+    moe_patch.py's per-token expert injection (module-list MoE layout, e.g.
+    MiniMax) — both need identical QMatrix construction, and the module-list
+    per-token path additionally needs the caller to clear mod.bc afterward
+    (see EXL3LoaderStrategy.free_from_gpu for why: C++-owned, not PyTorch-GC'd).
+
+    non_blocking=True only actually overlaps when the source tensor is
+    page-locked; for a pageable source, PyTorch silently routes it through an
+    internal pinned staging-buffer pool (CachingHostAllocator) that
+    torch.cuda.empty_cache() does NOT reclaim (that only clears the device
+    allocator) — under thousands of small per-token copies from non-pinned
+    disk-loaded tensors this pool balloons into a real host-RAM leak
+    (confirmed: prefill alone drove RSS to ~22-27GB). The per-layer pinned
+    path (inject_to_gpu, SlabArena-backed) keeps non_blocking=True since its
+    sources are genuinely pinned; the per-token module-list path
+    (moe_patch.py) passes non_blocking=False.
+    """
+    from exllamav3 import ext as exl3_ext
+    from exllamav3.util.tensor import g_tensor_cache
+
+    gpu_tensors = {k: t.to(device, non_blocking=non_blocking) for k, t in tensors_by_base.items()}
+
+    trellis = gpu_tensors.get("trellis")
+    suh = gpu_tensors.get("suh")
+    svh = gpu_tensors.get("svh")
+    mcg_tensor = gpu_tensors.get("mcg")
+    mul1_tensor = gpu_tensors.get("mul1")
+
+    # TODO: add fallback if su/sv packed weights are present
+    if suh is None and "su" in gpu_tensors:
+        raise NotImplementedError("su packed weight detected, please unpack to suh")
+
+    K = trellis.shape[-1] // 16 if trellis is not None else 0
+
+    bsz1_xh_args = (device, (1, mod.in_features), torch.float16)
+    xh = g_tensor_cache.get(*bsz1_xh_args)
+
+    mod.bc = exl3_ext.exllamav3_ext.BC_LinearEXL3(
+        trellis,
+        suh,
+        svh,
+        K,
+        mod.bias_param,
+        mcg_tensor is not None,
+        mul1_tensor is not None,
+        xh,
+    )
 
 
 class EXL3LoaderStrategy(LoaderStrategy):
@@ -367,48 +484,25 @@ class EXL3LoaderStrategy(LoaderStrategy):
                 base in _EXL3_QTENSOR_KEYS for base in params
             ):
                 # ── EXL3 quantized linear: build QMatrix ──────────────────
-                gpu_tensors = {}
-                param_names_moved = []
-                print(f"Resolving mod_path: {mod_path}, mod type: {type(mod)}")
                 for base, (full_name, tensor) in params.items():
-                    gpu_tensors[base] = tensor.to(device, non_blocking=True)
-                    param_names_moved.append(full_name)
                     moved.append(full_name)
-
-                trellis = gpu_tensors.get("trellis")
-                suh = gpu_tensors.get("suh")
-                svh = gpu_tensors.get("svh")
-                mcg_tensor = gpu_tensors.get("mcg")
-                mul1_tensor = gpu_tensors.get("mul1")
-
-                # TODO: add fallback if su/sv packed weights are present
-                if suh is None and "su" in gpu_tensors:
-                    raise NotImplementedError("su packed weight detected, please unpack to suh")
-
-                K = trellis.shape[-1] // 16 if trellis is not None else 0
-
-                from exllamav3.util.tensor import g_tensor_cache
-                bsz1_xh_args = (device, (1, mod.in_features), torch.float16)
-                xh = g_tensor_cache.get(*bsz1_xh_args)
-
-                mod.bc = exl3_ext.exllamav3_ext.BC_LinearEXL3(
-                    trellis,
-                    suh,
-                    svh,
-                    K,
-                    mod.bias_param,
-                    mcg_tensor is not None,
-                    mul1_tensor is not None,
-                    xh
+                build_exl3_qmatrix(
+                    mod, {base: tensor for base, (_, tensor) in params.items()}, device
                 )
                 qmatrices_this_layer.append((mod_path, mod.bc))
 
-                # Free the intermediate GPU tensors
-                del gpu_tensors
-
             else:
-                # ── Non-quantized (norm, bias, embed) — standard injection ─
+                # ── Non-quantized (norm, bias, embed, unquantized Linear) ──
                 for base, (full_name, tensor) in params.items():
+                    if isinstance(mod, ExLlamaV3Linear) and base == "weight":
+                        # Checkpoint left this ExLlamaV3Linear's weight
+                        # unquantized (e.g. a small MoE router gate) — no
+                        # "weight" attribute exists on the module to target
+                        # via set_module_tensor_to_device, use the plain
+                        # fallback path instead.
+                        mod.weight_fallback = tensor.to(device, dtype=dtype, non_blocking=True)
+                        moved.append(full_name)
+                        continue
                     try:
                         set_module_tensor_to_device(
                             model, full_name, device, value=tensor, dtype=dtype
@@ -436,13 +530,17 @@ class EXL3LoaderStrategy(LoaderStrategy):
         except ImportError:
             pass
         else:
-            # Walk ExLlamaV3Linear modules in this layer and clear bc
+            # Walk ExLlamaV3Linear modules in this layer and clear bc / plain fallback
             for sub_module in layer_module.modules():
-                if isinstance(sub_module, ExLlamaV3Linear) and sub_module.bc is not None:
-                    # Rely on pybind11 refcount to free C++ memory
-                    sub_module.bc = None
+                if isinstance(sub_module, ExLlamaV3Linear):
+                    if sub_module.bc is not None:
+                        # Rely on pybind11 refcount to free C++ memory
+                        sub_module.bc = None
+                    sub_module.weight_fallback = None
 
-        # Move non-quantized parameters back to meta
+        # Move non-quantized parameters back to meta (no-ops harmlessly for
+        # ExLlamaV3Linear plain-fallback weights — those aren't registered
+        # torch Parameters, already cleared via weight_fallback above).
         for param_name in moved_layers:
             param_base = param_name.rsplit(".", 1)[-1]
             if param_base not in _EXL3_QTENSOR_KEYS:

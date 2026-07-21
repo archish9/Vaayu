@@ -1427,42 +1427,125 @@ for eidx in unique_experts:
 
 ------
 
+evidence: MODEL_PATH = Qwen3-235B-A22B-Thinking-2507 — a thinking/reasoning-mode model. Output shows 2048 tokens of pure
+  chain-of-thought ("We are going to implement... Steps: 1... How about" — cuts off mid-sentence), zero actual async_watcher.py
+  code. Output tokens: 2048 == MAX_NEW_TOKENS exactly, no EOS — hard-capped mid-reasoning, before the model ever got to writing
+  code.
 
-  What Colibri does that Vaayu could steal (interesting)
+  test_generate.py:44-51 comment assumes 2048 tokens covers "a few hundred lines of Python" — true for code alone, but doesn't
+  budget for the Thinking model's mandatory reasoning preamble eating the same cap.
 
-  Genuinely worth studying for Vaayu:
-
-  1. KV cache persistence (.coli_kv). "Reopen warm via crash-safe file, byte-identical to uninterrupted sessions." Directly adjacent to your prefix-caching plan — this is a shipped implementation of the same
-  idea.
-  2. Learned expert pinning — they keep a .coli_usage histogram of expert access frequency and pin the hot ones. Vaayu's perf review considered this ("heavy-hitter pinning") and deferred it. Colibri
-  implemented it.
-  3. Auto-sized expert cache from MemAvailable at startup with peak-projection headroom to prevent OOM-killer. Vaayu has hardware constants (16 GB VRAM, 8.5 GB expert cache ceiling); dynamic sizing would be
-  more portable.
+  Check if this model's chat template supports skipping thinking mode (cleaner than just raising the cap):
   4. CPU AVX2 int4 matmul kernels as a fallback path. Vaayu is EXL3-only, which locks it to CUDA. A CPU fallback would broaden portability significantly.
 
 
+  ---
 
-  -------
+    Two real bugs fixed and verified in vaayu/persist/loader_strategy.py and vaayu/moe_patch.py:
+
+  1. Router detection gap: setup_model() swaps every nn.Linear to ExLlamaV3Linear, including MiniMax's unquantized router gate.
+  detect_moe_blocks() only recognized real nn.Linear or modules exposing .weight — missed it entirely, so 0 of 62 MoE blocks got 
+  patched and the model silently ran unpatched on uninitialized weights. Fixed with a weight_fallback path on ExLlamaV3Linear
+  plus teaching detection to recognize it.
+  2. Module-list + EXL3 injection never built: _inject_expert_weights (used only by the module-list expert layout, e.g. MiniMax)
+  did a blind setattr designed for plain dense experts — never built the QMatrix EXL3 quantized experts need. Fixed by making it
+  group tensors per-submodule and route quantized ones through the same QMatrix builder the tested per-layer path uses. Also
+  bounded peak per-token expert residency (inject→compute→free one at a time instead of all-then-free) and fixed non_blocking H2D
+  usage — both correct improvements, verified via instrumentation that per-token/per-expert memory is now flat.
+
+  Unresolved, and distinct from those bugs: prefill (this prompt's 435 tokens processed as one chunk) spikes host RAM to 16-28GB,
+  highly variable run to run, before any of my MoE code even runs its first expert. Ruled out via direct testing: not
+  prefix-cache, not KV-persist, not my expert injection code (proven flat by fine-grained instrumentation), not VRAM cache
+  (unused, empty). Traced to a single 16GB /dev/zero MAP_SHARED region via /proc/pid/smaps — likely PyTorch's pinned-memory
+  allocator or the _load_pinned double-buffer in safetensor_model_persister.py ballooning under the burst of ~13,000 expert loads
+  in one giant forward pass. Three fix attempts targeting my own code didn't move this number, so per the systematic-debugging
+  discipline I stopped guessing rather than attempt a fourth blind fix.
+
+  Cheapest next lever, untested: PREFILL_CHUNK_SIZE is 512 and the prompt is 435 tokens, so chunking is effectively off — the
+  whole prompt hits every layer's router in one shot. Dropping it (e.g. to 64) would force much smaller per-forward-pass expert
+  fan-out, directly targeting this spike, config-only, no code risk.
 
 
-  Revised order (my recommendation)
 
-  1. Task 6 A/B — as you planned
-  2. Task 3 diagnostic — as you planned
-  3. ~~Task 5 root cause~~ — skip
-  4. Agent workload brainstorm — moved up; may reprioritize what follows
-  5. Prefix caching + KV persistence (merged) — Colibri #1 folds in here
-  6. Learned expert pinning (Colibri #2) — nicely complements Task 6's routing bias
-  7. Auto-sized expert cache (Colibri #3) — small, easy, do in an odd hour
-  8. CPU AVX2 fallback (Colibri #4) — only if portability is a real requirement; otherwise drop
+=>  Full picture, start to finish:
+
+  Goal: run test_generate.py — load MiniMax-M2.7 (EXL3-quantized MoE model, 256 experts/layer, 62 layers) on this 32GB RAM / 16GB
+  VRAM box, generate code.
+
+  Bug 1 — model silently didn't run at all. Vaayu streams MoE expert weights from disk on demand (can't fit 256 experts × 62
+  layers in VRAM at once). To find where the MoE routing/expert logic lives in the model, detect_moe_blocks() scans for a router
+  (gate) + expert list pair. Separately, EXL3 loading swaps every Linear layer in the model to a custom ExLlamaV3Linear wrapper
+  (needed for the quantized-weight kernels). MiniMax's router gate happens to be unquantized plain weight — but it still got
+  swapped to that wrapper. Detection only recognized real nn.Linear or modules with a .weight attr — the wrapper has neither.
+  Result: 0 of 62 layers got patched, so the model quietly ran on uninitialized weights and crashed with garbage/errors. Fixed:
+  gave the wrapper a fallback path for unquantized weights, taught detection to recognize it.
+
+  Bug 2 — experts crashed once detection worked. MiniMax stores its 256 experts as a plain list of Linear-triples (w1/w2/w3),
+  unlike the model (Qwen) this MoE-streaming code was actually built/tested against, which bundles experts differently. The
+  per-token code that loads an expert's weights onto GPU didn't know how to build the special quantized-weight object (QMatrix)
+  these Linear wrappers need — it just did a naive attribute-set that silently did nothing useful. Fixed: taught it to build the
+  QMatrix correctly (reusing the logic from the code path that already does this right), and to properly free it after each
+  expert so nothing piles up in VRAM.
+
+Both bugs fixed and confirmed working — the model correctly loads, all 62 layers patch, and I instrumented it to prove expert
+  loading/freeing stays flat over time (no leak in that code).
+
+  What's still broken: the box still runs out of memory, but at a different point — during prefill (processing the whole prompt
+  before generating anything), RAM balloons to 16-28GB in one shot, before my expert code even runs its first expert. I ruled out
+  three suspects by direct testing (prefix-cache feature, KV-disk-persistence feature, my own expert-loading code — all
+  cleared). I traced it to one giant 16GB memory block that looks like it's coming from something lower-level (PyTorch's internal
+  memory pool, or a buffer in Vaayu's disk-loading code) — haven't pinned the exact source yet. This is a separate, still-open
+  problem.
 
 
-  Prefix caching (docs/superpowers/plans/2026-07-12-vaayu-prefix-caching-plan.md) + KV persistence (merged) - because Colibri KV persistence folds in here.
+---
 
-  once this is done i should steal 
+=> PREFILL_CHUNK_SIZE is 512 and the prompt is 435 tokens, so chunking is effectively off — the                                   
+    whole prompt hits every layer's router in one shot. Dropping it (e.g. to 64) would force much smaller per-forward-pass       
+  expert                                                                                                                         
+                                                                                                                                 
+                                                                                                                                 
+  how this will fix the issue?                                                                                                   
 
-  2. Learned expert pinning — they keep a .coli_usage histogram of expert access frequency and pin the hot ones. Vaayu's perf review considered this ("heavy-hitter pinning") and deferred it. Colibri
-  implemented it.
-  3. Auto-sized expert cache from MemAvailable at startup with peak-projection headroom to prevent OOM-killer. Vaayu has hardware constants (16 GB VRAM, 8.5 GB expert cache ceiling); dynamic sizing would be
-  more portable.
-  4. CPU AVX2 int4 matmul kernels as a fallback path. Vaayu is EXL3-only, which locks it to CUDA. A CPU fallback would broaden portability significantly.
+● Being straight about this — mechanism first, then why I'm actually not fully confident it fixes the dominant part.
+
+  The mechanism (why it could help): Right now the whole 435-token prompt goes through every layer in one forward pass. At each
+  layer, the router computes top-k experts for all 435 positions simultaneously, and the union of "which experts got touched by
+  any of those 435 positions" tends to be huge — we saw counts like 200+ unique experts out of 256 per layer, per single forward
+  call. Smaller chunks (e.g. 64 tokens) mean fewer, less-diverse positions per forward pass → smaller union of touched experts
+  per layer → fewer total expert load/inject/free cycles happening in that one burst.
+
+
+  Why I'm not confident that's the actual fix here: my debug trace showed the ~21-22GB figure was already fully present at the 
+  very first layer, before the router or any expert even ran once. And across dozens of layers/hundreds of experts after that,
+  RSS stayed completely flat — it didn't grow further as more experts got processed. That means whatever is eating ~21-22GB isn't
+  accumulating from the expert loop at all (I already proved that loop is flat and bounded) — it's something that exists before
+  layer 0 starts, most likely tied to overall prompt/context setup (KV cache allocation, attention buffers, or that mystery 16GB
+  /dev/zero block I found), not to how many experts get touched per forward pass.
+
+  So: reducing chunk size is cheap and worth trying, but I'd call it "plausible, untested, not the leading suspect" rather than a
+  confident fix. It might shrink attention-related buffers scaling with sequence length within a chunk, which is a real if
+  secondary factor — but the dominant ~21GB baseline showing up before any MoE work runs points somewhere else.
+
+
+=> is it possiable that i've developeed some feature that is useless and due to that this bug popup?                              
+
+● Yes, quite possible — and I actually have a concrete candidate, not just a "maybe."
+
+  vaayu/persist/safetensor_model_persister.py has a pinned double-buffer mechanism (_load_pinned, lines ~241-271) separate from
+  the expert RAM cache. It works like this: whenever it loads a shard file bigger than any it's seen before, it throws away the
+  old pinned buffer and allocates a new one sized to that shard (+padding), and it does this for two buffers (double-buffering
+  for pipelined loads). It never shrinks back down — once it's seen a big shard, it holds onto a buffer that size for the rest of
+  the run.
+
+  There's also a separate _EXPERT_BUF_POOL sizing heuristic right above it with a hardcoded 27.0 GB reserve constant in the
+  budget math — a number that reads like it was tuned against a different model's memory profile, not derived from MiniMax's
+  actual geometry.
+
+  Why this is my leading suspect over "useless feature": the smaps evidence showed one single contiguous 16GB memory block, not
+  scattered growth. That shape — one big allocation, not many small ones accumulating — matches "buffer grew once to fit an
+  unexpectedly large shard and stayed there" far better than it matches a leak or a redundant feature running in the background.
+
+  I haven't confirmed it's the actual source yet — that's the next thing to check (instrument that specific allocation, or just
+  add a print of alloc_size there and see if a MiniMax shard triggers a huge one-time grow). Want me to go check that directly
+  instead of the chunk-size guess?

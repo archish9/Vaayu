@@ -13,12 +13,9 @@
     --bits     4.5 \
     --resume > /home/a/code/ai-ml/Vaayu/quantize.log 2>&1 &
 
-claude --resume 23c6b129-7a65-4cbe-a5d3-f1c8ba24bcab
 
 
 nvidia-smi -q | grep -A 10 "Link Width"
-
-
 
 MAX_PINNED_LAYERS = 20       # Leaves ~2-3 GB of headroom to be safe
 EAGLE_HEAD_PATH = None
@@ -34,27 +31,8 @@ https://huggingface.co/models?other=exllamav3&sort=most_params
 
 
 model-agnostic engine
+                        
 
-
-
-
-
-                                                                                       
-  Execute the plan at docs/superpowers/plans/2026-07-12-vaayu-prefix-caching-plan.md                                             
-  using superpowers:executing-plans. Task-by-task with review checkpoints.                                                       
-
-
-
-  1. RAM prefix cache (2026-07-12-vaayu-prefix-caching-plan.md)
-  - Hard prerequisite for A + top TTFT lever. Must go first.
-
-  2. A — KV disk persistence (2026-07-19-vaayu-kv-persist-plan.md)
-  - Extends the prefix cache you just built (infra warm in head). Tasks 1–4 need nothing; Task 5 needs step 1 done.
-
-  3. B — expert usage histogram (2026-07-19-vaayu-expert-usage-histogram-plan.md)
-  - Independent, medium value (kills cold-start, matches loop-engineering). Biggest + riskiest (touches MoE hot path) → do once A
-  is stable. Internal gate: Phase 1 (Tasks 1–6) → on-device verify (Task 7) → Phase 2 (8–9). Don't start Phase 2 till the gate
-  passes.
 
   4. C — dynamic RAM ceiling (2026-07-19-vaayu-dynamic-ram-cache-ceiling-plan.md)
   - Last. Tiny (2 tasks) but lowest/speculative value (portability, only one box today). Flag-gated + needs on-device
@@ -68,4 +46,17 @@ python -u test_kv_persist_coherence.py --phase run1 > run1.log 2>&1
 python -u test_kv_persist_coherence.py --phase run2 > run2.log 2>&1
 python -u test_kv_persist_coherence.py --phase control > control.log 2>&1
 
-claude --resume 11724729-d32b-4e19-a5ae-1aac73da9ae2
+
+_PREFIX_CACHE_RAM_RESERVE
+
+
+https://huggingface.co/QuantTrio
+
+
+Best for High-Performance API & Cost-Efficiency: DeepSeek V4 Pro and DeepSeek V4 Flash are standout models offering elite performance across LiveCodeBench while being highly efficient for integration into coding agents.
+
+DeepSeek-R1 is the headline answer. Released January 2025, MIT-licensed, open weights, and explicitly a reasoning model with visible chain-of-thought — the direct open answer to OpenAI's o1/o3-mini line. On math-style reasoning (AIME and similar) it traded blows with o3-mini and sometimes beat it. On coding specifically — LiveCodeBench, the thing your quote emphasizes — it was genuinely competitive, though o3-mini-high often edged it on the hardest coding benchmarks. So "as good" is fair on reasoning broadly; on pure competitive coding it was more of a real contest.
+
+QwQ-32B (Qwen's reasoning model, March 2025) is the one that surprised people: it approached R1-level reasoning at only 32B parameters, putting o3-mini-class thinking in a dramatically smaller package.
+
+Qwen3 (2025) is probably the strongest open family for your use case now. The models have a built-in "thinking mode," come in sizes from tiny up to a 235B MoE, and the larger ones beat o3-mini on many reasoning and coding benchmarks. Worth also knowing: Phi-4-reasoning (Microsoft, 14B), GLM-Z1 (Zhipu), and Nvidia's Llama-Nemotron reasoning models all landed in this space too.

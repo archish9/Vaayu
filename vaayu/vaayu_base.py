@@ -204,6 +204,85 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     return set(sorted(moe_layer_ids)[:n_fit])
 
 
+def moe_supports_slab_pipeline(expert_styles, is_exl3: bool) -> bool:
+    """True iff this model's MoE forward can actually use the pinned slab arena
+    and the prefill stager's staged layers.
+
+    Zero-clone slab staging is implemented ONLY by
+    `moe_patch._make_fused_sparse_forward_exl3`: it alone calls
+    `acquire_slab`/`put_slab`, and it alone consumes `_prefill_staged`. The
+    module-list forward and the non-EXL3 fused forward both populate the cache
+    through `ExpertRAMCache.put()`, which CLONES into pageable RAM.
+
+    Allocating the arena for those layouts double-spends the expert budget —
+    once as pinned, unswappable slab memory nothing ever reads, and again as the
+    cache's own clone budget. Measured on this 32 GB box with MiniMax-M2
+    (module-list): a 9.19 GB arena sat untouched while the cache separately
+    cloned toward its own 9.13 GB, for a cache specified as 9.13 GB total.
+    Starting the prefill stager is likewise wasted work — it stages layers no
+    consumer ever reads.
+
+    Model-agnostic (CLAUDE.md §5): derived from the DETECTED expert layout and
+    the loader strategy, never from an architecture name. Mixed layouts return
+    False — a partially-usable arena is not worth the pinned RAM.
+    """
+    styles = list(expert_styles)
+    return bool(is_exl3) and bool(styles) and all(s == "fused" for s in styles)
+
+
+def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
+    """RoPE inverse frequencies for `config`, honouring PARTIAL rotary.
+
+    Single source of truth for the three places Vaayu computes RoPE itself:
+    the `ROPE_INIT_FUNCTIONS["default"]` shim, `_compute_full_position_embeddings`,
+    and the `_init_weights` `compute_default_rope_parameters` shim. All three
+    previously duplicated the same full-`head_dim` formula, so a partial-rotary
+    model was corrupted identically by whichever one happened to run.
+
+    A model may rotate only a PREFIX of each head: MiniMax-M2 sets
+    `rotary_dim: 64` against `head_dim: 128` (its config derives
+    `partial_rotary_factor = rotary_dim / head_dim = 0.5`). `apply_rotary_pos_emb`
+    infers the rotated width from `cos.shape[-1]`, so emitting a full-width
+    cos/sin makes it rotate all 128 dims — including the half meant to pass
+    through untouched — at the wrong frequency spacing. Measured effect: layer-0
+    attention output ~500x the known-good Qwen baseline, degenerate text, and no
+    NaN to make it obvious.
+
+    Matches the transformers convention `dim = int(head_dim * partial_rotary_factor)`.
+    Models without the attribute default to 1.0 (full rotary), which is
+    byte-identical to the previous behaviour — Qwen3-MoE and Mixtral included.
+    """
+    head_dim = getattr(config, "head_dim", None)
+    if not isinstance(head_dim, int):
+        head_dim = config.hidden_size // config.num_attention_heads
+    partial = getattr(config, "partial_rotary_factor", 1.0) or 1.0
+    dim = int(head_dim * partial)
+    base = float(getattr(config, "rope_theta", 10000.0))
+    return 1.0 / (base ** (
+        torch.arange(0, dim, 2, dtype=torch.int64).to(
+            device=device, dtype=torch.float) / dim
+    ))
+
+
+def act_stats(t) -> str:
+    """Compact activation summary for VAAYU_TRACE_ACT=1 diagnostics.
+
+    Forces a device sync (`.item()`), so it is DIAGNOSTIC ONLY and must never be
+    called on the default path — every call site is gated on the env flag being
+    captured at init. Reports norm/absmax plus explicit NaN/Inf flags, because a
+    collapsed (norm -> 0) and an exploded (NaN) hidden state are different bugs
+    and the norm alone cannot distinguish them.
+
+    Deliberately print-based: ptrace-based samplers (py-spy) corrupt this
+    process's io_uring state — see the io_uring_cqe_overflow_bug finding — so
+    env-gated prints are the established instrumentation mechanism here.
+    """
+    f = t.detach().float()
+    return (f"norm={f.norm().item():.4e} absmax={f.abs().max().item():.4e} "
+            f"nan={int(torch.isnan(f).any().item())} "
+            f"inf={int(torch.isinf(f).any().item())}")
+
+
 def compute_prefill_pass(seq_len: int, has_speculator: bool, draft_tokens: int) -> bool:
     """True iff a forward pass of seq_len positions is prompt prefill.
 
@@ -623,6 +702,16 @@ class VaayuBaseModel(GenerationMixin):
         """
 
 
+        # Diagnostic only (VAAYU_TRACE_ACT=1): per-layer activation norms during
+        # prefill + the first decode step, to localize where hidden states go
+        # wrong. Captured once here; every call site reads this, never os.environ
+        # live, so the default path is unaffected. Off => zero cost.
+        self._trace_act = os.environ.get("VAAYU_TRACE_ACT") == "1"
+        # VAAYU_TRACE_EXPERT=<layer_idx>: per-expert magnitudes for ONE MoE
+        # layer (the checks sync per expert, so model-wide is far too costly).
+        _te = os.environ.get("VAAYU_TRACE_EXPERT")
+        self._trace_expert_layer = int(_te) if _te and _te.lstrip("-").isdigit() else None
+
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
         self.telemetry = VaayuTelemetry()
@@ -924,8 +1013,20 @@ class VaayuBaseModel(GenerationMixin):
             # io_uring state — see io_uring_cqe_overflow_bug memory).
             self._overlap_trace = os.environ.get("VAAYU_OVERLAP_TRACE") == "1"
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
-            from .moe_patch import patch_moe_blocks
+            from .moe_patch import detect_moe_blocks, patch_moe_blocks
+            from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
+
+            # Detect the expert layout BEFORE sizing caches: only the EXL3 fused
+            # forward can use the pinned slab arena / prefill stager, and the
+            # arena is allocated below — before patch_moe_blocks() would
+            # otherwise reveal the layout. Detection is reused by
+            # patch_moe_blocks so the module tree is walked exactly once.
+            self._detected_moe_blocks = detect_moe_blocks(self.model)
+            self._moe_slab_capable = moe_supports_slab_pipeline(
+                [b.expert_style for b in self._detected_moe_blocks],
+                is_exl3=isinstance(self.loader_strategy, EXL3LoaderStrategy),
+            )
 
             _mem = _psutil.virtual_memory()
 
@@ -955,11 +1056,27 @@ class VaayuBaseModel(GenerationMixin):
             # cache is full. Pinned memory is unswappable — footprint equals
             # the budget the cache occupied anyway, but WARN for visibility.
             from .persist.safetensor_model_persister import compute_slab_bytes
-            _slab_bytes = compute_slab_bytes(self._expert_offset_index)
-            _n_slabs = max(1, _expert_budget // max(1, _slab_bytes)) + get_expert_pool_size()
-            _pin = torch.cuda.is_available()
             self._expert_slab_arena = None
+            if not self._moe_slab_capable:
+                # This layout's forward populates the cache via
+                # ExpertRAMCache.put() (clone path) and never reads staged
+                # layers — see moe_supports_slab_pipeline. Allocating the arena
+                # anyway would pin a second full copy of the expert budget that
+                # nothing ever reads. Skip compute_slab_bytes too: it rescans
+                # the whole offset index for a number no one will use.
+                _styles = sorted({b.expert_style for b in self._detected_moe_blocks})
+                print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — expert layout "
+                      f"{_styles or ['none detected']} does not use the zero-clone "
+                      f"slab path (only the EXL3 fused forward does). Freed "
+                      f"~{_expert_budget / 1e9:.1f} GB of pinned RAM; experts are "
+                      f"cached via the clone path instead.")
+                _slab_bytes = 0
+            else:
+                _slab_bytes = compute_slab_bytes(self._expert_offset_index)
+            _pin = torch.cuda.is_available()
             if _slab_bytes > 0:
+                _n_slabs = (max(1, _expert_budget // _slab_bytes)
+                            + get_expert_pool_size())
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
@@ -1029,6 +1146,7 @@ class VaayuBaseModel(GenerationMixin):
                 dtype=self.running_dtype,
                 vaayu_ref=self,
                 loader_strategy=self.loader_strategy,
+                blocks=self._detected_moe_blocks,
             )
             # Lookahead predictor (Task 12): O(1) next-block lookup by layer idx.
             self._moe_block_by_idx = {b.layer_idx: b for b in self._moe_blocks}
@@ -1216,15 +1334,8 @@ class VaayuBaseModel(GenerationMixin):
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
             if "default" not in ROPE_INIT_FUNCTIONS:
                 def _rope_default(config, device=None, seq_len=None, layer_type=None, **_kw):
-                    import torch as _torch
-                    base = getattr(config, "rope_theta", 10000.0)
-                    head_dim = (getattr(config, "head_dim", None)
-                                or config.hidden_size // config.num_attention_heads)
-                    inv_freq = 1.0 / (base ** (
-                        _torch.arange(0, head_dim, 2, dtype=_torch.int64)
-                        .to(device=device, dtype=_torch.float) / head_dim
-                    ))
-                    return inv_freq, 1.0
+                    # Must honour partial rotary — see compute_rope_inv_freq.
+                    return compute_rope_inv_freq(config, device), 1.0
                 ROPE_INIT_FUNCTIONS["default"] = _rope_default
         except Exception:
             pass
@@ -1247,13 +1358,8 @@ class VaayuBaseModel(GenerationMixin):
                 ):
                     def _cdrp(config=None, _m=module):
                         cfg = config if config is not None else _m.config
-                        base = getattr(cfg, "rope_theta", 10000.0)
-                        head_dim = (getattr(cfg, "head_dim", None)
-                                    or cfg.hidden_size // cfg.num_attention_heads)
-                        inv_freq = 1.0 / (base ** (
-                            _torch.arange(0, head_dim, 2, dtype=_torch.int64).float() / head_dim
-                        ))
-                        return inv_freq, 1.0
+                        # Must honour partial rotary — see compute_rope_inv_freq.
+                        return compute_rope_inv_freq(cfg), 1.0
                     module.compute_default_rope_parameters = _cdrp
                 return _orig_init_weights(self_model, module)
 
@@ -2125,15 +2231,12 @@ class VaayuBaseModel(GenerationMixin):
         produce garbage / overflowed values and corrupt the hidden states.
         """
         try:
-            head_dim = getattr(self.config, 'head_dim',
-                               self.config.hidden_size // self.config.num_attention_heads)
-            rope_theta = float(getattr(self.config, 'rope_theta', 10000.0))
+            # Honours partial rotary (rotary_dim < head_dim) — see
+            # compute_rope_inv_freq. Emitting a full-head_dim cos/sin here makes
+            # apply_rotary_pos_emb rotate dims meant to pass through untouched.
+            inv_freq = compute_rope_inv_freq(self.config, position_ids.device)
         except AttributeError:
             return None
-
-        inv_freq = 1.0 / (rope_theta ** (
-            torch.arange(0, head_dim, 2, dtype=torch.float32, device=position_ids.device) / head_dim
-        ))
 
         inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -2480,7 +2583,12 @@ class VaayuBaseModel(GenerationMixin):
             # sets while earlier layers compute. Long prompts only (short ones
             # don't route all experts — staging would over-read).
             self._prefill_stager_active = False
+            # _moe_slab_capable: only the EXL3 fused forward consumes
+            # _prefill_staged. For any other layout the stager would read every
+            # expert of every layer into memory no consumer ever reads — pure
+            # wasted I/O and RAM. See moe_supports_slab_pipeline.
             if (self._moe_prefill_pass and self._moe_blocks
+                    and getattr(self, "_moe_slab_capable", False)
                     and self._expert_cache is not None
                     and getattr(self, "_moe_executor", None) is not None
                     and compute_stage_gate(int(_seq_total), self._moe_geometry)):
@@ -2719,6 +2827,15 @@ class VaayuBaseModel(GenerationMixin):
 
                             batch[j] = new_seq
 
+                    # VAAYU_TRACE_ACT: hidden-state health after this layer.
+                    # Limited to the first two forward passes (prefill + first
+                    # decode step) — enough to localize a defect, and keeps the
+                    # log readable instead of n_layers x n_tokens lines.
+                    if self._trace_act and self._token_count <= 1:
+                        print(f"[VAAYU-ACT] tok={self._token_count} "
+                              f"i={i:>3} {layer_name} {act_stats(batch[0])}",
+                              flush=True)
+
                     if output_hidden_states:
                         all_hidden_states += (torch.cat(batch, 0),)
 
@@ -2804,7 +2921,13 @@ class VaayuBaseModel(GenerationMixin):
         _la = getattr(self, "_lookahead_state", None)
         _la_str = (f"  lookahead_acc={_la['hits']}/{_la['total']}"
                    f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}")
+        try:
+            with open("/proc/self/status") as _rf:
+                _rss_kb = next((int(_l.split()[1]) for _l in _rf if _l.startswith("VmRSS:")), 0)
+        except OSError:
+            _rss_kb = 0
+        _rss_str = f"  rss={_rss_kb / 1e6:.2f}GB"
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}{_rss_str}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")
