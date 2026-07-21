@@ -1235,3 +1235,48 @@ def test_dispatch_expert_misses_splits_hits_and_misses(tmp_path):
         "a cold disk miss must record a strictly positive stall, not just "
         "a non-negative one"
     )
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_accumulates_disk_telemetry(tmp_path, num_experts, top_k):
+    """Module-list disk stall lands in _expert_disk_s instead of hiding in compute."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    assert not hasattr(vaayu_ref, "_expert_disk_s") or vaayu_ref._expert_disk_s == 0.0
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    assert hasattr(vaayu_ref, "_expert_disk_s"), "_expert_disk_s never set"
+    assert vaayu_ref._expert_disk_s > 0.0, "cold misses recorded zero disk stall"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_gpu_residency_stays_bounded(tmp_path, num_experts, top_k):
+    """Async disk loads must not become async GPU injection: at most one uncached
+    expert holds real weights at a time."""
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(
+        tmp_path, num_experts, top_k, vram_budget=0)   # 0 budget -> nothing cached
+    moe = model.layers[0].block_sparse_moe
+    # MockExpert fixtures start with real (non-meta) weights — _make_checkpoint
+    # just clones them to disk, unlike the real loader which leaves modules on
+    # meta until injected. Without this, every never-routed expert would count
+    # as "holding real weights" from t=0, making peak==num_experts regardless
+    # of this task's implementation. Matches the existing precedent at the
+    # _inject_expert_weights unit test, which also starts from expert.to("meta").
+    moe.experts.to("meta")
+
+    peak = 0
+    real_inject = mp._inject_expert_weights
+
+    def _peek_inject(*a, **kw):
+        nonlocal peak
+        out = real_inject(*a, **kw)
+        live = sum(1 for e in moe.experts if not e.w1.weight.is_meta)
+        peak = max(peak, live)
+        return out
+
+    with mock_patch.object(mp, "_inject_expert_weights", _peek_inject):
+        moe.forward(torch.randn(1, 1, 8))
+
+    assert peak == 1, f"{peak} experts held real weights at once; bound is 1"

@@ -656,7 +656,6 @@ def _make_modulelist_sparse_forward(
     vaayu_ref,
     original_forward = None,
 ):
-    from .persist.safetensor_model_persister import load_expert_sparse
     from .persist.loader_strategy import ExLlamaV3Linear
 
     layer_name = block_info.layer_name
@@ -708,89 +707,98 @@ def _make_modulelist_sparse_forward(
         if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
             _vram = None
 
-        for eidx in unique_experts:
-            expert_mod = experts_list[eidx]
+        # Experts already VRAM-resident need no RAM lookup and no disk read at all.
+        # ONE get() per expert, entry held for the compute loop below — not
+        # has()-then-get(), which would take the lock twice and leave a window
+        # where an expert could vanish between the two calls.
+        _vram_resident: dict = {}
+        if _vram is not None:
+            for _e in unique_experts:
+                _entry = _vram.get(layer_idx, _e)
+                if _entry is not None:
+                    _vram_resident[_e] = _entry
+        _to_load = [e for e in unique_experts if e not in _vram_resident]
 
-            # try/finally wraps the WHOLE loop body (not just the compute
-            # section) so the teardown below runs on every exit path —
-            # normal completion, a `continue` (e.g. missing offset index /
-            # failed injection below), or an exception. A `continue` inside
-            # a try still executes its finally, so this is the only change
-            # needed to make that guarantee hold; nothing else about the
-            # control flow moves.
+        # Dispatch disk misses up front and consume hits first, so compute overlaps
+        # the in-flight reads. These futures are CPU-side (RAM cache / slab arena,
+        # bounded by the RAM expert budget) — GPU injection below stays strictly
+        # one expert at a time, so the residency bound is untouched.
+        _expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
+            _to_load,
+            layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
+            offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref,
+        )
+
+        def _run_expert(eidx: int, expert_mod) -> None:
+            b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
+            if b_idx.numel() == 0:
+                return
+            b_gpu = b_idx.to(hidden_states.device)
+            s_gpu = s_idx.to(hidden_states.device)
+            k_gpu = k_idx.to(hidden_states.device)
+            _x_in = hidden_states[b_gpu, s_gpu]
+            expert_out = expert_mod(_x_in)                               # (M, H)
+            _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod, _x_in, expert_out)
+            w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
+            final_hidden.index_put_((b_gpu, s_gpu),
+                                    (w * expert_out).to(final_hidden.dtype),
+                                    accumulate=True)
+
+        def _detach_expert(eidx: int, expert_mod) -> None:
             try:
-                entry = _vram.get(layer_idx, eidx) if _vram is not None else None
-                if entry is not None and not _attach_cached_expert(expert_mod, entry):
-                    entry = None      # structural mismatch — fall through to a real load
-                    if _vram is not None:
-                        # The partially-attached entry is now unusable AND still
-                        # keyed in the cache — ExpertVRAMCache.put() below would
-                        # refuse to re-insert it (key already present), leaving a
-                        # stale broken entry that reports a HIT and fails to
-                        # attach on every subsequent token forever. Drop it so
-                        # the re-injected entry can be inserted fresh.
-                        _vram.drop(layer_idx, eidx)
+                # Detach from the live module — ALWAYS, hit or miss. See the
+                # extended rationale on the miss arm below.
+                for submod in expert_mod.modules():
+                    if isinstance(submod, ExLlamaV3Linear):
+                        submod.bc = None
+                        submod.weight_fallback = None
+                expert_mod.to("meta")
+            except Exception as e:
+                _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
 
-                if entry is None:
-                    cached = expert_cache.get(layer_idx, eidx)
-                    if cached is not None:
-                        raw = cached
-                    else:
-                        metas = offset_index.get_expert_offsets(layer_name, eidx)
-                        if metas is None:
-                            print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
-                            continue
-                        raw = load_expert_sparse(shard_file, metas)
-                        if not getattr(vaayu_ref, "_moe_prefill_pass", False):
-                            expert_cache.put(layer_idx, eidx, raw)
-
-                    entry = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
-                    if not entry:
-                        continue
-                    if _vram is not None:
-                        # Return value deliberately ignored: unlike the fused path there
-                        # is no _owned_by_cache branch here. The teardown below must run
-                        # whether or not the cache accepted the entry — see its comment.
-                        _vram.put(layer_idx, eidx, entry)
-
-                b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
-                if b_idx.numel() > 0:
-                    b_gpu = b_idx.to(hidden_states.device)
-                    s_gpu = s_idx.to(hidden_states.device)
-                    k_gpu = k_idx.to(hidden_states.device)
-                    _x_in = hidden_states[b_gpu, s_gpu]
-                    expert_out = expert_mod(_x_in)                               # (M, H)
-                    _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod,
-                                  _x_in, expert_out)
-                    w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
-                    final_hidden.index_put_((b_gpu, s_gpu),
-                                            (w * expert_out).to(final_hidden.dtype),
-                                            accumulate=True)
-            finally:
+        try:
+            for eidx, entry in _vram_resident.items():
+                expert_mod = experts_list[eidx]
                 try:
-                    # Detach this expert from the live module — ALWAYS, hit or miss.
-                    # ExLlamaV3Linear's QMatrix (.bc) is a C++ object PyTorch's GC
-                    # does not manage, and .to("meta") only clears real torch
-                    # parameters/buffers, so both refs must be dropped explicitly.
-                    #
-                    # On a VRAM-cache hit this frees nothing: the cache entry holds
-                    # the surviving references. That is exactly the point — if the
-                    # weights stayed bound to experts_list[eidx], an entry the LRU
-                    # evicted would still be referenced by the live ModuleList, so
-                    # eviction would reclaim no VRAM and the byte budget would stop
-                    # matching reality. Detaching also keeps peak GPU residency at
-                    # one uncached expert regardless of routing width (the bound
-                    # whose absence previously caused an OOM-kill).
-                    #
-                    # try/finally so a compute exception still detaches before the
-                    # exception propagates.
-                    for submod in expert_mod.modules():
-                        if isinstance(submod, ExLlamaV3Linear):
-                            submod.bc = None
-                            submod.weight_fallback = None
-                    expert_mod.to("meta")
-                except Exception as e:
-                    _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
+                    if not _attach_cached_expert(expert_mod, entry):
+                        # Structural mismatch — a real bug, not a race. Drop the
+                        # now-unusable entry so it isn't reported as a HIT (and
+                        # fail to attach) on every subsequent token forever; skip
+                        # compute for this token only, the next token reloads
+                        # from disk. _attach_cached_expert may have partially
+                        # bound real submodules before returning False, so the
+                        # detach below (finally) must still run.
+                        _vram.drop(layer_idx, eidx)
+                        continue
+                    _run_expert(eidx, expert_mod)
+                finally:
+                    _detach_expert(eidx, expert_mod)
+
+            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
+                expert_mod = experts_list[eidx]
+                entry = _inject_expert_weights(
+                    expert_mod, raw, eidx, layer_name, device, dtype)
+                if not entry:
+                    continue
+                if _vram is not None:
+                    # Return value deliberately ignored: unlike the fused path there
+                    # is no _owned_by_cache branch. _detach_expert must run whether
+                    # or not the cache accepted the entry — on a hit it frees
+                    # nothing (the entry holds the refs); without it an evicted
+                    # entry would still be referenced by the live ModuleList, so
+                    # eviction would reclaim no VRAM. It also keeps peak GPU
+                    # residency at one uncached expert regardless of routing width.
+                    _vram.put(layer_idx, eidx, entry)
+                try:
+                    _run_expert(eidx, expert_mod)
+                finally:
+                    _detach_expert(eidx, expert_mod)
+        finally:
+            # Release every key THIS call pinned, even if compute raised partway
+            # through — a leaked pin permanently blocks that key's eviction.
+            for _pk in _pinned_keys:
+                expert_cache.unpin(*_pk)
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
