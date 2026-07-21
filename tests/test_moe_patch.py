@@ -798,3 +798,72 @@ def test_cache_aware_topk_weights_from_original_sum_to_one():
     expected = orig.gather(-1, sel)
     expected = expected / expected.sum(-1, keepdim=True)
     assert torch.allclose(w, expected)
+
+
+def test_inject_expert_weights_returns_state_non_exl3():
+    """_inject_expert_weights returns the per-submodule tensors it injected."""
+    from vaayu.moe_patch import _inject_expert_weights
+
+    expert = MockExpert(hidden=8)
+    raw = {
+        "layers.0.block_sparse_moe.experts.3.w1.weight": torch.randn(8, 8),
+        "layers.0.block_sparse_moe.experts.3.w2.weight": torch.randn(8, 8),
+    }
+    state = _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
+
+    assert state is not None
+    assert set(state.keys()) == {"w1", "w2"}, f"unexpected roles: {list(state)}"
+    assert state["w1"]["weight"].shape == (8, 8)
+    # Raw tensors, not nn.Parameter: expert_mod.to("meta") rebinds Parameter.data
+    # and must not disturb what the cache holds.
+    assert not isinstance(state["w1"]["weight"], nn.Parameter)
+    # And the weights really landed on the module.
+    assert expert.w1.weight.shape == (8, 8)
+
+
+def test_inject_expert_weights_returns_none_on_failure():
+    """A submodule path that doesn't exist on the module yields None, not a partial dict."""
+    from vaayu.moe_patch import _inject_expert_weights
+
+    expert = MockExpert(hidden=8)
+    raw = {"layers.0.block_sparse_moe.experts.3.nonexistent.weight": torch.randn(8, 8)}
+    state = _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
+    assert state is None
+
+
+def test_inject_expert_weights_collects_bc_objects():
+    """EXL3 submodules contribute their QMatrix under the 'bc' key and their GPU
+    tensors under the submodule path."""
+    from vaayu.moe_patch import _inject_expert_weights
+    from vaayu.persist.loader_strategy import ExLlamaV3Linear
+
+    class _FakeEXL3Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = ExLlamaV3Linear.__new__(ExLlamaV3Linear)
+            nn.Module.__init__(self.w1)
+            self.w1.bc = None
+            self.w1.bias_param = None
+            self.w1.weight_fallback = None
+            self.w1.in_features = 8
+            self.w1.out_features = 16
+
+    expert = _FakeEXL3Expert()
+    gpu_tensors = {"trellis": torch.randn(2, 4), "suh": torch.randn(8), "svh": torch.randn(16)}
+    sentinel_bc = object()
+
+    def _fake_build(mod, bases, device, non_blocking=True):
+        mod.bc = sentinel_bc
+        return gpu_tensors
+
+    raw = {
+        "layers.0.block_sparse_moe.experts.0.w1.trellis": gpu_tensors["trellis"],
+        "layers.0.block_sparse_moe.experts.0.w1.suh": gpu_tensors["suh"],
+        "layers.0.block_sparse_moe.experts.0.w1.svh": gpu_tensors["svh"],
+    }
+    with mock_patch("vaayu.persist.loader_strategy.build_exl3_qmatrix", _fake_build):
+        state = _inject_expert_weights(expert, raw, 0, "layers.0", "cpu", torch.float32)
+
+    assert state is not None
+    assert state["bc"]["w1"] is sentinel_bc
+    assert state["w1"] is gpu_tensors

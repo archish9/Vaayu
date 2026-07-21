@@ -422,10 +422,13 @@ def _inject_expert_weights(
     layer_name: str,
     device: str,
     dtype,
-) -> bool:
+) -> dict | None:
     """
     Inject expert tensor weights into expert_mod for inference.
-    Returns True if all weights injected, False if any failed (expert skipped).
+    Returns the per-submodule state it injected on success, None if any submodule
+    failed (expert skipped). The returned dict is
+    {submod_path: {tensor_name: gpu_tensor}, ..., "bc": {submod_path: qmatrix}} —
+    the exact shape ExpertVRAMCache stores, whose _group_bytes skips the "bc" key.
 
     Uses regex to strip the full key prefix generically:
         "layers.0.block_sparse_moe.experts.0.w1.weight" → "w1.weight"
@@ -439,6 +442,8 @@ def _inject_expert_weights(
     """
     from .persist.loader_strategy import ExLlamaV3Linear, build_exl3_qmatrix, _EXL3_QTENSOR_KEYS
 
+    state: dict = {}
+    bc_objs: dict = {}
     groups: dict[str, dict] = {}
     for param_key, tensor in raw.items():
         m = _EXPERT_PREFIX_RE.match(param_key)
@@ -460,11 +465,14 @@ def _inject_expert_weights(
                 # non_blocking=False: these tensors come from disk loads /
                 # the RAM cache, not guaranteed page-locked — see
                 # build_exl3_qmatrix's docstring for why async here leaks host RAM.
-                build_exl3_qmatrix(submod, bases, device, non_blocking=False)
+                state[submod_path] = build_exl3_qmatrix(
+                    submod, bases, device, non_blocking=False)
+                bc_objs[submod_path] = submod.bc
                 continue
 
             for base, tensor in bases.items():
                 t = tensor.to(device, dtype=dtype, non_blocking=False)
+                state.setdefault(submod_path, {})[base] = t
                 if isinstance(submod, ExLlamaV3Linear):
                     # Unquantized weight/bias landing on a module setup_model()
                     # swapped anyway — ExLlamaV3Linear has no "weight"/"bias"
@@ -481,8 +489,10 @@ def _inject_expert_weights(
             _log.warning(
                 f"Expert weight inject failed: {submod_path} ({list(bases)}): {e}"
             )
-            return False
-    return True
+            return None
+    if bc_objs:
+        state["bc"] = bc_objs
+    return state
 
 
 def patch_moe_blocks(
@@ -653,8 +663,8 @@ def _make_modulelist_sparse_forward(
                     expert_cache.put(layer_idx, eidx, raw)
 
             expert_mod = experts_list[eidx]
-            ok = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
-            if not ok:
+            state = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
+            if not state:
                 continue
 
             try:

@@ -281,10 +281,13 @@ class ExLlamaV3Linear(nn.Module):
 
 def build_exl3_qmatrix(
     mod: "ExLlamaV3Linear", tensors_by_base: dict, device: str, non_blocking: bool = True
-) -> None:
+) -> dict:
     """
     Build a C++ QMatrix (BC_LinearEXL3) from a group of EXL3 quant tensors
     (trellis/suh/svh/mcg/mul1, keyed by base name) and attach it to mod.bc.
+
+    Returns the dict of GPU-resident quant tensors it built, so a caller that
+    caches the QMatrix can also hold (and account for) the memory behind it.
 
     Shared by EXL3LoaderStrategy.inject_to_gpu (per-layer, pinned layers) and
     moe_patch.py's per-token expert injection (module-list MoE layout, e.g.
@@ -333,6 +336,12 @@ def build_exl3_qmatrix(
         mul1_tensor is not None,
         xh,
     )
+
+    # Returned so callers can keep their own reference for byte accounting: the
+    # QMatrix holds these tensors C++-side, where ExpertVRAMCache._group_bytes
+    # cannot see them. inject_to_gpu ignores this; the module-list expert cache
+    # (moe_patch.py) does not.
+    return gpu_tensors
 
 
 class EXL3LoaderStrategy(LoaderStrategy):
