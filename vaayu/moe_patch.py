@@ -757,30 +757,19 @@ def _make_modulelist_sparse_forward(
             except Exception as e:
                 _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
 
-        try:
-            for eidx, entry in _vram_resident.items():
-                expert_mod = experts_list[eidx]
-                try:
-                    if not _attach_cached_expert(expert_mod, entry):
-                        # Structural mismatch — a real bug, not a race. Drop the
-                        # now-unusable entry so it isn't reported as a HIT (and
-                        # fail to attach) on every subsequent token forever; skip
-                        # compute for this token only, the next token reloads
-                        # from disk. _attach_cached_expert may have partially
-                        # bound real submodules before returning False, so the
-                        # detach below (finally) must still run.
-                        _vram.drop(layer_idx, eidx)
-                        continue
-                    _run_expert(eidx, expert_mod)
-                finally:
-                    _detach_expert(eidx, expert_mod)
-
-            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
-                expert_mod = experts_list[eidx]
+        def _load_inject_run(eidx: int, raw) -> None:
+            # Shared by the normal miss-load loop and the attach-failure
+            # fallback below: inject -> (optionally cache) -> compute -> detach,
+            # with the continue-on-failed-injection check INSIDE the try so
+            # _detach_expert still runs when injection binds some submodules
+            # (e.g. w1) before a later group raises (e.g. w2) and returns None —
+            # skipping it would leave those bound tensors off-meta forever.
+            expert_mod = experts_list[eidx]
+            try:
                 entry = _inject_expert_weights(
                     expert_mod, raw, eidx, layer_name, device, dtype)
                 if not entry:
-                    continue
+                    return
                 if _vram is not None:
                     # Return value deliberately ignored: unlike the fused path there
                     # is no _owned_by_cache branch. _detach_expert must run whether
@@ -790,10 +779,48 @@ def _make_modulelist_sparse_forward(
                     # eviction would reclaim no VRAM. It also keeps peak GPU
                     # residency at one uncached expert regardless of routing width.
                     _vram.put(layer_idx, eidx, entry)
+                _run_expert(eidx, expert_mod)
+            finally:
+                _detach_expert(eidx, expert_mod)
+
+        try:
+            _attach_failed: list[int] = []
+            for eidx, entry in _vram_resident.items():
+                expert_mod = experts_list[eidx]
                 try:
+                    if not _attach_cached_expert(expert_mod, entry):
+                        # Structural mismatch — a real bug, not a race. Drop the
+                        # now-unusable entry so it isn't reported as a HIT (and
+                        # fail to attach) on every subsequent token forever.
+                        # _attach_cached_expert may have partially bound real
+                        # submodules before returning False, so the detach below
+                        # (finally) must still run. The project owner decided a
+                        # failed attach must not silently drop this expert's
+                        # contribution to final_hidden — fall through to a real
+                        # disk load below instead of skipping compute.
+                        _vram.drop(layer_idx, eidx)
+                        _attach_failed.append(eidx)
+                        continue
                     _run_expert(eidx, expert_mod)
                 finally:
                     _detach_expert(eidx, expert_mod)
+
+            if _attach_failed:
+                # These experts were excluded from _to_load (they looked like
+                # VRAM hits when dispatch ran), so _dispatch_expert_misses has
+                # never seen them — dispatch their disk loads now.
+                _fb_tensors, _fb_futures, _fb_pinned = _dispatch_expert_misses(
+                    _attach_failed,
+                    layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
+                    offset_index=offset_index, expert_cache=expert_cache,
+                    vaayu_ref=vaayu_ref,
+                )
+                _pinned_keys.update(_fb_pinned)
+                for eidx, raw in _iter_expert_loads(_fb_tensors, _fb_futures, vaayu_ref):
+                    _load_inject_run(eidx, raw)
+
+            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
+                _load_inject_run(eidx, raw)
         finally:
             # Release every key THIS call pinned, even if compute raised partway
             # through — a leaked pin permanently blocks that key's eviction.
@@ -1004,6 +1031,8 @@ def _dispatch_expert_misses(
         def _load_one(eidx: int):
             metas = offset_index.get_expert_offsets(layer_name, eidx)
             if metas is None:
+                _log.warning(
+                    f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
                 return eidx, None
             # Prefill: transient load, never cached (routes ~all experts
             # once; caching would clone content decode replaces).
@@ -1043,7 +1072,19 @@ def _dispatch_expert_misses(
             return eidx, views
 
         # Submit and DON'T wait: hit experts compute while these reads run.
-        miss_futures = [vaayu_ref._moe_executor.submit(_load_one, e) for e in misses]
+        # _moe_executor only exists for CUDA MoE (see vaayu_base.py's
+        # is_moe/running_device gate) — this helper is also the module-list
+        # forward's loader, which is the generic CPU-compute fallback, so it
+        # must not hard-depend on that attribute. Mirrors the same fallback
+        # in _make_fused_sparse_forward's own miss loader.
+        _ex = getattr(vaayu_ref, "_moe_executor", None)
+        if _ex is not None:
+            miss_futures = [_ex.submit(_load_one, e) for e in misses]
+        else:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _tmp_ex = _TPE(max_workers=min(len(misses), 8))
+            miss_futures = [_tmp_ex.submit(_load_one, e) for e in misses]
+            _tmp_ex.shutdown(wait=False)
 
     return expert_tensors, miss_futures, pinned_keys
 

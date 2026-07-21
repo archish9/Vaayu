@@ -695,7 +695,13 @@ def test_exl3_forward_source_overlaps_disk_and_compute():
         ("_iter_expert_loads", iter_src),
     ):
         assert "_moe_executor.map(" not in src, f"blocking map() barrier reintroduced in {name}"
-    assert "_moe_executor.submit(" in dispatch_src
+    # Critical 2 fix: _moe_executor is read via getattr(..., None) (module-list
+    # is also the CPU-compute fallback, which has no persistent executor), so
+    # the submit call is on a local (`_ex`), not the literal `_moe_executor.
+    # submit(` substring. Still assert the two things that matter: the
+    # attribute is consulted, and dispatch is non-blocking submit(), not map().
+    assert "_moe_executor" in dispatch_src
+    assert ".submit(" in dispatch_src
     assert "FIRST_COMPLETED" in iter_src
 
     # The above only proves the helpers themselves don't block — it says
@@ -1091,19 +1097,26 @@ def test_modulelist_output_unchanged_by_vram_cache(tmp_path, num_experts, top_k)
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_failed_attach_still_detaches(tmp_path, num_experts, top_k):
-    """Finding 1: a `continue` inside the load path must not skip the per-expert
-    teardown. _attach_cached_expert can re-bind an expert's real submodules and
-    still report a structural mismatch (False); if the subsequent load-path
-    `continue` (offset missing / re-injection failed) then fires, those real
-    tensors must still be detached to meta on the way out — not left bound to
-    experts_list forever.
+    """Covers the VRAM-arm's `continue` (not the load-arm's — see the note
+    below): _attach_cached_expert can re-bind an expert's real submodules and
+    still report a structural mismatch (False); the vram-arm's `continue` that
+    follows must not skip the per-expert teardown, or those real tensors stay
+    bound to experts_list forever.
 
     Reproduced by wrapping the real _attach_cached_expert (so it performs its
     real, successful re-bind — the cached entry is structurally identical to
-    the live module) but forcing its report to False, and also forcing the
-    fallback re-injection to fail so the load-path `continue` actually fires.
-    A bare mock that never touches the module wouldn't exercise the bug, since
-    nothing would leave real tensors bound in the first place.
+    the live module) but forcing its report to False. A bare mock that never
+    touches the module wouldn't exercise the bug, since nothing would leave
+    real tensors bound in the first place.
+
+    Note: a failed attach also makes this expert fall through to a real disk
+    load (Important 4 — restore fall-through so the token's output stays
+    numerically correct), which reaches _inject_expert_weights again. That
+    call is mocked here to return None unconditionally, but the mock never
+    touches expert_mod, so it re-proves nothing beyond "no crash" — it is
+    inert with respect to the LOAD arm's own teardown invariant.
+    test_modulelist_load_arm_continue_still_detaches below covers that path
+    for real, with a wrapper that performs a genuine partial bind.
     """
     import vaayu.moe_patch as mp
 
@@ -1128,6 +1141,66 @@ def test_modulelist_failed_attach_still_detaches(tmp_path, num_experts, top_k):
     for eidx in routed:
         assert moe.experts[eidx].w1.weight.is_meta, (
             f"expert {eidx} still holds real weights after a failed-attach continue")
+
+
+def test_modulelist_load_arm_continue_still_detaches(tmp_path):
+    """Finding (Important 3): a `continue` inside the LOAD arm — reached via a
+    genuine disk-load, not a VRAM hit — must not skip the per-expert teardown
+    either. _inject_expert_weights groups tensors by submodule and can bind
+    some groups (e.g. w1) for real before a later group (e.g. w2) raises and
+    the whole call returns None; Critical 1's fix moved that `if not entry:
+    continue`-equivalent check inside the try/finally so _detach_expert still
+    runs and un-binds the real w1 tensors.
+
+    No VRAM cache is attached, so every routed expert is a genuine _to_load /
+    disk-miss on every pass — this exercises the LOAD arm directly, unlike
+    test_modulelist_failed_attach_still_detaches above (which only reaches a
+    VRAM-arm continue, plus an inert fallback call).
+
+    Must FAIL against the pre-Critical-1 code (continue sits outside the try)
+    and PASS after the fix.
+    """
+    import vaayu.moe_patch as mp
+
+    model = MockModel(num_layers=1, hidden=8, num_experts=8)
+    _make_checkpoint(tmp_path, model)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()   # no VRAM cache attached
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=2,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    moe = model.layers[0].block_sparse_moe
+    moe.experts.to("meta")  # start from meta so a real bind is observable
+    hidden = torch.randn(1, 1, 8)
+
+    real_inject = mp._inject_expert_weights
+
+    def _partial_bind_then_fail(expert_mod, raw, eidx, layer_name, device, dtype):
+        # Real-bind only the w1 tensors (mirrors an EXL3 expert whose w1
+        # QMatrix builds fine), then report overall failure — mirrors a later
+        # group (w2) raising partway through injection.
+        w1_only = {k: v for k, v in raw.items() if ".w1." in k}
+        real_inject(expert_mod, w1_only, eidx, layer_name, device, dtype)
+        return None
+
+    with mock_patch.object(mp, "_inject_expert_weights", _partial_bind_then_fail):
+        moe.forward(hidden)
+
+    routed = vaayu_ref._expert_history[0]
+    assert routed, "expected at least one routed expert"
+    for eidx in routed:
+        assert moe.experts[eidx].w1.weight.is_meta, (
+            f"expert {eidx} still holds real w1 weights after a failed load-arm continue")
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
@@ -1166,6 +1239,48 @@ def test_modulelist_failed_attach_drops_stale_vram_entry(tmp_path, num_experts, 
     for eidx in routed:
         assert not vram.has(0, eidx), f"stale entry for expert {eidx} still resident"
     assert vram.current_usage == 0, "current_usage did not reflect the dropped entries"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_failed_attach_falls_through_to_correct_output(tmp_path, num_experts, top_k):
+    """Important 4 (project owner decision): a failed VRAM attach must not
+    silently drop this expert's contribution to final_hidden. Pre-Task-5 the
+    code fell through to a real disk load and computed correctly; restore
+    that fall-through instead of `continue`-ing past a real bug.
+
+    Compares a forward computed via the normal VRAM-hit path against a
+    forward where attach is forced to fail (real re-bind + report False,
+    `_inject_expert_weights` left UNMOCKED) — the forced-failure forward must
+    still reach a genuine disk load + injection + compute and produce the
+    same numeric output, not a token missing this expert's weighted term.
+    """
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                        # pass 1: populate the VRAM cache
+    routed = list(vaayu_ref._expert_history[0])
+    assert routed, "expected at least one routed expert"
+
+    expected, _ = moe.forward(hidden)           # pass 2: normal VRAM-hit path
+
+    real_attach = mp._attach_cached_expert
+
+    def _attach_but_report_false(mod, entry):
+        real_attach(mod, entry)
+        return False
+
+    with mock_patch.object(mp, "_attach_cached_expert", _attach_but_report_false):
+        # _inject_expert_weights is intentionally NOT mocked: the fall-through
+        # must reach a real disk load + real injection to be numerically correct.
+        actual, _ = moe.forward(hidden)         # pass 3: forced attach failure
+
+    assert torch.allclose(actual, expected, atol=1e-6), (
+        "forced attach failure produced a different output than the normal "
+        "VRAM-hit path — the fallback disk load must reproduce the same result"
+    )
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
@@ -1234,6 +1349,44 @@ def test_dispatch_expert_misses_splits_hits_and_misses(tmp_path):
     assert vaayu_ref._expert_disk_s > baseline, (
         "a cold disk miss must record a strictly positive stall, not just "
         "a non-negative one"
+    )
+
+
+def test_dispatch_expert_misses_without_persistent_executor(tmp_path):
+    """Finding (Critical 2): _dispatch_expert_misses must not hard-depend on
+    vaayu_ref._moe_executor. That attribute is only created for CUDA MoE
+    (vaayu_base.py's `is_moe and running_device.startswith("cuda")` gate) —
+    this helper is shared with the module-list forward, which is also the
+    generic CPU-compute fallback (see CLAUDE.md's dispatch table), so a
+    CPU-mode vaayu_ref genuinely lacks the attribute. MockVaayuRef always
+    constructs one, so it can't catch this gap on its own — this test uses a
+    bare stand-in with no _moe_executor at all and asserts misses still load
+    correctly instead of raising AttributeError.
+    """
+    from vaayu.moe_patch import _dispatch_expert_misses, _iter_expert_loads
+
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+
+    class _NoExecutorVaayuRef:
+        pass  # deliberately no _moe_executor attribute
+
+    vaayu_ref = _NoExecutorVaayuRef()
+
+    expert_tensors, futures, pinned = _dispatch_expert_misses(
+        [1, 2], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref,
+    )
+
+    assert not expert_tensors, "nothing cached yet — both should be dispatched as futures"
+    assert len(futures) == 2
+
+    loaded = dict(_iter_expert_loads(expert_tensors, futures, vaayu_ref))
+    assert set(loaded) == {1, 2}, (
+        "misses must still load correctly without a persistent _moe_executor"
     )
 
 
