@@ -677,14 +677,26 @@ def test_exl3_forward_skips_ram_cache_put_during_prefill(tmp_path):
 def test_exl3_forward_source_overlaps_disk_and_compute():
     """The EXL3 sparse forward must not use the blocking executor.map barrier:
     misses are submitted as individual futures and consumed via FIRST_COMPLETED
-    waits after hit experts are computed."""
+    waits after hit experts are computed. That dispatch/wait logic now lives in
+    the shared _dispatch_expert_misses/_iter_expert_loads helpers (extracted so
+    the module-list forward can reuse it), not inline in the fused forward
+    itself — so each assertion targets the specific function that should own
+    it, rather than a combined blob any one function could satisfy alone."""
     import inspect
     from vaayu import moe_patch
 
-    src = inspect.getsource(moe_patch._make_fused_sparse_forward_exl3)
-    assert "_moe_executor.map(" not in src, "blocking map() barrier reintroduced"
-    assert "_moe_executor.submit(" in src
-    assert "FIRST_COMPLETED" in src
+    fused_src = inspect.getsource(moe_patch._make_fused_sparse_forward_exl3)
+    dispatch_src = inspect.getsource(moe_patch._dispatch_expert_misses)
+    iter_src = inspect.getsource(moe_patch._iter_expert_loads)
+
+    for name, src in (
+        ("_make_fused_sparse_forward_exl3", fused_src),
+        ("_dispatch_expert_misses", dispatch_src),
+        ("_iter_expert_loads", iter_src),
+    ):
+        assert "_moe_executor.map(" not in src, f"blocking map() barrier reintroduced in {name}"
+    assert "_moe_executor.submit(" in dispatch_src
+    assert "FIRST_COMPLETED" in iter_src
 
 
 def test_permutation_dispatch_matches_one_hot_reference():
@@ -1167,3 +1179,30 @@ def test_modulelist_vram_eviction_reclaims_budget(tmp_path, num_experts, top_k):
 
     assert vram2.current_usage <= small_budget
     assert vram2.evictions > 0
+
+
+def test_dispatch_expert_misses_splits_hits_and_misses(tmp_path):
+    """RAM-cached experts come back inline; uncached ones become futures."""
+    from vaayu.moe_patch import _dispatch_expert_misses, _iter_expert_loads
+
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    cache.put(0, 1, _make_mock_exl3_raw("layers.0", 1, in_dim=8, out_dim=16))
+
+    expert_tensors, futures, pinned = _dispatch_expert_misses(
+        [1, 2], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref,
+    )
+
+    assert 1 in expert_tensors, "RAM-cached expert should be an inline hit"
+    assert 2 not in expert_tensors, "uncached expert should be dispatched as a future"
+    assert len(futures) == 1
+
+    seen = dict(_iter_expert_loads(expert_tensors, futures, vaayu_ref))
+    assert set(seen) == {1, 2}
+    assert vaayu_ref._expert_disk_s >= 0.0, "disk stall telemetry not accumulated"

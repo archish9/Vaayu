@@ -929,6 +929,127 @@ def _make_fused_sparse_forward(
     return sparse_forward
 
 
+def _dispatch_expert_misses(
+    unique_experts,
+    *,
+    layer_idx: int,
+    layer_name: str,
+    shard_file: str,
+    offset_index,
+    expert_cache,
+    vaayu_ref,
+    staged_layer=None,
+) -> tuple[dict, list, set]:
+    """
+    Split this layer's routed experts into RAM/staged hits and disk misses, submit
+    the misses to the persistent pool, and return without waiting — so the caller
+    computes hits while the reads are in flight.
+
+    Returns (expert_tensors, miss_futures, pinned_keys). The caller MUST unpin
+    every key in pinned_keys in a finally block; a leaked pin permanently blocks
+    that key's eviction (a slow cache-capacity leak).
+
+    Shared by the fused-EXL3 and module-list forwards: the slab/pin/arena
+    discipline below is subtle enough that a second copy would rot.
+    """
+    from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
+
+    _do_pin = expert_cache.arena is not None and not getattr(
+        vaayu_ref, "_moe_prefill_pass", False)
+    pinned_keys: set = set()
+    expert_tensors: dict = {}
+    misses: list = []
+
+    for eidx in unique_experts:
+        if staged_layer is not None and eidx in staged_layer:
+            expert_tensors[eidx] = staged_layer[eidx]
+            continue
+        cached = expert_cache.get(layer_idx, eidx, pin=_do_pin)
+        if cached is not None:
+            expert_tensors[eidx] = cached
+            if _do_pin:
+                pinned_keys.add((layer_idx, eidx))
+        else:
+            misses.append(eidx)
+
+    # Pin misses BEFORE dispatching their loads: the key isn't cached yet, so
+    # it can't be evicted until put_slab() inserts it — at which point the pin
+    # is already set and the evictor will skip it.
+    if _do_pin:
+        for _e in misses:
+            expert_cache.pin(layer_idx, _e)
+            pinned_keys.add((layer_idx, _e))
+
+    miss_futures = []
+    if misses:
+        def _load_one(eidx: int):
+            metas = offset_index.get_expert_offsets(layer_name, eidx)
+            if metas is None:
+                return eidx, None
+            # Prefill: transient load, never cached (routes ~all experts
+            # once; caching would clone content decode replaces).
+            if getattr(vaayu_ref, "_moe_prefill_pass", False):
+                return eidx, load_expert_sparse(shard_file, metas)
+            if expert_cache.arena is None:
+                # No arena (e.g. compute_slab_bytes()==0 or CUDA-less unit
+                # tests constructing ExpertRAMCache directly) — legacy
+                # clone path, still cached.
+                raw = load_expert_sparse(shard_file, metas)
+                expert_cache.put(layer_idx, eidx, raw)
+                return eidx, raw
+            # Zero-clone decode path: io_uring reads straight into a pinned
+            # slab; the cache adopts views (no clone anywhere disk→RAM→GPU).
+            slab_idx = expert_cache.acquire_slab()
+            if slab_idx is None:
+                # arena exhausted and nothing evictable — legacy fallback
+                raw = load_expert_sparse(shard_file, metas)
+                expert_cache.put(layer_idx, eidx, raw)
+                return eidx, raw
+            slab = expert_cache.arena.tensor(slab_idx)
+            try:
+                # tensor_align=False: decode's cached experts are only ever
+                # consumed via per-component .to(device) copies (always
+                # naturally aligned on a fresh cross-device copy), never via
+                # views_from_packed_copy — skip the scratch-pool repack, which
+                # regressed decode throughput when applied unconditionally.
+                views = load_expert_into_slab(
+                    shard_file, metas, slab,
+                    allow_direct=expert_cache.arena.pin,
+                    tensor_align=False,
+                )
+            except Exception:
+                expert_cache.arena.release(slab_idx)
+                raise
+            expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
+            return eidx, views
+
+        # Submit and DON'T wait: hit experts compute while these reads run.
+        miss_futures = [vaayu_ref._moe_executor.submit(_load_one, e) for e in misses]
+
+    return expert_tensors, miss_futures, pinned_keys
+
+
+def _iter_expert_loads(expert_tensors: dict, miss_futures: list, vaayu_ref, mp=None):
+    """Yield (eidx, raw): cache hits immediately (compute overlaps the in-flight
+    miss reads), then misses in completion order. Blocking time in the wait() is
+    the true disk stall and is accumulated into vaayu_ref._expert_disk_s
+    (telemetry: stall, not total read time)."""
+    for _e, _raw in expert_tensors.items():
+        yield _e, _raw
+    _pending = set(miss_futures)
+    while _pending:
+        _w0 = time.perf_counter()
+        _done, _pending = _futures_wait(_pending, return_when=FIRST_COMPLETED)
+        _stall = time.perf_counter() - _w0
+        vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
+        if mp is not None:
+            mp['disk_load'] += _stall
+        for _f in _done:
+            _e, _raw = _f.result()
+            if _raw is not None:
+                yield _e, _raw
+
+
 def _make_fused_sparse_forward_exl3(
     block_info: MoEBlockInfo,
     expert_cache: "ExpertRAMCache",
@@ -1083,7 +1204,6 @@ def _make_fused_sparse_forward_exl3(
 
         shard_file = shard_file_for(layer_name)
         expert_tensors: dict[int, dict] = {}
-        misses: list[int] = []
 
         # Pin mechanism (race fix, round 2): a slab-backed cache entry checked out
         # here (get() hit or put_slab() miss) but not yet H2D-copied must not be
@@ -1095,8 +1215,6 @@ def _make_fused_sparse_forward_exl3(
         # (arena is None) copies independent memory, so pinning is skipped there.
         # _pinned_keys tracks exactly which keys THIS call pinned, so the finally
         # below unpins each exactly once even if compute raises partway through.
-        _do_pin = expert_cache.arena is not None and not getattr(
-            vaayu_ref, "_moe_prefill_pass", False)
         _pinned_keys: set = set()
 
         # Prefill lookahead: if the stager pre-read this layer, WAIT for it
@@ -1143,77 +1261,12 @@ def _make_fused_sparse_forward_exl3(
                 if _staged_layer is not None and _is_last_call:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
-        for eidx in unique_experts:
-            if _staged_layer is not None and eidx in _staged_layer:
-                expert_tensors[eidx] = _staged_layer[eidx]
-                continue
-            cached = expert_cache.get(layer_idx, eidx, pin=_do_pin)
-            if cached is not None:
-                expert_tensors[eidx] = cached
-                if _do_pin:
-                    _pinned_keys.add((layer_idx, eidx))
-            else:
-                misses.append(eidx)
-
-        # Pin misses BEFORE dispatching their loads: the key isn't cached yet, so
-        # it can't be evicted until put_slab() inserts it — at which point the pin
-        # is already set and the evictor will skip it. pin() on a not-yet-cached
-        # key is valid (it only blocks a future victim selection). Prefetch/legacy
-        # misses (no arena insert) are pinned too but harmlessly — the finally
-        # unpins them and unpin() is a no-op for a key that was never cached.
-        if _do_pin:
-            for _e in misses:
-                expert_cache.pin(layer_idx, _e)
-                _pinned_keys.add((layer_idx, _e))
-
-        _miss_futures = []
-        if misses:
-            def _load_one(eidx: int):
-                metas = offset_index.get_expert_offsets(layer_name, eidx)
-                if metas is None:
-                    return eidx, None
-                # Prefill: transient load, never cached (routes ~all experts
-                # once; caching would clone content decode replaces).
-                if getattr(vaayu_ref, "_moe_prefill_pass", False):
-                    return eidx, load_expert_sparse(shard_file, metas)
-                if expert_cache.arena is None:
-                    # No arena (e.g. compute_slab_bytes()==0 or CUDA-less unit
-                    # tests constructing ExpertRAMCache directly) — legacy
-                    # clone path, still cached.
-                    raw = load_expert_sparse(shard_file, metas)
-                    expert_cache.put(layer_idx, eidx, raw)
-                    return eidx, raw
-                # Zero-clone decode path: io_uring reads straight into a pinned
-                # slab; the cache adopts views (no clone anywhere disk→RAM→GPU).
-                slab_idx = expert_cache.acquire_slab()
-                if slab_idx is None:
-                    # arena exhausted and nothing evictable — legacy fallback
-                    raw = load_expert_sparse(shard_file, metas)
-                    expert_cache.put(layer_idx, eidx, raw)
-                    return eidx, raw
-                slab = expert_cache.arena.tensor(slab_idx)
-                try:
-                    # tensor_align=False: decode's cached experts are only ever
-                    # consumed via the per-component .to(device) copies below
-                    # (always naturally aligned on a fresh cross-device copy),
-                    # never via views_from_packed_copy — skip the scratch-pool
-                    # repack, which regressed decode throughput when applied
-                    # unconditionally (see load_expert_into_slab's docstring).
-                    views = load_expert_into_slab(
-                        shard_file, metas, slab,
-                        allow_direct=expert_cache.arena.pin,
-                        tensor_align=False,
-                    )
-                except Exception:
-                    expert_cache.arena.release(slab_idx)
-                    raise
-                expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
-                return eidx, views
-
-            # Submit misses to the persistent pool and DON'T wait: hit experts
-            # compute below while these reads run. Only the remainder that hasn't
-            # landed when hits are done shows up as disk stall (_expert_disk_s).
-            _miss_futures = [vaayu_ref._moe_executor.submit(_load_one, e) for e in misses]
+        expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
+            unique_experts,
+            layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
+            offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref, staged_layer=_staged_layer,
+        )
 
         if _prof:
             _t0 = time.perf_counter()
@@ -1230,28 +1283,6 @@ def _make_fused_sparse_forward_exl3(
         final_hidden = torch.zeros_like(flat_hidden)
         intermediate_size = None  # inferred lazily from the first expert we see
 
-        def _iter_experts_hits_then_misses():
-            """Yield (eidx, raw): cache hits immediately (compute overlaps the
-            in-flight miss reads), then misses in completion order. Blocking
-            time in the wait() is the true disk stall and is accumulated into
-            vaayu_ref._expert_disk_s (telemetry: stall, not total read time)."""
-            for _e in unique_experts:
-                _raw = expert_tensors.get(_e)
-                if _raw is not None:
-                    yield _e, _raw
-            _pending = set(_miss_futures)
-            while _pending:
-                _w0 = time.perf_counter()
-                _done, _pending = _futures_wait(_pending, return_when=FIRST_COMPLETED)
-                _stall = time.perf_counter() - _w0
-                vaayu_ref._expert_disk_s = getattr(vaayu_ref, '_expert_disk_s', 0.0) + _stall
-                if _prof:
-                    _mp['disk_load'] += _stall
-                for _f in _done:
-                    _e, _raw = _f.result()
-                    if _raw is not None:
-                        yield _e, _raw
-
         _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
         # Prefill: don't churn the GPU LRU with a whole-model sweep.
         if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
@@ -1266,7 +1297,7 @@ def _make_fused_sparse_forward_exl3(
             print(f"[VAAYU-OVERLAP] compute_start layer={layer_idx} "
                   f"t={time.perf_counter():.6f} n_experts={len(unique_experts)}")
         try:
-            for eidx, raw in _iter_experts_hits_then_misses():
+            for eidx, raw in _iter_expert_loads(expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None):
                 groups = _group_exl3_tensors_by_weight(raw)
                 if not groups["gate"] or not groups["down"] or not groups["up"]:
                     _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
