@@ -697,23 +697,45 @@ def _make_modulelist_sparse_forward(
         final_hidden = torch.zeros_like(hidden_states)
         _idx_cpu = expert_indices.cpu()
 
-        for eidx in unique_experts:
-            cached = expert_cache.get(layer_idx, eidx)
-            if cached is not None:
-                raw = cached
-            else:
-                metas = offset_index.get_expert_offsets(layer_name, eidx)
-                if metas is None:
-                    print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
-                    continue
-                raw = load_expert_sparse(shard_file, metas)
-                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
-                    expert_cache.put(layer_idx, eidx, raw)
+        # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
+        # prefill routes ~every expert once, so caching there only churns the LRU;
+        # and _vram_cacheable_layers restricts to the layer prefix that fits when
+        # the budget can't hold a whole token's working set (None = no restriction).
+        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
+            _vram = None
+        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
+        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
+            _vram = None
 
+        for eidx in unique_experts:
             expert_mod = experts_list[eidx]
-            state = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
-            if not state:
-                continue
+
+            entry = _vram.get(layer_idx, eidx) if _vram is not None else None
+            if entry is not None and not _attach_cached_expert(expert_mod, entry):
+                entry = None      # structural mismatch — fall through to a real load
+
+            if entry is None:
+                cached = expert_cache.get(layer_idx, eidx)
+                if cached is not None:
+                    raw = cached
+                else:
+                    metas = offset_index.get_expert_offsets(layer_name, eidx)
+                    if metas is None:
+                        print(f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
+                        continue
+                    raw = load_expert_sparse(shard_file, metas)
+                    if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+                        expert_cache.put(layer_idx, eidx, raw)
+
+                entry = _inject_expert_weights(expert_mod, raw, eidx, layer_name, device, dtype)
+                if not entry:
+                    continue
+                if _vram is not None:
+                    # Return value deliberately ignored: unlike the fused path there
+                    # is no _owned_by_cache branch here. The teardown below must run
+                    # whether or not the cache accepted the entry — see its comment.
+                    _vram.put(layer_idx, eidx, entry)
 
             try:
                 b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
@@ -731,12 +753,22 @@ def _make_modulelist_sparse_forward(
                                             accumulate=True)
             finally:
                 try:
-                    # ExLlamaV3Linear QMatrix (.bc) is a C++ object PyTorch GC
-                    # does not manage — .to("meta") below only clears real
-                    # torch parameters/buffers. Must drop the pybind11 ref
-                    # explicitly or every token leaks VRAM until the 16GB GPU
-                    # OOMs. try/finally so a compute exception still frees
-                    # this expert before the exception propagates.
+                    # Detach this expert from the live module — ALWAYS, hit or miss.
+                    # ExLlamaV3Linear's QMatrix (.bc) is a C++ object PyTorch's GC
+                    # does not manage, and .to("meta") only clears real torch
+                    # parameters/buffers, so both refs must be dropped explicitly.
+                    #
+                    # On a VRAM-cache hit this frees nothing: the cache entry holds
+                    # the surviving references. That is exactly the point — if the
+                    # weights stayed bound to experts_list[eidx], an entry the LRU
+                    # evicted would still be referenced by the live ModuleList, so
+                    # eviction would reclaim no VRAM and the byte budget would stop
+                    # matching reality. Detaching also keeps peak GPU residency at
+                    # one uncached expert regardless of routing width (the bound
+                    # whose absence previously caused an OOM-kill).
+                    #
+                    # try/finally so a compute exception still detaches before the
+                    # exception propagates.
                     for submod in expert_mod.modules():
                         if isinstance(submod, ExLlamaV3Linear):
                             submod.bc = None

@@ -35,20 +35,21 @@ class MockMoEBlock(nn.Module):
 
 
 class MockTransformerLayer(nn.Module):
-    def __init__(self, hidden=8):
+    def __init__(self, hidden=8, num_experts=8):
         super().__init__()
         self.self_attn = nn.Linear(hidden, hidden)
-        self.block_sparse_moe = MockMoEBlock(hidden)
+        self.block_sparse_moe = MockMoEBlock(hidden, num_experts)
 
     def forward(self, x, **kwargs):
         return self.block_sparse_moe(self.self_attn(x).unsqueeze(0))
 
 
 class MockModel(nn.Module):
-    def __init__(self, num_layers=3, hidden=8):
+    def __init__(self, num_layers=3, hidden=8, num_experts=8):
         super().__init__()
         self.embed_tokens = nn.Embedding(100, hidden)
-        self.layers = nn.ModuleList([MockTransformerLayer(hidden) for _ in range(num_layers)])
+        self.layers = nn.ModuleList(
+            [MockTransformerLayer(hidden, num_experts) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(hidden)
 
     def forward(self, x):
@@ -919,3 +920,146 @@ def test_attach_cached_expert_returns_false_on_mismatch():
     expert = MockExpert(hidden=8)
     entry = {"nonexistent": {"weight": torch.randn(8, 8)}}
     assert _attach_cached_expert(expert, entry) is False
+
+
+# ── Module-list VRAM expert cache ─────────────────────────────────────────────
+
+def _patch_modulelist_with_vram(tmp_path, num_experts, top_k, vram_budget=10**9):
+    """Build a patched module-list MoE block with a VRAM expert cache attached.
+    Returns (model, vaayu_ref, vram_cache)."""
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+
+    model = MockModel(num_layers=1, hidden=8, num_experts=num_experts)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=100 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+    vram = ExpertVRAMCache(budget_bytes=vram_budget)
+    vaayu_ref._expert_vram_cache = vram
+    vaayu_ref._vram_cacheable_layers = None
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=top_k,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    return model, vaayu_ref, vram
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_second_pass_hits_vram_cache(tmp_path, num_experts, top_k):
+    """Identical routing on a second forward must be served from the VRAM cache."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                      # pass 1: all misses, populates
+    assert vram.hits == 0
+    assert vram.current_usage > 0, "nothing cached after first pass"
+    misses_after_first = vram.misses
+    assert misses_after_first > 0
+
+    moe.forward(hidden)                      # pass 2: same routing -> hits
+    assert vram.hits == misses_after_first, (
+        f"expected {misses_after_first} hits on identical routing, got {vram.hits}")
+    assert vram.misses == misses_after_first, "second pass should add no misses"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_vram_hit_skips_reinjection(tmp_path, num_experts, top_k):
+    """A VRAM hit must not re-read from disk or re-inject weights."""
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)
+
+    real_inject = mp._inject_expert_weights
+    calls = []
+
+    def _counting_inject(*a, **kw):
+        calls.append(1)
+        return real_inject(*a, **kw)
+
+    with mock_patch.object(mp, "_inject_expert_weights", _counting_inject):
+        moe.forward(hidden)
+
+    assert calls == [], f"re-injected {len(calls)} experts that were VRAM-resident"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_detaches_experts_after_every_pass(tmp_path, num_experts, top_k):
+    """Routed experts return to meta after a hit as well as a miss — otherwise the
+    live ModuleList keeps evicted entries alive and eviction reclaims nothing."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    for _ in range(2):                       # pass 1 = miss, pass 2 = hit
+        moe.forward(hidden)
+        for eidx in vaayu_ref._expert_history[0]:
+            assert moe.experts[eidx].w1.weight.is_meta, (
+                f"expert {eidx} still holds real weights after forward")
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_vram_byte_accounting_matches_tensors(tmp_path, num_experts, top_k):
+    """current_usage equals the summed nbytes of every non-'bc' role."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    expected = 0
+    for entry in vram.cache.values():
+        for role, tensors in entry.items():
+            if role == "bc":
+                continue
+            expected += sum(t.nbytes for t in tensors.values())
+
+    assert expected > 0
+    assert vram.current_usage == expected
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_skips_vram_cache_during_prefill(tmp_path, num_experts, top_k):
+    """Prefill sweeps ~every expert once; caching there only churns the LRU."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref._moe_prefill_pass = True
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 4, 8))
+
+    assert vram.current_usage == 0
+    assert vram.hits == 0 and vram.misses == 0, "cache was consulted during prefill"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_respects_vram_cacheable_layers(tmp_path, num_experts, top_k):
+    """A layer outside the cacheable prefix must not touch the VRAM cache."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref._vram_cacheable_layers = set()   # layer 0 excluded
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    assert vram.current_usage == 0
+    assert vram.hits == 0 and vram.misses == 0
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_output_unchanged_by_vram_cache(tmp_path, num_experts, top_k):
+    """Caching is a performance change only — a hit must produce the same numbers
+    as the miss that populated it."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    out1, _ = moe.forward(hidden)
+    out2, _ = moe.forward(hidden)
+    assert torch.allclose(out1, out2, atol=1e-6)
