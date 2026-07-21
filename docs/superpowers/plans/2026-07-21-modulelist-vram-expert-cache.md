@@ -1098,10 +1098,15 @@ In `_make_modulelist_sparse_forward`, the RAM-cache-hit / disk-read section insi
 
 ```python
         # Experts already VRAM-resident need no RAM lookup and no disk read at all.
-        _vram_resident = (
-            {e for e in unique_experts if _vram.has(layer_idx, e)}
-            if _vram is not None else set()
-        )
+        # ONE get() per expert, entry held for the compute loop below — not
+        # has()-then-get(), which would take the lock twice and leave a window
+        # where an expert could vanish between the two calls.
+        _vram_resident: dict = {}
+        if _vram is not None:
+            for _e in unique_experts:
+                _entry = _vram.get(layer_idx, _e)
+                if _entry is not None:
+                    _vram_resident[_e] = _entry
         _to_load = [e for e in unique_experts if e not in _vram_resident]
 
         # Dispatch disk misses up front and consume hits first, so compute overlaps
@@ -1147,12 +1152,10 @@ Restructure the loop to run VRAM hits first, then loaded experts. Factor the per
                 _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
 
         try:
-            for eidx in _vram_resident:
+            for eidx, entry in _vram_resident.items():
                 expert_mod = experts_list[eidx]
-                entry = _vram.get(layer_idx, eidx)
-                if entry is None or not _attach_cached_expert(expert_mod, entry):
-                    _to_load.append(eidx)      # raced out of the cache — load it
-                    continue
+                if not _attach_cached_expert(expert_mod, entry):
+                    continue      # structural mismatch — skip, next token reloads
                 try:
                     _run_expert(eidx, expert_mod)
                 finally:
@@ -1185,7 +1188,7 @@ Restructure the loop to run VRAM hits first, then loaded experts. Factor the per
 ```
 
 Two details:
-- Experts that raced out of the VRAM cache between `has()` and `get()` are appended to `_to_load` but their loads were never dispatched; they are simply skipped this token. That is correct-but-lossy for one token, and vanishingly rare (single-threaded decode). Leave it — do not add a re-dispatch path for it.
+- `_attach_cached_expert` returning False means the cached entry does not match the live module's structure — a real bug, not a race. Skipping the expert for this token keeps the model running and the next token reloads it from disk; the warning `_attach_cached_expert` logs is the signal to investigate. Do not add a re-dispatch path.
 - `_dispatch_expert_misses` handles the RAM-cache lookup and the `expert_cache.put`, so the old inline `expert_cache.get` / `load_expert_sparse` / `expert_cache.put` block is deleted entirely, along with the now-unused `load_expert_sparse` import at the top of `_make_modulelist_sparse_forward` if nothing else uses it.
 
 - [ ] **Step 4: Run the tests**
