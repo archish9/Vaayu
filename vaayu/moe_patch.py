@@ -9,6 +9,7 @@ Design rationale: see docs/superpowers/specs/2026-06-14-moe-expert-aware-streami
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import re
@@ -805,10 +806,17 @@ def _make_modulelist_sparse_forward(
                 finally:
                     _detach_expert(eidx, expert_mod)
 
+            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
+                _load_inject_run(eidx, raw)
+
             if _attach_failed:
                 # These experts were excluded from _to_load (they looked like
                 # VRAM hits when dispatch ran), so _dispatch_expert_misses has
-                # never seen them — dispatch their disk loads now.
+                # never seen them — dispatch their disk loads now. Run this
+                # AFTER the main loop above: it blocks on brand-new disk reads
+                # for these rare attach-failure experts, and running it first
+                # would stall the main loop's RAM-cache hits and already-
+                # in-flight futures behind that stall instead of overlapping.
                 _fb_tensors, _fb_futures, _fb_pinned = _dispatch_expert_misses(
                     _attach_failed,
                     layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
@@ -818,9 +826,6 @@ def _make_modulelist_sparse_forward(
                 _pinned_keys.update(_fb_pinned)
                 for eidx, raw in _iter_expert_loads(_fb_tensors, _fb_futures, vaayu_ref):
                     _load_inject_run(eidx, raw)
-
-            for eidx, raw in _iter_expert_loads(_expert_tensors, _miss_futures, vaayu_ref):
-                _load_inject_run(eidx, raw)
         finally:
             # Release every key THIS call pinned, even if compute raised partway
             # through — a leaked pin permanently blocks that key's eviction.
@@ -1081,10 +1086,18 @@ def _dispatch_expert_misses(
         if _ex is not None:
             miss_futures = [_ex.submit(_load_one, e) for e in misses]
         else:
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            _tmp_ex = _TPE(max_workers=min(len(misses), 8))
+            # No persistent executor (CPU MoE / mock vaayu_ref in unit tests) —
+            # build the fallback pool once and cache it on vaayu_ref instead of
+            # per-call, mirroring why _moe_executor itself is created once at
+            # model init rather than per-layer-per-token (see the comment at
+            # its construction site in vaayu_base.py).
+            _tmp_ex = getattr(vaayu_ref, "_moe_fallback_executor", None)
+            if _tmp_ex is None:
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                _tmp_ex = _TPE(max_workers=min(len(misses), 8))
+                vaayu_ref._moe_fallback_executor = _tmp_ex
+                atexit.register(_tmp_ex.shutdown, wait=False)
             miss_futures = [_tmp_ex.submit(_load_one, e) for e in misses]
-            _tmp_ex.shutdown(wait=False)
 
     return expert_tensors, miss_futures, pinned_keys
 

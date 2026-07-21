@@ -694,13 +694,15 @@ def test_exl3_forward_source_overlaps_disk_and_compute():
         ("_dispatch_expert_misses", dispatch_src),
         ("_iter_expert_loads", iter_src),
     ):
-        assert "_moe_executor.map(" not in src, f"blocking map() barrier reintroduced in {name}"
+        assert ".map(" not in src, f"blocking map() barrier reintroduced in {name}"
     # Critical 2 fix: _moe_executor is read via getattr(..., None) (module-list
     # is also the CPU-compute fallback, which has no persistent executor), so
     # the submit call is on a local (`_ex`), not the literal `_moe_executor.
     # submit(` substring. Still assert the two things that matter: the
-    # attribute is consulted, and dispatch is non-blocking submit(), not map().
-    assert "_moe_executor" in dispatch_src
+    # attribute is consulted (via the exact getattr call, not just the
+    # substring "_moe_executor" appearing anywhere — e.g. in a comment), and
+    # dispatch is non-blocking submit(), not map().
+    assert 'getattr(vaayu_ref, "_moe_executor", None)' in dispatch_src
     assert ".submit(" in dispatch_src
     assert "FIRST_COMPLETED" in iter_src
 
@@ -1267,8 +1269,10 @@ def test_modulelist_failed_attach_falls_through_to_correct_output(tmp_path, num_
     expected, _ = moe.forward(hidden)           # pass 2: normal VRAM-hit path
 
     real_attach = mp._attach_cached_expert
+    calls = []
 
     def _attach_but_report_false(mod, entry):
+        calls.append(1)
         real_attach(mod, entry)
         return False
 
@@ -1277,6 +1281,11 @@ def test_modulelist_failed_attach_falls_through_to_correct_output(tmp_path, num_
         # must reach a real disk load + real injection to be numerically correct.
         actual, _ = moe.forward(hidden)         # pass 3: forced attach failure
 
+    assert calls, (
+        "forced-failure wrapper was never invoked — the test proves nothing "
+        "about the fall-through path if the shared fixture stops attaching a "
+        "VRAM cache (both passes would then take the load arm and still match)"
+    )
     assert torch.allclose(actual, expected, atol=1e-6), (
         "forced attach failure produced a different output than the normal "
         "VRAM-hit path — the fallback disk load must reproduce the same result"
