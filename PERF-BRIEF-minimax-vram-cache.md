@@ -372,3 +372,95 @@ actively-tested path and had not been measured since `2f50fea`).
 No regression on any axis; output coherent. (A last-token `vram=23%` snapshot
 looked alarming until averaged over 200 tokens — single-token cache figures on
 this path are noisy and should not be read as trends.)
+
+### 12.12 Pinned slab arena enabled for module-list — the largest single win
+
+`moe_supports_slab_pipeline` excluded the module-list layout on the premise that
+its forward only ever cloned into pageable RAM. The Task 4/5 extraction (§12.9's
+lineage) moved that forward onto the shared miss loader, which calls
+`acquire_slab`/`load_expert_into_slab`/`put_slab` whenever an arena exists — so
+the premise became false and nobody updated the gate. The arena was skipped,
+`expert_cache.arena` stayed `None`, and every expert cloned to pageable memory.
+
+Split into `moe_supports_slab_arena` (fused + module_list) and
+`moe_supports_prefill_stager` (fused only); commits `b5fedb7..bd5e0c5`.
+
+| | before | after |
+|---|---|---|
+| decode (unprofiled) | 0.95 tok/s | **1.47 tok/s (+55%)** |
+| decode (profiled, like-for-like) | 0.93 tok/s | 1.42 tok/s |
+| `h2d` | 0.389s | **0.190s** |
+| **H2D bandwidth** | **7.1 GB/s** | **14.8 GB/s** |
+| TTFT | 31.32s | 32.62s |
+| arena | `SKIPPED` | `1034 x 8.9MB (pinned, 9.19GB resident)` |
+
+Bandwidth is the mechanism, measured directly: 316 misses/token x 8.9MB = 2.81GB
+moved in 0.190s. Pageable transfers route through a staging bounce buffer;
+pinned memory DMAs directly. Nothing was coalesced and no new caching machinery
+was written — the consuming code already existed.
+
+#### Costs, accepted deliberately
+
+**RSS 15.5-17GB -> 22.20GB, unswappable.** This tripped the plan's own
+stop-and-revert criterion (>1GB growth). That criterion's stated diagnosis —
+"arena allocated but the cache still cloning" — is disproven, because a
+never-read arena would leave `h2d` at 7.1 GB/s and it halved instead. Roughly
+5GB remains unexplained at steady state. Two untested hypotheses: pinned memory
+is always resident whereas the baseline's pageable clones were OS-reclaimable
+(so the old RSS understated the true footprint), and prefill misses still take
+the transient pageable path, which matches the 24GB spike observed during
+prefill. **Not distinguished — worth resolving before running parallel fan-out
+on this box.**
+
+**Prefix cache starved to 0** (`0.00 GB budget (free RAM 6.45 GB - 12.88 GB
+reserve)`). Invisible to `test_generate.py`, which issues a single `generate()`
+and so can never hit a cross-turn cache — but CLAUDE.md §0 names prefix caching
+the top TTFT lever for the real agentic workload.
+
+#### Why sizing the arena down was rejected
+
+Spec §5 pre-authorised shrinking the arena if the prefix budget zeroed. The
+arithmetic makes that useless here. Free RAM before the arena is ~15.64GB
+against a 12.88GB reserve, so the prefix cache's entire slack is **2.76GB**:
+
+```
+prefix_budget(A) = max(0, 2.76GB - A)
+```
+
+Any arena >= 2.76GB zeroes it. Preserving even 1GB of prefix budget caps the
+arena at 1.76GB — 19% of full size, ~198 of 1034 slabs — yielding `h2d` ~0.351s
+and ~0.97 tok/s against a 0.95 baseline. Indistinguishable from noise. There is
+no middle ground: the two features want 9.19GB and 2.76GB from the same ~15.6GB.
+
+#### The real lever, deferred to its own spec
+
+The expert **RAM** cache holds **9.13GB at a 5% hit rate** — the VRAM cache
+absorbs the hot experts, leaving the RAM tier only the cold tail (§12.3). It is
+the largest reclaimable allocation on the box, and since the arena is that
+cache's backing store, shrinking the budget shrinks both together and could fund
+the arena AND a live prefix cache. That touches `compute_expert_budget`, not
+arena sizing, and deserves its own before/after rather than riding along inside
+a memory change.
+
+#### Qwen regression check
+
+| | prior | after gate split |
+|---|---|---|
+| arena | `778 x 11.8MB (pinned, 9.21GB)` | identical |
+| decode | 0.88 tok/s | 0.85 tok/s (session range 0.83-0.88) |
+| avg VRAM hit rate | 46% | 48% |
+| RSS | 21.88GB | 21.88GB |
+
+Unaffected, as designed: it is `True` for both predicates, so its behavior is
+unchanged.
+
+### 12.13 Cumulative
+
+| | session start | now |
+|---|---|---|
+| MiniMax decode | 0.62 tok/s | **1.47 tok/s (+137%)** |
+| MiniMax TTFT | 53.1s | ~32.6s (-39%) |
+| Qwen decode | 0.84 tok/s | 0.85 tok/s (unchanged) |
+
+Remaining ranked: `gemm` ~0.154s is the compute floor; `disk_load` ~0.191s via
+RAM victim-cache semantics; the RAM-cache rebalance above.
