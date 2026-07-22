@@ -8,6 +8,15 @@ import os as _os
 # unreliable post-context-init. torch.cuda.is_available() does not allocate, so
 # this lands before the caching allocator reads the setting. setdefault: an
 # explicit launch env var still wins.
+#
+# KNOWN INCOMPATIBILITY — cross-process CUDA IPC. Expandable segments cannot be
+# shared across processes via CUDA IPC handles. Vaayu's parallel fan-out
+# (CLAUDE.md §0) is IN-PROCESS (multi-query batched decode), and nothing in the
+# tree uses torch.multiprocessing / CUDA IPC today, so this is inert. If
+# cross-process fan-out with shared GPU tensors is ever built, that path must
+# launch with an explicit PYTORCH_CUDA_ALLOC_CONF that omits expandable_segments
+# — the setdefault below already defers to it, and the warning fires so the
+# fragmentation trade-off is visible rather than silent.
 _alloc_conf = _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if "expandable_segments:true" not in _alloc_conf.lower():
     # A caller-set PYTORCH_CUDA_ALLOC_CONF wins (setdefault above) — correct, we

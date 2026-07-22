@@ -671,9 +671,12 @@ _PREFILL_VRAM_HEADROOM = 2 * 1024 ** 3
 
 def _ensure_prefill_headroom(vaayu_ref) -> None:
     """During a prefill pass, evict the VRAM expert cache until free VRAM meets
-    _PREFILL_VRAM_HEADROOM. The cache is gated OFF during prefill (each forward
-    sets _vram = None), so its residency gives prefill no benefit while starving
-    activations — evicting here is free for prefill and re-warms during decode.
+    _PREFILL_VRAM_HEADROOM. The cache is not read during prefill — the two
+    forwards that consult it (module-list and fused-EXL3) set their local
+    _vram = None when _moe_prefill_pass is set, and the non-EXL3 fused forward
+    never touches it at all — so its residency gives prefill no benefit while
+    starving activations. Evicting here is therefore free for prefill; the
+    evicted experts re-warm during the decode that follows.
     A no-op during decode, without a VRAM cache, or without CUDA."""
     if not getattr(vaayu_ref, "_moe_prefill_pass", False):
         return
