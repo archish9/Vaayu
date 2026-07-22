@@ -661,6 +661,30 @@ def _make_sparse_moe_forward(
         )
 
 
+# Hardware constant: free VRAM to guarantee before each MoE layer DURING PREFILL,
+# by evicting the (prefill-idle) VRAM expert cache. A property of the card, not
+# the model (CLAUDE.md §5) — the same class/value as vaayu_base._VRAM_RESERVE_BYTES.
+# It need only exceed one layer's prefill-chunk activation, since the poll runs
+# per layer; an over-conservative value merely evicts slightly more.
+_PREFILL_VRAM_HEADROOM = 2 * 1024 ** 3
+
+
+def _ensure_prefill_headroom(vaayu_ref) -> None:
+    """During a prefill pass, evict the VRAM expert cache until free VRAM meets
+    _PREFILL_VRAM_HEADROOM. The cache is gated OFF during prefill (each forward
+    sets _vram = None), so its residency gives prefill no benefit while starving
+    activations — evicting here is free for prefill and re-warms during decode.
+    A no-op during decode, without a VRAM cache, or without CUDA."""
+    if not getattr(vaayu_ref, "_moe_prefill_pass", False):
+        return
+    _vram = getattr(vaayu_ref, "_expert_vram_cache", None)
+    if _vram is None or not torch.cuda.is_available():
+        return
+    free, _ = torch.cuda.mem_get_info()
+    if free < _PREFILL_VRAM_HEADROOM:
+        _vram.evict_until_free(_PREFILL_VRAM_HEADROOM)
+
+
 def _make_modulelist_sparse_forward(
     block_info: MoEBlockInfo,
     expert_cache: "ExpertRAMCache",
@@ -678,6 +702,7 @@ def _make_modulelist_sparse_forward(
     layer_idx  = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
+        _ensure_prefill_headroom(vaayu_ref)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
@@ -969,6 +994,7 @@ def _make_fused_sparse_forward(
     layer_idx = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
+        _ensure_prefill_headroom(vaayu_ref)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
@@ -1312,6 +1338,7 @@ def _make_fused_sparse_forward_exl3(
             )
 
     def sparse_forward(hidden_states, **kwargs):
+        _ensure_prefill_headroom(vaayu_ref)
         _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
         _mp = vaayu_ref._moe_profile if _prof else None
 

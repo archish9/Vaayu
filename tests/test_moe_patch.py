@@ -2014,3 +2014,75 @@ def test_build_exl3_qmatrix_timing_attributes_construct_not_h2d():
     assert timing["h2d"] < 0.01, (
         f"h2d should be a fast tensor copy, not the slow construct call, "
         f"got {timing['h2d']:.4f}s")
+
+
+def test_ensure_prefill_headroom_evicts_only_under_pressure_during_prefill():
+    """During prefill, when free VRAM is below the headroom, the helper evicts."""
+    import vaayu.moe_patch as mp
+
+    class _Ref:
+        _moe_prefill_pass = True
+    ref = _Ref()
+    vram = MagicMock()
+    ref._expert_vram_cache = vram
+
+    # free below headroom → evict_until_free called with the headroom target.
+    with mock_patch("torch.cuda.is_available", return_value=True), \
+         mock_patch("torch.cuda.mem_get_info", return_value=(1, 10 ** 10)):
+        mp._ensure_prefill_headroom(ref)
+    vram.evict_until_free.assert_called_once_with(mp._PREFILL_VRAM_HEADROOM)
+
+
+def test_ensure_prefill_headroom_noop_when_free_above_headroom():
+    """Free VRAM above the headroom → no eviction call."""
+    import vaayu.moe_patch as mp
+
+    class _Ref:
+        _moe_prefill_pass = True
+    ref = _Ref()
+    vram = MagicMock()
+    ref._expert_vram_cache = vram
+
+    with mock_patch("torch.cuda.is_available", return_value=True), \
+         mock_patch("torch.cuda.mem_get_info", return_value=(10 ** 11, 10 ** 11)):
+        mp._ensure_prefill_headroom(ref)
+    vram.evict_until_free.assert_not_called()
+
+
+def test_ensure_prefill_headroom_noop_during_decode():
+    """Not a prefill pass → never touches VRAM, never evicts (decode untouched)."""
+    import vaayu.moe_patch as mp
+
+    class _Ref:
+        _moe_prefill_pass = False
+    ref = _Ref()
+    vram = MagicMock()
+    ref._expert_vram_cache = vram
+
+    with mock_patch("torch.cuda.mem_get_info") as mem:
+        mp._ensure_prefill_headroom(ref)
+    mem.assert_not_called()
+    vram.evict_until_free.assert_not_called()
+
+
+def test_ensure_prefill_headroom_noop_without_vram_cache():
+    """No VRAM cache (CPU / dense) → safe no-op."""
+    import vaayu.moe_patch as mp
+
+    class _Ref:
+        _moe_prefill_pass = True
+        _expert_vram_cache = None
+    mp._ensure_prefill_headroom(_Ref())   # must not raise
+
+
+def test_all_three_forwards_call_ensure_prefill_headroom():
+    """Every sparse_forward wires the headroom hook — a source guard so a future
+    forward added without it is caught. Binds to the CALL, not the def."""
+    import inspect
+    from vaayu import moe_patch
+    for factory in ("_make_modulelist_sparse_forward",
+                    "_make_fused_sparse_forward",
+                    "_make_fused_sparse_forward_exl3"):
+        src = inspect.getsource(getattr(moe_patch, factory))
+        assert "_ensure_prefill_headroom(vaayu_ref)" in src, \
+            f"{factory} does not call _ensure_prefill_headroom"
