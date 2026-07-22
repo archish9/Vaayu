@@ -452,6 +452,7 @@ class ExpertVRAMCache:
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self.prefill_evictions = 0   # reactive prefill-headroom evictions
         self._last_hits = 0
         self._last_misses = 0
         self._last_evictions = 0
@@ -521,6 +522,35 @@ class ExpertVRAMCache:
             self.current_usage -= self._group_bytes(entry)
             return True
 
+    def evict_until_free(self, free_target_bytes: int) -> int:
+        """Evict LRU entries until free VRAM would reach free_target_bytes, then
+        return blocks to the driver. Used reactively during prefill: the resident
+        cache is not consulted during a prefill pass, so evicting here has no
+        correctness impact, and the evicted experts re-warm during decode.
+
+        Reads free VRAM once, evicts enough BYTES to cover the deficit, then calls
+        empty_cache() ONCE — dropping Python refs alone leaves blocks in PyTorch's
+        caching allocator where mem_get_info still counts them used; only
+        empty_cache() reclaims them, so a per-pop re-poll would never see free
+        rise and would evict the whole cache. Returns bytes freed."""
+        if not torch.cuda.is_available():
+            return 0
+        with self.lock:
+            free, _ = torch.cuda.mem_get_info()
+            deficit = free_target_bytes - free
+            if deficit <= 0:
+                return 0
+            freed = 0
+            while freed < deficit and self.cache:
+                _key, evicted = self.cache.popitem(last=False)   # LRU
+                n = self._group_bytes(evicted)
+                self.current_usage -= n
+                freed += n
+                self.prefill_evictions += 1
+                del evicted   # drop GPU refs so empty_cache can reclaim
+        torch.cuda.empty_cache()   # outside the lock: realize the freed blocks
+        return freed
+
     def reset_stats(self) -> None:
         with self.lock:
             self.hits = self.misses = self.evictions = 0
@@ -532,6 +562,7 @@ class ExpertVRAMCache:
             rate = f"{self.hits / total:.0%}" if total > 0 else "n/a"
             return (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
                     f"hit_rate={rate} "
+                    f"prefill_evict={self.prefill_evictions} "
                     f"usage={self.current_usage / 1e9:.2f}GB/{self.budget_bytes / 1e9:.2f}GB")
 
     def delta_stats(self) -> str:
