@@ -1473,3 +1473,269 @@ def test_modulelist_gpu_residency_stays_bounded(tmp_path, num_experts, top_k):
         moe.forward(torch.randn(1, 1, 8))
 
     assert peak == 1, f"{peak} experts held real weights at once; bound is 1"
+
+
+# ── Module-list pin/unpin discipline (arena-backed ExpertRAMCache) ────────────
+#
+# Every module-list test above builds ExpertRAMCache(budget_bytes=...) with no
+# arena, which makes _dispatch_expert_misses' `_do_pin` gate permanently False
+# and the returned pinned_keys set permanently empty (see
+# _dispatch_expert_misses' docstring). The pin-before-dispatch /
+# unpin-in-finally discipline it documents is therefore proven only by
+# reading the code, never by any test. These tests build a genuinely
+# arena-backed cache so `_do_pin` is True and the discipline actually runs.
+
+def _patch_modulelist_with_arena(tmp_path, num_experts, top_k, *, with_vram=False,
+                                  vram_budget=10**9):
+    """Build a patched module-list MoE block backed by an arena-backed
+    ExpertRAMCache. Sized generously (every expert gets its own slab, plus
+    slack) so eviction never interferes with what these tests check. Returns
+    (model, vaayu_ref, cache, vram_or_None)."""
+    from vaayu.persist.expert_cache import SlabArena
+    from vaayu.persist.safetensor_model_persister import compute_slab_bytes
+
+    model = MockModel(num_layers=1, hidden=8, num_experts=num_experts)
+    _make_checkpoint(tmp_path, model)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+
+    slab_bytes = compute_slab_bytes(idx)
+    n_slabs = num_experts + 2
+    arena = SlabArena(n_slabs=n_slabs, slab_bytes=slab_bytes, pin=False)
+    cache = ExpertRAMCache(budget_bytes=n_slabs * slab_bytes, arena=arena)
+
+    vaayu_ref = MockVaayuRef()
+    vram = None
+    if with_vram:
+        from vaayu.persist.expert_cache import ExpertVRAMCache
+        vram = ExpertVRAMCache(budget_bytes=vram_budget)
+        vaayu_ref._expert_vram_cache = vram
+        vaayu_ref._vram_cacheable_layers = None
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=top_k,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    return model, vaayu_ref, cache, vram
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_pin_depth_zero_after_forward(tmp_path, num_experts, top_k):
+    """GAP I1: with a genuinely arena-backed cache, `_do_pin` is True, which
+    drives both branches _dispatch_expert_misses can pin from: pass 1 pins on
+    the disk-miss path (pin-before-dispatch), pass 2 (identical routing) pins
+    on the RAM-cache-hit path (get(..., pin=True)). Either way, the module-list
+    forward's outer `finally` must unpin every key it pinned before forward()
+    returns — a leaked pin would permanently block that key's eviction."""
+    model, vaayu_ref, cache, _ = _patch_modulelist_with_arena(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                      # pass 1: every routed expert a miss
+    assert cache._pinned == {}, f"pins leaked after miss pass: {cache._pinned}"
+
+    moe.forward(hidden)                      # pass 2: identical routing -> RAM hits
+    assert cache._pinned == {}, f"pins leaked after hit pass: {cache._pinned}"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_pin_depth_zero_with_attach_failure_fallback(tmp_path, num_experts, top_k):
+    """GAP I1 (fallback path): a failed VRAM attach makes the module-list
+    forward call _dispatch_expert_misses a SECOND time, for the attach-failed
+    experts. That call's pins land in a separate `_fb_pinned` set that must be
+    merged into the outer `_pinned_keys` (via `_pinned_keys.update(_fb_pinned)`)
+    before the final unpin loop runs, or that second call's pins never get
+    released. Forces a genuine re-bind-then-report-False attach failure (real
+    _attach_cached_expert call, only its return value is forced) so the
+    fallback dispatch actually runs, backed by an arena so its pin is real."""
+    import vaayu.moe_patch as mp
+
+    model, vaayu_ref, cache, vram = _patch_modulelist_with_arena(
+        tmp_path, num_experts, top_k, with_vram=True)
+    moe = model.layers[0].block_sparse_moe
+    hidden = torch.randn(1, 1, 8)
+
+    moe.forward(hidden)                      # pass 1: populates RAM + VRAM caches
+    routed = list(vaayu_ref._expert_history[0])
+    assert routed, "expected at least one routed expert"
+    assert cache._pinned == {}, f"pins leaked after populate pass: {cache._pinned}"
+
+    real_attach = mp._attach_cached_expert
+
+    def _attach_but_report_false(mod, entry):
+        real_attach(mod, entry)              # real re-bind succeeds
+        return False                          # ...but report a mismatch anyway
+
+    with mock_patch.object(mp, "_attach_cached_expert", _attach_but_report_false):
+        # _inject_expert_weights intentionally NOT mocked: the fallback must
+        # reach a real RAM-cache hit + real re-injection for this to say
+        # anything about the fallback dispatch call's pins.
+        moe.forward(hidden)                   # pass 2: forces the fallback dispatch
+
+    assert cache._pinned == {}, (
+        f"pins leaked after attach-failure fallback dispatch: {cache._pinned}")
+
+
+# ── EXL3 module-list bc lifecycle (end-to-end) ─────────────────────────────────
+#
+# Every module-list test above uses MockExpert (plain nn.Linear submodules).
+# Production's only module-list target (MiniMax) is EXL3-quantized, so its
+# experts are ExLlamaV3Linear submodules and every forward pass takes the
+# _inject_expert_weights build_exl3_qmatrix branch, _attach_cached_expert's bc
+# re-bind branch, _detach_expert's bc clear, and ExpertVRAMCache._group_bytes'
+# "bc"-key skip. None of that is reachable through MockExpert.
+
+from vaayu.persist.loader_strategy import ExLlamaV3Linear as _ExLlamaV3Linear
+
+
+class _EXL3ModuleListExpert(nn.Module):
+    """Module-list expert whose submodules are genuinely ExLlamaV3Linear."""
+    def __init__(self, hidden=8):
+        super().__init__()
+        self.w1 = _ExLlamaV3Linear(hidden, hidden, bias=False)
+        self.w2 = _ExLlamaV3Linear(hidden, hidden, bias=False)
+
+    def forward(self, x):
+        return self.w2(torch.relu(self.w1(x)))
+
+
+class _EXL3ModuleListBlock(nn.Module):
+    def __init__(self, hidden=8, num_experts=8):
+        super().__init__()
+        self.gate = nn.Linear(hidden, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [_EXL3ModuleListExpert(hidden) for _ in range(num_experts)])
+
+
+class _EXL3ModuleListLayer(nn.Module):
+    def __init__(self, hidden=8, num_experts=8):
+        super().__init__()
+        self.self_attn = nn.Linear(hidden, hidden)
+        self.block_sparse_moe = _EXL3ModuleListBlock(hidden, num_experts)
+
+
+class _EXL3ModuleListModel(nn.Module):
+    def __init__(self, num_layers=1, hidden=8, num_experts=8):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_EXL3ModuleListLayer(hidden, num_experts) for _ in range(num_layers)])
+
+
+def _make_exl3_modulelist_raw(layer_name: str, eidx: int, hidden: int = 8) -> dict:
+    """Genuine EXL3-shaped (trellis/suh/svh/mcg/mul1) tensors for a
+    _EXL3ModuleListExpert's two submodules (w1, w2) — mirrors
+    _make_mock_exl3_raw but restricted to the roles this expert actually has
+    (w1/w2, not w1/w2/w3) and rooted at 'block_sparse_moe.experts' (the
+    module-list layout's own experts_attr), not the fused path's 'mlp.experts'."""
+    prefix = f"{layer_name}.block_sparse_moe.experts.{eidx}"
+    raw = {}
+    for wname in ("w1", "w2"):
+        raw[f"{prefix}.{wname}.trellis"] = torch.zeros(hidden, hidden, dtype=torch.int16)
+        raw[f"{prefix}.{wname}.suh"]     = torch.zeros(1, hidden, dtype=torch.float16)
+        raw[f"{prefix}.{wname}.svh"]     = torch.zeros(1, hidden, dtype=torch.float16)
+        raw[f"{prefix}.{wname}.mcg"]     = torch.zeros(hidden, dtype=torch.int32)
+        raw[f"{prefix}.{wname}.mul1"]    = torch.zeros(hidden, dtype=torch.int32)
+    return raw
+
+
+def _make_exl3_modulelist_checkpoint(tmp_path, num_experts=8, hidden=8):
+    layer_name = "layers.0"
+    tensors = {}
+    for eidx in range(num_experts):
+        tensors.update(_make_exl3_modulelist_raw(layer_name, eidx, hidden=hidden))
+    tensors[f"{layer_name}.block_sparse_moe.gate.weight"] = torch.randn(num_experts, hidden)
+    _save_file(tensors, str(tmp_path / f"{layer_name}.safetensors"))
+
+
+def _fake_bc_run_alloc(x, out_feats, _flag):
+    return torch.zeros(x.shape[0], out_feats, dtype=torch.float16)
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_exl3_bc_lifecycle_end_to_end(tmp_path, num_experts, top_k):
+    """GAP I2: drives _make_modulelist_sparse_forward end-to-end with genuinely
+    EXL3-shaped experts. Across a miss pass then a VRAM-hit pass, asserts:
+      - the cached VRAM entry carries a 'bc' dict (_inject_expert_weights)
+      - the hit re-binds that bc rather than rebuilding it (_attach_cached_expert;
+        proven by spying on build_exl3_qmatrix's call count)
+      - submod.bc is None after every pass, hit or miss (_detach_expert)
+      - ExpertVRAMCache._group_bytes counts the real tensors but skips 'bc'
+    """
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+
+    model = _EXL3ModuleListModel(num_layers=1, hidden=8, num_experts=num_experts)
+    _make_exl3_modulelist_checkpoint(tmp_path, num_experts=num_experts, hidden=8)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+    vram = ExpertVRAMCache(budget_bytes=10**9)
+    vaayu_ref._expert_vram_cache = vram
+    vaayu_ref._vram_cacheable_layers = None
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=top_k,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    moe = model.layers[0].block_sparse_moe
+    hidden_states = torch.randn(1, 1, 8)
+
+    def _fake_build(mod, tensors_by_base, device, non_blocking=False):
+        bc = MagicMock()
+        bc.run_alloc.side_effect = _fake_bc_run_alloc
+        mod.bc = bc
+        return dict(tensors_by_base)
+
+    build_spy = MagicMock(side_effect=_fake_build)
+
+    with mock_patch("vaayu.persist.loader_strategy.build_exl3_qmatrix", build_spy):
+        out1, _ = moe.forward(hidden_states)     # pass 1: miss -> inject -> vram populate
+        routed = list(vaayu_ref._expert_history[0])
+        assert routed, "expected at least one routed expert"
+        n_first = build_spy.call_count
+        assert n_first > 0, "build_exl3_qmatrix was never called on the miss pass"
+
+        for eidx in routed:
+            entry = vram.cache.get((0, eidx))
+            assert entry is not None, f"expert {eidx} not cached in VRAM after miss pass"
+            assert set(entry.get("bc", {})) == {"w1", "w2"}, (
+                f"expert {eidx}'s cached entry missing bc dict for both "
+                f"submodules: {entry.get('bc')}")
+            assert moe.experts[eidx].w1.bc is None, "w1.bc not cleared after miss pass"
+            assert moe.experts[eidx].w2.bc is None, "w2.bc not cleared after miss pass"
+
+        expected_bytes = 0
+        for entry in vram.cache.values():
+            for role, tensors in entry.items():
+                if role == "bc":
+                    continue
+                expected_bytes += sum(t.nbytes for t in tensors.values())
+        assert expected_bytes > 0
+        assert vram.current_usage == expected_bytes, (
+            "_group_bytes must count the real tensors but skip the 'bc' key")
+
+        out2, _ = moe.forward(hidden_states)     # pass 2: identical routing -> VRAM hit
+        assert build_spy.call_count == n_first, (
+            "build_exl3_qmatrix was called again on a VRAM hit — the bc "
+            "object should have been re-bound, not rebuilt")
+
+        for eidx in routed:
+            assert moe.experts[eidx].w1.bc is None, "w1.bc not cleared after hit pass"
+            assert moe.experts[eidx].w2.bc is None, "w2.bc not cleared after hit pass"
+
+    assert out1.shape == (1, 1, 8)
+    assert out2.shape == (1, 1, 8)
