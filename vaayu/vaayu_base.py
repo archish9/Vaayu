@@ -1292,10 +1292,24 @@ class VaayuBaseModel(GenerationMixin):
         self._prefix_cache = None
         if getattr(self, "enable_prefix_cache", False):
             import psutil as _ps
+            _free_ram = _ps.virtual_memory().available
+            _pc_budget = compute_prefix_cache_budget(_free_ram)
             self._prefix_cache = PrefixCacheStore(
-                compute_prefix_cache_budget(_ps.virtual_memory().available),
+                _pc_budget,
                 auto_prefix_match=getattr(self, "auto_prefix_match", True))
-            print("[Vaayu] cross-turn prefix cache ENABLED")
+            print(f"[Vaayu] cross-turn prefix cache ENABLED: "
+                  f"{_pc_budget / 1e9:.2f} GB budget "
+                  f"(free RAM {_free_ram / 1e9:.2f} GB - "
+                  f"{_PREFIX_CACHE_RAM_RESERVE / 1e9:.0f} GB reserve)")
+            if _pc_budget == 0:
+                # Enabled but starved: every store() is refused, so cross-turn
+                # TTFT reuse — CLAUDE.md §0's top lever for the agentic workload
+                # — is silently inert. Anything that claims RAM before this point
+                # (notably the pinned expert slab arena) can cause it. Warn, do
+                # not hide (CLAUDE.md §5).
+                print("[Vaayu] WARNING: prefix cache budget is 0 GB — free RAM at "
+                      "this point is below the reserve, so the cache is enabled "
+                      "but will hold nothing. Cross-turn prefill reuse is inert.")
 
         # --- KV disk persistence tier (Subsystem A; ships dark) ---
         self._kv_writer = None
