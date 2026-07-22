@@ -1058,6 +1058,14 @@ class VaayuBaseModel(GenerationMixin):
             self._moe_stager_capable = moe_supports_prefill_stager(_styles_detected, _is_exl3)
 
             _mem = _psutil.virtual_memory()
+            # RAM arbitration ledger (diagnostic): what is already resident before
+            # any expert/prefix cache allocates. On a constrained box this load-time
+            # footprint — model non-expert weights, pinned layers, checkpoint
+            # buffers, CUDA/PyTorch host context — is what squeezes every cache that
+            # sizes itself from "free RAM at my construction point" afterward.
+            print(f"[Vaayu-RAM] ledger @ cache-sizing: {_mem.available / 1e9:.2f}GB "
+                  f"avail of {_mem.total / 1e9:.2f}GB "
+                  f"({(_mem.total - _mem.available) / 1e9:.2f}GB already resident)")
 
             # Model-agnostic geometry (Task 0) → single source of truth. No Qwen
             # numbers hardcoded; expert_bytes/num_moe_layers/working_set derived.
@@ -1118,6 +1126,8 @@ class VaayuBaseModel(GenerationMixin):
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
                           f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident)")
+                    print(f"[Vaayu-RAM] ledger @ post-arena: "
+                          f"{_psutil.virtual_memory().available / 1e9:.2f}GB avail")
             self._expert_cache = ExpertRAMCache(
                 _expert_budget, max_per_layer=_max_per_layer,
                 arena=self._expert_slab_arena,
@@ -1302,14 +1312,19 @@ class VaayuBaseModel(GenerationMixin):
                   f"(free RAM {_free_ram / 1e9:.2f} GB - "
                   f"{_PREFIX_CACHE_RAM_RESERVE / 1e9:.2f} GB reserve)")
             if _pc_budget == 0:
-                # Enabled but starved: every store() is refused, so cross-turn
-                # TTFT reuse — CLAUDE.md §0's top lever for the agentic workload
-                # — is silently inert. Anything that claims RAM before this point
-                # (notably the pinned expert slab arena) can cause it. Warn, do
-                # not hide (CLAUDE.md §5).
-                print("[Vaayu] WARNING: prefix cache budget is 0 GB — free RAM at "
-                      "this point is below the reserve, so the cache is enabled "
-                      "but will hold nothing. Cross-turn prefill reuse is inert.")
+                # Budget 0 does NOT disable the cache: store()'s eviction loop
+                # keeps at least one entry regardless of budget
+                # (`while current_bytes > budget and len(pool) > 1`), so a SINGLE
+                # session's cross-turn reuse still works — measured 108s -> 10s
+                # TTFT on a 2000-token shared prefix. What a 0 budget costs is
+                # CONCURRENCY: the pool degrades to one resident session, so under
+                # parallel fan-out (CLAUDE.md §0, multiple session_ids) every
+                # concurrent stream but the most recent is evicted. Anything that
+                # claims RAM before this point (notably the pinned expert slab
+                # arena) shrinks the budget. Warn, don't hide (CLAUDE.md §5).
+                print("[Vaayu] WARNING: prefix cache budget is 0 GB — single-session "
+                      "reuse still works, but concurrent sessions (parallel fan-out) "
+                      "collapse to one resident entry. Free RAM here is below the reserve.")
 
         # --- KV disk persistence tier (Subsystem A; ships dark) ---
         self._kv_writer = None
@@ -3058,10 +3073,15 @@ class VaayuBaseModel(GenerationMixin):
         kv, match_len = pc.lookup(session_id, ids_list)
         if kv is None:
             kv = self._create_kv_cache()
+            print(f"[Vaayu-Prefix] MISS session={session_id} "
+                  f"prompt_len={input_ids.shape[1]} — full prefill")
         else:
             kv.to_device(self.running_device)
             if match_len >= input_ids.shape[1]:
                 match_len = input_ids.shape[1] - 1   # leave >=1 position to run
+            print(f"[Vaayu-Prefix] HIT session={session_id} "
+                  f"match_len={match_len}/{input_ids.shape[1]} — "
+                  f"prefill only {input_ids.shape[1] - match_len} new positions")
             kv.crop(match_len)
             if self._kv_writer is not None and session_id is not None:
                 self._kv_writer.enqueue_truncate(session_id, match_len)

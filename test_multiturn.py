@@ -1,0 +1,127 @@
+"""
+Interleaved multi-session prefix-cache stress harness.
+
+The prefix cache's eviction loop (prefix_cache.py) keeps at least one entry
+regardless of budget (`while current_bytes > budget and len(pool) > 1`), so a
+SINGLE session's cross-turn reuse works even at budget 0. The budget only bites
+when MULTIPLE sessions must be resident at once — CLAUDE.md §0's parallel
+fan-out workload (concurrent sub-agents / tool calls, each its own session_id).
+
+This harness interleaves K sessions across R rounds: round 1 stores all K cold
+(MISS); round 2 re-runs each with a small new instruction and should HIT — but
+only for sessions the budget kept resident. At budget 0 the pool holds one entry,
+so only the last session survives to round 2; the rest were evicted → MISS. A
+budget large enough for K KVs lets all K hit. That HIT count is the direct
+measure of the budget's value, and K resident KVs is the RAM/OOM stress.
+
+Run:
+    source venv/bin/activate
+    python -u test_multiturn.py > run-multiturn.log 2>&1
+"""
+
+import sys
+import os
+import time
+import logging
+import resource
+import torch
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
+
+MODEL_PATH   = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
+KV_CACHE_MODE = "auto"
+MAX_NEW_TOKENS = 64          # short — TTFT is what we measure, not decode length
+MAX_LENGTH    = 2048
+PREFILL_CHUNK_SIZE = 512
+K_SESSIONS    = 2            # 2 is enough to reproduce (crash was on session 1)
+R_ROUNDS      = 1            # single cold round — isolates the reclaim question
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+from vaayu import AutoModel
+from vaayu.streaming import stream_generate
+
+
+def peak_rss_gb() -> float:
+    # ru_maxrss is KB on Linux.
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+
+
+print("Loading model...")
+_t0 = time.time()
+model = AutoModel.from_pretrained(
+    MODEL_PATH, device=DEVICE, kv_cache_mode=KV_CACHE_MODE,
+    max_pinned_layers=10, prefill_chunk_size=PREFILL_CHUNK_SIZE,
+    enable_prefix_cache=True, auto_prefix_match=True,
+    enable_kv_persist=False,   # isolate the RAM prefix cache; no disk tier
+)
+print(f"Model loaded in {time.time() - _t0:.1f}s")
+
+# Large FIXED prefix: a big system prompt standing in for the agentic
+# re-sent context (system rules + a chunk of "codebase"). Must be >512 tokens
+# so turn-1 prefill is chunked and expensive, making the cross-turn saving large.
+_SYSTEM = (
+    "You are an expert Python engineer working inside a large existing codebase. "
+    "Follow the project conventions exactly. Here is the shared project context "
+    "you must keep in mind for every task in this session:\n\n"
+    + "\n".join(
+        f"# module_{i}.py — utility {i}: validates and transforms record batches, "
+        f"raises ValueError on malformed input, logs via the project logger, and "
+        f"returns a typed dataclass with fields id:int, name:str, payload:bytes."
+        for i in range(40)
+    )
+)
+
+# Round-specific instruction — the SAME shared system prefix carries across both
+# rounds for a given session; only this short suffix changes, so lookup's common
+# prefix is the whole system block. All K sessions share the system prefix but
+# have distinct session_ids, so each is a distinct pool entry.
+_ROUND_TASKS = [
+    "Write a function `dedupe(records)` that removes duplicate ids, keeping the last.",
+    "Write a function `merge(a, b)` that combines two record batches by id.",
+]
+
+
+def vram():
+    return (torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9) if torch.cuda.is_available() else (0, 0)
+
+
+def run_one(session_id: str, task: str) -> float:
+    _a, _r = vram()
+    print(f"[VRAM] enter {session_id}: allocated={_a:.2f}GB reserved={_r:.2f}GB")
+    messages = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": task},
+    ]
+    prompt = model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    toks = model.tokenizer(prompt, return_tensors="pt", truncation=True,
+                           max_length=MAX_LENGTH)["input_ids"].to(DEVICE)
+    start = time.time()
+    first = None
+    for chunk in stream_generate(model, toks, max_new_tokens=MAX_NEW_TOKENS,
+                                 session_id=session_id):
+        if first is None and chunk:
+            first = time.time()
+    _a, _r = vram()
+    print(f"[VRAM] exit  {session_id}: allocated={_a:.2f}GB reserved={_r:.2f}GB "
+          f"(after generate; KV moved to CPU by store())")
+    return (first - start) if first else (time.time() - start)
+
+
+peak = 0.0
+print(f"\n=== {K_SESSIONS} interleaved sessions x {R_ROUNDS} rounds ===\n")
+for rnd in range(R_ROUNDS):
+    for sess in range(K_SESSIONS):
+        sid = f"stress-sess-{sess}"
+        ttft = run_one(sid, _ROUND_TASKS[rnd % len(_ROUND_TASKS)])
+        peak = max(peak, peak_rss_gb())
+        print(f"[R{rnd} S{sess}] session={sid}  TTFT={ttft:.2f}s  peak_rss={peak:.2f}GB")
+
+print(f"\n=== done: {K_SESSIONS}x{R_ROUNDS}, peak_rss={peak:.2f}GB ===")
+print("Round-2 HIT count = how many concurrent sessions the budget kept resident.")
+print("Grep the log for [Vaayu-Prefix] HIT/MISS and [Vaayu-RAM] ledger lines.")
