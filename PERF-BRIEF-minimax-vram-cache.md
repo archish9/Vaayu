@@ -355,3 +355,20 @@ MiniMax-M2.7, this line of work end to end:
 Remaining ranked targets: **h2d 0.389s (35%)** via the zero-clone slab port;
 **disk_load ~0.16-0.20s** via RAM victim-cache semantics. `gemm` ~0.23s is the
 compute floor.
+
+### 12.11 Qwen regression check — final
+
+Re-verified after all module-list work (the permutation port touches only
+`_make_modulelist_sparse_forward`, which Qwen does not execute, but Qwen is the
+actively-tested path and had not been measured since `2f50fea`).
+
+| | pre-extraction | post-extraction | post-permutation |
+|---|---|---|---|
+| decode | 0.84 tok/s | 0.83 tok/s | **0.88 tok/s** |
+| avg vram hit rate | 47% | — | **46%** |
+| expert_cache hit rate | 46% | — | 45% |
+| RSS | 21.88GB | 21.88GB | 21.88GB |
+
+No regression on any axis; output coherent. (A last-token `vram=23%` snapshot
+looked alarming until averaged over 200 tokens — single-token cache figures on
+this path are noisy and should not be read as trends.)
