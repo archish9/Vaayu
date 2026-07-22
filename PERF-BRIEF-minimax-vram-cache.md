@@ -252,3 +252,60 @@ and moves the source to pinned memory.
 
 The ~0.31s unaccounted (~28%) is router/scoring, `index_put_` accumulation,
 attach, non-MoE attention layers, and Python overhead — not yet broken down.
+
+### 12.7 Full per-token breakdown — the remainder is explained
+
+Instrumented `route`/`attach`/`detach`/`scatter` (commit `9dfbe4b`) and re-measured
+(`run-minimax-remainder.log`, 256 tokens, averaged over the last 200).
+
+| stage | per token | share of 1.11s token |
+|---|---|---|
+| h2d | 0.374s | 34% |
+| gemm | 0.223s | 20% |
+| disk_load | 0.162s | 15% |
+| **scatter** | **0.148s** | **13%** |
+| detach | 0.016s | 1.4% |
+| construct | 0.016s | 1.4% |
+| route | 0.013s | 1.2% |
+| attach | 0.002s | 0.2% |
+| mask_sync | 0.000s | — |
+| **MoE-attributed** | **0.954s** | **86%** |
+| non-MoE remainder | ~0.156s | ~14% |
+
+The previously-unaccounted remainder was **`scatter` (0.148s)** — the per-expert
+`torch.where(_idx_cpu == eidx)`, the `hidden_states[...]` gather, and the
+`index_put_(..., accumulate=True)`. The ~0.156s still outside these timers is
+non-MoE work: attention, the 10 pinned layers, embedding, lm_head, sampling, KV
+cache. Not a gap — it is simply not MoE.
+
+`attach`, `detach`, `route` and `construct` are each ≤1.4% and are **not worth
+optimizing**. That refutes the original brief's framing of per-token QMatrix
+construct/destroy (~1488/token) as a major cost.
+
+**Measurement confidence is higher than expected.** This run added ~2 syncs per
+expert activation versus ~1 in the §12.6 run, yet decode throughput was
+identical at 0.92 tok/s both times. The added synchronizes cost essentially
+nothing, which means there is little async overlap left to destroy — so these
+figures are trustworthy, and separately it suggests the overlap the async
+miss-loading was built to provide is largely already saturated. `scatter` is the
+one figure still somewhat inflated by its own sync (it brackets `index_put_`),
+so treat 0.148s as an upper bound.
+
+### 12.8 Revised optimization ranking
+
+1. **Permutation dispatch for the module-list path — best effort/reward.**
+   `scatter` (≤0.148s, 13%) is dominated by `torch.where(_idx_cpu == eidx)`
+   executed once per expert (~496/token), each a CPU scan over the whole routing
+   index tensor. **The fused path already solved this**: `compute_expert_dispatch`
+   (`vaayu/moe_patch.py`, used at the fused forward's `_pair`/`_starts`/`_counts_l`
+   setup) does ONE CPU argsort plus one H2D of index pairs per layer, explicitly
+   replacing "the int64 one_hot mask and the two tiny per-expert `.to(device)`
+   copies (~1,500 launches/token)". The function exists and is proven — this is a
+   port, the same shape as the work in §12.1, not new design.
+2. **Zero-clone slab port** — h2d 0.374s (34%), the largest single cost, but
+   materially more work. See §12.6.
+3. **RAM victim-cache semantics** — attacks `disk_load` (0.162s). See §12.5.
+
+`gemm` at 0.223s is real compute and is the floor. Eliminating h2d, scatter and
+disk_load entirely would take a token from ~1.11s to ~0.43s (~2.3 tok/s); that
+is the ceiling for all I/O-side work combined.
