@@ -1300,7 +1300,7 @@ class VaayuBaseModel(GenerationMixin):
             print(f"[Vaayu] cross-turn prefix cache ENABLED: "
                   f"{_pc_budget / 1e9:.2f} GB budget "
                   f"(free RAM {_free_ram / 1e9:.2f} GB - "
-                  f"{_PREFIX_CACHE_RAM_RESERVE / 1e9:.0f} GB reserve)")
+                  f"{_PREFIX_CACHE_RAM_RESERVE / 1e9:.2f} GB reserve)")
             if _pc_budget == 0:
                 # Enabled but starved: every store() is refused, so cross-turn
                 # TTFT reuse — CLAUDE.md §0's top lever for the agentic workload
