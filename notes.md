@@ -1556,27 +1556,14 @@ Both bugs fixed and confirmed working — the model correctly loads, all 62 laye
 
 test_generate.py because a single-turn benchmark can never hit a cross-turn cache
 
-------------------
-
-- The RAM-cache rebalance — 9.13GB returning a 5% hit rate is the largest reclaimable allocation here, and shrinking it could fund both the arena and a live prefix cache. That deserves its own spec and its own before/after, not a ride-along.
+----
 
 
---------------
+ Next, in this order
 
+  1. docs/superpowers/plans/2026-07-23-ram-accounting-diagnostic.md
+  Splits the ~5GB of unexplained RSS. Outputs a reclaimable-RAM figure.
 
-I have a strong candidate mechanism but I can't split the exact 5GB from static reading — that needs a targeted diagnostic
-  (CachingHostAllocator stats or /proc/self/smaps pinned-page accounting), not a benchmark. I'm going to record it as a
-  narrowed-but-open question rather than claim I closed it. Re-running the final review, scoped so it finishes, with these
-  findings handed in.
-
----
-
-Two things are genuinely open, and I did not close them:
-
-  1. ~5GB of RSS I could narrow but not split. Almost certainly pinned-unswappable vs pageable-reclaimable accounting — meaning
-  the old baseline understated the real footprint — but proving it needs a /proc/self/smaps or CachingHostAllocator diagnostic,
-  not another benchmark. It matters because the box now has 6.45GB free, and the whole point of this engine is parallel fan-out.
-  2. The prefix cache is off for MiniMax, and sizing the arena down can't fix it (2.76GB of slack vs a 9.19GB arena — no middle
-  ground). The real lever is the 9.13GB expert RAM cache returning 5% — the largest reclaimable allocation on the box. Shrinking
-  it could fund the arena and a live prefix cache. That's the next spec, and it touches compute_expert_budget, so it deserves its
-  own before/after rather than riding along here.
+  2. docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md
+  Consumes that figure. Reclaims RAM from the 5%-hit expert cache so the prefix cache gets a budget → concurrent sessions stay
+  cached under fan-out.
