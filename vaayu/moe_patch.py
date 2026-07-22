@@ -725,7 +725,31 @@ def _make_modulelist_sparse_forward(
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         experts_list = getattr(block_info.moe_module, block_info.experts_attr)
         final_hidden = torch.zeros_like(hidden_states)
-        _idx_cpu = expert_indices.cpu()
+
+        # Permutation dispatch (ported from _make_fused_sparse_forward_exl3): one
+        # CPU argsort per layer instead of one torch.where scan per expert
+        # (~496 scans/token on the target model). hidden_states is (B, S, H), not
+        # flat like the fused path's flat_hidden, so expert_indices/routing_weights
+        # are flattened to (B*S, top_k) here — flat index b*S+s agrees between
+        # .reshape(-1, top_k) and .view(-1, H) since both simply drop the B/S
+        # split of the same row-major layout.
+        if _prof:
+            _t0 = time.perf_counter()
+        B, S, H = hidden_states.shape
+        _pair, _starts, _counts_l = compute_expert_dispatch(
+            expert_indices.cpu().reshape(-1, top_k), len(experts_list))
+        _pair_gpu = _pair.to(hidden_states.device, non_blocking=True)
+        if _prof:
+            _mp['mask_sync'] += time.perf_counter() - _t0
+        # Gather source only (read-only): a copy-if-non-contiguous is harmless.
+        _flat_hidden = hidden_states.reshape(-1, H)
+        # Accumulation target: MUST share storage with final_hidden, so .view()
+        # (not .reshape()) — final_hidden is fresh from torch.zeros_like() and
+        # therefore always contiguous, so .view() is safe and never copies. If
+        # this ever silently copied, index_add_ below would write into a
+        # discarded temporary and the whole layer would output zeros.
+        _flat_final = final_hidden.view(-1, H)
+        _flat_routing = routing_weights.reshape(-1, top_k)
 
         # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
         # prefill routes ~every expert once, so caching there only churns the LRU;
@@ -763,8 +787,8 @@ def _make_modulelist_sparse_forward(
 
         def _run_expert(eidx: int, expert_mod) -> None:
             # 'scatter' covers the gather/scatter bracketing expert_mod(_x_in):
-            # the CPU-side torch.where + the gather before gemm, and the
-            # weighted index_put_ accumulate after it. It is timed in two
+            # the contiguous permutation-slice + gather before gemm, and the
+            # weighted index_add_ accumulate after it. It is timed in two
             # halves so 'gemm' keeps measuring ONLY the expert call itself.
             # Both halves reuse gemm's own pre-existing synchronize() calls as
             # their boundary instead of adding a second one back-to-back —
@@ -772,13 +796,12 @@ def _make_modulelist_sparse_forward(
             # expert call, so that sync is both gemm's boundary and scatter's.
             if _prof:
                 _t_scatter0 = time.perf_counter()
-            b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
-            if b_idx.numel() == 0:
+            _s, _c = _starts[eidx], _counts_l[eidx]
+            if _c == 0:
                 return
-            b_gpu = b_idx.to(hidden_states.device)
-            s_gpu = s_idx.to(hidden_states.device)
-            k_gpu = k_idx.to(hidden_states.device)
-            _x_in = hidden_states[b_gpu, s_gpu]
+            token_idx_gpu = _pair_gpu[0, _s:_s + _c]
+            kpos_gpu = _pair_gpu[1, _s:_s + _c]
+            _x_in = _flat_hidden[token_idx_gpu]
             if _prof:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -792,16 +815,14 @@ def _make_modulelist_sparse_forward(
             _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod, _x_in, expert_out)
             if _prof:
                 _t_scatter1 = time.perf_counter()
-            w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
-            final_hidden.index_put_((b_gpu, s_gpu),
-                                    (w * expert_out).to(final_hidden.dtype),
-                                    accumulate=True)
+            w = _flat_routing[token_idx_gpu, kpos_gpu].unsqueeze(-1)
+            _flat_final.index_add_(0, token_idx_gpu, (w * expert_out).to(final_hidden.dtype))
             if _prof:
                 # This is the one new synchronize() this phase actually adds
                 # (the pre-gather boundary above is free, borrowed from gemm's
                 # existing sync). It runs once per routed expert (~496x/token
                 # on the target model) — real added serialization, but the
-                # index_put_ accumulate is a real GPU kernel and an unsynced
+                # index_add_ accumulate is a real GPU kernel and an unsynced
                 # timer here would measure launch time, not completion.
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()

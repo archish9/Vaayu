@@ -1098,6 +1098,57 @@ def test_modulelist_output_unchanged_by_vram_cache(tmp_path, num_experts, top_k)
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+@pytest.mark.parametrize("B,S", [(1, 1), (1, 4), (3, 1), (3, 4)])
+def test_modulelist_permutation_dispatch_matches_naive_where_reference(
+        tmp_path, B, S, num_experts, top_k):
+    """Numerical-equivalence bar for the permutation-dispatch port: _run_expert
+    now locates each expert's routed tokens via one CPU argsort per layer
+    (compute_expert_dispatch) instead of a torch.where(expert_indices == eidx)
+    scan per expert. Build an independent reference using the OLD straightforward
+    per-expert torch.where formulation — with weights snapshotted BEFORE the
+    patched forward runs, since _detach_expert sets each expert's weights to
+    meta afterward — and assert the two match to float tolerance.
+
+    Parametrized over B and S specifically because the flat-index arithmetic
+    (b*S+s) inside the port is exactly what would break for batch size > 1 or
+    multi-token sequences; B=1,S=1 alone (all the other module-list tests use
+    only that shape) can't catch a swapped b/s order or a wrong stride.
+    """
+    import torch.nn.functional as F
+    from vaayu.moe_patch import route_experts
+
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    moe = model.layers[0].block_sparse_moe
+
+    # Snapshot pristine weights before the patched forward detaches experts to
+    # meta (router weights are never detached, so re-reading moe.gate is safe).
+    expert_w = [(e.w1.weight.detach().clone(), e.w2.weight.detach().clone())
+                for e in moe.experts]
+
+    hidden = torch.randn(B, S, 8)
+
+    final_hidden, _ = moe.forward(hidden)
+
+    routing_weights, expert_indices = route_experts(moe, moe.gate(hidden), top_k)
+    idx_cpu = expert_indices.cpu()
+
+    ref = torch.zeros_like(hidden)
+    for eidx in range(num_experts):
+        b_idx, s_idx, k_idx = torch.where(idx_cpu == eidx)
+        if b_idx.numel() == 0:
+            continue
+        w1, w2 = expert_w[eidx]
+        x_in = hidden[b_idx, s_idx]
+        out = F.linear(torch.relu(F.linear(x_in, w1)), w2)
+        w = routing_weights[b_idx, s_idx, k_idx].unsqueeze(-1)
+        ref.index_put_((b_idx, s_idx), w * out, accumulate=True)
+
+    max_diff = (final_hidden - ref).abs().max().item()
+    assert torch.allclose(final_hidden, ref, atol=1e-5, rtol=1e-5), (
+        f"B={B} S={S} num_experts={num_experts} top_k={top_k}: max abs diff {max_diff:.3e}")
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_failed_attach_still_detaches(tmp_path, num_experts, top_k):
     """Covers the VRAM-arm's `continue` (not the load-arm's — see the note
     below): _attach_cached_expert can re-bind an expert's real submodules and
