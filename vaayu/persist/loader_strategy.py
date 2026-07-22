@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import struct
 import glob
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -280,7 +281,8 @@ class ExLlamaV3Linear(nn.Module):
 
 
 def build_exl3_qmatrix(
-    mod: "ExLlamaV3Linear", tensors_by_base: dict, device: str, non_blocking: bool = True
+    mod: "ExLlamaV3Linear", tensors_by_base: dict, device: str, non_blocking: bool = True,
+    timing: dict | None = None,
 ) -> dict:
     """
     Build a C++ QMatrix (BC_LinearEXL3) from a group of EXL3 quant tensors
@@ -305,11 +307,26 @@ def build_exl3_qmatrix(
     path (inject_to_gpu, SlabArena-backed) keeps non_blocking=True since its
     sources are genuinely pinned; the per-token module-list path
     (moe_patch.py) passes non_blocking=False.
+
+    timing: optional dict to accumulate {'h2d': seconds, 'construct': seconds}
+    into (keys added with += so repeated calls, e.g. one per submodule role,
+    sum correctly). Deliberately a plain, caller-owned dict rather than the
+    MoE profiling dict itself — keeps this module unaware of _moe_profile's
+    shape. None (the default, and what inject_to_gpu passes implicitly by
+    omission) means "don't time" — zero overhead, unchanged behavior.
     """
     from exllamav3 import ext as exl3_ext
     from exllamav3.util.tensor import g_tensor_cache
 
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
     gpu_tensors = {k: t.to(device, non_blocking=non_blocking) for k, t in tensors_by_base.items()}
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timing['h2d'] = timing.get('h2d', 0.0) + (time.perf_counter() - _t0)
 
     trellis = gpu_tensors.get("trellis")
     suh = gpu_tensors.get("suh")
@@ -326,6 +343,10 @@ def build_exl3_qmatrix(
     bsz1_xh_args = (device, (1, mod.in_features), torch.float16)
     xh = g_tensor_cache.get(*bsz1_xh_args)
 
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
     mod.bc = exl3_ext.exllamav3_ext.BC_LinearEXL3(
         trellis,
         suh,
@@ -336,6 +357,10 @@ def build_exl3_qmatrix(
         mul1_tensor is not None,
         xh,
     )
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timing['construct'] = timing.get('construct', 0.0) + (time.perf_counter() - _t0)
 
     # Returned so callers can keep their own reference for byte accounting: the
     # QMatrix holds these tensors C++-side, where ExpertVRAMCache._group_bytes

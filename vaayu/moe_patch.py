@@ -423,6 +423,7 @@ def _inject_expert_weights(
     layer_name: str,
     device: str,
     dtype,
+    timing: dict | None = None,
 ) -> dict | None:
     """
     Inject expert tensor weights into expert_mod for inference.
@@ -440,6 +441,12 @@ def _inject_expert_weights(
     module-list expert's w1/w2/w3 to ExLlamaV3Linear) needs all its quant
     tensors (trellis/suh/svh/...) together to build one QMatrix — see
     persist.loader_strategy.build_exl3_qmatrix.
+
+    timing: optional dict accumulating {'h2d': seconds, 'construct': seconds}
+    across every submodule this call injects (EXL3 QMatrix build and plain
+    tensor copies alike land in 'h2d'; only the QMatrix construction lands in
+    'construct'). None (the default) means "don't time" — callers that don't
+    profile pay nothing extra.
     """
     from .persist.loader_strategy import ExLlamaV3Linear, build_exl3_qmatrix, _EXL3_QTENSOR_KEYS
 
@@ -467,12 +474,20 @@ def _inject_expert_weights(
                 # the RAM cache, not guaranteed page-locked — see
                 # build_exl3_qmatrix's docstring for why async here leaks host RAM.
                 state[submod_path] = build_exl3_qmatrix(
-                    submod, bases, device, non_blocking=False)
+                    submod, bases, device, non_blocking=False, timing=timing)
                 bc_objs[submod_path] = submod.bc
                 continue
 
             for base, tensor in bases.items():
+                if timing is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
                 t = tensor.to(device, dtype=dtype, non_blocking=False)
+                if timing is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    timing['h2d'] = timing.get('h2d', 0.0) + (time.perf_counter() - _t0)
                 state.setdefault(submod_path, {})[base] = t
                 if isinstance(submod, ExLlamaV3Linear):
                     # Unquantized weight/bias landing on a module setup_model()
@@ -742,7 +757,15 @@ def _make_modulelist_sparse_forward(
             s_gpu = s_idx.to(hidden_states.device)
             k_gpu = k_idx.to(hidden_states.device)
             _x_in = hidden_states[b_gpu, s_gpu]
+            if _prof:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             expert_out = expert_mod(_x_in)                               # (M, H)
+            if _prof:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _mp['gemm'] += time.perf_counter() - _t0
             _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod, _x_in, expert_out)
             w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
             final_hidden.index_put_((b_gpu, s_gpu),
@@ -770,16 +793,18 @@ def _make_modulelist_sparse_forward(
             # skipping it would leave those bound tensors off-meta forever.
             expert_mod = experts_list[eidx]
             try:
-                if _prof:
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    _t0 = time.perf_counter()
+                # _inject_expert_weights does two different things for an EXL3
+                # submodule (H2D tensor copy, then QMatrix construction) — a
+                # single bracket around the whole call would conflate them, so
+                # thread a scratch dict through and let it attribute each
+                # phase to its own _mp key (see build_exl3_qmatrix's timing
+                # param). Non-EXL3 submodules only ever populate 'h2d'.
+                _timing = {} if _prof else None
                 entry = _inject_expert_weights(
-                    expert_mod, raw, eidx, layer_name, device, dtype)
+                    expert_mod, raw, eidx, layer_name, device, dtype, timing=_timing)
                 if _prof:
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    _mp['h2d'] += time.perf_counter() - _t0
+                    _mp['h2d'] += _timing.get('h2d', 0.0)
+                    _mp['construct'] += _timing.get('construct', 0.0)
                 if not entry:
                     return
                 if _vram is not None:

@@ -885,7 +885,7 @@ def test_inject_expert_weights_collects_bc_objects():
     gpu_tensors = {"trellis": torch.randn(2, 4), "suh": torch.randn(8), "svh": torch.randn(16)}
     sentinel_bc = object()
 
-    def _fake_build(mod, bases, device, non_blocking=True):
+    def _fake_build(mod, bases, device, non_blocking=True, timing=None):
         mod.bc = sentinel_bc
         return gpu_tensors
 
@@ -1187,12 +1187,12 @@ def test_modulelist_load_arm_continue_still_detaches(tmp_path):
 
     real_inject = mp._inject_expert_weights
 
-    def _partial_bind_then_fail(expert_mod, raw, eidx, layer_name, device, dtype):
+    def _partial_bind_then_fail(expert_mod, raw, eidx, layer_name, device, dtype, timing=None):
         # Real-bind only the w1 tensors (mirrors an EXL3 expert whose w1
         # QMatrix builds fine), then report overall failure — mirrors a later
         # group (w2) raising partway through injection.
         w1_only = {k: v for k, v in raw.items() if ".w1." in k}
-        real_inject(expert_mod, w1_only, eidx, layer_name, device, dtype)
+        real_inject(expert_mod, w1_only, eidx, layer_name, device, dtype, timing=timing)
         return None
 
     with mock_patch.object(mp, "_inject_expert_weights", _partial_bind_then_fail):
@@ -1415,7 +1415,11 @@ def test_modulelist_accumulates_disk_telemetry(tmp_path, num_experts, top_k):
 def test_modulelist_profiling_records_disk_load_and_h2d(tmp_path, num_experts, top_k):
     """When profiling is on, the module-list path must thread the profiling dict
     through _iter_expert_loads (disk_load) and bracket _inject_expert_weights's
-    H2D copies (h2d) — mirroring the fused-forward profiling breakdown."""
+    H2D copies (h2d) — mirroring the fused-forward profiling breakdown. These
+    fixtures use plain nn.Linear experts (no EXL3 submodules), so 'construct'
+    stays at 0 here by design — see test_modulelist_profiling_records_construct_
+    for_exl3_expert below for the EXL3 case. 'gemm' (the expert_mod(_x_in) call
+    in _run_expert) fires for any expert style, so it is asserted here too."""
     model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
     vaayu_ref.profiling_mode = True
     vaayu_ref._moe_profile = {
@@ -1426,6 +1430,7 @@ def test_modulelist_profiling_records_disk_load_and_h2d(tmp_path, num_experts, t
 
     assert vaayu_ref._moe_profile["disk_load"] > 0.0, "cold misses recorded zero disk_load"
     assert vaayu_ref._moe_profile["h2d"] > 0.0, "expert injection recorded zero h2d"
+    assert vaayu_ref._moe_profile["gemm"] > 0.0, "expert compute recorded zero gemm"
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
@@ -1694,7 +1699,7 @@ def test_modulelist_exl3_bc_lifecycle_end_to_end(tmp_path, num_experts, top_k):
     moe = model.layers[0].block_sparse_moe
     hidden_states = torch.randn(1, 1, 8)
 
-    def _fake_build(mod, tensors_by_base, device, non_blocking=False):
+    def _fake_build(mod, tensors_by_base, device, non_blocking=False, timing=None):
         bc = MagicMock()
         bc.run_alloc.side_effect = _fake_bc_run_alloc
         mod.bc = bc
@@ -1739,3 +1744,142 @@ def test_modulelist_exl3_bc_lifecycle_end_to_end(tmp_path, num_experts, top_k):
 
     assert out1.shape == (1, 1, 8)
     assert out2.shape == (1, 1, 8)
+
+
+def _make_exl3_modulelist_with_vram(tmp_path, num_experts, top_k, vram_budget=10**9):
+    """EXL3-shaped counterpart to _patch_modulelist_with_vram: genuinely
+    ExLlamaV3Linear experts (see _EXL3ModuleListModel), so injection actually
+    reaches build_exl3_qmatrix's QMatrix-construction branch instead of the
+    plain-tensor-copy branch. Returns (model, vaayu_ref, vram_cache)."""
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+
+    model = _EXL3ModuleListModel(num_layers=1, hidden=8, num_experts=num_experts)
+    _make_exl3_modulelist_checkpoint(tmp_path, num_experts=num_experts, hidden=8)
+
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+    vram = ExpertVRAMCache(budget_bytes=vram_budget)
+    vaayu_ref._expert_vram_cache = vram
+    vaayu_ref._vram_cacheable_layers = None
+
+    patch_moe_blocks(
+        model=model,
+        expert_cache=cache,
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=top_k,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+    )
+    return model, vaayu_ref, vram
+
+
+def _slow_bc_linear_exl3(*args, **kwargs):
+    """Stand-in for the real C++ BC_LinearEXL3 constructor: artificially slow
+    (sleeps) so a test can tell 'construct' time apart from 'h2d' time by
+    magnitude, and returns a MagicMock whose run_alloc behaves like the real
+    kernel (see _fake_bc_run_alloc) so the subsequent expert_mod(_x_in) GEMM
+    call in _run_expert still succeeds instead of erroring on a bare MagicMock."""
+    import time
+    time.sleep(0.02)
+    bc = MagicMock()
+    bc.run_alloc.side_effect = _fake_bc_run_alloc
+    return bc
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_records_construct_for_exl3_expert(tmp_path, num_experts, top_k):
+    """When profiling is on and the module-list expert is genuinely EXL3
+    (ExLlamaV3Linear submodules), _inject_expert_weights must route the
+    QMatrix build through build_exl3_qmatrix's own h2d/construct split
+    (threaded via the 'timing' param) into _mp['h2d'] / _mp['construct'] —
+    not conflate them into a single h2d figure the way the old bracket around
+    the whole _inject_expert_weights call did. _mp['gemm'] must also be
+    populated by the expert_mod(_x_in) call in _run_expert.
+
+    Only the C++ BC_LinearEXL3 constructor is mocked (via _slow_bc_linear_exl3)
+    — the real build_exl3_qmatrix function runs, so its h2d copy and its
+    perf_counter brackets are exercised for real, not simulated by a fake."""
+    model, vaayu_ref, vram = _make_exl3_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref.profiling_mode = True
+    vaayu_ref._moe_profile = {
+        "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+    }
+
+    with mock_patch(
+        "exllamav3.ext.exllamav3_ext.BC_LinearEXL3", side_effect=_slow_bc_linear_exl3
+    ):
+        model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    mp = vaayu_ref._moe_profile
+    assert mp["disk_load"] > 0.0, "cold misses recorded zero disk_load"
+    assert mp["h2d"] > 0.0, "expert injection recorded zero h2d"
+    assert mp["construct"] > 0.0, "EXL3 QMatrix build recorded zero construct"
+    assert mp["gemm"] > 0.0, "expert compute recorded zero gemm"
+    # The artificial 0.02s sleep lives entirely in the mocked constructor, i.e.
+    # squarely inside 'construct' — if it leaked into 'h2d' (the bracket not
+    # actually separating the two phases) this would fail.
+    assert mp["construct"] > mp["h2d"], (
+        "construct should reflect the slow QMatrix build and dominate the "
+        "cheap tensor copy timed as h2d — got construct="
+        f"{mp['construct']:.4f}s h2d={mp['h2d']:.4f}s"
+    )
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_off_leaves_exl3_dict_untouched(tmp_path, num_experts, top_k):
+    """Same zero-cost-when-disabled guarantee as
+    test_modulelist_profiling_off_leaves_dict_untouched, but for a genuinely
+    EXL3 module-list expert — proves the new construct/gemm instrumentation
+    added to the EXL3 injection path is gated on profiling_mode too, not just
+    the pre-existing h2d/disk_load timers."""
+    model, vaayu_ref, vram = _make_exl3_modulelist_with_vram(tmp_path, num_experts, top_k)
+    vaayu_ref.profiling_mode = False
+    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+    vaayu_ref._moe_profile = dict(_blank)
+
+    with mock_patch(
+        "exllamav3.ext.exllamav3_ext.BC_LinearEXL3", side_effect=_slow_bc_linear_exl3
+    ):
+        model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+
+    assert vaayu_ref._moe_profile == _blank
+
+
+def test_build_exl3_qmatrix_timing_attributes_construct_not_h2d():
+    """Direct unit test on build_exl3_qmatrix (loader_strategy.py), one level
+    below the module-list forward: proves the h2d/construct split inside the
+    function itself is real, not just wiring. Only BC_LinearEXL3 (the C++
+    constructor call) is mocked, and made artificially slow; the '.to(device)'
+    H2D copy above it is real. If the two perf_counter brackets in
+    build_exl3_qmatrix were mispositioned (e.g. one bracket around both
+    phases), the slowdown would show up in 'h2d' too — it must not."""
+    import time
+    from vaayu.persist.loader_strategy import ExLlamaV3Linear, build_exl3_qmatrix
+
+    hidden = 8
+    mod = ExLlamaV3Linear(hidden, hidden, bias=False)
+    bases = {
+        "trellis": torch.zeros(hidden, hidden, dtype=torch.int16),
+        "suh": torch.zeros(1, hidden, dtype=torch.float16),
+        "svh": torch.zeros(1, hidden, dtype=torch.float16),
+        "mcg": torch.zeros(hidden, dtype=torch.int32),
+        "mul1": torch.zeros(hidden, dtype=torch.int32),
+    }
+
+    def _slow_bc(*args, **kwargs):
+        time.sleep(0.05)
+        return MagicMock()
+
+    timing: dict = {}
+    with mock_patch("exllamav3.ext.exllamav3_ext.BC_LinearEXL3", side_effect=_slow_bc):
+        build_exl3_qmatrix(mod, bases, "cpu", non_blocking=False, timing=timing)
+
+    assert timing["construct"] >= 0.04, (
+        f"construct should capture ~the full 0.05s sleep, got {timing['construct']:.4f}s")
+    assert timing["h2d"] < 0.01, (
+        f"h2d should be a fast tensor copy, not the slow construct call, "
+        f"got {timing['h2d']:.4f}s")
