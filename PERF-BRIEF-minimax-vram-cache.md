@@ -309,3 +309,49 @@ so treat 0.148s as an upper bound.
 `gemm` at 0.223s is real compute and is the floor. Eliminating h2d, scatter and
 disk_load entirely would take a token from ~1.11s to ~0.43s (~2.3 tok/s); that
 is the ceiling for all I/O-side work combined.
+
+### 12.9 Permutation dispatch ported — mechanism confirmed
+
+Ported the fused path's `compute_expert_dispatch` to the module-list forward
+(commit `af79203`), replacing the per-expert `torch.where(_idx_cpu == eidx)`
+CPU scan (~496/token) with ONE CPU argsort plus one H2D of index pairs per layer.
+
+**Unprofiled throughput: 0.89 -> 0.95 tok/s (+6.7%)**, avg token 1.11s -> 1.07s.
+
+That delta alone sits under this document's own "<10% from one sample is not a
+win" bar, so the mechanism was measured directly (profiled runs, 256 tokens,
+averaged over the last 200):
+
+| stage | before | after | |
+|---|---|---|---|
+| **scatter** | 0.148s | **0.056s** | **-62%** |
+| h2d | 0.374s | 0.389s | flat |
+| gemm | 0.223s | 0.235s | flat |
+| route | 0.013s | 0.013s | flat |
+| disk_load | 0.162s | 0.204s | routing/cache variance |
+
+`scatter` fell 62% (-0.092s/token) while every untouched phase stayed flat — the
+targeted signature. -0.092s off a 1.11s token predicts ~8.3% throughput; observed
++6.7%, the gap absorbed by `disk_load` drifting up. Two independent measurements
+agree, so the gain is real rather than sampling noise.
+
+Correctness: 81 pre-existing module-list tests pass UNEDITED (output-equivalence,
+teardown-invariant, pin-discipline, EXL3 bc-lifecycle). The new equivalence test
+builds an independent `torch.where` reference and compares across (B,S) =
+(1,1)/(1,4)/(3,1)/(3,4) x two geometries. Two separate perturbations were shown
+to fail it: a `kpos`-lookup break (fails all 8 cases) and a b/s flat-index
+transpose (fails ONLY the B=3,S=4 cases, exactly where `b*S+s` and `s*B+b`
+diverge — precise discrimination, not a blunt assertion).
+
+### 12.10 Cumulative
+
+MiniMax-M2.7, this line of work end to end:
+
+| | start | now |
+|---|---|---|
+| decode | 0.62 tok/s | **0.95 tok/s** (+53%) |
+| TTFT | 53.1s | ~31s (-41%) |
+
+Remaining ranked targets: **h2d 0.389s (35%)** via the zero-clone slab port;
+**disk_load ~0.16-0.20s** via RAM victim-cache semantics. `gemm` ~0.23s is the
+compute floor.
