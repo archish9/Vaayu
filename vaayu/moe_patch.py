@@ -685,6 +685,16 @@ def _make_modulelist_sparse_forward(
         _mp = vaayu_ref._moe_profile if _prof else None
 
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
+        # 'route' brackets the router forward + route_experts + the
+        # unique().tolist() sync below. Sync BEFORE starting the clock so any
+        # GPU work still in flight from the previous layer isn't misattributed
+        # to routing; no sync is needed at the end — .tolist() below already
+        # forces a blocking D2H copy, so the window it closes is truthful
+        # without an extra synchronize() call.
+        if _prof:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
         router = getattr(block_info.moe_module, block_info.router_attr)
         router_logits = router(hidden_states)
         # Use the model's OWN scoring function when it defines one — never a
@@ -696,6 +706,8 @@ def _make_modulelist_sparse_forward(
         )
 
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        if _prof:
+            _mp['route'] += time.perf_counter() - _t0
 
         if getattr(vaayu_ref, "_batch_n", 1) > 1:
             vaayu_ref.telemetry.record_batch_overlap(
@@ -750,6 +762,16 @@ def _make_modulelist_sparse_forward(
         )
 
         def _run_expert(eidx: int, expert_mod) -> None:
+            # 'scatter' covers the gather/scatter bracketing expert_mod(_x_in):
+            # the CPU-side torch.where + the gather before gemm, and the
+            # weighted index_put_ accumulate after it. It is timed in two
+            # halves so 'gemm' keeps measuring ONLY the expert call itself.
+            # Both halves reuse gemm's own pre-existing synchronize() calls as
+            # their boundary instead of adding a second one back-to-back —
+            # gemm already drains the queue right before and right after the
+            # expert call, so that sync is both gemm's boundary and scatter's.
+            if _prof:
+                _t_scatter0 = time.perf_counter()
             b_idx, s_idx, k_idx = torch.where(_idx_cpu == eidx)
             if b_idx.numel() == 0:
                 return
@@ -760,6 +782,7 @@ def _make_modulelist_sparse_forward(
             if _prof:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                _mp['scatter'] += time.perf_counter() - _t_scatter0
                 _t0 = time.perf_counter()
             expert_out = expert_mod(_x_in)                               # (M, H)
             if _prof:
@@ -767,12 +790,26 @@ def _make_modulelist_sparse_forward(
                     torch.cuda.synchronize()
                 _mp['gemm'] += time.perf_counter() - _t0
             _trace_expert(vaayu_ref, layer_idx, eidx, expert_mod, _x_in, expert_out)
+            if _prof:
+                _t_scatter1 = time.perf_counter()
             w = routing_weights[b_gpu, s_gpu, k_gpu].unsqueeze(-1)
             final_hidden.index_put_((b_gpu, s_gpu),
                                     (w * expert_out).to(final_hidden.dtype),
                                     accumulate=True)
+            if _prof:
+                # This is the one new synchronize() this phase actually adds
+                # (the pre-gather boundary above is free, borrowed from gemm's
+                # existing sync). It runs once per routed expert (~496x/token
+                # on the target model) — real added serialization, but the
+                # index_put_ accumulate is a real GPU kernel and an unsynced
+                # timer here would measure launch time, not completion.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _mp['scatter'] += time.perf_counter() - _t_scatter1
 
         def _detach_expert(eidx: int, expert_mod) -> None:
+            if _prof:
+                _t0 = time.perf_counter()
             try:
                 # Detach from the live module — ALWAYS, hit or miss. See the
                 # extended rationale on the miss arm below.
@@ -783,6 +820,12 @@ def _make_modulelist_sparse_forward(
                 expert_mod.to("meta")
             except Exception as e:
                 _log.warning(f"Failed to unload expert {eidx} to meta: {e}")
+            if _prof:
+                # Pure CPU-side: .modules() iteration + reference clears, and
+                # .to("meta") swaps storage metadata without launching a GPU
+                # kernel — no synchronize here, it would only add cost and
+                # distortion without making this figure any more truthful.
+                _mp['detach'] += time.perf_counter() - _t0
 
         def _load_inject_run(eidx: int, raw) -> None:
             # Shared by the normal miss-load loop and the attach-failure
@@ -825,7 +868,16 @@ def _make_modulelist_sparse_forward(
             for eidx, entry in _vram_resident.items():
                 expert_mod = experts_list[eidx]
                 try:
-                    if not _attach_cached_expert(expert_mod, entry):
+                    if _prof:
+                        _t0 = time.perf_counter()
+                    _attached = _attach_cached_expert(expert_mod, entry)
+                    if _prof:
+                        # Pure CPU-side: rebinds references (nn.Parameter
+                        # wrapping an already-resident GPU tensor, or an EXL3
+                        # QMatrix pointer swap) — no kernel is launched, so no
+                        # synchronize is needed for this figure to be truthful.
+                        _mp['attach'] += time.perf_counter() - _t0
+                    if not _attached:
                         # Structural mismatch — a real bug, not a race. Drop the
                         # now-unusable entry so it isn't reported as a HIT (and
                         # fail to attach) on every subsequent token forever.

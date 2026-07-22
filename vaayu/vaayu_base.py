@@ -2533,7 +2533,8 @@ class VaayuBaseModel(GenerationMixin):
         # MoE dispatch sub-timing (mask sync / disk load / H2D / object construct / GEMM),
         # gated behind profiling_mode so it's zero-cost when disabled.
         self._moe_profile = (
-            {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+            {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+             "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0}
             if self.profiling_mode and self.is_moe else None
         )
 
@@ -2930,7 +2931,7 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}{_rss_str}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
-            print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s")
+            print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s  route={_mp['route']:.3f}s  attach={_mp['attach']:.3f}s  detach={_mp['detach']:.3f}s  scatter={_mp['scatter']:.3f}s")
 
         if not return_dict:
             return tuple(v for v in [logits,

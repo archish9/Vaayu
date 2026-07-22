@@ -1419,11 +1419,19 @@ def test_modulelist_profiling_records_disk_load_and_h2d(tmp_path, num_experts, t
     fixtures use plain nn.Linear experts (no EXL3 submodules), so 'construct'
     stays at 0 here by design — see test_modulelist_profiling_records_construct_
     for_exl3_expert below for the EXL3 case. 'gemm' (the expert_mod(_x_in) call
-    in _run_expert) fires for any expert style, so it is asserted here too."""
+    in _run_expert) fires for any expert style, so it is asserted here too.
+
+    Also covers the remainder-instrumentation keys that populate on a first
+    (all-miss) pass: 'route' (router forward + route_experts + unique().tolist()),
+    'detach' (_detach_expert, hit or miss), and 'scatter' (the gather before
+    gemm plus the index_put_ accumulate after it — NOT the gemm call itself,
+    which must stay isolated to expert_mod(_x_in)). 'attach' only fires on a
+    VRAM-cache hit, so it is proven separately below with a second pass."""
     model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
     vaayu_ref.profiling_mode = True
     vaayu_ref._moe_profile = {
         "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+        "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0,
     }
 
     model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
@@ -1431,18 +1439,55 @@ def test_modulelist_profiling_records_disk_load_and_h2d(tmp_path, num_experts, t
     assert vaayu_ref._moe_profile["disk_load"] > 0.0, "cold misses recorded zero disk_load"
     assert vaayu_ref._moe_profile["h2d"] > 0.0, "expert injection recorded zero h2d"
     assert vaayu_ref._moe_profile["gemm"] > 0.0, "expert compute recorded zero gemm"
+    assert vaayu_ref._moe_profile["route"] > 0.0, "routing setup recorded zero route"
+    assert vaayu_ref._moe_profile["detach"] > 0.0, "expert detach recorded zero detach"
+    assert vaayu_ref._moe_profile["scatter"] > 0.0, "gather/scatter recorded zero scatter"
+    assert vaayu_ref._moe_profile["attach"] == 0.0, (
+        "no VRAM-cache hit occurred on a first pass — attach must stay at 0"
+    )
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_records_attach_on_vram_hit(tmp_path, num_experts, top_k):
+    """'attach' (_attach_cached_expert) only fires on a VRAM-cache hit, so it
+    needs a second forward pass with identical routing (see
+    test_modulelist_second_pass_hits_vram_cache) rather than the single pass
+    the other three new keys are provable on."""
+    model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    hidden = torch.randn(1, 1, 8)
+
+    model.layers[0].block_sparse_moe.forward(hidden)   # pass 1: all misses, populates VRAM
+    assert vram.current_usage > 0, "nothing cached after first pass"
+
+    vaayu_ref.profiling_mode = True
+    vaayu_ref._moe_profile = {
+        "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+        "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0,
+    }
+
+    model.layers[0].block_sparse_moe.forward(hidden)   # pass 2: identical routing -> VRAM hit
+
+    assert vaayu_ref._moe_profile["attach"] > 0.0, "VRAM-cache hit recorded zero attach"
+    assert vaayu_ref._moe_profile["route"] > 0.0, "routing setup recorded zero route"
+    assert vaayu_ref._moe_profile["detach"] > 0.0, "expert detach recorded zero detach"
+    assert vaayu_ref._moe_profile["scatter"] > 0.0, "gather/scatter recorded zero scatter"
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_profiling_off_leaves_dict_untouched(tmp_path, num_experts, top_k):
     """Profiling must be fully gated: with profiling_mode off, the dict (even if
-    present on vaayu_ref) is never written to, so it costs nothing when disabled."""
+    present on vaayu_ref) is never written to, so it costs nothing when disabled.
+    Runs two passes (miss then VRAM hit) so the 'attach' gate — which only fires
+    on a hit — is exercised too, not just the always-on-first-pass keys."""
     model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
     vaayu_ref.profiling_mode = False
-    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+              "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0}
     vaayu_ref._moe_profile = dict(_blank)
+    hidden = torch.randn(1, 1, 8)
 
-    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
+    model.layers[0].block_sparse_moe.forward(hidden)   # pass 1: miss
+    model.layers[0].block_sparse_moe.forward(hidden)   # pass 2: VRAM hit
 
     assert vaayu_ref._moe_profile == _blank
 
@@ -1807,6 +1852,7 @@ def test_modulelist_profiling_records_construct_for_exl3_expert(tmp_path, num_ex
     vaayu_ref.profiling_mode = True
     vaayu_ref._moe_profile = {
         "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+        "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0,
     }
 
     with mock_patch(
@@ -1819,6 +1865,12 @@ def test_modulelist_profiling_records_construct_for_exl3_expert(tmp_path, num_ex
     assert mp["h2d"] > 0.0, "expert injection recorded zero h2d"
     assert mp["construct"] > 0.0, "EXL3 QMatrix build recorded zero construct"
     assert mp["gemm"] > 0.0, "expert compute recorded zero gemm"
+    assert mp["route"] > 0.0, "routing setup recorded zero route"
+    assert mp["detach"] > 0.0, "expert detach recorded zero detach"
+    assert mp["scatter"] > 0.0, "gather/scatter recorded zero scatter"
+    assert mp["attach"] == 0.0, (
+        "no VRAM-cache hit occurred on a first pass — attach must stay at 0"
+    )
     # The artificial 0.02s sleep lives entirely in the mocked constructor, i.e.
     # squarely inside 'construct' — if it leaked into 'h2d' (the bracket not
     # actually separating the two phases) this would fail.
@@ -1830,6 +1882,33 @@ def test_modulelist_profiling_records_construct_for_exl3_expert(tmp_path, num_ex
 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
+def test_modulelist_profiling_records_attach_for_exl3_expert(tmp_path, num_experts, top_k):
+    """'attach' on a genuinely EXL3 module-list expert exercises
+    _attach_cached_expert's bc-pointer-swap branch specifically (as opposed to
+    the plain nn.Parameter rebind branch _patch_modulelist_with_vram's
+    nn.Linear experts hit) — the two are different code paths inside the same
+    function, so the plain-expert coverage above doesn't prove this one."""
+    model, vaayu_ref, vram = _make_exl3_modulelist_with_vram(tmp_path, num_experts, top_k)
+    hidden = torch.randn(1, 1, 8)
+
+    with mock_patch(
+        "exllamav3.ext.exllamav3_ext.BC_LinearEXL3", side_effect=_slow_bc_linear_exl3
+    ):
+        model.layers[0].block_sparse_moe.forward(hidden)   # pass 1: miss, populates VRAM
+        assert vram.current_usage > 0, "nothing cached after first pass"
+
+        vaayu_ref.profiling_mode = True
+        vaayu_ref._moe_profile = {
+            "mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+            "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0,
+        }
+
+        model.layers[0].block_sparse_moe.forward(hidden)   # pass 2: identical routing -> hit
+
+    assert vaayu_ref._moe_profile["attach"] > 0.0, "VRAM-cache hit recorded zero attach"
+
+
+@pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_profiling_off_leaves_exl3_dict_untouched(tmp_path, num_experts, top_k):
     """Same zero-cost-when-disabled guarantee as
     test_modulelist_profiling_off_leaves_dict_untouched, but for a genuinely
@@ -1838,7 +1917,8 @@ def test_modulelist_profiling_off_leaves_exl3_dict_untouched(tmp_path, num_exper
     the pre-existing h2d/disk_load timers."""
     model, vaayu_ref, vram = _make_exl3_modulelist_with_vram(tmp_path, num_experts, top_k)
     vaayu_ref.profiling_mode = False
-    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0}
+    _blank = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
+              "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0}
     vaayu_ref._moe_profile = dict(_blank)
 
     with mock_patch(
