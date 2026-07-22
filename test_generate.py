@@ -72,7 +72,7 @@ KV_PERSIST_SYNC     = False   # async append (production default) — faster, ma
 # Fresh id: earlier MiniMax runs persisted .vaayu_kv under the old id, and that
 # KV was computed with the BROKEN full-width RoPE. Restoring it would poison
 # this run's prefix with corrupt keys and mask the fix.
-SESSION_ID          = "minimax-6gb-repro"
+SESSION_ID          = "minimax-256-arena-clean"
 
 # torch.compile: shipped, but NOT enabled here. This model streams expert
 # weights from NVMe per-token (moe_patch.py) — a dynamic I/O-bound path

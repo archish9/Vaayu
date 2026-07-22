@@ -464,3 +464,24 @@ unchanged.
 
 Remaining ranked: `gemm` ~0.154s is the compute floor; `disk_load` ~0.191s via
 RAM victim-cache semantics; the RAM-cache rebalance above.
+
+### 12.14 expandable_segments decode A/B — no penalty
+
+`expandable_segments:True` (§12.12's fragmentation fix) is a PROCESS-WIDE
+allocator change, so it affects decode too, not just prefill. Prior verification
+covered only the multi-session prefill OOM and single-turn decode, leaving a
+steady-state decode A/B open. Closed here.
+
+| expandable_segments | Qwen decode | TTFT | RSS |
+|---|---|---|---|
+| enabled (4 runs) | 0.83 / 0.84 / 0.85 / 0.88 tok/s | ~27.2s | 21.88GB |
+| disabled (`PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512`) | 0.81 tok/s | 27.25s | 21.88GB |
+
+Disabling it did not make decode faster — 0.81 sits at/below the enabled band's
+floor. **No measurable decode penalty.** Not a claim that it is faster: one
+disabled-arm sample against a 0.83-0.88 band is within this stack's run-to-run
+variance. The open question was whether it COSTS anything; it does not.
+
+Incidental: the partial-config warning (added the same day) fired correctly in
+this run, since the A/B's explicit env var omits expandable_segments — the
+warning verified end-to-end in real conditions, not just unit-style checks.
