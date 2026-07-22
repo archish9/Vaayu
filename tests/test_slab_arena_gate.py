@@ -91,14 +91,28 @@ def test_capability_attributes_are_independent():
 
 def test_no_call_site_uses_a_single_conflated_gate():
     """Regression guard for the staleness this work fixes: the arena guard and
-    the stager guard must read DIFFERENT attributes. If a future edit points
-    both at one attribute again, the two capabilities can silently diverge and
-    the arena gets skipped for a layout that can use it."""
+    the stager guard must read DIFFERENT attributes, and each must actually be
+    wired to its own predicate.
+
+    Asserting merely that the predicate names appear somewhere in the module
+    source is inert — it's also satisfied by the functions' own `def` lines.
+    Instead this pins down the literal CALL SITES: the two assignments that
+    wire each attribute to its predicate (so unwiring one to a hardcoded
+    `False` breaks this test), and the two guard checks that consume the
+    attributes (so pointing both guards at the same attribute again — the
+    exact conflation this work fixed — breaks this test)."""
     import inspect
     from vaayu import vaayu_base
 
     src = inspect.getsource(vaayu_base)
-    assert "_moe_stager_capable" in src, "stager capability attribute missing"
-    assert "moe_supports_slab_arena(" in src, "arena predicate never called"
-    assert "moe_supports_prefill_stager(" in src, "stager predicate never called"
+    # Each attribute must be assigned from its OWN predicate call.
+    assert "self._moe_slab_capable = moe_supports_slab_arena(" in src, \
+        "arena attribute not wired to moe_supports_slab_arena()"
+    assert "self._moe_stager_capable = moe_supports_prefill_stager(" in src, \
+        "stager attribute not wired to moe_supports_prefill_stager()"
+    # Each guard must read its OWN attribute, not the other's.
+    assert "if not self._moe_slab_capable:" in src, \
+        "arena guard does not check _moe_slab_capable"
+    assert 'getattr(self, "_moe_stager_capable", False)' in src, \
+        "stager guard does not check _moe_stager_capable"
     assert "moe_supports_slab_pipeline" not in src, "old conflated gate still referenced"
