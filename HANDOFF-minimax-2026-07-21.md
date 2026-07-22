@@ -95,6 +95,13 @@ If the arena line says anything other than `SKIPPED` on MiniMax, fix #1 regresse
 
 ## 6. Open items
 
+- **PERF: MiniMax decodes at 0.64 tok/s vs Qwen's 1.02, despite smaller experts
+  and a 2x smaller working set.** Cause: the module-list forward never received
+  any of the perf work (no VRAM expert cache, no cached BC objects, no async miss
+  loading) — 9.7GB of VRAM cache sits allocated and idle (`vram=0hit/0miss/0evict`).
+  Full analysis, code map, risks and verification plan:
+  **`PERF-BRIEF-minimax-vram-cache.md`**.
+
 - **Full 2048-token run.** Not yet done. Bump `SESSION_ID` first (see §7).
 - **Fused-path fp16 exposure.** `moe_patch.py`'s EXL3 fused forward calls
   `bc.run_alloc` directly, bypassing `ExLlamaV3Linear.forward`, so fix #4's guard

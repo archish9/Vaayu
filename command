@@ -60,3 +60,6 @@ DeepSeek-R1 is the headline answer. Released January 2025, MIT-licensed, open we
 QwQ-32B (Qwen's reasoning model, March 2025) is the one that surprised people: it approached R1-level reasoning at only 32B parameters, putting o3-mini-class thinking in a dramatically smaller package.
 
 Qwen3 (2025) is probably the strongest open family for your use case now. The models have a built-in "thinking mode," come in sizes from tiny up to a 235B MoE, and the larger ones beat o3-mini on many reasoning and coding benchmarks. Worth also knowing: Phi-4-reasoning (Microsoft, 14B), GLM-Z1 (Zhipu), and Nvidia's Llama-Nemotron reasoning models all landed in this space too.
+
+
+claude --resume 348226a4-723f-42cd-aa21-d255b21f046f
