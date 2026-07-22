@@ -214,3 +214,41 @@ The RAM expert cache now holds 8.8GB at a 3-5% hit rate, largely caching experts
 the VRAM cache already holds. Victim-cache semantics (RAM holds only
 non-VRAM-resident experts) would raise the combined hit rate — but it attacks
 `disk_load` (0.17s), the smaller number. Sequence it after the slab port.
+
+### 12.6 CORRECTION to §12.4 — the h2d figure was a composite
+
+§12.4 reported `h2d=0.43s` and recommended the slab port on that basis. That
+timer bracketed the whole `_inject_expert_weights` call, which performs BOTH the
+H2D copies AND the EXL3 QMatrix construction — so the figure was `h2d + construct`
+combined, while the slab port only addresses the copy half.
+
+Instrumentation split into three separate timers (commit `4e0d7fb`) and re-measured
+(`run-minimax-split-prof.log`, `profiling_mode=True`, 256 tokens). Per-token
+layer totals, averaged:
+
+| stage | per token | share of ~1.09s token |
+|---|---|---|
+| **h2d** | **0.374s** | **~34%** |
+| gemm | 0.221s | ~20% |
+| disk_load | 0.169s | ~16% |
+| construct | **0.016s** | **~1.5%** |
+| accounted | 0.780s | ~72% |
+
+**The §12.4 recommendation survives the correction, but the reasoning behind it
+was wrong.** The hypothesis under test was that QMatrix construction might be a
+large share of the composite — the original brief claimed ~1488 construct/destroy
+per token — which would have made a cheaper fix more attractive than the slab
+port. It is not: construct is 0.016s, ~1.5%. Two reasons: the VRAM cache already
+serves ~48% of experts from cached `bc` tuples with no rebuild at all, and
+construction is genuinely cheap next to the copy.
+
+**H2D at 0.374s/token is confirmed as the single largest cost, now measured in
+isolation from what it is not.** The slab port is the right next optimization.
+
+Sizing it: at ~259 misses/token and ~9-15 per-component `.to(device)` copies per
+expert, the current path issues roughly 2,300-3,900 small pageable transfers per
+token. Coalescing to one packed copy per expert cuts that by ~10x in launch count
+and moves the source to pinned memory.
+
+The ~0.31s unaccounted (~28%) is router/scoring, `index_put_` accumulation,
+attach, non-MoE attention layers, and Python overhead — not yet broken down.
