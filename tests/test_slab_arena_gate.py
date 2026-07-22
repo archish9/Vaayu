@@ -14,48 +14,91 @@ up to 9.13 GB of clones for a cache specified as 9.13 GB.
 """
 import pytest
 
-from vaayu.vaayu_base import moe_supports_slab_pipeline
+from vaayu.vaayu_base import (
+    moe_supports_slab_arena,
+    moe_supports_prefill_stager,
+)
 
 
-def test_exl3_fused_uses_slab_pipeline():
-    """Qwen3-235B shape: EXL3 + fused experts — the actively-tested path.
-    Must keep the arena."""
-    assert moe_supports_slab_pipeline(["fused"] * 91, is_exl3=True) is True
+def test_exl3_fused_supports_both():
+    """The fused-EXL3 forward uses the arena AND consumes staged layers."""
+    assert moe_supports_slab_arena(["fused"] * 91, is_exl3=True) is True
+    assert moe_supports_prefill_stager(["fused"] * 91, is_exl3=True) is True
 
 
-def test_exl3_module_list_does_not():
-    """MiniMax-M2 shape: EXL3 + module-list experts. The forward never calls
-    acquire_slab/put_slab, so the arena is pure dead weight."""
-    assert moe_supports_slab_pipeline(["module_list"] * 62, is_exl3=False) is False
-    assert moe_supports_slab_pipeline(["module_list"] * 62, is_exl3=True) is False
+def test_exl3_module_list_supports_arena_not_stager():
+    """Task 4/5's shared loader routes module-list through
+    acquire_slab/load_expert_into_slab/put_slab, so it can use the arena. It
+    still passes staged_layer=None and never reads _prefill_staged, so staging
+    for it would be pure wasted I/O."""
+    assert moe_supports_slab_arena(["module_list"] * 62, is_exl3=True) is True
+    assert moe_supports_prefill_stager(["module_list"] * 62, is_exl3=True) is False
 
 
-def test_non_exl3_fused_does_not():
-    """The non-EXL3 fused forward (_make_fused_sparse_forward) uses
-    load_expert_sparse + ExpertRAMCache.put() — clone path, no slabs."""
-    assert moe_supports_slab_pipeline(["fused"] * 32, is_exl3=False) is False
+def test_non_exl3_supports_neither():
+    """Both paths require the EXL3 loader strategy."""
+    assert moe_supports_slab_arena(["fused"] * 32, is_exl3=False) is False
+    assert moe_supports_slab_arena(["module_list"] * 62, is_exl3=False) is False
+    assert moe_supports_prefill_stager(["fused"] * 32, is_exl3=False) is False
+    assert moe_supports_prefill_stager(["module_list"] * 62, is_exl3=False) is False
 
 
-def test_mixed_layouts_do_not():
-    """A model whose blocks disagree cannot be served entirely by the slab
-    path; refuse rather than half-allocate."""
-    assert moe_supports_slab_pipeline(["fused", "module_list"], is_exl3=True) is False
+def test_mixed_layouts_support_neither():
+    """A partially-usable arena is not worth the pinned RAM."""
+    assert moe_supports_slab_arena(["fused", "module_list"], is_exl3=True) is False
+    assert moe_supports_prefill_stager(["fused", "module_list"], is_exl3=True) is False
 
 
-def test_no_blocks_does_not():
-    """Detection found nothing (dense, or a layout we don't recognize) —
-    never allocate."""
-    assert moe_supports_slab_pipeline([], is_exl3=True) is False
-    assert moe_supports_slab_pipeline([], is_exl3=False) is False
+def test_unknown_layout_supports_neither():
+    """An unrecognised style must not be assumed slab-capable."""
+    assert moe_supports_slab_arena(["something_new"], is_exl3=True) is False
+    assert moe_supports_prefill_stager(["something_new"], is_exl3=True) is False
+
+
+def test_no_blocks_supports_neither():
+    assert moe_supports_slab_arena([], is_exl3=True) is False
+    assert moe_supports_slab_arena([], is_exl3=False) is False
+    assert moe_supports_prefill_stager([], is_exl3=True) is False
+    assert moe_supports_prefill_stager([], is_exl3=False) is False
 
 
 @pytest.mark.parametrize("styles,is_exl3", [
-    (["fused"] * 91, True),
-    (["module_list"] * 62, True),
-    (["fused"] * 32, False),
-    ([], True),
+    (["fused"], True), (["module_list"], True), ([], False),
+    (["fused", "module_list"], True),
 ])
 def test_returns_real_bool(styles, is_exl3):
-    """Callers gate object construction on this; it must be a plain bool, not
-    a truthy generator/np.bool_."""
-    assert isinstance(moe_supports_slab_pipeline(styles, is_exl3), bool)
+    """Callers use `is True` / `is False`; a truthy non-bool would break them."""
+    assert isinstance(moe_supports_slab_arena(styles, is_exl3), bool)
+    assert isinstance(moe_supports_prefill_stager(styles, is_exl3), bool)
+
+
+def test_capability_attributes_are_independent():
+    """The two attributes must come from different predicates. A model whose
+    forward uses the arena but not the stager (module-list) must get an arena
+    and no stager — the exact combination the single old gate could not express."""
+    from vaayu.vaayu_base import (
+        moe_supports_slab_arena, moe_supports_prefill_stager,
+    )
+
+    module_list = ["module_list"] * 62
+    assert moe_supports_slab_arena(module_list, is_exl3=True) is True
+    assert moe_supports_prefill_stager(module_list, is_exl3=True) is False
+
+    fused = ["fused"] * 91
+    assert moe_supports_slab_arena(fused, is_exl3=True) is True
+    assert moe_supports_prefill_stager(fused, is_exl3=True) is True
+
+
+def test_no_call_site_uses_a_single_conflated_gate():
+    """Regression guard for the staleness this work fixes: the arena guard and
+    the stager guard must read DIFFERENT attributes. If a future edit points
+    both at one attribute again, the two capabilities can silently diverge and
+    the arena gets skipped for a layout that can use it."""
+    import inspect
+    from vaayu import vaayu_base
+
+    src = inspect.getsource(vaayu_base)
+    assert "_moe_stager_capable" in src, "stager capability attribute missing"
+    assert "moe_supports_slab_arena(" in src, "arena predicate never called"
+    assert "moe_supports_prefill_stager(" in src, "stager predicate never called"
+    assert "moe_supports_slab_pipeline" not in src, "old conflated gate still referenced"

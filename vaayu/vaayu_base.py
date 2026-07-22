@@ -204,27 +204,52 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     return set(sorted(moe_layer_ids)[:n_fit])
 
 
-def moe_supports_slab_pipeline(expert_styles, is_exl3: bool) -> bool:
-    """True iff this model's MoE forward can actually use the pinned slab arena
-    and the prefill stager's staged layers.
+def moe_supports_slab_arena(expert_styles, is_exl3: bool) -> bool:
+    """True iff this model's MoE forward reads expert weights through the
+    pinned slab arena on its decode miss path.
 
-    Zero-clone slab staging is implemented ONLY by
-    `moe_patch._make_fused_sparse_forward_exl3`: it alone calls
-    `acquire_slab`/`put_slab`, and it alone consumes `_prefill_staged`. The
-    module-list forward and the non-EXL3 fused forward both populate the cache
-    through `ExpertRAMCache.put()`, which CLONES into pageable RAM.
+    Both the fused-EXL3 forward and the module-list forward reach
+    `acquire_slab` / `load_expert_into_slab` / `put_slab` via the shared
+    `moe_patch._dispatch_expert_misses` helper, which takes that path whenever
+    `expert_cache.arena is not None` (falling back to a clone + `put()` when the
+    arena is exhausted). Without an arena both silently clone into PAGEABLE RAM,
+    and host-to-device transfer runs at bounce-buffer speed — measured at
+    ~7.1 GB/s for MiniMax-M2.7, ~35% of a decode token.
 
-    Allocating the arena for those layouts double-spends the expert budget —
-    once as pinned, unswappable slab memory nothing ever reads, and again as the
-    cache's own clone budget. Measured on this 32 GB box with MiniMax-M2
-    (module-list): a 9.19 GB arena sat untouched while the cache separately
-    cloned toward its own 9.13 GB, for a cache specified as 9.13 GB total.
-    Starting the prefill stager is likewise wasted work — it stages layers no
-    consumer ever reads.
+    History worth keeping: the module-list layout was excluded here until
+    2026-07-22 because its forward genuinely did clone — it carried its own
+    inline serial loader. The Task 4/5 extraction (commits 2f50fea, dee5cdf)
+    moved it onto the shared helper and made it slab-capable; this predicate
+    lagged that change, so the arena was skipped and the clone path taken.
 
     Model-agnostic (CLAUDE.md §5): derived from the DETECTED expert layout and
-    the loader strategy, never from an architecture name. Mixed layouts return
-    False — a partially-usable arena is not worth the pinned RAM.
+    the loader strategy, never from an architecture name. An unrecognised style
+    returns False — a layout whose forward has not been checked must not be
+    assumed to consume the arena, since allocating one nothing reads is exactly
+    the double-spend this gate exists to prevent. Mixed layouts return False: a
+    partially-usable arena is not worth the pinned, unswappable RAM.
+    """
+    styles = list(expert_styles)
+    return (bool(is_exl3) and bool(styles)
+            and len(set(styles)) == 1
+            and styles[0] in ("fused", "module_list"))
+
+
+def moe_supports_prefill_stager(expert_styles, is_exl3: bool) -> bool:
+    """True iff this model's MoE forward CONSUMES the prefill stager's staged
+    layers (`vaayu_ref._prefill_staged`).
+
+    Only `moe_patch._make_fused_sparse_forward_exl3` does: it alone peeks/pops
+    `_prefill_staged`, tracks `_staged_consume_count`, and releases
+    `_prefill_stage_sem`. The module-list forward passes `staged_layer=None` to
+    `_dispatch_expert_misses` and never reads the staged dict, so starting the
+    stager for it would read every expert of every layer into memory no consumer
+    ever touches — pure wasted I/O and RAM, and it would hold stage slots against
+    the TTFT this path just improved.
+
+    Deliberately narrower than `moe_supports_slab_arena`: arena capability and
+    staged-layer consumption are independent, and conflating them is what caused
+    the module-list arena to be skipped after that layout became slab-capable.
     """
     styles = list(expert_styles)
     return bool(is_exl3) and bool(styles) and all(s == "fused" for s in styles)
@@ -1017,16 +1042,20 @@ class VaayuBaseModel(GenerationMixin):
             from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
 
-            # Detect the expert layout BEFORE sizing caches: only the EXL3 fused
-            # forward can use the pinned slab arena / prefill stager, and the
-            # arena is allocated below — before patch_moe_blocks() would
-            # otherwise reveal the layout. Detection is reused by
-            # patch_moe_blocks so the module tree is walked exactly once.
+            # Detect the expert layout BEFORE sizing caches: which layouts can use
+            # the pinned slab arena and which consume the prefill stager are two
+            # separate questions (see the predicates below), and the arena is
+            # allocated below — before patch_moe_blocks() would otherwise reveal
+            # the layout. Detection is reused by patch_moe_blocks so the module
+            # tree is walked exactly once.
             self._detected_moe_blocks = detect_moe_blocks(self.model)
-            self._moe_slab_capable = moe_supports_slab_pipeline(
-                [b.expert_style for b in self._detected_moe_blocks],
-                is_exl3=isinstance(self.loader_strategy, EXL3LoaderStrategy),
-            )
+            _styles_detected = [b.expert_style for b in self._detected_moe_blocks]
+            _is_exl3 = isinstance(self.loader_strategy, EXL3LoaderStrategy)
+            # Independent capabilities — see the two predicates' docstrings.
+            # The module-list layout reads the arena but does not consume staged
+            # layers, a combination the previous single gate could not express.
+            self._moe_slab_capable = moe_supports_slab_arena(_styles_detected, _is_exl3)
+            self._moe_stager_capable = moe_supports_prefill_stager(_styles_detected, _is_exl3)
 
             _mem = _psutil.virtual_memory()
 
@@ -1058,18 +1087,16 @@ class VaayuBaseModel(GenerationMixin):
             from .persist.safetensor_model_persister import compute_slab_bytes
             self._expert_slab_arena = None
             if not self._moe_slab_capable:
-                # This layout's forward populates the cache via
-                # ExpertRAMCache.put() (clone path) and never reads staged
-                # layers — see moe_supports_slab_pipeline. Allocating the arena
-                # anyway would pin a second full copy of the expert budget that
-                # nothing ever reads. Skip compute_slab_bytes too: it rescans
-                # the whole offset index for a number no one will use.
+                # This layout's forward never reads the arena — it populates the
+                # cache via ExpertRAMCache.put() (clone path). Allocating anyway
+                # would pin a second full copy of the expert budget that nothing
+                # reads. Skip compute_slab_bytes too: it rescans the whole offset
+                # index for a number no one will use.
                 _styles = sorted({b.expert_style for b in self._detected_moe_blocks})
                 print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — expert layout "
-                      f"{_styles or ['none detected']} does not use the zero-clone "
-                      f"slab path (only the EXL3 fused forward does). Freed "
-                      f"~{_expert_budget / 1e9:.1f} GB of pinned RAM; experts are "
-                      f"cached via the clone path instead.")
+                      f"{_styles or ['none detected']} does not read the pinned "
+                      f"slab arena. Freed ~{_expert_budget / 1e9:.1f} GB of pinned "
+                      f"RAM; experts are cached via the clone path instead.")
                 _slab_bytes = 0
             else:
                 _slab_bytes = compute_slab_bytes(self._expert_offset_index)
@@ -2584,12 +2611,13 @@ class VaayuBaseModel(GenerationMixin):
             # sets while earlier layers compute. Long prompts only (short ones
             # don't route all experts — staging would over-read).
             self._prefill_stager_active = False
-            # _moe_slab_capable: only the EXL3 fused forward consumes
-            # _prefill_staged. For any other layout the stager would read every
-            # expert of every layer into memory no consumer ever reads — pure
-            # wasted I/O and RAM. See moe_supports_slab_pipeline.
+            # _moe_stager_capable: only the EXL3 fused forward consumes
+            # _prefill_staged. For any other layout — including module-list,
+            # which uses the arena but passes staged_layer=None — the stager
+            # would read every expert of every layer into memory no consumer
+            # ever reads: pure wasted I/O and RAM. See moe_supports_prefill_stager.
             if (self._moe_prefill_pass and self._moe_blocks
-                    and getattr(self, "_moe_slab_capable", False)
+                    and getattr(self, "_moe_stager_capable", False)
                     and self._expert_cache is not None
                     and getattr(self, "_moe_executor", None) is not None
                     and compute_stage_gate(int(_seq_total), self._moe_geometry)):
