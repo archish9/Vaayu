@@ -44,12 +44,30 @@ def test_prefix_budget_is_free_minus_reserve_above_it():
 
 
 @pytest.mark.parametrize("geo", [QWEN_LIKE, MINIMAX_LIKE], ids=["qwen", "minimax"])
-def test_the_two_budgets_together_document_the_starvation(geo):
-    """The whole problem in one assertion: after the expert cache takes its
-    share of a realistic free-RAM figure, the prefix cache gets nothing."""
+def test_the_two_budgets_leave_room_for_the_prefix_cache(geo):
+    """After the rebalance: once the expert cache (and its mirroring pinned
+    slab arena) take their share of a realistic free-RAM figure, the prefix
+    cache still gets a real, non-zero budget."""
     free_at_start = 24 * GB          # measured: ~24.5GB free at cache-sizing
     expert, ne, _ = compute_expert_budget(available_bytes=free_at_start, **geo)
     # The expert cache AND its mirroring pinned slab arena (same budget) both
     # come out of free RAM, so subtract the expert budget twice.
     free_for_prefix = free_at_start - expert - expert - ne
-    assert compute_prefix_cache_budget(free_for_prefix) == 0
+    assert compute_prefix_cache_budget(free_for_prefix) > 0
+
+
+@pytest.mark.parametrize("geo", [QWEN_LIKE, MINIMAX_LIKE], ids=["qwen", "minimax"])
+def test_prefix_cache_gets_a_real_budget_after_rebalance(geo):
+    """After the rebalance, a realistic post-expert-cache free-RAM figure must
+    leave the prefix cache enough for MORE THAN ONE resident session — the whole
+    point, since budget 0 already serves one (the pool keeps >=1 entry)."""
+    free_at_start = 24 * GB
+    expert, ne, _ = compute_expert_budget(available_bytes=free_at_start, **geo)
+    # The expert cache AND its mirroring pinned slab arena (same budget) both
+    # come out of free RAM, so subtract the expert budget twice.
+    free_for_prefix = free_at_start - expert - expert - ne
+    budget = compute_prefix_cache_budget(free_for_prefix)
+    assert budget > 0, "prefix cache still starved"
+    # A ~2000-token KV entry is on the order of a few hundred MB; require room
+    # for at least two so concurrency is genuinely served, not just one entry.
+    assert budget >= 1 * GB

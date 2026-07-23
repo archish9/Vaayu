@@ -174,10 +174,25 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 
-# Hardware constant: RAM to leave for the OS + the expert RAM cache + the
-# io_uring pools when sizing the prefix-cache pool. Property of the 32 GB box,
-# NOT the model. Prefix caching borrows only what's comfortably free.
-_PREFIX_CACHE_RAM_RESERVE = int(12 * 1024 ** 3)
+# Hardware constant: RAM to leave for the OS + io_uring pools + post-sizing
+# host allocations when sizing the prefix-cache pool. Property of the 32 GB
+# box, NOT the model. Prefix caching borrows only what's comfortably free.
+#
+# This used to also reserve for "the expert RAM cache", double-counting it:
+# by the time compute_prefix_cache_budget runs, the expert RAM cache AND its
+# mirroring pinned slab arena are already allocated (see
+# `test_the_two_budgets_leave_room_for_the_prefix_cache`), so they are already
+# subtracted out of the `available`/free-RAM figure passed in here. Reserving
+# for them again left the prefix cache at 0 on this box (RAM-accounting
+# diagnostic RESULTS Q5). What legitimately remains, all allocated AFTER the
+# prefix cache measures:
+#   ~1.5 GB  OS working set / CUDA context margin (same figure
+#            compute_expert_budget uses for its own overhead)
+#   ~0.5 GB  io_uring expert buffer pool(s) (get_expert_pool_size() returns
+#            1-2 buffers, each ~expert_bytes)
+#   ~1.5 GB  safety margin for post-prefix-cache host allocations, notably
+#            KV-cache growth and PyTorch host staging during generation
+_PREFIX_CACHE_RAM_RESERVE = int(3.5 * 1024 ** 3)
 
 
 def ram_snapshot() -> dict:
