@@ -180,6 +180,46 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
 _PREFIX_CACHE_RAM_RESERVE = int(12 * 1024 ** 3)
 
 
+def ram_snapshot() -> dict:
+    """Categorized process RAM accounting, for the memory-arbitration ledger.
+
+    Reads /proc/self/smaps_rollup — the kernel's pre-aggregated rollup, one small
+    file, far cheaper than parsing per-mapping /proc/self/smaps. Fields:
+      rss            resident set size
+      pss            proportional set size (shared pages divided by sharer count)
+      shared_clean   file-backed pages shared and unmodified (e.g. mmapped weights)
+      shared_dirty   shared and modified
+      private_clean  private and unmodified
+      private_dirty  private and modified — anonymous allocations live here, which
+                     is where a pinned arena and PyTorch host buffers show up
+      swap           pages pushed to swap (pinned memory can never appear here)
+    plus `available`/`total` from psutil for the system view.
+
+    Degrades to zeros for smaps-derived fields on a kernel without smaps_rollup;
+    never raises, because this is diagnostics and must not break a load.
+    """
+    import psutil as _ps
+    _FIELDS = {
+        "Rss": "rss", "Pss": "pss",
+        "Shared_Clean": "shared_clean", "Shared_Dirty": "shared_dirty",
+        "Private_Clean": "private_clean", "Private_Dirty": "private_dirty",
+        "Swap": "swap",
+    }
+    out = {v: 0 for v in _FIELDS.values()}
+    try:
+        with open("/proc/self/smaps_rollup") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in _FIELDS:
+                    out[_FIELDS[key]] = int(rest.strip().split()[0]) * 1024
+    except Exception:
+        pass   # diagnostics only — a missing/!readable smaps_rollup must not break load
+    _vm = _ps.virtual_memory()
+    out["available"] = int(_vm.available)
+    out["total"] = int(_vm.total)
+    return out
+
+
 def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
     """RAM bytes the cross-turn prefix-cache pool may hold (A1). Derived from
     free system memory minus a hardware headroom reserve. Model-agnostic."""
@@ -1063,9 +1103,10 @@ class VaayuBaseModel(GenerationMixin):
             # footprint — model non-expert weights, pinned layers, checkpoint
             # buffers, CUDA/PyTorch host context — is what squeezes every cache that
             # sizes itself from "free RAM at my construction point" afterward.
-            print(f"[Vaayu-RAM] ledger @ cache-sizing: {_mem.available / 1e9:.2f}GB "
-                  f"avail of {_mem.total / 1e9:.2f}GB "
-                  f"({(_mem.total - _mem.available) / 1e9:.2f}GB already resident)")
+            _snap = ram_snapshot()
+            print(f"[Vaayu-RAM] ledger @ cache-sizing: avail={_snap['available'] / 1e9:.2f}GB "
+                  f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
+                  f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
 
             # Model-agnostic geometry (Task 0) → single source of truth. No Qwen
             # numbers hardcoded; expert_bytes/num_moe_layers/working_set derived.
@@ -1126,8 +1167,10 @@ class VaayuBaseModel(GenerationMixin):
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
                           f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident)")
-                    print(f"[Vaayu-RAM] ledger @ post-arena: "
-                          f"{_psutil.virtual_memory().available / 1e9:.2f}GB avail")
+                    _snap = ram_snapshot()
+                    print(f"[Vaayu-RAM] ledger @ post-arena: avail={_snap['available'] / 1e9:.2f}GB "
+                          f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
+                          f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
             self._expert_cache = ExpertRAMCache(
                 _expert_budget, max_per_layer=_max_per_layer,
                 arena=self._expert_slab_arena,
@@ -1325,6 +1368,14 @@ class VaayuBaseModel(GenerationMixin):
                 print("[Vaayu] WARNING: prefix cache budget is 0 GB — single-session "
                       "reuse still works, but concurrent sessions (parallel fan-out) "
                       "collapse to one resident entry. Free RAM here is below the reserve.")
+
+        # RAM arbitration ledger (diagnostic), bracketing close: same categorized
+        # snapshot as @ cache-sizing / @ post-arena, taken once model construction
+        # (including the prefix cache, whether enabled or not) is complete.
+        _snap = ram_snapshot()
+        print(f"[Vaayu-RAM] ledger @ post-load: avail={_snap['available'] / 1e9:.2f}GB "
+              f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
+              f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
 
         # --- KV disk persistence tier (Subsystem A; ships dark) ---
         self._kv_writer = None
