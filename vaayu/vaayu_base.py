@@ -206,6 +206,8 @@ def ram_snapshot() -> dict:
         "Swap": "swap",
     }
     out = {v: 0 for v in _FIELDS.values()}
+    out["available"] = 0
+    out["total"] = 0
     try:
         with open("/proc/self/smaps_rollup") as fh:
             for line in fh:
@@ -214,9 +216,12 @@ def ram_snapshot() -> dict:
                     out[_FIELDS[key]] = int(rest.strip().split()[0]) * 1024
     except Exception:
         pass   # diagnostics only — a missing/!readable smaps_rollup must not break load
-    _vm = _ps.virtual_memory()
-    out["available"] = int(_vm.available)
-    out["total"] = int(_vm.total)
+    try:
+        _vm = _ps.virtual_memory()
+        out["available"] = int(_vm.available)
+        out["total"] = int(_vm.total)
+    except Exception:
+        pass   # diagnostics only — psutil must never break a load either
     return out
 
 

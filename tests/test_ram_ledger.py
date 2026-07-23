@@ -1,5 +1,4 @@
 """RAM accounting snapshot — categorized /proc/self/smaps_rollup reader."""
-import pytest
 from vaayu.vaayu_base import ram_snapshot
 
 
