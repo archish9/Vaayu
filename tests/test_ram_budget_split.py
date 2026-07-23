@@ -1,6 +1,6 @@
 """Characterizes how free RAM is split between the expert cache and the prefix
-cache. These tests document CURRENT behavior so the rebalance is a visible,
-intentional change rather than an accident."""
+cache. These tests document the pre- and post-rebalance split so the change is
+a visible, intentional one rather than an accident."""
 import pytest
 from vaayu.vaayu_base import (
     compute_expert_budget, compute_prefix_cache_budget,

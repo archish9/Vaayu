@@ -192,6 +192,13 @@ def compute_vram_expert_budget(free_vram_bytes: int) -> int:
 #            1-2 buffers, each ~expert_bytes)
 #   ~1.5 GB  safety margin for post-prefix-cache host allocations, notably
 #            KV-cache growth and PyTorch host staging during generation
+#
+# NOTE: the "already allocated" premise holds for the EXL3/arena path (the
+# on-device targets), where the slab arena is pinned up-front before this
+# runs. On non-EXL3 clone-path layouts the expert cache fills lazily during
+# decode, so at sizing time it is NOT yet in `available` and this reserve is
+# not headroom-validated for that path — safe today because prefix caching
+# defaults OFF and clone paths are gated-in-but-untuned (CLAUDE.md).
 _PREFIX_CACHE_RAM_RESERVE = int(3.5 * 1024 ** 3)
 
 
