@@ -12,4 +12,5 @@ vaayu_rust/target
 
 
 vaayu_telemetry.json
-run.log
+run.logrun-rebalance-*.log
+run-vram-diag-*.log

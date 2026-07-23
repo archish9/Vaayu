@@ -38,9 +38,9 @@ logging.basicConfig(
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MODEL_PATH         = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
+# MODEL_PATH         = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
 # Known-good reference on this stack, for VAAYU_TRACE_ACT baselines:
-#MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
+MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 # max_new_tokens is a SAFETY CEILING, not a target length — you can't know a

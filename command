@@ -39,7 +39,7 @@ model-agnostic engine
   calibration. Could even defer until a 2nd box exists.
 
 
-Execute the plan at docs/superpowers/plans/2026-07-23-ram-accounting-diagnostic.md using superpowers:subagent-driven-development.
+Execute the plan at docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic.md using superpowers:subagent-driven-development
 
 
 python -u test_kv_persist_coherence.py --phase run1 > run1.log 2>&1
