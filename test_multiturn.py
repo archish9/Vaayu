@@ -34,8 +34,16 @@ KV_CACHE_MODE = "auto"
 MAX_NEW_TOKENS = 64          # short — TTFT is what we measure, not decode length
 MAX_LENGTH    = 2048
 PREFILL_CHUNK_SIZE = 512
-K_SESSIONS    = 2            # 2 is enough to reproduce (crash was on session 1)
-R_ROUNDS      = 1            # single cold round — isolates the reclaim question
+K_SESSIONS    = 2            # NOTE: on the 16GB box this test is currently
+                             # VRAM-blocked before round 2 — the warm VRAM expert
+                             # cache (~10GB) + weights (~3.5GB) leave <50MB free,
+                             # so a 2nd large-context cold prefill OOMs (observed
+                             # at both K=2 and K=3, stochastically on session 1-2).
+                             # This is a pre-existing VRAM ceiling, orthogonal to
+                             # the host-RAM prefix budget; measuring the round-2
+                             # concurrency HIT count needs the separate VRAM-cache
+                             # right-sizing fix first.
+R_ROUNDS      = 2            # single cold round — isolates the reclaim question
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)

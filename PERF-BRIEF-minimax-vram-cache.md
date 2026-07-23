@@ -485,3 +485,43 @@ variance. The open question was whether it COSTS anything; it does not.
 Incidental: the partial-config warning (added the same day) fired correctly in
 this run, since the A/B's explicit env var omits expandable_segments — the
 warning verified end-to-end in real conditions, not just unit-style checks.
+
+## 13. RAM budget rebalance results (2026-07-23)
+
+Plan `docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md`. Lever A:
+`_PREFIX_CACHE_RAM_RESERVE` 12 GiB → 3.5 GiB, removing the double-count of the
+expert RAM cache + pinned arena (both already allocated, so already excluded
+from the free-RAM figure the prefix cache measures).
+
+**Prefix-cache budget — before → after (the fix's direct effect):**
+
+| Run | Free RAM at sizing | Prefix budget before | Prefix budget after |
+|---|---|---|---|
+| MiniMax single | 6.82 GB | **0** | **3.06 GB** |
+| Qwen single | 8.42 GB | **0** | **4.66 GB** |
+| MiniMax multiturn | 7.45–7.56 GB | **0** | **3.70–3.80 GB** |
+
+**Decode — unregressed both models:**
+
+| Model | Decode after | Baseline | TTFT | Peak RSS |
+|---|---|---|---|---|
+| MiniMax | 1.49 tok/s | ~1.47 | 53.6s | 11.78 GB |
+| Qwen | 0.82 tok/s | ~0.85 (<10% var) | 27.6s | 26.23 GB |
+
+**Memory safety:** kernel OOM-kill count **0** on every run (baseline 0). The
+host-RAM reserve cut caused no RAM OOM.
+
+**Concurrency win (the actual goal) — proven in unit tests, VRAM-blocked
+on-device:** `tests/test_ram_budget_split.py` proves the rebalanced budget now
+clears ≥1 GiB (room for ≥2 resident sessions) where it was 0. On-device the
+round-2 HIT count could NOT be measured: `test_multiturn.py` OOMs on VRAM before
+round 2 at both K=3 and K=2. Root cause is a **pre-existing VRAM ceiling**, not
+this change — the warm VRAM expert cache (~10 GB, `compute_vram_expert_budget`,
+untouched here) plus weights (~3.5 GB) leave <50 MB VRAM free, so a second
+large-context cold prefill tips a 16 GB card over. VRAM `allocated` holds at
+13.69 GB across sessions (the persistent warm expert cache), confirming the
+consumer is device-side and orthogonal to the host-RAM prefix budget.
+
+**Next:** right-size the VRAM expert cache (its hit rate is ~5%, per the
+diagnostic) so 2+ concurrent large prefills fit and the round-2 HIT count
+becomes measurable. Tracked as a separate plan.
