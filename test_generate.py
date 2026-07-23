@@ -40,7 +40,7 @@ logging.basicConfig(
 
 MODEL_PATH         = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
 # Known-good reference on this stack, for VAAYU_TRACE_ACT baselines:
-# MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
+#MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 # max_new_tokens is a SAFETY CEILING, not a target length — you can't know a
@@ -72,7 +72,7 @@ KV_PERSIST_SYNC     = False   # async append (production default) — faster, ma
 # Fresh id: earlier MiniMax runs persisted .vaayu_kv under the old id, and that
 # KV was computed with the BROKEN full-width RoPE. Restoring it would poison
 # this run's prefix with corrupt keys and mask the fix.
-SESSION_ID          = "minimax-256-arena-clean"
+SESSION_ID          = "ramdiag-qwen"
 
 # torch.compile: shipped, but NOT enabled here. This model streams expert
 # weights from NVMe per-token (moe_patch.py) — a dynamic I/O-bound path
