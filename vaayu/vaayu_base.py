@@ -1369,14 +1369,6 @@ class VaayuBaseModel(GenerationMixin):
                       "reuse still works, but concurrent sessions (parallel fan-out) "
                       "collapse to one resident entry. Free RAM here is below the reserve.")
 
-        # RAM arbitration ledger (diagnostic), bracketing close: same categorized
-        # snapshot as @ cache-sizing / @ post-arena, taken once model construction
-        # (including the prefix cache, whether enabled or not) is complete.
-        _snap = ram_snapshot()
-        print(f"[Vaayu-RAM] ledger @ post-load: avail={_snap['available'] / 1e9:.2f}GB "
-              f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
-              f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
-
         # --- KV disk persistence tier (Subsystem A; ships dark) ---
         self._kv_writer = None
         if getattr(self, "enable_kv_persist", False) and self._prefix_cache is None:
@@ -1395,6 +1387,14 @@ class VaayuBaseModel(GenerationMixin):
             KvDiskLoader(persist_dir).load_all(
                 self._prefix_cache, self.config, self._prefix_cache.budget_bytes,
                 writer=self._kv_writer)
+
+        # RAM arbitration ledger (diagnostic), bracketing close: same categorized
+        # snapshot as @ cache-sizing / @ post-arena, taken once model construction
+        # (including the prefix cache, whether enabled or not) is complete.
+        _snap = ram_snapshot()
+        print(f"[Vaayu-RAM] ledger @ post-load: avail={_snap['available'] / 1e9:.2f}GB "
+              f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
+              f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
