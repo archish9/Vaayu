@@ -15,6 +15,47 @@ session-1 prefill that OOMs, then analyze the breakdown into a RESULTS doc.
 
 **Tech Stack:** Python, PyTorch (`torch.cuda` memory APIs), pytest.
 
+## Session Handoff — READ FIRST in a fresh session
+
+This plan is **step 2 of a 4-step chain**. A fresh session has no memory of the prior work;
+here is the whole arc and where you are in it.
+
+**Already DONE (on `main`, do not redo):**
+- **RAM budget rebalance** (`6c9bc76..54d660b`): the cross-turn prefix cache now gets a
+  non-zero host-RAM budget (0 → ~3.06 GB MiniMax / ~4.66 GB Qwen); decode unregressed
+  (1.49 / 0.82 tok/s); kernel OOM 0. Verified. Plan:
+  `docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md`.
+- **VRAM design spec** (`613c601`): `docs/superpowers/specs/2026-07-23-vram-prefill-headroom-design.md`
+  — Approach B (KV-aware prefill eviction). **ON HOLD:** its premise (KV grows into the fixed
+  2 GB prefill headroom) was invalidated by real geometry — both targets are GQA, KV footprint
+  ~1.1 GB (MiniMax) / ~0.83 GB (Qwen), *below* the 2 GB headroom that already OOMs. Do NOT
+  implement it as written.
+
+**The chain:**
+```
+[DONE]  1. RAM rebalance ............ prefix budget 0 -> ~3 GB
+[THIS]  2. VRAM diagnostic .......... name the real second-session-prefill OOM consumer
+[NEXT]  3. VRAM right-sizing FIX .... NEW plan, written from this plan's RESULTS
+[THEN]  4. re-run test_multiturn .... measure the round-2 HIT win (the original goal)
+```
+
+**What to do after this plan's Task 3 produces the RESULTS doc** — this requires CREATING A NEW
+PLAN, it is not covered by any existing plan:
+1. **Update the on-hold spec** (`...vram-prefill-headroom-design.md`) to match the RESULTS
+   verdict — replace the invalidated KV premise with the real consumer (H-activation or
+   H-eviction) and the fix it implies. (Use `superpowers:brainstorming` if the fix shape is a
+   genuine design choice; a straight correction if the verdict is unambiguous.)
+2. **Write the fix plan** `docs/superpowers/plans/2026-07-23-vram-prefill-headroom-fix.md`
+   via `superpowers:writing-plans`, sized from the RESULTS numbers. Carry the same Global
+   Constraints (don't regress single-stream decode 1.47/0.85; model/mode-agnostic §5; kernel
+   OOM 0).
+3. **Execute the fix plan** (subagent-driven), including its own on-device verification.
+4. **Re-run `test_multiturn.py`** at K=2 then K=3 → confirm round-2 HIT count > 1 (the
+   prefix-cache concurrency win the RAM rebalance enabled) and no CUDA OOM.
+
+The durable record of this chain is the memory file `vram_prefill_oom_chain.md` (indexed in
+`MEMORY.md`) — it points a cold session back here.
+
 ## Background (read first — you have no prior context)
 
 Vaayu is a low-resource LLM inference engine (`CLAUDE.md`). The cross-turn prefix cache was

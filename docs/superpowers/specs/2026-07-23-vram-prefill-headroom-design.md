@@ -1,7 +1,19 @@
 # KV-Aware Prefill VRAM Headroom — Design
 
+> **⚠️ ON HOLD — PREMISE INVALIDATED (2026-07-23).** This design assumes the second-session
+> prefill OOM is the KV cache growing into the fixed 2 GB prefill headroom. Real geometry
+> refutes it: both on-device targets are GQA, so the KV footprint is ~1.1 GB (MiniMax) /
+> ~0.83 GB (Qwen) — *below* the 2 GB headroom that already OOMs. KV is therefore NOT the
+> consumer. Do NOT implement Approach B as written. First run
+> `docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic.md`; its RESULTS names the real
+> consumer (H-activation: MoE prefill intermediates, or H-eviction: the eviction never
+> firing). Then REWRITE this spec around the verdict before writing the fix plan
+> `2026-07-23-vram-prefill-headroom-fix.md`. The problem statement, root-cause evidence,
+> non-goals, and the derive-don't-hardcode / no-single-stream-regression constraints below
+> remain valid; only the "KV is the consumer" mechanism and its Approach B are suspect.
+
 **Date:** 2026-07-23
-**Status:** design, pending plan
+**Status:** ON HOLD — premise invalidated; pending diagnostic RESULTS (see banner above).
 **Depends on:** `2026-07-23-ram-budget-rebalance.md` (done — host-RAM prefix budget now
 non-zero; this unblocks the on-device multi-session HIT measurement that plan could not run).
 
