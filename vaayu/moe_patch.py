@@ -669,7 +669,19 @@ def _make_sparse_moe_forward(
 _PREFILL_VRAM_HEADROOM = 2 * 1024 ** 3
 
 
-def _ensure_prefill_headroom(vaayu_ref) -> None:
+def _format_vram_diag(layer_idx, free, alloc, reserved,
+                      cache_usage, cache_budget, prefill_evict):
+    """One grep-able diagnostic line for the VRAM prefill trajectory. All byte
+    inputs; emits GB. Pure — no torch/CUDA calls, so it is unit-testable."""
+    g = 1024 ** 3
+    return (f"[VRAM-DIAG] layer={layer_idx} "
+            f"free={free / g:.2f}GB alloc={alloc / g:.2f}GB "
+            f"reserved={reserved / g:.2f}GB "
+            f"cache={cache_usage / g:.2f}/{cache_budget / g:.2f}GB "
+            f"prefill_evict={prefill_evict}")
+
+
+def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
     """During a prefill pass, evict the VRAM expert cache until free VRAM meets
     _PREFILL_VRAM_HEADROOM. The cache is not read during prefill — the two
     forwards that consult it (module-list and fused-EXL3) set their local
@@ -677,7 +689,10 @@ def _ensure_prefill_headroom(vaayu_ref) -> None:
     never touches it at all — so its residency gives prefill no benefit while
     starving activations. Evicting here is therefore free for prefill; the
     evicted experts re-warm during the decode that follows.
-    A no-op during decode, without a VRAM cache, or without CUDA."""
+    A no-op during decode, without a VRAM cache, or without CUDA.
+
+    When VAAYU_VRAM_DIAG is set, emits one grep-able [VRAM-DIAG] line per MoE
+    layer capturing the prefill VRAM trajectory (read-only; behavior unchanged)."""
     if not getattr(vaayu_ref, "_moe_prefill_pass", False):
         return
     _vram = getattr(vaayu_ref, "_expert_vram_cache", None)
@@ -686,6 +701,13 @@ def _ensure_prefill_headroom(vaayu_ref) -> None:
     free, _ = torch.cuda.mem_get_info()
     if free < _PREFILL_VRAM_HEADROOM:
         _vram.evict_until_free(_PREFILL_VRAM_HEADROOM)
+    if os.environ.get("VAAYU_VRAM_DIAG"):
+        free_now, _ = torch.cuda.mem_get_info()
+        print(_format_vram_diag(
+            layer_idx, free_now,
+            torch.cuda.memory_allocated(), torch.cuda.memory_reserved(),
+            _vram.current_usage, _vram.budget_bytes, _vram.prefill_evictions),
+            flush=True)
 
 
 def _make_modulelist_sparse_forward(
@@ -705,7 +727,7 @@ def _make_modulelist_sparse_forward(
     layer_idx  = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
-        _ensure_prefill_headroom(vaayu_ref)
+        _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
@@ -997,7 +1019,7 @@ def _make_fused_sparse_forward(
     layer_idx = block_info.layer_idx
 
     def sparse_forward(hidden_states, **kwargs):
-        _ensure_prefill_headroom(vaayu_ref)
+        _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
@@ -1341,7 +1363,7 @@ def _make_fused_sparse_forward_exl3(
             )
 
     def sparse_forward(hidden_states, **kwargs):
-        _ensure_prefill_headroom(vaayu_ref)
+        _ensure_prefill_headroom(vaayu_ref, layer_idx)
         _prof = getattr(vaayu_ref, 'profiling_mode', False) and getattr(vaayu_ref, '_moe_profile', None) is not None
         _mp = vaayu_ref._moe_profile if _prof else None
 

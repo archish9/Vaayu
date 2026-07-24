@@ -2084,5 +2084,5 @@ def test_all_three_forwards_call_ensure_prefill_headroom():
                     "_make_fused_sparse_forward",
                     "_make_fused_sparse_forward_exl3"):
         src = inspect.getsource(getattr(moe_patch, factory))
-        assert "_ensure_prefill_headroom(vaayu_ref)" in src, \
+        assert "_ensure_prefill_headroom(vaayu_ref, layer_idx)" in src, \
             f"{factory} does not call _ensure_prefill_headroom"
