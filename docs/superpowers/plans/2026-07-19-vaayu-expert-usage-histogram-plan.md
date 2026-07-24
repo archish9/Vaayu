@@ -10,6 +10,53 @@
 
 **Design source:** `docs/superpowers/specs/2026-07-19-vaayu-expert-usage-histogram-design.md`.
 
+> **Validity re-check (2026-07-24).** Cross-checked every code anchor against current
+> `main`. Result: Tasks 1–5 apply as written; Task 3's line anchors are an EXACT match
+> (`expert_cache.py` unchanged). Corrections folded in below: (a) Task 4 line refs were
+> stale + a branch-convergence caveat added; (b) Task 6 anchor `:979` is stale, the real
+> insertion point and real expert-loader idiom are now specified, and it reuses the
+> already-built `self._moe_geometry` instead of recomputing. The real MoE flag is
+> `self.is_moe` (no leading underscore). Feature is confirmed NOT started (no
+> `vaayu/expert_usage.py`, no `_hot`/`hot_pin`, no `maybe_record_usage`).
+
+> ## ⚠️ PREMISE WARNING (2026-07-24) — DO NOT BUILD PHASE 1 AS WRITTEN
+>
+> The code anchors above are valid, but a change that landed **after** this plan
+> (2026-07-19) has **undercut its core premise**. Read this before starting.
+>
+> **What changed.** This plan hot-pins the hottest experts in the **RAM** expert cache
+> (`ExpertRAMCache._hot`, Task 3). The **2026-07-23 RAM budget rebalance**
+> (`docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md:31`) documented that the
+> **VRAM** expert cache (`ExpertVRAMCache`, Fix #7, `vaayu_base.py:1211`) now absorbs the
+> hot experts, so the RAM expert cache's hit rate **fell 34% → ~5%** — it serves only a
+> cold tail, and the rebalance then **shrank** it to fund the prefix cache. **Pinning hot
+> experts in the RAM tier now pins a tier that is already bypassed.** The Phase-1
+> "keep hot experts resident in RAM" benefit is largely moot.
+>
+> **The plan's own spec already flagged the fix.** Spec §12 Deferred:
+> *"VRAM-tier hot-pin. Pinning hot experts in the VRAM cache (not just RAM) — overlaps
+> Subsystem C; revisit after C."* That deferred variant is now the one that matters.
+>
+> **What this means for execution:**
+> - **Reusable as-is (tier-agnostic):** the histogram itself — count + persist + rank +
+>   `compute_pin_set` (Tasks 1, 2, 5) and the per-forward counting hook (Task 4). Any pin
+>   scheme needs this measurement layer. Build these.
+> - **Retarget before building:** Task 3's `hot_pin`/`_hot` and Task 6's pre-warm+pin must
+>   move from `ExpertRAMCache` to **`ExpertVRAMCache`** (`expert_cache.py:447`), which has
+>   **no** pin mechanism today — it needs the same `_hot`/`hot_pin`/eviction-skip treatment
+>   Task 3 describes for the RAM class. The turn-1 pre-warm win is still real, but into the
+>   VRAM tier.
+> - **Sequence AFTER the VRAM prefill OOM chain.** The box is VRAM-constrained right now
+>   (active work: `docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic.md`, memory
+>   `vram_prefill_oom_chain.md`). A VRAM-tier hot-pin competes for the exact resource that
+>   is already OOMing — do not add VRAM pressure until that chain's fix lands and its
+>   leftover VRAM headroom is known. Size the pin fraction against that headroom.
+>
+> **Bottom line:** the histogram infra is good and unblocked; the *pin tier* is wrong for
+> today's cache topology. Do not execute Phase 1's RAM-tier pin verbatim — retarget to VRAM
+> and gate behind the OOM chain. Updating the design spec to match is a prerequisite
+> (`superpowers:brainstorming` if the VRAM-tier pin shape is a genuine design choice).
+
 ## Phasing & Gate
 
 - **Phase 1 = Tasks 1–6** (histogram + startup pre-warm + one-time startup hot-pin).
@@ -490,14 +537,23 @@ def maybe_record_usage(vaayu_ref, layer_idx, expert_indices):
         store.record(layer_idx, expert_indices)
 ```
 
-In each of the three forwards, immediately after the line that computes
-`expert_indices` (e.g. `_make_fused_sparse_forward` at `moe_patch.py:560`,
-`_make_fused_sparse_forward_exl3`, and `_make_modulelist_sparse_forward` at `:450`),
-add:
+In each of the three forwards, immediately after `expert_indices` is computed, add:
 
 ```python
             maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
 ```
+
+Current `expert_indices` assignment sites (verified 2026-07-24):
+- `_make_modulelist_sparse_forward` — `moe_patch.py:732` (single site: `route_experts(...)`).
+- `_make_fused_sparse_forward` — `moe_patch.py:1015` and `:1018` (two branches:
+  `router_res[:3]` vs `torch.topk`).
+- `_make_fused_sparse_forward_exl3` — `moe_patch.py:1359`, `:1367`, `:1379` (three
+  branches: `router_res[:3]` / `route_experts` / `cache_aware_topk`).
+
+**Placement caveat:** in the fused and EXL3 forwards `expert_indices` is set in
+multiple `if/elif` branches. Put the `maybe_record_usage` call **after the branch
+converges** (one call, on the value both branches produce) — NOT inside a single
+branch, or you miss the other routing path. The module-list forward is single-site.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -594,8 +650,8 @@ git commit -m "feat(expert-usage): derived pin-set size with starvation guard"
 ### Task 6: engine wiring — build store, startup warm+pin, persist cadence
 
 **Files:**
-- Modify: `vaayu/vaayu_base.py` (near the warmup block `:979`; the generation loop for
-  the save cadence; the shutdown path).
+- Modify: `vaayu/vaayu_base.py` (after `self._expert_cache` + `self._moe_geometry` are
+  built, ~line 1201; the generation loop for the save cadence; the shutdown path).
 - Test: `tests/test_expert_usage_integration.py`
 
 **Interfaces:**
@@ -652,17 +708,19 @@ Expected: PASS (locks the composition the engine wiring must reproduce).
 
 - [ ] **Step 3: Build the store at startup + warm + pin**
 
-In `vaayu/vaayu_base.py`, just before the NVMe warmup block at `:979`, add (gated;
-`is_moe` guard so dense is untouched — adapt `self._is_moe` to the real MoE flag name):
+In `vaayu/vaayu_base.py`, add the block below **after `self._expert_cache` is built**
+(line ~1201 on current `main`) and **after `self._moe_geometry` is assigned** (line
+~1140) — both must already exist. The stale `:979` anchor from the original draft is the
+dense NVMe-warmup path, not the MoE setup region; do NOT insert there. Gated by
+`self.is_moe` (real flag name — no leading underscore) so dense is untouched:
 
 ```python
         # --- Expert usage histogram + hot-pin (Subsystem B, Phase 1; ships dark) ---
         self._expert_usage = None
-        if getattr(self, "_is_moe", False) and bool(kwargs.get("enable_expert_usage", False)):
+        if self.is_moe and bool(kwargs.get("enable_expert_usage", False)):
             import os as _os
             from vaayu.expert_usage import ExpertUsageStore, compute_pin_set
-            _geo = compute_moe_geometry(self._expert_offset_index, self.config.num_hidden_layers,
-                                        self.moe_top_k, self.moe_num_experts)
+            _geo = self._moe_geometry   # already built above — do NOT recompute
             _path = kwargs.get("expert_usage_path") or _os.path.join(
                 _os.path.expanduser("~/.cache/vaayu"), "expert_usage", "hist.vaayu_usage")
             # Histogram is indexed by the full-model layer_idx from the forward, so its
@@ -683,19 +741,75 @@ In `vaayu/vaayu_base.py`, just before the NVMe warmup block at `:979`, add (gate
                 if warn:
                     print("[EXPERT-USAGE] WARNING: hot-pin set shrunk to leave room for "
                           "the decode working set (pinned+working exceeded cache budget)")
+                n_pinned = 0
                 for (l, e) in pins:
-                    raw = self._read_expert_tensors(l, e)   # existing loader used by the cache
-                    self._expert_cache.put(l, e, raw)
-                    self._expert_cache.hot_pin(l, e)
-                print(f"[EXPERT-USAGE] pre-warmed + pinned {len(pins)} hot experts")
+                    if self._prewarm_hot_expert(l, e):   # see Step 3b
+                        self._expert_cache.hot_pin(l, e)
+                        n_pinned += 1
+                print(f"[EXPERT-USAGE] pre-warmed + pinned {n_pinned} hot experts")
 ```
 
-Note for the implementer: `_read_expert_tensors(l, e)` stands for whatever helper the
-existing warmup / decode-miss path already uses to read an expert's tensors from the
-checkpoint (find it near the `expert_cache.put` call in `moe_patch.py:475/589`). Reuse
-it; do NOT write a new loader. If it lives on the block/forward rather than the engine,
-gate this pin loop to run after the blocks are built, or move the pin loop to the first
-forward. Keep the histogram-load + `compute_pin_set` here regardless.
+- [ ] **Step 3b: the real pre-warm loader (`_prewarm_hot_expert`)**
+
+The original draft's `_read_expert_tensors(l, e)` does NOT exist. The real admission
+path is `load_expert_sparse(shard_file, metas)` — it takes a shard file + per-tensor
+offset metas, NOT `(layer, expert)` — and the EXL3 hot path (Qwen) admits through the
+**slab arena** (`acquire_slab` → `load_expert_into_slab` → `put_slab`), not `put`. So the
+pre-warm must mirror the decode-miss branch in `_dispatch_expert_misses._load_one`
+(`moe_patch.py:1174-1214`). Add this method to the engine class:
+
+```python
+    def _prewarm_hot_expert(self, layer_idx: int, expert_idx: int) -> bool:
+        """Read one expert off disk and admit it to the cache the same way a decode
+        miss does, so hot_pin can protect an entry that is really resident. Returns
+        False (skip pin) if the layer/expert can't be resolved. Mirrors the
+        non-prefill branch of moe_patch._dispatch_expert_misses._load_one."""
+        from .persist.safetensor_model_persister import (
+            load_expert_sparse, load_expert_into_slab)
+        cache = self._expert_cache
+        # layer_name + shard_file: resolve the SAME way the forwards do — from the
+        # MoEBlockInfo list detect_moe_blocks() produced (keep a reference to it at
+        # patch time), and the offset index. layer_name is e.g. "model.layers.<idx>".
+        layer_name, shard_file = self._resolve_expert_source(layer_idx)   # see note
+        if layer_name is None:
+            return False
+        metas = self._expert_offset_index.get_expert_offsets(layer_name, expert_idx)
+        if metas is None:
+            return False
+        if cache.arena is None:
+            raw = load_expert_sparse(shard_file, metas)
+            cache.put(layer_idx, expert_idx, raw)
+            return True
+        slab_idx = cache.acquire_slab()
+        if slab_idx is None:                       # arena full — fall back to clone
+            raw = load_expert_sparse(shard_file, metas)
+            cache.put(layer_idx, expert_idx, raw)
+            return True
+        try:
+            views = load_expert_into_slab(
+                shard_file, metas, cache.arena.tensor(slab_idx),
+                allow_direct=cache.arena.pin, tensor_align=False)
+        except Exception:
+            cache.arena.release(slab_idx)
+            return False
+        cache.put_slab(layer_idx, expert_idx, views, slab_idx)
+        return True
+```
+
+Implementer notes:
+- `_resolve_expert_source(layer_idx)` is the one genuine wiring gap: it must return
+  `(layer_name, shard_file)` for a full-model layer index. Get `layer_name` from the
+  `MoEBlockInfo` list (`detect_moe_blocks`, `moe_patch.py:335`) — stash that list on the
+  engine when `patch_moe_blocks` runs — and `shard_file` from the offset index /
+  checkpoint path exactly as the EXL3 forward's `shard_file_for(name)` closure does
+  (`moe_patch.py:1304`). Do NOT hand-roll a parallel resolver.
+- **`_moe_prefill_pass` must be False** at startup pre-warm (it is — no prefill is
+  running), so this takes the cached decode branch, not the transient prefill branch.
+- If resolving `MoEBlockInfo`/`shard_file` from the engine proves awkward at init time,
+  the fallback the original draft allowed still holds: skip the disk read here, call only
+  `hot_pin(l, e)` (marks the key), and let the first natural route admit the expert — the
+  `_hot` flag then makes it permanently resident. That loses turn-1 pre-warm but keeps the
+  permanent-residency win and needs zero new loader wiring.
 
 - [ ] **Step 4: Add the save cadence + shutdown save helper**
 
@@ -889,7 +1003,7 @@ git commit -m "feat(expert-usage): live heat + anti-thrash re-pin decision (Phas
 
 **Interfaces:**
 - Consumes: `ExpertUsageStore.heat`/`decay_heat`, `plan_repin`, `ExpertRAMCache.hot_swap`,
-  `ExpertRAMCache._read_expert_tensors`/existing loader for admitting the new hot expert.
+  and `self._prewarm_hot_expert` (Task 6 Step 3b) to admit the new hot expert.
 
 - [ ] **Step 1: Add the between-turns re-pin (gated by `enable_live_repin`)**
 
@@ -909,9 +1023,8 @@ In `vaayu/vaayu_base.py`, at the safe point after each generation completes (sam
                 swap = plan_repin(heat[l].tolist(), hot_row, margin)
                 if swap is not None:
                     cold_e, hot_e = swap
-                    raw = self._read_expert_tensors(l, hot_e)
-                    self._expert_cache.put(l, hot_e, raw)
-                    self._expert_cache.hot_swap(l, cold_e, hot_e)
+                    if self._prewarm_hot_expert(l, hot_e):   # reads + admits (Task 6 Step 3b)
+                        self._expert_cache.hot_swap(l, cold_e, hot_e)
             store.decay_heat(self._live_repin_decay)
 ```
 
@@ -941,14 +1054,18 @@ git commit -m "feat(expert-usage): between-turns live re-pin + Phase 2 results (
 
 ## Notes & known limitations
 
-- **`_read_expert_tensors` is a placeholder name** for the existing expert-loading helper
-  the cache already uses (find it by the `expert_cache.put` call sites in
-  `moe_patch.py:475,589`). Reuse it — do not add a second loader.
-- **Adapt prerequisite names.** `self._is_moe`, `self.moe_top_k`, `self.moe_num_experts`,
-  `self._expert_cache`, `self._expert_offset_index`, `self.device`, and the
-  generation-complete / shutdown call sites are referenced by their expected names; map to
-  the real ones at implementation time. The pure modules (Tasks 1–5, 8's helpers) have no
-  such dependency.
+- **The pre-warm loader is `load_expert_sparse` / `load_expert_into_slab`** (in
+  `persist/safetensor_model_persister.py`), driven exactly like the decode-miss branch in
+  `moe_patch._dispatch_expert_misses._load_one` (`moe_patch.py:1174-1214`). Task 6 Step 3b
+  specifies it. Do NOT add a second loader. The original draft's `_read_expert_tensors` name
+  was fictional.
+- **Prerequisite names (verified 2026-07-24 against `main`):** real MoE flag is
+  **`self.is_moe`** (NOT `self._is_moe`). Confirmed present and correct:
+  `self.moe_top_k`, `self.moe_num_experts`, `self._expert_cache`,
+  `self._expert_offset_index`, `self.device`, and `self._moe_geometry` (reuse it — Task 6
+  no longer recomputes geometry). Still map at implement time: the generation-complete /
+  shutdown call sites (Task 6 Step 4) and `_resolve_expert_source` (Task 6 Step 3b). The
+  pure modules (Tasks 1–5, 8's helpers) have no such dependency.
 - **Startup pin loading cost.** Reading K experts at startup adds init time proportional to
   the pin set; bounded by `expert_pin_fraction`. Acceptable — it front-loads reads that
   would otherwise be cold misses.
