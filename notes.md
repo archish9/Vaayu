@@ -1567,3 +1567,23 @@ test_generate.py because a single-turn benchmark can never hit a cross-turn cach
   2. docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md
   Consumes that figure. Reclaims RAM from the 5%-hit expert cache so the prefix cache gets a budget → concurrent sessions stay
   cached under fan-out.
+
+
+  -----
+- docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md (9 TDD tasks)  
+
+   ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
+  │ 2   │ Batched decode (fan-out streams share 1    │ amortize   │ v1 designed, in progress             │ aggregate ~N×    │
+  │     │ stream)                                    │            │                                      │                  │
+  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
+  │ 3   │ Prompt-lookup decoding                     │ amortize   │ code exists, likely underused        │ big on code      │
+  │     │                                            │            │                                      │ output           │
+  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
+  │ 4   │ Lower/mixed-bpw quant                      │ fewer      │ not started                          │ direct linear    │
+  │     │                                            │ bytes      │                                      │                  │
+  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
+  │ 5   │ GPU Direct Storage (cuFile)                │ I/O path   │ not started                          │ skip host bounce │
+  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
+  │ 6   │ KV persist + prefix scaling                │ skip read  │ A1 landed, persist spec'd            │ TTFT             │
+  └─────┴────────────────────────────────────────────┴────────────┴──────────────────────────────────────┴──────────────────┘
+

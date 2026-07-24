@@ -1,5 +1,11 @@
 # VRAM Prefill Diagnostic — Implementation Plan
 
+> **✅ DONE (2026-07-24).** All 3 tasks executed. Task 1 instrumentation committed
+> (`855c09f`), Task 2 run on-device (MiniMax K=2 R=2), Task 3 RESULTS committed (`fc01df0`,
+> `docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic-RESULTS.md`). **VERDICT:** both
+> H-activation and H-eviction refuted — the OOM is at the prefill→decode boundary, not in
+> prefill. Follow-up fix = `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **SELF-CONTAINED.** Everything needed is in this file. No prior session context required.

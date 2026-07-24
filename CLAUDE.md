@@ -144,4 +144,30 @@ The reference doc is `docs/superpowers/plans/2026-07-09-vaayu-moe-perf-REPORT.md
 
 ---
 
+## 6. Task Ledger — `todo.md` (NON-NEGOTIABLE)
+
+**`todo.md` at the repo root is the living source of truth for what is done and what is
+pending. Both the user and Claude read and update it. Keep it current AS work happens —
+not after.** It exists because plans get forgotten, and because a bug found in Task 2's
+review can spawn another bug whose fix stalls Task 3 — and that dropped work must never
+vanish silently.
+
+- **Start of any work session:** read `todo.md` first. It carries what is in flight,
+  blocked, and pending — including plans easy to forget.
+- **When a plan is written or accepted:** add it with every task AND subtask as checkboxes.
+- **When you start a task:** mark it `[~]`. **When it is done and verified:** `[x]` (verified
+  per §4 — evidence, not assertion).
+- **Never silently drop work.** If review finds a bug you do not fix on the spot, add it
+  under **Pending bugs** with its location and what is wrong. If fixing one bug spawns
+  another and a later task stalls, record BOTH the new bug and the stalled task — this is
+  the exact failure mode this ledger prevents.
+- **Blocked ≠ gone.** A task waiting on something gets `[!]` + a one-line reason and what
+  unblocks it — never deletion.
+- Separate from any harness/session TODO tool: `todo.md` is on disk and survives across
+  sessions. Write it there.
+
+Status keys: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
