@@ -184,6 +184,26 @@ def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
     return w, sel
 
 
+def _warn_cache_bias_inert(vaayu_ref, reason: str) -> None:
+    """Warn once per model when VAAYU_CACHE_BIAS is set but cannot be applied.
+
+    cache_aware_topk only runs in the plain-softmax branch of the EXL3 fused
+    forward. Measured 2026-08-02 (Plan G): no current MoE model reaches it —
+    transformers 5.x routers do their own top-k, and MiniMax-family models own
+    their scoring function. Silently ignoring the setting is the degradation
+    CLAUDE.md §5 forbids, so say so. Call sites are per layer per token, hence
+    the once-per-instance latch."""
+    if not getattr(vaayu_ref, "_cache_bias", 0.0):
+        return
+    if getattr(vaayu_ref, "_cache_bias_warned", False):
+        return
+    vaayu_ref._cache_bias_warned = True
+    _log.warning(
+        f"[Vaayu-MoE] VAAYU_CACHE_BIAS={vaayu_ref._cache_bias} has NO EFFECT on this "
+        f"model: {reason}, so cache-aware expert routing never runs. Routing is "
+        f"unchanged; unset the variable or expect no bias.")
+
+
 def _build_resident_mask(vaayu_ref, expert_cache, layer_idx: int,
                          num_experts: int, device):
     """[num_experts] mask of experts resident in RAM ∪ VRAM for `layer_idx`, or
@@ -774,6 +794,9 @@ def _make_modulelist_sparse_forward(
         routing_weights, expert_indices = route_experts(
             block_info.moe_module, router_logits, top_k
         )
+        _warn_cache_bias_inert(
+            vaayu_ref, "this model uses the module-list expert layout, whose forward "
+                       "has no cache-aware routing")
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -1062,6 +1085,9 @@ def _make_fused_sparse_forward(
                 router_logits.float().softmax(dim=-1), top_k, dim=-1
             )
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        _warn_cache_bias_inert(
+            vaayu_ref, "this model takes the non-EXL3 fused forward, which has no "
+                       "cache-aware routing")
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -1401,6 +1427,7 @@ def _make_fused_sparse_forward_exl3(
         router_res = router(flat_hidden)
         if isinstance(router_res, tuple) and len(router_res) >= 3:
             router_logits, routing_weights, expert_indices = router_res[:3]
+            _warn_cache_bias_inert(vaayu_ref, "the router returned its own top-k")
         else:
             router_logits = router_res
             if callable(getattr(moe_mod, "route_tokens_to_experts", None)):
@@ -1410,6 +1437,9 @@ def _make_fused_sparse_forward_exl3(
                 # function we don't own, and softmax here would be simply wrong.
                 routing_weights, expert_indices = route_experts(
                     moe_mod, router_logits, top_k)
+                _warn_cache_bias_inert(
+                    vaayu_ref, "the model owns its scoring function "
+                               "(route_tokens_to_experts)")
             else:
                 # Cache-aware routing (advanced-opt #4): bias top-k toward resident
                 # experts. ONLY in this branch — the tuple branch above means the

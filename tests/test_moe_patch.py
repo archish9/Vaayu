@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import pytest
@@ -2086,3 +2087,58 @@ def test_all_three_forwards_call_ensure_prefill_headroom():
         src = inspect.getsource(getattr(moe_patch, factory))
         assert "_ensure_prefill_headroom(vaayu_ref, layer_idx)" in src, \
             f"{factory} does not call _ensure_prefill_headroom"
+
+
+def test_cache_bias_inert_warning_silent_when_feature_off(caplog):
+    """The default (bias 0.0) must stay completely quiet."""
+    from vaayu.moe_patch import _warn_cache_bias_inert
+
+    class _Ref:
+        pass
+
+    ref = _Ref()                      # no _cache_bias attribute at all
+    with caplog.at_level(logging.WARNING, logger="vaayu.moe_patch"):
+        _warn_cache_bias_inert(ref, "some reason")
+    assert caplog.records == []
+
+    ref._cache_bias = 0.0
+    with caplog.at_level(logging.WARNING, logger="vaayu.moe_patch"):
+        _warn_cache_bias_inert(ref, "some reason")
+    assert caplog.records == []
+
+
+def test_cache_bias_inert_warns_once_with_value_and_reason(caplog):
+    """Set-but-ignored must be loud (CLAUDE.md §5: warn, never silently degrade)
+    — and exactly once, since the call sites are per layer per token."""
+    from vaayu.moe_patch import _warn_cache_bias_inert
+
+    class _Ref:
+        pass
+
+    ref = _Ref()
+    ref._cache_bias = 1.5
+    with caplog.at_level(logging.WARNING, logger="vaayu.moe_patch"):
+        for _ in range(50):
+            _warn_cache_bias_inert(ref, "the router returned its own top-k")
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "VAAYU_CACHE_BIAS" in msg
+    assert "1.5" in msg
+    assert "the router returned its own top-k" in msg
+
+
+def test_cache_bias_inert_warning_is_per_model_instance(caplog):
+    """Two models loaded in one process must each report their own state."""
+    from vaayu.moe_patch import _warn_cache_bias_inert
+
+    class _Ref:
+        pass
+
+    a, b = _Ref(), _Ref()
+    a._cache_bias = 1.0
+    b._cache_bias = 1.0
+    with caplog.at_level(logging.WARNING, logger="vaayu.moe_patch"):
+        _warn_cache_bias_inert(a, "reason A")
+        _warn_cache_bias_inert(b, "reason B")
+        _warn_cache_bias_inert(a, "reason A")
+    assert len(caplog.records) == 2
