@@ -43,21 +43,22 @@ RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
   - [x] K=3 stretch — 6/6, no OOM
   - [x] RESULTS written + committed
 
-### Plan C — Prefix-cache hit telemetry  **(P2 — chain step 4)**
+### Plan C — Prefix-cache hit telemetry  **(P2 — chain step 4)** — ✅ DONE 2026-08-01
 `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry.md`
 Spec: `docs/superpowers/specs/2026-08-01-prefix-cache-hit-telemetry-design.md` (`140720c`)
-- [ ] **Task 1** — counters + `stats()` + `reset_stats()` on `PrefixCacheStore` (TDD)
-  - [ ] 9 unit tests in `tests/test_prefix_cache.py` (incl. degenerate hit, multi-evict, n/a rates)
-  - [ ] 5 counters under the store's existing lock; no caching-behavior change
-  - [ ] Full suite green (400)
-- [ ] **Task 2** — `test_multiturn.py` becomes a gate
-  - [ ] reset between rounds, print `stats()` per round
-  - [ ] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
-  - [ ] loud failure if `model._prefix_cache` is None
-- [ ] **Task 3** — on-device gate + RESULTS (closes chain step 4)
-  - [ ] K=2 run, exit 0, 2 hits final round
-  - [ ] K=3 run, exit 0, 3 hits final round; revert `K_SESSIONS` to 2
-  - [ ] RESULTS doc + close chain step 4 here
+RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.md`
+- [x] **Task 1** — counters + `stats()` + `reset_stats()` on `PrefixCacheStore` (TDD) — `626dcaf`
+  - [x] 9 unit tests in `tests/test_prefix_cache.py` (incl. degenerate hit, multi-evict, n/a rates)
+  - [x] 5 counters under the store's existing lock; no caching-behavior change
+  - [x] Full suite green (400)
+- [x] **Task 2** — `test_multiturn.py` becomes a gate — `cf7963e`
+  - [x] reset between rounds, print `stats()` per round
+  - [x] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
+  - [x] loud failure if `model._prefix_cache` is None
+- [x] **Task 3** — on-device gate + RESULTS (closes chain step 4)
+  - [x] K=2 run, exit 0, 2/2 hits final round, 0 evictions
+  - [x] K=3 run, exit 0, 3/3 hits final round, 0 evictions; `K_SESSIONS` reverted to 2
+  - [x] RESULTS doc + close chain step 4 here
 
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3 — do last)**
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
@@ -74,10 +75,10 @@ Spec: `docs/superpowers/specs/2026-08-01-prefix-cache-hit-telemetry-design.md` (
 - [x] Step 1 — RAM budget rebalance (`6c9bc76..54d660b`)
 - [x] Step 2 — VRAM diagnostic + RESULTS (2026-07-24, `855c09f` `fc01df0`); verdict = decode-boundary OOM
 - [x] Step 3 — execute Plan A (above), 2026-08-01 (`045f387` `86a6ca5`); OOM closed at K=2 and K=3
-- [~] Step 4 — round-2 HIT measurement **(P2)** — already OBSERVED in Plan A's gate runs: round-2
-  TTFT collapsed ~90-101s → ~9-10s at both K=2 and K=3 (~10x cross-turn prefix-cache win), no CUDA
-  OOM. Remaining: formalize as a step-4 measurement (explicit HIT-count assertion), not just an
-  observation from the OOM gate logs.
+- [x] Step 4 — round-2 HIT measurement **(P2)** — 2026-08-01, `626dcaf` `cf7963e` +
+  RESULTS commit (this task). Harness now asserts HITs itself (exit status 0 is the verdict):
+  K=2 → 2/2 HIT, 0evict, saved=3940/3980 tok (99%); K=3 → 3/3 HIT, 0evict, saved=5910/5970 tok
+  (99%). TTFT collapsed ~90-101s → ~9-10s at both K. Kernel OOM count 0.
 
 ---
 
