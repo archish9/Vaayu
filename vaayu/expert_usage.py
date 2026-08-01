@@ -39,14 +39,15 @@ class ExpertUsageTracker:
         module; call it after generation, never inside a forward."""
         return self.counts.detach().to("cpu").clone()
 
-    def report(self, vram_cache=None, top_n: int = 5) -> str:
+    def report(self, vram_cache=None, top_n: int = 5, covered_layers=None) -> str:
         """Human-readable join of this histogram with the VRAM cache's per-key
         eviction attribution. Safe to call with no cache (reports routes only)."""
         evicted = getattr(vram_cache, "evicted_keys", None) or {}
-        return format_usage_report(self.snapshot(), evicted, top_n=top_n)
+        return format_usage_report(self.snapshot(), evicted, top_n=top_n,
+                                    covered_layers=covered_layers)
 
 
-def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
+def format_usage_report(counts, evicted_keys, top_n: int = 5, covered_layers=None) -> str:
     """Join route counts with per-key budget-pressure evictions.
 
     `counts` is a [n_rows, n_experts] CPU tensor (ExpertUsageTracker.snapshot()),
@@ -56,7 +57,20 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
     An expert with many routes and ZERO evictions needs no pin — the cache is
     already keeping it resident. That negative result is what retires the pin
     feature, so it is labelled just as plainly as a candidate.
+
+    Zero evictions has two different causes, and they are not the same result.
+    Either the VRAM cache kept the expert resident (the intended negative
+    result, above) — OR that layer was never VRAM-cached at all (it falls
+    outside the cache's covered layer range, or the running forward path has
+    no VRAM cache), in which case zero evictions is structurally guaranteed
+    and says nothing about pin-worthiness. `covered_layers`, an optional set
+    of layer indices the VRAM cache actually covers, lets the two be told
+    apart: a layer outside it is labelled "(not VRAM-cached)" instead of
+    "no pin needed", and its experts are excluded from the pin-candidate
+    tally. `covered_layers=None` (the default) means "unknown / assume every
+    layer is covered" — today's behavior, unchanged.
     """
+    top_n = max(0, int(top_n))
     lines = []
     total_routes = int(counts.sum().item())
     if total_routes == 0:
@@ -70,6 +84,7 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
         layer_total = int(row.sum().item())
         if layer_total == 0:
             continue
+        layer_covered = covered_layers is None or layer_idx in covered_layers
         order = sorted(range(counts.shape[1]), key=lambda e: -int(row[e].item()))
         lines.append(f"[Vaayu-Usage] layer={layer_idx} top experts by routes:")
         for e in order[:top_n]:
@@ -77,7 +92,9 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
             if routes == 0:
                 continue
             ev = int(evicted_keys.get((layer_idx, e), 0)) if evicted_keys else 0
-            if ev > 0:
+            if not layer_covered:
+                tag = "(not VRAM-cached)"
+            elif ev > 0:
                 hot_evictions += ev
                 tag = "<-- pin candidate"
             else:
@@ -87,10 +104,10 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
     share = (hot_evictions / total_evictions) if total_evictions else 0.0
     lines.append(
         f"summary: {total_routes} routes, {total_evictions} budget-pressure evictions; "
-        f"top-{top_n} experts account for {hot_evictions} of them ({share:.0%})")
+        f"top-{top_n}-per-layer experts account for {hot_evictions} of them ({share:.0%})")
     if total_evictions > hot_evictions:
         remainder = total_evictions - hot_evictions
         lines.append(
-            f"WARNING: {remainder} evictions on experts outside top-{top_n} — "
+            f"WARNING: {remainder} evictions on experts outside top-{top_n}-per-layer — "
             f"raise top_n to inspect")
     return "\n".join(lines)

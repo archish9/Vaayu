@@ -226,3 +226,6 @@ print(f"Decode throughput: {decode_tok_per_s:.2f} tokens/sec")
 print(f"Generation time: {elapsed:.1f}s (model already loaded)")
 print(f"Model load time: {model_load_time:.1f}s")
 print(f"Total: {total_elapsed:.1f}s ({total_elapsed / 60:.2f} minutes)  [load -> full generation done]")
+
+if getattr(model, "_expert_usage", None) is not None:
+    print(model._expert_usage.report(getattr(model, "_expert_vram_cache", None), top_n=10))

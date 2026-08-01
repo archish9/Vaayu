@@ -1372,6 +1372,10 @@ class VaayuBaseModel(GenerationMixin):
         elif self.is_moe:
             print("[Vaayu-MoE] MoE model on non-CUDA device — expert-aware streaming disabled, "
                   "falling back to full-layer loading")
+            if getattr(self, "enable_expert_usage", False):
+                print("[Vaayu-Usage] WARNING: enable_expert_usage is set but no tracker will be "
+                      "built — no VRAM expert cache exists on this device, so there would be "
+                      "nothing to join eviction data against.")
 
         self.speculator = None
         if drafter_model_path or use_prompt_lookup:

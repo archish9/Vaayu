@@ -114,7 +114,7 @@ def test_report_warns_when_evictions_land_outside_top_n():
     out = format_usage_report(counts, {(0, 5): 200}, top_n=5)
     assert "WARNING" in out
     assert "200" in out
-    assert "top-5" in out
+    assert "top-5-per-layer" in out
     assert "top_n" in out
 
 
@@ -126,6 +126,48 @@ def test_report_no_warning_when_evictions_are_all_inside_top_n():
     counts[1, 3] = 400
     out = format_usage_report(counts, {(1, 2): 12}, top_n=5)
     assert "WARNING" not in out
+
+
+def test_report_labels_uncovered_layer_as_not_vram_cached():
+    """A layer outside covered_layers with many routes and zero evictions must
+    NOT be told apart from a genuinely-resident layer — it structurally never
+    had a chance to evict, so it must render (not VRAM-cached) and must not
+    count as a pin candidate."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[1, 2] = 500      # layer 1 has many routes, zero evictions
+    out = format_usage_report(counts, {}, top_n=5, covered_layers={0})  # layer 1 not covered
+    assert "(not VRAM-cached)" in out
+    assert "no pin needed" not in out
+    assert "pin candidate" not in out
+
+
+def test_report_covered_layer_zero_evictions_still_says_no_pin_needed():
+    """The distinction must actually discriminate: a layer INSIDE
+    covered_layers with zero evictions keeps the original negative-result
+    label."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[1, 2] = 500
+    out = format_usage_report(counts, {}, top_n=5, covered_layers={1})
+    assert "no pin needed" in out
+    assert "(not VRAM-cached)" not in out
+
+
+def test_report_covered_layers_none_reproduces_default_output():
+    """Regression guard: omitting covered_layers must be byte-identical to
+    today's behavior."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[1, 2] = 500
+    counts[1, 3] = 400
+    out_default = format_usage_report(counts, {(1, 2): 12}, top_n=5)
+    out_explicit_none = format_usage_report(counts, {(1, 2): 12}, top_n=5, covered_layers=None)
+    assert out_default == out_explicit_none
+
+
+def test_report_negative_top_n_does_not_render_nonsense():
+    counts = torch.zeros((1, 4), dtype=torch.int32)
+    counts[0, 0] = 10
+    out = format_usage_report(counts, {}, top_n=-1)
+    assert "top--1" not in out
 
 
 def test_report_respects_top_n():

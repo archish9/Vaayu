@@ -562,6 +562,11 @@ class ExpertVRAMCache:
         return freed
 
     def reset_stats(self) -> None:
+        """Zero hit/miss/eviction counters. Deliberately does NOT clear
+        evicted_keys (the per-key eviction attribution used by the expert usage
+        report): that mapping is meant to accumulate whole-run totals for the
+        report to join against, so a per-turn `evict=` telemetry number reset
+        here will legitimately read lower than evicted_keys' cumulative sum."""
         with self.lock:
             self.hits = self.misses = self.evictions = 0
             self._last_hits = self._last_misses = self._last_evictions = 0
