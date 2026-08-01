@@ -1910,6 +1910,13 @@ class VaayuBaseModel(GenerationMixin):
         if mode == "fp16":
             return DynamicCache()
 
+        if mode == "bf16":
+            # Ring buffer without the fp8 store or the dequantized mirror:
+            # 2.0 bytes/element vs 3.016 for fp8 mode, and lossless.
+            print("[Vaayu] KV Cache: bf16 ring buffer (no quantization, ~33% "
+                  "less VRAM than fp8 mode)")
+            return FP8DynamicCache(quantize=False)
+
         if not hasattr(torch, "float8_e4m3fn"):
             print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
             return DynamicCache()

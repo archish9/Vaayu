@@ -89,7 +89,9 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   `build_header` picks it off `cache.quantize`, and `DiskWriter.enqueue_append` refuses an
   unquantized cache (warn once, no file). Old fp8 files keep working; bf16 disk persistence
   can land later. 2 tests.
-- [ ] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged
+- [x] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged. 2 tests; suite 436.
+  VRAM sizing needed no change: `_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes`
+  both charge 2 B/elem for every non-fp8 mode, which is exactly right for bf16.
 - [ ] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
 
 ### Plan F — Expert-eviction `top_n` sweep  **(P2 — next)**

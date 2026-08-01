@@ -1,3 +1,5 @@
+import types
+
 import torch
 from vaayu.vaayu_base import FP8DynamicCache
 
@@ -178,6 +180,29 @@ def test_unquantized_mode_crop_and_to_cpu():
     cache.to_cpu()
     assert cache.key_cache[0].device.type == "cpu"
     assert cache.key_cache[0].shape[-2] == 4        # compacted to used length
+
+
+def _cache_for_mode(mode):
+    """_create_kv_cache reads only kv_cache_mode + loader_strategy off self."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    fake = types.SimpleNamespace(kv_cache_mode=mode, loader_strategy=None)
+    return VaayuBaseModel._create_kv_cache(fake)
+
+
+def test_create_kv_cache_bf16_mode():
+    cache = _cache_for_mode("bf16")
+    assert isinstance(cache, FP8DynamicCache)
+    assert cache.quantize is False
+
+
+def test_create_kv_cache_fp8_and_fp16_modes_unchanged():
+    from transformers import DynamicCache
+    fp8 = _cache_for_mode("fp8")
+    assert isinstance(fp8, FP8DynamicCache) and fp8.quantize is True
+    fp16 = _cache_for_mode("fp16")
+    assert type(fp16) is DynamicCache
+    # auto keeps selecting fp8 for EXL3 (non-EXL3 loader_strategy -> fp16 here)
+    assert type(_cache_for_mode("auto")) is DynamicCache
 
 
 def test_unquantized_mode_crop_front():
