@@ -92,7 +92,17 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
 - [x] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged. 2 tests; suite 436.
   VRAM sizing needed no change: `_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes`
   both charge 2 B/elem for every non-fp8 mode, which is exactly right for bf16.
-- [ ] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
+- [x] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
+  - [x] 5 runs: Qwen fp8/bf16, MiniMax fp8/bf16 ×2. KV 3.016 → **2.000 B/elem** on both
+    geometries (Qwen 192.1→127.4 MiB, MiniMax 252.0→167.1 MiB, **−33.7%**)
+  - [x] Decode: Qwen 0.80→0.85 (floor 0.82), MiniMax 1.45→1.50/1.51 (floor 1.47). No OOM.
+  - [x] TTFT gap on MiniMax is noise: bf16's own cold runs span 31.25–47.74s vs fp8's 39.47s
+  - [x] RESULTS written; **recommendation = flip `auto` → bf16**, as a separate commit, with the
+    disk-persistence caveat below
+- [ ] **Task 5b (decision, not yet made)** — flip `auto` → bf16? Recommended by RESULTS §5. Cost:
+  KV disk persistence refuses bf16 caches (Task 3 option (a)), so anyone who enabled
+  `enable_kv_persist` would silently lose it. Either flip now and add bf16 serialization later,
+  or land serialization first (`QUANT_SIG_BF16` already reserved) and flip after. **User's call.**
 
 ### Plan F — Expert-eviction `top_n` sweep  **(P2 — next)**
 `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained

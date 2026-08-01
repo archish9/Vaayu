@@ -18,3 +18,4 @@ run-vram-diag-*.log
 run-step4-hits-*.log
 run-decode-*.log
 run-expert-usage-*.log
+run-planE-*.log
