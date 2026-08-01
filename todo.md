@@ -5,7 +5,8 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (Plan F DONE — no viable pin N; Plan G reduced to its zero-code Task 1)._
+_Last updated: 2026-08-02 (Plans F and G both CLOSED — no viable pin N; the routing bias turned
+out to be unreachable code on both models)._
 
 ---
 
@@ -19,9 +20,9 @@ Plans A, C, D are ✅ DONE (2026-08-01) and F ✅ DONE (2026-08-02) — see Acti
    depend on it. Frees ~33% of KV VRAM, lossless, and *removes* quantization work.
 2. ~~**P2 — Plan F (`top_n` eviction sweep).**~~ ✅ DONE 2026-08-02. Verdict: **no N is viable**
    — eviction share is linear in N and 2–4× below the pin's share of the cache, on both models.
-3. **P3 — Plan G (routing locality only; pin dropped by F).** `2026-08-02-expert-pin-and-routing-locality.md`.
-   F returned no N, so the pin (Tasks 2–4) is dropped. What remains is Task 1, a zero-code
-   experiment (`VAAYU_CACHE_BIAS`, an existing env var defaulting to 0.0).
+3. ~~**P3 — Plan G (expert pin + routing locality).**~~ ✅ CLOSED 2026-08-02, nothing built.
+   Pin dropped on F's evidence; the bias was measured and found to be **unreachable code** on both
+   models. One follow-up falls out of it — see "cache-aware routing is dead code" below.
 4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
    precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
    context, NOT decode speed.
@@ -130,25 +131,24 @@ This produces the whole curve. **One GPU run per model, many reports** — rende
     N=10 on MiniMax reproduced the earlier 19% exactly, validating the sweep.
   - [x] Scaffolding reverted (`git checkout test_generate.py`); `enable_expert_usage` still False
 
-### Plan G — Expert pin + routing locality  **(P3 — RETARGETED by Plan F)**
-`docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality.md` — self-contained
-**Plan F answered its precondition with "no N is viable"** (share linear in N, 2–4× below the
-cost line, both models). **Tasks 2–4 (the pin) are therefore DROPPED — do not build them.**
-Task 1 is the whole of Plan G now: it attacks the diffuseness instead of reserving space in a
-cache that is already too small. Revisit the pin only if the cache stops thrashing (bigger VRAM
-budget or a smaller model).
-- [ ] **Task 1** — **zero-code**: measure `VAAYU_CACHE_BIAS` (existing env var, defaults 0.0).
-  `cache_aware_topk` + `_build_resident_mask` are already shipped and wired into the EXL3 fused
-  path; they bias top-k *selection* toward resident experts while taking weights from the original
-  logits. This attacks the distribution problem directly and **may make the pin unnecessary**.
-- [ ] **Task 2** — pin mechanism on `ExpertVRAMCache` (`pin`/`unpin_all`/`pinned`, eviction skip,
-  starvation guard; `evict_until_free()` must still reclaim pinned entries or prefill can OOM)
-- [ ] **Task 3** — `compute_pin_set(...)` with a hard `max_fraction` ceiling so the pin can never
-  starve the tail it is meant to help
-- [ ] **Task 4** — apply at the **prefill→decode boundary**, never at startup (a startup pre-warm
-  is a proven no-op: `_ensure_prefill_headroom` evicts the VRAM cache on every prefill, measured
-  9.04→2.64GB / 1362 evictions, and every generation begins with a prefill)
-- [ ] **Task 5** — on-device 2×2 matrix (pin off/on × bias off/on), both models, + VERDICT
+### Plan G — Expert pin + routing locality  **(P3)** — ✅ CLOSED 2026-08-02, nothing built
+`docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality.md`
+RESULTS: `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESULTS.md`
+- [x] **Task 1** — bias sweep RUN on MiniMax (bias 0/0.25/0.5/1.0/2.0, fresh session id each).
+  Decode 1.52/1.50/1.51/1.50/1.54 (floor 1.47), VRAM hit rate 36.8/36.1/36.7/36.0/37.2% — flat,
+  non-monotonic, i.e. **no effect even at 2 std of bias**. Plan G Step 3 said to investigate a
+  null result before trusting it, and that was right:
+  - [x] Call-count probe (scratchpad wrapper, no repo file touched) at bias=2.0:
+    **`cache_aware_topk` ran 0 times on BOTH models.** MiniMax took the
+    `route_tokens_to_experts` branch (15,872 = 62 layers × 256 tokens); Qwen took the
+    `len(router_res) >= 3` tuple branch (0 calls to either helper).
+  - [x] Root cause: transformers 5.5.4 refactored MoE routers into `*TopKRouter` modules that do
+    the top-k internally, so no current model reaches the plain-softmax `else` branch that
+    `cache_aware_topk` lives in. Vaayu did not regress — the feature was **stranded upstream**.
+  - [x] Output text differs between runs but not with bias (0.25/0.5 share an opener, 0/1.0/2.0
+    share another) — fp nondeterminism in the expert reduction, not routing change.
+- [x] **Tasks 2–4** (the pin) — DROPPED on Plan F's evidence, per this plan's own PRECONDITION.
+- [x] **Task 5** (2×2 pin × bias matrix) — moot, neither axis exists.
 
 ### Plan H — TurboQuant KV cache  **(P4 — needs E)**
 `docs/superpowers/plans/2026-08-02-turboquant-kv.md` — self-contained, carries a precondition check
@@ -254,6 +254,16 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   **Plan E built the fix** (`kv_cache_mode="bf16"`, 2.000 B/elem measured on both models,
   `c8cfca8`), but `auto` still selects fp8, so **default runs still pay the overcharge**. Closes
   when Task 5b flips `auto`. (found + measured 2026-08-01; fix available 2026-08-01)
+- [ ] **`VAAYU_CACHE_BIAS` is a silent no-op — cache-aware routing is unreachable code.**
+  `cache_aware_topk` / `_build_resident_mask` (`vaayu/moe_patch.py`) live in the plain-softmax
+  `else` branch of `sparse_forward`'s router dispatch. Under transformers 5.5.4 no MoE model
+  reaches it: MiniMax takes the `route_tokens_to_experts` branch, Qwen takes the
+  `len(router_res) >= 3` tuple branch (routers now do their own top-k). **Probe: 0 calls on both
+  models at bias=2.0.** A user who sets the env var gets no bias, no error, no warning — the
+  silent degradation CLAUDE.md §5 forbids. Three options in the Plan G RESULTS; the cheap one is
+  to warn once per process when `_cache_bias != 0.0` and no layer ever reached that branch.
+  Re-targeting the bias to run *before* the model's own top-k is a separate spec, not a patch.
+  (found + measured 2026-08-02, Plan G Task 1)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt
