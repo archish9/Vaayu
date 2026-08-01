@@ -252,14 +252,16 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   it was written (`cac8ccd`, the original A1 commit). **REMOVED 2026-08-01** on the user's call.
   `ExpertVRAMCache.drop()` is a different method and is genuinely used — untouched.
   (found + resolved 2026-08-01)
-- [ ] **KV cache stores every K/V twice.** `FP8DynamicCache` holds an fp8 store AND a full-size
+- [x] ~~**KV cache stores every K/V twice.**~~ **CLOSED 2026-08-02** — the entry's own criterion
+  ("closes when Task 5b flips `auto`") was met by `232745d`: `_create_kv_cache` now picks `bf16`
+  for EXL3, so default runs pay 2.000 B/elem, not 3.016. Only the disk-persistence follow-up
+  (below, Plan E) is left. Original finding: `FP8DynamicCache` holds an fp8 store AND a full-size
   dequantized mirror; `update()` returns the mirror, so the fp8 copy is never read by attention.
   Measured 3.016 bytes/element, mirror = 66% of it; plain fp16 is 2.0 B/elem — so `kv_cache_mode`
   fp8 (what `auto` picks for every EXL3 model) costs **~1.5× more VRAM than no quantization**.
   Not a crash, not a correctness bug; a standing ~33% VRAM overcharge on every run.
   **Plan E built the fix** (`kv_cache_mode="bf16"`, 2.000 B/elem measured on both models,
-  `c8cfca8`), but `auto` still selects fp8, so **default runs still pay the overcharge**. Closes
-  when Task 5b flips `auto`. (found + measured 2026-08-01; fix available 2026-08-01)
+  `c8cfca8`). (found + measured 2026-08-01; fixed 2026-08-01, `auto` flipped 2026-08-02)
 - [x] ~~**`VAAYU_CACHE_BIAS` is a silent no-op.**~~ **FIXED 2026-08-02 `df9a52e`**:
   `_warn_cache_bias_inert` warns once per model instance, naming the path that shadowed the
   bias, from all four routing dispatch sites. 3 tests; suite 443 → 446. On-device: Qwen 1
