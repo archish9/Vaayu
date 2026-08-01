@@ -511,16 +511,26 @@ class FP8DynamicCache(DynamicCache):
     rather than delegating to the parent's layer-based storage, so that FP8
     tensors (and their companion scale tensors) are stored contiguously and
     can be concatenated cheaply across decode steps.
+
+    With quantize=False the fp8 store, the scales and the dequantized mirror are
+    all skipped: K/V are held directly in their source dtype (bf16/fp16) and
+    update() returns slices of them. Measured 2.0 vs 3.016 bytes/element -- the
+    fp8 copy buys nothing once a full-precision copy has to exist for attention
+    anyway, and bf16 storage is lossless where fp8 is not. What this class
+    actually provides is the ring buffer (amortized O(1) append), which is
+    mode-independent.
     """
 
-    def __init__(self):
+    def __init__(self, quantize: bool = True):
         super().__init__()
+        self.quantize = bool(quantize)
         # Capacity buffers (allocated lazily on first update per layer). Each holds
         # >= _seq_len[layer] valid tokens on the dim=-2 (sequence) axis; the tail is
         # unused capacity. Fix #8: replaces per-token torch.cat (O(seq^2)) with
         # in-place writes + geometric doubling (amortized O(1) append).
         self.key_cache: list = []       # fp8 K, shape [B, H, capacity, D]
         self.value_cache: list = []     # fp8 V
+        # The four buffer lists below stay empty when quantize=False.
         self._key_scales: list = []     # [B, H, capacity, 1]
         self._value_scales: list = []
         self._k_out_cache: list = []    # dequantized K, [B, H, capacity, D]
@@ -538,7 +548,9 @@ class FP8DynamicCache(DynamicCache):
         new_cap = max(needed, max(1, cap) * self._GROWTH)
         B, H, _, D = template_kv.shape
         dev, kv_dtype = template_kv.device, template_kv.dtype
-        out_dtype = template_scale.dtype  # dequantized output dtype (fp16/bf16)
+        # unquantized: template_kv IS the source K, so its dtype is the storage
+        # dtype and there is no separate scale dtype.
+        out_dtype = kv_dtype if template_scale is None else template_scale.dtype
 
         def _grow(old_list, last_dim, dtype):
             buf = torch.zeros((B, H, new_cap, last_dim), dtype=dtype, device=dev)
@@ -551,14 +563,27 @@ class FP8DynamicCache(DynamicCache):
 
         _grow(self.key_cache,     D, kv_dtype)
         _grow(self.value_cache,   D, kv_dtype)
-        _grow(self._key_scales,   1, template_scale.dtype)
-        _grow(self._value_scales, 1, template_scale.dtype)
-        _grow(self._k_out_cache,  D, out_dtype)
-        _grow(self._v_out_cache,  D, out_dtype)
+        if self.quantize:
+            _grow(self._key_scales,   1, template_scale.dtype)
+            _grow(self._value_scales, 1, template_scale.dtype)
+            _grow(self._k_out_cache,  D, out_dtype)
+            _grow(self._v_out_cache,  D, out_dtype)
         if layer_idx >= len(self._seq_len):
             self._seq_len.append(0)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        if not self.quantize:
+            n_new = key_states.shape[-2]
+            prev = self._seq_len[layer_idx] if layer_idx < len(self._seq_len) else 0
+            self._ensure_capacity(layer_idx, prev + n_new, key_states, None)
+            s = slice(prev, prev + n_new)
+            self.key_cache[layer_idx][..., s, :] = key_states
+            self.value_cache[layer_idx][..., s, :] = value_states
+            self._seq_len[layer_idx] = prev + n_new
+            used = self._seq_len[layer_idx]
+            return (self.key_cache[layer_idx][..., :used, :],
+                    self.value_cache[layer_idx][..., :used, :])
+
         k_scale = key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
         v_scale = value_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
         k_fp8 = (key_states / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
@@ -606,13 +631,19 @@ class FP8DynamicCache(DynamicCache):
             if keep_len >= used:
                 continue
             start = used - keep_len
-            for buf in (self.key_cache, self.value_cache, self._key_scales,
-                        self._value_scales, self._k_out_cache, self._v_out_cache):
+            for name in self._BUFFER_LISTS:
+                buf = getattr(self, name)
                 buf[i][..., :keep_len, :] = buf[i][..., start:used, :].clone()
             self._seq_len[i] = keep_len
 
-    _BUFFER_LISTS = ("key_cache", "value_cache", "_key_scales",
-                     "_value_scales", "_k_out_cache", "_v_out_cache")
+    @property
+    def _BUFFER_LISTS(self):
+        """Only the buffer lists this instance actually allocates: unquantized
+        mode has no scales and no dequantized mirror."""
+        if self.quantize:
+            return ("key_cache", "value_cache", "_key_scales",
+                    "_value_scales", "_k_out_cache", "_v_out_cache")
+        return ("key_cache", "value_cache")
 
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU

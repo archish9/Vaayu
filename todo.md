@@ -74,7 +74,10 @@ dequantized mirror that `update()` actually returns. Measured (B=1 H=8 S=2048 D=
 is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization at all** — and
 `auto` selects fp8 for every EXL3 model. What the class really provides is the ring buffer
 (amortized O(1) append), which is mode-independent.
-- [ ] **Task 1** — `quantize=False` mode: bf16-only ring buffer, 2.0 B/elem, lossless (TDD)
+- [x] **Task 1** — `quantize=False` mode: bf16-only ring buffer, 2.0 B/elem, lossless (TDD)
+  - [x] 7 tests in `tests/test_fp8_kv_cache.py` (fail → pass); suite 424 → 431 green
+  - [x] `_BUFFER_LISTS` class constant → instance property; `crop_front` iterates it (it had
+    hardcoded all six lists, which would IndexError on the empty ones in unquantized mode)
 - [ ] **Task 2** — fix `kv_cache_manager._extract_kv_as_bf16`: it branches on `isinstance(...,
   FP8DynamicCache)` then unconditionally multiplies by `_key_scales` — wrong for an unquantized
   instance of the same class. **The sharpest trap in the plan.**

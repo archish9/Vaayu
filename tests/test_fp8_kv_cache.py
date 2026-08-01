@@ -7,6 +7,12 @@ def _random_kv(batch=1, heads=2, seq=1, dim=4):
     return torch.randn(batch, heads, seq, dim), torch.randn(batch, heads, seq, dim)
 
 
+def _bf16_kv(batch=1, heads=4, seq=8, dim=16):
+    torch.manual_seed(0)
+    return (torch.randn(batch, heads, seq, dim, dtype=torch.bfloat16),
+            torch.randn(batch, heads, seq, dim, dtype=torch.bfloat16))
+
+
 def _reference_dequant(cache: FP8DynamicCache, layer_idx: int, dtype: torch.dtype):
     """What update() used to compute: full re-dequant of the whole accumulated cache.
 
@@ -107,3 +113,78 @@ def test_trim_kv_cache_front_keeps_out_cache_in_sync():
     assert cache._k_out_cache[0].shape[-2] == target
     assert torch.equal(cache._k_out_cache[0], ref_k)
     assert torch.equal(cache._v_out_cache[0], ref_v)
+
+
+# --- unquantized (bf16-only ring buffer) mode ---
+
+
+def test_unquantized_mode_allocates_no_fp8_or_scale_buffers():
+    cache = FP8DynamicCache(quantize=False)
+    k, v = _bf16_kv()
+    cache.update(k, v, layer_idx=0)
+    assert cache.quantize is False
+    assert cache.key_cache[0].dtype == k.dtype      # stored in the source dtype
+    assert cache._key_scales == []                  # no scales allocated
+    assert cache._value_scales == []
+    assert cache._k_out_cache == []                 # no dequantized mirror
+    assert cache._v_out_cache == []
+
+
+def test_unquantized_mode_is_lossless():
+    """fp8 is lossy; bf16 storage is not. Round-trip must be exact."""
+    cache = FP8DynamicCache(quantize=False)
+    k, v = _bf16_kv()
+    k_out, v_out = cache.update(k, v, layer_idx=0)
+    assert torch.equal(k_out, k)
+    assert torch.equal(v_out, v)
+
+
+def test_unquantized_mode_is_two_bytes_per_element():
+    cache = FP8DynamicCache(quantize=False)
+    k, v = _bf16_kv(seq=8)
+    cache.update(k, v, layer_idx=0)
+    assert cache.resident_bytes() == 2 * k.numel() * 2   # K and V, 2 bytes each
+
+
+def test_quantized_mode_is_unchanged():
+    """Regression guard: the fp8 path must keep all six buffers."""
+    cache = FP8DynamicCache()                       # default quantize=True
+    k, v = _bf16_kv()
+    cache.update(k, v, layer_idx=0)
+    assert cache.quantize is True
+    assert cache.key_cache[0].dtype == torch.float8_e4m3fn
+    assert len(cache._key_scales) == 1 and len(cache._k_out_cache) == 1
+
+
+def test_unquantized_mode_appends_across_steps():
+    """The ring buffer must still work -- that is the whole reason this class exists."""
+    cache = FP8DynamicCache(quantize=False)
+    k1, v1 = _bf16_kv(seq=3)
+    k2, v2 = _bf16_kv(seq=1)
+    cache.update(k1, v1, layer_idx=0)
+    k_out, _ = cache.update(k2, v2, layer_idx=0)
+    assert cache.get_seq_length(0) == 4
+    assert k_out.shape[-2] == 4
+    assert torch.equal(k_out[..., :3, :], k1)
+    assert torch.equal(k_out[..., 3:, :], k2)
+
+
+def test_unquantized_mode_crop_and_to_cpu():
+    cache = FP8DynamicCache(quantize=False)
+    k, v = _bf16_kv(seq=6)
+    cache.update(k, v, layer_idx=0)
+    cache.crop(4)
+    assert cache.get_seq_length(0) == 4
+    cache.to_cpu()
+    assert cache.key_cache[0].device.type == "cpu"
+    assert cache.key_cache[0].shape[-2] == 4        # compacted to used length
+
+
+def test_unquantized_mode_crop_front():
+    cache = FP8DynamicCache(quantize=False)
+    k, v = _bf16_kv(seq=6)
+    cache.update(k, v, layer_idx=0)
+    cache.crop_front(2)
+    k_out, _ = cache.update(*_bf16_kv(seq=1), layer_idx=0)
+    assert cache.get_seq_length(0) == 3
+    assert torch.equal(k_out[..., :2, :], k[..., 4:, :])
