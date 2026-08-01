@@ -1235,7 +1235,12 @@ class VaayuBaseModel(GenerationMixin):
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
                 else:
-                    print("[Vaayu-MoE] Expert VRAM cache: disabled (insufficient free VRAM)")
+                    print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled — free VRAM "
+                          f"{_free_vram/1e9:.2f}GB leaves {_vram_budget/1e9:.2f}GB after the "
+                          f"{_VRAM_RESERVE_BYTES/1e9:.2f}GB decode reserve, under one "
+                          f"{self._moe_geometry['expert_bytes']/1e6:.1f}MB expert. Every expert "
+                          f"streams per token; expect very slow decode (a real hardware limit, "
+                          f"not a bug).")
 
             _ws_gb = _geo["working_set_bytes"] / 1e9
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "

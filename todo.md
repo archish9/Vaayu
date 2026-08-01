@@ -5,7 +5,7 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-07-24._
+_Last updated: 2026-08-01._
 
 ---
 
@@ -34,7 +34,7 @@ Sequence is forced by dependencies, not preference:
 RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
 - [x] **Task 1** — raise `_VRAM_RESERVE_BYTES` 2GB→3.5GB (in-code, TDD) — `045f387`
   - [x] Guard test in `tests/test_vram_budget.py` (fail → pass); full suite 391 green
-  - [x] Constant + hardware-comment in `vaayu_base.py` (now `:179`); docstring updated
+  - [x] Constant + hardware-comment on `_VRAM_RESERVE_BYTES` in `vaayu_base.py`; docstring updated
   - [x] Mark on-hold KV-eviction spec superseded
 - [x] **Task 2** — on-device gate — `86a6ca5`
   - [x] K=2 R=2 with `expandable_segments:True` → 4/4, no OOM, kernel OOM 0
@@ -71,10 +71,24 @@ RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
   **NO LONGER REPRODUCES** after Plan A (2026-08-01): round-2 revisits HIT at both K=2 and
   K=3 (TTFT ~90-101s → ~9-10s). The MISSes were a downstream effect of the OOM aborting/
   poisoning round 2, not a separate keying bug.
-- [bug] **Stale cross-reference comment.** `vaayu/moe_patch.py:666` says
-  `_PREFILL_VRAM_HEADROOM` is "the same class/value as `vaayu_base._VRAM_RESERVE_BYTES`" —
-  false since Plan A (2 GB vs 3.5 GB). File was off-limits to Plan A's tasks. Doc-only, no
-  behavior impact; fix when next touching `moe_patch.py`. (found 2026-08-01)
+- [x] ~~**Stale cross-reference comment.**~~ `vaayu/moe_patch.py` claimed
+  `_PREFILL_VRAM_HEADROOM` was "the same class/value as `vaayu_base._VRAM_RESERVE_BYTES`" —
+  false since Plan A (2 GB vs 3.5 GB). **FIXED** in `9aa2c61`: comment now states both are the
+  same CLASS of hardware constant but deliberately DIFFERENT values, with the reason.
+  (found + fixed 2026-08-01)
+- [x] ~~**VRAM-cache-disabled message was too quiet.**~~ `vaayu/vaayu_base.py` announced
+  "Expert VRAM cache: disabled (insufficient free VRAM)" as a plain info line, while the
+  milder working-set-exceeds-budget case right below it uses `WARNING:`. CLAUDE.md §5 says a
+  model that genuinely doesn't fit must WARN, not silently degrade — and this is the harder
+  failure of the two (every expert streams per token). **FIXED 2026-08-01**: now a `WARNING:`
+  carrying free VRAM, the post-reserve budget, the reserve, and the derived expert size.
+  Found by Plan A's final review (parked there as out-of-scope). Not reachable on this box
+  (11.7 GB free), so no on-device re-run needed. (found + fixed 2026-08-01)
+- [x] ~~**Drifting line-number citations.**~~ Plan A's docs cited `vaayu_base.py:168`, then
+  `:179`, while the constant is now at `:188` — each edit to the file re-broke them.
+  **FIXED 2026-08-01** by citing the SYMBOL (`_VRAM_RESERVE_BYTES`) instead of a line number,
+  which cannot drift. Historical line refs inside the 2026-07-23 diagnostic RESULTS are left
+  as-is: they are a point-in-time record, accurate when written.
 
 ---
 

@@ -40,14 +40,14 @@ Every task implicitly includes these.
 - **Kernel OOM-kill count stays 0.** Baseline before Task 2:
   `journalctl -k --no-pager | grep -ci "out of memory\|oom-kill"` → 0. Must not rise.
 - **Do NOT touch `_PREFILL_VRAM_HEADROOM`** (`vaayu/moe_patch.py:669`). The diagnostic proved
-  it works. This fix is the *cache-budget* reserve (`vaayu/vaayu_base.py:179`), a different
+  it works. This fix is the *cache-budget* reserve `_VRAM_RESERVE_BYTES` in `vaayu/vaayu_base.py`, a different
   constant.
 - Run tests with `source venv/bin/activate` first; `python -m pytest tests/ -q` must stay green.
 - On-device runs use the real models + GPU and are operator-run (Task 2).
 
 ## File Structure
 
-- **Modify `vaayu/vaayu_base.py:179`** — raise `_VRAM_RESERVE_BYTES` from 2 GB and rewrite its
+- **Modify `vaayu/vaayu_base.py`** — raise `_VRAM_RESERVE_BYTES` from 2 GB and rewrite its
   hardware-constant comment to cite the decode-boundary verdict. `compute_vram_expert_budget`
   (`:171`) is unchanged in logic; only its docstring is clarified.
 - **Modify `tests/test_vram_budget.py`** — add a guard test pinning the raised reserve + intent.
@@ -64,7 +64,7 @@ Shrink the VRAM expert cache so decode keeps headroom. One constant, one guard t
 reconciliation.
 
 **Files:**
-- Modify: `vaayu/vaayu_base.py:179` (`_VRAM_RESERVE_BYTES`) and `:182` (`compute_vram_expert_budget` docstring)
+- Modify: `vaayu/vaayu_base.py` — `_VRAM_RESERVE_BYTES` and the `compute_vram_expert_budget` docstring
 - Modify: `tests/test_vram_budget.py`
 - Modify: `docs/superpowers/specs/2026-07-23-vram-prefill-headroom-design.md`
 
@@ -268,7 +268,7 @@ grep -oE "decode [0-9.]+ tok/s|[0-9.]+ tok/s" run-decode-tps-qwen.log | tail -3
 - MiniMax ≥ ~1.47 AND Qwen ≥ ~0.85 (within run-to-run noise the project documents) → PASS,
   the 3.5 GB reserve is accepted.
 - If either regresses below floor → the cache shrink cost too much. Back the reserve off to
-  `int(3.0 * 1024 ** 3)` in `vaayu/vaayu_base.py:179` (still > the failed 2 GB), lean on
+  `int(3.0 * 1024 ** 3)` in `vaayu/vaayu_base.py` (still > the failed 2 GB), lean on
   expandable_segments to cover the remaining fragmentation, re-run Steps 2 + 4. Record the
   final accepted value in RESULTS.
 

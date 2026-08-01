@@ -10,7 +10,7 @@ The excerpts quoted below are the record of their content.
 
 ## Accepted reserve value
 
-`_VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)` (`vaayu/vaayu_base.py:179`), unchanged from the
+`_VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)` (`vaayu/vaayu_base.py`), unchanged from the
 Task 1 value — no back-off needed (decode did not regress, see below). This is a **hardware
 constant of the 16 GB box**, not a per-model number (§5): it sizes `free_vram − reserve` for
 the resident expert cache regardless of which model is loaded.
