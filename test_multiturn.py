@@ -48,6 +48,13 @@ sys.path.insert(0, project_root)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 from vaayu import AutoModel
+
+# Reclaim disk by deleting the ORIGINAL downloaded shards once the split copy
+# exists and is verified complete (~60-66 GB per model on this box). Off by
+# default and IRREVERSIBLE -- recovery is a re-download. Enable per-run with
+# VAAYU_DELETE_ORIGINAL=1, or flip the default here.
+DELETE_ORIGINAL = os.environ.get("VAAYU_DELETE_ORIGINAL", "0") == "1"
+
 from vaayu.streaming import stream_generate
 
 
@@ -60,6 +67,7 @@ print("Loading model...")
 _t0 = time.time()
 model = AutoModel.from_pretrained(
     MODEL_PATH, device=DEVICE, kv_cache_mode=KV_CACHE_MODE,
+    delete_original=DELETE_ORIGINAL,
     max_pinned_layers=10, prefill_chunk_size=PREFILL_CHUNK_SIZE,
     enable_prefix_cache=True, auto_prefix_match=True,
     enable_kv_persist=False,   # isolate the RAM prefix cache; no disk tier

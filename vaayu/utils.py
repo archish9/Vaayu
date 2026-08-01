@@ -183,6 +183,36 @@ def remove_real_and_linked_file(to_delete):
 
 
 
+def delete_original_shards(checkpoint_path, index, safetensors_format):
+    """Delete the source checkpoint shards a completed split has replaced.
+
+    Only the weight files named by `index` are removed -- config, tokenizer and
+    the index itself stay, since every subsequent load still reads them. Missing
+    files are skipped (already reclaimed by an earlier run).
+
+    Callers MUST have verified the split is complete first: this is
+    irreversible, and `remove_real_and_linked_file` follows symlinks, so a shard
+    linked into the shared HF cache takes the cached blob with it.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    freed = 0
+    for name in sorted(set(index.values())):
+        f = checkpoint_path / name
+        if not f.exists():
+            continue
+        try:
+            size = os.path.getsize(f)
+            remove_real_and_linked_file(f)
+            freed += size
+            print(f"deleting original file: {f}")
+        except OSError as e:
+            print(f"could not delete {f}: {e}")
+    if freed:
+        print(f"delete_original: reclaimed {freed / 1024 ** 3:.1f} GB from "
+              f"{checkpoint_path} (the split copy is now the only copy)")
+    return freed
+
+
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
                           compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None):
     """
@@ -267,6 +297,16 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         if all(found_layers.values()):
             # already downloaded, return saving path...
             print(f"saved layers already found in {saving_path}")
+            if delete_original:
+                # The mid-split deletion below never runs for an already-split
+                # model, so without this the originals sit next to the split
+                # copy forever -- the exact duplication the flag exists to
+                # avoid (measured 60-66 GB per model on the dev box).
+                # Gated on the split being VERIFIED COMPLETE: every expected
+                # layer has both its .safetensors and its .done marker, which
+                # is what all(found_layers.values()) above means. IRREVERSIBLE
+                # -- recovery is a re-download.
+                delete_original_shards(checkpoint_path, index, safetensors_format)
             return str(saving_path)
         else:
             print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
