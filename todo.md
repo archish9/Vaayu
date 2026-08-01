@@ -5,7 +5,7 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-01._
+_Last updated: 2026-08-01 (Plan D Task 5 RESULTS + verdict)._
 
 ---
 
@@ -68,28 +68,36 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
 by the measurement-only retarget below. Its gate (the VRAM OOM chain) closed 2026-08-01, but its
 PREMISE WARNING still stands: do not build Phase 1 as written.
 - [x] Blocker cleared — VRAM OOM chain closed (`045f387`..`aada3cd`)
-- [!] Tasks 3,6 (the pin) — NOT built. Two reasons: `ExpertVRAMCache` still has no pin mechanism,
-  and a startup pre-warm is a **no-op** — `_ensure_prefill_headroom` evicts the VRAM cache on
-  every prefill and every generation starts with one (measured 9.04→2.64GB, 1362 evictions).
-  Unblocks only if Plan D's measurement finds hot-but-evicted experts.
+- [!] Tasks 3,6 (the pin) — NOT built. No longer blocked on "is there a target?" — Plan D
+  measured one: hot-but-evicted experts exist, but a top-10-per-layer pin would only reach
+  **19%** of budget-pressure evictions (15,255 of 78,726); the other 81% sit in the long tail,
+  and the VRAM cache runs saturated (evictions ≈ misses per token), so pinning redistributes
+  pressure rather than eliminating it. `ExpertVRAMCache` still has no pin mechanism, and a
+  startup pre-warm is still a **no-op** (`_ensure_prefill_headroom` evicts the VRAM cache on
+  every prefill; measured 9.04→2.64GB, 1362 evictions). A future pin spec must justify its N
+  against the 19% figure, address the redistribution effect, and consider whether the 81% long
+  tail is better addressed some other way — see the RESULTS doc's Recommendation section.
 - [x] Tasks 2,5 (persist/decay, `compute_pin_set`) — **DROPPED as speculative** (§2): persistence
   matters only once a win is known; a pin set for a pin that doesn't exist is dead weight.
 - [ ] Tasks 8,9 (Phase 2 live re-pin) — untouched, still deferred
 
-### Plan D — Expert usage histogram, measurement only  **(P3 — active)**
+### Plan D — Expert usage histogram, measurement only  **(P3)** — ✅ DONE 2026-08-01
 `docs/superpowers/plans/2026-08-01-expert-usage-histogram-measurement.md`
 Spec: `docs/superpowers/specs/2026-08-01-expert-usage-histogram-measurement-design.md` (`c38132e`)
-Answers ONE question: are there experts decode routes to often but the VRAM cache keeps evicting?
-A "no" retires Plan B's pin on evidence — that outcome is a success, not a failure.
-- [ ] **Task 1** — `ExpertUsageTracker`: device-side route counter, no hot-path sync (TDD)
-- [ ] **Task 2** — per-key attribution of **budget-pressure evictions only** in `ExpertVRAMCache`
-  - [ ] Discriminating test: `evict_until_free()` evictions must NOT be attributed (needs CUDA —
-        confirm it RAN, not skipped)
-- [ ] **Task 3** — report joining routes with evictions; labels "no pin needed" as plainly as
-  "pin candidate"
-- [ ] **Task 4** — wire in behind `enable_expert_usage` (default False); hook at 3 routing sites,
-  decode-only
-- [ ] **Task 5** — on-device run on MiniMax + RESULTS + the pin VERDICT; check decode vs ~1.47 floor
+RESULTS: `docs/superpowers/plans/2026-08-01-expert-usage-histogram-measurement-RESULTS.md`
+Answered: are there experts decode routes to often but the VRAM cache keeps evicting? **Yes, but
+only 19% of budget-pressure evictions land on each layer's top-10 experts — routing is diffuse
+and the cache runs saturated.** See RESULTS for the full nuance and recommendation.
+- [x] **Task 1** — `ExpertUsageTracker`: device-side route counter, no hot-path sync (TDD) — `cc99f0b`
+- [x] **Task 2** — per-key attribution of **budget-pressure evictions only** in `ExpertVRAMCache` — `2abdc2b`
+  - [x] Discriminating test: `evict_until_free()` evictions must NOT be attributed (CUDA-gated, ran)
+- [x] **Task 3** — report joining routes with evictions; labels "no pin needed" as plainly as
+  "pin candidate" — `90bb75e` (+ remainder-warning fix `7d24b24`)
+- [x] **Task 4** — wire in behind `enable_expert_usage` (default False); hook at 3 routing sites,
+  decode-only — `1ea4374`
+- [x] **Task 5** — on-device run on MiniMax + RESULTS + the pin VERDICT — this commit.
+  126,480 routes, 78,726 budget-pressure evictions, top-10 share 19% (15,255), decode 1.48 tok/s
+  vs ~1.47 floor (PASS), 0 OOM.
 
 ---
 
