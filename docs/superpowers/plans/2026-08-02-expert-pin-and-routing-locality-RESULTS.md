@@ -62,22 +62,40 @@ calls to `cache_aware_topk`, `_build_resident_mask`, and `route_experts`, then r
 
 15,872 = 62 layers × 256 tokens, i.e. every single MoE dispatch went somewhere else.
 
-The dispatch is `vaayu/moe_patch.py` in `sparse_forward`, right after `router_res = router(...)`:
+**The two models miss the feature for different reasons, and they are not even on the same
+forward.** This was pinned down afterwards by the warning added in `df9a52e`, which names the
+path that shadowed the bias; an earlier draft of this document mis-attributed MiniMax to the
+EXL3 fused forward's `route_tokens_to_experts` branch, because `route_experts` is called from
+two different forwards and the probe alone could not tell them apart.
 
-1. **`isinstance(router_res, tuple) and len(router_res) >= 3`** → the model's router already
-   returned its own top-k; Vaayu uses it as-is. **This is the Qwen path** (both counters zero).
-   Under transformers 5.x the MoE routers were refactored into `*TopKRouter` modules that do the
-   top-k internally: `Qwen3MoeTopKRouter.forward` returns `(router_logits, routing_weights,
-   selected_experts)`, and `Qwen3MoeSparseMoeBlock` unpacks three values from it.
-2. **`callable(getattr(moe_mod, "route_tokens_to_experts", None))`** → the model owns its scoring
-   function; `route_experts` runs. **This is the MiniMax path** (15,872 calls). MiniMax scores
-   with sigmoid plus an `e_score_correction_bias` buffer, which Vaayu correctly refuses to
-   re-derive.
-3. The `else` — plain softmax top-k, the **only** branch that calls `cache_aware_topk`.
+**Qwen3-235B → `_make_fused_sparse_forward_exl3`, tuple branch.** Its router already returned
+its own top-k, so `sparse_forward` takes
+`isinstance(router_res, tuple) and len(router_res) >= 3` and uses the selection as-is. Under
+transformers 5.x the MoE routers were refactored into `*TopKRouter` modules that do the top-k
+internally: `Qwen3MoeTopKRouter.forward` returns `(router_logits, routing_weights,
+selected_experts)`. On-device warning: *"the router returned its own top-k"*.
 
-Branch 3 requires a router that returns bare logits and a block that does not own its scoring.
-No MoE model on this box does that any more. The feature did not regress in Vaayu; **it was
-stranded by the upstream transformers router refactor.**
+**MiniMax-M2.7 → `_make_modulelist_sparse_forward`, which has no cache-aware routing at all.**
+The MiniMax EXL3 repo ships custom modeling code and stores per-expert submodules
+(`...block_sparse_moe.experts.10.w1.*`), so `detect_moe_blocks` classifies it
+`expert_style="module_list"` and `_make_sparse_moe_forward` never reaches the EXL3 fused variant.
+Its 15,872 `route_experts` calls come from the module-list forward, not from the EXL3 one.
+On-device warning: *"this model uses the module-list expert layout"*.
+
+Inside the EXL3 fused forward there is a third branch —
+`callable(getattr(moe_mod, "route_tokens_to_experts", None))`, for models that own their scoring
+function — and only the final `else` (plain softmax top-k) calls `cache_aware_topk`. That branch
+needs a router returning bare logits *and* a block that does not own its scoring *and* the fused
+EXL3 layout. Nothing on this box satisfies all three. The feature did not regress in Vaayu; **it
+was stranded by the upstream transformers router refactor.**
+
+### Side finding: MiniMax is not on the EXL3 fused path
+
+`CLAUDE.md` §0's dispatch table calls MoE+EXL3 → `_make_fused_sparse_forward_exl3` the
+"actively tested" row and the module-list row "gated in, not perf-tuned". On this box that is
+backwards for MiniMax: it is EXL3-quantized but runs the **module-list** forward, and it is one
+of the two actively-tested models. Every MiniMax perf number ever recorded — including Plan F's
+— is a module-list-path number. Ledgered in `todo.md`; not acted on here.
 
 ## What this does and does not say
 
@@ -93,9 +111,10 @@ Three options, in ascending cost. **Do not silently leave things as they are** �
 `VAAYU_CACHE_BIAS=1.0` today gets no bias, no error, and no warning, which is the exact silent
 degradation CLAUDE.md §5 forbids.
 
-1. **Honesty fix (small, recommended now).** When `_cache_bias != 0.0` but no MoE layer ever
-   reaches branch 3, warn once per process that cache-aware routing is inactive on this model.
-   Cheapest correct behavior; keeps the code for a model that does hit branch 3.
+1. ~~**Honesty fix (small, recommended now).**~~ **DONE `df9a52e`.** `_warn_cache_bias_inert`
+   warns once per model instance, naming the path that shadowed the bias, from all four routing
+   dispatch sites. 3 unit tests; suite 443 → 446. On-device: Qwen 1 warning, MiniMax 1 warning,
+   unset run 0 warnings; decode unregressed (Qwen 0.84, MiniMax 1.49–1.51).
 2. **Re-target the bias (a real spec, not a patch).** Apply the resident-expert bias to the
    *scores the model itself computes*, before its top-k, rather than to raw logits after it.
    That means hooking each family's router (`*TopKRouter.forward`) instead of the block, and it

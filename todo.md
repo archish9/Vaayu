@@ -6,7 +6,8 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
 _Last updated: 2026-08-02 (Plans F and G both CLOSED — no viable pin N; the routing bias turned
-out to be unreachable code on both models)._
+out to be unreachable code on both models, now warned about; MiniMax found to run the
+module-list forward, not the EXL3 fused one)._
 
 ---
 
@@ -22,7 +23,8 @@ Plans A, C, D are ✅ DONE (2026-08-01) and F ✅ DONE (2026-08-02) — see Acti
    — eviction share is linear in N and 2–4× below the pin's share of the cache, on both models.
 3. ~~**P3 — Plan G (expert pin + routing locality).**~~ ✅ CLOSED 2026-08-02, nothing built.
    Pin dropped on F's evidence; the bias was measured and found to be **unreachable code** on both
-   models. One follow-up falls out of it — see "cache-aware routing is dead code" below.
+   models — now warned about (`df9a52e`). It also turned up a doc-level surprise: MiniMax runs the
+  module-list forward, not the EXL3 fused one. Both are ledgered below.
 4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
    precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
    context, NOT decode speed.
@@ -145,6 +147,10 @@ RESULTS: `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESU
   - [x] Root cause: transformers 5.5.4 refactored MoE routers into `*TopKRouter` modules that do
     the top-k internally, so no current model reaches the plain-softmax `else` branch that
     `cache_aware_topk` lives in. Vaayu did not regress — the feature was **stranded upstream**.
+  - [x] Attribution corrected after the warning landed: Qwen is on the EXL3 fused forward's tuple
+    branch, but **MiniMax is on the module-list forward entirely** — `route_experts` is called
+    from two different forwards, so the probe alone could not tell them apart.
+  - [x] Follow-up **DONE** `df9a52e`: warn once per model when the bias is set but inert.
   - [x] Output text differs between runs but not with bias (0.25/0.5 share an opener, 0/1.0/2.0
     share another) — fp nondeterminism in the expert reduction, not routing change.
 - [x] **Tasks 2–4** (the pin) — DROPPED on Plan F's evidence, per this plan's own PRECONDITION.
@@ -254,16 +260,31 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   **Plan E built the fix** (`kv_cache_mode="bf16"`, 2.000 B/elem measured on both models,
   `c8cfca8`), but `auto` still selects fp8, so **default runs still pay the overcharge**. Closes
   when Task 5b flips `auto`. (found + measured 2026-08-01; fix available 2026-08-01)
-- [ ] **`VAAYU_CACHE_BIAS` is a silent no-op — cache-aware routing is unreachable code.**
+- [x] ~~**`VAAYU_CACHE_BIAS` is a silent no-op.**~~ **FIXED 2026-08-02 `df9a52e`**:
+  `_warn_cache_bias_inert` warns once per model instance, naming the path that shadowed the
+  bias, from all four routing dispatch sites. 3 tests; suite 443 → 446. On-device: Qwen 1
+  warning ("the router returned its own top-k"), MiniMax 1 warning ("module-list expert
+  layout"), unset run 0; decode unregressed (Qwen 0.84, MiniMax 1.49-1.51). The bias itself is
+  still unreachable — re-targeting it before the model's own top-k remains an unwritten spec.
+  Original finding:
   `cache_aware_topk` / `_build_resident_mask` (`vaayu/moe_patch.py`) live in the plain-softmax
   `else` branch of `sparse_forward`'s router dispatch. Under transformers 5.5.4 no MoE model
-  reaches it: MiniMax takes the `route_tokens_to_experts` branch, Qwen takes the
-  `len(router_res) >= 3` tuple branch (routers now do their own top-k). **Probe: 0 calls on both
-  models at bias=2.0.** A user who sets the env var gets no bias, no error, no warning — the
+  reaches it: Qwen takes the `len(router_res) >= 3` tuple branch (transformers 5.x routers do
+  their own top-k), and MiniMax is not even on that forward — it runs the module-list one (see
+  the entry below). **Probe: 0 calls on both models at bias=2.0.** A user who sets the env var gets no bias, no error, no warning — the
   silent degradation CLAUDE.md §5 forbids. Three options in the Plan G RESULTS; the cheap one is
   to warn once per process when `_cache_bias != 0.0` and no layer ever reached that branch.
   Re-targeting the bias to run *before* the model's own top-k is a separate spec, not a patch.
-  (found + measured 2026-08-02, Plan G Task 1)
+  (found + measured 2026-08-02, Plan G Task 1; warning landed same day)
+- [ ] **MiniMax runs the module-list forward, not the EXL3 fused one.** `CLAUDE.md` §0's dispatch
+  table treats MoE+EXL3 → `_make_fused_sparse_forward_exl3` as the actively-tested row and
+  module-list as "gated in, not perf-tuned". MiniMax-M2.7 is EXL3-quantized but its repo ships
+  custom modeling code with per-expert submodules (`...block_sparse_moe.experts.10.w1.*`), so
+  `detect_moe_blocks` classifies it `expert_style="module_list"` and it takes
+  `_make_modulelist_sparse_forward`. Qwen does take the EXL3 fused path. So **both rows are
+  actively tested, and every MiniMax perf number on record is a module-list number** — including
+  Plan F's. Not a bug; the doc and the mental model are wrong, and an optimization aimed at "the
+  EXL3 fused path" would miss MiniMax entirely. (found 2026-08-02 via the bias warning)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt
