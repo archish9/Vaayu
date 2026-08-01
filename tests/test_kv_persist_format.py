@@ -1,5 +1,6 @@
 """Format helpers: header round-trip, record sizing, byte IO — CPU only,
 parametrized over Qwen-like, MiniMax-like, and MLA-like geometries (§5)."""
+import dataclasses
 import io
 import types
 import torch
@@ -45,7 +46,11 @@ def test_header_roundtrip_and_record_bytes(n_layers, heads, dim):
 
 def test_unquantized_cache_gets_its_own_quant_sig():
     """A bf16 ring buffer is a different on-disk scheme than fp8+scales. It must
-    never claim the fp8 signature, or a bf16 file would be read back as fp8."""
+    never claim the fp8 signature, or a bf16 file would be read back as fp8.
+
+    Both layouts are now readable (bf16 serialization landed), so the signature's
+    job is no longer to get the file rejected — it is what tells the reader which
+    layout to parse. That is what has_scales keys off."""
     from vaayu.vaayu_base import FP8DynamicCache
     c = FP8DynamicCache(quantize=False)
     c.update(torch.randn(1, 4, 3, 16, dtype=torch.bfloat16),
@@ -54,7 +59,19 @@ def test_unquantized_cache_gets_its_own_quant_sig():
     h = kp.build_header(c, cfg, "sess-bf16", nrec=3)
     assert h.quant_sig == kp.QUANT_SIG_BF16
     assert h.quant_sig != kp.QUANT_SIG
-    assert kp.header_matches(h, cfg) is False   # the fp8 reader must reject it
+    assert kp.has_scales(h) is False            # parsed as bf16, never as fp8
+    assert kp.header_matches(h, cfg) is True    # and it IS restorable
+
+    q = FP8DynamicCache()
+    q.update(torch.randn(1, 4, 3, 16, dtype=torch.float16),
+             torch.randn(1, 4, 3, 16, dtype=torch.float16), 0)
+    hq = kp.build_header(q, cfg, "sess-fp8", nrec=3)
+    assert kp.has_scales(hq) is True
+    # Scales cost real bytes — compare the SAME header with only the signature
+    # flipped (fp8 vs bf16 records differ in KV width too, so the two real
+    # headers are not comparable).
+    assert kp.record_bytes(hq) > kp.record_bytes(
+        dataclasses.replace(hq, quant_sig=kp.QUANT_SIG_BF16))
 
 
 def test_read_header_rejects_bad_magic():

@@ -24,25 +24,6 @@ def _read_nrec(path):
     return h.nrec
 
 
-def test_append_refuses_unquantized_cache(tmp_path, capsys):
-    """bf16 caches are not serialized yet: refuse loudly rather than write bf16
-    bytes under the fp8 signature."""
-    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
-    cfg = types.SimpleNamespace(vocab_size=1000)
-    c = FP8DynamicCache(quantize=False)
-    c.update(torch.randn(1, 4, 4, 16, dtype=torch.bfloat16),
-             torch.randn(1, 4, 4, 16, dtype=torch.bfloat16), 0)
-    w.enqueue_append("s-bf16", c, cfg, [1, 2, 3, 4], 4)
-    w.drain()
-    assert not os.path.exists(w.path_for("s-bf16"))
-    assert "unquantized" in capsys.readouterr().out
-    # warns once, not per append
-    w.enqueue_append("s-bf16", c, cfg, [1, 2, 3, 4], 4)
-    w.drain()
-    assert capsys.readouterr().out == ""
-    w.close()
-
-
 def test_append_writes_header_and_grows_nrec(tmp_path):
     w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
     cfg = types.SimpleNamespace(vocab_size=1000)
@@ -560,3 +541,29 @@ def test_pipelined_truncate_then_append_no_gap(tmp_path, monkeypatch):
     assert w._state["s1"]["nrec"] == h.nrec == 15
     assert got_toks == toks[:15]
     assert 0 not in got_toks
+
+
+def test_writer_persists_an_unquantized_cache(tmp_path):
+    """The bf16 refusal is gone: auto resolves to bf16 for EXL3, so refusing it
+    made enable_kv_persist a no-op on every default run."""
+    from vaayu.vaayu_base import FP8DynamicCache
+
+    c = FP8DynamicCache(quantize=False)
+    for L in range(2):
+        k = torch.randn(1, 4, 3, 16, dtype=torch.bfloat16)
+        v = torch.randn(1, 4, 3, 16, dtype=torch.bfloat16)
+        c.update(k, v, L)
+    cfg = types.SimpleNamespace(vocab_size=1000, num_hidden_layers=2,
+                                num_key_value_heads=4, head_dim=16)
+
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 8, sync=True)
+    w.enqueue_append("sess-bf16", c, cfg, [7, 8, 9], 3)
+    w.close()
+
+    path = w.path_for("sess-bf16")
+    assert os.path.exists(path), "no file written for an unquantized cache"
+    with open(path, "rb") as f:
+        h = kp.read_header(f)
+    assert h.quant_sig == kp.QUANT_SIG_BF16
+    assert h.nrec == 3
+    assert kp.header_matches(h, cfg), "a bf16 file must be restorable"

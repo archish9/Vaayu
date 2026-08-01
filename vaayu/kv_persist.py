@@ -84,9 +84,20 @@ def build_header(cache, config, session_id: str, nrec: int) -> KvHeader:
     )
 
 
+def has_scales(h: KvHeader) -> bool:
+    """Whether this file's records carry per-head-per-token scales.
+
+    The bf16 layout stores K/V directly and has none. The header still needs a
+    valid scale_dtype_code (build_header mirrors the KV dtype), so the SIGNATURE
+    is what decides — reading scale_dtype_code would silently charge 2 bytes per
+    head per record for scales that were never written, and every seek past the
+    first record would land mid-record."""
+    return h.quant_sig != QUANT_SIG_BF16
+
+
 def record_bytes(h: KvHeader) -> int:
     ks = _DTYPE_SIZE[code_dtype(h.kv_dtype_code)]
-    ss = _DTYPE_SIZE[code_dtype(h.scale_dtype_code)]
+    ss = _DTYPE_SIZE[code_dtype(h.scale_dtype_code)] if has_scales(h) else 0
     return 4 + h.num_layers * (2 * h.num_kv_heads * h.head_dim * ks + 2 * h.num_kv_heads * ss)
 
 
@@ -126,11 +137,13 @@ def from_bytes(buf: bytes, dt: torch.dtype, shape) -> torch.Tensor:
 def pack_record(cache, pos: int, token_id: int, h: KvHeader) -> bytes:
     out = bytearray()
     out += struct.pack("<i", int(token_id))
+    scaled = has_scales(h)
     for L in range(h.num_layers):
         out += to_bytes(cache.key_cache[L][0, :, pos, :])
         out += to_bytes(cache.value_cache[L][0, :, pos, :])
-        out += to_bytes(cache._key_scales[L][0, :, pos, :])
-        out += to_bytes(cache._value_scales[L][0, :, pos, :])
+        if scaled:
+            out += to_bytes(cache._key_scales[L][0, :, pos, :])
+            out += to_bytes(cache._value_scales[L][0, :, pos, :])
     return bytes(out)
 
 
@@ -139,24 +152,36 @@ def read_records(f, h: KvHeader):
     kdt, sdt = code_dtype(h.kv_dtype_code), code_dtype(h.scale_dtype_code)
     kb = H * D * _DTYPE_SIZE[kdt]
     sb = H * 1 * _DTYPE_SIZE[sdt]
+    scaled = has_scales(h)
     key = [torch.zeros((1, H, nrec, D), dtype=kdt) for _ in range(Ln)]
     val = [torch.zeros((1, H, nrec, D), dtype=kdt) for _ in range(Ln)]
-    ks = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)]
-    vs = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)]
+    ks = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)] if scaled else []
+    vs = [torch.zeros((1, H, nrec, 1), dtype=sdt) for _ in range(Ln)] if scaled else []
     toks = []
     for p in range(nrec):
         toks.append(struct.unpack("<i", f.read(4))[0])
         for L in range(Ln):
             key[L][0, :, p, :] = from_bytes(f.read(kb), kdt, (H, D))
             val[L][0, :, p, :] = from_bytes(f.read(kb), kdt, (H, D))
-            ks[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
-            vs[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
+            if scaled:
+                ks[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
+                vs[L][0, :, p, :] = from_bytes(f.read(sb), sdt, (H, 1))
     return toks, {"key": key, "value": val, "kscale": ks, "vscale": vs}
 
 
 def build_cache(h: KvHeader, buffers: dict):
     from vaayu.vaayu_base import FP8DynamicCache
     sdt = code_dtype(h.scale_dtype_code)
+    if not has_scales(h):
+        # bf16 layout: K/V ARE the storage, so there is nothing to dequantize and
+        # the scale / mirror lists stay empty, exactly as a live quantize=False
+        # cache holds them. The restored object must keep quantize=False or its
+        # next update() would quantize into buffers that have no scales.
+        c = FP8DynamicCache(quantize=False)
+        c.key_cache = buffers["key"]
+        c.value_cache = buffers["value"]
+        c._seq_len = [h.nrec] * h.num_layers
+        return c
     c = FP8DynamicCache()
     c.key_cache = buffers["key"]
     c.value_cache = buffers["value"]
@@ -181,7 +206,6 @@ class DiskWriter:
         self.sync = sync
         os.makedirs(self.dir, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1)
-        self._warned_unquantized = False
         self._lock = threading.Lock()   # guards _state dict structure only
         self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock, "future": Future|None}
 
@@ -204,16 +228,6 @@ class DiskWriter:
                 }
 
     def enqueue_append(self, session_id, cache, config, token_ids, length):
-        # Serializing the bf16 ring buffer is not implemented (pack_record reads
-        # the scale buffers, which do not exist). Skip rather than write bf16
-        # bytes that a reader would dequantize as fp8. Warn once: this fires on
-        # every turn of every session otherwise.
-        if not getattr(cache, "quantize", True):
-            if not self._warned_unquantized:
-                print("[KV] disk persistence skipped: unquantized (bf16) KV caches "
-                      "are not serialized yet. RAM prefix cache is unaffected.")
-                self._warned_unquantized = True
-            return
         # self._lock (global) only guards the _state dict structure: atomically
         # look up or create this session's entry -- including its per-session
         # lock -- so two threads can't race to install two different locks for a
@@ -430,7 +444,11 @@ class DiskWriter:
 
 
 def header_matches(h: KvHeader, config) -> bool:
-    if h.schema_ver != SCHEMA_VER or h.quant_sig != QUANT_SIG:
+    # Both layouts are readable, and a file may legitimately be in the other one:
+    # the mode is a per-run setting, while files outlive runs. build_cache keys
+    # off the signature, so a restored cache carries its OWN mode and stays
+    # self-consistent regardless of what this run selected.
+    if h.schema_ver != SCHEMA_VER or h.quant_sig not in (QUANT_SIG, QUANT_SIG_BF16):
         return False
     nl = getattr(config, "num_hidden_layers", None)
     if nl is not None and h.num_layers != nl:
