@@ -5,25 +5,28 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-01 (Plan D Task 5 RESULTS + verdict)._
+_Last updated: 2026-08-02 (Plans E/F/G/H queued; KV double-storage finding measured)._
 
 ---
 
 ## Execution order (priority)
 
-Sequence is forced by dependencies, not preference:
+Plans A, C, D are ✅ DONE (2026-08-01) — see Active plans below. **Current queue, four plans,
+each self-contained for a fresh session:**
 
-1. **P1 — Plan A (VRAM decode-headroom fix).** The gate. Removes the multi-session
-   prefill→decode OOM that blocks everything else. Start with Task 1 (tiny, in-code, TDD),
-   then the on-device gate.
-2. **P2 — Chain step 4 (measure round-2 HIT).** Only runnable once A stops the OOM. Cheap,
-   and it's the original goal. Expect it to surface the prefix MISS-on-revisit bug (see
-   Pending bugs) → likely spawns a small follow-up plan.
-3. **P3 — Plan D (expert histogram, MEASUREMENT ONLY).** Plan B's gate cleared, but its pin is
-   premise-invalidated twice over (wrong tier, and a startup pre-warm is evicted by the first
-   prefill). Plan D measures whether a pin has any target at all before one is designed. A
-   negative result retires the pin on evidence — cheaper than building it on assumption
-   (CLAUDE.md §2).
+1. **P1 — Plan E (KV double-storage fix).** `2026-08-02-kv-double-storage-fix.md`. Independent of
+   everything else; do it first because it is the biggest free win and because Plan H's ratios
+   depend on it. Frees ~33% of KV VRAM, lossless, and *removes* quantization work.
+2. **P2 — Plan F (`top_n` eviction sweep).** `2026-08-02-expert-eviction-topn-sweep.md`. Nearly
+   zero code. Produces the N that Plan G needs, or proves no N is viable. Independent of E.
+3. **P3 — Plan G (expert pin + routing locality).** `2026-08-02-expert-pin-and-routing-locality.md`.
+   **Requires F's N.** Task 1 is a zero-code experiment (`VAAYU_CACHE_BIAS`, an existing env var
+   defaulting to 0.0) that may make the pin unnecessary.
+4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
+   precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
+   context, NOT decode speed.
+
+**Dependency summary:** E → H, F → G. E/F are independent of each other and can run in any order.
 
 ---
 
@@ -62,6 +65,66 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
 - [x] **Final review fixes** — `aada3cd`: auto-match asymmetry documented + 2 tests,
   `.gitignore` for evidence logs, unlocked-read rationale, `R_ROUNDS<2` guard,
   kv_persist eviction note
+
+### Plan E — KV double-storage fix  **(P1 — next)**
+`docs/superpowers/plans/2026-08-02-kv-double-storage-fix.md` — self-contained, no prior context needed
+**Finding it acts on:** `FP8DynamicCache` stores every K/V twice — an fp8 copy AND a full-size
+dequantized mirror that `update()` actually returns. Measured (B=1 H=8 S=2048 D=128, one layer):
+12.65 MB total = **3.016 bytes/element**, of which the dequantized buffers are **66%**. Plain fp16
+is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization at all** — and
+`auto` selects fp8 for every EXL3 model. What the class really provides is the ring buffer
+(amortized O(1) append), which is mode-independent.
+- [ ] **Task 1** — `quantize=False` mode: bf16-only ring buffer, 2.0 B/elem, lossless (TDD)
+- [ ] **Task 2** — fix `kv_cache_manager._extract_kv_as_bf16`: it branches on `isinstance(...,
+  FP8DynamicCache)` then unconditionally multiplies by `_key_scales` — wrong for an unquantized
+  instance of the same class. **The sharpest trap in the plan.**
+- [ ] **Task 3** — `kv_persist` signature for the unquantized format (must not write bf16 under
+  the fp8 `QUANT_SIG`)
+- [ ] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged
+- [ ] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
+
+### Plan F — Expert-eviction `top_n` sweep  **(P2 — next)**
+`docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
+Only N=10 has ever been measured (19% of evictions for 63% of the cache budget — not viable).
+This produces the whole curve. **One GPU run per model, many reports** — rendering at a different
+`top_n` is pure formatting over the same snapshot, no re-run needed.
+- [ ] **Task 1** — `format_eviction_sweep(...)`: eviction share AND VRAM cost per N (TDD)
+- [ ] **Task 2** — print it from `test_generate.py`'s existing guarded block
+- [ ] **Task 3** — on-device sweep both models + RESULTS naming an N, or "none viable"
+  - Decision rule: **an N is viable only if its eviction share materially exceeds its share of
+    the cache budget.**
+
+### Plan G — Expert pin + routing locality  **(P3 — needs F's N)**
+`docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality.md` — self-contained
+- [ ] **Task 1** — **zero-code**: measure `VAAYU_CACHE_BIAS` (existing env var, defaults 0.0).
+  `cache_aware_topk` + `_build_resident_mask` are already shipped and wired into the EXL3 fused
+  path; they bias top-k *selection* toward resident experts while taking weights from the original
+  logits. This attacks the distribution problem directly and **may make the pin unnecessary**.
+- [ ] **Task 2** — pin mechanism on `ExpertVRAMCache` (`pin`/`unpin_all`/`pinned`, eviction skip,
+  starvation guard; `evict_until_free()` must still reclaim pinned entries or prefill can OOM)
+- [ ] **Task 3** — `compute_pin_set(...)` with a hard `max_fraction` ceiling so the pin can never
+  starve the tail it is meant to help
+- [ ] **Task 4** — apply at the **prefill→decode boundary**, never at startup (a startup pre-warm
+  is a proven no-op: `_ensure_prefill_headroom` evicts the VRAM cache on every prefill, measured
+  9.04→2.64GB / 1362 evictions, and every generation begins with a prefill)
+- [ ] **Task 5** — on-device 2×2 matrix (pin off/on × bias off/on), both models, + VERDICT
+
+### Plan H — TurboQuant KV cache  **(P4 — needs E)**
+`docs/superpowers/plans/2026-08-02-turboquant-kv.md` — self-contained, carries a precondition check
+Paper: arXiv 2504.19874. Verified claims: 5× compression; *"absolute quality neutrality with 3.5
+bits per channel"*; LongBench 50.06 vs 50.06 baseline; Needle-in-Haystack identical at 4×.
+Reconstruction to float happens **before** inner products — so a working copy is always required.
+**Value is prefix-cache fan-out headroom and longer context — NOT decode speed.** Against the
+pre-fix cache it is worth only ~18.6%, because it compresses the 33% store and leaves the 66%
+mirror; that is why Plan E comes first.
+- [ ] **Task 1** — `vaayu/turboquant.py`: rotation, Lloyd-Max codebook, quantize/reconstruct (TDD)
+- [ ] **Task 2** — `TurboQuantKVCache` reusing the ring-buffer structure; reconstruct-on-**read**
+  (on-write would reintroduce exactly the mirror Plan E deleted)
+- [ ] **Task 3** — mode selection + `_extract_kv_as_bf16`; audit every `isinstance(..., Cache)` —
+  an unknown class falls through and returns **indices interpreted as values**, silent corruption
+- [ ] **Task 4** — persistence signature or explicit refusal (never write TQ data under the fp8 sig)
+- [ ] **Task 5** — on-device: **quality gate first**, then size, then decode, then the fan-out
+  measurement this feature actually exists for (`test_multiturn.py` at rising `K_SESSIONS`)
 
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3)** — RETARGETED 2026-08-01
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md` — Phase 1 **superseded**
@@ -141,6 +204,12 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   it was written (`cac8ccd`, the original A1 commit). **REMOVED 2026-08-01** on the user's call.
   `ExpertVRAMCache.drop()` is a different method and is genuinely used — untouched.
   (found + resolved 2026-08-01)
+- [ ] **KV cache stores every K/V twice.** `FP8DynamicCache` holds an fp8 store AND a full-size
+  dequantized mirror; `update()` returns the mirror, so the fp8 copy is never read by attention.
+  Measured 3.016 bytes/element, mirror = 66% of it; plain fp16 is 2.0 B/elem — so `kv_cache_mode`
+  fp8 (what `auto` picks for every EXL3 model) costs **~1.5× more VRAM than no quantization**.
+  Not a crash, not a correctness bug; a standing ~33% VRAM overcharge on every run.
+  **Plan E fixes this** — see Active plans. (found + measured 2026-08-01)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt

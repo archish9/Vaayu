@@ -1,5 +1,47 @@
 # TurboQuant × Vaayu: Feasibility Analysis
 
+> ## ⚠️ CORRECTION (2026-08-02, measured) — the headline number in §4 is wrong
+>
+> **The claim "Vaayu's current FP8 KV cache gives 2× compression over FP16" (§1) is false for this
+> implementation, and §4's "~780 MB freed" does not follow.**
+>
+> `FP8DynamicCache` allocates **six** per-layer buffers, not two. Alongside the fp8 store it keeps
+> a full-size **dequantized** mirror (`_k_out_cache` / `_v_out_cache`) — and `update()` returns
+> slices of the *mirror*, so the fp8 copy is never read by attention. Measured directly
+> (B=1 H=8 S=2048 D=128, one layer):
+>
+> ```
+> key_cache      2.10 MB  ┐ fp8 store        4.20 MB  (33%)
+> value_cache    2.10 MB  ┘
+> _key_scales    0.03 MB
+> _value_scales  0.03 MB
+> _k_out_cache   4.19 MB  ┐ DEQUANTIZED      8.38 MB  (66%)
+> _v_out_cache   4.19 MB  ┘
+> TOTAL         12.65 MB  = 3.016 bytes/element
+> ```
+>
+> Plain fp16 `DynamicCache` is 2.0 bytes/element. **So fp8 mode currently costs ~1.5× MORE VRAM
+> than fp16, not 2× less** — and `kv_cache_mode="auto"` selects fp8 for every EXL3 model.
+>
+> **Consequences for this document:**
+> - TurboQuant compresses only the 33% store. The 66% mirror is untouched, because attention needs
+>   real numbers (the paper reconstructs to float before inner products). As specified here,
+>   TurboQuant 3.5b is worth **~18.6% of KV (~203 MB)**, not 4.6× / ~780 MB.
+> - §3 spots this ("could remove them... saving 2× the dequantized buffer VRAM") but §4 does not
+>   carry it through. §3 is right; §4 is not.
+> - **The bigger win needs no new math:** a bf16-only ring buffer is 2.0 B/elem — **~33% freed,
+>   lossless, and it removes quantization work rather than adding any.** Larger than TurboQuant's
+>   contribution, with no codebooks, no bit-packing, and no disk-format change.
+> - **Neither win rescues the expert pin.** Even freeing ~930 MB raises the expert-cache budget
+>   ~10%, against a cache holding 6.2% of all experts that thrashes on routing diversity, not
+>   capacity.
+>
+> Everything this document says about TurboQuant *itself* checks out against the paper. The error
+> is confined to the claim about Vaayu's starting point.
+>
+> **Superseded by:** `docs/superpowers/plans/2026-08-02-kv-double-storage-fix.md` (do first) and
+> `docs/superpowers/plans/2026-08-02-turboquant-kv.md` (depends on it).
+
 ## 1. What TurboQuant Is
 
 **Paper:** [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (Google Research, April 2025)
