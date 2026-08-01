@@ -228,4 +228,13 @@ print(f"Model load time: {model_load_time:.1f}s")
 print(f"Total: {total_elapsed:.1f}s ({total_elapsed / 60:.2f} minutes)  [load -> full generation done]")
 
 if getattr(model, "_expert_usage", None) is not None:
-    print(model._expert_usage.report(getattr(model, "_expert_vram_cache", None), top_n=10))
+    # covered_layers matters: a layer the VRAM cache never covers records zero
+    # evictions for a structural reason, not because the cache kept its experts
+    # resident. Without it those layers print "(resident, no pin needed)" — the
+    # very label that would retire the pin feature. Inert on MiniMax (working set
+    # fits, so the attr is None = all layers covered); on Qwen the cache is
+    # restricted to a layer prefix (~72 of 91), so ~19 layers would read wrong.
+    print(model._expert_usage.report(
+        getattr(model, "_expert_vram_cache", None),
+        top_n=10,
+        covered_layers=getattr(model, "_vram_cacheable_layers", None)))

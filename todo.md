@@ -141,6 +141,14 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   it was written (`cac8ccd`, the original A1 commit). **REMOVED 2026-08-01** on the user's call.
   `ExpertVRAMCache.drop()` is a different method and is genuinely used — untouched.
   (found + resolved 2026-08-01)
+- [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
+  raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
+  clamps it down by one position so the model has a token to run. Fires only when the new prompt
+  is a complete prefix of the cached one — ≤0.05% at the ~2000-token prefixes this targets, and
+  exactly zero in the K=2/K=3 gate runs (prompts diverge, so the clamp never triggered).
+  Documented in the `stats()` docstring, NOT fixed: moving the clamp into the store would couple
+  the cache to the caller's execution needs to correct a rounding error. **Zero perf impact —
+  telemetry precision only.** (found 2026-08-01, Plan C design; ledgered 2026-08-01)
 - [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session, an entry
   that shares ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the
   same case counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing semantics —
