@@ -119,6 +119,32 @@ def test_degenerate_hit_shows_full_hit_rate_but_no_savings():
     assert "saved=0/100 tok (0%)" in out
 
 
+def test_auto_match_shared_tokens_counts_hit():
+    """session_id=None with an entry that shares tokens: counts a HIT and
+    matched_tokens equals the shared-prefix length (best_m > 0 path)."""
+    s = PrefixCacheStore(budget_bytes=10_000, auto_prefix_match=True)
+    s.store("s1", [1, 2, 3, 4], _FakeCache(1000))
+    kv, m = s.lookup(None, [1, 2, 3, 9])
+    assert kv is not None and m == 3
+    assert s.hits == 1
+    assert s.misses == 0
+    assert s.matched_tokens == 3
+
+
+def test_auto_match_zero_shared_tokens_counts_miss():
+    """session_id=None with an entry that shares ZERO tokens: counts a MISS,
+    unlike the named-session path (test_degenerate_hit_shows_full_hit_rate_
+    but_no_savings) where the same situation counts as a HIT. This pins the
+    documented asymmetry rather than leaving it accidental."""
+    s = PrefixCacheStore(budget_bytes=10_000, auto_prefix_match=True)
+    s.store("s1", [1, 2, 3, 4], _FakeCache(1000))
+    kv, m = s.lookup(None, [9] * 100)
+    assert kv is None and m == 0
+    assert s.hits == 0
+    assert s.misses == 1
+    assert s.matched_tokens == 0
+
+
 def test_evictions_counted_once_per_dropped_entry():
     """One store() call can drop several entries; each is a lost reuse."""
     s = PrefixCacheStore(budget_bytes=1000)

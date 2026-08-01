@@ -97,6 +97,16 @@ class PrefixCacheStore:
         by at most 1 token per hit, and only in that exact-replay case. The
         clamp stays in the caller on purpose: needing a token to run is a
         generation concern, not a caching one.
+
+        NOTE on hit_rate asymmetry: "hit" means different things on the two
+        lookup() paths. On a named session, the key is set whenever the
+        session's entry exists in the pool, so a session whose context fully
+        diverged still counts as a HIT with 0 matched_tokens (check `saved`
+        for the real payoff). On an anonymous lookup (session_id=None, the
+        default `generate()` call shape), the key is only set when some pool
+        entry shares at least one token, so the same "entry present, nothing
+        shared" case counts as a MISS. A mixed workload's hit_rate is
+        therefore not directly comparable across the two modes.
         """
         with self._lock:
             total = self.hits + self.misses
@@ -111,7 +121,13 @@ class PrefixCacheStore:
         """Zero the counters, leaving the pool untouched. Called between
         measurement rounds so one round's hit count is measured clean, without
         the previous round's guaranteed-miss cold pass polluting it (same role
-        as ExpertRAMCache.reset_stats at the prefill->decode boundary)."""
+        as ExpertRAMCache.reset_stats at the prefill->decode boundary).
+
+        NOTE: when enable_kv_persist=True, kv_persist.py's disk-restore path
+        calls store.store() during model construction, before any harness
+        obtains its handle — so load-time evictions can already be nonzero by
+        the time a caller first reads stats() or calls reset_stats(). A
+        "[R0] ...Nevict" line is not necessarily round 0's own activity."""
         with self._lock:
             self.hits = 0
             self.misses = 0

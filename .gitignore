@@ -15,3 +15,5 @@ vaayu_telemetry.json
 run.log
 run-rebalance-*.log
 run-vram-diag-*.log
+run-step4-hits-*.log
+run-decode-*.log

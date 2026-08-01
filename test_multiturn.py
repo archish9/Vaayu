@@ -125,6 +125,10 @@ _pc = model._prefix_cache
 if _pc is None:
     raise SystemExit("FAIL: model._prefix_cache is None — prefix caching is "
                      "disabled, so the round-2 HIT assertion cannot run.")
+if R_ROUNDS < 2:
+    raise SystemExit(f"FAIL: R_ROUNDS={R_ROUNDS} — the HIT assertion needs at "
+                     "least one revisit round (round 0 is a guaranteed cold "
+                     "MISS per session) to be meaningful.")
 
 peak = 0.0
 print(f"\n=== {K_SESSIONS} interleaved sessions x {R_ROUNDS} rounds ===\n")
@@ -142,6 +146,12 @@ for rnd in range(R_ROUNDS):
 
 print(f"\n=== done: {K_SESSIONS}x{R_ROUNDS}, peak_rss={peak:.2f}GB ===")
 print(f"final round prefix cache: {_pc.stats()}")
+# Unlocked read of _pc.hits is safe here (no store()'s lock held) only because
+# stream_generate (vaayu/streaming.py, ~line 64) runs generate() on a background
+# thread and thread.join()s it before the generator returns, so run_one() cannot
+# return while a store() is still in flight — this harness is fully sequential
+# at this point. If this harness ever gains concurrent fan-out, this read would
+# need the lock (or a stats() snapshot) instead.
 if _pc.hits != K_SESSIONS:
     raise SystemExit(
         f"FAIL: final-round prefix HITs = {_pc.hits}, expected {K_SESSIONS} "
