@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from vaayu.expert_usage import ExpertUsageTracker
+from vaayu.expert_usage import ExpertUsageTracker, format_usage_report
 
 
 def test_record_accumulates_routes():
@@ -63,3 +63,48 @@ def test_record_accepts_flat_indices():
     counts = t.snapshot()
     assert counts[2, 1].item() == 2
     assert counts[2, 3].item() == 1
+
+
+def test_report_flags_hot_and_evicted_as_pin_candidate():
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[1, 2] = 500      # hot AND evicted -> candidate
+    counts[1, 3] = 400      # hot, never evicted -> not a candidate
+    out = format_usage_report(counts, {(1, 2): 12}, top_n=5)
+    assert "layer=1" in out
+    assert "e2" in out and "500" in out and "12" in out
+    assert "pin candidate" in out
+    assert "no pin needed" in out          # e3 must be labelled the other way
+
+
+def test_report_says_no_pin_needed_when_nothing_was_evicted():
+    """The negative result must be as legible as the positive one — it is what
+    retires the pin feature."""
+    counts = torch.zeros((1, 3), dtype=torch.int32)
+    counts[0, 1] = 900
+    out = format_usage_report(counts, {}, top_n=5)
+    assert "no pin needed" in out
+    assert "pin candidate" not in out
+
+
+def test_report_skips_layers_with_no_routes():
+    counts = torch.zeros((3, 4), dtype=torch.int32)
+    counts[2, 0] = 7
+    out = format_usage_report(counts, {}, top_n=5)
+    assert "layer=2" in out
+    assert "layer=0" not in out
+    assert "layer=1" not in out
+
+
+def test_report_on_empty_histogram_does_not_crash():
+    out = format_usage_report(torch.zeros((4, 8), dtype=torch.int32), {}, top_n=5)
+    assert isinstance(out, str)
+    assert "no expert routes recorded" in out
+
+
+def test_report_respects_top_n():
+    counts = torch.zeros((1, 10), dtype=torch.int32)
+    for e in range(10):
+        counts[0, e] = 100 - e
+    out = format_usage_report(counts, {}, top_n=3)
+    assert "e0" in out and "e1" in out and "e2" in out
+    assert "e9" not in out
