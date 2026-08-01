@@ -5,7 +5,7 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (bf16 KV disk serialization landed, gate in flight; Plans F and G CLOSED — no viable pin N; the routing bias turned
+_Last updated: 2026-08-02 (bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
 out to be unreachable code on both models, now warned about; MiniMax found to run the
 module-list forward, not the EXL3 fused one)._
 
@@ -13,12 +13,12 @@ module-list forward, not the EXL3 fused one)._
 
 ## Execution order (priority)
 
-Plans A, C, D are ✅ DONE (2026-08-01) and F ✅ DONE (2026-08-02) — see Active plans below.
-**Current queue, three plans left, each self-contained for a fresh session:**
+Plans A, C, D ✅ DONE (2026-08-01); E, F, G ✅ CLOSED (2026-08-02) — see Active plans below.
+**Current queue — only Plan H is left:**
 
-1. **P1 — Plan E (KV double-storage fix).** `2026-08-02-kv-double-storage-fix.md`. Independent of
-   everything else; do it first because it is the biggest free win and because Plan H's ratios
-   depend on it. Frees ~33% of KV VRAM, lossless, and *removes* quantization work.
+1. ~~**P1 — Plan E (KV double-storage fix).**~~ ✅ FULLY CLOSED 2026-08-02. KV is 2.000 B/elem
+   (−33.7%), `auto` → bf16, and the bf16 layout now serializes to disk (gate: TTFT 27.6s → 3.0s
+   on restore). Plan H's precondition is met.
 2. ~~**P2 — Plan F (`top_n` eviction sweep).**~~ ✅ DONE 2026-08-02. Verdict: **no N is viable**
    — eviction share is linear in N and 2–4× below the pin's share of the cache, on both models.
 3. ~~**P3 — Plan G (expert pin + routing locality).**~~ ✅ CLOSED 2026-08-02, nothing built.
@@ -29,7 +29,7 @@ Plans A, C, D are ✅ DONE (2026-08-01) and F ✅ DONE (2026-08-02) — see Acti
    precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
    context, NOT decode speed.
 
-**Dependency summary:** E → H (both still open), F → G (F is done; its answer shrank G).
+**Dependency summary:** E → H (E done, H unblocked), F → G (both closed; F's answer retired G's pin).
 
 ---
 
@@ -69,7 +69,7 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   `.gitignore` for evidence logs, unlocked-read rationale, `R_ROUNDS<2` guard,
   kv_persist eviction note
 
-### Plan E — KV double-storage fix  **(P1 — next)**
+### Plan E — KV double-storage fix  **(P1)** — ✅ FULLY CLOSED 2026-08-02
 `docs/superpowers/plans/2026-08-02-kv-double-storage-fix.md` — self-contained, no prior context needed
 **Finding it acts on:** `FP8DynamicCache` stores every K/V twice — an fp8 copy AND a full-size
 dequantized mirror that `update()` actually returns. Measured (B=1 H=8 S=2048 D=128, one layer):
@@ -106,8 +106,8 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   now, serialize later). `_create_kv_cache` + `batch._resolve_kv_elem_bytes` (would have
   under-reserved KV at 1 B/elem otherwise); `test_kv_persist_coherence.py` pinned to `"fp8"`
   since disk persistence refuses bf16; README/`test_quick.py` mode lists updated.
-- [~] **bf16 KV disk serialization** (Plan E Task 3 option (b)) — code DONE `c892069`, on-device
-  gate in flight.
+- [x] **bf16 KV disk serialization** (Plan E Task 3 option (b)) — ✅ DONE 2026-08-02 `c892069`,
+  gate PASSED. `enable_kv_persist` now works under `auto`; **Plan E is fully closed.**
   - [x] `has_scales(h)` keyed off the SIGNATURE (not `scale_dtype_code`, which build_header
     mirrors from the KV dtype for bf16 — reading it would over-charge every record and make
     every seek land mid-record). Gates `record_bytes`/`pack_record`/`read_records`/`build_cache`.
@@ -119,9 +119,13 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
     bf16 file must never be parsed as fp8); suite 443 → 451 green.
   - [x] `test_kv_persist_coherence.py` unpinned from `"fp8"` back to `"auto"`; stale
     `_create_kv_cache` comment corrected.
-  - [~] On-device 3-phase gate (run1 write → run2 restart+restore → control) on Qwen under
-    `auto`. Pre-existing fp8 files moved to `~/.cache/vaayu/kv.pre-bf16-gate` so the gate starts
-    clean — RESTORE THEM afterwards.
+  - [x] On-device 3-phase gate on Qwen under `auto` — **PASS**, exit 0 ×3, no OOM:
+    - file written with `sig=bf16`, nrec=2678, 94 layers, **rec_bytes=192516 = 4 + 94×(2×4×128×2)
+      exactly** — arithmetic proof that zero scale bytes reached disk
+    - run2 printed `[KV] resumed 1 session(s) from disk`; **TTFT 27.60s cold → 3.01s (9.2×)**
+    - run2 and control produced **token-identical** continuations (the bar was only coherence,
+      since this stack's greedy decode is not bit-reproducible)
+    - pre-existing fp8 files restored to `~/.cache/vaayu/kv` afterwards; gate artifacts deleted
 
 ### Plan F — Expert-eviction `top_n` sweep  **(P2)** — ✅ DONE 2026-08-02 (`36ab143` `ace7021`)
 `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
