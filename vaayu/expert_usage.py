@@ -47,6 +47,12 @@ class ExpertUsageTracker:
                                     covered_layers=covered_layers)
 
 
+def _top_experts(row, top_n: int):
+    """Indices of `row`'s top_n experts by route count, dropping zero-route ones."""
+    order = sorted(range(row.shape[0]), key=lambda e: -int(row[e].item()))
+    return [e for e in order[:top_n] if int(row[e].item()) > 0]
+
+
 def format_usage_report(counts, evicted_keys, top_n: int = 5, covered_layers=None) -> str:
     """Join route counts with per-key budget-pressure evictions.
 
@@ -85,12 +91,9 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5, covered_layers=Non
         if layer_total == 0:
             continue
         layer_covered = covered_layers is None or layer_idx in covered_layers
-        order = sorted(range(counts.shape[1]), key=lambda e: -int(row[e].item()))
         lines.append(f"[Vaayu-Usage] layer={layer_idx} top experts by routes:")
-        for e in order[:top_n]:
+        for e in _top_experts(row, top_n):
             routes = int(row[e].item())
-            if routes == 0:
-                continue
             ev = int(evicted_keys.get((layer_idx, e), 0)) if evicted_keys else 0
             if not layer_covered:
                 tag = "(not VRAM-cached)"
@@ -110,4 +113,46 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5, covered_layers=Non
         lines.append(
             f"WARNING: {remainder} evictions on experts outside top-{top_n}-per-layer — "
             f"raise top_n to inspect")
+    return "\n".join(lines)
+
+
+def format_eviction_sweep(counts, evicted_keys, n_values, expert_bytes=None,
+                          cache_budget_bytes=None, covered_layers=None) -> str:
+    """Render the SAME histogram snapshot at several top_n cuts.
+
+    Answers "how far down each layer's route ranking do the budget-pressure
+    evictions actually sit?" — one GPU run, many cuts, since re-rendering is
+    pure formatting over `counts` + `evicted_keys`.
+
+    A pin costs `N x covered_layers x expert_bytes` of VRAM taken from the very
+    cache it is meant to help, so when `expert_bytes` and `cache_budget_bytes`
+    are supplied each row also carries that cost. The decision rule: an N is
+    viable only if its eviction share materially exceeds its share of the
+    budget. Both figures are caller-supplied — nothing about any model's
+    geometry is known here (CLAUDE.md §5).
+
+    `covered_layers` has the same meaning as in format_usage_report: layers the
+    VRAM cache never covers are excluded from BOTH sides, since they can record
+    no evictions and a pin would not be placed on them either.
+    """
+    total_evictions = sum(evicted_keys.values()) if evicted_keys else 0
+    active_layers = [layer_idx for layer_idx in range(counts.shape[0])
+                     if int(counts[layer_idx].sum().item()) > 0
+                     and (covered_layers is None or layer_idx in covered_layers)]
+
+    lines = [f"[Vaayu-Sweep] {len(active_layers)} routed+covered layers, "
+             f"{total_evictions} budget-pressure evictions"]
+    for n in n_values:
+        n = max(0, int(n))
+        covered = 0
+        for layer_idx in active_layers:
+            for e in _top_experts(counts[layer_idx], n):
+                covered += int(evicted_keys.get((layer_idx, e), 0)) if evicted_keys else 0
+        share = (covered / total_evictions) if total_evictions else 0.0
+        line = f"[Vaayu-Sweep] N={n}  {covered}/{total_evictions}  {share:.0%}"
+        if expert_bytes and cache_budget_bytes:
+            cost = n * len(active_layers) * int(expert_bytes)
+            line += (f"  pin cost {cost / 1024 ** 3:.2f} GB  "
+                     f"{cost / int(cache_budget_bytes):.0%} of budget")
+        lines.append(line)
     return "\n".join(lines)

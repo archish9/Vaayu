@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from vaayu.expert_usage import ExpertUsageTracker, format_usage_report
+from vaayu.expert_usage import (ExpertUsageTracker, format_eviction_sweep,
+                                format_usage_report)
 
 
 def test_record_accumulates_routes():
@@ -200,3 +201,61 @@ def test_hook_is_a_noop_without_a_tracker_and_during_prefill():
     ref._moe_prefill_pass = False
     _maybe_record_usage(ref, 1, torch.tensor([[2]], dtype=torch.int64))
     assert ref._expert_usage.snapshot()[1, 2].item() == 1     # decode counted
+
+
+def test_sweep_share_is_monotonic_in_n():
+    """A larger cut can only cover more evictions, never fewer."""
+    counts = torch.zeros((1, 6), dtype=torch.int32)
+    for e, r in enumerate([100, 90, 80, 70, 60, 50]):
+        counts[0, e] = r
+    ev = {(0, 0): 5, (0, 3): 20, (0, 5): 50}
+    out = format_eviction_sweep(counts, ev, n_values=[1, 3, 6])
+    shares = [int(tok.rstrip('%')) for tok in out.split() if tok.endswith('%')]
+    assert shares == sorted(shares)
+
+
+def test_sweep_reports_full_coverage_at_max_n():
+    counts = torch.zeros((1, 3), dtype=torch.int32)
+    counts[0, 0], counts[0, 1], counts[0, 2] = 10, 9, 8
+    out = format_eviction_sweep(counts, {(0, 0): 4, (0, 2): 6}, n_values=[3])
+    assert "10/10" in out          # every eviction accounted for at N = n_experts
+    assert "100%" in out
+
+
+def test_sweep_includes_vram_cost_when_geometry_supplied():
+    """The cost side is the whole point: a share smaller than the budget share
+    is self-defeating."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[0, 0] = 10
+    counts[1, 0] = 10
+    out = format_eviction_sweep(counts, {(0, 0): 1}, n_values=[1],
+                                expert_bytes=10 * 1024 ** 2,
+                                cache_budget_bytes=100 * 1024 ** 2)
+    # 1 expert x 2 layers x 10MB = 20MB of a 100MB budget
+    assert "20" in out and "%" in out
+
+
+def test_sweep_without_geometry_omits_cost_but_does_not_crash():
+    counts = torch.zeros((1, 2), dtype=torch.int32)
+    counts[0, 0] = 5
+    out = format_eviction_sweep(counts, {}, n_values=[1])
+    assert isinstance(out, str) and "N=1" in out
+
+
+def test_sweep_on_empty_histogram():
+    out = format_eviction_sweep(torch.zeros((2, 4), dtype=torch.int32), {}, n_values=[1, 2])
+    assert isinstance(out, str)
+
+
+def test_sweep_excludes_layers_the_vram_cache_never_covers():
+    """Same trap as the report: an uncovered layer records zero evictions for a
+    structural reason, and must not inflate the pin's VRAM cost either."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[0, 0] = 10
+    counts[1, 0] = 10
+    out = format_eviction_sweep(counts, {(0, 0): 7}, n_values=[1],
+                                expert_bytes=10 * 1024 ** 2,
+                                cache_budget_bytes=100 * 1024 ** 2,
+                                covered_layers={0})
+    assert "7/7" in out
+    assert "10%" in out            # 1 expert x 1 covered layer x 10MB of 100MB
