@@ -92,6 +92,7 @@ print(f"Using device: {DEVICE}")
 
 from vaayu import AutoModel
 from vaayu.streaming import stream_generate
+from vaayu.expert_usage import format_eviction_sweep
 
 script_start = time.time()   # total = this -> end of generation, incl. model load
 
@@ -234,7 +235,17 @@ if getattr(model, "_expert_usage", None) is not None:
     # very label that would retire the pin feature. Inert on MiniMax (working set
     # fits, so the attr is None = all layers covered); on Qwen the cache is
     # restricted to a layer prefix (~72 of 91), so ~19 layers would read wrong.
-    print(model._expert_usage.report(
-        getattr(model, "_expert_vram_cache", None),
-        top_n=10,
-        covered_layers=getattr(model, "_vram_cacheable_layers", None)))
+    _vram_cache = getattr(model, "_expert_vram_cache", None)
+    _covered = getattr(model, "_vram_cacheable_layers", None)
+    print(model._expert_usage.report(_vram_cache, top_n=10, covered_layers=_covered))
+
+    # Same snapshot, several cuts: re-rendering at another N is pure formatting,
+    # so the whole eviction-share curve costs no extra GPU run.
+    _geom = getattr(model, "_moe_geometry", None) or {}
+    print(format_eviction_sweep(
+        model._expert_usage.snapshot(),
+        getattr(_vram_cache, "evicted_keys", None) or {},
+        n_values=[1, 2, 3, 5, 10, 20, 40],
+        expert_bytes=_geom.get("expert_bytes"),
+        cache_budget_bytes=getattr(_vram_cache, "budget_bytes", None),
+        covered_layers=_covered))
