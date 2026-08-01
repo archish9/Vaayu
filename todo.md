@@ -43,6 +43,22 @@ RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
   - [x] K=3 stretch — 6/6, no OOM
   - [x] RESULTS written + committed
 
+### Plan C — Prefix-cache hit telemetry  **(P2 — chain step 4)**
+`docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry.md`
+Spec: `docs/superpowers/specs/2026-08-01-prefix-cache-hit-telemetry-design.md` (`140720c`)
+- [ ] **Task 1** — counters + `stats()` + `reset_stats()` on `PrefixCacheStore` (TDD)
+  - [ ] 9 unit tests in `tests/test_prefix_cache.py` (incl. degenerate hit, multi-evict, n/a rates)
+  - [ ] 5 counters under the store's existing lock; no caching-behavior change
+  - [ ] Full suite green (400)
+- [ ] **Task 2** — `test_multiturn.py` becomes a gate
+  - [ ] reset between rounds, print `stats()` per round
+  - [ ] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
+  - [ ] loud failure if `model._prefix_cache` is None
+- [ ] **Task 3** — on-device gate + RESULTS (closes chain step 4)
+  - [ ] K=2 run, exit 0, 2 hits final round
+  - [ ] K=3 run, exit 0, 3 hits final round; revert `K_SESSIONS` to 2
+  - [ ] RESULTS doc + close chain step 4 here
+
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3 — do last)**
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
 - [!] **BLOCKED / needs retarget** — premise warning (see plan header): RAM-tier pin is
