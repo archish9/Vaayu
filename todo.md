@@ -56,10 +56,12 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   - [x] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
   - [x] loud failure if `model._prefix_cache` is None
 - [x] **Task 3** — on-device gate + RESULTS (closes chain step 4) — `e7f5939` `899ce91`
-- [x] **Final review fixes** — `aada3cd`: auto-match asymmetry documented + 2 tests, .gitignore for evidence logs, unlocked-read rationale, R_ROUNDS<2 guard, kv_persist eviction note
   - [x] K=2 run, exit 0, 2/2 hits final round, 0 evictions
   - [x] K=3 run, exit 0, 3/3 hits final round, 0 evictions; `K_SESSIONS` reverted to 2
   - [x] RESULTS doc + close chain step 4 here
+- [x] **Final review fixes** — `aada3cd`: auto-match asymmetry documented + 2 tests,
+  `.gitignore` for evidence logs, unlocked-read rationale, `R_ROUNDS<2` guard,
+  kv_persist eviction note
 
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3 — do last)**
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
