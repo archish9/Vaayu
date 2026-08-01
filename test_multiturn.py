@@ -119,15 +119,32 @@ def run_one(session_id: str, task: str) -> float:
     return (first - start) if first else (time.time() - start)
 
 
+# The HIT assertion below is the point of this harness. If prefix caching is
+# off there is nothing to assert, so fail loudly rather than skip silently.
+_pc = model._prefix_cache
+if _pc is None:
+    raise SystemExit("FAIL: model._prefix_cache is None — prefix caching is "
+                     "disabled, so the round-2 HIT assertion cannot run.")
+
 peak = 0.0
 print(f"\n=== {K_SESSIONS} interleaved sessions x {R_ROUNDS} rounds ===\n")
 for rnd in range(R_ROUNDS):
+    if rnd > 0:
+        # Round 0 is a guaranteed cold MISS per session; zero it so this
+        # round's hit count stands alone.
+        _pc.reset_stats()
     for sess in range(K_SESSIONS):
         sid = f"stress-sess-{sess}"
         ttft = run_one(sid, _ROUND_TASKS[rnd % len(_ROUND_TASKS)])
         peak = max(peak, peak_rss_gb())
         print(f"[R{rnd} S{sess}] session={sid}  TTFT={ttft:.2f}s  peak_rss={peak:.2f}GB")
+    print(f"[R{rnd}] prefix cache: {_pc.stats()}")
 
 print(f"\n=== done: {K_SESSIONS}x{R_ROUNDS}, peak_rss={peak:.2f}GB ===")
-print("Round-2 HIT count = how many concurrent sessions the budget kept resident.")
-print("Grep the log for [Vaayu-Prefix] HIT/MISS and [Vaayu-RAM] ledger lines.")
+print(f"final round prefix cache: {_pc.stats()}")
+if _pc.hits != K_SESSIONS:
+    raise SystemExit(
+        f"FAIL: final-round prefix HITs = {_pc.hits}, expected {K_SESSIONS} "
+        f"(one per revisited session). {_pc.stats()}")
+print(f"PASS: all {K_SESSIONS} sessions HIT on revisit — the budget kept every "
+      f"concurrent session resident.")
