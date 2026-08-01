@@ -173,9 +173,13 @@ def compress_layer_state_dict(layer_state_dict, compression=None):
     return compressed_layer_state_dict if compressed_layer_state_dict is not None else layer_state_dict
 
 def remove_real_and_linked_file(to_delete):
-    targetpath = None
-    if os.path.realpath(to_delete) != to_delete:
-        targetpath = os.path.realpath(to_delete)
+    # os.fspath + abspath before comparing: realpath() returns a str, and every
+    # caller passes a Path, so `realpath(p) != p` used to be True even for a
+    # plain file -- the same path was then unlinked twice and the second unlink
+    # raised ENOENT AFTER the delete had already succeeded.
+    to_delete = os.path.abspath(os.fspath(to_delete))
+    realpath = os.path.realpath(to_delete)
+    targetpath = realpath if realpath != to_delete else None
 
     os.remove(to_delete)
     if targetpath:

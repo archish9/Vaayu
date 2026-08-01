@@ -22,3 +22,4 @@ run-planE-*.log
 run-sweep-*.log
 run-bias-*.log
 run-kvbf16-*.log
+run-delorig-*.log

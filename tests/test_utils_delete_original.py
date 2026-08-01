@@ -87,3 +87,46 @@ def test_incomplete_split_never_deletes_originals(tmp_path):
     for f in originals:
         assert f.exists(), (
             f"{f.name} deleted while the split was incomplete — unrecoverable")
+
+
+def test_remove_real_and_linked_file_handles_a_plain_path(tmp_path):
+    """os.path.realpath() returns str, so `realpath(p) != p` is ALWAYS True for a
+    Path argument — the helper then removed the same file twice and the second
+    unlink raised ENOENT. Every caller passes a Path, so this fired every time:
+    handled (and silently mis-accounted) in delete_original_shards, UNHANDLED in
+    the mid-split loop, where it would abort a fresh conversion."""
+    from vaayu.utils import remove_real_and_linked_file
+
+    f = tmp_path / "shard.safetensors"
+    f.write_bytes(b"z" * 8)
+    remove_real_and_linked_file(f)          # must not raise
+    assert not f.exists()
+
+
+def test_remove_real_and_linked_file_follows_a_symlink(tmp_path):
+    """The linked-target deletion is the helper's whole reason to exist: an HF
+    cache blob reached through a symlink must go too, or nothing is reclaimed."""
+    from vaayu.utils import remove_real_and_linked_file
+
+    real = tmp_path / "blob"
+    real.write_bytes(b"z" * 8)
+    link = tmp_path / "shard.safetensors"
+    link.symlink_to(real)
+
+    remove_real_and_linked_file(link)
+    assert not link.exists() and not real.exists()
+
+
+def test_delete_original_shards_reports_what_it_freed(tmp_path, capsys):
+    """The byte total is the user-visible confirmation; the double-unlink bug
+    suppressed it while still deleting, which looks exactly like a no-op."""
+    from vaayu.utils import delete_original_shards
+
+    originals = _fake_model_dir(tmp_path)
+    index = {"a": originals[0].name, "b": originals[1].name}
+    freed = delete_original_shards(tmp_path, index, True)
+
+    assert freed == sum(16 for _ in originals)
+    out = capsys.readouterr().out
+    assert "reclaimed" in out
+    assert "could not delete" not in out
