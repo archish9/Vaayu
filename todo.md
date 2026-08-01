@@ -276,7 +276,10 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   to warn once per process when `_cache_bias != 0.0` and no layer ever reached that branch.
   Re-targeting the bias to run *before* the model's own top-k is a separate spec, not a patch.
   (found + measured 2026-08-02, Plan G Task 1; warning landed same day)
-- [ ] **MiniMax runs the module-list forward, not the EXL3 fused one.** `CLAUDE.md` §0's dispatch
+- [x] ~~**MiniMax runs the module-list forward, not the EXL3 fused one.**~~ **CLAUDE.md §0 FIXED
+  2026-08-02**: the dispatch table now branches on `expert_style` first, names which model sits
+  on each row, states that EXL3 does not imply the EXL3 fused forward, and warns that a feature
+  wired into one forward silently no-ops on the others. §5 cross-references it. Finding: `CLAUDE.md` §0's dispatch
   table treats MoE+EXL3 → `_make_fused_sparse_forward_exl3` as the actively-tested row and
   module-list as "gated in, not perf-tuned". MiniMax-M2.7 is EXL3-quantized but its repo ships
   custom modeling code with per-expert submodules (`...block_sparse_moe.experts.10.w1.*`), so

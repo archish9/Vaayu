@@ -10,7 +10,8 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 agent doing loop-engineering** (repeated agentic iterations). It is **a true
 model-agnostic engine — MoE or dense, EXL3-quantized or not, CUDA or CPU compute
 — the user selects what to load** (see the dispatch table below). MoE-EXL3 on
-CUDA is the actively-tested / perf-tuned path much of the current work targets.
+CUDA is the actively-tested / perf-tuned area much of the current work targets —
+but note it spans **two different forwards**, one per expert layout (table below).
 Dense must keep working: **large streamed-dense performance is a planned FUTURE
 target**, deferred until the MoE path is solid. When that work starts, optimize
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
@@ -18,20 +19,36 @@ the MoE tests green, and treat any change to shared infra (staging, prefix
 cache, NVMe warmup, io_uring) as touching both paths. Until then, MoE changes
 must not silently break dense — a dense load+generate smoke test guards that.
 
-**Dispatch table (`vaayu/moe_patch.py:357-424`):**
+**Dispatch table (`_make_sparse_moe_forward` in `vaayu/moe_patch.py`). It branches
+on `block_info.expert_style` FIRST, and only then on `is_exl3` — so the expert
+layout, not the quant format, picks the forward:**
 
-| Model | Compute | Code path | Status |
-|---|---|---|---|
-| MoE + EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | actively tested |
-| MoE + non-EXL3 (fused) | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | gated in, not perf-tuned |
-| MoE + module-list layout | CUDA or CPU | `_make_modulelist_sparse_forward` | gated in, not perf-tuned |
-| Dense | as configured | non-MoE forward | works, streamed-perf deferred |
+| Expert layout | Quant | Compute | Code path | On-device today |
+|---|---|---|---|---|
+| fused (experts module with `num_experts`) | EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | **Qwen3-235B** — actively tested |
+| fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | none — gated in, not perf-tuned |
+| module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested |
+| dense | either | as configured | non-MoE forward | works, streamed-perf deferred |
 
-The `is_exl3` gate at `moe_patch.py:357` is set from `EXL3LoaderStrategy`
-detection at load time; the `compute_device` gate at `:360` forces CUDA for
-EXL3 (kernel requirement) and honours the requested `device=` otherwise. When
-you touch any of these paths, respect the axis you're on — a "MoE fix" often
-means "MoE-EXL3 fix," not "MoE-in-general fix."
+**An EXL3 model does NOT imply the EXL3 fused forward.** `detect_moe_blocks`
+reads the layout off the module tree: an experts module exposing `num_experts`
+is `"fused"`, an `nn.ModuleList` of per-expert submodules is `"module_list"`.
+MiniMax's EXL3 repo ships custom modeling code with per-expert submodules
+(`...block_sparse_moe.experts.10.w1.*`), so it is EXL3-quantized yet runs the
+module-list forward. **Both of the actively-tested models are EXL3, but they are
+on different rows** — and every MiniMax perf number on record is a module-list
+number. (Measured 2026-08-02; see
+`docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESULTS.md`.)
+
+`is_exl3` is set from `EXL3LoaderStrategy` detection at load time. The derived
+`compute_device` forces CUDA for EXL3 (kernel requirement) and honours the
+requested `device=` otherwise, but it is passed **only** to
+`_make_fused_sparse_forward` — the other two MoE forwards take the device off
+the loaded modules. When you touch any of these paths, respect the axis you're
+on: a "MoE fix" is usually a fix to ONE forward, and a change aimed at "the EXL3
+path" will miss MiniMax unless it also covers the module-list forward. Features
+wired into a single forward silently no-op elsewhere — that is exactly how
+`VAAYU_CACHE_BIAS` came to do nothing on either model.
 
 It is NOT a plain single-user chatbot backend. Two workload facts follow from
 that and shape which optimizations matter:
@@ -113,9 +130,11 @@ compute — on low-resource hardware. Never one specific model, quant format, or
 compute device.** See §0's dispatch table for which code paths currently exist.
 Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5
 (62 layers, 256 experts) — both EXL3-quantized MoE, selected in
-`test_generate.py`. Non-EXL3, dense, and CPU-compute paths are architecturally
-supported (gated by `is_exl3` and the `compute_device` switch) but not actively
-tested on-device today. Any code, plan, or fix you produce MUST work for all of
+`test_generate.py` — but on **different forwards**: Qwen is fused-layout (EXL3
+fused forward), MiniMax is module-list layout (module-list forward). See §0.
+Non-EXL3, dense, and CPU-compute paths are architecturally supported (gated by
+`is_exl3` and the `compute_device` switch) but not actively tested on-device
+today. Any code, plan, or fix you produce MUST work for all of
 them without edits — never assume EXL3, never assume CUDA, never assume MoE.
 
 **Rules — apply to every change and every plan:**
