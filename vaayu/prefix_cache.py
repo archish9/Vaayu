@@ -134,9 +134,3 @@ class PrefixCacheStore:
             self.evictions = 0
             self.matched_tokens = 0
             self.lookup_tokens = 0
-
-    def drop(self, session_id: str) -> None:
-        with self._lock:
-            e = self._pool.pop(session_id, None)
-            if e is not None:
-                self._current_bytes -= e.nbytes

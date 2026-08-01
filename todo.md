@@ -110,10 +110,10 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   which cannot drift. Historical line refs inside the 2026-07-23 diagnostic RESULTS are left
   as-is: they are a point-in-time record, accurate when written.
 
-- [ ] **Dead code (flagged, not removed — §3).** `PrefixCacheStore.drop()` in
-  `vaayu/prefix_cache.py` has no callers anywhere in the repo (the `.drop(` grep hits are all
-  `ExpertVRAMCache`). Predates the telemetry work. Decide keep-or-remove when next owning that
-  file. (found 2026-08-01, Plan C final review)
+- [x] ~~**Dead code — `PrefixCacheStore.drop()`.**~~ No callers anywhere in the repo; dead since
+  it was written (`cac8ccd`, the original A1 commit). **REMOVED 2026-08-01** on the user's call.
+  `ExpertVRAMCache.drop()` is a different method and is genuinely used — untouched.
+  (found + resolved 2026-08-01)
 - [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session, an entry
   that shares ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the
   same case counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing semantics —
