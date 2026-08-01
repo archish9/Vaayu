@@ -5,7 +5,7 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (Plans F and G both CLOSED — no viable pin N; the routing bias turned
+_Last updated: 2026-08-02 (bf16 KV disk serialization landed, gate in flight; Plans F and G CLOSED — no viable pin N; the routing bias turned
 out to be unreachable code on both models, now warned about; MiniMax found to run the
 module-list forward, not the EXL3 fused one)._
 
@@ -106,10 +106,22 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   now, serialize later). `_create_kv_cache` + `batch._resolve_kv_elem_bytes` (would have
   under-reserved KV at 1 B/elem otherwise); `test_kv_persist_coherence.py` pinned to `"fp8"`
   since disk persistence refuses bf16; README/`test_quick.py` mode lists updated.
-- [ ] **bf16 KV disk serialization** (Plan E Task 3 option (b), now the outstanding follow-up).
-  `QUANT_SIG_BF16` is already reserved; `pack_record`/`read_records`/`build_cache` need a
-  no-scales path. Until then `enable_kv_persist` is a no-op under `auto` — the writer says so
-  once per process. Not urgent: persistence ships dark.
+- [~] **bf16 KV disk serialization** (Plan E Task 3 option (b)) — code DONE `c892069`, on-device
+  gate in flight.
+  - [x] `has_scales(h)` keyed off the SIGNATURE (not `scale_dtype_code`, which build_header
+    mirrors from the KV dtype for bf16 — reading it would over-charge every record and make
+    every seek land mid-record). Gates `record_bytes`/`pack_record`/`read_records`/`build_cache`.
+  - [x] Restored bf16 cache rebuilt as `FP8DynamicCache(quantize=False)`, empty scale/mirror
+    lists, so the next `update()` appends rather than quantizing into buffers that don't exist.
+  - [x] `header_matches` accepts either signature (mode is per-run, files outlive runs); writer
+    refusal + `_warned_unquantized` removed.
+  - [x] Two Plan E tests that pinned the refusal rewritten to the invariant they protected (a
+    bf16 file must never be parsed as fp8); suite 443 → 451 green.
+  - [x] `test_kv_persist_coherence.py` unpinned from `"fp8"` back to `"auto"`; stale
+    `_create_kv_cache` comment corrected.
+  - [~] On-device 3-phase gate (run1 write → run2 restart+restore → control) on Qwen under
+    `auto`. Pre-existing fp8 files moved to `~/.cache/vaayu/kv.pre-bf16-gate` so the gate starts
+    clean — RESTORE THEM afterwards.
 
 ### Plan F — Expert-eviction `top_n` sweep  **(P2)** — ✅ DONE 2026-08-02 (`36ab143` `ace7021`)
 `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
