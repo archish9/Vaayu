@@ -201,8 +201,21 @@ def test_create_kv_cache_fp8_and_fp16_modes_unchanged():
     assert isinstance(fp8, FP8DynamicCache) and fp8.quantize is True
     fp16 = _cache_for_mode("fp16")
     assert type(fp16) is DynamicCache
-    # auto keeps selecting fp8 for EXL3 (non-EXL3 loader_strategy -> fp16 here)
+    # non-EXL3 loader_strategy -> auto still resolves to fp16
     assert type(_cache_for_mode("auto")) is DynamicCache
+
+
+def test_auto_selects_bf16_for_exl3():
+    """auto used to resolve to fp8 for EXL3 models — 3.016 bytes/element, lossy,
+    and slower than storing bf16 outright (Plan E RESULTS)."""
+    from vaayu.persist.loader_strategy import EXL3LoaderStrategy
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    fake = types.SimpleNamespace(kv_cache_mode="auto",
+                                 loader_strategy=EXL3LoaderStrategy())
+    cache = VaayuBaseModel._create_kv_cache(fake)
+    assert isinstance(cache, FP8DynamicCache)
+    assert cache.quantize is False
 
 
 def test_unquantized_mode_crop_front():

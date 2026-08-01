@@ -99,10 +99,14 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   - [x] TTFT gap on MiniMax is noise: bf16's own cold runs span 31.25–47.74s vs fp8's 39.47s
   - [x] RESULTS written; **recommendation = flip `auto` → bf16**, as a separate commit, with the
     disk-persistence caveat below
-- [ ] **Task 5b (decision, not yet made)** — flip `auto` → bf16? Recommended by RESULTS §5. Cost:
-  KV disk persistence refuses bf16 caches (Task 3 option (a)), so anyone who enabled
-  `enable_kv_persist` would silently lose it. Either flip now and add bf16 serialization later,
-  or land serialization first (`QUANT_SIG_BF16` already reserved) and flip after. **User's call.**
+- [x] **Task 5b** — **`auto` FLIPPED to bf16** for EXL3 (user's call 2026-08-01, option 1: flip
+  now, serialize later). `_create_kv_cache` + `batch._resolve_kv_elem_bytes` (would have
+  under-reserved KV at 1 B/elem otherwise); `test_kv_persist_coherence.py` pinned to `"fp8"`
+  since disk persistence refuses bf16; README/`test_quick.py` mode lists updated.
+- [ ] **bf16 KV disk serialization** (Plan E Task 3 option (b), now the outstanding follow-up).
+  `QUANT_SIG_BF16` is already reserved; `pack_record`/`read_records`/`build_cache` need a
+  no-scales path. Until then `enable_kv_persist` is a no-op under `auto` — the writer says so
+  once per process. Not urgent: persistence ships dark.
 
 ### Plan F — Expert-eviction `top_n` sweep  **(P2 — next)**
 `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
@@ -230,7 +234,9 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   Measured 3.016 bytes/element, mirror = 66% of it; plain fp16 is 2.0 B/elem — so `kv_cache_mode`
   fp8 (what `auto` picks for every EXL3 model) costs **~1.5× more VRAM than no quantization**.
   Not a crash, not a correctness bug; a standing ~33% VRAM overcharge on every run.
-  **Plan E fixes this** — see Active plans. (found + measured 2026-08-01)
+  **Plan E built the fix** (`kv_cache_mode="bf16"`, 2.000 B/elem measured on both models,
+  `c8cfca8`), but `auto` still selects fp8, so **default runs still pay the overcharge**. Closes
+  when Task 5b flips `auto`. (found + measured 2026-08-01; fix available 2026-08-01)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt

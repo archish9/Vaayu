@@ -7,7 +7,7 @@ Configure parameters in the CONFIG block below, then run:
 
 Parameters:
     MODEL_PATH        — local path to the model checkpoint directory
-    KV_CACHE_MODE     — "auto" | "fp8" | "fp16"
+    KV_CACHE_MODE     — "auto" | "bf16" | "fp8" | "fp16"
                         "auto" selects FP8 for EXL3 models, FP16 otherwise
                         FP8 saves ~50% KV cache VRAM vs FP16
     MAX_PINNED_LAYERS — 0  = shared layers only (embed/norm/lm_head, ~1 GB) [default]
@@ -36,7 +36,7 @@ logging.basicConfig(
 # ── Configuration ────────────────────────────────────────────────────────────
 
 MODEL_PATH        = "/home/a/code/ai-ml/models/mistralai--Mixtral-8x7B-Instruct-v0.1"
-KV_CACHE_MODE     = "auto"   # "auto" | "fp8" | "fp16"
+KV_CACHE_MODE     = "auto"   # "auto" | "bf16" | "fp8" | "fp16"
 MAX_PINNED_LAYERS = 10      # 0=shared only, -1=auto fill VRAM budget, N=first N layers
 MAX_NEW_TOKENS    = 512      # coding agent response needs room for real code output
 MAX_LENGTH        = 2048     # coding agent context is long; must be > PREFILL_CHUNK_SIZE

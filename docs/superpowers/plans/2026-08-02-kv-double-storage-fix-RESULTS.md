@@ -99,7 +99,24 @@ for anyone who had turned it on. Two orderings are defensible:
    `QUANT_SIG_BF16`), then flip, so no feature is lost at any point.
 
 Per the plan, the flip is a **separate, explicit commit** and is not part of this one. `auto`
-remains fp8 as of these results.
+remained fp8 as of these results.
+
+**UPDATE — the flip was made** (option 1: flip now, serialize later), on the user's call, in the
+commit that follows these results. What changed with it:
+
+- `_create_kv_cache`: `auto` → `"bf16"` for EXL3 (was `"fp8"`); non-EXL3 still `"fp16"`.
+- `batch._resolve_kv_elem_bytes`: mirrors the same resolution, so batch planning charges 2
+  bytes/element instead of 1. Left unchanged it would have **under-reserved** KV — the exact
+  failure its docstring says it must never have.
+- `test_kv_persist_coherence.py` pinned to `"fp8"` explicitly. Under `auto` it would now build a
+  bf16 cache, `DiskWriter` would refuse it, and the harness would measure nothing while appearing
+  to run.
+- README + `test_quick.py` mode lists updated.
+
+**Known benign interaction:** a session whose fp8 KV was restored from disk stays fp8 for that
+session even in a bf16-mode process — `update()` dispatches on the cache instance, not on the
+model's configured mode. Correct, but such a session keeps paying 3.016 bytes/element until it is
+re-prefilled.
 
 **Also note for Plan H (TurboQuant):** its precondition is met. TurboQuant now compresses a store
 that is 100% of the footprint rather than the 33% it would have compressed before this fix.

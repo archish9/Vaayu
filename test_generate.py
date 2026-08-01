@@ -5,7 +5,7 @@ Model: whatever MODEL_PATH below points to (any vaayu.AutoModel-supported archit
 Task:  Generate a complete async file watcher Python module from spec.
 PLD:   OFF — output is novel code, not copied from prompt.
 
-Uses every shipped, on-device-validated optimization: FP8 KV cache (auto), pinned
+Uses every shipped, on-device-validated optimization: bf16 KV ring buffer (auto), pinned
 layers, layer-major chunked prefill, speculative decoding (draft model), cross-turn
 RAM prefix cache, and disk KV persistence. See the "Shipped optimizations" block
 below for what's deliberately left off and why.

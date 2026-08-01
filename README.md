@@ -420,7 +420,7 @@ DRAFT_TOKENS = 15
 
 ```python
 MODEL_PATH         = "/path/to/Llama-3.3-70B-Instruct-exl3-4.5bpw"
-KV_CACHE_MODE      = "auto"          # FP8 for EXL3 → saves ~1.3 GB VRAM
+KV_CACHE_MODE      = "auto"          # bf16 ring buffer for EXL3 → 2.0 bytes/element
 MAX_PINNED_LAYERS  = -1              # auto-fill → ~28 layers pinned
 MAX_NEW_TOKENS     = 512             # room for full code output
 MAX_LENGTH         = 2048            # system prompt + code context
@@ -474,7 +474,9 @@ from vaayu import AutoModel
 
 model = AutoModel.from_pretrained(
     "/path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
-    kv_cache_mode="auto",        # "auto" selects FP8 for EXL3, FP16 otherwise
+    kv_cache_mode="auto",        # "auto" selects bf16 for EXL3, FP16 otherwise
+                                 # ("fp8" still available; it is 1.5x LARGER — it
+                                 #  keeps a dequantized mirror alongside the fp8 store)
     max_pinned_layers=-1,        # auto-fill remaining VRAM with transformer layers
     prefill_chunk_size=512,      # chunk long prompts to avoid VRAM spikes
     drafter_model_path=None,     # set to enable speculative decoding

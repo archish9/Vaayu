@@ -64,7 +64,10 @@ from vaayu import AutoModel
 from vaayu.streaming import stream_generate
 
 MODEL_PATH = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
-KV_CACHE_MODE = "auto"
+# Pinned to fp8, NOT "auto": auto now resolves to bf16 for EXL3, and the disk
+# format serializes the fp8 store + scales, so DiskWriter refuses an unquantized
+# cache. Under "auto" this harness would write nothing and measure nothing.
+KV_CACHE_MODE = "fp8"
 MAX_PINNED_LAYERS = 10
 MAX_NEW_TOKENS = 40          # modest -- model load dominates wall-clock either way
 MAX_LENGTH = 4096

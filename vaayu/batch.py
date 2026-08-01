@@ -104,8 +104,8 @@ def _resolve_kv_elem_bytes(model) -> int:
     if mode == "auto":
         try:
             from .persist.loader_strategy import EXL3LoaderStrategy
-            mode = "fp8" if isinstance(getattr(model, "loader_strategy", None),
-                                       EXL3LoaderStrategy) else "fp16"
+            mode = "bf16" if isinstance(getattr(model, "loader_strategy", None),
+                                        EXL3LoaderStrategy) else "fp16"
         except Exception:
             mode = "fp16"
     return 1 if mode == "fp8" else 2

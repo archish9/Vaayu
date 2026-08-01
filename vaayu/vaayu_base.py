@@ -1904,8 +1904,14 @@ class VaayuBaseModel(GenerationMixin):
         mode = self.kv_cache_mode
 
         if mode == "auto":
+            # bf16, not fp8: fp8 mode stores an fp8 copy AND the dequantized
+            # mirror attention actually reads, measured 3.016 bytes/element
+            # against bf16's 2.000. bf16 is lossless, 33.7% smaller, and decodes
+            # slightly faster on both on-device models (Plan E RESULTS). Note
+            # this costs KV DISK persistence, which serializes the fp8 store +
+            # scales an unquantized cache does not have and so refuses it.
             from .persist.loader_strategy import EXL3LoaderStrategy
-            mode = "fp8" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
+            mode = "bf16" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
 
         if mode == "fp16":
             return DynamicCache()
