@@ -5,28 +5,28 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (Plans E/F/G/H queued; KV double-storage finding measured)._
+_Last updated: 2026-08-02 (Plan F DONE — no viable pin N; Plan G reduced to its zero-code Task 1)._
 
 ---
 
 ## Execution order (priority)
 
-Plans A, C, D are ✅ DONE (2026-08-01) — see Active plans below. **Current queue, four plans,
-each self-contained for a fresh session:**
+Plans A, C, D are ✅ DONE (2026-08-01) and F ✅ DONE (2026-08-02) — see Active plans below.
+**Current queue, three plans left, each self-contained for a fresh session:**
 
 1. **P1 — Plan E (KV double-storage fix).** `2026-08-02-kv-double-storage-fix.md`. Independent of
    everything else; do it first because it is the biggest free win and because Plan H's ratios
    depend on it. Frees ~33% of KV VRAM, lossless, and *removes* quantization work.
-2. **P2 — Plan F (`top_n` eviction sweep).** `2026-08-02-expert-eviction-topn-sweep.md`. Nearly
-   zero code. Produces the N that Plan G needs, or proves no N is viable. Independent of E.
-3. **P3 — Plan G (expert pin + routing locality).** `2026-08-02-expert-pin-and-routing-locality.md`.
-   **Requires F's N.** Task 1 is a zero-code experiment (`VAAYU_CACHE_BIAS`, an existing env var
-   defaulting to 0.0) that may make the pin unnecessary.
+2. ~~**P2 — Plan F (`top_n` eviction sweep).**~~ ✅ DONE 2026-08-02. Verdict: **no N is viable**
+   — eviction share is linear in N and 2–4× below the pin's share of the cache, on both models.
+3. **P3 — Plan G (routing locality only; pin dropped by F).** `2026-08-02-expert-pin-and-routing-locality.md`.
+   F returned no N, so the pin (Tasks 2–4) is dropped. What remains is Task 1, a zero-code
+   experiment (`VAAYU_CACHE_BIAS`, an existing env var defaulting to 0.0).
 4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
    precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
    context, NOT decode speed.
 
-**Dependency summary:** E → H, F → G. E/F are independent of each other and can run in any order.
+**Dependency summary:** E → H (both still open), F → G (F is done; its answer shrank G).
 
 ---
 
@@ -108,19 +108,35 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   no-scales path. Until then `enable_kv_persist` is a no-op under `auto` — the writer says so
   once per process. Not urgent: persistence ships dark.
 
-### Plan F — Expert-eviction `top_n` sweep  **(P2 — next)**
+### Plan F — Expert-eviction `top_n` sweep  **(P2)** — ✅ DONE 2026-08-02 (`36ab143` `ace7021`)
 `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
-Only N=10 has ever been measured (19% of evictions for 63% of the cache budget — not viable).
+RESULTS: `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep-RESULTS.md`
+Only N=10 had ever been measured (19% of evictions for 63% of the cache budget — not viable).
 This produces the whole curve. **One GPU run per model, many reports** — rendering at a different
 `top_n` is pure formatting over the same snapshot, no re-run needed.
-- [ ] **Task 1** — `format_eviction_sweep(...)`: eviction share AND VRAM cost per N (TDD)
-- [ ] **Task 2** — print it from `test_generate.py`'s existing guarded block
-- [ ] **Task 3** — on-device sweep both models + RESULTS naming an N, or "none viable"
-  - Decision rule: **an N is viable only if its eviction share materially exceeds its share of
-    the cache budget.**
+- [x] **Task 1** — `format_eviction_sweep(...)`: eviction share AND VRAM cost per N (TDD) — `36ab143`
+  - [x] 6 tests in `tests/test_expert_usage.py` (fail → pass); suite 437 → 443 green
+  - [x] Top-N selection extracted to `_top_experts`, shared with `format_usage_report`
+  - [x] Uncovered layers excluded from BOTH share and pin cost (extra test beyond the plan)
+- [x] **Task 2** — print it from `test_generate.py`'s existing guarded block — `ace7021`
+- [x] **Task 3** — on-device sweep both models + RESULTS — **VERDICT: no N is viable**
+  RESULTS: `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep-RESULTS.md`
+  - [x] MiniMax: 126,480 routes, 79,638 evictions, decode 1.50 (floor 1.47), 0 OOM.
+    Share is 2/4/6/10/19/33/53% at N=1/2/3/5/10/20/40 for 6/13/19/32/63/126/253% of budget.
+  - [x] Qwen: 191,760 routes, 71,825 evictions, decode 0.85 (floor 0.82), 0 OOM.
+    Share 3/6/9/16/30/54/83% for 12/25/37/62/123/247/493% of budget. `covered_layers` was a
+    real set (65 of 94 layers) and the report labelled the other 29 "(not VRAM-cached)".
+  - [x] **Eviction share is linear in N and always 2–4× below the cost line** — no head to pin.
+    N=10 on MiniMax reproduced the earlier 19% exactly, validating the sweep.
+  - [x] Scaffolding reverted (`git checkout test_generate.py`); `enable_expert_usage` still False
 
-### Plan G — Expert pin + routing locality  **(P3 — needs F's N)**
+### Plan G — Expert pin + routing locality  **(P3 — RETARGETED by Plan F)**
 `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality.md` — self-contained
+**Plan F answered its precondition with "no N is viable"** (share linear in N, 2–4× below the
+cost line, both models). **Tasks 2–4 (the pin) are therefore DROPPED — do not build them.**
+Task 1 is the whole of Plan G now: it attacks the diffuseness instead of reserving space in a
+cache that is already too small. Revisit the pin only if the cache stops thrashing (bigger VRAM
+budget or a smaller model).
 - [ ] **Task 1** — **zero-code**: measure `VAAYU_CACHE_BIAS` (existing env var, defaults 0.0).
   `cache_aware_topk` + `_build_resident_mask` are already shipped and wired into the EXL3 fused
   path; they bias top-k *selection* toward resident experts while taking weights from the original
@@ -165,6 +181,7 @@ PREMISE WARNING still stands: do not build Phase 1 as written.
   every prefill; measured 9.04→2.64GB, 1362 evictions). A future pin spec must justify its N
   against the 19% figure, address the redistribution effect, and consider whether the 81% long
   tail is better addressed some other way — see the RESULTS doc's Recommendation section.
+  **Plan F (2026-08-02) settled it: no N clears the bar on either model, so the pin stays unbuilt.**
 - [x] Tasks 2,5 (persist/decay, `compute_pin_set`) — **DROPPED as speculative** (§2): persistence
   matters only once a win is known; a pin set for a pin that doesn't exist is dead weight.
 - [ ] Tasks 8,9 (Phase 2 live re-pin) — untouched, still deferred
