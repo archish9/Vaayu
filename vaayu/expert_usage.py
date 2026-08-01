@@ -88,4 +88,9 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
     lines.append(
         f"summary: {total_routes} routes, {total_evictions} budget-pressure evictions; "
         f"top-{top_n} experts account for {hot_evictions} of them ({share:.0%})")
+    if total_evictions > hot_evictions:
+        remainder = total_evictions - hot_evictions
+        lines.append(
+            f"WARNING: {remainder} evictions on experts outside top-{top_n} — "
+            f"raise top_n to inspect")
     return "\n".join(lines)

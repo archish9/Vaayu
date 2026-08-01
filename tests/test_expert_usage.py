@@ -101,6 +101,33 @@ def test_report_on_empty_histogram_does_not_crash():
     assert "no expert routes recorded" in out
 
 
+def test_report_warns_when_evictions_land_outside_top_n():
+    """An expert just outside the top-N cutoff can absorb all the evictions —
+    the summary must not silently report 0% in that case."""
+    counts = torch.zeros((1, 6), dtype=torch.int32)
+    counts[0, 0] = 100
+    counts[0, 1] = 90
+    counts[0, 2] = 80
+    counts[0, 3] = 70
+    counts[0, 4] = 60
+    counts[0, 5] = 55       # just outside top_n=5, holds all the evictions
+    out = format_usage_report(counts, {(0, 5): 200}, top_n=5)
+    assert "WARNING" in out
+    assert "200" in out
+    assert "top-5" in out
+    assert "top_n" in out
+
+
+def test_report_no_warning_when_evictions_are_all_inside_top_n():
+    """When every eviction belongs to a printed top-N expert, no WARNING line
+    should appear — the fix must not add noise to the common case."""
+    counts = torch.zeros((2, 4), dtype=torch.int32)
+    counts[1, 2] = 500
+    counts[1, 3] = 400
+    out = format_usage_report(counts, {(1, 2): 12}, top_n=5)
+    assert "WARNING" not in out
+
+
 def test_report_respects_top_n():
     counts = torch.zeros((1, 10), dtype=torch.int32)
     for e in range(10):
