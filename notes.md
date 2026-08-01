@@ -1556,34 +1556,11 @@ Both bugs fixed and confirmed working — the model correctly loads, all 62 laye
 
 test_generate.py because a single-turn benchmark can never hit a cross-turn cache
 
-----
+-----
+Best for High-Performance API & Cost-Efficiency: DeepSeek V4 Pro and DeepSeek V4 Flash are standout models offering elite performance across LiveCodeBench while being highly efficient for integration into coding agents.
 
+DeepSeek-R1 is the headline answer. Released January 2025, MIT-licensed, open weights, and explicitly a reasoning model with visible chain-of-thought — the direct open answer to OpenAI's o1/o3-mini line. On math-style reasoning (AIME and similar) it traded blows with o3-mini and sometimes beat it. On coding specifically — LiveCodeBench, the thing your quote emphasizes — it was genuinely competitive, though o3-mini-high often edged it on the hardest coding benchmarks. So "as good" is fair on reasoning broadly; on pure competitive coding it was more of a real contest.
 
- Next, in this order
+QwQ-32B (Qwen's reasoning model, March 2025) is the one that surprised people: it approached R1-level reasoning at only 32B parameters, putting o3-mini-class thinking in a dramatically smaller package.
 
-  1. docs/superpowers/plans/2026-07-23-ram-accounting-diagnostic.md
-  Splits the ~5GB of unexplained RSS. Outputs a reclaimable-RAM figure.
-
-  2. docs/superpowers/plans/2026-07-23-ram-budget-rebalance.md
-  Consumes that figure. Reclaims RAM from the 5%-hit expert cache so the prefix cache gets a budget → concurrent sessions stay
-  cached under fan-out.
-
-
-  -----
-- docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md (9 TDD tasks)  
-
-   ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
-  │ 2   │ Batched decode (fan-out streams share 1    │ amortize   │ v1 designed, in progress             │ aggregate ~N×    │
-  │     │ stream)                                    │            │                                      │                  │
-  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
-  │ 3   │ Prompt-lookup decoding                     │ amortize   │ code exists, likely underused        │ big on code      │
-  │     │                                            │            │                                      │ output           │
-  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
-  │ 4   │ Lower/mixed-bpw quant                      │ fewer      │ not started                          │ direct linear    │
-  │     │                                            │ bytes      │                                      │                  │
-  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
-  │ 5   │ GPU Direct Storage (cuFile)                │ I/O path   │ not started                          │ skip host bounce │
-  ├─────┼────────────────────────────────────────────┼────────────┼──────────────────────────────────────┼──────────────────┤
-  │ 6   │ KV persist + prefix scaling                │ skip read  │ A1 landed, persist spec'd            │ TTFT             │
-  └─────┴────────────────────────────────────────────┴────────────┴──────────────────────────────────────┴──────────────────┘
-
+Qwen3 (2025) is probably the strongest open family for your use case now. The models have a built-in "thinking mode," come in sizes from tiny up to a 235B MoE, and the larger ones beat o3-mini on many reasoning and coding benchmarks. Worth also knowing: Phi-4-reasoning (Microsoft, 14B), GLM-Z1 (Zhipu), and Nvidia's Llama-Nemotron reasoning models all landed in this space too.
