@@ -19,10 +19,10 @@ Sequence is forced by dependencies, not preference:
 2. **P2 — Chain step 4 (measure round-2 HIT).** Only runnable once A stops the OOM. Cheap,
    and it's the original goal. Expect it to surface the prefix MISS-on-revisit bug (see
    Pending bugs) → likely spawns a small follow-up plan.
-3. **P3 — Plan B (expert histogram).** Last. Blocked on A: its header mandates "after the
-   VRAM OOM chain," it needs retargeting RAM→`ExpertVRAMCache`, and its VRAM-tier pin can't
-   be **sized** until A fixes how much VRAM headroom exists. Do NOT start early — the infra
-   is tier-agnostic but delivers zero value before the pin, so building it now is speculative
+3. **P3 — Plan D (expert histogram, MEASUREMENT ONLY).** Plan B's gate cleared, but its pin is
+   premise-invalidated twice over (wrong tier, and a startup pre-warm is evicted by the first
+   prefill). Plan D measures whether a pin has any target at all before one is designed. A
+   negative result retires the pin on evidence — cheaper than building it on assumption
    (CLAUDE.md §2).
 
 ---
@@ -63,14 +63,33 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   `.gitignore` for evidence logs, unlocked-read rationale, `R_ROUNDS<2` guard,
   kv_persist eviction note
 
-### Plan B — Expert usage histogram (Subsystem B)  **(P3 — do last)**
-`docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
-- [!] **BLOCKED / needs retarget** — premise warning (see plan header): RAM-tier pin is
-  low-value now (RAM expert-cache hit 34%→5%; VRAM cache serves hot experts). Retarget the
-  pin RAM→`ExpertVRAMCache`, and sequence AFTER Plan A / the VRAM OOM chain (VRAM contended).
-- [ ] Tasks 1,2,4,5 — histogram infra (count/persist/rank/hook) — tier-agnostic, buildable now
-- [!] Tasks 3,6 — pin: move from `ExpertRAMCache._hot` → `ExpertVRAMCache` before building
-  (VRAM class has no pin mechanism yet)
+### Plan B — Expert usage histogram (Subsystem B)  **(P3)** — RETARGETED 2026-08-01
+`docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md` — Phase 1 **superseded**
+by the measurement-only retarget below. Its gate (the VRAM OOM chain) closed 2026-08-01, but its
+PREMISE WARNING still stands: do not build Phase 1 as written.
+- [x] Blocker cleared — VRAM OOM chain closed (`045f387`..`aada3cd`)
+- [!] Tasks 3,6 (the pin) — NOT built. Two reasons: `ExpertVRAMCache` still has no pin mechanism,
+  and a startup pre-warm is a **no-op** — `_ensure_prefill_headroom` evicts the VRAM cache on
+  every prefill and every generation starts with one (measured 9.04→2.64GB, 1362 evictions).
+  Unblocks only if Plan D's measurement finds hot-but-evicted experts.
+- [x] Tasks 2,5 (persist/decay, `compute_pin_set`) — **DROPPED as speculative** (§2): persistence
+  matters only once a win is known; a pin set for a pin that doesn't exist is dead weight.
+- [ ] Tasks 8,9 (Phase 2 live re-pin) — untouched, still deferred
+
+### Plan D — Expert usage histogram, measurement only  **(P3 — active)**
+`docs/superpowers/plans/2026-08-01-expert-usage-histogram-measurement.md`
+Spec: `docs/superpowers/specs/2026-08-01-expert-usage-histogram-measurement-design.md` (`c38132e`)
+Answers ONE question: are there experts decode routes to often but the VRAM cache keeps evicting?
+A "no" retires Plan B's pin on evidence — that outcome is a success, not a failure.
+- [ ] **Task 1** — `ExpertUsageTracker`: device-side route counter, no hot-path sync (TDD)
+- [ ] **Task 2** — per-key attribution of **budget-pressure evictions only** in `ExpertVRAMCache`
+  - [ ] Discriminating test: `evict_until_free()` evictions must NOT be attributed (needs CUDA —
+        confirm it RAN, not skipped)
+- [ ] **Task 3** — report joining routes with evictions; labels "no pin needed" as plainly as
+  "pin candidate"
+- [ ] **Task 4** — wire in behind `enable_expert_usage` (default False); hook at 3 routing sites,
+  decode-only
+- [ ] **Task 5** — on-device run on MiniMax + RESULTS + the pin VERDICT; check decode vs ~1.47 floor
 
 ---
 
