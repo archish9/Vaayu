@@ -16,8 +16,16 @@ import torch
 MAGIC = b"VAAYUKV1"
 SCHEMA_VER = 1
 # quant scheme signature: changes whenever FP8DynamicCache.update's scheme changes.
-_QUANT_SIG_UNSIGNED = zlib.crc32(b"fp8_e4m3fn:448.0:per-head-per-token") & 0xFFFFFFFF
-QUANT_SIG = struct.unpack('<i', struct.pack('<I', _QUANT_SIG_UNSIGNED))[0]
+def _sig(scheme: bytes) -> int:
+    return struct.unpack('<i', struct.pack('<I', zlib.crc32(scheme) & 0xFFFFFFFF))[0]
+
+
+QUANT_SIG = _sig(b"fp8_e4m3fn:448.0:per-head-per-token")
+# FP8DynamicCache(quantize=False) stores bf16 with no scales -- a different
+# on-disk layout, so it gets its own signature. Serializing it is not
+# implemented yet (DiskWriter refuses); the signature exists so such a file can
+# never be read back through the fp8 path.
+QUANT_SIG_BF16 = _sig(b"bf16:none:ring")
 
 _DTYPE_CODES = {
     torch.float8_e4m3fn: 1,
@@ -58,14 +66,18 @@ class KvHeader:
 
 def build_header(cache, config, session_id: str, nrec: int) -> KvHeader:
     key0 = cache.key_cache[0]            # [1, H, cap, D]
+    quantized = getattr(cache, "quantize", True)
+    # unquantized caches carry no scales; the field still needs a valid code, so
+    # it mirrors the storage dtype and the signature marks the layout as bf16.
+    scale_dtype = cache._key_scales[0].dtype if quantized else key0.dtype
     return KvHeader(
         schema_ver=SCHEMA_VER,
         num_layers=len(cache.key_cache),
         num_kv_heads=int(key0.shape[1]),
         head_dim=int(key0.shape[3]),
         kv_dtype_code=dtype_code(cache.key_cache[0].dtype),
-        scale_dtype_code=dtype_code(cache._key_scales[0].dtype),
-        quant_sig=QUANT_SIG,
+        scale_dtype_code=dtype_code(scale_dtype),
+        quant_sig=QUANT_SIG if quantized else QUANT_SIG_BF16,
         vocab=int(getattr(config, "vocab_size", 0)),
         nrec=nrec,
         session_id=session_id,
@@ -169,6 +181,7 @@ class DiskWriter:
         self.sync = sync
         os.makedirs(self.dir, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1)
+        self._warned_unquantized = False
         self._lock = threading.Lock()   # guards _state dict structure only
         self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock, "future": Future|None}
 
@@ -191,6 +204,16 @@ class DiskWriter:
                 }
 
     def enqueue_append(self, session_id, cache, config, token_ids, length):
+        # Serializing the bf16 ring buffer is not implemented (pack_record reads
+        # the scale buffers, which do not exist). Skip rather than write bf16
+        # bytes that a reader would dequantize as fp8. Warn once: this fires on
+        # every turn of every session otherwise.
+        if not getattr(cache, "quantize", True):
+            if not self._warned_unquantized:
+                print("[KV] disk persistence skipped: unquantized (bf16) KV caches "
+                      "are not serialized yet. RAM prefix cache is unaffected.")
+                self._warned_unquantized = True
+            return
         # self._lock (global) only guards the _state dict structure: atomically
         # look up or create this session's entry -- including its per-session
         # lock -- so two threads can't race to install two different locks for a

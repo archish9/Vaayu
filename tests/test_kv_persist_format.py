@@ -43,6 +43,20 @@ def test_header_roundtrip_and_record_bytes(n_layers, heads, dim):
     assert kp.record_start(h) == buf.tell()  # records begin right after header+sid
 
 
+def test_unquantized_cache_gets_its_own_quant_sig():
+    """A bf16 ring buffer is a different on-disk scheme than fp8+scales. It must
+    never claim the fp8 signature, or a bf16 file would be read back as fp8."""
+    from vaayu.vaayu_base import FP8DynamicCache
+    c = FP8DynamicCache(quantize=False)
+    c.update(torch.randn(1, 4, 3, 16, dtype=torch.bfloat16),
+             torch.randn(1, 4, 3, 16, dtype=torch.bfloat16), 0)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    h = kp.build_header(c, cfg, "sess-bf16", nrec=3)
+    assert h.quant_sig == kp.QUANT_SIG_BF16
+    assert h.quant_sig != kp.QUANT_SIG
+    assert kp.header_matches(h, cfg) is False   # the fp8 reader must reject it
+
+
 def test_read_header_rejects_bad_magic():
     buf = io.BytesIO(b"NOTVAAYU" + b"\x00" * 40)
     assert kp.read_header(buf) is None

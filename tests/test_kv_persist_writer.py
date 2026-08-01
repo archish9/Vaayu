@@ -24,6 +24,25 @@ def _read_nrec(path):
     return h.nrec
 
 
+def test_append_refuses_unquantized_cache(tmp_path, capsys):
+    """bf16 caches are not serialized yet: refuse loudly rather than write bf16
+    bytes under the fp8 signature."""
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    c = FP8DynamicCache(quantize=False)
+    c.update(torch.randn(1, 4, 4, 16, dtype=torch.bfloat16),
+             torch.randn(1, 4, 4, 16, dtype=torch.bfloat16), 0)
+    w.enqueue_append("s-bf16", c, cfg, [1, 2, 3, 4], 4)
+    w.drain()
+    assert not os.path.exists(w.path_for("s-bf16"))
+    assert "unquantized" in capsys.readouterr().out
+    # warns once, not per append
+    w.enqueue_append("s-bf16", c, cfg, [1, 2, 3, 4], 4)
+    w.drain()
+    assert capsys.readouterr().out == ""
+    w.close()
+
+
 def test_append_writes_header_and_grows_nrec(tmp_path):
     w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
     cfg = types.SimpleNamespace(vocab_size=1000)

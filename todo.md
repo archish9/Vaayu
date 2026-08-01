@@ -84,8 +84,11 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   - [x] Test reproduced the predicted `IndexError`; branch now also requires `cache.quantize`
   - [x] Repo-wide grep: only other class-based sites are `_trim_kv_cache`/`_trim_kv_cache_front`
     (they call `crop`/`crop_front`, mode-independent) and `kv_persist` (Task 3)
-- [ ] **Task 3** — `kv_persist` signature for the unquantized format (must not write bf16 under
-  the fp8 `QUANT_SIG`)
+- [x] **Task 3** — `kv_persist` signature for the unquantized format (must not write bf16 under
+  the fp8 `QUANT_SIG`) — **option (a), signature-only**: `QUANT_SIG_BF16` (`bf16:none:ring`),
+  `build_header` picks it off `cache.quantize`, and `DiskWriter.enqueue_append` refuses an
+  unquantized cache (warn once, no file). Old fp8 files keep working; bf16 disk persistence
+  can land later. 2 tests.
 - [ ] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged
 - [ ] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
 
