@@ -163,14 +163,27 @@ def compute_expert_budget(
     return expert_budget, ne_budget, max_per_layer
 
 
-# Hardware constant: reserve for activations + KV-cache growth on the GPU.
-# Property of the box (16 GB VRAM here), NOT the model.
-_VRAM_RESERVE_BYTES = 2 * 1024 ** 3
+# Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
+# Property of the 16 GB box, NOT the model (§5). Sizes the cache = free_vram - this.
+#
+# Raised 2 GB -> 3.5 GB after the 2026-07-23 prefill-OOM diagnostic
+# (docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic-RESULTS.md). The 2 GB
+# value covered PREFILL (proven: prefill held 2.01 GB free across all 62 layers and
+# never OOMed) but NOT DECODE: at the prefill->decode boundary the cache re-warms
+# toward its full budget while weights (~3.5 GB) + KV (~1.1 GB) are resident, leaving
+# no room for the first decode step's logits/sampling transient (dies in
+# TopKLogitsWarper) plus allocator fragmentation — OOM at 13.73 GB alloc / 17 MB free
+# on the 3rd generation. 3.5 GB shrinks the cache by ~1.5 GB so decode peak drops
+# clear of the 15.47 GB usable ceiling. Pair with
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to remove the fragmentation slack.
+_VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)
 
 
 def compute_vram_expert_budget(free_vram_bytes: int) -> int:
     """VRAM available to cache resident expert tensors, after reserving headroom
-    for activations/KV growth. Model-agnostic (Fix #7)."""
+    (_VRAM_RESERVE_BYTES) for decode-side transients: activations, KV growth, and
+    the first-decode-step logits/sampling temporaries + allocator fragmentation.
+    Model-agnostic (Fix #7) — only free VRAM in, no geometry."""
     return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
 
 

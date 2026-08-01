@@ -50,3 +50,15 @@ def test_vram_layer_range_zero_budget():
     geo = {"expert_bytes": 11 * 1024 ** 2, "top_k": 8, "num_moe_layers": 91,
            "num_experts": 128, "working_set_bytes": 8 * 91 * 11 * 1024 ** 2}
     assert compute_vram_layer_range(0, geo, list(range(91))) == set()
+
+
+def test_reserve_covers_decode_transients_not_just_prefill():
+    """RESULTS 2026-07-24: the old 2 GB reserve was sized for prefill; it left the
+    first decode step with no room for the VRAM-cache re-warm + logits/sampling
+    transient, OOMing at the prefill->decode boundary at the 3rd generation. The
+    reserve must exceed 2 GB so decode keeps headroom. Hardware constant (§5),
+    model-agnostic — no geometry input to the sizing function."""
+    from vaayu.vaayu_base import _VRAM_RESERVE_BYTES
+    assert _VRAM_RESERVE_BYTES >= int(3.5 * GB)
+    # And it still leaves a usable cache on this box (~11.7 GB free at cache-sizing):
+    assert compute_vram_expert_budget(free_vram_bytes=int(11.7 * GB)) >= 6 * GB

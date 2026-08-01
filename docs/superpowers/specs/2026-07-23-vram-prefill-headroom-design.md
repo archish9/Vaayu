@@ -1,5 +1,15 @@
 # KV-Aware Prefill VRAM Headroom — Design
 
+> **SUPERSEDED (2026-07-24).** Approach B below (KV-aware prefill eviction) is
+> premise-invalidated. The on-device diagnostic
+> (`docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic-RESULTS.md`) proved the OOM is
+> NOT in prefill and NOT KV-driven: prefill's evictor works and holds 2 GB free across all
+> layers; the OOM is at the prefill→decode boundary, driven by the VRAM expert cache
+> re-warming to its full budget with no headroom for decode-side sampling + fragmentation.
+> The real fix is `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix.md` (raise the
+> cache-budget reserve `_VRAM_RESERVE_BYTES`, NOT the prefill headroom). Do not implement
+> Approach B.
+
 > **⚠️ ON HOLD — PREMISE INVALIDATED (2026-07-23).** This design assumes the second-session
 > prefill OOM is the KV cache growing into the fixed 2 GB prefill headroom. Real geometry
 > refutes it: both on-device targets are GQA, so the KV footprint is ~1.1 GB (MiniMax) /
