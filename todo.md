@@ -75,8 +75,8 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
 - [x] Step 1 — RAM budget rebalance (`6c9bc76..54d660b`)
 - [x] Step 2 — VRAM diagnostic + RESULTS (2026-07-24, `855c09f` `fc01df0`); verdict = decode-boundary OOM
 - [x] Step 3 — execute Plan A (above), 2026-08-01 (`045f387` `86a6ca5`); OOM closed at K=2 and K=3
-- [x] Step 4 — round-2 HIT measurement **(P2)** — 2026-08-01, `626dcaf` `cf7963e` +
-  RESULTS commit (this task). Harness now asserts HITs itself (exit status 0 is the verdict):
+- [x] Step 4 — round-2 HIT measurement **(P2)** — 2026-08-01, `626dcaf` `cf7963e` `e7f5939`.
+  Harness now asserts HITs itself (exit status 0 is the verdict):
   K=2 → 2/2 HIT, 0evict, saved=3940/3980 tok (99%); K=3 → 3/3 HIT, 0evict, saved=5910/5970 tok
   (99%). TTFT collapsed ~90-101s → ~9-10s at both K. Kernel OOM count 0.
 
