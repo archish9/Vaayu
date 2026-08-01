@@ -30,7 +30,10 @@ def _extract_kv_as_bf16(cache, layer_idx: int):
     from vaayu.vaayu_base import FP8DynamicCache
     k = cache.key_cache[layer_idx]
     v = cache.value_cache[layer_idx]
-    if isinstance(cache, FP8DynamicCache):
+    # The class alone does not imply quantization: FP8DynamicCache(quantize=False)
+    # stores bf16 directly and allocates no scales, so a class-only check would
+    # IndexError on the empty scale lists (or scale data that isn't fp8).
+    if isinstance(cache, FP8DynamicCache) and getattr(cache, "quantize", True):
         ks = cache._key_scales[layer_idx]
         vs = cache._value_scales[layer_idx]
         k = k.to(torch.bfloat16) * ks

@@ -78,9 +78,12 @@ is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization
   - [x] 7 tests in `tests/test_fp8_kv_cache.py` (fail → pass); suite 424 → 431 green
   - [x] `_BUFFER_LISTS` class constant → instance property; `crop_front` iterates it (it had
     hardcoded all six lists, which would IndexError on the empty ones in unquantized mode)
-- [ ] **Task 2** — fix `kv_cache_manager._extract_kv_as_bf16`: it branches on `isinstance(...,
+- [x] **Task 2** — fix `kv_cache_manager._extract_kv_as_bf16`: it branches on `isinstance(...,
   FP8DynamicCache)` then unconditionally multiplies by `_key_scales` — wrong for an unquantized
   instance of the same class. **The sharpest trap in the plan.**
+  - [x] Test reproduced the predicted `IndexError`; branch now also requires `cache.quantize`
+  - [x] Repo-wide grep: only other class-based sites are `_trim_kv_cache`/`_trim_kv_cache_front`
+    (they call `crop`/`crop_front`, mode-independent) and `kv_persist` (Task 3)
 - [ ] **Task 3** — `kv_persist` signature for the unquantized format (must not write bf16 under
   the fp8 `QUANT_SIG`)
 - [ ] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged
