@@ -149,3 +149,37 @@ def test_evict_until_free_stops_when_cache_empty():
     assert c.current_usage == 0
     assert len(c.cache) == 0
     assert freed == ExpertVRAMCache._group_bytes(_groups(1000)) * 2
+
+
+def test_evicted_keys_is_none_when_tracking_off():
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+    c = ExpertVRAMCache(budget_bytes=10_000)
+    assert c.evicted_keys is None
+
+
+def test_put_pressure_evictions_are_attributed_per_key():
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+    c = ExpertVRAMCache(budget_bytes=700, track_evicted_keys=True)
+    assert c.put(1, 7, _groups(150))
+    assert c.put(1, 8, _groups(150))          # over budget -> evicts (1,7)
+    assert c.evicted_keys[(1, 7)] == 1
+    assert c.evictions == 1
+
+
+def test_prefill_wipe_evictions_are_not_attributed():
+    """THE discriminating test. evict_until_free() is the deliberate wholesale
+    prefill wipe (1362 entries in one measured pass). Attributing it per-expert
+    would drown the budget-pressure signal and make every expert look like a
+    pin candidate. It must increment prefill_evictions only."""
+    import torch
+    from vaayu.persist.expert_cache import ExpertVRAMCache
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("evict_until_free reads CUDA free memory")
+    c = ExpertVRAMCache(budget_bytes=10_000, track_evicted_keys=True)
+    c.put(2, 5, _groups(1000))
+    free, _ = torch.cuda.mem_get_info()
+    c.evict_until_free(free + 10_000)          # force a wipe
+    assert c.prefill_evictions >= 1
+    assert c.evicted_keys[(2, 5)] == 0         # NOT attributed
+    assert sum(c.evicted_keys.values()) == 0

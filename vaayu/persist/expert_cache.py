@@ -1,5 +1,5 @@
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import torch
 
@@ -444,7 +444,7 @@ class ExpertVRAMCache:
     torch caching allocator can reuse the memory.
     """
 
-    def __init__(self, budget_bytes: int):
+    def __init__(self, budget_bytes: int, track_evicted_keys: bool = False):
         self.budget_bytes = budget_bytes
         self.cache: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
         self.current_usage = 0
@@ -453,6 +453,14 @@ class ExpertVRAMCache:
         self.misses = 0
         self.evictions = 0
         self.prefill_evictions = 0   # reactive prefill-headroom evictions
+        # Per-(layer, expert) attribution of BUDGET-PRESSURE evictions only, for
+        # the expert usage histogram. None unless explicitly enabled (ships dark).
+        #
+        # Deliberately NOT incremented by evict_until_free(): that is the
+        # wholesale prefill wipe (measured at 1362 entries in a single pass),
+        # not the LRU failing to afford an expert. Counting it here would drown
+        # the signal and make every expert look like a pin candidate.
+        self.evicted_keys = Counter() if track_evicted_keys else None
         self._last_hits = 0
         self._last_misses = 0
         self._last_evictions = 0
@@ -500,9 +508,11 @@ class ExpertVRAMCache:
             if size > self.budget_bytes:
                 return False  # single expert bigger than whole budget — refuse
             while self.current_usage + size > self.budget_bytes and self.cache:
-                _, evicted = self.cache.popitem(last=False)
+                _ekey, evicted = self.cache.popitem(last=False)
                 self.current_usage -= self._group_bytes(evicted)
                 self.evictions += 1
+                if self.evicted_keys is not None:
+                    self.evicted_keys[_ekey] += 1
                 del evicted  # drop GPU references so the allocator can reuse
             self.cache[key] = gpu_groups
             self.current_usage += size
