@@ -468,6 +468,27 @@ def test_report_respects_top_n():
     out = format_usage_report(counts, {}, top_n=3)
     assert "e0" in out and "e1" in out and "e2" in out
     assert "e9" not in out
+
+
+def test_report_names_evictions_hiding_outside_top_n():
+    """An expert just BELOW the cutoff can hold all the evictions. Without the
+    remainder warning the reader sees only 'no pin needed' lines and a 0%
+    summary while those evictions go unnamed — hiding the exact population a
+    pin would help, which is the one thing this report exists to find."""
+    counts = torch.zeros((1, 6), dtype=torch.int32)
+    for e, r in enumerate([100, 90, 80, 70, 60, 55]):
+        counts[0, e] = r
+    out = format_usage_report(counts, {(0, 5): 200}, top_n=5)
+    assert "WARNING" in out
+    assert "200 evictions on experts outside top-5" in out
+
+
+def test_report_has_no_warning_when_all_evictions_are_accounted_for():
+    """The warning must not add noise to the common case."""
+    counts = torch.zeros((1, 3), dtype=torch.int32)
+    counts[0, 0] = 100
+    out = format_usage_report(counts, {(0, 0): 5}, top_n=5)
+    assert "WARNING" not in out
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -526,6 +547,15 @@ def format_usage_report(counts, evicted_keys, top_n: int = 5) -> str:
     lines.append(
         f"summary: {total_routes} routes, {total_evictions} budget-pressure evictions; "
         f"top-{top_n} experts account for {hot_evictions} of them ({share:.0%})")
+    # hot_evictions only covers experts inside each layer's printed top-N, while
+    # total_evictions sums ALL keys — so evictions concentrated just OUTSIDE the
+    # cutoff would otherwise be invisible, and the reader would see "no pin
+    # needed" lines plus a 0% summary while hundreds of evictions went unnamed.
+    # That is exactly the population a pin would help, so name the remainder.
+    remainder = total_evictions - hot_evictions
+    if remainder > 0:
+        lines.append(f"WARNING: {remainder} evictions on experts outside "
+                     f"top-{top_n} — raise top_n to inspect")
     return "\n".join(lines)
 ```
 
@@ -546,7 +576,7 @@ source venv/bin/activate
 python -m pytest tests/test_expert_usage.py -v
 ```
 
-Expected: PASS — all 12 tests.
+Expected: PASS — all 14 tests.
 
 - [ ] **Step 5: Run the full suite**
 
@@ -555,7 +585,7 @@ source venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-Expected: green, 417 passed (412 + 5).
+Expected: green, 419 passed (412 + 7).
 
 - [ ] **Step 6: Commit**
 
@@ -749,7 +779,7 @@ source venv/bin/activate
 python -m pytest tests/test_expert_usage.py -v && python -m pytest tests/ -q
 ```
 
-Expected: `tests/test_expert_usage.py` all PASS; full suite green at 418 passed (417 + 1).
+Expected: `tests/test_expert_usage.py` all PASS; full suite green at 420 passed (419 + 1).
 
 - [ ] **Step 7: Verify the feature is genuinely dark**
 
@@ -872,7 +902,7 @@ Mark Plan B's status per the verdict, add this plan's tasks as complete, and upd
 - The report labels high-routes/zero-eviction experts as needing no pin, and renders on an empty
   histogram without crashing.
 - With `enable_expert_usage=False` (the default): no tracker, no Counter, hook returns on one
-  getattr, `pytest tests/ -q` green at 418.
+  getattr, `pytest tests/ -q` green at 420.
 - An on-device report exists, and the pin question is answered with a recorded VERDICT either
   way.
 
