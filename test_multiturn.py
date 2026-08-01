@@ -34,15 +34,13 @@ KV_CACHE_MODE = "auto"
 MAX_NEW_TOKENS = 64          # short — TTFT is what we measure, not decode length
 MAX_LENGTH    = 2048
 PREFILL_CHUNK_SIZE = 512
-K_SESSIONS    = 2            # NOTE: on the 16GB box this test is currently
-                             # VRAM-blocked before round 2 — the warm VRAM expert
-                             # cache (~10GB) + weights (~3.5GB) leave <50MB free,
-                             # so a 2nd large-context cold prefill OOMs (observed
-                             # at both K=2 and K=3, stochastically on session 1-2).
-                             # This is a pre-existing VRAM ceiling, orthogonal to
-                             # the host-RAM prefix budget; measuring the round-2
-                             # concurrency HIT count needs the separate VRAM-cache
-                             # right-sizing fix first.
+K_SESSIONS    = 2            # NOTE: the prefill->decode-boundary VRAM OOM that
+                             # used to block round 2 here was closed 2026-08-01 by
+                             # raising _VRAM_RESERVE_BYTES 2GB->3.5GB (see
+                             # docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md).
+                             # On-device gate: K=2 (4/4) and K=3 (6/6) both complete
+                             # with zero OOM, and round-2 revisits now HIT the prefix
+                             # cache.
 R_ROUNDS      = 2            # single cold round — isolates the reclaim question
 
 project_root = os.path.dirname(os.path.abspath(__file__))

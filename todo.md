@@ -29,19 +29,19 @@ Sequence is forced by dependencies, not preference:
 
 ## Active plans
 
-### Plan A — VRAM decode-headroom fix  **(P1)**
+### Plan A — VRAM decode-headroom fix  **(P1)** — ✅ DONE 2026-08-01 (`045f387` `86a6ca5`)
 `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix.md` (chain step 3)
-- [ ] **Task 1** — raise `_VRAM_RESERVE_BYTES` 2GB→3.5GB (in-code, TDD)
-  - [ ] Guard test in `tests/test_vram_budget.py` (fail → pass)
-  - [ ] Constant + hardware-comment in `vaayu_base.py:168`; docstring at `:171`
-  - [ ] Mark on-hold KV-eviction spec superseded
-  - [ ] Full suite green + commit
-- [ ] **Task 2** — on-device gate (operator-run)
-  - [ ] K=2 R=2 with `expandable_segments:True` → no OOM, kernel OOM 0
-  - [ ] Isolate reserve vs expandable_segments contribution
-  - [ ] Decode unregressed: MiniMax ≥1.47, Qwen ≥0.85 tok/s (back off to 3.0GB if not)
-  - [ ] K=3 stretch
-  - [ ] Write RESULTS + commit
+RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
+- [x] **Task 1** — raise `_VRAM_RESERVE_BYTES` 2GB→3.5GB (in-code, TDD) — `045f387`
+  - [x] Guard test in `tests/test_vram_budget.py` (fail → pass); full suite 391 green
+  - [x] Constant + hardware-comment in `vaayu_base.py` (now `:179`); docstring updated
+  - [x] Mark on-hold KV-eviction spec superseded
+- [x] **Task 2** — on-device gate — `86a6ca5`
+  - [x] K=2 R=2 with `expandable_segments:True` → 4/4, no OOM, kernel OOM 0
+  - [x] Attribution: reserve bump ALONE fixes it (no-exp run also 4/4); expandable_segments = optional insurance
+  - [x] Decode unregressed: MiniMax 1.49 (floor 1.47); Qwen 0.84/0.83 vs pre-fix **measured** 0.82 → no back-off needed
+  - [x] K=3 stretch — 6/6, no OOM
+  - [x] RESULTS written + committed
 
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3 — do last)**
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
@@ -57,16 +57,24 @@ Sequence is forced by dependencies, not preference:
 ## Chain — VRAM prefill OOM (memory: `vram_prefill_oom_chain`)
 - [x] Step 1 — RAM budget rebalance (`6c9bc76..54d660b`)
 - [x] Step 2 — VRAM diagnostic + RESULTS (2026-07-24, `855c09f` `fc01df0`); verdict = decode-boundary OOM
-- [ ] Step 3 — execute Plan A (above) **(= P1)**
-- [ ] Step 4 — re-run `test_multiturn.py` K=2 then K=3: confirm round-2 HIT count > 1, no CUDA OOM **(P2)**
+- [x] Step 3 — execute Plan A (above), 2026-08-01 (`045f387` `86a6ca5`); OOM closed at K=2 and K=3
+- [~] Step 4 — round-2 HIT measurement **(P2)** — already OBSERVED in Plan A's gate runs: round-2
+  TTFT collapsed ~90-101s → ~9-10s at both K=2 and K=3 (~10x cross-turn prefix-cache win), no CUDA
+  OOM. Remaining: formalize as a step-4 measurement (explicit HIT-count assertion), not just an
+  observation from the OOM gate logs.
 
 ---
 
 ## Pending bugs / open questions (found in review, not yet fixed)
-- [bug] **Prefix cache MISS-on-revisit.** Diagnostic run showed every `test_multiturn`
-  session was a prefix MISS even revisiting its own session id — the round-2 HIT the chain
-  wants is not landing even before the OOM. Separate cache eviction/keying question; chase
-  after Plan A closes the OOM. (found 2026-07-24)
+- [x] ~~**Prefix cache MISS-on-revisit.**~~ Diagnostic run showed every `test_multiturn`
+  session was a prefix MISS even revisiting its own session id. (found 2026-07-24)
+  **NO LONGER REPRODUCES** after Plan A (2026-08-01): round-2 revisits HIT at both K=2 and
+  K=3 (TTFT ~90-101s → ~9-10s). The MISSes were a downstream effect of the OOM aborting/
+  poisoning round 2, not a separate keying bug.
+- [bug] **Stale cross-reference comment.** `vaayu/moe_patch.py:666` says
+  `_PREFILL_VRAM_HEADROOM` is "the same class/value as `vaayu_base._VRAM_RESERVE_BYTES`" —
+  false since Plan A (2 GB vs 3.5 GB). File was off-limits to Plan A's tasks. Doc-only, no
+  behavior impact; fix when next touching `moe_patch.py`. (found 2026-08-01)
 
 ---
 

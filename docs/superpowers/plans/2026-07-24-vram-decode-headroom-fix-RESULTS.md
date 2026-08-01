@@ -4,6 +4,10 @@ Plan: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix.md` (Task 2, S
 operator-run gate). Fix landed in Task 1 (`fix(vram): raise expert-cache reserve 2GB->3.5GB
 for decode headroom`, commit `045f387`).
 
+Note: the `run-decode-*.log` files cited by name throughout this doc are untracked,
+operator-local run artifacts (not committed) — they will not be present on a fresh clone.
+The excerpts quoted below are the record of their content.
+
 ## Accepted reserve value
 
 `_VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)` (`vaayu/vaayu_base.py:179`), unchanged from the
@@ -96,13 +100,21 @@ OOM-kill occurred in any run).
 ## Secondary observation (not a formally-gated measurement)
 
 Round-2 TTFT collapsed from ~90-101s (round 0, cold prefill) to ~9-10.5s (round 1, revisit) at
-**both K=2 and K=3** — a roughly 10x drop, consistent with a cross-turn KV prefix-cache HIT.
-This is visible now only because the decode-boundary OOM no longer aborts round 2 before it can
-run. It is the win the chain's step 4 was set up to measure; it is recorded here as an
-observation from these runs, not as a separately-gated pass/fail step. Confirming it as an
-actual cache HIT (vs. some other speedup source) and reconciling it with the prior diagnostic's
-note that "every session was a prefix MISS even on revisit" is chain step 4's job, not this
-task's.
+**both K=2 and K=3** — a roughly 10x drop. This is visible now only because the decode-boundary
+OOM no longer aborts round 2 before it can run.
+
+This is confirmed as an actual cross-turn KV prefix-cache HIT, not inferred from TTFT alone:
+`run-decode-headroom-minimax.log` lines 762764 and 898836 read
+
+```
+[Vaayu-Prefix] HIT session=stress-sess-0 match_len=1970/1990 — prefill only 20 new positions
+[Vaayu-Prefix] HIT session=stress-sess-1 match_len=1970/1990 — prefill only 20 new positions
+```
+
+versus `MISS` for both sessions on round 0 (lines 786, 395673). It is the win the chain's step 4
+was set up to measure; recorded here as an observation from these runs, not as a
+separately-gated pass/fail step. Reconciling this HIT with the prior diagnostic's note that
+"every session was a prefix MISS even on revisit" is chain step 4's job, not this task's.
 
 ## VERDICT
 

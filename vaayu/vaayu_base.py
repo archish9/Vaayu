@@ -174,8 +174,17 @@ def compute_expert_budget(
 # no room for the first decode step's logits/sampling transient (dies in
 # TopKLogitsWarper) plus allocator fragmentation — OOM at 13.73 GB alloc / 17 MB free
 # on the 3rd generation. 3.5 GB shrinks the cache by ~1.5 GB so decode peak drops
-# clear of the 15.47 GB usable ceiling. Pair with
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to remove the fragmentation slack.
+# clear of the 15.47 GB usable ceiling. The on-device gate
+# (docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md) attributed the
+# fix to the reserve bump ALONE (4/4, zero OOM with no expandable_segments set);
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is optional fragmentation insurance
+# on top, not required for correctness.
+#
+# Known ceiling: this reserve is context-length-insensitive — the ~1.1 GB KV figure
+# above was measured at MAX_LENGTH=2048. A much longer context, or an MLA-style model
+# with a larger per-token KV footprint, could re-enter the decode-boundary squeeze.
+# This is inherent to keeping compute_vram_expert_budget geometry-free (§5); not a
+# defect to fix here, just a documented limit of the current constant.
 _VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)
 
 
