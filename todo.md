@@ -5,7 +5,8 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
+_Last updated: 2026-08-02 (delete_original now reclaims already-split models — 273 GB freed;
+bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
 out to be unreachable code on both models, now warned about; MiniMax found to run the
 module-list forward, not the EXL3 fused one)._
 
@@ -240,6 +241,20 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
 ---
 
 ## Pending bugs / open questions (found in review, not yet fixed)
+- [x] ~~**`delete_original` never fired for an already-split model.**~~ **FIXED 2026-08-02
+  `c170474`.** `split_and_save_layers` returns early at "saved layers already found" before the
+  flag is read, so both copies were kept forever. `delete_original_shards()` now runs on that
+  path, gated on `all(found_layers.values())` (every layer present WITH its `.done` marker).
+  Wired into 5 test scripts as `DELETE_ORIGINAL` (default off, `VAAYU_DELETE_ORIGINAL=1`).
+  **Executed on both models 2026-08-02 (user's call): Qwen 277→139 GB, MiniMax 270→135 GB,
+  273 GB reclaimed, disk 89%→57%.** Both still load and generate (Qwen 0.87, MiniMax 1.51).
+- [x] ~~**`remove_real_and_linked_file` unlinked the same file twice.**~~ **FIXED 2026-08-02
+  `72c7b08`.** `os.path.realpath()` returns `str` and every caller passes a `Path`, so
+  `realpath(p) != p` was always True and the second `os.remove` hit ENOENT after the first had
+  already deleted the file. Caught (and mis-accounted) in `delete_original_shards` — the Qwen run
+  reclaimed 138 GB while printing "could not delete" 19 times and no total. **UNHANDLED in the
+  pre-existing mid-split loop, where it would abort a fresh conversion with
+  `delete_original=True`.** 3 tests. (found 2026-08-02 while running the reclaim)
 - [x] ~~**Prefix cache MISS-on-revisit.**~~ Diagnostic run showed every `test_multiturn`
   session was a prefix MISS even revisiting its own session id. (found 2026-07-24)
   **NO LONGER REPRODUCES** after Plan A (2026-08-01): round-2 revisits HIT at both K=2 and
