@@ -55,7 +55,8 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   - [x] reset between rounds, print `stats()` per round
   - [x] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
   - [x] loud failure if `model._prefix_cache` is None
-- [x] **Task 3** — on-device gate + RESULTS (closes chain step 4)
+- [x] **Task 3** — on-device gate + RESULTS (closes chain step 4) — `e7f5939` `899ce91`
+- [x] **Final review fixes** — `aada3cd`: auto-match asymmetry documented + 2 tests, .gitignore for evidence logs, unlocked-read rationale, R_ROUNDS<2 guard, kv_persist eviction note
   - [x] K=2 run, exit 0, 2/2 hits final round, 0 evictions
   - [x] K=3 run, exit 0, 3/3 hits final round, 0 evictions; `K_SESSIONS` reverted to 2
   - [x] RESULTS doc + close chain step 4 here
@@ -106,6 +107,16 @@ RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.m
   **FIXED 2026-08-01** by citing the SYMBOL (`_VRAM_RESERVE_BYTES`) instead of a line number,
   which cannot drift. Historical line refs inside the 2026-07-23 diagnostic RESULTS are left
   as-is: they are a point-in-time record, accurate when written.
+
+- [ ] **Dead code (flagged, not removed — §3).** `PrefixCacheStore.drop()` in
+  `vaayu/prefix_cache.py` has no callers anywhere in the repo (the `.drop(` grep hits are all
+  `ExpertVRAMCache`). Predates the telemetry work. Decide keep-or-remove when next owning that
+  file. (found 2026-08-01, Plan C final review)
+- [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session, an entry
+  that shares ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the
+  same case counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing semantics —
+  documented in `stats()` and pinned by tests in `aada3cd`, NOT changed. Worth revisiting if a
+  mixed-mode workload ever needs one comparable number. (found 2026-08-01, Plan C final review)
 
 ---
 
