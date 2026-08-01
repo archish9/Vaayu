@@ -713,6 +713,23 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
             flush=True)
 
 
+def _maybe_record_usage(vaayu_ref, layer_idx, expert_indices) -> None:
+    """Count DECODE-time expert routes when the usage histogram is enabled.
+
+    A no-op when the feature is off (the common case — one getattr). Skipped
+    during prefill on purpose: the VRAM expert cache is not consulted in a
+    prefill pass, so there are no budget-pressure evictions then, and counting
+    prefill routes would make the report compare decode-side evictions against
+    prefill+decode routes. See the measurement design spec.
+    """
+    tracker = getattr(vaayu_ref, "_expert_usage", None)
+    if tracker is None:
+        return
+    if getattr(vaayu_ref, "_moe_prefill_pass", False):
+        return
+    tracker.record(layer_idx, expert_indices)
+
+
 def _make_modulelist_sparse_forward(
     block_info: MoEBlockInfo,
     expert_cache: "ExpertRAMCache",
@@ -758,6 +775,7 @@ def _make_modulelist_sparse_forward(
             block_info.moe_module, router_logits, top_k
         )
 
+        _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
         if _prof:
             _mp['route'] += time.perf_counter() - _t0
@@ -1045,6 +1063,7 @@ def _make_fused_sparse_forward(
             )
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
+        _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
 
         if getattr(vaayu_ref, "_batch_n", 1) > 1:
@@ -1407,6 +1426,7 @@ def _make_fused_sparse_forward_exl3(
 
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
+        _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         expert_indices_cpu = expert_indices.cpu()
         unique_experts: list[int] = unique_expert_indices(expert_indices_cpu)
 

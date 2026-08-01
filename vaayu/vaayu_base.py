@@ -789,7 +789,8 @@ class VaayuBaseModel(GenerationMixin):
                  drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
                  attn_implementation=None, enable_prefix_cache=False,
                  auto_prefix_match=True, enable_kv_persist=False,
-                 kv_persist_dir=None, kv_persist_sync=False):
+                 kv_persist_dir=None, kv_persist_sync=False,
+                 enable_expert_usage=False):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -856,6 +857,7 @@ class VaayuBaseModel(GenerationMixin):
         self.enable_kv_persist = enable_kv_persist
         self.kv_persist_dir = kv_persist_dir
         self.kv_persist_sync = kv_persist_sync
+        self.enable_expert_usage = enable_expert_usage
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -1107,6 +1109,10 @@ class VaayuBaseModel(GenerationMixin):
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
+        # Expert usage histogram (measurement only, ships dark). Default None
+        # so the attribute always exists, on every load path (dense, CPU, or
+        # no VRAM cache) — the hook's getattr must never be the only guard.
+        self._expert_usage = None
         if self.running_device.startswith("cuda") and self.is_moe:
             # Hard-block guard (Task 5 follow-up) — must fire before any MoE
             # cache/executor/prefetch object is created. See
@@ -1230,7 +1236,10 @@ class VaayuBaseModel(GenerationMixin):
                 _free_vram, _ = torch.cuda.mem_get_info()
                 _vram_budget = compute_vram_expert_budget(_free_vram)
                 if _vram_budget >= self._moe_geometry["expert_bytes"]:
-                    self._expert_vram_cache = ExpertVRAMCache(_vram_budget)
+                    self._expert_vram_cache = ExpertVRAMCache(
+                        _vram_budget,
+                        track_evicted_keys=bool(getattr(self, "enable_expert_usage", False)),
+                    )
                     print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
@@ -1241,6 +1250,19 @@ class VaayuBaseModel(GenerationMixin):
                           f"{self._moe_geometry['expert_bytes']/1e6:.1f}MB expert. Every expert "
                           f"streams per token; expect very slow decode (a real hardware limit, "
                           f"not a bug).")
+
+            # Expert usage histogram (measurement only, ships dark). Rows are
+            # indexed by the model's own layer_idx; both dimensions derived (§5).
+            if getattr(self, "enable_expert_usage", False) and self.is_moe:
+                from vaayu.expert_usage import ExpertUsageTracker
+                self._expert_usage = ExpertUsageTracker(
+                    n_rows=int(self.config.num_hidden_layers),
+                    n_experts=int(self._moe_geometry["num_experts"]),
+                    device=self.running_device,
+                )
+                print(f"[Vaayu-Usage] expert usage histogram ON "
+                      f"({self.config.num_hidden_layers} rows x "
+                      f"{self._moe_geometry['num_experts']} experts)")
 
             _ws_gb = _geo["working_set_bytes"] / 1e9
             print(f"[Vaayu-MoE] Expert RAM cache: {_expert_budget / 1e9:.1f} GB budget "

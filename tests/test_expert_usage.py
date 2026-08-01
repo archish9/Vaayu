@@ -135,3 +135,26 @@ def test_report_respects_top_n():
     out = format_usage_report(counts, {}, top_n=3)
     assert "e0" in out and "e1" in out and "e2" in out
     assert "e9" not in out
+
+
+def test_hook_is_a_noop_without_a_tracker_and_during_prefill():
+    """Ships dark: no tracker -> the hook must return before touching anything.
+    And with a tracker, a prefill pass must not be counted — the VRAM cache is
+    not consulted during prefill, so counting prefill routes would compare
+    decode-side evictions against prefill+decode routes."""
+    from vaayu.moe_patch import _maybe_record_usage
+
+    class _Ref:
+        pass
+
+    ref = _Ref()                      # no _expert_usage attribute at all
+    _maybe_record_usage(ref, 0, torch.tensor([[1]], dtype=torch.int64))   # must not raise
+
+    ref._expert_usage = ExpertUsageTracker(n_rows=4, n_experts=8, device="cpu")
+    ref._moe_prefill_pass = True
+    _maybe_record_usage(ref, 1, torch.tensor([[2]], dtype=torch.int64))
+    assert ref._expert_usage.snapshot().sum().item() == 0     # prefill not counted
+
+    ref._moe_prefill_pass = False
+    _maybe_record_usage(ref, 1, torch.tensor([[2]], dtype=torch.int64))
+    assert ref._expert_usage.snapshot()[1, 2].item() == 1     # decode counted
