@@ -15,6 +15,18 @@ module-list forward, not the EXL3 fused one)._
 
 ---
 
+## NEXT SESSION — the misplaced-feature audit
+**Brief: `docs/superpowers/specs/2026-08-03-misplaced-feature-audit-brief.md`** (self-contained).
+Find every feature that is correctly written but installed where it cannot act — the class of defect
+Plan H turned out to be (right algorithm, hot path instead of the eviction boundary; Plan I moved it
+and the cost went to zero). Session finds, proves and ranks; it does **not** fix. Three candidates
+already in hand: the expert VRAM cache emptied every prefill (1362 evictions), `VAAYU_CACHE_BIAS`
+stranded in an unreachable branch (0 calls, both models), and batched decode collapsing to N=1.
+Plans get written **only** for findings that clear the brief's §6 promotion bar — F, G and H all
+ended in refutation, and that bar exists to stop a fourth.
+
+---
+
 ## Execution order (priority)
 
 Plans A, C, D ✅ DONE (2026-08-01); E, F, G ✅ CLOSED (2026-08-02) — see Active plans below.
@@ -263,7 +275,14 @@ at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full
   - [x] On-device confirmation of Task 4: the persistence refusal fired and no file was written.
   - [x] Scaffolding reverted (`git checkout test_generate.py test_multiturn.py`), tree clean.
 - **Follow-ups, UNBUILT, in priority order (from the RESULTS recommendation):**
-  - [ ] **Plan I — compress-on-evict KV** ⭐ **spec written 2026-08-02, ready to execute:**
+  - [~] **Plan I — compress-on-evict KV** ⭐ **Tasks 1–4 DONE 2026-08-02** on branch
+    `plan-i-compress-on-evict` (`6d96049` `e84d101` `dc0da7a` `0459be2`), suite 500 → 518 green.
+    **Task 5 on-device gate IN PROGRESS.** Step 1 (the defining check) **PASSED**: decode is
+    unchanged with `prefix_compress=8` — Qwen 0.86 → 0.86, MiniMax 1.53 → 1.56 tok/s, TTFT flat on
+    both. That is the whole premise: Plan H's compress-on-write cost MiniMax 5–8% and would cost
+    +1.49 s/token at 32k; moving compression off the decode path removes it entirely.
+    Steps 2–6 (pool capacity at K=12, long context, per-turn cost, restored-prefix quality, the
+    live ordering trap) still to run. Spec:
     `docs/superpowers/plans/2026-08-02-compress-on-evict-kv.md`. Compresses pooled KV only while it
     sits in the RAM prefix pool (once per turn), leaving the live cache bf16 — so it delivers Plan
     H's memory win with **zero per-token cost**. This is what Plan H should have been: benchmarked
