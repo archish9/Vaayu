@@ -5,7 +5,7 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-03. Restructured: completed plans (A, C, D, E, F, G, H, I) moved to the
+_Last updated: 2026-08-02 (Plan J on-device gates). Restructured 2026-08-03: completed plans (A, C, D, E, F, G, H, I) moved to the
 archive at the bottom as one-line verdicts; only unfinished work appears above it. Full task-level
 detail for those plans is in their RESULTS docs under `docs/superpowers/plans/` and in this file's
 git history._
@@ -19,13 +19,17 @@ do not start a row until the one above it is `[x]` and its RESULTS doc exists.
 
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
-| **1** | **J — pinned-allocation round-up** | P1 | `[ ]` ready | — | Biggest measured win in the queue and the cheapest to verify: ~7.6 GiB of a 32 GB box is resident and unaddressable. Freed RAM lands in the prefix pool automatically (3.88 → ~10.5 GB predicted). |
-| **2** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing hard; run after J | J changes free RAM, not free VRAM, so K is not *blocked* — but J is cheaper, more certain, and touches the same allocation code. Do it second so K's sweep runs against a settled memory layout. |
-| **3** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **J** | Hard dependency. ~8 GiB of the arena's footprint is allocator round-up, so rebalancing the expert-cache/prefix-pool split before J measures an imaginary scarcity. **Re-open only if the prefix pool is still binding after J.** No plan written yet — write one only if that condition holds. |
+| **1** | **J — pinned-allocation round-up** | P1 | `[~]` in progress | — | Tasks 1, 2, 5 + fix waves landed; Task 3 **PASSED both models**; Task 4 partly measured. **Delivers on MiniMax only** — pool 4.69 → 13.38 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed). Qwen gets **nothing**: its 8.90 GB working set does not fit the 8 GiB clamped cache, so Task 5 correctly skips the clamp for it. Last open question is MiniMax decode (−2.7 %, under variance measurement). |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[ ]` **evidence first, then plan** | J landing | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence before writing the plan.** |
+| **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing hard; run after J | J changes free RAM, not free VRAM, so K is not *blocked* — but J is cheaper, more certain, and touches the same allocation code. Do it after J so K's sweep runs against a settled memory layout. |
+| **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **J**, and now **L** | Hard dependency. ~8 GiB of the arena's footprint is allocator round-up, so rebalancing the expert-cache/prefix-pool split before J measures an imaginary scarcity. **After J the answer differs per model** — MiniMax's pool is 13.38 GB and almost certainly no longer binding, Qwen's is unchanged at ~4.7 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
 **Dependency rules that outlive this queue:**
 
-- **J → F1** — never rebalance a RAM split while a consumer's real footprint is unknown.
+- **J → L** — L exists only because J measured the effect and found the single-allocation clamp
+  cannot deliver it to every geometry. Do not start L from theory; start from J's RESULTS.
+- **J, L → F1** — never rebalance a RAM split while a consumer's real footprint is unknown. J fixed
+  that for MiniMax; Qwen's stays unknown until L.
 - **K's measurement is biased by F3** (the prefix cache is not wired into `batched_generate`), so K
   must report decode throughput separately from TTFT. See K's plan §8c. Fixing F3 first is *not*
   required and is a bigger job — see "Open bugs".
@@ -80,14 +84,44 @@ charged exactly.
   `get_expert_pool_size()` slabs to **zero** (a plan defect, since corrected in the plan doc);
   (b) the clamp fired on pageable arenas too, where pow2 charging does not apply and the trade is
   strictly negative. Suite 519 → **559**, warnings flat at 20. Dense smoke ran on real GPU + model.
-- [ ] **Task 3** — verify the freed RAM actually reaches the prefix pool (`post-arena avail` and
-  `prefix cache ENABLED` log lines, both models) — measured, not assumed. **Operator-run.**
-  Commands: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`.
-- [ ] **Task 4** — on-device gate + RESULTS: decode ≥ floors (**MiniMax 1.47 / Qwen 0.82**), pinned
-  H2D still 19.7 GB/s, `test_multiturn.py` exits 0 at a K that previously failed, new cliff K
-  recorded, 0 OOM. Note that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up —
-  post-clamp any budget in [8 GiB, 16 GiB) yields the same 8 GiB resident arena, so the ceiling is
-  now nearly inert in that range. **Operator-run**; same runbook.
+- [x] **Task 5** — **floor the clamp at the model's working set** (`d40bdff`, `cd7fdb1`). ADDED
+  after Task 4's decode gate failed. Rule: clamp only when the clamped **cache** (excluding staging
+  slabs) still covers `_moe_geometry["working_set_bytes"]`; skip when clamping would break a working
+  set that currently fits; clamp anyway when it fits neither way (thrashes regardless, so take the
+  RAM). `working_set_bytes=0` default is a true no-op. Both boundary edges pinned by test. Review
+  caught the skip-note keying on `_pin` (intent) rather than the arena's actual pin state, so a
+  pageable retry would have falsely reported a working-set skip — fixed. Suite **564**, warnings 20.
+- [x] **Task 3** — freed RAM reaches the prefix pool. **PASSED BOTH MODELS**, measured:
+  | | MiniMax | Qwen |
+  |---|---|---|
+  | arena | 1034 → **966** × 8.9MB, 9.19 → 8.59 GB | 778 → **725** × 11.8MB, 9.21 → 8.59 GB |
+  | `post-arena avail` | 8.46 → **17.15 GB** | 7.43 → **16.91 GB** |
+  | `post-arena rss` | 21.59 → **12.91 GB** | → **12.51 GB** |
+  | **prefix pool** | 4.69 → **13.38 GB** | → **13.14 GB** |
+  | H2D | **19.8 GB/s pinned** | **19.8 GB/s pinned** |
+  0 OOM in both. *(These are pre-Task-5 numbers: with Task 5, Qwen no longer clamps, so Qwen's
+  column reverts to main's values. Re-measure Qwen for the RESULTS doc.)*
+- [~] **Task 4** — on-device gate + RESULTS. Measured so far, all same-box A/B against `main`:
+  - **Pool gate, MiniMax: PASSES.** `test_multiturn.py` K=3 × 7 751 tok, Plan I's exact config.
+    main **0/3 HIT, exit 1**; branch **3/3 HIT, exit 0**, round-2 TTFT **338.4 → 9.6 s (35×)**,
+    peak rss 26.46 → 20.72 GB, 0 OOM. **Achieved with `PREFIX_COMPRESS=None`** — Plan I needed
+    9-bit compression for its 34× because a 3.54 GB pool could not hold 3 bf16 sessions; J's pool
+    holds them uncompressed, so the same win arrives with **no quantization and no quality question**.
+  - **Decode, Qwen: FAILED, then fixed by Task 5.** main **0.85 tok/s / 47 % expert-cache hit**;
+    branch pre-Task-5 **0.43 tok/s / 0 % hit** (−49 %) with the engine's own
+    `WARNING: working set 8.90GB exceeds cache budget 8.49GB — decode will thrash`. Cause: the
+    clamp cut the budget 9.13 → 8.49 GB across Qwen's 8.90 GB working set. Task 5 skips the clamp
+    for this geometry. **Needs a confirming run: expect ~0.85 and no thrash warning.**
+  - [~] **Decode, MiniMax: −2.7 %, unresolved.** main **1.48** vs branch **1.44** (floor 1.47),
+    expert-cache hit 6 % → 4 %. Task 5 does *not* change this — MiniMax's 4.40 GB working set still
+    fits the clamped cache, so it still clamps and still loses 68 slabs. Both arms are n=1;
+    **3 runs per arm alternating are in flight** to separate a real −2.7 % from run-to-run noise.
+  - [ ] K-cliff sweep (raise `K_SESSIONS` until the gate fails; record the first failing K).
+  - [ ] RESULTS doc. Must state plainly that **J delivers on MiniMax and not on Qwen**, and note
+    that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up — post-clamp any
+    budget in [8 GiB, 16 GiB) yields the same 8 GiB resident arena, so the ceiling is now nearly
+    inert in that range.
+  Runbook: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`.
 
 **Pending bugs / parked findings from Plan J review** (none block the on-device gates):
 - [ ] `vaayu_base.py` trim line prints "to match the **clamped** slab arena" on an unclamped
@@ -106,7 +140,76 @@ charged exactly.
   its own requirement — but the two sites disagree on policy and the 4 MiB pad still buys dead
   surplus. Recorded in the plan's §10 as the natural follow-up.
 
-## Plan K — batched-decode admission reclaim  **(P2 — do second)**
+## Plan L — chunked slab-arena backing (Option B)  **(P1 — evidence, THEN plan)**
+
+**No plan doc yet, and do not write one from this section.** Gather the evidence below first; the
+plan must be self-contained and built on measurements, the way J's v2 was. J's §3 already sketches
+Option B — that sketch is a starting point, not a spec, and one of its claims is already known
+shaky (see E4).
+
+**Why it exists:** Plan J proved the pinned-allocation round-up is real and that removing it is
+worth **35× round-2 TTFT**. It also proved the single-tensor power-of-two clamp **cannot deliver
+that to Qwen**: Qwen's 8.90 GB working set does not fit an 8 GiB clamped cache, and there is no
+allocation size between 8 and 16 GiB — the allocator charges the next power of two, so anything
+above 8 GiB costs 16. Clamping Qwen cost **49 % of decode** (0.85 → 0.43 tok/s, expert RAM cache
+47 % → 0 % hit). Plan J Task 5 therefore skips the clamp for Qwen, correctly, and Qwen keeps the
+~8.6 GB of dead resident RAM.
+
+**The idea:** allocate the arena as *k* power-of-two-sized pinned tensors instead of one. Measured
+in the audit: 9 × 1 GiB costs 9.09 GiB resident (ratio **1.011**) where one 9.21 GB request costs
+16 GiB. That keeps **every** slab *and* drops resident RAM — both models win, and Task 5's
+working-set floor would stop firing for Qwen because the cache never shrinks.
+
+**Prize, if it works:** Qwen's prefix pool ~4.7 → ~13 GB, i.e. the same 35× round-2 TTFT MiniMax
+now gets, plus Qwen's 47 % expert-cache hit rate preserved. This is the larger of the two models
+and the one whose expert cache actually works well.
+
+**The risk, stated up front:** `SlabArena.slab_index_of()` currently does pointer arithmetic against
+a single `_backing` (`off = tensor.data_ptr() - self._backing.data_ptr()`). Chunking makes it a
+search over per-chunk `(base_ptr, first_slab_idx, n_slabs)` ranges — a change to a function **on the
+eviction path**, whose failure mode is returning a wrong slab index and freeing a slab another
+expert is still reading. That is silent memory corruption, not a crash. This is the single reason
+Option B was deferred out of J, and it has not become less true.
+
+### Evidence to gather BEFORE writing the plan
+
+- [ ] **E1 — confirm the chunked-allocation ratio at the real geometry.** The 1.011 figure is
+  9 × 1 GiB from the audit. Re-measure at the sizes actually needed (Qwen 9.21 GB in chunks of
+  4/2/1 GiB, and the same for MiniMax), in a fresh process, RSS-differenced. **Include the
+  last-partial-slab waste per chunk**, which the 9 × 1 GiB probe did not model: a slab must not
+  straddle a chunk boundary, so each chunk wastes `chunk_bytes % slab_bytes`. At Qwen's 11.8 MB
+  slabs across 9 chunks that could be ~50 MB — small, but it must be counted, not assumed away.
+- [ ] **E2 — find every consumer of `_backing` and single-base-pointer arithmetic.** `slab_index_of`
+  is the known one. Grep for `.data_ptr()`, `_backing`, and anything doing offset math against the
+  arena — including the io_uring path in `vaayu_rust`, which receives raw pointers and lengths.
+  **A chunked arena must never hand the loader a length that crosses a chunk boundary.** Enumerate
+  the list before designing; a missed consumer is the corruption path.
+- [ ] **E3 — price the `slab_index_of` lookup.** It sits on the eviction path. With k ≈ 9 chunks a
+  linear scan is likely free, but measure rather than assume: how often is it called per decode
+  token at the real eviction rates (MiniMax ~76 k evictions/run, Qwen ~190 k)?
+- [ ] **E4 — check whether pinning k separate tensors costs anything the single allocation did not.**
+  Registration/lock-down overhead, `cudaHostAlloc` count, and whether H2D still measures
+  **19.8 GB/s pinned** — J's whole justification for the arena is that pinned H2D is 19.7-19.8 GB/s
+  against ~7.1 pageable, so a chunked arena that quietly loses pinning is worse than doing nothing.
+  Also re-check the audit's assumption that freed pinned blocks are cached and reused, not returned
+  to the OS: with k chunks the allocator's block bookkeeping is different.
+- [ ] **E5 — decide the fallback.** If any chunk allocation fails partway, what happens? The current
+  code retries pageable for the whole arena. Chunked needs an explicit answer.
+
+### Gates the plan must pre-state (do not soften them later)
+
+- **Qwen decode ≥ 0.85 tok/s** (same-box main baseline, measured 2026-08-02 — not the older 0.82
+  floor) **and expert-cache hit rate ≥ 47 %.** Losing the cache is exactly what J's clamp did.
+- **MiniMax decode ≥ 1.48** (same-box baseline) — L must not regress what J already delivers.
+- **H2D still reports `pinned` at ~19.8 GB/s on both models.**
+- **Qwen prefix pool ≥ 11 GB**, the same bar J used.
+- **Zero OOM, suite green, and a test that proves `slab_index_of` returns the right index for a
+  slab in every chunk, including the first and last slab of each.**
+
+**A refutation is an acceptable outcome.** If E1-E4 show chunking costs pinning, or the corruption
+risk cannot be tested down, record the verdict and close the row — the same way F, G and H closed.
+
+## Plan K — batched-decode admission reclaim  **(P2 — do third)**
 
 `docs/superpowers/plans/2026-08-03-batch-admission-reclaim.md` — self-contained. Audit finding F2.
 
@@ -184,6 +287,24 @@ Recorded so the same ground is not re-measured. Each cost a full plan or probe t
 - **MiniMax runs the module-list forward, not the EXL3 fused one.** Every MiniMax perf number on
   record is a module-list number. `CLAUDE.md` §0's dispatch table was fixed 2026-08-02.
 - **Decode floors, for every future gate: MiniMax 1.47 tok/s, Qwen 0.82 tok/s.**
+  **Re-confirmed same-box 2026-08-02 on `main`: MiniMax 1.48, Qwen 0.85.** Prefer these — they were
+  measured on the same box, same day, against the branch they gate. A cross-session floor misled a
+  full debugging cycle this session; a same-day A/B baseline costs ~12 min and removes the doubt.
+- **PyTorch's caching host allocator charges the NEXT POWER OF TWO for every pinned allocation, and
+  charges an exact power of two exactly.** Measured directly 2026-08-02, torch 2.11.0+cu130, fresh
+  processes: 64 MiB → 64, 128 → 128, **129 → 256**, 257 → 512, 1024 → 1024. Consequences: a backing
+  store a hair over a power of two costs nearly double and the surplus is never addressable; and
+  freed pinned blocks are cached for reuse, not returned to the OS. Any future pinned allocation
+  must be sized with this in mind. (Plan J §0)
+- **The expert RAM cache hit rate is NOT uniformly low, and "5-7 %" is a MiniMax number.**
+  Same-box, same day: **MiniMax 6 %, Qwen 47 %** (89 645 hit / 102 867 miss). Plan J's §2 argued the
+  cache had "not much to lose" by generalising MiniMax's figure to both models, and that reasoning
+  is what let an unconditional clamp ship — it cost Qwen 49 % of decode. **Never generalise a
+  cache-effectiveness number across the two geometries.**
+- **Audit F8 does NOT license shrinking the expert RAM cache.** F8 measured the expert **VRAM**
+  cache re-saturating in ~4 tokens (cold 37.2 % vs warm 36.8 %). Plan J cited it as evidence that
+  losing 6.7 % of **RAM** cache slabs would not matter. Different cache, different question, and the
+  RAM answer was the opposite for Qwen. F8's own claim stands as written; **its scope does not.**
 
 ---
 
