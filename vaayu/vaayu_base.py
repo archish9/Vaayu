@@ -164,6 +164,35 @@ def compute_expert_budget(
     return expert_budget, ne_budget, max_per_layer
 
 
+def unclamped_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
+    """Slabs the expert cache budget asks for, before allocator-round-up clamping:
+    the cache's own slabs plus `pool_size` extra so in-flight loader threads never
+    starve while the cache is full."""
+    return max(1, int(budget_bytes) // int(slab_bytes)) + int(pool_size)
+
+
+def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
+    """Slab count whose pinned backing store is a power of two.
+
+    The backing store is ONE pinned allocation, and the caching host allocator
+    charges the next power of two >= its size — so a backing store a hair over a
+    power of two costs nearly double, and the surplus is never addressable. Clamp
+    the whole backing store (cache slabs AND the in-flight staging addend, which
+    must stay INSIDE the clamped total or it pushes the size back over the
+    boundary) down to the power of two already being paid for.
+
+    No-op when the unclamped backing size is already an exact power of two — which
+    is exactly the case where the allocator was not over-charging. Never returns
+    fewer than `pool_size` slabs: the loader's landing zone survives any clamp.
+    """
+    from .persist.safetensor_model_persister import largest_pow2_at_most
+    slab_bytes = int(slab_bytes)
+    pool_size = int(pool_size)
+    n = unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
+    max_backing = largest_pow2_at_most(n * slab_bytes)
+    return max(pool_size, max_backing // slab_bytes)
+
+
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
 # Property of the 16 GB box, NOT the model (§5). Sizes the cache = free_vram - this.
 #
@@ -1362,8 +1391,10 @@ class VaayuBaseModel(GenerationMixin):
                 _slab_bytes = compute_slab_bytes(self._expert_offset_index)
             _pin = torch.cuda.is_available()
             if _slab_bytes > 0:
-                _n_slabs = (max(1, _expert_budget // _slab_bytes)
-                            + get_expert_pool_size())
+                _unclamped_n = unclamped_slab_count(
+                    _expert_budget, _slab_bytes, get_expert_pool_size())
+                _n_slabs = clamp_slab_count(
+                    _expert_budget, _slab_bytes, get_expert_pool_size())
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
@@ -1374,14 +1405,30 @@ class VaayuBaseModel(GenerationMixin):
                     except RuntimeError:
                         self._expert_slab_arena = None
                 if self._expert_slab_arena is not None:
+                    _clamp_note = ""
+                    if _n_slabs < _unclamped_n:
+                        _charged = (_unclamped_n * _slab_bytes - 1).bit_length()
+                        _clamp_note = (
+                            f" — clamped from {_unclamped_n} slabs "
+                            f"(−{(_unclamped_n - _n_slabs) * _slab_bytes / 1e9:.2f}GB cache) "
+                            f"so the pinned backing store is a power of two; the "
+                            f"allocator would have charged {(1 << _charged) / 1e9:.2f}GB")
                     print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
-                          f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident)")
+                          f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident){_clamp_note}")
                     _snap = ram_snapshot()
                     print(f"[Vaayu-RAM] ledger @ post-arena: avail={_snap['available'] / 1e9:.2f}GB "
                           f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
                           f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
+            if self._expert_slab_arena is not None:
+                _arena_bytes = self._expert_slab_arena.n_slabs * self._expert_slab_arena.slab_bytes
+                if _arena_bytes < _expert_budget:
+                    print(f"[Vaayu-Cache] Expert RAM cache budget trimmed "
+                          f"{_expert_budget / 1e9:.2f} -> {_arena_bytes / 1e9:.2f} GB "
+                          f"to match the clamped slab arena (the arena, not the budget, "
+                          f"is what binds)")
+                    _expert_budget = _arena_bytes
             self._expert_cache = ExpertRAMCache(
                 _expert_budget, max_per_layer=_max_per_layer,
                 arena=self._expert_slab_arena,

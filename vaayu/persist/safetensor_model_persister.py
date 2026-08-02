@@ -48,6 +48,21 @@ def _align_up_to(x: int, align: int) -> int:
     return (x + align - 1) & ~(align - 1)
 
 
+def largest_pow2_at_most(n: int) -> int:
+    """Greatest power of two <= n (0 for n <= 0).
+
+    PyTorch's caching host allocator charges every pinned allocation the next
+    power of two >= the request, and charges an exact power of two exactly
+    (measured 2026-08-03, torch 2.11.0+cu130: 128 MiB -> 128 MiB, 129 MiB ->
+    256 MiB). Sizing a pinned buffer with this keeps the charge equal to the
+    request. Allocator behaviour, not a model number (CLAUDE.md §5).
+    """
+    n = int(n)
+    if n <= 0:
+        return 0
+    return 1 << (n.bit_length() - 1)
+
+
 _USE_PINNED = torch.cuda.is_available()
 if _USE_PINNED:
     print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path")

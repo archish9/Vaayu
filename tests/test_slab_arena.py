@@ -376,3 +376,86 @@ def test_load_expert_into_slab_tensor_align_gates_pool_usage(tmp_path):
         assert bytes(views_true["w"].numpy().tobytes()) == payload
         # buffer returned to the pool afterward, so it doesn't leak into other tests
         assert persister._EXPERT_BUF_POOL.qsize() == 1
+
+
+# ── power-of-two pinned arena clamp ─────────────────────────────────────────
+
+from vaayu.persist.safetensor_model_persister import largest_pow2_at_most
+from vaayu.vaayu_base import clamp_slab_count, unclamped_slab_count
+
+_GiB = 1024 ** 3
+
+# Both on-device geometries, from the shipped load logs (CLAUDE.md §5: these are
+# TEST FIXTURES describing real models, not constants in production code).
+_GEO_MINIMAX = dict(budget_bytes=int(8.5 * _GiB), slab_bytes=8_900_000, pool_size=6)
+_GEO_QWEN = dict(budget_bytes=int(8.5 * _GiB), slab_bytes=11_800_000, pool_size=6)
+
+
+def test_largest_pow2_never_exceeds_request():
+    for req in (1, 2, 1023, 1024, 1025, 9_203_000_000):
+        n = largest_pow2_at_most(req)
+        assert n <= req
+        assert n & (n - 1) == 0
+
+
+def test_largest_pow2_is_identity_on_exact_powers():
+    # Measured: the allocator charges an exact power of two exactly, so the
+    # clamp must not shrink a request that is already one.
+    for p in range(0, 35):
+        assert largest_pow2_at_most(1 << p) == (1 << p)
+
+
+def test_largest_pow2_of_nonpositive_is_zero():
+    assert largest_pow2_at_most(0) == 0
+    assert largest_pow2_at_most(-5) == 0
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_clamp_wastes_less_than_one_slab_of_the_block_it_pays_for(geo):
+    # Tightness: the clamped backing must fill the power-of-two block to within
+    # one slab. A looser clamp would give away cache for no extra RAM — the
+    # backing size is what is charged, so every slab below the boundary is pure
+    # loss. (The backing itself is NOT a power of two: it is the largest whole
+    # number of slabs that fits inside one.)
+    target = largest_pow2_at_most(unclamped_slab_count(**geo) * geo["slab_bytes"])
+    backing = clamp_slab_count(**geo) * geo["slab_bytes"]
+    assert target - backing < geo["slab_bytes"]
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_clamped_backing_fits_under_the_pow2_the_allocator_charges(geo):
+    # The whole point: the backing store must fit inside the power of two we are
+    # already paying for, so the allocator does not double the charge.
+    n = clamp_slab_count(**geo)
+    assert n * geo["slab_bytes"] <= largest_pow2_at_most(
+        unclamped_slab_count(**geo) * geo["slab_bytes"])
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_clamp_never_grows_the_arena(geo):
+    assert clamp_slab_count(**geo) <= unclamped_slab_count(**geo)
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_clamp_keeps_the_staging_addend(geo):
+    # The +get_expert_pool_size() in-flight slabs must survive the clamp, or the
+    # loader starves while the cache is full.
+    assert clamp_slab_count(**geo) >= geo["pool_size"]
+
+
+def test_tiny_budget_still_yields_the_staging_slabs():
+    # Degenerate box: budget smaller than one slab. Never return 0 slabs.
+    assert clamp_slab_count(budget_bytes=1, slab_bytes=8_900_000, pool_size=6) >= 6
+
+
+def test_clamp_is_a_noop_when_nothing_was_wasted():
+    # The clamp shrinks a box IFF the allocator was over-charging it, i.e. iff the
+    # nominal backing size is not already an exact power of two. Construct a
+    # budget whose unclamped backing lands exactly on 2 GiB with slab_bytes a
+    # power of two, and assert the count is untouched.
+    slab_bytes = 1 << 20                      # 1 MiB slabs
+    pool_size = 6
+    n_target = 2048                           # 2 GiB backing, exactly
+    budget = (n_target - pool_size) * slab_bytes
+    assert unclamped_slab_count(budget, slab_bytes, pool_size) == n_target
+    assert clamp_slab_count(budget, slab_bytes, pool_size) == n_target
