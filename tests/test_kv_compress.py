@@ -127,11 +127,25 @@ def test_prefix_compress_defaults_to_off():
     assert VaayuBaseModel._build_prefix_store(fake, budget_bytes=10 ** 9).compress_bits is None
 
 
-def test_below_eight_bits_warns(capsys):
-    """Plan H's gate failed at 4 bits on both models; a user asking for it gets
-    told, not silently degraded."""
+def test_below_nine_bits_warns(capsys):
+    """8 bits measured 0.0612 worst-layer attention-score error on MiniMax
+    against a 0.05 bar (Plan I gate); a user asking for it gets told, not
+    silently degraded."""
     import types
     from vaayu.vaayu_base import VaayuBaseModel
-    fake = types.SimpleNamespace(enable_prefix_cache=True, prefix_compress=4)
+    fake = types.SimpleNamespace(enable_prefix_cache=True, prefix_compress=8)
     VaayuBaseModel._build_prefix_store(fake, budget_bytes=10 ** 9)
     assert "WARNING" in capsys.readouterr().out
+
+
+def test_default_bits_is_nine_and_passes_both_models():
+    """The shipped default must be the width the on-device gate passed. 8 bits
+    failed MiniMax's worst layer (0.0612 > 0.05); 9 passed both (Qwen 0.0372,
+    MiniMax 0.0214)."""
+    from vaayu.kv_compress import _DEFAULT_BITS
+    assert _DEFAULT_BITS == 9
+    c = _cache(seq=64)
+    p = compress_cache(c)
+    assert p.bits_total == 9
+    elems = sum(c._seq_len) * 2 * 4 * DIM
+    assert p.nbytes / elems == pytest.approx(1.156, abs=0.002)

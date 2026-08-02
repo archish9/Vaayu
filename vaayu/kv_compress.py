@@ -14,7 +14,11 @@ import torch
 
 from . import turboquant
 
-_DEFAULT_BITS = 8       # Plan H's gate failed at 4 and first passed at 8
+# 9, not 8: the Plan I on-device gate (2026-08-02) measured worst-layer
+# attention-score error of 0.0612 at 8 bits on MiniMax -- over the 0.05 bar --
+# against 0.0214 at 9. Costs 1.156 B/elem instead of 1.031 (0.578x bf16 rather
+# than 0.516x). Early layers are the outliers on both models.
+_DEFAULT_BITS = 9
 _ROT_SEED = 0x5EED
 _QJL_SEED = 0x9317
 

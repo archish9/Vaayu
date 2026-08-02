@@ -1005,8 +1005,9 @@ class VaayuBaseModel(GenerationMixin):
         self._forced_attn_impl = attn_implementation
         self.enable_prefix_cache = enable_prefix_cache
         # None = pooled KV stays bf16 (default). An int = TurboQuant-pack pooled
-        # entries at that many bits/channel; 8 is the only value Plan H's quality
-        # gate passed. Costs one pack per turn, nothing per token.
+        # entries at that many bits/channel; 9 is the lowest width that passed
+        # the quality gate on BOTH on-device models. Costs one pack per turn,
+        # nothing per token.
         self.prefix_compress = prefix_compress
         self.auto_prefix_match = auto_prefix_match
         self.enable_kv_persist = enable_kv_persist
@@ -3410,11 +3411,12 @@ class VaayuBaseModel(GenerationMixin):
     def _build_prefix_store(self, budget_bytes):
         """Construct the RAM prefix pool, honouring prefix_compress."""
         bits = getattr(self, "prefix_compress", None)
-        if bits is not None and bits < 8:
-            print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 8 "
+        if bits is not None and bits < 9:
+            print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
                   f"bits/channel that passed the quality gate on both on-device "
-                  f"models (see 2026-08-02-turboquant-kv-RESULTS.md). Restored "
-                  f"prefixes will be measurably wrong.")
+                  f"models (see 2026-08-02-compress-on-evict-kv-RESULTS.md; 8 bits "
+                  f"measured 0.0612 worst-layer attention-score error on MiniMax "
+                  f"against a 0.05 bar). Restored prefixes will be measurably wrong.")
         # getattr, matching the construction this replaced: callers in tests
         # build partial objects.
         return PrefixCacheStore(budget_bytes,

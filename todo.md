@@ -275,28 +275,27 @@ at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full
   - [x] On-device confirmation of Task 4: the persistence refusal fired and no file was written.
   - [x] Scaffolding reverted (`git checkout test_generate.py test_multiturn.py`), tree clean.
 - **Follow-ups, UNBUILT, in priority order (from the RESULTS recommendation):**
-  - [~] **Plan I — compress-on-evict KV** ⭐ **Tasks 1–4 DONE 2026-08-02** on branch
-    `plan-i-compress-on-evict` (`6d96049` `e84d101` `dc0da7a` `0459be2`), suite 500 → 518 green.
-    **Task 5 on-device gate IN PROGRESS.** Step 1 (the defining check) **PASSED**: decode is
-    unchanged with `prefix_compress=8` — Qwen 0.86 → 0.86, MiniMax 1.53 → 1.56 tok/s, TTFT flat on
-    both. That is the whole premise: Plan H's compress-on-write cost MiniMax 5–8% and would cost
-    +1.49 s/token at 32k; moving compression off the decode path removes it entirely.
-    Steps 2–6 (pool capacity at K=12, long context, per-turn cost, restored-prefix quality, the
-    live ordering trap) still to run. Spec:
-    `docs/superpowers/plans/2026-08-02-compress-on-evict-kv.md`. Compresses pooled KV only while it
-    sits in the RAM prefix pool (once per turn), leaving the live cache bf16 — so it delivers Plan
-    H's memory win with **zero per-token cost**. This is what Plan H should have been: benchmarked
-    reconstruct-on-read at +0.28 s/token at 8k and **+1.49 s/token at 32k** (Qwen, whole model),
-    i.e. Plan H's mode gets worse exactly as context grows, and its gate ran at 2k where that is
-    invisible. Target: pool holds ~2× the sessions, and long sessions become cacheable at all (one
-    32k bf16 Qwen session is 5.88 GiB against a 4.8 GiB pool, so prefix caching currently *dies* at
-    long context). 5 tasks; carries a mandatory ordering fix (`kv_persist` reads the cache **after**
-    `pc.store()` today, so compressing in `store()` would write packed indices into a bf16-stamped
-    file).
-  - [ ] **Mixed-precision outlier split** — the only way the paper reaches its quality-neutral
-    fractional bit-widths, and now the only credible route to sub-1 B/elem KV here. Uniform 4 bits
-    spends *more* than the paper's 3.5 and still misses a 5% bar by 2–7×, so the split is doing the
-    quality work, not the bit count. A spec, not a patch.
+  - [x] **Plan I — compress-on-evict KV** ✅ **COMPLETE 2026-08-02** on branch
+    `plan-i-compress-on-evict` (`6d96049` `e84d101` `dc0da7a` `0459be2` + gate commit), suite
+    500 → 519 green. RESULTS: `docs/superpowers/plans/2026-08-02-compress-on-evict-kv-RESULTS.md`
+    - [x] **Decode untouched** — Qwen 0.86 → 0.86, MiniMax 1.53 → 1.56, TTFT flat. The defining
+      property, and the thing Plan H failed (−5–8% MiniMax, +1.49 s/token at 32k).
+    - [x] **Pool capacity** — K=4 at a capped 1050 MiB budget: bf16 **0/4 HIT, 4 evictions**;
+      compressed **4/4 HIT, 0 evictions**. Round-2 TTFT **91 s → 9.6 s (9.5×)**. Per session
+      497.2 → 256.4 MiB. **Reuse collapses to zero, not proportionally** — a pool one session short
+      evicts each entry before its revisit, so capacity is a cliff, not a slope.
+    - [x] **Per-turn cost** — 0.45 s at 2k, 0.73 s at 8k, 3.55 s at 32k, against the ~91 s cold
+      prefill a HIT avoids. Two orders of magnitude in favour.
+    - [x] **Quality gate: 8 bits FAILED** (MiniMax worst layer 0.0612 > 0.05 bar; Qwen 0.0480,
+      thin). **9 bits PASSED both** (0.0214 / 0.0372). **`_DEFAULT_BITS` raised 8 → 9**, warning
+      threshold with it. Costs 1.156 B/elem (0.578× bf16) instead of 1.031. Outliers are early
+      layers on both models — exactly what the outlier split addresses.
+    - [x] **Ordering trap verified live** — with compression AND persist on, the file is `sig=bf16`,
+      `rec_bytes=192516 = 4 + 94×(2×4×128×2)` exactly. No packed index reached disk.
+    - [ ] **Long context NOT measured** — analytic only: a 32k bf16 Qwen session is 5.88 GiB vs a
+      ~4.8 GiB pool (uncacheable), 3.40 GiB at 9 bits (fits). Confirm on device before relying on it.
+    - Honest limit: benefit is **latent**. The real ~5 GB pool binds past ~11 sessions; K=3 runs
+      show 0 evictions in both modes. Headroom that now costs nothing, not a speed-up felt today.
   - [ ] **Real-query quality gate** — this gate used K-row and Gaussian query proxies because
     `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds, but any attempt
     to certify a specific bit-width needs real queries captured with an attention hook.
