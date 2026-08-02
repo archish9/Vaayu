@@ -28,9 +28,18 @@ class PrefixCacheStore:
     """Thread-safe, byte-budgeted pool of per-session KV caches held in RAM
     between turns (A1). See the design spec for the reuse protocol."""
 
-    def __init__(self, budget_bytes: int, auto_prefix_match: bool = True):
+    def __init__(self, budget_bytes: int, auto_prefix_match: bool = True,
+                 compress_bits: int | None = None):
         self.budget_bytes = budget_bytes
         self.auto_prefix_match = auto_prefix_match
+        # None = store cache objects as-is (default, unchanged behaviour).
+        # An int = TurboQuant-pack entries while they sit in the pool, so the
+        # same budget holds ~2x more sessions at 8 bits. Compression happens
+        # once per turn here, never on the decode path -- see
+        # docs/superpowers/plans/2026-08-02-compress-on-evict-kv.md.
+        self.compress_bits = compress_bits
+        self.compressions = 0
+        self.decompressions = 0
         self._pool: "OrderedDict[str, _Entry]" = OrderedDict()  # LRU order
         self._current_bytes = 0
         self._lock = threading.Lock()
@@ -44,7 +53,7 @@ class PrefixCacheStore:
         self.matched_tokens = 0
         self.lookup_tokens = 0
 
-    def lookup(self, session_id, input_ids: list):
+    def lookup(self, session_id, input_ids: list, device=None):
         """Return (cache_or_None, match_len). A hit REMOVES the entry from the
         pool (checked out to the in-flight request); store() re-inserts it."""
         with self._lock:
@@ -67,15 +76,32 @@ class PrefixCacheStore:
             m = longest_common_prefix(entry.token_ids, input_ids)
             self.hits += 1
             self.matched_tokens += m
+            from .kv_compress import CompressedKV
+            if isinstance(entry.cache, CompressedKV):
+                if device is None:
+                    raise ValueError(
+                        f"session {key!r} is stored compressed; lookup() needs a "
+                        f"device= to rebuild it. Returning the packed container "
+                        f"would hand the caller indices in place of values.")
+                from .kv_compress import decompress_cache
+                self.decompressions += 1
+                return decompress_cache(entry.cache, device), m
             return entry.cache, m
 
     def store(self, session_id: str, token_ids: list, cache) -> None:
-        cache.to_cpu()
-        nbytes = cache.resident_bytes()
+        if self.compress_bits is None:
+            cache.to_cpu()
+            payload, nbytes = cache, cache.resident_bytes()
+        else:
+            # Compress-on-evict: once per turn, off the decode path entirely.
+            from .kv_compress import compress_cache
+            payload = compress_cache(cache, bits_total=self.compress_bits)
+            nbytes = payload.nbytes
+            self.compressions += 1
         with self._lock:
             if session_id in self._pool:
                 self._current_bytes -= self._pool.pop(session_id).nbytes
-            self._pool[session_id] = _Entry(list(token_ids), cache, nbytes)
+            self._pool[session_id] = _Entry(list(token_ids), payload, nbytes)
             self._current_bytes += nbytes
             while self._current_bytes > self.budget_bytes and len(self._pool) > 1:
                 _k, ev = self._pool.popitem(last=False)  # evict LRU
@@ -113,9 +139,13 @@ class PrefixCacheStore:
             rate = f"{self.hits / total:.0%}" if total > 0 else "n/a"
             saved = (f"{self.matched_tokens / self.lookup_tokens:.0%}"
                      if self.lookup_tokens > 0 else "n/a")
-            return (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
-                    f"hit_rate={rate} "
-                    f"saved={self.matched_tokens}/{self.lookup_tokens} tok ({saved})")
+            out = (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
+                   f"hit_rate={rate} "
+                   f"saved={self.matched_tokens}/{self.lookup_tokens} tok ({saved})")
+            if self.compress_bits is not None:
+                out += (f" compress={self.compress_bits}b "
+                        f"{self.compressions}pack/{self.decompressions}unpack")
+            return out
 
     def reset_stats(self) -> None:
         """Zero the counters, leaving the pool untouched. Called between
@@ -134,3 +164,5 @@ class PrefixCacheStore:
             self.evictions = 0
             self.matched_tokens = 0
             self.lookup_tokens = 0
+            self.compressions = 0
+            self.decompressions = 0
