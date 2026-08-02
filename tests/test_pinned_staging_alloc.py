@@ -60,3 +60,44 @@ def test_alloc_size_is_monotonic():
         cur = pinned_alloc_size(total_size)
         assert cur >= prev
         prev = cur
+
+
+def test_reuse_boundary_is_pinned_to_pinned_alloc_size():
+    """The call site's reuse test is
+    `_PINNED_SIZES[buf_idx] < pinned_alloc_size(total_size)`. Pin the
+    invariant it depends on with pure arithmetic over `pinned_alloc_size` --
+    no allocation, no `vaayu_rust`. A recorded buffer size may only be
+    treated as sufficient for a later `total_size` when
+    `total_size + 2 * _ALIGN <= recorded size`; testing the old bound
+    (`recorded_size < total_size`) is not enough, since it ignores the
+    io_uring O_DIRECT slack and the power-of-two step.
+    """
+    # First shard: a 100 MiB request is charged a 128 MiB block.
+    t0 = 100 * 1024 ** 2
+    recorded_size = pinned_alloc_size(t0)
+    assert recorded_size == 128 * 1024 ** 2
+
+    # A later shard of exactly 128 MiB (== the recorded block size) must NOT
+    # be treated as reusable: its own pinned_alloc_size need steps up to the
+    # next power of two, since total_size + 2*_ALIGN pushes past 128 MiB.
+    later_total_size = 134_217_728  # 128 MiB
+    assert later_total_size + 2 * _ALIGN > recorded_size
+    must_reallocate = recorded_size < pinned_alloc_size(later_total_size)
+    assert must_reallocate
+
+    # The old, buggy bound (`recorded_size < later_total_size`) would have
+    # said "no reallocation needed" here -- silently reusing an undersized
+    # buffer and writing past its end.
+    assert not (recorded_size < later_total_size)
+
+
+def test_alloc_size_exact_values():
+    # Exact figure from the on-device dense smoke run (Task 2 report): a
+    # ~116.02 MiB shard is charged a 128 MiB block. Every other assertion in
+    # this file is a property (>= request, power of two, monotonic, < 8 MiB)
+    # that a regression like `4 * next_pow2_at_least(...)` would still pass.
+    assert pinned_alloc_size(121_643_008) == 128 * 1024 ** 2
+
+    # Boundary: total_size itself already an exact power of two must still
+    # step up one block, since the +2*_ALIGN slack pushes past the boundary.
+    assert pinned_alloc_size(128 * 1024 ** 2) == 256 * 1024 ** 2

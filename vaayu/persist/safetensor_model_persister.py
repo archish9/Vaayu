@@ -301,7 +301,7 @@ def _load_pinned(file_path: str) -> dict:
         buf_idx = _BUF_IDX
         _BUF_IDX = 1 - _BUF_IDX
 
-    if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
+    if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < pinned_alloc_size(total_size):
         alloc_size = pinned_alloc_size(total_size)
         _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
                                             pin_memory=True)
