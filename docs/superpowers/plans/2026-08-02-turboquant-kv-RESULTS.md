@@ -211,4 +211,7 @@ by tests:
 - `vaayu/turboquant.py`, `tests/test_turboquant.py` (43 tests)
 - `vaayu/vaayu_base.py` — `TurboQuantKVCache`, `_create_kv_cache`, `_get_vram_pinning_budget`
 - `vaayu/batch.py`, `vaayu/kv_cache_manager.py`, `vaayu/kv_persist.py`
-- Evidence logs are operator-local and untracked (scratchpad `planh/run-*.log`).
+- Evidence logs are operator-local and untracked: **`~/vaayu-evidence/2026-08-02-plan-h/`**
+  (9 gzipped run logs, 516 MB → 27 MB, plus `SUMMARY.md` with the distilled figures and the two
+  CPU-only analysis scripts `quality_gate.py` / `sweep.py`, which re-run the quality gate and the
+  bits sweep from the persisted bf16 `.vaayu_kv` files with no GPU).
