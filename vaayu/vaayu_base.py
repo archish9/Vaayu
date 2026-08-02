@@ -22,6 +22,7 @@ from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
 from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
+from .persist.safetensor_model_persister import next_pow2_at_least
 from .prefix_cache import PrefixCacheStore
 from . import turboquant
 
@@ -1407,12 +1408,13 @@ class VaayuBaseModel(GenerationMixin):
                 if self._expert_slab_arena is not None:
                     _clamp_note = ""
                     if _n_slabs < _unclamped_n:
-                        _charged = (_unclamped_n * _slab_bytes - 1).bit_length()
+                        _charged_bytes = next_pow2_at_least(_unclamped_n * _slab_bytes)
                         _clamp_note = (
                             f" — clamped from {_unclamped_n} slabs "
                             f"(−{(_unclamped_n - _n_slabs) * _slab_bytes / 1e9:.2f}GB cache) "
                             f"so the pinned backing store is a power of two; the "
-                            f"allocator would have charged {(1 << _charged) / 1e9:.2f}GB")
+                            f"allocator would have charged {_charged_bytes / 1e9:.2f}GB"
+                            f"; frees {(_charged_bytes - _n_slabs * _slab_bytes) / 1e9:.2f}GB")
                     print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "

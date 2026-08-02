@@ -63,6 +63,29 @@ def largest_pow2_at_most(n: int) -> int:
     return 1 << (n.bit_length() - 1)
 
 
+def next_pow2_at_least(n: int) -> int:
+    """Least power of two >= n (0 for n <= 0). This is exactly what the caching
+    host allocator will charge for a pinned request of n bytes."""
+    n = int(n)
+    if n <= 0:
+        return 0
+    return 1 << (n - 1).bit_length()
+
+
+def pinned_alloc_size(total_size: int) -> int:
+    """Bytes to request for a pinned layer-staging buffer holding `total_size`
+    bytes of tensor data.
+
+    Requests the power of two the allocator charges anyway, so the whole block is
+    usable instead of the surplus being dead pages. `2 * _ALIGN` of slack covers
+    the O_DIRECT worst case: io_uring reads `_align_up(total_size + prefix_pad)`
+    with `prefix_pad < _ALIGN`. This replaces a flat +100 MB reallocation pad —
+    power-of-two sizing already steps by doubling, and that pad was the sole
+    reason a ~0.1 MB shard was charged a 128 MiB block.
+    """
+    return next_pow2_at_least(int(total_size) + 2 * _ALIGN)
+
+
 _USE_PINNED = torch.cuda.is_available()
 if _USE_PINNED:
     print(">>>> pinned-memory loader active — direct NVMe→RAM→GPU path")
@@ -279,7 +302,7 @@ def _load_pinned(file_path: str) -> dict:
         _BUF_IDX = 1 - _BUF_IDX
 
     if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < total_size:
-        alloc_size = total_size + (100 * 1024 * 1024) + _ALIGN  # pad +100 MB + O_DIRECT padding
+        alloc_size = pinned_alloc_size(total_size)
         _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8,
                                             pin_memory=True)
         _PINNED_SIZES[buf_idx] = alloc_size
