@@ -173,22 +173,42 @@ RESULTS: `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESU
 - [x] **Tasks 2–4** (the pin) — DROPPED on Plan F's evidence, per this plan's own PRECONDITION.
 - [x] **Task 5** (2×2 pin × bias matrix) — moot, neither axis exists.
 
-### Plan H — TurboQuant KV cache  **(P4 — needs E)**
-`docs/superpowers/plans/2026-08-02-turboquant-kv.md` — self-contained, carries a precondition check
-Paper: arXiv 2504.19874. Verified claims: 5× compression; *"absolute quality neutrality with 3.5
-bits per channel"*; LongBench 50.06 vs 50.06 baseline; Needle-in-Haystack identical at 4×.
+### Plan H — TurboQuant KV cache  **(P4 — needs E, which is done → unblocked)**
+`docs/superpowers/plans/2026-08-02-turboquant-kv.md` — **REVISION 2 (2026-08-02)**, self-contained,
+carries a precondition check. Rev 1 was audited line-by-line against the paper (arXiv 2504.19874)
+and against the working tree; **8 corrections landed, 6 of which would have produced a wrong or
+silently-corrupt implementation** — see the changelog table at the top of the plan.
+Verified paper claims: >5× compression vs fp16 (index bits only, norms not itemised); *"absolute
+quality neutrality with 3.5 bits per channel"*; LongBench 50.06 vs 50.06; Needle 0.997 at 4×;
+rotation generated ONCE (data-oblivious); unit-norm assumed with norms stored in float.
 Reconstruction to float happens **before** inner products — so a working copy is always required.
-**Value is prefix-cache fan-out headroom and longer context — NOT decode speed.** Against the
-pre-fix cache it is worth only ~18.6%, because it compresses the 33% store and leaves the 66%
-mirror; that is why Plan E comes first.
-- [ ] **Task 1** — `vaayu/turboquant.py`: rotation, Lloyd-Max codebook, quantize/reconstruct (TDD)
-- [ ] **Task 2** — `TurboQuantKVCache` reusing the ring-buffer structure; reconstruct-on-**read**
-  (on-write would reintroduce exactly the mirror Plan E deleted)
-- [ ] **Task 3** — mode selection + `_extract_kv_as_bf16`; audit every `isinstance(..., Cache)` —
-  an unknown class falls through and returns **indices interpreted as values**, silent corruption
-- [ ] **Task 4** — persistence signature or explicit refusal (never write TQ data under the fp8 sig)
-- [ ] **Task 5** — on-device: **quality gate first**, then size, then decode, then the fan-out
-  measurement this feature actually exists for (`test_multiturn.py` at rising `K_SESSIONS`)
+**Value is prefix-cache fan-out headroom and longer context — NOT decode speed.**
+Target: **0.531 B/elem** at 4 bits/channel vs today's bf16 2.000 (−73.5%).
+- [ ] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
+  scales `1/√d` — a dim-blind one reconstructs noise), **mandatory QJL `_prod` stage** (unbiased
+  inner products is why it is safe for attention), and **bit-packing** (one index per uint8 byte
+  yields 1.16 B/elem, not 0.53 — packing is required, not an optimization) (TDD)
+- [ ] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
+  to_cpu/to_device/resident_bytes unchanged); reconstruct-on-**read** (on-write would reintroduce
+  exactly the mirror Plan E deleted)
+- [ ] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
+  (`_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes` charge 2 B/elem for every non-fp8
+  mode; left alone the saved VRAM is reserved right back and the feature measures as a no-op);
+  audit every `isinstance(..., Cache)` — an unhandled class returns **indices interpreted as
+  values**, silent corruption
+- [ ] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
+  picks the signature off `getattr(cache, "quantize", True)` and **neither value is safe** —
+  `False` stamps `QUANT_SIG_BF16` on packed indices (silent garbage on restore, and `head_dim`
+  recorded as the packed last dim), `True` IndexErrors on the absent scales. Seeds belong in the sig
+- [ ] **Task 5** — on-device: **deterministic numerical quality gate first** (attention-score
+  relative error — greedy decode here is NOT bit-reproducible, so a text diff proves nothing), then
+  size, then decode **and TTFT** (reconstruct-on-read is quadratic-ish across chunked prefill, so
+  TTFT moves more than decode), then the fan-out measurement this feature actually exists for
+  (`test_multiturn.py` at rising `K_SESSIONS`). Both models — they sit on different forwards.
+- Out of scope, and it costs us a claim: the **mixed-precision outlier split** is the *only* way the
+  paper reaches fractional bit-widths (`(32×3+96×2)/128 = 2.5`), so a uniform implementation
+  **cannot claim the 3.5-bit LongBench result**. `bits_total=4` uniform spends more bits than 3.5,
+  so quality should be no worse — but that must be measured, not inherited.
 
 ### Plan B — Expert usage histogram (Subsystem B)  **(P3)** — RETARGETED 2026-08-01
 `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md` — Phase 1 **superseded**
@@ -321,6 +341,15 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   actively tested, and every MiniMax perf number on record is a module-list number** — including
   Plan F's. Not a bug; the doc and the mental model are wrong, and an optimization aimed at "the
   EXL3 fused path" would miss MiniMax entirely. (found 2026-08-02 via the bias warning)
+- [ ] **Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).** Still says
+  "Serializing it is not implemented yet (DiskWriter refuses)" — false since `c892069` landed bf16
+  disk serialization and removed the refusal. One-line comment fix, no behavior change. Found
+  2026-08-02 while auditing Plan H against the tree; not fixed on the spot to keep that audit
+  read-only. (found 2026-08-02)
+- [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
+  `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation
+  CLAUDE.md §5 forbids. Plan H Task 3 must insert its branch *before* the fall-through; whether the
+  fall-through itself becomes a raise is a separate call. (found 2026-08-02, Plan H audit)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt
