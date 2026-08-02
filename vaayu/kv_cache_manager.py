@@ -27,7 +27,13 @@ def _extract_kv_as_bf16(cache, layer_idx: int):
     Extract key/value tensors from cache as BF16 CPU tensors.
     Handles both FP8DynamicCache (needs dequantization) and standard DynamicCache.
     """
-    from vaayu.vaayu_base import FP8DynamicCache
+    from vaayu.vaayu_base import FP8DynamicCache, TurboQuantKVCache
+    # Checked FIRST: a TurboQuantKVCache is an FP8DynamicCache with
+    # quantize=False, so it would otherwise slip through the guard below and
+    # return packed INDICES interpreted as values — no crash, no warning.
+    if isinstance(cache, TurboQuantKVCache):
+        k, v = cache.reconstruct_layer(layer_idx, dtype=torch.bfloat16)
+        return k.cpu(), v.cpu()
     k = cache.key_cache[layer_idx]
     v = cache.value_cache[layer_idx]
     # The class alone does not imply quantization: FP8DynamicCache(quantize=False)

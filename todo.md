@@ -5,7 +5,10 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (delete_original now reclaims already-split models — 273 GB freed;
+_Last updated: 2026-08-02 (Plan H TurboQuant KV COMPLETE on branch `plan-h-turboquant-kv`, suite
+457 → 500, two plan-math errors corrected — size target hit exactly but the quality gate FAILED at
+4 bits and MiniMax decode regressed, so it ships dark; delete_original now reclaims already-split
+models — 273 GB freed;
 bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
 out to be unreachable code on both models, now warned about; MiniMax found to run the
 module-list forward, not the EXL3 fused one)._
@@ -26,9 +29,11 @@ Plans A, C, D ✅ DONE (2026-08-01); E, F, G ✅ CLOSED (2026-08-02) — see Act
    Pin dropped on F's evidence; the bias was measured and found to be **unreachable code** on both
    models — now warned about (`df9a52e`). It also turned up a doc-level surprise: MiniMax runs the
   module-list forward, not the EXL3 fused one. Both are ledgered below.
-4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
-   precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
-   context, NOT decode speed.
+4. ~~**P4 — Plan H (TurboQuant KV).**~~ ✅ **COMPLETE 2026-08-02** on branch
+   `plan-h-turboquant-kv`, suite 500 green. Size target hit exactly (0.5312 B/elem, 0.266× bf16,
+   pool sessions 10 → 35) but the **pre-stated quality gate FAILED by 2–7× on both models** at the
+   4-bit default, and MiniMax decode regressed 5–8% below its floor. Ships dark and opt-in; `auto`
+   unchanged. See RESULTS for the operating point that does pass (1.031 B/elem, 1.94×).
 
 **Dependency summary:** E → H (E done, H unblocked), F → G (both closed; F's answer retired G's pin).
 
@@ -184,27 +189,91 @@ rotation generated ONCE (data-oblivious); unit-norm assumed with norms stored in
 Reconstruction to float happens **before** inner products — so a working copy is always required.
 **Value is prefix-cache fan-out headroom and longer context — NOT decode speed.**
 Target: **0.531 B/elem** at 4 bits/channel vs today's bf16 2.000 (−73.5%).
-- [ ] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
+**ALL 5 TASKS DONE 2026-08-02** (branch `plan-h-turboquant-kv`); suite 457 → 500 green.
+**VERDICT: quality gate FAILED at the plan's 4-bit default — do not ship as a default, do not ship
+at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full numbers in
+`2026-08-02-turboquant-kv-RESULTS.md`. Two plan-rev-2 errors found and corrected in code+tests:
+  - **Codebook `dim`-scaling ratio is inverted in the plan.** Post-rotation coords are ~`N(0,1/d)`,
+    so centroids scale `1/√d`: `make_codebook(3,128)` = **√(64/128) ×** the `dim=64` one, not √2×.
+    Implemented per the plan's own prose; pinned by `test_codebook_scales_with_one_over_sqrt_dim`.
+  - **"QJL strictly helps [L2]" is false as specced.** With the `d×d` sketch the estimator's own
+    variance adds `γ²(π/2 − 1/d)`, so reconstruction error is **~1.57× the MSE stage alone**
+    (measured 1.56×). QJL buys **unbiased inner products**, not lower distortion — beating the MSE
+    stage on L2 would need a sketch with `m > 1.57d` rows. That test was replaced by two: one
+    pinning the 1.57 factor, one proving the unbiasedness the `_prod` stage exists for.
+  - **Consequence for Task 5:** measured relative L2 error is **0.230** at `bits_total=4`
+    (0.184 MSE stage × 1.25 from QJL), and 0.426 at 3 bits. That is the number the quality gate has
+    to survive. Spending the same bit on MSE instead (4-bit MSE, no QJL) gives 0.097 — worth
+    reporting as the alternative if the gate is marginal.
+- [x] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
   scales `1/√d` — a dim-blind one reconstructs noise), **mandatory QJL `_prod` stage** (unbiased
   inner products is why it is safe for attention), and **bit-packing** (one index per uint8 byte
   yields 1.16 B/elem, not 0.53 — packing is required, not an optimization) (TDD)
-- [ ] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
+  - [x] 24 tests; MSE stage reproduces the paper's anchors (0.1165/0.0338/0.0093 at b=2/3/4);
+    **0.5312 B/elem measured**, matching the plan's 0.531 prediction exactly
+- [x] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
   to_cpu/to_device/resident_bytes unchanged); reconstruct-on-**read** (on-write would reintroduce
   exactly the mirror Plan E deleted)
-- [ ] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
+  - [x] 9 tests; `resident_bytes` = **0.266×** the bf16 cache for identical content (bar was <0.35);
+    chunked prefill is bit-identical to a single update (per-token independent quantization);
+    new `reconstruct_layer()` is the only supported read path
+- [x] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
   (`_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes` charge 2 B/elem for every non-fp8
   mode; left alone the saved VRAM is reserved right back and the feature measures as a no-op);
   audit every `isinstance(..., Cache)` — an unhandled class returns **indices interpreted as
   values**, silent corruption
-- [ ] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
+  - [x] 7 tests. `_extract_kv_as_bf16` checks `TurboQuantKVCache` FIRST (it has `quantize=False`,
+    so it slipped through the old guard and returned packed indices as values). Both byte-accounting
+    sites charge 1 B/elem (integer arithmetic → round up from the true 0.531, never under-reserves).
+  - [x] `isinstance` audit: `vaayu_base:2547` (`get_seq_length` only) and `:3305/:3320`
+    (`_trim_kv_cache[_front]` → `crop`/`crop_front`) are correct by inheritance; `kv_persist` is
+    Task 4; `vaayu_base:546..600` are parent internals never reached (update + growth both
+    overridden). Also checked transformers itself: only flaubert/olmo_hybrid read `key_cache`
+    directly, neither is on-device.
+- [x] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
   picks the signature off `getattr(cache, "quantize", True)` and **neither value is safe** —
   `False` stamps `QUANT_SIG_BF16` on packed indices (silent garbage on restore, and `head_dim`
   recorded as the packed last dim), `True` IndexErrors on the absent scales. Seeds belong in the sig
-- [ ] **Task 5** — on-device: **deterministic numerical quality gate first** (attention-score
-  relative error — greedy decode here is NOT bit-reproducible, so a text diff proves nothing), then
-  size, then decode **and TTFT** (reconstruct-on-read is quadratic-ish across chunked prefill, so
-  TTFT moves more than decode), then the fan-out measurement this feature actually exists for
-  (`test_multiturn.py` at rising `K_SESSIONS`). Both models — they sit on different forwards.
+  - [x] **Scope (a) chosen** (refusal, as recommended — the format is unproven and KV persistence
+    ships dark). `DiskWriter.enqueue_append` returns before `build_header`, warns once;
+    `turboquant_sig(bits, rot_seed, qjl_seed)` added so no reader can ever mistake such a file for
+    values. 3 tests, incl. one asserting fp8/bf16 caches still persist.
+- [x] **Task 5** — on-device gate, both models — **DONE 2026-08-02. VERDICT: quality gate FAILED.**
+  RESULTS: `docs/superpowers/plans/2026-08-02-turboquant-kv-RESULTS.md`
+  - [x] **Quality (pre-stated bar: attention-score rel. error < 0.05) — FAIL on both.** Qwen mean
+    0.092 / max 0.241; MiniMax mean 0.178 / max 0.350. K/V rel L2 = **0.230** on real keys, matching
+    the synthetic 0.2297 to four decimals — the quantizer is correct, uniform 4-bit is just that
+    lossy. Method: real K/V read back from the bf16 `.vaayu_kv` files (CPU-only, no extra model
+    load); queries are not persisted, so two proxies were used and **both** miss the bar widely.
+  - [x] **Size — exactly as predicted.** 0.5312 B/elem on device, both models, every session size
+    (Qwen 127.4→33.8 MiB, MiniMax 167.1→44.4 MiB, fan-out sessions 497.2→132.1 MiB). Ratio 0.266.
+  - [x] **Decode — Qwen unaffected (0.81/0.87 → 0.84/0.83); MiniMax REGRESSES 5–8% below its 1.47
+    floor** (1.53 → 1.45, 1.40, two runs). Reconstruction scales with `layers × kv_heads`: MiniMax
+    496 head-layers vs Qwen 376, on half the per-token budget. Different forwards, different answer.
+  - [x] **TTFT — +1.0% with chunking genuinely ON** (chunk=128, 4 chunks: 27.11 → 27.39s). The
+    unchunked +11% (27.45 → 30.52s) is therefore run variance. The plan's quadratic-across-chunks
+    risk is **unexercised, not refuted** — 439-token prompts are too short for the S² term.
+  - [x] **Fan-out — headroom only, zero benefit today.** K=3 both modes: 3/3 HIT, **0 evictions in
+    both**, so the budget is not binding. Sessions that fit in the pool go **10 → 35**.
+  - [x] **Bits sweep (real K):** the 0.05 bar first passes at `bits_total=8` / 1.031 B/elem on both
+    models — a **1.94×** win over bf16, not 3.77×. MSE-only (no QJL) at equal storage never passes
+    on MiniMax at any bit-width, so the QJL stage earns its bit despite costing L2.
+  - [x] Coherence: both Qwen continuations fluent and on-task — recorded, but it proves little; the
+    numerical gate exists because coherent output can hide a 23% perturbation of every key.
+  - [x] On-device confirmation of Task 4: the persistence refusal fired and no file was written.
+  - [x] Scaffolding reverted (`git checkout test_generate.py test_multiturn.py`), tree clean.
+- **Follow-ups, UNBUILT, in priority order (from the RESULTS recommendation):**
+  - [ ] **Mixed-precision outlier split** — the only way the paper reaches its quality-neutral
+    fractional bit-widths, and now the only credible route to sub-1 B/elem KV here. Uniform 4 bits
+    spends *more* than the paper's 3.5 and still misses a 5% bar by 2–7×, so the split is doing the
+    quality work, not the bit count. A spec, not a patch.
+  - [ ] **Real-query quality gate** — this gate used K-row and Gaussian query proxies because
+    `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds, but any attempt
+    to certify a specific bit-width needs real queries captured with an attention hook.
+  - [ ] **Fold `Π` into the query** (`⟨q, Πᵀỹ⟩ = ⟨Πq, ỹ⟩`) — turns per-token reconstruction from
+    `O(S·d²)` into `O(d²)`, which is exactly what costs MiniMax its 5–8% decode. Needs hooking
+    attention itself. **Only worth writing after the quality question is settled** — a fast cache
+    that is 23% wrong is not worth speeding up.
 - Out of scope, and it costs us a claim: the **mixed-precision outlier split** is the *only* way the
   paper reaches fractional bit-widths (`(32×3+96×2)/128 = 2.5`), so a uniform implementation
   **cannot claim the 3.5-bit LongBench result**. `bits_total=4` uniform spends more bits than 3.5,
@@ -341,15 +410,15 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   actively tested, and every MiniMax perf number on record is a module-list number** — including
   Plan F's. Not a bug; the doc and the mental model are wrong, and an optimization aimed at "the
   EXL3 fused path" would miss MiniMax entirely. (found 2026-08-02 via the bias warning)
-- [ ] **Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).** Still says
-  "Serializing it is not implemented yet (DiskWriter refuses)" — false since `c892069` landed bf16
-  disk serialization and removed the refusal. One-line comment fix, no behavior change. Found
-  2026-08-02 while auditing Plan H against the tree; not fixed on the spot to keep that audit
-  read-only. (found 2026-08-02)
+- [x] ~~**Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).**~~ **FIXED
+  2026-08-02** in Plan H Task 4, which edits that same constant block. Said "Serializing it is not
+  implemented yet (DiskWriter refuses)" — false since `c892069`. Comment-only, no behavior change.
+  (found 2026-08-02)
 - [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
   `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation
-  CLAUDE.md §5 forbids. Plan H Task 3 must insert its branch *before* the fall-through; whether the
-  fall-through itself becomes a raise is a separate call. (found 2026-08-02, Plan H audit)
+  CLAUDE.md §5 forbids. Plan H Task 3 inserted the turboquant branch *before* the fall-through (done
+  2026-08-02), so this entry is now only about the fall-through itself: **should an unknown mode
+  raise?** Still open, still a separate call. (found 2026-08-02, Plan H audit)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt
