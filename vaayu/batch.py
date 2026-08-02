@@ -98,8 +98,12 @@ def build_batch_attention_mask(pad_mask, q_len, dtype, device):
 
 
 def _resolve_kv_elem_bytes(model) -> int:
-    """1 byte (fp8) or 2 (fp16), mirroring VaayuBaseModel._create_kv_cache.
-    Conservative: unknown/auto-non-EXL3 -> 2 (never under-reserves KV)."""
+    """1 byte (fp8, turboquant) or 2 (fp16), mirroring
+    VaayuBaseModel._create_kv_cache.
+    Conservative: unknown/auto-non-EXL3 -> 2 (never under-reserves KV).
+    TurboQuant's true rate is bits_total/8 + 4/head_dim bytes/element (0.531 at
+    4 bits, head_dim 128), but this returns an int and callers multiply ints, so
+    it rounds up to 1."""
     mode = getattr(model, "kv_cache_mode", "fp16")
     if mode == "auto":
         try:
@@ -108,7 +112,7 @@ def _resolve_kv_elem_bytes(model) -> int:
                                         EXL3LoaderStrategy) else "fp16"
         except Exception:
             mode = "fp16"
-    return 1 if mode == "fp8" else 2
+    return 1 if mode == "fp8" or mode.startswith("turboquant") else 2
 
 
 def geo_from_model(model) -> tuple:

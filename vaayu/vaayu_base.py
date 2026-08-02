@@ -708,6 +708,7 @@ class TurboQuantKVCache(FP8DynamicCache):
         self._k_norms: list = []    # (||x||, gamma) fp16, [B, H, capacity, 2]
         self._v_norms: list = []
         self._params: dict = {}     # (dim, device) -> (rot, gauss, codebook)
+        self._head_dims: dict = {}  # layer_idx -> (k head_dim, v head_dim)
 
     @property
     def _BUFFER_LISTS(self):
@@ -770,17 +771,26 @@ class TurboQuantKVCache(FP8DynamicCache):
             getattr(self, name)[layer_idx][..., s, :] = t
         self._seq_len[layer_idx] = prev + n_new
 
-        used = self._seq_len[layer_idx]
-        w = slice(0, used)
-        k_dim, v_dim = key_states.shape[-1], value_states.shape[-1]
+        self._head_dims[layer_idx] = (key_states.shape[-1], value_states.shape[-1])
+        return self.reconstruct_layer(layer_idx, dtype=key_states.dtype)
+
+    def reconstruct_layer(self, layer_idx: int, dtype=torch.bfloat16):
+        """Full-length (K, V) for one layer, reconstructed to `dtype`.
+
+        The ONLY supported way to read this cache's contents: key_cache and
+        value_cache hold packed indices, so anything that slices them directly
+        gets indices interpreted as values.
+        """
+        k_dim, v_dim = self._head_dims[layer_idx]
+        w = slice(0, self._seq_len[layer_idx])
         return (self._reconstruct(self.key_cache[layer_idx][..., w, :],
                                   self._k_signs[layer_idx][..., w, :],
                                   self._k_norms[layer_idx][..., w, :],
-                                  k_dim, key_states.dtype),
+                                  k_dim, dtype),
                 self._reconstruct(self.value_cache[layer_idx][..., w, :],
                                   self._v_signs[layer_idx][..., w, :],
                                   self._v_norms[layer_idx][..., w, :],
-                                  v_dim, value_states.dtype))
+                                  v_dim, dtype))
 
 
 def _layer_path_exists(model: nn.Module, path: str) -> bool:
@@ -1990,7 +2000,10 @@ class VaayuBaseModel(GenerationMixin):
             head_dim = self.config.hidden_size // self.config.num_attention_heads
 
         mode = getattr(self, 'kv_cache_mode', 'fp16')
-        if mode == 'fp8':
+        # TurboQuant really costs bits_total/8 + 4/head_dim bytes/element (0.531
+        # at 4 bits, head_dim 128), but this arithmetic is integer, so charge the
+        # next whole byte: conservative, never under-reserves.
+        if mode == 'fp8' or mode.startswith('turboquant'):
             kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len
         else:
             kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len * 2
@@ -2030,6 +2043,18 @@ class VaayuBaseModel(GenerationMixin):
             print("[Vaayu] KV Cache: bf16 ring buffer (no quantization, ~33% "
                   "less VRAM than fp8 mode)")
             return FP8DynamicCache(quantize=False)
+
+        # Before the fp8 fall-through below, which silently swallows any
+        # unrecognised mode string.
+        if mode == "turboquant" or mode.startswith("turboquant:"):
+            bits_total = int(mode.split(":", 1)[1]) if ":" in mode else 4
+            # head_dim is not known until the first update(), so quote the
+            # index rate only; the norms add 4 bytes per (token, head) on top.
+            print(f"[Vaayu] KV Cache: TurboQuant, {bits_total} bits/channel "
+                  f"({bits_total / 8:.3f} bytes/element of indices + 4 bytes per "
+                  f"token-head of norms, vs bf16's 2.0). LOSSY — see the Plan H "
+                  f"RESULTS quality gate.")
+            return TurboQuantKVCache(bits_total=bits_total)
 
         if not hasattr(torch, "float8_e4m3fn"):
             print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")

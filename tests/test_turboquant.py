@@ -311,3 +311,87 @@ def test_multiple_layers_are_independent():
     c.update(k0, v0, 0)
     c.update(k1, v1, 1)
     assert c.get_seq_length(0) == 5 and c.get_seq_length(1) == 9
+
+
+# --- mode selection, extraction, byte accounting (Task 3) -------------------
+
+import types  # noqa: E402
+
+
+def _cache_for_mode(mode):
+    from vaayu.vaayu_base import VaayuBaseModel
+    fake = types.SimpleNamespace(kv_cache_mode=mode, loader_strategy=None)
+    return VaayuBaseModel._create_kv_cache(fake)
+
+
+def test_create_kv_cache_turboquant_mode():
+    c = _cache_for_mode("turboquant")
+    assert isinstance(c, TurboQuantKVCache)
+    assert c.bits_total == 4
+
+
+def test_create_kv_cache_turboquant_with_explicit_bits():
+    assert _cache_for_mode("turboquant:3").bits_total == 3
+    assert _cache_for_mode("turboquant:5").bits_total == 5
+
+
+def test_create_kv_cache_existing_modes_unchanged():
+    from transformers import DynamicCache
+    assert type(_cache_for_mode("fp16")) is DynamicCache
+    assert type(_cache_for_mode("auto")) is DynamicCache        # non-EXL3
+    bf16 = _cache_for_mode("bf16")
+    assert type(bf16) is FP8DynamicCache and bf16.quantize is False
+    fp8 = _cache_for_mode("fp8")
+    assert type(fp8) is FP8DynamicCache and fp8.quantize is True
+
+
+def test_extract_kv_as_bf16_reconstructs_turboquant():
+    """The silent-corruption site: a TurboQuantKVCache has quantize=False, so
+    the pre-existing guard would pass it through and return packed INDICES
+    interpreted as values -- no crash, no warning, garbage KV."""
+    from vaayu.kv_cache_manager import _extract_kv_as_bf16
+    k, v = _kv(16, seed=20)
+    c = TurboQuantKVCache()
+    c.update(k, v, 0)
+    ek, ev = _extract_kv_as_bf16(c, 0)
+    assert ek.shape == k.shape and ev.shape == v.shape   # NOT the packed last dim
+    assert ek.dtype == torch.bfloat16
+    assert _rel_l2(ek, k) < 0.30 and _rel_l2(ev, v) < 0.30
+
+
+def test_extract_kv_as_bf16_existing_modes_unchanged():
+    from vaayu.kv_cache_manager import _extract_kv_as_bf16
+    k, v = _kv(8, seed=21)
+    bf16 = FP8DynamicCache(quantize=False)
+    bf16.update(k, v, 0)
+    ek, _ = _extract_kv_as_bf16(bf16, 0)
+    assert torch.equal(ek, k[:, :, :8, :].cpu())
+
+
+def test_batch_kv_elem_bytes_charges_less_for_turboquant():
+    from vaayu.batch import _resolve_kv_elem_bytes
+    tq_bytes = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant"))
+    bf16_bytes = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="bf16"))
+    assert tq_bytes < bf16_bytes
+    assert _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant:3")) == tq_bytes
+
+
+def test_vram_pinning_budget_charges_less_for_turboquant():
+    """Left at 2 B/elem the saved VRAM would be reserved right back and the
+    whole feature would measure as a no-op."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for _get_vram_pinning_budget")
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    def budget(mode):
+        fake = types.SimpleNamespace(
+            kv_cache_mode=mode, device="cuda:0", max_seq_len=4096,
+            config=types.SimpleNamespace(num_hidden_layers=32, num_key_value_heads=8,
+                                         head_dim=128, hidden_size=4096,
+                                         num_attention_heads=32),
+            checkpoint_path="/nonexistent",
+            layer_names_dict={"layer_prefix": "model.layers"},
+        )
+        return VaayuBaseModel._get_vram_pinning_budget(fake)
+
+    assert budget("turboquant") > budget("bf16")   # smaller KV reserve -> more room
