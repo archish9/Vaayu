@@ -80,7 +80,8 @@ Anything below 9 prints a warning.
 always bf16. If a single session's KV won't fit in VRAM, this cannot help — that
 needs attention over compressed keys, which is not built.
 
-Details: `docs/superpowers/plans/2026-08-02-compress-on-evict-kv-RESULTS.md`.
+Full measurements: the compress-on-evict RESULTS doc under `docs/superpowers/plans/`
+(local working notes, not tracked in the repo).
 
 ## 3. `enable_kv_persist` — on, unless disk is precious
 

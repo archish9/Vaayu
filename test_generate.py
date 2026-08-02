@@ -13,7 +13,7 @@ deliberately left off and why.
 
 Deliberately NOT set here: prefix_compress. It compresses pooled KV so more
 sessions stay cached, and this script runs one session for one turn -- nothing
-to evict, nothing to reuse, so it would be pure cost. See docs/TUNING.md, and
+to evict, nothing to reuse, so it would be pure cost. See documentation/TUNING.md, and
 run `python tune_advisor.py` for what YOUR workload should set.
 
 Reports:

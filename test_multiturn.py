@@ -47,7 +47,7 @@ R_ROUNDS      = 2            # single cold round — isolates the reclaim questi
 # (or the system-prompt size below) pushes the pool over budget: measured 0/3
 # HIT -> 3/3 and TTFT 332s -> 9.8s at K=3 x 7.7k tokens. 9 is the lowest width
 # that passed the quality gate on both on-device models; below it warns.
-# `python tune_advisor.py` computes the crossover for your box. See docs/TUNING.md.
+# `python tune_advisor.py` computes the crossover for your box. See documentation/TUNING.md.
 PREFIX_COMPRESS = None
 
 project_root = os.path.dirname(os.path.abspath(__file__))

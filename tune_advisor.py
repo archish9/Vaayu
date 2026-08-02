@@ -16,7 +16,7 @@ Run:
     python tune_advisor.py                       # uses the defaults below
     K_SESSIONS=4 TOKENS_PER_SESSION=8000 python tune_advisor.py
 
-See docs/TUNING.md for the reasoning behind each recommendation.
+See documentation/TUNING.md for the reasoning behind each recommendation.
 """
 import os
 import sys
@@ -181,7 +181,7 @@ def main() -> int:
     print(f"        kv_cache_mode=\"auto\",          # bf16; do not use \"turboquant\"")
     print("    )")
     print()
-    print("Full reasoning and the other knobs: docs/TUNING.md")
+    print("Full reasoning and the other knobs: documentation/TUNING.md")
     return 0
 
 
