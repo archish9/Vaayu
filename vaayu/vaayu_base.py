@@ -3398,18 +3398,30 @@ class VaayuBaseModel(GenerationMixin):
         result = super().generate(*args, **kwargs)
         resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
         # `kv` was mutated in place through the forward passes -> holds the full
-        # final KV. Persist it (store() moves it back to RAM).
-        pc.store(resolved_sid, result[0].tolist(), kv)
+        # final KV.
+        self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())
+        return result
+
+    def _persist_and_store(self, pc, resolved_sid, kv, token_ids):
+        """Persist the finished KV, THEN hand it to the prefix pool.
+
+        Order matters and is locked by test. kv_persist reads kv.key_cache
+        directly, while pc.store() may TurboQuant-compress that very same object
+        (prefix_compress=). Persisting second would write packed indices into a
+        file whose header says bf16 values -- silent garbage on restore.
+        kv_persist.to_bytes() does its own .cpu(), so persisting from the
+        still-on-GPU cache is fine.
+        """
         if self._kv_writer is not None:
-            # kv.get_seq_length(), not len(result[0]): the last sampled token is
+            # kv.get_seq_length(), not len(token_ids): the last sampled token is
             # never fed back through a forward pass (generation stops right after
             # sampling it), so it never went through cache.update() -- the cache's
-            # true occupied length is exactly len(result[0]) - 1. Using the longer
+            # true occupied length is exactly len(token_ids) - 1. Using the longer
             # value here indexes one position past what the cache actually holds.
             self._kv_writer.enqueue_append(
-                resolved_sid, kv, self.config, result[0].tolist(), kv.get_seq_length())
+                resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
+        pc.store(resolved_sid, token_ids, kv)
         self.telemetry.dump_json("vaayu_telemetry.json")
-        return result
 
     @torch.no_grad()
     def speculative_generate(

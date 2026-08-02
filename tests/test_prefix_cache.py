@@ -267,3 +267,27 @@ def test_stats_reports_compression_and_reset_zeroes_it():
     assert "0pack/0unpack" in s.stats()
     # off by default -> no compression fragment at all
     assert "compress=" not in PrefixCacheStore(budget_bytes=10 ** 9).stats()
+
+
+def test_persist_runs_before_store_compresses():
+    """kv_persist reads the cache directly; store() may compress it. If the
+    order ever flips back, the disk file silently receives packed indices."""
+    import types
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    order = []
+
+    class _Writer:
+        def enqueue_append(self, sid, cache, cfg, toks, length):
+            order.append(("persist", type(cache).__name__))
+
+    class _PC:
+        def store(self, sid, toks, cache):
+            order.append(("store", type(cache).__name__))
+
+    c = _bf16_cache(seq=4)
+    fake = types.SimpleNamespace(
+        _kv_writer=_Writer(), config=None,
+        telemetry=types.SimpleNamespace(dump_json=lambda p: None))
+    VaayuBaseModel._persist_and_store(fake, _PC(), "sess", c, [1, 2, 3, 4, 5])
+    assert [o[0] for o in order] == ["persist", "store"]
