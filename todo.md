@@ -14,8 +14,10 @@ git history._
 
 ## Execution sequence — read this first
 
-**Nothing is in progress.** Execute strictly top to bottom. Each row's plan doc is self-contained;
-do not start a row until the one above it is `[x]` and its RESULTS doc exists.
+**Plan J is in progress** (code complete on branch `worktree-plan-j-pinned-roundup`, on-device gates
+partly measured). Otherwise execute strictly top to bottom. Each row's plan doc is self-contained;
+do not start a row until the one above it is `[x]` and its RESULTS doc exists — **except L, whose
+first step is evidence-gathering and can begin as soon as J's RESULTS lands.**
 
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
@@ -54,9 +56,10 @@ which **rounds every pinned allocation up to the next power of two**. Measured i
 appears identically on both models across the arena window and was never attributed.
 
 **Waste ≈ 7.6 GiB on a 32 GB box** (arena 6.79 + `_PINNED_BUFS[0]` 0.76 + smaller), resident and
-unaddressable. **Number it moves:** cross-turn prefix pool budget **3.88 GB → ~12.5 GB predicted**
-(bar: ≥ 11 GB) — and Plan I measured that pool coming up ~1.4 GB short at a cost of 332 s of
-round-2 TTFT.
+unaddressable. **Number it moves:** cross-turn prefix pool budget — predicted ~12.5 GB (bar ≥ 11),
+**measured 4.69 → 13.38 GB on MiniMax**, with `post-arena rss` down 21.59 → 12.91 GB. Plan I had
+measured that pool coming up ~1.4 GB short at a cost of 332 s of round-2 TTFT; J closes that gap
+and the round-2 TTFT is now **9.6 s**.
 
 **Plan rewritten to v2 (2026-08-03)** after a pre-flight scan found three defects in v1. Corrected
 there, and these corrections supersede the numbers above: the clamp costs **6.7 %** of slabs, not
