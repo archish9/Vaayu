@@ -5,7 +5,9 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (delete_original now reclaims already-split models — 273 GB freed;
+_Last updated: 2026-08-02 (Plan H TurboQuant KV Tasks 1–4 landed on branch `plan-h-turboquant-kv`,
+suite 457 → 500, two plan-math errors corrected; Task 5 on-device gate pending operator;
+delete_original now reclaims already-split models — 273 GB freed;
 bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
 out to be unreachable code on both models, now warned about; MiniMax found to run the
 module-list forward, not the EXL3 fused one)._
@@ -26,9 +28,10 @@ Plans A, C, D ✅ DONE (2026-08-01); E, F, G ✅ CLOSED (2026-08-02) — see Act
    Pin dropped on F's evidence; the bias was measured and found to be **unreachable code** on both
    models — now warned about (`df9a52e`). It also turned up a doc-level surprise: MiniMax runs the
   module-list forward, not the EXL3 fused one. Both are ledgered below.
-4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Requires E** — it carries a
-   precondition check and stops if E has not landed. Buys prefix-cache fan-out headroom and longer
-   context, NOT decode speed.
+4. **P4 — Plan H (TurboQuant KV).** `2026-08-02-turboquant-kv.md`. **Tasks 1–4 DONE 2026-08-02**
+   on branch `plan-h-turboquant-kv` (suite 500 green, KV measured 0.266× bf16). **Task 5, the
+   on-device gate, is the only remaining work and is operator-run.** Buys prefix-cache fan-out
+   headroom and longer context, NOT decode speed.
 
 **Dependency summary:** E → H (E done, H unblocked), F → G (both closed; F's answer retired G's pin).
 
@@ -184,22 +187,54 @@ rotation generated ONCE (data-oblivious); unit-norm assumed with norms stored in
 Reconstruction to float happens **before** inner products — so a working copy is always required.
 **Value is prefix-cache fan-out headroom and longer context — NOT decode speed.**
 Target: **0.531 B/elem** at 4 bits/channel vs today's bf16 2.000 (−73.5%).
-- [ ] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
+**Tasks 1–4 DONE 2026-08-02** (branch `plan-h-turboquant-kv`, `20a581a` `89c1f79` `44373bb`
++ Task 4 commit); suite 457 → 500 green. **Task 5 (on-device gate) is the only thing left and is
+operator-run.** Two plan-rev-2 errors found and corrected in code+tests along the way:
+  - **Codebook `dim`-scaling ratio is inverted in the plan.** Post-rotation coords are ~`N(0,1/d)`,
+    so centroids scale `1/√d`: `make_codebook(3,128)` = **√(64/128) ×** the `dim=64` one, not √2×.
+    Implemented per the plan's own prose; pinned by `test_codebook_scales_with_one_over_sqrt_dim`.
+  - **"QJL strictly helps [L2]" is false as specced.** With the `d×d` sketch the estimator's own
+    variance adds `γ²(π/2 − 1/d)`, so reconstruction error is **~1.57× the MSE stage alone**
+    (measured 1.56×). QJL buys **unbiased inner products**, not lower distortion — beating the MSE
+    stage on L2 would need a sketch with `m > 1.57d` rows. That test was replaced by two: one
+    pinning the 1.57 factor, one proving the unbiasedness the `_prod` stage exists for.
+  - **Consequence for Task 5:** measured relative L2 error is **0.230** at `bits_total=4`
+    (0.184 MSE stage × 1.25 from QJL), and 0.426 at 3 bits. That is the number the quality gate has
+    to survive. Spending the same bit on MSE instead (4-bit MSE, no QJL) gives 0.097 — worth
+    reporting as the alternative if the gate is marginal.
+- [x] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
   scales `1/√d` — a dim-blind one reconstructs noise), **mandatory QJL `_prod` stage** (unbiased
   inner products is why it is safe for attention), and **bit-packing** (one index per uint8 byte
   yields 1.16 B/elem, not 0.53 — packing is required, not an optimization) (TDD)
-- [ ] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
+  - [x] 24 tests; MSE stage reproduces the paper's anchors (0.1165/0.0338/0.0093 at b=2/3/4);
+    **0.5312 B/elem measured**, matching the plan's 0.531 prediction exactly
+- [x] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
   to_cpu/to_device/resident_bytes unchanged); reconstruct-on-**read** (on-write would reintroduce
   exactly the mirror Plan E deleted)
-- [ ] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
+  - [x] 9 tests; `resident_bytes` = **0.266×** the bf16 cache for identical content (bar was <0.35);
+    chunked prefill is bit-identical to a single update (per-token independent quantization);
+    new `reconstruct_layer()` is the only supported read path
+- [x] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
   (`_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes` charge 2 B/elem for every non-fp8
   mode; left alone the saved VRAM is reserved right back and the feature measures as a no-op);
   audit every `isinstance(..., Cache)` — an unhandled class returns **indices interpreted as
   values**, silent corruption
-- [ ] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
+  - [x] 7 tests. `_extract_kv_as_bf16` checks `TurboQuantKVCache` FIRST (it has `quantize=False`,
+    so it slipped through the old guard and returned packed indices as values). Both byte-accounting
+    sites charge 1 B/elem (integer arithmetic → round up from the true 0.531, never under-reserves).
+  - [x] `isinstance` audit: `vaayu_base:2547` (`get_seq_length` only) and `:3305/:3320`
+    (`_trim_kv_cache[_front]` → `crop`/`crop_front`) are correct by inheritance; `kv_persist` is
+    Task 4; `vaayu_base:546..600` are parent internals never reached (update + growth both
+    overridden). Also checked transformers itself: only flaubert/olmo_hybrid read `key_cache`
+    directly, neither is on-device.
+- [x] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
   picks the signature off `getattr(cache, "quantize", True)` and **neither value is safe** —
   `False` stamps `QUANT_SIG_BF16` on packed indices (silent garbage on restore, and `head_dim`
   recorded as the packed last dim), `True` IndexErrors on the absent scales. Seeds belong in the sig
+  - [x] **Scope (a) chosen** (refusal, as recommended — the format is unproven and KV persistence
+    ships dark). `DiskWriter.enqueue_append` returns before `build_header`, warns once;
+    `turboquant_sig(bits, rot_seed, qjl_seed)` added so no reader can ever mistake such a file for
+    values. 3 tests, incl. one asserting fp8/bf16 caches still persist.
 - [ ] **Task 5** — on-device: **deterministic numerical quality gate first** (attention-score
   relative error — greedy decode here is NOT bit-reproducible, so a text diff proves nothing), then
   size, then decode **and TTFT** (reconstruct-on-read is quadratic-ish across chunked prefill, so
@@ -341,15 +376,15 @@ and the cache runs saturated.** See RESULTS for the full nuance and recommendati
   actively tested, and every MiniMax perf number on record is a module-list number** — including
   Plan F's. Not a bug; the doc and the mental model are wrong, and an optimization aimed at "the
   EXL3 fused path" would miss MiniMax entirely. (found 2026-08-02 via the bias warning)
-- [ ] **Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).** Still says
-  "Serializing it is not implemented yet (DiskWriter refuses)" — false since `c892069` landed bf16
-  disk serialization and removed the refusal. One-line comment fix, no behavior change. Found
-  2026-08-02 while auditing Plan H against the tree; not fixed on the spot to keep that audit
-  read-only. (found 2026-08-02)
+- [x] ~~**Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).**~~ **FIXED
+  2026-08-02** in Plan H Task 4, which edits that same constant block. Said "Serializing it is not
+  implemented yet (DiskWriter refuses)" — false since `c892069`. Comment-only, no behavior change.
+  (found 2026-08-02)
 - [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
   `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation
-  CLAUDE.md §5 forbids. Plan H Task 3 must insert its branch *before* the fall-through; whether the
-  fall-through itself becomes a raise is a separate call. (found 2026-08-02, Plan H audit)
+  CLAUDE.md §5 forbids. Plan H Task 3 inserted the turboquant branch *before* the fall-through (done
+  2026-08-02), so this entry is now only about the fall-through itself: **should an unknown mode
+  raise?** Still open, still a separate call. (found 2026-08-02, Plan H audit)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
   raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
   clamps it down by one position so the model has a token to run. Fires only when the new prompt
