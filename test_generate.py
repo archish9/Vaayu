@@ -5,10 +5,16 @@ Model: whatever MODEL_PATH below points to (any vaayu.AutoModel-supported archit
 Task:  Generate a complete async file watcher Python module from spec.
 PLD:   OFF — output is novel code, not copied from prompt.
 
-Uses every shipped, on-device-validated optimization: bf16 KV ring buffer (auto), pinned
-layers, layer-major chunked prefill, speculative decoding (draft model), cross-turn
-RAM prefix cache, and disk KV persistence. See the "Shipped optimizations" block
-below for what's deliberately left off and why.
+Uses the shipped, on-device-validated optimizations that a SINGLE-TURN run can
+benefit from: bf16 KV ring buffer (auto), pinned layers, layer-major chunked
+prefill, speculative decoding (draft model), cross-turn RAM prefix cache, and
+disk KV persistence. See the "Shipped optimizations" block below for what's
+deliberately left off and why.
+
+Deliberately NOT set here: prefix_compress. It compresses pooled KV so more
+sessions stay cached, and this script runs one session for one turn -- nothing
+to evict, nothing to reuse, so it would be pure cost. See docs/TUNING.md, and
+run `python tune_advisor.py` for what YOUR workload should set.
 
 Reports:
   - Prompt tokens, output tokens

@@ -42,6 +42,13 @@ K_SESSIONS    = 2            # NOTE: the prefill->decode-boundary VRAM OOM that
                              # with zero OOM, and round-2 revisits now HIT the prefix
                              # cache.
 R_ROUNDS      = 2            # single cold round — isolates the reclaim question
+# Pooled-KV compression (Plan I). None = off, which is right whenever the pool
+# already holds all K sessions -- then it is pure cost. Set to 9 once K_SESSIONS
+# (or the system-prompt size below) pushes the pool over budget: measured 0/3
+# HIT -> 3/3 and TTFT 332s -> 9.8s at K=3 x 7.7k tokens. 9 is the lowest width
+# that passed the quality gate on both on-device models; below it warns.
+# `python tune_advisor.py` computes the crossover for your box. See docs/TUNING.md.
+PREFIX_COMPRESS = None
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
@@ -70,6 +77,7 @@ model = AutoModel.from_pretrained(
     delete_original=DELETE_ORIGINAL,
     max_pinned_layers=10, prefill_chunk_size=PREFILL_CHUNK_SIZE,
     enable_prefix_cache=True, auto_prefix_match=True,
+    prefix_compress=PREFIX_COMPRESS,
     enable_kv_persist=False,   # isolate the RAM prefix cache; no disk tier
 )
 print(f"Model loaded in {time.time() - _t0:.1f}s")

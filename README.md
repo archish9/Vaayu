@@ -105,11 +105,19 @@ We have structured the entire architectural knowledge, installation guides, and 
 * [**📂 Quantization & Pluggable Strategies**](documentation/quantization_and_strategies.md): Explaining our decoupled `LoaderStrategy` pattern (Peeking safetensors headers to auto-detect strategies), compiling custom ExLlamaV3 4-bit CUDA kernels, managing heap memory safety, and executing `quantize.py`.
 * [**🔮 Speculative Decoding & MoE Roadmap**](documentation/speculative_decoding_and_moe.md): Our technical blueprint detailing drafting-verification loops, Mixture-of-Experts routing gates, and expert-aware byte-offset disk streaming.
 * [**🍎 Apple Silicon & The Unified Memory Paradigm**](documentation/mac_unified_memory_paradigm.md): Exploring UMA zero-copy superpowers (`gpu_load` drops to 0s), analyzing the 16 GB MacBook VM swap thrashing constraint, and outlining a Mac manual swap manager using Metal (MPS) and `F_NOCACHE` (via `fcntl`).
+* [**⚙️ Tuning Guide: what to set, and when**](docs/TUNING.md): The decision guide for the caching knobs — when `prefix_compress` pays (and when it is pure cost), why the pool budget is not free RAM, and which knobs currently do nothing. Pairs with `tune_advisor.py`, which computes the crossover for your own model and box.
 * [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, Gemma4 multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
 
 ---
 
 ## ⚙️ Complete Configuration Parameter Reference
+
+> **Just want to know what to turn on?** See [**docs/TUNING.md**](docs/TUNING.md) — a short
+> decision guide for the caching knobs (`enable_prefix_cache`, `prefix_compress`,
+> `enable_kv_persist`, `kv_cache_mode`), including which settings are proven no-ops today.
+> Or run `python tune_advisor.py`, which derives the thresholds for **your** model and
+> workload and prints the settings to copy. The reference below covers every parameter in
+> depth.
 
 All parameters are set in the `CONFIG` block at the top of `test_quick.py` and passed to `AutoModel.from_pretrained()`. This section explains **what each parameter does internally**, **how it affects generation speed and quality**, and **how to set the correct value** for your hardware and workload.
 
