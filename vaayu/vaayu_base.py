@@ -938,6 +938,7 @@ class VaayuBaseModel(GenerationMixin):
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
                  drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
                  attn_implementation=None, enable_prefix_cache=False,
+                 prefix_compress=None,
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
                  enable_expert_usage=False):
@@ -1003,6 +1004,10 @@ class VaayuBaseModel(GenerationMixin):
         self.hf_token = hf_token
         self._forced_attn_impl = attn_implementation
         self.enable_prefix_cache = enable_prefix_cache
+        # None = pooled KV stays bf16 (default). An int = TurboQuant-pack pooled
+        # entries at that many bits/channel; 8 is the only value Plan H's quality
+        # gate passed. Costs one pack per turn, nothing per token.
+        self.prefix_compress = prefix_compress
         self.auto_prefix_match = auto_prefix_match
         self.enable_kv_persist = enable_kv_persist
         self.kv_persist_dir = kv_persist_dir
@@ -1577,9 +1582,7 @@ class VaayuBaseModel(GenerationMixin):
             import psutil as _ps
             _free_ram = _ps.virtual_memory().available
             _pc_budget = compute_prefix_cache_budget(_free_ram)
-            self._prefix_cache = PrefixCacheStore(
-                _pc_budget,
-                auto_prefix_match=getattr(self, "auto_prefix_match", True))
+            self._prefix_cache = self._build_prefix_store(_pc_budget)
             print(f"[Vaayu] cross-turn prefix cache ENABLED: "
                   f"{_pc_budget / 1e9:.2f} GB budget "
                   f"(free RAM {_free_ram / 1e9:.2f} GB - "
@@ -3378,7 +3381,9 @@ class VaayuBaseModel(GenerationMixin):
             input_ids = args[0]
         ids_list = input_ids[0].tolist()
 
-        kv, match_len = pc.lookup(session_id, ids_list)
+        # device= so a compressed entry is rebuilt straight onto the GPU; the
+        # store raises rather than handing back a packed container.
+        kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
         if kv is None:
             kv = self._create_kv_cache()
             print(f"[Vaayu-Prefix] MISS session={session_id} "
@@ -3401,6 +3406,20 @@ class VaayuBaseModel(GenerationMixin):
         # final KV.
         self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())
         return result
+
+    def _build_prefix_store(self, budget_bytes):
+        """Construct the RAM prefix pool, honouring prefix_compress."""
+        bits = getattr(self, "prefix_compress", None)
+        if bits is not None and bits < 8:
+            print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 8 "
+                  f"bits/channel that passed the quality gate on both on-device "
+                  f"models (see 2026-08-02-turboquant-kv-RESULTS.md). Restored "
+                  f"prefixes will be measurably wrong.")
+        # getattr, matching the construction this replaced: callers in tests
+        # build partial objects.
+        return PrefixCacheStore(budget_bytes,
+                                auto_prefix_match=getattr(self, "auto_prefix_match", True),
+                                compress_bits=bits)
 
     def _persist_and_store(self, pc, resolved_sid, kv, token_ids):
         """Persist the finished KV, THEN hand it to the prefix pool.

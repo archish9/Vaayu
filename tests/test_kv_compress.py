@@ -108,3 +108,30 @@ def test_compression_is_deterministic():
     a, b = compress_cache(c), compress_cache(c)
     for x, y in zip(a.k_idx, b.k_idx):
         assert torch.equal(x, y)
+
+
+# --- model flag (Task 4) ----------------------------------------------------
+
+def test_prefix_compress_flag_reaches_the_store():
+    import types
+    from vaayu.vaayu_base import VaayuBaseModel
+    fake = types.SimpleNamespace(enable_prefix_cache=True, prefix_compress=8)
+    store = VaayuBaseModel._build_prefix_store(fake, budget_bytes=10 ** 9)
+    assert store.compress_bits == 8
+
+
+def test_prefix_compress_defaults_to_off():
+    import types
+    from vaayu.vaayu_base import VaayuBaseModel
+    fake = types.SimpleNamespace(enable_prefix_cache=True, prefix_compress=None)
+    assert VaayuBaseModel._build_prefix_store(fake, budget_bytes=10 ** 9).compress_bits is None
+
+
+def test_below_eight_bits_warns(capsys):
+    """Plan H's gate failed at 4 bits on both models; a user asking for it gets
+    told, not silently degraded."""
+    import types
+    from vaayu.vaayu_base import VaayuBaseModel
+    fake = types.SimpleNamespace(enable_prefix_cache=True, prefix_compress=4)
+    VaayuBaseModel._build_prefix_store(fake, budget_bytes=10 ** 9)
+    assert "WARNING" in capsys.readouterr().out
