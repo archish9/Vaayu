@@ -50,21 +50,61 @@ which **rounds every pinned allocation up to the next power of two**. Measured i
 appears identically on both models across the arena window and was never attributed.
 
 **Waste ≈ 7.6 GiB on a 32 GB box** (arena 6.79 + `_PINNED_BUFS[0]` 0.76 + smaller), resident and
-unaddressable. **Number it moves:** cross-turn prefix pool budget **3.88 GB → ~10.5 GB predicted** —
-and Plan I measured that pool coming up ~1.4 GB short at a cost of 332 s of round-2 TTFT.
+unaddressable. **Number it moves:** cross-turn prefix pool budget **3.88 GB → ~12.5 GB predicted**
+(bar: ≥ 11 GB) — and Plan I measured that pool coming up ~1.4 GB short at a cost of 332 s of
+round-2 TTFT.
 
-- [ ] **Task 1** — clamp the arena backing store to the power of two already being paid for
-  (Option A. Option B = chunked backing; only if Task 4 shows the 13 % of slabs mattered)
-  - [ ] Tests incl. **the clamp must be a no-op on a box that was not wasting anything**, and the
-    `+ get_expert_pool_size()` staging slabs must survive it
-  - [ ] Announce the clamp in the arena log line (CLAUDE.md §5 — never silently smaller)
-- [ ] **Task 2** — `_PINNED_BUFS` alloc_size: round the request UP and use the whole block
-  (option (a) — the bytes are already charged). ~0.79 GiB.
+**Plan rewritten to v2 (2026-08-03)** after a pre-flight scan found three defects in v1. Corrected
+there, and these corrections supersede the numbers above: the clamp costs **6.7 %** of slabs, not
+13 % (v1 confused GB with GiB — the arena is 9.20 GB = 8.571 GiB); **Task 2 frees ~0.12 GiB, not
+0.79** (rounding a request up to the block already charged makes dead pages addressable, it does
+not return them — the only real saving is dropping the `+100 MB` pad); and Task 2's chunked-buffer
+option (b) is **infeasible**, not deferred (tensors are zero-copy views spanning the whole file, so
+one would straddle a chunk). Allocator rule re-measured directly: next pow2, and an exact pow2 is
+charged exactly.
+
+- [x] **Task 1** — clamp the arena backing store to the power of two already being paid for
+  (`3037810`). MiniMax 1031 → 965 slabs, Qwen 779 → 727. Option B (chunked backing) still deferred;
+  only revisit if Task 4 shows the 6.7 % mattered.
+  - [x] Tests: the clamp is a no-op iff nominal is already an exact power of two (v1's stated
+    "no-op on a box that was not wasting anything" — the two conditions are the same set), plus
+    tightness, and the `+ get_expert_pool_size()` staging slabs survive
+  - [x] Clamp announced in the arena log line with slabs lost AND RAM freed (CLAUDE.md §5)
+- [x] **Task 2** — `_PINNED_BUFS` alloc_size: round the request UP and use the whole block
+  (`b4344f6`). ~0.12 GiB freed; the `+100 MB` pad is gone. Review also caught a latent
+  off-by-`prefix_pad` in the reuse test, fixed in `f49dadd`: `_PINNED_SIZES < total_size` ignored
+  the alignment padding the io_uring read actually writes, an unbounded raw-pointer write that
+  power-of-two sizing moved onto a reachable boundary.
+- [x] **Final whole-branch review + fix wave** (`07f929c`) — 2 Important. (a) the Task 1 budget trim
+  set the cache budget to the WHOLE arena, driving the loader's staging reserve from
+  `get_expert_pool_size()` slabs to **zero** (a plan defect, since corrected in the plan doc);
+  (b) the clamp fired on pageable arenas too, where pow2 charging does not apply and the trade is
+  strictly negative. Suite 519 → **559**, warnings flat at 20. Dense smoke ran on real GPU + model.
 - [ ] **Task 3** — verify the freed RAM actually reaches the prefix pool (`post-arena avail` and
-  `prefix cache ENABLED` log lines, both models) — measured, not assumed
+  `prefix cache ENABLED` log lines, both models) — measured, not assumed. **Operator-run.**
+  Commands: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`.
 - [ ] **Task 4** — on-device gate + RESULTS: decode ≥ floors (**MiniMax 1.47 / Qwen 0.82**), pinned
   H2D still 19.7 GB/s, `test_multiturn.py` exits 0 at a K that previously failed, new cliff K
-  recorded, 0 OOM. Note that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up.
+  recorded, 0 OOM. Note that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up —
+  post-clamp any budget in [8 GiB, 16 GiB) yields the same 8 GiB resident arena, so the ceiling is
+  now nearly inert in that range. **Operator-run**; same runbook.
+
+**Pending bugs / parked findings from Plan J review** (none block the on-device gates):
+- [ ] `vaayu_base.py` trim line prints "to match the **clamped** slab arena" on an unclamped
+  (pageable, or no-op-clamp) arena, where nothing was clamped. Cosmetic; wrong text only on the
+  non-pinned path. On this box `_pin=True` and the clamp bites, so Task 3's logs read correctly.
+- [ ] Degenerate branch: when the expert budget is under ~one slab, the trimmed budget is 0 and the
+  expert RAM cache is fully disabled **silently**, where CLAUDE.md §5 asks for a WARNING.
+  `put_slab` handles a 0 budget safely. Unreachable on any box that can load these models.
+- [ ] The staging-reserve and pageable-gate tests assert against test-local mirrors of the
+  call-site expressions, not `vaayu_base.py` itself, so a regression in the production one-liners
+  would leave them green. Consequence of keeping the tests free of `VaayuBaseModel`; fix properly
+  by extracting the block into a helper if it is ever touched again.
+- [ ] `load_non_expert_tensors` still uses `alloc_size = aligned_length + 4 MiB` and writes that
+  non-power-of-two value into the same shared `_PINNED_SIZES` slots Task 2 now sizes by powers of
+  two. No correctness problem — both sites only grow a slot and each reuse test is sound against
+  its own requirement — but the two sites disagree on policy and the 4 MiB pad still buys dead
+  surplus. Recorded in the plan's §10 as the natural follow-up.
 
 ## Plan K — batched-decode admission reclaim  **(P2 — do second)**
 
