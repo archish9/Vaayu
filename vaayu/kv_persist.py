@@ -22,10 +22,18 @@ def _sig(scheme: bytes) -> int:
 
 QUANT_SIG = _sig(b"fp8_e4m3fn:448.0:per-head-per-token")
 # FP8DynamicCache(quantize=False) stores bf16 with no scales -- a different
-# on-disk layout, so it gets its own signature. Serializing it is not
-# implemented yet (DiskWriter refuses); the signature exists so such a file can
-# never be read back through the fp8 path.
+# on-disk layout, so it gets its own signature, and a file in either layout can
+# be read back only through its own path.
 QUANT_SIG_BF16 = _sig(b"bf16:none:ring")
+
+
+def turboquant_sig(bits_total: int, rot_seed: int, qjl_seed: int) -> int:
+    """Signature for a TurboQuantKVCache layout (packed indices + QJL signs +
+    norms). Not serialized today -- DiskWriter refuses these caches -- but the
+    signature exists so no reader can ever mistake such a file for fp8 or bf16
+    values. The seeds are part of it: a cache restored under a different
+    rotation is noise, not degraded data."""
+    return _sig(f"turboquant:{bits_total}:{rot_seed}:{qjl_seed}:ring".encode())
 
 _DTYPE_CODES = {
     torch.float8_e4m3fn: 1,
@@ -208,6 +216,7 @@ class DiskWriter:
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.Lock()   # guards _state dict structure only
         self._state = {}   # sid -> {"header": KvHeader, "nrec": int, "lock": Lock, "future": Future|None}
+        self._warned_turboquant = False
 
     def path_for(self, session_id: str) -> str:
         h = hashlib.sha1(session_id.encode("utf-8")).hexdigest()
@@ -228,6 +237,20 @@ class DiskWriter:
                 }
 
     def enqueue_append(self, session_id, cache, config, token_ids, length):
+        # Refuse BEFORE build_header runs. It picks the signature off
+        # cache.quantize, and neither value is safe for a TurboQuant cache:
+        # False stamps QUANT_SIG_BF16 on packed indices (and records head_dim as
+        # the packed last dim -- silent garbage on restore), True dereferences
+        # scales that do not exist.
+        from .vaayu_base import TurboQuantKVCache
+        if isinstance(cache, TurboQuantKVCache):
+            if not self._warned_turboquant:
+                self._warned_turboquant = True
+                print("[KV] WARNING: KV disk persistence is not implemented for "
+                      "kv_cache_mode=turboquant (packed indices, no on-disk "
+                      "format). Nothing will be written; use bf16 or fp8 to "
+                      "persist KV.")
+            return
         # self._lock (global) only guards the _state dict structure: atomically
         # look up or create this session's entry -- including its per-session
         # lock -- so two threads can't race to install two different locks for a

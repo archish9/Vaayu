@@ -315,6 +315,7 @@ def test_multiple_layers_are_independent():
 
 # --- mode selection, extraction, byte accounting (Task 3) -------------------
 
+import os  # noqa: E402
 import types  # noqa: E402
 
 
@@ -395,3 +396,56 @@ def test_vram_pinning_budget_charges_less_for_turboquant():
         return VaayuBaseModel._get_vram_pinning_budget(fake)
 
     assert budget("turboquant") > budget("bf16")   # smaller KV reserve -> more room
+
+
+# --- persistence refusal (Task 4) -------------------------------------------
+
+def test_turboquant_signature_differs_and_is_rejected_by_readers():
+    """A file written under an existing signature would be parsed as fp8 or
+    bf16 values -- packed indices reconstructed as garbage. The seeds are part
+    of the signature because a cache restored under a different rotation is
+    noise."""
+    from vaayu import kv_persist as kp
+    sig = kp.turboquant_sig(4, 0x5EED, 0x9317)
+    assert sig != kp.QUANT_SIG and sig != kp.QUANT_SIG_BF16
+    assert kp.turboquant_sig(3, 0x5EED, 0x9317) != sig      # bits are in the sig
+    assert kp.turboquant_sig(4, 1, 0x9317) != sig           # so are the seeds
+
+    cfg = types.SimpleNamespace(vocab_size=1000, num_hidden_layers=2,
+                                num_key_value_heads=4, head_dim=DIM)
+    h = types.SimpleNamespace(schema_ver=kp.SCHEMA_VER, quant_sig=sig,
+                              num_layers=2, vocab=1000, num_kv_heads=4, head_dim=DIM)
+    assert kp.header_matches(h, cfg) is False
+
+
+def test_writer_refuses_turboquant_cache_and_writes_no_file(tmp_path, capsys):
+    """Refusal must happen BEFORE build_header: with quantize=False it would
+    stamp QUANT_SIG_BF16 on packed indices and record head_dim as the packed
+    last dim."""
+    from vaayu import kv_persist as kp
+    c = TurboQuantKVCache()
+    for L in range(2):
+        k, v = _kv(6, seed=30 + L)
+        c.update(k.to(torch.float16), v.to(torch.float16), L)
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+    w.enqueue_append("s-tq", c, cfg, [1, 2, 3, 4, 5, 6], 6)
+    w.drain()
+    assert not os.path.exists(w.path_for("s-tq"))
+    assert "turboquant" in capsys.readouterr().out.lower()
+    w.close()
+
+
+def test_writer_still_persists_bf16_and_fp8_caches(tmp_path):
+    from vaayu import kv_persist as kp
+    cfg = types.SimpleNamespace(vocab_size=1000)
+    for tag, cache in (("bf16", FP8DynamicCache(quantize=False)),
+                       ("fp8", FP8DynamicCache())):
+        for L in range(2):
+            k, v = _kv(6, seed=40)
+            cache.update(k.to(torch.float16), v.to(torch.float16), L)
+        w = kp.DiskWriter(str(tmp_path), budget_bytes=10 ** 12)
+        w.enqueue_append(f"s-{tag}", cache, cfg, [1, 2, 3, 4, 5, 6], 6)
+        w.drain()
+        assert os.path.exists(w.path_for(f"s-{tag}")), tag
+        w.close()
