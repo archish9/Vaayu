@@ -5,476 +5,255 @@ add/update here, as work happens.** Protocol: `CLAUDE.md` §6.
 
 Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked · `[bug]` open bug/regression.
 
-_Last updated: 2026-08-02 (Plan H TurboQuant KV COMPLETE on branch `plan-h-turboquant-kv`, suite
-457 → 500, two plan-math errors corrected — size target hit exactly but the quality gate FAILED at
-4 bits and MiniMax decode regressed, so it ships dark; delete_original now reclaims already-split
-models — 273 GB freed;
-bf16 KV disk serialization DONE + gated → Plan E fully closed; Plans F and G CLOSED — no viable pin N; the routing bias turned
-out to be unreachable code on both models, now warned about; MiniMax found to run the
-module-list forward, not the EXL3 fused one)._
+_Last updated: 2026-08-03. Restructured: completed plans (A, C, D, E, F, G, H, I) moved to the
+archive at the bottom as one-line verdicts; only unfinished work appears above it. Full task-level
+detail for those plans is in their RESULTS docs under `docs/superpowers/plans/` and in this file's
+git history._
 
 ---
 
-## NEXT SESSION — the misplaced-feature audit
-**Brief: `docs/superpowers/specs/2026-08-03-misplaced-feature-audit-brief.md`** (self-contained).
-Find every feature that is correctly written but installed where it cannot act — the class of defect
-Plan H turned out to be (right algorithm, hot path instead of the eviction boundary; Plan I moved it
-and the cost went to zero). Session finds, proves and ranks; it does **not** fix. Three candidates
-already in hand: the expert VRAM cache emptied every prefill (1362 evictions), `VAAYU_CACHE_BIAS`
-stranded in an unreachable branch (0 calls, both models), and batched decode collapsing to N=1.
-Plans get written **only** for findings that clear the brief's §6 promotion bar — F, G and H all
-ended in refutation, and that bar exists to stop a fourth.
+## Execution sequence — read this first
+
+**Nothing is in progress.** Execute strictly top to bottom. Each row's plan doc is self-contained;
+do not start a row until the one above it is `[x]` and its RESULTS doc exists.
+
+| # | Plan | Prio | Status | Blocked by | Why here |
+|---|---|---|---|---|---|
+| **1** | **J — pinned-allocation round-up** | P1 | `[ ]` ready | — | Biggest measured win in the queue and the cheapest to verify: ~7.6 GiB of a 32 GB box is resident and unaddressable. Freed RAM lands in the prefix pool automatically (3.88 → ~10.5 GB predicted). |
+| **2** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing hard; run after J | J changes free RAM, not free VRAM, so K is not *blocked* — but J is cheaper, more certain, and touches the same allocation code. Do it second so K's sweep runs against a settled memory layout. |
+| **3** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **J** | Hard dependency. ~8 GiB of the arena's footprint is allocator round-up, so rebalancing the expert-cache/prefix-pool split before J measures an imaginary scarcity. **Re-open only if the prefix pool is still binding after J.** No plan written yet — write one only if that condition holds. |
+
+**Dependency rules that outlive this queue:**
+
+- **J → F1** — never rebalance a RAM split while a consumer's real footprint is unknown.
+- **K's measurement is biased by F3** (the prefix cache is not wired into `batched_generate`), so K
+  must report decode throughput separately from TTFT. See K's plan §8c. Fixing F3 first is *not*
+  required and is a bigger job — see "Open bugs".
+- **Historical, both satisfied:** E → H (KV double-storage before TurboQuant), F → G (the `top_n`
+  sweep retired G's pin). Both closed 2026-08-02.
+
+**If a plan ends in refutation, that closes the row.** Record the verdict under "Settled" and move
+to the next row — do not re-scope the plan to find a win. Plans F, G and H all ended in refutation;
+that is the system working.
 
 ---
 
-## Execution order (priority)
+## Plan J — pinned-allocation round-up  **(P1 — do first)**
 
-Plans A, C, D ✅ DONE (2026-08-01); E, F, G ✅ CLOSED (2026-08-02) — see Active plans below.
-**Current queue — only Plan H is left:**
+`docs/superpowers/plans/2026-08-03-pinned-allocation-roundup.md` — self-contained, no prior context
+needed. From the 2026-08-03 misplaced-feature audit, finding F0.
 
-1. ~~**P1 — Plan E (KV double-storage fix).**~~ ✅ FULLY CLOSED 2026-08-02. KV is 2.000 B/elem
-   (−33.7%), `auto` → bf16, and the bf16 layout now serializes to disk (gate: TTFT 27.6s → 3.0s
-   on restore). Plan H's precondition is met.
-2. ~~**P2 — Plan F (`top_n` eviction sweep).**~~ ✅ DONE 2026-08-02. Verdict: **no N is viable**
-   — eviction share is linear in N and 2–4× below the pin's share of the cache, on both models.
-3. ~~**P3 — Plan G (expert pin + routing locality).**~~ ✅ CLOSED 2026-08-02, nothing built.
-   Pin dropped on F's evidence; the bias was measured and found to be **unreachable code** on both
-   models — now warned about (`df9a52e`). It also turned up a doc-level surprise: MiniMax runs the
-  module-list forward, not the EXL3 fused one. Both are ledgered below.
-4. ~~**P4 — Plan H (TurboQuant KV).**~~ ✅ **COMPLETE 2026-08-02** on branch
-   `plan-h-turboquant-kv`, suite 500 green. Size target hit exactly (0.5312 B/elem, 0.266× bf16,
-   pool sessions 10 → 35) but the **pre-stated quality gate FAILED by 2–7× on both models** at the
-   4-bit default, and MiniMax decode regressed 5–8% below its floor. Ships dark and opt-in; `auto`
-   unchanged. See RESULTS for the operating point that does pass (1.031 B/elem, 1.94×).
+**Finding:** `torch.empty(..., pin_memory=True)` is served by PyTorch's caching host allocator,
+which **rounds every pinned allocation up to the next power of two**. Measured in isolation:
+5.00 GiB → 8.09, 8.50 → 16.00, **9.21 → 16.09 (the expert slab arena exactly as shipped)**; but
+9 × 1 GiB separate tensors → 9.09 GiB (ratio 1.011). This explains the 17.18 GB rss rise that
+appears identically on both models across the arena window and was never attributed.
 
-**Dependency summary:** E → H (E done, H unblocked), F → G (both closed; F's answer retired G's pin).
+**Waste ≈ 7.6 GiB on a 32 GB box** (arena 6.79 + `_PINNED_BUFS[0]` 0.76 + smaller), resident and
+unaddressable. **Number it moves:** cross-turn prefix pool budget **3.88 GB → ~10.5 GB predicted** —
+and Plan I measured that pool coming up ~1.4 GB short at a cost of 332 s of round-2 TTFT.
 
----
+- [ ] **Task 1** — clamp the arena backing store to the power of two already being paid for
+  (Option A. Option B = chunked backing; only if Task 4 shows the 13 % of slabs mattered)
+  - [ ] Tests incl. **the clamp must be a no-op on a box that was not wasting anything**, and the
+    `+ get_expert_pool_size()` staging slabs must survive it
+  - [ ] Announce the clamp in the arena log line (CLAUDE.md §5 — never silently smaller)
+- [ ] **Task 2** — `_PINNED_BUFS` alloc_size: round the request UP and use the whole block
+  (option (a) — the bytes are already charged). ~0.79 GiB.
+- [ ] **Task 3** — verify the freed RAM actually reaches the prefix pool (`post-arena avail` and
+  `prefix cache ENABLED` log lines, both models) — measured, not assumed
+- [ ] **Task 4** — on-device gate + RESULTS: decode ≥ floors (**MiniMax 1.47 / Qwen 0.82**), pinned
+  H2D still 19.7 GB/s, `test_multiturn.py` exits 0 at a K that previously failed, new cliff K
+  recorded, 0 OOM. Note that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up.
 
-## Active plans
+## Plan K — batched-decode admission reclaim  **(P2 — do second)**
 
-### Plan A — VRAM decode-headroom fix  **(P1)** — ✅ DONE 2026-08-01 (`045f387` `86a6ca5`)
-`docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix.md` (chain step 3)
-RESULTS: `docs/superpowers/plans/2026-07-24-vram-decode-headroom-fix-RESULTS.md`
-- [x] **Task 1** — raise `_VRAM_RESERVE_BYTES` 2GB→3.5GB (in-code, TDD) — `045f387`
-  - [x] Guard test in `tests/test_vram_budget.py` (fail → pass); full suite 391 green
-  - [x] Constant + hardware-comment on `_VRAM_RESERVE_BYTES` in `vaayu_base.py`; docstring updated
-  - [x] Mark on-hold KV-eviction spec superseded
-- [x] **Task 2** — on-device gate — `86a6ca5`
-  - [x] K=2 R=2 with `expandable_segments:True` → 4/4, no OOM, kernel OOM 0
-  - [x] Attribution: reserve bump ALONE fixes it (no-exp run also 4/4); expandable_segments = optional insurance
-  - [x] Decode unregressed: MiniMax 1.49 (floor 1.47); Qwen 0.84/0.83 vs pre-fix **measured** 0.82 → no back-off needed
-  - [x] K=3 stretch — 6/6, no OOM
-  - [x] RESULTS written + committed
+`docs/superpowers/plans/2026-08-03-batch-admission-reclaim.md` — self-contained. Audit finding F2.
 
-### Plan C — Prefix-cache hit telemetry  **(P2 — chain step 4)** — ✅ DONE 2026-08-01
-`docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry.md`
-Spec: `docs/superpowers/specs/2026-08-01-prefix-cache-hit-telemetry-design.md` (`140720c`)
-RESULTS: `docs/superpowers/plans/2026-08-01-prefix-cache-hit-telemetry-RESULTS.md`
-- [x] **Task 1** — counters + `stats()` + `reset_stats()` on `PrefixCacheStore` (TDD) — `626dcaf`
-  - [x] 9 unit tests in `tests/test_prefix_cache.py` (incl. degenerate hit, multi-evict, n/a rates)
-  - [x] 5 counters under the store's existing lock; no caching-behavior change
-  - [x] Full suite green (400)
-- [x] **Task 2** — `test_multiturn.py` becomes a gate — `cf7963e`
-  - [x] reset between rounds, print `stats()` per round
-  - [x] assert final-round `hits == K_SESSIONS`, exit non-zero on failure
-  - [x] loud failure if `model._prefix_cache` is None
-- [x] **Task 3** — on-device gate + RESULTS (closes chain step 4) — `e7f5939` `899ce91`
-  - [x] K=2 run, exit 0, 2/2 hits final round, 0 evictions
-  - [x] K=3 run, exit 0, 3/3 hits final round, 0 evictions; `K_SESSIONS` reverted to 2
-  - [x] RESULTS doc + close chain step 4 here
-- [x] **Final review fixes** — `aada3cd`: auto-match asymmetry documented + 2 tests,
-  `.gitignore` for evidence logs, unlocked-read rationale, `R_ROUNDS<2` guard,
-  kv_persist eviction note
+**Finding:** `free_vram_budget()` charges a batch against free VRAM while **5.82 GB (Qwen) /
+8.7 GB (MiniMax)** sits in a pure LRU that already has an eviction entry point
+(`ExpertVRAMCache.evict_until_free`). At 7 751-token streams that is **N=1 today vs N=5 if counted**.
+N=3 measured **1.28× aggregate** (0.631 → 0.809 tok/s, Qwen), and the win is amortised non-expert
+weight movement, not expert sharing (union ratio 0.82).
 
-### Plan E — KV double-storage fix  **(P1)** — ✅ FULLY CLOSED 2026-08-02
-`docs/superpowers/plans/2026-08-02-kv-double-storage-fix.md` — self-contained, no prior context needed
-**Finding it acts on:** `FP8DynamicCache` stores every K/V twice — an fp8 copy AND a full-size
-dequantized mirror that `update()` actually returns. Measured (B=1 H=8 S=2048 D=128, one layer):
-12.65 MB total = **3.016 bytes/element**, of which the dequantized buffers are **66%**. Plain fp16
-is 2.0 B/elem, so today's fp8 mode costs **~1.5× more VRAM than no quantization at all** — and
-`auto` selects fp8 for every EXL3 model. What the class really provides is the ring buffer
-(amortized O(1) append), which is mode-independent.
-- [x] **Task 1** — `quantize=False` mode: bf16-only ring buffer, 2.0 B/elem, lossless (TDD)
-  - [x] 7 tests in `tests/test_fp8_kv_cache.py` (fail → pass); suite 424 → 431 green
-  - [x] `_BUFFER_LISTS` class constant → instance property; `crop_front` iterates it (it had
-    hardcoded all six lists, which would IndexError on the empty ones in unquantized mode)
-- [x] **Task 2** — fix `kv_cache_manager._extract_kv_as_bf16`: it branches on `isinstance(...,
-  FP8DynamicCache)` then unconditionally multiplies by `_key_scales` — wrong for an unquantized
-  instance of the same class. **The sharpest trap in the plan.**
-  - [x] Test reproduced the predicted `IndexError`; branch now also requires `cache.quantize`
-  - [x] Repo-wide grep: only other class-based sites are `_trim_kv_cache`/`_trim_kv_cache_front`
-    (they call `crop`/`crop_front`, mode-independent) and `kv_persist` (Task 3)
-- [x] **Task 3** — `kv_persist` signature for the unquantized format (must not write bf16 under
-  the fp8 `QUANT_SIG`) — **option (a), signature-only**: `QUANT_SIG_BF16` (`bf16:none:ring`),
-  `build_header` picks it off `cache.quantize`, and `DiskWriter.enqueue_append` refuses an
-  unquantized cache (warn once, no file). Old fp8 files keep working; bf16 disk persistence
-  can land later. 2 tests.
-- [x] **Task 4** — `kv_cache_mode="bf16"` wiring; `auto` deliberately unchanged. 2 tests; suite 436.
-  VRAM sizing needed no change: `_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes`
-  both charge 2 B/elem for every non-fp8 mode, which is exactly right for bf16.
-- [x] **Task 5** — on-device gate both models + RESULTS; recommend whether `auto` should flip
-  - [x] 5 runs: Qwen fp8/bf16, MiniMax fp8/bf16 ×2. KV 3.016 → **2.000 B/elem** on both
-    geometries (Qwen 192.1→127.4 MiB, MiniMax 252.0→167.1 MiB, **−33.7%**)
-  - [x] Decode: Qwen 0.80→0.85 (floor 0.82), MiniMax 1.45→1.50/1.51 (floor 1.47). No OOM.
-  - [x] TTFT gap on MiniMax is noise: bf16's own cold runs span 31.25–47.74s vs fp8's 39.47s
-  - [x] RESULTS written; **recommendation = flip `auto` → bf16**, as a separate commit, with the
-    disk-persistence caveat below
-- [x] **Task 5b** — **`auto` FLIPPED to bf16** for EXL3 (user's call 2026-08-01, option 1: flip
-  now, serialize later). `_create_kv_cache` + `batch._resolve_kv_elem_bytes` (would have
-  under-reserved KV at 1 B/elem otherwise); `test_kv_persist_coherence.py` pinned to `"fp8"`
-  since disk persistence refuses bf16; README/`test_quick.py` mode lists updated.
-- [x] **bf16 KV disk serialization** (Plan E Task 3 option (b)) — ✅ DONE 2026-08-02 `c892069`,
-  gate PASSED. `enable_kv_persist` now works under `auto`; **Plan E is fully closed.**
-  - [x] `has_scales(h)` keyed off the SIGNATURE (not `scale_dtype_code`, which build_header
-    mirrors from the KV dtype for bf16 — reading it would over-charge every record and make
-    every seek land mid-record). Gates `record_bytes`/`pack_record`/`read_records`/`build_cache`.
-  - [x] Restored bf16 cache rebuilt as `FP8DynamicCache(quantize=False)`, empty scale/mirror
-    lists, so the next `update()` appends rather than quantizing into buffers that don't exist.
-  - [x] `header_matches` accepts either signature (mode is per-run, files outlive runs); writer
-    refusal + `_warned_unquantized` removed.
-  - [x] Two Plan E tests that pinned the refusal rewritten to the invariant they protected (a
-    bf16 file must never be parsed as fp8); suite 443 → 451 green.
-  - [x] `test_kv_persist_coherence.py` unpinned from `"fp8"` back to `"auto"`; stale
-    `_create_kv_cache` comment corrected.
-  - [x] On-device 3-phase gate on Qwen under `auto` — **PASS**, exit 0 ×3, no OOM:
-    - file written with `sig=bf16`, nrec=2678, 94 layers, **rec_bytes=192516 = 4 + 94×(2×4×128×2)
-      exactly** — arithmetic proof that zero scale bytes reached disk
-    - run2 printed `[KV] resumed 1 session(s) from disk`; **TTFT 27.60s cold → 3.01s (9.2×)**
-    - run2 and control produced **token-identical** continuations (the bar was only coherence,
-      since this stack's greedy decode is not bit-reproducible)
-    - pre-existing fp8 files restored to `~/.cache/vaayu/kv` afterwards; gate artifacts deleted
+**The eviction cost has never been priced. That is the experiment, and a refutation is an
+acceptable outcome** — Plans F, G and H all ended in refutation and cost far more to reach it.
 
-### Plan F — Expert-eviction `top_n` sweep  **(P2)** — ✅ DONE 2026-08-02 (`36ab143` `ace7021`)
-`docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep.md` — self-contained
-RESULTS: `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep-RESULTS.md`
-Only N=10 had ever been measured (19% of evictions for 63% of the cache budget — not viable).
-This produces the whole curve. **One GPU run per model, many reports** — rendering at a different
-`top_n` is pure formatting over the same snapshot, no re-run needed.
-- [x] **Task 1** — `format_eviction_sweep(...)`: eviction share AND VRAM cost per N (TDD) — `36ab143`
-  - [x] 6 tests in `tests/test_expert_usage.py` (fail → pass); suite 437 → 443 green
-  - [x] Top-N selection extracted to `_top_experts`, shared with `format_usage_report`
-  - [x] Uncovered layers excluded from BOTH share and pin cost (extra test beyond the plan)
-- [x] **Task 2** — print it from `test_generate.py`'s existing guarded block — `ace7021`
-- [x] **Task 3** — on-device sweep both models + RESULTS — **VERDICT: no N is viable**
-  RESULTS: `docs/superpowers/plans/2026-08-02-expert-eviction-topn-sweep-RESULTS.md`
-  - [x] MiniMax: 126,480 routes, 79,638 evictions, decode 1.50 (floor 1.47), 0 OOM.
-    Share is 2/4/6/10/19/33/53% at N=1/2/3/5/10/20/40 for 6/13/19/32/63/126/253% of budget.
-  - [x] Qwen: 191,760 routes, 71,825 evictions, decode 0.85 (floor 0.82), 0 OOM.
-    Share 3/6/9/16/30/54/83% for 12/25/37/62/123/247/493% of budget. `covered_layers` was a
-    real set (65 of 94 layers) and the report labelled the other 29 "(not VRAM-cached)".
-  - [x] **Eviction share is linear in N and always 2–4× below the cost line** — no head to pin.
-    N=10 on MiniMax reproduced the earlier 19% exactly, validating the sweep.
-  - [x] Scaffolding reverted (`git checkout test_generate.py`); `enable_expert_usage` still False
-
-### Plan G — Expert pin + routing locality  **(P3)** — ✅ CLOSED 2026-08-02, nothing built
-`docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality.md`
-RESULTS: `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESULTS.md`
-- [x] **Task 1** — bias sweep RUN on MiniMax (bias 0/0.25/0.5/1.0/2.0, fresh session id each).
-  Decode 1.52/1.50/1.51/1.50/1.54 (floor 1.47), VRAM hit rate 36.8/36.1/36.7/36.0/37.2% — flat,
-  non-monotonic, i.e. **no effect even at 2 std of bias**. Plan G Step 3 said to investigate a
-  null result before trusting it, and that was right:
-  - [x] Call-count probe (scratchpad wrapper, no repo file touched) at bias=2.0:
-    **`cache_aware_topk` ran 0 times on BOTH models.** MiniMax took the
-    `route_tokens_to_experts` branch (15,872 = 62 layers × 256 tokens); Qwen took the
-    `len(router_res) >= 3` tuple branch (0 calls to either helper).
-  - [x] Root cause: transformers 5.5.4 refactored MoE routers into `*TopKRouter` modules that do
-    the top-k internally, so no current model reaches the plain-softmax `else` branch that
-    `cache_aware_topk` lives in. Vaayu did not regress — the feature was **stranded upstream**.
-  - [x] Attribution corrected after the warning landed: Qwen is on the EXL3 fused forward's tuple
-    branch, but **MiniMax is on the module-list forward entirely** — `route_experts` is called
-    from two different forwards, so the probe alone could not tell them apart.
-  - [x] Follow-up **DONE** `df9a52e`: warn once per model when the bias is set but inert.
-  - [x] Output text differs between runs but not with bias (0.25/0.5 share an opener, 0/1.0/2.0
-    share another) — fp nondeterminism in the expert reduction, not routing change.
-- [x] **Tasks 2–4** (the pin) — DROPPED on Plan F's evidence, per this plan's own PRECONDITION.
-- [x] **Task 5** (2×2 pin × bias matrix) — moot, neither axis exists.
-
-### Plan H — TurboQuant KV cache  **(P4 — needs E, which is done → unblocked)**
-`docs/superpowers/plans/2026-08-02-turboquant-kv.md` — **REVISION 2 (2026-08-02)**, self-contained,
-carries a precondition check. Rev 1 was audited line-by-line against the paper (arXiv 2504.19874)
-and against the working tree; **8 corrections landed, 6 of which would have produced a wrong or
-silently-corrupt implementation** — see the changelog table at the top of the plan.
-Verified paper claims: >5× compression vs fp16 (index bits only, norms not itemised); *"absolute
-quality neutrality with 3.5 bits per channel"*; LongBench 50.06 vs 50.06; Needle 0.997 at 4×;
-rotation generated ONCE (data-oblivious); unit-norm assumed with norms stored in float.
-Reconstruction to float happens **before** inner products — so a working copy is always required.
-**Value is prefix-cache fan-out headroom and longer context — NOT decode speed.**
-Target: **0.531 B/elem** at 4 bits/channel vs today's bf16 2.000 (−73.5%).
-**ALL 5 TASKS DONE 2026-08-02** (branch `plan-h-turboquant-kv`); suite 457 → 500 green.
-**VERDICT: quality gate FAILED at the plan's 4-bit default — do not ship as a default, do not ship
-at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full numbers in
-`2026-08-02-turboquant-kv-RESULTS.md`. Two plan-rev-2 errors found and corrected in code+tests:
-  - **Codebook `dim`-scaling ratio is inverted in the plan.** Post-rotation coords are ~`N(0,1/d)`,
-    so centroids scale `1/√d`: `make_codebook(3,128)` = **√(64/128) ×** the `dim=64` one, not √2×.
-    Implemented per the plan's own prose; pinned by `test_codebook_scales_with_one_over_sqrt_dim`.
-  - **"QJL strictly helps [L2]" is false as specced.** With the `d×d` sketch the estimator's own
-    variance adds `γ²(π/2 − 1/d)`, so reconstruction error is **~1.57× the MSE stage alone**
-    (measured 1.56×). QJL buys **unbiased inner products**, not lower distortion — beating the MSE
-    stage on L2 would need a sketch with `m > 1.57d` rows. That test was replaced by two: one
-    pinning the 1.57 factor, one proving the unbiasedness the `_prod` stage exists for.
-  - **Consequence for Task 5:** measured relative L2 error is **0.230** at `bits_total=4`
-    (0.184 MSE stage × 1.25 from QJL), and 0.426 at 3 bits. That is the number the quality gate has
-    to survive. Spending the same bit on MSE instead (4-bit MSE, no QJL) gives 0.097 — worth
-    reporting as the alternative if the gate is marginal.
-- [x] **Task 1** — `vaayu/turboquant.py`: rotation, **`make_codebook(bits, dim)`** (the codebook
-  scales `1/√d` — a dim-blind one reconstructs noise), **mandatory QJL `_prod` stage** (unbiased
-  inner products is why it is safe for attention), and **bit-packing** (one index per uint8 byte
-  yields 1.16 B/elem, not 0.53 — packing is required, not an optimization) (TDD)
-  - [x] 24 tests; MSE stage reproduces the paper's anchors (0.1165/0.0338/0.0093 at b=2/3/4);
-    **0.5312 B/elem measured**, matching the plan's 0.531 prediction exactly
-- [x] **Task 2** — `TurboQuantKVCache` **subclassing `FP8DynamicCache`** (inherits crop/crop_front/
-  to_cpu/to_device/resident_bytes unchanged); reconstruct-on-**read** (on-write would reintroduce
-  exactly the mirror Plan E deleted)
-  - [x] 9 tests; `resident_bytes` = **0.266×** the bf16 cache for identical content (bar was <0.35);
-    chunked prefill is bit-identical to a single update (per-token independent quantization);
-    new `reconstruct_layer()` is the only supported read path
-- [x] **Task 3** — mode selection + `_extract_kv_as_bf16` + **byte accounting**
-  (`_get_vram_pinning_budget` and `batch._resolve_kv_elem_bytes` charge 2 B/elem for every non-fp8
-  mode; left alone the saved VRAM is reserved right back and the feature measures as a no-op);
-  audit every `isinstance(..., Cache)` — an unhandled class returns **indices interpreted as
-  values**, silent corruption
-  - [x] 7 tests. `_extract_kv_as_bf16` checks `TurboQuantKVCache` FIRST (it has `quantize=False`,
-    so it slipped through the old guard and returned packed indices as values). Both byte-accounting
-    sites charge 1 B/elem (integer arithmetic → round up from the true 0.531, never under-reserves).
-  - [x] `isinstance` audit: `vaayu_base:2547` (`get_seq_length` only) and `:3305/:3320`
-    (`_trim_kv_cache[_front]` → `crop`/`crop_front`) are correct by inheritance; `kv_persist` is
-    Task 4; `vaayu_base:546..600` are parent internals never reached (update + growth both
-    overridden). Also checked transformers itself: only flaubert/olmo_hybrid read `key_cache`
-    directly, neither is on-device.
-- [x] **Task 4** — persistence: explicit refusal **before `build_header` runs**. `build_header`
-  picks the signature off `getattr(cache, "quantize", True)` and **neither value is safe** —
-  `False` stamps `QUANT_SIG_BF16` on packed indices (silent garbage on restore, and `head_dim`
-  recorded as the packed last dim), `True` IndexErrors on the absent scales. Seeds belong in the sig
-  - [x] **Scope (a) chosen** (refusal, as recommended — the format is unproven and KV persistence
-    ships dark). `DiskWriter.enqueue_append` returns before `build_header`, warns once;
-    `turboquant_sig(bits, rot_seed, qjl_seed)` added so no reader can ever mistake such a file for
-    values. 3 tests, incl. one asserting fp8/bf16 caches still persist.
-- [x] **Task 5** — on-device gate, both models — **DONE 2026-08-02. VERDICT: quality gate FAILED.**
-  RESULTS: `docs/superpowers/plans/2026-08-02-turboquant-kv-RESULTS.md`
-  - [x] **Quality (pre-stated bar: attention-score rel. error < 0.05) — FAIL on both.** Qwen mean
-    0.092 / max 0.241; MiniMax mean 0.178 / max 0.350. K/V rel L2 = **0.230** on real keys, matching
-    the synthetic 0.2297 to four decimals — the quantizer is correct, uniform 4-bit is just that
-    lossy. Method: real K/V read back from the bf16 `.vaayu_kv` files (CPU-only, no extra model
-    load); queries are not persisted, so two proxies were used and **both** miss the bar widely.
-  - [x] **Size — exactly as predicted.** 0.5312 B/elem on device, both models, every session size
-    (Qwen 127.4→33.8 MiB, MiniMax 167.1→44.4 MiB, fan-out sessions 497.2→132.1 MiB). Ratio 0.266.
-  - [x] **Decode — Qwen unaffected (0.81/0.87 → 0.84/0.83); MiniMax REGRESSES 5–8% below its 1.47
-    floor** (1.53 → 1.45, 1.40, two runs). Reconstruction scales with `layers × kv_heads`: MiniMax
-    496 head-layers vs Qwen 376, on half the per-token budget. Different forwards, different answer.
-  - [x] **TTFT — +1.0% with chunking genuinely ON** (chunk=128, 4 chunks: 27.11 → 27.39s). The
-    unchunked +11% (27.45 → 30.52s) is therefore run variance. The plan's quadratic-across-chunks
-    risk is **unexercised, not refuted** — 439-token prompts are too short for the S² term.
-  - [x] **Fan-out — headroom only, zero benefit today.** K=3 both modes: 3/3 HIT, **0 evictions in
-    both**, so the budget is not binding. Sessions that fit in the pool go **10 → 35**.
-  - [x] **Bits sweep (real K):** the 0.05 bar first passes at `bits_total=8` / 1.031 B/elem on both
-    models — a **1.94×** win over bf16, not 3.77×. MSE-only (no QJL) at equal storage never passes
-    on MiniMax at any bit-width, so the QJL stage earns its bit despite costing L2.
-  - [x] Coherence: both Qwen continuations fluent and on-task — recorded, but it proves little; the
-    numerical gate exists because coherent output can hide a 23% perturbation of every key.
-  - [x] On-device confirmation of Task 4: the persistence refusal fired and no file was written.
-  - [x] Scaffolding reverted (`git checkout test_generate.py test_multiturn.py`), tree clean.
-- **Follow-ups, UNBUILT, in priority order (from the RESULTS recommendation):**
-  - [x] **Plan I — compress-on-evict KV** ✅ **COMPLETE 2026-08-02** on branch
-    `plan-i-compress-on-evict` (`6d96049` `e84d101` `dc0da7a` `0459be2` + gate commit), suite
-    500 → 519 green. RESULTS: `docs/superpowers/plans/2026-08-02-compress-on-evict-kv-RESULTS.md`
-    - [x] **Decode untouched** — Qwen 0.86 → 0.86, MiniMax 1.53 → 1.56, TTFT flat. The defining
-      property, and the thing Plan H failed (−5–8% MiniMax, +1.49 s/token at 32k).
-    - [x] **Pool capacity** — K=4 at a capped 1050 MiB budget: bf16 **0/4 HIT, 4 evictions**;
-      compressed **4/4 HIT, 0 evictions**. Round-2 TTFT **91 s → 9.6 s (9.5×)**. Per session
-      497.2 → 256.4 MiB. **Reuse collapses to zero, not proportionally** — a pool one session short
-      evicts each entry before its revisit, so capacity is a cliff, not a slope.
-    - [x] **Per-turn cost** — 0.45 s at 2k, 0.73 s at 8k, 3.55 s at 32k, against the ~91 s cold
-      prefill a HIT avoids. Two orders of magnitude in favour.
-    - [x] **Quality gate: 8 bits FAILED** (MiniMax worst layer 0.0612 > 0.05 bar; Qwen 0.0480,
-      thin). **9 bits PASSED both** (0.0214 / 0.0372). **`_DEFAULT_BITS` raised 8 → 9**, warning
-      threshold with it. Costs 1.156 B/elem (0.578× bf16) instead of 1.031. Outliers are early
-      layers on both models — exactly what the outlier split addresses.
-    - [x] **Ordering trap verified live** — with compression AND persist on, the file is `sig=bf16`,
-      `rec_bytes=192516 = 4 + 94×(2×4×128×2)` exactly. No packed index reached disk.
-    - [x] **Long context MEASURED (uncapped budget)** — K=3 × 7,751 tok = 23.3k combined, MiniMax:
-      bf16 **0/3 HIT, 3 evictions, round-2 TTFT ~332 s**; 9-bit **3/3 HIT, 0 evictions, ~9.8 s**.
-      **34× TTFT — the largest effect measured anywhere in Plans H or I.** Per session 1877 → 1094
-      MiB. Budgets differed (3.54 vs 4.18 GB, computed from free RAM); conclusion holds either way
-      since bf16 needs 5.50 GB for 3 sessions.
-    - Honest limit: benefit is **conditional, not universal**. It needs ≥2 sessions whose combined
-      tokens exceed the pool budget (~20k for MiniMax, ~27k Qwen). Below that: no benefit, ~0.45
-      s/turn cost. Above ~35k: both modes thrash. Sweet spot = a few sessions each carrying a large
-      re-sent context — the agent shape this engine targets.
-  - [ ] **Real-query quality gate** — this gate used K-row and Gaussian query proxies because
-    `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds, but any attempt
-    to certify a specific bit-width needs real queries captured with an attention hook.
-  - [ ] **Fold `Π` into the query** (`⟨q, Πᵀỹ⟩ = ⟨Πq, ỹ⟩`) — turns per-token reconstruction from
-    `O(S·d²)` into `O(d²)`, which is exactly what costs MiniMax its 5–8% decode. Needs hooking
-    attention itself. **Only worth writing after the quality question is settled** — a fast cache
-    that is 23% wrong is not worth speeding up.
-- Out of scope, and it costs us a claim: the **mixed-precision outlier split** is the *only* way the
-  paper reaches fractional bit-widths (`(32×3+96×2)/128 = 2.5`), so a uniform implementation
-  **cannot claim the 3.5-bit LongBench result**. `bits_total=4` uniform spends more bits than 3.5,
-  so quality should be no worse — but that must be measured, not inherited.
-
-### Plan B — Expert usage histogram (Subsystem B)  **(P3)** — RETARGETED 2026-08-01
-`docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md` — Phase 1 **superseded**
-by the measurement-only retarget below. Its gate (the VRAM OOM chain) closed 2026-08-01, but its
-PREMISE WARNING still stands: do not build Phase 1 as written.
-- [x] Blocker cleared — VRAM OOM chain closed (`045f387`..`aada3cd`)
-- [!] Tasks 3,6 (the pin) — NOT built. No longer blocked on "is there a target?" — Plan D
-  measured one: hot-but-evicted experts exist, but a top-10-per-layer pin would only reach
-  **19%** of budget-pressure evictions (15,255 of 78,726); the other 81% sit in the long tail,
-  and the VRAM cache runs saturated (evictions ≈ misses per token), so pinning redistributes
-  pressure rather than eliminating it. `ExpertVRAMCache` still has no pin mechanism, and a
-  startup pre-warm is still a **no-op** (`_ensure_prefill_headroom` evicts the VRAM cache on
-  every prefill; measured 9.04→2.64GB, 1362 evictions). A future pin spec must justify its N
-  against the 19% figure, address the redistribution effect, and consider whether the 81% long
-  tail is better addressed some other way — see the RESULTS doc's Recommendation section.
-  **Plan F (2026-08-02) settled it: no N clears the bar on either model, so the pin stays unbuilt.**
-- [x] Tasks 2,5 (persist/decay, `compute_pin_set`) — **DROPPED as speculative** (§2): persistence
-  matters only once a win is known; a pin set for a pin that doesn't exist is dead weight.
-- [ ] Tasks 8,9 (Phase 2 live re-pin) — untouched, still deferred
-
-### Plan D — Expert usage histogram, measurement only  **(P3)** — ✅ DONE 2026-08-01
-`docs/superpowers/plans/2026-08-01-expert-usage-histogram-measurement.md`
-Spec: `docs/superpowers/specs/2026-08-01-expert-usage-histogram-measurement-design.md` (`c38132e`)
-RESULTS: `docs/superpowers/plans/2026-08-01-expert-usage-histogram-measurement-RESULTS.md`
-Answered: are there experts decode routes to often but the VRAM cache keeps evicting? **Yes, but
-only 19% of budget-pressure evictions land on each layer's top-10 experts — routing is diffuse
-and the cache runs saturated.** See RESULTS for the full nuance and recommendation.
-- [x] **Task 1** — `ExpertUsageTracker`: device-side route counter, no hot-path sync (TDD) — `cc99f0b`
-- [x] **Task 2** — per-key attribution of **budget-pressure evictions only** in `ExpertVRAMCache` — `2abdc2b`
-  - [x] Discriminating test: `evict_until_free()` evictions must NOT be attributed (CUDA-gated, ran)
-- [x] **Task 3** — report joining routes with evictions; labels "no pin needed" as plainly as
-  "pin candidate" — `90bb75e` (+ remainder-warning fix `7d24b24`)
-- [x] **Task 4** — wire in behind `enable_expert_usage` (default False); hook at 3 routing sites,
-  decode-only — `1ea4374`
-- [x] **Task 5** — on-device run on MiniMax + RESULTS + the pin VERDICT — this commit.
-  126,480 routes, 78,726 budget-pressure evictions, top-10 share 19% (15,255), decode 1.48 tok/s
-  vs ~1.47 floor (PASS), 0 OOM.
+- [ ] **Task 1** — `reclaimable_vram_budget(model, reclaim=False)`; floor = one token's working set
+  (derived), so a batch can never be admitted onto a zero-resident cache
+- [ ] **Task 2** — `batched_generate(reclaim=)` performs the reclaim it was admitted under, **once
+  at the batch boundary, never per decode step** (pinned by test — Plan H's mistake in a new costume)
+- [ ] **Task 3** — on-device: (a) does `batched_generate` run at all on MiniMax's module-list
+  forward? Never exercised. (b) sweep N × reclaim at ~7.7k context, both models. Measure decode
+  separately from TTFT (the batch arm gets no prefix HITs — see plan §8c, and F3 below)
+- [ ] **Task 4** — RESULTS + verdict + the expert-VRAM hit-rate-vs-reclaim cost curve; correct the
+  stale "always defers to N=1" claim in `test_batched_decode.py` and `.superpowers/sdd/task-7-report.md`
 
 ---
 
-## Chain — VRAM prefill OOM (memory: `vram_prefill_oom_chain`)
-- [x] Step 1 — RAM budget rebalance (`6c9bc76..54d660b`)
-- [x] Step 2 — VRAM diagnostic + RESULTS (2026-07-24, `855c09f` `fc01df0`); verdict = decode-boundary OOM
-- [x] Step 3 — execute Plan A (above), 2026-08-01 (`045f387` `86a6ca5`); OOM closed at K=2 and K=3
-- [x] Step 4 — round-2 HIT measurement **(P2)** — 2026-08-01, `626dcaf` `cf7963e` `e7f5939`.
-  Harness now asserts HITs itself (exit status 0 is the verdict):
-  K=2 → 2/2 HIT, 0evict, saved=3940/3980 tok (99%); K=3 → 3/3 HIT, 0evict, saved=5910/5970 tok
-  (99%). TTFT collapsed ~90-101s → ~9-10s at both K. Kernel OOM count 0.
+## Deferred — written up, deliberately not being built
+
+- [!] **F1 — expert-cache / prefix-pool RAM arbitration is decided by line order.**
+  **This is row 3 of the execution sequence** — it is the only deferred item with a place in the
+  queue; everything else below has no scheduled slot.
+  `compute_expert_budget` runs at `vaayu_base.py:1331`, sees 25.24 GB free, takes 9.19 GB.
+  `compute_prefix_cache_budget` runs ~250 lines later at `:1585` and gets the remainder, 3.88 GB.
+  Nothing arbitrates. Measured payoff per side: expert RAM cache **5–7 % hit rate** vs prefix pool
+  **a cliff worth up to 34× TTFT**. **BLOCKED on Plan J** — ~8 GiB of the arena's footprint is
+  allocator round-up, so rebalancing now would measure an imaginary scarcity. Re-open only if the
+  pool is still binding after J. (audit F1, 2026-08-03)
+- [ ] **Plan B Tasks 8, 9 — Phase 2 live expert re-pin.** Untouched. The Phase 1 pin it builds on is
+  refuted (see "Settled" below), so this needs a new premise before it means anything.
+  `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
+- [ ] **Plan H follow-up — real-query quality gate.** Plan I's gate used K-row and Gaussian query
+  proxies because `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds,
+  but certifying a specific bit-width needs real queries captured with an attention hook.
+- [ ] **Plan H follow-up — fold `Π` into the query** (`⟨q, Πᵀỹ⟩ = ⟨Πq, ỹ⟩`): turns per-token
+  reconstruction from `O(S·d²)` into `O(d²)`, which is exactly what costs MiniMax its 5–8 % decode.
+  Needs hooking attention itself. **Only worth writing after the quality question is settled** — a
+  fast cache that is 23 % wrong is not worth speeding up.
+- [ ] **Mixed-precision outlier split (TurboQuant).** The *only* way the paper reaches fractional
+  bit-widths, so the uniform implementation cannot claim its 3.5-bit LongBench result. Outliers are
+  early layers on both models — exactly what the split addresses.
 
 ---
 
-## Pending bugs / open questions (found in review, not yet fixed)
-- [x] ~~**`delete_original` never fired for an already-split model.**~~ **FIXED 2026-08-02
-  `c170474`.** `split_and_save_layers` returns early at "saved layers already found" before the
-  flag is read, so both copies were kept forever. `delete_original_shards()` now runs on that
-  path, gated on `all(found_layers.values())` (every layer present WITH its `.done` marker).
-  Wired into 5 test scripts as `DELETE_ORIGINAL` (default off, `VAAYU_DELETE_ORIGINAL=1`).
-  **Executed on both models 2026-08-02 (user's call): Qwen 277→139 GB, MiniMax 270→135 GB,
-  273 GB reclaimed, disk 89%→57%.** Both still load and generate (Qwen 0.87, MiniMax 1.51).
-- [x] ~~**`remove_real_and_linked_file` unlinked the same file twice.**~~ **FIXED 2026-08-02
-  `72c7b08`.** `os.path.realpath()` returns `str` and every caller passes a `Path`, so
-  `realpath(p) != p` was always True and the second `os.remove` hit ENOENT after the first had
-  already deleted the file. Caught (and mis-accounted) in `delete_original_shards` — the Qwen run
-  reclaimed 138 GB while printing "could not delete" 19 times and no total. **UNHANDLED in the
-  pre-existing mid-split loop, where it would abort a fresh conversion with
-  `delete_original=True`.** 3 tests. (found 2026-08-02 while running the reclaim)
-- [x] ~~**Prefix cache MISS-on-revisit.**~~ Diagnostic run showed every `test_multiturn`
-  session was a prefix MISS even revisiting its own session id. (found 2026-07-24)
-  **NO LONGER REPRODUCES** after Plan A (2026-08-01): round-2 revisits HIT at both K=2 and
-  K=3 (TTFT ~90-101s → ~9-10s). The MISSes were a downstream effect of the OOM aborting/
-  poisoning round 2, not a separate keying bug.
-- [x] ~~**Stale cross-reference comment.**~~ `vaayu/moe_patch.py` claimed
-  `_PREFILL_VRAM_HEADROOM` was "the same class/value as `vaayu_base._VRAM_RESERVE_BYTES`" —
-  false since Plan A (2 GB vs 3.5 GB). **FIXED** in `9aa2c61`: comment now states both are the
-  same CLASS of hardware constant but deliberately DIFFERENT values, with the reason.
-  (found + fixed 2026-08-01)
-- [x] ~~**VRAM-cache-disabled message was too quiet.**~~ `vaayu/vaayu_base.py` announced
-  "Expert VRAM cache: disabled (insufficient free VRAM)" as a plain info line, while the
-  milder working-set-exceeds-budget case right below it uses `WARNING:`. CLAUDE.md §5 says a
-  model that genuinely doesn't fit must WARN, not silently degrade — and this is the harder
-  failure of the two (every expert streams per token). **FIXED 2026-08-01**: now a `WARNING:`
-  carrying free VRAM, the post-reserve budget, the reserve, and the derived expert size.
-  Found by Plan A's final review (parked there as out-of-scope). Not reachable on this box
-  (11.7 GB free), so no on-device re-run needed. (found + fixed 2026-08-01)
-- [x] ~~**Drifting line-number citations.**~~ Plan A's docs cited `vaayu_base.py:168`, then
-  `:179`, while the constant is now at `:188` — each edit to the file re-broke them.
-  **FIXED 2026-08-01** by citing the SYMBOL (`_VRAM_RESERVE_BYTES`) instead of a line number,
-  which cannot drift. Historical line refs inside the 2026-07-23 diagnostic RESULTS are left
-  as-is: they are a point-in-time record, accurate when written.
+## Settled — do not re-open without new evidence
 
-- [x] ~~**Dead code — `PrefixCacheStore.drop()`.**~~ No callers anywhere in the repo; dead since
-  it was written (`cac8ccd`, the original A1 commit). **REMOVED 2026-08-01** on the user's call.
-  `ExpertVRAMCache.drop()` is a different method and is genuinely used — untouched.
-  (found + resolved 2026-08-01)
-- [x] ~~**KV cache stores every K/V twice.**~~ **CLOSED 2026-08-02** — the entry's own criterion
-  ("closes when Task 5b flips `auto`") was met by `232745d`: `_create_kv_cache` now picks `bf16`
-  for EXL3, so default runs pay 2.000 B/elem, not 3.016. Only the disk-persistence follow-up
-  (below, Plan E) is left. Original finding: `FP8DynamicCache` holds an fp8 store AND a full-size
-  dequantized mirror; `update()` returns the mirror, so the fp8 copy is never read by attention.
-  Measured 3.016 bytes/element, mirror = 66% of it; plain fp16 is 2.0 B/elem — so `kv_cache_mode`
-  fp8 (what `auto` picks for every EXL3 model) costs **~1.5× more VRAM than no quantization**.
-  Not a crash, not a correctness bug; a standing ~33% VRAM overcharge on every run.
-  **Plan E built the fix** (`kv_cache_mode="bf16"`, 2.000 B/elem measured on both models,
-  `c8cfca8`). (found + measured 2026-08-01; fixed 2026-08-01, `auto` flipped 2026-08-02)
-- [x] ~~**`VAAYU_CACHE_BIAS` is a silent no-op.**~~ **FIXED 2026-08-02 `df9a52e`**:
-  `_warn_cache_bias_inert` warns once per model instance, naming the path that shadowed the
-  bias, from all four routing dispatch sites. 3 tests; suite 443 → 446. On-device: Qwen 1
-  warning ("the router returned its own top-k"), MiniMax 1 warning ("module-list expert
-  layout"), unset run 0; decode unregressed (Qwen 0.84, MiniMax 1.49-1.51). The bias itself is
-  still unreachable — re-targeting it before the model's own top-k remains an unwritten spec.
-  Original finding:
-  `cache_aware_topk` / `_build_resident_mask` (`vaayu/moe_patch.py`) live in the plain-softmax
-  `else` branch of `sparse_forward`'s router dispatch. Under transformers 5.5.4 no MoE model
-  reaches it: Qwen takes the `len(router_res) >= 3` tuple branch (transformers 5.x routers do
-  their own top-k), and MiniMax is not even on that forward — it runs the module-list one (see
-  the entry below). **Probe: 0 calls on both models at bias=2.0.** A user who sets the env var gets no bias, no error, no warning — the
-  silent degradation CLAUDE.md §5 forbids. Three options in the Plan G RESULTS; the cheap one is
-  to warn once per process when `_cache_bias != 0.0` and no layer ever reached that branch.
-  Re-targeting the bias to run *before* the model's own top-k is a separate spec, not a patch.
-  (found + measured 2026-08-02, Plan G Task 1; warning landed same day)
-- [x] ~~**MiniMax runs the module-list forward, not the EXL3 fused one.**~~ **CLAUDE.md §0 FIXED
-  2026-08-02**: the dispatch table now branches on `expert_style` first, names which model sits
-  on each row, states that EXL3 does not imply the EXL3 fused forward, and warns that a feature
-  wired into one forward silently no-ops on the others. §5 cross-references it. Finding: `CLAUDE.md` §0's dispatch
-  table treats MoE+EXL3 → `_make_fused_sparse_forward_exl3` as the actively-tested row and
-  module-list as "gated in, not perf-tuned". MiniMax-M2.7 is EXL3-quantized but its repo ships
-  custom modeling code with per-expert submodules (`...block_sparse_moe.experts.10.w1.*`), so
-  `detect_moe_blocks` classifies it `expert_style="module_list"` and it takes
-  `_make_modulelist_sparse_forward`. Qwen does take the EXL3 fused path. So **both rows are
-  actively tested, and every MiniMax perf number on record is a module-list number** — including
-  Plan F's. Not a bug; the doc and the mental model are wrong, and an optimization aimed at "the
-  EXL3 fused path" would miss MiniMax entirely. (found 2026-08-02 via the bias warning)
-- [x] ~~**Stale comment in `vaayu/kv_persist.py` (`QUANT_SIG_BF16`, ~line 24).**~~ **FIXED
-  2026-08-02** in Plan H Task 4, which edits that same constant block. Said "Serializing it is not
-  implemented yet (DiskWriter refuses)" — false since `c892069`. Comment-only, no behavior change.
-  (found 2026-08-02)
+Recorded so the same ground is not re-measured. Each cost a full plan or probe to establish.
+
+- **No expert pin is viable.** Eviction share is linear in N and always 2–4× below the pin's share
+  of the cache, on both models (Plan F, 2026-08-02, whole curve measured).
+- **The expert VRAM cache is NOT emptied every prefill, and preserving it would not help anyway.**
+  0 wipes across 4 turns (Plan A's reserve bump took prefill clear of the 2 GB threshold), and a
+  **cold** cache reaches **37.2 %** hit rate against a fully warm one's **36.8 %** — it re-saturates
+  in ~4 tokens. **This kills the whole preserve / pre-warm / pin family, not just Plan F's pin.**
+  (audit F8, 2026-08-03)
+- **`VAAYU_CACHE_BIAS` is unreachable**, and more narrowly than recorded: `cache_aware_topk` /
+  `_build_resident_mask` exist in **1 of the 3** MoE forwards (fused-EXL3) and are absent from
+  module-list and non-EXL3-fused entirely — so even reverting the upstream transformers router
+  refactor would leave the bias unreachable for MiniMax **by construction**. A warning ships
+  (`df9a52e`). Any re-targeting spec must cover all three forwards or say which it excludes.
+- **`plan_batch` does not "always defer to N=1".** That claim in `test_batched_decode.py` and
+  `.superpowers/sdd/task-7-report.md` is stale (pre-Plan A) — it admitted 3/3 on a warm box at short
+  prompts. It is true only at agentic context lengths, which is what Plan K acts on.
+- **TurboQuant KV at 4 bits fails its quality gate** by 2–7× on both models; 8 bits fails on MiniMax
+  (0.0612 vs a 0.05 bar); **9 bits passes both**, which is the shipped `_DEFAULT_BITS`.
+- **Uniform-bit TurboQuant on the live KV cache is the wrong tier** — Plan I moved the identical code
+  to the eviction boundary and the per-token cost went to zero.
+- **MiniMax runs the module-list forward, not the EXL3 fused one.** Every MiniMax perf number on
+  record is a module-list number. `CLAUDE.md` §0's dispatch table was fixed 2026-08-02.
+- **Decode floors, for every future gate: MiniMax 1.47 tok/s, Qwen 0.82 tok/s.**
+
+---
+
+## Open bugs / questions (found in review, not yet fixed)
+
+- [ ] **F3 — the cross-turn prefix cache is wired into `generate()` only.** `batched_generate`
+  (`vaayu_base.py:3553`) and `speculative_generate` (`:3448`) never call `PrefixCacheStore.lookup()`
+  or `_persist_and_store()`. CLAUDE.md §0's two shaping facts — parallel fan-out and heavy context
+  reuse — therefore cannot compose: a fan-out batch pays a full cold prefill per stream even when
+  every stream shares the system prefix. **Not a positional fix** (N per-session caches must merge
+  into one left-padded batch cache = new mechanism), so it was not promoted. It also biases Plan K's
+  measurement — see that plan's §8c. (found 2026-08-03, audit F3)
+- [ ] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so
+  `_get_vram_pinning_budget()` reserves KV for 512 tokens against real contexts of 2 048–7 751.
+  Measured (Qwen): KV 0.193 MB/token → reserved 0.092 GB, actual 0.367 GB at 2k (**−0.28 GB**) and
+  1.390 GB at 7.7k (**−1.30 GB**). Pinning therefore claims VRAM the KV cache later needs — the
+  context-length sensitivity `_VRAM_RESERVE_BYTES`' own comment warns about, attributed there to the
+  blanket reserve rather than to this input, and plausibly part of why Plan A needed +1.5 GB of
+  blanket reserve. Fix is parameter plumbing, not a move. (found 2026-08-03, audit F4)
+- [ ] **F6 — `vaayu/kv_cache_manager.py` (`KVCacheManager`) is unreachable but still maintained.**
+  Constructed only in `tests/test_kv_cache_manager_fp8.py`; superseded by `PrefixCacheStore` (A1).
+  Its helper `_extract_kv_as_bf16` is reachable only from `save_snapshot`, and was hardened by
+  **Plan E Task 2** and again by **Plan H Task 3** — two plan tasks spent making an unreachable
+  function correct, a tax every future KV-format change will pay again. Delete the module + tests,
+  or mark it a reference implementation and exempt it from cache-mode work. (found 2026-08-03, F6)
+- [ ] **F7 — `vaayu_ref._expert_history` is write-only.** Written by all three MoE forwards
+  (`moe_patch.py:1039`, `:1174`, `:1786`), read by no production code — the consumer went with the
+  dead prefetch path. `patch_moe_blocks`' docstring still claims *"The forward() loop reads
+  _expert_history after each layer and submits speculative prefetch"*, pointing the next reader at a
+  mechanism that does not exist. Runtime cost ≈ 0; the cost is the false docstring.
+  (found 2026-08-03, audit F7)
+- [ ] **F13 — `_decode_stats_reset` latches for the process, not the turn.** Set True on the first
+  decode pass (`vaayu_base.py:2946`) and never cleared, so the reset that exists to exclude prefill's
+  ~100 %-miss pollution runs once per model lifetime. From turn 2 on, cumulative expert-cache hit
+  rate is diluted by every new prefill. **Telemetry only.** (found 2026-08-03, audit F13)
 - [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
   `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation
-  CLAUDE.md §5 forbids. Plan H Task 3 inserted the turboquant branch *before* the fall-through (done
-  2026-08-02), so this entry is now only about the fall-through itself: **should an unknown mode
-  raise?** Still open, still a separate call. (found 2026-08-02, Plan H audit)
+  CLAUDE.md §5 forbids. Plan H Task 3 inserted the turboquant branch *before* the fall-through, so
+  this entry is now only about the fall-through itself: **should an unknown mode raise?** Still open,
+  still a separate call. (found 2026-08-02, Plan H audit)
 - [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
-  raw match length; the caller (the `generate` override that prints `[Vaayu-Prefix] HIT`) then
-  clamps it down by one position so the model has a token to run. Fires only when the new prompt
-  is a complete prefix of the cached one — ≤0.05% at the ~2000-token prefixes this targets, and
-  exactly zero in the K=2/K=3 gate runs (prompts diverge, so the clamp never triggered).
-  Documented in the `stats()` docstring, NOT fixed: moving the clamp into the store would couple
-  the cache to the caller's execution needs to correct a rounding error. **Zero perf impact —
-  telemetry precision only.** (found 2026-08-01, Plan C design; ledgered 2026-08-01)
-- [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session, an entry
-  that shares ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the
-  same case counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing semantics —
-  documented in `stats()` and pinned by tests in `aada3cd`, NOT changed. Worth revisiting if a
-  mixed-mode workload ever needs one comparable number. (found 2026-08-01, Plan C final review)
+  raw match length; the `generate` override then clamps it down by one position so the model has a
+  token to run. Fires only when the new prompt is a complete prefix of the cached one — ≤0.05 % at
+  the ~2000-token prefixes this targets, and exactly zero in the K=2/K=3 gate runs. Documented in the
+  `stats()` docstring, NOT fixed: moving the clamp into the store would couple the cache to the
+  caller's execution needs to correct a rounding error. **Telemetry precision only.**
+  (found 2026-08-01, Plan C design)
+- [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session, an entry that
+  shares ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the same case
+  counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing semantics — documented in
+  `stats()` and pinned by tests in `aada3cd`, NOT changed. Worth revisiting if a mixed-mode workload
+  ever needs one comparable number. (found 2026-08-01, Plan C final review)
 
 ---
 
-## Done (archive)
-- [x] **VRAM prefill diagnostic** — `docs/superpowers/plans/2026-07-23-vram-prefill-diagnostic.md`
-  (= chain step 2). All 3 tasks done 2026-07-24: Task 1 instrumentation `855c09f`, Task 2
-  on-device run, Task 3 RESULTS `fc01df0`. Verdict: OOM is decode-boundary, not prefill →
-  spawned Plan A.
+## Done — archive
+
+Verdicts only. Task-level detail is in each plan's RESULTS doc (`docs/superpowers/plans/`) and in
+this file's git history before 2026-08-03.
+
+**2026-08-03**
+- [x] **Misplaced-feature audit** — register:
+  `docs/superpowers/specs/2026-08-03-misplaced-feature-audit-RESULTS.md` (14 findings, F0–F14).
+  Found, proved and ranked; fixed nothing, per the brief. **Two of the three starting candidates did
+  not reproduce**, and the largest finding (F0, → Plan J) was not on the candidate list — it came
+  from chasing the one number the load-time RAM ledger could not explain. Promoted: F0 → Plan J,
+  F2 → Plan K. Refutations and corrections are under "Settled" above; non-promoted findings F1, F3,
+  F4, F6, F7, F13 are open items above. Evidence: `~/vaayu-evidence/2026-08-03-audit/` (2 gzipped
+  run logs + 3 re-runnable probe scripts).
+
+**2026-08-02**
+- [x] **Plan I — compress-on-evict KV.** MERGED (`82a217f`), suite 519. Decode untouched (Qwen
+  0.86 → 0.86, MiniMax 1.53 → 1.56) — the property Plan H failed. Pool capacity K=4: bf16 0/4 HIT →
+  compressed 4/4, round-2 TTFT 91 s → 9.6 s. **Long context K=3 × 7 751 tok: 332 s → 9.8 s (34×) —
+  the largest effect measured anywhere.** `_DEFAULT_BITS` 8 → 9 after 8 failed MiniMax's quality
+  gate. Honest limit: benefit is conditional on ≥2 sessions exceeding the pool budget; reuse
+  collapses to zero, not proportionally — **capacity is a cliff, not a slope.**
+- [x] **Plan H — TurboQuant KV.** Branch `plan-h-turboquant-kv`. Size target hit exactly (0.5312
+  B/elem, 0.266× bf16) but the pre-stated quality gate **FAILED by 2–7 % on both models** at 4 bits
+  and MiniMax decode regressed 5–8 %. Ships dark and opt-in; `auto` unchanged. The 0.05 bar first
+  passes at `bits_total=8` / 1.031 B/elem (1.94× over bf16, not 3.77×).
+- [x] **Plan G — expert pin + routing locality.** CLOSED, nothing built. Pin dropped on Plan F's
+  evidence; the bias measured as unreachable code on both models, now warned about (`df9a52e`).
+- [x] **Plan F — expert-eviction `top_n` sweep.** DONE. **Verdict: no N is viable.**
+- [x] **Plan E — KV double-storage fix.** FULLY CLOSED. KV 3.016 → **2.000 B/elem** (−33.7 %) on
+  both geometries, `auto` flipped to bf16, and the bf16 layout serializes to disk (restore gate:
+  TTFT 27.6 s → 3.0 s).
+- [x] **`delete_original` never fired for an already-split model** — FIXED `c170474`. Executed on
+  both models: **273 GB reclaimed**, disk 89 % → 57 %; both still load and generate.
+- [x] **`remove_real_and_linked_file` unlinked the same file twice** — FIXED `72c7b08`
+  (`os.path.realpath()` returns `str`, every caller passes a `Path`). 3 tests.
+- [x] **Stale `QUANT_SIG_BF16` comment in `vaayu/kv_persist.py`** — FIXED in Plan H Task 4.
+
+**2026-08-01**
+- [x] **Plan A — VRAM decode-headroom fix** (`045f387` `86a6ca5`). `_VRAM_RESERVE_BYTES` 2 → 3.5 GB;
+  OOM closed at K=2 (4/4) and K=3 (6/6), decode unregressed. Attribution: the reserve bump alone
+  fixes it; `expandable_segments` is optional insurance.
+- [x] **Plan C — prefix-cache hit telemetry.** `PrefixCacheStore` counters + `stats()`;
+  `test_multiturn.py` is now a **gate** (exit ≠ 0 on a bad HIT count).
+- [x] **Plan D — expert usage histogram, measurement only.** Answered the pin question: hot-but-
+  evicted experts exist, but only **19 %** of budget-pressure evictions land on each layer's top-10,
+  and the cache runs saturated. Fed Plan F.
+- [x] **VRAM prefill OOM chain, all 4 steps** — RAM budget rebalance → VRAM diagnostic (verdict:
+  decode-boundary, not prefill) → Plan A → round-2 HIT measurement (TTFT ~90-101 s → ~9-10 s at
+  both K=2 and K=3, kernel OOM 0).
+- [x] Dead code `PrefixCacheStore.drop()` removed; VRAM-cache-disabled message promoted to a
+  `WARNING`; stale `_PREFILL_VRAM_HEADROOM` cross-reference fixed (`9aa2c61`); line-number citations
+  replaced with symbol names.
+
+**Earlier**
 - [x] KV prefix cache A1 + KV disk persistence (landed, ships dark)
-- [x] Batched decode static v1 (landed; `plan_batch` collapses to N=1 on the 16GB box)
+- [x] Batched decode static v1 (landed)
 - [x] MiniMax-M2.7 bring-up (4 root causes fixed)
-- [x] Expert-usage histogram plan — anchors re-verified + premise warning added (`417e0e0`)
