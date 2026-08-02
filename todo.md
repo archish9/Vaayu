@@ -203,6 +203,26 @@ Recorded so the same ground is not re-measured. Each cost a full plan or probe t
   context-length sensitivity `_VRAM_RESERVE_BYTES`' own comment warns about, attributed there to the
   blanket reserve rather than to this input, and plausibly part of why Plan A needed +1.5 GB of
   blanket reserve. Fix is parameter plumbing, not a move. (found 2026-08-03, audit F4)
+  **PROMOTED 2026-08-02 — F4 is no longer theoretical: it is FATAL at the agentic context length.**
+  First hit running Plan J's Task 4 gate on MiniMax at K=3 × ~7.7k tokens. VRAM fills to
+  15.21/15.47 GiB, a flood of `Expert weight inject failed: w2 ... CUDA out of memory` precedes it,
+  and the process dies. **It does not present as an OOM** — see the next entry. Workaround until
+  fixed: harnesses must pass `max_seq_len=` explicitly (`AutoModel.from_pretrained` forwards
+  `**kwargs` straight to the constructor). Neither `test_multiturn.py` nor `test_generate.py` does.
+  This blocks Plan J Task 4 Step 4 and will block **Plan K Task 3** identically — K sweeps N at
+  ~7.7k context, the same shape.
+- [ ] **VRAM exhaustion surfaces as a bogus `TypeError`, and the "graceful" RoPE fallback is a lie.**
+  When VRAM is exhausted, both RoPE precompute paths in `vaayu_base.py:2917-2941` raise
+  `CUDA out of memory`, the handler sets `_full_position_embeddings = None` and prints
+  **"RoPE will be computed per-layer"** — but no such per-layer path exists. `get_pos_emb_args`
+  (`:2685-2689`) then returns `{}` and the layer call dies with
+  `MiniMaxM2DecoderLayer.forward() missing 1 required positional argument: 'position_embeddings'`,
+  ~30 frames from the real cause. Every modern decoder layer takes `position_embeddings` as a
+  required arg, so the fallback cannot work for any of them. Two things wrong: the message promises
+  a mechanism that does not exist, and a VRAM OOM is laundered into a signature error that sends the
+  reader to the wrong subsystem entirely. Cost me a full debugging cycle. Fix: either re-raise the
+  OOM (honest failure, CLAUDE.md §5) or implement the per-layer path the message claims.
+  (found 2026-08-02, Plan J Task 4 gate)
 - [ ] **F6 — `vaayu/kv_cache_manager.py` (`KVCacheManager`) is unreachable but still maintained.**
   Constructed only in `tests/test_kv_cache_manager_fp8.py`; superseded by `PrefixCacheStore` (A1).
   Its helper `_extract_kv_as_bf16` is reachable only from `save_snapshot`, and was hardened by
