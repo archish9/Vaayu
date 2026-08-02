@@ -1394,27 +1394,36 @@ class VaayuBaseModel(GenerationMixin):
             if _slab_bytes > 0:
                 _unclamped_n = unclamped_slab_count(
                     _expert_budget, _slab_bytes, get_expert_pool_size())
-                _n_slabs = clamp_slab_count(
-                    _expert_budget, _slab_bytes, get_expert_pool_size())
+                # Power-of-two charging is a property of the caching HOST
+                # allocator, i.e. pinned memory only — a pageable arena pays
+                # no round-up, so clamping it would only cost cache for zero
+                # RAM freed. Only clamp when we are actually about to pin.
+                _n_slabs = (clamp_slab_count(
+                                _expert_budget, _slab_bytes, get_expert_pool_size())
+                            if _pin else _unclamped_n)
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
                     print(f"[Vaayu-MoE] WARNING: pinned slab alloc failed ({_slab_err}); "
                           f"retrying pageable (H2D will be slower)")
+                    # Retry is pageable by definition, so it doesn't pay the
+                    # pinned round-up either — use the unclamped count.
+                    _n_slabs = _unclamped_n
                     try:
                         self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=False)
                     except RuntimeError:
                         self._expert_slab_arena = None
                 if self._expert_slab_arena is not None:
                     _clamp_note = ""
-                    if _n_slabs < _unclamped_n:
+                    if _pin and _n_slabs < _unclamped_n:
                         _charged_bytes = next_pow2_at_least(_unclamped_n * _slab_bytes)
+                        _freed_bytes = _charged_bytes - next_pow2_at_least(_n_slabs * _slab_bytes)
                         _clamp_note = (
                             f" — clamped from {_unclamped_n} slabs "
                             f"(−{(_unclamped_n - _n_slabs) * _slab_bytes / 1e9:.2f}GB cache) "
                             f"so the pinned backing store is a power of two; the "
                             f"allocator would have charged {_charged_bytes / 1e9:.2f}GB"
-                            f"; frees {(_charged_bytes - _n_slabs * _slab_bytes) / 1e9:.2f}GB")
+                            f"; frees {_freed_bytes / 1e9:.2f}GB")
                     print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
@@ -1424,9 +1433,14 @@ class VaayuBaseModel(GenerationMixin):
                           f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
                           f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
             if self._expert_slab_arena is not None:
-                _arena_bytes = self._expert_slab_arena.n_slabs * self._expert_slab_arena.slab_bytes
+                # Exclude the pool_size in-flight staging addend: those slabs are
+                # the loader's landing zone and must stay permanently free, not
+                # be handed to the cache as usable budget (see
+                # unclamped_slab_count's docstring / the arena comment above).
+                _arena_bytes = max(0, self._expert_slab_arena.n_slabs - get_expert_pool_size()) \
+                               * self._expert_slab_arena.slab_bytes
                 if _arena_bytes < _expert_budget:
-                    print(f"[Vaayu-Cache] Expert RAM cache budget trimmed "
+                    print(f"[Vaayu-MoE] Expert RAM cache budget trimmed "
                           f"{_expert_budget / 1e9:.2f} -> {_arena_bytes / 1e9:.2f} GB "
                           f"to match the clamped slab arena (the arena, not the budget, "
                           f"is what binds)")

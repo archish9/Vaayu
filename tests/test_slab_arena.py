@@ -459,3 +459,121 @@ def test_clamp_is_a_noop_when_nothing_was_wasted():
     budget = (n_target - pool_size) * slab_bytes
     assert unclamped_slab_count(budget, slab_bytes, pool_size) == n_target
     assert clamp_slab_count(budget, slab_bytes, pool_size) == n_target
+
+
+# ── Finding 1: the budget trim must exclude the pool_size addend ───────────
+#
+# ExpertRAMCache.put_slab (vaayu/persist/expert_cache.py) charges arena.slab_bytes
+# per entry against budget_bytes, evicting while current_usage + size >
+# budget_bytes -- so the cache's steady-state entry cap is exactly
+# budget_bytes // slab_bytes. The arena is deliberately n_slabs = cache slabs +
+# pool_size in-flight staging slabs (unclamped_slab_count's docstring). The trim
+# at the arena-mirroring call site must size the budget off the CACHE's share of
+# the arena (n_slabs - pool_size), not the whole arena, or the loader's landing
+# zone gets folded into the cache's own cap and the freelist reserve collapses
+# to 0. This test pins that arithmetic identity directly -- it is the fixed
+# expression from vaayu_base.py's trim block, exercised as pure arithmetic
+# (CLAUDE.md: no VaayuBaseModel construction).
+
+def _trimmed_budget(n_slabs: int, slab_bytes: int, pool_size: int) -> int:
+    """Mirrors the vaayu_base.py trim block's corrected _arena_bytes expression."""
+    return max(0, n_slabs - pool_size) * slab_bytes
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+@pytest.mark.parametrize("pool_size", [6, 9])
+def test_trimmed_budget_leaves_the_pool_size_reserve_free(geo, pool_size):
+    geo = dict(geo, pool_size=pool_size)
+    n_slabs = clamp_slab_count(**geo)
+    trimmed_budget = _trimmed_budget(n_slabs, geo["slab_bytes"], pool_size)
+    cache_cap = trimmed_budget // geo["slab_bytes"]
+    # The cache can never fill the arena: its steady-state entry cap plus the
+    # staging addend must equal (not exceed) the arena's slab count.
+    assert cache_cap + pool_size == n_slabs
+
+
+@pytest.mark.parametrize("pool_size", [6, 9])
+def test_trimmed_budget_is_strictly_less_than_whole_arena_when_pool_size_positive(pool_size):
+    # Regression guard for the bug as found: using the WHOLE arena (n_slabs *
+    # slab_bytes) as the trimmed budget folds the staging addend into the
+    # cache's own cap, giving a freelist reserve of 0.
+    n_slabs, slab_bytes = 965, 8_900_000
+    whole_arena = n_slabs * slab_bytes
+    trimmed = _trimmed_budget(n_slabs, slab_bytes, pool_size)
+    assert trimmed < whole_arena
+    assert (whole_arena - trimmed) == pool_size * slab_bytes
+
+
+# ── Finding 2: the clamp must not fire on a pageable (non-pinned) arena ─────
+#
+# Power-of-two charging is a caching HOST allocator property -- pinned memory
+# only. A pageable torch.empty allocation (CPU-only box, or the pinned-alloc
+# RuntimeError retry path) pays no round-up, so clamping it trades cache for
+# zero RAM freed. The call site guards clamp_slab_count behind `if _pin`; this
+# helper mirrors that gate as pure arithmetic.
+
+def _n_slabs_for(pin: bool, budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
+    """Mirrors the vaayu_base.py call-site gate: clamp only when pinning."""
+    unclamped = unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
+    return clamp_slab_count(budget_bytes, slab_bytes, pool_size) if pin else unclamped
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_unpinned_arena_gets_the_unclamped_count(geo):
+    unclamped = unclamped_slab_count(**geo)
+    assert _n_slabs_for(False, **geo) == unclamped
+    # Sanity: on these real geometries the clamp DOES bite when pinned, so this
+    # isn't vacuously true because clamping happened to be a no-op.
+    assert clamp_slab_count(**geo) < unclamped
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_pinned_arena_gets_the_clamped_count(geo):
+    assert _n_slabs_for(True, **geo) == clamp_slab_count(**geo)
+
+
+# ── Finding 3: the printed "frees" figure must be exact, not an upper bound ─
+#
+# The RAM actually returned is _charged_bytes - next_pow2_at_least(actual
+# backing bytes), not _charged_bytes - (n_slabs * slab_bytes) directly -- those
+# only coincide when the clamped backing itself lands exactly on the power-of-
+# two floor. In the degenerate max(pool_size, ...) branch of clamp_slab_count,
+# the backing can exceed that floor, and the naive subtraction overstates the
+# freed bytes.
+
+from vaayu.persist.safetensor_model_persister import next_pow2_at_least
+
+
+def test_freed_bytes_is_zero_when_degenerate_branch_exceeds_the_floor():
+    # Tiny budget forces clamp_slab_count's max(pool_size, ...) branch: the
+    # backing (pool_size slabs) exceeds the power-of-two floor computed from
+    # the (much smaller) unclamped request actually asked for.
+    budget_bytes, slab_bytes, pool_size = 1, 8_900_000, 6
+    unclamped = unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
+    n_slabs = clamp_slab_count(budget_bytes, slab_bytes, pool_size)
+    charged_bytes = next_pow2_at_least(unclamped * slab_bytes)
+    naive_freed = charged_bytes - n_slabs * slab_bytes
+    exact_freed = charged_bytes - next_pow2_at_least(n_slabs * slab_bytes)
+    # The degenerate branch actually exceeds the floor here, so the naive and
+    # exact figures must differ -- and the exact one must be the smaller,
+    # honest bound (never negative-implying nonsense in real use, since the
+    # clamp guarantees n_slabs * slab_bytes <= the floor in the non-degenerate
+    # case; here it's the reverse, so exact_freed <= naive_freed).
+    assert exact_freed <= naive_freed
+    assert exact_freed == 0
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_freed_bytes_close_to_naive_figure_at_real_geometries(geo):
+    # At the real on-device geometries (non-degenerate branch) the two figures
+    # differ by less than one slab -- per the finding's own observation ("both
+    # round to the same printed value" at typical precision). The exact figure
+    # is still the correct one to print; this just confirms the fix is not a
+    # behavior change at the geometries that matter on-device.
+    unclamped = unclamped_slab_count(**geo)
+    n_slabs = clamp_slab_count(**geo)
+    charged_bytes = next_pow2_at_least(unclamped * geo["slab_bytes"])
+    naive_freed = charged_bytes - n_slabs * geo["slab_bytes"]
+    exact_freed = charged_bytes - next_pow2_at_least(n_slabs * geo["slab_bytes"])
+    assert exact_freed <= naive_freed
+    assert naive_freed - exact_freed < geo["slab_bytes"]
