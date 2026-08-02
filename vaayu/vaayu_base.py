@@ -23,6 +23,7 @@ from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
 from .prefix_cache import PrefixCacheStore
+from . import turboquant
 
 # BetterTransformer is deprecated in newer optimum versions
 try:
@@ -672,6 +673,114 @@ class FP8DynamicCache(DynamicCache):
                    for t in getattr(self, name))
 
 
+class TurboQuantKVCache(FP8DynamicCache):
+    """KV cache storing TurboQuant codes instead of values (arXiv 2504.19874).
+
+    Per (token, head) it holds bit-packed codebook indices, bit-packed QJL sign
+    bits and two fp16 norms -- 0.531 bytes/element at bits_total=4 and
+    head_dim=128, against bf16's 2.000. Reconstruction happens on READ, inside
+    update(); nothing full-size is ever retained, because a persistent
+    reconstructed mirror is exactly what Plan E deleted from the fp8 mode.
+
+    key_cache / value_cache keep their names so inherited code paths work, but
+    they hold INDICES, NOT VALUES. Any consumer reading them directly must
+    special-case this class -- see kv_cache_manager._extract_kv_as_bf16 and
+    kv_persist.DiskWriter.enqueue_append.
+
+    Lossy in a way bf16 is not: measured relative L2 error ~0.23 on random K/V
+    at bits_total=4.
+    """
+
+    def __init__(self, bits_total: int = 4, rot_seed: int = 0x5EED,
+                 qjl_seed: int = 0x9317):
+        # quantize=False: there are no fp8 scales. The flag alone does NOT make
+        # the persistence path safe (both of its values mis-describe this
+        # layout); explicit type checks do.
+        super().__init__(quantize=False)
+        if bits_total < 2:
+            raise ValueError(f"bits_total must be >= 2 (1 bit goes to QJL), got {bits_total}")
+        self.bits_total = int(bits_total)
+        self._b_mse = self.bits_total - 1
+        self.rot_seed = rot_seed
+        self.qjl_seed = qjl_seed
+        self._k_signs: list = []    # packed QJL signs, [B, H, capacity, D/8]
+        self._v_signs: list = []
+        self._k_norms: list = []    # (||x||, gamma) fp16, [B, H, capacity, 2]
+        self._v_norms: list = []
+        self._params: dict = {}     # (dim, device) -> (rot, gauss, codebook)
+
+    @property
+    def _BUFFER_LISTS(self):
+        return ("key_cache", "value_cache", "_k_signs", "_v_signs",
+                "_k_norms", "_v_norms")
+
+    def _get_params(self, dim: int, device):
+        """Rotation, QJL sketch and codebook for this head_dim. Built once from
+        fixed seeds (data-oblivious) and shared across every layer and head."""
+        key = (dim, str(device))
+        params = self._params.get(key)
+        if params is None:
+            params = (turboquant.make_rotation(dim, self.rot_seed, device),
+                      turboquant.make_gaussian(dim, self.qjl_seed, device),
+                      turboquant.make_codebook(self._b_mse, dim, device))
+            self._params[key] = params
+        return params
+
+    def _quantize(self, x):
+        rot, gauss, cb = self._get_params(x.shape[-1], x.device)
+        return turboquant.quantize(x, rot, gauss, cb, self._b_mse)
+
+    def _reconstruct(self, packed, signs, norms, dim, dtype):
+        rot, gauss, cb = self._get_params(dim, packed.device)
+        return turboquant.reconstruct(packed, signs, norms, rot, gauss, cb,
+                                      self._b_mse, dim, out_dtype=dtype)
+
+    def _ensure_capacity_packed(self, layer_idx, needed, tensors):
+        """Grow layer_idx's six buffers so capacity >= needed, reusing the
+        parent's geometric-doubling policy. Each list has its own last dim and
+        dtype, so the templates come from the freshly packed tensors."""
+        cap = self.key_cache[layer_idx].shape[-2] if layer_idx < len(self.key_cache) else 0
+        if layer_idx < len(self.key_cache) and cap >= needed:
+            return
+        new_cap = max(needed, max(1, cap) * self._GROWTH)
+        for name, t in zip(self._BUFFER_LISTS, tensors):
+            lst = getattr(self, name)
+            B, H, _, D = t.shape
+            buf = torch.zeros((B, H, new_cap, D), dtype=t.dtype, device=t.device)
+            if layer_idx < len(lst):
+                used = self._seq_len[layer_idx]
+                buf[..., :used, :] = lst[layer_idx][..., :used, :]
+                lst[layer_idx] = buf
+            else:
+                lst.append(buf)
+        if layer_idx >= len(self._seq_len):
+            self._seq_len.append(0)
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        k_idx, k_sign, k_norm = self._quantize(key_states)
+        v_idx, v_sign, v_norm = self._quantize(value_states)
+        tensors = (k_idx, v_idx, k_sign, v_sign, k_norm, v_norm)
+
+        n_new = key_states.shape[-2]
+        prev = self._seq_len[layer_idx] if layer_idx < len(self._seq_len) else 0
+        self._ensure_capacity_packed(layer_idx, prev + n_new, tensors)
+
+        s = slice(prev, prev + n_new)
+        for name, t in zip(self._BUFFER_LISTS, tensors):
+            getattr(self, name)[layer_idx][..., s, :] = t
+        self._seq_len[layer_idx] = prev + n_new
+
+        used = self._seq_len[layer_idx]
+        w = slice(0, used)
+        k_dim, v_dim = key_states.shape[-1], value_states.shape[-1]
+        return (self._reconstruct(self.key_cache[layer_idx][..., w, :],
+                                  self._k_signs[layer_idx][..., w, :],
+                                  self._k_norms[layer_idx][..., w, :],
+                                  k_dim, key_states.dtype),
+                self._reconstruct(self.value_cache[layer_idx][..., w, :],
+                                  self._v_signs[layer_idx][..., w, :],
+                                  self._v_norms[layer_idx][..., w, :],
+                                  v_dim, value_states.dtype))
 
 
 def _layer_path_exists(model: nn.Module, path: str) -> bool:

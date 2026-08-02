@@ -188,3 +188,126 @@ def test_bytes_per_element_matches_plan_prediction():
     idx, signs, norms = tq.quantize(x, rot, gauss, cb, 3)
     total = idx.nbytes + signs.nbytes + norms.nbytes
     assert total / x.numel() == pytest.approx(0.531, abs=0.001)
+
+
+# --- TurboQuantKVCache (Task 2) ---------------------------------------------
+
+from vaayu.vaayu_base import FP8DynamicCache, TurboQuantKVCache  # noqa: E402
+
+KV_SHAPE = (1, 4, 0, DIM)  # B, H, S, D
+
+
+def _kv(seq, seed=0, dtype=torch.bfloat16):
+    g = torch.Generator().manual_seed(seed)
+    B, H, _, D = KV_SHAPE
+    k = torch.randn(B, H, seq, D, generator=g, dtype=torch.float32).to(dtype)
+    v = torch.randn(B, H, seq, D, generator=g, dtype=torch.float32).to(dtype)
+    return k, v
+
+
+def _rel_l2(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+def test_cache_append_returns_full_sequence():
+    c = TurboQuantKVCache()
+    k1, v1 = _kv(10, seed=1)
+    ko, vo = c.update(k1, v1, 0)
+    assert ko.shape == k1.shape and ko.dtype == k1.dtype and ko.device == k1.device
+    k2, v2 = _kv(3, seed=2)
+    ko, vo = c.update(k2, v2, 0)
+    assert ko.shape == (1, 4, 13, DIM) and vo.shape == (1, 4, 13, DIM)
+    assert c.get_seq_length(0) == 13
+
+
+def test_prefill_then_decode_matches_single_update():
+    """Quantization is per-token independent, so chunking must not change it."""
+    k, v = _kv(72, seed=3)
+    one = TurboQuantKVCache()
+    ko_all, vo_all = one.update(k, v, 0)
+
+    split = TurboQuantKVCache()
+    split.update(k[:, :, :64], v[:, :, :64], 0)
+    for i in range(64, 72):
+        ko, vo = split.update(k[:, :, i:i + 1], v[:, :, i:i + 1], 0)
+    assert torch.equal(ko, ko_all) and torch.equal(vo, vo_all)
+
+
+def test_crop_and_crop_front():
+    c = TurboQuantKVCache()
+    k, v = _kv(20, seed=4)
+    ko_full, _ = c.update(k, v, 0)
+    c.crop(12)
+    assert c.get_seq_length(0) == 12
+    k2, v2 = _kv(1, seed=5)
+    ko, _ = c.update(k2, v2, 0)
+    assert ko.shape[-2] == 13
+    c.crop_front(5)
+    assert c.get_seq_length(0) == 5
+    kept = c.update(*_kv(1, seed=7), 0)[0]
+    assert kept.shape[-2] == 6
+
+
+def test_crop_front_keeps_newest_values():
+    c = TurboQuantKVCache()
+    k, v = _kv(20, seed=8)
+    ko_full, _ = c.update(k, v, 0)
+    tail = ko_full[:, :, -5:, :].clone()
+    c.crop_front(5)
+    ko, _ = c.update(*_kv(1, seed=9), 0)
+    assert torch.equal(ko[:, :, :5, :], tail)
+
+
+def test_to_cpu_to_device_roundtrip_and_compaction():
+    c = TurboQuantKVCache()
+    k, v = _kv(19, seed=10)
+    c.update(k, v, 0)
+    ko_full, vo_full = c.update(*_kv(1, seed=17), 0)   # forces a doubling step
+    ko_full, vo_full = ko_full.clone(), vo_full.clone()
+    assert c.key_cache[0].shape[-2] > 20  # capacity tail from doubling
+    c.to_cpu()
+    assert c.key_cache[0].shape[-2] == 20  # compacted
+    assert c.key_cache[0].device.type == "cpu"
+    c.to_device(k.device)
+    ko, vo = c.update(*_kv(1, seed=11), 0)
+    assert torch.equal(ko[:, :, :20, :], ko_full)
+    assert torch.equal(vo[:, :, :20, :], vo_full)
+
+
+def test_resident_bytes_ratio_against_bf16():
+    k, v = _kv(64, seed=12)
+    tq_cache = TurboQuantKVCache()
+    tq_cache.update(k, v, 0)
+    bf16 = FP8DynamicCache(quantize=False)
+    bf16.update(k, v, 0)
+    ratio = tq_cache.resident_bytes() / bf16.resident_bytes()
+    assert ratio < 0.35, ratio
+
+
+def test_reconstruction_fidelity_on_realistic_kv():
+    """Measured 2026-08-02 at bits_total=4, head_dim=128: relative L2 error
+    ~0.23 for K and V (0.184 from the MSE stage, x1.25 from the QJL variance).
+    Threshold 0.30 leaves headroom without admitting a broken codebook."""
+    k, v = _kv(128, seed=13)
+    c = TurboQuantKVCache()
+    ko, vo = c.update(k, v, 0)
+    assert _rel_l2(ko, k) < 0.30
+    assert _rel_l2(vo, v) < 0.30
+
+
+def test_bits_total_three_is_smaller_and_worse():
+    k, v = _kv(64, seed=14)
+    c4, c3 = TurboQuantKVCache(bits_total=4), TurboQuantKVCache(bits_total=3)
+    ko4, _ = c4.update(k, v, 0)
+    ko3, _ = c3.update(k, v, 0)
+    assert c3.resident_bytes() < c4.resident_bytes()
+    assert _rel_l2(ko3, k) > _rel_l2(ko4, k)
+
+
+def test_multiple_layers_are_independent():
+    c = TurboQuantKVCache()
+    k0, v0 = _kv(5, seed=15)
+    k1, v1 = _kv(9, seed=16)
+    c.update(k0, v0, 0)
+    c.update(k1, v1, 1)
+    assert c.get_seq_length(0) == 5 and c.get_seq_length(1) == 9
