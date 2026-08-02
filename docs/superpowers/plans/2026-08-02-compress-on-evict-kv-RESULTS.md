@@ -6,15 +6,18 @@
 ## VERDICT
 
 **Works, and does what Plan H could not.** Compressing pooled KV at the eviction boundary costs
-**zero** decode throughput on both models, halves the bytes a cached session occupies, and at a
-budget-constrained fan-out turns a total prefix-cache collapse into a full set of hits —
-**round-2 TTFT 91 s → 9.6 s, a 9.5× win at identical budget.** The default bit-width was raised
-from 8 to **9** on the gate's own evidence.
+**zero** decode throughput on both models, nearly halves the bytes a cached session occupies, and
+where the pool is budget-bound it turns a total prefix-cache collapse into a full set of hits.
+Measured twice: **91 s → 9.6 s (9.5×)** at K=4 with a capped budget, and **332 s → 9.8 s (34×)** at
+K=3 × 7.7k tokens with the real budget. The default bit-width was raised from 8 to **9** on the
+gate's own evidence.
 
-The honest limit is unchanged from Plan H: the benefit is **latent** at today's scale. With the
-real ~5 GB pool and 2k-token sessions the budget only binds past ~11 concurrent sessions, and
-nothing today runs that wide. This is headroom that now costs nothing to carry, not a speed-up you
-will feel on the next run.
+**The benefit is real but conditional.** It appears only when ≥2 concurrent sessions exceed the pool
+budget — for MiniMax, roughly 20k–35k combined resident tokens. Below that the pool already fits and
+compression is pure cost (~0.45 s/turn); above it, both modes thrash. At the harness default (K=2–3
+× 2k tokens) there is no benefit at all, which is why it ships off by default. The realistic hit is
+**a few concurrent sessions each carrying a large re-sent context** — which is the agent shape this
+engine exists for.
 
 ---
 
@@ -62,18 +65,36 @@ more than a linear reading suggests.
 Extrapolated to the real ~5 GB budget and these session sizes: **~10 → ~20 concurrent sessions**
 before the cliff.
 
-## 3. Long context — **analytic, not measured**
+## 3. Long context — **MEASURED, 34× TTFT, no budget cap**
 
-Not run: the harness's fixed system prompt yields ~2000-token sessions, and reaching 32k would have
-needed a new prompt corpus plus hours of prefill. What is known from arithmetic and §4's timings:
+Run at the operator's request before merging, since §2's demonstration needed a capped budget.
+`test_multiturn.py`, MiniMax, **K=3 sessions × 7,751 tokens = 23.3k combined**, `N_MODULES=160`,
+`MAX_LENGTH=16384`, **real (uncapped) pool budget**, 9 bits.
 
-- One 32k-token bf16 Qwen session = `32768 × 2 × 4 × 128 × 94 × 2 B` = **5.88 GiB**, against a
-  ~4.8 GiB pool — **a single long session cannot be cached at all** today.
-- At 9 bits the same session is **3.40 GiB**, which fits.
+| | bf16 | compressed (9b) |
+|---|---|---|
+| pool budget this run | 3.54 GB | 4.18 GB |
+| bytes per session | ~1,877 MiB (derived) | **1,093.9 MiB** (measured, 0.583×) |
+| round-0 evictions | **2** | **0** |
+| final-round HITs | **0/3** | **3/3** |
+| final-round evictions | 3 | 0 |
+| round-2 TTFT | **~332 s** (full re-prefill) | **~9.8 s** |
+| tokens saved | 0 / 23,250 (0%) | 23,190 / 23,250 (**100%**) |
+| harness exit | 1 | 0 |
 
-So compression is what makes long-context prefix caching possible at all on this box, rather than
-merely more efficient. **Stated as arithmetic, not as a measurement** — someone should confirm it
-on device before relying on it.
+**332 s → 9.8 s, a 34× TTFT reduction**, and the largest effect measured anywhere in Plans H or I.
+It is larger than §2's 9.5× for the obvious reason: a cold prefill at 7.7k tokens costs far more
+than at 2k, so preserving the HIT is worth proportionally more.
+
+**Budget confound, disclosed:** the two runs drew different pool budgets (3.54 vs 4.18 GB) because
+the budget is computed from free RAM at load time. This does not affect the conclusion — bf16 needs
+`3 × 1,877 MiB = 5.50 GB` for three resident sessions, which exceeds **both** figures, so bf16
+would have evicted even with the compressed run's larger budget. Compressed needed 3.20 GB and fit
+in either.
+
+This is the configuration the feature exists for, and it is a realistic agent shape: **a few
+concurrent sessions, each carrying a large re-sent context.** Not many tiny sessions, and not one
+enormous one (§7).
 
 ## 4. Per-turn compression cost — acceptable, and it is the whole cost
 
@@ -131,8 +152,9 @@ conditions; without it this file would have been packed indices stamped as bf16.
 
 - **No VRAM saving for the in-flight session.** The live cache stays bf16 by design. Longer context
   on one card still needs attention against compressed keys (fold `Π` into the query).
-- **No benefit at today's scale.** The real pool binds past ~11 concurrent sessions; measured runs
-  at K=3 show 0 evictions in both modes. The K=4 result required a capped budget to surface.
+- **No benefit at small scale.** At K=2–3 × 2k tokens the pool holds everything in both modes
+  (0 evictions), so compression is pure cost. §3 shows the benefit arrives once sessions get large;
+  §2's small-session demonstration needed a capped budget to surface at all.
 - **Plan H's mode is not retired.** `kv_cache_mode="turboquant"` remains, opt-in and documented as
   unsuitable for long context.
 
@@ -140,10 +162,12 @@ conditions; without it this file would have been packed indices stamped as bf16.
 
 1. **Merge, keep default off.** `prefix_compress=None` remains the default; nothing changes for
    existing runs.
-2. **Turn it on when fan-out exceeds ~8 concurrent sessions, or when sessions exceed ~8k tokens.**
-   Below that it is inert; above it, §2's cliff says the transition is abrupt and expensive.
+2. **Turn it on when combined resident tokens approach the pool budget** — measured for MiniMax at
+   ~20k (bf16 wall) against ~35k at 9 bits. In practice: **3 sessions at ~8k tokens each already
+   qualifies** (§3, 34×), as does fan-out past ~8–10 short sessions. Below that it is inert and
+   costs ~0.45 s/turn; the transition is a cliff, not a slope (§2).
 3. **Use 9 bits** (now the default). Do not use 8 — it fails MiniMax's worst layer.
-4. **Confirm §3 on device** before relying on long-context caching.
+4. §3 is now measured on device, uncapped — the strongest result in this plan.
 5. **The outlier split remains the real follow-up.** Both models' failures at 8 bits are early-layer
    outliers, which is exactly what that technique addresses — and it would buy back the 12% that
    moving to 9 bits cost.

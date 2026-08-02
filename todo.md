@@ -292,10 +292,15 @@ at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full
       layers on both models — exactly what the outlier split addresses.
     - [x] **Ordering trap verified live** — with compression AND persist on, the file is `sig=bf16`,
       `rec_bytes=192516 = 4 + 94×(2×4×128×2)` exactly. No packed index reached disk.
-    - [ ] **Long context NOT measured** — analytic only: a 32k bf16 Qwen session is 5.88 GiB vs a
-      ~4.8 GiB pool (uncacheable), 3.40 GiB at 9 bits (fits). Confirm on device before relying on it.
-    - Honest limit: benefit is **latent**. The real ~5 GB pool binds past ~11 sessions; K=3 runs
-      show 0 evictions in both modes. Headroom that now costs nothing, not a speed-up felt today.
+    - [x] **Long context MEASURED (uncapped budget)** — K=3 × 7,751 tok = 23.3k combined, MiniMax:
+      bf16 **0/3 HIT, 3 evictions, round-2 TTFT ~332 s**; 9-bit **3/3 HIT, 0 evictions, ~9.8 s**.
+      **34× TTFT — the largest effect measured anywhere in Plans H or I.** Per session 1877 → 1094
+      MiB. Budgets differed (3.54 vs 4.18 GB, computed from free RAM); conclusion holds either way
+      since bf16 needs 5.50 GB for 3 sessions.
+    - Honest limit: benefit is **conditional, not universal**. It needs ≥2 sessions whose combined
+      tokens exceed the pool budget (~20k for MiniMax, ~27k Qwen). Below that: no benefit, ~0.45
+      s/turn cost. Above ~35k: both modes thrash. Sweet spot = a few sessions each carrying a large
+      re-sent context — the agent shape this engine targets.
   - [ ] **Real-query quality gate** — this gate used K-row and Gaussian query proxies because
     `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds, but any attempt
     to certify a specific bit-width needs real queries captured with an attention hook.
