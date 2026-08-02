@@ -203,14 +203,17 @@ Recorded so the same ground is not re-measured. Each cost a full plan or probe t
   context-length sensitivity `_VRAM_RESERVE_BYTES`' own comment warns about, attributed there to the
   blanket reserve rather than to this input, and plausibly part of why Plan A needed +1.5 GB of
   blanket reserve. Fix is parameter plumbing, not a move. (found 2026-08-03, audit F4)
-  **PROMOTED 2026-08-02 — F4 is no longer theoretical: it is FATAL at the agentic context length.**
-  First hit running Plan J's Task 4 gate on MiniMax at K=3 × ~7.7k tokens. VRAM fills to
-  15.21/15.47 GiB, a flood of `Expert weight inject failed: w2 ... CUDA out of memory` precedes it,
-  and the process dies. **It does not present as an OOM** — see the next entry. Workaround until
-  fixed: harnesses must pass `max_seq_len=` explicitly (`AutoModel.from_pretrained` forwards
-  `**kwargs` straight to the constructor). Neither `test_multiturn.py` nor `test_generate.py` does.
-  This blocks Plan J Task 4 Step 4 and will block **Plan K Task 3** identically — K sweeps N at
-  ~7.7k context, the same shape.
+  **Attempted promotion to "FATAL" on 2026-08-02 was WRONG — retracted the same day.** A crash at
+  K=3 × ~8.2k was blamed on F4 before the cause was isolated; setting `max_seq_len` did not fix it,
+  and the controlled A/B then showed Plan I's documented shape (K=3 × 7 751) runs fine on BOTH main
+  and the Plan J branch **without** `max_seq_len` being set by any harness. F4 is a real VRAM
+  accounting bug, but it is not what breaks these runs, and no harness needs the workaround.
+  What the A/B did establish: **VRAM headroom at 7.7k is only ~1 GB** (allocated 12.24-12.33 GB,
+  reserved peaks 14.54-14.58 GB of 15.47 GiB), and the crash reproduces at ~8.2k. So there is a
+  real context-length cliff between 7.7k and 8.2k on this box, owned by the
+  `_VRAM_RESERVE_BYTES` / `compute_vram_expert_budget` pair (the expert VRAM cache takes
+  `free_vram_at_load − 3.5 GB` = 8.7-8.8 GB before any KV exists, and never evicts: `0evict`
+  throughout). **Characterize that cliff before blaming any single input for it.**
 - [ ] **VRAM exhaustion surfaces as a bogus `TypeError`, and the "graceful" RoPE fallback is a lie.**
   When VRAM is exhausted, both RoPE precompute paths in `vaayu_base.py:2917-2941` raise
   `CUDA out of memory`, the handler sets `_full_position_embeddings = None` and prints
