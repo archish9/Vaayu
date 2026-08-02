@@ -263,6 +263,17 @@ at 4 bits.** The mode stays in, opt-in and dark, at 0.5312 B/elem measured. Full
   - [x] On-device confirmation of Task 4: the persistence refusal fired and no file was written.
   - [x] Scaffolding reverted (`git checkout test_generate.py test_multiturn.py`), tree clean.
 - **Follow-ups, UNBUILT, in priority order (from the RESULTS recommendation):**
+  - [ ] **Plan I — compress-on-evict KV** ⭐ **spec written 2026-08-02, ready to execute:**
+    `docs/superpowers/plans/2026-08-02-compress-on-evict-kv.md`. Compresses pooled KV only while it
+    sits in the RAM prefix pool (once per turn), leaving the live cache bf16 — so it delivers Plan
+    H's memory win with **zero per-token cost**. This is what Plan H should have been: benchmarked
+    reconstruct-on-read at +0.28 s/token at 8k and **+1.49 s/token at 32k** (Qwen, whole model),
+    i.e. Plan H's mode gets worse exactly as context grows, and its gate ran at 2k where that is
+    invisible. Target: pool holds ~2× the sessions, and long sessions become cacheable at all (one
+    32k bf16 Qwen session is 5.88 GiB against a 4.8 GiB pool, so prefix caching currently *dies* at
+    long context). 5 tasks; carries a mandatory ordering fix (`kv_persist` reads the cache **after**
+    `pc.store()` today, so compressing in `store()` would write packed indices into a bf16-stamped
+    file).
   - [ ] **Mixed-precision outlier split** — the only way the paper reaches its quality-neutral
     fractional bit-widths, and now the only credible route to sub-1 B/elem KV here. Uniform 4 bits
     spends *more* than the paper's 3.5 and still misses a 5% bar by 2–7×, so the split is doing the
