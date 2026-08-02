@@ -938,6 +938,7 @@ class VaayuBaseModel(GenerationMixin):
                  layer_names_dict=None, tokenizer_class=None, prefill_chunk_size=512,
                  drafter_model_path=None, draft_tokens=5, use_prompt_lookup=False,
                  attn_implementation=None, enable_prefix_cache=False,
+                 prefix_compress=None,
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
                  enable_expert_usage=False):
@@ -1003,6 +1004,11 @@ class VaayuBaseModel(GenerationMixin):
         self.hf_token = hf_token
         self._forced_attn_impl = attn_implementation
         self.enable_prefix_cache = enable_prefix_cache
+        # None = pooled KV stays bf16 (default). An int = TurboQuant-pack pooled
+        # entries at that many bits/channel; 9 is the lowest width that passed
+        # the quality gate on BOTH on-device models. Costs one pack per turn,
+        # nothing per token.
+        self.prefix_compress = prefix_compress
         self.auto_prefix_match = auto_prefix_match
         self.enable_kv_persist = enable_kv_persist
         self.kv_persist_dir = kv_persist_dir
@@ -1577,9 +1583,7 @@ class VaayuBaseModel(GenerationMixin):
             import psutil as _ps
             _free_ram = _ps.virtual_memory().available
             _pc_budget = compute_prefix_cache_budget(_free_ram)
-            self._prefix_cache = PrefixCacheStore(
-                _pc_budget,
-                auto_prefix_match=getattr(self, "auto_prefix_match", True))
+            self._prefix_cache = self._build_prefix_store(_pc_budget)
             print(f"[Vaayu] cross-turn prefix cache ENABLED: "
                   f"{_pc_budget / 1e9:.2f} GB budget "
                   f"(free RAM {_free_ram / 1e9:.2f} GB - "
@@ -3378,7 +3382,9 @@ class VaayuBaseModel(GenerationMixin):
             input_ids = args[0]
         ids_list = input_ids[0].tolist()
 
-        kv, match_len = pc.lookup(session_id, ids_list)
+        # device= so a compressed entry is rebuilt straight onto the GPU; the
+        # store raises rather than handing back a packed container.
+        kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
         if kv is None:
             kv = self._create_kv_cache()
             print(f"[Vaayu-Prefix] MISS session={session_id} "
@@ -3398,18 +3404,45 @@ class VaayuBaseModel(GenerationMixin):
         result = super().generate(*args, **kwargs)
         resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
         # `kv` was mutated in place through the forward passes -> holds the full
-        # final KV. Persist it (store() moves it back to RAM).
-        pc.store(resolved_sid, result[0].tolist(), kv)
+        # final KV.
+        self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())
+        return result
+
+    def _build_prefix_store(self, budget_bytes):
+        """Construct the RAM prefix pool, honouring prefix_compress."""
+        bits = getattr(self, "prefix_compress", None)
+        if bits is not None and bits < 9:
+            print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
+                  f"bits/channel that passed the quality gate on both on-device "
+                  f"models (see 2026-08-02-compress-on-evict-kv-RESULTS.md; 8 bits "
+                  f"measured 0.0612 worst-layer attention-score error on MiniMax "
+                  f"against a 0.05 bar). Restored prefixes will be measurably wrong.")
+        # getattr, matching the construction this replaced: callers in tests
+        # build partial objects.
+        return PrefixCacheStore(budget_bytes,
+                                auto_prefix_match=getattr(self, "auto_prefix_match", True),
+                                compress_bits=bits)
+
+    def _persist_and_store(self, pc, resolved_sid, kv, token_ids):
+        """Persist the finished KV, THEN hand it to the prefix pool.
+
+        Order matters and is locked by test. kv_persist reads kv.key_cache
+        directly, while pc.store() may TurboQuant-compress that very same object
+        (prefix_compress=). Persisting second would write packed indices into a
+        file whose header says bf16 values -- silent garbage on restore.
+        kv_persist.to_bytes() does its own .cpu(), so persisting from the
+        still-on-GPU cache is fine.
+        """
         if self._kv_writer is not None:
-            # kv.get_seq_length(), not len(result[0]): the last sampled token is
+            # kv.get_seq_length(), not len(token_ids): the last sampled token is
             # never fed back through a forward pass (generation stops right after
             # sampling it), so it never went through cache.update() -- the cache's
-            # true occupied length is exactly len(result[0]) - 1. Using the longer
+            # true occupied length is exactly len(token_ids) - 1. Using the longer
             # value here indexes one position past what the cache actually holds.
             self._kv_writer.enqueue_append(
-                resolved_sid, kv, self.config, result[0].tolist(), kv.get_seq_length())
+                resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
+        pc.store(resolved_sid, token_ids, kv)
         self.telemetry.dump_json("vaayu_telemetry.json")
-        return result
 
     @torch.no_grad()
     def speculative_generate(

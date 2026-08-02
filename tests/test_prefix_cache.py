@@ -191,3 +191,103 @@ def test_reset_stats_does_not_evict_the_pool():
     s.reset_stats()
     kv, m = s.lookup("s1", [1, 2, 3])
     assert kv is c and m == 3
+
+
+# --- Plan I: compress-on-evict ----------------------------------------------
+
+def _bf16_cache(seq=64, heads=4, dim=128, layers=1):
+    import torch
+    from vaayu.vaayu_base import FP8DynamicCache
+    c = FP8DynamicCache(quantize=False)
+    for L in range(layers):
+        k = torch.randn(1, heads, seq, dim, dtype=torch.bfloat16)
+        c.update(k, k, L)
+    return c
+
+
+def test_compression_off_by_default_stores_the_cache_itself():
+    from vaayu.prefix_cache import PrefixCacheStore
+    c = _bf16_cache(seq=8)
+    s = PrefixCacheStore(budget_bytes=10 ** 9)
+    s.store("a", [1, 2, 3], c)
+    got, _ = s.lookup("a", [1, 2, 3])
+    assert got is c
+
+
+def test_compressed_store_shrinks_the_entry_and_round_trips():
+    import torch
+    from vaayu.prefix_cache import PrefixCacheStore
+    c = _bf16_cache(seq=64)
+    k = c.key_cache[0][..., :64, :].clone()
+    raw = c.resident_bytes()
+
+    s = PrefixCacheStore(budget_bytes=10 ** 9, compress_bits=8)
+    s.store("a", [1, 2, 3], c)
+    assert s._current_bytes < raw * 0.6          # 1.031 vs 2.000 B/elem
+
+    got, m = s.lookup("a", [1, 2, 3], device="cpu")
+    assert got is not c                           # rebuilt, not the original
+    assert got.get_seq_length(0) == 64
+    err = ((got.key_cache[0][..., :64, :].float() - k.float()).norm()
+           / k.float().norm()).item()
+    assert err < 0.05
+
+
+def test_compressed_pool_holds_more_sessions_than_bf16():
+    """The point of the feature: same budget, more resident sessions."""
+    from vaayu.prefix_cache import PrefixCacheStore
+    budget = _bf16_cache(seq=64).resident_bytes() * 3 + 1024   # ~3 bf16 sessions
+    plain = PrefixCacheStore(budget_bytes=budget)
+    comp = PrefixCacheStore(budget_bytes=budget, compress_bits=8)
+    for i in range(6):
+        plain.store(f"s{i}", [i], _bf16_cache(seq=64))
+        comp.store(f"s{i}", [i], _bf16_cache(seq=64))
+    assert len(comp._pool) > len(plain._pool)
+    assert comp.evictions < plain.evictions
+
+
+def test_lookup_without_device_on_a_compressed_entry_raises():
+    """No silent degradation: never hand a caller packed data."""
+    import pytest
+    from vaayu.prefix_cache import PrefixCacheStore
+    s = PrefixCacheStore(budget_bytes=10 ** 9, compress_bits=8)
+    s.store("a", [1], _bf16_cache(seq=8))
+    with pytest.raises(ValueError, match="device"):
+        s.lookup("a", [1])
+
+
+def test_stats_reports_compression_and_reset_zeroes_it():
+    from vaayu.prefix_cache import PrefixCacheStore
+    s = PrefixCacheStore(budget_bytes=10 ** 9, compress_bits=8)
+    s.store("a", [1], _bf16_cache(seq=8))
+    s.lookup("a", [1], device="cpu")
+    line = s.stats()
+    assert "compress=8b" in line and "1pack/1unpack" in line
+    s.reset_stats()
+    assert "0pack/0unpack" in s.stats()
+    # off by default -> no compression fragment at all
+    assert "compress=" not in PrefixCacheStore(budget_bytes=10 ** 9).stats()
+
+
+def test_persist_runs_before_store_compresses():
+    """kv_persist reads the cache directly; store() may compress it. If the
+    order ever flips back, the disk file silently receives packed indices."""
+    import types
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    order = []
+
+    class _Writer:
+        def enqueue_append(self, sid, cache, cfg, toks, length):
+            order.append(("persist", type(cache).__name__))
+
+    class _PC:
+        def store(self, sid, toks, cache):
+            order.append(("store", type(cache).__name__))
+
+    c = _bf16_cache(seq=4)
+    fake = types.SimpleNamespace(
+        _kv_writer=_Writer(), config=None,
+        telemetry=types.SimpleNamespace(dump_json=lambda p: None))
+    VaayuBaseModel._persist_and_store(fake, _PC(), "sess", c, [1, 2, 3, 4, 5])
+    assert [o[0] for o in order] == ["persist", "store"]
