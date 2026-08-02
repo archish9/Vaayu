@@ -12,17 +12,72 @@ git history._
 
 ---
 
+## ▶ START HERE — fresh session, 2026-08-02
+
+**Plan J's code is MERGED TO `main`.** Nothing is running, no branch is open, the tree is clean and
+the suite is green at **564 passed / 20 warnings**. The worktree `plan-j-pinned-roundup` and the
+throwaway `plan-j-main-baseline` have both been removed.
+
+**What Plan J delivered (all measured same-box A/B against `main`, not predicted):**
+
+| | MiniMax | Qwen |
+|---|---|---|
+| prefix pool | 4.69 → **13.38 GB** | **unchanged** (~4.7 GB) |
+| round-2 TTFT, K=3 × 7 751 tok | 338.4 → **9.6 s (35×)**, uncompressed | untested |
+| decode | 1.483 → 1.48 (**unchanged**) | 0.85, **clamp skipped so unchanged** |
+| `post-arena rss` | 21.59 → **12.91 GB** | unchanged |
+
+**The honest headline: J delivers on MiniMax and NOTHING on Qwen.** Qwen's 8.90 GB working set does
+not fit an 8 GiB clamped cache and there is no allocation size between 8 and 16 GiB, so Task 5
+correctly skips the clamp for it. Recovering Qwen's share is exactly what **Plan L** exists for.
+
+### Do these next, in order
+
+1. **Finish Plan J's Task 4** (~40 min GPU, no code changes):
+   - **Qwen confirming run.** Task 5 landed after Qwen's decode was measured, so the passing number
+     is inferred, not observed. Run `test_generate.py` on Qwen and confirm **≥ 0.85 tok/s, ~47 %
+     expert-cache hit, and NO `working set ... exceeds cache budget` warning**. If that warning
+     still appears, Task 5 is not doing its job and everything below is premature.
+   - **K-cliff sweep.** `test_multiturn.py`, MiniMax, Plan I's config (`MAX_LENGTH=16384`,
+     `range(160)` → prompt_len 7751, `PREFIX_COMPRESS=None`), raising `K_SESSIONS` from 4 until the
+     gate exits non-zero. **Record the first failing K** — that number is the deliverable for the
+     fan-out workload. Then repeat the last two K values with `PREFIX_COMPRESS=9`.
+   - **Write `docs/superpowers/plans/2026-08-03-pinned-allocation-roundup-RESULTS.md`.**
+   - Commands for all of the above: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`
+     (verified against the shipped code; note its `max_seq_len` warning is **retracted** — see F4).
+2. **Then Plan L** — its evidence checklist (E1-E5) is below. **Gather evidence before writing the
+   plan doc.**
+
+### Where the evidence lives
+
+`~/vaayu-evidence/2026-08-03-pinned-roundup/` — every log behind the numbers above:
+`gen-{minimax,qwen}-after.log` (branch, pre-Task-5), `gen-{minimax,qwen}-MAIN-baseline.log`
+(main, same box), `multiturn-K3-MAIN-baseline.log` (0/3 HIT, exit 1),
+`multiturn-K3-BRANCH.log` (3/3 HIT, exit 0), `var-{main,branch}-{1,2,3}.log` (the variance runs).
+Note the multiturn logs are 300-550 MB each — always `grep`, never `cat`.
+
+### Method notes that cost real time to learn
+
+- **Always A/B against a same-box baseline run the same day.** A cross-session decode floor sent one
+  investigation down a wrong path for an hour. A baseline load costs ~12 min.
+- **n=1 decode comparisons cannot resolve <~4 % on this box.** Repeat, alternating arms.
+- **A VRAM OOM does not present as an OOM** — it surfaces as
+  `MiniMaxM2DecoderLayer.forward() missing 1 required positional argument: 'position_embeddings'`,
+  ~30 frames away. See the open bug below before debugging any such TypeError.
+
+---
+
 ## Execution sequence — read this first
 
-**Plan J is in progress** (code complete on branch `worktree-plan-j-pinned-roundup`, on-device gates
-partly measured). Otherwise execute strictly top to bottom. Each row's plan doc is self-contained;
+**Plan J's code is merged to `main`; its Task 4 write-up is the only thing left on it.**
+Otherwise execute strictly top to bottom. Each row's plan doc is self-contained;
 do not start a row until the one above it is `[x]` and its RESULTS doc exists — **except L, whose
 first step is evidence-gathering and can begin as soon as J's RESULTS lands.**
 
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
-| **1** | **J — pinned-allocation round-up** | P1 | `[~]` in progress | — | Tasks 1, 2, 5 + fix waves landed; Task 3 **PASSED both models**; Task 4 partly measured. **Delivers on MiniMax only** — pool 4.69 → 13.38 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed). Qwen gets **nothing**: its 8.90 GB working set does not fit the 8 GiB clamped cache, so Task 5 correctly skips the clamp for it. Last open question is MiniMax decode (−2.7 %, under variance measurement). |
-| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[ ]` **evidence first, then plan** | J landing | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence before writing the plan.** |
+| **1** | **J — pinned-allocation round-up** | P1 | `[~]` **code MERGED; Task 4 write-up open** | — | Code, tests and both fix waves are on `main`. Decode gates PASS on both models. **Delivers on MiniMax only** — pool 4.69 → 13.38 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Remaining: Qwen confirming run, K-cliff sweep, RESULTS doc. See **START HERE**. |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[ ]` **evidence first, then plan** | J's RESULTS doc | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence before writing the plan.** |
 | **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing hard; run after J | J changes free RAM, not free VRAM, so K is not *blocked* — but J is cheaper, more certain, and touches the same allocation code. Do it after J so K's sweep runs against a settled memory layout. |
 | **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **J**, and now **L** | Hard dependency. ~8 GiB of the arena's footprint is allocator round-up, so rebalancing the expert-cache/prefix-pool split before J measures an imaginary scarcity. **After J the answer differs per model** — MiniMax's pool is 13.38 GB and almost certainly no longer binding, Qwen's is unchanged at ~4.7 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
@@ -44,7 +99,7 @@ that is the system working.
 
 ---
 
-## Plan J — pinned-allocation round-up  **(P1 — do first)**
+## Plan J — pinned-allocation round-up  **(code merged; write-up open)**
 
 `docs/superpowers/plans/2026-08-03-pinned-allocation-roundup.md` — self-contained, no prior context
 needed. From the 2026-08-03 misplaced-feature audit, finding F0.
@@ -115,10 +170,16 @@ charged exactly.
     `WARNING: working set 8.90GB exceeds cache budget 8.49GB — decode will thrash`. Cause: the
     clamp cut the budget 9.13 → 8.49 GB across Qwen's 8.90 GB working set. Task 5 skips the clamp
     for this geometry. **Needs a confirming run: expect ~0.85 and no thrash warning.**
-  - [~] **Decode, MiniMax: −2.7 %, unresolved.** main **1.48** vs branch **1.44** (floor 1.47),
-    expert-cache hit 6 % → 4 %. Task 5 does *not* change this — MiniMax's 4.40 GB working set still
-    fits the clamped cache, so it still clamps and still loses 68 slabs. Both arms are n=1;
-    **3 runs per arm alternating are in flight** to separate a real −2.7 % from run-to-run noise.
+  - [x] **Decode, MiniMax: PASSES — the −2.7 % was noise.** A single pair (main 1.48 / branch 1.44)
+    suggested a regression; alternating repeat runs refuted it:
+    | | run 1 | run 2 | run 3 | mean |
+    |---|---|---|---|---|
+    | main | 1.47 | 1.50 | 1.48 | **1.483** |
+    | branch | 1.51 | 1.45 | *(cut short)* | **1.48** |
+    Branch run 1 (1.51) beats every main run and the arms overlap completely, so 1.44 was the low
+    end of ordinary variance. Expert-cache hit rate is stably **6 % → 4 %** — the cache really does
+    shrink, it just does not move decode on this geometry. **Lesson worth keeping: n=1 decode
+    comparisons on this box cannot resolve differences below ~4 %.**
   - [ ] K-cliff sweep (raise `K_SESSIONS` until the gate fails; record the first failing K).
   - [ ] RESULTS doc. Must state plainly that **J delivers on MiniMax and not on Qwen**, and note
     that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up — post-clamp any
