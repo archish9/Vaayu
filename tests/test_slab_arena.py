@@ -618,3 +618,17 @@ def test_clamp_still_applies_when_the_working_set_fits_neither_way():
 def test_working_set_defaults_to_zero_and_changes_nothing():
     for geo in (_GEO_QWEN, _GEO_MINIMAX):
         assert clamp_slab_count(**geo) == clamp_slab_count(**geo, working_set_bytes=0)
+
+
+def test_boundaries_of_the_working_set_floor():
+    # The three tests above all sit at comfortable margins, so a `<=`/`<` swap at
+    # either edge of the rule (clamped_cache_bytes < working_set_bytes <=
+    # unclamped_cache_bytes) would still pass them. Pin both edges exactly,
+    # computed from the fixture rather than literals.
+    slab, pool = _GEO_QWEN["slab_bytes"], _GEO_QWEN["pool_size"]
+    clamped_cache = (clamp_slab_count(**_GEO_QWEN) - pool) * slab
+    unclamped_cache = (unclamped_slab_count(**_GEO_QWEN) - pool) * slab
+    # exactly covered after clamping -> still clamp
+    assert clamp_slab_count(**_GEO_QWEN, working_set_bytes=clamped_cache) == clamp_slab_count(**_GEO_QWEN)
+    # exactly covered only before clamping -> skip
+    assert clamp_slab_count(**_GEO_QWEN, working_set_bytes=unclamped_cache) == unclamped_slab_count(**_GEO_QWEN)

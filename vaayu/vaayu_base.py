@@ -1443,7 +1443,12 @@ class VaayuBaseModel(GenerationMixin):
                         self._expert_slab_arena = None
                 if self._expert_slab_arena is not None:
                     _clamp_note = ""
-                    if _pin and _n_slabs < _unclamped_n:
+                    # Key off the arena's ACTUAL pin state, not the `_pin` intent:
+                    # after a pinned-alloc RuntimeError the retry is pageable but
+                    # `_pin` stays True, and either note below would otherwise
+                    # misreport why the count is unclamped (Task 5 review Finding 1).
+                    _was_pinned = self._expert_slab_arena.pin
+                    if _was_pinned and _n_slabs < _unclamped_n:
                         _charged_bytes = next_pow2_at_least(_unclamped_n * _slab_bytes)
                         _freed_bytes = _charged_bytes - next_pow2_at_least(_n_slabs * _slab_bytes)
                         _clamp_note = (
@@ -1452,7 +1457,7 @@ class VaayuBaseModel(GenerationMixin):
                             f"so the pinned backing store is a power of two; the "
                             f"allocator would have charged {_charged_bytes / 1e9:.2f}GB"
                             f"; frees {_freed_bytes / 1e9:.2f}GB")
-                    elif _pin and _n_slabs == _unclamped_n and _raw_clamped_n < _unclamped_n:
+                    elif _was_pinned and _n_slabs == _unclamped_n and _raw_clamped_n < _unclamped_n:
                         _clamp_note = (
                             f" — clamp skipped: clamping to {_raw_clamped_n} slabs would "
                             f"cut the cache below the {_geo['working_set_bytes'] / 1e9:.2f}GB "
