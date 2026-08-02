@@ -172,7 +172,8 @@ def unclamped_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> 
     return max(1, int(budget_bytes) // int(slab_bytes)) + int(pool_size)
 
 
-def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
+def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
+                      working_set_bytes: int = 0) -> int:
     """Slab count whose pinned backing store is a power of two.
 
     The backing store is ONE pinned allocation, and the caching host allocator
@@ -185,13 +186,31 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
     No-op when the unclamped backing size is already an exact power of two — which
     is exactly the case where the allocator was not over-charging. Never returns
     fewer than `pool_size` slabs: the loader's landing zone survives any clamp.
+
+    `working_set_bytes` (default 0, a true no-op) floors the clamp at the model's
+    working set: measured on-device, the clamp cut Qwen3-235B's cache budget from
+    9.13 GB to 8.49 GB and crossed its 8.90 GB working-set boundary, costing 48% of
+    decode throughput (MiniMax's 4.40 GB working set was nowhere near either
+    boundary, so it clamped for free). Clamp only when the clamped cache still
+    covers the working set; when the clamped cache would NOT cover it but the
+    unclamped one does, skip the clamp — a fitting model must not be made to
+    thrash. When the working set fits neither way it thrashes regardless, so take
+    the RAM and clamp anyway.
     """
     from .persist.safetensor_model_persister import largest_pow2_at_most
     slab_bytes = int(slab_bytes)
     pool_size = int(pool_size)
+    working_set_bytes = int(working_set_bytes)
     n = unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
     max_backing = largest_pow2_at_most(n * slab_bytes)
-    return max(pool_size, max_backing // slab_bytes)
+    n_clamped = max(pool_size, max_backing // slab_bytes)
+    # Compare CACHE bytes only (exclude the pool_size staging addend), matching
+    # what the cache actually gets (Task 1 Step 7).
+    unclamped_cache_bytes = max(0, n - pool_size) * slab_bytes
+    clamped_cache_bytes = max(0, n_clamped - pool_size) * slab_bytes
+    if clamped_cache_bytes < working_set_bytes <= unclamped_cache_bytes:
+        return n
+    return n_clamped
 
 
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
@@ -1398,8 +1417,17 @@ class VaayuBaseModel(GenerationMixin):
                 # allocator, i.e. pinned memory only — a pageable arena pays
                 # no round-up, so clamping it would only cost cache for zero
                 # RAM freed. Only clamp when we are actually about to pin.
+                # working_set_bytes floors the clamp: if clamping would push the
+                # cache below the model's working set while the unclamped budget
+                # still covers it, skip the clamp (Task 5 — Qwen measured 0.43
+                # tok/s against a 0.82 floor, -48%, when clamped to 8.49GB against
+                # an 8.90GB working set that the unclamped 9.13GB budget covered).
+                _raw_clamped_n = (clamp_slab_count(
+                                      _expert_budget, _slab_bytes, get_expert_pool_size())
+                                  if _pin else _unclamped_n)
                 _n_slabs = (clamp_slab_count(
-                                _expert_budget, _slab_bytes, get_expert_pool_size())
+                                _expert_budget, _slab_bytes, get_expert_pool_size(),
+                                working_set_bytes=_geo["working_set_bytes"])
                             if _pin else _unclamped_n)
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
@@ -1424,6 +1452,11 @@ class VaayuBaseModel(GenerationMixin):
                             f"so the pinned backing store is a power of two; the "
                             f"allocator would have charged {_charged_bytes / 1e9:.2f}GB"
                             f"; frees {_freed_bytes / 1e9:.2f}GB")
+                    elif _pin and _n_slabs == _unclamped_n and _raw_clamped_n < _unclamped_n:
+                        _clamp_note = (
+                            f" — clamp skipped: clamping to {_raw_clamped_n} slabs would "
+                            f"cut the cache below the {_geo['working_set_bytes'] / 1e9:.2f}GB "
+                            f"working set, so the unclamped (allocator-rounded) size was kept instead")
                     print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
                           f"{_slab_bytes / 1e6:.1f}MB "
                           f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "

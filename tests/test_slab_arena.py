@@ -577,3 +577,44 @@ def test_freed_bytes_close_to_naive_figure_at_real_geometries(geo):
     exact_freed = charged_bytes - next_pow2_at_least(n_slabs * geo["slab_bytes"])
     assert exact_freed <= naive_freed
     assert naive_freed - exact_freed < geo["slab_bytes"]
+
+
+# ── Task 5: floor the clamp at the model's working set ─────────────────────
+#
+# Task 4's on-device gate FAILED on Qwen: 0.43 tok/s against a 0.82 floor (-48%),
+# with the engine's own WARNING that the clamped 8.49 GB cache budget no longer
+# covers Qwen's 8.90 GB working set (the unclamped 9.13 GB budget did, by 0.23 GB).
+# MiniMax's 4.40 GB working set is nowhere near either boundary, which is why it
+# passed. The clamp must not fire when doing so would convert a fitting model
+# into a thrashing one -- only when the clamped cache still covers the working
+# set, or the working set doesn't fit either way (thrashes regardless, so the
+# RAM is worth more).
+
+_WS_QWEN = 8.90 * 1e9        # measured working_set_bytes, Qwen3-235B (log line)
+_WS_MINIMAX = 4.40 * 1e9     # measured working_set_bytes, MiniMax-M2.7 (log line)
+
+
+def test_clamp_is_skipped_when_it_would_break_a_fitting_working_set():
+    # Qwen: unclamped cache 9.13 GB fits the 8.90 GB working set; clamped 8.49 GB does not.
+    # Clamping here costs 48% of decode, so it must not happen.
+    n = clamp_slab_count(**_GEO_QWEN, working_set_bytes=_WS_QWEN)
+    assert n == unclamped_slab_count(**_GEO_QWEN)
+
+
+def test_clamp_still_applies_when_the_working_set_fits_after_clamping():
+    # MiniMax: 4.40 GB working set fits inside the clamped cache, so the win is free.
+    n = clamp_slab_count(**_GEO_MINIMAX, working_set_bytes=_WS_MINIMAX)
+    assert n == clamp_slab_count(**_GEO_MINIMAX)
+    assert n < unclamped_slab_count(**_GEO_MINIMAX)
+
+
+def test_clamp_still_applies_when_the_working_set_fits_neither_way():
+    # A working set larger than even the unclamped cache thrashes either way; take the RAM.
+    huge = 50 * 1e9
+    n = clamp_slab_count(**_GEO_QWEN, working_set_bytes=huge)
+    assert n == clamp_slab_count(**_GEO_QWEN)
+
+
+def test_working_set_defaults_to_zero_and_changes_nothing():
+    for geo in (_GEO_QWEN, _GEO_MINIMAX):
+        assert clamp_slab_count(**geo) == clamp_slab_count(**geo, working_set_bytes=0)
