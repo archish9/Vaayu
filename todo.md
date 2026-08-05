@@ -12,41 +12,39 @@ git history._
 
 ---
 
-## ▶ START HERE — fresh session, 2026-08-02
+## ▶ START HERE — fresh session, 2026-08-05
 
-**Plan J's code is MERGED TO `main`.** Nothing is running, no branch is open, the tree is clean and
-the suite is green at **564 passed / 20 warnings**. The worktree `plan-j-pinned-roundup` and the
-throwaway `plan-j-main-baseline` have both been removed.
+**Plan J is CLOSED.** Code, tests and all four parked review bugs are on `main`; tree clean apart
+from the untracked `command` scratch file; suite **576 passed / 20 warnings**. No worktree open,
+nothing running.
 
 **What Plan J delivered (all measured same-box A/B against `main`, not predicted):**
 
 | | MiniMax | Qwen |
 |---|---|---|
-| prefix pool | 4.69 → **13.38 GB** | **unchanged** (~4.7 GB) |
-| round-2 TTFT, K=3 × 7 751 tok | 338.4 → **9.6 s (35×)**, uncompressed | untested |
-| decode | 1.483 → 1.48 (**unchanged**) | 0.85, **clamp skipped so unchanged** |
-| `post-arena rss` | 21.59 → **12.91 GB** | unchanged |
+| prefix pool | 4.69 → **13.4 GB** | 4.96 GB — **unchanged** |
+| round-2 TTFT, K=3 × 7 751 tok | 338.4 → **9.6 s (35×)**, uncompressed | n/a — pool unchanged |
+| decode | 1.483 → 1.48 (**unchanged**) | 0.85 → **0.86**, 47 % hit, clamp skipped |
+| `post-arena rss` | 21.59 → **12.91 GB** | 21.08 GB — **unchanged** |
+| fan-out capacity | **K_max = floor(pool / 1.968 GB)**; first failing K = **7** | unchanged |
 
 **The honest headline: J delivers on MiniMax and NOTHING on Qwen.** Qwen's 8.90 GB working set does
 not fit an 8 GiB clamped cache and there is no allocation size between 8 and 16 GiB, so Task 5
 correctly skips the clamp for it. Recovering Qwen's share is exactly what **Plan L** exists for.
 
-### Do these next, in order
+**Two results from the K sweep that outlive Plan J:**
+- **Never quote a bare K.** The pool budget is `free RAM at load − 3.76 GB reserve` and measured
+  **11.49 / 12.16 / 12.87 / 13.70 / 13.76 GB across five loads.** Capacity is the rule, not the
+  integer; the same box cliffs at a different K on a different day.
+- **Overshooting capacity costs EVERYTHING, not a share.** K=7 gave **0** hits, not the 5 the pool
+  could still hold — round 1's re-stores cascade-evict. 9.8 s → 352 s. Provisioning the pool to
+  exactly the expected session count is provisioning it to fail.
 
-1. **Finish Plan J's Task 4** (~40 min GPU, no code changes):
-   - **Qwen confirming run.** Task 5 landed after Qwen's decode was measured, so the passing number
-     is inferred, not observed. Run `test_generate.py` on Qwen and confirm **≥ 0.85 tok/s, ~47 %
-     expert-cache hit, and NO `working set ... exceeds cache budget` warning**. If that warning
-     still appears, Task 5 is not doing its job and everything below is premature.
-   - **K-cliff sweep.** `test_multiturn.py`, MiniMax, Plan I's config (`MAX_LENGTH=16384`,
-     `range(160)` → prompt_len 7751, `PREFIX_COMPRESS=None`), raising `K_SESSIONS` from 4 until the
-     gate exits non-zero. **Record the first failing K** — that number is the deliverable for the
-     fan-out workload. Then repeat the last two K values with `PREFIX_COMPRESS=9`.
-   - **Write `docs/superpowers/plans/2026-08-03-pinned-allocation-roundup-RESULTS.md`.**
-   - Commands for all of the above: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`
-     (verified against the shipped code; note its `max_seq_len` warning is **retracted** — see F4).
-2. **Then Plan L** — its evidence checklist (E1-E5) is below. **Gather evidence before writing the
-   plan doc.**
+### Do this next
+
+**Plan L — gather evidence E1-E5 (below), THEN write the plan.** Do not start from J's §3 sketch;
+one of its claims is already known shaky (see E4). E1 is a fresh-process pinned-allocation probe
+and needs the box quiet — it allocates 9-16 GB pinned, so nothing else may be running.
 
 ### Where the evidence lives
 
@@ -69,17 +67,15 @@ Note the multiturn logs are 300-550 MB each — always `grep`, never `cat`.
 
 ## Execution sequence — read this first
 
-**Plan J's code is merged to `main`; its Task 4 write-up is the only thing left on it.**
-Otherwise execute strictly top to bottom. Each row's plan doc is self-contained;
-do not start a row until the one above it is `[x]` and its RESULTS doc exists — **except L, whose
-first step is evidence-gathering and can begin as soon as J's RESULTS lands.**
+**Plan J is closed; L is the live row.** Execute strictly top to bottom. Each row's plan doc is
+self-contained; do not start a row until the one above it is `[x]` and its RESULTS doc exists.
 
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
-| **1** | **J — pinned-allocation round-up** | P1 | `[~]` **code MERGED; Task 4 write-up open** | — | Code, tests and both fix waves are on `main`. Decode gates PASS on both models. **Delivers on MiniMax only** — pool 4.69 → 13.38 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Remaining: Qwen confirming run, K-cliff sweep, RESULTS doc. See **START HERE**. |
-| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[ ]` **evidence first, then plan** | J's RESULTS doc | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence before writing the plan.** |
-| **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing hard; run after J | J changes free RAM, not free VRAM, so K is not *blocked* — but J is cheaper, more certain, and touches the same allocation code. Do it after J so K's sweep runs against a settled memory layout. |
-| **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **J**, and now **L** | Hard dependency. ~8 GiB of the arena's footprint is allocator round-up, so rebalancing the expert-cache/prefix-pool split before J measures an imaginary scarcity. **After J the answer differs per model** — MiniMax's pool is 13.38 GB and almost certainly no longer binding, Qwen's is unchanged at ~4.7 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
+| **1** | **J — pinned-allocation round-up** | P1 | `[x]` **CLOSED 2026-08-05** | — | Code, tests, both fix waves and all four parked bugs are on `main`; suite **576**. **Delivers on MiniMax only** — pool 4.69 → 13.4 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed, no quantization). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Fan-out deliverable: **K_max = floor(pool / per-session KV)**, first failing K = 7 uncompressed, and 9-bit compression clears it (7/7). RESULTS: `2026-08-03-pinned-allocation-roundup-RESULTS.md`. |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **NEXT — gather evidence, then plan** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence (E1-E5) before writing the plan.** |
+| **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing — J is closed | J changed free RAM, not free VRAM, so K was never *blocked* — it waited so its sweep would run against a settled memory layout. That layout is now settled. |
+| **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **L** (J satisfied) | ~8 GiB of the arena's footprint was allocator round-up, so rebalancing the expert-cache/prefix-pool split before J would have measured an imaginary scarcity. **The answer now differs per model** — MiniMax's pool is 13.4 GB and almost certainly no longer binding, Qwen's is unchanged at 4.96 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
 **Dependency rules that outlive this queue:**
 
@@ -99,7 +95,7 @@ that is the system working.
 
 ---
 
-## Plan J — pinned-allocation round-up  **(code merged; write-up open)**
+## Plan J — pinned-allocation round-up  **(CLOSED 2026-08-05)**
 
 `docs/superpowers/plans/2026-08-03-pinned-allocation-roundup.md` — self-contained, no prior context
 needed. From the 2026-08-03 misplaced-feature audit, finding F0.
@@ -159,7 +155,7 @@ charged exactly.
   | H2D | **19.8 GB/s pinned** | **19.8 GB/s pinned** |
   0 OOM in both. *(These are pre-Task-5 numbers: with Task 5, Qwen no longer clamps, so Qwen's
   column reverts to main's values. Re-measure Qwen for the RESULTS doc.)*
-- [~] **Task 4** — on-device gate + RESULTS. Measured so far, all same-box A/B against `main`:
+- [x] **Task 4** — on-device gate + RESULTS. **COMPLETE 2026-08-05.** All same-box A/B against `main`:
   - **Pool gate, MiniMax: PASSES.** `test_multiturn.py` K=3 × 7 751 tok, Plan I's exact config.
     main **0/3 HIT, exit 1**; branch **3/3 HIT, exit 0**, round-2 TTFT **338.4 → 9.6 s (35×)**,
     peak rss 26.46 → 20.72 GB, 0 OOM. **Achieved with `PREFIX_COMPRESS=None`** — Plan I needed
@@ -218,10 +214,23 @@ charged exactly.
       the rest, so every one of the 7 misses and round-2 TTFT stays at the cold 352 s. This is
       Plan I's **"capacity is a cliff, not a slope"** reproduced exactly — one session past capacity
       does not cost 1/7th of the win, it costs all of it (9.8 s → 352 s, **36×**).
-  - [ ] RESULTS doc. Must state plainly that **J delivers on MiniMax and not on Qwen**, and note
-    that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up — post-clamp any
-    budget in [8 GiB, 16 GiB) yields the same 8 GiB resident arena, so the ceiling is now nearly
-    inert in that range.
+  - [x] **9-bit compressed repeat at K=7 — PASSES**, clearing the cliff it had just hit:
+    | K | compress | pool | HIT | round-2 TTFT | peak rss | exit |
+    |---|---|---|---|---|---|---|
+    | 7 | none | 11.49 GB | **0/7** | 352 → 352 s | 26.99 GB | 1 |
+    | 7 | **9-bit** | 12.87 GB | **7/7** | 354 → **10.4 s** | **22.57 GB** | 0 |
+    Per-session pooled KV 2.03 → **~1.12 GB** (0.55× bf16, matching the ~0.56× 9 bits predicts),
+    peak rss −4.42 GB at equal K, cost **~0.7 s of TTFT** unpacking at restore. **K=6-compressed
+    was deliberately skipped** (user call): K=7 carries the result since it is the K that failed
+    uncompressed, and K=6 would have been a ~50 min confirmation of an implied pass. **The
+    compressed cliff was therefore NOT located** — above 7, predicted near 11 by arithmetic only.
+    Label it as arithmetic wherever quoted.
+  - [x] **RESULTS doc written**: `docs/superpowers/plans/2026-08-03-pinned-allocation-roundup-RESULTS.md`
+    (docs/ is gitignored, so it lives on disk only, as every prior RESULTS doc does).
+  - [x] Zero-OOM sweep across all five runs of this session: clean, no host OOM-kill. The 296
+    `out of memory` hits in `multiturn-K3-nocompress.log` are the **Aug-2 aborted run** at ~8.2k
+    context (the documented VRAM cliff), not part of this sweep.
+  - [x] Harness scaffolding reverted (`git checkout test_multiturn.py`).
   Runbook: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`.
 
 **Pending bugs / parked findings from Plan J review — ALL FOUR FIXED 2026-08-05.**
@@ -383,6 +392,18 @@ acceptable outcome** — Plans F, G and H all ended in refutation and cost far m
 
 Recorded so the same ground is not re-measured. Each cost a full plan or probe to establish.
 
+- **The prefix pool budget is NOT a constant of this box.** It is `free RAM at load − 3.76 GB
+  reserve`, and free RAM at load varies with whatever ran before: measured **11.49 / 12.16 / 12.87 /
+  13.70 / 13.76 GB across five loads of the same model on the same day.** Never quote a session
+  capacity as a bare integer — quote **K_max = floor(pool_budget / per-session KV)** and the pool it
+  was measured at. (Plan J Task 4, 2026-08-05)
+- **Exceeding prefix-pool capacity costs the ENTIRE win, not a proportional share.** At K=7 against
+  a pool holding 5-6, the result was **0 hits — not 5** — because round 1's re-stores cascade-evict
+  the entries round 0 left. Round-2 TTFT stayed at the cold 352 s vs 9.8 s at K=6 (**36×**). This is
+  Plan I's "capacity is a cliff, not a slope" reproduced on a different mechanism (pool budget
+  rather than compression). **Provisioning the pool to exactly the expected concurrency is
+  provisioning it to fail.** 9-bit compression clears the cliff at the same K (7/7, TTFT 10.4 s,
+  peak rss −4.4 GB) for ~0.7 s of unpack on the hit path. (Plan J Task 4, 2026-08-05)
 - **No expert pin is viable.** Eviction share is linear in N and always 2–4× below the pin's share
   of the cache, on both models (Plan F, 2026-08-02, whole curve measured).
 - **The expert VRAM cache is NOT emptied every prefill, and preserving it would not help anyway.**
