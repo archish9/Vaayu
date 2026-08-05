@@ -37,10 +37,15 @@ class _FakeCache:
 
 # Both on-device geometries, as per-session pooled-KV bytes at the 7 751-token
 # shape Plan J measured. TEST FIXTURES describing real models, not production
-# constants (CLAUDE.md §5). MiniMax: 62 layers x 2 x 8 kv-heads x 128 head_dim x
-# 2 B = 0.254 MB/token. Qwen is the larger-KV geometry.
-_SESS_MINIMAX = 1_968_000_000
-_SESS_QWEN = 1_496_000_000
+# constants (CLAUDE.md §5). Derived as layers x 2 (K and V) x kv_heads x head_dim
+# x 2 B/elem x tokens, straight from each config.json:
+#   MiniMax-M2.7   62 layers,  8 kv-heads, head_dim 128 -> 0.254 MB/tok
+#   Qwen3-235B     94 layers,  4 kv-heads, head_dim 128 -> 0.193 MB/tok
+# Qwen is the SMALLER per-session geometry despite having half again as many
+# layers -- it has half the KV heads, and that dominates. The two differ ~32%,
+# which is why the warning must derive its capacity rather than carry a constant.
+_SESS_MINIMAX = 62 * 2 * 8 * 128 * 2 * 7751     # 1.968e9 bytes
+_SESS_QWEN = 94 * 2 * 4 * 128 * 2 * 7751        # 1.492e9 bytes
 
 
 def _warnings(capsys):
