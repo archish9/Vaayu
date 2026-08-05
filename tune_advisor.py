@@ -64,6 +64,38 @@ GB = 1e9
 MiB = 1024 ** 2   # display only, for per-session KV
 
 
+def pool_capacity(pool_bytes: float, per_session_bytes: float) -> int:
+    """Whole sessions the pool holds. Floor, never negative.
+
+    This is the number the whole script turns on, and it is where the units bug
+    lived: `pool_bytes` must be DECIMAL bytes, matching the engine's own
+    `X.XX GB budget` startup line, or the count comes out one too high near a
+    boundary. Overshooting costs 100% of the reuse, not a share (Plan J Task 4).
+    """
+    if per_session_bytes <= 0:
+        return 0
+    return max(0, int(pool_bytes // per_session_bytes))
+
+
+def recommend_compress_bits(pool_bytes: float, per_sess_bf16: float,
+                            per_sess_comp: float, k_sessions: int,
+                            compress_bits: int) -> int | None:
+    """The `prefix_compress=` value to recommend, or None for uncompressed.
+
+    None when a single session is live (the pool always keeps one entry
+    regardless of budget, so it is cached already and compression is pure cost),
+    or when every session fits uncompressed (compression would add per-turn work
+    and buy nothing). Otherwise the compressed width — including the case where
+    even compressed does not fit, since it still widens the range and the caller
+    reports the shortfall separately.
+    """
+    if k_sessions < 2:
+        return None
+    if k_sessions * per_sess_bf16 <= pool_bytes:
+        return None
+    return compress_bits
+
+
 def main() -> int:
     import psutil
     from transformers import AutoConfig
@@ -128,13 +160,15 @@ def main() -> int:
     print(f"KV for all {K_SESSIONS:>2}    bf16 {need_bf16/MiB:8.1f} MiB   "
           f"{COMPRESS_BITS}-bit {need_comp/MiB:8.1f} MiB")
     if pool > 0:
-        print(f"Pool holds       bf16 {int(pool // max(1, per_sess_bf16)):>3} session(s)     "
-              f"{COMPRESS_BITS}-bit {int(pool // max(1, per_sess_comp)):>3} session(s)")
+        print(f"Pool holds       bf16 {pool_capacity(pool, per_sess_bf16):>3} session(s)     "
+              f"{COMPRESS_BITS}-bit {pool_capacity(pool, per_sess_comp):>3} session(s)")
         print(f"Token ceiling    bf16 {int(pool / bf16_per_tok):>7,} tok   "
               f"{COMPRESS_BITS}-bit {int(pool / comp_per_tok):>7,} tok  (summed over sessions)")
     print()
 
     # ── The recommendation ───────────────────────────────────────────────────
+    rec = recommend_compress_bits(pool, per_sess_bf16, per_sess_comp,
+                                  K_SESSIONS, COMPRESS_BITS)
     fits_bf16 = need_bf16 <= pool
     fits_comp = need_comp <= pool
     single = K_SESSIONS < 2
@@ -194,7 +228,6 @@ def main() -> int:
     print("    model = AutoModel.from_pretrained(")
     print(f"        MODEL_PATH,")
     print(f"        enable_prefix_cache=True,      # required for any of this")
-    rec = None if (single or fits_bf16) else COMPRESS_BITS
     print(f"        prefix_compress={rec},")
     print(f"        enable_kv_persist=True,        # survives restarts; costs disk only")
     print(f"        kv_cache_mode=\"auto\",          # bf16; do not use \"turboquant\"")

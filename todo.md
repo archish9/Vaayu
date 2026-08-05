@@ -295,9 +295,15 @@ of four GPU-hours sitting in a document. Both items below were built afterwards,
   reproduces all four measured points (K=3/4/6 → `None`, all PASSED; K=7 → `9`, and 7 failed
   uncompressed / passed compressed). Its "3.5–5.4 GB across six runs" guidance was pre-Plan-J and
   understated MiniMax ~2.5×.
-- [ ] **No regression guard on `tune_advisor.py`.** It is a standalone script with no tests, and the
-  unit bug above would have been caught by one. A test pinning the four measured points against its
-  recommendations is the obvious guard. Not built — flagged rather than dropped.
+- [x] **Regression guard on `tune_advisor.py`** — `tests/test_tune_advisor.py`, 16 tests.
+  Extracted `pool_capacity()` and `recommend_compress_bits()` from the print-entangled `main()`
+  (the same extract-don't-mirror move that fixed parked finding 3), so the tests exercise the
+  production path; `main()` now calls both, and its end-to-end output is unchanged. The guard pins
+  **all four on-device points from Task 4** (K=3/13.76, K=4/13.70, K=6/12.16 → `None`, all of which
+  PASSED uncompressed; K=7/11.49 → `9`, which FAILED uncompressed and PASSED compressed), the
+  `GB == 1e9` convention, per-session size derived from geometry rather than pasted, and capacity
+  across every measured budget including Qwen's 4.96 GB. **Verified it fails under the bug it
+  guards**: reinstating `GB = 1024 ** 3` fails 5 of the 16. Suite 586 → **602**, warnings flat.
 
 ## Plan L — chunked slab-arena backing (Option B)  **(P1 — evidence, THEN plan)**
 
