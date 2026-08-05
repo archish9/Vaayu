@@ -213,6 +213,33 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
     return n_clamped
 
 
+def arena_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
+                     working_set_bytes: int = 0, *, pin: bool) -> int:
+    """Slab count for the arena as it will actually be allocated.
+
+    Power-of-two charging is a property of the caching HOST allocator, i.e.
+    pinned memory only: a pageable arena pays no round-up, so clamping it would
+    cost cache for zero RAM freed. Clamp only when we are actually about to pin;
+    `working_set_bytes` is inert on the pageable path for the same reason (it
+    exists solely to floor the clamp).
+    """
+    if not pin:
+        return unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
+    return clamp_slab_count(budget_bytes, slab_bytes, pool_size, working_set_bytes)
+
+
+def cache_budget_for_arena(n_slabs: int, slab_bytes: int, pool_size: int) -> int:
+    """Bytes the expert RAM cache may charge against an arena of `n_slabs`.
+
+    Excludes the `pool_size` in-flight staging addend: those slabs are the
+    loader's landing zone and must stay permanently free, not be handed to the
+    cache as usable budget (see `unclamped_slab_count`). Returns 0 for an arena
+    with nothing beyond that reserve — the caller must WARN there rather than
+    disable the cache silently (CLAUDE.md §5).
+    """
+    return max(0, int(n_slabs) - int(pool_size)) * int(slab_bytes)
+
+
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
 # Property of the 16 GB box, NOT the model (§5). Sizes the cache = free_vram - this.
 #
@@ -1422,13 +1449,11 @@ class VaayuBaseModel(GenerationMixin):
                 # still covers it, skip the clamp (Task 5 — Qwen measured 0.43
                 # tok/s against a 0.82 floor, -48%, when clamped to 8.49GB against
                 # an 8.90GB working set that the unclamped 9.13GB budget covered).
-                _raw_clamped_n = (clamp_slab_count(
-                                      _expert_budget, _slab_bytes, get_expert_pool_size())
-                                  if _pin else _unclamped_n)
-                _n_slabs = (clamp_slab_count(
-                                _expert_budget, _slab_bytes, get_expert_pool_size(),
-                                working_set_bytes=_geo["working_set_bytes"])
-                            if _pin else _unclamped_n)
+                _raw_clamped_n = arena_slab_count(
+                    _expert_budget, _slab_bytes, get_expert_pool_size(), pin=_pin)
+                _n_slabs = arena_slab_count(
+                    _expert_budget, _slab_bytes, get_expert_pool_size(),
+                    working_set_bytes=_geo["working_set_bytes"], pin=_pin)
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
@@ -1471,18 +1496,31 @@ class VaayuBaseModel(GenerationMixin):
                           f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
                           f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
             if self._expert_slab_arena is not None:
-                # Exclude the pool_size in-flight staging addend: those slabs are
-                # the loader's landing zone and must stay permanently free, not
-                # be handed to the cache as usable budget (see
-                # unclamped_slab_count's docstring / the arena comment above).
-                _arena_bytes = max(0, self._expert_slab_arena.n_slabs - get_expert_pool_size()) \
-                               * self._expert_slab_arena.slab_bytes
+                _arena_bytes = cache_budget_for_arena(
+                    self._expert_slab_arena.n_slabs,
+                    self._expert_slab_arena.slab_bytes,
+                    get_expert_pool_size())
                 if _arena_bytes < _expert_budget:
+                    # The trim fires whenever the arena's CACHE share is smaller
+                    # than the requested budget — which includes the unclamped
+                    # case, where the staging addend alone accounts for the gap.
+                    # Do not call the arena "clamped" here: it often is not, and
+                    # a skipped clamp prints its own notice two lines above.
                     print(f"[Vaayu-MoE] Expert RAM cache budget trimmed "
                           f"{_expert_budget / 1e9:.2f} -> {_arena_bytes / 1e9:.2f} GB "
-                          f"to match the clamped slab arena (the arena, not the budget, "
-                          f"is what binds)")
+                          f"to match the slab arena's cache share (the arena, not "
+                          f"the budget, is what binds)")
                     _expert_budget = _arena_bytes
+                if _expert_budget <= 0:
+                    # A real hardware limit, not a bug to hide (CLAUDE.md §5).
+                    # put_slab handles a 0 budget safely, so the failure is
+                    # silent otherwise: every expert streams from disk per token.
+                    print(f"[Vaayu-MoE] WARNING: Expert RAM cache DISABLED — the "
+                          f"{self._expert_slab_arena.n_slabs}-slab arena has nothing "
+                          f"beyond the {get_expert_pool_size()} in-flight staging slabs "
+                          f"the loader must keep free, so the cache gets 0 bytes. Every "
+                          f"expert streams from disk on every token; expect very slow "
+                          f"decode (a real hardware limit on this box, not a bug).")
             self._expert_cache = ExpertRAMCache(
                 _expert_budget, max_per_layer=_max_per_layer,
                 arena=self._expert_slab_arena,

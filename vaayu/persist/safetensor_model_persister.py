@@ -467,7 +467,14 @@ def load_non_expert_tensors(
             _BUF_IDX = 1 - _BUF_IDX
 
         if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < aligned_length:
-            alloc_size = aligned_length + (4 * 1024 * 1024)
+            # Same policy as pinned_alloc_size: ask for the power of two the
+            # caching host allocator charges anyway, so the whole block is
+            # usable. No O_DIRECT slack on top — unlike the expert path's
+            # total_size, aligned_length is already _align_up(read_len +
+            # prefix_pad), i.e. exactly what io_uring writes below. The old
+            # `+ 4 MiB` pad bought dead surplus and left these shared
+            # _PINNED_SIZES slots sized by two different policies.
+            alloc_size = next_pow2_at_least(aligned_length)
             _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
             _PINNED_SIZES[buf_idx] = alloc_size
             print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB (non-expert)")

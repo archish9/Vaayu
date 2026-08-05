@@ -101,3 +101,40 @@ def test_alloc_size_exact_values():
     # Boundary: total_size itself already an exact power of two must still
     # step up one block, since the +2*_ALIGN slack pushes past the boundary.
     assert pinned_alloc_size(128 * 1024 ** 2) == 256 * 1024 ** 2
+
+
+# ── load_non_expert_tensors shares these slots and must share the policy ─────
+#
+# Both staging sites write into the same `_PINNED_BUFS` / `_PINNED_SIZES` slots.
+# The expert path sizes by `pinned_alloc_size` (power of two); the non-expert
+# path used `aligned_length + 4 MiB`, a non-power-of-two the allocator rounded up
+# anyway -- so the pad bought dead surplus and the two sites disagreed on policy
+# (Plan J review, parked finding 4). Its requirement differs from the expert
+# path's: `aligned_length` is ALREADY `_align_up(read_len + prefix_pad)`, i.e.
+# exactly the byte count io_uring writes, so it needs no O_DIRECT slack on top --
+# only the power-of-two round-up that is being charged regardless.
+
+@pytest.mark.parametrize("aligned_length", [
+    _ALIGN,                    # single-block group
+    100 * 1024 ** 2,           # small non-expert group
+    1_229_000_000,             # MiniMax-like non-expert span
+    1_500_000_000,             # Qwen-like non-expert span
+])
+def test_non_expert_alloc_covers_the_read_and_is_a_power_of_two(aligned_length):
+    alloc = next_pow2_at_least(aligned_length)
+    # io_uring writes exactly aligned_length bytes from buf.data_ptr().
+    assert alloc >= aligned_length
+    assert alloc & (alloc - 1) == 0
+
+
+def test_non_expert_alloc_never_costs_more_than_the_old_pad_policy():
+    # The old policy asked for aligned_length + 4 MiB. Since the allocator
+    # charges the next power of two for either request, the new size is never a
+    # larger CHARGE -- and on an exact-power-of-two aligned_length it is a
+    # strictly smaller one, because the pad used to push it a whole block up.
+    for aligned_length in (_ALIGN, 100 * 1024 ** 2, 1_229_000_000, 128 * 1024 ** 2):
+        old_charge = next_pow2_at_least(aligned_length + 4 * 1024 ** 2)
+        assert next_pow2_at_least(aligned_length) <= old_charge
+    exact_pow2 = 128 * 1024 ** 2
+    assert next_pow2_at_least(exact_pow2) == exact_pow2
+    assert next_pow2_at_least(exact_pow2 + 4 * 1024 ** 2) == 256 * 1024 ** 2

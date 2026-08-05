@@ -381,7 +381,12 @@ def test_load_expert_into_slab_tensor_align_gates_pool_usage(tmp_path):
 # ── power-of-two pinned arena clamp ─────────────────────────────────────────
 
 from vaayu.persist.safetensor_model_persister import largest_pow2_at_most
-from vaayu.vaayu_base import clamp_slab_count, unclamped_slab_count
+from vaayu.vaayu_base import (
+    arena_slab_count,
+    cache_budget_for_arena,
+    clamp_slab_count,
+    unclamped_slab_count,
+)
 
 _GiB = 1024 ** 3
 
@@ -471,21 +476,20 @@ def test_clamp_is_a_noop_when_nothing_was_wasted():
 # at the arena-mirroring call site must size the budget off the CACHE's share of
 # the arena (n_slabs - pool_size), not the whole arena, or the loader's landing
 # zone gets folded into the cache's own cap and the freelist reserve collapses
-# to 0. This test pins that arithmetic identity directly -- it is the fixed
-# expression from vaayu_base.py's trim block, exercised as pure arithmetic
-# (CLAUDE.md: no VaayuBaseModel construction).
-
-def _trimmed_budget(n_slabs: int, slab_bytes: int, pool_size: int) -> int:
-    """Mirrors the vaayu_base.py trim block's corrected _arena_bytes expression."""
-    return max(0, n_slabs - pool_size) * slab_bytes
-
+# to 0.
+#
+# These tests call the PRODUCTION helper `cache_budget_for_arena` directly. They
+# used to assert against a test-local mirror of the call-site expression, which
+# meant a regression in vaayu_base.py's one-liner would have left them green
+# (Plan J review, parked finding 3). Keeping them free of VaayuBaseModel
+# construction is what motivated the mirror; extracting the expression gets both.
 
 @pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
 @pytest.mark.parametrize("pool_size", [6, 9])
 def test_trimmed_budget_leaves_the_pool_size_reserve_free(geo, pool_size):
     geo = dict(geo, pool_size=pool_size)
     n_slabs = clamp_slab_count(**geo)
-    trimmed_budget = _trimmed_budget(n_slabs, geo["slab_bytes"], pool_size)
+    trimmed_budget = cache_budget_for_arena(n_slabs, geo["slab_bytes"], pool_size)
     cache_cap = trimmed_budget // geo["slab_bytes"]
     # The cache can never fill the arena: its steady-state entry cap plus the
     # staging addend must equal (not exceed) the arena's slab count.
@@ -499,9 +503,31 @@ def test_trimmed_budget_is_strictly_less_than_whole_arena_when_pool_size_positiv
     # cache's own cap, giving a freelist reserve of 0.
     n_slabs, slab_bytes = 965, 8_900_000
     whole_arena = n_slabs * slab_bytes
-    trimmed = _trimmed_budget(n_slabs, slab_bytes, pool_size)
+    trimmed = cache_budget_for_arena(n_slabs, slab_bytes, pool_size)
     assert trimmed < whole_arena
     assert (whole_arena - trimmed) == pool_size * slab_bytes
+
+
+# Parked finding 2: when the arena has no slabs beyond the staging reserve the
+# cache budget is 0 and the expert RAM cache is fully disabled. That is a real
+# hardware limit, so CLAUDE.md §5 requires it be WARNED about rather than
+# silently degraded. `put_slab` already handles a 0 budget safely; what was
+# missing is the operator ever being told. These tests pin the exact boundary the
+# call site's warning keys on.
+
+@pytest.mark.parametrize("pool_size", [6, 9])
+def test_cache_budget_is_zero_when_the_arena_is_all_staging_reserve(pool_size):
+    # An arena of exactly pool_size slabs is entirely the loader's landing zone.
+    assert cache_budget_for_arena(pool_size, 8_900_000, pool_size) == 0
+    # Never negative, however degenerate the arena.
+    assert cache_budget_for_arena(pool_size - 1, 8_900_000, pool_size) == 0
+    assert cache_budget_for_arena(0, 8_900_000, pool_size) == 0
+
+
+@pytest.mark.parametrize("pool_size", [6, 9])
+def test_one_slab_past_the_staging_reserve_is_a_live_cache(pool_size):
+    # The boundary is sharp: the warning must not fire one slab above it.
+    assert cache_budget_for_arena(pool_size + 1, 8_900_000, pool_size) == 8_900_000
 
 
 # ── Finding 2: the clamp must not fire on a pageable (non-pinned) arena ─────
@@ -509,19 +535,13 @@ def test_trimmed_budget_is_strictly_less_than_whole_arena_when_pool_size_positiv
 # Power-of-two charging is a caching HOST allocator property -- pinned memory
 # only. A pageable torch.empty allocation (CPU-only box, or the pinned-alloc
 # RuntimeError retry path) pays no round-up, so clamping it trades cache for
-# zero RAM freed. The call site guards clamp_slab_count behind `if _pin`; this
-# helper mirrors that gate as pure arithmetic.
-
-def _n_slabs_for(pin: bool, budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
-    """Mirrors the vaayu_base.py call-site gate: clamp only when pinning."""
-    unclamped = unclamped_slab_count(budget_bytes, slab_bytes, pool_size)
-    return clamp_slab_count(budget_bytes, slab_bytes, pool_size) if pin else unclamped
-
+# zero RAM freed. `arena_slab_count` IS that gate in production; these tests call
+# it directly rather than mirroring it (Plan J review, parked finding 3).
 
 @pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
 def test_unpinned_arena_gets_the_unclamped_count(geo):
     unclamped = unclamped_slab_count(**geo)
-    assert _n_slabs_for(False, **geo) == unclamped
+    assert arena_slab_count(**geo, pin=False) == unclamped
     # Sanity: on these real geometries the clamp DOES bite when pinned, so this
     # isn't vacuously true because clamping happened to be a no-op.
     assert clamp_slab_count(**geo) < unclamped
@@ -529,7 +549,23 @@ def test_unpinned_arena_gets_the_unclamped_count(geo):
 
 @pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
 def test_pinned_arena_gets_the_clamped_count(geo):
-    assert _n_slabs_for(True, **geo) == clamp_slab_count(**geo)
+    assert arena_slab_count(**geo, pin=True) == clamp_slab_count(**geo)
+
+
+@pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
+def test_unpinned_arena_ignores_the_working_set_floor(geo):
+    # working_set_bytes only exists to stop the clamp breaking a fitting cache.
+    # A pageable arena never clamps at all, so the floor must not perturb it --
+    # including at a working set large enough to trip the skip branch.
+    unclamped = unclamped_slab_count(**geo)
+    assert arena_slab_count(**geo, working_set_bytes=8_900_000_000, pin=False) == unclamped
+
+
+def test_pinned_arena_honours_the_working_set_floor():
+    # Qwen's geometry is the one Task 5 exists for: clamping crosses its working
+    # set, so the pinned path must come back unclamped once the floor is passed.
+    assert (arena_slab_count(**_GEO_QWEN, working_set_bytes=_WS_QWEN, pin=True)
+            == unclamped_slab_count(**_GEO_QWEN))
 
 
 # ── Finding 3: the printed "frees" figure must be exact, not an upper bound ─
