@@ -165,11 +165,23 @@ charged exactly.
     peak rss 26.46 → 20.72 GB, 0 OOM. **Achieved with `PREFIX_COMPRESS=None`** — Plan I needed
     9-bit compression for its 34× because a 3.54 GB pool could not hold 3 bf16 sessions; J's pool
     holds them uncompressed, so the same win arrives with **no quantization and no quality question**.
-  - **Decode, Qwen: FAILED, then fixed by Task 5.** main **0.85 tok/s / 47 % expert-cache hit**;
-    branch pre-Task-5 **0.43 tok/s / 0 % hit** (−49 %) with the engine's own
+  - [x] **Decode, Qwen: FAILED pre-Task-5, CONFIRMED FIXED by Task 5.** main **0.85 tok/s / 47 %
+    expert-cache hit**; branch pre-Task-5 **0.43 tok/s / 0 % hit** (−49 %) with the engine's own
     `WARNING: working set 8.90GB exceeds cache budget 8.49GB — decode will thrash`. Cause: the
     clamp cut the budget 9.13 → 8.49 GB across Qwen's 8.90 GB working set. Task 5 skips the clamp
-    for this geometry. **Needs a confirming run: expect ~0.85 and no thrash warning.**
+    for this geometry. **Confirming run on merged `main` (2026-08-05,
+    `gen-qwen-task5-confirm.log`): decode 0.86 tok/s, expert_cache 90307hit/101453miss = 47 %,
+    NO thrash warning, 0 OOM, `PCIe measured: 19.9 GB/s pinned H2D`.** The arena logs the skip
+    explicitly: `778 x 11.8MB (pinned, 9.21GB resident) — clamp skipped: clamping to 725 slabs
+    would cut the cache below the 8.90GB working set`. **Prefix pool 4.96 GB — unchanged**, which
+    is the measured form of "J delivers nothing on Qwen". Two riders:
+    - The cosmetic trim-line bug (first Pending bug below) is **confirmed live on this path**:
+      `budget trimmed 9.13 -> 9.12 GB to match the clamped slab arena` printed on an arena that
+      was explicitly NOT clamped, two lines under the skip notice.
+    - TTFT was **27.5 s cold** here vs 4.21 s in the main baseline. Not a regression: every
+      `.vaayu_kv` on disk was rejected with `different model/quant/schema` (Plan E's bf16 disk
+      layout changed the schema), so the restore that made the baseline 4.21 s could not fire.
+      Irrelevant to this gate, but do not quote the two TTFTs against each other.
   - [x] **Decode, MiniMax: PASSES — the −2.7 % was noise.** A single pair (main 1.48 / branch 1.44)
     suggested a regression; alternating repeat runs refuted it:
     | | run 1 | run 2 | run 3 | mean |
@@ -180,29 +192,71 @@ charged exactly.
     end of ordinary variance. Expert-cache hit rate is stably **6 % → 4 %** — the cache really does
     shrink, it just does not move decode on this geometry. **Lesson worth keeping: n=1 decode
     comparisons on this box cannot resolve differences below ~4 %.**
-  - [ ] K-cliff sweep (raise `K_SESSIONS` until the gate fails; record the first failing K).
+  - [~] **K-cliff sweep** (MiniMax, Plan I shape: `MAX_LENGTH=16384`, `range(160)` → 7 751 tok/session,
+    `PREFIX_COMPRESS=None`, no `max_seq_len`). **Sweep is size-targeted, not walked one K at a time.**
+    Per-session pooled KV derived from config (62 layers × 2 × 8 kv-heads × 128 head_dim × 2 B bf16)
+    = **0.254 MB/tok = 1.968 GB per 7 751-tok session**; measured peak_rss grows **2.03 GB/session**,
+    confirming it. Pool holds `floor(budget / 1.968)`. The model reproduces both known points
+    (main pool 4.69 GB holds 2 → K=3 fails; merged pool ~13.7 GB holds 6), so K=5 is skipped as a
+    predictable pass — K=6 (expect pass) and K=7 (expect fail) pin the cliff. Back-fill K=5 only if
+    K=6 fails.
+    | K | pool | HIT | round-2 TTFT | peak_rss | exit |
+    |---|---|---|---|---|---|
+    | 3 | 13.76 GB | 3/3 | 338 → **9.6 s** | 20.72 GB | 0 |
+    | 4 | 13.70 GB | 4/4 | 340 → **9.6 s** | 22.78 GB | 0 |
+    | 6 | 12.16 GB | 6/6 | 350 → **9.8 s** | 25.31 GB | 0 |
+    | **7** | 11.49 GB | **0/7** | 352 → **352 s (no benefit)** | 26.99 GB | **1** |
+    **First failing K = 7.** 0 OOM at every K including the failing one.
+    Two things the RESULTS doc must carry, both more useful than the bare integer:
+    - **The pool budget is not constant — 11.49 / 12.16 / 13.70 / 13.76 GB across four loads.**
+      It is `free RAM at load − 3.76 GB reserve`, and free RAM at load varies. So the deliverable is
+      the capacity rule **K_max = floor(pool_budget / per-session KV)**, not "6". At the K=7 load's
+      11.49 GB pool even 5 sessions was the true capacity; at 13.76 GB it is 6. A box with less free
+      RAM at load cliffs earlier, and the same box cliffs at different K on different days.
+    - **The failure is total, not partial: 0 hits, not the 5 the pool could still hold.** Round 0
+      already logged 2 evictions; in round 1 each recomputed session re-stores and cascade-evicts
+      the rest, so every one of the 7 misses and round-2 TTFT stays at the cold 352 s. This is
+      Plan I's **"capacity is a cliff, not a slope"** reproduced exactly — one session past capacity
+      does not cost 1/7th of the win, it costs all of it (9.8 s → 352 s, **36×**).
   - [ ] RESULTS doc. Must state plainly that **J delivers on MiniMax and not on Qwen**, and note
     that `_EXPERT_CACHE_OOM_CEILING`'s derivation was made under the round-up — post-clamp any
     budget in [8 GiB, 16 GiB) yields the same 8 GiB resident arena, so the ceiling is now nearly
     inert in that range.
   Runbook: `docs/superpowers/plans/2026-08-03-pinned-roundup-RUNBOOK.md`.
 
-**Pending bugs / parked findings from Plan J review** (none block the on-device gates):
-- [ ] `vaayu_base.py` trim line prints "to match the **clamped** slab arena" on an unclamped
-  (pageable, or no-op-clamp) arena, where nothing was clamped. Cosmetic; wrong text only on the
-  non-pinned path. On this box `_pin=True` and the clamp bites, so Task 3's logs read correctly.
-- [ ] Degenerate branch: when the expert budget is under ~one slab, the trimmed budget is 0 and the
-  expert RAM cache is fully disabled **silently**, where CLAUDE.md §5 asks for a WARNING.
-  `put_slab` handles a 0 budget safely. Unreachable on any box that can load these models.
-- [ ] The staging-reserve and pageable-gate tests assert against test-local mirrors of the
-  call-site expressions, not `vaayu_base.py` itself, so a regression in the production one-liners
-  would leave them green. Consequence of keeping the tests free of `VaayuBaseModel`; fix properly
-  by extracting the block into a helper if it is ever touched again.
-- [ ] `load_non_expert_tensors` still uses `alloc_size = aligned_length + 4 MiB` and writes that
-  non-power-of-two value into the same shared `_PINNED_SIZES` slots Task 2 now sizes by powers of
-  two. No correctness problem — both sites only grow a slot and each reuse test is sound against
-  its own requirement — but the two sites disagree on policy and the 4 MiB pad still buys dead
-  surplus. Recorded in the plan's §10 as the natural follow-up.
+**Pending bugs / parked findings from Plan J review — ALL FOUR FIXED 2026-08-05.**
+Fixed while K=7 was running; none of them blocked the on-device gates, and none touch the
+measurement path (the running process had already imported the old code).
+- [x] `vaayu_base.py` trim line printed "to match the **clamped** slab arena" on an arena that was
+  not clamped. **Confirmed live** on the Qwen confirming run, two lines under `clamp skipped: ...`.
+  Reworded to "to match the slab arena's cache share" — the trim fires whenever the arena's cache
+  share is under the requested budget, which includes the unclamped case where the staging addend
+  alone accounts for the gap. **No test: pure output string.**
+- [x] Degenerate branch: trimmed budget 0 → expert RAM cache fully disabled **silently**. Now emits
+  a WARNING naming the arena's slab count and the staging reserve that consumed it (CLAUDE.md §5).
+  `put_slab` already handled a 0 budget safely — what was missing was telling the operator.
+  Boundary pinned by test (`== 0` at and below `pool_size` slabs, one live slab immediately above);
+  **the print itself is not asserted.** Still unreachable on any box that loads these models.
+- [x] Tests asserted against test-local mirrors of the call-site expressions. **Fixed properly, as
+  the finding prescribed**: extracted `arena_slab_count(..., pin=)` (the pageable/clamp gate + the
+  working-set floor) and `cache_budget_for_arena(n_slabs, slab_bytes, pool_size)` (the staging
+  reserve) into `vaayu_base.py`, and the tests now call those directly. Mirrors `_trimmed_budget`
+  and `_n_slabs_for` are gone, so a regression in the production expressions now fails the suite.
+  Two tests added for the pageable path ignoring the working-set floor and the pinned path honouring
+  it — the interaction the old mirror could not express.
+- [x] `load_non_expert_tensors` used `alloc_size = aligned_length + 4 MiB`, a non-power-of-two
+  written into the same shared `_PINNED_SIZES` slots Task 2 sizes by powers of two. Now
+  `next_pow2_at_least(aligned_length)`. **No slack added on top, deliberately**: unlike the expert
+  path's `total_size`, `aligned_length` is already `_align_up(read_len + prefix_pad)` — exactly the
+  byte count io_uring writes — so `pinned_alloc_size`'s `2 * _ALIGN` O_DIRECT slack would be wrong
+  here, not merely wasteful. Never a larger charge than the old pad, and strictly smaller when
+  `aligned_length` is an exact power of two (the pad used to push it a whole block up). Verified
+  the other `_PINNED_SIZES` consumer — the io_uring buffer registration at
+  `safetensor_model_persister.py:318-319` — still receives the true allocated size from both sites.
+
+  Verification: `tests/test_slab_arena.py` + `tests/test_pinned_staging_alloc.py` **74 passed**.
+  Full-suite re-run deferred until K=7 lands — a pinned-memory test competing for RAM would move
+  the prefix-pool budget that run is measuring.
 
 ## Plan L — chunked slab-arena backing (Option B)  **(P1 — evidence, THEN plan)**
 
