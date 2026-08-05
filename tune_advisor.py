@@ -36,15 +36,32 @@ TOKENS_PER_SESSION = int(os.environ.get("TOKENS_PER_SESSION", "8000"))
 COMPRESS_BITS = int(os.environ.get("COMPRESS_BITS", "9"))
 # The pool budget is computed at MODEL-LOAD time, after the expert RAM cache has
 # taken its share -- so free RAM measured now (before loading) badly overstates
-# it. On this box the gap is ~5x: 23 GB free before load vs 3.5-5.4 GB of actual
-# pool budget across six measured runs. If you have run the model, read the real
-# figure off the startup line
+# it. If you have run the model, read the real figure off the startup line
 #     [Vaayu] cross-turn prefix cache ENABLED: X.XX GB budget
 # and pass it here. Without it this script falls back to an estimate and says so.
+#
+# Pass it. The budget is NOT a property of the box, and two things move it:
+#   - The model. Post-Plan-J (2026-08-05) MiniMax measures 11.49-13.76 GB while
+#     Qwen3-235B measures 4.96 GB on the same box -- Plan J's arena clamp fires
+#     for one geometry and is correctly skipped for the other. A single "typical"
+#     figure is now meaningless across models.
+#   - The run. It is `free RAM at load - reserve`, and free RAM at load depends
+#     on what ran before: 11.49 / 12.16 / 12.87 / 13.70 / 13.76 GB across five
+#     loads of the SAME model on the SAME day.
+# (The 3.5-5.4 GB range this comment used to quote was measured before Plan J
+# reclaimed ~8.6 GB of pinned-allocator round-up, and understates MiniMax by
+# ~2.5x. Any estimate here will be wrong for one model or the other.)
 POOL_BUDGET_GB = float(os.environ["POOL_BUDGET_GB"]) if os.environ.get("POOL_BUDGET_GB") else None
 
-GB = 1024 ** 3
-MiB = 1024 ** 2
+# DECIMAL GB, to match what the engine prints. Every GB figure this script reads
+# or echoes comes from a vaayu_base.py log line that divides by 1e9 -- the prefix
+# pool budget, free RAM, _VRAM_RESERVE_BYTES. Using 1024**3 here silently inflated
+# a pasted POOL_BUDGET_GB by 7.4%, which is enough to move the session count
+# across a boundary: at MiniMax's measured 11.49 GB pool it reported room for 6
+# sessions where only 5 fit -- and overshooting pool capacity costs 100% of the
+# reuse, not a share of it (todo.md "Settled", Plan J Task 4).
+GB = 1e9
+MiB = 1024 ** 2   # display only, for per-session KV
 
 
 def main() -> int:
@@ -86,8 +103,10 @@ def main() -> int:
     if POOL_BUDGET_GB is None:
         print("!! WARNING: that budget is measured BEFORE the model loads, and the")
         print("   engine computes the real one AFTER the expert RAM cache is")
-        print("   allocated. The gap is large -- on the development box, 23 GB free")
-        print("   before load became a 3.5-5.4 GB pool in six measured runs.")
+        print("   allocated. The gap is large AND model-dependent -- on the")
+        print("   development box, 23 GB free before load became 11.49-13.76 GB")
+        print("   of pool on MiniMax but 4.96 GB on Qwen3-235B, and it varied by")
+        print("   2.3 GB across five loads of the same model on the same day.")
         print("   This run's advice is therefore OPTIMISTIC: it will under-recommend")
         print("   compression. For a real answer, load the model once, read")
         print("     [Vaayu] cross-turn prefix cache ENABLED: X.XX GB budget")
