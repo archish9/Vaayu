@@ -52,6 +52,11 @@ class PrefixCacheStore:
         self.evictions = 0
         self.matched_tokens = 0
         self.lookup_tokens = 0
+        # Latch for the capacity warning below: once per store lifetime, not
+        # once per eviction. The agentic workload re-stores every session every
+        # turn, so per-eviction warning would emit hundreds of lines per run and
+        # bury the first one.
+        self._capacity_warned = False
 
     def lookup(self, session_id, input_ids: list, device=None):
         """Return (cache_or_None, match_len). A hit REMOVES the entry from the
@@ -103,10 +108,50 @@ class PrefixCacheStore:
                 self._current_bytes -= self._pool.pop(session_id).nbytes
             self._pool[session_id] = _Entry(list(token_ids), payload, nbytes)
             self._current_bytes += nbytes
+            _evicted_here = 0
             while self._current_bytes > self.budget_bytes and len(self._pool) > 1:
                 _k, ev = self._pool.popitem(last=False)  # evict LRU
                 self._current_bytes -= ev.nbytes
                 self.evictions += 1
+                _evicted_here += 1
+            if _evicted_here and not self._capacity_warned:
+                self._capacity_warned = True
+                self._warn_over_capacity(nbytes)
+
+    def _warn_over_capacity(self, sess_bytes: int) -> None:
+        """Announce that the pool is over capacity, on the first budget-pressure
+        eviction. Called under _lock.
+
+        A budget-pressure eviction is unambiguous — the loop above only runs when
+        the pool is over budget — and it is the moment cross-turn reuse stops
+        working. Measured on-device (Plan J Task 4): one session past capacity
+        does not cost a proportional share of the reuse, it costs ALL of it. At
+        K=7 against a pool holding 5-6, the final round scored 0 hits, not 5,
+        because each recomputed session's re-store cascade-evicts the ones before
+        it. Round-2 TTFT stayed at the cold 352 s against 9.8 s at K=6.
+
+        Everything printed is derived from this pool's own state (CLAUDE.md §5):
+        the budget it was constructed with and the size of the session just
+        stored. No model constant appears here — the two on-device geometries
+        differ by ~30% per session and their pool budgets by ~2.7x.
+        """
+        capacity = int(self.budget_bytes // sess_bytes) if sess_bytes else 0
+        if self.compress_bits is None:
+            remedy = ("Set prefix_compress=9 to pack pooled KV (~0.55x, so roughly "
+                      "double the sessions) — measured cost is ~0.7s of TTFT on the "
+                      "hit path, against a full cold prefill if you thrash.")
+        else:
+            remedy = (f"Pooled KV is already compressed at {self.compress_bits} bits, "
+                      f"so the remaining levers are fewer concurrent sessions or less "
+                      f"context per session.")
+        print(f"[Vaayu-Prefix] WARNING: prefix pool over capacity — evicting under "
+              f"budget pressure. Budget {self.budget_bytes / 1e9:.2f} GB holds "
+              f"{capacity} session(s) at this session's measured "
+              f"{sess_bytes / 1e9:.2f} GB; beyond that, cross-turn reuse collapses to "
+              f"zero rather than degrading, because each session's re-store evicts "
+              f"the others. {remedy} Run tune_advisor.py with "
+              f"POOL_BUDGET_GB={self.budget_bytes / 1e9:.2f} for the full trade-off. "
+              f"(a real capacity limit, not a bug)")
 
     def stats(self) -> str:
         """One grep-able line: pool hit/miss/evict, plus the share of requested

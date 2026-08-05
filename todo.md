@@ -267,6 +267,38 @@ measurement path (the running process had already imported the old code).
   Full-suite re-run deferred until K=7 lands — a pinned-memory test competing for RAM would move
   the prefix-pool budget that run is measuring.
 
+## Applied findings — turning Plan J's measurements into engine behaviour
+
+Recorded because the measurements alone were not the deliverable. Plan J's Task 4 defined its
+output as "record the first failing K"; **a number in a RESULTS doc is not a deliverable for an
+inference engine**, and executing that definition faithfully instead of challenging it left ~40 %
+of four GPU-hours sitting in a document. Both items below were built afterwards, with no GPU.
+
+- [x] **Prefix-pool capacity WARNING** (`vaayu/prefix_cache.py`, `_warn_over_capacity`).
+  `compute_expert_budget` warns when the expert working set exceeds its budget ("decode will
+  thrash") — that warning is what caught the Qwen regression. **The prefix pool had no equivalent**:
+  it evicted in silence, hit rate went to 0, TTFT went 9.8 s → 352 s, and nothing was printed. The
+  silent degradation CLAUDE.md §5 forbids, in the subsystem holding the engine's largest TTFT lever.
+  Fires on the first budget-pressure eviction in `store()` (unambiguous — that loop only runs over
+  budget), latched to once per store lifetime (the agentic workload re-stores every session every
+  turn; per-eviction would emit hundreds of lines). Every figure derived from the pool's own state,
+  no model constant. Names the remedy, and does NOT recommend compression when already compressed.
+  10 tests, parametrized over both geometries. **Deliberately not auto-configured**: the engine does
+  not know K or tokens/session at load time — sessions arrive later — so runtime detection is the
+  only correct place, and `K=7` is not a constant to hardcode (pool varies 11.49–13.76 GB same box
+  same day; Qwen is 4.96 GB).
+- [x] **`tune_advisor.py` unit bug** (`3108342`). It instructs you to paste the pool budget off the
+  engine's startup line, which prints `/1e9` (decimal GB), then multiplied by `1024**3` — inflating
+  it 7.4 %. Enough to cross a capacity boundary: at K=6 / 11.49 GB pool it reported room for 6 and
+  recommended `prefix_compress=None`, where only 5 fit — the exact config that thrashes to 0 hits.
+  **Found by validating the advisor against the measurements**, which had never been done; now
+  reproduces all four measured points (K=3/4/6 → `None`, all PASSED; K=7 → `9`, and 7 failed
+  uncompressed / passed compressed). Its "3.5–5.4 GB across six runs" guidance was pre-Plan-J and
+  understated MiniMax ~2.5×.
+- [ ] **No regression guard on `tune_advisor.py`.** It is a standalone script with no tests, and the
+  unit bug above would have been caught by one. A test pinning the four measured points against its
+  recommendations is the obvious guard. Not built — flagged rather than dropped.
+
 ## Plan L — chunked slab-arena backing (Option B)  **(P1 — evidence, THEN plan)**
 
 **No plan doc yet, and do not write one from this section.** Gather the evidence below first; the
