@@ -79,6 +79,26 @@ def test_chunk_bases_are_o_direct_aligned():
         assert c.data_ptr() % _ALIGN == 0
 
 
+def test_the_arena_requests_only_powers_of_two(monkeypatch):
+    # THE property this whole plan exists to establish, and the one a green
+    # suite otherwise cannot see: chunk_decomposition returning pow2 sizes is
+    # worthless if SlabArena does not REQUEST them. A non-pow2 request is
+    # charged the next power of two -- an 8 GiB chunk becomes a 16 GiB charge.
+    real_empty = torch.empty
+    requested = []
+
+    def spy(*args, **kwargs):
+        if kwargs.get("pin_memory") is not None and args:
+            requested.append(int(args[0]))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", spy)
+    SlabArena(20, 4096, pin=False)
+    assert requested, "no allocations observed -- the spy did not attach"
+    for n in requested:
+        assert n & (n - 1) == 0, f"non-power-of-two allocation request: {n}"
+
+
 def test_acquire_release_still_cover_every_slab():
     # acquire/release are index-based and must be untouched by chunking.
     arena = SlabArena(9, 4096, pin=False)
@@ -90,6 +110,7 @@ def test_acquire_release_still_cover_every_slab():
     for idx in got:
         arena.release(idx)
     assert arena.acquire() is not None
+
 
 # Real derived geometries, used as test INPUTS only (never in vaayu/).
 # MiniMax-M2.7 and Qwen3-235B as measured 2026-08-07 by compute_slab_bytes().

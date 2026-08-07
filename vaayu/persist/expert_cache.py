@@ -39,37 +39,53 @@ class SlabArena:
         for chunk_bytes in chunk_decomposition(self.n_slabs, self.slab_bytes):
             if placed >= self.n_slabs:
                 break
-            chunk = torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=self.pin)
-            if chunk.data_ptr() % _ALIGN != 0:
-                # Deviation from the brief's literal allocation, needed because
-                # the natural allocation is not ALWAYS _ALIGN-aligned in
-                # practice, on either path. Measured directly on this box
-                # (torch 2.11.0+cu130): plain (pin=False) torch.empty is only
-                # posix_memalign(64)-aligned, never page-aligned, at every size
-                # this suite uses. And even pin=True is not immune once the
-                # pinned pool is fragmented by other tests' churn (observed via
-                # test_slab_arena.py::test_acquire_consumes_pending_read_event
-                # failing only as part of the full suite, never alone) -- the
-                # evidence doc's "pinned allocations come back 2 MiB-aligned"
-                # finding (todo.md, E2) was measured on a fresh pool with the
-                # real 8 GiB/512 MiB/16 MiB chunk sizes only, not guaranteed
-                # for a fragmented pool or tiny allocations. Pad and slice as a
-                # fallback so the invariant holds unconditionally. Only reached
-                # off the fast path (it never fires for the production chunk
-                # sizes on a fresh pool, per E2), so it never costs the
-                # production case the pow2 charge exactness this task exists
-                # to preserve -- the untouched branch above still requests the
-                # exact chunk_bytes.
-                raw = torch.empty(chunk_bytes + _ALIGN, dtype=torch.uint8, pin_memory=self.pin)
-                pad = (-raw.data_ptr()) % _ALIGN
-                chunk = raw[pad:pad + chunk_bytes]
+            # ONE allocation per chunk, at the EXACT power of two -- that is the
+            # whole point: the caching host allocator charges an exact power of
+            # two exactly. Never request chunk_bytes + anything; a non-pow2
+            # request is charged the NEXT power of two, which for an 8 GiB chunk
+            # means 16 GiB and re-creates the waste this design removes.
+            #
             # O_DIRECT needs every slab start sector-aligned, and slab starts are
             # offsets from the chunk base -- so the base must be aligned too.
-            # Measured 2026-08-07: pinned allocations come back 2 MiB-aligned.
-            assert chunk.data_ptr() % _ALIGN == 0, (
-                f"chunk base {chunk.data_ptr():#x} is not {_ALIGN}-aligned; "
-                f"O_DIRECT slab reads would fail")
-            held = min(self.n_slabs - placed, chunk_bytes // self.slab_bytes)
+            # The allocation itself is NOT reliably aligned: pageable torch.empty
+            # is only posix_memalign(64)-aligned, and a fragmented pinned pool can
+            # serve a small request from a misaligned split remainder (measured
+            # 2026-08-07: 2 of 120 pow2 requests, both 4 KiB, at offset 1024;
+            # large pow2 requests stayed page-aligned). So take the aligned offset
+            # INSIDE the allocation rather than padding the request.
+            #
+            # That slicing can itself cost up to _ALIGN-1 bytes of the chunk's
+            # OWN capacity (chunk_bytes // slab_bytes), not just its already-
+            # discarded tail remainder -- fatal for a chunk sized tight against
+            # its slab count (e.g. exactly 2 slabs, no slack) with no later
+            # chunk to make up the loss. Measured: this cost a real slab on
+            # SlabArena(n_slabs=2, slab_bytes=4096) every run. If that happens,
+            # escalate the REQUEST to the next exact power of two -- still
+            # charged exactly, never a non-pow2 size -- and retry. One doubling
+            # always suffices: pad < _ALIGN <= slab_bytes <= chunk_bytes (chunk
+            # holds >=1 slab whenever escalation is warranted), so the doubled
+            # buffer's post-pad remainder exceeds the original chunk_bytes,
+            # which by construction already covers `natural_held` slabs. This
+            # never fires for the real 8 GiB/512 MiB/16 MiB production chunks
+            # (E2 measured them page-aligned with huge margin) -- it exists for
+            # tight small chunks like this suite's fixtures.
+            natural_held = chunk_bytes // self.slab_bytes
+            request_bytes = chunk_bytes
+            while True:
+                raw = torch.empty(request_bytes, dtype=torch.uint8, pin_memory=self.pin)
+                pad = (-raw.data_ptr()) % _ALIGN
+                chunk = raw[pad:] if pad else raw
+                if chunk.data_ptr() % _ALIGN != 0:
+                    raise RuntimeError(
+                        f"chunk base {chunk.data_ptr():#x} is not {_ALIGN}-aligned "
+                        f"after padding by {pad}B; O_DIRECT slab reads would fail")
+                aligned_capacity = chunk.numel() // self.slab_bytes
+                if aligned_capacity >= natural_held:
+                    break
+                request_bytes *= 2
+            held = min(self.n_slabs - placed, aligned_capacity)
+            if held == 0:
+                continue
             self._chunks.append(chunk)
             self._chunk_first.append(placed)
             self._chunk_nslabs.append(held)
