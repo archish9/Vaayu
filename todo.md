@@ -83,7 +83,7 @@ self-contained; do not start a row until the one above it is `[x]` and its RESUL
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
 | **1** | **J — pinned-allocation round-up** | P1 | `[x]` **CLOSED 2026-08-05** | — | Code, tests, both fix waves and all four parked bugs are on `main`; suite **576**. **Delivers on MiniMax only** — pool 4.69 → 13.4 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed, no quantization). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Fan-out deliverable: **K_max = floor(pool / per-session KV)**, first failing K = 7 uncompressed, and 9-bit compression clears it (7/7). RESULTS: `2026-08-03-pinned-allocation-roundup-RESULTS.md`. |
-| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **NEXT — gather evidence, then plan** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence (E1-E5) before writing the plan.** |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **evidence DONE, plan WRITTEN — execute it** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence (E1-E5) before writing the plan.** |
 | **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing — J is closed | J changed free RAM, not free VRAM, so K was never *blocked* — it waited so its sweep would run against a settled memory layout. That layout is now settled. |
 | **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **L** (J satisfied) | ~8 GiB of the arena's footprint was allocator round-up, so rebalancing the expert-cache/prefix-pool split before J would have measured an imaginary scarcity. **The answer now differs per model** — MiniMax's pool is 13.4 GB and almost certainly no longer binding, Qwen's is unchanged at 4.96 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
@@ -402,42 +402,133 @@ tail remainder unused** — waste is `chunk_bytes % slab_bytes` per chunk, bound
 before anything else. Both need the box quiet (they allocate 9-16 GB pinned) — no model loaded,
 no other run in flight.
 
-- [ ] **E4 — FIRST, and the likeliest refutation. Does chunking keep pinned H2D?**
-  The entire justification for the arena is **19.7-19.8 GB/s pinned vs ~7.1 pageable**. A chunked
-  arena that quietly loses that is *worse than doing nothing*, and no amount of reclaimed RAM buys
-  it back. **This is the one claim J's §3 sketch asserted without measuring.**
-  Probe, fresh process, no model: allocate 9 × 1 GiB pinned; `cudaMemcpyAsync` H2D from each chunk
-  to a device buffer; report GB/s per chunk and aggregate. Compare against one 8 GiB pinned tensor
-  measured the same way in the same process. Also record `cudaHostAlloc` count/latency — k
-  registrations may cost lock-down time at load even if steady-state bandwidth is fine.
-  **KILL CRITERION: if per-chunk H2D is materially below the single-tensor figure, or any chunk
-  falls back to pageable rates, close the row and go to Plan K.**
-  Also re-check the audit's assumption that freed pinned blocks are cached for reuse rather than
-  returned to the OS — with k chunks the allocator's block bookkeeping differs.
-- [ ] **E1 — SECOND. Confirm the chunked ratio at the REAL geometry, waste included.**
-  The 1.011 figure is 9 × 1 GiB from the audit — not the sizes actually needed, and it never
-  modelled slab waste. Re-measure in a fresh process, RSS-differenced (`ram_snapshot()` or
-  `/proc/self/status` VmRSS), for **both** models: Qwen 9.21 GB and MiniMax 9.20 GB, each in chunk
-  sizes of 4 / 2 / 1 GiB. **Report resident bytes AND usable slabs**, i.e. subtract
-  `chunk_bytes % slab_bytes` per chunk (slab 11.8 MB Qwen / 8.9 MB MiniMax — derive, never paste).
-  **KILL CRITERION: the win must beat the clamp's. Task 5 keeps Qwen unclamped at 9.21 GB resident
-  today; chunking must land near ~9.3 GB resident *while keeping ≥ the unclamped slab count*, or it
-  is not worth the corruption risk.**
-- [ ] **E2 — THIRD. Enumerate every consumer of `_backing` / single-base-pointer arithmetic.**
-  Largely pre-answered above (only `tensor()` and `slab_index_of()`), but **verify rather than
-  trust it** — grep `.data_ptr()`, `_backing`, and offset math against the arena across `vaayu/`
-  and the `vaayu_rust` io_uring path, which receives raw pointers and lengths. **A chunked arena
-  must never hand the loader a span crossing a chunk boundary.** A missed consumer is the
-  corruption path.
-- [ ] **E3 — FOURTH. Price the `slab_index_of` lookup.** It is on the eviction path. With k ≈ 9 a
-  linear scan over `(base_ptr, first_idx, n_slabs)` is likely free, but measure: real eviction
-  rates are **MiniMax ~76 k/run, Qwen ~190 k/run**. If it does show up, the fix is a sorted
-  `bisect` over chunk base pointers, not a redesign.
-- [ ] **E5 — LAST. Decide the partial-failure fallback.** If chunk *j* of *k* fails to allocate,
-  what happens? Today the code retries the whole arena pageable (`vaayu_base.py`, the
-  `except RuntimeError` around `SlabArena(...)`). Chunked needs an explicit answer: free the j-1
-  successful chunks and fall back whole, or run degraded on j chunks. **State it in the plan; do
-  not leave it to the code.**
+- [x] **E4 — PASSED 2026-08-07. Chunking does NOT cost pinned H2D.** The likeliest refutation
+  did not refute. Probe: `~/vaayu-evidence/2026-08-07-chunked-arena/probe_e4_chunked_h2d.py`,
+  log `e4.log`. Fresh process per arm, no model load. Baseline = single 8 GiB pinned tensor
+  (19.6 GB/s burst / 19.5 slab).
+  | arm | k | charged | burst | vs base | slab-granularity | vs base | worst single chunk |
+  |---|---|---|---|---|---|---|---|
+  | mixed pow2 | 2 | 9.66 GB | 19.7 | 101% | 19.8 | 102% | 19.5 |
+  | uniform 4GiB | 3 | 12.88 GB | 20.0 | 102% | 19.9 | 102% | 19.4 |
+  | uniform 2GiB | 5 | 10.74 GB | 20.0 | 102% | 19.9 | 102% | 19.3 |
+  | uniform 1GiB | 9 | 9.66 GB | 20.0 | 102% | 20.0 | 103% | 19.4 |
+  | uniform 512MiB | 18 | 9.66 GB | 20.0 | 102% | 19.9 | 102% | 19.2 |
+  | uniform 256MiB | 36 | 9.66 GB | 19.9 | 102% | 20.0 | 102% | 19.2 |
+  **Every chunk `is_pinned()` True; worst of 111 chunks = 19.2 GB/s against a 15.0 GB/s floor.**
+  Measured at BOTH granularities: 256 MiB bursts (comparable to the engine's own
+  `PCIe measured:` line) and real `slab_bytes` copies (11.84 MB, the per-expert access pattern).
+  **Allocation cost is flat in k** — 1.5 s at k=1 vs 1.7 s at k=36, so no `cudaHostAlloc`
+  lock-down penalty either. **k is free**: whatever k a future geometry derives costs nothing,
+  so the design need not minimise it.
+- [x] **NEW FACT, not previously in this ledger: `torch._C._host_emptyCache()` DOES return pinned
+  memory to the OS.** Measured in E4's free probe on a k=2 / 9.66 GB arena: after `del`,
+  rss **+0.00 GB** (confirming the Settled "cached, not returned" rule); after
+  `torch._C._host_emptyCache()`, rss **−8.59 GB**. So the Settled entry is right about `del` but
+  incomplete — torch 2.11.0+cu130 exposes an explicit release. Potentially useful to Vaayu
+  itself (arena teardown / retry paths). Not yet wired anywhere.
+- [x] **E1 — PASSED 2026-08-07, but only with a better decomposition. Chunking recovers
+  7.93 GB resident while keeping EVERY slab.** Probe:
+  `~/vaayu-evidence/2026-08-07-chunked-arena/probe_e1_chunked_residency.py`, log `e1.log`;
+  decomposition comparison in `recursive_check.py`. Fresh process per arm, no model load.
+  **The winning shape is `[8 GiB, 512 MiB, 16 MiB]`, k=3, IDENTICAL on both models:**
+  | | MiniMax | Qwen |
+  |---|---|---|
+  | today, single tensor | 9.13 GB nominal → **17.18 GB charged** | same |
+  | recursive k=3 | **9.14 GB charged, 9.245 GB resident** | same bytes |
+  | usable slabs | **1027, exactly the unclamped need** | **771, exactly the need** |
+  | tail waste | 15 MB | 14 MB |
+  | **resident saving** | **−7.93 GB** | **−7.93 GB** |
+  All chunks `is_pinned()`. E4 already priced k=3 at **20.0 GB/s, 102 % of baseline** — so this
+  costs nothing in bandwidth.
+  **Two things the first run got wrong, recorded so the plan does not inherit them:**
+  - **The pre-stated bar was set against CHARGED bytes and missed a flat +0.107 GB of residency
+    overhead** (page tables + allocator bookkeeping for pinned pages). It is constant across every
+    config and both models, so it discriminates between nothing — but it made the first pass report
+    1/12. **The bar was NOT softened**; the decomposition was fixed instead.
+  - **A one-halving greedy is not good enough.** It jumped 512 MiB → 1 GiB at the tail and charged
+    **9.66 GB for 815 slabs when 771 were needed** — 0.47 GB wasted by the helper, not by chunking.
+    Recursing on the REMAINDER lands on 9.14 GB with slabs exactly equal to need.
+    **The plan must specify the recursive decomposition, with a floor (64 MiB used here) so k stays
+    small.** Uniform-chunk configs are all strictly worse and are not candidates.
+  **Expert-size sensitivity (arithmetic, no allocation): k stays 2-3 from 8.89 MB to 1 GB slabs**,
+  because the arena's byte size is bounded by the RAM budget, not by model size. A larger model does
+  not raise k on this box; a larger-RAM box raises it as log2 of the arena (~25 GB arena → k≈4).
+  Bounded near 5 for any plausible machine, and E4 measured k=36 at full bandwidth anyway.
+- [x] **E2 — DONE 2026-08-07. Blast radius confirmed at TWO methods; no consumer assumes arena
+  contiguity.** Verified by grep over `vaayu/`, `vaayu_rust/` and `tests/`, not trusted from the
+  earlier pre-read.
+  **The only base-pointer arithmetic against the arena is inside `SlabArena` itself:**
+  `tensor(idx)` (`expert_cache.py:64`) and `slab_index_of(tensor)` (`:82-86`). Everything else is
+  index-based (`acquire`/`release`/`record_read`/`_pending_read`) or slab-relative.
+  **Why the loader is safe:** every io_uring destination is `slab[slab_off : slab_off +
+  raw_aligned_length]` where `slab = arena.tensor(idx)`, and `load_expert_into_slab` raises
+  `RuntimeError` if `slab_off + slab_span > slab.nbytes`. **Spans are slab-relative and hard-bounded
+  by one slab**, so the loader can never hand io_uring a range crossing a chunk boundary. Same for
+  `views_from_packed_copy` (`persister:934-937`) and the `_used` computation
+  (`moe_patch:1628-1629`) — both offset from the slab, not the arena.
+  **The biggest unknown came back clean: the arena is NEVER registered with io_uring.**
+  `reregister_buffers` (`persister:317`) registers `_PINNED_BUFS[0]/[1]` — the staging pool — only.
+  Nothing depends on arena contiguity at the kernel level.
+  `arena.tensor()` production call sites: `moe_patch.py:1269, 1399, 1627`, `vaayu_base.py:926`.
+  **CORRECTION to this ledger: `slab_index_of` is NOT on the eviction path.** Eviction uses the
+  `slab_idx` already stored in the entry (`_account_evict`, `expert_cache.py:308-315`).
+  `slab_index_of` has exactly **ONE production caller** — `moe_patch.py:1658`, the `record_read`
+  H2D read-guard in the module-list forward — plus one test. Its failure mode is still real
+  (a wrong index attaches the read-guard event to the wrong slab, so the correct slab can be reused
+  while an H2D read is in flight → torn read), but the surface is one call site, not a hot path.
+- [x] **E3 — answered by E2, no probe needed.** The premise ("it is on the eviction path",
+  "MiniMax ~76 k/run, Qwen ~190 k/run") was wrong: eviction never calls it. At k=3 a linear scan
+  over three `(base_ptr, first_idx, n_slabs)` ranges is free at the one call site that exists.
+  No `bisect` needed. Revisit only if a future geometry derives a large k — and E4 measured k=36 at
+  102 % bandwidth, so a large k is viable if it ever arrives.
+- [x] **NEW REQUIREMENT found by E2, not in the original plan sketch: chunk bases must be
+  `_ALIGN`(4096)-aligned.** `slab_bytes` is `_ALIGN`-aligned so slab starts stay sector-aligned for
+  O_DIRECT — but that only holds relative to the chunk base, so each chunk base must be aligned too
+  or O_DIRECT reads break. **Measured: pinned allocations come back 2 MiB-aligned** (8 GiB, 512 MiB
+  and 16 MiB chunks all `data_ptr() % 2MiB == 0`, torch 2.11.0+cu130), so the property holds with
+  huge margin. **The plan must ASSERT it at construction rather than assume it.**
+  Also: `SlabArena`'s docstring claim *"Allocation is ONE backing tensor (a single cudaHostAlloc,
+  not thousands)"* must be updated.
+- [x] **E5 — DECIDED 2026-08-07 (user call): keep the successful chunks if they cover the working
+  set; otherwise free them and fall back pageable.** Chosen over three alternatives because it
+  reuses **Task 5's already-tested working-set floor** rather than inventing a new rule.
+  ```
+  chunks = []
+  for nbytes in decomposition:            # largest first: [8 GiB, 512 MiB, 16 MiB]
+      try:    chunks.append(pinned(nbytes))
+      except RuntimeError:  break         # keep what we have
+  n = sum(c // slab_bytes for c in chunks)
+  if cache_budget_for_arena(n, slab_bytes, pool_size) >= working_set_bytes:
+      WARN(...); use(chunks)              # degraded but still pinned, 19.8 GB/s
+  else:
+      free(chunks); WARN(...); fall_back_pageable()   # today's path, ~7.1 GB/s
+  ```
+  **Why this shape:** the decomposition is largest-first, so *which* chunk failed carries most of
+  the information — chunk 0 is ~88 % of capacity (its failure covers nothing and correctly falls
+  back), while a tail-chunk failure keeps ~99 % of capacity **and** pinned bandwidth. Falling back
+  to pageable costs **19.8 → ~7.1 GB/s on the whole expert path**, a far bigger loss than a slightly
+  smaller cache, so discarding 8.5 GiB of secured pinned memory over a 16 MiB shortfall would be
+  the wrong trade.
+  **Compare against the CACHE share, not the raw slab count** — `cache_budget_for_arena(n,
+  slab_bytes, pool_size)`, excluding the staging reserve, exactly as Task 5 does.
+  Rejected: (a) free-all-and-fall-back — simplest but pays the 2.8× cliff for a 0.2 % shortfall;
+  (b) retry-remainder-with-smaller-chunks — recovers most capacity and E4 proved small chunks are
+  free, but adds a retry loop and termination floor for a case that may never fire (**keep as a
+  documented future option if partial failure is ever observed**); (c) keep-whatever-succeeded
+  unconditionally — reintroduces exactly the Qwen thrash Task 5 exists to prevent (0.85 → 0.43
+  tok/s, 47 % → 0 % hit).
+  Both branches WARN per CLAUDE.md §5, and the cache budget is re-derived from the ACTUAL slab
+  count rather than the requested one.
+
+**PLAN WRITTEN 2026-08-07:** `docs/superpowers/plans/2026-08-07-chunked-slab-arena-plan.md`
+— 7 tasks, TDD, self-contained. Tasks 1-6 are code+tests with no GPU; Task 7 is the
+on-device gate. Execute with `superpowers:subagent-driven-development`.
+
+**EVIDENCE PHASE COMPLETE 2026-08-07 — E1, E2, E3, E4, E5 all closed. Plan L is NOT refuted.
+Write the plan next.** Headline: the winning design is a **recursive** power-of-two decomposition,
+`[8 GiB, 512 MiB, 16 MiB]` (k=3, identical on both models), giving **9.245 GB resident vs today's
+17.18 GB (−7.93 GB)** with **every slab kept** and **102 % of baseline H2D**. Blast radius is two
+`SlabArena` methods and one `slab_index_of` caller.
 
 ### Gates the plan must pre-state (do not soften them later)
 
@@ -478,6 +569,17 @@ measured 1.28× aggregate sitting in it.
   advertise does not exist. See the open bug below before debugging any such TypeError.
 - **Run logs are 300 MB - 1.3 GB.** Always `grep -a`, never `cat`, and never grep them while
   another run is streaming experts off the same NVMe.
+- **NEVER run multiple pinned-allocation arms in ONE process, and cap every probe's cgroup.**
+  Freed pinned blocks are cached, not returned (Settled), so `del` frees nothing at the OS level
+  and `torch.cuda.empty_cache()` is device memory. E4's first version ran 8 arms sequentially in
+  one process; they accumulated to a **28.3 GB peak** and **systemd-oomd killed the whole terminal
+  cgroup scope — 7 processes, four times**, because oomd kills by *scope*, not by process
+  (`oom_score_adj` is therefore useless). The working pattern, now in the probe: **one arm per
+  subprocess** (process exit is the only reliable release), each spawned under
+  `systemd-run --user --scope -p MemoryMax=<charge+2GB> -p MemorySwapMax=0` so a runaway arm dies
+  alone, plus a driver-side ceiling of `min(40% total RAM, available − 4 GB)`. Verified by
+  deliberately over-allocating against the cap: the arm died, the terminal lived.
+  Applies to **any** future pinned-memory probe on this box.
 - **A measurement that only lands in a doc is not a deliverable.** Plan J's Task 4 defined its
   output as "record the first failing K"; the number sat inert until it was turned into a runtime
   warning and an advisor fix — and *using* it immediately exposed a 7.4 % bug in the tool meant to
