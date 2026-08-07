@@ -173,12 +173,21 @@ class SlabArena:
     def slab_index_of(self, tensor: torch.Tensor) -> "int | None":
         """Return the slab index whose backing span contains `tensor`'s storage,
         or None if `tensor` is not a view into this arena (e.g. a legacy cloned
-        expert). Pure host-side pointer arithmetic — no CUDA, no lock."""
-        base = self._backing.data_ptr()
-        off = tensor.data_ptr() - base
-        if off < 0 or off >= self.n_slabs * self.slab_bytes:
-            return None
-        return int(off // self.slab_bytes)
+        expert). Pure host-side pointer arithmetic — no CUDA, no lock.
+
+        Bounds each chunk by its USED span (`_chunk_nslabs * slab_bytes`), not by
+        `chunk.numel()`: a chunk is a power of two and slab_bytes is not, so the
+        tail remainder belongs to no slab and a pointer there must be rejected
+        rather than mapped to a bogus index. A wrong index here attaches the H2D
+        read-guard to the wrong slab and lets the right one be reused mid-DMA —
+        silent torn-read corruption, not a crash.
+        """
+        ptr = tensor.data_ptr()
+        for c, base in enumerate(self._chunk_base_ptr):
+            off = ptr - base
+            if 0 <= off < self._chunk_nslabs[c] * self.slab_bytes:
+                return self._chunk_first[c] + int(off // self.slab_bytes)
+        return None
 
 
 class ExpertRAMCache:

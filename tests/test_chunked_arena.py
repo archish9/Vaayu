@@ -180,3 +180,56 @@ def test_slab_larger_than_any_natural_chunk_still_terminates():
     # would yield zero capacity and loop forever without the fallback.
     chunks = chunk_decomposition(3, 700 * 1024 * 1024)
     assert sum(c // (700 * 1024 * 1024) for c in chunks) >= 3
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_slab_index_of_round_trips_every_slab(n_slabs, slab_bytes):
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    for i in range(arena.n_slabs):
+        assert arena.slab_index_of(arena.tensor(i)) == i
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_slab_index_of_handles_first_and_last_slab_of_every_chunk(n_slabs, slab_bytes):
+    # The boundaries a single-_backing arena could not have.
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    for c, first in enumerate(arena._chunk_first):
+        last = first + arena._chunk_nslabs[c] - 1
+        assert arena.slab_index_of(arena.tensor(first)) == first
+        assert arena.slab_index_of(arena.tensor(last)) == last
+
+
+def test_pointer_in_a_chunk_tail_remainder_returns_none():
+    # THE new failure mode. Chunks are powers of two and slab_bytes is not, so
+    # each chunk ends with chunk_bytes % slab_bytes bytes belonging to no slab.
+    # A pointer there must be rejected, not mapped to a bogus index -- a wrong
+    # index frees/guards a slab another expert is still reading.
+    slab_bytes = 3 * 4096  # deliberately not a power of two
+    arena = SlabArena(5, slab_bytes, pin=False)
+    tails = 0
+    for c, chunk in enumerate(arena._chunks):
+        used = arena._chunk_nslabs[c] * slab_bytes
+        if used >= chunk.numel():
+            continue                      # this chunk happens to have no tail
+        tails += 1
+        tail = chunk[used:used + 1]
+        assert arena.slab_index_of(tail) is None
+    assert tails > 0, "fixture must produce at least one chunk with a tail"
+
+
+def test_pointer_outside_every_chunk_returns_none():
+    arena = SlabArena(6, 4096, pin=False)
+    foreign = torch.zeros(16, dtype=torch.uint8)
+    assert arena.slab_index_of(foreign) is None
+    # And a view into an unrelated arena, which is the realistic case
+    # (a legacy cloned expert, or a second model's arena).
+    other = SlabArena(6, 4096, pin=False)
+    assert arena.slab_index_of(other.tensor(0)) is None
+
+
+def test_interior_pointer_maps_to_its_own_slab():
+    # moe_patch passes a VIEW of a tensor inside the slab, not the slab start.
+    arena = SlabArena(6, 4096, pin=False)
+    for i in range(arena.n_slabs):
+        interior = arena.tensor(i)[100:200]
+        assert arena.slab_index_of(interior) == i
