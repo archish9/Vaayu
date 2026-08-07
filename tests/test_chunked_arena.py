@@ -334,3 +334,67 @@ def test_first_chunk_failure_raises_so_the_caller_can_fall_back(monkeypatch):
 def test_full_allocation_reports_requested_equals_allocated():
     arena = SlabArena(20, 4096, pin=False)
     assert arena.requested_n_slabs == arena.n_slabs == 20
+
+
+# --- Task 5: wire it into the loader, with the E5 working-set floor ---
+
+from vaayu.vaayu_base import (
+    arena_backing_is_sufficient,
+    cache_budget_for_arena,
+    unclamped_slab_count,
+)
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", GEOMETRIES)
+def test_full_arena_is_always_sufficient(n_slabs, slab_bytes):
+    # Nothing degraded -> no judgement call to make.
+    assert arena_backing_is_sufficient(
+        n_slabs=n_slabs, requested_n_slabs=n_slabs, slab_bytes=slab_bytes,
+        pool_size=4, working_set_bytes=10 ** 12) is True
+
+
+def test_degraded_arena_that_still_covers_the_working_set_is_kept():
+    slab_bytes, pool_size = 1_000_000, 4
+    # 100 slabs, 4 reserved for staging -> 96 MB of cache against a 50 MB
+    # working set: degraded, but decode will not thrash.
+    assert arena_backing_is_sufficient(
+        n_slabs=100, requested_n_slabs=200, slab_bytes=slab_bytes,
+        pool_size=pool_size, working_set_bytes=50_000_000) is True
+
+
+def test_degraded_arena_below_the_working_set_is_rejected():
+    # This is the Qwen failure Plan J Task 5 exists to prevent, measured:
+    # a cache below the working set thrashes (0.85 -> 0.43 tok/s, 47% -> 0%).
+    slab_bytes, pool_size = 1_000_000, 4
+    assert arena_backing_is_sufficient(
+        n_slabs=20, requested_n_slabs=200, slab_bytes=slab_bytes,
+        pool_size=pool_size, working_set_bytes=50_000_000) is False
+
+
+def test_the_staging_reserve_is_excluded_from_the_comparison():
+    # cache_budget_for_arena excludes pool_size; the floor must use the CACHE
+    # share, exactly as Plan J Task 5 does, not the raw slab count.
+    slab_bytes, pool_size = 1_000_000, 10
+    # 15 slabs - 10 staging = 5 MB of cache, under a 6 MB working set,
+    # even though 15 raw slabs would have cleared it.
+    assert cache_budget_for_arena(15, slab_bytes, pool_size) == 5_000_000
+    assert arena_backing_is_sufficient(
+        n_slabs=15, requested_n_slabs=200, slab_bytes=slab_bytes,
+        pool_size=pool_size, working_set_bytes=6_000_000) is False
+
+
+def test_zero_working_set_is_a_true_no_op():
+    # working_set_bytes defaults to 0 for models whose geometry is unknown;
+    # that must never reject an arena.
+    assert arena_backing_is_sufficient(
+        n_slabs=1, requested_n_slabs=200, slab_bytes=1_000_000,
+        pool_size=0, working_set_bytes=0) is True
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", GEOMETRIES)
+def test_the_arena_is_now_sized_unclamped(n_slabs, slab_bytes):
+    # The pow2 clamp existed only because the backing store was ONE pinned
+    # allocation. With chunks charged exactly, clamping would forfeit slabs
+    # for zero RAM.
+    budget = n_slabs * slab_bytes
+    assert unclamped_slab_count(budget, slab_bytes, pool_size=4) == n_slabs + 4
