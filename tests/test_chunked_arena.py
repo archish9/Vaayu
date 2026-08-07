@@ -189,14 +189,37 @@ def test_slab_index_of_round_trips_every_slab(n_slabs, slab_bytes):
         assert arena.slab_index_of(arena.tensor(i)) == i
 
 
-@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(5, 3 * 4096)])
 def test_slab_index_of_handles_first_and_last_slab_of_every_chunk(n_slabs, slab_bytes):
-    # The boundaries a single-_backing arena could not have.
+    # The boundaries a single-_backing arena could not have. (20,4096)/(7,8192)
+    # were dropped: Task 2's alignment-escalation path collapses them to a
+    # single chunk under pytest (non-deterministically -- observed 1 chunk in
+    # 1/40 standalone runs too), which silently degenerates this test into a
+    # subset of the round-trip test. (5, 3*4096) is deterministically
+    # multi-chunk (_chunk_first == [0, 2, 4] on 40/40 constructions).
     arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    assert len(arena._chunk_first) > 1, (
+        f"fixture must produce a multi-chunk arena, got {len(arena._chunk_first)} "
+        f"chunk(s) -- this test is vacuous otherwise")
     for c, first in enumerate(arena._chunk_first):
         last = first + arena._chunk_nslabs[c] - 1
         assert arena.slab_index_of(arena.tensor(first)) == first
         assert arena.slab_index_of(arena.tensor(last)) == last
+
+
+def test_slab_index_of_is_global_not_chunk_local():
+    # THE failure mode this function's one production caller cannot survive:
+    # a chunk-LOCAL index is silently correct for chunk 0 and wrong for every
+    # chunk after it, which attaches the H2D read-guard to the wrong slab and
+    # lets the right one be overwritten mid-DMA. A chunk-local implementation
+    # returns [0,1,0,1,0] here where the correct one returns [0,1,2,3,4].
+    slab_bytes = 3 * 4096          # forces >1 chunk deterministically
+    arena = SlabArena(5, slab_bytes, pin=False)
+    assert len(arena._chunk_first) > 1, (
+        f"fixture must produce a multi-chunk arena, got {len(arena._chunk_first)} "
+        f"chunk(s) -- this test is vacuous otherwise")
+    assert [arena.slab_index_of(arena.tensor(i)) for i in range(arena.n_slabs)] == \
+        list(range(arena.n_slabs))
 
 
 def test_pointer_in_a_chunk_tail_remainder_returns_none():
@@ -229,7 +252,11 @@ def test_pointer_outside_every_chunk_returns_none():
 
 def test_interior_pointer_maps_to_its_own_slab():
     # moe_patch passes a VIEW of a tensor inside the slab, not the slab start.
-    arena = SlabArena(6, 4096, pin=False)
+    slab_bytes = 4096
+    arena = SlabArena(6, slab_bytes, pin=False)
     for i in range(arena.n_slabs):
         interior = arena.tensor(i)[100:200]
         assert arena.slab_index_of(interior) == i
+        # Last byte of the slab: the offset adjacent to the next slab, and the
+        # one an off-by-one in the `//` bound would break.
+        assert arena.slab_index_of(arena.tensor(i)[slab_bytes - 1:]) == i
