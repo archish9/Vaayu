@@ -300,6 +300,23 @@ def degraded_arena_decision(n_slabs: int, requested_n_slabs: int, slab_bytes: in
                     f"to a pageable arena")
 
 
+def slab_arena_exhausted_warning(err: Exception) -> str:
+    """Operator-facing message for when the pageable retry after a rejected
+    degraded arena ALSO fails to allocate: there is no slab arena at all, not
+    just a smaller one.
+
+    Split into its own function (rather than an inline print, CLAUDE.md §5)
+    so this exact path -- the arena falling through to `None` with nothing
+    printed -- is covered by a test that does not need a model load, and a
+    future edit that drops the print cannot do so without also breaking that
+    assertion. This is the third silent-degradation defect on this branch.
+    """
+    return (f"[Vaayu-MoE] WARNING: pageable fallback also failed ({err}) — "
+            f"there is NO slab arena at all. Every expert streams from disk "
+            f"via the clone path; expect very slow decode (a real hardware "
+            f"limit on this box, not a bug).")
+
+
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
 # Property of the 16 GB box, NOT the model (§5). Sizes the cache = free_vram - this.
 #
@@ -1536,8 +1553,9 @@ class VaayuBaseModel(GenerationMixin):
                         try:
                             self._expert_slab_arena = SlabArena(
                                 _n_slabs, _slab_bytes, pin=False)
-                        except RuntimeError:
+                        except RuntimeError as _pageable_err:
                             self._expert_slab_arena = None
+                            print(slab_arena_exhausted_warning(_pageable_err))
                 if self._expert_slab_arena is not None:
                     _arena = self._expert_slab_arena
                     _chunk_note = ""

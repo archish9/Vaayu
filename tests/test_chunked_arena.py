@@ -342,6 +342,7 @@ from vaayu.vaayu_base import (
     arena_backing_is_sufficient,
     cache_budget_for_arena,
     degraded_arena_decision,
+    slab_arena_exhausted_warning,
     unclamped_slab_count,
 )
 
@@ -456,3 +457,18 @@ def test_degraded_arena_decision_message_never_claims_the_wrong_pin_state():
         n_slabs=5, requested_n_slabs=10, slab_bytes=1000,
         pool_size=0, working_set_bytes=0, pinned=False)
     assert "(pageable)" in pageable_why
+
+
+# --- Final review: the arena can vanish with no WARNING (§5) ---
+
+
+def test_slab_arena_exhausted_warning_names_the_real_state():
+    # The blocking finding: when the pageable retry after a rejected degraded
+    # arena ALSO fails, the loader must not fall through silently -- it must
+    # say there is NO arena at all (not just a smaller one) and what that
+    # means operationally.
+    msg = slab_arena_exhausted_warning(RuntimeError("out of memory"))
+    assert "WARNING" in msg
+    assert "NO slab arena" in msg
+    assert "out of memory" in msg
+    assert "clone path" in msg
