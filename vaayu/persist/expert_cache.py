@@ -24,7 +24,10 @@ class SlabArena:
     of the single-tensor figure). slab_bytes is _ALIGN-aligned and every chunk
     base is _ALIGN-aligned, so every slab start stays sector-aligned for
     O_DIRECT; a slab never straddles a chunk boundary, so each chunk's tail
-    remainder (chunk_bytes % slab_bytes) is deliberately left unused.
+    remainder (chunk_bytes % slab_bytes) is deliberately left unused. A chunk
+    sized tight against its own slab count can lose a slab to interior
+    alignment; when that happens the chunk is doubled to the next exact power
+    of two (still charged exactly) and a WARNING is printed, per CLAUDE.md §5.
     """
 
     def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
@@ -61,14 +64,22 @@ class SlabArena:
             # chunk to make up the loss. Measured: this cost a real slab on
             # SlabArena(n_slabs=2, slab_bytes=4096) every run. If that happens,
             # escalate the REQUEST to the next exact power of two -- still
-            # charged exactly, never a non-pow2 size -- and retry. One doubling
-            # always suffices: pad < _ALIGN <= slab_bytes <= chunk_bytes (chunk
-            # holds >=1 slab whenever escalation is warranted), so the doubled
-            # buffer's post-pad remainder exceeds the original chunk_bytes,
-            # which by construction already covers `natural_held` slabs. This
+            # charged exactly, never a non-pow2 size -- and retry (WARNING
+            # below; this doubles the chunk's resident cost and the abandoned
+            # buffer is not returned to the OS, so it must not be silent per
+            # CLAUDE.md §5). The loop (not a single bounded retry) is what
+            # guarantees termination: once request_bytes >= _ALIGN +
+            # natural_held * slab_bytes, the post-pad remainder always covers
+            # natural_held, and that threshold is a fixed number of doublings
+            # away since natural_held * slab_bytes is fixed. (NOT "one
+            # doubling always suffices" -- that assumed _ALIGN <= slab_bytes,
+            # which SlabArena does not validate and does not always hold: the
+            # suite's own SlabArena(n_slabs=2, slab_bytes=64) takes five.) This
             # never fires for the real 8 GiB/512 MiB/16 MiB production chunks
-            # (E2 measured them page-aligned with huge margin) -- it exists for
-            # tight small chunks like this suite's fixtures.
+            # (E2 measured them page-aligned with huge margin, and the
+            # re-review independently confirmed zero escalations on the real
+            # geometry) -- it exists for tight small chunks like this suite's
+            # fixtures.
             natural_held = chunk_bytes // self.slab_bytes
             request_bytes = chunk_bytes
             while True:
@@ -82,6 +93,12 @@ class SlabArena:
                 aligned_capacity = chunk.numel() // self.slab_bytes
                 if aligned_capacity >= natural_held:
                     break
+                print(f"[Vaayu-MoE] WARNING: chunk {len(self._chunks)} ({chunk_bytes} B) came back "
+                      f"{pad}B off a {_ALIGN}B boundary, leaving room for {aligned_capacity} of "
+                      f"{natural_held} slabs; retrying at {request_bytes * 2} B. This doubles the "
+                      f"chunk's resident cost -- the allocator charges an exact power of two, so the "
+                      f"larger request is still charged exactly, but the abandoned buffer is not "
+                      f"returned to the OS.")
                 request_bytes *= 2
             held = min(self.n_slabs - placed, aligned_capacity)
             if held == 0:
