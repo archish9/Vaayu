@@ -83,7 +83,7 @@ self-contained; do not start a row until the one above it is `[x]` and its RESUL
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
 | **1** | **J — pinned-allocation round-up** | P1 | `[x]` **CLOSED 2026-08-05** | — | Code, tests, both fix waves and all four parked bugs are on `main`; suite **576**. **Delivers on MiniMax only** — pool 4.69 → 13.4 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed, no quantization). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Fan-out deliverable: **K_max = floor(pool / per-session KV)**, first failing K = 7 uncompressed, and 9-bit compression clears it (7/7). RESULTS: `2026-08-03-pinned-allocation-roundup-RESULTS.md`. |
-| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **evidence DONE, plan WRITTEN — execute it** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — **gather evidence (E1-E5) before writing the plan.** |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **CODE DONE on branch — awaiting the on-device gate (Task 7)** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — evidence E1-E5 done, plan written, **Tasks 1-6 implemented and reviewed; only the on-device gate remains.** |
 | **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing — J is closed | J changed free RAM, not free VRAM, so K was never *blocked* — it waited so its sweep would run against a settled memory layout. That layout is now settled. |
 | **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **L** (J satisfied) | ~8 GiB of the arena's footprint was allocator round-up, so rebalancing the expert-cache/prefix-pool split before J would have measured an imaginary scarcity. **The answer now differs per model** — MiniMax's pool is 13.4 GB and almost certainly no longer binding, Qwen's is unchanged at 4.96 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
@@ -520,9 +520,42 @@ no other run in flight.
   Both branches WARN per CLAUDE.md §5, and the cache budget is re-derived from the ACTUAL slab
   count rather than the requested one.
 
-**PLAN WRITTEN 2026-08-07:** `docs/superpowers/plans/2026-08-07-chunked-slab-arena-plan.md`
-— 7 tasks, TDD, self-contained. Tasks 1-6 are code+tests with no GPU; Task 7 is the
-on-device gate. Execute with `superpowers:subagent-driven-development`.
+**IMPLEMENTATION COMPLETE 2026-08-08 — Tasks 1-6 of 7 on branch `plan-l-chunked-slab-arena`
+(11 commits, `72fb2a7..75c8e72`), suite 602 → 650 passed, warnings flat at 20. NOT MERGED.**
+
+Plan: `docs/superpowers/plans/2026-08-07-chunked-slab-arena-plan.md`. Ledger with every review
+finding: `.superpowers/sdd/2026-08-07-chunked-slab-arena-plan/progress.md`.
+
+| task | what landed | commit |
+|---|---|---|
+| 1 | `chunk_decomposition()` — recursive pow2, reuses `largest_pow2_at_most`/`next_pow2_at_least` | `e87b161` |
+| 2 | chunked backing; exact-pow2 request + aligned offset INSIDE it; escalation warned | `64360ee` `efec8c5` `4cc092f` |
+| 3 | `slab_index_of()` across chunk base pointers, bounded by the HELD span | `3adad1a` `2ab9c3e` |
+| 4 | partial-allocation failure keeps secured chunks; `requested_n_slabs` | `41ea849` |
+| 5 | loader wired unclamped; `arena_backing_is_sufficient` + `degraded_arena_decision` | `d3d1a91` `d14b399` `75c8e72` |
+| 6 | suite pointer | `8070ecc` |
+
+**Task 7 — the on-device gate — has NOT run and this must not merge without it.** Plan J's clamp
+passed every unit test and still cost Qwen **49 % of decode**; unit-green is not evidence for this
+class of change. Gates and the runbook are in the plan doc §Task 7. Needs a quiet box, both models,
+~60-90 min: same-day `main` baselines, branch runs, and a **Qwen multiturn at K=4** (K=3 needs
+4.5 GB and fits today's 4.96 GB pool, so main would pass and prove nothing; K=4 needs 5.97 GB).
+
+**Three defects were caught by review that a green suite did not see**, all silent-degradation on
+paths that only run when something has already gone wrong — worth remembering as a class:
+- a pad-and-realloc that requested a NON-pow2 size, charging 16 GiB for an 8 GiB chunk and
+  abandoning the original (~24 GiB for a 9.13 GB arena). Found by instrumenting `torch.empty`:
+  the "rare" fallback fired on **100 %** of chunks.
+- a **chunk-local** `slab_index_of` index where a global one is required — correct for chunk 0,
+  corrupting after. Found by mutation testing; the mutant passed **84/84** because every test
+  fixture collapsed to a single chunk, non-deterministically (2 chunks 39/40 runs standalone,
+  1 under pytest). Fixed with a deterministic multi-chunk fixture AND an asserted premise.
+- the arena silently becoming `None` when the pageable fallback also failed.
+
+**Method that paid for itself:** extracting load-time decisions into pure functions
+(`arena_backing_is_sufficient`, `degraded_arena_decision`, `slab_arena_exhausted_warning`) so they
+are testable without a model load. Two of the three defects above lived in code that was
+"verified" by a hand-run harness which **copied** the logic instead of executing it.
 
 **EVIDENCE PHASE COMPLETE 2026-08-07 — E1, E2, E3, E4, E5 all closed. Plan L is NOT refuted.
 Write the plan next.** Headline: the winning design is a **recursive** power-of-two decomposition,
@@ -704,6 +737,25 @@ Recorded so the same ground is not re-measured. Each cost a full plan or probe t
 ---
 
 ## Open bugs / questions (found in review, not yet fixed)
+
+- [ ] **`slab_bytes` is not provably a multiple of `_ALIGN` (4096), so `SlabArena`'s O_DIRECT
+  premise is unenforced.** The class docstring asserts "slab_bytes is _ALIGN-aligned so every slab
+  start stays sector-aligned for O_DIRECT", and nothing validates it. Traced by the Plan L final
+  review: `compute_slab_bytes` → `expert_span_bytes` → `_group_layout`'s
+  `slab_span = max(raw_aligned_length, packed_span)`, and `packed_span` only guarantees
+  `_TENSOR_ALIGN` (16-byte) alignment — so a slab layout dominated by `packed_span` can land
+  non-sector-aligned. **Pre-existing and unrelated to chunking** (unenforced identically before and
+  after), narrow edge case, never observed on either target model. Fix is a constructor validation
+  or an `_align_up` on the computed slab size. (found 2026-08-08, Plan L final review)
+- [ ] **Backlog from the Plan L reviews, all triaged as non-blocking:** (a) `SlabArena` exposes no
+  `chunk_count` / `charged_bytes` accessor, so `vaayu_base.py` reaches into `_chunks` and computes
+  `sum(c.numel() ...)` inline — one property would fix both call sites; (b)
+  `tests/test_slab_arena.py:538` still claims "`arena_slab_count` IS that gate in production",
+  stale since Plan L removed it from the arena path; (c) no test exercises an allocation failure on
+  an *escalated* retry specifically, only on a chunk's first request; (d) the zero-chunks error
+  message recomputes `chunk_decomposition()` purely for a count in the string; (e) the
+  *pre-existing* first-construction `except RuntimeError` can still leave the arena `None` with no
+  message — Plan L fixed only the new instance it introduced. (2026-08-08)
 
 - [ ] **F3 — the cross-turn prefix cache is wired into `generate()` only.** `batched_generate`
   (`vaayu_base.py:3553`) and `speculative_generate` (`:3448`) never call `PrefixCacheStore.lookup()`
