@@ -19,6 +19,78 @@ from vaayu.persist.safetensor_model_persister import (
     next_pow2_at_least,
 )
 
+# --- Task 2: SlabArena chunked backing ---
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_arena_allocates_chunks_not_one_backing_tensor(n_slabs, slab_bytes):
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    assert not hasattr(arena, "_backing"), \
+        "the single backing tensor must be gone, not shadowed"
+    assert len(arena._chunks) >= 1
+    assert sum(arena._chunk_nslabs) == arena.n_slabs
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_every_slab_is_distinct_and_the_right_size(n_slabs, slab_bytes):
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    seen = set()
+    for i in range(arena.n_slabs):
+        t = arena.tensor(i)
+        assert t.numel() == slab_bytes
+        assert t.data_ptr() not in seen, f"slab {i} aliases an earlier slab"
+        seen.add(t.data_ptr())
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_writing_one_slab_does_not_disturb_its_neighbours(n_slabs, slab_bytes):
+    # The real corruption symptom, expressed directly: a slab must be exactly
+    # its own bytes, including the first and last slab of every chunk.
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    for i in range(arena.n_slabs):
+        arena.tensor(i).fill_(0)
+    target = arena.n_slabs // 2
+    arena.tensor(target).fill_(0xAB)
+    for i in range(arena.n_slabs):
+        expected = 0xAB if i == target else 0
+        assert int(arena.tensor(i).min()) == expected
+        assert int(arena.tensor(i).max()) == expected
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", [(20, 4096), (7, 8192)])
+def test_slab_lives_entirely_inside_one_chunk(n_slabs, slab_bytes):
+    # If a slab straddled two allocations, tensor() would hand io_uring a span
+    # crossing a boundary -- the failure this design exists to prevent.
+    arena = SlabArena(n_slabs, slab_bytes, pin=False)
+    spans = [(c.data_ptr(), c.data_ptr() + c.numel()) for c in arena._chunks]
+    for i in range(arena.n_slabs):
+        t = arena.tensor(i)
+        start, end = t.data_ptr(), t.data_ptr() + t.numel()
+        assert any(lo <= start and end <= hi for lo, hi in spans), \
+            f"slab {i} is not contained in a single chunk"
+
+
+def test_chunk_bases_are_o_direct_aligned():
+    # slab_bytes is _ALIGN-aligned so slab starts stay sector-aligned -- but
+    # only RELATIVE TO THE CHUNK BASE, so each base must be aligned too or
+    # O_DIRECT reads break. Found by the E2 audit, 2026-08-07.
+    arena = SlabArena(20, _ALIGN * 2, pin=False)
+    for c in arena._chunks:
+        assert c.data_ptr() % _ALIGN == 0
+
+
+def test_acquire_release_still_cover_every_slab():
+    # acquire/release are index-based and must be untouched by chunking.
+    arena = SlabArena(9, 4096, pin=False)
+    got = []
+    while (idx := arena.acquire()) is not None:
+        got.append(idx)
+    assert sorted(got) == list(range(arena.n_slabs))
+    assert arena.acquire() is None
+    for idx in got:
+        arena.release(idx)
+    assert arena.acquire() is not None
+
 # Real derived geometries, used as test INPUTS only (never in vaayu/).
 # MiniMax-M2.7 and Qwen3-235B as measured 2026-08-07 by compute_slab_bytes().
 GEOMETRIES = [

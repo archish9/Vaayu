@@ -3,6 +3,8 @@ from collections import Counter, OrderedDict
 
 import torch
 
+from .safetensor_model_persister import _ALIGN, chunk_decomposition
+
 
 class SlabArena:
     """Fixed-size slab pool backing the expert RAM cache (zero-clone path).
@@ -14,18 +16,66 @@ class SlabArena:
     are never hardcoded). pin=True allocates CUDA-pinned memory so H2D copies
     run at pinned bandwidth and non_blocking=True is honored.
 
-    Allocation is ONE backing tensor (a single cudaHostAlloc, not thousands),
-    sliced into slabs; slab_bytes is _ALIGN-aligned so every slab start stays
-    sector-aligned for O_DIRECT.
+    Allocation is SEVERAL exact-power-of-two pinned chunks, not one backing
+    tensor: the caching host allocator charges the next power of two for every
+    pinned request, so a single 9.13 GB arena is charged 16 GiB and ~7.9 GB is
+    resident but unaddressable. Chunks are charged exactly (measured 2026-08-07:
+    9.14 GB charged, 9.245 GB resident, every slab kept, H2D unchanged at 102%
+    of the single-tensor figure). slab_bytes is _ALIGN-aligned and every chunk
+    base is _ALIGN-aligned, so every slab start stays sector-aligned for
+    O_DIRECT; a slab never straddles a chunk boundary, so each chunk's tail
+    remainder (chunk_bytes % slab_bytes) is deliberately left unused.
     """
 
     def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
         self.slab_bytes = int(slab_bytes)
         self.n_slabs = int(n_slabs)
         self.pin = bool(pin)
-        self._backing = torch.empty(
-            self.n_slabs * self.slab_bytes, dtype=torch.uint8, pin_memory=self.pin
-        )
+        self._chunks: list[torch.Tensor] = []
+        self._chunk_first: list[int] = []      # first GLOBAL slab index in chunk
+        self._chunk_nslabs: list[int] = []     # slabs this chunk actually holds
+        self._chunk_base_ptr: list[int] = []   # cached: data_ptr() per chunk
+        placed = 0
+        for chunk_bytes in chunk_decomposition(self.n_slabs, self.slab_bytes):
+            if placed >= self.n_slabs:
+                break
+            chunk = torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=self.pin)
+            if chunk.data_ptr() % _ALIGN != 0:
+                # Deviation from the brief's literal allocation, needed because
+                # the natural allocation is not ALWAYS _ALIGN-aligned in
+                # practice, on either path. Measured directly on this box
+                # (torch 2.11.0+cu130): plain (pin=False) torch.empty is only
+                # posix_memalign(64)-aligned, never page-aligned, at every size
+                # this suite uses. And even pin=True is not immune once the
+                # pinned pool is fragmented by other tests' churn (observed via
+                # test_slab_arena.py::test_acquire_consumes_pending_read_event
+                # failing only as part of the full suite, never alone) -- the
+                # evidence doc's "pinned allocations come back 2 MiB-aligned"
+                # finding (todo.md, E2) was measured on a fresh pool with the
+                # real 8 GiB/512 MiB/16 MiB chunk sizes only, not guaranteed
+                # for a fragmented pool or tiny allocations. Pad and slice as a
+                # fallback so the invariant holds unconditionally. Only reached
+                # off the fast path (it never fires for the production chunk
+                # sizes on a fresh pool, per E2), so it never costs the
+                # production case the pow2 charge exactness this task exists
+                # to preserve -- the untouched branch above still requests the
+                # exact chunk_bytes.
+                raw = torch.empty(chunk_bytes + _ALIGN, dtype=torch.uint8, pin_memory=self.pin)
+                pad = (-raw.data_ptr()) % _ALIGN
+                chunk = raw[pad:pad + chunk_bytes]
+            # O_DIRECT needs every slab start sector-aligned, and slab starts are
+            # offsets from the chunk base -- so the base must be aligned too.
+            # Measured 2026-08-07: pinned allocations come back 2 MiB-aligned.
+            assert chunk.data_ptr() % _ALIGN == 0, (
+                f"chunk base {chunk.data_ptr():#x} is not {_ALIGN}-aligned; "
+                f"O_DIRECT slab reads would fail")
+            held = min(self.n_slabs - placed, chunk_bytes // self.slab_bytes)
+            self._chunks.append(chunk)
+            self._chunk_first.append(placed)
+            self._chunk_nslabs.append(held)
+            self._chunk_base_ptr.append(chunk.data_ptr())
+            placed += held
+        self.n_slabs = placed
         self._free: list[int] = list(range(self.n_slabs))
         self._lock = threading.Lock()
         # slab idx -> CUDA event marking the most recent async (non_blocking)
@@ -60,8 +110,20 @@ class SlabArena:
         with self._lock:
             self._free.append(idx)
 
+    def _chunk_of(self, idx: int) -> int:
+        """Index of the chunk holding global slab `idx`. Linear scan: k is 3 on
+        both target geometries and bounded near 5 on any plausible box (chunk
+        count tracks log2 of the arena, which is bounded by the RAM budget, not
+        by model size)."""
+        for c, first in enumerate(self._chunk_first):
+            if first <= idx < first + self._chunk_nslabs[c]:
+                return c
+        raise IndexError(f"slab index {idx} outside arena of {self.n_slabs} slabs")
+
     def tensor(self, idx: int) -> torch.Tensor:
-        return self._backing[idx * self.slab_bytes:(idx + 1) * self.slab_bytes]
+        c = self._chunk_of(idx)
+        off = (idx - self._chunk_first[c]) * self.slab_bytes
+        return self._chunks[c][off:off + self.slab_bytes]
 
     def record_read(self, idx: int) -> None:
         """Mark that an async (non_blocking) H2D copy reading FROM slab `idx`
