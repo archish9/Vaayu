@@ -341,6 +341,7 @@ def test_full_allocation_reports_requested_equals_allocated():
 from vaayu.vaayu_base import (
     arena_backing_is_sufficient,
     cache_budget_for_arena,
+    degraded_arena_decision,
     unclamped_slab_count,
 )
 
@@ -398,3 +399,60 @@ def test_the_arena_is_now_sized_unclamped(n_slabs, slab_bytes):
     # for zero RAM.
     budget = n_slabs * slab_bytes
     assert unclamped_slab_count(budget, slab_bytes, pool_size=4) == n_slabs + 4
+
+
+# --- Task 5 review round 1: the degraded-arena DECISION, made testable ---
+#
+# Two defects shipped in the loader's hand-copied logic that nothing in the
+# suite could catch: a hardcoded "(pinned)" on the kept-branch message
+# (wrong for a pageable arena), and a pageable -> pageable retry that could
+# only lose slabs. degraded_arena_decision() is the extracted, directly
+# tested decision + message the loader now calls instead of re-deriving.
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", GEOMETRIES)
+def test_degraded_arena_decision_keeps_pinned_when_sufficient(n_slabs, slab_bytes):
+    keep, why = degraded_arena_decision(
+        n_slabs=n_slabs, requested_n_slabs=n_slabs + 1, slab_bytes=slab_bytes,
+        pool_size=4, working_set_bytes=1, pinned=True)
+    assert keep is True
+    assert "(pinned)" in why
+    assert "(pageable)" not in why
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", GEOMETRIES)
+def test_degraded_arena_decision_drops_pinned_when_under_working_set(n_slabs, slab_bytes):
+    # The Qwen failure this whole floor exists to prevent: a PINNED arena that
+    # cannot cover the working set must be dropped for a pageable retry.
+    keep, why = degraded_arena_decision(
+        n_slabs=1, requested_n_slabs=n_slabs, slab_bytes=slab_bytes,
+        pool_size=0, working_set_bytes=10 ** 15, pinned=True)
+    assert keep is False
+    assert "falling back to a pageable arena" in why
+
+
+@pytest.mark.parametrize("n_slabs,slab_bytes", GEOMETRIES)
+def test_degraded_arena_decision_keeps_pageable_regardless_of_working_set(n_slabs, slab_bytes):
+    # A pageable arena has nothing to trade: a pageable retry would use the
+    # same slab count and the same pin=False, so it can only do as well or
+    # worse. Even a working set the arena cannot cover must not trigger a
+    # retry -- keep it, and let the downstream working-set WARNING report it.
+    keep, why = degraded_arena_decision(
+        n_slabs=1, requested_n_slabs=n_slabs, slab_bytes=slab_bytes,
+        pool_size=0, working_set_bytes=10 ** 15, pinned=False)
+    assert keep is True
+    assert "(pageable)" in why
+    assert "(pinned)" not in why
+
+
+def test_degraded_arena_decision_message_never_claims_the_wrong_pin_state():
+    # The exact defect the review found: the kept-branch message must report
+    # the arena's ACTUAL pin state, not a hardcoded one.
+    _, pinned_why = degraded_arena_decision(
+        n_slabs=5, requested_n_slabs=10, slab_bytes=1000,
+        pool_size=0, working_set_bytes=0, pinned=True)
+    assert "(pinned)" in pinned_why
+    _, pageable_why = degraded_arena_decision(
+        n_slabs=5, requested_n_slabs=10, slab_bytes=1000,
+        pool_size=0, working_set_bytes=0, pinned=False)
+    assert "(pageable)" in pageable_why

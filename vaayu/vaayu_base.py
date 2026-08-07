@@ -182,6 +182,10 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
     must stay INSIDE the clamped total or it pushes the size back over the
     boundary) down to the power of two already being paid for.
 
+    No longer on the arena's construction path as of Plan L (chunked backing is
+    charged exactly per chunk, so there is nothing to clamp) — retained because it
+    still describes real allocator behaviour for any future single pinned allocation.
+
     No-op when the unclamped backing size is already an exact power of two — which
     is exactly the case where the allocator was not over-charging. Never returns
     fewer than `pool_size` slabs: the loader's landing zone survives any clamp.
@@ -214,7 +218,12 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
 
 def arena_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
                      working_set_bytes: int = 0, *, pin: bool) -> int:
-    """Slab count for the arena as it will actually be allocated.
+    """Slab count for a single-pinned-allocation arena, clamped if pinning.
+
+    No longer called from the arena's construction path as of Plan L (chunked
+    backing is charged exactly per chunk, so there is nothing to clamp) —
+    retained because it still describes real allocator behaviour for any future
+    single pinned allocation. Do not wire this back into the loader.
 
     Power-of-two charging is a property of the caching HOST allocator, i.e.
     pinned memory only: a pageable arena pays no round-up, so clamping it would
@@ -258,6 +267,37 @@ def arena_backing_is_sufficient(n_slabs: int, requested_n_slabs: int,
     if n_slabs >= requested_n_slabs:
         return True
     return cache_budget_for_arena(n_slabs, slab_bytes, pool_size) >= int(working_set_bytes)
+
+
+def degraded_arena_decision(n_slabs: int, requested_n_slabs: int, slab_bytes: int,
+                            pool_size: int, working_set_bytes: int,
+                            pinned: bool) -> tuple:
+    """Whether to keep a partially-allocated arena, and the operator-facing reason.
+
+    Returns (keep, why). Split out from the loader so the branch selection and its
+    message are testable without a model load -- the two defects this replaced
+    (a hardcoded "(pinned)" on a pageable arena, and a pageable->pageable retry
+    that could only lose slabs) were both invisible to the suite.
+
+    A pageable arena has nothing to trade: a pageable retry would use the same
+    slab count and the same pin=False, so it can only do as well or worse. Keep
+    it unconditionally -- the working-set-exceeds-cache-budget WARNING further
+    down the loader already reports a shortfall, if there is one. Only a PINNED
+    degraded arena has a real trade to weigh (this arena's slightly smaller
+    pinned cache vs. a pageable arena's full-but-slower one), so only that case
+    calls arena_backing_is_sufficient.
+    """
+    _pin_word = "pinned" if pinned else "pageable"
+    if not pinned:
+        return True, (f"keeping it ({_pin_word}) — already pageable, so a "
+                       f"pageable retry could not do better")
+    _ws_gb = working_set_bytes / 1e9
+    if arena_backing_is_sufficient(n_slabs, requested_n_slabs, slab_bytes,
+                                    pool_size, working_set_bytes):
+        return True, (f"keeping it ({_pin_word}) since its cache share still "
+                       f"covers the {_ws_gb:.2f}GB working set")
+    return False, (f"below the {_ws_gb:.2f}GB working set, falling back "
+                    f"to a pageable arena")
 
 
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
@@ -1465,9 +1505,8 @@ class VaayuBaseModel(GenerationMixin):
                 # away: take the full unclamped count (Plan L; measured
                 # 2026-08-07, 9.14GB charged vs 17.18GB for one tensor, every
                 # slab kept, H2D unchanged).
-                _unclamped_n = unclamped_slab_count(
+                _n_slabs = unclamped_slab_count(
                     _expert_budget, _slab_bytes, get_expert_pool_size())
-                _n_slabs = _unclamped_n
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
@@ -1480,19 +1519,14 @@ class VaayuBaseModel(GenerationMixin):
                 # A chunked arena keeps what it secured when a later chunk fails
                 # (E5). Keep the degraded arena only while its cache share still
                 # covers the working set; otherwise drop it and retry pageable,
-                # which trades bandwidth for capacity rather than thrashing.
+                # which trades bandwidth for capacity rather than thrashing. A
+                # degraded arena that is ALREADY pageable has nothing to trade --
+                # degraded_arena_decision keeps it unconditionally in that case.
                 _arena = self._expert_slab_arena
                 if _arena is not None and _arena.n_slabs < _arena.requested_n_slabs:
-                    _kept = arena_backing_is_sufficient(
+                    _kept, _why = degraded_arena_decision(
                         _arena.n_slabs, _arena.requested_n_slabs, _slab_bytes,
-                        get_expert_pool_size(), _geo["working_set_bytes"])
-                    _ws_gb = _geo["working_set_bytes"] / 1e9
-                    if _kept:
-                        _why = (f"keeping it (pinned) since its cache share still "
-                                f"covers the {_ws_gb:.2f}GB working set")
-                    else:
-                        _why = (f"below the {_ws_gb:.2f}GB working set, falling back "
-                                f"to a pageable arena")
+                        get_expert_pool_size(), _geo["working_set_bytes"], _arena.pin)
                     print(f"[Vaayu-MoE] WARNING: slab arena allocated only "
                           f"{_arena.n_slabs} of {_arena.requested_n_slabs} slabs "
                           f"({_arena.n_slabs * _slab_bytes / 1e9:.2f} of "
@@ -1530,8 +1564,7 @@ class VaayuBaseModel(GenerationMixin):
                     # The trim fires whenever the arena's CACHE share is smaller
                     # than the requested budget — which includes the unclamped
                     # case, where the staging addend alone accounts for the gap.
-                    # Do not call the arena "clamped" here: it often is not, and
-                    # a skipped clamp prints its own notice two lines above.
+                    # Do not call the arena "clamped" here: it often is not.
                     print(f"[Vaayu-MoE] Expert RAM cache budget trimmed "
                           f"{_expert_budget / 1e9:.2f} -> {_arena_bytes / 1e9:.2f} GB "
                           f"to match the slab arena's cache share (the arena, not "
