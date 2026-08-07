@@ -33,12 +33,14 @@ class SlabArena:
     def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
         self.slab_bytes = int(slab_bytes)
         self.n_slabs = int(n_slabs)
+        self.requested_n_slabs = int(n_slabs)
         self.pin = bool(pin)
         self._chunks: list[torch.Tensor] = []
         self._chunk_first: list[int] = []      # first GLOBAL slab index in chunk
         self._chunk_nslabs: list[int] = []     # slabs this chunk actually holds
         self._chunk_base_ptr: list[int] = []   # cached: data_ptr() per chunk
         placed = 0
+        alloc_failed = False
         for chunk_bytes in chunk_decomposition(self.n_slabs, self.slab_bytes):
             if placed >= self.n_slabs:
                 break
@@ -83,7 +85,20 @@ class SlabArena:
             natural_held = chunk_bytes // self.slab_bytes
             request_bytes = chunk_bytes
             while True:
-                raw = torch.empty(request_bytes, dtype=torch.uint8, pin_memory=self.pin)
+                try:
+                    raw = torch.empty(request_bytes, dtype=torch.uint8, pin_memory=self.pin)
+                except RuntimeError:
+                    # Keep the chunks already secured: they are still pinned, and a
+                    # pageable fallback costs 19.8 -> ~7.1 GB/s across the whole
+                    # expert path. The decomposition is largest-first, so a tail
+                    # failure keeps ~99% of capacity. An allocation failure at ANY
+                    # point -- the chunk's first request or an escalated retry --
+                    # stops placement entirely; a partially-escalated chunk is
+                    # never accepted. The caller applies the working-set floor and
+                    # decides whether the surviving capacity is good enough
+                    # (vaayu_base, Plan L Task 5 / E5).
+                    alloc_failed = True
+                    break
                 pad = (-raw.data_ptr()) % _ALIGN
                 chunk = raw[pad:] if pad else raw
                 if chunk.data_ptr() % _ALIGN != 0:
@@ -100,6 +115,8 @@ class SlabArena:
                       f"larger request is still charged exactly, but the abandoned buffer is not "
                       f"returned to the OS.")
                 request_bytes *= 2
+            if alloc_failed:
+                break
             held = min(self.n_slabs - placed, aligned_capacity)
             if held == 0:
                 continue
@@ -108,6 +125,11 @@ class SlabArena:
             self._chunk_nslabs.append(held)
             self._chunk_base_ptr.append(chunk.data_ptr())
             placed += held
+        if not self._chunks:
+            raise RuntimeError(
+                f"slab arena could not allocate any of "
+                f"{len(chunk_decomposition(self.requested_n_slabs, self.slab_bytes))} "
+                f"chunks for {self.requested_n_slabs} x {self.slab_bytes}B slabs")
         self.n_slabs = placed
         self._free: list[int] = list(range(self.n_slabs))
         self._lock = threading.Lock()

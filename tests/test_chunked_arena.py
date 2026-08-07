@@ -260,3 +260,77 @@ def test_interior_pointer_maps_to_its_own_slab():
         # Last byte of the slab: the offset adjacent to the next slab, and the
         # one an off-by-one in the `//` bound would break.
         assert arena.slab_index_of(arena.tensor(i)[slab_bytes - 1:]) == i
+
+
+# --- Task 4: partial-allocation failure (the E5 decision) ---
+
+
+def test_partial_allocation_keeps_the_chunks_that_succeeded(monkeypatch):
+    # A tail-chunk failure must not discard the chunks already secured:
+    # falling back to a pageable arena costs 19.8 -> ~7.1 GB/s across the
+    # whole expert path, far more than a slightly smaller cache.
+    #
+    # Deviation from the brief: trigger the failure on request SIZE, not a
+    # torch.empty call counter, AND hand back a pre-aligned buffer for every
+    # size that must succeed. Two reasons, both found by actually running the
+    # brief's version against this code:
+    #  1. Pageable allocations' return-pointer alignment is nondeterministic,
+    #     so chunk 0 (65536 B here) may need 0, 1, or several escalation
+    #     retries before it lands aligned (measured on this box: 1, landing
+    #     1280-3392B off a 4096B boundary across repeated runs). A "fail on
+    #     the 2nd call" counter lands inside that escalation instead of on
+    #     the tail chunk, leaving 0 chunks placed where 1 was intended.
+    #  2. `largest_pow2_at_most` always returns MORE than half of the bytes
+    #     it's asked for, so the first (largest) chunk always captures over
+    #     50% of the requested slabs -- if it genuinely escalates (doubles),
+    #     its capacity necessarily exceeds 100% of the total demand, and the
+    #     tail chunk is never even requested (observed on this box: with a
+    #     real escalation, chunk 0 alone absorbed all 20 slabs and
+    #     `arena.n_slabs` came back 20, not partial).
+    # Padding every non-tail-size allocation to a guaranteed-aligned slice
+    # removes the dependence on the allocator's alignment behaviour so the
+    # tail chunk's request always genuinely happens, making the "which chunk
+    # fails" outcome deterministic rather than allocator-luck-dependent.
+    real_empty = torch.empty
+    chunk_sizes = chunk_decomposition(20, 4096)
+    assert len(chunk_sizes) >= 2, "fixture must decompose into >= 2 chunks"
+    tail_size = chunk_sizes[1]
+
+    def flaky(*args, **kwargs):
+        if kwargs.get("pin_memory") is None or not args:
+            return real_empty(*args, **kwargs)
+        size = args[0]
+        if size == tail_size:
+            raise RuntimeError("simulated pinned allocation failure")
+        raw = real_empty(size + _ALIGN, **kwargs)
+        pad = (-raw.data_ptr()) % _ALIGN
+        return raw[pad:pad + size]
+
+    monkeypatch.setattr(torch, "empty", flaky)
+    arena = SlabArena(20, 4096, pin=False)
+    assert len(arena._chunks) == 1
+    assert arena.requested_n_slabs == 20
+    assert 0 < arena.n_slabs < 20
+    assert arena.n_slabs == arena._chunk_nslabs[0]
+    # and the surviving arena is fully coherent
+    for i in range(arena.n_slabs):
+        assert arena.slab_index_of(arena.tensor(i)) == i
+    assert sorted(arena._free) == list(range(arena.n_slabs))
+
+
+def test_first_chunk_failure_raises_so_the_caller_can_fall_back(monkeypatch):
+    # vaayu_base wraps SlabArena() in `except RuntimeError` and retries
+    # pageable; an arena with zero slabs must reach that handler.
+    def always_fails(*args, **kwargs):
+        if kwargs.get("pin_memory") is not None:
+            raise RuntimeError("simulated pinned allocation failure")
+        return torch.zeros(0, dtype=torch.uint8)
+
+    monkeypatch.setattr(torch, "empty", always_fails)
+    with pytest.raises(RuntimeError):
+        SlabArena(20, 4096, pin=False)
+
+
+def test_full_allocation_reports_requested_equals_allocated():
+    arena = SlabArena(20, 4096, pin=False)
+    assert arena.requested_n_slabs == arena.n_slabs == 20
