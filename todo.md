@@ -83,7 +83,7 @@ self-contained; do not start a row until the one above it is `[x]` and its RESUL
 | # | Plan | Prio | Status | Blocked by | Why here |
 |---|---|---|---|---|---|
 | **1** | **J — pinned-allocation round-up** | P1 | `[x]` **CLOSED 2026-08-05** | — | Code, tests, both fix waves and all four parked bugs are on `main`; suite **576**. **Delivers on MiniMax only** — pool 4.69 → 13.4 GB, round-2 TTFT 338 → 9.6 s (**35×**, uncompressed, no quantization). Qwen gets **nothing** (working set does not fit the clamped cache; Task 5 correctly skips the clamp). Fan-out deliverable: **K_max = floor(pool / per-session KV)**, first failing K = 7 uncompressed, and 9-bit compression clears it (7/7). RESULTS: `2026-08-03-pinned-allocation-roundup-RESULTS.md`. |
-| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[~]` **CODE DONE on branch — awaiting the on-device gate (Task 7)** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. See its own section below — evidence E1-E5 done, plan written, **Tasks 1-6 implemented and reviewed; only the on-device gate remains.** |
+| **2** | **L — chunked slab-arena backing (Option B)** | P1 | `[x]` **GATE PASSED 2026-08-08 — ready to merge** | — (J's RESULTS landed 2026-08-05) | **The only way Qwen gets Plan J's win.** J proved the effect is real and worth 35× TTFT; it also proved the single-tensor clamp cannot deliver it to a geometry whose working set sits between 8 and 16 GiB. Chunked backing keeps every slab *and* drops resident RAM. **DELIVERED: Qwen −7.94 GB rss, pool 2.36 → 10.53 GB, round-2 TTFT 55.4 → 12.6 s (4.4×), decode unregressed. MiniMax neutral.** |
 | **3** | **K — batched-decode admission reclaim** | P2 | `[ ]` ready | nothing — J is closed | J changed free RAM, not free VRAM, so K was never *blocked* — it waited so its sweep would run against a settled memory layout. That layout is now settled. |
 | **4** | **F1 — RAM budget arbitration** | P3 | `[!]` blocked | **L** (J satisfied) | ~8 GiB of the arena's footprint was allocator round-up, so rebalancing the expert-cache/prefix-pool split before J would have measured an imaginary scarcity. **The answer now differs per model** — MiniMax's pool is 13.4 GB and almost certainly no longer binding, Qwen's is unchanged at 4.96 GB and still is. Re-open only after L settles Qwen's footprint. No plan written yet. |
 
@@ -520,20 +520,40 @@ no other run in flight.
   Both branches WARN per CLAUDE.md §5, and the cache budget is re-derived from the ACTUAL slab
   count rather than the requested one.
 
-**IMPLEMENTATION COMPLETE 2026-08-08 — Tasks 1-6 of 7 on branch `plan-l-chunked-slab-arena`
-(11 commits, `72fb2a7..75c8e72`), suite 602 → 650 passed, warnings flat at 20. NOT MERGED.**
+**COMPLETE 2026-08-08 — all 7 tasks. Branch `plan-l-chunked-slab-arena` (11 commits,
+`72fb2a7..75c8e72`), suite 602 → 650 passed, warnings flat at 20. ON-DEVICE GATE PASSED.
+RESULTS: `docs/superpowers/plans/2026-08-08-chunked-slab-arena-RESULTS.md`.**
 
-Plan: `docs/superpowers/plans/2026-08-07-chunked-slab-arena-plan.md`. Ledger with every review
-finding: `.superpowers/sdd/2026-08-07-chunked-slab-arena-plan/progress.md`.
+**Qwen — the model Plan J delivered NOTHING to — is the win, all same-box same-day A/B:**
 
-| task | what landed | commit |
+| | main | branch |
 |---|---|---|
-| 1 | `chunk_decomposition()` — recursive pow2, reuses `largest_pow2_at_most`/`next_pow2_at_least` | `e87b161` |
-| 2 | chunked backing; exact-pow2 request + aligned offset INSIDE it; escalation warned | `64360ee` `efec8c5` `4cc092f` |
-| 3 | `slab_index_of()` across chunk base pointers, bounded by the HELD span | `3adad1a` `2ab9c3e` |
-| 4 | partial-allocation failure keeps secured chunks; `requested_n_slabs` | `41ea849` |
-| 5 | loader wired unclamped; `arena_backing_is_sufficient` + `degraded_arena_decision` | `d3d1a91` `d14b399` `75c8e72` |
-| 6 | suite pointer | `8070ecc` |
+| arena charge | **16 GiB** for 9.21 GB of slabs | **9.24 GB** (5 pow2 chunks), all 778 slabs kept |
+| post-arena rss | 21.10 GB | **13.16 GB (−7.94 GB)** |
+| prefix pool | 2.36 GB | **10.53 GB (4.46×)** |
+| decode / hit | 0.83 tok/s / 44 % | **0.85 / 46 %** — no regression |
+| multiturn K=4 × 7 751 tok | **0/4 HIT, 0 tokens saved, exit FAIL** | **4/4 HIT, 100 % saved, exit PASS** |
+| round-2 TTFT | 55.42 s | **12.61 s — 4.4×** |
+
+**Qwen's TTFT multiplier is now MEASURED (4.4×), not inherited from MiniMax's 35×** — which is what
+this plan's own gate demanded. It is smaller only because Qwen's cold TTFT is 55 s where MiniMax's
+is 338 s; the mechanism is identical.
+
+**MiniMax is a WASH, stated plainly:** the branch spends 0.62 GB more RAM there and gets a 0.61 GB
+smaller pool, buying back the 68 slabs J's clamp forfeits (966 → 1034). Decode flat (1.45 → 1.47),
+session capacity unchanged at 5 either way. But MiniMax's expert cache hits only 6 %, so those
+slabs are worth little — **if a future load put those numbers either side of a session boundary this
+trade turns negative.** L is the mirror image of J: J won on MiniMax and gave Qwen nothing; L wins
+on Qwen and gives MiniMax nothing.
+
+**Two gates need honesty rather than a checkmark:**
+- **Qwen pool ≥ 11 GB: measured 10.53 GB — misses the literal bar.** That bar came from a day when
+  `main` gave 4.96 GB; today `main` gave **2.36 GB**. Free RAM at load varies (already Settled).
+  The generalizable result is the mechanism: +8.17 GB, 4.46×, every slab kept.
+- **Both decode bars are historical and today's own `main` sits BELOW them** (0.83 vs 0.85 Qwen,
+  1.45 vs 1.48 MiniMax) on unchanged code. The branch beats today's baseline on both. Using the
+  historical figures as the gate would have failed `main` itself — the same-day A/B rule earning
+  its place in real time.
 
 **Task 7 — the on-device gate — has NOT run and this must not merge without it.** Plan J's clamp
 passed every unit test and still cost Qwen **49 % of decode**; unit-green is not evidence for this
@@ -737,6 +757,31 @@ Recorded so the same ground is not re-measured. Each cost a full plan or probe t
 ---
 
 ## Open bugs / questions (found in review, not yet fixed)
+
+- [bug] **Vaayu's DENSE path generates incoherent output — the checkpoint is fine, Vaayu is wrong.**
+  `Llama-3.2-1B-Instruct`, prompt `"The capital of France is"`:
+  | stack | output |
+  |---|---|
+  | stock transformers, same files | `' Paris. The Eiffel Tower is located in'` |
+  | Vaayu `attn=sdpa` | `'izzie!ong gotten gottenongpectivepectivepective there'` |
+  | Vaayu `attn=eager` | `'izzie there suggest gottenongpective gottenpectivepectivepective'` |
+  | Vaayu `attn=flash_attention_2` (default) | `'izzie factory.identity /////pectivepectivepective...'` |
+  All three attention implementations are wrong, so it is not an attn-impl issue. **Pre-existing:
+  identical on `main` and on the Plan L branch — byte-identical generations under `do_sample=False`,
+  which is also the strongest possible evidence that Plan L did not touch dense.** CLAUDE.md §0
+  requires dense to keep working; right now it does not. Note `Llama-3.2-1B-Instruct` is also the
+  README's suggested **drafter** for speculative decoding, so bad dense output likely means the
+  drafter proposes garbage (verify would reject it — correctness preserved, speedup lost).
+  Found 2026-08-08 running Plan L's dense gate. Logs:
+  `~/vaayu-evidence/2026-08-07-chunked-arena/dense-smoke-{MAIN,BRANCH}.log`.
+- [bug] **The dense smoke test CLAUDE.md §0 relies on cannot catch the bug above.**
+  `test_batched_dense_smoke.py` asserts `seen[0] > 0 and seen[1] > 0` — token **count**, not
+  correctness — so it passes while the model emits noise. CLAUDE.md §0 says "a dense load+generate
+  smoke test guards that"; it does not. Fix: assert on content (a greedy completion of a factual
+  prompt, or a perplexity/logit check against a reference), not on token count. **The first version
+  of Plan L's own gate script had the identical flaw (`assert n > 0`) and would have reported the
+  garbage above as a PASS** — this failure mode is easy to write by accident.
+  (found 2026-08-08, Plan L Task 7)
 
 - [ ] **`slab_bytes` is not provably a multiple of `_ALIGN` (4096), so `SlabArena`'s O_DIRECT
   premise is unenforced.** The class docstring asserts "slab_bytes is _ALIGN-aligned so every slab
