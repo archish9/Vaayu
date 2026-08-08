@@ -63,6 +63,49 @@ def largest_pow2_at_most(n: int) -> int:
     return 1 << (n.bit_length() - 1)
 
 
+def chunk_decomposition(n_slabs: int, slab_bytes: int) -> list[int]:
+    """Split an arena of `n_slabs` into exact-power-of-two chunk sizes.
+
+    The caching host allocator charges the NEXT power of two for every pinned
+    request and charges an exact power of two exactly, so ONE backing tensor a
+    hair over a power of two costs nearly double and the surplus is never
+    addressable (measured: a 9.13 GB arena is charged 16 GiB). Several exact-pow2
+    chunks are each charged exactly.
+
+    A slab must not straddle a chunk boundary — `tensor()` would hand io_uring a
+    span crossing two allocations — so each chunk contributes only
+    `floor(chunk_bytes / slab_bytes)` slabs and its tail remainder is left
+    unused. `slab_bytes` is _ALIGN-aligned but is not a power of two, so that
+    remainder is unavoidable; measured at ~15 MB total across the whole arena.
+
+    Largest chunk first: take the largest power of two that does not exceed what
+    is still needed, then recurse on the remainder. When that candidate cannot
+    hold even one slab (a model whose experts are larger than the remaining
+    need), fall back to the smallest power of two that holds one.
+
+    Returns [] for a non-positive slab count. Allocator behaviour, not a model
+    number (CLAUDE.md §5).
+    """
+    n_slabs = int(n_slabs)
+    slab_bytes = int(slab_bytes)
+    if n_slabs <= 0 or slab_bytes <= 0:
+        return []
+    chunks: list[int] = []
+    left = n_slabs
+    while left > 0:
+        need = left * slab_bytes
+        chunk = largest_pow2_at_most(need)
+        capacity = (chunk // slab_bytes) if chunk else 0
+        if capacity == 0:
+            # The remaining need is smaller than one slab's own power-of-two
+            # footprint; take the smallest chunk that holds a slab.
+            chunk = next_pow2_at_least(slab_bytes)
+            capacity = chunk // slab_bytes
+        chunks.append(chunk)
+        left -= min(left, capacity)
+    return chunks
+
+
 def next_pow2_at_least(n: int) -> int:
     """Least power of two >= n (0 for n <= 0). This is exactly what the caching
     host allocator will charge for a pinned request of n bytes."""

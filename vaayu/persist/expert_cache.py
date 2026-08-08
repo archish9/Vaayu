@@ -3,6 +3,8 @@ from collections import Counter, OrderedDict
 
 import torch
 
+from .safetensor_model_persister import _ALIGN, chunk_decomposition
+
 
 class SlabArena:
     """Fixed-size slab pool backing the expert RAM cache (zero-clone path).
@@ -14,18 +16,121 @@ class SlabArena:
     are never hardcoded). pin=True allocates CUDA-pinned memory so H2D copies
     run at pinned bandwidth and non_blocking=True is honored.
 
-    Allocation is ONE backing tensor (a single cudaHostAlloc, not thousands),
-    sliced into slabs; slab_bytes is _ALIGN-aligned so every slab start stays
-    sector-aligned for O_DIRECT.
+    Allocation is SEVERAL exact-power-of-two pinned chunks, not one backing
+    tensor: the caching host allocator charges the next power of two for every
+    pinned request, so a single 9.13 GB arena is charged 16 GiB and ~7.9 GB is
+    resident but unaddressable. Chunks are charged exactly (measured 2026-08-07:
+    9.14 GB charged, 9.245 GB resident, every slab kept, H2D unchanged at 102%
+    of the single-tensor figure). slab_bytes is _ALIGN-aligned and every chunk
+    base is _ALIGN-aligned, so every slab start stays sector-aligned for
+    O_DIRECT; a slab never straddles a chunk boundary, so each chunk's tail
+    remainder (chunk_bytes % slab_bytes) is deliberately left unused. A chunk
+    sized tight against its own slab count can lose a slab to interior
+    alignment; when that happens the chunk is doubled to the next exact power
+    of two (still charged exactly) and a WARNING is printed, per CLAUDE.md §5.
     """
 
     def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
         self.slab_bytes = int(slab_bytes)
         self.n_slabs = int(n_slabs)
+        self.requested_n_slabs = int(n_slabs)
         self.pin = bool(pin)
-        self._backing = torch.empty(
-            self.n_slabs * self.slab_bytes, dtype=torch.uint8, pin_memory=self.pin
-        )
+        self._chunks: list[torch.Tensor] = []
+        self._chunk_first: list[int] = []      # first GLOBAL slab index in chunk
+        self._chunk_nslabs: list[int] = []     # slabs this chunk actually holds
+        self._chunk_base_ptr: list[int] = []   # cached: data_ptr() per chunk
+        placed = 0
+        alloc_failed = False
+        for chunk_bytes in chunk_decomposition(self.n_slabs, self.slab_bytes):
+            if placed >= self.n_slabs:
+                break
+            # ONE allocation per chunk, at the EXACT power of two -- that is the
+            # whole point: the caching host allocator charges an exact power of
+            # two exactly. Never request chunk_bytes + anything; a non-pow2
+            # request is charged the NEXT power of two, which for an 8 GiB chunk
+            # means 16 GiB and re-creates the waste this design removes.
+            #
+            # O_DIRECT needs every slab start sector-aligned, and slab starts are
+            # offsets from the chunk base -- so the base must be aligned too.
+            # The allocation itself is NOT reliably aligned: pageable torch.empty
+            # is only posix_memalign(64)-aligned, and a fragmented pinned pool can
+            # serve a small request from a misaligned split remainder (measured
+            # 2026-08-07: 2 of 120 pow2 requests, both 4 KiB, at offset 1024;
+            # large pow2 requests stayed page-aligned). So take the aligned offset
+            # INSIDE the allocation rather than padding the request.
+            #
+            # That slicing can itself cost up to _ALIGN-1 bytes of the chunk's
+            # OWN capacity (chunk_bytes // slab_bytes), not just its already-
+            # discarded tail remainder -- fatal for a chunk sized tight against
+            # its slab count (e.g. exactly 2 slabs, no slack) with no later
+            # chunk to make up the loss. Measured: this cost a real slab on
+            # SlabArena(n_slabs=2, slab_bytes=4096) every run. If that happens,
+            # escalate the REQUEST to the next exact power of two -- still
+            # charged exactly, never a non-pow2 size -- and retry (WARNING
+            # below; this doubles the chunk's resident cost and the abandoned
+            # buffer is not returned to the OS, so it must not be silent per
+            # CLAUDE.md §5). The loop (not a single bounded retry) is what
+            # guarantees termination: once request_bytes >= _ALIGN +
+            # natural_held * slab_bytes, the post-pad remainder always covers
+            # natural_held, and that threshold is a fixed number of doublings
+            # away since natural_held * slab_bytes is fixed. (NOT "one
+            # doubling always suffices" -- that assumed _ALIGN <= slab_bytes,
+            # which SlabArena does not validate and does not always hold: the
+            # suite's own SlabArena(n_slabs=2, slab_bytes=64) takes five.) This
+            # never fires for the real 8 GiB/512 MiB/16 MiB production chunks
+            # (E2 measured them page-aligned with huge margin, and the
+            # re-review independently confirmed zero escalations on the real
+            # geometry) -- it exists for tight small chunks like this suite's
+            # fixtures.
+            natural_held = chunk_bytes // self.slab_bytes
+            request_bytes = chunk_bytes
+            while True:
+                try:
+                    raw = torch.empty(request_bytes, dtype=torch.uint8, pin_memory=self.pin)
+                except RuntimeError:
+                    # Keep the chunks already secured: they are still pinned, and a
+                    # pageable fallback costs 19.8 -> ~7.1 GB/s across the whole
+                    # expert path. The decomposition is largest-first, so a tail
+                    # failure keeps ~99% of capacity. An allocation failure at ANY
+                    # point -- the chunk's first request or an escalated retry --
+                    # stops placement entirely; a partially-escalated chunk is
+                    # never accepted. The caller applies the working-set floor and
+                    # decides whether the surviving capacity is good enough
+                    # (vaayu_base, Plan L Task 5 / E5).
+                    alloc_failed = True
+                    break
+                pad = (-raw.data_ptr()) % _ALIGN
+                chunk = raw[pad:] if pad else raw
+                if chunk.data_ptr() % _ALIGN != 0:
+                    raise RuntimeError(
+                        f"chunk base {chunk.data_ptr():#x} is not {_ALIGN}-aligned "
+                        f"after padding by {pad}B; O_DIRECT slab reads would fail")
+                aligned_capacity = chunk.numel() // self.slab_bytes
+                if aligned_capacity >= natural_held:
+                    break
+                print(f"[Vaayu-MoE] WARNING: chunk {len(self._chunks)} ({chunk_bytes} B) came back "
+                      f"{pad}B off a {_ALIGN}B boundary, leaving room for {aligned_capacity} of "
+                      f"{natural_held} slabs; retrying at {request_bytes * 2} B. This doubles the "
+                      f"chunk's resident cost -- the allocator charges an exact power of two, so the "
+                      f"larger request is still charged exactly, but the abandoned buffer is not "
+                      f"returned to the OS.")
+                request_bytes *= 2
+            if alloc_failed:
+                break
+            held = min(self.n_slabs - placed, aligned_capacity)
+            if held == 0:
+                continue
+            self._chunks.append(chunk)
+            self._chunk_first.append(placed)
+            self._chunk_nslabs.append(held)
+            self._chunk_base_ptr.append(chunk.data_ptr())
+            placed += held
+        if not self._chunks:
+            raise RuntimeError(
+                f"slab arena could not allocate any of "
+                f"{len(chunk_decomposition(self.requested_n_slabs, self.slab_bytes))} "
+                f"chunks for {self.requested_n_slabs} x {self.slab_bytes}B slabs")
+        self.n_slabs = placed
         self._free: list[int] = list(range(self.n_slabs))
         self._lock = threading.Lock()
         # slab idx -> CUDA event marking the most recent async (non_blocking)
@@ -60,8 +165,20 @@ class SlabArena:
         with self._lock:
             self._free.append(idx)
 
+    def _chunk_of(self, idx: int) -> int:
+        """Index of the chunk holding global slab `idx`. Linear scan: k is 3 on
+        both target geometries and bounded near 5 on any plausible box (chunk
+        count tracks log2 of the arena, which is bounded by the RAM budget, not
+        by model size)."""
+        for c, first in enumerate(self._chunk_first):
+            if first <= idx < first + self._chunk_nslabs[c]:
+                return c
+        raise IndexError(f"slab index {idx} outside arena of {self.n_slabs} slabs")
+
     def tensor(self, idx: int) -> torch.Tensor:
-        return self._backing[idx * self.slab_bytes:(idx + 1) * self.slab_bytes]
+        c = self._chunk_of(idx)
+        off = (idx - self._chunk_first[c]) * self.slab_bytes
+        return self._chunks[c][off:off + self.slab_bytes]
 
     def record_read(self, idx: int) -> None:
         """Mark that an async (non_blocking) H2D copy reading FROM slab `idx`
@@ -78,12 +195,21 @@ class SlabArena:
     def slab_index_of(self, tensor: torch.Tensor) -> "int | None":
         """Return the slab index whose backing span contains `tensor`'s storage,
         or None if `tensor` is not a view into this arena (e.g. a legacy cloned
-        expert). Pure host-side pointer arithmetic — no CUDA, no lock."""
-        base = self._backing.data_ptr()
-        off = tensor.data_ptr() - base
-        if off < 0 or off >= self.n_slabs * self.slab_bytes:
-            return None
-        return int(off // self.slab_bytes)
+        expert). Pure host-side pointer arithmetic — no CUDA, no lock.
+
+        Bounds each chunk by its USED span (`_chunk_nslabs * slab_bytes`), not by
+        `chunk.numel()`: a chunk is a power of two and slab_bytes is not, so the
+        tail remainder belongs to no slab and a pointer there must be rejected
+        rather than mapped to a bogus index. A wrong index here attaches the H2D
+        read-guard to the wrong slab and lets the right one be reused mid-DMA —
+        silent torn-read corruption, not a crash.
+        """
+        ptr = tensor.data_ptr()
+        for c, base in enumerate(self._chunk_base_ptr):
+            off = ptr - base
+            if 0 <= off < self._chunk_nslabs[c] * self.slab_bytes:
+                return self._chunk_first[c] + int(off // self.slab_bytes)
+        return None
 
 
 class ExpertRAMCache:

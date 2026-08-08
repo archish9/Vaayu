@@ -4,6 +4,7 @@ CLAUDE.md §5: sizing helpers are tested over BOTH target geometries
 (Qwen-like: 91 layers x 128 experts, MiniMax-like: 62 x 256). All tests are
 CPU-only (pin=False) so the suite runs without CUDA.
 """
+# Chunked backing (Plan L, 2026-08-07) is covered in tests/test_chunked_arena.py.
 import pytest
 import torch
 

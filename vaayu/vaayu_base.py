@@ -22,7 +22,6 @@ from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
 from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
-from .persist.safetensor_model_persister import next_pow2_at_least
 from .prefix_cache import PrefixCacheStore
 from . import turboquant
 
@@ -183,6 +182,10 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
     must stay INSIDE the clamped total or it pushes the size back over the
     boundary) down to the power of two already being paid for.
 
+    No longer on the arena's construction path as of Plan L (chunked backing is
+    charged exactly per chunk, so there is nothing to clamp) — retained because it
+    still describes real allocator behaviour for any future single pinned allocation.
+
     No-op when the unclamped backing size is already an exact power of two — which
     is exactly the case where the allocator was not over-charging. Never returns
     fewer than `pool_size` slabs: the loader's landing zone survives any clamp.
@@ -215,7 +218,12 @@ def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
 
 def arena_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
                      working_set_bytes: int = 0, *, pin: bool) -> int:
-    """Slab count for the arena as it will actually be allocated.
+    """Slab count for a single-pinned-allocation arena, clamped if pinning.
+
+    No longer called from the arena's construction path as of Plan L (chunked
+    backing is charged exactly per chunk, so there is nothing to clamp) —
+    retained because it still describes real allocator behaviour for any future
+    single pinned allocation. Do not wire this back into the loader.
 
     Power-of-two charging is a property of the caching HOST allocator, i.e.
     pinned memory only: a pageable arena pays no round-up, so clamping it would
@@ -238,6 +246,75 @@ def cache_budget_for_arena(n_slabs: int, slab_bytes: int, pool_size: int) -> int
     disable the cache silently (CLAUDE.md §5).
     """
     return max(0, int(n_slabs) - int(pool_size)) * int(slab_bytes)
+
+
+def arena_backing_is_sufficient(n_slabs: int, requested_n_slabs: int,
+                                slab_bytes: int, pool_size: int,
+                                working_set_bytes: int) -> bool:
+    """Whether a possibly-degraded chunked arena is worth keeping.
+
+    A chunked arena keeps whatever chunks it secured when a later one fails to
+    allocate (Plan L / E5): those chunks are still PINNED, and falling back to a
+    pageable arena costs 19.8 -> ~7.1 GB/s across the whole expert path, far more
+    than a slightly smaller cache. But a cache below the model's working set
+    thrashes — measured on Qwen3-235B, 0.85 -> 0.43 tok/s with the expert RAM
+    cache falling 47% -> 0% hit — so a shortfall that crosses that boundary is
+    not worth keeping and the caller should fall back instead.
+
+    Compares the CACHE share (excluding the staging reserve), matching
+    clamp_slab_count. `working_set_bytes=0` is a true no-op.
+    """
+    if n_slabs >= requested_n_slabs:
+        return True
+    return cache_budget_for_arena(n_slabs, slab_bytes, pool_size) >= int(working_set_bytes)
+
+
+def degraded_arena_decision(n_slabs: int, requested_n_slabs: int, slab_bytes: int,
+                            pool_size: int, working_set_bytes: int,
+                            pinned: bool) -> tuple:
+    """Whether to keep a partially-allocated arena, and the operator-facing reason.
+
+    Returns (keep, why). Split out from the loader so the branch selection and its
+    message are testable without a model load -- the two defects this replaced
+    (a hardcoded "(pinned)" on a pageable arena, and a pageable->pageable retry
+    that could only lose slabs) were both invisible to the suite.
+
+    A pageable arena has nothing to trade: a pageable retry would use the same
+    slab count and the same pin=False, so it can only do as well or worse. Keep
+    it unconditionally -- the working-set-exceeds-cache-budget WARNING further
+    down the loader already reports a shortfall, if there is one. Only a PINNED
+    degraded arena has a real trade to weigh (this arena's slightly smaller
+    pinned cache vs. a pageable arena's full-but-slower one), so only that case
+    calls arena_backing_is_sufficient.
+    """
+    _pin_word = "pinned" if pinned else "pageable"
+    if not pinned:
+        return True, (f"keeping it ({_pin_word}) — already pageable, so a "
+                       f"pageable retry could not do better")
+    _ws_gb = working_set_bytes / 1e9
+    if arena_backing_is_sufficient(n_slabs, requested_n_slabs, slab_bytes,
+                                    pool_size, working_set_bytes):
+        return True, (f"keeping it ({_pin_word}) since its cache share still "
+                       f"covers the {_ws_gb:.2f}GB working set")
+    return False, (f"below the {_ws_gb:.2f}GB working set, falling back "
+                    f"to a pageable arena")
+
+
+def slab_arena_exhausted_warning(err: Exception) -> str:
+    """Operator-facing message for when the pageable retry after a rejected
+    degraded arena ALSO fails to allocate: there is no slab arena at all, not
+    just a smaller one.
+
+    Split into its own function (rather than an inline print, CLAUDE.md §5)
+    so this exact path -- the arena falling through to `None` with nothing
+    printed -- is covered by a test that does not need a model load, and a
+    future edit that drops the print cannot do so without also breaking that
+    assertion. This is the third silent-degradation defect on this branch.
+    """
+    return (f"[Vaayu-MoE] WARNING: pageable fallback also failed ({err}) — "
+            f"there is NO slab arena at all. Every expert streams from disk "
+            f"via the clone path; expect very slow decode (a real hardware "
+            f"limit on this box, not a bug).")
 
 
 # Hardware constant: VRAM headroom to leave UNused by the resident expert cache.
@@ -1438,59 +1515,60 @@ class VaayuBaseModel(GenerationMixin):
                 _slab_bytes = compute_slab_bytes(self._expert_offset_index)
             _pin = torch.cuda.is_available()
             if _slab_bytes > 0:
-                _unclamped_n = unclamped_slab_count(
+                # The pow2 clamp existed only because the backing store was ONE
+                # pinned allocation, which the caching host allocator charges at
+                # the next power of two. The arena is now several exact-pow2
+                # chunks, each charged exactly, so there is nothing to clamp
+                # away: take the full unclamped count (Plan L; measured
+                # 2026-08-07, 9.14GB charged vs 17.18GB for one tensor, every
+                # slab kept, H2D unchanged).
+                _n_slabs = unclamped_slab_count(
                     _expert_budget, _slab_bytes, get_expert_pool_size())
-                # Power-of-two charging is a property of the caching HOST
-                # allocator, i.e. pinned memory only — a pageable arena pays
-                # no round-up, so clamping it would only cost cache for zero
-                # RAM freed. Only clamp when we are actually about to pin.
-                # working_set_bytes floors the clamp: if clamping would push the
-                # cache below the model's working set while the unclamped budget
-                # still covers it, skip the clamp (Task 5 — Qwen measured 0.43
-                # tok/s against a 0.82 floor, -48%, when clamped to 8.49GB against
-                # an 8.90GB working set that the unclamped 9.13GB budget covered).
-                _raw_clamped_n = arena_slab_count(
-                    _expert_budget, _slab_bytes, get_expert_pool_size(), pin=_pin)
-                _n_slabs = arena_slab_count(
-                    _expert_budget, _slab_bytes, get_expert_pool_size(),
-                    working_set_bytes=_geo["working_set_bytes"], pin=_pin)
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
                     print(f"[Vaayu-MoE] WARNING: pinned slab alloc failed ({_slab_err}); "
                           f"retrying pageable (H2D will be slower)")
-                    # Retry is pageable by definition, so it doesn't pay the
-                    # pinned round-up either — use the unclamped count.
-                    _n_slabs = _unclamped_n
                     try:
                         self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=False)
                     except RuntimeError:
                         self._expert_slab_arena = None
+                # A chunked arena keeps what it secured when a later chunk fails
+                # (E5). Keep the degraded arena only while its cache share still
+                # covers the working set; otherwise drop it and retry pageable,
+                # which trades bandwidth for capacity rather than thrashing. A
+                # degraded arena that is ALREADY pageable has nothing to trade --
+                # degraded_arena_decision keeps it unconditionally in that case.
+                _arena = self._expert_slab_arena
+                if _arena is not None and _arena.n_slabs < _arena.requested_n_slabs:
+                    _kept, _why = degraded_arena_decision(
+                        _arena.n_slabs, _arena.requested_n_slabs, _slab_bytes,
+                        get_expert_pool_size(), _geo["working_set_bytes"], _arena.pin)
+                    print(f"[Vaayu-MoE] WARNING: slab arena allocated only "
+                          f"{_arena.n_slabs} of {_arena.requested_n_slabs} slabs "
+                          f"({_arena.n_slabs * _slab_bytes / 1e9:.2f} of "
+                          f"{_arena.requested_n_slabs * _slab_bytes / 1e9:.2f}GB) — {_why}")
+                    if not _kept:
+                        self._expert_slab_arena = None
+                        try:
+                            self._expert_slab_arena = SlabArena(
+                                _n_slabs, _slab_bytes, pin=False)
+                        except RuntimeError as _pageable_err:
+                            self._expert_slab_arena = None
+                            print(slab_arena_exhausted_warning(_pageable_err))
                 if self._expert_slab_arena is not None:
-                    _clamp_note = ""
-                    # Key off the arena's ACTUAL pin state, not the `_pin` intent:
-                    # after a pinned-alloc RuntimeError the retry is pageable but
-                    # `_pin` stays True, and either note below would otherwise
-                    # misreport why the count is unclamped (Task 5 review Finding 1).
-                    _was_pinned = self._expert_slab_arena.pin
-                    if _was_pinned and _n_slabs < _unclamped_n:
-                        _charged_bytes = next_pow2_at_least(_unclamped_n * _slab_bytes)
-                        _freed_bytes = _charged_bytes - next_pow2_at_least(_n_slabs * _slab_bytes)
-                        _clamp_note = (
-                            f" — clamped from {_unclamped_n} slabs "
-                            f"(−{(_unclamped_n - _n_slabs) * _slab_bytes / 1e9:.2f}GB cache) "
-                            f"so the pinned backing store is a power of two; the "
-                            f"allocator would have charged {_charged_bytes / 1e9:.2f}GB"
-                            f"; frees {_freed_bytes / 1e9:.2f}GB")
-                    elif _was_pinned and _n_slabs == _unclamped_n and _raw_clamped_n < _unclamped_n:
-                        _clamp_note = (
-                            f" — clamp skipped: clamping to {_raw_clamped_n} slabs would "
-                            f"cut the cache below the {_geo['working_set_bytes'] / 1e9:.2f}GB "
-                            f"working set, so the unclamped (allocator-rounded) size was kept instead")
-                    print(f"[Vaayu-MoE] Expert slab arena: {_n_slabs} x "
-                          f"{_slab_bytes / 1e6:.1f}MB "
-                          f"({'pinned' if self._expert_slab_arena.pin else 'pageable'}, "
-                          f"{_n_slabs * _slab_bytes / 1e9:.2f}GB resident){_clamp_note}")
+                    _arena = self._expert_slab_arena
+                    _chunk_note = ""
+                    if _arena.n_slabs < _arena.requested_n_slabs:
+                        _chunk_note = (f" — DEGRADED: {_arena.n_slabs} of "
+                                       f"{_arena.requested_n_slabs} slabs allocated")
+                    print(f"[Vaayu-MoE] Expert slab arena: {_arena.n_slabs} x "
+                          f"{_slab_bytes / 1e6:.1f}MB in {len(_arena._chunks)} "
+                          f"power-of-two chunks "
+                          f"({'pinned' if _arena.pin else 'pageable'}, "
+                          f"{sum(c.numel() for c in _arena._chunks) / 1e9:.2f}GB "
+                          f"charged for {_arena.n_slabs * _slab_bytes / 1e9:.2f}GB "
+                          f"of slabs){_chunk_note}")
                     _snap = ram_snapshot()
                     print(f"[Vaayu-RAM] ledger @ post-arena: avail={_snap['available'] / 1e9:.2f}GB "
                           f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
@@ -1504,8 +1582,7 @@ class VaayuBaseModel(GenerationMixin):
                     # The trim fires whenever the arena's CACHE share is smaller
                     # than the requested budget — which includes the unclamped
                     # case, where the staging addend alone accounts for the gap.
-                    # Do not call the arena "clamped" here: it often is not, and
-                    # a skipped clamp prints its own notice two lines above.
+                    # Do not call the arena "clamped" here: it often is not.
                     print(f"[Vaayu-MoE] Expert RAM cache budget trimmed "
                           f"{_expert_budget / 1e9:.2f} -> {_arena_bytes / 1e9:.2f} GB "
                           f"to match the slab arena's cache share (the arena, not "
