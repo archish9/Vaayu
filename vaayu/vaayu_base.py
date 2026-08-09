@@ -498,6 +498,43 @@ def moe_supports_prefill_stager(expert_styles, is_exl3: bool) -> bool:
     return bool(is_exl3) and bool(styles) and all(s == "fused" for s in styles)
 
 
+def should_use_tied_lm_head(layer_name, lm_head_name, state_dict, load_failed: bool) -> bool:
+    """True iff `layer_name`'s weights must come from the embedding instead.
+
+    A checkpoint with `tie_word_embeddings` stores no `lm_head` tensor. Two
+    shapes of that reach the loader, and only the first was ever handled:
+
+    - the shard is ABSENT      -> `load_layer` raises      -> `load_failed=True`
+    - the shard is EMPTY       -> `load_layer` SUCCEEDS with `{}` (bug D1)
+
+    Vaayu's splitter produces the second: it writes a valid 16-byte `{}`
+    safetensors file and its `.done` marker, so the split verifies as complete
+    and the load never raises. `lm_head` then keeps its meta-initialized
+    weights and the model emits uniform-random logits.
+
+    Only the head can be tied, so every other layer keeps propagating its
+    error — an empty decoder layer is a real failure, not something to paper
+    over with embeddings. `lm_head_name` may be None when the module tree
+    exposes no nn.Linear head (see `detect_layer_names`), which is not a
+    fallback case either.
+    """
+    if lm_head_name is None or layer_name is None:
+        return False
+    if layer_name.rstrip(".") != lm_head_name.rstrip("."):
+        return False
+    return bool(load_failed) or not state_dict
+
+
+def rekey_embed_as_lm_head(state_dict, embed_name: str, lm_head_name: str) -> dict:
+    """Re-key an embedding shard's tensors so they land on the tied head.
+
+    Names come from `layer_names_dict`, never assumed to be Llama's (§5).
+    Returns {} for an empty input so callers can fail honestly rather than
+    inject an unweighted head.
+    """
+    return {k.replace(embed_name, lm_head_name): v for k, v in state_dict.items()}
+
+
 def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
     """RoPE inverse frequencies for `config`, honouring PARTIAL rotary.
 
@@ -1796,6 +1833,26 @@ class VaayuBaseModel(GenerationMixin):
         # after both branches converge, not inside the is_moe block above.
         self._prefix_cache = None
         if getattr(self, "enable_prefix_cache", False):
+            # PrefixCacheStore drives to_cpu()/to_device()/resident_bytes() on
+            # every cache it stores. Vaayu's own cache classes have them; the
+            # bare transformers DynamicCache that kv_cache_mode "fp16" yields
+            # (what "auto" resolves to for every non-EXL3 model) does not, and
+            # store() would AttributeError. Since lookup() POPS an entry before
+            # store() can put one back, failing per-turn would silently drain
+            # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
+            # silently degrade). Pre-existing limit of the prefix subsystem,
+            # not of batched decode -- generate() calls the same store().
+            from .batch import cache_supports_prefix_store
+            _probe = self._create_kv_cache()
+            if not cache_supports_prefix_store(_probe):
+                print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
+                      f"kv_cache_mode={self.kv_cache_mode!r} yields "
+                      f"{type(_probe).__name__}, which does not implement "
+                      f"to_cpu/to_device/resident_bytes. Load with "
+                      f"kv_cache_mode='bf16' to enable it on this model.")
+                self.enable_prefix_cache = False
+            del _probe
+        if getattr(self, "enable_prefix_cache", False):
             import psutil as _ps
             _free_ram = _ps.virtual_memory().available
             _pc_budget = compute_prefix_cache_budget(_free_ram)
@@ -2304,6 +2361,25 @@ class VaayuBaseModel(GenerationMixin):
                            self.layer_names_dict["lm_head"]]:
             try:
                 tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                # A tied-weight checkpoint has no lm_head tensor; the split still
+                # contains an empty-but-valid shard for it, so this load SUCCEEDS
+                # with zero tensors (bug D1). Pinning that marks the layer resident
+                # while it is still meta-initialized, and the forward then never
+                # loads it -- the model emits uniform-random logits.
+                if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
+                                           tensors, load_failed=False):
+                    print(f"[Vaayu-Pin] {layer_name} shard holds no tensors (tied weights); "
+                          f"loading them from {self.layer_names_dict['embed']} instead.")
+                    tensors = rekey_embed_as_lm_head(
+                        self.loader_strategy.load_from_disk(
+                            self.layer_names_dict["embed"], self.checkpoint_path),
+                        self.layer_names_dict["embed"], layer_name)
+                if not tensors:
+                    # NOT `size == 0`: model.norm legitimately measures 0.00 GB.
+                    print(f"[Vaayu-Pin] WARNING: {layer_name} yielded no tensors — refusing to "
+                          f"mark it pinned. It would stay meta-initialized and emit garbage "
+                          f"(CLAUDE.md §5: warn, never silently degrade).")
+                    continue
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
                     print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
@@ -2628,40 +2704,60 @@ class VaayuBaseModel(GenerationMixin):
             cache.put(layer_name, result)
         return result
 
+    def _load_tied_lm_head_from_embed(self, layer_name):
+        """Load the embedding shard and re-key its tensors as lm_head's."""
+        embed_layer_name = self.layer_names_dict['embed']
+        # Sometimes layer names are passed with dots depending on the execution context, so strip it for comparison but fetch the exact embed equivalent
+        if layer_name.endswith("."):
+            embed_layer_name += "."
+        load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
+
+        # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
+        if self.profiling_mode:
+            state_dict, compression_time = load_layer_output
+        else:
+            state_dict = load_layer_output
+
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k.replace(self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
+            new_state_dict[new_k] = v
+
+        if not new_state_dict:
+            # Failing honestly beats degrading silently (CLAUDE.md §5): an
+            # unweighted lm_head does not crash, it emits uniform-random
+            # logits, which is exactly how bug D1 survived a smoke test.
+            raise RuntimeError(
+                f"Cannot supply weights for {layer_name}: its shard is empty or missing "
+                f"(tied weights) and the embedding shard '{embed_layer_name}' yielded no "
+                f"tensors either. The checkpoint split at {self.checkpoint_path} is incomplete.")
+
+        if self.profiling_mode:
+            return (new_state_dict, compression_time)
+        return new_state_dict
+
     def load_layer_to_cpu(self, layer_name):
 
         t = time.time()
 
+        # For models with tied weights, the lm_head shard carries no tensors
+        # because lm_head is implicitly tied to embed_tokens. Safely fallback to
+        # embed_tokens. Both shapes of that count -- an absent shard (raises) and
+        # an empty-but-valid one (does NOT raise; see should_use_tied_lm_head).
+        _lm_head_name = self.layer_names_dict.get('lm_head')
         try:
             load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
         except Exception as e:
-            # For models with tied weights, lm_head.safetensors might not be generated
-            # because it's implicitly tied to embed_tokens. Safely fallback to embed_tokens.
-            if layer_name == self.layer_names_dict['lm_head'] or layer_name == self.layer_names_dict['lm_head'] + ".":
-                print(f"Failed to load {layer_name}, attempting to use tied weights from {self.layer_names_dict['embed']}. (original error: {repr(e)})")
-                embed_layer_name = self.layer_names_dict['embed']
-                # Sometimes layer names are passed with dots depending on the execution context, so strip it for comparison but fetch the exact embed equivalent
-                if layer_name.endswith("."):
-                     embed_layer_name += "."
-                load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
-                
-                # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
-                if self.profiling_mode:
-                    state_dict, compression_time = load_layer_output
-                else:
-                    state_dict = load_layer_output
-                
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    new_k = k.replace(self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
-                    new_state_dict[new_k] = v
-                
-                if self.profiling_mode:
-                    load_layer_output = (new_state_dict, compression_time)
-                else:
-                    load_layer_output = new_state_dict
-            else:
+            if not should_use_tied_lm_head(layer_name, _lm_head_name, None, load_failed=True):
                 raise e
+            print(f"Failed to load {layer_name}, attempting to use tied weights from {self.layer_names_dict['embed']}. (original error: {repr(e)})")
+            load_layer_output = self._load_tied_lm_head_from_embed(layer_name)
+        else:
+            _loaded = load_layer_output[0] if self.profiling_mode else load_layer_output
+            if should_use_tied_lm_head(layer_name, _lm_head_name, _loaded, load_failed=False):
+                print(f"{layer_name} shard holds no tensors (tied weights); loading them "
+                      f"from {self.layer_names_dict['embed']} instead.")
+                load_layer_output = self._load_tied_lm_head_from_embed(layer_name)
 
         elapsed_time = time.time() - t
 
@@ -2831,6 +2927,54 @@ class VaayuBaseModel(GenerationMixin):
             cos = emb.cos().to(dtype=self.running_dtype)
             sin = emb.sin().to(dtype=self.running_dtype)
         return cos, sin
+
+    def _precompute_rope(self, position_ids):
+        """Return (cos, sin) for every position, or None if this architecture
+        computes RoPE inside each decoder layer.
+
+        None is a REAL answer, not a failure: models with no top-level
+        rotary_emb expect `get_pos_emb_args` to pass nothing. Precompute
+        failure must therefore raise rather than return None — every modern
+        decoder layer takes `position_embeddings` as a required argument, so
+        returning None on failure surfaces a VRAM exhaustion as
+        `...DecoderLayer.forward() missing 1 required positional argument`
+        roughly 30 frames away, naming the wrong subsystem (bug D3). The
+        handler this replaced printed "RoPE will be computed per-layer"; no
+        such per-layer path has ever existed.
+        """
+        if self.get_rotary_emb() is None:
+            return None
+        try:
+            # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
+            # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
+            rotary_emb_cls = type(self.get_rotary_emb())
+            real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+
+            # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
+            dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+            dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+
+            return real_rotary(dummy_x, position_ids)
+        except Exception as e:
+            print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+            try:
+                return self._compute_full_position_embeddings(position_ids)
+            except Exception as e2:
+                # Free what we can so the caller's error path has room to run,
+                # then fail honestly (CLAUDE.md §5) with the real cause chained.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Nothing in this message may itself raise: a diagnostic that
+                # dies re-creates the very bug it reports (D3).
+                _npos = position_ids.shape[1] if position_ids is not None else "unknown"
+                raise RuntimeError(
+                    f"Could not precompute RoPE position embeddings for "
+                    f"{_npos} positions on {self.running_device}. Both the "
+                    f"native rotary path (failed: {e}) and the manual computation (failed: "
+                    f"{e2}) were exhausted. This is most often VRAM exhaustion — reduce "
+                    f"prefill_chunk_size, max_seq_len, or the expert VRAM budget. There is no "
+                    f"per-layer RoPE fallback to degrade to."
+                ) from e2
 
     def get_pos_emb_args(self, len_p, len_s):
         # If position_embeddings were pre-computed for the full sequence (new transformers API),
@@ -3070,28 +3214,7 @@ class VaayuBaseModel(GenerationMixin):
             self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
             self._rope_cache_key = None
         elif getattr(self, '_rope_cache_key', None) != _rope_cache_key:
-            if self.get_rotary_emb() is not None:
-                try:
-                    # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
-                    # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
-                    rotary_emb_cls = type(self.get_rotary_emb())
-                    real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
-
-                    # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
-                    dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
-                    dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
-
-                    self._full_position_embeddings = real_rotary(dummy_x, position_ids)
-                except Exception as e:
-                    print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
-                    try:
-                        self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
-                    except Exception as e2:
-                        print(f"Manual RoPE fallback also failed ({e2}). RoPE will be computed per-layer.")
-                        torch.cuda.empty_cache()
-                        self._full_position_embeddings = None
-            else:
-                self._full_position_embeddings = None
+            self._full_position_embeddings = self._precompute_rope(position_ids)
             self._rope_cache_key = _rope_cache_key
 
         if use_cache and past_key_values is None:
@@ -3667,6 +3790,7 @@ class VaayuBaseModel(GenerationMixin):
         max_new_tokens: int = 20,
         streamer=None,
         temperature: float = 0.0,
+        session_id=None,
         **kwargs,
     ) -> torch.LongTensor:
         """
@@ -3684,9 +3808,31 @@ class VaayuBaseModel(GenerationMixin):
         self._batch_decode_active = False
         self._batch_n = 1
 
+        pc = getattr(self, "_prefix_cache", None)
+        kv, ids_list = None, input_ids[0].tolist()
+        if pc is not None:
+            kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
+            if kv is None:
+                kv = self._create_kv_cache()
+            else:
+                kv.to_device(self.running_device)
+                if match_len >= input_ids.shape[1]:
+                    match_len = input_ids.shape[1] - 1   # leave >=1 position to run
+                kv.crop(match_len)
+
+        # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
+        # gets away with passing the untouched prompt because HF's own
+        # generate() loop calls prepare_inputs_for_generation (above), which
+        # slices input_ids down to what the cache doesn't already hold. This
+        # loop calls forward() directly with no such step, so do it here: feed
+        # only the tail beyond kv's current length, or forward() would
+        # re-append the already-cached prefix on top of itself.
+        prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
+
         # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
         prefill_out = self.forward(
-            input_ids=input_ids,
+            input_ids=prefill_ids,
+            past_key_values=kv,
             use_cache=True,
             return_dict=True,
         )
@@ -3707,6 +3853,9 @@ class VaayuBaseModel(GenerationMixin):
         if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
             if streamer is not None:
                 streamer.end()
+            if pc is not None:
+                resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+                self._persist_and_store(pc, resolved, kv, generated[0].tolist())
             return generated
 
         while tokens_generated < max_new_tokens:
@@ -3762,6 +3911,9 @@ class VaayuBaseModel(GenerationMixin):
 
         if streamer is not None:
             streamer.end()
+        if pc is not None:
+            resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+            self._persist_and_store(pc, resolved, kv, generated[0].tolist())
         self.telemetry.dump_json("vaayu_telemetry.json")
         return generated
 
@@ -3779,7 +3931,9 @@ class VaayuBaseModel(GenerationMixin):
         generate()/speculative_generate() defensively reset both flags at
         entry so a leaked flag can't corrupt those call paths, but relying on
         GC timing here is still not clean design."""
-        from .batch import (sample_step, batch_position_ids)
+        from .batch import (sample_step, batch_position_ids, batch_common_prefix,
+                            broadcast_cache_rows, slice_cache_row,
+                            prefix_store_row, resolve_matched_len)
         assert self._active_attn_impl == "sdpa", (
             f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
         N = len(requests)
@@ -3788,14 +3942,40 @@ class VaayuBaseModel(GenerationMixin):
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
 
-        max_L = max(len(r.prompt_ids) for r in requests)
-        input_ids = torch.full((N, max_L), pad_id, dtype=torch.long, device=device)
-        pad_mask = torch.zeros((N, max_L), dtype=torch.long, device=device)
-        for i, r in enumerate(requests):
-            L = len(r.prompt_ids)
-            input_ids[i, max_L - L:] = torch.tensor(r.prompt_ids, device=device)
-            pad_mask[i, max_L - L:] = 1
+        pc = getattr(self, "_prefix_cache", None)
+        common_ids = batch_common_prefix(requests) if pc is not None else []
+        kv, m = (pc.lookup(None, common_ids, device=device)
+                 if common_ids else (None, 0))
+        if kv is not None:
+            # Every stream must keep >=1 token to run, same clamp generate()
+            # applies at :3714 and for the same reason.
+            m = min(m, min(len(r.prompt_ids) for r in requests) - 1)
+        if kv is None or m <= 0:
+            kv, m = None, 0
+        else:
+            kv.to_device(device)
+            m = resolve_matched_len(kv, m)
+            broadcast_cache_rows(kv, N)
+            print(f"[Vaayu-Prefix] BATCH HIT n={N} match_len={m}/"
+                  f"{len(common_ids)} — prefilling only the divergent tails")
+
+        tails = [r.prompt_ids[m:] for r in requests]
+        max_R = max(len(t) for t in tails)
+        input_ids = torch.full((N, max_R), pad_id, dtype=torch.long, device=device)
+        tail_mask = torch.zeros((N, max_R), dtype=torch.long, device=device)
+        for i, t in enumerate(tails):
+            input_ids[i, max_R - len(t):] = torch.tensor(t, device=device)
+            tail_mask[i, max_R - len(t):] = 1
+        pad_mask = torch.cat(
+            [torch.ones((N, m), dtype=torch.long, device=device), tail_mask], dim=1)
         position_ids = batch_position_ids(pad_mask)
+
+        _total_prompt = sum(len(r.prompt_ids) for r in requests)
+        self._batch_prefix_stats = {
+            "matched": m, "common": len(common_ids),
+            "prefill_tokens": _total_prompt,
+            "coverage": (N * m / _total_prompt) if _total_prompt else 0.0,
+        }
 
         eos = self.config.eos_token_id
         eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
@@ -3812,6 +3992,8 @@ class VaayuBaseModel(GenerationMixin):
         self._batch_decode_active = True
         self._batch_n = N
         self.telemetry.reset_batch_overlap()
+        past = None   # bound in finally's store-back guard; stays None if the
+                       # generator is torn down before the prefill forward returns
         try:
             # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
             _saved_chunk = self.prefill_chunk_size
@@ -3819,7 +4001,8 @@ class VaayuBaseModel(GenerationMixin):
             try:
                 out = self.forward(
                     input_ids=input_ids, attention_mask=pad_mask,
-                    position_ids=position_ids, use_cache=True, return_dict=True)
+                    position_ids=position_ids, past_key_values=kv,
+                    use_cache=True, return_dict=True)
             finally:
                 self.prefill_chunk_size = _saved_chunk
             past = out.past_key_values
@@ -3855,6 +4038,39 @@ class VaayuBaseModel(GenerationMixin):
                     if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                         active[i] = False
         finally:
+            # Store-back lives in finally, not after the while loop: lookup()
+            # already POPPED the pooled entry, and only store() puts one back.
+            # batched_generate is a generator (its own docstring treats early
+            # abandonment as real) -- a consumer `break` raises GeneratorExit
+            # at the currently-suspended yield, which unwinds straight past a
+            # post-loop store-back and permanently deletes the pool's best
+            # entry. `past is not None` guards the case where teardown hits
+            # before the prefill forward() call returns (nothing to store yet).
+            if past is not None and pc is not None and common_ids:
+                # Exactly ONE entry per batch regardless of N: writing N would
+                # be the K=7-against-a-5-slot-pool configuration that measured
+                # ZERO hits (capacity is a cliff, not a slope).
+                # Row choice must be the LONGEST prompt, never row 0 -- see
+                # prefix_store_row's docstring for why row 0 would silently
+                # store padding as if it were the shared prefix.
+                #
+                # try/except Exception (never bare/BaseException -- GeneratorExit
+                # must keep propagating): the cleanup below must run unconditionally
+                # on exit, and a failure here must never replace whatever exception
+                # is already unwinding through this finally (e.g. a CUDA OOM in
+                # decode, where slice_cache_row's clone or store()'s to_cpu pinned
+                # alloc can plausibly fail again) -- that would be the exact
+                # diagnostic-laundering failure this repo already fixed elsewhere
+                # (bug D3). Not re-raising means the entry is simply lost, which
+                # lookup()'s pop already made true the moment this batch started.
+                try:
+                    one = slice_cache_row(past, prefix_store_row(requests))
+                    one.crop(len(common_ids))
+                    pc.store(_auto_session_id(common_ids), list(common_ids), one)
+                except Exception as e:
+                    print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
+                          f"({e!r}) -- lookup() already popped this entry, so "
+                          f"it is now LOST from the pool.")
             self._batch_decode_active = False
             self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")

@@ -3,6 +3,7 @@
 Pure, GPU-free helpers live here; the decode loop is VaayuBaseModel.batched_generate.
 All sizing is DERIVED from model geometry — see CLAUDE.md §5.
 """
+import copy
 import warnings
 from dataclasses import dataclass, field
 
@@ -85,6 +86,96 @@ def batch_position_ids(pad_mask: "torch.Tensor") -> "torch.Tensor":
     return pos.clamp_(min=0)
 
 
+def batch_common_prefix(requests) -> list:
+    """Longest token prefix shared by EVERY request in the batch.
+
+    This is what a fan-out actually shares -- the system prompt plus the files
+    every sub-agent was given. Derived from the prompts themselves, so no
+    session_id plumbing is needed on BatchRequest.
+    """
+    if not requests:
+        return []
+    shortest = min(len(r.prompt_ids) for r in requests)
+    first = requests[0].prompt_ids
+    n = 0
+    while n < shortest and all(r.prompt_ids[n] == first[n] for r in requests):
+        n += 1
+    return list(first[:n])
+
+
+def broadcast_cache_rows(cache, n: int) -> None:
+    """Grow every buffer of a batch-1 cache to n identical rows, in place.
+
+    A REAL copy, never .expand(): expanded tensors share storage, so each
+    stream's decode writes would alias into a single row. The shape assertion
+    would still pass and the output would be silently wrong.
+
+    Buffer names come from the cache's own _BUFFER_LISTS, so this covers the
+    unquantized, fp8 and TurboQuant layouts without naming their tensors.
+    """
+    for name in cache._BUFFER_LISTS:
+        lst = getattr(cache, name)
+        for i in range(len(lst)):
+            t = lst[i]
+            if t.shape[0] == n:
+                continue
+            if t.shape[0] != 1:
+                raise ValueError(
+                    f"broadcast_cache_rows expects a batch-1 cache, got "
+                    f"{name}[{i}] with batch {t.shape[0]}")
+            lst[i] = t.repeat(n, *([1] * (t.dim() - 1))).contiguous()
+
+
+def prefix_store_row(requests) -> int:
+    """Row to source a batched prefix store-back entry from: the request with
+    the LONGEST prompt, never row 0.
+
+    Tails are left-padded, so row i's cache is
+    [prefix 0..m-1][max_R - r_i pads][r_i real tokens] -- the pad block sits
+    immediately after the cached prefix, exactly where a
+    crop(len(common_ids)) reads. size_batch() sorts requests ascending by
+    length, so row 0 is typically the SHORTEST prompt and carries the MOST
+    padding: slicing row 0 would store padding KVs as if they were the
+    shared prefix, and the next batch that hits the entry would decode
+    against shifted keys with silently wrong RoPE positions. The longest
+    prompt's row has r_i == max_R (zero tail padding), so its columns
+    0..len(prompt)-1 are genuinely prefix+real tokens throughout, and
+    len(common_ids) <= len(that prompt) always holds.
+    """
+    return max(range(len(requests)), key=lambda i: len(requests[i].prompt_ids))
+
+
+def resolve_matched_len(cache, requested_m: int) -> int:
+    """Crop `cache` to `requested_m` tokens and return what the cache
+    actually ends up holding.
+
+    crop() is min(existing_len, requested_m) -- a silent no-op when the
+    cache holds FEWER tokens than requested_m claims (an entry generate()
+    stored can be cache_len + 1 long, see _persist_and_store's own
+    comment). Callers must split tails at the length the cache truly has,
+    not at what a prior lookup() claimed, or they skip a token the model
+    never saw.
+    """
+    cache.crop(requested_m)
+    return cache.get_seq_length()
+
+
+def slice_cache_row(cache, row: int):
+    """Return a new batch-1 cache holding only `row`, sharing no storage.
+
+    The batch dimension must genuinely shrink. PrefixCacheStore.store() calls
+    to_cpu(), whose `[..., :used, :]` trims the SEQUENCE axis only -- handing
+    it an N-row cache would copy all N rows into the pool and charge N times
+    the bytes against a budget whose overrun is a measured cliff.
+    """
+    out = copy.copy(cache)
+    for name in cache._BUFFER_LISTS:
+        setattr(out, name,
+                [t[row:row + 1].clone() for t in getattr(cache, name)])
+    out._seq_len = list(cache._seq_len)
+    return out
+
+
 def build_batch_attention_mask(pad_mask, q_len, dtype, device):
     """Additive float mask [N, 1, q_len, KV] = causal AND key-not-pad.
     Queries are the LAST q_len positions of KV (right-aligned decode)."""
@@ -138,3 +229,25 @@ def plan_batch(model, requests):
     n_layers, n_kv_heads, head_dim, elem = geo_from_model(model)
     return size_batch(requests, free_vram_budget(model),
                       n_layers, n_kv_heads, head_dim, elem)
+
+
+# Methods PrefixCacheStore drives on a cache it stores or hands back:
+# store() -> to_cpu()/resident_bytes(), and the caller -> to_device().
+_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")
+
+
+def cache_supports_prefix_store(cache) -> bool:
+    """True iff `cache` carries the surface PrefixCacheStore requires.
+
+    Vaayu's FP8DynamicCache / TurboQuantKVCache do. A bare
+    transformers.cache_utils.DynamicCache -- what `_create_kv_cache` returns
+    whenever kv_cache_mode resolves to "fp16", which is what "auto" gives every
+    non-EXL3 model -- does NOT: it has no to_cpu, no to_device and no
+    resident_bytes. store() would raise AttributeError on it, and because
+    lookup() POPS an entry before store() puts one back, each such failure
+    permanently drops the pool's entry.
+
+    This is a pre-existing limit of the prefix-cache subsystem, not of batched
+    decode: generate()'s own cross-turn path calls the same store().
+    """
+    return all(callable(getattr(cache, m, None)) for m in _PREFIX_STORE_METHODS)

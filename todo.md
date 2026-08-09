@@ -18,10 +18,10 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 | # | Do this | Why here, and not later |
 |---|---|---|
-| **1** | **Strengthen the dense smoke test** (bug **D2**) | Do this BEFORE fixing dense. It gives you a failing test that actually detects the bug — TDD, and this repo's own discipline. Cheap: it is one assertion change. |
-| **2** | **Fix the dense path** (bug **D1**) | `CLAUDE.md` §0 makes dense a hard requirement and it is currently **broken** — Vaayu emits noise where stock transformers is correct on the same checkpoint. Everything else on this list optimises a path that works; this one is wrong. Step 1 gives you the gate. |
-| **3** | **Make VRAM exhaustion fail honestly** (bug **D3**) | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
-| **4** | **F3 — wire the prefix cache into `batched_generate`** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
+| **1** | ~~Strengthen the dense smoke test (**D2**)~~ — **DONE 2026-08-09** | Gate is now teacher-forced perplexity, not token count. It caught D1 immediately. |
+| **2** | ~~Fix the dense path (**D1**)~~ — **DONE 2026-08-09** | Tied `lm_head` was never weighted; see Settled. Left behind **D4** (the splitter still emits the empty shard) — unblocked, not urgent. |
+| **3** | ~~Make VRAM exhaustion fail honestly (**D3**)~~ — **DONE 2026-08-09** | `_precompute_rope` now raises with the OOM chained instead of returning an overloaded `None`. See Settled. | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
+| **4** | **F3 — wire the prefix cache into `batched_generate`** ← **START HERE** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
 | **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
 | **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
@@ -38,38 +38,15 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 ## Correctness — these break stated requirements
 
-- [bug] **D1 — the DENSE path generates incoherent output. The checkpoint is fine; Vaayu is wrong.**
-  `Llama-3.2-1B-Instruct`, prompt `"The capital of France is"`:
-  | stack | output |
-  |---|---|
-  | stock transformers, same files | `' Paris. The Eiffel Tower is located in'` |
-  | Vaayu `attn=sdpa` | `'izzie!ong gotten gottenongpectivepectivepective there'` |
-  | Vaayu `attn=eager` | `'izzie there suggest gottenongpective gottenpectivepectivepective'` |
-  | Vaayu `attn=flash_attention_2` (default) | `'izzie factory.identity /////pectivepectivepective...'` |
-  All three attention implementations are wrong, so this is not an attn-impl issue. Identical on
-  `main` and on the Plan L branch (**byte-identical generations** under `do_sample=False`).
-  `CLAUDE.md` §0 requires dense to keep working; it does not. Note `Llama-3.2-1B-Instruct` is also
-  the README's suggested **drafter** for speculative decoding, so bad dense output likely means the
-  drafter proposes garbage (verify would reject it — correctness preserved, speedup lost).
-  Logs: `~/vaayu-evidence/2026-08-07-chunked-arena/dense-smoke-{MAIN,BRANCH}.log`.
-  (found 2026-08-08, Plan L Task 7)
-- [bug] **D2 — the dense smoke test `CLAUDE.md` §0 relies on cannot catch D1.**
-  `test_batched_dense_smoke.py` asserts `seen[0] > 0 and seen[1] > 0` — token **count**, not
-  correctness — so it passes while the model emits noise. §0 claims "a dense load+generate smoke
-  test guards that"; it does not. Fix: assert on content (a greedy completion of a factual prompt,
-  or a logit/perplexity check against a reference), not on token count. **Plan L's own gate script
-  had the identical flaw (`assert n > 0`) and would have reported D1's garbage as a PASS** — this
-  failure mode is easy to write by accident. (found 2026-08-08, Plan L Task 7)
-- [ ] **D3 — VRAM exhaustion surfaces as a bogus `TypeError`, and the "graceful" RoPE fallback is a
-  lie.** Both RoPE precompute paths in `vaayu_base.py:2917-2941` raise `CUDA out of memory`, the
-  handler sets `_full_position_embeddings = None` and prints **"RoPE will be computed per-layer"** —
-  but no such per-layer path exists. `get_pos_emb_args` (`:2685-2689`) then returns `{}` and the
-  layer call dies with `MiniMaxM2DecoderLayer.forward() missing 1 required positional argument:
-  'position_embeddings'`, ~30 frames from the real cause. Every modern decoder layer takes
-  `position_embeddings` as a required arg, so the fallback cannot work for any of them. Two things
-  wrong: the message promises a mechanism that does not exist, and a VRAM OOM is laundered into a
-  signature error pointing at the wrong subsystem. Fix: either re-raise the OOM (honest failure,
-  §5) or implement the per-layer path the message claims. (found 2026-08-02, Plan J Task 4 gate)
+- [ ] **D4 — the splitter writes an EMPTY `lm_head.safetensors` for tied-weight checkpoints, and
+  marks it `.done`.** Spun out of D1's fix, which repaired the two *consumers* rather than the
+  producer. `vaayu/utils.py`'s split emits a valid 16-byte `{}` shard when the source checkpoint
+  has no `lm_head.weight`, and `all(found_layers.values())` then reports the split as complete —
+  an incomplete split that looks verified. Every future consumer of these shards inherits the same
+  trap D1 fell into. Two candidate fixes: write the tied copy at split time (costs a duplicated
+  embedding on disk), or omit the shard so the existing absent-file paths fire. **Not urgent** —
+  D1's consumer-side fallbacks make already-split models load correctly, and both on-device
+  targets plus the 70B dense reference are untied. (found 2026-08-09, D1 fix)
 - [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
   `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation §5
   forbids. **Should an unknown mode raise?** (found 2026-08-02, Plan H audit)
@@ -81,16 +58,55 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `_TENSOR_ALIGN` (16-byte) alignment. Narrow edge case, never observed on either target model,
   unenforced identically before and after chunking. Fix is a constructor validation or an
   `_align_up` on the computed slab size. (found 2026-08-08, Plan L final review)
+- [ ] **The cross-turn prefix cache only works for EXL3 models; it is DISABLED with a warning for
+  everything else.** `PrefixCacheStore` drives `to_cpu()` / `to_device()` / `resident_bytes()` on
+  every cache it stores. Vaayu's `FP8DynamicCache` / `TurboQuantKVCache` have them; the bare
+  `transformers.cache_utils.DynamicCache` that `_create_kv_cache` returns for `kv_cache_mode="fp16"`
+  — which is what `"auto"` resolves to for every **non-EXL3** model — has none of the three.
+  (Verified on transformers 5.5.4: that class is layer-object based, `layers[i].keys`/`.values`,
+  with no `key_cache` attribute at all.) **Pre-existing, not an F3 regression** — `generate()`'s
+  cross-turn path calls the same `store()` and would fail identically; F3 merely surfaced it.
+  As of 2026-08-09 `vaayu_base.py` probes the cache at load and, when unsupported, prints a WARNING
+  and disables the pool rather than failing per-turn — the per-turn failure was the dangerous one,
+  because `lookup()` POPS an entry before `store()` puts one back, so each swallowed failure
+  permanently drained the pool. To actually SUPPORT fp16, either give `DynamicCache` the three
+  methods via an adapter, or route fp16 through `FP8DynamicCache(quantize=False)`. Neither is
+  urgent: all three on-device targets and the 70B dense reference are EXL3. (found 2026-08-09, F3
+  Task 4 on-device gate)
 
 ## Architectural gaps
 
-- [ ] **F3 — the cross-turn prefix cache is wired into `generate()` only.** `batched_generate`
-  (`vaayu_base.py:3553`) and `speculative_generate` (`:3448`) never call `PrefixCacheStore.lookup()`
-  or `_persist_and_store()`. §0's two shaping facts — parallel fan-out and heavy context reuse —
-  therefore cannot compose: a fan-out batch pays a full cold prefill per stream even when every
-  stream shares the system prefix. **Not a positional fix** (N per-session caches must merge into
-  one left-padded batch cache = new mechanism). Also biases Plan K's measurement (K's plan §8c).
-  (found 2026-08-03, audit F3)
+- [~] **F3 — cross-turn prefix cache in the batched paths.** Phase 1 (shared-prefix broadcast)
+  landed 2026-08-09 on `feat/f3-batched-prefix-cache`: `batched_generate` computes the batch's
+  longest common prefix, looks it up ONCE, broadcasts that cache to N rows, prefills only the
+  divergent tails, and stores exactly one entry back (from the longest-prompt row, inside the
+  `finally` so an abandoned generator cannot lose the popped entry). `speculative_generate` is
+  wired in too. Verified token-identical on Llama-3.3-70B-exl3: round 1 MISS, round 2 HIT,
+  `warm == cold`. **Remaining: the measurement (plan Task 6)** — the coverage fraction that gates
+  whether Phase 2 is ever built, plus the TTFT A/B that Plan K needs. Phase 2 (ragged per-stream
+  merge) is NOT built and needs that number first; it also needs a cache-class change, since
+  `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
+  Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
+- [bug] **F3: one unreproduced attention-mask/KV length mismatch.**
+  `RuntimeError: The expanded size of the tensor (1690) must match the existing size (1127) at
+  non-singleton dimension 3. Target sizes: [3, 64, 1127, 1690]. Tensor sizes: [3, 1, 1127, 1127]` —
+  mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). Did NOT reproduce
+  across 7 later runs of the identical config; **not fixed, not explained.** Instrumentation proved
+  round 1 runs with `m=0, kv=None` (F3's path is a no-op there), so the suspect is **round 2 with a
+  PARTIAL match** — `m` strictly between 0 and `len(common_ids)` — which every successful run
+  avoided by matching the full prefix. The Task 3 review predicted a mechanism here and called it
+  "degenerate but not reachable from a real lookup() hit". Reproducer to build: a batch whose common
+  prefix is a STRICT prefix of a longer stored entry. (found 2026-08-09, F3 Task 6)
+- [ ] **`speculative_generate` skips `enqueue_truncate` on a prefix HIT, so `enable_kv_persist`
+  can corrupt that session's on-disk KV.** `generate()` calls
+  `self._kv_writer.enqueue_truncate(session_id, match_len)` on a HIT; the new
+  `speculative_generate` hook does not. `DiskWriter.enqueue_append` packs `range(st["nrec"],
+  length)` from its OWN tracked `nrec`, not from `match_len`. Scenario: turn 1 persists positions
+  [0,7) (`nrec=7`); turn 2 HITs at `match_len=5` and ends at length 9; `enqueue_append` starts at 7
+  and writes only [7,9), leaving [5,7) holding **turn 1's stale bytes** merged with turn 2's — a
+  corrupted record, undetectable until restore. **Dormant today**: no on-device target combines a
+  speculator with `enable_kv_persist=True`. Fix is the two-line mirror of `generate()`.
+  (found 2026-08-09, F3 Task 5 review)
 - [ ] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so `_get_vram_pinning_budget()`
   reserves KV for 512 tokens against real contexts of 2 048–7 751. Measured (Qwen): KV
   0.193 MB/token → reserved 0.092 GB, actual 0.367 GB at 2k (**−0.28 GB**) and 1.390 GB at 7.7k
@@ -237,9 +253,52 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   free.** (Plan L E4)
 - **MiniMax runs the module-list forward, not the EXL3 fused one.** Every MiniMax perf number on
   record is a module-list number.
+- **Layer offload to meta destroys BUFFERS, and a buffer the checkpoint cannot restore is gone for
+  good (fixed 2026-08-09).** `free_from_gpu` in BOTH loader strategies ended with
+  `layer_module.to("meta")`. Parameters SHOULD go to meta — that is layer streaming, and the next
+  per-layer load restores them. Buffers are the trap: `MiniMaxM2SparseMoeBlock` registers
+  `e_score_correction_bias` via `register_buffer(torch.zeros(...))`, the checkpoint has **no tensor
+  by that name** (layer 3: 3093 keys, only `block_sparse_moe.gate.weight`), and the only thing that
+  ever materialized it was the load-time `named_buffers()` pass. Each layer's router therefore
+  worked on the FIRST forward pass and died on every one after. **Latent for as long as the
+  module-list forward used a hardcoded softmax; it surfaced the moment that forward switched to the
+  model's own `route_tokens_to_experts` (sigmoid + bias).** A "works once then fails" symptom on a
+  streamed layer means look at what the offload destroys that the reload cannot rebuild.
 - **Decode floors, same-box same-day 2026-08-08: MiniMax 1.45 tok/s, Qwen 0.83 tok/s.** These are
   BASELINE numbers from `main`, and they sit *below* the older 1.48 / 0.85 figures on unchanged code.
   Always re-measure the baseline the same day; never gate against a historical number.
+- **`_full_position_embeddings = None` was an OVERLOADED sentinel; failure now raises (D3, fixed
+  2026-08-09).** `None` legitimately means "this architecture exposes no top-level `rotary_emb`, so
+  each decoder layer computes RoPE itself" — `get_pos_emb_args`' empty-dict path exists for exactly
+  those models. The old handler reused that same `None` to mean "precompute failed", printing
+  "RoPE will be computed per-layer" for a mechanism that has never existed. Since every modern
+  decoder layer takes `position_embeddings` as a REQUIRED argument, a VRAM OOM surfaced as
+  `...DecoderLayer.forward() missing 1 required positional argument` ~30 frames away. Now
+  `_precompute_rope` returns `None` only for the no-`rotary_emb` case and raises otherwise, with
+  the OOM chained via `from` and the real levers named (`prefill_chunk_size`, `max_seq_len`,
+  expert VRAM budget). **A diagnostic must not be able to raise:** the first draft of that error
+  interpolated `position_ids.shape[1]`, which would have re-created D3 inside D3's own fix — there
+  is now a test pinning it.
+- **D1 was a tied `lm_head`, never an attention/RoPE/mask bug (fixed 2026-08-09).** A checkpoint with
+  `tie_word_embeddings: true` stores no `lm_head.weight`; the splitter still writes a valid EMPTY
+  16-byte `{}` shard plus its `.done` marker, so the split verifies complete and the load SUCCEEDS
+  with zero tensors. The pin phase measured `size = 0`, injected nothing, and still added `lm_head`
+  to `pinned_layer_names` — **resident while meta-initialized** — and the forward skips pinned
+  layers, so nothing ever weighted it. Measured, all same box same day:
+  | arm | ppl | note |
+  |---|---|---|
+  | arm | forward | ppl | note |
+  |---|---|---|---|
+  | Llama-3.2-1B (tied), before | dense | 128365.41 | vocab-uniform baseline 128256 — zero signal |
+  | Llama-3.2-1B (tied), after | dense | **11.94** | |
+  | Llama-3.3-70B-exl3 (untied) | dense | 8.78 → 8.78 | unaffected both sides of the fix |
+  | MiniMax-M2.7 | MoE module-list | 8.73 / 8.66 | shared pin phase, no regression |
+  | Qwen3-235B (94 layers) | MoE fused-EXL3 | **6.71** | arena + prefill-stager path |
+  **All four rows of `CLAUDE.md` §0's dispatch table that have an on-device model were measured.**
+  Every untied checkpoint pinned a real `lm_head` (70B 0.79 GB, MiniMax 0.46, Qwen 0.47); the tied
+  branch stays silent for them.
+  **A perplexity at the vocab-uniform baseline means an unweighted output layer — go to weight
+  loading, not to attention.** Three attn impls failing identically was the same tell, misread.
 
 ---
 
@@ -268,3 +327,16 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   logic instead of executing it.
 - **Silent degradation hides on paths that only run once something has already gone wrong.** All
   three Plan L review defects were of this shape and none was visible on a healthy box.
+- **When a fix changes nothing, check whether your code EXECUTED before forming a second
+  hypothesis.** D1's first fix was correct code at the wrong site: `load_layer_to_cpu` already had a
+  tied-weights fallback, but its comment read "lm_head.safetensors might not be generated" — it
+  anticipated a MISSING file, and an empty-but-valid one does not raise. Patching it changed
+  nothing because **pinned layers never reach that function at all**. The tells were that the
+  re-run was byte-identical AND *neither new print appeared*; `[Vaayu-Pin] pinned lm_head: 0.00 GB`
+  was the log line that named the real path. A second hypothesis about *why the fix was wrong*
+  would have been wasted — the fix was never run.
+- **An existing fallback is not proof the case is handled.** Check what TRIGGERS it. D1's fallback
+  keyed on an exception; the failure mode was a success returning `{}`.
+- **`size == 0` is not the emptiness test for a layer — `not tensors` is.** `model.norm`
+  legitimately measures 0.00 GB, so a byte-size check silently lumps a real layer in with an
+  unloaded one.
