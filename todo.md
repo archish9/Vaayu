@@ -210,15 +210,34 @@ movement, not expert sharing (union ratio 0.82).
 **The eviction cost has never been priced. That is the experiment, and a refutation is an acceptable
 outcome.**
 
-- [ ] **Task 1** — `reclaimable_vram_budget(model, reclaim=False)`; floor = one token's working set
-  (derived), so a batch can never be admitted onto a zero-resident cache
-- [ ] **Task 2** — `batched_generate(reclaim=)` performs the reclaim it was admitted under, **once at
-  the batch boundary, never per decode step** (pinned by test — Plan H's mistake in a new costume)
-- [ ] **Task 3** — on-device: (a) does `batched_generate` run at all on MiniMax's module-list
-  forward? Never exercised. (b) sweep N × reclaim at ~7.7k context, both models. Measure decode
-  separately from TTFT (the batch arm gets no prefix HITs — see plan §8c, and F3 above)
-- [ ] **Task 4** — RESULTS + verdict + the expert-VRAM hit-rate-vs-reclaim cost curve; correct the
-  stale "always defers to N=1" claim in `test_batched_decode.py`
+**Three of the plan's premises changed on 2026-08-09, before execution:**
+- **§8c's confound is GONE.** The plan says to measure decode-only because `batched_generate` never
+  consults the prefix cache. F3 landed; it does now. The sweep therefore crosses **pool on/off** with
+  reclaim on/off rather than working around the gap.
+- **§8's Task 3a is already answered** — `batched_generate` runs on MiniMax's module-list forward
+  (F3 RESULTS §6).
+- **The MoE determinism fix is load-bearing here.** Until 2026-08-09 the engine was not a
+  deterministic function of its input on either MoE model; a throughput sweep run before it would
+  have been partly measuring that.
+- §3's baselines (Qwen 0.82 / MiniMax 1.47 tok/s) are cross-day and must be re-measured same-day.
+
+- [x] **Task 1** — `reclaimable_vram_budget(model, reclaim=False)` + `reclaimable_expert_vram`;
+  floor = one decode step's working set from `_moe_geometry`, and **no geometry ⇒ reclaim nothing**
+  (an unknown floor is not a zero floor). 8 tests. **One deliberate deviation:** the plan's §6 writes
+  the budget as `free + usage − SAFETY` (the WHOLE cache), which contradicts its own floor test two
+  cases later; the floor always applies.
+- [x] **Task 2** — `batched_generate(reclaim=)` evicts once at the batch boundary, before the prefix
+  lookup's `to_device()` so freed VRAM is still free when the reused KV lands. `batch_kv_cost`
+  extracted so admission and the reclaim that pays for it quote the SAME expression. 6 tests,
+  including the once-not-per-step pin.
+- [~] **Task 3** — full sweep RUNNING (launched 2026-08-09 16:18): 2 models × N∈{1,2,3,5} ×
+  reclaim{off,on} × pool{off,on} = **32 cells**, one process per cell, ~7.7k-token prompts,
+  discarded warm-up per checkpoint (a model's first touch is never a valid baseline). Pool-ON cells
+  run two rounds and report the warm one. Evidence: `~/vaayu-evidence/2026-08-09-plan-k/`.
+- [ ] **Task 4** — RESULTS + verdict + the expert-VRAM hit-rate-vs-reclaim cost curve.
+  The stale "always defers to N=1" claim is **already corrected** in `test_batched_decode.py` and
+  `.superpowers/sdd/task-7-report.md` — it was false when written (measured before Plan A moved
+  `_VRAM_RESERVE_BYTES` 2 → 3.5 GB; re-run admits all 3 at L=35).
 
 ## F1 — expert-cache / prefix-pool RAM arbitration  (sequence #7)
 

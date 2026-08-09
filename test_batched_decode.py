@@ -95,16 +95,25 @@ reference = [single_stream(ids, f"single_{i}") for i, ids in enumerate(req_ids)]
 requests = [BatchRequest(ids, MAX_NEW) for ids in req_ids]
 
 # plan_batch is still exercised (logs what production admission would decide
-# on this box), but the gate below does not hard-assert on its result. On
-# this box, the model's expert-cache VRAM footprint (~11.7GB, a deliberate
-# production tuning tradeoff maximizing single-stream hit rate) leaves ~1.2-
-# 1.3GB free once warmed -- below free_vram_budget's 1.5GB hardware safety
-# margin, so plan_batch always defers to N=1 here. That's plan_batch/
-# size_batch working correctly (CLAUDE.md SS5: warn, don't silently degrade),
-# not a bug -- see task-7-report.md. The N=3 batch below is constructed
-# directly (same bypass pattern single_stream() already uses for N=1) so the
-# actual thing under test -- forward()'s Task 5/6 gated mask/position/RoPE
-# path at N>1 -- gets exercised regardless of VRAM-budget admission.
+# on this box), but the gate below does not hard-assert on its result.
+#
+# CORRECTED 2026-08-09 (Plan K). This comment used to claim plan_batch "always
+# defers to N=1 here". That is FALSE and was already false when written: it
+# was measured before Plan A moved _VRAM_RESERVE_BYTES 2 -> 3.5 GB. Re-checked
+# on a warm box with this harness's own short prompts (L=35, per-stream KV
+# 6.7 MB), plan_batch admits all 3 -- nothing was ever blocked at that size.
+#
+# What IS true is the opposite failure, and it only appears at the context
+# lengths this engine targets: at ~7.7k-token streams Qwen's per-stream KV is
+# 1.49 GB, so N=1 is admitted against free VRAM alone while ~5.8 GB sits in
+# the expert VRAM cache -- a pure LRU one evict_until_free() call away.
+# plan_batch(..., reclaim=True) counts those bytes; whether spending them is
+# worth it is the Plan K sweep's question.
+#
+# The N=3 batch below is constructed directly (same bypass pattern
+# single_stream() already uses for N=1) so the actual thing under test --
+# forward()'s Task 5/6 gated mask/position/RoPE path at N>1 -- gets exercised
+# regardless of VRAM-budget admission.
 admitted, deferred = plan_batch(model, requests)
 if deferred:
     print(f"[info] plan_batch would defer {len(deferred)}/{len(requests)} "
