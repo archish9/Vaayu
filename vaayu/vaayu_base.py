@@ -4060,17 +4060,58 @@ class VaayuBaseModel(GenerationMixin):
         past = None   # bound in finally's store-back guard; stays None if the
                        # generator is torn down before the prefill forward returns
         try:
-            # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
+            # Prefill, CHUNKED. Running the whole batch prompt as one forward
+            # made long contexts unreachable at any N: measured on MiniMax,
+            # N=1 fits at 4k tokens and OOMs at 7 768 (tried 5.79 GiB with
+            # 5.13 free), N=3 fits at 2k and OOMs at 4k. The constraint is
+            # prefill ACTIVATIONS, scaling with N x context — which is why no
+            # admission policy could help there (Plan K Task 3).
+            #
+            # forward()'s own chunked path is NOT reusable here: its MoE fast
+            # path turns chunks INTO batch elements, so it needs the batch
+            # dimension this caller is already using. Hence chunking here,
+            # where pad_mask and the per-stream positions already exist, with
+            # forward's own chunking disabled for each call.
+            #
+            # Per chunk, with past = m + start and q = end - start:
+            #   mask       pad_mask[:, :m + end]      width == past + q
+            #   positions  position_ids[:, :m + end]  get_pos_emb_args slices
+            #                                         [len_p : len_p + len_s],
+            #                                         so positions are absolute
+            #                                         from 0, never chunk-local.
+            # check_batch_kv_invariant re-checks the mask/KV agreement on every
+            # one of these calls.
+            #
+            # Cost, stated because it is real: the layer-major optimisation that
+            # reads each expert once per PREFILL rather than once per chunk is
+            # the very trick that cannot compose with a batch, so a batched
+            # chunked prefill re-reads the expert set per chunk. That buys the
+            # ability to run at all.
             _saved_chunk = self.prefill_chunk_size
             self.prefill_chunk_size = 0
+            _step = _saved_chunk if _saved_chunk and _saved_chunk > 0 else max_R
             try:
-                out = self.forward(
-                    input_ids=input_ids, attention_mask=pad_mask,
-                    position_ids=position_ids, past_key_values=kv,
-                    use_cache=True, return_dict=True)
+                _acc = kv
+                for _start in range(0, max_R, _step):
+                    _end = min(_start + _step, max_R)
+                    out = self.forward(
+                        input_ids=input_ids[:, _start:_end],
+                        attention_mask=pad_mask[:, :m + _end],
+                        position_ids=position_ids[:, :m + _end],
+                        past_key_values=_acc,
+                        use_cache=True, return_dict=True)
+                    _acc = out.past_key_values
+                    # Bind after each SUCCESSFUL chunk, not before the loop: a
+                    # chunk that raises must not leave `past` pointing at a
+                    # cache the finally-block would then store back as if the
+                    # prefill had completed. Binding it as we go still lets the
+                    # store-back return the popped pool entry rather than lose
+                    # it — store()'s crop plus lookup()'s resolve_matched_len
+                    # make a short entry safe, an over-claimed one is what they
+                    # exist to handle.
+                    past = _acc
             finally:
                 self.prefill_chunk_size = _saved_chunk
-            past = out.past_key_values
             logits = out.logits[:, -1, :]           # right edge aligned by left-pad
 
             next_tokens = torch.empty((N, 1), dtype=torch.long, device=device)
