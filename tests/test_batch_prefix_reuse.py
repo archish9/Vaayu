@@ -121,3 +121,26 @@ def test_slice_row_copies_seq_len_list():
     one = slice_cache_row(c, 0)
     one._seq_len[0] = 999
     assert c._seq_len[0] != 999
+
+
+from vaayu.batch import batch_position_ids, build_batch_attention_mask
+
+
+def test_prefix_mask_and_positions_are_absolute():
+    """With m cached tokens and left-padded tails, tail tokens must land on
+    absolute positions m..m+r_i-1, and tail queries must see the cache."""
+    m, max_R = 3, 4
+    tail_mask = torch.tensor([[1, 1, 1, 1],      # r=4, no pad
+                              [0, 0, 1, 1]])     # r=2, two pads
+    pad_mask = torch.cat([torch.ones(2, m, dtype=torch.long), tail_mask], dim=1)
+
+    pos = batch_position_ids(pad_mask)
+    assert pos.shape == (2, m + max_R)
+    assert pos[0, m:].tolist() == [3, 4, 5, 6]     # r=4 -> m..m+3
+    assert pos[1, m:].tolist() == [2, 2, 3, 4]     # pads clamp, reals m..m+1
+
+    mask = build_batch_attention_mask(pad_mask, max_R, torch.float32, "cpu")
+    assert mask.shape == (2, 1, max_R, m + max_R)
+    neg = torch.finfo(torch.float32).min
+    assert (mask[0, 0, 0, :m] != neg).all()        # first tail query sees cache
+    assert (mask[1, 0, :, m:m + 2] == neg).all()   # row 1's pads are masked

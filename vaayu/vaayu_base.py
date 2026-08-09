@@ -3891,14 +3891,42 @@ class VaayuBaseModel(GenerationMixin):
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
 
-        max_L = max(len(r.prompt_ids) for r in requests)
-        input_ids = torch.full((N, max_L), pad_id, dtype=torch.long, device=device)
-        pad_mask = torch.zeros((N, max_L), dtype=torch.long, device=device)
-        for i, r in enumerate(requests):
-            L = len(r.prompt_ids)
-            input_ids[i, max_L - L:] = torch.tensor(r.prompt_ids, device=device)
-            pad_mask[i, max_L - L:] = 1
+        from .batch import (batch_common_prefix, broadcast_cache_rows,
+                            slice_cache_row)
+        pc = getattr(self, "_prefix_cache", None)
+        common_ids = batch_common_prefix(requests) if pc is not None else []
+        kv, m = (pc.lookup(None, common_ids, device=device)
+                 if common_ids else (None, 0))
+        if kv is not None:
+            # Every stream must keep >=1 token to run, same clamp generate()
+            # applies at :3714 and for the same reason.
+            m = min(m, min(len(r.prompt_ids) for r in requests) - 1)
+        if kv is None or m <= 0:
+            kv, m = None, 0
+        else:
+            kv.to_device(device)
+            kv.crop(m)
+            broadcast_cache_rows(kv, N)
+            print(f"[Vaayu-Prefix] BATCH HIT n={N} match_len={m}/"
+                  f"{len(common_ids)} — prefilling only the divergent tails")
+
+        tails = [r.prompt_ids[m:] for r in requests]
+        max_R = max(len(t) for t in tails)
+        input_ids = torch.full((N, max_R), pad_id, dtype=torch.long, device=device)
+        tail_mask = torch.zeros((N, max_R), dtype=torch.long, device=device)
+        for i, t in enumerate(tails):
+            input_ids[i, max_R - len(t):] = torch.tensor(t, device=device)
+            tail_mask[i, max_R - len(t):] = 1
+        pad_mask = torch.cat(
+            [torch.ones((N, m), dtype=torch.long, device=device), tail_mask], dim=1)
         position_ids = batch_position_ids(pad_mask)
+
+        _total_prompt = sum(len(r.prompt_ids) for r in requests)
+        self._batch_prefix_stats = {
+            "matched": m, "common": len(common_ids),
+            "prefill_tokens": _total_prompt,
+            "coverage": (N * m / _total_prompt) if _total_prompt else 0.0,
+        }
 
         eos = self.config.eos_token_id
         eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
@@ -3922,7 +3950,8 @@ class VaayuBaseModel(GenerationMixin):
             try:
                 out = self.forward(
                     input_ids=input_ids, attention_mask=pad_mask,
-                    position_ids=position_ids, use_cache=True, return_dict=True)
+                    position_ids=position_ids, past_key_values=kv,
+                    use_cache=True, return_dict=True)
             finally:
                 self.prefill_chunk_size = _saved_chunk
             past = out.past_key_values
@@ -3957,6 +3986,14 @@ class VaayuBaseModel(GenerationMixin):
                     produced[i] += 1
                     if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                         active[i] = False
+
+            if pc is not None and common_ids:
+                # Exactly ONE entry per batch regardless of N: writing N would
+                # be the K=7-against-a-5-slot-pool configuration that measured
+                # ZERO hits (capacity is a cliff, not a slope).
+                one = slice_cache_row(past, 0)
+                one.crop(len(common_ids))
+                pc.store(_auto_session_id(common_ids), list(common_ids), one)
         finally:
             self._batch_decode_active = False
             self._batch_n = 1
