@@ -24,9 +24,16 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
 | **4b** | ~~Fix MiniMax's non-identical output under prefix reuse~~ — **DONE 2026-08-09** | Was not a prefix-reuse bug at all: the MoE forwards accumulated experts in bf16 while expert arrival order is nondeterministic. fp32 accumulator in all three forwards. See Settled. Left behind **one open bug** (fused-EXL3 residual). |
 | **5** | ~~Plan K — batched-decode admission reclaim~~ — **REFUTED 2026-08-09** | Admission was never the limiter: `plan_batch` deferred ZERO requests in every cell of both models at N≤5 × 7.7k. See Settled. Tasks 1-2 ship default-off. |
-| **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** ← **START HERE** | Plan K answered where the cliff bites, and it is lower than the row assumed: peak allocation is **14.17-15.57 GB of 15.47 GiB at N=1 × 7.7k**, and N≥2 does not run at all. F4's `max_seq_len=512` under-reservation is a real contributor to a ceiling now known to be the engine's binding constraint — not a side issue. |
+| **6** | **[~] F4 + the 7.7k→8.2k VRAM ceiling** ← **PLAN WRITTEN — JUST EXECUTE IT.** No design work left. Run `docs/superpowers/plans/2026-08-09-vram-plan.md` task-by-task (superpowers:subagent-driven-development or executing-plans). The plan is **self-contained** — its §0 carries every prior result, model path and hardware constant it needs, so a fresh session needs nothing from this file or the spec. | Plan K answered where the cliff bites, and it is lower than the row assumed: peak allocation is **14.17-15.57 GB of 15.47 GiB at N=1 × 7.7k**, and N≥2 does not run at all. F4's `max_seq_len=512` under-reservation is a real contributor to a ceiling now known to be the engine's binding constraint — not a side issue. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
 | **8** | **Hygiene, any order** | `_create_kv_cache` silent fp8 fall-through, `slab_bytes`/`_ALIGN` validation, the Plan L review backlog, F6, F7, and the three telemetry items. None blocks anything; all are small. |
+
+> ### ▶▶ NEXT ACTION: execute an already-written plan
+> `docs/superpowers/plans/2026-08-09-vram-plan.md` — 10 TDD tasks, self-contained (§0 has
+> the background), written and reviewed 2026-08-09. **Do not re-brainstorm row 6; do not
+> re-derive its findings.** Estimated 8–12 h if the ±10 % fit gate passes first try,
+> 12–16 h if not. Start at Task 1 — it costs no model load and can delete a whole term
+> from the design.
 
 **Rules that outlive this list**
 - A plan ending in **refutation closes its row.** Record the verdict under "Settled" and move on — do not re-scope a plan to find a win. F, G and H all ended this way; that is the system working.
@@ -114,7 +121,7 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   corrupted record, undetectable until restore. **Dormant today**: no on-device target combines a
   speculator with `enable_kv_persist=True`. Fix is the two-line mirror of `generate()`.
   (found 2026-08-09, F3 Task 5 review)
-- [ ] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so `_get_vram_pinning_budget()`
+- [~] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so `_get_vram_pinning_budget()`
   reserves KV for 512 tokens against real contexts of 2 048–7 751. Measured (Qwen): KV
   0.193 MB/token → reserved 0.092 GB, actual 0.367 GB at 2k (**−0.28 GB**) and 1.390 GB at 7.7k
   (**−1.30 GB**). Pinning therefore claims VRAM the KV cache later needs. Fix is parameter plumbing.
@@ -127,6 +134,36 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `free_vram_at_load − 3.5 GB` = 8.7-8.8 GB before any KV exists, and never evicts: `0evict`
   throughout). **Characterize that cliff before blaming any single input for it.**
   (found 2026-08-03, audit F4)
+  **MECHANISM IDENTIFIED 2026-08-09 (design exploration), and it explains the retraction.**
+  *"Pinning claims VRAM the KV cache later needs"* is true for DENSE and a **no-op for MoE**.
+  The expert VRAM cache is sized at `:1686`, AFTER pinning at `:1472`, as
+  `free_vram_now − 3.5 GB` — so it soaks up whatever pinning leaves behind. Under-reserving
+  KV moves VRAM from the expert cache to pinned layers; **post-load headroom is
+  `_VRAM_RESERVE_BYTES` = 3.5 GB flat, independent of `max_seq_len`.** That is exactly why
+  setting `max_seq_len` did not fix the K=3 × ~8.2k crash. Dense builds no expert VRAM cache
+  (the block is inside the MoE branch), so there pinning IS the only consumer and F4's
+  original reasoning holds — Llama-3.3-70B-exl3 is affected.
+  **Also: "cliff" is probably the wrong word.** Derived per-token KV (calibrated against
+  this row's own 0.193 MB/tok Qwen figure) puts the 7.7k→8.2k growth at **+0.10 GB (Qwen) /
+  +0.12 GB (MiniMax) / +0.17 GB (dense)** — nothing in KV cliffs there. Plan K's peak was
+  already 14.17-15.57 GB of 15.47 GiB, so the hypothesis is a **ceiling tipped by a linear
+  term**. Two intermediate readings corrected so they are not re-derived: batched prefill IS
+  chunked (`:4110-4132` runs its own `_step` loop), and only the LAST chunk's logits are
+  materialized (`:3512-3519`). One S-linear suspect survives: **sdpa backend selection** —
+  prefill passes an explicit 4D mask, and if that drops sdpa off flash onto math/efficient,
+  scores materialize at `N × n_heads × chunk × S` (Qwen N=1 @8.2k ≈ 1.6 GB with the softmax
+  copy, linear in S). Probe P1 settles it with no model load.
+  **Three findings from the design pass that the plan already encodes — do not re-derive:**
+  (a) batched prefill IS chunked (`:4110-4132`) and only the LAST chunk's logits are
+  materialized (`:3512-3519`); (b) prefill is **chunk-major/layer-major**
+  (`_chunked_prefill`, `:3171`), so every chunk is a live batch element and **activations
+  are S-linear**, and peak-vs-S is NOT observable inside one prefill call; (c) the
+  `expandable_segments` arm is **vacuous** — `vaayu/__init__.py:20` already sets it via
+  `setdefault` at import time, so Plan K's 2.3 GB reserved−allocated gap persists DESPITE
+  it and is not recoverable by flipping that flag. The informative control arm is
+  `max_split_size_mb:512`.
+  Design: `docs/superpowers/specs/2026-08-09-vram-plan-design.md` (docs/ is gitignored)
+  **Plan (self-contained, ready to execute): `docs/superpowers/plans/2026-08-09-vram-plan.md`**
 
 ## Dead or misleading code
 
