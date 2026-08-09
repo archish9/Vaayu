@@ -17,7 +17,16 @@ target**, deferred until the MoE path is solid. When that work starts, optimize
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
 the MoE tests green, and treat any change to shared infra (staging, prefix
 cache, NVMe warmup, io_uring) as touching both paths. Until then, MoE changes
-must not silently break dense — a dense load+generate smoke test guards that.
+must not silently break dense — `test_batched_dense_smoke.py` guards that.
+
+**Dense reference checkpoint (on-device):**
+`/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` —
+Llama-3.3-70B-Instruct, EXL3 4.5 bpw (head 6 bits), 80 layers, 39 GB on disk, so
+it exercises the real streamed-dense path (~37 GB read per token). This is
+`test_batched_dense_smoke.py`'s default; override with `DENSE_CKPT=`.
+`models/Llama-3.2-1B-Instruct` is the small unquantized dense checkpoint (and the
+README's suggested speculative-decoding drafter) — use it when you need a dense
+run in seconds rather than minutes.
 
 **Dispatch table (`_make_sparse_moe_forward` in `vaayu/moe_patch.py`). It branches
 on `block_info.expert_style` FIRST, and only then on `is_exl3` — so the expert
@@ -28,7 +37,7 @@ layout, not the quant format, picks the forward:**
 | fused (experts module with `num_experts`) | EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | **Qwen3-235B** — actively tested |
 | fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | none — gated in, not perf-tuned |
 | module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested |
-| dense | either | as configured | non-MoE forward | works, streamed-perf deferred |
+| dense | either | as configured | non-MoE forward | **Llama-3.3-70B-exl3** (path below), ppl 8.78; tied-`lm_head` checkpoints (Llama-3.2-1B) fixed 2026-08-09, ppl 11.94; streamed-perf deferred |
 
 **An EXL3 model does NOT imply the EXL3 fused forward.** `detect_moe_blocks`
 reads the layout off the module tree: an experts module exposing `num_experts`
@@ -132,9 +141,10 @@ Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5
 (62 layers, 256 experts) — both EXL3-quantized MoE, selected in
 `test_generate.py` — but on **different forwards**: Qwen is fused-layout (EXL3
 fused forward), MiniMax is module-list layout (module-list forward). See §0.
-Non-EXL3, dense, and CPU-compute paths are architecturally supported (gated by
-`is_exl3` and the `compute_device` switch) but not actively tested on-device
-today. Any code, plan, or fix you produce MUST work for all of
+Dense is also an on-device target — Llama-3.3-70B-Instruct EXL3 4.5 bpw (80
+layers), path in §0, gated by `test_batched_dense_smoke.py`. Non-EXL3 and
+CPU-compute paths are architecturally supported (gated by `is_exl3` and the
+`compute_device` switch) but not actively tested on-device today. Any code, plan, or fix you produce MUST work for all of
 them without edits — never assume EXL3, never assume CUDA, never assume MoE.
 
 **Rules — apply to every change and every plan:**

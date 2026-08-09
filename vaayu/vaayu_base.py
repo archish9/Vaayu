@@ -498,6 +498,43 @@ def moe_supports_prefill_stager(expert_styles, is_exl3: bool) -> bool:
     return bool(is_exl3) and bool(styles) and all(s == "fused" for s in styles)
 
 
+def should_use_tied_lm_head(layer_name, lm_head_name, state_dict, load_failed: bool) -> bool:
+    """True iff `layer_name`'s weights must come from the embedding instead.
+
+    A checkpoint with `tie_word_embeddings` stores no `lm_head` tensor. Two
+    shapes of that reach the loader, and only the first was ever handled:
+
+    - the shard is ABSENT      -> `load_layer` raises      -> `load_failed=True`
+    - the shard is EMPTY       -> `load_layer` SUCCEEDS with `{}` (bug D1)
+
+    Vaayu's splitter produces the second: it writes a valid 16-byte `{}`
+    safetensors file and its `.done` marker, so the split verifies as complete
+    and the load never raises. `lm_head` then keeps its meta-initialized
+    weights and the model emits uniform-random logits.
+
+    Only the head can be tied, so every other layer keeps propagating its
+    error — an empty decoder layer is a real failure, not something to paper
+    over with embeddings. `lm_head_name` may be None when the module tree
+    exposes no nn.Linear head (see `detect_layer_names`), which is not a
+    fallback case either.
+    """
+    if lm_head_name is None or layer_name is None:
+        return False
+    if layer_name.rstrip(".") != lm_head_name.rstrip("."):
+        return False
+    return bool(load_failed) or not state_dict
+
+
+def rekey_embed_as_lm_head(state_dict, embed_name: str, lm_head_name: str) -> dict:
+    """Re-key an embedding shard's tensors so they land on the tied head.
+
+    Names come from `layer_names_dict`, never assumed to be Llama's (§5).
+    Returns {} for an empty input so callers can fail honestly rather than
+    inject an unweighted head.
+    """
+    return {k.replace(embed_name, lm_head_name): v for k, v in state_dict.items()}
+
+
 def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
     """RoPE inverse frequencies for `config`, honouring PARTIAL rotary.
 
@@ -2304,6 +2341,25 @@ class VaayuBaseModel(GenerationMixin):
                            self.layer_names_dict["lm_head"]]:
             try:
                 tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+                # A tied-weight checkpoint has no lm_head tensor; the split still
+                # contains an empty-but-valid shard for it, so this load SUCCEEDS
+                # with zero tensors (bug D1). Pinning that marks the layer resident
+                # while it is still meta-initialized, and the forward then never
+                # loads it -- the model emits uniform-random logits.
+                if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
+                                           tensors, load_failed=False):
+                    print(f"[Vaayu-Pin] {layer_name} shard holds no tensors (tied weights); "
+                          f"loading them from {self.layer_names_dict['embed']} instead.")
+                    tensors = rekey_embed_as_lm_head(
+                        self.loader_strategy.load_from_disk(
+                            self.layer_names_dict["embed"], self.checkpoint_path),
+                        self.layer_names_dict["embed"], layer_name)
+                if not tensors:
+                    # NOT `size == 0`: model.norm legitimately measures 0.00 GB.
+                    print(f"[Vaayu-Pin] WARNING: {layer_name} yielded no tensors — refusing to "
+                          f"mark it pinned. It would stay meta-initialized and emit garbage "
+                          f"(CLAUDE.md §5: warn, never silently degrade).")
+                    continue
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
                     print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
@@ -2628,40 +2684,60 @@ class VaayuBaseModel(GenerationMixin):
             cache.put(layer_name, result)
         return result
 
+    def _load_tied_lm_head_from_embed(self, layer_name):
+        """Load the embedding shard and re-key its tensors as lm_head's."""
+        embed_layer_name = self.layer_names_dict['embed']
+        # Sometimes layer names are passed with dots depending on the execution context, so strip it for comparison but fetch the exact embed equivalent
+        if layer_name.endswith("."):
+            embed_layer_name += "."
+        load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
+
+        # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
+        if self.profiling_mode:
+            state_dict, compression_time = load_layer_output
+        else:
+            state_dict = load_layer_output
+
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k.replace(self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
+            new_state_dict[new_k] = v
+
+        if not new_state_dict:
+            # Failing honestly beats degrading silently (CLAUDE.md §5): an
+            # unweighted lm_head does not crash, it emits uniform-random
+            # logits, which is exactly how bug D1 survived a smoke test.
+            raise RuntimeError(
+                f"Cannot supply weights for {layer_name}: its shard is empty or missing "
+                f"(tied weights) and the embedding shard '{embed_layer_name}' yielded no "
+                f"tensors either. The checkpoint split at {self.checkpoint_path} is incomplete.")
+
+        if self.profiling_mode:
+            return (new_state_dict, compression_time)
+        return new_state_dict
+
     def load_layer_to_cpu(self, layer_name):
 
         t = time.time()
 
+        # For models with tied weights, the lm_head shard carries no tensors
+        # because lm_head is implicitly tied to embed_tokens. Safely fallback to
+        # embed_tokens. Both shapes of that count -- an absent shard (raises) and
+        # an empty-but-valid one (does NOT raise; see should_use_tied_lm_head).
+        _lm_head_name = self.layer_names_dict.get('lm_head')
         try:
             load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
         except Exception as e:
-            # For models with tied weights, lm_head.safetensors might not be generated
-            # because it's implicitly tied to embed_tokens. Safely fallback to embed_tokens.
-            if layer_name == self.layer_names_dict['lm_head'] or layer_name == self.layer_names_dict['lm_head'] + ".":
-                print(f"Failed to load {layer_name}, attempting to use tied weights from {self.layer_names_dict['embed']}. (original error: {repr(e)})")
-                embed_layer_name = self.layer_names_dict['embed']
-                # Sometimes layer names are passed with dots depending on the execution context, so strip it for comparison but fetch the exact embed equivalent
-                if layer_name.endswith("."):
-                     embed_layer_name += "."
-                load_layer_output = load_layer(self.checkpoint_path, embed_layer_name, self.profiling_mode)
-                
-                # Replace the 'model.embed_tokens' prefix with 'lm_head' in the returned state dict
-                if self.profiling_mode:
-                    state_dict, compression_time = load_layer_output
-                else:
-                    state_dict = load_layer_output
-                
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    new_k = k.replace(self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
-                    new_state_dict[new_k] = v
-                
-                if self.profiling_mode:
-                    load_layer_output = (new_state_dict, compression_time)
-                else:
-                    load_layer_output = new_state_dict
-            else:
+            if not should_use_tied_lm_head(layer_name, _lm_head_name, None, load_failed=True):
                 raise e
+            print(f"Failed to load {layer_name}, attempting to use tied weights from {self.layer_names_dict['embed']}. (original error: {repr(e)})")
+            load_layer_output = self._load_tied_lm_head_from_embed(layer_name)
+        else:
+            _loaded = load_layer_output[0] if self.profiling_mode else load_layer_output
+            if should_use_tied_lm_head(layer_name, _lm_head_name, _loaded, load_failed=False):
+                print(f"{layer_name} shard holds no tensors (tied weights); loading them "
+                      f"from {self.layer_names_dict['embed']} instead.")
+                load_layer_output = self._load_tied_lm_head_from_embed(layer_name)
 
         elapsed_time = time.time() - t
 

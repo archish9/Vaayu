@@ -18,9 +18,9 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 | # | Do this | Why here, and not later |
 |---|---|---|
-| **1** | **Strengthen the dense smoke test** (bug **D2**) | Do this BEFORE fixing dense. It gives you a failing test that actually detects the bug — TDD, and this repo's own discipline. Cheap: it is one assertion change. |
-| **2** | **Fix the dense path** (bug **D1**) | `CLAUDE.md` §0 makes dense a hard requirement and it is currently **broken** — Vaayu emits noise where stock transformers is correct on the same checkpoint. Everything else on this list optimises a path that works; this one is wrong. Step 1 gives you the gate. |
-| **3** | **Make VRAM exhaustion fail honestly** (bug **D3**) | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
+| **1** | ~~Strengthen the dense smoke test (**D2**)~~ — **DONE 2026-08-09** | Gate is now teacher-forced perplexity, not token count. It caught D1 immediately. |
+| **2** | ~~Fix the dense path (**D1**)~~ — **DONE 2026-08-09** | Tied `lm_head` was never weighted; see Settled. Left behind **D4** (the splitter still emits the empty shard) — unblocked, not urgent. |
+| **3** | **Make VRAM exhaustion fail honestly** (bug **D3**) | ← **START HERE** | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
 | **4** | **F3 — wire the prefix cache into `batched_generate`** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
 | **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
 | **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
@@ -38,28 +38,15 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 ## Correctness — these break stated requirements
 
-- [bug] **D1 — the DENSE path generates incoherent output. The checkpoint is fine; Vaayu is wrong.**
-  `Llama-3.2-1B-Instruct`, prompt `"The capital of France is"`:
-  | stack | output |
-  |---|---|
-  | stock transformers, same files | `' Paris. The Eiffel Tower is located in'` |
-  | Vaayu `attn=sdpa` | `'izzie!ong gotten gottenongpectivepectivepective there'` |
-  | Vaayu `attn=eager` | `'izzie there suggest gottenongpective gottenpectivepectivepective'` |
-  | Vaayu `attn=flash_attention_2` (default) | `'izzie factory.identity /////pectivepectivepective...'` |
-  All three attention implementations are wrong, so this is not an attn-impl issue. Identical on
-  `main` and on the Plan L branch (**byte-identical generations** under `do_sample=False`).
-  `CLAUDE.md` §0 requires dense to keep working; it does not. Note `Llama-3.2-1B-Instruct` is also
-  the README's suggested **drafter** for speculative decoding, so bad dense output likely means the
-  drafter proposes garbage (verify would reject it — correctness preserved, speedup lost).
-  Logs: `~/vaayu-evidence/2026-08-07-chunked-arena/dense-smoke-{MAIN,BRANCH}.log`.
-  (found 2026-08-08, Plan L Task 7)
-- [bug] **D2 — the dense smoke test `CLAUDE.md` §0 relies on cannot catch D1.**
-  `test_batched_dense_smoke.py` asserts `seen[0] > 0 and seen[1] > 0` — token **count**, not
-  correctness — so it passes while the model emits noise. §0 claims "a dense load+generate smoke
-  test guards that"; it does not. Fix: assert on content (a greedy completion of a factual prompt,
-  or a logit/perplexity check against a reference), not on token count. **Plan L's own gate script
-  had the identical flaw (`assert n > 0`) and would have reported D1's garbage as a PASS** — this
-  failure mode is easy to write by accident. (found 2026-08-08, Plan L Task 7)
+- [ ] **D4 — the splitter writes an EMPTY `lm_head.safetensors` for tied-weight checkpoints, and
+  marks it `.done`.** Spun out of D1's fix, which repaired the two *consumers* rather than the
+  producer. `vaayu/utils.py`'s split emits a valid 16-byte `{}` shard when the source checkpoint
+  has no `lm_head.weight`, and `all(found_layers.values())` then reports the split as complete —
+  an incomplete split that looks verified. Every future consumer of these shards inherits the same
+  trap D1 fell into. Two candidate fixes: write the tied copy at split time (costs a duplicated
+  embedding on disk), or omit the shard so the existing absent-file paths fire. **Not urgent** —
+  D1's consumer-side fallbacks make already-split models load correctly, and both on-device
+  targets plus the 70B dense reference are untied. (found 2026-08-09, D1 fix)
 - [ ] **D3 — VRAM exhaustion surfaces as a bogus `TypeError`, and the "graceful" RoPE fallback is a
   lie.** Both RoPE precompute paths in `vaayu_base.py:2917-2941` raise `CUDA out of memory`, the
   handler sets `_full_position_embeddings = None` and prints **"RoPE will be computed per-layer"** —
@@ -240,6 +227,21 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
 - **Decode floors, same-box same-day 2026-08-08: MiniMax 1.45 tok/s, Qwen 0.83 tok/s.** These are
   BASELINE numbers from `main`, and they sit *below* the older 1.48 / 0.85 figures on unchanged code.
   Always re-measure the baseline the same day; never gate against a historical number.
+- **D1 was a tied `lm_head`, never an attention/RoPE/mask bug (fixed 2026-08-09).** A checkpoint with
+  `tie_word_embeddings: true` stores no `lm_head.weight`; the splitter still writes a valid EMPTY
+  16-byte `{}` shard plus its `.done` marker, so the split verifies complete and the load SUCCEEDS
+  with zero tensors. The pin phase measured `size = 0`, injected nothing, and still added `lm_head`
+  to `pinned_layer_names` — **resident while meta-initialized** — and the forward skips pinned
+  layers, so nothing ever weighted it. Measured, all same box same day:
+  | arm | ppl | note |
+  |---|---|---|
+  | Llama-3.2-1B (tied), before | 128365.41 | vocab-uniform baseline 128256 — literally zero signal |
+  | Llama-3.2-1B (tied), after | **11.94** | |
+  | Llama-3.3-70B-exl3 (untied) | 8.78 → 8.78 | unaffected both sides of the fix |
+  | MiniMax-M2.7 (MoE, module-list) | 8.73 | shared pin phase, no regression |
+  **A perplexity at the vocab-uniform baseline means an unweighted output layer — go to weight
+  loading, not to attention.** Three attn impls failing identically was the same tell, misread.
+  Qwen was NOT re-run: the changed code only diverges when a shared layer loads zero tensors.
 
 ---
 
@@ -268,3 +270,16 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   logic instead of executing it.
 - **Silent degradation hides on paths that only run once something has already gone wrong.** All
   three Plan L review defects were of this shape and none was visible on a healthy box.
+- **When a fix changes nothing, check whether your code EXECUTED before forming a second
+  hypothesis.** D1's first fix was correct code at the wrong site: `load_layer_to_cpu` already had a
+  tied-weights fallback, but its comment read "lm_head.safetensors might not be generated" — it
+  anticipated a MISSING file, and an empty-but-valid one does not raise. Patching it changed
+  nothing because **pinned layers never reach that function at all**. The tells were that the
+  re-run was byte-identical AND *neither new print appeared*; `[Vaayu-Pin] pinned lm_head: 0.00 GB`
+  was the log line that named the real path. A second hypothesis about *why the fix was wrong*
+  would have been wasted — the fix was never run.
+- **An existing fallback is not proof the case is handled.** Check what TRIGGERS it. D1's fallback
+  keyed on an exception; the failure mode was a success returning `{}`.
+- **`size == 0` is not the emptiness test for a layer — `not tensors` is.** `model.norm`
+  legitimately measures 0.00 GB, so a byte-size check silently lumps a real layer in with an
+  unloaded one.
