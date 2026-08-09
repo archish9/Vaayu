@@ -104,54 +104,6 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
   Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
   Results: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-RESULTS.md` (docs/ is gitignored)
-- [bug] **ROOT CAUSE FOUND 2026-08-09: the OOM handler SILENTLY HALVES THE KV CACHE mid-forward.**
-  `vaayu_base.py:3563-3571`, inside the layer loop's `except torch.cuda.OutOfMemoryError`:
-  `_oom_target = _oom_seq_len // 2` then `_trim_kv_cache_front(...)` → `crop_front`, then the layer
-  retries. Nothing tells the CALLER, so `batched_generate`'s `pad_mask` still describes the full
-  sequence and the next forward mismatches.
-  **Two independent incidents, both landing on exact `// 2`:**
-  | incident | mask | KV | delta |
-  |---|---|---|---|
-  | F3 Task 6, unreproduced (2026-08-09 am) | 1127 | 1690 | 563 = **1127 // 2** |
-  | Plan K, N=3 @ 7 700 (2026-08-09 pm) | 7 770 | 3 885 = **7 770 // 2** | — |
-  This is why it never reproduced: it fires only when a layer actually OOMs, which depends on expert
-  cache warmth and free VRAM — the same config crashes or does not run to run.
-  **It is worse than a shape bug.** `crop_front` drops the OLDEST tokens, so every surviving token's
-  position shifts relative to both the attention mask and the RoPE positions already baked into the
-  cached keys. A run that "recovers" and completes has silently answered from a truncated,
-  position-shifted context. The per-layer variant is nastier still: the OOM hits at layer i, so
-  layers 0..i-1 hold the pre-crop length and layer i onward hold post-crop + the retried chunk —
-  ragged `_seq_len`, which is exactly what `check_batch_kv_invariant`'s per-layer arm now catches.
-  **Proposed fix:** delete the truncation. The `empty_cache()` + `gc.collect()` retry is
-  non-destructive and can stay; silently shrinking the user's context to survive is the degradation
-  CLAUDE.md §5 forbids, and D3 already settled that a VRAM wall must raise with the real levers
-  named rather than fabricate a "recovery". Blocks Plan K's sweep at 7.7k × N≥3.
-- [bug] **F3: one unreproduced attention-mask/KV length mismatch. Suspect REFUTED 2026-08-09;
-  root cause above.**
-  `RuntimeError: The expanded size of the tensor (1690) must match the existing size (1127) at
-  non-singleton dimension 3. Target sizes: [3, 64, 1127, 1690]. Tensor sizes: [3, 1, 1127, 1127]` —
-  mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). The failing log
-  was never preserved; only this transcribed message survives.
-  **The documented suspect — round 2 with a PARTIAL match — is refuted.**
-  `tests/test_batch_prefix_partial_match.py` drives `batched_generate` through exactly that shape
-  (batch's common prefix a STRICT prefix of a longer stored entry), its inverse, a ragged-length
-  version, the shortest-prompt-minus-one clamp, and every decode step, asserting mask width ==
-  past + q_len at each forward. All hold.
-  **What the arithmetic pins down:** mask width is always `m + max_R` and `q_len == max_R`, so a
-  width equal to `q_len` means `m` was 0 in the mask while the cache held 563. Inside
-  `batched_generate` that state is unreachable — `m <= 0 ⟹ kv = None` has guarded it since the
-  first F3 commit (`23bd619`). So the disagreement was introduced OUTSIDE that function, or by a
-  build predating one of the three fix commits.
-  **Remaining suspects, in order:** (a) per-layer `_seq_len` divergence — `get_seq_length()` reads
-  layer 0 ONLY, so a cache whose layers hold different lengths satisfies every length check in
-  `forward()` and still mismatches at whichever layer differs (a forward that raised mid-layer-loop
-  is how a cache reaches that state, and this campaign did hit a CUDA OOM); (b) a `_batch_decode_active`
-  leak putting a non-batched caller's 2D mask down the batch branch.
-  **Landed meanwhile:** `check_batch_kv_invariant` (`vaayu_base.py`) now runs at the point where the
-  mask is built and raises naming both lengths and which side is wrong, so a recurrence reports its
-  own cause instead of surfacing ~30 frames away inside attention — bug D3's lesson applied to a
-  second subsystem. Pinned by `tests/test_batch_mask_kv_invariant.py`, including a case
-  reconstructing the exact 1127/563/1690 state. (found 2026-08-09, F3 Task 6)
 - [ ] **`speculative_generate` skips `enqueue_truncate` on a prefix HIT, so `enable_kv_persist`
   can corrupt that session's on-disk KV.** `generate()` calls
   `self._kv_writer.enqueue_truncate(session_id, match_len)` on a HIT; the new
@@ -310,6 +262,37 @@ outcome.**
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.
 
+- **The OOM handler SILENTLY HALVED THE KV CACHE mid-forward (fixed 2026-08-09). This was F3's unreproduced mask/KV bug.**
+  `vaayu_base.py:3563-3571`, inside the layer loop's `except torch.cuda.OutOfMemoryError`:
+  `_oom_target = _oom_seq_len // 2` then `_trim_kv_cache_front(...)` → `crop_front`, then the layer
+  retries. Nothing tells the CALLER, so `batched_generate`'s `pad_mask` still describes the full
+  sequence and the next forward mismatches.
+  **Two independent incidents, both landing on exact `// 2`:**
+  | incident | mask | KV | delta |
+  |---|---|---|---|
+  | F3 Task 6, unreproduced (2026-08-09 am) | 1127 | 1690 | 563 = **1127 // 2** |
+  | Plan K, N=3 @ 7 700 (2026-08-09 pm) | 7 770 | 3 885 = **7 770 // 2** | — |
+  This is why it never reproduced: it fires only when a layer actually OOMs, which depends on expert
+  cache warmth and free VRAM — the same config crashes or does not run to run.
+  **It is worse than a shape bug.** `crop_front` drops the OLDEST tokens, so every surviving token's
+  position shifts relative to both the attention mask and the RoPE positions already baked into the
+  cached keys. A run that "recovers" and completes has silently answered from a truncated,
+  position-shifted context. The per-layer variant is nastier still: the OOM hits at layer i, so
+  layers 0..i-1 hold the pre-crop length and layer i onward hold post-crop + the retried chunk —
+  ragged `_seq_len`, which is exactly what `check_batch_kv_invariant`'s per-layer arm now catches.
+  **Confirmed by log, not inferred** — MiniMax N=3 @ 7 700, pool off:
+  ```
+  [Vaayu] OOM on model.layers.35 (attempt 1/2). Clearing cache and retrying...
+  [Vaayu] Truncating KV cache: 7770 -> 3885 tokens
+  RuntimeError: The expanded size of the tensor (3886) must match the existing size (7770)
+  ```
+  **FIXED:** deleted the truncation. The `empty_cache()` + `gc.collect()` retry is
+  non-destructive and can stay; silently shrinking the user's context to survive is the degradation
+  CLAUDE.md §5 forbids, and D3 already settled that a VRAM wall must raise with the real levers
+  named rather than fabricate a "recovery". **Consequence for measurement:** configs that used to
+  "recover" and finish now raise honestly, so a sweep cell at high N × long context reports an OOM
+  where it previously reported a number. Any throughput figure taken at the VRAM edge before this
+  date may have been measured on a silently truncated context.
 - **The MoE forwards accumulated experts in bf16, and expert ARRIVAL ORDER is nondeterministic — so
   the engine was not a deterministic function of its input (fixed 2026-08-09).** Experts reach
   `index_add_` in an order that varies run to run: VRAM-resident experts run first (residency
