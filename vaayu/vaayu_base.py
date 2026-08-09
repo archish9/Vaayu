@@ -3959,7 +3959,7 @@ class VaayuBaseModel(GenerationMixin):
         return generated
 
     @torch.no_grad()
-    def batched_generate(self, requests):
+    def batched_generate(self, requests, reclaim: bool = False):
         """Static multi-query batched decode. Yields (stream_id, token_id) live.
         requests: list[vaayu.batch.BatchRequest] (already admitted, or pass raw and
         call plan_batch first). MoE forward is unchanged; batching is this loop
@@ -3974,7 +3974,8 @@ class VaayuBaseModel(GenerationMixin):
         GC timing here is still not clean design."""
         from .batch import (sample_step, batch_position_ids, batch_common_prefix,
                             broadcast_cache_rows, slice_cache_row,
-                            prefix_store_row, resolve_matched_len)
+                            prefix_store_row, resolve_matched_len,
+                            batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES)
         assert self._active_attn_impl == "sdpa", (
             f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
         N = len(requests)
@@ -3982,6 +3983,29 @@ class VaayuBaseModel(GenerationMixin):
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
+
+        # Plan K: perform the reclaim this batch was ADMITTED under. Admitting
+        # against reclaimable VRAM without reclaiming it just moves the OOM.
+        #
+        # ONCE, here at the batch boundary, never on the decode path below --
+        # a per-step reclaim would re-evict the cache every token, which is
+        # Plan H's mistake in a different costume (right mechanism, hot path).
+        # Pinned by test.
+        #
+        # Runs before the prefix lookup's to_device() so the freed VRAM is
+        # still free when the reused KV lands on the GPU; reclaiming after it
+        # would evict experts to make room for bytes already allocated.
+        # batch_kv_cost is the SAME expression plan_batch admitted against --
+        # if these two diverge, admission is lying and the gap surfaces as an
+        # OOM instead of a deferral.
+        if reclaim:
+            _vram = getattr(self, "_expert_vram_cache", None)
+            if _vram is not None:
+                _target = (batch_kv_cost(requests, *geo_from_model(self))
+                           + _VRAM_SAFETY_BYTES)
+                _freed = _vram.evict_until_free(_target)
+                print(f"[Vaayu-Batch] reclaim: freed {_freed / 1e9:.2f} GB of expert "
+                      f"VRAM cache for N={N} (free target {_target / 1e9:.2f} GB)")
 
         pc = getattr(self, "_prefix_cache", None)
         common_ids = batch_common_prefix(requests) if pc is not None else []

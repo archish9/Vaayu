@@ -27,6 +27,22 @@ def kv_bytes_for(seq_len: int, n_layers: int, n_kv_heads: int,
     return n_layers * 2 * n_kv_heads * head_dim * seq_len * elem_bytes
 
 
+def batch_kv_cost(requests, n_layers, n_kv_heads, head_dim, elem_bytes) -> int:
+    """RECTANGULAR KV cost of running `requests` as one batch: every stream is
+    charged the longest stream's length, because the batch tensors are.
+
+    Extracted so admission and the reclaim that pays for it quote the SAME
+    expression. If batched_generate frees to a different number than plan_batch
+    admitted against, admission is lying and the difference surfaces as an OOM
+    rather than as a deferral.
+    """
+    if not requests:
+        return 0
+    max_L = max(len(r.prompt_ids) + r.max_new_tokens for r in requests)
+    return len(requests) * kv_bytes_for(max_L, n_layers, n_kv_heads,
+                                        head_dim, elem_bytes)
+
+
 def size_batch(requests, budget_bytes, n_layers, n_kv_heads, head_dim, elem_bytes):
     """Greedy-admit under RECTANGULAR KV cost. Returns (admitted, deferred).
     Sorts ascending by (prompt_len + max_new) so wide batches of short streams win.
@@ -216,18 +232,68 @@ def geo_from_model(model) -> tuple:
     return n_layers, n_kv_heads, head_dim, _resolve_kv_elem_bytes(model)
 
 
+# CUDA context + streaming double-buffer. A HARDWARE constant for this box,
+# not a model number (CLAUDE.md §5).
+_VRAM_SAFETY_BYTES = int(1.5 * 1024 ** 3)
+
+
 def free_vram_budget(model) -> int:
-    """Live free VRAM minus a hardware safety margin (CUDA context + streaming
-    double-buffer). 1.5 GB is a HARDWARE constant for this box, not a model number."""
+    """Live free VRAM minus a hardware safety margin."""
     import torch
-    _SAFETY = int(1.5 * 1024 ** 3)   # hardware constant
     free, _ = torch.cuda.mem_get_info(model.device)
-    return max(0, free - _SAFETY)
+    return max(0, free - _VRAM_SAFETY_BYTES)
 
 
-def plan_batch(model, requests):
+def reclaimable_expert_vram(model) -> int:
+    """Bytes the expert VRAM cache can give back without leaving decode unable
+    to serve the layer it is on.
+
+    The cache is a pure LRU with an eviction entry point
+    (`ExpertVRAMCache.evict_until_free`), so its bytes are available on demand
+    — `free_vram_budget` alone counts them as spoken for. What must stay behind
+    is ONE decode step's expert working set, DERIVED from `_moe_geometry`
+    (§5). A budget that offered the whole cache would admit a batch that then
+    decodes with zero resident experts: every expert streaming from NVMe every
+    token, a guaranteed regression dressed as a win.
+
+    Returns 0 — reclaim nothing — when there is no cache (dense, or CPU
+    compute) or no geometry to derive the floor from. An unknown floor is not
+    a zero floor.
+    """
+    cache = getattr(model, "_expert_vram_cache", None)
+    if cache is None:
+        return 0
+    geometry = getattr(model, "_moe_geometry", None)
+    if not geometry:
+        return 0
+    floor = int(geometry.get("working_set_bytes", 0))
+    if floor <= 0:
+        return 0
+    return max(0, int(getattr(cache, "current_usage", 0)) - floor)
+
+
+def reclaimable_vram_budget(model, reclaim: bool = False) -> int:
+    """Free VRAM, plus — when `reclaim` is on — the part of the expert VRAM
+    cache the decode loop can afford to give back.
+
+    With `reclaim=False` this is `free_vram_budget` exactly, so a caller that
+    does not opt in gets today's admission decision byte for byte.
+
+    The safety margin is subtracted from the COMBINED total rather than from
+    free VRAM alone: clamping free-minus-margin at zero first would silently
+    forgive a deficit, and admit against a margin that was never actually
+    reserved.
+    """
+    if not reclaim:
+        return free_vram_budget(model)
+    import torch
+    free, _ = torch.cuda.mem_get_info(model.device)
+    return max(0, free + reclaimable_expert_vram(model) - _VRAM_SAFETY_BYTES)
+
+
+def plan_batch(model, requests, reclaim: bool = False):
     n_layers, n_kv_heads, head_dim, elem = geo_from_model(model)
-    return size_batch(requests, free_vram_budget(model),
+    return size_batch(requests, reclaimable_vram_budget(model, reclaim),
                       n_layers, n_kv_heads, head_dim, elem)
 
 
