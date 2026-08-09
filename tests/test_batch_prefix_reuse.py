@@ -35,3 +35,11 @@ def test_single_stream_is_its_whole_prompt():
 def test_empty_inputs():
     assert batch_common_prefix([]) == []
     assert batch_common_prefix([_req([]), _req([1])]) == []
+
+
+def test_a_later_request_value_mismatch_truncates():
+    """A request beyond index 1 must be able to shorten the prefix by VALUE,
+    not just by length -- otherwise a two-request-only implementation that
+    truncates by min length passes the whole suite."""
+    reqs = [_req([1, 2, 3, 9]), _req([1, 2, 3, 8]), _req([1, 9, 9])]
+    assert batch_common_prefix(reqs) == [1]
