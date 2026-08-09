@@ -3790,6 +3790,7 @@ class VaayuBaseModel(GenerationMixin):
         max_new_tokens: int = 20,
         streamer=None,
         temperature: float = 0.0,
+        session_id=None,
         **kwargs,
     ) -> torch.LongTensor:
         """
@@ -3807,9 +3808,31 @@ class VaayuBaseModel(GenerationMixin):
         self._batch_decode_active = False
         self._batch_n = 1
 
+        pc = getattr(self, "_prefix_cache", None)
+        kv, ids_list = None, input_ids[0].tolist()
+        if pc is not None:
+            kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
+            if kv is None:
+                kv = self._create_kv_cache()
+            else:
+                kv.to_device(self.running_device)
+                if match_len >= input_ids.shape[1]:
+                    match_len = input_ids.shape[1] - 1   # leave >=1 position to run
+                kv.crop(match_len)
+
+        # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
+        # gets away with passing the untouched prompt because HF's own
+        # generate() loop calls prepare_inputs_for_generation (above), which
+        # slices input_ids down to what the cache doesn't already hold. This
+        # loop calls forward() directly with no such step, so do it here: feed
+        # only the tail beyond kv's current length, or forward() would
+        # re-append the already-cached prefix on top of itself.
+        prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
+
         # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
         prefill_out = self.forward(
-            input_ids=input_ids,
+            input_ids=prefill_ids,
+            past_key_values=kv,
             use_cache=True,
             return_dict=True,
         )
@@ -3830,6 +3853,9 @@ class VaayuBaseModel(GenerationMixin):
         if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
             if streamer is not None:
                 streamer.end()
+            if pc is not None:
+                resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+                self._persist_and_store(pc, resolved, kv, generated[0].tolist())
             return generated
 
         while tokens_generated < max_new_tokens:
@@ -3885,6 +3911,9 @@ class VaayuBaseModel(GenerationMixin):
 
         if streamer is not None:
             streamer.end()
+        if pc is not None:
+            resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+            self._persist_and_store(pc, resolved, kv, generated[0].tolist())
         self.telemetry.dump_json("vaayu_telemetry.json")
         return generated
 
