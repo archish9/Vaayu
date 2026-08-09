@@ -20,8 +20,8 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 |---|---|---|
 | **1** | ~~Strengthen the dense smoke test (**D2**)~~ — **DONE 2026-08-09** | Gate is now teacher-forced perplexity, not token count. It caught D1 immediately. |
 | **2** | ~~Fix the dense path (**D1**)~~ — **DONE 2026-08-09** | Tied `lm_head` was never weighted; see Settled. Left behind **D4** (the splitter still emits the empty shard) — unblocked, not urgent. |
-| **3** | **Make VRAM exhaustion fail honestly** (bug **D3**) | ← **START HERE** | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
-| **4** | **F3 — wire the prefix cache into `batched_generate`** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
+| **3** | ~~Make VRAM exhaustion fail honestly (**D3**)~~ — **DONE 2026-08-09** | `_precompute_rope` now raises with the OOM chained instead of returning an overloaded `None`. See Settled. | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
+| **4** | **F3 — wire the prefix cache into `batched_generate`** ← **START HERE** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
 | **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
 | **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
@@ -47,16 +47,6 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   embedding on disk), or omit the shard so the existing absent-file paths fire. **Not urgent** —
   D1's consumer-side fallbacks make already-split models load correctly, and both on-device
   targets plus the 70B dense reference are untied. (found 2026-08-09, D1 fix)
-- [ ] **D3 — VRAM exhaustion surfaces as a bogus `TypeError`, and the "graceful" RoPE fallback is a
-  lie.** Both RoPE precompute paths in `vaayu_base.py:2917-2941` raise `CUDA out of memory`, the
-  handler sets `_full_position_embeddings = None` and prints **"RoPE will be computed per-layer"** —
-  but no such per-layer path exists. `get_pos_emb_args` (`:2685-2689`) then returns `{}` and the
-  layer call dies with `MiniMaxM2DecoderLayer.forward() missing 1 required positional argument:
-  'position_embeddings'`, ~30 frames from the real cause. Every modern decoder layer takes
-  `position_embeddings` as a required arg, so the fallback cannot work for any of them. Two things
-  wrong: the message promises a mechanism that does not exist, and a VRAM OOM is laundered into a
-  signature error pointing at the wrong subsystem. Fix: either re-raise the OOM (honest failure,
-  §5) or implement the per-layer path the message claims. (found 2026-08-02, Plan J Task 4 gate)
 - [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
   `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation §5
   forbids. **Should an unknown mode raise?** (found 2026-08-02, Plan H audit)
@@ -227,6 +217,18 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
 - **Decode floors, same-box same-day 2026-08-08: MiniMax 1.45 tok/s, Qwen 0.83 tok/s.** These are
   BASELINE numbers from `main`, and they sit *below* the older 1.48 / 0.85 figures on unchanged code.
   Always re-measure the baseline the same day; never gate against a historical number.
+- **`_full_position_embeddings = None` was an OVERLOADED sentinel; failure now raises (D3, fixed
+  2026-08-09).** `None` legitimately means "this architecture exposes no top-level `rotary_emb`, so
+  each decoder layer computes RoPE itself" — `get_pos_emb_args`' empty-dict path exists for exactly
+  those models. The old handler reused that same `None` to mean "precompute failed", printing
+  "RoPE will be computed per-layer" for a mechanism that has never existed. Since every modern
+  decoder layer takes `position_embeddings` as a REQUIRED argument, a VRAM OOM surfaced as
+  `...DecoderLayer.forward() missing 1 required positional argument` ~30 frames away. Now
+  `_precompute_rope` returns `None` only for the no-`rotary_emb` case and raises otherwise, with
+  the OOM chained via `from` and the real levers named (`prefill_chunk_size`, `max_seq_len`,
+  expert VRAM budget). **A diagnostic must not be able to raise:** the first draft of that error
+  interpolated `position_ids.shape[1]`, which would have re-created D3 inside D3's own fix — there
+  is now a test pinning it.
 - **D1 was a tied `lm_head`, never an attention/RoPE/mask bug (fixed 2026-08-09).** A checkpoint with
   `tie_word_embeddings: true` stores no `lm_head.weight`; the splitter still writes a valid EMPTY
   16-byte `{}` shard plus its `.done` marker, so the split verifies complete and the load SUCCEEDS

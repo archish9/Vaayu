@@ -2908,6 +2908,54 @@ class VaayuBaseModel(GenerationMixin):
             sin = emb.sin().to(dtype=self.running_dtype)
         return cos, sin
 
+    def _precompute_rope(self, position_ids):
+        """Return (cos, sin) for every position, or None if this architecture
+        computes RoPE inside each decoder layer.
+
+        None is a REAL answer, not a failure: models with no top-level
+        rotary_emb expect `get_pos_emb_args` to pass nothing. Precompute
+        failure must therefore raise rather than return None — every modern
+        decoder layer takes `position_embeddings` as a required argument, so
+        returning None on failure surfaces a VRAM exhaustion as
+        `...DecoderLayer.forward() missing 1 required positional argument`
+        roughly 30 frames away, naming the wrong subsystem (bug D3). The
+        handler this replaced printed "RoPE will be computed per-layer"; no
+        such per-layer path has ever existed.
+        """
+        if self.get_rotary_emb() is None:
+            return None
+        try:
+            # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
+            # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
+            rotary_emb_cls = type(self.get_rotary_emb())
+            real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+
+            # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
+            dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+            dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+
+            return real_rotary(dummy_x, position_ids)
+        except Exception as e:
+            print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
+            try:
+                return self._compute_full_position_embeddings(position_ids)
+            except Exception as e2:
+                # Free what we can so the caller's error path has room to run,
+                # then fail honestly (CLAUDE.md §5) with the real cause chained.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Nothing in this message may itself raise: a diagnostic that
+                # dies re-creates the very bug it reports (D3).
+                _npos = position_ids.shape[1] if position_ids is not None else "unknown"
+                raise RuntimeError(
+                    f"Could not precompute RoPE position embeddings for "
+                    f"{_npos} positions on {self.running_device}. Both the "
+                    f"native rotary path (failed: {e}) and the manual computation (failed: "
+                    f"{e2}) were exhausted. This is most often VRAM exhaustion — reduce "
+                    f"prefill_chunk_size, max_seq_len, or the expert VRAM budget. There is no "
+                    f"per-layer RoPE fallback to degrade to."
+                ) from e2
+
     def get_pos_emb_args(self, len_p, len_s):
         # If position_embeddings were pre-computed for the full sequence (new transformers API),
         # slice out just the tokens being processed in this call.
@@ -3146,28 +3194,7 @@ class VaayuBaseModel(GenerationMixin):
             self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
             self._rope_cache_key = None
         elif getattr(self, '_rope_cache_key', None) != _rope_cache_key:
-            if self.get_rotary_emb() is not None:
-                try:
-                    # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
-                    # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
-                    rotary_emb_cls = type(self.get_rotary_emb())
-                    real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
-
-                    # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
-                    dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
-                    dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
-
-                    self._full_position_embeddings = real_rotary(dummy_x, position_ids)
-                except Exception as e:
-                    print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
-                    try:
-                        self._full_position_embeddings = self._compute_full_position_embeddings(position_ids)
-                    except Exception as e2:
-                        print(f"Manual RoPE fallback also failed ({e2}). RoPE will be computed per-layer.")
-                        torch.cuda.empty_cache()
-                        self._full_position_embeddings = None
-            else:
-                self._full_position_embeddings = None
+            self._full_position_embeddings = self._precompute_rope(position_ids)
             self._rope_cache_key = _rope_cache_key
 
         if use_cache and past_key_values is None:
