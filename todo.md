@@ -293,6 +293,25 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   "recover" and finish now raise honestly, so a sweep cell at high N × long context reports an OOM
   where it previously reported a number. Any throughput figure taken at the VRAM edge before this
   date may have been measured on a silently truncated context.
+- **The batched store-back cloned the KV row in VRAM, so the prefix cache could not store at long
+  context (fixed 2026-08-09).** `slice_cache_row` did `t[row:row + 1].clone()` — a second full copy
+  of the KV cache on the SOURCE device — immediately after a long prefill, when VRAM is at its peak,
+  and `store()` moved it to the CPU anyway. At 7 700 tokens on MiniMax it died allocating **16 MiB
+  with 19.56 MiB free**. The store-back deliberately swallows exceptions (it must not replace an
+  exception already unwinding through that `finally`), so the pool was simply never populated and
+  the failure printed one warning nobody was reading.
+  **Measured, same box same day, MiniMax N=1 @ 7 768 tokens:**
+  | arm | round 1 (cold) | round 2 (warm) | ratio |
+  |---|---|---|---|
+  | before fix | 380.9 s | 352.8 s | **1.08×** (no hit at all) |
+  | after fix | ~380 s | **~1.0 s** | **377×**, `match_len=7767/7768` |
+  Slicing straight to host fixes it: `t[row:row + 1]` is a contiguous view, so the device slice
+  costs nothing and only the host copy allocates.
+  **Two lessons:** (a) **the prefix cache was broken exactly where it is most valuable** — short
+  contexts fit, so every earlier measurement passed; (b) **a swallowed exception plus a plausible
+  number is worse than a crash.** The pool-on arm of a 16-cell sweep would have read as "prefix
+  reuse does not help at long context", contradicting F3's measured 2.15× with nobody able to say
+  why. Check that a HIT actually happened before believing an arm that depends on one.
 - **The MoE forwards accumulated experts in bf16, and expert ARRIVAL ORDER is nondeterministic — so
   the engine was not a deterministic function of its input (fixed 2026-08-09).** Experts reach
   `index_add_` in an order that varies run to run: VRAM-resident experts run first (residency
