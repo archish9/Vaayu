@@ -126,6 +126,40 @@ def broadcast_cache_rows(cache, n: int) -> None:
             lst[i] = t.repeat(n, *([1] * (t.dim() - 1))).contiguous()
 
 
+def prefix_store_row(requests) -> int:
+    """Row to source a batched prefix store-back entry from: the request with
+    the LONGEST prompt, never row 0.
+
+    Tails are left-padded, so row i's cache is
+    [prefix 0..m-1][max_R - r_i pads][r_i real tokens] -- the pad block sits
+    immediately after the cached prefix, exactly where a
+    crop(len(common_ids)) reads. size_batch() sorts requests ascending by
+    length, so row 0 is typically the SHORTEST prompt and carries the MOST
+    padding: slicing row 0 would store padding KVs as if they were the
+    shared prefix, and the next batch that hits the entry would decode
+    against shifted keys with silently wrong RoPE positions. The longest
+    prompt's row has r_i == max_R (zero tail padding), so its columns
+    0..len(prompt)-1 are genuinely prefix+real tokens throughout, and
+    len(common_ids) <= len(that prompt) always holds.
+    """
+    return max(range(len(requests)), key=lambda i: len(requests[i].prompt_ids))
+
+
+def resolve_matched_len(cache, requested_m: int) -> int:
+    """Crop `cache` to `requested_m` tokens and return what the cache
+    actually ends up holding.
+
+    crop() is min(existing_len, requested_m) -- a silent no-op when the
+    cache holds FEWER tokens than requested_m claims (an entry generate()
+    stored can be cache_len + 1 long, see _persist_and_store's own
+    comment). Callers must split tails at the length the cache truly has,
+    not at what a prior lookup() claimed, or they skip a token the model
+    never saw.
+    """
+    cache.crop(requested_m)
+    return cache.get_seq_length()
+
+
 def slice_cache_row(cache, row: int):
     """Return a new batch-1 cache holding only `row`, sharing no storage.
 

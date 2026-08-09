@@ -3882,7 +3882,9 @@ class VaayuBaseModel(GenerationMixin):
         generate()/speculative_generate() defensively reset both flags at
         entry so a leaked flag can't corrupt those call paths, but relying on
         GC timing here is still not clean design."""
-        from .batch import (sample_step, batch_position_ids)
+        from .batch import (sample_step, batch_position_ids, batch_common_prefix,
+                            broadcast_cache_rows, slice_cache_row,
+                            prefix_store_row, resolve_matched_len)
         assert self._active_attn_impl == "sdpa", (
             f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
         N = len(requests)
@@ -3891,8 +3893,6 @@ class VaayuBaseModel(GenerationMixin):
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
 
-        from .batch import (batch_common_prefix, broadcast_cache_rows,
-                            slice_cache_row)
         pc = getattr(self, "_prefix_cache", None)
         common_ids = batch_common_prefix(requests) if pc is not None else []
         kv, m = (pc.lookup(None, common_ids, device=device)
@@ -3905,7 +3905,7 @@ class VaayuBaseModel(GenerationMixin):
             kv, m = None, 0
         else:
             kv.to_device(device)
-            kv.crop(m)
+            m = resolve_matched_len(kv, m)
             broadcast_cache_rows(kv, N)
             print(f"[Vaayu-Prefix] BATCH HIT n={N} match_len={m}/"
                   f"{len(common_ids)} — prefilling only the divergent tails")
@@ -3943,6 +3943,8 @@ class VaayuBaseModel(GenerationMixin):
         self._batch_decode_active = True
         self._batch_n = N
         self.telemetry.reset_batch_overlap()
+        past = None   # bound in finally's store-back guard; stays None if the
+                       # generator is torn down before the prefill forward returns
         try:
             # Prefill — bypass chunked prefill (it assumes batch=1, indexes [0]).
             _saved_chunk = self.prefill_chunk_size
@@ -3986,15 +3988,25 @@ class VaayuBaseModel(GenerationMixin):
                     produced[i] += 1
                     if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                         active[i] = False
-
-            if pc is not None and common_ids:
+        finally:
+            # Store-back lives in finally, not after the while loop: lookup()
+            # already POPPED the pooled entry, and only store() puts one back.
+            # batched_generate is a generator (its own docstring treats early
+            # abandonment as real) -- a consumer `break` raises GeneratorExit
+            # at the currently-suspended yield, which unwinds straight past a
+            # post-loop store-back and permanently deletes the pool's best
+            # entry. `past is not None` guards the case where teardown hits
+            # before the prefill forward() call returns (nothing to store yet).
+            if past is not None and pc is not None and common_ids:
                 # Exactly ONE entry per batch regardless of N: writing N would
                 # be the K=7-against-a-5-slot-pool configuration that measured
                 # ZERO hits (capacity is a cliff, not a slope).
-                one = slice_cache_row(past, 0)
+                # Row choice must be the LONGEST prompt, never row 0 -- see
+                # prefix_store_row's docstring for why row 0 would silently
+                # store padding as if it were the shared prefix.
+                one = slice_cache_row(past, prefix_store_row(requests))
                 one.crop(len(common_ids))
                 pc.store(_auto_session_id(common_ids), list(common_ids), one)
-        finally:
             self._batch_decode_active = False
             self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")

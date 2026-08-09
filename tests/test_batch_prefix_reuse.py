@@ -62,6 +62,13 @@ class _FakeCache:
     def _BUFFER_LISTS(self):
         return self._buffers
 
+    def crop(self, max_length: int) -> None:
+        for i in range(len(self._seq_len)):
+            self._seq_len[i] = min(self._seq_len[i], max_length)
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self._seq_len[layer_idx]
+
 
 def test_broadcast_expands_every_buffer_to_n_rows():
     c = _FakeCache()
@@ -144,3 +151,44 @@ def test_prefix_mask_and_positions_are_absolute():
     neg = torch.finfo(torch.float32).min
     assert (mask[0, 0, 0, :m] != neg).all()        # first tail query sees cache
     assert (mask[1, 0, :, m:m + 2] == neg).all()   # row 1's pads are masked
+
+
+from vaayu.batch import prefix_store_row, resolve_matched_len
+
+
+def test_prefix_store_row_picks_the_longest_prompt_not_row_zero():
+    """size_batch sorts ascending, so row 0 is typically the SHORTEST prompt
+    -- the one with the MOST left-pad. A `_row = 0` implementation would
+    pass a test built any other way; put the shortest prompt at index 0 on
+    purpose so that bug fails loudly here."""
+    reqs = [_req([1, 2]), _req([1, 2, 3, 4, 5, 6, 7, 8]), _req([1, 2, 3, 4])]
+    assert prefix_store_row(reqs) == 1
+
+
+def test_prefix_store_row_ties_pick_a_longest_row():
+    reqs = [_req([1, 2, 3]), _req([9, 9, 9])]
+    assert prefix_store_row(reqs) in (0, 1)
+    assert len(reqs[prefix_store_row(reqs)].prompt_ids) == 3
+
+
+def test_resolve_matched_len_reads_back_the_real_cache_length():
+    """crop() is min(existing_len, requested) -- a silent no-op when the
+    cache holds FEWER tokens than requested (e.g. a generate()-stored entry
+    of cache_len + 1, per _persist_and_store). resolve_matched_len must
+    return what the cache actually has, not the requested value, so a
+    caller deriving tails from it never skips a token the model never saw."""
+    c = _FakeCache(s=5)                 # cache only holds 5 tokens
+    real_m = resolve_matched_len(c, 8)  # lookup() claimed 8
+    assert real_m == 5
+    assert c.get_seq_length() == 5
+
+    reqs = [_req(list(range(10))), _req(list(range(12)))]
+    tails = [r.prompt_ids[real_m:] for r in reqs]
+    assert tails[0] == list(range(5, 10))
+    assert tails[1] == list(range(5, 12))
+
+
+def test_resolve_matched_len_is_a_true_no_op_when_cache_is_longer():
+    c = _FakeCache(s=10)
+    assert resolve_matched_len(c, 6) == 6
+    assert c.get_seq_length() == 6
