@@ -230,10 +230,27 @@ outcome.**
   lookup's `to_device()` so freed VRAM is still free when the reused KV lands. `batch_kv_cost`
   extracted so admission and the reclaim that pays for it quote the SAME expression. 6 tests,
   including the once-not-per-step pin.
-- [~] **Task 3** — full sweep RUNNING (launched 2026-08-09 16:18): 2 models × N∈{1,2,3,5} ×
-  reclaim{off,on} × pool{off,on} = **32 cells**, one process per cell, ~7.7k-token prompts,
-  discarded warm-up per checkpoint (a model's first touch is never a valid baseline). Pool-ON cells
-  run two rounds and report the warm one. Evidence: `~/vaayu-evidence/2026-08-09-plan-k/`.
+- [!] **Task 3 — BLOCKED at the plan's own context length.** The 32-cell sweep was launched
+  2026-08-09 16:18 and killed after cell 1: **`batched_generate` OOMs on a 7 768-token prompt at
+  N=1**, before any batching question arises. `batched_generate` deliberately disables chunked
+  prefill (`self.prefill_chunk_size = 0`, "it assumes batch=1, indexes [0]"), so the whole prompt is
+  ONE unchunked forward. Measured envelope, MiniMax, same box same day:
+  | N | 2 000 tok | 4 000 tok | 7 768 tok |
+  |---|---|---|---|
+  | 1 | OK | OK | **OOM** (tried 5.79 GiB, 5.13 free) |
+  | 3 | OK | **OOM** (tried 4.54 GiB, 4.49 free) | — |
+  **This partly refutes Plan K's F2 arithmetic.** F2 reads "N=1 today vs N=5 if counted" at 7 751
+  tokens, derived by comparing per-stream KV against the admission budget — but KV is not the
+  binding constraint there. You cannot run **N=1** at that length through `batched_generate` at all,
+  so no admission policy can help. The constraint is unchunked batched prefill ACTIVATIONS, and it
+  scales with N × context. Reclaim may still be worth having *if* batched prefill were chunked;
+  until then Plan K's question cannot be asked at the length where it was posed.
+  **Unblocked by:** batch-aware chunked prefill (explicitly out of scope per plan §11), or
+  re-scoping the sweep to a context that fits, or seeding the prefix pool via `generate()` (which
+  DOES chunk) so the batch only prefills short tails.
+  **Banked meanwhile** — a real batching win inside the envelope, MiniMax @ 2 000 tok, pool off,
+  reclaim off: N=1 aggregate decode **0.766 tok/s** → N=3 **1.776 tok/s** = **2.32×**, above the
+  plan's 1.28× short-prompt anchor. Evidence: `~/vaayu-evidence/2026-08-09-plan-k/`.
 - [ ] **Task 4** — RESULTS + verdict + the expert-VRAM hit-rate-vs-reclaim cost curve.
   The stale "always defers to N=1" claim is **already corrected** in `test_batched_decode.py` and
   `.superpowers/sdd/task-7-report.md` — it was false when written (measured before Plan A moved
