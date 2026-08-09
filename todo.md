@@ -23,8 +23,8 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **3** | ~~Make VRAM exhaustion fail honestly (**D3**)~~ — **DONE 2026-08-09** | `_precompute_rope` now raises with the OOM chained instead of returning an overloaded `None`. See Settled. | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
 | **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
 | **4b** | ~~Fix MiniMax's non-identical output under prefix reuse~~ — **DONE 2026-08-09** | Was not a prefix-reuse bug at all: the MoE forwards accumulated experts in bf16 while expert arrival order is nondeterministic. fp32 accumulator in all three forwards. See Settled. Left behind **one open bug** (fused-EXL3 residual). |
-| **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
-| **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
+| **5** | ~~Plan K — batched-decode admission reclaim~~ — **REFUTED 2026-08-09** | Admission was never the limiter: `plan_batch` deferred ZERO requests in every cell of both models at N≤5 × 7.7k. See Settled. Tasks 1-2 ship default-off. |
+| **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** ← **START HERE** | Plan K answered where the cliff bites, and it is lower than the row assumed: peak allocation is **14.17-15.57 GB of 15.47 GiB at N=1 × 7.7k**, and N≥2 does not run at all. F4's `max_seq_len=512` under-reservation is a real contributor to a ceiling now known to be the engine's binding constraint — not a side issue. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
 | **8** | **Hygiene, any order** | `_create_kv_cache` silent fp8 fall-through, `slab_bytes`/`_ALIGN` validation, the Plan L review backlog, F6, F7, and the three telemetry items. None blocks anything; all are small. |
 
@@ -171,65 +171,6 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 # PLANNED WORK
 
-## Plan K — batched-decode admission reclaim  (sequence #5)
-
-`docs/superpowers/plans/2026-08-03-batch-admission-reclaim.md` — self-contained. Audit finding F2.
-
-**Finding:** `free_vram_budget()` charges a batch against free VRAM while **5.82 GB (Qwen) /
-8.7 GB (MiniMax)** sits in a pure LRU that already has an eviction entry point
-(`ExpertVRAMCache.evict_until_free`). At 7 751-token streams that is **N=1 today vs N=5 if counted**.
-N=3 measured **1.28× aggregate** (0.631 → 0.809 tok/s, Qwen); the win is amortised non-expert weight
-movement, not expert sharing (union ratio 0.82).
-
-**The eviction cost has never been priced. That is the experiment, and a refutation is an acceptable
-outcome.**
-
-**Three of the plan's premises changed on 2026-08-09, before execution:**
-- **§8c's confound is GONE.** The plan says to measure decode-only because `batched_generate` never
-  consults the prefix cache. F3 landed; it does now. The sweep therefore crosses **pool on/off** with
-  reclaim on/off rather than working around the gap.
-- **§8's Task 3a is already answered** — `batched_generate` runs on MiniMax's module-list forward
-  (F3 RESULTS §6).
-- **The MoE determinism fix is load-bearing here.** Until 2026-08-09 the engine was not a
-  deterministic function of its input on either MoE model; a throughput sweep run before it would
-  have been partly measuring that.
-- §3's baselines (Qwen 0.82 / MiniMax 1.47 tok/s) are cross-day and must be re-measured same-day.
-
-- [x] **Task 1** — `reclaimable_vram_budget(model, reclaim=False)` + `reclaimable_expert_vram`;
-  floor = one decode step's working set from `_moe_geometry`, and **no geometry ⇒ reclaim nothing**
-  (an unknown floor is not a zero floor). 8 tests. **One deliberate deviation:** the plan's §6 writes
-  the budget as `free + usage − SAFETY` (the WHOLE cache), which contradicts its own floor test two
-  cases later; the floor always applies.
-- [x] **Task 2** — `batched_generate(reclaim=)` evicts once at the batch boundary, before the prefix
-  lookup's `to_device()` so freed VRAM is still free when the reused KV lands. `batch_kv_cost`
-  extracted so admission and the reclaim that pays for it quote the SAME expression. 6 tests,
-  including the once-not-per-step pin.
-- [!] **Task 3 — BLOCKED at the plan's own context length.** The 32-cell sweep was launched
-  2026-08-09 16:18 and killed after cell 1: **`batched_generate` OOMs on a 7 768-token prompt at
-  N=1**, before any batching question arises. `batched_generate` deliberately disables chunked
-  prefill (`self.prefill_chunk_size = 0`, "it assumes batch=1, indexes [0]"), so the whole prompt is
-  ONE unchunked forward. Measured envelope, MiniMax, same box same day:
-  | N | 2 000 tok | 4 000 tok | 7 768 tok |
-  |---|---|---|---|
-  | 1 | OK | OK | **OOM** (tried 5.79 GiB, 5.13 free) |
-  | 3 | OK | **OOM** (tried 4.54 GiB, 4.49 free) | — |
-  **This partly refutes Plan K's F2 arithmetic.** F2 reads "N=1 today vs N=5 if counted" at 7 751
-  tokens, derived by comparing per-stream KV against the admission budget — but KV is not the
-  binding constraint there. You cannot run **N=1** at that length through `batched_generate` at all,
-  so no admission policy can help. The constraint is unchunked batched prefill ACTIVATIONS, and it
-  scales with N × context. Reclaim may still be worth having *if* batched prefill were chunked;
-  until then Plan K's question cannot be asked at the length where it was posed.
-  **Unblocked by:** batch-aware chunked prefill (explicitly out of scope per plan §11), or
-  re-scoping the sweep to a context that fits, or seeding the prefix pool via `generate()` (which
-  DOES chunk) so the batch only prefills short tails.
-  **Banked meanwhile** — a real batching win inside the envelope, MiniMax @ 2 000 tok, pool off,
-  reclaim off: N=1 aggregate decode **0.766 tok/s** → N=3 **1.776 tok/s** = **2.32×**, above the
-  plan's 1.28× short-prompt anchor. Evidence: `~/vaayu-evidence/2026-08-09-plan-k/`.
-- [ ] **Task 4** — RESULTS + verdict + the expert-VRAM hit-rate-vs-reclaim cost curve.
-  The stale "always defers to N=1" claim is **already corrected** in `test_batched_decode.py` and
-  `.superpowers/sdd/task-7-report.md` — it was false when written (measured before Plan A moved
-  `_VRAM_RESERVE_BYTES` 2 → 3.5 GB; re-run admits all 3 at L=35).
-
 ## F1 — expert-cache / prefix-pool RAM arbitration  (sequence #7)
 
 - [!] **Premise needs re-deriving before any work.** `compute_expert_budget` runs at
@@ -293,6 +234,31 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   "recover" and finish now raise honestly, so a sweep cell at high N × long context reports an OOM
   where it previously reported a number. Any throughput figure taken at the VRAM edge before this
   date may have been measured on a silently truncated context.
+- **Plan K is REFUTED: batch admission was never the limiter (2026-08-09).** `plan_batch` deferred
+  **zero** requests in **every cell of both models**, at N up to 5 and ~7 700-token streams — the
+  exact context F2 was written about. `reclaimable_vram_budget` and the once-per-batch reclaim both
+  work (freed 1.22 GB Qwen / 2.09 GB MiniMax when asked) and unlock nothing. F2's "N=1 today vs N=5
+  if counted" compared per-stream KV against the admission budget; **KV admission is not what binds.**
+  Total VRAM residency is — prefill activations + KV + expert cache + (pool on) restored prefix KV,
+  against 15.47 GiB. Peak allocation was 14.17-15.57 GB in every cell that ran.
+  **Reclaim's measured cost is nil and so is its benefit:** MiniMax 0.713 → 0.716 tok/s (+0.4 %),
+  Qwen's four N=1 arms span 0.454-0.488 with no ordering by reclaim. Giving back 1.22 GB moved the
+  expert-VRAM hit rate 43 % → 41 %, consistent with audit F8's "the cache re-saturates in ~4 tokens".
+  **Keep both default-off rather than deleting them** — the mechanism is sound and tested; only its
+  premise failed, and that premise could return if batched prefill activations come down.
+  RESULTS: `docs/superpowers/plans/2026-08-03-batch-admission-reclaim-RESULTS.md` (docs/ is gitignored).
+- **N≥2 at ~7 700 tokens is INFEASIBLE on this 16 GB box, both MoE models**, with or without reclaim
+  or the prefix pool. Only N=1 runs. 14 of MiniMax's 16 cells died of VRAM exhaustion, and Qwen's
+  cheapest N=2 cell did too. **§0 names parallel fan-out as a first-class lever; at agentic context
+  lengths on this hardware it is currently unreachable**, and admission control is not what stands in
+  the way. **Limit on this claim:** Qwen N=3 and N=5 were never executed — the sweep was stopped at 21
+  of 32 cells once the remainder could not change the verdict. Re-measure rather than extrapolate if
+  per-cell VRAM drops.
+- **Cross-turn prefix reuse beats every batching lever by two orders of magnitude, and works where
+  batching does not.** Same box, same day, N=1 @ ~7 700 tokens: Qwen cold 396.4 s → warm **2.4-2.9 s
+  (136-165×)**; MiniMax ~380 s → **~1.0 s (377×)**, `match_len=7767/7768`. For §0's agentic loop —
+  which re-sends a largely-unchanged context every iteration — **this is the lever, and batching is
+  not** at this context length on this hardware.
 - **The batched store-back cloned the KV row in VRAM, so the prefix cache could not store at long
   context (fixed 2026-08-09).** `slice_cache_row` did `t[row:row + 1].clone()` — a second full copy
   of the KV cache on the SOURCE device — immediately after a long prefill, when VRAM is at its peak,
