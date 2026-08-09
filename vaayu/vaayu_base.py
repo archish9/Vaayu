@@ -4184,11 +4184,17 @@ class VaayuBaseModel(GenerationMixin):
                 # must keep propagating): the cleanup below must run unconditionally
                 # on exit, and a failure here must never replace whatever exception
                 # is already unwinding through this finally (e.g. a CUDA OOM in
-                # decode, where slice_cache_row's clone or store()'s to_cpu pinned
-                # alloc can plausibly fail again) -- that would be the exact
-                # diagnostic-laundering failure this repo already fixed elsewhere
-                # (bug D3). Not re-raising means the entry is simply lost, which
-                # lookup()'s pop already made true the moment this batch started.
+                # decode, where store()'s to_cpu pinned alloc can plausibly fail
+                # again) -- that would be the exact diagnostic-laundering failure
+                # this repo already fixed elsewhere (bug D3). Not re-raising means
+                # the entry is simply lost, which lookup()'s pop already made true
+                # the moment this batch started.
+                #
+                # That swallowing is why this failed SILENTLY for a whole sweep:
+                # slice_cache_row used to clone on-device and OOM'd here at 7.7k
+                # context, so every pool-on cell reported a 1.08x "hit" that was
+                # a full re-prefill. The warning below is the only signal, and it
+                # is worth reading whenever a prefix hit looks too small.
                 try:
                     one = slice_cache_row(past, prefix_store_row(requests))
                     one.crop(len(common_ids))

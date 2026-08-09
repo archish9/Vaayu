@@ -363,3 +363,19 @@ def test_prefix_cache_support_rejects_plain_dynamic_cache():
     assert not hasattr(c, "to_cpu")
     assert not hasattr(c, "resident_bytes")
     assert cache_supports_prefix_store(c) is False
+
+
+def test_slice_row_lands_on_the_cpu_not_the_source_device():
+    """The store-back runs when VRAM is at its peak -- right after a long
+    prefill. Cloning the row on the source device needs a second full copy of
+    the KV cache in VRAM exactly then. Measured on MiniMax at 7 700 tokens,
+    that allocation failed with 19.56 MiB free, the pool was never populated,
+    and round 2 re-prefilled from scratch. Slicing straight to host keeps the
+    device allocation at zero.
+    """
+    c = _FakeCache()
+    broadcast_cache_rows(c, 3)
+    one = slice_cache_row(c, 1)
+    for name in one._BUFFER_LISTS:
+        for t in getattr(one, name):
+            assert t.device.type == "cpu", f"{name} landed on {t.device}"

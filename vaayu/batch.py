@@ -177,17 +177,31 @@ def resolve_matched_len(cache, requested_m: int) -> int:
 
 
 def slice_cache_row(cache, row: int):
-    """Return a new batch-1 cache holding only `row`, sharing no storage.
+    """Return a new batch-1 CPU cache holding only `row`, sharing no storage.
 
     The batch dimension must genuinely shrink. PrefixCacheStore.store() calls
     to_cpu(), whose `[..., :used, :]` trims the SEQUENCE axis only -- handing
     it an N-row cache would copy all N rows into the pool and charge N times
     the bytes against a budget whose overrun is a measured cliff.
+
+    Lands on the CPU directly rather than cloning on the source device. This
+    used to be `t[row:row + 1].clone()`, which allocates a full copy of the KV
+    cache in VRAM -- at precisely the moment the batch has finished a long
+    prefill and VRAM is at its peak. Measured on MiniMax at 7 700 tokens: the
+    store-back died on a 16 MiB allocation with 19.56 MiB free, so the pool
+    was never populated and round 2 re-prefilled from scratch (TTFT 380.9s ->
+    352.8s, a 1.08x "hit" that was no hit at all). The cache cannot store at
+    the context lengths cross-turn reuse is most valuable for, which is the
+    opposite of the intended behaviour.
+
+    `t[row:row + 1]` is a contiguous view on a contiguous buffer, so the
+    device-side slice costs nothing and only the host copy allocates.
+    store()'s to_cpu() then trims and pins, and is a no-op on the device axis.
     """
     out = copy.copy(cache)
     for name in cache._BUFFER_LISTS:
         setattr(out, name,
-                [t[row:row + 1].clone() for t in getattr(cache, name)])
+                [t[row:row + 1].to("cpu", copy=True) for t in getattr(cache, name)])
     out._seq_len = list(cache._seq_len)
     return out
 
