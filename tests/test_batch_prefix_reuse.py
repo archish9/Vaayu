@@ -69,6 +69,16 @@ class _FakeCache:
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self._seq_len[layer_idx]
 
+    def to_device(self, device) -> None:
+        pass
+
+    def to_cpu(self) -> None:
+        pass
+
+    def resident_bytes(self) -> int:
+        return sum(t.numel() * t.element_size()
+                   for name in self._BUFFER_LISTS for t in getattr(self, name))
+
 
 def test_broadcast_expands_every_buffer_to_n_rows():
     c = _FakeCache()
@@ -192,3 +202,123 @@ def test_resolve_matched_len_is_a_true_no_op_when_cache_is_longer():
     c = _FakeCache(s=10)
     assert resolve_matched_len(c, 6) == 6
     assert c.get_seq_length() == 6
+
+
+# --- IMPORTANT 3 coverage: store-back on generator abandonment -------------
+#
+# batched_generate's own docstring treats early abandonment as real:
+# .close() (or GC dropping the generator) raises GeneratorExit at the
+# currently-suspended yield. lookup() already POPPED the pooled entry by
+# that point; only the finally block's store-back puts one back. Reasoning
+# about that in prose isn't verification -- this drives the real method
+# end-to-end against the smallest fake VaayuBaseModel-shaped object that
+# lets it reach its first yield, so abandonment is exercised for real.
+
+from types import SimpleNamespace
+
+from vaayu.prefix_cache import PrefixCacheStore
+from vaayu.vaayu_base import VaayuBaseModel, _auto_session_id
+
+
+class _FakeBatchedModel:
+    """Just enough of VaayuBaseModel's surface for batched_generate to run:
+    sdpa attn, a device string, a tokenizer/config/telemetry stub, and a
+    forward() that manufactures a fresh _FakeCache sized off whatever
+    attention_mask/input_ids it's handed -- generic enough to serve both
+    the prefill call and (if ever reached) the decode loop."""
+    _active_attn_impl = "sdpa"
+    running_device = "cpu"
+    prefill_chunk_size = 0
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    class _Cfg:
+        eos_token_id = -999   # unreachable: the fake forward's logits are
+
+    class _Telemetry:
+        def reset_batch_overlap(self):
+            pass
+
+        def dump_json(self, path):
+            pass
+
+    def __init__(self, pc):
+        self._prefix_cache = pc
+        self.tokenizer = self._Tok()
+        self.config = self._Cfg()
+        self.telemetry = self._Telemetry()
+
+    def forward(self, input_ids, attention_mask, position_ids, use_cache=True,
+                return_dict=True, past_key_values=None):
+        cache = _FakeCache(s=attention_mask.shape[1], b=input_ids.shape[0])
+        logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 8)
+        return SimpleNamespace(past_key_values=cache, logits=logits)
+
+
+def test_abandoning_the_generator_still_stores_the_prefix_back():
+    common_ids = [1, 2, 3, 4, 5]
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("preexisting", common_ids, _FakeCache(s=len(common_ids), b=1))
+    assert len(pc._pool) == 1
+
+    requests = [_req([1, 2, 3, 4, 5, 6, 7]), _req([1, 2, 3, 4, 5, 8, 9, 10])]
+    model = _FakeBatchedModel(pc)
+
+    gen = VaayuBaseModel.batched_generate(model, requests)
+    next(gen)     # advance to the first yield -- lookup() has already popped
+                  # the entry and `past` is now bound from the prefill call
+    gen.close()   # GeneratorExit at the suspended yield
+
+    assert model._batch_decode_active is False
+    assert len(pc._pool) == 1              # entry restored, not lost
+    restored = next(iter(pc._pool.values()))
+    assert restored.token_ids == common_ids
+
+
+def test_abandoning_before_the_first_yield_does_not_crash():
+    """A generator-iterator runs none of its body until first resumed, so
+    closing one before any next() is a true no-op in CPython -- nothing in
+    batched_generate has executed yet, including lookup(). Pin that this
+    stays a clean no-op (no crash, pool untouched) rather than a change
+    here accidentally forcing eager work."""
+    common_ids = [1, 2, 3]
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("preexisting", common_ids, _FakeCache(s=len(common_ids), b=1))
+
+    requests = [_req([1, 2, 3, 6]), _req([1, 2, 3, 7])]
+    model = _FakeBatchedModel(pc)
+
+    gen = VaayuBaseModel.batched_generate(model, requests)
+    gen.close()   # closed before even calling next() once
+    assert not hasattr(model, "_batch_decode_active")   # body never ran
+    assert len(pc._pool) == 1                           # lookup() never ran
+
+
+class _RaisingStorePC:
+    """Stub prefix-cache store whose store() always fails, to exercise the
+    store-back's own try/except without needing a real budget-eviction pool."""
+
+    def lookup(self, session_id, input_ids, device=None):
+        return _FakeCache(s=len(input_ids), b=1), len(input_ids)
+
+    def store(self, session_id, token_ids, cache):
+        raise RuntimeError("disk full (simulated)")
+
+
+def test_store_back_failure_does_not_skip_cleanup():
+    """A raise inside slice_cache_row/crop/pc.store must not skip clearing
+    _batch_decode_active/_batch_n or dumping telemetry -- those three lines
+    sit after the store-back in the same finally block, so if the store-back
+    isn't guarded, a failure there propagates straight out and skips them."""
+    common_ids = [1, 2, 3]
+    requests = [_req([1, 2, 3, 6]), _req([1, 2, 3, 7])]
+    model = _FakeBatchedModel(_RaisingStorePC())
+
+    gen = VaayuBaseModel.batched_generate(model, requests)
+    next(gen)
+    gen.close()   # must not raise RuntimeError out of close()
+
+    assert model._batch_decode_active is False
+    assert model._batch_n == 1

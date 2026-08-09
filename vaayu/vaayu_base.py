@@ -4004,9 +4004,24 @@ class VaayuBaseModel(GenerationMixin):
                 # Row choice must be the LONGEST prompt, never row 0 -- see
                 # prefix_store_row's docstring for why row 0 would silently
                 # store padding as if it were the shared prefix.
-                one = slice_cache_row(past, prefix_store_row(requests))
-                one.crop(len(common_ids))
-                pc.store(_auto_session_id(common_ids), list(common_ids), one)
+                #
+                # try/except Exception (never bare/BaseException -- GeneratorExit
+                # must keep propagating): the cleanup below must run unconditionally
+                # on exit, and a failure here must never replace whatever exception
+                # is already unwinding through this finally (e.g. a CUDA OOM in
+                # decode, where slice_cache_row's clone or store()'s to_cpu pinned
+                # alloc can plausibly fail again) -- that would be the exact
+                # diagnostic-laundering failure this repo already fixed elsewhere
+                # (bug D3). Not re-raising means the entry is simply lost, which
+                # lookup()'s pop already made true the moment this batch started.
+                try:
+                    one = slice_cache_row(past, prefix_store_row(requests))
+                    one.crop(len(common_ids))
+                    pc.store(_auto_session_id(common_ids), list(common_ids), one)
+                except Exception as e:
+                    print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
+                          f"({e!r}) -- lookup() already popped this entry, so "
+                          f"it is now LOST from the pool.")
             self._batch_decode_active = False
             self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")
