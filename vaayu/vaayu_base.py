@@ -3553,23 +3553,43 @@ class VaayuBaseModel(GenerationMixin):
                                         _compute_s += time.time() - _t
                                         _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                                     break
-                                except torch.cuda.OutOfMemoryError:
+                                except torch.cuda.OutOfMemoryError as _oom_err:
                                     if _oom_retry == _MAX_OOM_RETRIES:
-                                        print(f"[Vaayu] ❌ Fatal OOM on {layer_name}. Recovery failed.")
-                                        raise
+                                        raise RuntimeError(
+                                            f"CUDA OOM on {layer_name} after "
+                                            f"{_MAX_OOM_RETRIES} non-destructive retries "
+                                            f"(empty_cache + gc). The KV cache is NOT truncated "
+                                            f"to recover — see below. Reduce prefill_chunk_size, "
+                                            f"the batch width N, the context length, or the "
+                                            f"expert VRAM budget."
+                                        ) from _oom_err
                                     print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {_oom_retry + 1}/{_MAX_OOM_RETRIES}). "
                                           f"Clearing cache and retrying...")
                                     torch.cuda.empty_cache()
                                     gc.collect()
-                                    if past_key_values is not None:
-                                        try:
-                                            _oom_seq_len = self.get_past_key_values_cache_seq_len(past_key_values)
-                                            if _oom_seq_len > 512:
-                                                _oom_target = _oom_seq_len // 2
-                                                print(f"[Vaayu] \U0001f52a Truncating KV cache: {_oom_seq_len} → {_oom_target} tokens")
-                                                self._trim_kv_cache_front(past_key_values, _oom_target)
-                                        except Exception as _oom_e:
-                                            print(f"[Vaayu] Cache truncation failed: {_oom_e}")
+                                    # This handler used to halve the KV cache here
+                                    # (`_oom_seq_len // 2` + _trim_kv_cache_front) and retry.
+                                    # REMOVED 2026-08-09 -- it was the root cause of two
+                                    # mask/KV mismatches, both landing on exact `// 2`:
+                                    # F3 Task 6's unreproduced 1127-vs-1690 (563 = 1127 // 2)
+                                    # and Plan K's 7770-vs-3885 at N=3 x 7.7k.
+                                    #
+                                    # It is not merely a shape bug. crop_front drops the
+                                    # OLDEST tokens, so every survivor's position shifts
+                                    # relative to both the caller's attention mask and the
+                                    # RoPE positions already baked into the cached keys --
+                                    # and the caller is never told, so its mask still
+                                    # describes the full sequence. A run that "recovered"
+                                    # and completed had silently answered from a truncated,
+                                    # position-shifted context. Worse per-layer: the OOM
+                                    # lands at layer i, so layers before it keep the
+                                    # pre-crop length while later ones get post-crop plus
+                                    # the retried chunk, leaving _seq_len ragged.
+                                    #
+                                    # Silently shrinking the user's context to survive is
+                                    # the degradation CLAUDE.md §5 forbids, and D3 already
+                                    # settled that a VRAM wall must raise and name the real
+                                    # levers rather than fabricate a recovery.
                             new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                             if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:

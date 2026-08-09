@@ -104,8 +104,30 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
   Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
   Results: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-RESULTS.md` (docs/ is gitignored)
+- [bug] **ROOT CAUSE FOUND 2026-08-09: the OOM handler SILENTLY HALVES THE KV CACHE mid-forward.**
+  `vaayu_base.py:3563-3571`, inside the layer loop's `except torch.cuda.OutOfMemoryError`:
+  `_oom_target = _oom_seq_len // 2` then `_trim_kv_cache_front(...)` → `crop_front`, then the layer
+  retries. Nothing tells the CALLER, so `batched_generate`'s `pad_mask` still describes the full
+  sequence and the next forward mismatches.
+  **Two independent incidents, both landing on exact `// 2`:**
+  | incident | mask | KV | delta |
+  |---|---|---|---|
+  | F3 Task 6, unreproduced (2026-08-09 am) | 1127 | 1690 | 563 = **1127 // 2** |
+  | Plan K, N=3 @ 7 700 (2026-08-09 pm) | 7 770 | 3 885 = **7 770 // 2** | — |
+  This is why it never reproduced: it fires only when a layer actually OOMs, which depends on expert
+  cache warmth and free VRAM — the same config crashes or does not run to run.
+  **It is worse than a shape bug.** `crop_front` drops the OLDEST tokens, so every surviving token's
+  position shifts relative to both the attention mask and the RoPE positions already baked into the
+  cached keys. A run that "recovers" and completes has silently answered from a truncated,
+  position-shifted context. The per-layer variant is nastier still: the OOM hits at layer i, so
+  layers 0..i-1 hold the pre-crop length and layer i onward hold post-crop + the retried chunk —
+  ragged `_seq_len`, which is exactly what `check_batch_kv_invariant`'s per-layer arm now catches.
+  **Proposed fix:** delete the truncation. The `empty_cache()` + `gc.collect()` retry is
+  non-destructive and can stay; silently shrinking the user's context to survive is the degradation
+  CLAUDE.md §5 forbids, and D3 already settled that a VRAM wall must raise with the real levers
+  named rather than fabricate a "recovery". Blocks Plan K's sweep at 7.7k × N≥3.
 - [bug] **F3: one unreproduced attention-mask/KV length mismatch. Suspect REFUTED 2026-08-09;
-  still open, now with a tripwire.**
+  root cause above.**
   `RuntimeError: The expanded size of the tensor (1690) must match the existing size (1127) at
   non-singleton dimension 3. Target sizes: [3, 64, 1127, 1690]. Tensor sizes: [3, 1, 1127, 1127]` —
   mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). The failing log
