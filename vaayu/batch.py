@@ -85,6 +85,23 @@ def batch_position_ids(pad_mask: "torch.Tensor") -> "torch.Tensor":
     return pos.clamp_(min=0)
 
 
+def batch_common_prefix(requests) -> list:
+    """Longest token prefix shared by EVERY request in the batch.
+
+    This is what a fan-out actually shares -- the system prompt plus the files
+    every sub-agent was given. Derived from the prompts themselves, so no
+    session_id plumbing is needed on BatchRequest.
+    """
+    if not requests:
+        return []
+    shortest = min(len(r.prompt_ids) for r in requests)
+    first = requests[0].prompt_ids
+    n = 0
+    while n < shortest and all(r.prompt_ids[n] == first[n] for r in requests):
+        n += 1
+    return list(first[:n])
+
+
 def build_batch_attention_mask(pad_mask, q_len, dtype, device):
     """Additive float mask [N, 1, q_len, KV] = causal AND key-not-pad.
     Queries are the LAST q_len positions of KV (right-aligned decode)."""
