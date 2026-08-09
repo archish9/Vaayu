@@ -637,6 +637,46 @@ def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     return max(int(max_seq_len), int(past_len) + int(seq_total))
 
 
+def check_batch_kv_invariant(pad_mask, q_len: int, past_key_values) -> None:
+    """Raise if the batched padding mask disagrees with the cache it will be
+    used against.
+
+    build_batch_attention_mask derives its KV axis from pad_mask.shape[1]
+    alone; it never inspects the cache. Attention then expands that mask to
+    the real key length, so any disagreement dies deep inside a decoder layer
+    as a bare torch expand error naming head counts and no cause -- the same
+    diagnostic-at-the-wrong-frame shape as bug D3. One 2026-08-09 batched run
+    failed exactly this way (mask 1127 wide against a 1690-long KV) and was
+    never explained, because nothing recorded which side was wrong.
+
+    Both halves matter:
+      - total length: pad_mask width must equal past + this call's queries.
+      - per-layer agreement: get_seq_length() reads layer 0 ONLY, so a cache
+        whose layers hold different lengths satisfies every length check in
+        forward() and still mismatches at whichever layer differs. Checked
+        only for caches that expose _seq_len (Vaayu's own classes); a plain
+        transformers DynamicCache has no per-layer view to check.
+    """
+    past = past_key_values.get_seq_length() if past_key_values is not None else 0
+    lens = getattr(past_key_values, "_seq_len", None)
+    if lens and min(lens) != max(lens):
+        raise RuntimeError(
+            f"batched KV cache has per-layer lengths that disagree: "
+            f"min={min(lens)} max={max(lens)} over {len(lens)} layers. The "
+            f"attention mask can only be built for one length (layer 0's "
+            f"{past}), so every layer that differs would mismatch inside "
+            f"attention. A partially-completed forward (an exception in the "
+            f"layer loop) is the way a cache reaches this state.")
+    width = int(pad_mask.shape[1])
+    if width != past + int(q_len):
+        raise RuntimeError(
+            f"batched attention mask is {width} wide but the KV it will be "
+            f"used against will be {past + int(q_len)} long "
+            f"(past={past} + q_len={int(q_len)}). The mask is built from the "
+            f"caller's padding mask, so the caller's idea of how many cached "
+            f"tokens precede this call is wrong by {past + int(q_len) - width}.")
+
+
 def compute_warmup_ranges(offset_index, checkpoint_path, warm_bytes: int):
     """Byte ranges to pre-read to prime the NVMe controller's DRAM cache before
     generation (Task 7). Walks the offset index in order, emitting one
@@ -3163,6 +3203,7 @@ class VaayuBaseModel(GenerationMixin):
             if getattr(self, '_batch_decode_active', False) and _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
                 from .batch import build_batch_attention_mask
                 _q_len = input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0
+                check_batch_kv_invariant(_caller_attention_mask, _q_len, past_key_values)
                 attention_mask = build_batch_attention_mask(
                     _caller_attention_mask, _q_len,
                     dtype=self.running_dtype, device=self.running_device)
