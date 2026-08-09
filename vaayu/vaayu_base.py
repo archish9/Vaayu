@@ -1833,6 +1833,26 @@ class VaayuBaseModel(GenerationMixin):
         # after both branches converge, not inside the is_moe block above.
         self._prefix_cache = None
         if getattr(self, "enable_prefix_cache", False):
+            # PrefixCacheStore drives to_cpu()/to_device()/resident_bytes() on
+            # every cache it stores. Vaayu's own cache classes have them; the
+            # bare transformers DynamicCache that kv_cache_mode "fp16" yields
+            # (what "auto" resolves to for every non-EXL3 model) does not, and
+            # store() would AttributeError. Since lookup() POPS an entry before
+            # store() can put one back, failing per-turn would silently drain
+            # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
+            # silently degrade). Pre-existing limit of the prefix subsystem,
+            # not of batched decode -- generate() calls the same store().
+            from .batch import cache_supports_prefix_store
+            _probe = self._create_kv_cache()
+            if not cache_supports_prefix_store(_probe):
+                print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
+                      f"kv_cache_mode={self.kv_cache_mode!r} yields "
+                      f"{type(_probe).__name__}, which does not implement "
+                      f"to_cpu/to_device/resident_bytes. Load with "
+                      f"kv_cache_mode='bf16' to enable it on this model.")
+                self.enable_prefix_cache = False
+            del _probe
+        if getattr(self, "enable_prefix_cache", False):
             import psutil as _ps
             _free_ram = _ps.virtual_memory().available
             _pc_budget = compute_prefix_cache_budget(_free_ram)

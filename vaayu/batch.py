@@ -229,3 +229,25 @@ def plan_batch(model, requests):
     n_layers, n_kv_heads, head_dim, elem = geo_from_model(model)
     return size_batch(requests, free_vram_budget(model),
                       n_layers, n_kv_heads, head_dim, elem)
+
+
+# Methods PrefixCacheStore drives on a cache it stores or hands back:
+# store() -> to_cpu()/resident_bytes(), and the caller -> to_device().
+_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")
+
+
+def cache_supports_prefix_store(cache) -> bool:
+    """True iff `cache` carries the surface PrefixCacheStore requires.
+
+    Vaayu's FP8DynamicCache / TurboQuantKVCache do. A bare
+    transformers.cache_utils.DynamicCache -- what `_create_kv_cache` returns
+    whenever kv_cache_mode resolves to "fp16", which is what "auto" gives every
+    non-EXL3 model -- does NOT: it has no to_cpu, no to_device and no
+    resident_bytes. store() would raise AttributeError on it, and because
+    lookup() POPS an entry before store() puts one back, each such failure
+    permanently drops the pool's entry.
+
+    This is a pre-existing limit of the prefix-cache subsystem, not of batched
+    decode: generate()'s own cross-turn path calls the same store().
+    """
+    return all(callable(getattr(cache, m, None)) for m in _PREFIX_STORE_METHODS)

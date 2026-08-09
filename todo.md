@@ -58,6 +58,21 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `_TENSOR_ALIGN` (16-byte) alignment. Narrow edge case, never observed on either target model,
   unenforced identically before and after chunking. Fix is a constructor validation or an
   `_align_up` on the computed slab size. (found 2026-08-08, Plan L final review)
+- [ ] **The cross-turn prefix cache only works for EXL3 models; it is DISABLED with a warning for
+  everything else.** `PrefixCacheStore` drives `to_cpu()` / `to_device()` / `resident_bytes()` on
+  every cache it stores. Vaayu's `FP8DynamicCache` / `TurboQuantKVCache` have them; the bare
+  `transformers.cache_utils.DynamicCache` that `_create_kv_cache` returns for `kv_cache_mode="fp16"`
+  — which is what `"auto"` resolves to for every **non-EXL3** model — has none of the three.
+  (Verified on transformers 5.5.4: that class is layer-object based, `layers[i].keys`/`.values`,
+  with no `key_cache` attribute at all.) **Pre-existing, not an F3 regression** — `generate()`'s
+  cross-turn path calls the same `store()` and would fail identically; F3 merely surfaced it.
+  As of 2026-08-09 `vaayu_base.py` probes the cache at load and, when unsupported, prints a WARNING
+  and disables the pool rather than failing per-turn — the per-turn failure was the dangerous one,
+  because `lookup()` POPS an entry before `store()` puts one back, so each swallowed failure
+  permanently drained the pool. To actually SUPPORT fp16, either give `DynamicCache` the three
+  methods via an adapter, or route fp16 through `FP8DynamicCache(quantize=False)`. Neither is
+  urgent: all three on-device targets and the 70B dense reference are EXL3. (found 2026-08-09, F3
+  Task 4 on-device gate)
 
 ## Architectural gaps
 

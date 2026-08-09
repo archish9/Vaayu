@@ -322,3 +322,44 @@ def test_store_back_failure_does_not_skip_cleanup():
 
     assert model._batch_decode_active is False
     assert model._batch_n == 1
+
+
+# ── Prefix cache requires a Vaayu cache class ────────────────────────────────
+
+def test_prefix_cache_support_detects_a_vaayu_cache():
+    """FP8DynamicCache/TurboQuantKVCache carry the to_cpu/to_device/
+    resident_bytes surface PrefixCacheStore drives -- and so does _FakeCache,
+    which is modelled on them."""
+    from vaayu.batch import cache_supports_prefix_store
+    assert cache_supports_prefix_store(_FakeCache()) is True
+
+
+def test_prefix_cache_support_needs_every_method():
+    """Missing any one of the three is enough to break store()."""
+    from vaayu.batch import cache_supports_prefix_store
+
+    class _Partial:
+        def to_cpu(self): pass
+        def to_device(self, d): pass
+        # no resident_bytes -- store() reads it immediately after to_cpu()
+
+    assert cache_supports_prefix_store(_Partial()) is False
+    assert cache_supports_prefix_store(object()) is False
+
+
+def test_prefix_cache_support_rejects_plain_dynamic_cache():
+    """The real reason this exists: `_create_kv_cache` returns a bare
+    transformers DynamicCache for kv_cache_mode "fp16" (what "auto" resolves
+    to for every non-EXL3 model), and it has no to_cpu/resident_bytes at all.
+    PrefixCacheStore.store() would AttributeError on it."""
+    import torch as _t
+    from transformers.cache_utils import DynamicCache
+    from vaayu.batch import cache_supports_prefix_store
+
+    c = DynamicCache()
+    c.update(_t.randn(1, 2, 3, 4), _t.randn(1, 2, 3, 4), 0)
+    # Pin the premise rather than assuming it -- if a future transformers
+    # grows these methods, this test should tell us, not silently pass.
+    assert not hasattr(c, "to_cpu")
+    assert not hasattr(c, "resident_bytes")
+    assert cache_supports_prefix_store(c) is False
