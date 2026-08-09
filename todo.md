@@ -76,13 +76,37 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 ## Architectural gaps
 
-- [ ] **F3 — the cross-turn prefix cache is wired into `generate()` only.** `batched_generate`
-  (`vaayu_base.py:3553`) and `speculative_generate` (`:3448`) never call `PrefixCacheStore.lookup()`
-  or `_persist_and_store()`. §0's two shaping facts — parallel fan-out and heavy context reuse —
-  therefore cannot compose: a fan-out batch pays a full cold prefill per stream even when every
-  stream shares the system prefix. **Not a positional fix** (N per-session caches must merge into
-  one left-padded batch cache = new mechanism). Also biases Plan K's measurement (K's plan §8c).
-  (found 2026-08-03, audit F3)
+- [~] **F3 — cross-turn prefix cache in the batched paths.** Phase 1 (shared-prefix broadcast)
+  landed 2026-08-09 on `feat/f3-batched-prefix-cache`: `batched_generate` computes the batch's
+  longest common prefix, looks it up ONCE, broadcasts that cache to N rows, prefills only the
+  divergent tails, and stores exactly one entry back (from the longest-prompt row, inside the
+  `finally` so an abandoned generator cannot lose the popped entry). `speculative_generate` is
+  wired in too. Verified token-identical on Llama-3.3-70B-exl3: round 1 MISS, round 2 HIT,
+  `warm == cold`. **Remaining: the measurement (plan Task 6)** — the coverage fraction that gates
+  whether Phase 2 is ever built, plus the TTFT A/B that Plan K needs. Phase 2 (ragged per-stream
+  merge) is NOT built and needs that number first; it also needs a cache-class change, since
+  `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
+  Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
+- [bug] **F3: one unreproduced attention-mask/KV length mismatch.**
+  `RuntimeError: The expanded size of the tensor (1690) must match the existing size (1127) at
+  non-singleton dimension 3. Target sizes: [3, 64, 1127, 1690]. Tensor sizes: [3, 1, 1127, 1127]` —
+  mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). Did NOT reproduce
+  across 7 later runs of the identical config; **not fixed, not explained.** Instrumentation proved
+  round 1 runs with `m=0, kv=None` (F3's path is a no-op there), so the suspect is **round 2 with a
+  PARTIAL match** — `m` strictly between 0 and `len(common_ids)` — which every successful run
+  avoided by matching the full prefix. The Task 3 review predicted a mechanism here and called it
+  "degenerate but not reachable from a real lookup() hit". Reproducer to build: a batch whose common
+  prefix is a STRICT prefix of a longer stored entry. (found 2026-08-09, F3 Task 6)
+- [ ] **`speculative_generate` skips `enqueue_truncate` on a prefix HIT, so `enable_kv_persist`
+  can corrupt that session's on-disk KV.** `generate()` calls
+  `self._kv_writer.enqueue_truncate(session_id, match_len)` on a HIT; the new
+  `speculative_generate` hook does not. `DiskWriter.enqueue_append` packs `range(st["nrec"],
+  length)` from its OWN tracked `nrec`, not from `match_len`. Scenario: turn 1 persists positions
+  [0,7) (`nrec=7`); turn 2 HITs at `match_len=5` and ends at length 9; `enqueue_append` starts at 7
+  and writes only [7,9), leaving [5,7) holding **turn 1's stale bytes** merged with turn 2's — a
+  corrupted record, undetectable until restore. **Dormant today**: no on-device target combines a
+  speculator with `enable_kv_persist=True`. Fix is the two-line mirror of `generate()`.
+  (found 2026-08-09, F3 Task 5 review)
 - [ ] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so `_get_vram_pinning_budget()`
   reserves KV for 512 tokens against real contexts of 2 048–7 751. Measured (Qwen): KV
   0.193 MB/token → reserved 0.092 GB, actual 0.367 GB at 2k (**−0.28 GB**) and 1.390 GB at 7.7k
@@ -229,6 +253,17 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   free.** (Plan L E4)
 - **MiniMax runs the module-list forward, not the EXL3 fused one.** Every MiniMax perf number on
   record is a module-list number.
+- **Layer offload to meta destroys BUFFERS, and a buffer the checkpoint cannot restore is gone for
+  good (fixed 2026-08-09).** `free_from_gpu` in BOTH loader strategies ended with
+  `layer_module.to("meta")`. Parameters SHOULD go to meta — that is layer streaming, and the next
+  per-layer load restores them. Buffers are the trap: `MiniMaxM2SparseMoeBlock` registers
+  `e_score_correction_bias` via `register_buffer(torch.zeros(...))`, the checkpoint has **no tensor
+  by that name** (layer 3: 3093 keys, only `block_sparse_moe.gate.weight`), and the only thing that
+  ever materialized it was the load-time `named_buffers()` pass. Each layer's router therefore
+  worked on the FIRST forward pass and died on every one after. **Latent for as long as the
+  module-list forward used a hardcoded softmax; it surfaced the moment that forward switched to the
+  model's own `route_tokens_to_experts` (sigmoid + bias).** A "works once then fails" symptom on a
+  streamed layer means look at what the offload destroys that the reload cannot rebuild.
 - **Decode floors, same-box same-day 2026-08-08: MiniMax 1.45 tok/s, Qwen 0.83 tok/s.** These are
   BASELINE numbers from `main`, and they sit *below* the older 1.48 / 0.85 figures on unchanged code.
   Always re-measure the baseline the same day; never gate against a historical number.
