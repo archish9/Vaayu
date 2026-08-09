@@ -3,6 +3,7 @@
 Pure, GPU-free helpers live here; the decode loop is VaayuBaseModel.batched_generate.
 All sizing is DERIVED from model geometry — see CLAUDE.md §5.
 """
+import copy
 import warnings
 from dataclasses import dataclass, field
 
@@ -100,6 +101,45 @@ def batch_common_prefix(requests) -> list:
     while n < shortest and all(r.prompt_ids[n] == first[n] for r in requests):
         n += 1
     return list(first[:n])
+
+
+def broadcast_cache_rows(cache, n: int) -> None:
+    """Grow every buffer of a batch-1 cache to n identical rows, in place.
+
+    A REAL copy, never .expand(): expanded tensors share storage, so each
+    stream's decode writes would alias into a single row. The shape assertion
+    would still pass and the output would be silently wrong.
+
+    Buffer names come from the cache's own _BUFFER_LISTS, so this covers the
+    unquantized, fp8 and TurboQuant layouts without naming their tensors.
+    """
+    for name in cache._BUFFER_LISTS:
+        lst = getattr(cache, name)
+        for i in range(len(lst)):
+            t = lst[i]
+            if t.shape[0] == n:
+                continue
+            if t.shape[0] != 1:
+                raise ValueError(
+                    f"broadcast_cache_rows expects a batch-1 cache, got "
+                    f"{name}[{i}] with batch {t.shape[0]}")
+            lst[i] = t.repeat(n, *([1] * (t.dim() - 1))).contiguous()
+
+
+def slice_cache_row(cache, row: int):
+    """Return a new batch-1 cache holding only `row`, sharing no storage.
+
+    The batch dimension must genuinely shrink. PrefixCacheStore.store() calls
+    to_cpu(), whose `[..., :used, :]` trims the SEQUENCE axis only -- handing
+    it an N-row cache would copy all N rows into the pool and charge N times
+    the bytes against a budget whose overrun is a measured cliff.
+    """
+    out = copy.copy(cache)
+    for name in cache._BUFFER_LISTS:
+        setattr(out, name,
+                [t[row:row + 1].clone() for t in getattr(cache, name)])
+    out._seq_len = list(cache._seq_len)
+    return out
 
 
 def build_batch_attention_mask(pad_mask, q_len, dtype, device):
