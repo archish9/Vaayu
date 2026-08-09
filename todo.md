@@ -22,7 +22,7 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **2** | ~~Fix the dense path (**D1**)~~ — **DONE 2026-08-09** | Tied `lm_head` was never weighted; see Settled. Left behind **D4** (the splitter still emits the empty shard) — unblocked, not urgent. |
 | **3** | ~~Make VRAM exhaustion fail honestly (**D3**)~~ — **DONE 2026-08-09** | `_precompute_rope` now raises with the OOM chained instead of returning an overloaded `None`. See Settled. | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
 | **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
-| **4b** | **Fix MiniMax's non-identical output under prefix reuse** ← **START HERE** | Correctness, and it is in merged code on an actively-tested target. F3's measured win on the module-list forward is not bankable until `warm == cold` holds there — a 2.15× TTFT win that changes the tokens is not a win. Dense and fused-EXL3 both pass, so the search is bounded to one forward. |
+| **4b** | ~~Fix MiniMax's non-identical output under prefix reuse~~ — **DONE 2026-08-09** | Was not a prefix-reuse bug at all: the MoE forwards accumulated experts in bf16 while expert arrival order is nondeterministic. fp32 accumulator in all three forwards. See Settled. Left behind **one open bug** (fused-EXL3 residual). |
 | **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
 | **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
@@ -75,28 +75,23 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   urgent: all three on-device targets and the 70B dense reference are EXL3. (found 2026-08-09, F3
   Task 4 on-device gate)
 
+- [bug] **The fused-EXL3 expert GEMM is still nondeterministic after the fp32 accumulator fix.**
+  Qwen3-235B, two forwards over identical input ids: layers 0–8 bitwise identical (they are pinned,
+  so they bypass `sparse_forward`), layer 9 — the first STREAMED MoE layer — diverges by
+  **3.05e-05**, which is one fp16 ULP at that magnitude, growing to 4.5 by layer 94 and
+  max|Δlogit| ≈ 0.25–0.28. Greedy argmax has not flipped in any run so far, so it is not currently
+  changing tokens, but it is the same amplify-through-depth mechanism that DID flip MiniMax's.
+  **Not the accumulator** (fp32 now) and **not the caches**: measured with the expert VRAM cache
+  disabled, and again with both VRAM and RAM caches disabled — nondeterministic in every arm. Since
+  layer 9's inputs are bitwise identical, the differing quantity is the expert GEMM's own output.
+  The fused-EXL3 path casts `current_state` to **fp16** and calls the EXL3 kernel through
+  `_make_bc_linear_exl3`, where the module-list path calls `ExLlamaV3Linear` and is now bitwise
+  deterministic — so the suspect is split-K/atomic accumulation inside the fused kernel path, not
+  Vaayu's Python. **Cost of chasing it is likely a third-party kernel change**; the cheap first step
+  is to confirm the kernel is the source by calling it twice on identical inputs in isolation.
+  (found 2026-08-09)
 ## Architectural gaps
 
-- [bug] **F3 prefix reuse is NOT token-identical on MiniMax's module-list MoE forward.**
-  `tests/test_batch_prefix_equivalence.py` with `PREFIX_CKPT=NeuroSenko--MiniMax-M2.7-exl3`: round 1
-  MISS and round 2 HIT both happen as designed, but `warm != cold` — **row 1 of 3 diverges from its
-  second token on**, while rows 0 and 2 stay byte-identical for all 8. Sampling is greedy
-  (`BatchRequest.temperature` defaults to 0.0 → `argmax`), so this is a real numeric/logic
-  difference, not sampling noise. **Pre-existing on `main`, not caused by the invariant check
-  below** — verified by stashing the change and re-running the identical command, same box, same
-  day, same failure. All three dispatch-table forwards were run:
-  | forward | model | warm == cold |
-  |---|---|---|
-  | dense | Llama-3.3-70B-exl3 | PASS (106 s) |
-  | MoE fused-EXL3 | Qwen3-235B | PASS (96 s) |
-  | MoE module-list | MiniMax-M2.7 | **FAIL** (71 s) |
-  So the defect is **specific to the module-list forward**, not to prefix reuse generally. This was
-  never caught because the Task 6 measurement harness times TTFT and never compares tokens, and
-  RESULTS §6's "4/4 succeeded" is a completion count, not an equivalence check — the only
-  token-identical claim on record is the 70B's. That one row diverging while its neighbours do not
-  points at per-row state in the broadcast rather than at global numerics; the module-list forward's
-  router (`route_tokens_to_experts`, sigmoid + `e_score_correction_bias`) is the one thing on this
-  path that differs from the two passing forwards. (found 2026-08-09)
 - [~] **F3 — cross-turn prefix cache in the batched paths.** Phase 1 (shared-prefix broadcast)
   landed 2026-08-09 on `feat/f3-batched-prefix-cache`: `batched_generate` computes the batch's
   longest common prefix, looks it up ONCE, broadcasts that cache to N rows, prefills only the
@@ -257,6 +252,28 @@ outcome.**
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.
 
+- **The MoE forwards accumulated experts in bf16, and expert ARRIVAL ORDER is nondeterministic — so
+  the engine was not a deterministic function of its input (fixed 2026-08-09).** Experts reach
+  `index_add_` in an order that varies run to run: VRAM-resident experts run first (residency
+  depends on cache warmth) and the rest arrive in **disk COMPLETION order** — `_iter_expert_loads`
+  waits `FIRST_COMPLETED` and iterates the resulting set. `final_hidden` was
+  `torch.zeros_like(hidden_states)`, i.e. **bf16**, whose ~2⁻⁸ rounding makes addition
+  non-associative at the 1-ULP scale. Measured on MiniMax, two forwards over identical ids: layer 0
+  bitwise identical, **layer 1 off by one bf16 ULP (0.00195)**, compounding to **37.0 by layer 62**
+  and max|Δlogit| **2.29** — **three distinct outputs from four identical greedy runs**
+  (`temperature=0.0`). Fix is an fp32 accumulator cast back at the return, in **all three** forwards.
+  After: bitwise identical, 4/4. Decode cost is **nil** — alternating same-day A/B, MiniMax
+  0.7833 vs 0.7812 tok/s (+0.27%), Qwen 0.4459 vs 0.4430 (+0.66%), both far inside this box's ~4%
+  resolution. Dense was **bitwise identical throughout**, before and after: it has no such
+  accumulation, which is what made it the control that localised this.
+  **Two lessons worth more than the fix:**
+  (a) **A perf-driven ordering optimisation silently became a correctness bug.** Consuming experts
+  in completion order is exactly right for overlapping disk reads, and it is what made the output
+  order-dependent. Anywhere output is accumulated in the order work completes, the accumulator's
+  precision is load-bearing.
+  (b) **Every MoE measurement before this date was taken on a nondeterministic engine.** Any
+  historical A/B under ~1 % on MiniMax, and any single-run quality/perplexity figure, carries this
+  as unmodelled variance.
 - **F3 Phase 1 ships; F3 Phase 2 is refuted at the measured tail sizes.** Shared-prefix broadcast in
   `batched_generate` cuts TTFT on a 3-stream fan-out over a ~1104-token shared prefix, with a control
   arm (pool OFF) that moves 1.00–1.01× — so the win is prefix reuse, not page cache or allocator

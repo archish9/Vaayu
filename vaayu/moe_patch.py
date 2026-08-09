@@ -818,7 +818,12 @@ def _make_modulelist_sparse_forward(
         # since it was a single-token spike, not a slow leak.
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         experts_list = getattr(block_info.moe_module, block_info.experts_attr)
-        final_hidden = torch.zeros_like(hidden_states)
+        # fp32 accumulator, cast back at the return -- see the extended note in
+        # _make_fused_sparse_forward_exl3. Experts reach index_add_ in an order
+        # that varies run to run (VRAM residency, then disk completion order),
+        # and a bf16 accumulator turns that into ~1 ULP per layer that compounds
+        # into different tokens over 62 layers.
+        final_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
 
         # Permutation dispatch (ported from _make_fused_sparse_forward_exl3): one
         # CPU argsort per layer instead of one torch.where scan per expert
@@ -1039,7 +1044,7 @@ def _make_modulelist_sparse_forward(
         vaayu_ref._expert_history[layer_idx] = unique_experts
         _trace_moe_block(vaayu_ref, layer_idx, "module_list", hidden_states,
                          final_hidden, routing_weights, unique_experts)
-        return final_hidden, router_logits
+        return final_hidden.to(hidden_states.dtype), router_logits
 
     return sparse_forward
 
@@ -1132,6 +1137,9 @@ def _make_fused_sparse_forward(
                 if raw is not None:
                     expert_tensors[eidx] = raw
 
+        # fp32 accumulator, cast back at the return -- see the identical note in
+        # _make_fused_sparse_forward_exl3. Experts reach index_add_ in disk
+        # completion order, and a bf16 accumulator makes that order observable.
         # Expert mask on CPU (avoids PCIe for index tensors)
         expert_indices_cpu = expert_indices.cpu()
         expert_mask = F.one_hot(
@@ -1139,7 +1147,7 @@ def _make_fused_sparse_forward(
         ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
 
         # ── Compute FFN on the target device ──────────────────────────────────
-        final_hidden = torch.zeros_like(flat_hidden)
+        final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
 
         for eidx in unique_experts:
             raw = expert_tensors.get(eidx)
@@ -1169,7 +1177,7 @@ def _make_fused_sparse_forward(
 
             del w_gate_gpu, w_down_gpu, w_up_gpu
 
-        result = final_hidden
+        result = final_hidden.to(flat_hidden.dtype)
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return result.view(B, S, H)
@@ -1570,7 +1578,17 @@ def _make_fused_sparse_forward_exl3(
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
 
-        final_hidden = torch.zeros_like(flat_hidden)
+        # fp32 accumulator, cast back at the return. Experts land in
+        # index_add_ order, and that order is NOT deterministic: cache-resident
+        # experts run first (residency varies with warmth) and the rest arrive
+        # in disk COMPLETION order (_iter_expert_loads waits FIRST_COMPLETED).
+        # Accumulating in bf16 makes that order observable -- bf16 addition
+        # rounds at ~2^-8, so a reordered sum differs by ~1 ULP per layer, and
+        # over a deep stack that compounds into different tokens. fp32 rounds
+        # at ~2^-24, far below the bf16 output's own precision, so the cast
+        # result is identical whatever the order. Measured on MiniMax: 3
+        # distinct outputs in 4 identical runs before, bitwise identical after.
+        final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
         intermediate_size = None  # inferred lazily from the first expert we see
 
         _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
@@ -1784,6 +1802,7 @@ def _make_fused_sparse_forward_exl3(
             vaayu_ref._chunk_major_gpu_bytes = 0
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
+        final_hidden = final_hidden.to(flat_hidden.dtype)
         _trace_moe_block(vaayu_ref, layer_idx, "fused_exl3", flat_hidden,
                          final_hidden, routing_weights, unique_experts)
         return final_hidden.view(B, S, H)
