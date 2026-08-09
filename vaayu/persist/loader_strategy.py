@@ -91,6 +91,43 @@ class LoaderStrategy(ABC):
 # Standard safetensors strategy  (wraps existing Vaayu logic unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _assign_tensor_by_path(root: nn.Module, dotted: str, tensor) -> None:
+    """Put `tensor` back at `dotted` under `root` (buffer or attribute)."""
+    parts = dotted.split(".")
+    mod = root
+    for part in parts[:-1]:
+        mod = getattr(mod, part)
+    leaf = parts[-1]
+    if leaf in mod._buffers:
+        mod._buffers[leaf] = tensor
+    else:
+        setattr(mod, leaf, tensor)
+
+
+def _to_meta_preserving_buffers(layer_module: nn.Module) -> None:
+    """`layer_module.to("meta")`, but buffers survive.
+
+    Sending PARAMETERS to meta is the point of layer streaming: they are the
+    large tensors and the next per-layer load restores them from the
+    checkpoint. BUFFERS are different. A module may register one the checkpoint
+    has no tensor for -- MiniMax-M2's `MiniMaxM2SparseMoeBlock` does exactly
+    this with `e_score_correction_bias` -- in which case the only thing that
+    ever materialized it was the load-time `named_buffers()` pass in
+    vaayu_base. Re-metaing it here destroyed it permanently: the layer's router
+    worked on the FIRST forward pass and every later pass died with
+    "Tensor on device meta is not on the expected device cuda:0!".
+
+    Costs no extra memory: the saved entries are the SAME tensor objects the
+    module already held, so holding a reference across the call keeps them
+    alive rather than copying them.
+    """
+    saved = [(name, buf) for name, buf in layer_module.named_buffers(recurse=True)
+             if buf is not None and buf.device.type != "meta"]
+    layer_module.to("meta")
+    for name, buf in saved:
+        _assign_tensor_by_path(layer_module, name, buf)
+
+
 class StandardSafetensorsStrategy(LoaderStrategy):
     """
     Proxies load_from_disk → utils.load_layer (existing pinned/io_uring path).
@@ -142,7 +179,7 @@ class StandardSafetensorsStrategy(LoaderStrategy):
             for param_name in moved_layers:
                 set_module_tensor_to_device(model, param_name, "meta")
         else:
-            layer_module.to("meta")
+            _to_meta_preserving_buffers(layer_module)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -583,7 +620,7 @@ class EXL3LoaderStrategy(LoaderStrategy):
                 except Exception:
                     pass
 
-        layer_module.to("meta")
+        _to_meta_preserving_buffers(layer_module)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
