@@ -21,7 +21,8 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **1** | ~~Strengthen the dense smoke test (**D2**)~~ — **DONE 2026-08-09** | Gate is now teacher-forced perplexity, not token count. It caught D1 immediately. |
 | **2** | ~~Fix the dense path (**D1**)~~ — **DONE 2026-08-09** | Tied `lm_head` was never weighted; see Settled. Left behind **D4** (the splitter still emits the empty shard) — unblocked, not urgent. |
 | **3** | ~~Make VRAM exhaustion fail honestly (**D3**)~~ — **DONE 2026-08-09** | `_precompute_rope` now raises with the OOM chained instead of returning an overloaded `None`. See Settled. | Cheap, and it has already cost one full debugging cycle. A VRAM OOM currently surfaces as a `TypeError` ~30 frames away, and the "graceful fallback" the message promises does not exist. Every later item on this list runs near the VRAM ceiling — fix the diagnostic before you need it. |
-| **4** | **F3 — wire the prefix cache into `batched_generate`** ← **START HERE** | The single biggest architectural gap. §0's two shaping facts — parallel fan-out and heavy context reuse — **cannot compose** today. Plan L just took Qwen's pool 2.36 → 10.53 GB, which is enough to hold a fan-out's sessions; F3 is what stops them being used. **Also do this before Plan K**, whose measurement is biased by its absence (K's plan §8c). |
+| **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
+| **4b** | **Fix MiniMax's non-identical output under prefix reuse** ← **START HERE** | Correctness, and it is in merged code on an actively-tested target. F3's measured win on the module-list forward is not bankable until `warm == cold` holds there — a 2.15× TTFT win that changes the tokens is not a win. Dense and fused-EXL3 both pass, so the search is bounded to one forward. |
 | **5** | **Plan K — batched-decode admission reclaim** | Scheduled, self-contained, and has a measured **1.28× aggregate** waiting in it. Lands cleaner after F3 because the batch arm will finally get prefix HITs. |
 | **6** | **F4 + characterize the 7.7k→8.2k VRAM cliff** | A real accounting bug plus an unexplained context-length cliff on this box. Do it after K so K's sweep tells you where the cliff actually bites. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
@@ -76,27 +77,64 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 ## Architectural gaps
 
+- [bug] **F3 prefix reuse is NOT token-identical on MiniMax's module-list MoE forward.**
+  `tests/test_batch_prefix_equivalence.py` with `PREFIX_CKPT=NeuroSenko--MiniMax-M2.7-exl3`: round 1
+  MISS and round 2 HIT both happen as designed, but `warm != cold` — **row 1 of 3 diverges from its
+  second token on**, while rows 0 and 2 stay byte-identical for all 8. Sampling is greedy
+  (`BatchRequest.temperature` defaults to 0.0 → `argmax`), so this is a real numeric/logic
+  difference, not sampling noise. **Pre-existing on `main`, not caused by the invariant check
+  below** — verified by stashing the change and re-running the identical command, same box, same
+  day, same failure. All three dispatch-table forwards were run:
+  | forward | model | warm == cold |
+  |---|---|---|
+  | dense | Llama-3.3-70B-exl3 | PASS (106 s) |
+  | MoE fused-EXL3 | Qwen3-235B | PASS (96 s) |
+  | MoE module-list | MiniMax-M2.7 | **FAIL** (71 s) |
+  So the defect is **specific to the module-list forward**, not to prefix reuse generally. This was
+  never caught because the Task 6 measurement harness times TTFT and never compares tokens, and
+  RESULTS §6's "4/4 succeeded" is a completion count, not an equivalence check — the only
+  token-identical claim on record is the 70B's. That one row diverging while its neighbours do not
+  points at per-row state in the broadcast rather than at global numerics; the module-list forward's
+  router (`route_tokens_to_experts`, sigmoid + `e_score_correction_bias`) is the one thing on this
+  path that differs from the two passing forwards. (found 2026-08-09)
 - [~] **F3 — cross-turn prefix cache in the batched paths.** Phase 1 (shared-prefix broadcast)
   landed 2026-08-09 on `feat/f3-batched-prefix-cache`: `batched_generate` computes the batch's
   longest common prefix, looks it up ONCE, broadcasts that cache to N rows, prefills only the
   divergent tails, and stores exactly one entry back (from the longest-prompt row, inside the
   `finally` so an abandoned generator cannot lose the popped entry). `speculative_generate` is
-  wired in too. Verified token-identical on Llama-3.3-70B-exl3: round 1 MISS, round 2 HIT,
-  `warm == cold`. **Remaining: the measurement (plan Task 6)** — the coverage fraction that gates
-  whether Phase 2 is ever built, plus the TTFT A/B that Plan K needs. Phase 2 (ragged per-stream
-  merge) is NOT built and needs that number first; it also needs a cache-class change, since
+  wired in too. Token-identical on Llama-3.3-70B-exl3 and Qwen3-235B; **NOT on MiniMax — see the
+  bug above.** Task 6's measurement is DONE (coverage + TTFT A/B, all three forwards; verdict in
+  Settled). Phase 2 (ragged per-stream merge) is REFUTED at the measured tail sizes and is NOT
+  built; reopening it needs a workload with ~500-token mean tails AND a cache-class change, since
   `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
   Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
-- [bug] **F3: one unreproduced attention-mask/KV length mismatch.**
+  Results: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-RESULTS.md` (docs/ is gitignored)
+- [bug] **F3: one unreproduced attention-mask/KV length mismatch. Suspect REFUTED 2026-08-09;
+  still open, now with a tripwire.**
   `RuntimeError: The expanded size of the tensor (1690) must match the existing size (1127) at
   non-singleton dimension 3. Target sizes: [3, 64, 1127, 1690]. Tensor sizes: [3, 1, 1127, 1127]` —
-  mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). Did NOT reproduce
-  across 7 later runs of the identical config; **not fixed, not explained.** Instrumentation proved
-  round 1 runs with `m=0, kv=None` (F3's path is a no-op there), so the suspect is **round 2 with a
-  PARTIAL match** — `m` strictly between 0 and `len(common_ids)` — which every successful run
-  avoided by matching the full prefix. The Task 3 review predicted a mechanism here and called it
-  "degenerate but not reachable from a real lookup() hit". Reproducer to build: a batch whose common
-  prefix is a STRICT prefix of a longer stored entry. (found 2026-08-09, F3 Task 6)
+  mask built for a 1127-long KV while the cache held 563 more (1690 = 1127 + 563). The failing log
+  was never preserved; only this transcribed message survives.
+  **The documented suspect — round 2 with a PARTIAL match — is refuted.**
+  `tests/test_batch_prefix_partial_match.py` drives `batched_generate` through exactly that shape
+  (batch's common prefix a STRICT prefix of a longer stored entry), its inverse, a ragged-length
+  version, the shortest-prompt-minus-one clamp, and every decode step, asserting mask width ==
+  past + q_len at each forward. All hold.
+  **What the arithmetic pins down:** mask width is always `m + max_R` and `q_len == max_R`, so a
+  width equal to `q_len` means `m` was 0 in the mask while the cache held 563. Inside
+  `batched_generate` that state is unreachable — `m <= 0 ⟹ kv = None` has guarded it since the
+  first F3 commit (`23bd619`). So the disagreement was introduced OUTSIDE that function, or by a
+  build predating one of the three fix commits.
+  **Remaining suspects, in order:** (a) per-layer `_seq_len` divergence — `get_seq_length()` reads
+  layer 0 ONLY, so a cache whose layers hold different lengths satisfies every length check in
+  `forward()` and still mismatches at whichever layer differs (a forward that raised mid-layer-loop
+  is how a cache reaches that state, and this campaign did hit a CUDA OOM); (b) a `_batch_decode_active`
+  leak putting a non-batched caller's 2D mask down the batch branch.
+  **Landed meanwhile:** `check_batch_kv_invariant` (`vaayu_base.py`) now runs at the point where the
+  mask is built and raises naming both lengths and which side is wrong, so a recurrence reports its
+  own cause instead of surfacing ~30 frames away inside attention — bug D3's lesson applied to a
+  second subsystem. Pinned by `tests/test_batch_mask_kv_invariant.py`, including a case
+  reconstructing the exact 1127/563/1690 state. (found 2026-08-09, F3 Task 6)
 - [ ] **`speculative_generate` skips `enqueue_truncate` on a prefix HIT, so `enable_kv_persist`
   can corrupt that session's on-disk KV.** `generate()` calls
   `self._kv_writer.enqueue_truncate(session_id, match_len)` on a HIT; the new
@@ -219,6 +257,25 @@ outcome.**
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.
 
+- **F3 Phase 1 ships; F3 Phase 2 is refuted at the measured tail sizes.** Shared-prefix broadcast in
+  `batched_generate` cuts TTFT on a 3-stream fan-out over a ~1104-token shared prefix, with a control
+  arm (pool OFF) that moves 1.00–1.01× — so the win is prefix reuse, not page cache or allocator
+  warmth. **The speedup spans 2.8× across models and must never be quoted bare:** Llama-3.3-70B-exl3
+  dense **4.96×** (n=3), MiniMax-M2.7 module-list **2.15×** (n=2), Qwen3-235B fused-EXL3 **1.76×**
+  (n=1 usable). Coverage is 0.981–0.983 on all three because it is a property of the prompts, not the
+  model; the divergent tails are 1.7 % of prefill, so Phase 2 — which needs a cache-class change,
+  `_seq_len` being per-LAYER — would be paying for 1.7 %. Break-even is roughly a **500-token mean
+  tail**. Re-measure before reopening; do not re-scope Phase 2 to find a win.
+- **The FIRST run of a checkpoint in a session is not a valid baseline, even same-box same-day
+  same-process.** Qwen's repeat 0 cold arm took **165.7 s** against 29.1–29.2 s in the other three
+  runs — a 5.7× first-touch NVMe outlier that inflated its ratio to 10.20×. The warm arm was stable
+  across both repeats, so the BASELINE was contaminated, not the treatment; averaging the repeats
+  would have baked a disk-warming artifact into a headline. Discard or repeat any checkpoint's first
+  touch.
+- **A completion count is not an equivalence check.** F3's "4/4 succeeded" on MiniMax meant four runs
+  did not crash; the harness timed TTFT and never compared tokens. The token-equivalence gate, run
+  later, FAILED on that same model. Whenever a perf harness and a correctness gate are separate,
+  a green perf run says nothing about correctness.
 - **No expert pin is viable.** Eviction share is linear in N and always 2–4× below the pin's share of
   the cache, on both models. (Plan F, whole curve measured)
 - **The expert VRAM cache is NOT emptied every prefill, and preserving it would not help.** 0 wipes
