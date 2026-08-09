@@ -237,13 +237,18 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   layers, so nothing ever weighted it. Measured, all same box same day:
   | arm | ppl | note |
   |---|---|---|
-  | Llama-3.2-1B (tied), before | 128365.41 | vocab-uniform baseline 128256 — literally zero signal |
-  | Llama-3.2-1B (tied), after | **11.94** | |
-  | Llama-3.3-70B-exl3 (untied) | 8.78 → 8.78 | unaffected both sides of the fix |
-  | MiniMax-M2.7 (MoE, module-list) | 8.73 | shared pin phase, no regression |
+  | arm | forward | ppl | note |
+  |---|---|---|---|
+  | Llama-3.2-1B (tied), before | dense | 128365.41 | vocab-uniform baseline 128256 — zero signal |
+  | Llama-3.2-1B (tied), after | dense | **11.94** | |
+  | Llama-3.3-70B-exl3 (untied) | dense | 8.78 → 8.78 | unaffected both sides of the fix |
+  | MiniMax-M2.7 | MoE module-list | 8.73 / 8.66 | shared pin phase, no regression |
+  | Qwen3-235B (94 layers) | MoE fused-EXL3 | **6.71** | arena + prefill-stager path |
+  **All four rows of `CLAUDE.md` §0's dispatch table that have an on-device model were measured.**
+  Every untied checkpoint pinned a real `lm_head` (70B 0.79 GB, MiniMax 0.46, Qwen 0.47); the tied
+  branch stays silent for them.
   **A perplexity at the vocab-uniform baseline means an unweighted output layer — go to weight
   loading, not to attention.** Three attn impls failing identically was the same tell, misread.
-  Qwen was NOT re-run: the changed code only diverges when a shared layer loads zero tensors.
 
 ---
 
