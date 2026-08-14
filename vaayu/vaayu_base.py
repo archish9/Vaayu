@@ -2379,6 +2379,13 @@ class VaayuBaseModel(GenerationMixin):
         built once at load time from the same reserve the expert VRAM cache
         also subtracts (expert_vram_budget_for) -- see vram_plan.py's module
         docstring for why the two budgets must share one reserve number.
+
+        Reads self._vram_plan directly, NOT via getattr: __init__ always sets
+        it (to None or a real VramPlan), so a missing attribute here is a
+        genuine bug, not a legitimate "no plan" state -- unlike
+        _assert_context_fits's getattr, which is a diagnostic guard bound by
+        the D3 rule that a diagnostic must never itself crash. A budget
+        computation should fail loudly instead; do not "harmonize" the two.
         """
         if not torch.cuda.is_available():
             return 0
@@ -2410,14 +2417,21 @@ class VaayuBaseModel(GenerationMixin):
         shape = dataclasses.replace(shape, N=int(N))
         try:
             free_vram, _ = torch.cuda.mem_get_info()
-            resident = torch.cuda.memory_allocated()
         except Exception:
             return
+        # Compare against free_vram alone, NOT free_vram + resident.
+        # mem_get_info() already reports free VRAM excluding this process's
+        # own allocations (verified empirically), and predict_peak_vram's
+        # terms are KV + activations + scores + logits -- there is no
+        # model-weights term, so `need` is a TRANSIENT, not an absolute peak.
+        # Adding resident back in would double-count it and pretend the
+        # pinned weights/expert cache are not resident, inflating the
+        # admitted budget by exactly that amount.
         need = predict_peak_vram(shape, int(n_tokens))
-        if need > free_vram + resident:
+        if need > free_vram:
             raise VramPlanError(_too_big_message(
                 requested=int(n_tokens), s_max=plan.s_max,
-                free_vram=free_vram + resident, shape=shape,
+                free_vram=free_vram, shape=shape,
                 min_resident=0))
 
     def _kv_cache_is_bucketed(self) -> bool:
@@ -3887,6 +3901,12 @@ class VaayuBaseModel(GenerationMixin):
         if input_ids is None and args:
             input_ids = args[0]
         if input_ids is not None:
+            # kwargs.get(..., 0): every in-repo caller passes max_new_tokens
+            # explicitly. A caller relying on self.generation_config's default
+            # instead would under-count here -- HF's own merge of kwargs with
+            # generation_config happens deeper inside super().generate(),
+            # replicating it here was judged not worth the duplication for a
+            # gap no current call site hits.
             self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0))
 
         pc = getattr(self, "_prefix_cache", None)

@@ -633,10 +633,49 @@ def test_eager_mask_shape_and_causal_structure_from_pos_range():
 def test_batch_width_is_rechecked_against_the_plan():
     """The plan is sized for N=1. A fan-out of N streams multiplies KV,
     activations and logits, so admission must re-evaluate rather than assume the
-    load-time answer still holds. Plan K measured N>=2 at ~7700 tokens as
-    infeasible on this box for both MoE models."""
+    load-time answer still holds. This holds at the reserve_floor=0 operating
+    point exercised here (`_plan(name)`'s default -- chosen=s_max, essentially
+    the whole card), where s_max is generous enough that N=3 obviously
+    overflows. It is NOT the same claim as "N=3 is rejected at the
+    max_seq_len the running model actually uses in production" -- see
+    test_batch_width_at_the_real_reserve_floor_xfails below, which checks
+    that point directly and currently does NOT hold there."""
     import dataclasses
     sh = shape_for("minimax-m2.7")
     p = _plan("minimax-m2.7")
+    wide = dataclasses.replace(sh, N=3)
+    assert predict_peak_vram(wide, p.max_seq_len) > USABLE_VRAM
+
+
+@pytest.mark.xfail(reason="uncalibrated model under-predicts at N>1 (see docstring)",
+                   strict=False)
+def test_batch_width_at_the_real_reserve_floor_xfails():
+    """Prior ON-DEVICE measurement (Plan K) established that N>=2 at ~7700
+    tokens is infeasible on this box for both MoE models -- a real GPU OOM,
+    not a model prediction. This test checks that claim at the operating
+    point production actually uses: self._vram_plan.max_seq_len as built by
+    vaayu_base.py's __init__, which calls plan_vria with
+    reserve_floor=_VRAM_RESERVE_FLOOR_BYTES (3.5 GiB), not the
+    reserve_floor=0 default test_batch_width_is_rechecked_against_the_plan
+    above exercises.
+
+    It currently does NOT hold: DEFAULT_ACT_COEFF/DEFAULT_ALLOC_FACTOR remain
+    the Task 3 placeholders (task-8-report.md), never calibrated past a
+    worst -28% UNDER-prediction, and that -28% bound was only ever validated
+    at N=1 -- extrapolating to N=2/3 is out of sample. At minimax-m2.7's real
+    floor-derived max_seq_len (8192 tokens), predict_peak_vram at N=3
+    currently comes out to ~9.5 GiB, comfortably under this box's 15.47 GiB,
+    even though real hardware cannot actually sustain it there. So this
+    xfails today -- `_assert_context_fits` can admit an N=3 batch at this
+    length that will not actually fit.
+
+    strict=False (report XPASS, not a suite failure) so that the day
+    calibration is fixed and this starts passing, the run says so loudly
+    instead of quietly landing as one-more-green-test: an XPASS here is the
+    signal that the underlying gap has finally closed."""
+    from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
+    import dataclasses
+    sh = shape_for("minimax-m2.7")
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
     wide = dataclasses.replace(sh, N=3)
     assert predict_peak_vram(wide, p.max_seq_len) > USABLE_VRAM
