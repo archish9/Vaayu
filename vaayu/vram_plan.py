@@ -72,18 +72,26 @@ def kv_bytes_per_token(*, num_hidden_layers: int, num_key_value_heads: int,
 
 
 # Still Task 3's UNFITTED placeholders. Task 5b (2026-08-09) fixed the KV
-# term's structural bug (see kv_capacity_tokens) and re-ran the ±10% gate
-# against Task 5's already-logged measurements with the CORRECTED model --
-# the fit improved (13/17 points outside +-10%, worst +41.2% -> 11/17, worst
-# -30.2%) but still FAILED the gate. A second, uncorrected term explains most
-# of the remaining residual: the trailing PARTIAL chunk's real length (S mod
-# prefill_chunk_size) is not the constant `chunk` _peak_intercept_bytes
-# assumes, which the Task 5 report already flagged as a secondary effect
-# (docs/superpowers/plans/2026-08-09-vram-plan-RESULTS.md). Per that same
-# report's and this task's own rule -- do not tune constants to force a
-# failing gate to pass -- these stay the Task 3 placeholders. See
-# docs/superpowers/plans/2026-08-09-vram-plan-RESULTS.md, section "Task 5b"
-# for the full corrected-model gate table and the fit that was attempted.
+# term's structural bug (see kv_capacity_tokens): fit improved from 13/17
+# points outside +-10% (worst +41.2%) to 11/17 (worst -30.2%), still FAILED.
+# Task 5c (2026-08-14) then fixed the second, already-flagged term --
+# _peak_intercept_bytes now follows the real trailing chunk
+# (_trailing_chunk_tokens: S mod prefill_chunk_size, never the constant
+# `chunk`) -- and re-ran OLS against the same 17 already-logged Task 5
+# measurements with BOTH corrections in place: 10/17 outside +-10% (worst
+# -28.0%, unweighted) / 8/17 (worst +28.9%, relative-error-weighted). Still
+# FAILS the gate, and the residual is no longer explained by a further named
+# mechanism: MiniMax's within-bucket drift matches the trailing-chunk theory
+# closely, but Qwen's measured peak is nearly FLAT within its bucket
+# (+-1%, S=5000..7700) where the trailing-chunk model predicts a large drop
+# -- evidence of a real forward-path difference (MoE layer-major prefill
+# never calls the dense legacy loop's per-chunk reset_peak_memory_stats(),
+# so its observed peak can reflect the largest INTERMEDIATE chunk's
+# transient, not only the last chunk's logits) that is not modeled here.
+# Per this task's own rule (mirroring Task 5/5b) -- do not tune constants to
+# force a failing gate to pass -- these stay the Task 3 placeholders. This is
+# the last corrective round (see task-5c-report.md): the failure is reported,
+# not hidden.
 DEFAULT_ACT_COEFF = 4.0
 DEFAULT_ALLOC_FACTOR = 1.18
 
@@ -198,26 +206,59 @@ def _kv_term_bytes(shape: VramShape, S: int) -> int:
     return shape.kv_per_token * cap * shape.N
 
 
-def _peak_intercept_bytes(shape: VramShape) -> float:
-    """Bytes of peak VRAM independent of context length, before alloc_factor.
+def _trailing_chunk_tokens(S: int, chunk: int) -> int:
+    """Length, in tokens, of the LAST prefill chunk of a context of S tokens.
+
+    Chunked prefill processes S tokens as ceil(S/chunk) slices of `chunk`
+    tokens each, except the final slice, which is only `chunk` tokens long
+    when S divides evenly -- otherwise it is the S tokens (S <= chunk, only
+    one slice exists at all) or S mod chunk tokens (S > chunk). Task 5/5b
+    (task-5-report.md, RESULTS "Task 5b" section) measured
+    `_peak_intercept_bytes` charging the constant `chunk` here instead,
+    producing a sawtooth error that tracks this exact quantity: MiniMax's
+    trailing chunk shrinks 392->368->344->20 tokens across S=5000..7700 at
+    chunk=512, matching the observed drift in measured peak almost exactly.
+
+    S mod chunk == 0 (an exact multiple) is a FULL trailing chunk, not an
+    empty one -- plain `%` alone would return 0 there, which is wrong (there
+    is still one slice of `chunk` tokens; nothing about prefill produces a
+    zero-length final chunk). S <= 0 has no chunk at all.
+    """
+    s, c = int(S), int(chunk)
+    if s <= 0:
+        return 0
+    return ((s - 1) % c) + 1
+
+
+def _peak_intercept_bytes(shape: VramShape, S: int) -> float:
+    """Bytes of peak VRAM from the last chunk's logits, before alloc_factor.
 
     Only the last chunk's logits are materialized (vaayu_base.py:3512-3519), and
-    sampling upcasts them to fp32 -- hence (elem_bytes + 4).
+    sampling upcasts them to fp32 -- hence (elem_bytes + 4). The last chunk is
+    `_trailing_chunk_tokens(S, shape.chunk)` tokens long, not always a full
+    `chunk` -- see that function's docstring for the measured evidence.
     """
-    return shape.N * shape.chunk * shape.vocab * (shape.elem_bytes + 4)
+    trailing = _trailing_chunk_tokens(S, shape.chunk)
+    return shape.N * trailing * shape.vocab * (shape.elem_bytes + 4)
 
 
 def predict_peak_vram(shape: VramShape, S: int) -> int:
     """Predicted PEAK VRAM in bytes for a prefill of S tokens at this shape.
 
-    PIECEWISE-linear in S, not linear everywhere: the KV term
-    (_kv_term_bytes) is a step function of S on any bucketed shape (every
-    EXL3 checkpoint's ring-buffer KV cache), flat within a capacity bucket
-    and jumping by a whole bucket's worth of KV at each boundary. Every
-    other term stays linear. solve_max_seq_len below no longer inverts this
-    in closed form for that reason -- see its docstring.
+    PIECEWISE-linear in S, not linear everywhere, and NOT globally monotone:
+    the KV term (_kv_term_bytes) is a step function of S on any bucketed
+    shape (every EXL3 checkpoint's ring-buffer KV cache), flat within a
+    capacity bucket and jumping by a whole bucket's worth of KV at each
+    boundary; the intercept (_peak_intercept_bytes) is a sawtooth that RESETS
+    DOWN at every chunk boundary (trailing chunk goes from a full `chunk`
+    back to 1 token) even as the linear activation term keeps climbing --
+    so crossing an ordinary (non-doubling) chunk boundary can make peak VRAM
+    go DOWN as S goes up (measured: MiniMax/Qwen/Llama-1b all show this,
+    task-5b-report.md). solve_max_seq_len below accounts for this
+    explicitly -- see its docstring for why a plain single-level binary
+    search over this function would be unsound.
     """
-    raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_intercept_bytes(shape)
+    raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_intercept_bytes(shape, int(S))
            + _kv_term_bytes(shape, S))
     return int(round(raw * shape.alloc_factor))
 
@@ -239,20 +280,46 @@ class VramPlan:
 
 def solve_max_seq_len(*, free_vram: int, min_resident: int,
                       shape: VramShape) -> int:
-    """Largest S with predict_peak_vram(shape, S) + min_resident <= free_vram.
+    """Largest S such that predict_peak_vram(shape, S') + min_resident <=
+    free_vram for EVERY S' in [1, S] -- not just for S itself.
 
-    predict_peak_vram is no longer linear in S (the KV term is a step
-    function -- see kv_capacity_tokens), so this is no longer a division.
-    It IS still monotone non-decreasing in S: the linear terms have
-    non-negative slope, kv_capacity_tokens never decreases, and
-    round()/alloc_factor preserve monotonicity. A monotone step function is
-    invertible by search, so this does an exponential-then-binary search
-    directly against predict_peak_vram -- the exact same function callers
-    use to check feasibility, so there is no separate formula to drift out
-    of sync with it, and it is exact at bucket boundaries by construction
-    (see test_solve_max_seq_len_is_exact_at_its_own_bucket_boundary).
-    `min_resident` is the floor the model needs beside the transient -- one
-    expert for MoE, 0 for dense.
+    That stronger property is what a max_seq_len CAP must actually
+    guarantee: plan_vram reserves VRAM once, sized at exactly the chosen
+    max_seq_len, and that one reservation has to cover any real request up
+    to that length. It is also no longer the same question as "the single
+    largest S that fits": Task 5c made `_peak_intercept_bytes` follow the
+    real trailing chunk, which RESETS DOWN at every chunk boundary even as
+    the other terms keep climbing -- so predict_peak_vram is NOT monotone in
+    S (see test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_
+    boundary). A plain single-level binary search assumes "doesn't fit here
+    -> doesn't fit anywhere larger," which this function can violate; used
+    directly it can return an S that itself fits while some SMALLER S' does
+    not -- silently wrong in the unsafe direction.
+
+    Two facts rescue an exact search:
+    - predict_peak_vram AT chunk boundaries (S = k*chunk) is monotone
+      non-decreasing in k: the trailing chunk is always exactly `chunk`
+      there (constant across k, so the intercept cannot be the one term
+      pulling it down), kv_capacity_tokens never decreases in k, and the
+      linear slope term is non-negative in k.
+    - WITHIN one boundary-to-boundary period (S in (k*chunk, (k+1)*chunk]),
+      the trailing chunk climbs monotonically from 1 back up to `chunk`
+      while the KV bucket is constant (kv_capacity_tokens only changes AT
+      the boundaries) -- so predict_peak_vram is monotone non-decreasing
+      within a period too.
+
+    So this runs two nested, individually-sound binary searches: first the
+    largest number of WHOLE periods k that fit entirely (monotone in k,
+    found by exponential-then-binary search against predict_peak_vram at
+    k*chunk), then a binary search of the one remaining partial period
+    (monotone within itself) for the exact token. Every S at or below the
+    chosen boundary is provably safe because boundary values are
+    non-decreasing in k -- pinned by
+    test_solve_max_seq_len_stays_safe_for_every_smaller_context and
+    test_solve_max_seq_len_can_land_exactly_on_a_chunk_boundary (the case
+    where nothing in the next period survives at all). `min_resident` is the
+    floor the model needs beside the transient -- one expert for MoE, 0 for
+    dense.
     """
     if shape.kv_per_token <= 0 or shape.hidden <= 0:
         raise VramPlanError(
@@ -264,10 +331,27 @@ def solve_max_seq_len(*, free_vram: int, min_resident: int,
     if budget <= 0 or predict_peak_vram(shape, 1) > budget:
         return 0
 
-    lo, hi = 1, 1
-    while predict_peak_vram(shape, hi) <= budget:
-        lo = hi
-        hi *= 2
+    chunk = int(shape.chunk)
+
+    def boundary(k: int) -> int:
+        return predict_peak_vram(shape, k * chunk)
+
+    lo_k, hi_k = 0, 1
+    while boundary(hi_k) <= budget:
+        lo_k = hi_k
+        hi_k *= 2
+    while lo_k < hi_k - 1:
+        mid = (lo_k + hi_k) // 2
+        if boundary(mid) <= budget:
+            lo_k = mid
+        else:
+            hi_k = mid
+
+    period_start = lo_k * chunk
+    if predict_peak_vram(shape, period_start + 1) > budget:
+        return period_start
+
+    lo, hi = period_start + 1, period_start + chunk
     while lo < hi - 1:
         mid = (lo + hi) // 2
         if predict_peak_vram(shape, mid) <= budget:

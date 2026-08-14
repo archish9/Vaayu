@@ -94,6 +94,8 @@ from vaayu.vram_plan import (
     DEFAULT_ACT_COEFF,
     DEFAULT_ALLOC_FACTOR,
     VramShape,
+    _peak_intercept_bytes,
+    _trailing_chunk_tokens,
     predict_peak_vram,
 )
 
@@ -264,6 +266,66 @@ def test_kv_dominates_at_long_context_on_a_flash_backend():
     assert kv > 0.5 * predict_peak_vram(sh, 7700)
 
 
+# --- _trailing_chunk_tokens / _peak_intercept_bytes: the real trailing chunk
+#
+# Task 5/5b already flagged that _peak_intercept_bytes charged the last
+# chunk's logits at a CONSTANT `chunk`, when the real trailing partial chunk
+# of a prefill is `S mod chunk` (never zero -- an exact multiple has a FULL
+# trailing chunk, not an empty one). Task 5c corrects this.
+
+def test_trailing_chunk_tokens_boundary_cases():
+    """S=0 -> no chunk at all. S < chunk -> the whole context is the one
+    partial chunk. S an exact multiple of chunk -> a FULL trailing chunk
+    (chunk, not 0 -- the naive `S % chunk` gets this case wrong). Anything
+    else -> S mod chunk."""
+    assert _trailing_chunk_tokens(0, chunk=512) == 0
+    assert _trailing_chunk_tokens(1, chunk=512) == 1
+    assert _trailing_chunk_tokens(5, chunk=512) == 5          # S < chunk
+    assert _trailing_chunk_tokens(512, chunk=512) == 512      # S == chunk
+    assert _trailing_chunk_tokens(513, chunk=512) == 1        # just past
+    assert _trailing_chunk_tokens(1024, chunk=512) == 512     # S == 2*chunk
+    assert _trailing_chunk_tokens(1025, chunk=512) == 1
+
+
+def test_trailing_chunk_tokens_matches_the_measured_report_figures():
+    """task-5-report.md / RESULTS Task 5b section measured the real trailing
+    partial chunk at chunk=512 for S=5000,6000,7000,7700,8200 as
+    392,368,344,20,8 tokens -- not the constant 512 the old model charged."""
+    for s, expected in ((5000, 392), (6000, 368), (7000, 344),
+                        (7700, 20), (8200, 8)):
+        assert _trailing_chunk_tokens(s, chunk=512) == expected
+
+
+def test_peak_intercept_bytes_follows_the_trailing_chunk_not_a_constant():
+    sh = shape_for("qwen3-235b")
+    assert _peak_intercept_bytes(sh, 0) == 0
+    # a full trailing chunk (S an exact multiple) charges the most; the very
+    # next token resets to a single-token trailing chunk and charges far less.
+    full = _peak_intercept_bytes(sh, sh.chunk)
+    reset = _peak_intercept_bytes(sh, sh.chunk + 1)
+    assert full == sh.N * sh.chunk * sh.vocab * (sh.elem_bytes + 4)
+    assert reset == sh.N * 1 * sh.vocab * (sh.elem_bytes + 4)
+    assert reset < full
+
+
+def test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_boundary():
+    """The whole reason solve_max_seq_len can no longer do a plain
+    single-level binary search: crossing an ordinary (non-doubling) chunk
+    boundary, the intercept's trailing-chunk reset (chunk tokens -> 1 token)
+    outweighs the tiny per-token activation slope, and the KV term does not
+    move at all if both S values share one capacity bucket -- so peak VRAM
+    actually goes DOWN as S goes up. This is the measured MiniMax/Qwen/
+    Llama-1b sawtooth (task-5b-report.md), not a bug."""
+    sh = shape_for("qwen3-235b")
+    boundary = 5 * sh.chunk  # not a KV capacity-doubling point (see below)
+    cap_before = kv_capacity_tokens(boundary, chunk=sh.chunk,
+                                    growth=sh.kv_growth_factor, buckets=True)
+    cap_after = kv_capacity_tokens(boundary + 1, chunk=sh.chunk,
+                                   growth=sh.kv_growth_factor, buckets=True)
+    assert cap_before == cap_after, "premise: no KV jump at this boundary"
+    assert predict_peak_vram(sh, boundary) > predict_peak_vram(sh, boundary + 1)
+
+
 from vaayu.vram_plan import (
     VramPlan,
     expert_vram_budget_for,
@@ -311,29 +373,34 @@ def test_reserve_covers_actual_kv_at_the_derived_context(name):
     assert p.reserve_bytes >= sh.kv_per_token * p.max_seq_len
 
 
-def test_the_four_geometries_are_not_collapsed_into_one_fixture():
+def test_the_four_geometries_produce_at_least_three_distinct_s_max():
     """Assert the fixture premise. Plan L's slab_index_of mutant passed 84/84
     because every fixture collapsed to a single chunk -- a test whose premise is
     not asserted can silently stop testing anything.
 
-    This used to require all FOUR s_max values distinct. Task 5b's bucketed
-    KV model (kv_capacity_tokens) makes that too strong: within a capacity
-    bucket the KV term is flat, so two shapes can each have enough budget to
-    fill a bucket up to its ceiling but not enough for the next doubling,
-    landing both exactly on that ceiling. Verified by hand at USABLE_VRAM:
-    llama-70b and minimax-m2.7 both solve to unclamped S=32768 even though
-    their kv_per_token values differ (327680 vs 253952 B/token) -- the
-    SATURATING bucket ceiling coincides, which is a real property of the
-    corrected model, not a fixture defect. So this now asserts the weaker,
-    still-meaningful claim the old test actually protected: the four
-    fixtures do not all collapse to ONE value."""
+    This used to require all FOUR s_max values distinct, then (Task 5b) was
+    weakened to merely "not all collapsed" because llama-70b and
+    minimax-m2.7 both saturate at the same S=32768 bucket ceiling. Task 5c's
+    trailing-chunk intercept correction changes the picture: verified by
+    hand at USABLE_VRAM, s_max is now {llama-1b: 131072 (position-limit
+    clamped), llama-70b: 32768, minimax-m2.7: 32768, qwen3-235b: 33166}. The
+    llama-70b/minimax-m2.7 tie is still real (same bucket-saturation
+    mechanism, demonstrated below) but qwen3-235b is no longer part of it --
+    the correction broke that specific collision. So this asserts the
+    three-way distinctness that IS real (one demonstrated pairwise tie, not
+    the weakest possible "not all four collapsed" claim), per this task's
+    instruction to show the actual colliding values rather than assume."""
     s_maxes = {name: _plan(name).s_max for name in GEOMETRIES}
-    assert len(set(s_maxes.values())) > 1, s_maxes
+    assert s_maxes["llama-70b"] == s_maxes["minimax-m2.7"], s_maxes
+    distinct = {s_maxes["llama-1b"], s_maxes["llama-70b"], s_maxes["qwen3-235b"]}
+    assert len(distinct) == 3, s_maxes
 
     unclamped = {name: solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES,
                                          shape=shape_for(name))
                 for name in GEOMETRIES}
-    assert len(set(unclamped.values())) > 1, unclamped
+    assert unclamped["llama-70b"] == unclamped["minimax-m2.7"], unclamped
+    distinct_unclamped = {unclamped["llama-1b"], unclamped["llama-70b"], unclamped["qwen3-235b"]}
+    assert len(distinct_unclamped) == 3, unclamped
 
 
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
@@ -353,19 +420,64 @@ def test_solve_max_seq_len_is_exact_at_its_own_bucket_boundary(name):
     assert predict_peak_vram(shape, s_max + 1) > budget
 
 
+def test_solve_max_seq_len_stays_safe_for_every_smaller_context():
+    """The property that actually matters: max_seq_len is a CAP, and the one
+    reserve plan_vram computes from it must cover any real request up to
+    that length -- not just a request of exactly max_seq_len tokens. Now
+    that the intercept sawtooths (predict_peak_vram is not globally
+    monotone -- see test_predict_peak_vram_is_not_globally_monotone_...),
+    a single-level binary search could return an S_max that fits by itself
+    while some SMALLER S' < S_max does not (a local sawtooth peak). Exhaust
+    every S' up to S_max on a small synthetic shape (cheap: chunk=16 keeps
+    the whole range tiny) to prove that cannot happen."""
+    tiny = VramShape(kv_per_token=37, N=1, chunk=16, hidden=64, n_heads=4,
+                     vocab=1000, elem_bytes=2, act_coeff=4.0,
+                     materializes_scores=False, alloc_factor=1.1,
+                     kv_growth_factor=2, kv_capacity_buckets=True)
+    free_vram = 400_000
+    s_max = solve_max_seq_len(free_vram=free_vram, min_resident=0, shape=tiny)
+    assert s_max > 0
+    for s in range(1, s_max + 1):
+        assert predict_peak_vram(tiny, s) <= free_vram, s
+    assert predict_peak_vram(tiny, s_max + 1) > free_vram
+
+
+def test_solve_max_seq_len_can_land_exactly_on_a_chunk_boundary():
+    """Pin the property the task calls out explicitly: at a KV
+    capacity-doubling boundary (S=8192, chunk=512, growth=2), the huge KV
+    jump to the next bucket cannot be offset by the tiny intercept drop, so
+    nothing past the boundary survives and solve_max_seq_len must return the
+    boundary itself -- predict_peak_vram(shape, S_max) <= budget <
+    predict_peak_vram(shape, S_max + 1), exactly at S_max = a chunk
+    boundary, not somewhere inside the next period."""
+    shape = shape_for("qwen3-235b")
+    boundary = 8192
+    assert kv_capacity_tokens(boundary, chunk=shape.chunk,
+                              growth=shape.kv_growth_factor, buckets=True) == 8192
+    assert kv_capacity_tokens(boundary + 1, chunk=shape.chunk,
+                              growth=shape.kv_growth_factor, buckets=True) == 16384
+    budget = predict_peak_vram(shape, boundary)
+    s_max = solve_max_seq_len(free_vram=budget, min_resident=0, shape=shape)
+    assert s_max == boundary
+    assert predict_peak_vram(shape, s_max) <= budget
+    assert predict_peak_vram(shape, s_max + 1) > budget
+
+
 def test_s_max_decreases_as_kv_per_token_grows():
-    """Was a strict '<'. Task 5b's bucketed KV model (kv_capacity_tokens)
-    makes the KV term flat within a capacity bucket, so a fatter KV/token
-    shape can legitimately SATURATE at the same bucket ceiling as a thinner
-    one (verified by hand at USABLE_VRAM + DEFAULT_ACT_COEFF/ALLOC_FACTOR:
-    llama-70b and qwen3-235b both land on unclamped S=32768) without
-    contradicting "more KV cost never buys more context" -- that claim is
-    <=, not <, once the KV term can plateau."""
+    """Task 5b weakened this to '<=' because llama-70b and qwen3-235b tied
+    at unclamped S=32768 under the (still-uncorrected) intercept. Task 5c's
+    trailing-chunk correction breaks that specific tie: verified by hand at
+    USABLE_VRAM + DEFAULT_ACT_COEFF/ALLOC_FACTOR, llama-70b now solves to
+    32768 and qwen3-235b to 33166 (strictly larger) -- fatter KV/token (327680
+    vs 192512 B/token) strictly buys less context again for this pair, so
+    '<' is restored. (llama-70b still ties with minimax-m2.7 at 32768 --
+    see test_the_four_geometries_produce_at_least_three_distinct_s_max --
+    but that is a different pair from the one this test compares.)"""
     fat = shape_for("llama-70b")            # 0.328 MB/token
     thin = shape_for("qwen3-235b")          # 0.193 MB/token
     assert fat.kv_per_token > thin.kv_per_token
     assert (solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=fat)
-            <= solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=thin))
+            < solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=thin))
 
 
 def test_s_max_is_capped_by_position_limit():
@@ -389,18 +501,22 @@ def test_requested_context_below_s_max_is_accepted_unchanged():
 
 
 def test_free_vram_too_small_for_any_context_raises():
-    """Measured collapse threshold for llama-70b is ~0.44 GiB, and it sits
-    there because the floor is _peak_intercept_bytes -- the S-independent
-    last-chunk logits buffer -- not KV. "Too small for any context" really
-    means "too small for one chunk's logits." 0.25 GiB is deliberately well
-    under that threshold rather than just under it: the intercept does not
-    depend on act_coeff at all, and alloc_factor is always >= 1.0, so
-    (0.25 GiB - min_resident) / alloc_factor - intercept < 0 holds for ANY
-    value a later measurement task could give those constants. A value chosen
-    just under 0.44 GiB would silently stop testing the raise path once the
-    constants are re-measured."""
+    """Task 5c made _peak_intercept_bytes follow the real trailing chunk
+    (_trailing_chunk_tokens), not a constant `chunk` -- so at S=1 the
+    intercept is now a SINGLE token's logits, not a whole chunk's worth. The
+    old ~0.44 GiB collapse threshold was itself an artifact of that bug (a
+    phantom chunk-sized floor that never existed at S=1); the real floor at
+    S=1 is now on the order of a couple MB for every geometry (it is
+    N*1*vocab*(elem_bytes+4) plus a couple-token KV/activation sliver, all
+    tiny by construction since they are multiplied by S=1), so the dominant
+    term is simply `min_resident` (EXPERT_BYTES). A free_vram well under
+    EXPERT_BYTES alone is unreconcilable regardless of act_coeff/alloc_factor
+    -- solve_max_seq_len's own budget<=0 guard fires before predict_peak_vram
+    is even evaluated, so this is robust to any later re-measurement of
+    those constants."""
+    assert EXPERT_BYTES > int(5 * MB)  # premise: min_resident alone exceeds this free_vram
     with pytest.raises(VramPlanError) as e:
-        _plan("llama-70b", free_vram=int(0.25 * GB))
+        _plan("llama-70b", free_vram=int(5 * MB))
     assert "does not fit" in str(e.value)
 
 
