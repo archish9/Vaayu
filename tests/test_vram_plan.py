@@ -628,3 +628,15 @@ def test_eager_mask_shape_and_causal_structure_from_pos_range():
         for j in range(pos_range):
             expected = j <= i
             assert bool(mask[0, 0, i, j]) == expected, (i, j)
+
+
+def test_batch_width_is_rechecked_against_the_plan():
+    """The plan is sized for N=1. A fan-out of N streams multiplies KV,
+    activations and logits, so admission must re-evaluate rather than assume the
+    load-time answer still holds. Plan K measured N>=2 at ~7700 tokens as
+    infeasible on this box for both MoE models."""
+    import dataclasses
+    sh = shape_for("minimax-m2.7")
+    p = _plan("minimax-m2.7")
+    wide = dataclasses.replace(sh, N=3)
+    assert predict_peak_vram(wide, p.max_seq_len) > USABLE_VRAM

@@ -2386,6 +2386,40 @@ class VaayuBaseModel(GenerationMixin):
             return 0
         return self._vram_plan.pinning_budget if self._vram_plan else 0
 
+    def _assert_context_fits(self, n_tokens: int, N: int = 1) -> None:
+        """Refuse an oversized request HERE, where the prompt length is known.
+
+        Without this, the wall surfaces as an OOM inside the layer loop ~30
+        frames away -- exactly the diagnostic failure D3 fixed for RoPE.
+
+        A diagnostic guard, not a source of failure in its own right (D3): it
+        must never itself be the thing that crashes. Returns quietly (does
+        not raise) when there is no plan to check against -- CPU, CUDA
+        unavailable, or _vram_shape somehow unset -- rather than raising an
+        unrelated error in any of those cases.
+        """
+        plan = getattr(self, "_vram_plan", None)
+        shape = getattr(self, "_vram_shape", None)
+        if plan is None or shape is None:
+            return
+        if not torch.cuda.is_available():
+            return
+        import dataclasses
+
+        from .vram_plan import VramPlanError, _too_big_message, predict_peak_vram
+        shape = dataclasses.replace(shape, N=int(N))
+        try:
+            free_vram, _ = torch.cuda.mem_get_info()
+            resident = torch.cuda.memory_allocated()
+        except Exception:
+            return
+        need = predict_peak_vram(shape, int(n_tokens))
+        if need > free_vram + resident:
+            raise VramPlanError(_too_big_message(
+                requested=int(n_tokens), s_max=plan.s_max,
+                free_vram=free_vram + resident, shape=shape,
+                min_resident=0))
+
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
         ring buffer -- FP8DynamicCache or its TurboQuantKVCache subclass --
@@ -3847,6 +3881,14 @@ class VaayuBaseModel(GenerationMixin):
         self._batch_decode_active = False
         self._batch_n = 1
 
+        # Fail fast here, where the prompt length is known (Task 8) -- before
+        # this can surface ~30 frames deep as an OOM in the layer loop.
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is not None:
+            self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0))
+
         pc = getattr(self, "_prefix_cache", None)
         if pc is None:
             result = super().generate(*args, **kwargs)
@@ -3855,9 +3897,6 @@ class VaayuBaseModel(GenerationMixin):
 
         # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
         # calls with distinct session ids).
-        input_ids = kwargs.get("input_ids")
-        if input_ids is None and args:
-            input_ids = args[0]
         ids_list = input_ids[0].tolist()
 
         # device= so a compressed entry is rebuilt straight onto the GPU; the
@@ -3946,6 +3985,15 @@ class VaayuBaseModel(GenerationMixin):
 
         self._batch_decode_active = False
         self._batch_n = 1
+
+        # Fail fast here too (Task 8), same entry-point policy as generate().
+        # This loop is single-stream (N=1, the default); the per-step verify
+        # forward routes draft_tokens+1 positions at once, but that transient
+        # is far below a full prefill chunk and the final KV length is capped
+        # by prompt_len + max_new_tokens regardless of how many draft/verify
+        # rounds it takes to get there -- the same total this predicate checks
+        # for generate().
+        self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)
 
         pc = getattr(self, "_prefix_cache", None)
         kv, ids_list = None, input_ids[0].tolist()
@@ -4081,6 +4129,13 @@ class VaayuBaseModel(GenerationMixin):
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
+
+        # Fail fast here, at the real batch width (Task 8): the load-time
+        # plan is sized for N=1, and a fan-out of N streams multiplies KV,
+        # activations and logits, so admission must re-evaluate rather than
+        # assume the load-time answer still holds.
+        self._assert_context_fits(
+            max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N)
 
         # Plan K: perform the reclaim this batch was ADMITTED under. Admitting
         # against reclaimable VRAM without reclaiming it just moves the OOM.
