@@ -383,8 +383,28 @@ def test_vram_pinning_budget_charges_less_for_turboquant():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA for _get_vram_pinning_budget")
     from vaayu.vaayu_base import VaayuBaseModel
+    from vaayu.vram_plan import (DEFAULT_ACT_COEFF, DEFAULT_ALLOC_FACTOR,
+                                 VramShape, kv_bytes_per_token, plan_vram)
 
     def budget(mode):
+        # _get_vram_pinning_budget now reads self._vram_plan.pinning_budget
+        # directly (Task 6, feat/f4-vram-plan) rather than computing a
+        # budget live from kv_cache_mode -- so exercising a mode difference
+        # here means building a real per-mode VramPlan, not just stubbing
+        # _vram_plan=None (that made both modes charge 0 alike, silently
+        # collapsing the very comparison this test exists to make).
+        shape = VramShape(
+            kv_per_token=kv_bytes_per_token(
+                num_hidden_layers=32, num_key_value_heads=8, head_dim=128,
+                kv_cache_mode=mode),
+            N=1, chunk=512, hidden=4096, n_heads=32, vocab=32000,
+            elem_bytes=2, act_coeff=DEFAULT_ACT_COEFF,
+            materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR,
+            kv_growth_factor=2, kv_capacity_buckets=True)
+        plan = plan_vram(
+            free_vram=20 * 1024 ** 3,  # synthetic box, plenty of room to pin
+            shape=shape, min_resident=0, requested_max_seq_len=4096,
+            position_limit=2 ** 31 - 1, layer_slack=0, reserve_floor=0)
         fake = types.SimpleNamespace(
             kv_cache_mode=mode, device="cuda:0", max_seq_len=4096,
             config=types.SimpleNamespace(num_hidden_layers=32, num_key_value_heads=8,
@@ -392,10 +412,7 @@ def test_vram_pinning_budget_charges_less_for_turboquant():
                                          num_attention_heads=32),
             checkpoint_path="/nonexistent",
             layer_names_dict={"layer_prefix": "model.layers"},
-            # _get_vram_pinning_budget now reads self._vram_plan directly
-            # (Task 6, feat/f4-vram-plan); this fake predates that and has
-            # no plan built, so it must be explicitly None like a CPU load.
-            _vram_plan=None,
+            _vram_plan=plan,
         )
         return VaayuBaseModel._get_vram_pinning_budget(fake)
 
