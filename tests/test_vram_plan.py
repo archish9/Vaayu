@@ -581,3 +581,16 @@ def test_derived_context_sizes_for_the_reserve_floor_not_the_whole_free_vram(nam
     # The reserve must still actually cover the KV at the length it chose (F4).
     sh = shape_for(name)
     assert with_floor.reserve_bytes >= sh.kv_per_token * with_floor.max_seq_len, name
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_batch_kv_helper_agrees_with_the_planner(name):
+    """batch.py:kv_bytes_for's docstring already admitted 'Same formula as
+    _get_vram_pinning_budget'. Two copies of one formula is how admission ends
+    up quoting a different number than the reserve it was admitted against."""
+    from vaayu.batch import kv_bytes_for
+    geo = GEOMETRIES[name]
+    planner = kv_bytes_per_token(**_kv_kwargs(geo), kv_cache_mode="bf16") * 4096
+    legacy = kv_bytes_for(4096, geo["num_hidden_layers"], geo["num_key_value_heads"],
+                          geo["head_dim"], 2)
+    assert planner == legacy

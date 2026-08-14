@@ -1,6 +1,7 @@
 import pytest
 import warnings
 from vaayu.batch import BatchRequest, kv_bytes_for, size_batch
+from vaayu.vram_plan import kv_elem_bytes
 
 # Geometry fixtures — derived shapes, NOT model literals baked into src.
 QWEN = dict(n_layers=94, n_kv_heads=8, head_dim=128)
@@ -13,11 +14,24 @@ def test_kv_bytes_for_scales_linearly(geo, elem_bytes):
     b2 = kv_bytes_for(2000, elem_bytes=elem_bytes, **geo)
     # KV is linear in seq_len
     assert b2 == 2 * b1
-    # exact formula: n_layers * 2 * n_kv_heads * head_dim * L * elem_bytes
-    assert b1 == geo["n_layers"] * 2 * geo["n_kv_heads"] * geo["head_dim"] * 1000 * elem_bytes
+    # exact formula: n_layers * 2 * n_kv_heads * head_dim * L * elem, where elem
+    # is the planner's measured per-mode rate (kv_bytes_for delegates to it,
+    # Task 7) -- not the raw elem_bytes literal, since elem_bytes=1 now selects
+    # fp8's measured 3.016 B/elem rather than a literal 1.0.
+    mode = "fp8" if elem_bytes == 1 else "bf16"
+    elem = kv_elem_bytes(mode, geo["head_dim"])
+    # int() truncates per-token (matching kv_bytes_per_token), before scaling by L.
+    per_token = int(geo["n_layers"] * 2 * geo["n_kv_heads"] * geo["head_dim"] * elem)
+    assert b1 == per_token * 1000
 
-def test_kv_bytes_fp8_half_of_fp16():
-    assert kv_bytes_for(512, **QWEN, elem_bytes=1) * 2 == kv_bytes_for(512, **QWEN, elem_bytes=2)
+def test_kv_bytes_fp8_costs_more_than_bf16():
+    """fp8 mode keeps the fp8 store AND the dequantized mirror attention reads
+    (Plan E: measured 3.016 B/elem vs bf16's 2.0) -- fp8 costs MORE than bf16,
+    not half of it, since Task 7 made kv_bytes_for delegate to that measured
+    rate instead of the raw elem_bytes literal."""
+    fp8 = kv_bytes_for(512, **QWEN, elem_bytes=1)
+    bf16 = kv_bytes_for(512, **QWEN, elem_bytes=2)
+    assert fp8 > bf16
 
 def test_batch_request_defaults():
     r = BatchRequest(prompt_ids=[1, 2, 3], max_new_tokens=16)

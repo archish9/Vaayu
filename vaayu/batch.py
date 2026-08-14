@@ -22,9 +22,19 @@ class BatchRequest:
 
 def kv_bytes_for(seq_len: int, n_layers: int, n_kv_heads: int,
                  head_dim: int, elem_bytes: int) -> int:
-    """Per-stream KV footprint in bytes. Same formula as _get_vram_pinning_budget.
-    elem_bytes: 1 (fp8 KV) or 2 (fp16). All geometry DERIVED, never literal."""
-    return n_layers * 2 * n_kv_heads * head_dim * seq_len * elem_bytes
+    """Per-stream KV footprint in bytes.
+
+    Delegates to vram_plan.kv_bytes_per_token so admission and the reserve quote
+    the SAME expression -- if they diverge, admission is lying and the difference
+    surfaces as an OOM rather than as a deferral. `elem_bytes` is kept in the
+    signature for callers that already computed it; it selects the cache mode.
+    """
+    from .vram_plan import kv_bytes_per_token
+    mode = "fp8" if elem_bytes == 1 else "bf16"
+    return kv_bytes_per_token(num_hidden_layers=n_layers,
+                              num_key_value_heads=n_kv_heads,
+                              head_dim=head_dim,
+                              kv_cache_mode=mode) * int(seq_len)
 
 
 def batch_kv_cost(requests, n_layers, n_kv_heads, head_dim, elem_bytes) -> int:
