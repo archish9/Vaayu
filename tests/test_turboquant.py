@@ -392,6 +392,10 @@ def test_vram_pinning_budget_charges_less_for_turboquant():
                                          num_attention_heads=32),
             checkpoint_path="/nonexistent",
             layer_names_dict={"layer_prefix": "model.layers"},
+            # _get_vram_pinning_budget now reads self._vram_plan directly
+            # (Task 6, feat/f4-vram-plan); this fake predates that and has
+            # no plan built, so it must be explicitly None like a CPU load.
+            _vram_plan=None,
         )
         return VaayuBaseModel._get_vram_pinning_budget(fake)
 

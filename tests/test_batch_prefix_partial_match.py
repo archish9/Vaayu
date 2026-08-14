@@ -43,6 +43,10 @@ class _Recorder:
         self._prefix_cache = pc
         self.calls = []
 
+    def _assert_context_fits(self, n_tokens, N=1):
+        # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
+        pass
+
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, use_cache=True, return_dict=True):
         n, q = input_ids.shape

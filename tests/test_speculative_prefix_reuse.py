@@ -78,6 +78,10 @@ class _FakeSpecModel:
         self.speculator = _FakeSpeculator()
         self.forward_calls = []   # input_ids.shape[1] for every forward() call
 
+    def _assert_context_fits(self, n_tokens, N=1):
+        # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
+        pass
+
     def _create_kv_cache(self):
         return _FakeSpecCache(seq_len=0)
 

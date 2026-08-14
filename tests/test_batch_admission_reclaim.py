@@ -166,6 +166,10 @@ class _StubEngine:
         self._moe_geometry = {"working_set_bytes": working_set}
         self.forward_calls = 0
 
+    def _assert_context_fits(self, n_tokens, N=1):
+        # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
+        pass
+
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, use_cache=True, return_dict=True):
         self.forward_calls += 1

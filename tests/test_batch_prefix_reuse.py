@@ -250,6 +250,10 @@ class _FakeBatchedModel:
         self.config = self._Cfg()
         self.telemetry = self._Telemetry()
 
+    def _assert_context_fits(self, n_tokens, N=1):
+        # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
+        pass
+
     def forward(self, input_ids, attention_mask, position_ids, use_cache=True,
                 return_dict=True, past_key_values=None):
         cache = _FakeCache(s=attention_mask.shape[1], b=input_ids.shape[0])
