@@ -3340,10 +3340,22 @@ class VaayuBaseModel(GenerationMixin):
         # to max_seq_len and crashing later chunks with an empty cos/sin slice.
         _pos_range        = compute_pos_range(self.max_seq_len, _past_len_for_pos, _seq_total)
         if self._active_attn_impl not in ("flash_attention_2", "sdpa"):
-            # Sized from the live position range, not max_seq_len: max_seq_len is
-            # now DERIVED (it used to be a hardcoded 512), so an S x S mask built
-            # from it would be a 268 MB fp32 transient on every forward.
-            attention_mask = torch.ones(_pos_range, _pos_range)
+            # Sized from past+new tokens actually being processed, NOT from
+            # _pos_range (which is max(max_seq_len, past+seq_total) -- since
+            # max_seq_len is now DERIVED rather than a hardcoded 512, it is
+            # frequently >> past+seq_total, and _pos_range never drops below it).
+            # get_attention_mask_args only ever reads the bottom-right
+            # full_attention_mask[:, :, -len_s:, -len_p-len_s:] block, so sizing
+            # the mask any larger than the max (len_p+len_s) seen this forward is
+            # pure waste -- and reusing _pos_range for it silently reintroduced
+            # the exact 268 MB/12.9 GB transient this branch's comment claims to
+            # avoid. _mask_size is that max: for a single (non-chunk-major) call
+            # len_p+len_s == _past_len_for_pos+_seq_total exactly; for layer-major
+            # chunked prefill, per-chunk len_p+len_s (via compute_chunk_past_lens)
+            # is monotonically increasing and tops out at the same total on the
+            # last chunk -- so no chunk's slice can ever exceed this size.
+            _mask_size = max(1, _past_len_for_pos + _seq_total)
+            attention_mask = torch.ones(_mask_size, _mask_size)
             attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
             attention_mask = attention_mask.to(self.running_device)
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;

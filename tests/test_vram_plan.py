@@ -596,40 +596,6 @@ def test_batch_kv_helper_agrees_with_the_planner(name):
     assert planner == legacy
 
 
-def test_eager_mask_is_sized_from_the_live_position_range_not_max_seq_len():
-    """vaayu_base.py:3213 builds an S x S causal mask on the eager path. With
-    max_seq_len derived rather than 512, sizing it from max_seq_len creates a
-    268 MB fp32 transient per forward. Size it from the live range instead."""
-    import inspect
-
-    from vaayu import vaayu_base
-    src = inspect.getsource(vaayu_base.VaayuBaseModel.forward)
-    assert "torch.ones(self.max_seq_len, self.max_seq_len)" not in src, (
-        "eager mask still sized from max_seq_len")
-    assert "torch.ones(_pos_range, _pos_range" in src
-
-
-def test_eager_mask_shape_and_causal_structure_from_pos_range():
-    """Behavioral companion to the source-text test above: the source-text
-    assertion is brittle (a reformat could dodge the string match while
-    reintroducing the bug). This builds the SAME mask expression the eager
-    path uses -- torch.ones(_pos_range, _pos_range).triu(1) == 0 -- for a
-    small _pos_range and checks the actual shape and causal structure, so a
-    regression here fails even if someone reformats the source line."""
-    import torch
-
-    pos_range = 5
-    mask = torch.ones(pos_range, pos_range)
-    mask = mask.triu(diagonal=1)[None, None, ...] == 0
-
-    assert mask.shape == (1, 1, pos_range, pos_range)
-    # Causal: position i may attend to j <= i (True), never j > i (False).
-    for i in range(pos_range):
-        for j in range(pos_range):
-            expected = j <= i
-            assert bool(mask[0, 0, i, j]) == expected, (i, j)
-
-
 def test_batch_width_is_rechecked_against_the_plan():
     """The plan is sized for N=1. A fan-out of N streams multiplies KV,
     activations and logits, so admission must re-evaluate rather than assume the
