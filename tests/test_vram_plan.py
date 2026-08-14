@@ -557,10 +557,18 @@ def test_sub_one_expert_budget_is_reported_not_silently_zeroed():
 
 def test_reserve_never_falls_below_the_measured_decode_boundary_floor():
     """2026-07-24 RESULTS: 2 GB covered prefill but not the prefill->decode
-    boundary; 3.5 GB fixed it 4/4. A short context must not undercut that."""
-    floor = int(3.5 * GB)
-    p = _plan("llama-1b", requested_max_seq_len=512, reserve_floor=floor)
-    assert p.reserve_bytes >= floor
+    boundary; 3.5 GB fixed it 4/4. A short context must not undercut that.
+
+    Must import the REAL constant, not a local literal copy: a local
+    `floor = int(3.5 * GB)` would keep passing even if someone edited
+    vaayu_base.py's `_VRAM_RESERVE_FLOOR_BYTES` down to the 2 GB figure that
+    2026-07-24 measured OOMing at the prefill->decode boundary."""
+    from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
+    assert _VRAM_RESERVE_FLOOR_BYTES >= int(3.5 * GB)
+
+    p = _plan("llama-1b", requested_max_seq_len=512,
+             reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert p.reserve_bytes >= _VRAM_RESERVE_FLOOR_BYTES
 
 
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
