@@ -10,6 +10,17 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 _Restructured 2026-08-08 to be a pending list only. Everything removed is recoverable via
 `git log -- todo.md`._
 
+**Detailed work briefs live in `plans/` — which is TRACKED IN GIT, unlike `docs/` (gitignored,
+local-only, may not exist on a fresh clone). Each brief is self-contained: it carries its own
+background, measured numbers, file/symbol names, hygiene rules and stop condition, so a fresh
+session needs nothing from this file.**
+
+| brief | row | what it is |
+|---|---|---|
+| `plans/next_1_vram_calibration.md` | 7 | Close the `predict_peak_vram` ±10 % gate. ~1–2 h, **no GPU**. |
+| `plans/next_2_f1_ram_arbitration.md` | 8 | Re-derive F1's premise before building arbitration. |
+| `plans/next_3_hygiene_backlog.md` | 9 | Seven small items (H1–H7), none blocking. |
+
 ---
 
 # ▶ FIX SEQUENCE — work top to bottom
@@ -24,18 +35,20 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
 | **4b** | ~~Fix MiniMax's non-identical output under prefix reuse~~ — **DONE 2026-08-09** | Was not a prefix-reuse bug at all: the MoE forwards accumulated experts in bf16 while expert arrival order is nondeterministic. fp32 accumulator in all three forwards. See Settled. Left behind **one open bug** (fused-EXL3 residual). |
 | **5** | ~~Plan K — batched-decode admission reclaim~~ — **REFUTED 2026-08-09** | Admission was never the limiter: `plan_batch` deferred ZERO requests in every cell of both models at N≤5 × 7.7k. See Settled. Tasks 1-2 ship default-off. |
-| **6** | ~~F4 + the 7.7k→8.2k VRAM ceiling~~ — **DONE 2026-08-14.** All 10 tasks shipped, branch `feat/f4-vram-plan` commits `5205e84`..`9c0b610`, full suite **795 passed / 2 skipped / 1 xfailed**, and Task 10's five on-device gates **all PASSED** on real hardware (see Settled). **F4's core defect is FIXED**: `max_seq_len` no longer defaults to 512 — it is derived per model, live-measured: Qwen3-235B **8192**, MiniMax-M2.7 **8192**, Llama-3.3-70B-exl3 **4373**, Llama-3.2-1B **56828** (`s_max` unclamped ceiling 32768/32768/32768/131072 respectively). **`DEFAULT_ACT_COEFF`/`DEFAULT_ALLOC_FACTOR` remain uncalibrated placeholders (4.0/1.18)** — three fitting rounds against 17 real GPU points failed the ±10% gate (13/17 → 11/17 → 10/17 outside, worst +41.2% → −30.2% → −28.0%) and were correctly NOT written in. Decode A/B (4 alternating arms, both MoE models, same day): Qwen +0.21%, MiniMax −0.36%, both within the box's ~4% noise floor — no regression. | Root cause: `kv_cache_mode="auto"` on EXL3 resolves to a ring-buffer KV cache whose capacity grows by **geometric doubling** (`_GROWTH=2`), locking at 8192 tokens for S∈[4609,8192] and jumping to 16384 past it — confirmed within 7% on three EXL3 geometries, absent on the non-EXL3 control. **This is a real cliff, not a ceiling grazed by a linear term** — the framing question this whole plan was written to answer. See Settled for the full verdict and `docs/superpowers/plans/2026-08-09-vram-plan-RESULTS.md` for every gate's raw output. |
-| **6b** | ~~Final whole-branch review fix wave on `feat/f4-vram-plan`~~ — **DONE 2026-08-15** | Two Important findings fixed before merge: (1) the eager causal-mask "fix" (row 6) was a no-op — `_pos_range = max(max_seq_len, past+seq_total)` is never `< max_seq_len`, so reusing it to size the mask left a 12+ GiB fp32 transient on Llama-3.2-1B (measured 56828×56828 before, 9×9/10×10 after at prefill/decode) — now sized from `max(1, past_len_for_pos+seq_total)`, a new local, with `compute_pos_range` itself untouched. Both guard tests replaced (one asserted on source text, one exercised no Vaayu code); new `tests/test_eager_causal_mask.py` drives a real live forward in a subprocess (isolation from `safetensor_model_persister`'s global buffer pool), fails against the old code and passes against the fix, both stages (prefill + decode). (2) the reserve-floor test used a local `floor = int(3.5*GB)` literal instead of importing `_VRAM_RESERVE_FLOOR_BYTES`, so an edit to the real constant couldn't fail it — now imports and asserts directly. Hygiene batch: turboquant was charged fp8's 3.016 B/elem rate instead of its own 0.531 (5.7x over-charge, `batch.py`'s `_resolve_kv_elem_bytes`/`kv_bytes_for`), a stale `_VRAM_RESERVE_BYTES` comment (renamed to `_VRAM_RESERVE_FLOOR_BYTES`), three stale line-number comments replaced with symbol references, a `plan_vria` typo, and `_assert_context_fits`'s refusal message always printing `min_resident=0.00 GiB` even for MoE (now the real expert-floor). Full suite `795 passed / 2 skipped / 1 xfailed`, run twice, stable. Report: `.superpowers/sdd/2026-08-09-vram-plan/final-fix-report.md`. |
-| **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
-| **8** | **Hygiene, any order** | `_create_kv_cache` silent fp8 fall-through, `slab_bytes`/`_ALIGN` validation, the Plan L review backlog, F6, F7, and the three telemetry items. None blocks anything; all are small. |
+| **6** | ~~F4 + the 7.7k→8.2k VRAM ceiling~~ — **DONE 2026-08-14, merged to `main` 2026-08-15** (commits `5205e84`..`4e873e8`, incl. the final-review fix wave). All 10 tasks shipped, full suite **795 passed / 2 skipped / 1 xfailed**, five on-device gates all PASSED. See Settled. | **F4's core defect is FIXED**: `max_seq_len` is derived, not 512 — Qwen **8192**, MiniMax **8192**, Llama-70B **4373**, Llama-1B **56828**. Left behind ONE unfinished piece (calibration → row 7) and three pending items (below). |
+| **7** | **[ ] Close the `predict_peak_vram` calibration gate** → **`plans/next_1_vram_calibration.md`** | **Cheap (~1–2 h, NO GPU) and it gates two other items.** Evidence in hand says the residual is a **constant offset**, not a missing mechanism: the probe measured a weights-INCLUSIVE `max_memory_allocated()` against a model with **no weights term**. The bucket step itself already matches to **1 %** (measured 7700→8200 jump 2.06 GB vs predicted 2.08 GB). Fit against `measured − baseline` and re-gate. **If it still fails, STOP and park it** — calibration only affects refusal accuracy, not reserve/pinning/decode. |
+| **8** | **[!] F1 — RAM budget arbitration** → **`plans/next_2_f1_ram_arbitration.md`** | **Re-derive the premise before building anything.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure across repeated loads (free RAM at load varies 2.36–13.76 GB), then decide. Expected outcome: close as obsolete. |
+| **9** | **[ ] Hygiene, any order** → **`plans/next_3_hygiene_backlog.md`** | H1 `_create_kv_cache` silent fp8 fall-through · H2 `slab_bytes`/`_ALIGN` · H3 F6 dead `KVCacheManager` · H4 F7 write-only `_expert_history` · H5 Plan L backlog · H6 telemetry · H7 D4 + two carried correctness items. None blocks anything; all are small. |
 
-> ### ▶▶ NEXT ACTION: F1 — re-derive the RAM-arbitration premise
-> Row 6 (F4 + the VRAM ceiling) is DONE — see Settled. Next up is row 7: measure whether the
-> prefix pool is still starved (Plan L already took Qwen's pool 2.36 → 10.53 GB) before
-> scheduling any arbitration work. **Five new pending items fell out of the VRAM plan's own
-> findings** (the 2x KV overshoot, the non-monotone-search fix already shipped, the probe/
-> instrument mismatch, the N≥2 admission gap, and the weights-inclusive-vs-weights-free
-> calibration lead) — see **Pending bugs / open work** below. None of them block row 7.
+> ### ▶▶ NEXT ACTION: row 7 — the calibration offset check
+> **`plans/next_1_vram_calibration.md`** is self-contained: mechanism, the 17 measured points,
+> the decisive 1 % step match, file/symbol names, and the stop rule. Start there — it is
+> ~1–2 h with **no GPU runs**, and its outcome decides whether the two deferred VRAM items
+> below are real work or moot.
+>
+> **Deliberately NOT scheduled** (judged low-value against this engine's workload — see
+> "Deferred, judged low-value" below): the 2× KV overshoot and the MoE probe re-instrumentation.
+> Both are recorded, neither is worth GPU hours today.
 
 **Rules that outlive this list**
 - A plan ending in **refutation closes its row.** Record the verdict under "Settled" and move on — do not re-scope a plan to find a win. F, G and H all ended this way; that is the system working.
@@ -47,42 +60,6 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 # BUGS
 
 ## Correctness — these break stated requirements
-
-- [ ] **D4 — the splitter writes an EMPTY `lm_head.safetensors` for tied-weight checkpoints, and
-  marks it `.done`.** Spun out of D1's fix, which repaired the two *consumers* rather than the
-  producer. `vaayu/utils.py`'s split emits a valid 16-byte `{}` shard when the source checkpoint
-  has no `lm_head.weight`, and `all(found_layers.values())` then reports the split as complete —
-  an incomplete split that looks verified. Every future consumer of these shards inherits the same
-  trap D1 fell into. Two candidate fixes: write the tied copy at split time (costs a duplicated
-  embedding on disk), or omit the shard so the existing absent-file paths fire. **Not urgent** —
-  D1's consumer-side fallbacks make already-split models load correctly, and both on-device
-  targets plus the 70B dense reference are untied. (found 2026-08-09, D1 fix)
-- [ ] **`_create_kv_cache` falls through to fp8 on an unrecognised mode string.** A typo in
-  `kv_cache_mode` silently yields the fp8 cache rather than an error — the silent degradation §5
-  forbids. **Should an unknown mode raise?** (found 2026-08-02, Plan H audit)
-- [ ] **`slab_bytes` is not provably a multiple of `_ALIGN` (4096), so `SlabArena`'s O_DIRECT
-  premise is unenforced.** The class docstring asserts "slab_bytes is _ALIGN-aligned so every slab
-  start stays sector-aligned for O_DIRECT", and nothing validates it:
-  `compute_slab_bytes` → `expert_span_bytes` → `_group_layout`'s
-  `slab_span = max(raw_aligned_length, packed_span)`, and `packed_span` only guarantees
-  `_TENSOR_ALIGN` (16-byte) alignment. Narrow edge case, never observed on either target model,
-  unenforced identically before and after chunking. Fix is a constructor validation or an
-  `_align_up` on the computed slab size. (found 2026-08-08, Plan L final review)
-- [ ] **The cross-turn prefix cache only works for EXL3 models; it is DISABLED with a warning for
-  everything else.** `PrefixCacheStore` drives `to_cpu()` / `to_device()` / `resident_bytes()` on
-  every cache it stores. Vaayu's `FP8DynamicCache` / `TurboQuantKVCache` have them; the bare
-  `transformers.cache_utils.DynamicCache` that `_create_kv_cache` returns for `kv_cache_mode="fp16"`
-  — which is what `"auto"` resolves to for every **non-EXL3** model — has none of the three.
-  (Verified on transformers 5.5.4: that class is layer-object based, `layers[i].keys`/`.values`,
-  with no `key_cache` attribute at all.) **Pre-existing, not an F3 regression** — `generate()`'s
-  cross-turn path calls the same `store()` and would fail identically; F3 merely surfaced it.
-  As of 2026-08-09 `vaayu_base.py` probes the cache at load and, when unsupported, prints a WARNING
-  and disables the pool rather than failing per-turn — the per-turn failure was the dangerous one,
-  because `lookup()` POPS an entry before `store()` puts one back, so each swallowed failure
-  permanently drained the pool. To actually SUPPORT fp16, either give `DynamicCache` the three
-  methods via an adapter, or route fp16 through `FP8DynamicCache(quantize=False)`. Neither is
-  urgent: all three on-device targets and the 70B dense reference are EXL3. (found 2026-08-09, F3
-  Task 4 on-device gate)
 
 - [bug] **The fused-EXL3 expert GEMM is still nondeterministic after the fp32 accumulator fix.**
   Qwen3-235B, two forwards over identical input ids: layers 0–8 bitwise identical (they are pinned,
@@ -113,33 +90,29 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   helper omits `reserve_floor`, leaving `s_max` unclamped at 32768 — an operating point production
   never reaches; that test's premise does not currently exercise the real admission path. (found
   2026-08-14, F4 plan Task 8 review + Task 10 gate 3)
-- [ ] **A 2x KV overshoot, ~0.83 GB, at Qwen's derived operating context — real, quantified, and
-  recoverable.** The EXL3 ring-buffer KV cache's geometric-doubling capacity (see Settled) means that
-  at Qwen's derived `max_seq_len=8192`, the cache allocates capacity for **16384** tokens even though
-  only ~12065 tokens of real context are ever used at that reserve — wasted VRAM on a box already
-  grazing 15.47 GiB. Pre-sizing the KV cache to the derived `max_seq_len` at load time (rather than
-  letting it double blindly) would recover this, but it is allocator surgery with its own decode
-  behavior implications and needs its own decode A/B — **new pending work, not part of the F4 plan.**
-  (found 2026-08-14, F4 plan Task 5 ruling R12)
-- [ ] **Probe/instrument mismatch: the MoE prefill-peak probe may be measuring the wrong thing,
-  and this should be resolved BEFORE any further `predict_peak_vram` modelling.** The trailing-chunk
-  intercept fix (Task 5c) matches MiniMax's measured peak-vs-S closely but NOT Qwen's, whose measured
-  peak is nearly flat within a KV-capacity bucket instead of showing the predicted sawtooth. Likely
-  cause: the dense legacy per-chunk prefill loop calls `torch.cuda.reset_peak_memory_stats()` after
-  every chunk (so the probe's `max_memory_allocated()` genuinely reflects only the last chunk), but
-  MoE's layer-major prefill has no equivalent per-chunk reset — so for MoE the probe may be measuring
-  expert-streaming residency across the WHOLE prefill, not last-chunk structure. If true, adding more
-  terms to `predict_peak_vram` is the wrong next move; re-instrumenting the probe per-phase (e.g.
-  resetting stats at MoE layer boundaries too) is. (found 2026-08-14, F4 plan Task 5c)
-- [ ] **Calibration lead for the −28% gate failure, found but not yet checked: the probe measures a
-  weights-inclusive figure against a weights-free model.** `scripts/probe_vram_curve.py` reads
-  `max_memory_allocated()` after a reset — an ABSOLUTE figure that includes the resident model
-  weights — while `predict_peak_vram` has NO weights term at all (its terms are KV + activations +
-  scores + logits). Every one of the three failed fitting rounds (Task 5/5b/5c) was therefore
-  comparing a weights-inclusive measurement against a weights-free model. **Check this before anyone
-  re-fits `act_coeff`/`alloc_factor` or adds further terms** — it may explain a meaningful share of
-  the residual error without inventing any new mechanism. (found 2026-08-14, F4 plan Task 8 review,
-  ruling R14)
+- [ ] **A 2x KV overshoot, ~0.83 GB, at Qwen's derived operating context — real, quantified,
+  recoverable, and DELIBERATELY NOT SCHEDULED.** The EXL3 ring-buffer KV cache's geometric-doubling
+  capacity (see Settled) means that at Qwen's derived `max_seq_len=8192` the cache allocates capacity
+  for **16384** tokens, wasting ~0.83 GB on a box already grazing 15.47 GiB. Pre-sizing the cache to
+  the derived `max_seq_len` at load would recover it — allocator surgery, needs its own decode A/B.
+  **Why it is parked rather than queued:** this repo has already priced that VRAM. Audit F8 measured
+  the expert VRAM cache re-saturating in ~4 tokens (cold 37.2% vs warm 36.8% hit rate), and Plan K
+  measured giving back a LARGER 1.22 GB moving Qwen's hit rate 43%→41% with decode +0.4% — i.e.
+  "unlocked nothing". 0.83 GB is less than that, and well short of what N≥2 needs (peak was
+  14.17–15.57 GB of 15.47 GiB). **Re-open only if a measurement shows per-cell VRAM has dropped
+  enough for N=2 to be within reach** — then this 0.83 GB becomes part of a real budget rather than
+  a rounding error. (found 2026-08-14, F4 plan Task 5 ruling R12)
+- [ ] **Probe/instrument mismatch on the MoE prefill-peak probe — CONTINGENT on row 7, do not start
+  it first.** The trailing-chunk intercept fix matches MiniMax's measured peak-vs-S closely but NOT
+  Qwen's, whose measured peak is nearly flat within a KV-capacity bucket instead of showing the
+  predicted sawtooth. Likely cause: the dense legacy per-chunk prefill loop calls
+  `torch.cuda.reset_peak_memory_stats()` after every chunk (so `max_memory_allocated()` genuinely
+  reflects only the last chunk), but MoE's layer-major prefill has no equivalent per-chunk reset — so
+  for MoE the probe may be measuring expert-streaming residency across the WHOLE prefill, not
+  last-chunk structure. **If true, adding more terms to `predict_peak_vram` is the wrong move;
+  re-instrumenting the probe per-phase is.** Row 7's baseline-subtraction check is cheaper and may
+  close the gate without this — do row 7 first, and only come here if it fails.
+  (found 2026-08-14, F4 plan Task 5c)
 
 ## Architectural gaps
 
@@ -155,110 +128,24 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   `_seq_len` is per-LAYER and cannot represent per-row sequence lengths.
   Plan: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-plan.md`
   Results: `docs/superpowers/plans/2026-08-09-batched-prefix-cache-RESULTS.md` (docs/ is gitignored)
-- [ ] **`speculative_generate` skips `enqueue_truncate` on a prefix HIT, so `enable_kv_persist`
-  can corrupt that session's on-disk KV.** `generate()` calls
-  `self._kv_writer.enqueue_truncate(session_id, match_len)` on a HIT; the new
-  `speculative_generate` hook does not. `DiskWriter.enqueue_append` packs `range(st["nrec"],
-  length)` from its OWN tracked `nrec`, not from `match_len`. Scenario: turn 1 persists positions
-  [0,7) (`nrec=7`); turn 2 HITs at `match_len=5` and ends at length 9; `enqueue_append` starts at 7
-  and writes only [7,9), leaving [5,7) holding **turn 1's stale bytes** merged with turn 2's — a
-  corrupted record, undetectable until restore. **Dormant today**: no on-device target combines a
-  speculator with `enable_kv_persist=True`. Fix is the two-line mirror of `generate()`.
-  (found 2026-08-09, F3 Task 5 review)
-- [~] **F4 — `max_seq_len` defaults to 512 and no harness sets it**, so `_get_vram_pinning_budget()`
-  reserves KV for 512 tokens against real contexts of 2 048–7 751. Measured (Qwen): KV
-  0.193 MB/token → reserved 0.092 GB, actual 0.367 GB at 2k (**−0.28 GB**) and 1.390 GB at 7.7k
-  (**−1.30 GB**). Pinning therefore claims VRAM the KV cache later needs. Fix is parameter plumbing.
-  **A 2026-08-02 promotion to "FATAL" was WRONG and was retracted the same day** — a crash at
-  K=3 × ~8.2k was blamed on F4 before the cause was isolated; setting `max_seq_len` did not fix it.
-  What that A/B did establish, and what still needs doing: **VRAM headroom at 7.7k is only ~1 GB**
-  (allocated 12.24-12.33 GB, reserved peaks 14.54-14.58 GB of 15.47 GiB) and the crash reproduces at
-  ~8.2k, so **there is a real context-length cliff between 7.7k and 8.2k** owned by the
-  `_VRAM_RESERVE_BYTES` / `compute_vram_expert_budget` pair (the expert VRAM cache takes
-  `free_vram_at_load − 3.5 GB` = 8.7-8.8 GB before any KV exists, and never evicts: `0evict`
-  throughout). **Characterize that cliff before blaming any single input for it.**
-  (found 2026-08-03, audit F4)
-  **MECHANISM IDENTIFIED 2026-08-09 (design exploration), and it explains the retraction.**
-  *"Pinning claims VRAM the KV cache later needs"* is true for DENSE and a **no-op for MoE**.
-  The expert VRAM cache is sized at `:1686`, AFTER pinning at `:1472`, as
-  `free_vram_now − 3.5 GB` — so it soaks up whatever pinning leaves behind. Under-reserving
-  KV moves VRAM from the expert cache to pinned layers; **post-load headroom is
-  `_VRAM_RESERVE_BYTES` = 3.5 GB flat, independent of `max_seq_len`.** That is exactly why
-  setting `max_seq_len` did not fix the K=3 × ~8.2k crash. Dense builds no expert VRAM cache
-  (the block is inside the MoE branch), so there pinning IS the only consumer and F4's
-  original reasoning holds — Llama-3.3-70B-exl3 is affected.
-  **Also: "cliff" is probably the wrong word.** Derived per-token KV (calibrated against
-  this row's own 0.193 MB/tok Qwen figure) puts the 7.7k→8.2k growth at **+0.10 GB (Qwen) /
-  +0.12 GB (MiniMax) / +0.17 GB (dense)** — nothing in KV cliffs there. Plan K's peak was
-  already 14.17-15.57 GB of 15.47 GiB, so the hypothesis is a **ceiling tipped by a linear
-  term**. Two intermediate readings corrected so they are not re-derived: batched prefill IS
-  chunked (`:4110-4132` runs its own `_step` loop), and only the LAST chunk's logits are
-  materialized (`:3512-3519`). One S-linear suspect survives: **sdpa backend selection** —
-  prefill passes an explicit 4D mask, and if that drops sdpa off flash onto math/efficient,
-  scores materialize at `N × n_heads × chunk × S` (Qwen N=1 @8.2k ≈ 1.6 GB with the softmax
-  copy, linear in S). Probe P1 settles it with no model load.
-  **Three findings from the design pass that the plan already encodes — do not re-derive:**
-  (a) batched prefill IS chunked (`:4110-4132`) and only the LAST chunk's logits are
-  materialized (`:3512-3519`); (b) prefill is **chunk-major/layer-major**
-  (`_chunked_prefill`, `:3171`), so every chunk is a live batch element and **activations
-  are S-linear**, and peak-vs-S is NOT observable inside one prefill call; (c) the
-  `expandable_segments` arm is **vacuous** — `vaayu/__init__.py:20` already sets it via
-  `setdefault` at import time, so Plan K's 2.3 GB reserved−allocated gap persists DESPITE
-  it and is not recoverable by flipping that flag. The informative control arm is
-  `max_split_size_mb:512`.
-  Design: `docs/superpowers/specs/2026-08-09-vram-plan-design.md` (docs/ is gitignored)
-  **Plan (self-contained, ready to execute): `docs/superpowers/plans/2026-08-09-vram-plan.md`**
+## Dead or misleading code · Telemetry only
 
-## Dead or misleading code
-
-- [ ] **F6 — `vaayu/kv_cache_manager.py` (`KVCacheManager`) is unreachable but still maintained.**
-  Constructed only in `tests/test_kv_cache_manager_fp8.py`; superseded by `PrefixCacheStore`. Its
-  helper `_extract_kv_as_bf16` is reachable only from `save_snapshot`, and was hardened by **Plan E
-  Task 2** and again by **Plan H Task 3** — two plan tasks spent making an unreachable function
-  correct, a tax every future KV-format change pays again. Delete the module + tests, or mark it a
-  reference implementation and exempt it from cache-mode work. (found 2026-08-03, F6)
-- [ ] **F7 — `vaayu_ref._expert_history` is write-only.** Written by all three MoE forwards
-  (`moe_patch.py:1039`, `:1174`, `:1786`), read by no production code. `patch_moe_blocks`' docstring
-  still claims *"The forward() loop reads _expert_history after each layer and submits speculative
-  prefetch"*, pointing the next reader at a mechanism that does not exist. Runtime cost ≈ 0; the
-  cost is the false docstring. (found 2026-08-03, audit F7)
-- [ ] **Plan L review backlog, all triaged non-blocking (2026-08-08):** (a) `SlabArena` exposes no
-  `chunk_count` / `charged_bytes` accessor, so `vaayu_base.py` reaches into `_chunks` and computes
-  `sum(c.numel() ...)` inline — one property fixes both call sites; (b) `tests/test_slab_arena.py:538`
-  still claims "`arena_slab_count` IS that gate in production", stale since Plan L removed it from
-  the arena path; (c) no test exercises an allocation failure on an *escalated* retry, only on a
-  chunk's first request; (d) the zero-chunks error message recomputes `chunk_decomposition()` purely
-  for a count in the string; (e) the *pre-existing* first-construction `except RuntimeError` can
-  still leave the arena `None` with no message — Plan L fixed only the new instance it introduced.
-
-## Telemetry only — correctness unaffected
-
-- [ ] **F13 — `_decode_stats_reset` latches for the process, not the turn.** Set True on the first
-  decode pass (`vaayu_base.py:2946`) and never cleared, so the reset that exists to exclude
-  prefill's ~100 %-miss pollution runs once per model lifetime. From turn 2 on, cumulative
-  expert-cache hit rate is diluted by every new prefill. (found 2026-08-03, audit F13)
-- [ ] **`matched_tokens` over-reports by ≤1 token per hit.** `PrefixCacheStore.lookup()` records the
-  raw match length; the `generate` override clamps it down by one so the model has a token to run.
-  Fires only when the new prompt is a complete prefix of the cached one — ≤0.05 % at the ~2000-token
-  prefixes this targets. Documented in `stats()`, NOT fixed: moving the clamp into the store would
-  couple the cache to the caller's execution needs to fix a rounding error. (2026-08-01, Plan C)
-- [ ] **Prefix `hit_rate` is not comparable across lookup modes.** On a named session an entry
-  sharing ZERO tokens counts as a HIT; on the `session_id=None` auto-prefix-match path the same case
-  counts as a MISS (`key` is only set when `best_m > 0`). Pre-existing, documented in `stats()` and
-  pinned by tests in `aada3cd`. Worth revisiting if a mixed-mode workload needs one comparable
-  number. (2026-08-01, Plan C final review)
+Moved to **`plans/next_3_hygiene_backlog.md`** (row 9) so this file stays a sequence, not a
+dump: F6 (dead `KVCacheManager`), F7 (write-only `_expert_history`), the Plan L review backlog,
+F13, and the two prefix-telemetry quirks. Nothing dropped — each item kept its evidence there.
 
 ---
 
 # PLANNED WORK
 
-## F1 — expert-cache / prefix-pool RAM arbitration  (sequence #7)
+## F1 — expert-cache / prefix-pool RAM arbitration  (sequence #8)
 
-- [!] **Premise needs re-deriving before any work.** `compute_expert_budget` runs at
-  `vaayu_base.py:1331`, takes its share, and `compute_prefix_cache_budget` runs ~250 lines later and
-  gets the remainder. Nothing arbitrates. F1 was written when the pool was starved — but **Plan L
-  took Qwen's pool 2.36 → 10.53 GB**, so the scarcity this was meant to fix may no longer exist.
-  Measure whether the pool still binds before scheduling. (audit F1, 2026-08-03)
+- [!] **Premise needs re-deriving before any work.** `compute_expert_budget` takes its share, and
+  `compute_prefix_cache_budget` runs ~250 lines later and gets the remainder. Nothing arbitrates.
+  F1 was written when the pool was starved — but Plan L took Qwen's pool 2.36 → 10.53 GB, so the
+  scarcity it was meant to fix may no longer exist.
+  **Full brief, decision rule and measurement hygiene: `plans/next_2_f1_ram_arbitration.md`.**
+  (audit F1, 2026-08-03)
 
 ---
 
