@@ -23,6 +23,8 @@ BOTH subtract the same `VramPlan.reserve_bytes`, so the arithmetic closes.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 class VramPlanError(RuntimeError):
     """Raised when a context cannot fit, or when an input is not understood.
@@ -68,8 +70,6 @@ def kv_bytes_per_token(*, num_hidden_layers: int, num_key_value_heads: int,
     elem = kv_elem_bytes(kv_cache_mode, head_dim)
     return int(num_hidden_layers * 2 * num_key_value_heads * head_dim * elem)
 
-
-from dataclasses import dataclass
 
 # Placeholders until Task 5 measures them. act_coeff is the number of live
 # hidden-sized buffers per layer during chunk-major prefill; alloc_factor is

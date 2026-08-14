@@ -121,9 +121,18 @@ def test_alloc_factor_scales_the_whole_prediction():
 
 
 def test_peak_grows_with_batch_width():
+    """predict_peak_vram is exactly homogeneous of degree 1 in N: every term --
+    KV, activations, scores, and the last-chunk logits intercept -- carries an
+    explicit N factor. An inequality (e.g. `> 2.5 * one`) only catches a term
+    losing its N factor if that term is large enough to move the ratio past the
+    threshold; equality catches ANY term losing it, large or small. If a future
+    term is legitimately not proportional to N (a fixed CUDA-context overhead,
+    say), this test is *supposed* to fail -- and whoever adds that term must
+    also revisit the batch-width re-check a later task builds on top of this
+    N-scaling."""
     one = predict_peak_vram(shape_for("minimax-m2.7", N=1), 7700)
     three = predict_peak_vram(shape_for("minimax-m2.7", N=3), 7700)
-    assert three > 2.5 * one
+    assert three == pytest.approx(3 * one, rel=1e-6)
 
 
 def test_kv_dominates_at_long_context_on_a_flash_backend():
