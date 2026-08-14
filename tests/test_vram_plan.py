@@ -553,3 +553,31 @@ def test_sub_one_expert_budget_is_reported_not_silently_zeroed():
     tiny = expert_vram_budget_for(p, free_vram_now=p.reserve_bytes + 1 * MB)
     assert 0 < tiny < EXPERT_BYTES, (
         "caller must be able to see 'nonzero but under one expert' and warn")
+
+
+def test_reserve_never_falls_below_the_measured_decode_boundary_floor():
+    """2026-07-24 RESULTS: 2 GB covered prefill but not the prefill->decode
+    boundary; 3.5 GB fixed it 4/4. A short context must not undercut that."""
+    floor = int(3.5 * GB)
+    p = _plan("llama-1b", requested_max_seq_len=512, reserve_floor=floor)
+    assert p.reserve_bytes >= floor
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_derived_context_sizes_for_the_reserve_floor_not_the_whole_free_vram(name):
+    """Amendment 4 (task-6-brief.md): with reserve_floor=0 (Task 4's own
+    default, the only value its existing tests reach), requested_max_seq_len
+    =None sizes the reserve for s_max -- essentially all free VRAM -- which
+    measured out to pinning_budget=0 and a sub-one-expert cache on every
+    on-device geometry (Qwen, MiniMax, Llama-70B). With a real reserve_floor
+    supplied, the derived max_seq_len must land well below s_max, and pinning
+    must actually get real room, on every geometry (CLAUDE.md §5)."""
+    floor = int(3.5 * GB)
+    without_floor = _plan(name, reserve_floor=0)
+    with_floor = _plan(name, reserve_floor=floor)
+    assert with_floor.max_seq_len < without_floor.max_seq_len, name
+    assert with_floor.reserve_bytes >= floor, name
+    assert with_floor.pinning_budget > int(1 * GB), (name, with_floor)
+    # The reserve must still actually cover the KV at the length it chose (F4).
+    sh = shape_for(name)
+    assert with_floor.reserve_bytes >= sh.kv_per_token * with_floor.max_seq_len, name

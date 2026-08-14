@@ -96,6 +96,15 @@ DEFAULT_ACT_COEFF = 4.0
 DEFAULT_ALLOC_FACTOR = 1.18
 
 
+# P1 verdict, measured 2026-08-14 on torch 2.11.0+cu130 (see the RESULTS file).
+# Whether F.scaled_dot_product_attention materializes an S-sized score matrix
+# under the (N, 1, q_len, kv_len) additive mask the prefill passes. FLASH rejects
+# that masked call; EFFICIENT and MATH accept it and neither materializes scores.
+# Backend selection is torch-version-dependent, so this is only meaningful with
+# the version recorded beside it.
+MATERIALIZES_SCORES = False
+
+
 def kv_capacity_tokens(S: int, *, chunk: int, growth: int, buckets: bool) -> int:
     """Tokens actually ALLOCATED in the KV buffer for a prefill of S tokens.
 
@@ -328,6 +337,16 @@ def solve_max_seq_len(*, free_vram: int, min_resident: int,
             f"kv_per_token={shape.kv_per_token}, hidden={shape.hidden})."
         )
     budget = int(free_vram) - int(min_resident)
+    return _largest_s_within_budget(shape, budget)
+
+
+def _largest_s_within_budget(shape: VramShape, budget: int) -> int:
+    """Largest S such that predict_peak_vram(shape, S') <= budget for EVERY
+    S' in [1, S] -- the two-nested-binary-search body solve_max_seq_len's
+    docstring describes, factored out so plan_vram's `None`-branch
+    reserve-floor sizing (Amendment 4, task-6-brief.md) can reuse it against
+    a different budget (the reserve floor, not free_vram - min_resident)
+    without duplicating the search."""
     if budget <= 0 or predict_peak_vram(shape, 1) > budget:
         return 0
 
@@ -389,8 +408,20 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
 
 def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
               requested_max_seq_len: int | None, position_limit: int,
-              layer_slack: int) -> VramPlan:
-    """Decide max_seq_len and the one reserve both budget consumers subtract."""
+              layer_slack: int, reserve_floor: int = 0) -> VramPlan:
+    """Decide max_seq_len and the one reserve both budget consumers subtract.
+
+    `reserve_floor` (Amendment 4, task-6-brief.md): a `None` request used to
+    set `chosen = s_max`, sizing the reserve for essentially all free VRAM --
+    measured to leave pinning_budget=0 and a sub-one-expert cache on Qwen,
+    MiniMax and Llama-70B alike. When a real floor is supplied, `None` now
+    derives the largest context whose predicted peak fits WITHIN that floor
+    (capped at s_max), so the reserve lands at the floor's operating point
+    (today ~3.5 GiB, a 7-12k token context on the on-device geometries)
+    instead of at the honest-refusal ceiling. `reserve_floor=0` (Task 4's own
+    default, the only value its pre-existing tests reach) keeps today's
+    `chosen = s_max` behavior unchanged.
+    """
     s_max = min(solve_max_seq_len(free_vram=free_vram, min_resident=min_resident,
                                   shape=shape),
                 int(position_limit))
@@ -400,9 +431,15 @@ def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
             raise VramPlanError(_too_big_message(
                 requested=1, s_max=s_max, free_vram=free_vram,
                 shape=shape, min_resident=min_resident))
-        chosen = s_max
-        why = (f"derived: the largest context fitting "
-               f"{float(free_vram) / 1024 ** 3:.2f} GiB free VRAM")
+        if reserve_floor > 0:
+            chosen = min(max(1, _largest_s_within_budget(shape, int(reserve_floor))), s_max)
+            why = (f"derived: largest context whose predicted peak fits the "
+                   f"{float(reserve_floor) / 1024 ** 3:.2f} GiB reserve floor "
+                   f"(capped at s_max={s_max})")
+        else:
+            chosen = s_max
+            why = (f"derived: the largest context fitting "
+                   f"{float(free_vram) / 1024 ** 3:.2f} GiB free VRAM")
     else:
         chosen = int(requested_max_seq_len)
         if chosen <= 0:
@@ -414,7 +451,7 @@ def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
                 shape=shape, min_resident=min_resident))
         why = f"caller-supplied, validated against S_max={s_max}"
 
-    reserve = predict_peak_vram(shape, chosen)
+    reserve = max(predict_peak_vram(shape, chosen), int(reserve_floor))
     pinning = max(0, int(free_vram) - reserve - int(layer_slack))
     gb = 1024.0 ** 3
     reason = (f"max_seq_len={chosen} ({why}); reserve={reserve / gb:.2f} GiB "

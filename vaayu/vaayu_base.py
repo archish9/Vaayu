@@ -334,20 +334,17 @@ def slab_arena_exhausted_warning(err: Exception) -> str:
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is optional fragmentation insurance
 # on top, not required for correctness.
 #
-# Known ceiling: this reserve is context-length-insensitive — the ~1.1 GB KV figure
-# above was measured at MAX_LENGTH=2048. A much longer context, or an MLA-style model
-# with a larger per-token KV footprint, could re-enter the decode-boundary squeeze.
-# This is inherent to keeping compute_vram_expert_budget geometry-free (§5); not a
-# defect to fix here, just a documented limit of the current constant.
-_VRAM_RESERVE_BYTES = int(3.5 * 1024 ** 3)
-
-
-def compute_vram_expert_budget(free_vram_bytes: int) -> int:
-    """VRAM available to cache resident expert tensors, after reserving headroom
-    (_VRAM_RESERVE_BYTES) for decode-side transients: activations, KV growth, and
-    the first-decode-step logits/sampling temporaries + allocator fragmentation.
-    Model-agnostic (Fix #7) — only free VRAM in, no geometry."""
-    return max(0, int(free_vram_bytes) - _VRAM_RESERVE_BYTES)
+# RETIRED as a sizing constant 2026-08-09 -- superseded by
+# vaayu.vram_plan.VramPlan.reserve_bytes, which is context-aware. The 3.5 GB
+# figure documented its own ceiling ("this reserve is context-length-insensitive
+# -- the ~1.1 GB KV figure above was measured at MAX_LENGTH=2048"), and bug F4
+# was the other half of the same defect.
+#
+# Kept ONLY as the floor below which no derived reserve may fall: it is the
+# measured decode-boundary requirement at short context (2026-07-24 RESULTS,
+# 4/4 with no expandable_segments), so a reserve smaller than this is known bad
+# regardless of how short the context is.
+_VRAM_RESERVE_FLOOR_BYTES = int(3.5 * 1024 ** 3)
 
 
 # Hardware constant: RAM to leave for the OS + io_uring pools + post-sizing
@@ -1161,7 +1158,7 @@ class VaayuBaseModel(GenerationMixin):
 
 
 
-    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
+    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=None,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  use_torch_compile=False, kv_cache_mode="auto", max_pinned_layers=0,
@@ -1186,7 +1183,9 @@ class VaayuBaseModel(GenerationMixin):
         dtype : torch.dtype, optional
             dtype, by default torch.float16
         max_seq_len : int, optional
-            max seq lenght, by default 512
+            max seq length, by default None -- derives the largest context that
+            fits in free VRAM (vaayu.vram_plan.plan_vram). A supplied value is
+            validated against that derived ceiling and raises if it does not fit.
         layer_shards_saving_path : str, optional
             optional path to save layered shards model file, by default just save to the local cache of model, subdir named splitted_model will be saved
         profiling_mode : book, optional
@@ -1468,6 +1467,95 @@ class VaayuBaseModel(GenerationMixin):
             self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
             self._expert_offset_index.build_or_load()
 
+        # Geometry is needed by plan_vram below (for its min_resident floor), so
+        # it is computed BEFORE pinning rather than at cache-sizing time. Its
+        # inputs are all ready: _detect_moe() ran above, set_layers_from_layer_names()
+        # ran above that, the offset index just above.
+        self._moe_geometry = None
+        if self.is_moe and self._expert_offset_index is not None:
+            self._moe_geometry = compute_moe_geometry(
+                self._expert_offset_index,
+                num_layers=len(self.layers),
+                moe_top_k=self.moe_top_k,
+                moe_num_experts=self.moe_num_experts,
+            )
+
+        self._vram_plan = None
+        if device.startswith("cuda") and torch.cuda.is_available():
+            from .vram_plan import (DEFAULT_ACT_COEFF, DEFAULT_ALLOC_FACTOR,
+                                    MATERIALIZES_SCORES, VramShape,
+                                    kv_bytes_per_token, plan_vram)
+            _free_vram, _ = torch.cuda.mem_get_info()
+            _n_heads = self.config.num_attention_heads
+            _head_dim = getattr(self.config, "head_dim", None)
+            if not isinstance(_head_dim, int):
+                _head_dim = self.config.hidden_size // _n_heads
+            _layer0 = Path(self.checkpoint_path) / \
+                f"{self.layer_names_dict['layer_prefix']}.0.safetensors"
+            try:
+                _layer_slack = _layer0.stat().st_size
+            except Exception:
+                _layer_slack = int(0.6 * 1024 ** 3)   # hardware fallback
+            # kv_growth_factor/kv_capacity_buckets are algorithmic properties of
+            # the KV cache class _create_kv_cache will build (Amendment 1,
+            # task-6-brief.md), not of any model (§5) — derived by mirroring
+            # _create_kv_cache's own mode resolution, not guessed.
+            _shape = VramShape(
+                kv_per_token=kv_bytes_per_token(
+                    num_hidden_layers=self.config.num_hidden_layers,
+                    num_key_value_heads=getattr(self.config, "num_key_value_heads",
+                                                _n_heads),
+                    head_dim=_head_dim,
+                    kv_cache_mode=self.kv_cache_mode),
+                N=1, chunk=max(1, self.prefill_chunk_size),
+                hidden=self.config.hidden_size, n_heads=_n_heads,
+                vocab=self.config.vocab_size,
+                elem_bytes=torch.finfo(self.running_dtype).bits // 8,
+                act_coeff=DEFAULT_ACT_COEFF,
+                materializes_scores=MATERIALIZES_SCORES,
+                alloc_factor=DEFAULT_ALLOC_FACTOR,
+                kv_growth_factor=FP8DynamicCache._GROWTH,
+                kv_capacity_buckets=self._kv_cache_is_bucketed())
+            self._vram_plan = plan_vram(
+                free_vram=_free_vram, shape=_shape,
+                min_resident=(self._moe_geometry["expert_bytes"]
+                              if self._moe_geometry else 0),
+                requested_max_seq_len=max_seq_len,
+                position_limit=getattr(self.config, "max_position_embeddings",
+                                       2 ** 31 - 1),
+                layer_slack=_layer_slack,
+                reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+            self._vram_shape = _shape      # Task 8's predicate re-uses it at N>1
+            self.max_seq_len = self._vram_plan.max_seq_len
+            # expert_vram_budget_for at this same free-VRAM snapshot -- the
+            # ceiling the reserve implies, not yet corrected for what pinning
+            # (below) actually consumes; the real post-pinning figure is
+            # printed at the expert-cache-creation call site further down.
+            from .vram_plan import expert_vram_budget_for as _expert_budget_for
+            _expert_budget_planned = _expert_budget_for(self._vram_plan, _free_vram)
+            _gib = 1024.0 ** 3
+            print(f"[Vaayu-VRAM] {self._vram_plan.reason}; "
+                  f"pinning_budget={self._vram_plan.pinning_budget / _gib:.2f} GiB; "
+                  f"expert cache ceiling={_expert_budget_planned / _gib:.2f} GiB")
+            # CLAUDE.md §5: warn rather than silently degrade when the plan
+            # leaves nothing for pinning -- a real hardware limit, not a bug
+            # to hide. (The parallel "expert budget under one expert" case is
+            # warned at the expert-cache-creation call site below, where the
+            # real post-pinning free VRAM is known.)
+            if self._vram_plan.pinning_budget == 0:
+                print(f"[Vaayu-VRAM] WARNING: pinning_budget is 0 — no shared "
+                      f"or transformer layers can be pinned in VRAM. Every "
+                      f"layer streams from disk/RAM on every token; expect "
+                      f"very slow decode (a real hardware limit on this box, "
+                      f"not a bug).")
+
+        if self.max_seq_len is None:
+            # CPU / no-CUDA path (§5: dense and non-EXL3/CPU paths must keep
+            # working; CPU builds no VramPlan at all since there is no free-VRAM
+            # figure to derive a ceiling from). Keep the historical default
+            # rather than leaving max_seq_len unset.
+            self.max_seq_len = 512
+
         if device.startswith("cuda"):
             self._init_pinned_layers()
 
@@ -1549,14 +1637,6 @@ class VaayuBaseModel(GenerationMixin):
                   f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
                   f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
 
-            # Model-agnostic geometry (Task 0) → single source of truth. No Qwen
-            # numbers hardcoded; expert_bytes/num_moe_layers/working_set derived.
-            self._moe_geometry = compute_moe_geometry(
-                self._expert_offset_index,
-                num_layers=len(self.layers),
-                moe_top_k=self.moe_top_k,
-                moe_num_experts=self.moe_num_experts,
-            )
             _geo = self._moe_geometry
             _expert_budget, _ne_budget, _max_per_layer = compute_expert_budget(
                 available_bytes=_mem.available,
@@ -1682,8 +1762,9 @@ class VaayuBaseModel(GenerationMixin):
 
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                from .vram_plan import expert_vram_budget_for
                 _free_vram, _ = torch.cuda.mem_get_info()
-                _vram_budget = compute_vram_expert_budget(_free_vram)
+                _vram_budget = expert_vram_budget_for(self._vram_plan, _free_vram)
                 if _vram_budget >= self._moe_geometry["expert_bytes"]:
                     self._expert_vram_cache = ExpertVRAMCache(
                         _vram_budget,
@@ -1695,7 +1776,7 @@ class VaayuBaseModel(GenerationMixin):
                 else:
                     print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled — free VRAM "
                           f"{_free_vram/1e9:.2f}GB leaves {_vram_budget/1e9:.2f}GB after the "
-                          f"{_VRAM_RESERVE_BYTES/1e9:.2f}GB decode reserve, under one "
+                          f"{self._vram_plan.reserve_bytes/1e9:.2f}GB reserve, under one "
                           f"{self._moe_geometry['expert_bytes']/1e6:.1f}MB expert. Every expert "
                           f"streams per token; expect very slow decode (a real hardware limit, "
                           f"not a bug).")
@@ -2294,49 +2375,41 @@ class VaayuBaseModel(GenerationMixin):
         """
         VRAM budget available for permanently pinned layers.
 
-        Reserves space for KV cache (sized by kv_cache_mode) + 1.5 GB overhead
-        (CUDA context + streaming double-buffer).
-
-        KV cache formulas:
-          BF16: n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 2 bytes
-          FP8:  n_layers × 2 × n_kv_heads × head_dim × max_seq_len × 1 byte
-                (per-head scales are negligible vs 1.5 GB overhead and absorbed there)
+        Sourced from self._vram_plan.pinning_budget (vaayu.vram_plan.plan_vram),
+        built once at load time from the same reserve the expert VRAM cache
+        also subtracts (expert_vram_budget_for) -- see vram_plan.py's module
+        docstring for why the two budgets must share one reserve number.
         """
         if not torch.cuda.is_available():
             return 0
         if not str(self.device).startswith("cuda"):
             return 0
-        total = torch.cuda.get_device_properties(self.device).total_memory
+        return self._vram_plan.pinning_budget if self._vram_plan else 0
 
-        n_layers = getattr(self.config, 'num_hidden_layers', 80)
-        n_kv_heads = getattr(self.config, 'num_key_value_heads', 8)
-        _head_dim_attr = getattr(self.config, 'head_dim', None)
-        if isinstance(_head_dim_attr, int):
-            head_dim = _head_dim_attr
-        else:
-            head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        mode = getattr(self, 'kv_cache_mode', 'fp16')
-        # TurboQuant really costs bits_total/8 + 4/head_dim bytes/element (0.531
-        # at 4 bits, head_dim 128), but this arithmetic is integer, so charge the
-        # next whole byte: conservative, never under-reserves.
-        if mode == 'fp8' or mode.startswith('turboquant'):
-            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len
-        else:
-            kv_bytes = n_layers * 2 * n_kv_heads * head_dim * self.max_seq_len * 2
-
-        # Reserve one transformer layer's worth of VRAM as a streaming buffer.
-        # Without this slack, auto-fill pinning leaves <200 MB free, causing
-        # H2D transfers to serialize instead of pipeline during short compute
-        # windows (e.g., the final small prefill chunk with only a few tokens).
-        layer0_path = Path(self.checkpoint_path) / f"{self.layer_names_dict['layer_prefix']}.0.safetensors"
-        try:
-            layer_slack = layer0_path.stat().st_size
-        except Exception:
-            layer_slack = int(0.6 * 1024 ** 3)  # 600 MB conservative fallback
-
-        overhead = int(1.5 * 1024 ** 3) + layer_slack
-        return max(0, total - kv_bytes - overhead)
+    def _kv_cache_is_bucketed(self) -> bool:
+        """Whether _create_kv_cache (below) would return a geometric-doubling
+        ring buffer -- FP8DynamicCache or its TurboQuantKVCache subclass --
+        rather than a plain transformers DynamicCache that holds exactly S
+        tokens with no over-allocation (VramShape.kv_capacity_buckets,
+        Amendment 1, task-6-brief.md). Mirrors _create_kv_cache's own mode
+        resolution exactly, since the real cache is not constructed until
+        first use but the VRAM plan (built at load time, see __init__) needs
+        the answer before that. Not a guess: every branch here matches a
+        branch in _create_kv_cache."""
+        mode = self.kv_cache_mode
+        if mode == "auto":
+            from .persist.loader_strategy import EXL3LoaderStrategy
+            mode = "bf16" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
+        if mode == "fp16":
+            return False
+        if mode == "bf16":
+            return True
+        if mode == "turboquant" or mode.startswith("turboquant:"):
+            return True
+        # fp8 (or a bare/unrecognised passthrough): FP8DynamicCache, unless
+        # this PyTorch build lacks float8 support, in which case
+        # _create_kv_cache falls back to a plain DynamicCache.
+        return hasattr(torch, "float8_e4m3fn")
 
     def _create_kv_cache(self):
         """Return a KV cache instance sized and typed for the configured kv_cache_mode."""

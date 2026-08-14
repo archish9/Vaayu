@@ -1,19 +1,5 @@
 """Fix #7: VRAM expert-cache budget derived from free VRAM (hardware), reserves headroom."""
-from vaayu.vaayu_base import compute_vram_expert_budget
 GB = 1024 ** 3
-
-
-def test_reserves_headroom():
-    # 8 GB free after model load → budget must leave >=2 GB headroom
-    budget = compute_vram_expert_budget(free_vram_bytes=8 * GB)
-    assert budget <= 6 * GB
-    assert budget >= 1 * GB
-
-
-def test_tiny_free_vram_yields_zero_or_min():
-    budget = compute_vram_expert_budget(free_vram_bytes=1 * GB)
-    assert budget >= 0
-    assert budget <= 1 * GB
 
 
 def test_vram_layer_range_restricts_when_budget_below_working_set():
@@ -52,13 +38,25 @@ def test_vram_layer_range_zero_budget():
     assert compute_vram_layer_range(0, geo, list(range(91))) == set()
 
 
-def test_reserve_covers_decode_transients_not_just_prefill():
-    """RESULTS 2026-07-24: the old 2 GB reserve was sized for prefill; it left the
-    first decode step with no room for the VRAM-cache re-warm + logits/sampling
-    transient, OOMing at the prefill->decode boundary at the 3rd generation. The
-    reserve must exceed 2 GB so decode keeps headroom. Hardware constant (§5),
-    model-agnostic — no geometry input to the sizing function."""
-    from vaayu.vaayu_base import _VRAM_RESERVE_BYTES
-    assert _VRAM_RESERVE_BYTES >= int(3.5 * GB)
-    # And it still leaves a usable cache on this box (~11.7 GB free at cache-sizing):
-    assert compute_vram_expert_budget(free_vram_bytes=int(11.7 * GB)) >= 6 * GB
+def test_reserve_is_context_aware_not_a_flat_constant():
+    """The 3.5 GB flat reserve documented its own ceiling: 'this reserve is
+    context-length-insensitive -- the ~1.1 GB KV figure above was measured at
+    MAX_LENGTH=2048'. At 7.7k the same models need 1.48-2.52 GB of KV, so the
+    reserve was covering KV and almost nothing else. It must now grow with S."""
+    from vaayu.vram_plan import (DEFAULT_ACT_COEFF, DEFAULT_ALLOC_FACTOR,
+                                 VramShape, kv_bytes_per_token, plan_vram)
+
+    shape = VramShape(
+        kv_per_token=kv_bytes_per_token(num_hidden_layers=94, num_key_value_heads=4,
+                                        head_dim=128, kv_cache_mode="bf16"),
+        N=1, chunk=512, hidden=4096, n_heads=64, vocab=151936, elem_bytes=2,
+        act_coeff=DEFAULT_ACT_COEFF, materializes_scores=False,
+        alloc_factor=DEFAULT_ALLOC_FACTOR)
+    common = dict(free_vram=int(15.47 * GB), shape=shape,
+                  min_resident=int(11.28 * 1024 ** 2),
+                  position_limit=131072, layer_slack=int(0.6 * GB))
+    short = plan_vram(requested_max_seq_len=2048, **common)
+    long_ = plan_vram(requested_max_seq_len=7700, **common)
+    assert long_.reserve_bytes > short.reserve_bytes
+    # And the long reserve must actually cover the KV it is reserving for -- F4.
+    assert long_.reserve_bytes >= shape.kv_per_token * 7700

@@ -99,7 +99,7 @@ def recommend_compress_bits(pool_bytes: float, per_sess_bf16: float,
 def main() -> int:
     import psutil
     from transformers import AutoConfig
-    from vaayu.vaayu_base import compute_prefix_cache_budget, _VRAM_RESERVE_BYTES
+    from vaayu.vaayu_base import compute_prefix_cache_budget, _VRAM_RESERVE_FLOOR_BYTES
 
     cfg = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
     layers = cfg.num_hidden_layers
@@ -214,9 +214,10 @@ def main() -> int:
             live = per_sess_bf16      # the in-flight session is never compressed
             print(f"VRAM    free {free_vram/GB:.2f} GB; the LIVE session's KV is "
                   f"{live/GB:.2f} GB (always bf16 — compression applies only to the pool)")
-            if live > free_vram - _VRAM_RESERVE_BYTES:
+            if live > free_vram - _VRAM_RESERVE_FLOOR_BYTES:
                 print(f"        !! At {TOKENS_PER_SESSION} tokens the live KV alone may not fit "
-                      f"beside the {_VRAM_RESERVE_BYTES/GB:.1f} GB reserve.")
+                      f"beside the {_VRAM_RESERVE_FLOOR_BYTES/GB:.1f} GB reserve floor (the "
+                      f"real reserve grows with context length).")
                 print(f"        Shrinking the pool cannot help — that needs attention over")
                 print(f"        compressed keys, which is not built. Reduce context length.")
     except Exception as e:
