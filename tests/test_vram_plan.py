@@ -6,6 +6,7 @@ import pytest
 from vaayu.vram_plan import (
     VramPlanError,
     kv_bytes_per_token,
+    kv_capacity_tokens,
     kv_elem_bytes,
 )
 
@@ -21,15 +22,27 @@ GB_DEC = 10 ** 9
 
 # Four real on-device geometries, read off their config.json. CLAUDE.md §5:
 # a fix that only proves out on Qwen is not done.
+#
+# `kv_capacity_buckets` records each checkpoint's REAL cache format (Task 5,
+# task-5-report.md): kv_cache_mode="auto" resolves to FP8DynamicCache (a
+# geometric-doubling ring buffer) on every EXL3 checkpoint, and to a plain
+# transformers.DynamicCache (no over-allocation) otherwise. Three of these
+# four on-device geometries are EXL3; llama-1b is the non-EXL3 format
+# control and must NOT be bucketed, or the cliff-vs-no-cliff contrast this
+# module exists to model collapses.
 GEOMETRIES = {
     "qwen3-235b":   dict(num_hidden_layers=94, num_key_value_heads=4,
-                         head_dim=128, hidden=4096, n_heads=64, vocab=151936),
+                         head_dim=128, hidden=4096, n_heads=64, vocab=151936,
+                         kv_capacity_buckets=True),
     "minimax-m2.7": dict(num_hidden_layers=62, num_key_value_heads=8,
-                         head_dim=128, hidden=3072, n_heads=48, vocab=200064),
+                         head_dim=128, hidden=3072, n_heads=48, vocab=200064,
+                         kv_capacity_buckets=True),
     "llama-70b":    dict(num_hidden_layers=80, num_key_value_heads=8,
-                         head_dim=128, hidden=8192, n_heads=64, vocab=128256),
+                         head_dim=128, hidden=8192, n_heads=64, vocab=128256,
+                         kv_capacity_buckets=True),
     "llama-1b":     dict(num_hidden_layers=16, num_key_value_heads=8,
-                         head_dim=64, hidden=2048, n_heads=32, vocab=128256),
+                         head_dim=64, hidden=2048, n_heads=32, vocab=128256,
+                         kv_capacity_buckets=False),
 }
 
 
@@ -86,25 +99,132 @@ from vaayu.vram_plan import (
 
 
 def shape_for(name, *, N=1, chunk=512, kv_cache_mode="bf16",
-              materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR):
+              materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR,
+              kv_growth_factor=2, kv_capacity_buckets=None):
     geo = GEOMETRIES[name]
+    if kv_capacity_buckets is None:
+        kv_capacity_buckets = geo["kv_capacity_buckets"]
     return VramShape(
         kv_per_token=kv_bytes_per_token(**_kv_kwargs(geo), kv_cache_mode=kv_cache_mode),
         N=N, chunk=chunk, hidden=geo["hidden"], n_heads=geo["n_heads"],
         vocab=geo["vocab"], elem_bytes=2, act_coeff=DEFAULT_ACT_COEFF,
         materializes_scores=materializes_scores, alloc_factor=alloc_factor,
+        kv_growth_factor=kv_growth_factor, kv_capacity_buckets=kv_capacity_buckets,
     )
 
 
+# --- kv_capacity_tokens -----------------------------------------------
+#
+# Task 5 (task-5-report.md) measured that kv_cache_mode="auto" resolves to
+# FP8DynamicCache(quantize=False) on every EXL3 checkpoint, and its
+# _ensure_capacity (vaayu_base.py) grows the KV ring buffer by GEOMETRIC
+# DOUBLING (`new_cap = max(needed, max(1, cap) * growth)`), not per token.
+# The naive S-linear KV model failed the ±10% accuracy gate by up to +41.2%
+# because of this missing step term (13 of 17 measured points off by more
+# than 10%). kv_capacity_tokens reproduces that growth in closed form so
+# predict_peak_vram can charge the KV term against what is actually
+# ALLOCATED, not the raw context length.
+
+def test_kv_capacity_tokens_no_bucketing_returns_S_unchanged():
+    """buckets=False models a plain transformers.DynamicCache (every
+    non-EXL3 checkpoint) which holds exactly S tokens, no over-allocation."""
+    for s in (1, 2, 511, 512, 513, 5000, 8192, 8193, 100_000):
+        assert kv_capacity_tokens(s, chunk=512, growth=2, buckets=False) == s
+
+
+def test_kv_capacity_tokens_sub_chunk_boundary():
+    """S <= chunk means the WHOLE context is the first (and only)
+    _ensure_capacity call, whose `needed` is the context's own length, not a
+    full chunk: new_cap = max(needed, max(1, 0) * growth) = max(S, growth).
+    So capacity for a sub-chunk context tracks S once S >= growth, and only
+    floors at `growth` for very small S -- it is never a full `chunk`."""
+    assert kv_capacity_tokens(1, chunk=512, growth=2, buckets=True) == 2
+    assert kv_capacity_tokens(2, chunk=512, growth=2, buckets=True) == 2
+    assert kv_capacity_tokens(3, chunk=512, growth=2, buckets=True) == 3
+    assert kv_capacity_tokens(100, chunk=512, growth=2, buckets=True) == 100
+    assert kv_capacity_tokens(512, chunk=512, growth=2, buckets=True) == 512
+
+
+def test_kv_capacity_tokens_matches_the_measured_doubling_table():
+    """task-5-report.md's traced simulation, chunk=512 growth=2: capacity
+    locks at 8192 for any S in [4609, 8192] and jumps to 16384 the instant S
+    exceeds 8192 -- exactly the S=7700->8200 boundary the GPU probe hit."""
+    for s in (4609, 5000, 6000, 7000, 7700, 8192):
+        assert kv_capacity_tokens(s, chunk=512, growth=2, buckets=True) == 8192
+    assert kv_capacity_tokens(8193, chunk=512, growth=2, buckets=True) == 16384
+    assert kv_capacity_tokens(8704, chunk=512, growth=2, buckets=True) == 16384
+    assert kv_capacity_tokens(16384, chunk=512, growth=2, buckets=True) == 16384
+    assert kv_capacity_tokens(16385, chunk=512, growth=2, buckets=True) == 32768
+
+
+def test_kv_capacity_tokens_is_not_hardcoded_to_growth_2_or_chunk_512():
+    """CLAUDE.md §5: chunk and growth must be derived/passed, never literals
+    baked into the function. Hand-simulated for chunk=100, growth=3:
+    i=1 needed=100 cap=0->100; i=2 needed=200 cap=100->300;
+    i=3 needed=300 cap=300 (no growth); i=4(partial) needed=350 cap=300->900."""
+    assert kv_capacity_tokens(100, chunk=100, growth=3, buckets=True) == 100
+    assert kv_capacity_tokens(200, chunk=100, growth=3, buckets=True) == 300
+    assert kv_capacity_tokens(300, chunk=100, growth=3, buckets=True) == 300
+    assert kv_capacity_tokens(350, chunk=100, growth=3, buckets=True) == 900
+
+
+def test_kv_capacity_tokens_is_monotone_non_decreasing():
+    """A step function, never a decrease -- the ring buffer never shrinks."""
+    prev = 0
+    for s in range(1, 9000, 137):
+        cap = kv_capacity_tokens(s, chunk=512, growth=2, buckets=True)
+        assert cap >= prev
+        assert cap >= s  # capacity can never hold fewer tokens than S itself
+        prev = cap
+
+
+def test_kv_capacity_tokens_growth_below_2_raises():
+    """growth=1 would mean max(needed, cap*1) == needed exactly whenever
+    growth triggers -- an always-exact-fit cache this closed form does not
+    model, and not a value FP8DynamicCache._GROWTH (a doubling factor) can
+    take. Raise rather than loop or silently misreport."""
+    with pytest.raises(VramPlanError):
+        kv_capacity_tokens(1000, chunk=512, growth=1, buckets=True)
+
+
+# --- predict_peak_vram: piecewise-linear, not linear ---------------------
+
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
-def test_peak_is_linear_in_S(name):
-    """Every S-dependent term is first-order, so equal steps in S must produce
-    equal steps in peak. If this ever fails, a quadratic term was added and the
-    closed-form S_max solve in plan_vram is no longer valid."""
+def test_peak_is_linear_within_a_kv_capacity_bucket_and_steps_at_the_boundary(name):
+    """This test used to assert predict_peak_vram was linear in S EVERYWHERE
+    ("Every S-dependent term is first-order"). Task 5's GPU probe measured
+    that this is false for the KV term on every EXL3 checkpoint: capacity is
+    a step function (kv_capacity_tokens), so peak is linear only WITHIN a
+    capacity bucket and jumps by a whole bucket's worth of KV at each
+    boundary -- confirmed within 7% of the doubling prediction on three
+    independent geometries (task-5-report.md). Do not "restore" the old
+    everywhere-linear assertion; it asserts something the measurement
+    refuted.
+    """
     sh = shape_for(name)
+    if sh.kv_capacity_buckets:
+        # 5000, 6000, 7000 share one capacity bucket at chunk=512 -- that is
+        # WHY equal steps in S must produce equal steps in peak here.
+        cap5000 = kv_capacity_tokens(5000, chunk=sh.chunk, growth=sh.kv_growth_factor,
+                                      buckets=True)
+        cap6000 = kv_capacity_tokens(6000, chunk=sh.chunk, growth=sh.kv_growth_factor,
+                                      buckets=True)
+        cap7000 = kv_capacity_tokens(7000, chunk=sh.chunk, growth=sh.kv_growth_factor,
+                                      buckets=True)
+        assert cap5000 == cap6000 == cap7000
+    # llama-1b (buckets=False) has no bucket to share -- its KV term is
+    # kv_per_token * S * N directly, which is linear in S on its own, so the
+    # equal-steps assertion below holds for it too, for a different reason.
     d1 = predict_peak_vram(sh, 6000) - predict_peak_vram(sh, 5000)
     d2 = predict_peak_vram(sh, 7000) - predict_peak_vram(sh, 6000)
     assert d1 == pytest.approx(d2, rel=1e-6)
+
+    if sh.kv_capacity_buckets:
+        # Crossing 8192->8193 (bucketed models only) adds a WHOLE bucket's
+        # worth of KV capacity (kv_per_token * 8192 * N) in one token -- far
+        # larger than the per-1000-token delta measured above.
+        jump = predict_peak_vram(sh, 8193) - predict_peak_vram(sh, 8192)
+        assert jump > d1
 
 
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
@@ -191,32 +311,61 @@ def test_reserve_covers_actual_kv_at_the_derived_context(name):
     assert p.reserve_bytes >= sh.kv_per_token * p.max_seq_len
 
 
-def test_the_four_geometries_produce_four_distinct_s_max():
+def test_the_four_geometries_are_not_collapsed_into_one_fixture():
     """Assert the fixture premise. Plan L's slab_index_of mutant passed 84/84
     because every fixture collapsed to a single chunk -- a test whose premise is
     not asserted can silently stop testing anything.
 
-    Plan-level s_max alone is not enough: at USABLE_VRAM, llama-1b's solve is
-    clamped by position_limit (131072) down from its true unclamped value of
-    278176. That clamp makes it distinct from the other three "for free," not
-    because of its own KV/activation geometry. So assert distinctness on the
-    UNCLAMPED solve_max_seq_len too -- that is the actual geometry claim --
-    alongside the existing plan-level check."""
+    This used to require all FOUR s_max values distinct. Task 5b's bucketed
+    KV model (kv_capacity_tokens) makes that too strong: within a capacity
+    bucket the KV term is flat, so two shapes can each have enough budget to
+    fill a bucket up to its ceiling but not enough for the next doubling,
+    landing both exactly on that ceiling. Verified by hand at USABLE_VRAM:
+    llama-70b and minimax-m2.7 both solve to unclamped S=32768 even though
+    their kv_per_token values differ (327680 vs 253952 B/token) -- the
+    SATURATING bucket ceiling coincides, which is a real property of the
+    corrected model, not a fixture defect. So this now asserts the weaker,
+    still-meaningful claim the old test actually protected: the four
+    fixtures do not all collapse to ONE value."""
     s_maxes = {name: _plan(name).s_max for name in GEOMETRIES}
-    assert len(set(s_maxes.values())) == len(GEOMETRIES), s_maxes
+    assert len(set(s_maxes.values())) > 1, s_maxes
 
     unclamped = {name: solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES,
                                          shape=shape_for(name))
                 for name in GEOMETRIES}
-    assert len(set(unclamped.values())) == len(GEOMETRIES), unclamped
+    assert len(set(unclamped.values())) > 1, unclamped
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_solve_max_seq_len_is_exact_at_its_own_bucket_boundary(name):
+    """The whole point of an honest refusal is being exactly right at the
+    edge. predict_peak_vram is now a step function of S (kv_capacity_tokens),
+    so solve_max_seq_len can no longer just divide a slope -- it must return
+    the largest S that TRULY fits, verified against predict_peak_vram itself:
+    the chosen S_max fits, and S_max + 1 does not. An off-by-one here is the
+    difference between a clean refusal and an OOM."""
+    shape = shape_for(name)
+    s_max = solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES,
+                              shape=shape)
+    assert s_max > 0
+    budget = USABLE_VRAM - EXPERT_BYTES
+    assert predict_peak_vram(shape, s_max) <= budget
+    assert predict_peak_vram(shape, s_max + 1) > budget
 
 
 def test_s_max_decreases_as_kv_per_token_grows():
+    """Was a strict '<'. Task 5b's bucketed KV model (kv_capacity_tokens)
+    makes the KV term flat within a capacity bucket, so a fatter KV/token
+    shape can legitimately SATURATE at the same bucket ceiling as a thinner
+    one (verified by hand at USABLE_VRAM + DEFAULT_ACT_COEFF/ALLOC_FACTOR:
+    llama-70b and qwen3-235b both land on unclamped S=32768) without
+    contradicting "more KV cost never buys more context" -- that claim is
+    <=, not <, once the KV term can plateau."""
     fat = shape_for("llama-70b")            # 0.328 MB/token
     thin = shape_for("qwen3-235b")          # 0.193 MB/token
     assert fat.kv_per_token > thin.kv_per_token
     assert (solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=fat)
-            < solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=thin))
+            <= solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=thin))
 
 
 def test_s_max_is_capped_by_position_limit():
