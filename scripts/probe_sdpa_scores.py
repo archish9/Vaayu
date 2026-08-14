@@ -13,6 +13,7 @@ import json
 import sys
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 CHUNK = 512          # matches the prefill_chunk_size default
 N = 1
@@ -47,7 +48,31 @@ def peak_for(n_heads, head_dim, S, masked):
     return peak
 
 
-def main(config_paths):
+def check_backends(n_heads, head_dim, S=8192):
+    """Opt-in (--check-backends): force each SDPBackend on the masked call and
+    log which ones actually accept a (N,1,q,kv) additive mask. This is the
+    evidence behind "which backend does the unforced call in peak_for() fall
+    through to" -- logged here rather than asserted, per review on Task 1.
+    Does not affect the default two-arm run the brief's Step 1 specifies.
+    """
+    dev = "cuda:0"
+    q = torch.randn(N, n_heads, CHUNK, head_dim, device=dev, dtype=DTYPE)
+    k = torch.randn(N, n_heads, S, head_dim, device=dev, dtype=DTYPE)
+    v = torch.randn(N, n_heads, S, head_dim, device=dev, dtype=DTYPE)
+    mask = torch.zeros(N, 1, CHUNK, S, device=dev, dtype=DTYPE)
+    for name, backend in [("FLASH_ATTENTION", SDPBackend.FLASH_ATTENTION),
+                           ("EFFICIENT_ATTENTION", SDPBackend.EFFICIENT_ATTENTION),
+                           ("MATH", SDPBackend.MATH)]:
+        try:
+            with sdpa_kernel(backend):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            print(f"  backend={name:20s} OK    shape={tuple(out.shape)}")
+        except Exception as e:
+            print(f"  backend={name:20s} FAILED: {str(e).splitlines()[0][:160]}")
+    del q, k, v, mask
+
+
+def main(config_paths, check_backends_flag=False):
     for cp in config_paths:
         n_heads, head_dim = geometry(cp)
         print(f"\n=== {cp}  n_heads={n_heads} head_dim={head_dim} ===")
@@ -65,7 +90,15 @@ def main(config_paths):
             print(f"  masked={masked!s:5s} materialized-score slope would be "
                   f"{score_slope} bytes/token -> "
                   f"{'MATERIALIZES' if slope > 0.5 * score_slope else 'does NOT materialize'}")
+        if check_backends_flag:
+            print(f"  backend check (S=8192, masked):")
+            check_backends(n_heads, head_dim)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    args = sys.argv[1:]
+    flag = "--check-backends"
+    check_backends_flag = flag in args
+    if check_backends_flag:
+        args = [a for a in args if a != flag]
+    main(args, check_backends_flag=check_backends_flag)
