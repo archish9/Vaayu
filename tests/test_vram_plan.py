@@ -75,3 +75,61 @@ def test_unknown_mode_raises_instead_of_falling_through_to_fp8():
     with pytest.raises(VramPlanError) as e:
         kv_elem_bytes("bf16_typo", head_dim=128)
     assert "bf16_typo" in str(e.value)
+
+
+from vaayu.vram_plan import (
+    DEFAULT_ACT_COEFF,
+    DEFAULT_ALLOC_FACTOR,
+    VramShape,
+    predict_peak_vram,
+)
+
+
+def shape_for(name, *, N=1, chunk=512, kv_cache_mode="bf16",
+              materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR):
+    geo = GEOMETRIES[name]
+    return VramShape(
+        kv_per_token=kv_bytes_per_token(**_kv_kwargs(geo), kv_cache_mode=kv_cache_mode),
+        N=N, chunk=chunk, hidden=geo["hidden"], n_heads=geo["n_heads"],
+        vocab=geo["vocab"], elem_bytes=2, act_coeff=DEFAULT_ACT_COEFF,
+        materializes_scores=materializes_scores, alloc_factor=alloc_factor,
+    )
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_peak_is_linear_in_S(name):
+    """Every S-dependent term is first-order, so equal steps in S must produce
+    equal steps in peak. If this ever fails, a quadratic term was added and the
+    closed-form S_max solve in plan_vram is no longer valid."""
+    sh = shape_for(name)
+    d1 = predict_peak_vram(sh, 6000) - predict_peak_vram(sh, 5000)
+    d2 = predict_peak_vram(sh, 7000) - predict_peak_vram(sh, 6000)
+    assert d1 == pytest.approx(d2, rel=1e-6)
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_scores_term_is_zero_when_flash_is_selected(name):
+    off = predict_peak_vram(shape_for(name, materializes_scores=False), 8192)
+    on = predict_peak_vram(shape_for(name, materializes_scores=True), 8192)
+    assert on > off
+
+
+def test_alloc_factor_scales_the_whole_prediction():
+    a = predict_peak_vram(shape_for("qwen3-235b", alloc_factor=1.0), 7700)
+    b = predict_peak_vram(shape_for("qwen3-235b", alloc_factor=1.2), 7700)
+    assert b == pytest.approx(1.2 * a, rel=1e-6)
+
+
+def test_peak_grows_with_batch_width():
+    one = predict_peak_vram(shape_for("minimax-m2.7", N=1), 7700)
+    three = predict_peak_vram(shape_for("minimax-m2.7", N=3), 7700)
+    assert three > 2.5 * one
+
+
+def test_kv_dominates_at_long_context_on_a_flash_backend():
+    """Sanity anchor against a measured number: Qwen KV at 7.7k is ~1.48 GB
+    (todo.md). With scores off, KV must be the largest single term."""
+    sh = shape_for("qwen3-235b", materializes_scores=False, alloc_factor=1.0)
+    kv = sh.kv_per_token * 7700
+    assert kv / GB_DEC == pytest.approx(1.48, abs=0.02)
+    assert kv > 0.5 * predict_peak_vram(sh, 7700)

@@ -67,3 +67,59 @@ def kv_bytes_per_token(*, num_hidden_layers: int, num_key_value_heads: int,
     """
     elem = kv_elem_bytes(kv_cache_mode, head_dim)
     return int(num_hidden_layers * 2 * num_key_value_heads * head_dim * elem)
+
+
+from dataclasses import dataclass
+
+# Placeholders until Task 5 measures them. act_coeff is the number of live
+# hidden-sized buffers per layer during chunk-major prefill; alloc_factor is
+# reserved/allocated, the allocator's fragmentation overhead. Both are
+# properties of the FORWARD and the ALLOCATOR, not of any model (§5).
+DEFAULT_ACT_COEFF = 4.0
+DEFAULT_ALLOC_FACTOR = 1.18
+
+
+@dataclass(frozen=True)
+class VramShape:
+    """Everything predict_peak_vram needs that does not vary with S.
+
+    All geometry fields are DERIVED from config at the call site (§5):
+    hidden <- hidden_size, n_heads <- num_attention_heads, vocab <- vocab_size.
+    """
+    kv_per_token: int
+    N: int                      # batch width the plan is sized for
+    chunk: int                  # prefill_chunk_size
+    hidden: int
+    n_heads: int
+    vocab: int
+    elem_bytes: int             # compute dtype width (2 for fp16/bf16)
+    act_coeff: float
+    materializes_scores: bool
+    alloc_factor: float
+
+
+def _peak_slope_bytes(shape: VramShape) -> float:
+    """Bytes of peak VRAM per additional token of context, before alloc_factor."""
+    scores = (shape.N * shape.n_heads * shape.chunk * shape.elem_bytes * 2
+              if shape.materializes_scores else 0.0)
+    return (shape.kv_per_token * shape.N
+            + shape.N * shape.hidden * shape.elem_bytes * shape.act_coeff
+            + scores)
+
+
+def _peak_intercept_bytes(shape: VramShape) -> float:
+    """Bytes of peak VRAM independent of context length, before alloc_factor.
+
+    Only the last chunk's logits are materialized (vaayu_base.py:3512-3519), and
+    sampling upcasts them to fp32 -- hence (elem_bytes + 4).
+    """
+    return shape.N * shape.chunk * shape.vocab * (shape.elem_bytes + 4)
+
+
+def predict_peak_vram(shape: VramShape, S: int) -> int:
+    """Predicted PEAK VRAM in bytes for a prefill of S tokens at this shape.
+
+    Linear in S by construction -- plan_vram inverts it in closed form.
+    """
+    raw = _peak_slope_bytes(shape) * int(S) + _peak_intercept_bytes(shape)
+    return int(round(raw * shape.alloc_factor))
