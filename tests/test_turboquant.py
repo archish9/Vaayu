@@ -370,11 +370,26 @@ def test_extract_kv_as_bf16_existing_modes_unchanged():
 
 
 def test_batch_kv_elem_bytes_charges_less_for_turboquant():
-    from vaayu.batch import _resolve_kv_elem_bytes
-    tq_bytes = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant"))
-    bf16_bytes = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="bf16"))
+    """_resolve_kv_elem_bytes used to collapse EVERY turboquant mode to the
+    same int (1, fp8's selector) -- so turboquant:3 and turboquant:9 (and
+    fp8) all charged fp8's 3.016 B/elem rate, a 5.7x over-charge against
+    turboquant's real 0.531 B/elem (4 bits, head_dim 128). It now returns the
+    mode STRING for turboquant so kv_bytes_for can charge the true,
+    bit-count-dependent rate."""
+    from vaayu.batch import _resolve_kv_elem_bytes, kv_bytes_for
+    tq_mode = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant"))
+    bf16_mode = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="bf16"))
+    assert isinstance(tq_mode, str) and tq_mode.startswith("turboquant")
+    assert bf16_mode == 2
+
+    tq_bytes = kv_bytes_for(1000, 10, 8, 128, tq_mode)
+    bf16_bytes = kv_bytes_for(1000, 10, 8, 128, bf16_mode)
     assert tq_bytes < bf16_bytes
-    assert _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant:3")) == tq_bytes
+
+    # Different bit counts must no longer collapse to the same charge.
+    tq3_mode = _resolve_kv_elem_bytes(types.SimpleNamespace(kv_cache_mode="turboquant:3"))
+    tq3_bytes = kv_bytes_for(1000, 10, 8, 128, tq3_mode)
+    assert tq3_bytes < tq_bytes
 
 
 def test_vram_pinning_budget_charges_less_for_turboquant():

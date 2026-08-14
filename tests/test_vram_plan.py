@@ -546,7 +546,8 @@ def test_expert_budget_is_zero_rather_than_negative_when_nothing_is_left():
 
 def test_sub_one_expert_budget_is_reported_not_silently_zeroed():
     """CLAUDE.md §5: when a model genuinely does not fit the hardware, WARN --
-    do not silently degrade. The caller at vaayu_base.py:1686 prints the warning;
+    do not silently degrade. The caller (vaayu_base.py's expert-VRAM-cache
+    setup, right after its `expert_vram_budget_for` call) prints the warning;
     this pins the helper it decides on, which must return a real byte count
     (possibly below one expert) rather than clamping to 0 and hiding the case."""
     p = _plan("qwen3-235b")
@@ -628,7 +629,7 @@ def test_batch_width_at_the_real_reserve_floor_xfails():
     tokens is infeasible on this box for both MoE models -- a real GPU OOM,
     not a model prediction. This test checks that claim at the operating
     point production actually uses: self._vram_plan.max_seq_len as built by
-    vaayu_base.py's __init__, which calls plan_vria with
+    vaayu_base.py's __init__, which calls plan_vram with
     reserve_floor=_VRAM_RESERVE_FLOOR_BYTES (3.5 GiB), not the
     reserve_floor=0 default test_batch_width_is_rechecked_against_the_plan
     above exercises.

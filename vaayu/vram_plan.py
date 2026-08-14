@@ -242,7 +242,9 @@ def _trailing_chunk_tokens(S: int, chunk: int) -> int:
 def _peak_intercept_bytes(shape: VramShape, S: int) -> float:
     """Bytes of peak VRAM from the last chunk's logits, before alloc_factor.
 
-    Only the last chunk's logits are materialized (vaayu_base.py:3512-3519), and
+    Only the last chunk's logits are materialized (vaayu_base.py's forward(),
+    around the `run_lm_head` call and its "only the last chunk's logits
+    exist/matter" comment further down), and
     sampling upcasts them to fp32 -- hence (elem_bytes + 4). The last chunk is
     `_trailing_chunk_tokens(S, shape.chunk)` tokens long, not always a full
     `chunk` -- see that function's docstring for the measured evidence.

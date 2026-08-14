@@ -683,7 +683,7 @@ def _make_sparse_moe_forward(
 
 # Hardware constant: free VRAM to guarantee before each MoE layer DURING PREFILL,
 # by evicting the (prefill-idle) VRAM expert cache. A property of the card, not
-# the model (CLAUDE.md §5) — same CLASS of constant as vaayu_base._VRAM_RESERVE_BYTES
+# the model (CLAUDE.md §5) — same CLASS of constant as vaayu_base._VRAM_RESERVE_FLOOR_BYTES
 # (both are hardware headroom reserves), but a deliberately DIFFERENT value (2 GB
 # here vs 3.5 GB there): this one only needs to exceed one layer's prefill-chunk
 # activation, since the poll runs per layer, while the other must additionally

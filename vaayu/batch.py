@@ -21,16 +21,21 @@ class BatchRequest:
 
 
 def kv_bytes_for(seq_len: int, n_layers: int, n_kv_heads: int,
-                 head_dim: int, elem_bytes: int) -> int:
+                 head_dim: int, elem_bytes) -> int:
     """Per-stream KV footprint in bytes.
 
     Delegates to vram_plan.kv_bytes_per_token so admission and the reserve quote
     the SAME expression -- if they diverge, admission is lying and the difference
     surfaces as an OOM rather than as a deferral. `elem_bytes` is kept in the
-    signature for callers that already computed it; it selects the cache mode.
+    signature for callers that already computed it; it selects the cache mode:
+    1 -> fp8, anything else int -> bf16 (existing integer callers, unchanged).
+    It may also be given the real kv_cache_mode string directly (e.g.
+    'turboquant:9', as `_resolve_kv_elem_bytes` now returns for TurboQuant),
+    which is passed straight through to kv_bytes_per_token instead of being
+    squeezed into an int -- see _resolve_kv_elem_bytes's docstring.
     """
     from .vram_plan import kv_bytes_per_token
-    mode = "fp8" if elem_bytes == 1 else "bf16"
+    mode = elem_bytes if isinstance(elem_bytes, str) else ("fp8" if elem_bytes == 1 else "bf16")
     return kv_bytes_per_token(num_hidden_layers=n_layers,
                               num_key_value_heads=n_kv_heads,
                               head_dim=head_dim,
@@ -228,13 +233,19 @@ def build_batch_attention_mask(pad_mask, q_len, dtype, device):
     return mask.masked_fill(~keep, torch.finfo(dtype).min)
 
 
-def _resolve_kv_elem_bytes(model) -> int:
-    """1 byte (fp8, turboquant) or 2 (fp16), mirroring
-    VaayuBaseModel._create_kv_cache.
-    Conservative: unknown/auto-non-EXL3 -> 2 (never under-reserves KV).
-    TurboQuant's true rate is bits_total/8 + 4/head_dim bytes/element (0.531 at
-    4 bits, head_dim 128), but this returns an int and callers multiply ints, so
-    it rounds up to 1."""
+def _resolve_kv_elem_bytes(model):
+    """1 (fp8), 2 (bf16/fp16), mirroring VaayuBaseModel._create_kv_cache, or
+    the real kv_cache_mode STRING for TurboQuant (e.g. 'turboquant:9').
+    Conservative for the unknown/auto-non-EXL3 case: 2 (never under-reserves
+    KV).
+
+    TurboQuant used to collapse into the same `1` as fp8, but fp8 and
+    TurboQuant are NOT the same rate: fp8 measures 3.016 B/elem while
+    TurboQuant is bits_total/8 + 4/head_dim (0.531 at 4 bits, head_dim 128) --
+    a 5.7x over-charge that silently shrank batch width. Returning the mode
+    string instead of squeezing it through an int lets kv_bytes_for pass it
+    straight through to vram_plan.kv_bytes_per_token, which already has the
+    correct turboquant branch (vram_plan.kv_elem_bytes)."""
     mode = getattr(model, "kv_cache_mode", "fp16")
     if mode == "auto":
         try:
@@ -243,7 +254,11 @@ def _resolve_kv_elem_bytes(model) -> int:
                                         EXL3LoaderStrategy) else "fp16"
         except Exception:
             mode = "fp16"
-    return 1 if mode == "fp8" or mode.startswith("turboquant") else 2
+    if mode == "fp8":
+        return 1
+    if mode == "turboquant" or mode.startswith("turboquant:"):
+        return mode
+    return 2
 
 
 def geo_from_model(model) -> tuple:

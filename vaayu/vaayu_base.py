@@ -2429,10 +2429,15 @@ class VaayuBaseModel(GenerationMixin):
         # admitted budget by exactly that amount.
         need = predict_peak_vram(shape, int(n_tokens))
         if need > free_vram:
+            # The floor the load-time plan actually reserved one of (an expert,
+            # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
+            # prints "min_resident=0.00 GiB" even though one expert is resident.
+            _moe_geo = getattr(self, "_moe_geometry", None)
+            _min_resident = _moe_geo["expert_bytes"] if _moe_geo else 0
             raise VramPlanError(_too_big_message(
                 requested=int(n_tokens), s_max=plan.s_max,
                 free_vram=free_vram, shape=shape,
-                min_resident=0))
+                min_resident=_min_resident))
 
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
