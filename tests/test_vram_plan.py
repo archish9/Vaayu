@@ -142,3 +142,149 @@ def test_kv_dominates_at_long_context_on_a_flash_backend():
     kv = sh.kv_per_token * 7700
     assert kv / GB_DEC == pytest.approx(1.48, abs=0.02)
     assert kv > 0.5 * predict_peak_vram(sh, 7700)
+
+
+from vaayu.vram_plan import (
+    VramPlan,
+    expert_vram_budget_for,
+    plan_vram,
+    solve_max_seq_len,
+)
+
+# Hardware constants for this box, not model numbers (§5).
+USABLE_VRAM = int(15.47 * GB)
+EXPERT_BYTES = int(11.28 * MB)   # a real Qwen expert, used only as a floor input
+LAYER_SLACK = int(0.6 * GB)
+POSITION_LIMIT = 131072
+
+
+def _plan(name, **kw):
+    kw.setdefault("free_vram", USABLE_VRAM)
+    kw.setdefault("shape", shape_for(name))
+    kw.setdefault("min_resident", EXPERT_BYTES)
+    kw.setdefault("requested_max_seq_len", None)
+    kw.setdefault("position_limit", POSITION_LIMIT)
+    kw.setdefault("layer_slack", LAYER_SLACK)
+    return plan_vram(**kw)
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_coordination_invariant_holds_at_the_plans_own_operating_point(name):
+    """THE defect this module exists to fix: pinning and the expert VRAM cache
+    were two budgets that each looked fine alone and jointly overcommitted.
+    Both now subtract the same reserve, so the arithmetic must close."""
+    p = _plan(name)
+    # Pinning consumes its whole budget in the worst case; the expert cache then
+    # sizes itself from what is left.
+    free_after_pinning = USABLE_VRAM - p.pinning_budget
+    expert = expert_vram_budget_for(p, free_after_pinning)
+    total = p.pinning_budget + expert + p.reserve_bytes
+    assert total <= USABLE_VRAM
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_reserve_covers_actual_kv_at_the_derived_context(name):
+    """Bug F4, as an executable test. Measured gaps were -0.28 GB at 2k and
+    -1.30 GB at 7.7k because max_seq_len was 512."""
+    p = _plan(name)
+    sh = shape_for(name)
+    assert p.reserve_bytes >= sh.kv_per_token * p.max_seq_len
+
+
+def test_the_four_geometries_produce_four_distinct_s_max():
+    """Assert the fixture premise. Plan L's slab_index_of mutant passed 84/84
+    because every fixture collapsed to a single chunk -- a test whose premise is
+    not asserted can silently stop testing anything.
+
+    Plan-level s_max alone is not enough: at USABLE_VRAM, llama-1b's solve is
+    clamped by position_limit (131072) down from its true unclamped value of
+    278176. That clamp makes it distinct from the other three "for free," not
+    because of its own KV/activation geometry. So assert distinctness on the
+    UNCLAMPED solve_max_seq_len too -- that is the actual geometry claim --
+    alongside the existing plan-level check."""
+    s_maxes = {name: _plan(name).s_max for name in GEOMETRIES}
+    assert len(set(s_maxes.values())) == len(GEOMETRIES), s_maxes
+
+    unclamped = {name: solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES,
+                                         shape=shape_for(name))
+                for name in GEOMETRIES}
+    assert len(set(unclamped.values())) == len(GEOMETRIES), unclamped
+
+
+def test_s_max_decreases_as_kv_per_token_grows():
+    fat = shape_for("llama-70b")            # 0.328 MB/token
+    thin = shape_for("qwen3-235b")          # 0.193 MB/token
+    assert fat.kv_per_token > thin.kv_per_token
+    assert (solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=fat)
+            < solve_max_seq_len(free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES, shape=thin))
+
+
+def test_s_max_is_capped_by_position_limit():
+    p = _plan("llama-1b", position_limit=4096)
+    assert p.max_seq_len == 4096
+
+
+def test_requested_context_above_s_max_raises_and_names_the_levers():
+    p = _plan("qwen3-235b")
+    with pytest.raises(VramPlanError) as e:
+        _plan("qwen3-235b", requested_max_seq_len=p.s_max + 1)
+    msg = str(e.value)
+    for lever in ("prefill_chunk_size", "max_seq_len", "expert VRAM"):
+        assert lever in msg, f"missing lever {lever!r} in: {msg}"
+
+
+def test_requested_context_below_s_max_is_accepted_unchanged():
+    p = _plan("minimax-m2.7", requested_max_seq_len=2048)
+    assert p.max_seq_len == 2048
+    assert p.reserve_bytes < _plan("minimax-m2.7").reserve_bytes
+
+
+def test_free_vram_too_small_for_any_context_raises():
+    """Measured collapse threshold for llama-70b is ~0.44 GiB, and it sits
+    there because the floor is _peak_intercept_bytes -- the S-independent
+    last-chunk logits buffer -- not KV. "Too small for any context" really
+    means "too small for one chunk's logits." 0.25 GiB is deliberately well
+    under that threshold rather than just under it: the intercept does not
+    depend on act_coeff at all, and alloc_factor is always >= 1.0, so
+    (0.25 GiB - min_resident) / alloc_factor - intercept < 0 holds for ANY
+    value a later measurement task could give those constants. A value chosen
+    just under 0.44 GiB would silently stop testing the raise path once the
+    constants are re-measured."""
+    with pytest.raises(VramPlanError) as e:
+        _plan("llama-70b", free_vram=int(0.25 * GB))
+    assert "does not fit" in str(e.value)
+
+
+def test_the_diagnostic_cannot_itself_raise():
+    """D3: the first draft of that error interpolated a tensor shape and would
+    have re-created D3 inside D3's own fix. Build the message from scalars only."""
+    from vaayu.vram_plan import _too_big_message
+    for free in (0, 1, USABLE_VRAM):
+        for s_max in (0, 1, 10 ** 9):
+            msg = _too_big_message(requested=10 ** 9, s_max=s_max,
+                                   free_vram=free, shape=shape_for("qwen3-235b"),
+                                   min_resident=0)
+            assert isinstance(msg, str) and msg
+
+
+def test_reason_string_states_where_max_seq_len_came_from():
+    derived = _plan("qwen3-235b")
+    given = _plan("qwen3-235b", requested_max_seq_len=2048)
+    assert "derived" in derived.reason
+    assert "caller-supplied" in given.reason
+
+
+def test_expert_budget_is_zero_rather_than_negative_when_nothing_is_left():
+    p = _plan("qwen3-235b")
+    assert expert_vram_budget_for(p, free_vram_now=0) == 0
+
+
+def test_sub_one_expert_budget_is_reported_not_silently_zeroed():
+    """CLAUDE.md §5: when a model genuinely does not fit the hardware, WARN --
+    do not silently degrade. The caller at vaayu_base.py:1686 prints the warning;
+    this pins the helper it decides on, which must return a real byte count
+    (possibly below one expert) rather than clamping to 0 and hiding the case."""
+    p = _plan("qwen3-235b")
+    tiny = expert_vram_budget_for(p, free_vram_now=p.reserve_bytes + 1 * MB)
+    assert 0 < tiny < EXPERT_BYTES, (
+        "caller must be able to see 'nonzero but under one expert' and warn")
