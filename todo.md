@@ -24,16 +24,17 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 | **4** | ~~F3 — wire the prefix cache into `batched_generate`~~ — **Phase 1 + Task 6 DONE 2026-08-09** | Shipped and measured on all three forwards (4.96× / 2.15× / 1.76×); Phase 2 refuted. See Settled. |
 | **4b** | ~~Fix MiniMax's non-identical output under prefix reuse~~ — **DONE 2026-08-09** | Was not a prefix-reuse bug at all: the MoE forwards accumulated experts in bf16 while expert arrival order is nondeterministic. fp32 accumulator in all three forwards. See Settled. Left behind **one open bug** (fused-EXL3 residual). |
 | **5** | ~~Plan K — batched-decode admission reclaim~~ — **REFUTED 2026-08-09** | Admission was never the limiter: `plan_batch` deferred ZERO requests in every cell of both models at N≤5 × 7.7k. See Settled. Tasks 1-2 ship default-off. |
-| **6** | **[~] F4 + the 7.7k→8.2k VRAM ceiling** ← **PLAN WRITTEN — JUST EXECUTE IT.** No design work left. Run `docs/superpowers/plans/2026-08-09-vram-plan.md` task-by-task (superpowers:subagent-driven-development or executing-plans). The plan is **self-contained** — its §0 carries every prior result, model path and hardware constant it needs, so a fresh session needs nothing from this file or the spec. | Plan K answered where the cliff bites, and it is lower than the row assumed: peak allocation is **14.17-15.57 GB of 15.47 GiB at N=1 × 7.7k**, and N≥2 does not run at all. F4's `max_seq_len=512` under-reservation is a real contributor to a ceiling now known to be the engine's binding constraint — not a side issue. |
+| **6** | ~~F4 + the 7.7k→8.2k VRAM ceiling~~ — **DONE 2026-08-14.** All 10 tasks shipped, branch `feat/f4-vram-plan` commits `5205e84`..`9c0b610`, full suite **795 passed / 2 skipped / 1 xfailed**, and Task 10's five on-device gates **all PASSED** on real hardware (see Settled). **F4's core defect is FIXED**: `max_seq_len` no longer defaults to 512 — it is derived per model, live-measured: Qwen3-235B **8192**, MiniMax-M2.7 **8192**, Llama-3.3-70B-exl3 **4373**, Llama-3.2-1B **56828** (`s_max` unclamped ceiling 32768/32768/32768/131072 respectively). **`DEFAULT_ACT_COEFF`/`DEFAULT_ALLOC_FACTOR` remain uncalibrated placeholders (4.0/1.18)** — three fitting rounds against 17 real GPU points failed the ±10% gate (13/17 → 11/17 → 10/17 outside, worst +41.2% → −30.2% → −28.0%) and were correctly NOT written in. Decode A/B (4 alternating arms, both MoE models, same day): Qwen +0.21%, MiniMax −0.36%, both within the box's ~4% noise floor — no regression. | Root cause: `kv_cache_mode="auto"` on EXL3 resolves to a ring-buffer KV cache whose capacity grows by **geometric doubling** (`_GROWTH=2`), locking at 8192 tokens for S∈[4609,8192] and jumping to 16384 past it — confirmed within 7% on three EXL3 geometries, absent on the non-EXL3 control. **This is a real cliff, not a ceiling grazed by a linear term** — the framing question this whole plan was written to answer. See Settled for the full verdict and `docs/superpowers/plans/2026-08-09-vram-plan-RESULTS.md` for every gate's raw output. |
 | **7** | **F1 — RAM budget arbitration** | **Re-derive the premise before scheduling any work.** F1 assumed the prefix pool was starved; Plan L took Qwen's pool 2.36 → 10.53 GB, so the scarcity it was written to fix may no longer exist. Measure first, then decide whether there is anything to arbitrate. |
 | **8** | **Hygiene, any order** | `_create_kv_cache` silent fp8 fall-through, `slab_bytes`/`_ALIGN` validation, the Plan L review backlog, F6, F7, and the three telemetry items. None blocks anything; all are small. |
 
-> ### ▶▶ NEXT ACTION: execute an already-written plan
-> `docs/superpowers/plans/2026-08-09-vram-plan.md` — 10 TDD tasks, self-contained (§0 has
-> the background), written and reviewed 2026-08-09. **Do not re-brainstorm row 6; do not
-> re-derive its findings.** Estimated 8–12 h if the ±10 % fit gate passes first try,
-> 12–16 h if not. Start at Task 1 — it costs no model load and can delete a whole term
-> from the design.
+> ### ▶▶ NEXT ACTION: F1 — re-derive the RAM-arbitration premise
+> Row 6 (F4 + the VRAM ceiling) is DONE — see Settled. Next up is row 7: measure whether the
+> prefix pool is still starved (Plan L already took Qwen's pool 2.36 → 10.53 GB) before
+> scheduling any arbitration work. **Five new pending items fell out of the VRAM plan's own
+> findings** (the 2x KV overshoot, the non-monotone-search fix already shipped, the probe/
+> instrument mismatch, the N≥2 admission gap, and the weights-inclusive-vs-weights-free
+> calibration lead) — see **Pending bugs / open work** below. None of them block row 7.
 
 **Rules that outlive this list**
 - A plan ending in **refutation closes its row.** Record the verdict under "Settled" and move on — do not re-scope a plan to find a win. F, G and H all ended this way; that is the system working.
@@ -97,6 +98,48 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   Vaayu's Python. **Cost of chasing it is likely a third-party kernel change**; the cheap first step
   is to confirm the kernel is the source by calling it twice on identical inputs in isolation.
   (found 2026-08-09)
+
+- [ ] **`_assert_context_fits` can still ADMIT a batch that then OOMs, because `predict_peak_vram`'s
+  −28% worst-case error was only ever validated at N=1.** At minimax-m2.7's REAL floor-derived
+  operating point (`max_seq_len=8192`, `reserve_floor=_VRAM_RESERVE_FLOOR_BYTES`), the model predicts
+  N=3 FITS (9.55 GiB < 15.47 GiB usable) — directly contradicting Plan K's real GPU measurement that
+  N≥2 at ~7700 tokens is infeasible on this box for both MoE models. The refusal predicate correctly
+  catches the extreme, obviously-oversized case (Task 10's Gate 3 above); it does NOT yet catch a
+  moderately-oversized batch width at the real operating context. Pinned by a committed, non-strict
+  `xfail` test — `test_batch_width_at_the_real_reserve_floor_xfails` in `tests/test_vram_plan.py` —
+  that will **XPASS the moment calibration is fixed**, so this is a visible signal, not a silent gap.
+  Also: `test_batch_width_is_rechecked_against_the_plan` passes only because its own `_plan()` test
+  helper omits `reserve_floor`, leaving `s_max` unclamped at 32768 — an operating point production
+  never reaches; that test's premise does not currently exercise the real admission path. (found
+  2026-08-14, F4 plan Task 8 review + Task 10 gate 3)
+- [ ] **A 2x KV overshoot, ~0.83 GB, at Qwen's derived operating context — real, quantified, and
+  recoverable.** The EXL3 ring-buffer KV cache's geometric-doubling capacity (see Settled) means that
+  at Qwen's derived `max_seq_len=8192`, the cache allocates capacity for **16384** tokens even though
+  only ~12065 tokens of real context are ever used at that reserve — wasted VRAM on a box already
+  grazing 15.47 GiB. Pre-sizing the KV cache to the derived `max_seq_len` at load time (rather than
+  letting it double blindly) would recover this, but it is allocator surgery with its own decode
+  behavior implications and needs its own decode A/B — **new pending work, not part of the F4 plan.**
+  (found 2026-08-14, F4 plan Task 5 ruling R12)
+- [ ] **Probe/instrument mismatch: the MoE prefill-peak probe may be measuring the wrong thing,
+  and this should be resolved BEFORE any further `predict_peak_vram` modelling.** The trailing-chunk
+  intercept fix (Task 5c) matches MiniMax's measured peak-vs-S closely but NOT Qwen's, whose measured
+  peak is nearly flat within a KV-capacity bucket instead of showing the predicted sawtooth. Likely
+  cause: the dense legacy per-chunk prefill loop calls `torch.cuda.reset_peak_memory_stats()` after
+  every chunk (so the probe's `max_memory_allocated()` genuinely reflects only the last chunk), but
+  MoE's layer-major prefill has no equivalent per-chunk reset — so for MoE the probe may be measuring
+  expert-streaming residency across the WHOLE prefill, not last-chunk structure. If true, adding more
+  terms to `predict_peak_vram` is the wrong next move; re-instrumenting the probe per-phase (e.g.
+  resetting stats at MoE layer boundaries too) is. (found 2026-08-14, F4 plan Task 5c)
+- [ ] **Calibration lead for the −28% gate failure, found but not yet checked: the probe measures a
+  weights-inclusive figure against a weights-free model.** `scripts/probe_vram_curve.py` reads
+  `max_memory_allocated()` after a reset — an ABSOLUTE figure that includes the resident model
+  weights — while `predict_peak_vram` has NO weights term at all (its terms are KV + activations +
+  scores + logits). Every one of the three failed fitting rounds (Task 5/5b/5c) was therefore
+  comparing a weights-inclusive measurement against a weights-free model. **Check this before anyone
+  re-fits `act_coeff`/`alloc_factor` or adds further terms** — it may explain a meaningful share of
+  the residual error without inventing any new mechanism. (found 2026-08-14, F4 plan Task 8 review,
+  ruling R14)
+
 ## Architectural gaps
 
 - [~] **F3 — cross-turn prefix cache in the batched paths.** Phase 1 (shared-prefix broadcast)
@@ -240,6 +283,44 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.
 
+- **F4 + the 7.7k→8.2k VRAM ceiling: the framing question is ANSWERED and the plan's hypothesis
+  REFUTED. It is a real CLIFF, not "a ceiling grazed by a linear term" (settled 2026-08-14,
+  F4 plan Tasks 5/5b/5c, verified on-device by Task 10).** Root cause, traced in code, not just
+  measured: `kv_cache_mode="auto"` on ANY EXL3 checkpoint resolves to `FP8DynamicCache(quantize=
+  False)` (`vaayu_base.py`'s `_create_kv_cache`), a ring-buffer KV cache whose `_ensure_capacity`
+  grows capacity by **geometric doubling** — `_GROWTH = 2`, `new_cap = max(needed, max(1, cap) *
+  _GROWTH)`. At `prefill_chunk_size=512`, capacity locks at 8192 tokens for every S in [4609, 8192]
+  and jumps to 16384 the instant S exceeds 8192 by even one token — exactly the 7.7k→8.2k boundary
+  the plan set out to characterize. Closed form: `capacity(S) = chunk · 2^ceil(log2(ceil(S/chunk)))`.
+  Confirmed within 7% of `kv_bytes_per_token × 8192` on THREE independent geometries: Qwen fused-MoE
+  (−6.8%), MiniMax module-list-MoE (−0.8%), Llama-70B dense (−6.4%) — all EXL3. **The non-EXL3
+  Llama-3.2-1B control (plain `transformers.DynamicCache`, no ring buffer) shows NO cliff over the
+  same S range**, proving the mechanism is format-dependent (EXL3's KV cache implementation), not a
+  property of context length or of any one model. `predict_peak_vram` now models this as a derived
+  bucket term (`kv_capacity_tokens`, parameterized by `kv_growth_factor`/`kv_capacity_buckets`, both
+  read off the live cache class per CLAUDE.md §5 — never a literal). Verified on-device (Task 10,
+  2026-08-14): derived `max_seq_len` per model — Qwen3-235B 8192, MiniMax-M2.7 8192, Llama-3.3-70B
+  4373, Llama-3.2-1B 56828, all against the old flat 512 — and the honest-refusal gate (Gate 3) fires
+  a clean `VramPlanError` at `s_max+512` with no OOM. Full gate results, raw logs, and the derived
+  numbers per model: `docs/superpowers/plans/2026-08-09-vram-plan-RESULTS.md` (Task 10 section).
+- **`solve_max_seq_len`'s single-level binary search was UNSOUND, because `predict_peak_vram` is NOT
+  monotone in S once the KV-cliff/trailing-chunk terms are both modeled (fixed 2026-08-14, F4 plan
+  Task 5c).** The trailing-chunk intercept resets DOWN at every ordinary chunk boundary (the last
+  chunk's logits shrink from `chunk` tokens' worth back to 1) while the linear activation term only
+  grows by one token and the KV term is flat within a capacity bucket — so peak VRAM can go DOWN as
+  S goes up (proven concretely: Qwen at `S=5·chunk` vs `S=5·chunk+1`, `predict(S) > predict(S+1)`). A
+  single-level binary search over a non-monotone function can silently return an S for which some
+  SMALLER S′ does not actually fit — dangerous for a value whose entire purpose is "every request up
+  to this length is safe." **Fixed with a two-level search**: first an exponential+binary search over
+  whole chunk PERIODS against `predict_peak_vram(shape, k·chunk)` (provably monotone in the period
+  count k — boundary values are non-decreasing since trailing chunk is constant there, KV never
+  decreases, and the slope term is non-negative), then a bounded search within the one remaining
+  partial period (also monotone, since KV is flat inside a period and trailing chunk climbs
+  monotonically). Every S ≤ the chosen answer is now provably safe, not merely the answer itself.
+  Pinned by `test_solve_max_seq_len_stays_safe_for_every_smaller_context` (exhaustive on a tiny
+  synthetic shape) and `test_solve_max_seq_len_can_land_exactly_on_a_chunk_boundary` (the real Qwen
+  S=8192 KV-doubling boundary). This was a latent correctness bug independent of the fit gate's
+  pass/fail — it would have been wrong even if `act_coeff`/`alloc_factor` had been calibrated.
 - **The OOM handler SILENTLY HALVED THE KV CACHE mid-forward (fixed 2026-08-09). This was F3's unreproduced mask/KV bug.**
   `vaayu_base.py:3563-3571`, inside the layer loop's `except torch.cuda.OutOfMemoryError`:
   `_oom_target = _oom_seq_len // 2` then `_trim_kv_cache_front(...)` → `crop_front`, then the layer
