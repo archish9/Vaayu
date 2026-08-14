@@ -3283,9 +3283,7 @@ class VaayuBaseModel(GenerationMixin):
             else:
                 attention_mask = None
         else:
-            attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
-            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-            attention_mask = attention_mask.to(self.running_device)
+            attention_mask = None
         _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
                              if past_key_values is not None else 0)
         # Bug fix: must use _seq_total (already correctly sums ALL chunks for
@@ -3293,6 +3291,13 @@ class VaayuBaseModel(GenerationMixin):
         # which silently evaluates to 0 for a list, undersizing the RoPE cache
         # to max_seq_len and crashing later chunks with an empty cos/sin slice.
         _pos_range        = compute_pos_range(self.max_seq_len, _past_len_for_pos, _seq_total)
+        if self._active_attn_impl not in ("flash_attention_2", "sdpa"):
+            # Sized from the live position range, not max_seq_len: max_seq_len is
+            # now DERIVED (it used to be a hardcoded 512), so an S x S mask built
+            # from it would be a 268 MB fp32 transient on every forward.
+            attention_mask = torch.ones(_pos_range, _pos_range)
+            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
+            attention_mask = attention_mask.to(self.running_device)
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.
