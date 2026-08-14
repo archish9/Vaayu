@@ -60,7 +60,7 @@ https://huggingface.co/QuantTrio
 
 
 
-claude --resume 348226a4-723f-42cd-aa21-d255b21f046f
+CPU AVX2
 
 
 
