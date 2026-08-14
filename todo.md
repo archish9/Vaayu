@@ -90,6 +90,10 @@ Reasons for the order, not just the order. Deviate deliberately, not by accident
   helper omits `reserve_floor`, leaving `s_max` unclamped at 32768 — an operating point production
   never reaches; that test's premise does not currently exercise the real admission path. (found
   2026-08-14, F4 plan Task 8 review + Task 10 gate 3)
+  **This is NOT separately scheduled — it is downstream of row 7.** Fixing calibration
+  (`plans/next_1_vram_calibration.md`) is what closes it; the xfail flipping to XPASS is the
+  signal. Do not chase this entry on its own, and if row 7's re-fit fails and gets parked, this
+  gap is parked with it — it is a known, bounded limitation, not a silent one.
 - [ ] **A 2x KV overshoot, ~0.83 GB, at Qwen's derived operating context — real, quantified,
   recoverable, and DELIBERATELY NOT SCHEDULED.** The EXL3 ring-buffer KV cache's geometric-doubling
   capacity (see Settled) means that at Qwen's derived `max_seq_len=8192` the cache allocates capacity
