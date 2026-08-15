@@ -430,7 +430,7 @@ def test_vram_pinning_budget_charges_less_for_turboquant():
                 kv_cache_mode=mode),
             N=1, chunk=512, hidden=4096, n_heads=32, vocab=32000,
             elem_bytes=2,
-            materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR,
+            score_elem_bytes=0.0, alloc_factor=DEFAULT_ALLOC_FACTOR,
             kv_growth_factor=2, kv_capacity_buckets=True)
         plan = plan_vram(
             free_vram=20 * 1024 ** 3,  # synthetic box, plenty of room to pin

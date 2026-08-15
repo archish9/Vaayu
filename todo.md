@@ -36,10 +36,12 @@ for the three scheduled rows and are self-contained on their own.
 |---|---|---|---|---|---|
 | Qwen3-235B | `Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw` | 94 / 4 / 128 / 4096 / 64 / 151936 | 0.193 MB/tok | MoE fused-EXL3 | 8192 |
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
-| Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 4373 |
-| Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 56828 |
+| Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 3821 (sdpa) |
+| Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 14052 (sdpa) |
 
-(KV figures are **decimal** MB. `tests/test_vram_plan.py` has binary `MB`/`GB` for hardware
+(`max_seq_len` is now KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15, row 6/7.
+The two dense figures above are sdpa, measured at load; both MoE geometries derive 8192 on flash.
+KV figures are **decimal** MB. `tests/test_vram_plan.py` has binary `MB`/`GB` for hardware
 constants and decimal `MB_DEC`/`GB_DEC` for these — use the right family.)
 
 ---
@@ -87,19 +89,22 @@ pending-only._
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
-| **6** | Phase 2 — re-point `MEASURED`, re-decide the form | `[ ]` | uses row 10's sdpa data | **Unblocked 2026-08-15.** Re-point at row 10's sdpa arms (`plans/2026-08-15-row10-attention-kernel-RESULTS.md` §3), not the flash data in `plans/2026-08-15-vram-peak-RESULTS.md` — sdpa is what `batched_generate` runs and row 10's verdict is kernel-aware calibration, sdpa branch. |
-| **7** | Phase 2 — re-decide `MATERIALIZES_SCORES` on corrected data | `[ ]` | — | **Unblocked 2026-08-15, re-scoped: make it kernel-aware, not a single re-decision.** Row 10 found the constant should be `True` under sdpa (an `n_heads · chunk · S · elem_bytes` term, `elem_bytes` clustered 10.4–11.4 across all four geometries — see RESULTS §4.4) and stay `False` under flash_attention_2 — gate on `model._active_attn_impl`, don't pick one value for both. |
+| **6** | Phase 2 — re-point `MEASURED`, re-decide the form | `[x]` | closed 2026-08-15 | Done WITH row 7 as one change (the gate cannot pass without it). `MEASURED` is kernel-keyed, fresh sdpa arms on explicit S lists, and the intercept was corrected — the trailing-chunk sawtooth was an artefact of last-chunk-only peaks. **Gate still FAILS (44/77), deliberately and visibly** — see row 6a. Verdict: `plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md`. |
+| **7** | Phase 2 — re-decide `MATERIALIZES_SCORES` on corrected data | `[x]` | closed 2026-08-15, in row 6's change | Done in row 6's change: `MATERIALIZES_SCORES` bool → `SCORE_ELEM_BYTES` per-kernel dict (flash 0.0, sdpa 10.9 B/elem, unmeasured kernels take the largest measured value), read off `model._active_attn_impl` at load. |
 | **8** | Phase 2 — budget policy: reserve vs expert-cache tradeoff | `[ ]` | user decision | Unblocked 2026-08-15 (row 10 closed). Decide once 6/7 land: if the sdpa-calibrated form says today's derived contexts exceed the reserve, choose explicitly between growing the reserve (at the expert cache's expense) and accepting shorter derived contexts. |
+| **6a** | The intercept residual row 6 could not explain | `[ ]` | GPU round | Opened 2026-08-15 out of row 6. One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **9** | Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm | `[ ]` | GPU | Unblocked 2026-08-15. Re-derive against the sdpa form (rows 6/7), not flash — row 10 directly demonstrated the stakes: on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB) while sdpa OOMs at that same S, same box, same cap. A flash-calibrated ceiling would admit contexts `batched_generate` cannot actually serve. |
 
 ---
 
-> ### ▶▶ NEXT ACTION: row 6 — re-point `MEASURED` at row 10's sdpa data
-> Row 10 closed 2026-08-15 (full detail in its own section below, and
-> `plans/2026-08-15-row10-attention-kernel-RESULTS.md`): calibrate against sdpa, kernel-aware. Rows
-> 6-9 now proceed in order: re-point `MEASURED` (6), make `MATERIALIZES_SCORES` kernel-aware (7),
-> decide the reserve vs expert-cache tradeoff if the sdpa form demands it (8), re-derive
-> `max_seq_len` + on-device arm (9).
+> ### ▶▶ NEXT ACTION: row 8 — the reserve vs expert-cache decision, now that the numbers exist
+> Rows 6 and 7 closed 2026-08-15 as one change
+> (`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md`). The sdpa-calibrated form DOES cut
+> today's derived contexts, measured on-device at the new form: Llama-3.3-70B 4373 → **3821**
+> (−13 %), Llama-3.2-1B 106987 → **14052** (−87 %) — both on sdpa; the two MoE geometries are
+> unchanged at 8192 on flash. That is exactly the condition row 8 was written for, so it is a real
+> decision now, not a hypothetical. Then row 9 (re-derive + on-device arm), and row 6a
+> (the intercept residual row 6 could not explain) whenever a GPU round is available.
 
 ---
 
@@ -204,52 +209,81 @@ four architecturally-unrelated geometries — consistent with sdpa's masked call
 
 ---
 
-# 6 · [ ] Phase 2 — re-point `MEASURED`, re-decide the form
+# 6 · [x] CLOSED — Phase 2, `MEASURED` re-pointed and the form corrected (with row 7)
 
-**Unblocked 2026-08-15 (row 10 closed): calibrate against sdpa.** Row 10's sdpa arms
-(`plans/2026-08-15-row10-attention-kernel-RESULTS.md` §3) are the data to re-point at — not the
-flash_attention_2 data in `plans/2026-08-15-vram-peak-RESULTS.md`, which is what `MEASURED`
-currently holds. `plans/2026-08-15-vram-peak-RESULTS.md` still has all four geometries' honest
-`(S, alloc_before, alloc_peak, status)` rows and fitted-slope method if a flash-side table is ever
-wanted too (row 10 §5's point 4), but sdpa is the one `batched_generate` needs.
+Done 2026-08-15, **together with row 7** — measured, not assumed: re-pointing `MEASURED` at sdpa
+data alone leaves the form under-predicting by 20–82 %, so the gate cannot pass for row 6 without
+row 7's kernel-gated score term in the same edit.
 
-**Sharpened hypothesis for the residual, so the next person starts here instead of re-deriving it
-(RESULTS.md §7):** the dense geometries' under-prediction is NOT a flat, S-independent gap — it
-clusters tightly by trailing-chunk length (`_trailing_chunk_tokens`), the same quantity
-`predict_peak_vram`'s own sawtooth intercept already keys on. On Llama-3.2-1B: ~0.539 G residual at
-a full (512-token) trailing chunk vs ~0.792 G at a 1-token trailing chunk (1.47×); Llama-3.3-70B
-shows the same direction more weakly (~0.641 G vs ~0.716 G, 1.12×). Both cluster means exclude each
-dense geometry's first sweep pair (S=512 and S=513 -- TWO points, not one, and unrelated to §4's
-noise flag, which §4 correctly says the dense geometries do not have); folding those two back in
-barely moves it (1B: 1.43× vs 1.47×) -- the clustering does not depend on the exclusion. Two hypotheses, NEITHER ruled
-out by the RESULTS.md data: (a) a fixed unmodelled residency term (shape-like Qwen3-235B's
-`resident_expert_bytes`) that happens to correlate with trailing-chunk phase for a separate reason,
-or (b) the existing sawtooth intercept term itself is under-sized specifically at short trailing
-chunks — its charge is smallest exactly where the residual is largest. Test directly (hold S fixed
-at one KV-capacity plateau, vary only trailing-chunk length) before picking one.
+Full writeup: `plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md`. What shipped:
 
-**File:** `scripts/fit_vram_calibration.py` (`MEASURED` dict) and `vaayu/vram_plan.py`
-(`predict_peak_vram`, `DEFAULT_ALLOC_FACTOR`) — both explicitly untouched by item 1's task; this is
-where the change lands now that item 10 is settled (sdpa, kernel-aware).
+- `MEASURED` keyed by kernel first (`{impl: {model: [...]}}`), flash = the honest whole-prefill data
+  from `plans/2026-08-15-vram-peak-RESULTS.md` §3 (STALE last-chunk caveat gone), sdpa = fresh arms
+  on **explicit** S lists. Excluded points live in `NOISY_FIRST_POINTS` with a reason and are
+  printed, never silently dropped.
+- `MATERIALIZES_SCORES` bool → `SCORE_ELEM_BYTES` per-kernel dict + `score_elem_bytes(impl)`;
+  `VramShape.materializes_scores` → `score_elem_bytes: float`; call site reads
+  `model._active_attn_impl`. sdpa = 10.9 B/elem, the mean of four per-geometry paired slope
+  estimates (10.35 / 10.52 / 11.33 / 11.42) — fitted from measurement, NOT tuned to the gate.
+- **Intercept corrected, which was not in the brief:** the trailing-chunk sawtooth was an artefact
+  of last-chunk-only peaks. `_peak_intercept_bytes` now charges `head_bytes + min(S, chunk)·vocab·4`,
+  `head_bytes` being a file stat on the checkpoint's head shard (embedding shard when
+  `tie_word_embeddings`). This took Llama-3.2-1B flash from −12…−97 % to −2.2…+0.3 % at S ≥ 4096.
+  `_trailing_chunk_tokens` and its tests are gone with it; `predict_peak_vram` is now monotone, and
+  `solve_max_seq_len`'s exhaustive check was KEPT (redundant, not wrong — the sawtooth already came
+  and went once).
 
-**Done means:** `MEASURED` re-pointed at the resolved-kernel data; `predict_peak_vram` re-verified
-(or adjusted, with the reasoning recorded) against it; the ±10 % gate passes for the right reason.
+**Two method lessons worth the cost of learning them:**
+
+- **Never derive a probe's sweep grid from the quantity being calibrated.** The first sdpa arms used
+  `sweep_points`, whose ceiling comes from `model.max_seq_len` — which `predict_peak_vram` decides.
+  Changing the form moved the grid. Caught mid-run, arms discarded, relaunched with explicit lists.
+- **A residual with structure is a form error, not noise.** Llama-3.2-1B's transient at S=4096 and
+  S=4097 is byte-identical, and `transient − KV` is flat at 0.7922 G across five S values spanning
+  26× — which decomposes exactly as tied fp16 head (0.5253) + full-chunk fp32 logits (0.2627).
+
+**Gate: still FAILS, 44/77 outside ±10 %, and that is left visible on purpose.** Every failure but
+two (−2.2 %, −0.5 %) is over-prediction, the safe direction. What remains is row 6a.
 
 ---
 
-# 7 · [ ] Phase 2 — re-decide `MATERIALIZES_SCORES` on corrected data
+# 7 · [x] CLOSED — `MATERIALIZES_SCORES` is now kernel-aware
 
-**Unblocked 2026-08-15, re-scoped: make it kernel-aware, not a single re-decision.** Row 10 found
-`False` is right for flash_attention_2 (every existing calibration point) but wrong for sdpa — the
-flash-to-sdpa slope gap implies a real `n_heads · chunk · S · elem_bytes` term, `elem_bytes`
-clustered 10.4–11.4 across all four geometries (`plans/2026-08-15-row10-attention-kernel-RESULTS.md`
-§4.4). Gate the constant (or the whole added term) on `model._active_attn_impl` — `True` under
-sdpa, `False` under flash_attention_2 — rather than picking one value for both.
+Shipped inside row 6's change; see above and the RESULTS file. `SCORE_ELEM_BYTES` in
+`vaayu/vram_plan.py`. Unmeasured kernels (`eager`, BetterTransformer, `None`) take the LARGEST
+measured coefficient rather than 0 — `eager` materializes scores by construction, and
+under-reserving is the dangerous direction.
 
-**File:** `vaayu/vram_plan.py:96`.
+---
 
-**Done means:** `MATERIALIZES_SCORES` (or its replacement) documented and gated per-kernel, matching
-whatever `MEASURED` ends up describing for each kernel (item 6).
+# 6a · [ ] The intercept residual row 6 could not explain
+
+Opened 2026-08-15 out of row 6, with the data already in hand
+(`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md` §7).
+
+**One intercept rule cannot be right for both forwards.** `transient − KV(capacity)`, flash arm:
+
+| geometry | full trailing chunk | 1-token trailing chunk | charged now |
+|---|---|---|---|
+| llama-3.2-1b | 0.792 G | **0.792 G** (identical) | 0.788 ✅ |
+| llama-3.3-70b | 0.928 G | 0.714 G | 1.051 (over) |
+| minimax-m2.7 | 0.62–0.67 G | 0.082–0.089 G | 0.871 (over) |
+| qwen3-235b | ≈ residency | ≈ residency | residency ✅ |
+
+Llama-3.2-1B does **not** sawtooth in whole-prefill data; MiniMax-M2.7 does (0.3415 G at S=513
+against 0.8690 G at S=512 — real, and consistent across all three of its `+1` points). Everything
+is over-predicted (safe): 15–63 % at small S, up to +231 % on MiniMax at a short trailing chunk,
+and on sdpa the score term and the intercept are summed although they do not fully coexist
+(charging `max()` instead was tested and is worse in the DANGEROUS direction: −38 % on Qwen at
+S=4096).
+
+**The decisive experiment**, already named in row 6's old brief: hold S fixed at one KV-capacity
+plateau and vary only trailing-chunk length, plus per-chunk allocation instrumentation to find
+which chunk sets the peak in the module-list forward. GPU round, own row.
+
+**Stop rule:** if the per-forward difference turns out not to be derivable from geometry
+(CLAUDE.md §5 forbids a per-model literal), say so and close the row — the current form is already
+safe, just loose.
 
 ---
 

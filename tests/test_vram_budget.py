@@ -50,7 +50,7 @@ def test_reserve_is_context_aware_not_a_flat_constant():
         kv_per_token=kv_bytes_per_token(num_hidden_layers=94, num_key_value_heads=4,
                                         head_dim=128, kv_cache_mode="bf16"),
         N=1, chunk=512, hidden=4096, n_heads=64, vocab=151936, elem_bytes=2,
-        materializes_scores=False,
+        score_elem_bytes=0.0,
         alloc_factor=DEFAULT_ALLOC_FACTOR)
     common = dict(free_vram=int(15.47 * GB), shape=shape,
                   min_resident=int(11.28 * 1024 ** 2),

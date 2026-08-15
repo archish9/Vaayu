@@ -1504,9 +1504,9 @@ class VaayuBaseModel(GenerationMixin):
 
         self._vram_plan = None
         if device.startswith("cuda") and torch.cuda.is_available():
-            from .vram_plan import (DEFAULT_ALLOC_FACTOR,
-                                    MATERIALIZES_SCORES, VramShape,
-                                    kv_bytes_per_token, plan_vram)
+            from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
+                                    kv_bytes_per_token, plan_vram,
+                                    score_elem_bytes)
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
             _head_dim = getattr(self.config, "head_dim", None)
@@ -1518,6 +1518,22 @@ class VaayuBaseModel(GenerationMixin):
                 _layer_slack = _layer0.stat().st_size
             except Exception:
                 _layer_slack = int(0.6 * 1024 ** 3)   # hardware fallback
+            # Bytes of lm_head weight that go resident when the logits are
+            # computed -- a file stat on the checkpoint's own head shard, the
+            # same way _layer_slack above is one, so no model number is typed
+            # (§5). A tied-embedding checkpoint ships an EMPTY lm_head shard
+            # (Llama-3.2-1B: 16 bytes) because the head IS the embedding, so
+            # read the embedding shard instead -- decided by the config flag,
+            # not by a size threshold. Missing shard -> 0, which under-reserves
+            # by this one term rather than failing the load.
+            _head_name = (self.layer_names_dict['embed']
+                          if getattr(self.config, "tie_word_embeddings", False)
+                          else self.layer_names_dict['lm_head'])
+            try:
+                _head_bytes = (Path(self.checkpoint_path)
+                               / f"{_head_name}.safetensors").stat().st_size
+            except Exception:
+                _head_bytes = 0
             # kv_growth_factor/kv_capacity_buckets are algorithmic properties of
             # the KV cache class _create_kv_cache will build (Amendment 1,
             # task-6-brief.md), not of any model (§5) — derived by mirroring
@@ -1568,8 +1584,15 @@ class VaayuBaseModel(GenerationMixin):
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
                 elem_bytes=torch.finfo(self.running_dtype).bits // 8,
-                materializes_scores=MATERIALIZES_SCORES,
+                # Kernel property, read off the model init_model() just
+                # built (line ~1421, before this block): sdpa materializes an
+                # S-sized score buffer and flash_attention_2 does not, a gap
+                # that GROWS with S and flips OOM outcomes at large context
+                # (todo row 10). Charging one kernel's number for both
+                # under-reserves batched_generate, which requires sdpa.
+                score_elem_bytes=score_elem_bytes(self._active_attn_impl),
                 resident_expert_bytes=_resident_expert_bytes,
+                head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
                 kv_capacity_buckets=self._kv_cache_is_bucketed())

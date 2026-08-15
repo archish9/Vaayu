@@ -92,17 +92,18 @@ def test_unknown_mode_raises_instead_of_falling_through_to_fp8():
 
 from vaayu.vram_plan import (
     DEFAULT_ALLOC_FACTOR,
+    SCORE_ELEM_BYTES,
     VramShape,
     _kv_term_bytes,
     _peak_intercept_bytes,
-    _trailing_chunk_tokens,
     predict_peak_vram,
+    score_elem_bytes,
 )
 
 
 def shape_for(name, *, N=1, chunk=512, kv_cache_mode="bf16",
-              materializes_scores=False, alloc_factor=DEFAULT_ALLOC_FACTOR,
-              kv_growth_factor=2, kv_capacity_buckets=None):
+              score_elem_bytes=0.0, alloc_factor=DEFAULT_ALLOC_FACTOR,
+              kv_growth_factor=2, kv_capacity_buckets=None, head_bytes=0):
     geo = GEOMETRIES[name]
     if kv_capacity_buckets is None:
         kv_capacity_buckets = geo["kv_capacity_buckets"]
@@ -110,8 +111,9 @@ def shape_for(name, *, N=1, chunk=512, kv_cache_mode="bf16",
         kv_per_token=kv_bytes_per_token(**_kv_kwargs(geo), kv_cache_mode=kv_cache_mode),
         N=N, chunk=chunk, hidden=geo["hidden"], n_heads=geo["n_heads"],
         vocab=geo["vocab"], elem_bytes=2,
-        materializes_scores=materializes_scores, alloc_factor=alloc_factor,
+        score_elem_bytes=score_elem_bytes, alloc_factor=alloc_factor,
         kv_growth_factor=kv_growth_factor, kv_capacity_buckets=kv_capacity_buckets,
+        head_bytes=head_bytes,
     )
 
 
@@ -230,10 +232,35 @@ def test_peak_is_linear_within_a_kv_capacity_bucket_and_steps_at_the_boundary(na
 
 
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
-def test_scores_term_is_zero_when_flash_is_selected(name):
-    off = predict_peak_vram(shape_for(name, materializes_scores=False), 8192)
-    on = predict_peak_vram(shape_for(name, materializes_scores=True), 8192)
+def test_scores_term_is_zero_under_flash_and_charged_under_sdpa(name):
+    """The scores term is a KERNEL property, and the two kernels this engine
+    actually runs disagree about it: flash_attention_2 materializes no S-sized
+    buffer, sdpa materializes `N * n_heads * chunk * S` elements (todo row 10).
+    Assert the exact difference, not just `on > off` -- an inequality would
+    still pass if the term lost its `chunk` or `n_heads` factor."""
+    flash = shape_for(name, score_elem_bytes=score_elem_bytes("flash_attention_2"))
+    sdpa = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    off = predict_peak_vram(flash, 8192)
+    on = predict_peak_vram(sdpa, 8192)
+    expected = (sdpa.N * sdpa.n_heads * sdpa.chunk
+                * score_elem_bytes("sdpa") * 8192)
+    assert on - off == pytest.approx(expected, rel=1e-9)
     assert on > off
+
+
+def test_score_elem_bytes_is_kernel_keyed():
+    """flash_attention_2 is genuinely 0.0 (not "disabled"); sdpa is non-zero."""
+    assert score_elem_bytes("flash_attention_2") == 0.0
+    assert score_elem_bytes("sdpa") > 0.0
+
+
+@pytest.mark.parametrize("impl", ["eager", "BetterTransformer", None, "unknown"])
+def test_unmeasured_kernels_take_the_largest_measured_cost(impl):
+    """An unmeasured kernel must never be charged 0 -- `eager` materializes
+    scores by construction, so a 0 there would silently under-reserve. The
+    conservative default is the largest MEASURED coefficient."""
+    assert score_elem_bytes(impl) == max(SCORE_ELEM_BYTES.values())
+    assert score_elem_bytes(impl) > 0.0
 
 
 def test_alloc_factor_scales_the_whole_prediction():
@@ -260,74 +287,67 @@ def test_peak_grows_with_batch_width():
 def test_kv_dominates_at_long_context_on_a_flash_backend():
     """Sanity anchor against a measured number: Qwen KV at 7.7k is ~1.48 GB
     (todo.md). With scores off, KV must be the largest single term."""
-    sh = shape_for("qwen3-235b", materializes_scores=False, alloc_factor=1.0)
+    sh = shape_for("qwen3-235b", score_elem_bytes=0.0, alloc_factor=1.0)
     kv = sh.kv_per_token * 7700
     assert kv / GB_DEC == pytest.approx(1.48, abs=0.02)
     assert kv > 0.5 * predict_peak_vram(sh, 7700)
 
 
-# --- _trailing_chunk_tokens / _peak_intercept_bytes: the real trailing chunk
+# --- _peak_intercept_bytes: lm_head weight + a FULL chunk of logits
 #
-# Task 5/5b already flagged that _peak_intercept_bytes charged the last
-# chunk's logits at a CONSTANT `chunk`, when the real trailing partial chunk
-# of a prefill is `S mod chunk` (never zero -- an exact multiple has a FULL
-# trailing chunk, not an empty one). Task 5c corrects this.
+# This term used to follow the TRAILING chunk (`S mod chunk`), measured against
+# a table whose dense rows were last-chunk-only peaks. Against the honest
+# whole-prefill data (todo rows 1 and 6, 2026-08-15) that sawtooth does not
+# exist: Llama-3.2-1B's measured transient at S=4096 and S=4097 is
+# byte-identical, and its `transient - KV(capacity)` is flat at 0.7917 GB from
+# S=4096 to S=106987 -- which is its tied fp16 head (0.5253 GB) plus a FULL
+# chunk of fp32 logits (0.2627 GB), 0.5% apart.
 
-def test_trailing_chunk_tokens_boundary_cases():
-    """S=0 -> no chunk at all. S < chunk -> the whole context is the one
-    partial chunk. S an exact multiple of chunk -> a FULL trailing chunk
-    (chunk, not 0 -- the naive `S % chunk` gets this case wrong). Anything
-    else -> S mod chunk."""
-    assert _trailing_chunk_tokens(0, chunk=512) == 0
-    assert _trailing_chunk_tokens(1, chunk=512) == 1
-    assert _trailing_chunk_tokens(5, chunk=512) == 5          # S < chunk
-    assert _trailing_chunk_tokens(512, chunk=512) == 512      # S == chunk
-    assert _trailing_chunk_tokens(513, chunk=512) == 1        # just past
-    assert _trailing_chunk_tokens(1024, chunk=512) == 512     # S == 2*chunk
-    assert _trailing_chunk_tokens(1025, chunk=512) == 1
-
-
-def test_trailing_chunk_tokens_matches_the_measured_report_figures():
-    """task-5-report.md / RESULTS Task 5b section measured the real trailing
-    partial chunk at chunk=512 for S=5000,6000,7000,7700,8200 as
-    392,368,344,20,8 tokens -- not the constant 512 the old model charged."""
-    for s, expected in ((5000, 392), (6000, 368), (7000, 344),
-                        (7700, 20), (8200, 8)):
-        assert _trailing_chunk_tokens(s, chunk=512) == expected
+def test_peak_intercept_charges_a_full_chunk_not_the_trailing_one():
+    """A whole-prefill peak is the max over chunks, and a full chunk always
+    precedes a short trailing one, so crossing a chunk boundary must NOT drop
+    the charge."""
+    sh = shape_for("qwen3-235b")
+    full = _peak_intercept_bytes(sh, sh.chunk)
+    past = _peak_intercept_bytes(sh, sh.chunk + 1)
+    assert full == sh.N * sh.chunk * sh.vocab * 4
+    assert past == full
 
 
-def test_peak_intercept_bytes_follows_the_trailing_chunk_not_a_constant():
+def test_peak_intercept_charges_only_S_below_one_chunk():
+    """Under one chunk the whole context IS the only chunk, so there is no
+    full chunk to charge for."""
     sh = shape_for("qwen3-235b")
     assert _peak_intercept_bytes(sh, 0) == 0
-    # a full trailing chunk (S an exact multiple) charges the most; the very
-    # next token resets to a single-token trailing chunk and charges far less.
-    full = _peak_intercept_bytes(sh, sh.chunk)
-    reset = _peak_intercept_bytes(sh, sh.chunk + 1)
-    # x4, not x(elem_bytes + 4): only the fp32 upcast is resident at the peak
-    # (measured 2026-08-15 -- see
-    # test_the_logits_term_charges_fp32_only_not_both_copies). This test is
-    # about the trailing chunk FOLLOWING S, not about the byte multiplier.
-    assert full == sh.N * sh.chunk * sh.vocab * 4
-    assert reset == sh.N * 1 * sh.vocab * 4
-    assert reset < full
+    assert _peak_intercept_bytes(sh, 5) == sh.N * 5 * sh.vocab * 4
 
 
-def test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_boundary():
-    """The whole reason solve_max_seq_len can no longer do a plain
-    single-level binary search: crossing an ordinary (non-doubling) chunk
-    boundary, the intercept's trailing-chunk reset (chunk tokens -> 1 token)
-    outweighs the tiny per-token activation slope, and the KV term does not
-    move at all if both S values share one capacity bucket -- so peak VRAM
-    actually goes DOWN as S goes up. This is the measured MiniMax/Qwen/
-    Llama-1b sawtooth (task-5b-report.md), not a bug."""
+def test_peak_intercept_adds_the_head_weight():
+    """head_bytes is the lm_head weight that goes resident when the logits are
+    computed -- 0.5253 GB of tied fp16 head on Llama-3.2-1B, a file stat at the
+    call site, additive on top of the logits."""
+    without = shape_for("qwen3-235b", head_bytes=0)
+    with_head = shape_for("qwen3-235b", head_bytes=525_336_576)
+    assert (_peak_intercept_bytes(with_head, 8192)
+            - _peak_intercept_bytes(without, 8192)) == 525_336_576
+
+
+def test_predict_peak_vram_is_monotone_across_a_chunk_boundary():
+    """The intercept no longer resets at a chunk boundary (see the section
+    comment above), so peak VRAM cannot go DOWN as S goes up. This replaces
+    test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_boundary,
+    which asserted the opposite from the last-chunk-only data. solve_max_seq_len
+    still verifies every S' <= S_max rather than binary-searching: the check is
+    now redundant, not wrong, and it is what makes the sawtooth's return
+    (a future term keyed on the trailing chunk) safe rather than silent."""
     sh = shape_for("qwen3-235b")
-    boundary = 5 * sh.chunk  # not a KV capacity-doubling point (see below)
+    boundary = 5 * sh.chunk  # not a KV capacity-doubling point
     cap_before = kv_capacity_tokens(boundary, chunk=sh.chunk,
                                     growth=sh.kv_growth_factor, buckets=True)
     cap_after = kv_capacity_tokens(boundary + 1, chunk=sh.chunk,
                                    growth=sh.kv_growth_factor, buckets=True)
     assert cap_before == cap_after, "premise: no KV jump at this boundary"
-    assert predict_peak_vram(sh, boundary) > predict_peak_vram(sh, boundary + 1)
+    assert predict_peak_vram(sh, boundary + 1) >= predict_peak_vram(sh, boundary)
 
 
 from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
@@ -439,7 +459,7 @@ def test_solve_max_seq_len_stays_safe_for_every_smaller_context():
     the whole range tiny) to prove that cannot happen."""
     tiny = VramShape(kv_per_token=37, N=1, chunk=16, hidden=64, n_heads=4,
                      vocab=1000, elem_bytes=2,
-                     materializes_scores=False, alloc_factor=1.1,
+                     score_elem_bytes=0.0, alloc_factor=1.1,
                      kv_growth_factor=2, kv_capacity_buckets=True)
     free_vram = 400_000
     s_max = solve_max_seq_len(free_vram=free_vram, min_resident=0, shape=tiny)
@@ -773,7 +793,7 @@ def test_batch_width_at_the_real_reserve_floor_is_refused():
 
 def _shape_with(**kw):
     base = dict(kv_per_token=1000, N=1, chunk=512, hidden=4096, n_heads=32,
-                vocab=1000, elem_bytes=2, materializes_scores=False,
+                vocab=1000, elem_bytes=2, score_elem_bytes=0.0,
                 alloc_factor=1.0, kv_capacity_buckets=False)
     base.update(kw)
     return VramShape(**base)

@@ -87,13 +87,57 @@ def kv_bytes_per_token(*, num_hidden_layers: int, num_key_value_heads: int,
 DEFAULT_ALLOC_FACTOR = 1.0
 
 
-# P1 verdict, measured 2026-08-14 on torch 2.11.0+cu130 (see the RESULTS file).
-# Whether F.scaled_dot_product_attention materializes an S-sized score matrix
-# under the (N, 1, q_len, kv_len) additive mask the prefill passes. FLASH rejects
-# that masked call; EFFICIENT and MATH accept it and neither materializes scores.
-# Backend selection is torch-version-dependent, so this is only meaningful with
-# the version recorded beside it.
-MATERIALIZES_SCORES = False
+# Bytes of transient attention-score buffer per (head, query-position,
+# key-position) element, BY ATTENTION KERNEL -- i.e. the coefficient of the
+# `N * n_heads * chunk * S` term in _peak_linear_slope_bytes. Zero means the
+# kernel never materializes an S-sized score matrix at all.
+#
+# This replaces a single global `MATERIALIZES_SCORES = False` bool. That bool
+# was measured correctly -- but only against flash_attention_2, the kernel
+# every calibration arm before 2026-08-15 happened to run, and it is WRONG for
+# sdpa, which batched_generate hard-requires (vaayu_base.py's assert). Paired
+# flash-vs-sdpa sweeps on all four on-device geometries (todo row 10,
+# plans/2026-08-15-row10-attention-kernel-RESULTS.md) showed the sdpa/flash
+# transient ratio GROWING with S on every one of them (1B: 1.32x at S=4096 ->
+# 4.66x at S=65536), and the flash-to-sdpa slope gap implying the same
+# per-element cost -- 10.4-11.4 bytes -- across 16-to-94 layers, 1B-to-235B
+# params, dense and both MoE layouts. A cost four unrelated geometries agree on
+# is a real buffer, not noise. It is ~2.5-2.9x a plain fp32 element, consistent
+# with an fp32 score buffer plus an fp32 softmax-probability buffer plus mask;
+# the exact PyTorch-internal split is not identified here.
+#
+# These are KERNEL properties (and torch-version-dependent -- measured on
+# 2.11.0+cu130), not model properties, so they stay literal under CLAUDE.md §5
+# the same way MATERIALIZES_SCORES did. scripts/fit_vram_calibration.py holds
+# the data and reproduces the fit.
+SCORE_ELEM_BYTES = {
+    "flash_attention_2": 0.0,   # fused/tiled; no S-sized buffer ever exists
+    # 10.9 = the mean of the four geometries' own paired flash-vs-sdpa slope
+    # estimates, measured 2026-08-15 on identical S lists (todo row 6, arms in
+    # scripts/fit_vram_calibration.py): Llama-3.2-1B 10.35, Qwen3-235B 10.52,
+    # Llama-3.3-70B 11.33, MiniMax-M2.7 11.42 B/elem. Fitted from the measured
+    # slopes, NOT tuned to make the gate green -- the spread is 10%, so no
+    # single value can be right for all four, and picking one to minimise gate
+    # failures would hide that.
+    "sdpa": 10.9,
+}
+
+# Charged for any kernel with no measured coefficient: `eager` materializes
+# scores by construction and BetterTransformer's footprint is unmeasured here,
+# so both take the largest MEASURED cost rather than 0. Over-reserving is the
+# safe error for a number whose job is "every request up to this length fits";
+# charging 0 for an unmeasured kernel would silently under-reserve.
+_UNMEASURED_SCORE_ELEM_BYTES = max(SCORE_ELEM_BYTES.values())
+
+
+def score_elem_bytes(attn_impl: str | None) -> float:
+    """Score-buffer bytes per element for the attention kernel actually loaded.
+
+    Callers pass `model._active_attn_impl` (set by init_model, which runs
+    before the VRAM plan is built). None/unknown -> the conservative default
+    above, never 0.
+    """
+    return SCORE_ELEM_BYTES.get(attn_impl, _UNMEASURED_SCORE_ELEM_BYTES)
 
 
 def kv_capacity_tokens(S: int, *, chunk: int, growth: int, buckets: bool) -> int:
@@ -170,7 +214,11 @@ class VramShape:
     n_heads: int
     vocab: int
     elem_bytes: int             # compute dtype width (2 for fp16/bf16)
-    materializes_scores: bool
+    # Bytes per score-matrix element for the ATTENTION KERNEL this plan is
+    # sized for -- see SCORE_ELEM_BYTES / score_elem_bytes() above. A kernel
+    # property, so the caller reads it off `model._active_attn_impl`; 0.0 is
+    # flash_attention_2's real value, not a "disabled" sentinel.
+    score_elem_bytes: float
     alloc_factor: float
     # kv_growth_factor/kv_capacity_buckets: algorithmic properties of the KV
     # CACHE IMPLEMENTATION (FP8DynamicCache._ensure_capacity), not of any
@@ -190,18 +238,30 @@ class VramShape:
     # 1.514 GB = 128 experts = one full layer, constant across S=5000..12288
     # and reset per layer.
     resident_expert_bytes: int = 0
+    # Bytes of the lm_head weight that become GPU-resident when the logits are
+    # computed. DERIVED by the caller from the checkpoint's own lm_head shard
+    # (or, for a tied-embedding checkpoint whose head shard is empty, its
+    # embedding shard) -- a file stat, exactly like the layer_slack figure
+    # beside it in vaayu_base, never a literal (CLAUDE.md S5). Measured
+    # 2026-08-15 (todo row 6): on Llama-3.2-1B this term plus a FULL chunk of
+    # fp32 logits accounts for the whole-prefill transient to within 0.5% at
+    # every S from 4096 to 106987.
+    head_bytes: int = 0
 
 
 def _peak_linear_slope_bytes(shape: VramShape) -> float:
     """Bytes of peak VRAM per additional token of context from terms linear in S.
 
-    Only the attention-scores term remains, and it is ZERO on this box
-    (MATERIALIZES_SCORES=False). The activation term that used to live here was
-    removed 2026-08-15 as unobservable -- see DEFAULT_ALLOC_FACTOR's comment.
-    The KV term is charged separately (kv_capacity_tokens): it is a step
-    function of S, not linear, so it cannot live in a per-token slope."""
-    return (shape.N * shape.n_heads * shape.chunk * shape.elem_bytes * 2
-            if shape.materializes_scores else 0.0)
+    Only the attention-scores term remains, and whether it is zero is a
+    property of the ATTENTION KERNEL, not of the box: 0 under
+    flash_attention_2, real and large under sdpa (SCORE_ELEM_BYTES). Vaayu's
+    prefill only ever presents `chunk` query positions against up to S key
+    positions per step, so the buffer is `N * n_heads * chunk * S` elements.
+    The activation term that used to live here was removed 2026-08-15 as
+    unobservable -- see DEFAULT_ALLOC_FACTOR's comment. The KV term is charged
+    separately (kv_capacity_tokens): it is a step function of S, not linear, so
+    it cannot live in a per-token slope."""
+    return shape.N * shape.n_heads * shape.chunk * shape.score_elem_bytes
 
 
 def _kv_term_bytes(shape: VramShape, S: int) -> int:
@@ -216,55 +276,40 @@ def _kv_term_bytes(shape: VramShape, S: int) -> int:
     return shape.kv_per_token * cap * shape.N
 
 
-def _trailing_chunk_tokens(S: int, chunk: int) -> int:
-    """Length, in tokens, of the LAST prefill chunk of a context of S tokens.
-
-    Chunked prefill processes S tokens as ceil(S/chunk) slices of `chunk`
-    tokens each, except the final slice, which is only `chunk` tokens long
-    when S divides evenly -- otherwise it is the S tokens (S <= chunk, only
-    one slice exists at all) or S mod chunk tokens (S > chunk). Task 5/5b
-    (task-5-report.md, RESULTS "Task 5b" section) measured
-    `_peak_intercept_bytes` charging the constant `chunk` here instead,
-    producing a sawtooth error that tracks this exact quantity: MiniMax's
-    trailing chunk shrinks 392->368->344->20 tokens across S=5000..7700 at
-    chunk=512, matching the observed drift in measured peak almost exactly.
-
-    S mod chunk == 0 (an exact multiple) is a FULL trailing chunk, not an
-    empty one -- plain `%` alone would return 0 there, which is wrong (there
-    is still one slice of `chunk` tokens; nothing about prefill produces a
-    zero-length final chunk). S <= 0 has no chunk at all.
-    """
-    s, c = int(S), int(chunk)
-    if s <= 0:
-        return 0
-    return ((s - 1) % c) + 1
-
-
 def _peak_intercept_bytes(shape: VramShape, S: int) -> float:
-    """Bytes of peak VRAM from the last chunk's logits, before alloc_factor.
+    """Bytes of peak VRAM from the lm_head weight plus a FULL chunk of logits.
 
-    Only the last chunk's logits are materialized (vaayu_base.py's forward(),
-    around the `run_lm_head` call and its "only the last chunk's logits
-    exist/matter" comment further down), and sampling upcasts them to fp32.
+    Charged at 4 bytes/logit -- the fp32 upcast ALONE, not `elem_bytes + 4`.
+    The fp16 copy is not resident at the peak (measured 2026-08-15 on three
+    geometries: `trailing * vocab * 4` = 0.2627 GB exactly against a measured
+    0.2627, where `* (elem_bytes + 4)` would be 0.3940).
 
-    Charged at 4 bytes/element -- the fp32 upcast ALONE, not `elem_bytes + 4`.
-    The fp16 copy is not resident at the peak. Measured 2026-08-15 on three
-    independent geometries at a full trailing chunk, where this term is largest
-    and cleanest to isolate: the residual (transient - KV - residency) is
-    0.2627 GB on llama-3.3-70b at BOTH S=12288 and S=16384, and on llama-3.2-1b
-    at S=16384, 32768 and 49152. `trailing * vocab * 4` = 0.2627 GB exactly;
-    `* (elem_bytes + 4)` = 0.3940 GB. Five points, four decimals, nothing
-    fitted. (MiniMax-M2.7 sits ~0.079 GB ABOVE even the x6 figure at the same
-    point -- its module-list forward holds something small this does not model.
-    That leaves it under-predicted by 5.8% there, inside the gate, and is the
-    known residual to chase if the bar ever tightens.)
+    A FULL chunk (`min(S, chunk)`), NOT the trailing partial chunk. This term
+    used to follow `_trailing_chunk_tokens(S, chunk)`, and that was measured --
+    but against a table whose dense rows were LAST-CHUNK peaks, because the
+    chunked-prefill loop reset the CUDA peak counter mid-forward. Against the
+    honest whole-prefill data (todo rows 1 and 6) the sawtooth is not there:
+    Llama-3.2-1B's transient at S=4096 and S=4097 is BYTE-IDENTICAL
+    (2013892608 vs 2013893120 alloc_peak, 512 bytes apart), and its
+    `transient - KV(capacity)` is a flat 0.7917 GB at every S from 4096 to
+    106987. A whole-prefill peak is the max over chunks, and a full chunk
+    always precedes a short trailing one, so the trailing chunk cannot lower
+    the peak.
 
-    The last chunk is
-    `_trailing_chunk_tokens(S, shape.chunk)` tokens long, not always a full
-    `chunk` -- see that function's docstring for the measured evidence.
+    `head_bytes` is the other half of that 0.7917: 0.5253 GB of tied fp16
+    lm_head weight + 0.2627 GB of full-chunk fp32 logits = 0.788 GB, 0.5% from
+    the measurement, on five independent points. It is a file stat on the
+    checkpoint's own head shard, so it costs nothing to derive and is not a
+    model literal.
+
+    Known residual, NOT modelled (todo row 6a): the other three geometries need
+    a different amount than this term charges -- Llama-3.3-70B wants 0.93 GB at
+    a full chunk and 0.71 at a short one against the 1.05 charged here,
+    MiniMax-M2.7 wants 0.63-0.67 and 0.085 against 0.87. Both are
+    OVER-predicted, which is the safe direction for a reserve, but neither is
+    explained. Qwen3-235B is unaffected: its resident-expert term dominates.
     """
-    trailing = _trailing_chunk_tokens(S, shape.chunk)
-    return shape.N * trailing * shape.vocab * 4
+    return shape.head_bytes + shape.N * min(int(S), shape.chunk) * shape.vocab * 4
 
 
 def _peak_transient_bytes(shape: VramShape, S: int) -> float:
@@ -285,18 +330,19 @@ def _peak_transient_bytes(shape: VramShape, S: int) -> float:
 def predict_peak_vram(shape: VramShape, S: int) -> int:
     """Predicted PEAK VRAM in bytes for a prefill of S tokens at this shape.
 
-    PIECEWISE-linear in S, not linear everywhere, and NOT globally monotone:
-    the KV term (_kv_term_bytes) is a step function of S on any bucketed
-    shape (every EXL3 checkpoint's ring-buffer KV cache), flat within a
-    capacity bucket and jumping by a whole bucket's worth of KV at each
-    boundary; the intercept (_peak_intercept_bytes) is a sawtooth that RESETS
-    DOWN at every chunk boundary (trailing chunk goes from a full `chunk`
-    back to 1 token) even as the linear activation term keeps climbing --
-    so crossing an ordinary (non-doubling) chunk boundary can make peak VRAM
-    go DOWN as S goes up (measured: MiniMax/Qwen/Llama-1b all show this,
-    task-5b-report.md). solve_max_seq_len below accounts for this
-    explicitly -- see its docstring for why a plain single-level binary
-    search over this function would be unsound.
+    PIECEWISE-linear in S and not linear everywhere: the KV term
+    (_kv_term_bytes) is a step function of S on any bucketed shape (every
+    EXL3 checkpoint's ring-buffer KV cache), flat within a capacity bucket
+    and jumping by a whole bucket's worth of KV at each boundary.
+
+    It IS monotone non-decreasing in S as of 2026-08-15 (todo row 6): the
+    intercept used to saw back DOWN at every chunk boundary, but that was
+    fitted to last-chunk-only peaks, and the honest whole-prefill data has
+    no such sawtooth (see _peak_intercept_bytes). solve_max_seq_len below
+    still verifies every S' <= S rather than binary-searching on the
+    single-S question -- now redundant rather than load-bearing, and what
+    keeps a future trailing-chunk-keyed term from silently returning an
+    S_max that some smaller S' exceeds.
     """
     raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_transient_bytes(shape, int(S))
            + _kv_term_bytes(shape, S))
@@ -326,27 +372,27 @@ def solve_max_seq_len(*, free_vram: int, min_resident: int,
     That stronger property is what a max_seq_len CAP must actually
     guarantee: plan_vram reserves VRAM once, sized at exactly the chosen
     max_seq_len, and that one reservation has to cover any real request up
-    to that length. It is also no longer the same question as "the single
-    largest S that fits": Task 5c made `_peak_intercept_bytes` follow the
-    real trailing chunk, which RESETS DOWN at every chunk boundary even as
-    the other terms keep climbing -- so predict_peak_vram is NOT monotone in
-    S (see test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_
-    boundary). A plain single-level binary search assumes "doesn't fit here
-    -> doesn't fit anywhere larger," which this function can violate; used
-    directly it can return an S that itself fits while some SMALLER S' does
-    not -- silently wrong in the unsafe direction.
+    to that length. It was also, until 2026-08-15, not the same question as
+    "the single largest S that fits": `_peak_intercept_bytes` followed the
+    real trailing chunk and RESET DOWN at every chunk boundary, so
+    predict_peak_vram was not monotone in S, and a plain single-level binary
+    search ("doesn't fit here -> doesn't fit anywhere larger") could return
+    an S that itself fits while some SMALLER S' does not. The whole-prefill
+    data removed that sawtooth (todo row 6), so the two questions now
+    coincide -- but the exact search below is KEPT: it is the difference
+    between "correct because the current form happens to be monotone" and
+    "correct whatever the form does", and the sawtooth already came and went
+    once.
 
-    Two facts rescue an exact search:
+    Two facts make the exact search cheap, and both still hold:
     - predict_peak_vram AT chunk boundaries (S = k*chunk) is monotone
-      non-decreasing in k: the trailing chunk is always exactly `chunk`
-      there (constant across k, so the intercept cannot be the one term
-      pulling it down), kv_capacity_tokens never decreases in k, and the
+      non-decreasing in k: the intercept is constant there (a full chunk of
+      logits at every k), kv_capacity_tokens never decreases in k, and the
       linear slope term is non-negative in k.
     - WITHIN one boundary-to-boundary period (S in (k*chunk, (k+1)*chunk]),
-      the trailing chunk climbs monotonically from 1 back up to `chunk`
-      while the KV bucket is constant (kv_capacity_tokens only changes AT
-      the boundaries) -- so predict_peak_vram is monotone non-decreasing
-      within a period too.
+      the intercept is flat at a full chunk and the KV bucket is constant
+      (kv_capacity_tokens only changes AT the boundaries) -- so
+      predict_peak_vram is monotone non-decreasing within a period too.
 
     So this runs two nested, individually-sound binary searches: first the
     largest number of WHOLE periods k that fit entirely (monotone in k,
