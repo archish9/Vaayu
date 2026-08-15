@@ -36,13 +36,25 @@ def main():
                                       max_seq_len=max(lengths))
     total = torch.cuda.get_device_properties(0).total_memory
     after_load_free, _ = torch.cuda.mem_get_info()
-    print(f"[probe] total={total/1e9:.2f}GB free_after_load={after_load_free/1e9:.2f}GB")
+    # BOTH baselines, because they are not the same quantity and confusing them
+    # cost a calibration round: mem_get_info is DRIVER-level (includes the CUDA
+    # context and allocator-reserved-but-unallocated blocks), memory_allocated
+    # is ALLOCATOR-level and is the one comparable to max_memory_allocated
+    # below. scripts/fit_vram_calibration.py needs the allocator figure.
+    print(f"[probe] total={total/1e9:.2f}GB free_after_load={after_load_free/1e9:.2f}GB "
+          f"driver_resident={(total - after_load_free)/1e9:.2f}GB "
+          f"alloc_resident={torch.cuda.memory_allocated()/1e9:.2f}GB")
 
-    print("S,alloc_peak_bytes,reserved_peak_bytes,wall_s,status")
+    print("S,alloc_before_bytes,alloc_peak_bytes,reserved_peak_bytes,wall_s,status")
     for S in lengths:
         ids = torch.randint(0, cfg["vocab_size"], (1, S), device="cuda:0")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        # Per-point, not once at load: on a MoE model the expert VRAM cache
+        # keeps growing across this loop, so the resident floor entering each
+        # forward differs. max_memory_allocated is peak-since-reset and so
+        # INCLUDES this floor; the transient is the difference.
+        alloc_before = torch.cuda.memory_allocated()
         t0 = time.time()
         status = "ok"
         try:
@@ -53,7 +65,7 @@ def main():
         except Exception as e:                      # noqa: BLE001 - probe
             status = f"ERR:{type(e).__name__}"
         wall = time.time() - t0
-        print(f"{S},{torch.cuda.max_memory_allocated()},"
+        print(f"{S},{alloc_before},{torch.cuda.max_memory_allocated()},"
               f"{torch.cuda.max_memory_reserved()},{wall:.1f},{status}", flush=True)
         if status != "ok":
             print("[probe] stopping at first failure -- that S is the datum")

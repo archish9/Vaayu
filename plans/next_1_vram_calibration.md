@@ -1,12 +1,21 @@
 # NEXT-1 — Close the `predict_peak_vram` calibration gate
 
-**Status:** `[ ]` pending · **Cost:** ~1–2 h, **NO GPU runs needed** · **Owner:** next session
-**Sequence:** do this FIRST. It is cheap, self-contained, and it decides whether two other
-pending items (NEXT-4 probe re-instrumentation, the N≥2 admission gap) are real work or moot.
+**Status:** `[~]` in progress — hypothesis CONFIRMED 2026-08-15, blocked on three measured
+baselines · **Cost:** ~40 min GPU remaining · **Owner:** next session
 
-> **This document is self-contained.** Everything needed — the mechanism, the measured data,
-> the file/symbol names, the rules — is below. You do not need `todo.md`, the F4 plan, or any
-> `docs/` file (that directory is gitignored and may not exist on a fresh clone).
+> **CLOSED 2026-08-15 — REFUTED. Read `todo.md` item 1 for the full verdict.**
+> The §3 hypothesis was half right: the residual IS a per-model constant the model lacks, and the
+> §3 note that 2.77 GB is driver-level was the decisive catch (the measured driver-vs-allocator gap
+> is 0.51–0.61 GB). But calibrating the two constants cannot close the gate, because the FORM is
+> wrong. Four measured-baseline arms (26 points, 2026-08-15) show `KV(at capacity) + last-chunk
+> logits` predicts three of the four on-device forwards to within ±0.13 GB **with no fitted
+> constants at all**, while the fused-EXL3 forward carries ~1.39 GB of residency nothing models —
+> and does not include the last-chunk logits in its peak at all. `act_coeff × S` is not observable
+> (Llama-70B's peak is identical at S=12288 and 16384) and `alloc_factor` wants ~1.0. A joint fit
+> fails 13/26 at worst 44.2 %, with negative `act_coeff` for two models.
+> **Do not re-run this brief.** The successor is a FORM change — drop the activation term, add a
+> derived expert-staging term for fused-EXL3 — which needs its own design and approval.
+> Evidence, data and provenance: `scripts/fit_vram_calibration.py`.
 
 ---
 
