@@ -831,3 +831,37 @@ Headline findings:
 
 Phase 2 (form, `MATERIALIZES_SCORES`, budget policy, `max_seq_len` re-derivation) is now `todo.md`
 items 6-9, gated behind item 10 (the attention-kernel question).
+
+## Attention-kernel calibration question (todo row 10) — CLOSED 2026-08-15
+
+**Question:** which kernel should the VRAM calibration describe — `flash_attention_2` (what the
+probe picks by default) or `sdpa` (what `batched_generate` hard-requires)? And does the
+flash-vs-sdpa gap grow with S enough to explain the pre-fix "6.2×/2.2×" slopes above, or is
+something else going on?
+
+**Method:** `scripts/probe_vram_curve.py` gained an opt-in `PROBE_ATTN` env var (default behaviour
+unchanged), then paired flash/sdpa sweeps were run on all four on-device geometries — 1B out to
+S=98304, the other three to S=8192 — one arm per subprocess, same caps as the row-1 re-probe.
+
+**Verdict — sdpa, kernel-aware. Full data and derivation: `plans/2026-08-15-row10-attention-kernel-RESULTS.md`.**
+
+- The flash-vs-sdpa ratio **grows with S on all four geometries** (1B: 1.00×→4.66×; 70B:
+  1.00×→1.82×; Qwen3-235B: 1.00×→1.97×; MiniMax: 1.00×→1.64×), never flat, never shrinks.
+- Reaches **3.774× at S=32768 on the 1B**, matching the ~3.7× the "gap explains 6.2×" hypothesis
+  needed — confirmed as the asymptotic ratio of two fitted lines (sdpa slope 0.2028 MB/tok / flash
+  slope 0.0328 MB/tok ≈ 6.2×).
+- sdpa's own slopes **reproduce the pre-fix hand-measured figures above almost exactly** (1B: 0.2028
+  vs 0.2027 MB/tok, three independent segments; 70B: 0.6984 vs 0.7149 MB/tok) — those old readings
+  were sdpa readings all along, not a form error.
+- `MATERIALIZES_SCORES = False` **is contradicted by the sdpa data specifically**: the
+  flash-to-sdpa slope gap implies a per-element byte cost clustered at 10.4–11.4 bytes across all
+  four architecturally-unrelated geometries — consistent with a real `n_heads · chunk · S`-shaped
+  score buffer sdpa's masked call materializes and flash's kernel does not. The constant is right
+  for flash, wrong for sdpa.
+- **Recommendation:** calibrate `MEASURED` against sdpa (what `batched_generate` needs), and make
+  `MATERIALIZES_SCORES` kernel-aware (gate on `model._active_attn_impl`) rather than a single global
+  value — flash and sdpa need different constants, not one constant picked for both. Single-stream
+  `generate()` (which may run flash) stays out of scope, same reason as before: nothing today gates
+  that path on `predict_peak_vram`.
+
+Rows 6-9 are unblocked and re-scoped onto this verdict (`todo.md`).

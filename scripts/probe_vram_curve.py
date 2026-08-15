@@ -11,11 +11,22 @@ MEASURED table became a last-chunk peak.
 Usage:
   python scripts/probe_vram_curve.py <checkpoint> [S ...]
 
+  PROBE_ATTN=<impl> overrides which attention kernel is forced at load (e.g.
+  PROBE_ATTN=sdpa). Passed straight through as attn_implementation=<impl> to
+  AutoModel.from_pretrained -- forces it the same way test_batched_dense_smoke.py
+  does, and the printed [probe] active_attn_impl=... line asserts it actually
+  took effect rather than silently falling back (see row 10,
+  plans/2026-08-15-row10-attention-kernel-RESULTS.md). Unset: behaviour is
+  byte-identical to before this override existed -- Vaayu's own candidate order
+  picks the kernel (flash_attention_2 first if importable, see vaayu_base.py's
+  init_model), with no fallback added here.
+
 Run ONE model per process (METHOD NOTES: freed pinned blocks are cached, not
 returned, so arms accumulate; one probe hit a 28.3 GB peak and systemd-oomd
 killed the whole terminal cgroup).
 """
 import json
+import os
 import sys
 import time
 
@@ -78,6 +89,15 @@ def sweep_points(*, chunk: int, growth: int, s_max: int) -> list[int]:
     return sorted(p for p in pts if 0 < p <= s_max)
 
 
+def attn_kwargs_from_env(env: dict) -> dict:
+    """PROBE_ATTN -> the from_pretrained kwargs it becomes, isolated from
+    torch/CUDA so this plumbing is testable without a GPU. Unset PROBE_ATTN
+    must yield {} (no attn_implementation key at all) -- that is what keeps
+    the unset-env-var default byte-identical to pre-override behaviour."""
+    forced_attn = env.get("PROBE_ATTN")
+    return {"attn_implementation": forced_attn} if forced_attn else {}
+
+
 def main():
     ckpt = sys.argv[1]
 
@@ -86,8 +106,17 @@ def main():
     print(f"[probe] torch={torch.__version__} "
           f"alloc_conf={__import__('os').environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}")
 
+    forced_attn = os.environ.get("PROBE_ATTN")
+    from_pretrained_kwargs = attn_kwargs_from_env(os.environ)
     model = AutoModel.from_pretrained(ckpt, device="cuda:0",
-                                      max_seq_len=None)
+                                      max_seq_len=None, **from_pretrained_kwargs)
+    if forced_attn:
+        assert model._active_attn_impl == forced_attn, (
+            f"PROBE_ATTN={forced_attn!r} requested but "
+            f"model._active_attn_impl={model._active_attn_impl!r} -- silent "
+            f"fallback to a different kernel would corrupt this measurement")
+    print(f"[probe] active_attn_impl={model._active_attn_impl} "
+          f"(PROBE_ATTN={forced_attn or '<unset, engine default order>'})")
     lengths = [int(x) for x in sys.argv[2:]] or sweep_points(
         chunk=model.prefill_chunk_size,
         growth=FP8DynamicCache._GROWTH,

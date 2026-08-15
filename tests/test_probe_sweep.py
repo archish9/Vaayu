@@ -135,3 +135,32 @@ def test_sweep_raises_on_nonpositive_s_max(s_max):
 
     with pytest.raises(VramPlanError, match="s_max"):
         probe.sweep_points(chunk=512, growth=2, s_max=s_max)
+
+
+# ---- PROBE_ATTN plumbing (row 10) ------------------------------------------
+# CPU-only: main() itself needs a real CUDA device (unconditional
+# torch.cuda.get_device_properties/mem_get_info calls), so it cannot be
+# exercised here. attn_kwargs_from_env is the env-var -> from_pretrained-kwargs
+# translation extracted specifically so this plumbing has a GPU-free test.
+
+def test_attn_kwargs_from_env_unset_is_empty():
+    """Unset PROBE_ATTN must add NO attn_implementation kwarg at all -- this
+    is what keeps the probe's default behaviour byte-identical to before the
+    override existed (brief's non-negotiable)."""
+    assert probe.attn_kwargs_from_env({}) == {}
+    assert probe.attn_kwargs_from_env({"OTHER_VAR": "x"}) == {}
+
+
+@pytest.mark.parametrize("impl", ["sdpa", "flash_attention_2", "eager"])
+def test_attn_kwargs_from_env_set_passes_through(impl):
+    assert probe.attn_kwargs_from_env({"PROBE_ATTN": impl}) == {
+        "attn_implementation": impl,
+    }
+
+
+def test_attn_kwargs_from_env_empty_string_is_treated_as_unset():
+    """PROBE_ATTN='' (e.g. from an accidentally-exported empty var) must not
+    be forwarded as attn_implementation='' -- that would fail from_pretrained
+    with a confusing error instead of behaving like the override was never
+    set."""
+    assert probe.attn_kwargs_from_env({"PROBE_ATTN": ""}) == {}
