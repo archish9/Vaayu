@@ -297,6 +297,35 @@ def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tenso
     return result
 
 
+def accumulate_expert_outputs(final_hidden, contributions) -> None:
+    """Add every expert's contribution to `final_hidden` in EXPERT-ID order.
+
+    `contributions` is an iterable of (expert_idx, token_idx, hidden) built as
+    experts finish. Experts are CONSUMED in arrival order on purpose -- that is
+    what overlaps disk reads with compute -- but arrival order varies run to
+    run: VRAM-resident experts run first, and the rest arrive in disk COMPLETION
+    order (_iter_expert_loads waits FIRST_COMPLETED). Since each token routes to
+    top_k experts, several contributions land on the SAME rows, and floating
+    point addition is not associative at any width, so summing in arrival order
+    makes the engine a non-deterministic function of its input.
+
+    Measured on Qwen3-235B (2026-08-15): three identical greedy generate runs
+    produced TWO distinct token sequences, diverging at the 4th new token, with
+    per-run BC construction counts of 25380 / 24570 / 24696 -- cache warmth
+    changing the order. An earlier fix widened this accumulator from bf16 to
+    fp32 and its comment claimed fp32 made "the cast result identical whatever
+    the order": that is false. fp32's error is normally far below the bf16
+    output's own precision, but any value sitting on a bf16 rounding boundary
+    tips regardless, and across 94 layers something always does. Width narrows
+    the window; only a fixed summation order closes it.
+
+    Sorting here rather than sorting execution keeps the overlap: the disk reads
+    still complete in whatever order the NVMe gives them.
+    """
+    for _eidx, token_idx, hidden in sorted(contributions, key=lambda c: c[0]):
+        final_hidden.index_add_(0, token_idx, hidden.to(final_hidden.dtype))
+
+
 def _make_bc_linear_exl3(
     gpu_components: "dict[str, torch.Tensor]",
     in_features: int,
@@ -600,8 +629,17 @@ def patch_moe_blocks(
       3. Injects each expert's weights to GPU, runs it, unloads back to meta
       4. Writes routing result to vaayu_ref._expert_history[layer_idx]
 
-    vaayu_ref: reference to VaayuBaseModel instance. The forward() loop reads
-    _expert_history after each layer and submits speculative prefetch.
+    vaayu_ref: reference to VaayuBaseModel instance.
+
+    _expert_history has NO production reader (audit F7). The docstring used to
+    claim "the forward() loop reads _expert_history after each layer and submits
+    speculative prefetch" -- that mechanism does not exist and never did, and
+    the claim sent readers looking for it. The write stays because the tests
+    read it: it is the observation hook they use to assert WHICH experts a
+    forward actually routed to (tests/test_moe_patch.py, ~8 assertions across
+    all three forwards). Removing it would cost those tests their only view of
+    routing and buy a runtime saving of approximately zero -- one dict
+    assignment per layer.
 
     Returns list of patched MoEBlockInfo for logging.
     """
@@ -822,7 +860,9 @@ def _make_modulelist_sparse_forward(
         # _make_fused_sparse_forward_exl3. Experts reach index_add_ in an order
         # that varies run to run (VRAM residency, then disk completion order),
         # and a bf16 accumulator turns that into ~1 ULP per layer that compounds
-        # into different tokens over 62 layers.
+        # into different tokens over 62 layers. fp32 shrinks that error but does
+        # not remove the order dependence -- accumulate_expert_outputs below is
+        # what makes the sum order-independent.
         final_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
 
         # Permutation dispatch (ported from _make_fused_sparse_forward_exl3): one
@@ -848,6 +888,12 @@ def _make_modulelist_sparse_forward(
         # this ever silently copied, index_add_ below would write into a
         # discarded temporary and the whole layer would output zeros.
         _flat_final = final_hidden.view(-1, H)
+        # Buffered, then summed in expert-id order after every expert has run
+        # (accumulate_expert_outputs). Experts are still CONSUMED in completion
+        # order -- that overlap is the point -- but the SUM must not depend on
+        # it. Holds tokens x top_k x H of fp16, which is 64 KB at decode and
+        # ~32 MB for a 512-token prefill chunk.
+        _contribs: list = []
         _flat_routing = routing_weights.reshape(-1, top_k)
 
         # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
@@ -915,7 +961,7 @@ def _make_modulelist_sparse_forward(
             if _prof:
                 _t_scatter1 = time.perf_counter()
             w = _flat_routing[token_idx_gpu, kpos_gpu].unsqueeze(-1)
-            _flat_final.index_add_(0, token_idx_gpu, (w * expert_out).to(final_hidden.dtype))
+            _contribs.append((eidx, token_idx_gpu, w * expert_out))
             if _prof:
                 # This is the one new synchronize() this phase actually adds
                 # (the pre-gather boundary above is free, borrowed from gemm's
@@ -1039,6 +1085,8 @@ def _make_modulelist_sparse_forward(
             # through — a leaked pin permanently blocks that key's eviction.
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+
+        accumulate_expert_outputs(_flat_final, _contribs)
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
         vaayu_ref._expert_history[layer_idx] = unique_experts
@@ -1582,13 +1630,24 @@ def _make_fused_sparse_forward_exl3(
         # index_add_ order, and that order is NOT deterministic: cache-resident
         # experts run first (residency varies with warmth) and the rest arrive
         # in disk COMPLETION order (_iter_expert_loads waits FIRST_COMPLETED).
-        # Accumulating in bf16 makes that order observable -- bf16 addition
-        # rounds at ~2^-8, so a reordered sum differs by ~1 ULP per layer, and
-        # over a deep stack that compounds into different tokens. fp32 rounds
-        # at ~2^-24, far below the bf16 output's own precision, so the cast
-        # result is identical whatever the order. Measured on MiniMax: 3
-        # distinct outputs in 4 identical runs before, bitwise identical after.
+        # Accumulating in bf16 makes that order loudly observable -- bf16
+        # addition rounds at ~2^-8, so a reordered sum differs by ~1 ULP per
+        # layer and compounds into different tokens over a deep stack. fp32
+        # rounds at ~2^-24 and shrinks that error ~2^13x.
+        #
+        # It does NOT remove it. This comment used to claim "the cast result is
+        # identical whatever the order"; that was disproven on Qwen3-235B
+        # 2026-08-15 -- three identical greedy generate runs gave TWO distinct
+        # token sequences. fp32's error is normally far below the bf16 output's
+        # own precision, but a value sitting on a bf16 rounding boundary tips
+        # regardless, and across 94 layers something always does. Width narrows
+        # the window; only a fixed summation order closes it, which is what
+        # accumulate_expert_outputs now does.
         final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
+        # See the module-list forward and accumulate_expert_outputs: summed in
+        # expert-id order once the loop is done, so a run-to-run change in
+        # arrival order cannot change the result.
+        _contribs: list = []
         intermediate_size = None  # inferred lazily from the first expert we see
 
         _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
@@ -1745,7 +1804,7 @@ def _make_fused_sparse_forward_exl3(
 
                     weights_slice = routing_weights[token_idx_gpu, top_k_pos_gpu, None]
                     hidden = hidden * weights_slice
-                    final_hidden.index_add_(0, token_idx_gpu, hidden.to(final_hidden.dtype))
+                    _contribs.append((eidx, token_idx_gpu, hidden))
                 finally:
                     # Free C++ QMatrix objects ONLY when the cache does not hold them:
                     # cached BC objects (entry["bc"]) live until entry eviction. For
@@ -1800,6 +1859,8 @@ def _make_fused_sparse_forward_exl3(
             # allocator reuses the memory for the next layer's retention dict.
             vaayu_ref._chunk_major_gpu = None
             vaayu_ref._chunk_major_gpu_bytes = 0
+
+        accumulate_expert_outputs(final_hidden, _contribs)
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         final_hidden = final_hidden.to(flat_hidden.dtype)

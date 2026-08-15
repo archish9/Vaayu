@@ -31,6 +31,17 @@ class SlabArena:
     """
 
     def __init__(self, n_slabs: int, slab_bytes: int, pin: bool):
+        # The class docstring above asserts every slab start is sector-aligned
+        # for O_DIRECT. Slab starts are multiples of slab_bytes from an aligned
+        # chunk base, so that assertion is only true if slab_bytes is aligned
+        # too -- and nothing used to check it (H2). Enforce it here rather than
+        # trusting every caller's arithmetic; compute_slab_bytes aligns its own
+        # result, but it is not the only possible source.
+        if int(slab_bytes) % _ALIGN != 0:
+            raise ValueError(
+                f"slab_bytes must be a multiple of _ALIGN ({_ALIGN}) so every "
+                f"slab start stays sector-aligned for O_DIRECT; got "
+                f"{int(slab_bytes)}.")
         self.slab_bytes = int(slab_bytes)
         self.n_slabs = int(n_slabs)
         self.requested_n_slabs = int(n_slabs)
@@ -41,7 +52,11 @@ class SlabArena:
         self._chunk_base_ptr: list[int] = []   # cached: data_ptr() per chunk
         placed = 0
         alloc_failed = False
-        for chunk_bytes in chunk_decomposition(self.n_slabs, self.slab_bytes):
+        # Computed once: the error path below needs the count, and recomputing
+        # the whole decomposition just to call len() on it was the only reason
+        # chunk_decomposition ran twice (H5.4).
+        self._planned_chunks = chunk_decomposition(self.n_slabs, self.slab_bytes)
+        for chunk_bytes in self._planned_chunks:
             if placed >= self.n_slabs:
                 break
             # ONE allocation per chunk, at the EXACT power of two -- that is the
@@ -128,7 +143,7 @@ class SlabArena:
         if not self._chunks:
             raise RuntimeError(
                 f"slab arena could not allocate any of "
-                f"{len(chunk_decomposition(self.requested_n_slabs, self.slab_bytes))} "
+                f"{len(self._planned_chunks)} "
                 f"chunks for {self.requested_n_slabs} x {self.slab_bytes}B slabs")
         self.n_slabs = placed
         self._free: list[int] = list(range(self.n_slabs))
@@ -139,6 +154,22 @@ class SlabArena:
         # write, so an io_uring rewrite can't race an in-flight DMA read of the
         # same bytes (silent torn-read corruption). See record_read().
         self._pending_read: dict[int, "torch.cuda.Event"] = {}
+
+    @property
+    def chunk_count(self) -> int:
+        """Number of power-of-two chunks actually backing this arena."""
+        return len(self._chunks)
+
+    @property
+    def charged_bytes(self) -> int:
+        """Bytes the host allocator is charged for this arena.
+
+        Not the same as `n_slabs * slab_bytes`: each chunk is an exact power of
+        two, so the surplus over the slabs it holds is charged but unusable.
+        Reporting both is how the arena's overhead stays visible (H5.1) --
+        vaayu_base used to compute this by reaching into `_chunks`.
+        """
+        return sum(c.numel() for c in self._chunks)
 
     def acquire(self) -> "int | None":
         with self._lock:

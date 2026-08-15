@@ -205,7 +205,12 @@ def test_per_layer_hit_miss_counters():
 def test_put_slab_prefetch_telemetry(tmp_path):
     import torch
     from vaayu.persist.expert_cache import ExpertRAMCache, SlabArena
-    arena = SlabArena(n_slabs=2, slab_bytes=64, pin=False)
+    from vaayu.persist.safetensor_model_persister import _ALIGN
+    # _ALIGN, not a toy 64: SlabArena now enforces the sector alignment its
+    # docstring always claimed (H2), and real slabs hold whole expert tensors so
+    # they are never sub-page anyway. The size is incidental to this test -- it
+    # only takes a 32-byte view.
+    arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
     cache = ExpertRAMCache(budget_bytes=10_000, max_per_layer=4, arena=arena)
 
     sidx = arena.acquire()

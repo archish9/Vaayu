@@ -164,6 +164,28 @@ def compute_expert_budget(
     return expert_budget, ne_budget, max_per_layer
 
 
+def decode_stats_reset(*, is_moe: bool, has_expert_cache: bool,
+                       is_prefill_pass: bool,
+                       already_reset: bool) -> tuple[bool, bool]:
+    """Should this forward pass reset the expert-cache counters, and what does
+    the latch become? Returns (reset_now, latched).
+
+    Decode hit-rate telemetry has to exclude prefill, which routes ~every expert
+    once and so misses ~100% by construction. The reset therefore fires on the
+    FIRST DECODE PASS of a turn -- and the latch that stops it firing again must
+    drop when the next prefill runs, or it only ever fires once per process
+    (F13). Turn 2's prefill pollutes the counters exactly as turn 1's did.
+
+    Pure so the state machine is testable without a model load, per todo.md's
+    METHOD NOTES.
+    """
+    if is_prefill_pass:
+        return False, False          # the polluter itself: never reset, re-arm
+    if is_moe and has_expert_cache and not already_reset:
+        return True, True
+    return False, already_reset
+
+
 def unclamped_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> int:
     """Slabs the expert cache budget asks for, before allocator-round-up clamping:
     the cache's own slabs plus `pool_size` extra so in-flight loader threads never
@@ -911,7 +933,7 @@ class TurboQuantKVCache(FP8DynamicCache):
 
     key_cache / value_cache keep their names so inherited code paths work, but
     they hold INDICES, NOT VALUES. Any consumer reading them directly must
-    special-case this class -- see kv_cache_manager._extract_kv_as_bf16 and
+    special-case this class -- see kv_extract._extract_kv_as_bf16 and
     kv_persist.DiskWriter.enqueue_append.
 
     Lossy in a way bf16 is not: measured relative L2 error ~0.23 on random K/V
@@ -1688,8 +1710,14 @@ class VaayuBaseModel(GenerationMixin):
                           f"retrying pageable (H2D will be slower)")
                     try:
                         self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=False)
-                    except RuntimeError:
+                    except RuntimeError as _pageable_err:
+                        # Was silent (H5.5): the arena fell through to None with
+                        # nothing printed, so a box with no slab arena at all
+                        # looked identical to a healthy one until decode crawled.
+                        # Same helper the rejected-degraded path below already
+                        # uses -- this is the other way into the same state.
                         self._expert_slab_arena = None
+                        print(slab_arena_exhausted_warning(_pageable_err))
                 # A chunked arena keeps what it secured when a later chunk fails
                 # (E5). Keep the degraded arena only while its cache share still
                 # covers the working set; otherwise drop it and retry pageable,
@@ -1720,10 +1748,10 @@ class VaayuBaseModel(GenerationMixin):
                         _chunk_note = (f" — DEGRADED: {_arena.n_slabs} of "
                                        f"{_arena.requested_n_slabs} slabs allocated")
                     print(f"[Vaayu-MoE] Expert slab arena: {_arena.n_slabs} x "
-                          f"{_slab_bytes / 1e6:.1f}MB in {len(_arena._chunks)} "
+                          f"{_slab_bytes / 1e6:.1f}MB in {_arena.chunk_count} "
                           f"power-of-two chunks "
                           f"({'pinned' if _arena.pin else 'pageable'}, "
-                          f"{sum(c.numel() for c in _arena._chunks) / 1e9:.2f}GB "
+                          f"{_arena.charged_bytes / 1e9:.2f}GB "
                           f"charged for {_arena.n_slabs * _slab_bytes / 1e9:.2f}GB "
                           f"of slabs){_chunk_note}")
                     _snap = ram_snapshot()
@@ -2496,8 +2524,6 @@ class VaayuBaseModel(GenerationMixin):
                   "less VRAM than fp8 mode)")
             return FP8DynamicCache(quantize=False)
 
-        # Before the fp8 fall-through below, which silently swallows any
-        # unrecognised mode string.
         if mode == "turboquant" or mode.startswith("turboquant:"):
             bits_total = int(mode.split(":", 1)[1]) if ":" in mode else 4
             # head_dim is not known until the first update(), so quote the
@@ -2508,12 +2534,27 @@ class VaayuBaseModel(GenerationMixin):
                   f"RESULTS quality gate.")
             return TurboQuantKVCache(bits_total=bits_total)
 
-        if not hasattr(torch, "float8_e4m3fn"):
-            print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
-            return DynamicCache()
+        if mode == "fp8":
+            if not hasattr(torch, "float8_e4m3fn"):
+                print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
+                return DynamicCache()
 
-        print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
-        return FP8DynamicCache()
+            print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
+            return FP8DynamicCache()
+
+        # H1: fp8 used to be the FALL-THROUGH, so any unrecognised mode string
+        # -- a typo included -- silently got a different cache format than the
+        # caller asked for. vram_plan.kv_elem_bytes already refuses the same
+        # value, so accepting it here made the planner and the cache disagree
+        # about the very same config. Refuse in both places, and say so the
+        # same way.
+        from .vram_plan import VramPlanError
+        raise VramPlanError(
+            f"Unknown kv_cache_mode {self.kv_cache_mode!r}. Known: "
+            f"['auto', 'bf16', 'fp16', 'fp8'] or 'turboquant[:bits]'. "
+            f"Refusing to guess -- an unrecognised mode used to fall through to "
+            f"the fp8 cache silently."
+        )
 
     def _init_pinned_layers(self) -> None:
         """
@@ -3472,10 +3513,12 @@ class VaayuBaseModel(GenerationMixin):
             # hit-rate telemetry excludes prefill's ~100%-miss pollution. (The old
             # guard here tested `_token_count == 0 and shape[1] == 1`, which is
             # unsatisfiable after prefill increments _token_count — it never ran.)
-            if (self.is_moe and self._expert_cache is not None
-                    and not self._moe_prefill_pass
-                    and not getattr(self, "_decode_stats_reset", False)):
-                self._decode_stats_reset = True
+            _reset_now, self._decode_stats_reset = decode_stats_reset(
+                is_moe=self.is_moe,
+                has_expert_cache=self._expert_cache is not None,
+                is_prefill_pass=self._moe_prefill_pass,
+                already_reset=getattr(self, "_decode_stats_reset", False))
+            if _reset_now:
                 self._expert_cache.reset_stats()
                 if getattr(self, '_expert_vram_cache', None) is not None:
                     self._expert_vram_cache.reset_stats()
@@ -3953,15 +3996,11 @@ class VaayuBaseModel(GenerationMixin):
             print(f"[Vaayu-Prefix] MISS session={session_id} "
                   f"prompt_len={input_ids.shape[1]} — full prefill")
         else:
-            kv.to_device(self.running_device)
-            if match_len >= input_ids.shape[1]:
-                match_len = input_ids.shape[1] - 1   # leave >=1 position to run
+            match_len = self._adopt_prefix_hit(
+                kv, match_len, input_ids.shape[1], session_id)
             print(f"[Vaayu-Prefix] HIT session={session_id} "
                   f"match_len={match_len}/{input_ids.shape[1]} — "
                   f"prefill only {input_ids.shape[1] - match_len} new positions")
-            kv.crop(match_len)
-            if self._kv_writer is not None and session_id is not None:
-                self._kv_writer.enqueue_truncate(session_id, match_len)
         kwargs["past_key_values"] = kv
 
         result = super().generate(*args, **kwargs)
@@ -4007,6 +4046,33 @@ class VaayuBaseModel(GenerationMixin):
         pc.store(resolved_sid, token_ids, kv)
         self.telemetry.dump_json("vaayu_telemetry.json")
 
+    def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
+                          session_id) -> int:
+        """Take ownership of a prefix-cache HIT. Returns the clamped match_len.
+
+        Every caller of PrefixCacheStore.lookup() owes the same three steps, and
+        H7 was one caller doing only two of them: generate() cropped the on-disk
+        record along with the cache, speculative_generate cropped only the
+        cache. Both persist through _persist_and_store, whose enqueue_append
+        packs `range(st["nrec"], length)` off the WRITER's own nrec -- so a
+        missing truncate leaves the bytes between match_len and the stale nrec
+        holding the PREVIOUS turn's data. A corrupted record, undetectable until
+        restore. Sharing the sequence is the fix: a fourth caller cannot forget
+        a step that is not theirs to remember.
+
+        The session_id guard is deliberate, not an oversight to mirror: with
+        session_id=None the store resolves an auto id by HASHING the prompt, so
+        each turn is a different record and there is nothing to truncate --
+        truncating would crop some unrelated session's file.
+        """
+        kv.to_device(self.running_device)
+        if match_len >= prompt_len:
+            match_len = prompt_len - 1   # leave >=1 position to run
+        kv.crop(match_len)
+        if self._kv_writer is not None and session_id is not None:
+            self._kv_writer.enqueue_truncate(session_id, match_len)
+        return match_len
+
     @torch.no_grad()
     def speculative_generate(
         self,
@@ -4048,10 +4114,8 @@ class VaayuBaseModel(GenerationMixin):
             if kv is None:
                 kv = self._create_kv_cache()
             else:
-                kv.to_device(self.running_device)
-                if match_len >= input_ids.shape[1]:
-                    match_len = input_ids.shape[1] - 1   # leave >=1 position to run
-                kv.crop(match_len)
+                self._adopt_prefix_hit(
+                    kv, match_len, input_ids.shape[1], session_id)
 
         # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
         # gets away with passing the untouched prompt because HF's own

@@ -19,6 +19,354 @@ Each line cost a full plan or probe to establish; re-measuring is wasted GPU.
 
 ---
 
+# DONE 2026-08-15 — moved out of `todo.md` when they closed
+
+## Calibration gate (was todo item 1) — REFUTED
+
+**Brief:** `plans/next_1_vram_calibration.md` (self-contained, 247 lines).
+**Cost:** ~1–2 h, **NO GPU runs needed.**
+
+### VERDICT 2026-08-15 — calibration REFUTED as the fix. The FORM is wrong, not the constants.
+
+**Do not tune `DEFAULT_ACT_COEFF` / `DEFAULT_ALLOC_FACTOR`. They cannot close the ±10 % gate.**
+Evidence and data: `scripts/fit_vram_calibration.py` (new, tracked, GPU-free, exits 1).
+`scripts/probe_vram_curve.py` gained a per-point `alloc_before_bytes` column plus
+`driver_resident=` / `alloc_resident=` in its header — per-point because a MoE model's expert VRAM
+cache keeps growing across the S loop. Suite unchanged: **795 passed / 2 skipped / 1 xfailed**
+(nothing under `vaayu/` was touched).
+
+**What made this decidable:** four measured-baseline probe arms, 2026-08-15, ~60 min GPU, one
+subprocess each under `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`, all
+`status=ok` with no OOM even at S=16384. 26 points. Overlapping S reproduce the 2026-08-14 arm to
+within **0.063 GB** worst (MiniMax 0.001 GB). With `transient = peak − alloc_before` the unknown
+per-model offset is measured rather than estimated — and that is what exposed the form error, since
+every earlier round had a free offset absorbing exactly this structure.
+
+**The decomposition, with ZERO fitted constants** — measured transient minus `KV(at capacity)` and
+`last-chunk logits`:
+
+| model | forward | residual mean | spread | verdict |
+|---|---|---|---|---|
+| llama-3.2-1b | dense non-EXL3 | **−0.083 G** | 0.129 G | explained |
+| llama-3.3-70b | dense EXL3 streamed | **−0.087 G** | 0.129 G | explained |
+| minimax-m2.7 | MoE module-list | **+0.048 G** | 0.142 G | explained |
+| qwen3-235b | **MoE fused-EXL3** | **+1.106 G** | 0.536 G | **unexplained** |
+
+Three of the four on-device forwards are already predicted to within ±0.13 GB **by KV + logits
+alone, with no constants at all.**
+
+**Three reasons the two constants cannot fix the fourth:**
+1. **`act_coeff × S` is not observable.** Llama-3.3-70B's peak is *identical* at S=12288 and
+   S=16384 — 8538230272 vs 8538263040 bytes, a 33 KB difference — where the term predicts +0.13 GB.
+   Llama-3.2-1B's entire growth out to S=49152 is accounted for by KV alone.
+2. **`alloc_factor` wants ~1.0**, per the table above.
+3. **The real gap is one forward's unmodelled residency**, and a global multiplier cannot express
+   a term that is ~0 on three geometries and ~1.39 GB on the fourth.
+
+Fitting both constants jointly across all four therefore **FAILS: 13/26 outside ±10 %, worst
+44.2 %**, and the per-model fits are mutually incompatible — `alloc_factor` 0.69–1.44, `act_coeff`
+−1.34 to +3.51, **negative for two models**, which is physically meaningless and is the signature
+of a form error being absorbed by a free constant.
+
+**Bonus finding — item 6 is CONFIRMED and localised.** Qwen's peak does not contain the last-chunk
+logits at all: subtracting them leaves residual spread **0.536 G**, leaving them in leaves
+**0.140 G** — 4× flatter. On the fused-EXL3 forward a larger, roughly constant residency (~1.39 GB)
+dominates the logits, so the logits never SET the peak. Qwen's router geometry, for whoever models
+it: 128 experts, top_k 8, `moe_intermediate_size` 1536, hidden 4096.
+
+**What this row becomes.** Calibration is closed — refuted, per the rule that a refutation closes
+its row. The live question is now a FORM change, which needs its own brief: drop the activation
+term, keep `alloc_factor` at ~1.0, and add an expert-staging residency term for the fused-EXL3
+forward derived from `_moe_geometry` (never a literal, CLAUDE.md §5). **That is a design change to
+`predict_peak_vram`, not a calibration, so it needs its own approval before anyone writes it.**
+
+**Item 4 was closed separately on 2026-08-15** — not by calibration, which could never have done
+it, but by charging the request against the reserve. See item 4.
+
+### What is wrong
+
+`vaayu/vram_plan.py` — **PURE** module (no `torch`, no CUDA, no I/O, never imports
+`vaayu_base`; ~60 tests run GPU-free because of it — **do not break that**). Two constants are
+still placeholders:
+
+```python
+DEFAULT_ACT_COEFF = 4.0        # placeholder
+DEFAULT_ALLOC_FACTOR = 1.18    # placeholder
+```
+
+Three fitting rounds against 17 real GPU-measured points all failed a **±10 %** gate:
+
+| round | model change | points outside ±10 % | worst error |
+|---|---|---|---|
+| Task 5 | KV charged at `S` (naive linear) | 13/17 | **+41.2 %** |
+| Task 5b | KV charged at bucketed capacity | 11/17 | **−30.2 %** |
+| Task 5c | + trailing-chunk logits intercept | **10/17** | **−28.0 %** |
+
+**No round tuned a constant to force a pass. Keep that line.**
+
+### The model being fitted
+
+| term | expression | notes |
+|---|---|---|
+| KV | `kv_per_token × kv_capacity_tokens(S, ...) × N` | charged at **allocated capacity**, not `S` |
+| activations | `N × S × hidden × elem_bytes × act_coeff` | `act_coeff` uncalibrated |
+| attn scores | `N × n_heads × chunk × elem × 2` if `materializes_scores` | **zero on this box** (measured) |
+| logits | `N × trailing_chunk × vocab × (elem_bytes + 4)` | last chunk only; trailing = `S mod chunk` |
+
+…all multiplied by `alloc_factor` (second uncalibrated constant).
+
+### THE HYPOTHESIS TO TEST (this is the whole task)
+
+**The probe measured a weights-INCLUSIVE figure against a weights-FREE model.**
+`scripts/probe_vram_curve.py` records `torch.cuda.max_memory_allocated()` — absolute, including
+resident weights, pinned layers, expert VRAM cache. `predict_peak_vram` has **no weights term**.
+So all three fits compared *weights + transients* against *transients*: a **constant offset per
+model**, not a slope error or missing mechanism.
+
+Evidence already in hand (recomputed 2026-08-15, **do not re-run**) — MiniMax-M2.7, header
+`total=16.62GB free_after_load=13.85GB` ⇒ ~2.77 GB resident after load:
+
+| S | measured peak alloc | peak − resident | KV at bucket capacity |
+|---|---|---|---|
+| 5000 | 4.29 GB | 1.52 GB | 2.08 GB (cap 8192) |
+| 6000 | 4.26 GB | 1.49 GB | 2.08 GB (cap 8192) |
+| 7000 | 4.24 GB | 1.47 GB | 2.08 GB (cap 8192) |
+| 7700 | 3.89 GB | 1.12 GB | 2.08 GB (cap 8192) |
+| 8200 | 5.96 GB | 3.19 GB | 4.16 GB (cap 16384) |
+
+Decisive, allocator-to-allocator: measured jump 7700→8200 = **2.06 GB** vs predicted KV-capacity
+jump 8192→16384 = **2.08 GB** — a **1 % match on the step**. The mechanism is right; the residual
+is flat at 1.47–1.52 GB across S=5000/6000/7000 — the shape of a missing weights term.
+
+### Steps
+
+1. **Locate the baseline for every logged point (no GPU).** Probe prints
+   `[probe] total=16.62GB free_after_load=13.85GB` per run. Logs:
+   `/tmp/vramcurve_NeuroSenko--MiniMax-M2.7-exl3.log`,
+   `/tmp/vramcurve_Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw.log`,
+   `/tmp/vramcurve_llama70b.log`, `/tmp/vramcurve_Llama-3.2-1B-Instruct.log`, plus `*_noexpand.log`
+   allocator-control arms for the two MoE models. **`grep -a`, never `cat`** (MiniMax's is ~437 MB).
+   **If the logs are gone:** do NOT re-run the sweep. `free_after_load` is driver-level while
+   `max_memory_allocated` is allocator-level, so add ONE cheap probe line — record
+   `torch.cuda.memory_allocated()` right after load, before the first prefill — and re-run **only
+   Llama-3.2-1B** (seconds) to validate the method.
+2. **Re-fit `act_coeff` and `alloc_factor` against `measured − baseline`, jointly across all four
+   geometries** — never per-model; they are properties of the FORWARD and the ALLOCATOR
+   (CLAUDE.md §5). Re-run the ±10 % gate arithmetically against the same 17 points.
+3. **Decide honestly.**
+   - **Pass** → write the constants into `vaayu/vram_plan.py` with a comment recording the date,
+     torch version (**2.11.0+cu130**), that they were fitted across all four geometries, and that
+     the fit is baseline-subtracted. Then check whether
+     `tests/test_vram_plan.py::test_batch_width_at_the_real_reserve_floor_xfails` **XPASSes** —
+     that is the designed signal that item 4 is closed.
+   - **Fail** → **STOP and park it.** Record the residual pattern in the brief. Do not add a fifth
+     term, do not tune. Next hypothesis is item 6 (the probe instrument), which is measurement
+     work, not modelling work.
+4. **Optional cleaner fix:** give `VramShape` a `resident_bytes` field from
+   `torch.cuda.memory_allocated()` at load so `predict_peak_vram` returns an ABSOLUTE peak.
+   **Interacts with a deliberate decision:** `_assert_context_fits` compares `need > free_vram`
+   alone because `need` is a transient and `mem_get_info()`'s free figure already excludes this
+   process's allocations. Make `need` absolute and that predicate must change too, or it silently
+   double-counts. The current framing is coherent — change only if absolute measurably fits better.
+
+### Why it is capped at ~1 h of effort
+
+The reserve is clamped to `_VRAM_RESERVE_FLOOR_BYTES` (3.5 GB, `vaayu/vaayu_base.py`), so
+calibration does **not** affect reserve, pinning, expert cache, or decode throughput. It affects
+exactly two things: `s_max` (the honest-refusal ceiling) and `_assert_context_fits`. Uncalibrated
+= occasional ugly CUDA OOM instead of a clean `VramPlanError` — pre-F4 behaviour, a diagnostics
+issue.
+
+### Do NOT re-derive (settled)
+
+- The KV cliff mechanism: `kv_cache_mode="auto"` on any EXL3 checkpoint → `FP8DynamicCache(
+  quantize=False)` (`_create_kv_cache`), whose `_ensure_capacity` doubles: `_GROWTH = 2`,
+  `new_cap = max(needed, max(1, cap) * _GROWTH)`. Closed form, already implemented as
+  `kv_capacity_tokens`: `capacity(S) = chunk · 2^ceil(log2(ceil(S/chunk)))`. Non-EXL3 Llama-1B
+  control shows **no cliff** — format-dependent.
+- `MATERIALIZES_SCORES = False` on torch 2.11.0+cu130 → the scores term contributes nothing.
+- `predict_peak_vram` is **NOT monotone in S**; `solve_max_seq_len`'s **two-level search** handles
+  it. Do not "simplify" it back to a single binary search — that was a real latent correctness bug.
+- `expandable_segments:True` is already the default (`vaayu/__init__.py`, via `setdefault`). The
+  informative control arm is `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512`.
+
+---
+
+## N>=2 admission gap (was todo item 4) — FIXED
+
+**The earlier diagnosis in this file was wrong, and so was the xfail's reason string.** This was
+never a calibration gap. Even an exact `predict_peak_vram` returns ~7.5 GiB for MiniMax at N=3,
+S=8192 — which genuinely fits a bare 15.47 GiB card. A bigger prediction could never have produced
+the refusal.
+
+**Real cause:** `expert_vram_budget_for(plan, free_vram_now)` = `free_vram_now − plan.reserve_bytes`,
+so the expert VRAM cache is entitled to *everything above the reserve* — and it fills **lazily,
+during the very prefill being admitted**. `_assert_context_fits` compared against live
+`mem_get_info()`, so the answer depended on cache warmth:
+
+| cache state | free VRAM seen | N=3 need (MiniMax, S=8192) | outcome |
+|---|---|---|---|
+| warm | ≈ reserve, 3.5 GiB | 7.67 GiB | refused — correct |
+| **cold** | ≈ 13 GiB | 7.67 GiB | **admitted** → cache expands into the same bytes → OOM |
+
+**Fix:** new pure `admission_headroom(free_vram, plan, expert_cache_active)` in `vaayu/vram_plan.py`
+returns `min(free_vram, plan.reserve_bytes)` when a VRAM expert cache exists, and `free_vram`
+untouched otherwise (dense checkpoints have no such cache — clamping there would refuse contexts
+that fit). The reserve is exactly the right budget: `plan_vram` sizes it as
+`max(predict_peak_vram(shape, max_seq_len), reserve_floor)`, i.e. one N=1 request at
+`max_seq_len`. A fan-out of N multiplies the request but not the reserve, so N≥2 at long context is
+refused — matching Plan K's on-device result.
+
+`_too_big_message` gained an optional `headroom` so the refusal does not read as a contradiction
+(D3's lesson): it now names the budget, the real free figure, and the expert cache as what took the
+difference. Dense refusals are byte-identical to before, pinned by a test. It also stops offering
+`s_max` unqualified at N>1 — `solve_max_seq_len` solves it at N=1, so printing it bare while
+refusing a wide batch pointed the reader at a length that does not fit either.
+
+**Deliberately NOT reclaim-aware** — Plan K's reclaim runs *after* this check and ships default-off
+because it was refuted; even reserve + reclaim (1.22 GB Qwen / 2.09 GB MiniMax) stays under what
+N≥2 needs. Recorded in the function's docstring: if reclaim ever moves ahead of admission, that is
+the function that must learn about it.
+
+**What this buys:** a clean `VramPlanError` instead of a mid-prefill CUDA OOM. It does **not**
+unlock N≥2 — that remains a hardware wall on this box.
+
+Tests: `test_headroom_is_capped_by_the_reserve_when_an_expert_cache_is_active`,
+`test_headroom_is_the_whole_free_vram_without_an_expert_cache`,
+`test_headroom_never_exceeds_the_vram_that_is_actually_free`,
+`test_batch_width_at_the_real_reserve_floor_is_refused` (was a non-strict xfail; now a real test
+with the correct premise), `test_the_admission_predicate_charges_a_wide_batch_against_the_reserve`
+(drives the real `VaayuBaseModel._assert_context_fits`), plus two on message honesty.
+Suite: **803 passed / 2 skipped / 0 xfailed** (was 795 / 2 / 1).
+
+---
+
+## Hygiene backlog H1–H7 (was todo row 1) — CLOSED 2026-08-15
+
+All seven items resolved. Suite went 803 → 824 passed / 2 skipped / 0 xfailed.
+
+| item | what it was | resolution |
+|---|---|---|
+| **H1** | `_create_kv_cache` fell through to fp8 on an unrecognised `kv_cache_mode` | `fp8` is now an explicit branch; anything else raises `VramPlanError` naming the value and the known modes, worded to match `kv_elem_bytes` so planner and cache agree. `tests/test_kv_cache_mode_dispatch.py`. |
+| **H2** | `SlabArena`'s O_DIRECT alignment premise asserted in prose, enforced nowhere | `compute_slab_bytes` now `_align_up`s its result, and `SlabArena.__init__` raises on a misaligned `slab_bytes`. `tests/test_slab_alignment.py` builds the case that bites — 300 contiguous 1-byte tensors make `packed_span` (16-aligned, 4800 B) exceed `raw_aligned_length`, so the old code returned a slab size off every sector boundary. One existing test used a toy `slab_bytes=64` and was moved to `_ALIGN`. |
+| **H3** | `KVCacheManager` unreachable but maintained | **Split, because the module was not uniformly dead.** Deleted `KVCacheManager` and its INT8 helpers (no other caller) and `tests/test_kv_cache_manager_fp8.py`. KEPT `_extract_kv_as_bf16` — `tests/test_turboquant.py` uses it as an independent oracle for the TurboQuant packed-indices corruption case — and moved it to `vaayu/kv_extract.py`, since a file named `kv_cache_manager.py` with no manager in it is the same misleading-name defect H4 is about. Its one surviving test moved into `test_turboquant.py` beside the other two. |
+| **H4** | `_expert_history` write-only, docstring claims a prefetch loop reads it | **Docstring fixed, write KEPT** — deviating from "remove the write", with reason: `_expert_history` is not write-only in the tests. Eight-plus assertions across `tests/test_moe_patch.py` use it as the observation hook for which experts a forward actually routed to, on all three forwards. Removing it would cost those tests their only view of routing to save one dict assignment per layer. The docstring now says plainly that there is no production reader and that the prefetch mechanism never existed. |
+| **H5.1** | no `chunk_count` / `charged_bytes` accessor | Both added as properties; `vaayu_base.py` stops reaching into `_chunks`. |
+| **H5.2** | stale "`arena_slab_count` IS that gate in production" | Corrected — Plan L took it off the arena path, which calls `unclamped_slab_count`. **Noted while there: `arena_slab_count` now has NO production caller at all.** Left in place deliberately (CLAUDE.md §3: mention unrelated dead code, do not delete it). |
+| **H5.3** | no test for an allocation failure on an ESCALATED retry | Added. It passes on unchanged code — a coverage gap, not a bug — and its premise asserts (`calls[1] > calls[0]`) prove it really reaches the doubled request rather than passing on the first-request path. |
+| **H5.4** | zero-chunks error recomputed `chunk_decomposition()` for a count | Decomposition computed once into `_planned_chunks`. |
+| **H5.5** | pinned→pageable fallback could leave the arena `None` silently | Now prints `slab_arena_exhausted_warning` — the helper the sibling path already used. This was the fourth silent-degradation defect on that branch. |
+| **H6/F13** | `_decode_stats_reset` latched per PROCESS, not per turn | New pure `decode_stats_reset(...)` returns `(reset_now, latched)`; a prefill pass re-arms the latch, so every turn's first decode clears prefill's ~100 %-miss pollution instead of only the first turn's. `tests/test_decode_stats_reset.py`. |
+| **H6 (other two)** | `matched_tokens` ≤1-token over-report; `hit_rate` not comparable across lookup modes | Both were already recorded as deliberate non-fixes, documented in `stats()` and pinned by tests. No change. |
+| **H7** | D4 empty `lm_head` shard; `speculative_generate` missing `enqueue_truncate` | Both fixed 2026-08-15 — see their own entries above. |
+
+---
+
+## Fused-EXL3 / module-list decode order-nondeterminism (was todo row 2) — FIXED 2026-08-15
+
+**The bug was NOT where the ledger said.** Three claims corrected by measurement:
+
+1. **The EXL3 kernel is bitwise deterministic.** Built a `BC_LinearEXL3` from one real Qwen expert
+   read off `splitted_model/model.layers.9.safetensors` — no model load — and called `run_alloc` on
+   identical fp16 input at T = 1, 8, 512, 2048, 7700: five repeats on the same object, a rebuilt
+   object, and a call interleaved with a second linear sharing the same `g_tensor_cache` `xh`
+   scratch. **All identical, max diff 0.000e+00.** "Split-K/atomics in the fused kernel" is refuted,
+   and so is "cost of chasing it is likely a third-party kernel change".
+2. **Prefill-only forwards are reproducible** — 3 runs, identical logits, identical weight multiset,
+   identical call order, 20991 BC constructions every run. `_moe_prefill_pass` suppresses cache
+   puts during prompt ingestion, so nothing is retained and arrival order never varies. (A first
+   probe that CLEARED caches between runs also showed no divergence — that null was the harness
+   removing the mechanism, not evidence.)
+3. **Decode DOES flip greedy tokens**, which the row denied. Three `do_sample=False` runs:
+   `[68, 377, 291, 83, 349, 11]` vs `[68, 377, 291, 220, 15, 15]` twice — two distinct sequences,
+   diverging at the 4th new token, with BC construction counts 25380 / 24570 / 24696 showing cache
+   warmth changing the order.
+
+**Root cause:** both completion-order forwards accumulated expert outputs in ARRIVAL order.
+Execution order varies (VRAM-resident experts first, the rest in disk completion order via
+`_iter_expert_loads`' `FIRST_COMPLETED`), each token routes to `top_k` experts so contributions
+overlap the same rows, and floating-point addition is not associative at any width.
+
+**The fp32 accumulator was not the fix it was recorded as.** Its comment claimed fp32 made "the
+cast result identical whatever the order". False: fp32's error is normally far below the bf16
+output's own precision, but a value on a bf16 rounding boundary tips regardless, and across 94
+layers something always does. Width narrows the window; only a fixed summation order closes it.
+Both comments now say so.
+
+**Fix:** `accumulate_expert_outputs(final_hidden, contributions)` buffers `(expert_idx, token_idx,
+hidden)` during the loop and replays `index_add_` **sorted by expert id** afterwards. Execution
+stays in completion order, so the disk overlap — the entire point of `_iter_expert_loads` — is
+untouched. Wired into the two affected forwards. `_make_fused_sparse_forward` (non-EXL3) iterates
+`for eidx in unique_experts`, a fixed list, so it was never affected and is unchanged.
+
+**Verification:**
+- Qwen3-235B, same probe that failed: **1 distinct sequence of 3** (was 2), while BC construction
+  counts still vary (25848 / 24714 / 24714) — order still varies, output no longer depends on it.
+- MiniMax-M2.7 (module-list): 3 runs identical. This is a **regression check, not a before/after** —
+  MiniMax was already reported deterministic, so it proves the change did not break that path.
+- Decode A/B, alternating arms against one loaded model, control = same buffer replayed unsorted:
+  **−0.29 %** (0.2032 vs 0.2038 tok/s), far inside this box's ~4 % resolution. Peak VRAM
+  **identical at 12.531 GB** both arms. (Absolute tok/s here includes prefill and is an A/B figure
+  only — not comparable to the 0.83 decode floor.)
+- `tests/test_expert_accumulation_order.py`: 5 CPU-only tests, including an asserted premise that
+  the fixture really is order-sensitive (1e8 + 1.0 rounds away, (1e8 + −1e8) + 1.0 does not).
+
+**Memory:** buffers `tokens × top_k × H` of fp16 — 64 KB at decode, ~32 MB for a 512-token prefill
+chunk. Applied to both phases deliberately: prefill uses the same completion-order iterator, so its
+determinism was empirical (one 512-token chunk, nothing retained), not structural.
+
+---
+
+## F3 broadcast prefix reuse on MoE (was todo row 5) — RE-SCOPED, gate now passes 2026-08-15
+
+**Token-identity under prefix reuse is UNACHIEVABLE on an MoE model. The old gate asserted it, so
+it was asserting a bug that cannot be fixed.** Established by three probes, not by argument.
+
+**It is not nondeterminism.** Three COLD batched rounds are bitwise identical to each other and to
+the gate's cold arm — the engine IS a deterministic function of its input (the arrival-order
+accumulation bug that used to break that was fixed the same day). This is *path-dependence*: two
+routes equal in exact arithmetic, unequal in floating point.
+
+**It is not the mask, the positions, or a lossy pool.** First decode step, cold vs warm:
+
+| row | tail | pads | mask equal | positions equal | max\|Δlogit\| | relative |
+|---|---|---|---|---|---|---|
+| 0 | 7 | 0 | **yes** | **yes** | **1.125** | 4.9 % |
+| 1 | 4 | 3 | no | no | 1.281 | 9.0 % |
+| 2 | 3 | 4 | no | no | 2.371 | 17.1 % |
+
+Padded rows encode differently — cold puts pads at the FRONT (`[0,0,0,1×15]`), warm puts them
+INSIDE (`[1×10,0,0,0,1×5]`) — but both are semantically valid and the REAL tokens get identical
+positions. Row 0 settles it: identical mask, identical positions, `store()` on its lossless
+`compress_bits is None` branch, and still 1.125 of logit difference. (An interim reading that "only
+padded rows diverge" was the argmax fooling the tokens — every row differs numerically.)
+
+**Root cause: call-shape rounding amplified by discontinuous top-k routing.** Cold prefills all 17
+tokens in one pass; warm prefills a 7-token tail against a 10-token restored prefix. A 7-query GEMM
+tiles differently from a 17-query one, so layer 0's attention output shifts ~1 ULP — and on an MoE
+that flips a top-k selection. Measured at the first decode step on MiniMax-M2.7: **53 of 62 layers
+routed a different expert set**, first divergence at **layer 1** (expert 137 → 139), one layer even
+differing in COUNT (14 vs 15).
+
+**Both MoE models drift; the old note's "Qwen is token-identical" was prompt luck.** Drift onset by
+row (None = never diverged over 8 tokens): MiniMax `{0: None, 1: 4, 2: 6}`, Qwen `{0: 3, 1: None,
+2: 1}` — Qwen's row 2 diverges at the SECOND token. Dense Llama-3.3-70B is token-identical, as it
+has no discontinuous routing to amplify the rounding.
+
+**Re-scoped gate** (`tests/test_batch_prefix_equivalence.py`, renamed
+`test_broadcast_reuse_preserves_behaviour`), branching on `model.is_moe`:
+- **dense** — token-identical, exactly as before. Verified: Llama-3.3-70B **passes** (123 s).
+- **MoE** — (1) round 2 HITs, the unchanged premise; (2) every row's FIRST token is unchanged by
+  reuse; (3) two warm rounds are token-identical to each other. Verified: MiniMax **passes** (94 s),
+  Qwen **passes** (142 s). Drift onset is PRINTED, not asserted.
+
+A broken mask or an unpopulated pool yields garbage from token 1 and still fails (2). **Known flake
+risk, deliberately accepted:** (2) leans on the argmax margin, and Qwen's row 2 held by exactly one
+position. If it ever flakes, that is a finding about how close reuse runs to the edge — do not
+suppress it.
+
+---
+
 # SETTLED — do not re-open without new evidence
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.
@@ -145,8 +493,10 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
   non-associative at the 1-ULP scale. Measured on MiniMax, two forwards over identical ids: layer 0
   bitwise identical, **layer 1 off by one bf16 ULP (0.00195)**, compounding to **37.0 by layer 62**
   and max|Δlogit| **2.29** — **three distinct outputs from four identical greedy runs**
-  (`temperature=0.0`). Fix is an fp32 accumulator cast back at the return, in **all three** forwards.
-  After: bitwise identical, 4/4. Decode cost is **nil** — alternating same-day A/B, MiniMax
+  (`temperature=0.0`). Fix was an fp32 accumulator cast back at the return, in **all three** forwards.
+  After: bitwise identical, 4/4 **on MiniMax** — but see the 2026-08-15 entry above: fp32 only
+  NARROWED the window. Qwen still flipped greedy tokens until the summation order itself was
+  fixed. Do not cite this entry as evidence that accumulator width removes order dependence. Decode cost is **nil** — alternating same-day A/B, MiniMax
   0.7833 vs 0.7812 tok/s (+0.27%), Qwen 0.4459 vs 0.4430 (+0.66%), both far inside this box's ~4%
   resolution. Dense was **bitwise identical throughout**, before and after: it has no such
   accumulation, which is what made it the control that localised this.
@@ -161,7 +511,9 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
 - **F3 Phase 1 ships; F3 Phase 2 is refuted at the measured tail sizes.** Shared-prefix broadcast in
   `batched_generate` cuts TTFT on a 3-stream fan-out over a ~1104-token shared prefix, with a control
   arm (pool OFF) that moves 1.00–1.01× — so the win is prefix reuse, not page cache or allocator
-  warmth. **The speedup spans 2.8× across models and must never be quoted bare:** Llama-3.3-70B-exl3
+  warmth. **(Its "token-identical on Llama-3.3-70B-exl3 and Qwen3-235B" claim was later shown to be
+  prompt luck for Qwen — see the 2026-08-15 re-scope entry above.)** **The speedup spans 2.8×
+  across models and must never be quoted bare:** Llama-3.3-70B-exl3
   dense **4.96×** (n=3), MiniMax-M2.7 module-list **2.15×** (n=2), Qwen3-235B fused-EXL3 **1.76×**
   (n=1 usable). Coverage is 0.981–0.983 on all three because it is a property of the prompts, not the
   model; the divergent tails are 1.7 % of prefill, so Phase 2 — which needs a cache-class change,

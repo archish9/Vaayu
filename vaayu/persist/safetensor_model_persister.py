@@ -779,7 +779,13 @@ def compute_slab_bytes(offset_index) -> int:
     for layer_experts in offset_index.index.values():
         for expert_metas in layer_experts.values():
             worst = max(worst, expert_span_bytes(expert_metas))
-    return worst
+    # H2: slab starts are multiples of slab_bytes from an aligned chunk base, so
+    # SlabArena's O_DIRECT premise needs slab_bytes itself _ALIGN-aligned. It is
+    # NOT automatic: _group_layout returns max(raw_aligned_length, packed_span),
+    # and packed_span only rounds each tensor to _TENSOR_ALIGN (16) -- a group of
+    # many small tensors makes it the larger of the two and 16-aligned is not
+    # 4096-aligned. Costs at most _ALIGN-1 bytes per slab.
+    return _align_up(worst)
 
 
 def load_expert_into_slab(

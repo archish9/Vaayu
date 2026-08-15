@@ -63,6 +63,10 @@ class _FakeSpecModel:
     running_device = "cpu"
     draft_tokens = 5
 
+    # The REAL helper, not a stand-in: it is what owes the enqueue_truncate on a
+    # HIT, so a fake copy here would test the fake instead of the engine.
+    _adopt_prefix_hit = VaayuBaseModel._adopt_prefix_hit
+
     class _Cfg:
         eos_token_id = -999   # unreachable: fake logits always argmax to 0
 
@@ -93,9 +97,12 @@ class _FakeSpecModel:
         pass
 
     def _persist_and_store(self, pc, resolved_sid, kv, token_ids):
-        # Mirrors the real VaayuBaseModel._persist_and_store minus the
-        # _kv_writer branch (self._kv_writer is always None here -- no disk
-        # persistence under test).
+        # Mirrors the real VaayuBaseModel._persist_and_store, including its
+        # _kv_writer branch -- the truncate tests below install a recording
+        # writer, and it is the append side that a missing truncate corrupts.
+        if self._kv_writer is not None:
+            self._kv_writer.enqueue_append(
+                resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
         pc.store(resolved_sid, token_ids, kv)
         self.telemetry.dump_json("vaayu_telemetry.json")
 
@@ -106,6 +113,62 @@ class _FakeSpecModel:
         past_key_values.seq_len += input_ids.shape[1]
         logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 8)
         return SimpleNamespace(past_key_values=past_key_values, logits=logits)
+
+
+class _RecordingWriter:
+    """Records the DiskWriter calls speculative_generate is supposed to make."""
+
+    def __init__(self):
+        self.truncates = []
+        self.appends = []
+
+    def enqueue_truncate(self, session_id, match_len):
+        self.truncates.append((session_id, match_len))
+
+    def enqueue_append(self, session_id, cache, config, token_ids, length):
+        self.appends.append((session_id, length))
+
+
+def test_a_prefix_hit_truncates_the_on_disk_record_to_the_crop_point():
+    """H7: generate() calls enqueue_truncate on a HIT; speculative_generate did
+    not. Both persist through _persist_and_store, whose enqueue_append packs
+    range(st["nrec"], length) from the WRITER's own nrec -- so without the
+    truncate, turn 2 appends from the stale, longer nrec and leaves the bytes
+    between match_len and nrec holding turn 1's data. A corrupted record,
+    undetectable until restore."""
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    model = _FakeSpecModel(pc)
+    model._kv_writer = _RecordingWriter()
+    prompt = torch.tensor([[1, 2, 3, 4, 5]])
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    assert model._kv_writer.truncates == [], "round 1 is a MISS -- nothing to truncate"
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    assert pc.hits == 1, "premise: round 2 must be a HIT"
+    assert len(model._kv_writer.truncates) == 1, \
+        "a HIT crops the cache, so the on-disk record must be cropped with it"
+    sid, match_len = model._kv_writer.truncates[0]
+    assert sid == "s1"
+    assert match_len == prompt.shape[1] - 1, \
+        "truncate at the same point crop() used, after the >=1-position clamp"
+
+
+def test_an_auto_session_hit_does_not_truncate():
+    """session_id=None resolves to _auto_session_id(prompt), which HASHES the
+    prompt -- so a different turn is a different record and there is nothing to
+    truncate. Truncating here would crop an unrelated session's file."""
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    model = _FakeSpecModel(pc)
+    model._kv_writer = _RecordingWriter()
+    prompt = torch.tensor([[1, 2, 3, 4, 5]])
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3)
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3)
+    assert pc.hits == 1, "premise: round 2 must be a HIT"
+    assert model._kv_writer.truncates == []
 
 
 def test_miss_then_hit_shortens_the_second_prefill():

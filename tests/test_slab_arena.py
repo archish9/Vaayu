@@ -536,8 +536,13 @@ def test_one_slab_past_the_staging_reserve_is_a_live_cache(pool_size):
 # Power-of-two charging is a caching HOST allocator property -- pinned memory
 # only. A pageable torch.empty allocation (CPU-only box, or the pinned-alloc
 # RuntimeError retry path) pays no round-up, so clamping it trades cache for
-# zero RAM freed. `arena_slab_count` IS that gate in production; these tests call
-# it directly rather than mirroring it (Plan J review, parked finding 3).
+# zero RAM freed. `arena_slab_count` used to BE that gate in production; Plan L
+# took it off the arena path, which now calls `unclamped_slab_count` (see
+# vaayu_base.py's arena construction) because chunking charges every chunk
+# exactly and leaves nothing to clamp away. So these tests pin the clamp
+# HELPER's own arithmetic, not a production decision -- `arena_slab_count` has
+# no production caller today (noted 2026-08-15, H5.2; the stale claim is fixed
+# here, the dead helper is left alone deliberately).
 
 @pytest.mark.parametrize("geo", [_GEO_MINIMAX, _GEO_QWEN], ids=["minimax", "qwen"])
 def test_unpinned_arena_gets_the_unclamped_count(geo):

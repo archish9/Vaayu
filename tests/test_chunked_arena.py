@@ -472,3 +472,43 @@ def test_slab_arena_exhausted_warning_names_the_real_state():
     assert "NO slab arena" in msg
     assert "out of memory" in msg
     assert "clone path" in msg
+
+
+# --- H5, Plan L review backlog (2026-08-15) ---------------------------------
+
+
+def test_arena_exposes_its_chunk_count_and_charged_bytes():
+    """vaayu_base reached into `_chunks` at two call sites in one print --
+    `len(_arena._chunks)` and `sum(c.numel() for c in _arena._chunks)`. One
+    property each moves that arithmetic behind the class that owns it."""
+    arena = SlabArena(4, _ALIGN, pin=False)
+    assert arena.chunk_count == len(arena._chunks)
+    assert arena.charged_bytes == sum(c.numel() for c in arena._chunks)
+    assert arena.chunk_count > 0 and arena.charged_bytes >= arena.n_slabs * _ALIGN
+
+
+def test_an_allocation_failure_on_an_ESCALATED_retry_stops_placement(monkeypatch):
+    """The escalation path had no failure test -- only a chunk's FIRST request
+    did. A partially-escalated chunk must never be accepted: the code breaks out
+    of placement entirely, and with no other chunk secured the constructor
+    raises rather than handing back a silently empty arena."""
+    import torch as _torch
+    real_empty = _torch.empty
+    calls = []
+
+    def fake_empty(*args, **kwargs):
+        calls.append(args[0] if args else kwargs.get("size"))
+        if len(calls) == 1:
+            # Misaligned by construction, so aligned_capacity < natural_held and
+            # the arena escalates to the next power of two.
+            buf = real_empty(args[0] + 8, dtype=kwargs.get("dtype"),
+                             pin_memory=kwargs.get("pin_memory", False))
+            return buf[8:] if buf.data_ptr() % _ALIGN == 0 else buf
+        raise RuntimeError("simulated: no memory for the escalated request")
+
+    monkeypatch.setattr(_torch, "empty", fake_empty)
+    with pytest.raises(RuntimeError) as e:
+        SlabArena(2, _ALIGN, pin=False)
+    assert len(calls) >= 2, "premise: the escalated retry must actually be reached"
+    assert calls[1] > calls[0], "premise: the retry must be the DOUBLED request"
+    assert "could not allocate any" in str(e.value)

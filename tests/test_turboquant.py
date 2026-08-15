@@ -350,7 +350,7 @@ def test_extract_kv_as_bf16_reconstructs_turboquant():
     """The silent-corruption site: a TurboQuantKVCache has quantize=False, so
     the pre-existing guard would pass it through and return packed INDICES
     interpreted as values -- no crash, no warning, garbage KV."""
-    from vaayu.kv_cache_manager import _extract_kv_as_bf16
+    from vaayu.kv_extract import _extract_kv_as_bf16
     k, v = _kv(16, seed=20)
     c = TurboQuantKVCache()
     c.update(k, v, 0)
@@ -360,8 +360,24 @@ def test_extract_kv_as_bf16_reconstructs_turboquant():
     assert _rel_l2(ek, k) < 0.30 and _rel_l2(ev, v) < 0.30
 
 
+def test_extract_kv_as_bf16_handles_an_unquantized_cache():
+    """An unquantized FP8DynamicCache has no scales -- extraction must not
+    assume they exist just because the class matches. Moved here 2026-08-15 from
+    tests/test_kv_cache_manager_fp8.py, deleted with KVCacheManager (F6); this
+    function outlived that class and its coverage should too."""
+    from vaayu.kv_extract import _extract_kv_as_bf16
+    c = FP8DynamicCache(quantize=False)
+    k = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    c.update(k, v, 0)
+    k_out, v_out = _extract_kv_as_bf16(c, 0)
+    assert k_out.dtype == torch.bfloat16
+    assert torch.equal(k_out, k.cpu())      # lossless, no scale multiply
+    assert torch.equal(v_out, v.cpu())
+
+
 def test_extract_kv_as_bf16_existing_modes_unchanged():
-    from vaayu.kv_cache_manager import _extract_kv_as_bf16
+    from vaayu.kv_extract import _extract_kv_as_bf16
     k, v = _kv(8, seed=21)
     bf16 = FP8DynamicCache(quantize=False)
     bf16.update(k, v, 0)

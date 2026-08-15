@@ -286,6 +286,16 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             layers = [layer_names['rotary_pos_emb']] + layers
         layers = [l + "." for l in layers]
 
+    # A tied-weight checkpoint has no lm_head of its own (D4). Stop expecting
+    # one BEFORE the completeness check below, so a split that legitimately has
+    # no head still verifies -- and so the write loop below does not mint an
+    # empty shard for it.
+    _lm_head = 'lm_head.' if layer_names is None else layer_names['lm_head'] + '.'
+    _with_head = layers
+    layers = drop_absent_lm_head(layers, index, _lm_head)
+    if layers is not _with_head:
+        print(f"no {_lm_head.rstrip('.')} weight in the checkpoint index "
+              f"(tied embeddings) -- not expecting a shard for it")
 
     # check if splitting exists and all files are there
     found_layers = None
@@ -436,6 +446,30 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         remove_real_and_linked_file(to_delete)
 
     return str(saving_path)
+
+def drop_absent_lm_head(layers, index, lm_head):
+    """Remove the lm_head entry from `layers` when the index has no key for it.
+
+    D4: a checkpoint with `tie_word_embeddings: true` stores no lm_head weight,
+    but `layers` listed one unconditionally. The splitter then either wrote a
+    valid EMPTY shard plus its `.done` marker -- so `all(found_layers.values())`
+    called the split COMPLETE when it was not -- or, on sharded sources, skipped
+    the layer and left found_layers[lm_head] False forever, re-splitting the
+    whole model on every load.
+
+    Decided from the INDEX, not from the config's tie_word_embeddings flag:
+    detection over assumption (CLAUDE.md §5), and it covers any reason the
+    weight is absent rather than the one reason we thought of. The consumer side
+    already handles a missing head -- an untied checkpoint pins a real lm_head,
+    a tied one falls back to the embedding.
+
+    ONLY the head is ever dropped. A decoder layer missing from the index is a
+    real problem and must stay loud.
+    """
+    if any(lm_head in key for key in index):
+        return layers
+    return [layer for layer in layers if layer != lm_head]
+
 
 def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
                                        layer_names=None, hf_token=None, delete_original=False):
