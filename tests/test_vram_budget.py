@@ -43,14 +43,14 @@ def test_reserve_is_context_aware_not_a_flat_constant():
     context-length-insensitive -- the ~1.1 GB KV figure above was measured at
     MAX_LENGTH=2048'. At 7.7k the same models need 1.48-2.52 GB of KV, so the
     reserve was covering KV and almost nothing else. It must now grow with S."""
-    from vaayu.vram_plan import (DEFAULT_ACT_COEFF, DEFAULT_ALLOC_FACTOR,
+    from vaayu.vram_plan import (DEFAULT_ALLOC_FACTOR,
                                  VramShape, kv_bytes_per_token, plan_vram)
 
     shape = VramShape(
         kv_per_token=kv_bytes_per_token(num_hidden_layers=94, num_key_value_heads=4,
                                         head_dim=128, kv_cache_mode="bf16"),
         N=1, chunk=512, hidden=4096, n_heads=64, vocab=151936, elem_bytes=2,
-        act_coeff=DEFAULT_ACT_COEFF, materializes_scores=False,
+        materializes_scores=False,
         alloc_factor=DEFAULT_ALLOC_FACTOR)
     common = dict(free_vram=int(15.47 * GB), shape=shape,
                   min_resident=int(11.28 * 1024 ** 2),

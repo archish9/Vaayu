@@ -91,9 +91,9 @@ def test_unknown_mode_raises_instead_of_falling_through_to_fp8():
 
 
 from vaayu.vram_plan import (
-    DEFAULT_ACT_COEFF,
     DEFAULT_ALLOC_FACTOR,
     VramShape,
+    _kv_term_bytes,
     _peak_intercept_bytes,
     _trailing_chunk_tokens,
     predict_peak_vram,
@@ -109,7 +109,7 @@ def shape_for(name, *, N=1, chunk=512, kv_cache_mode="bf16",
     return VramShape(
         kv_per_token=kv_bytes_per_token(**_kv_kwargs(geo), kv_cache_mode=kv_cache_mode),
         N=N, chunk=chunk, hidden=geo["hidden"], n_heads=geo["n_heads"],
-        vocab=geo["vocab"], elem_bytes=2, act_coeff=DEFAULT_ACT_COEFF,
+        vocab=geo["vocab"], elem_bytes=2,
         materializes_scores=materializes_scores, alloc_factor=alloc_factor,
         kv_growth_factor=kv_growth_factor, kv_capacity_buckets=kv_capacity_buckets,
     )
@@ -303,8 +303,12 @@ def test_peak_intercept_bytes_follows_the_trailing_chunk_not_a_constant():
     # next token resets to a single-token trailing chunk and charges far less.
     full = _peak_intercept_bytes(sh, sh.chunk)
     reset = _peak_intercept_bytes(sh, sh.chunk + 1)
-    assert full == sh.N * sh.chunk * sh.vocab * (sh.elem_bytes + 4)
-    assert reset == sh.N * 1 * sh.vocab * (sh.elem_bytes + 4)
+    # x4, not x(elem_bytes + 4): only the fp32 upcast is resident at the peak
+    # (measured 2026-08-15 -- see
+    # test_the_logits_term_charges_fp32_only_not_both_copies). This test is
+    # about the trailing chunk FOLLOWING S, not about the byte multiplier.
+    assert full == sh.N * sh.chunk * sh.vocab * 4
+    assert reset == sh.N * 1 * sh.vocab * 4
     assert reset < full
 
 
@@ -434,7 +438,7 @@ def test_solve_max_seq_len_stays_safe_for_every_smaller_context():
     every S' up to S_max on a small synthetic shape (cheap: chunk=16 keeps
     the whole range tiny) to prove that cannot happen."""
     tiny = VramShape(kv_per_token=37, N=1, chunk=16, hidden=64, n_heads=4,
-                     vocab=1000, elem_bytes=2, act_coeff=4.0,
+                     vocab=1000, elem_bytes=2,
                      materializes_scores=False, alloc_factor=1.1,
                      kv_growth_factor=2, kv_capacity_buckets=True)
     free_vram = 400_000
@@ -470,7 +474,7 @@ def test_s_max_decreases_as_kv_per_token_grows():
     """Task 5b weakened this to '<=' because llama-70b and qwen3-235b tied
     at unclamped S=32768 under the (still-uncorrected) intercept. Task 5c's
     trailing-chunk correction breaks that specific tie: verified by hand at
-    USABLE_VRAM + DEFAULT_ACT_COEFF/ALLOC_FACTOR, llama-70b now solves to
+    USABLE_VRAM + DEFAULT_ALLOC_FACTOR, llama-70b now solves to
     32768 and qwen3-235b to 33166 (strictly larger) -- fatter KV/token (327680
     vs 192512 B/token) strictly buys less context again for this pair, so
     '<' is restored. (llama-70b still ties with minimax-m2.7 at 32768 --
@@ -755,3 +759,88 @@ def test_batch_width_at_the_real_reserve_floor_is_refused():
     assert predict_peak_vram(dataclasses.replace(sh, N=1), p.max_seq_len) <= headroom, \
         "N=1 at the plan's own max_seq_len must still be admitted"
     assert predict_peak_vram(dataclasses.replace(sh, N=3), p.max_seq_len) > headroom
+
+
+# --- NEXT-4: the form change (2026-08-15) ---------------------------------
+#
+# Measured over 26 points on four geometries (scripts/fit_vram_calibration.py):
+# KV(at capacity) + last-chunk logits explains three of the four on-device
+# forwards to within +-0.13 GB with NO fitted constants. The fourth, fused-EXL3,
+# carries a flat ~1.5 GB more -- confirmed to be chunk-major GPU retention,
+# measured at 1.514 GB = 128 Qwen experts = one full layer, constant across
+# S=5000..12288 and reset per layer.
+
+
+def _shape_with(**kw):
+    base = dict(kv_per_token=1000, N=1, chunk=512, hidden=4096, n_heads=32,
+                vocab=1000, elem_bytes=2, materializes_scores=False,
+                alloc_factor=1.0, kv_capacity_buckets=False)
+    base.update(kw)
+    return VramShape(**base)
+
+
+def test_hidden_size_no_longer_changes_the_prediction():
+    """The activation term (act_coeff * S) is GONE -- it was the only term that
+    depended on hidden, and it is not observable: llama-3.3-70b's measured peak
+    is IDENTICAL at S=12288 and S=16384 (33 KB apart) where the term predicted
+    +0.13 GB, and two of four geometries fitted it NEGATIVE."""
+    small = predict_peak_vram(_shape_with(hidden=1024), 4096)
+    large = predict_peak_vram(_shape_with(hidden=32768), 4096)
+    assert small == large
+
+
+def test_resident_experts_raise_the_peak_when_they_dominate_the_logits():
+    """fused-EXL3 holds one layer's experts on the GPU across prefill chunks."""
+    plain = predict_peak_vram(_shape_with(), 4096)
+    withres = predict_peak_vram(_shape_with(resident_expert_bytes=2_000_000_000), 4096)
+    assert withres > plain
+    assert withres - plain == 2_000_000_000 - _peak_intercept_bytes(_shape_with(), 4096)
+
+
+def test_residency_and_logits_do_not_BOTH_count():
+    """They never coexist: retention is dropped on the layer loop's last call,
+    and the logits materialize afterwards in the lm_head. Charging their sum
+    would over-reserve by the smaller of the two on every fused-EXL3 model."""
+    sh = _shape_with(resident_expert_bytes=2_000_000_000)
+    kv = _kv_term_bytes(sh, 4096)
+    assert predict_peak_vram(sh, 4096) == kv + 2_000_000_000
+
+
+def test_a_big_last_chunk_of_logits_can_still_set_the_peak():
+    """max(), not a one-way override: a small expert set loses to the logits."""
+    sh = _shape_with(vocab=200_000, resident_expert_bytes=1000)
+    kv = _kv_term_bytes(sh, 4096)
+    assert predict_peak_vram(sh, 4096) == kv + _peak_intercept_bytes(sh, 4096)
+
+
+def test_zero_residency_leaves_dense_and_module_list_untouched():
+    a = predict_peak_vram(_shape_with(), 4096)
+    b = predict_peak_vram(_shape_with(resident_expert_bytes=0), 4096)
+    assert a == b
+
+
+def test_residency_does_not_break_the_smaller_context_guarantee():
+    """solve_max_seq_len's two-level search needs the peak non-decreasing at
+    chunk boundaries and within a period. A constant term preserves both, but
+    assert it rather than trust it -- weakening that search was a real latent
+    bug once."""
+    sh = _shape_with(kv_per_token=10_000, resident_expert_bytes=50_000_000,
+                     kv_capacity_buckets=True)
+    budget = predict_peak_vram(sh, 6000) + 1
+    smax = solve_max_seq_len(free_vram=budget, min_resident=0, shape=sh)
+    for s in range(1, smax + 1):
+        assert predict_peak_vram(sh, s) <= budget, f"S={s} exceeds the budget"
+
+
+def test_the_logits_term_charges_fp32_only_not_both_copies():
+    """Only the fp32 upcast is resident at the peak, not the fp16 logits too.
+
+    Measured 2026-08-15 on three independent geometries at a full trailing
+    chunk, where the term is largest and cleanest to isolate: the residual
+    (transient - KV - residency) is 0.2627 GB on llama-3.3-70b (S=12288 AND
+    S=16384) and on llama-3.2-1b (S=16384, 32768, 49152). trailing * vocab * 4
+    is 0.2627 GB; trailing * vocab * 6 -- charging the fp16 copy as well -- is
+    0.3940 GB. Five points, four decimals, no fitting.
+    """
+    sh = _shape_with(vocab=128256, chunk=512, elem_bytes=2)
+    assert _peak_intercept_bytes(sh, 4096) == 512 * 128256 * 4

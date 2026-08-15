@@ -1504,7 +1504,7 @@ class VaayuBaseModel(GenerationMixin):
 
         self._vram_plan = None
         if device.startswith("cuda") and torch.cuda.is_available():
-            from .vram_plan import (DEFAULT_ACT_COEFF, DEFAULT_ALLOC_FACTOR,
+            from .vram_plan import (DEFAULT_ALLOC_FACTOR,
                                     MATERIALIZES_SCORES, VramShape,
                                     kv_bytes_per_token, plan_vram)
             _free_vram, _ = torch.cuda.mem_get_info()
@@ -1522,6 +1522,41 @@ class VaayuBaseModel(GenerationMixin):
             # the KV cache class _create_kv_cache will build (Amendment 1,
             # task-6-brief.md), not of any model (§5) — derived by mirroring
             # _create_kv_cache's own mode resolution, not guessed.
+            # Chunk-major GPU retention exists ONLY in the fused-EXL3 forward
+            # (_chunk_major_gpu, moe_patch.py): it holds one layer's routed
+            # experts across prefill chunks. Measured on Qwen3-235B 2026-08-15 at
+            # a flat 1.514 GB = 128 experts x 11.8 MB, constant across
+            # S=5000..12288 and reset per layer. The module-list and dense
+            # forwards have no equivalent, so DETECT the layout rather than
+            # assume it -- charging MiniMax's 256 experts would over-reserve
+            # 2.28 GB and shrink its expert cache for nothing.
+            #
+            # NOT clamped to the expert VRAM cache budget, even though that is
+            # the runtime bound: that budget is `free - reserve`, so clamping
+            # would make the reserve depend on itself. Unclamped can only
+            # over-reserve, and the clamp is ~6x from binding on this box.
+            #
+            # num_experts, not the count actually routed: a full prefill chunk
+            # routes essentially all of them, and over-reserving is the safe
+            # error for a value whose job is "every request up to this length
+            # fits" (S5: both numbers come from _moe_geometry, never literals).
+            _resident_expert_bytes = 0
+            if self._moe_geometry is not None:
+                # Local imports: both names are imported further down in
+                # __init__, past this point, so referencing them here without
+                # this would make them unbound locals. (It did: both MoE models
+                # failed to load with UnboundLocalError, and the 836-test suite
+                # could not see it -- nothing unit-tests this path.)
+                from .moe_patch import detect_moe_blocks
+                from .persist.loader_strategy import EXL3LoaderStrategy
+                if getattr(self, "_detected_moe_blocks", None) is None:
+                    self._detected_moe_blocks = detect_moe_blocks(self.model)
+                if (isinstance(self.loader_strategy, EXL3LoaderStrategy)
+                        and any(b.expert_style == "fused"
+                                for b in self._detected_moe_blocks)):
+                    _resident_expert_bytes = int(
+                        self._moe_geometry["num_experts"]
+                        * self._moe_geometry["expert_bytes"])
             _shape = VramShape(
                 kv_per_token=kv_bytes_per_token(
                     num_hidden_layers=self.config.num_hidden_layers,
@@ -1533,8 +1568,8 @@ class VaayuBaseModel(GenerationMixin):
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
                 elem_bytes=torch.finfo(self.running_dtype).bits // 8,
-                act_coeff=DEFAULT_ACT_COEFF,
                 materializes_scores=MATERIALIZES_SCORES,
+                resident_expert_bytes=_resident_expert_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
                 kv_capacity_buckets=self._kv_cache_is_bucketed())
@@ -1639,7 +1674,8 @@ class VaayuBaseModel(GenerationMixin):
             # allocated below — before patch_moe_blocks() would otherwise reveal
             # the layout. Detection is reused by patch_moe_blocks so the module
             # tree is walked exactly once.
-            self._detected_moe_blocks = detect_moe_blocks(self.model)
+            if getattr(self, "_detected_moe_blocks", None) is None:
+                self._detected_moe_blocks = detect_moe_blocks(self.model)
             _styles_detected = [b.expert_style for b in self._detected_moe_blocks]
             _is_exl3 = isinstance(self.loader_strategy, EXL3LoaderStrategy)
             # Independent capabilities — see the two predicates' docstrings.

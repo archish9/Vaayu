@@ -1,6 +1,10 @@
 # NEXT-2 — F1: re-derive the RAM-arbitration premise before building anything
 
-**Status:** `[!]` blocked on its own premise · **Cost:** ~1 h to measure, then decide ·
+**Status:** **CLOSED AS OBSOLETE 2026-08-15** — premise refuted by measurement, nothing built.
+Measured pools: Qwen **11.95–12.02 GB** (K_max 7), MiniMax **11.71–11.77 GB** (K_max 5), spread
+≤0.07 GB over three loads each; the slab arena is allocated before the pool sizes itself, so the
+two budgets never overlapped. Full verdict in `plans/settled_and_method_notes.md`. Do not re-run
+this brief. · **Cost:** ~1 h to measure, then decide ·
 **Sequence:** second. Independent of NEXT-1 — either can go first if you prefer.
 
 > **This document is self-contained.** It carries the mechanism, the contradicting

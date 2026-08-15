@@ -71,29 +71,20 @@ def kv_bytes_per_token(*, num_hidden_layers: int, num_key_value_heads: int,
     return int(num_hidden_layers * 2 * num_key_value_heads * head_dim * elem)
 
 
-# Still Task 3's UNFITTED placeholders. Task 5b (2026-08-09) fixed the KV
-# term's structural bug (see kv_capacity_tokens): fit improved from 13/17
-# points outside +-10% (worst +41.2%) to 11/17 (worst -30.2%), still FAILED.
-# Task 5c (2026-08-14) then fixed the second, already-flagged term --
-# _peak_intercept_bytes now follows the real trailing chunk
-# (_trailing_chunk_tokens: S mod prefill_chunk_size, never the constant
-# `chunk`) -- and re-ran OLS against the same 17 already-logged Task 5
-# measurements with BOTH corrections in place: 10/17 outside +-10% (worst
-# -28.0%, unweighted) / 8/17 (worst +28.9%, relative-error-weighted). Still
-# FAILS the gate, and the residual is no longer explained by a further named
-# mechanism: MiniMax's within-bucket drift matches the trailing-chunk theory
-# closely, but Qwen's measured peak is nearly FLAT within its bucket
-# (+-1%, S=5000..7700) where the trailing-chunk model predicts a large drop
-# -- evidence of a real forward-path difference (MoE layer-major prefill
-# never calls the dense legacy loop's per-chunk reset_peak_memory_stats(),
-# so its observed peak can reflect the largest INTERMEDIATE chunk's
-# transient, not only the last chunk's logits) that is not modeled here.
-# Per this task's own rule (mirroring Task 5/5b) -- do not tune constants to
-# force a failing gate to pass -- these stay the Task 3 placeholders. This is
-# the last corrective round (see task-5c-report.md): the failure is reported,
-# not hidden.
-DEFAULT_ACT_COEFF = 4.0
-DEFAULT_ALLOC_FACTOR = 1.18
+# Measured, not fitted (2026-08-15, torch 2.11.0+cu130, 26 points over four
+# geometries -- scripts/fit_vram_calibration.py holds the data and reproduces
+# this). `KV(at allocated capacity) + last-chunk logits` predicts three of the
+# four on-device forwards to within +-0.13 GB with NO fitted constant at all,
+# so the multiplier is 1.0 and there is nothing left to calibrate.
+#
+# There used to be a DEFAULT_ACT_COEFF here multiplying an `act_coeff * S`
+# activation term. Both are GONE: that term is not observable. Llama-3.3-70B's
+# measured peak is IDENTICAL at S=12288 and S=16384 -- 8538230272 vs 8538263040
+# bytes, 33 KB apart -- where the term predicted +0.13 GB, and Llama-3.2-1B's
+# entire growth out to S=49152 is accounted for by KV alone. Fitting it across
+# all four geometries produced mutually incompatible constants, NEGATIVE for two
+# of them, which is the signature of a form error absorbed by a free parameter.
+DEFAULT_ALLOC_FACTOR = 1.0
 
 
 # P1 verdict, measured 2026-08-14 on torch 2.11.0+cu130 (see the RESULTS file).
@@ -179,7 +170,6 @@ class VramShape:
     n_heads: int
     vocab: int
     elem_bytes: int             # compute dtype width (2 for fp16/bf16)
-    act_coeff: float
     materializes_scores: bool
     alloc_factor: float
     # kv_growth_factor/kv_capacity_buckets: algorithmic properties of the KV
@@ -191,16 +181,27 @@ class VramShape:
     # is actively tested on-device (CLAUDE.md §0 dispatch table).
     kv_growth_factor: int = 2
     kv_capacity_buckets: bool = True
+    # Bytes of expert weights the forward keeps GPU-resident across prefill
+    # chunks. NON-ZERO ONLY for the fused-EXL3 forward, which is the only one
+    # with chunk-major retention (_chunk_major_gpu in moe_patch.py); the
+    # module-list and dense forwards have no equivalent and pass 0. Derived by
+    # the caller from _moe_geometry as num_experts * expert_bytes -- never a
+    # literal (CLAUDE.md S5). Measured on Qwen3-235B 2026-08-15: a flat
+    # 1.514 GB = 128 experts = one full layer, constant across S=5000..12288
+    # and reset per layer.
+    resident_expert_bytes: int = 0
 
 
 def _peak_linear_slope_bytes(shape: VramShape) -> float:
-    """Bytes of peak VRAM per additional token of context from the terms that
-    stay linear in S -- activations and (if materializing) attention scores.
-    The KV term is charged separately (see kv_capacity_tokens): it is a step
+    """Bytes of peak VRAM per additional token of context from terms linear in S.
+
+    Only the attention-scores term remains, and it is ZERO on this box
+    (MATERIALIZES_SCORES=False). The activation term that used to live here was
+    removed 2026-08-15 as unobservable -- see DEFAULT_ALLOC_FACTOR's comment.
+    The KV term is charged separately (kv_capacity_tokens): it is a step
     function of S, not linear, so it cannot live in a per-token slope."""
-    scores = (shape.N * shape.n_heads * shape.chunk * shape.elem_bytes * 2
-              if shape.materializes_scores else 0.0)
-    return shape.N * shape.hidden * shape.elem_bytes * shape.act_coeff + scores
+    return (shape.N * shape.n_heads * shape.chunk * shape.elem_bytes * 2
+            if shape.materializes_scores else 0.0)
 
 
 def _kv_term_bytes(shape: VramShape, S: int) -> int:
@@ -244,13 +245,41 @@ def _peak_intercept_bytes(shape: VramShape, S: int) -> float:
 
     Only the last chunk's logits are materialized (vaayu_base.py's forward(),
     around the `run_lm_head` call and its "only the last chunk's logits
-    exist/matter" comment further down), and
-    sampling upcasts them to fp32 -- hence (elem_bytes + 4). The last chunk is
+    exist/matter" comment further down), and sampling upcasts them to fp32.
+
+    Charged at 4 bytes/element -- the fp32 upcast ALONE, not `elem_bytes + 4`.
+    The fp16 copy is not resident at the peak. Measured 2026-08-15 on three
+    independent geometries at a full trailing chunk, where this term is largest
+    and cleanest to isolate: the residual (transient - KV - residency) is
+    0.2627 GB on llama-3.3-70b at BOTH S=12288 and S=16384, and on llama-3.2-1b
+    at S=16384, 32768 and 49152. `trailing * vocab * 4` = 0.2627 GB exactly;
+    `* (elem_bytes + 4)` = 0.3940 GB. Five points, four decimals, nothing
+    fitted. (MiniMax-M2.7 sits ~0.079 GB ABOVE even the x6 figure at the same
+    point -- its module-list forward holds something small this does not model.
+    That leaves it under-predicted by 5.8% there, inside the gate, and is the
+    known residual to chase if the bar ever tightens.)
+
+    The last chunk is
     `_trailing_chunk_tokens(S, shape.chunk)` tokens long, not always a full
     `chunk` -- see that function's docstring for the measured evidence.
     """
     trailing = _trailing_chunk_tokens(S, shape.chunk)
-    return shape.N * trailing * shape.vocab * (shape.elem_bytes + 4)
+    return shape.N * trailing * shape.vocab * 4
+
+
+def _peak_transient_bytes(shape: VramShape, S: int) -> float:
+    """The larger of the two transients that can SET the peak -- they never
+    coexist, so charging their sum would over-reserve by the smaller one.
+
+    Chunk-major expert retention lives inside the layer loop and is dropped on
+    its last call (`_chunk_major_gpu = None`); the last chunk's logits are
+    materialized afterwards, in the lm_head. Measured on Qwen3-235B, where
+    retention (1.514 GB) dominates the logits (0.467 GB at a full trailing
+    chunk): modelling max() lands every point within 7% of the measured
+    transient, and always on the over-predicting side, which is the safe
+    direction for a reserve.
+    """
+    return max(_peak_intercept_bytes(shape, S), float(shape.resident_expert_bytes))
 
 
 def predict_peak_vram(shape: VramShape, S: int) -> int:
@@ -269,7 +298,7 @@ def predict_peak_vram(shape: VramShape, S: int) -> int:
     explicitly -- see its docstring for why a plain single-level binary
     search over this function would be unsound.
     """
-    raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_intercept_bytes(shape, int(S))
+    raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_transient_bytes(shape, int(S))
            + _kv_term_bytes(shape, S))
     return int(round(raw * shape.alloc_factor))
 

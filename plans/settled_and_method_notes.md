@@ -367,6 +367,86 @@ suppress it.
 
 ---
 
+## F1 — expert-cache / prefix-pool RAM arbitration (was todo row 2) — CLOSED AS OBSOLETE 2026-08-15
+
+**Premise refuted by measurement; nothing built.** F1 assumed the expert RAM cache took its share
+first and left the prefix pool starved, with nothing arbitrating between them. Measured across
+three loads per model, separate processes, `VAAYU_NO_WARMUP=1`, on an otherwise idle box — every
+number the task needed was ALREADY printed at load, so no instrumentation was added:
+
+| model | expert RAM cache | slab arena charged | free RAM at load | prefix pool | spread over 3 loads | KV/session @ 8192 | K_max |
+|---|---|---|---|---|---|---|---|
+| Qwen3-235B | 9.1 GB | 9.24 GB | 15.71–15.78 GB | **11.95–12.02 GB** | 0.07 GB | 1.58 GB | **7** |
+| MiniMax-M2.7 | 9.1 GB | 9.21 GB | 15.46–15.52 GB | **11.71–11.77 GB** | 0.06 GB | 2.08 GB | **5** |
+
+**The two budgets do not overlap, so there is nothing to arbitrate.** The slab arena is allocated
+FIRST and its ~9.2 GB is already gone from the free-RAM figure the pool then sizes itself against
+(`free RAM − 3.76 GB reserve`). The arithmetic closes by construction; F1's "two budgets, each
+plausible alone, jointly overcommitting" describes the VRAM situation that `plan_vram` fixed, not
+this one.
+
+**Capacity vastly exceeds need.** Realistic concurrency here is **sequential turns of ONE stream** —
+N≥2 at long context is separately settled as infeasible on this box — against a measured K_max of
+5–7 sessions. Even allowing the cliff (exceeding pool capacity costs the ENTIRE win, not a share:
+K=7 against a pool holding 5–6 gave 0 hits, Plan J Task 4), there is 5–7× headroom over a need of 1.
+
+**On the old 2.36 GB reading** that motivated F1: today's pools are stable to within 0.07 GB across
+six loads. That earlier scarcity was environmental — other processes holding RAM at load — not the
+expert cache crowding the pool out. Per the brief's own decision rule, the remedy for environmental
+variance would be a FLOOR on the pool, not an arbitration mechanism, and no measurement today shows
+one is needed. Re-open only if a load is observed where the pool falls below one session's KV.
+
+---
+
+## `predict_peak_vram` form change (was todo row 2) — DONE 2026-08-15, gate PASSES
+
+**The ±10 % accuracy gate passes for the first time: 0/26 points outside, worst 7.3 %, with ZERO
+fitted constants.** Prior best was 10/17 outside at worst −28.0 %, across four rounds of trying to
+calibrate two constants that turned out to be the wrong lever.
+
+**The form now:** `peak = KV(at allocated capacity) + max(last-chunk logits, resident experts)`.
+
+Four changes, each measured rather than fitted:
+
+1. **The activation term is GONE.** `act_coeff × S` was unobservable — Llama-3.3-70B's measured
+   peak is IDENTICAL at S=12288 and S=16384 (33 KB apart) where it predicted +0.13 GB. `act_coeff`
+   and `DEFAULT_ACT_COEFF` are deleted, not defaulted to zero.
+2. **`alloc_factor` = 1.0.** KV + logits alone explains three of four forwards to ±0.13 GB.
+3. **Resident-experts term**, non-zero only for fused-EXL3, derived as
+   `num_experts × expert_bytes` from `_moe_geometry`. Confirmed by instrumenting
+   `_chunk_major_gpu_bytes`: a flat **1.514 GB = 128 Qwen experts = one full layer**, constant
+   across S=5000..12288, reset per layer. The caller DETECTS the layout (`expert_style == "fused"`
+   and EXL3) rather than assuming it — charging MiniMax's 256 experts would over-reserve 2.28 GB.
+4. **Logits charged at 4 bytes/element, not `elem_bytes + 4`.** Only the fp32 upcast is resident at
+   the peak, not the fp16 copy too. Measured at a full trailing chunk on THREE geometries: the
+   residual is 0.2627 GB on llama-3.3-70b (S=12288 AND 16384) and llama-3.2-1b (S=16384, 32768,
+   49152); `trailing × vocab × 4` = 0.2627 GB exactly, `× 6` = 0.3940 GB. **Five points, four
+   decimals.** This was found BY the gate: with ×6 it failed 4/26, all on llama-1b.
+
+`max(logits, residency)` rather than their sum: retention lives inside the layer loop and is
+dropped on its last call; the logits materialize afterwards in the lm_head, so the two never
+coexist.
+
+**Effect on derived `max_seq_len`:** Qwen **8192 → 8192**, MiniMax **8192 → 8192** (both pinned by
+the reserve floor and the KV cliff, exactly as the brief predicted), Llama-3.3-70B **4373 → 8192**,
+Llama-3.2-1B **56828 → 106987**. The dense models gain context because an unobservable term was
+inflating their predicted peak.
+
+**Verification:** suite **836 passed / 3 skipped**; `scripts/fit_vram_calibration.py` (now a form
+CHECK, not a fit) exits 0; dense smoke perplexity **8.78**, unchanged; MoE accumulator gate passes
+on Qwen and MiniMax.
+
+**Known residual, not chased:** MiniMax sits ~0.079 GB above even the ×6 logits figure at a full
+trailing chunk — its module-list forward holds something small this does not model. It leaves that
+point under-predicted by 5.8 %, inside the gate. That is the thing to chase if the bar tightens.
+
+**Two bugs I introduced and caught on-device, both invisible to the suite:** referencing
+`detect_moe_blocks` and then `EXL3LoaderStrategy` before their in-function imports made them
+unbound locals, and **both MoE models failed to load** while 836 tests stayed green. Nothing
+unit-tests the load path. Run a real load after touching `__init__`.
+
+---
+
 # SETTLED — do not re-open without new evidence
 
 Not tasks. Each cost a full plan or probe to establish; re-measuring them is wasted GPU.

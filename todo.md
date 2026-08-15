@@ -43,6 +43,37 @@ constants and decimal `MB_DEC`/`GB_DEC` for these — use the right family.)
 
 ---
 
+## On-device gates — how to run them, and what each one can actually catch
+
+`pytest tests/` runs NONE of these: they need a checkpoint, and two of them live at the repo ROOT,
+not under `tests/`. Verified 2026-08-15 against the day's committed work.
+
+| gate | invoke | ~time | catches |
+|---|---|---|---|
+| dense smoke (CLAUDE.md §0's named guard) | `./venv/bin/python test_batched_dense_smoke.py` | ~2 min | dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged by the day's work |
+| MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
+| prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility |
+
+**Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`.**
+
+**Two lessons from strengthening these, both of which cost a run to learn:**
+
+- **A gate that cannot fail is not a gate.** The accumulator gate's original on-device arm ran two
+  PREFILL forwards — a configuration where the defect provably cannot appear, since
+  `_moe_prefill_pass` suppresses cache puts so arrival order never varies. It passed identically
+  before and after the bug it existed to catch. Its replacement asserts on DECODE, and asserts its
+  own premise (`_expert_vram_cache.hits > 0`) so it can never silently degrade back into that blind
+  spot. **Both versions were checked by reverting the fix underneath them** — the first draft
+  compared generated TOKENS and still passed with the bug restored, because an argmax flip is
+  probabilistic; comparing LOGITS bitwise fails immediately (`max|d|=5.156e-01`). Assert on the
+  continuous quantity, not on the discrete one that usually follows it.
+- **Never load a model twice in one pytest process.** Both on-device arms called
+  `from_pretrained`, and the second load was OOM-killed (exit 137) under a 22 GB cgroup cap —
+  freed pinned host blocks are cached, not returned. A module-scoped fixture shares one load and
+  halves the wall time.
+
+---
+
 # ▶ PENDING SEQUENCE — work top to bottom
 
 _Re-sequenced 2026-08-15. Closed rows live in `plans/settled_and_method_notes.md`; this file stays
@@ -51,16 +82,18 @@ pending-only._
 | # | Item | Status | Cost | Why here |
 |---|---|---|---|---|
 | **1** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
-| **2** | F1 — RAM budget arbitration | `[!]` | ~1 h GPU, then decide | Blocked on its own premise; expected outcome "close as obsolete". |
-| **3** | Fused-EXL3 prefill peak: ~1.39 GB unmodelled residency | `[ ]` | needs a design brief first | **Real but NOT urgent** — the reserve floor and the KV cliff mask it today. |
-| **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
-| **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
+| **2** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
+| **3** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 
-> ### ▶▶ NEXT ACTION: row 2 or row 3 — nothing is blocking
-> Row 2 is ~1 h of GPU whose expected outcome is closing it as obsolete; row 3 is the only item
-> that needs design work. Rows 1, 4 and 5 are deliberately not scheduled.
+> ### ▶▶ NEXT ACTION: none scheduled — every remaining row is deliberately unscheduled
+> Row 1 is a capability gap no on-device target hits, row 2 is parked VRAM already priced, and
+> row 3 is four write-ups each blocked on a new premise. The VRAM-planning work that occupied this
+> list is finished: the ±10 % gate now PASSES (0/26, worst 7.3 %, zero fitted constants).
+> Pick up row 1 if non-EXL3 support becomes real; otherwise this backlog is at a natural stopping
+> point.
 
 ---
+
 # 1 · [ ] The cross-turn prefix cache only works for EXL3 models
 
 Carried out of the hygiene backlog (H7's third item) when the rest of that row closed
@@ -83,90 +116,7 @@ model nobody currently runs here. (found 2026-08-09)
 
 ---
 
-# 2 · [!] F1 — expert-cache / prefix-pool RAM arbitration
-
-**Brief:** `plans/next_2_f1_ram_arbitration.md`. **Blocked on its own premise.** ~1 h to measure.
-Independent of every other row.
-
-### What is wrong
-
-In `vaayu/vaayu_base.py`, two RAM budgets are computed independently and **nothing arbitrates**:
-`compute_expert_budget(...)` runs first and takes its share; `compute_prefix_cache_budget(...)`
-runs ~250 lines later and gets the remainder.
-
-**F1's premise — "the prefix pool is starved because the expert cache ate the RAM first" — may no
-longer hold.** Plan L took Qwen's measured pool **2.36 → 10.53 GB**. Measure before building.
-
-### Constraints on the measurement
-
-- **The pool budget is not a constant of this box:** `pool = free RAM at load − 3.76 GB reserve`,
-  and free RAM at load varies — MiniMax across five loads **11.49 / 12.16 / 12.87 / 13.70 /
-  13.76 GB**; Qwen **4.96**, then **2.36**, then **10.53** after Plan L. **Never quote a bare pool
-  size or a bare K** — quote `K_max = floor(pool / per-session KV)` and the pool it was measured at.
-- **Capacity is a cliff, not a slope.** At K=7 against a pool holding 5–6: **0 hits, not 5** —
-  round 1's re-stores cascade-evict round 0's. Sizing the pool to exactly expected concurrency is
-  sizing it to fail.
-- **Realistic concurrency is sequential turns of ONE stream**, not wide fan-out: N≥2 at ~7700
-  tokens is infeasible on this box for both MoE models (VRAM binds, not RAM).
-- **The prize is still large if it binds:** cross-turn prefix reuse is Qwen 396.4 s → 2.4–2.9 s
-  (136–165×), MiniMax ~380 s → ~1.0 s (377×).
-
-### Steps
-
-1. Instrument, don't guess: at load, print for both models — free RAM at load, expert RAM cache
-   budget actually taken, prefix pool budget actually granted, derived `K_max`.
-2. Repeat across several loads per model (free RAM at load is the variable that moves).
-3. Apply the decision rule:
-
-| finding | action |
-|---|---|
-| Pool comfortably exceeds realistic `K_max` need, across repeated loads | **Close F1 as obsolete** (expected outcome). Record measured pools in the archive. |
-| Pool binds sometimes (varies with free RAM at load) | The defect is *variance*, not *allocation order* → consider a pool floor, not arbitration. |
-| Pool binds consistently | Only now design arbitration — with headroom above `K_max`, per the cliff. |
-
-**Write the numbers into this file with the pool they were measured at.** A measurement that only
-lands in a doc is not a deliverable.
-
----
-
-# 3 · [ ] Fused-EXL3 prefill peak carries ~1.39 GB of residency nothing models
-
-**CONFIRMED and quantified 2026-08-15** (four measured-baseline probe arms; see
-`scripts/fit_vram_calibration.py` and the calibration verdict in
-`plans/settled_and_method_notes.md`). Originally filed as a suspected probe/instrument artifact —
-it is not an artifact, it is a real term the model lacks.
-
-Measured transient minus `KV(at capacity) + last-chunk logits`, with **zero fitted constants**:
-
-| model | forward | residual | spread |
-|---|---|---|---|
-| llama-3.2-1b | dense non-EXL3 | −0.083 G | 0.129 G |
-| llama-3.3-70b | dense EXL3 streamed | −0.087 G | 0.129 G |
-| minimax-m2.7 | MoE module-list | +0.048 G | 0.142 G |
-| qwen3-235b | **MoE fused-EXL3** | **+1.106 G** | 0.536 G |
-
-Three of four forwards need no activation term at all. The fourth carries residency nothing
-models — and **its peak does not include the last-chunk logits**: subtracting them leaves spread
-0.536 G, leaving them in leaves **0.140 G**, 4× flatter. So on fused-EXL3 a roughly constant
-~1.39 GB of residency (expert staging) dominates the logits, which therefore never SET the peak.
-Qwen's router geometry, for whoever models it: 128 experts, top_k 8, `moe_intermediate_size` 1536,
-hidden 4096 — all readable from `_moe_geometry`, never a literal (CLAUDE.md §5).
-
-**Why it is NOT urgent, checked 2026-08-15:** at the derived operating point the true transient
-still fits the reserve — Qwen ~2.76 GiB and MiniMax ~2.56 GiB against a 3.50 GiB floor at
-`max_seq_len=8192`. The 3.5 GiB reserve floor and the KV doubling cliff both pin `max_seq_len` to
-8192 for both MoE models regardless of this error, so it changes nothing operational today. It
-becomes live if the reserve floor changes, the hardware changes, or another fused-EXL3 checkpoint
-lands with different expert geometry.
-
-**Shape of the fix (needs its own brief and approval — it is a design change, not a calibration):**
-drop the activation term, pin `alloc_factor` at ~1.0, and add an expert-staging residency term for
-the fused-EXL3 forward derived from `_moe_geometry`. Note the logits term must also be suppressed
-on that forward, not merely added to.
-
----
-
-# 4 · [ ] 2× KV overshoot, ~0.83 GB at Qwen's derived operating context — PARKED
+# 2 · [ ] 2× KV overshoot, ~0.83 GB at Qwen's derived operating context — PARKED
 
 Real, quantified, recoverable, and **deliberately not scheduled.** The EXL3 ring-buffer KV cache's
 geometric-doubling capacity means that at Qwen's derived `max_seq_len=8192` the cache allocates
@@ -185,7 +135,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-# 5 · [ ] DEFERRED — written up, no scheduled slot
+# 3 · [ ] DEFERRED — written up, no scheduled slot
 
 - **Plan B Tasks 8, 9 — Phase 2 live expert re-pin.** The Phase 1 pin it builds on is refuted (no
   viable pin N: eviction share is linear in N and always 2–4× below the pin's share of the cache,

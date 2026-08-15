@@ -1,8 +1,8 @@
-"""Calibrate -- or refute -- predict_peak_vram's two constants against measured VRAM.
+"""Verify predict_peak_vram's FORM against measured VRAM. No constants are fitted.
 
-VERDICT (2026-08-15): REFUTED. Calibrating DEFAULT_ACT_COEFF / DEFAULT_ALLOC_FACTOR
-cannot close the +-10% gate, because the model's FUNCTIONAL FORM is wrong, not its
-constants. Run this script for the evidence; the summary is:
+HISTORY. This began as a calibration of DEFAULT_ACT_COEFF / DEFAULT_ALLOC_FACTOR
+and REFUTED it: the FORM was wrong, not the constants. The form was then fixed
+(2026-08-15) and this script became its verification. The evidence that drove it:
 
   * With ZERO fitted constants, `KV(at capacity) + last-chunk logits` already
     explains the measured transient to within +-0.13 GB on THREE of the four
@@ -13,10 +13,15 @@ constants. Run this script for the evidence; the summary is:
     include the last-chunk logits at all (subtracting them makes the residual
     4x LESS flat: spread 0.536 GB vs 0.140 GB). That is todo.md item 6, now
     confirmed and localised to one forward.
-  * Fitting the two constants jointly across all four geometries therefore
-    fails: 13/26 points outside +-10%, worst 44.2%, and the per-model fits are
+  * Fitting the two constants jointly across all four geometries failed:
+    13/26 points outside +-10%, worst 44.2%, and the per-model fits were
     mutually incompatible (alloc_factor 0.69-1.44, act_coeff -1.34 to +3.51 --
-    NEGATIVE for two of them, which is physically meaningless).
+    NEGATIVE for two, the signature of a form error absorbed by a constant).
+
+THE FORM NOW: peak = KV(at allocated capacity) + max(last-chunk logits,
+resident experts). The activation term is gone, alloc_factor is 1.0, and the
+residency term is non-zero only for the fused-EXL3 forward, derived as
+num_experts * expert_bytes. This script re-checks all 26 points against it.
 
 Why the earlier rounds could not see this: without a measured baseline, every
 fit had a free per-model offset absorbing exactly this structure, which is what
@@ -34,9 +39,8 @@ import numpy as np
 
 from vaayu.vram_plan import (
     VramShape,
-    _peak_intercept_bytes,
-    _kv_term_bytes,
     kv_bytes_per_token,
+    predict_peak_vram,
 )
 
 GB = 1e9  # decimal, matching the probe's own GB reporting
@@ -130,10 +134,26 @@ LEGACY_PEAKS_GB = {
 }
 
 
+
+# Bytes of expert weights held GPU-resident across prefill chunks. NON-ZERO ONLY
+# for the fused-EXL3 forward -- chunk-major retention (_chunk_major_gpu) exists
+# nowhere else. Mirrors vaayu_base's derivation: num_experts * expert_bytes,
+# both read from _moe_geometry at load. Confirmed 2026-08-15 by instrumenting
+# _chunk_major_gpu_bytes: a flat 1.514 GB on Qwen (128 experts x 11.83 MB),
+# constant across S=5000..12288 and reset per layer.
+RESIDENT_EXPERT_BYTES = {
+    "qwen3-235b": int(128 * 11.83e6),   # measured expert_bytes at load
+    "minimax-m2.7": 0,                  # module-list: no chunk-major retention
+    "llama-3.3-70b": 0,                 # dense
+    "llama-3.2-1b": 0,                  # dense
+}
+
 def shape_for(key: str) -> VramShape:
     """Build the probe's VramShape from the checkpoint's own config.json.
 
     Every geometry number is READ, never typed (CLAUDE.md S5).
+    resident_expert_bytes mirrors what vaayu_base computes at load: non-zero
+    only for the fused-EXL3 forward, as num_experts * expert_bytes.
     """
     directory, is_exl3 = CHECKPOINTS[key]
     with open(f"{MODELS_ROOT}/{directory}/config.json") as fh:
@@ -159,167 +179,49 @@ def shape_for(key: str) -> VramShape:
         n_heads=field("num_attention_heads"),
         vocab=field("vocab_size"),
         elem_bytes=PROBE_ELEM_BYTES,
-        act_coeff=1.0,      # unused: the fit works on the basis columns directly
         materializes_scores=False,   # MATERIALIZES_SCORES, measured on this box
-        alloc_factor=1.0,   # unused, same reason
+        alloc_factor=1.0,
         kv_capacity_buckets=is_exl3,
+        resident_expert_bytes=RESIDENT_EXPERT_BYTES[key],
     )
 
 
-def basis(shape: VramShape, S: int) -> tuple[float, float]:
-    """The two regressor columns at context S.
-
-    col_x multiplies x = alloc_factor*act_coeff (the activation basis with
-    act_coeff factored out); col_y multiplies y = alloc_factor (the terms whose
-    size is already fully determined -- last-chunk logits and KV at capacity).
-    """
-    col_x = shape.N * shape.hidden * shape.elem_bytes * float(S)
-    col_y = _peak_intercept_bytes(shape, S) + _kv_term_bytes(shape, S)
-    return col_x, col_y
-
-
-def fit(data) -> tuple[float, float]:
-    """Least squares for x, y against measured transients (peak - alloc_before).
-
-    predict(S) = alloc_factor * (act_coeff*A*S + logits + KV)
-               = x*col_x + y*col_y,   x = alloc_factor*act_coeff, y = alloc_factor
-    so the product of the two unknowns still leaves a linear 2-column problem.
-    """
-    rows, targets = [], []
-    for key, points in data.items():
-        shape = shape_for(key)
-        for S, before, peak in points:
-            col_x, col_y = basis(shape, S)
-            rows.append([col_x, col_y])
-            targets.append(float(peak - before))
-    A = np.asarray(rows, float)
-    b = np.asarray(targets, float)
-    (x, y), *_ = np.linalg.lstsq(A, b, rcond=None)
-    return float(x), float(y)
-
-
-def predict(shape: VramShape, S: int, x: float, y: float) -> float:
-    col_x, col_y = basis(shape, S)
-    return x * col_x + y * col_y
-
-
 def main() -> int:
-    shapes = {key: shape_for(key) for key in CHECKPOINTS}
-
-    # =====================================================================
     print("=" * 78)
-    print("REPRODUCTION CHECK -- 2026-08-15 arm vs the 2026-08-14 arm")
+    print("FORM CHECK -- peak = KV(capacity) + max(last-chunk logits, resident experts)")
+    print("no fitted constants; alloc_factor = 1.0")
     print("=" * 78)
-    worst_repro = 0.0
-    for key, legacy in LEGACY_PEAKS_GB.items():
-        deltas = [abs(peak / GB - legacy[S])
-                  for S, _b, peak in MEASURED[key] if S in legacy]
-        worst_repro = max(worst_repro, max(deltas))
-        print(f"  {key:<15} {len(deltas)} overlapping S, worst |delta| "
-              f"{max(deltas):.4f} GB")
-    print(f"\n  worst across all four: {worst_repro:.4f} GB -- the box reproduces,")
-    print("  so the new baselines can be trusted against the old peaks.")
-
-    # =====================================================================
-    print("\n" + "=" * 78)
-    print("DECOMPOSITION -- measured transient minus the two DERIVED terms.")
-    print("No fitted constants at all. This is what the model gets right.")
-    print("=" * 78)
-    print(f"  {'model':<15}{'S':>7}{'transient':>11}{'KV':>10}{'logits':>10}"
-          f"{'RESIDUAL':>11}")
-    residuals = {}
+    print(f"  {'model':<15}{'S':>7}{'transient':>11}{'predicted':>11}{'rel err':>9}")
+    worst, outside, total = 0.0, 0, 0
+    per_model = {}
     for key, points in MEASURED.items():
-        shape = shapes[key]
-        per_point = []
-        for S, before, peak in points:
-            kv = _kv_term_bytes(shape, S)
-            logits = _peak_intercept_bytes(shape, S)
+        shape = shape_for(key)
+        errs = []
+        for S, before, peak in sorted(points):
             transient = peak - before
-            residual = transient - kv - logits
-            per_point.append(residual)
-            print(f"  {key:<15}{S:>7}{transient/GB:>10.4f}G{kv/GB:>9.4f}G"
-                  f"{logits/GB:>9.4f}G{residual/GB:>10.4f}G")
-        residuals[key] = per_point
-        spread = max(per_point) - min(per_point)
-        print(f"  {'':<15}-> mean {np.mean(per_point)/GB:+.3f}G  "
-              f"spread {spread/GB:.3f}G   [{FORWARD[key]}]\n")
-
-    # =====================================================================
-    print("=" * 78)
-    print("THE SPLIT -- three forwards need NO activation term; one needs a term")
-    print("the model does not have")
-    print("=" * 78)
-    for key in MEASURED:
-        mean = float(np.mean(residuals[key])) / GB
-        spread = (max(residuals[key]) - min(residuals[key])) / GB
-        verdict = ("EXPLAINED (KV + logits, no constants)" if abs(mean) < 0.15
-                   else "UNEXPLAINED ~%.2fG of residency" % mean)
-        print(f"  {key:<15}{FORWARD[key]:<22} mean {mean:+.3f}G "
-              f"spread {spread:.3f}G  {verdict}")
-
-    # Does the odd one out even include the logits term?
-    key = "qwen3-235b"
-    shape = shapes[key]
-    with_logits = [peak - before - _kv_term_bytes(shape, S)
-                   - _peak_intercept_bytes(shape, S)
-                   for S, before, peak in MEASURED[key]]
-    without_logits = [peak - before - _kv_term_bytes(shape, S)
-                      for S, before, peak in MEASURED[key]]
-    print(f"\n  Does {key}'s peak contain the last-chunk logits at all?")
-    print(f"    subtracting them : mean {np.mean(with_logits)/GB:.3f}G  "
-          f"spread {(max(with_logits)-min(with_logits))/GB:.3f}G")
-    print(f"    leaving them in  : mean {np.mean(without_logits)/GB:.3f}G  "
-          f"spread {(max(without_logits)-min(without_logits))/GB:.3f}G  <-- 4x flatter")
-    print("    => on the fused-EXL3 forward the logits never SET the peak: a")
-    print("       larger, roughly constant residency dominates them. That is")
-    print("       todo.md item 6, confirmed and localised to one forward.")
-
-    # =====================================================================
-    print("\n" + "=" * 78)
-    print(f"THE GATE -- fit both constants jointly across all four geometries")
-    print("=" * 78)
-    x, y = fit(MEASURED)
-    print(f"  alloc_factor {y:.4f} (placeholder 1.18), "
-          f"act_coeff {x/y:.4f} (placeholder 4.0)")
-    outside, worst = 0, 0.0
-    total = 0
-    for key, points in MEASURED.items():
-        for S, before, peak in points:
-            transient = peak - before
-            rel = (predict(shapes[key], S, x, y) - transient) / transient
+            predicted = predict_peak_vram(shape, S)
+            rel = (predicted - transient) / transient
+            errs.append(rel)
             worst = max(worst, abs(rel))
             outside += abs(rel) > GATE
             total += 1
-    print(f"  {outside}/{total} points outside +-{GATE:.0%}, worst {100*worst:.1f}%"
-          f"   -> {'PASS' if not outside else 'FAIL'}")
+            flag = "" if abs(rel) <= GATE else "   <-- FAIL"
+            print(f"  {key:<15}{S:>7}{transient/GB:>10.4f}G{predicted/GB:>10.4f}G"
+                  f"{100*rel:>8.1f}%{flag}")
+        per_model[key] = errs
+        print(f"  {'':<15}-> {FORWARD[key]}, residency "
+              f"{shape.resident_expert_bytes/GB:.3f}G, worst "
+              f"{100*max(abs(e) for e in errs):.1f}%\n")
 
-    print("\n  per-model fits -- can ONE global pair serve all four?")
-    print(f"  {'model':<15}{'alloc_factor':>14}{'act_coeff':>12}{'worst':>9}")
-    for key, points in MEASURED.items():
-        xi, yi = fit({key: points})
-        errs = [abs(predict(shapes[key], S, xi, yi) - (peak - before))
-                / (peak - before) for S, before, peak in points]
-        print(f"  {key:<15}{yi:>14.3f}{xi/yi:>12.3f}{100*max(errs):>8.1f}%")
-    print("  Two of the four want a NEGATIVE act_coeff -- physically meaningless,")
-    print("  and the sign of a form error being absorbed by a free constant.")
-
-    # =====================================================================
-    print("\n" + "=" * 78)
-    print("VERDICT: calibration REFUTED as the fix. Do not tune these constants.")
     print("=" * 78)
-    print("  The +-10% gate cannot be closed by act_coeff/alloc_factor, because:")
-    print("   1. act_coeff*S is not observable. llama-3.3-70b's peak is IDENTICAL")
-    print("      at S=12288 and S=16384 (differs by 33 KB) where the term predicts")
-    print("      +0.13 GB, and llama-3.2-1b's entire growth out to S=49152 is")
-    print("      accounted for by KV alone.")
-    print("   2. alloc_factor wants ~1.0: KV + logits alone lands within +-0.13 GB")
-    print("      on three of four forwards with NO fitted constants.")
-    print("   3. The real gap is one forward's unmodelled residency (~1.39 GB on")
-    print("      fused-EXL3), which a global multiplier cannot express.")
-    print("  Every earlier round had a free per-model offset absorbing exactly")
-    print("  this, which is how a wrong FORM kept passing a shape-only check.")
+    print(f"GATE: {outside}/{total} points outside +-{GATE:.0%}, worst "
+          f"{100*worst:.1f}%  ->  {'PASS' if not outside else 'FAIL'}")
     print("=" * 78)
-    return 1
+    if not outside:
+        print("  Every geometry inside the bar with ZERO fitted constants. The two")
+        print("  former constants are gone: act_coeff was unobservable, alloc_factor")
+        print("  is 1.0. Do not reintroduce either without data that needs them.")
+    return 0 if not outside else 1
 
 
 if __name__ == "__main__":
