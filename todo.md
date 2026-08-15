@@ -81,54 +81,64 @@ pending-only._
 
 | # | Item | Status | Cost | Why here |
 |---|---|---|---|---|
-| **1** | Verify the context limits raised by the form change | `[ ]` | ~5 min GPU | **Only scheduled row.** Two `max_seq_len` values were raised on the strength of a model, not a measurement. Boundary sits exactly on the KV cliff. |
-| **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN today and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **1** | `predict_peak_vram` calibrated against a peak that was never the peak | `[bug]` | re-probe + re-derive | **Only scheduled row.** An in-loop `reset_peak_memory_stats` makes every calibration point a last-chunk peak; true prefill slope is 2.2–6.2× the modelled KV term, and the 1B's derived `max_seq_len` OOMs 34 % short. |
+| **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 
-> ### ▶▶ NEXT ACTION: row 1 — verify the context limits the form change raised
-> ~5 min GPU, self-contained below. Everything after it is deliberately unscheduled: row 2 is a
-> ten-minute curiosity, row 3 a capability gap no on-device target hits, row 4 parked VRAM already
-> priced, row 5 four write-ups each blocked on a new premise. The VRAM-planning thread that
-> dominated this list is finished — the ±10 % gate PASSES (0/26, worst 7.3 %, zero fitted
-> constants).
+> ### ▶▶ NEXT ACTION: row 1 — fix the VRAM peak measurement, then re-derive the limits
+> The ±10 % gate's 0/26 pass does NOT mean the form is right: measurement and model share the same
+> blind spot. Fix the measurement first ((a) below), re-probe, and only then touch the form. Nothing
+> else on this list should be scheduled ahead of it — a `max_seq_len` that OOMs is the one failure
+> mode the whole module exists to prevent.
 
 ---
 
-# 1 · [ ] Verify the context limits the form change raised
+# 1 · [bug] `predict_peak_vram` is calibrated against a peak that was never the peak
 
-The `predict_peak_vram` form change (DONE 2026-08-15, verdict in
-`plans/settled_and_method_notes.md`) moved two derived limits:
+**`vaayu_base.py:3334` calls `torch.cuda.reset_peak_memory_stats()` after EVERY prefill chunk**
+(inside the chunk loop, right after the `[Vaayu] Chunk [...] peak VRAM` print). Any
+`max_memory_allocated()` read taken after a chunked-prefill forward therefore reports the peak of
+the LAST CHUNK ONLY, not of the prefill.
 
-| model | before | after |
-|---|---|---|
-| Llama-3.3-70B-exl3 | 4373 | **8192** |
-| Llama-3.2-1B | 56828 | **106987** |
-| Qwen3-235B / MiniMax-M2.7 | 8192 | 8192 (unchanged) |
+`scripts/probe_vram_curve.py:52` measures exactly that way, so **every point in
+`scripts/fit_vram_calibration.py`'s `MEASURED` table is a last-chunk peak.** That is why the form
+`KV(capacity) + last-chunk logits` fits with zero fitted constants and why the ±10 % gate passes
+0/26: both sides describe the same under-measured quantity. Verified — llama-3.2-1b at S=32768,
+`MEASURED` says 2.409 GB, an independent post-`generate` read says 2.426 GB, and the in-loop chunk
+log for the same run says **8.13 GB**.
 
-`max_seq_len`'s entire contract is **"every request up to this length fits"**, and these two
-increases rest on a model, not a measurement. **8192 is the dangerous one: it sits exactly on the
-KV doubling cliff** — `capacity(8192) = 8192`, `capacity(8193) = 16384`, a jump of a whole
-bucket's KV — so it is the single least forgiving point in the range.
+**Measured true slope of prefill peak (least-squares over the in-loop chunk series):**
 
-**What to run** (~5 min GPU, one arm per subprocess, `systemd-run --user --scope -p MemoryMax=28G
--p MemorySwapMax=0` — 22G is no longer enough for the 70B on this box, see the gates table above):
+| model | measured | `predict_peak_vram`'s KV term | ratio |
+|---|---|---|---|
+| Llama-3.2-1B | 0.2027 MB/tok (n=120, to S=32768) and 0.2025 (n=275, to S=70656) | 0.0328 MB/tok | **6.2×** |
+| Llama-3.3-70B | 0.7149 MB/tok (n=32, to S=8191) | 0.328 MB/tok | **2.2×** |
 
-1. Llama-3.3-70B, prefill at **exactly 8192** → must complete, no OOM.
-2. Same model at **8193** → must raise `VramPlanError` from `_assert_context_fits`, NOT a CUDA OOM.
-   (Note `forward()` is unguarded; the predicate runs in `generate`/`batched_generate`, so drive it
-   through one of those.)
-3. Llama-3.2-1B at **106987** → must complete. Cheap, seconds per run.
+The excess is score/mask-shaped — several copies of `n_heads · chunk · elem_bytes` per token
+(5.2× that quantity on the 1B, 5.9× on the 70B) — i.e. `MATERIALIZES_SCORES = False` and the
+2026-08-15 removal of the S-linear activation term are both consequences of the blind spot, not
+findings about the hardware. **Do not re-fit anything until the measurement is fixed.**
 
-**If 8192 OOMs**, the residency/logits terms are wrong in the UNSAFE direction and the gate's ±10 %
-pass is hiding it — that is a real defect, not a tuning question. Record and fix before anything
-else.
+**Design spec:** `plans/2026-08-15-vram-peak-measurement-design.md` (approved for Phase 1:
+drop the in-loop reset, re-probe all four geometries, change no prediction). Two decisions
+taken with it: the fix is deleting the reset (no engine-side peak state), and `max_seq_len`
+is a derived DEFAULT, not a hard cap — so **8193 running to completion is CORRECT** and this
+row's original "must raise `VramPlanError`" expectation is retired as wrong, not filed as a
+bug. The ±10 % gate is EXPECTED to go red after Phase 1; do not tune the form to re-green it.
 
-**Why it was not done at the time:** the boundary safety was argued from the KV bucket arithmetic
-(`capacity(8192) = 8192`, so the transient is 2.745 GiB against a 3.50 GiB reserve) rather than
-measured. The arithmetic is probably right. Measure it anyway — this is the one number the whole
-module exists to produce.
+**Done means:** (a) peak measurement that survives the in-loop reset (measure inside the loop, or
+stop resetting and let the caller reset); (b) `MEASURED` re-probed on all four geometries with it;
+(c) the S-linear term restored and re-checked against the ±10 % gate; (d) `max_seq_len` re-derived
+— today's 1B value is ~1.5× past what fits; (e) an on-device arm at the newly derived limit for at
+least the 1B and the 70B, since that is what caught this.
+
+**Settled (2026-08-15):** `_assert_context_fits` admitting 8193 is not a defect — `max_seq_len` is
+a derived default, and admission belongs to the headroom predicate. The predicate's PREDICTION is
+the only thing wrong here.
+
+Raw logs (throwaway, session scratchpad): `arm_70b.log`, `arm_1b.log`, `slope_1b_gen.log`.
 
 ---
 

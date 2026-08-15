@@ -730,3 +730,27 @@ Not tasks. Each cost a full plan or probe to establish; re-measuring them is was
 - **`size == 0` is not the emptiness test for a layer — `not tensors` is.** `model.norm`
   legitimately measures 0.00 GB, so a byte-size check silently lumps a real layer in with an
   unloaded one.
+
+
+---
+
+## Context-limit verification (todo row 1, 2026-08-15) — RAN, FAILED
+
+
+Ran, on-device, one arm per subprocess under `systemd-run --user --scope -p MemoryMax=22G/28G
+-p MemorySwapMax=0`:
+
+| arm | expected | measured |
+|---|---|---|
+| Llama-3.3-70B, total == 8192 | completes | **PASS** — prefill peak 9.39 GB, no OOM |
+| Llama-3.3-70B, total == 8193 | `VramPlanError` | **FAIL** — no exception, request ran to completion |
+| Llama-3.2-1B, total == 106987 | completes | **FAIL** — CUDA OOM at ~70,656 tokens (34 % short) |
+
+So the dangerous point (8192, the KV doubling cliff) is safe, and the row's real finding is the
+one below: the cap is not a cap, and the 1B's limit is 1.5× past what fits. Both trace to a single
+measurement defect, now row 2.
+
+---
+
+
+The defect this exposed is now the scheduled row in `todo.md` (`predict_peak_vram` calibrated against a last-chunk peak).
