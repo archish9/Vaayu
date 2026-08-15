@@ -21,6 +21,18 @@ the standard measurement — observes **only the final chunk**, not the prefill.
 "±10 % gate, 0/26 outside, worst 7.3 %, zero fitted constants" result compares a
 last-chunk model against a last-chunk measurement. It is self-consistent and wrong.
 
+### Which forwards are affected (verified in source, 2026-08-15)
+
+The reset sits in `_chunked_prefill`'s **legacy per-chunk loop** (`vaayu_base.py:3315-3334`).
+The MoE **layer-major** branch above it (`is_moe` and attn in `flash_attention_2`/`sdpa` and
+no `output_attentions`/`output_hidden_states`) issues ONE forward with the chunks as batch
+elements and RETURNS before that loop, so it never resets.
+
+Therefore the blind spot is **dense-only**: Llama-3.3-70B and Llama-3.2-1B points in
+`MEASURED` are truncated; Qwen3-235B and MiniMax-M2.7 points were measured through a
+single forward and are genuine. Expect only the two dense geometries to move when
+re-probed — and re-probe all four anyway, because that expectation is itself a model.
+
 ### Evidence (measured 2026-08-15, this box)
 
 Llama-3.2-1B at S=32768, one run, three readings of the same quantity:
