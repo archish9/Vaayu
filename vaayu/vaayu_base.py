@@ -2413,7 +2413,8 @@ class VaayuBaseModel(GenerationMixin):
             return
         import dataclasses
 
-        from .vram_plan import VramPlanError, _too_big_message, predict_peak_vram
+        from .vram_plan import (VramPlanError, _too_big_message,
+                                 admission_headroom, predict_peak_vram)
         shape = dataclasses.replace(shape, N=int(N))
         try:
             free_vram, _ = torch.cuda.mem_get_info()
@@ -2427,8 +2428,16 @@ class VaayuBaseModel(GenerationMixin):
         # Adding resident back in would double-count it and pretend the
         # pinned weights/expert cache are not resident, inflating the
         # admitted budget by exactly that amount.
+        #
+        # ...but free_vram is not the budget either when a VRAM expert cache
+        # exists: it is entitled to everything above the reserve and fills
+        # LAZILY, during the very prefill being admitted. See
+        # admission_headroom.
+        headroom = admission_headroom(
+            free_vram=free_vram, plan=plan,
+            expert_cache_active=getattr(self, "_expert_vram_cache", None) is not None)
         need = predict_peak_vram(shape, int(n_tokens))
-        if need > free_vram:
+        if need > headroom:
             # The floor the load-time plan actually reserved one of (an expert,
             # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
             # prints "min_resident=0.00 GiB" even though one expert is resident.
@@ -2437,7 +2446,7 @@ class VaayuBaseModel(GenerationMixin):
             raise VramPlanError(_too_big_message(
                 requested=int(n_tokens), s_max=plan.s_max,
                 free_vram=free_vram, shape=shape,
-                min_resident=_min_resident))
+                min_resident=_min_resident, headroom=headroom))
 
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling

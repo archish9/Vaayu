@@ -326,8 +326,11 @@ def test_predict_peak_vram_is_not_globally_monotone_across_a_chunk_boundary():
     assert predict_peak_vram(sh, boundary) > predict_peak_vram(sh, boundary + 1)
 
 
+from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
 from vaayu.vram_plan import (
     VramPlan,
+    _too_big_message,
+    admission_headroom,
     expert_vram_budget_for,
     plan_vram,
     solve_max_seq_len,
@@ -622,35 +625,133 @@ def test_batch_width_is_rechecked_against_the_plan():
     assert predict_peak_vram(wide, p.max_seq_len) > USABLE_VRAM
 
 
-@pytest.mark.xfail(reason="uncalibrated model under-predicts at N>1 (see docstring)",
-                   strict=False)
-def test_batch_width_at_the_real_reserve_floor_xfails():
+# --- admission headroom ------------------------------------------------
+#
+# Measured 2026-08-15 (scripts/fit_vram_calibration.py, four probe arms): the
+# expert VRAM cache is entitled to `free_vram_now - reserve_bytes` by
+# expert_vram_budget_for, and it fills LAZILY during prefill. So a request
+# admitted against raw live free VRAM on a COLD cache is admitted against
+# headroom the cache is about to take. Free VRAM right after MiniMax loads,
+# before any prefill has warmed the cache.
+FREE_VRAM_COLD_CACHE = int(14.21 * 1e9)
+
+
+def test_headroom_is_capped_by_the_reserve_when_an_expert_cache_is_active():
+    """The bug: on a cold cache free VRAM reads far larger than what a request
+    may actually spend, because expert_vram_budget_for has already promised
+    everything above the reserve to the expert VRAM cache."""
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert FREE_VRAM_COLD_CACHE > p.reserve_bytes, "premise: cache is still cold"
+    assert admission_headroom(free_vram=FREE_VRAM_COLD_CACHE, plan=p,
+                              expert_cache_active=True) == p.reserve_bytes
+
+
+def test_headroom_is_the_whole_free_vram_without_an_expert_cache():
+    """Dense models have no expert VRAM cache, so nothing else is entitled to
+    the headroom and clamping to the reserve would REFUSE contexts that fit."""
+    p = _plan("llama-70b", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert admission_headroom(free_vram=FREE_VRAM_COLD_CACHE, plan=p,
+                              expert_cache_active=False) == FREE_VRAM_COLD_CACHE
+
+
+def test_headroom_never_exceeds_the_vram_that_is_actually_free():
+    """Once the cache HAS filled, free VRAM is the binding limit, not the
+    reserve -- and other processes can take VRAM too."""
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    starved = p.reserve_bytes // 4
+    assert admission_headroom(free_vram=starved, plan=p,
+                              expert_cache_active=True) == starved
+
+
+def test_the_refusal_does_not_offer_s_max_as_a_fix_for_a_wide_batch():
+    """s_max is solved at N=1. Printing it unqualified while refusing an N=3
+    request tells the reader that length would fit, which is false -- the batch
+    width multiplies the request but not the reserve. Only the N=1 phrasing may
+    present s_max as the thing to lower to."""
+    kw = dict(requested=8192, s_max=32768, free_vram=FREE_VRAM_COLD_CACHE,
+              min_resident=EXPERT_BYTES)
+    wide = _too_big_message(shape=shape_for("minimax-m2.7", N=3), **kw)
+    assert "at a batch width of 1" in wide
+    single = _too_big_message(shape=shape_for("minimax-m2.7", N=1), **kw)
+    assert "at a batch width of 1" not in single
+
+
+def test_the_refusal_explains_why_the_budget_is_smaller_than_free_vram():
+    """D3's lesson: a diagnostic must not mislead. Refusing a 7.5 GiB request
+    with "does not fit in 14.21 GiB of free VRAM" reads as a contradiction and
+    sends the reader hunting for a leak. When the reserve is what bound the
+    request, the message has to say so AND still report the real free figure."""
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    msg = _too_big_message(requested=p.max_seq_len, s_max=p.s_max,
+                           free_vram=FREE_VRAM_COLD_CACHE,
+                           shape=shape_for("minimax-m2.7", N=3),
+                           min_resident=EXPERT_BYTES,
+                           headroom=p.reserve_bytes)
+    assert f"{p.reserve_bytes / GB:.2f} GiB" in msg, "must name the real budget"
+    assert f"{FREE_VRAM_COLD_CACHE / GB:.2f} GiB" in msg, "must not hide free VRAM"
+    assert "expert VRAM cache" in msg, "must name what took the difference"
+
+
+def test_the_refusal_is_unchanged_when_nothing_clamps_the_budget():
+    """Dense models pass no headroom, and their message must not grow a clause
+    about a cache they do not have."""
+    kw = dict(requested=99999, s_max=4096, free_vram=FREE_VRAM_COLD_CACHE,
+              shape=shape_for("llama-70b"), min_resident=0)
+    assert _too_big_message(**kw) == _too_big_message(**kw, headroom=None)
+
+
+def test_the_admission_predicate_charges_a_wide_batch_against_the_reserve():
+    """The pure helper above is only worth anything if _assert_context_fits
+    actually calls it. Exercises the REAL production method against a stand-in
+    holding just the attributes it reads, with a cold cache's free VRAM."""
+    import types
+    import torch
+    from vaayu.vaayu_base import VaayuBaseModel
+    from vaayu.vram_plan import VramPlanError
+
+    if not torch.cuda.is_available():
+        pytest.skip("_assert_context_fits returns early without CUDA")
+
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    model = types.SimpleNamespace(
+        _vram_plan=p, _vram_shape=shape_for("minimax-m2.7"),
+        _moe_geometry={"expert_bytes": EXPERT_BYTES},
+        _expert_vram_cache=object(),      # MoE: the cache owns the headroom
+    )
+    real_mem_get_info = torch.cuda.mem_get_info
+    torch.cuda.mem_get_info = lambda *a, **k: (FREE_VRAM_COLD_CACHE, FREE_VRAM_COLD_CACHE)
+    try:
+        # N=1 at the plan's own max_seq_len is what the reserve was sized for.
+        VaayuBaseModel._assert_context_fits(model, p.max_seq_len, N=1)
+        with pytest.raises(VramPlanError):
+            VaayuBaseModel._assert_context_fits(model, p.max_seq_len, N=3)
+        # Same request, dense model (no expert VRAM cache): nothing else is
+        # entitled to the headroom, so it must NOT be refused.
+        model._expert_vram_cache = None
+        VaayuBaseModel._assert_context_fits(model, p.max_seq_len, N=3)
+    finally:
+        torch.cuda.mem_get_info = real_mem_get_info
+
+
+def test_batch_width_at_the_real_reserve_floor_is_refused():
     """Prior ON-DEVICE measurement (Plan K) established that N>=2 at ~7700
-    tokens is infeasible on this box for both MoE models -- a real GPU OOM,
-    not a model prediction. This test checks that claim at the operating
-    point production actually uses: self._vram_plan.max_seq_len as built by
-    vaayu_base.py's __init__, which calls plan_vram with
-    reserve_floor=_VRAM_RESERVE_FLOOR_BYTES (3.5 GiB), not the
-    reserve_floor=0 default test_batch_width_is_rechecked_against_the_plan
-    above exercises.
+    tokens is infeasible on this box for both MoE models -- a real GPU OOM, not
+    a model prediction. This checks that claim at the operating point
+    production actually uses: max_seq_len as built by vaayu_base.py's __init__,
+    which passes reserve_floor=_VRAM_RESERVE_FLOOR_BYTES.
 
-    It currently does NOT hold: DEFAULT_ACT_COEFF/DEFAULT_ALLOC_FACTOR remain
-    the Task 3 placeholders (task-8-report.md), never calibrated past a
-    worst -28% UNDER-prediction, and that -28% bound was only ever validated
-    at N=1 -- extrapolating to N=2/3 is out of sample. At minimax-m2.7's real
-    floor-derived max_seq_len (8192 tokens), predict_peak_vram at N=3
-    currently comes out to ~9.5 GiB, comfortably under this box's 15.47 GiB,
-    even though real hardware cannot actually sustain it there. So this
-    xfails today -- `_assert_context_fits` can admit an N=3 batch at this
-    length that will not actually fit.
-
-    strict=False (report XPASS, not a suite failure) so that the day
-    calibration is fixed and this starts passing, the run says so loudly
-    instead of quietly landing as one-more-green-test: an XPASS here is the
-    signal that the underlying gap has finally closed."""
-    from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
+    This used to be a non-strict xfail blamed on uncalibrated constants. That
+    was a MISDIAGNOSIS, settled 2026-08-15: even an exact predict_peak_vram
+    returns ~7.5 GiB for N=3 here, which genuinely does fit a bare 15.47 GiB
+    card. The refusal cannot come from a bigger prediction -- it has to come
+    from the headroom, because the expert VRAM cache owns everything above the
+    reserve. Charging the request against the reserve is what makes the
+    prediction and the hardware agree."""
     import dataclasses
     sh = shape_for("minimax-m2.7")
     p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
-    wide = dataclasses.replace(sh, N=3)
-    assert predict_peak_vram(wide, p.max_seq_len) > USABLE_VRAM
+    headroom = admission_headroom(free_vram=FREE_VRAM_COLD_CACHE, plan=p,
+                                  expert_cache_active=True)
+    assert predict_peak_vram(dataclasses.replace(sh, N=1), p.max_seq_len) <= headroom, \
+        "N=1 at the plan's own max_seq_len must still be admitted"
+    assert predict_peak_vram(dataclasses.replace(sh, N=3), p.max_seq_len) > headroom

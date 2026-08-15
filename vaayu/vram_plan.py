@@ -383,21 +383,47 @@ def _largest_s_within_budget(shape: VramShape, budget: int) -> int:
 
 
 def _too_big_message(*, requested: int, s_max: int, free_vram: int,
-                     shape: VramShape, min_resident: int) -> str:
+                     shape: VramShape, min_resident: int,
+                     headroom: int | None = None) -> str:
     """Build the refusal text. Scalars only -- no tensor shapes, no attribute
-    walks. D3: a diagnostic that can raise re-creates the bug it explains."""
+    walks. D3: a diagnostic that can raise re-creates the bug it explains.
+
+    `headroom` (see admission_headroom) is what the request may actually spend.
+    When it is smaller than free_vram, saying only "does not fit in <free_vram>"
+    reads as a contradiction -- the predicted peak printed below it is visibly
+    smaller than the figure the text claims is available -- and sends the reader
+    hunting for a leak instead of at the expert VRAM cache. So name both.
+    """
     gb = 1024.0 ** 3
+    # s_max is solved at N=1 (see solve_max_seq_len). Offering it unqualified
+    # while refusing a wide batch would point the reader at a length that does
+    # not fit either: N multiplies the request but not the reserve.
+    ceiling = (f"max_seq_len={int(s_max)} at a batch width of 1"
+               if int(shape.N) > 1 else f"max_seq_len={int(s_max)}")
+    if headroom is not None and int(headroom) < int(free_vram):
+        opening = (
+            f"Context of {int(requested)} tokens does not fit in the "
+            f"{float(headroom) / gb:.2f} GiB this request may use. "
+            f"{float(free_vram) / gb:.2f} GiB is free, but the expert VRAM cache "
+            f"is entitled to everything above the reserve and fills during "
+            f"prefill, so only the reserve is actually available here. "
+            f"The largest context that fits at this configuration is "
+            f"{ceiling}.\n")
+    else:
+        opening = (
+            f"Context of {int(requested)} tokens does not fit in "
+            f"{float(free_vram) / gb:.2f} GiB of free VRAM. The largest context "
+            f"that fits at this configuration is {ceiling}.\n")
     return (
-        f"Context of {int(requested)} tokens does not fit in "
-        f"{float(free_vram) / gb:.2f} GiB of free VRAM. The largest context that "
-        f"fits at this configuration is max_seq_len={int(s_max)}.\n"
+        opening +
         f"  predicted peak at {int(requested)} tokens: "
         f"{predict_peak_vram(shape, int(requested)) / gb:.2f} GiB "
         f"(KV {_kv_term_bytes(shape, int(requested)) / gb:.2f} GiB, "
         f"batch width N={shape.N}, prefill_chunk_size={shape.chunk})\n"
         f"  floor that must stay resident beside it: {float(min_resident) / gb:.2f} GiB\n"
         f"Real levers, in the order they usually pay:\n"
-        f"  - shorten the context, or lower max_seq_len to {int(s_max)} or less\n"
+        f"  - shorten the context, or lower max_seq_len to {int(s_max)} or less"
+        f"{' (that ceiling assumes N=1)' if int(shape.N) > 1 else ''}\n"
         f"  - reduce prefill_chunk_size (currently {shape.chunk}) to shrink the "
         f"logits and score transients\n"
         f"  - reduce the batch width N (currently {shape.N})\n"
@@ -461,6 +487,41 @@ def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
               f"pinning budget={pinning / gb:.2f} GiB")
     return VramPlan(max_seq_len=chosen, reserve_bytes=reserve,
                     pinning_budget=pinning, s_max=s_max, reason=reason)
+
+
+def admission_headroom(*, free_vram: int, plan: VramPlan,
+                       expert_cache_active: bool) -> int:
+    """VRAM a single request may actually spend, in bytes.
+
+    NOT the same as free VRAM. `expert_vram_budget_for` hands the expert VRAM
+    cache everything above `plan.reserve_bytes`, and that cache fills LAZILY --
+    it grows during the very prefill being admitted. So on a COLD cache
+    `mem_get_info()` reports headroom that is already promised, and a request
+    admitted against it OOMs mid-prefill once the cache expands into the same
+    bytes. Measured 2026-08-15 (scripts/fit_vram_calibration.py): MiniMax reads
+    ~14.2 GB free right after load against a 3.5 GiB reserve.
+
+    The reserve is exactly the right budget to charge against, because
+    plan_vram sizes it as `max(predict_peak_vram(shape, max_seq_len),
+    reserve_floor)` -- one N=1 request at max_seq_len. A fan-out of N
+    multiplies the request but not the reserve, which is why N>=2 at long
+    context is refused here, matching Plan K's on-device result that N>=2 at
+    ~7700 tokens OOMs on this box for both MoE models.
+
+    Without an expert VRAM cache (every dense checkpoint) nothing else is
+    entitled to the headroom, so free VRAM stands unclamped -- clamping there
+    would refuse contexts that genuinely fit.
+
+    Deliberately NOT reclaim-aware. Plan K's once-per-batch reclaim can hand
+    some of the cache back (measured 1.22 GB Qwen / 2.09 GB MiniMax), but it
+    runs AFTER this check, and it ships default-off because it was refuted --
+    even reserve + reclaim stays under what N>=2 needs at long context, so
+    counting it here would admit batches that still OOM. If reclaim is ever
+    moved ahead of admission, this is the function that has to learn about it.
+    """
+    if not expert_cache_active:
+        return int(free_vram)
+    return min(int(free_vram), int(plan.reserve_bytes))
 
 
 def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:

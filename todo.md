@@ -50,7 +50,7 @@ constants and decimal `MB_DEC`/`GB_DEC` for these — use the right family.)
 | **1** | ~~Close the `predict_peak_vram` calibration gate~~ | **REFUTED 2026-08-15** | done, ~1 h GPU | The form is wrong, not the constants. Verdict below; the successor work is item 6. |
 | **2** | F1 — RAM budget arbitration | `[!]` | ~1 h measure, then decide | Blocked on its own premise; expected outcome is "close as obsolete". |
 | **3** | Hygiene backlog H1–H7 | `[ ]` | minutes–1 h each | Nothing blocks anything; good filler. |
-| **4** | N≥2 admission gap (xfail pinned) | `[ ]` | — | **Downstream of #1.** Do not chase separately. |
+| **4** | ~~N≥2 admission gap~~ | **FIXED 2026-08-15** | done | Root cause was the expert cache owning the headroom, not calibration. |
 | **5** | Fused-EXL3 expert GEMM nondeterminism | `[bug]` | likely third-party kernel | Open bug; cheap first probe defined below. |
 | **6** | Fused-EXL3 prefill peak: ~1.39 G unmodelled residency | `[ ]` | needs a form change | **CONFIRMED 2026-08-15** and localised to one forward. Now the live VRAM item. |
 | **7** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
@@ -122,10 +122,8 @@ term, keep `alloc_factor` at ~1.0, and add an expert-staging residency term for 
 forward derived from `_moe_geometry` (never a literal, CLAUDE.md §5). **That is a design change to
 `predict_peak_vram`, not a calibration, so it needs its own approval before anyone writes it.**
 
-**Item 4 stays parked and is NOT closed by this.** The xfail
-`test_batch_width_at_the_real_reserve_floor_xfails` will not flip, because the model still
-under-predicts the fused-EXL3 forward by ~1.1 GB at N=1 — the admit-too-much direction, and the
-error grows with N.
+**Item 4 was closed separately on 2026-08-15** — not by calibration, which could never have done
+it, but by charging the request against the reserve. See item 4.
 
 ### What is wrong
 
@@ -368,29 +366,52 @@ lands in a doc is not a deliverable.
 
 ---
 
-# 4 · [ ] `_assert_context_fits` can still ADMIT a batch that then OOMs
+# 4 · [x] `_assert_context_fits` could ADMIT a batch that then OOMs — FIXED 2026-08-15
 
-**DOWNSTREAM OF ITEM 1 — do not chase separately.** Fixing calibration is what closes it.
+**The earlier diagnosis in this file was wrong, and so was the xfail's reason string.** This was
+never a calibration gap. Even an exact `predict_peak_vram` returns ~7.5 GiB for MiniMax at N=3,
+S=8192 — which genuinely fits a bare 15.47 GiB card. A bigger prediction could never have produced
+the refusal.
 
-`predict_peak_vram`'s −28 % worst-case error was only ever validated at N=1. At MiniMax-M2.7's
-REAL floor-derived operating point (`max_seq_len=8192`, `reserve_floor=_VRAM_RESERVE_FLOOR_BYTES`)
-the model predicts **N=3 FITS** (9.55 GiB < 15.47 GiB usable) — directly contradicting Plan K's
-real GPU measurement that N≥2 at ~7700 tokens is infeasible on this box for both MoE models. The
-refusal predicate correctly catches the extreme, obviously-oversized case (F4 Task 10 Gate 3); it
-does NOT yet catch a moderately-oversized batch width at the real operating context.
+**Real cause:** `expert_vram_budget_for(plan, free_vram_now)` = `free_vram_now − plan.reserve_bytes`,
+so the expert VRAM cache is entitled to *everything above the reserve* — and it fills **lazily,
+during the very prefill being admitted**. `_assert_context_fits` compared against live
+`mem_get_info()`, so the answer depended on cache warmth:
 
-Pinned by a committed, non-strict `xfail`:
-`tests/test_vram_plan.py::test_batch_width_at_the_real_reserve_floor_xfails` — it **XPASSes the
-moment calibration is fixed**, so this is a visible signal, not a silent gap.
+| cache state | free VRAM seen | N=3 need (MiniMax, S=8192) | outcome |
+|---|---|---|---|
+| warm | ≈ reserve, 3.5 GiB | 7.67 GiB | refused — correct |
+| **cold** | ≈ 13 GiB | 7.67 GiB | **admitted** → cache expands into the same bytes → OOM |
 
-Also: `test_batch_width_is_rechecked_against_the_plan` passes only because its own `_plan()` helper
-omits `reserve_floor`, leaving `s_max` unclamped at 32768 — an operating point production never
-reaches; that test's premise does not exercise the real admission path.
+**Fix:** new pure `admission_headroom(free_vram, plan, expert_cache_active)` in `vaayu/vram_plan.py`
+returns `min(free_vram, plan.reserve_bytes)` when a VRAM expert cache exists, and `free_vram`
+untouched otherwise (dense checkpoints have no such cache — clamping there would refuse contexts
+that fit). The reserve is exactly the right budget: `plan_vram` sizes it as
+`max(predict_peak_vram(shape, max_seq_len), reserve_floor)`, i.e. one N=1 request at
+`max_seq_len`. A fan-out of N multiplies the request but not the reserve, so N≥2 at long context is
+refused — matching Plan K's on-device result.
 
-**If item 1's re-fit fails and gets parked, this gap is parked with it** — known and bounded, not
-silent. (2026-08-14, F4 Task 8 review + Task 10 gate 3)
+`_too_big_message` gained an optional `headroom` so the refusal does not read as a contradiction
+(D3's lesson): it now names the budget, the real free figure, and the expert cache as what took the
+difference. Dense refusals are byte-identical to before, pinned by a test. It also stops offering
+`s_max` unqualified at N>1 — `solve_max_seq_len` solves it at N=1, so printing it bare while
+refusing a wide batch pointed the reader at a length that does not fit either.
 
----
+**Deliberately NOT reclaim-aware** — Plan K's reclaim runs *after* this check and ships default-off
+because it was refuted; even reserve + reclaim (1.22 GB Qwen / 2.09 GB MiniMax) stays under what
+N≥2 needs. Recorded in the function's docstring: if reclaim ever moves ahead of admission, that is
+the function that must learn about it.
+
+**What this buys:** a clean `VramPlanError` instead of a mid-prefill CUDA OOM. It does **not**
+unlock N≥2 — that remains a hardware wall on this box.
+
+Tests: `test_headroom_is_capped_by_the_reserve_when_an_expert_cache_is_active`,
+`test_headroom_is_the_whole_free_vram_without_an_expert_cache`,
+`test_headroom_never_exceeds_the_vram_that_is_actually_free`,
+`test_batch_width_at_the_real_reserve_floor_is_refused` (was a non-strict xfail; now a real test
+with the correct premise), `test_the_admission_predicate_charges_a_wide_batch_against_the_reserve`
+(drives the real `VaayuBaseModel._assert_context_fits`), plus two on message honesty.
+Suite: **803 passed / 2 skipped / 0 xfailed** (was 795 / 2 / 1).
 
 # 5 · [bug] The fused-EXL3 expert GEMM is still nondeterministic after the fp32 accumulator fix
 
