@@ -93,6 +93,7 @@ pending-only._
 | **7** | Phase 2 — re-decide `MATERIALIZES_SCORES` on corrected data | `[x]` | closed 2026-08-15, in row 6's change | Done in row 6's change: `MATERIALIZES_SCORES` bool → `SCORE_ELEM_BYTES` per-kernel dict (flash 0.0, sdpa 10.9 B/elem, unmeasured kernels take the largest measured value), read off `model._active_attn_impl` at load. |
 | **8** | Phase 2 — budget policy: reserve vs expert-cache tradeoff | `[ ]` | user decision | Unblocked 2026-08-15 (row 10 closed). Decide once 6/7 land: if the sdpa-calibrated form says today's derived contexts exceed the reserve, choose explicitly between growing the reserve (at the expert cache's expense) and accepting shorter derived contexts. |
 | **6a** | The intercept residual row 6 could not explain | `[ ]` | GPU round | Opened 2026-08-15 out of row 6. One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
+| **11** | `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever | `[ ]` | prefill A/B, GPU | Opened 2026-08-15. The sdpa score term is `N·n_heads·**chunk**·C·S`, so halving `prefill_chunk_size` halves it — buying context for free, no reserve fight. Derived, not measured: 1B sdpa 14,052 → 25,408 → 40,910 at chunk 512/256/128. Cost unmeasured and probably per-forward: MoE re-stages experts per chunk. |
 | **9** | Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm | `[ ]` | GPU | Unblocked 2026-08-15. Re-derive against the sdpa form (rows 6/7), not flash — row 10 directly demonstrated the stakes: on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB) while sdpa OOMs at that same S, same box, same cap. A flash-calibrated ceiling would admit contexts `batched_generate` cannot actually serve. |
 
 ---
@@ -299,6 +300,53 @@ silently.
 **File:** wherever `plan_vram`/`solve_max_seq_len`'s reserve floor is set (`vaayu/vram_plan.py`).
 
 **Done means:** an explicit, written choice with the tradeoff numbers beside it.
+
+---
+
+# 11 · [ ] `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever
+
+Opened 2026-08-15, falling out of rows 6/7. Not scheduled, not measured — recorded so the
+arithmetic does not have to be re-derived.
+
+**The claim.** The sdpa score term this repo now charges is `N · n_heads · **chunk** · C · S`
+(`SCORE_ELEM_BYTES`, `vaayu/vram_plan.py`). `chunk` is `prefill_chunk_size` — OUR knob, not the
+model's. Halving it halves the term, which buys admissible context at the SAME reserve, with no
+expert-cache tradeoff (row 8) and no extra VRAM.
+
+**Derived (NOT measured) admissible S at the 3.50 GiB reserve floor**, via
+`solve_max_seq_len(free_vram=3.50 GiB, min_resident=0)` on each checkpoint's own shape — a
+simplification of the load-time call, so treat these as ratios, not as ceilings to ship:
+
+| geometry | kernel | chunk=512 (today) | chunk=256 | chunk=128 |
+|---|---|---|---|---|
+| llama-3.2-1b | sdpa | 14,052 | 25,408 | 40,910 |
+| llama-3.3-70b | sdpa | 3,821 | 4,096* | 4,096* |
+| qwen3-235b | sdpa | 4,074 | 4,096* | 7,467 |
+| minimax-m2.7 | sdpa | 4,096* | 7,551 | 8,192* |
+| all four | flash_attention_2 | at their caps already | unchanged | unchanged |
+
+`*` = pinned by a KV-bucket/position cap, not by the score term, so the lever is invisible there.
+**The headline: at chunk=128 MiniMax-M2.7 gets its full shipped 8192 back under sdpa, and Qwen
+reaches 7,467 of 8192** — i.e. this lever alone could close most of the gap rows 6/7 opened in the
+batched path, without spending a byte of the expert cache.
+
+**Why it is NOT free, and why this is a row rather than a change.** More chunks = more per-chunk
+work, and that cost is per-forward, not global:
+
+- **fused-EXL3 MoE (Qwen)** — the forward re-stages routed experts per chunk
+  (`_chunk_major_gpu`, the measured 1.514 GB residency term). Halving `chunk` roughly doubles that
+  traffic. This is the geometry the lever helps most AND likely costs most: it must be A/B'd, not
+  assumed.
+- **streamed dense (Llama-3.3-70B)** — weights stream per layer per chunk; prefill is already
+  disk-bandwidth-bound (~5.5 GB/s, `moe_perf_rootcause`), so smaller chunks may cost little or may
+  cost a full re-read. Unknown.
+- **small dense (Llama-3.2-1B)** — nothing streams; probably close to free, and it is where the
+  derived gain is largest (2.9x at chunk=128).
+
+**Done means:** a same-box, same-day prefill-throughput A/B at chunk 512/256/128 on at least one
+MoE and one dense geometry, with TTFT and tok/s beside the admissible-S figures — then either a
+per-forward default, or a written refutation. **Stop rule:** if TTFT regresses more than the
+context gain is worth on the fan-out workload (CLAUDE.md §0), say so and close the row.
 
 ---
 
