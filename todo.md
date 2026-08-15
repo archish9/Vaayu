@@ -190,12 +190,12 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 # 10 · [bug] Calibration data is `flash_attention_2`; the batched-decode path requires `sdpa`
 
 **Found during item 1's re-probe (2026-08-15), not part of the original Phase 2 scope. Blocks
-items 6, 7, and 9 — resolve this first.**
+items 6, 7, 8, and 9 — resolve this first.**
 
 `scripts/probe_vram_curve.py` calls `AutoModel.from_pretrained` with no `attn_implementation`
 argument, so Vaayu's own candidate order (`vaayu_base.py:2254-2298`) applies: `flash_attention_2`
 first. Confirmed from every one of this task's four arm logs
-(`grep -a "Attention implementation" /tmp/vramcurve_*.log` → `flash_attention_2` on all four,
+(`grep -a "Attention implementation" /tmp/vramcurve/vramcurve_*.log` → `flash_attention_2` on all four,
 dense and MoE alike). The OLD `MEASURED` table in `scripts/fit_vram_calibration.py` was collected
 the same way (same script, same default), so it describes the same kernel.
 
@@ -243,7 +243,10 @@ Whether that holds for sdpa (item 10) is unknown.
 clusters tightly by trailing-chunk length (`_trailing_chunk_tokens`), the same quantity
 `predict_peak_vram`'s own sawtooth intercept already keys on. On Llama-3.2-1B: ~0.539 G residual at
 a full (512-token) trailing chunk vs ~0.792 G at a 1-token trailing chunk (1.47×); Llama-3.3-70B
-shows the same direction more weakly (~0.641 G vs ~0.716 G, 1.12×). Two hypotheses, NEITHER ruled
+shows the same direction more weakly (~0.641 G vs ~0.716 G, 1.12×). Both cluster means exclude each
+dense geometry's first sweep pair (S=512 and S=513 -- TWO points, not one, and unrelated to §4's
+noise flag, which §4 correctly says the dense geometries do not have); folding those two back in
+barely moves it (1B: 1.43× vs 1.47×) -- the clustering does not depend on the exclusion. Two hypotheses, NEITHER ruled
 out by the RESULTS.md data: (a) a fixed unmodelled residency term (shape-like Qwen3-235B's
 `resident_expert_bytes`) that happens to correlate with trailing-chunk phase for a separate reason,
 or (b) the existing sawtooth intercept term itself is under-sized specifically at short trailing

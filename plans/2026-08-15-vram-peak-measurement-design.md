@@ -35,6 +35,13 @@ re-probed — and re-probe all four anyway, because that expectation is itself a
 
 ### Evidence (measured 2026-08-15, this box)
 
+> **Annotation, not a rewrite:** the "True prefill-peak slope" table below and the 1B "OOMs at
+> ~70,656" claim are both sdpa-path readings (§2 of this doc's own follow-up,
+> `plans/2026-08-15-vram-peak-RESULTS.md`). This task's later flash_attention_2 re-probe found NO
+> OOM anywhere through Llama-3.2-1B's full derived `max_seq_len=106987`, and the 1.91-1.80×
+> flash-vs-sdpa gap `RESULTS.md` §2 measures directly accounts for the slope disagreement. See
+> `RESULTS.md` §2 before treating either number here as current.
+
 Llama-3.2-1B at S=32768, one run, three readings of the same quantity:
 
 | reading | value |

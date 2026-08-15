@@ -28,13 +28,15 @@ table at the data below, and re-deciding the form, is Phase 2 — not done here.
   SECOND load of each checkpoint (warm page cache), so "discard first touch, keep second" is
   satisfied; it's just folded into the geometry-discovery step instead of a wasted identical-sweep
   repeat.
-- Sweep: for the two arms whose derived `s_max` was large (Llama-3.2-1B: 106987), the full
-  `sweep_points(chunk=512, growth=2, s_max=...)` list was generated and trimmed to 8 points,
-  keeping a chunk-boundary pair, the largest S the arm could attempt, and a point at the previously
-  reported OOM boundary (~70,656). For the three arms whose derived `s_max` was exactly 8192
-  (Llama-3.3-70B, Qwen3-235B, MiniMax-M2.7), the full sweep was already only 9 points
-  (`512 513 1024 1025 2048 2049 4096 4097 8192`); one redundant point (`1025`) was dropped to fit
-  the ~8-point budget, keeping both `2048/2049` and `4096/4097` as chunk-boundary pairs.
+- Sweep: for the arm whose derived `s_max` was large (Llama-3.2-1B: 106987),
+  `sweep_points(chunk=512, growth=2, s_max=106987)` returns 17 points; this arm's table (§3) keeps
+  8 of them (`512 513 4096 4097 16384 32768 65537 106987`) plus `70656`, which is NOT one of the 17
+  -- it was added by hand, on top of the trimmed sweep, specifically to re-test the previously
+  reported OOM boundary (~70,656). The resulting table has 9 rows, not 8. For the three arms whose
+  derived `s_max` was exactly 8192 (Llama-3.3-70B, Qwen3-235B, MiniMax-M2.7), the full sweep was
+  already only 9 points (`512 513 1024 1025 2048 2049 4096 4097 8192`); one redundant point
+  (`1025`) was dropped to fit the ~8-point budget, keeping both `2048/2049` and `4096/4097` as
+  chunk-boundary pairs.
 
 ## ⚠️ 2. Attention implementation: this data is flash_attention_2, not sdpa
 
@@ -76,13 +78,18 @@ empty_cache+reset_peak_memory_stats bracketing as the probe):
 
 Ratio 1.91×, in the same direction and the same rough magnitude as the coordinator's own
 independent hand measurement (sdpa-forced Llama-3.3-70B at S=8192: ~6.5 GB, vs this task's
-flash_attention_2 reading of 3.61 GB at the same S — ratio 1.80×). **This also resolves §4's
-"disagreement with earlier hand-measured slopes" finding below**: those earlier slopes
-(0.2027 MB/tok on the 1B, 0.7149 MB/tok on the 70B, recorded in
+flash_attention_2 reading of 3.61 GB at the same S — ratio 1.80×). **This plausibly explains §4's
+"disagreement with earlier hand-measured slopes" finding below, but is hedged, not settled**: those
+earlier slopes (0.2027 MB/tok on the 1B, 0.7149 MB/tok on the 70B, recorded in
 `plans/2026-08-15-vram-peak-measurement-design.md` and `todo.md`'s item 1) were read from the
 in-loop chunk-log print *during a run that forced sdpa* — an entirely different, and apparently
 much more memory-hungry, kernel than the one this task's arms (and the OLD `MEASURED` table)
-describe. The earlier figures are not wrong; they are answering a different question.
+describe. The earlier figures are not wrong; they are answering a different question. **The hedge:**
+the 1.91×/1.80× ratios above are a single measurement at S=8192. Explaining the 1B's full
+6.2× discrepancy (measured up to S=32768/70656, §4) with a flash-vs-sdpa gap alone needs that gap
+to be roughly **~3.7× by S=32768**, not 1.91× — plausible if the flash-vs-sdpa gap widens with S
+(sdpa's masked call has no chunking analogue, flash's does), but that S-dependence was not
+measured here. Treat "resolved" as "the same-direction, plausible explanation," not a closed case.
 
 **Consequence for Phase 2:** every number in this document, and every number already in
 `fit_vram_calibration.py`'s `MEASURED` table, describes `flash_attention_2`'s footprint, not
@@ -95,7 +102,8 @@ implementation" scope.
 
 ## 3. Raw data: `(S, alloc_before, alloc_peak, status)` per geometry
 
-All eight points per arm ran to `status=ok` — **no OOM was observed in any arm**, including the
+Every point in every arm (8 for the three 8192-ceiling geometries, 9 for Llama-3.2-1B, see §1) ran
+to `status=ok` — **no OOM was observed in any arm**, including the
 Llama-3.2-1B point at S=70,656, previously reported (via the in-loop chunk log, i.e. also
 sdpa-measured, see §2) as an OOM boundary, and the point at S=106,987 (the honest, derived
 `max_seq_len` itself). See §4's third block for the direct discussion of why that expected OOM did
@@ -306,15 +314,41 @@ same S (§2 explains why: that figure was sdpa, this is flash_attention_2).
 **Moved, but not comparable point-for-point**, and not simply "up": the closest overlap (old
 S=8200: 5.3728 G; new S=8192: 3.6122 G) shows a *decrease*. Two confounds, not one:
 
-1. **Different derived `max_seq_len`.** This task's geometry probe measured
-   `model.max_seq_len == 8192` under the 28G cap this task used. The old table has points up to
-   S=16384 — i.e. it was collected when the derived ceiling was higher (a different cgroup cap, or
-   the box's free VRAM/host RAM state at the time, produced a different `solve_max_seq_len`
-   result). That is orthogonal to Task 1's fix.
-2. **The reset bug's own truncation on the old data**, in the OPPOSITE direction of what makes
+1. **The old table's ceiling was never *derived* — it was passed explicitly.** The pre-branch probe
+   called `AutoModel.from_pretrained(ckpt, device="cuda:0", max_seq_len=max(lengths))`
+   (`git show f9e5fbe:scripts/probe_vram_curve.py:36`) — literally the line this branch replaced
+   with `max_seq_len=None` (`scripts/probe_vram_curve.py:89-90`), which is what lets
+   `solve_max_seq_len` derive the real ceiling instead of taking a caller-supplied one. So the old
+   table's S=16384 point says nothing about what this box's cgroup cap or free-VRAM state would
+   have derived; it says only that the old script was told to try S=16384 and did. There is no
+   cgroup-cap or host-RAM-state confound to invoke here — the two runs simply didn't ask the same
+   question.
+2. **The apparent decrease needs no confound at all — it is the KV-capacity-doubling boundary
+   `predict_peak_vram` already models, the same argument §5 uses below for Qwen3-235B.**
+   `kv_capacity_tokens` returns 8192 tokens of allocated KV capacity at S=8192 and 16384 at S=8200
+   (a full doubling, 8 tokens apart), and `predict_peak_vram` steps from 2.947 G to 5.373 G across
+   that exact boundary for this geometry:
+
+   ```
+   $ ./venv/bin/python -c "
+   import sys; sys.path.insert(0, 'scripts')
+   from fit_vram_calibration import shape_for, GB
+   from vaayu.vram_plan import predict_peak_vram, kv_capacity_tokens
+   shape = shape_for('llama-3.3-70b')
+   for s in (8192, 8200):
+       print(s, kv_capacity_tokens(s, chunk=shape.chunk, growth=2, buckets=shape.kv_capacity_buckets),
+             predict_peak_vram(shape, s) / GB)"
+   8192 8192 2.947022848
+   8200 16384 5.372813312
+   ```
+
+   So the "decrease" from old S=8200 (5.3728 G) to new S=8192 (3.6122 G) is comparing a point just
+   past the doubling to one just before it — the modelled term itself predicts new-S=8200 should be
+   noticeably higher than new-S=8192, not that the two nearby S values should read the same.
+3. **The reset bug's own truncation on the old data**, in the OPPOSITE direction of what makes
    naive "old vs new" comparison safe: since the old table already reads too LOW (truncated to the
    last chunk), the honest number should be higher at the SAME S, not lower — so an apparent
-   decrease at nearby S must be explained by (1), not by the fix doing something unexpected.
+   decrease at nearby S must be explained by (1)-(2), not by the fix doing something unexpected.
 
 Given confound (1), this pair does not cleanly test "did the number move" the way the 1B's exact
 S=32768 overlap does. What is clean: every new-table point here was measured with the reset
@@ -439,7 +473,8 @@ not the sdpa path `batched_generate` actually uses.
 
 Once the reset is honestly gone, `KV(at capacity) + max(last-chunk logits, resident experts)` is
 much closer to right than the pre-fix "6.2×/2.2× off" framing suggested — but that framing itself
-turns out to describe a different attention kernel (sdpa, §2), not a bigger form error. Under the
+plausibly (§2's hedge: measured at one S, not the S the discrepancy needs) describes a different
+attention kernel (sdpa, §2), not a bigger form error. Under the
 kernel this task's arms and the *existing* `MEASURED` table both actually run
 (`flash_attention_2`), the fitted slope on every one of the four geometries lands within roughly
 **1.0-1.14×** of the modelled KV term, once §4's sensitivity check excludes the two points §3
@@ -452,10 +487,11 @@ earlier sdpa-based hand measurements implied.
 
 **What the residual actually tracks.** The two dense geometries under-predict throughout their
 sweep, but the gap is not the flat, S-independent offset an initial read of the tables suggests —
-computing `transient − predicted` per point (excluding each geometry's flagged first-sweep point)
-and grouping by **trailing-chunk length** (`_trailing_chunk_tokens`, the same quantity
-`predict_peak_vram`'s own sawtooth intercept term already keys on) shows two tight, phase-locked
-clusters instead of one flat band:
+computing `transient − predicted` per point, EXCLUDING each dense geometry's first sweep pair
+(S=512 and S=513 — TWO points, not one; unrelated to §4's noise flag, which §4 correctly says the
+dense geometries do not have) and grouping by **trailing-chunk length** (`_trailing_chunk_tokens`,
+the same quantity `predict_peak_vram`'s own sawtooth intercept term already keys on) shows two
+tight, phase-locked clusters instead of one flat band:
 
 | geometry | FULL trailing chunk (S a multiple of 512) | 1-token trailing chunk (S = multiple+1) | ratio |
 |---|---|---|---|
@@ -464,6 +500,13 @@ clusters instead of one flat band:
 
 (Llama-3.2-1B's S=106987 has a 491-token trailing chunk, neither bucket; its residual, 0.524 G,
 sits with the FULL cluster rather than the 1-token one, consistent with the pattern.)
+
+**The conclusion is insensitive to this exclusion.** Folding S=512 (FULL bucket) and S=513
+(1-token bucket) back in barely moves either ratio: 1B residuals are 0.3037 G at S=512 and 0.5290 G
+at S=513, both close to their bucket's existing mean, giving FULL mean 0.492 G / 1-token mean
+0.704 G / ratio **1.43×** (vs. the reported 1.47×). Same direction and same order of magnitude
+either way; the phase-locking this section argues for does not depend on dropping these two
+points.
 
 A ~47% swing on the 1B, ~12% on the 70B, both in the same direction (1-token trailing chunk
 residual HIGHER than full-trailing-chunk residual) and both phase-locked to the SAME S-mod-chunk

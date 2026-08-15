@@ -53,6 +53,58 @@ def test_sweep_straddles_a_kv_capacity_doubling(chunk, growth, s_max):
     assert len(caps) >= 2
 
 
+def _chunk_boundary_points(chunk: int, s_max: int) -> set[int]:
+    """Mirror of sweep_points' chunk-boundary loop, standalone so the test
+    below can compute what THAT loop alone would emit."""
+    pts: set[int] = set()
+    k = 1
+    while k * chunk <= s_max:
+        pts.add(k * chunk)
+        if k * chunk + 1 <= s_max:
+            pts.add(k * chunk + 1)
+        k *= 2
+    return pts
+
+
+def _kv_boundary_points(chunk: int, growth: int, s_max: int) -> set[int]:
+    """Mirror of sweep_points' KV-doubling loop, standalone so the test below
+    can compute what THAT loop alone would emit."""
+    from vaayu.vram_plan import kv_capacity_tokens
+    pts: set[int] = set()
+    s = chunk
+    while s <= s_max:
+        cap = kv_capacity_tokens(s, chunk=chunk, growth=growth, buckets=True)
+        if cap < s_max:
+            pts.add(min(cap, s_max))
+            pts.add(min(cap + 1, s_max))
+        s = max(s + 1, cap + 1)
+    return pts
+
+
+def test_sweep_hits_points_only_one_loop_can_produce():
+    """I1: the two straddle tests above are mutually satisfiable -- either
+    of sweep_points' two loops alone straddles both a chunk boundary and a
+    KV-capacity doubling for every parametrization above, so deleting either
+    loop still ships green there. Pin points that only ONE loop's own,
+    independently-derived set contains, so dropping that loop is caught.
+
+    chunk=256/growth=3/s_max=20000 is used (rather than the parametrizations
+    above) because with growth=2 the KV-doubling sequence chunk*2^n coincides
+    with the chunk-boundary sequence chunk*2^n -- growth=3 is required for
+    the two loops to diverge at all.
+    """
+    chunk, growth, s_max = 256, 3, 20000
+    pts = set(probe.sweep_points(chunk=chunk, growth=growth, s_max=s_max))
+    chunk_pts = _chunk_boundary_points(chunk, s_max)
+    kv_pts = _kv_boundary_points(chunk, growth, s_max)
+    chunk_only = chunk_pts - kv_pts
+    kv_only = kv_pts - chunk_pts
+    assert chunk_only, "test parameters must yield a chunk-exclusive point"
+    assert kv_only, "test parameters must yield a KV-exclusive point"
+    assert chunk_only & pts, "chunk-boundary loop's own points are missing"
+    assert kv_only & pts, "KV-doubling loop's own points are missing"
+
+
 def test_sweep_degenerates_gracefully_when_the_ceiling_is_tiny():
     """A ceiling below one chunk still yields a usable, in-range sweep."""
     pts = probe.sweep_points(chunk=512, growth=2, s_max=300)
