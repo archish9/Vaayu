@@ -3329,9 +3329,19 @@ class VaayuBaseModel(GenerationMixin):
             past_key_values = output.past_key_values
 
             if torch.cuda.is_available():
+                # RUNNING high-water mark across the whole prefill, not this
+                # chunk's own peak: max_memory_allocated() is one PROCESS-GLOBAL
+                # counter, and it is deliberately NOT cleared here. Clearing
+                # it per chunk truncated every external measurement of a
+                # chunked prefill to its final chunk -- which is how every dense point in
+                # scripts/fit_vram_calibration.py's MEASURED table came to be a
+                # last-chunk peak (llama-3.2-1b at S=32768: 2.409 GB recorded,
+                # 8.13 GB actual). The counter belongs to whoever called
+                # torch's peak-stats reset last; the engine must not touch
+                # it. (Naming that function literally here would trip the
+                # package-wide scan in tests/test_vram_peak_measurement.py.)
                 peak = torch.cuda.max_memory_allocated() / 1e9
                 print(f"[Vaayu] Chunk [{start}:{end}] done — peak VRAM: {peak:.2f} GB")
-                torch.cuda.reset_peak_memory_stats()
 
         if not return_dict:
             return tuple(v for v in [
