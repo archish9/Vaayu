@@ -36,7 +36,22 @@ def sweep_points(*, chunk: int, growth: int, s_max: int) -> list[int]:
     growth are properties of the prefill loop and the KV cache implementation,
     s_max of the box's free VRAM. No model number appears here.
     """
-    from vaayu.vram_plan import kv_capacity_tokens
+    from vaayu.vram_plan import VramPlanError, kv_capacity_tokens
+
+    if chunk <= 0:
+        raise VramPlanError(
+            f"sweep_points requires chunk > 0 (got {chunk}). chunk=0 is the "
+            f"documented sentinel for 'no chunking' (vaayu_base.py's "
+            f"prefill_chunk_size, see :3387 and :4399-4400) -- the "
+            f"chunk-boundary loop below steps `k * chunk` and would never "
+            f"clear `s_max` at chunk<=0, looping forever."
+        )
+    if s_max <= 0:
+        raise VramPlanError(
+            f"sweep_points requires s_max > 0 (got {s_max}). s_max is the "
+            f"box's derived context ceiling; a non-positive ceiling has no "
+            f"S values to sweep."
+        )
 
     pts: set[int] = set()
 

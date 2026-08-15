@@ -57,3 +57,29 @@ def test_sweep_degenerates_gracefully_when_the_ceiling_is_tiny():
     """A ceiling below one chunk still yields a usable, in-range sweep."""
     pts = probe.sweep_points(chunk=512, growth=2, s_max=300)
     assert pts and all(0 < s <= 300 for s in pts)
+
+
+@pytest.mark.parametrize("chunk", [0, -1, -512])
+def test_sweep_raises_fast_on_nonpositive_chunk_instead_of_hanging(chunk):
+    """chunk=0 is the documented 'no chunking' sentinel (prefill_chunk_size in
+    vaayu_base.py) -- the chunk-boundary loop's `k * chunk` never clears
+    `s_max` at chunk<=0, so this must raise before entering that loop rather
+    than spin forever. Bounded wall-clock proves it raised, not looped."""
+    import time
+
+    from vaayu.vram_plan import VramPlanError
+
+    t0 = time.monotonic()
+    with pytest.raises(VramPlanError, match="chunk"):
+        probe.sweep_points(chunk=chunk, growth=2, s_max=100)
+    assert time.monotonic() - t0 < 1.0
+
+
+@pytest.mark.parametrize("s_max", [0, -1, -100])
+def test_sweep_raises_on_nonpositive_s_max(s_max):
+    """A non-positive ceiling has no S values to sweep -- fail fast rather
+    than silently returning an empty list."""
+    from vaayu.vram_plan import VramPlanError
+
+    with pytest.raises(VramPlanError, match="s_max"):
+        probe.sweep_points(chunk=512, growth=2, s_max=s_max)
