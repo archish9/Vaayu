@@ -81,20 +81,73 @@ pending-only._
 
 | # | Item | Status | Cost | Why here |
 |---|---|---|---|---|
-| **1** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
-| **2** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
-| **3** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
+| **1** | Verify the context limits raised by the form change | `[ ]` | ~5 min GPU | **Only scheduled row.** Two `max_seq_len` values were raised on the strength of a model, not a measurement. Boundary sits exactly on the KV cliff. |
+| **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN today and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
+| **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
+| **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 
-> ### ▶▶ NEXT ACTION: none scheduled — every remaining row is deliberately unscheduled
-> Row 1 is a capability gap no on-device target hits, row 2 is parked VRAM already priced, and
-> row 3 is four write-ups each blocked on a new premise. The VRAM-planning work that occupied this
-> list is finished: the ±10 % gate now PASSES (0/26, worst 7.3 %, zero fitted constants).
-> Pick up row 1 if non-EXL3 support becomes real; otherwise this backlog is at a natural stopping
-> point.
+> ### ▶▶ NEXT ACTION: row 1 — verify the context limits the form change raised
+> ~5 min GPU, self-contained below. Everything after it is deliberately unscheduled: row 2 is a
+> ten-minute curiosity, row 3 a capability gap no on-device target hits, row 4 parked VRAM already
+> priced, row 5 four write-ups each blocked on a new premise. The VRAM-planning thread that
+> dominated this list is finished — the ±10 % gate PASSES (0/26, worst 7.3 %, zero fitted
+> constants).
 
 ---
 
-# 1 · [ ] The cross-turn prefix cache only works for EXL3 models
+# 1 · [ ] Verify the context limits the form change raised
+
+The `predict_peak_vram` form change (DONE 2026-08-15, verdict in
+`plans/settled_and_method_notes.md`) moved two derived limits:
+
+| model | before | after |
+|---|---|---|
+| Llama-3.3-70B-exl3 | 4373 | **8192** |
+| Llama-3.2-1B | 56828 | **106987** |
+| Qwen3-235B / MiniMax-M2.7 | 8192 | 8192 (unchanged) |
+
+`max_seq_len`'s entire contract is **"every request up to this length fits"**, and these two
+increases rest on a model, not a measurement. **8192 is the dangerous one: it sits exactly on the
+KV doubling cliff** — `capacity(8192) = 8192`, `capacity(8193) = 16384`, a jump of a whole
+bucket's KV — so it is the single least forgiving point in the range.
+
+**What to run** (~5 min GPU, one arm per subprocess, `systemd-run --user --scope -p MemoryMax=28G
+-p MemorySwapMax=0` — 22G is no longer enough for the 70B on this box, see the gates table above):
+
+1. Llama-3.3-70B, prefill at **exactly 8192** → must complete, no OOM.
+2. Same model at **8193** → must raise `VramPlanError` from `_assert_context_fits`, NOT a CUDA OOM.
+   (Note `forward()` is unguarded; the predicate runs in `generate`/`batched_generate`, so drive it
+   through one of those.)
+3. Llama-3.2-1B at **106987** → must complete. Cheap, seconds per run.
+
+**If 8192 OOMs**, the residency/logits terms are wrong in the UNSAFE direction and the gate's ±10 %
+pass is hiding it — that is a real defect, not a tuning question. Record and fix before anything
+else.
+
+**Why it was not done at the time:** the boundary safety was argued from the KV bucket arithmetic
+(`capacity(8192) = 8192`, so the transient is 2.745 GiB against a 3.50 GiB reserve) rather than
+measured. The arithmetic is probably right. Measure it anyway — this is the one number the whole
+module exists to produce.
+
+---
+
+# 2 · [ ] Static check for unbound locals / import order
+
+Two bugs of exactly this shape shipped GREEN today, inside the same edit: `detect_moe_blocks` and
+then `EXL3LoaderStrategy` were referenced in `vaayu_base.__init__` ABOVE their in-function
+imports, making them unbound locals. **Both MoE models failed to load with `UnboundLocalError`
+while the full 836-test suite passed** — nothing unit-tests the load path, and the first was found
+by reading, the second only by running a real load.
+
+**Task:** check whether `ruff` / `pyflakes` flags that class (undefined-name / used-before-assign).
+If it does, wire it in — it would have caught both, immediately, for free. If it does not, say so
+here and close the row; the fallback is already recorded in the gates table ("run a real load after
+touching `__init__`").
+
+---
+
+# 3 · [ ] The cross-turn prefix cache only works for EXL3 models
 
 Carried out of the hygiene backlog (H7's third item) when the rest of that row closed
 2026-08-15. Not hygiene — a real capability gap, and the only one left from that group.
@@ -116,7 +169,7 @@ model nobody currently runs here. (found 2026-08-09)
 
 ---
 
-# 2 · [ ] 2× KV overshoot, ~0.83 GB at Qwen's derived operating context — PARKED
+# 4 · [ ] 2× KV overshoot, ~0.83 GB at Qwen's derived operating context — PARKED
 
 Real, quantified, recoverable, and **deliberately not scheduled.** The EXL3 ring-buffer KV cache's
 geometric-doubling capacity means that at Qwen's derived `max_seq_len=8192` the cache allocates
@@ -135,7 +188,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-# 3 · [ ] DEFERRED — written up, no scheduled slot
+# 5 · [ ] DEFERRED — written up, no scheduled slot
 
 - **Plan B Tasks 8, 9 — Phase 2 live expert re-pin.** The Phase 1 pin it builds on is refuted (no
   viable pin N: eviction share is linear in N and always 2–4× below the pin's share of the cache,
