@@ -16,8 +16,9 @@ for the three scheduled rows and are self-contained on their own.
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
-- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **795 passed, 2 skipped,
-  1 xfailed**.
+- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **854 passed, 3 skipped**
+  (re-measured 2026-08-15 during the VRAM peak re-probe; supersedes the older 795/2/1 figure —
+  Phase 1's two new tests plus other work since account for the difference).
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
   literals (16 GB VRAM / **15.47 GiB usable**, 32 GB RAM, ~8.5 GB expert-cache ceiling,
   ~5.5 GB/s NVMe), each commented as such.
@@ -81,7 +82,7 @@ pending-only._
 
 | # | Item | Status | Cost | Why here |
 |---|---|---|---|---|
-| **1** | `predict_peak_vram` calibrated against a peak that was never the peak | `[x]` | closed 2026-08-15 | Re-probed with the reset removed. **Verdict: `plans/2026-08-15-vram-peak-RESULTS.md`.** Dense geometries moved (as expected, though far less than the pre-fix hand estimate); MoE did not move (confirmed by source + a KV-capacity-boundary check, not assumed). The ±10 % gate stays knowingly RED — `MEASURED` was deliberately NOT re-pointed at the new data (items 6-10 below are why). |
+| **1** | `predict_peak_vram` calibrated against a peak that was never the peak | `[x]` | closed 2026-08-15 | Re-probed with the reset removed. **Verdict: `plans/2026-08-15-vram-peak-RESULTS.md`.** Dense geometries moved (as expected, though far less than the pre-fix hand estimate); MoE did not move (confirmed by source + a KV-capacity-boundary check, not assumed). The ±10 % gate's captured output still PASSES (0/26 outside) — deliberately NOT made meaningful: `MEASURED` was NOT re-pointed at the new data on purpose, so the green is self-consistent against the old table, not a real check. It goes red-for-real once repointed (items 6-10 below are why that hasn't happened yet). |
 | **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
@@ -230,12 +231,24 @@ this happened the first time.
 # 6 · [ ] Phase 2 — re-point `MEASURED`, re-decide the form
 
 **Blocked on item 10.** Data is ready either way: `plans/2026-08-15-vram-peak-RESULTS.md` has all
-four geometries' honest `(S, alloc_before, alloc_peak, status)` rows, fitted slopes, and signed
-error against the current (unmodified) `predict_peak_vram`. Under flash_attention_2 the fitted
-slope is within 1.0-1.3× of the modelled KV term on all four geometries (§4's summary table) — the
-form's linear structure looks mostly right for that kernel; the dense geometries show a fairly flat
-~0.3-0.9 GB unmodelled intercept instead of a slope error. Whether that holds for sdpa (item 10) is
-unknown.
+four geometries' honest `(S, alloc_before, alloc_peak, status)` rows, fitted slopes (with a
+sensitivity check excluding each geometry's flagged first-sweep noise point), and signed error
+against the current (unmodified) `predict_peak_vram`. Under flash_attention_2 the fitted slope is
+within roughly 1.0-1.14× of the modelled KV term on all four geometries once the noise points are
+excluded (§4's summary table) — the form's linear structure looks mostly right for that kernel.
+Whether that holds for sdpa (item 10) is unknown.
+
+**Sharpened hypothesis for the residual, so the next person starts here instead of re-deriving it
+(RESULTS.md §7):** the dense geometries' under-prediction is NOT a flat, S-independent gap — it
+clusters tightly by trailing-chunk length (`_trailing_chunk_tokens`), the same quantity
+`predict_peak_vram`'s own sawtooth intercept already keys on. On Llama-3.2-1B: ~0.539 G residual at
+a full (512-token) trailing chunk vs ~0.792 G at a 1-token trailing chunk (1.47×); Llama-3.3-70B
+shows the same direction more weakly (~0.641 G vs ~0.716 G, 1.12×). Two hypotheses, NEITHER ruled
+out by the RESULTS.md data: (a) a fixed unmodelled residency term (shape-like Qwen3-235B's
+`resident_expert_bytes`) that happens to correlate with trailing-chunk phase for a separate reason,
+or (b) the existing sawtooth intercept term itself is under-sized specifically at short trailing
+chunks — its charge is smallest exactly where the residual is largest. Test directly (hold S fixed
+at one KV-capacity plateau, vary only trailing-chunk length) before picking one.
 
 **File:** `scripts/fit_vram_calibration.py` (`MEASURED` dict) and `vaayu/vram_plan.py`
 (`predict_peak_vram`, `DEFAULT_ALLOC_FACTOR`) — both explicitly untouched by item 1's task; this is

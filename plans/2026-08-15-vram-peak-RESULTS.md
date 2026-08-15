@@ -213,8 +213,14 @@ Fitted slope (least squares, all points): **0.3740 MB/token**, intercept 0.9345 
 | 4097 | 3.0052 | 3.0913 | +2.9% |
 | 8192 | 3.0948 | 3.0913 | -0.1% |
 
-Fitted slope (least squares, all points, including the noisy S=512 point): **0.2533 MB/token**,
-intercept 1.3263 G
+Fitted slope, all points including the noisy S=512 point (§3): **0.2533 MB/token**, intercept
+1.3263 G, ratio to the modelled KV term (0.193 MB/tok) **1.31×**.
+
+**Sensitivity check — excluding S=512** (the point §3 flags as first-sweep allocator/warm-up
+noise, not evidence about the forward's actual behaviour): **0.2012 MB/token**, intercept
+1.6061 G, ratio **1.04×**. The headline 1.31× figure is entirely a product of the one point this
+document itself calls unreliable; the slope this checkpoint actually supports is close to 1×.
+Both figures are reported; §7's summary uses the excl-S=512 one.
 
 ### minimax-m2.7 — predicted vs measured
 
@@ -229,21 +235,31 @@ intercept 1.3263 G
 | 4097 | 2.1693 | 2.0812 | -4.1% |
 | 8192 | 2.7484 | 2.4901 | -9.4% |
 
-Fitted slope (least squares, all points): **0.2879 MB/token**, intercept 0.5603 G
+Fitted slope, all points including the S=513 undershoot (§3): **0.2879 MB/token**, intercept
+0.5603 G, ratio to the modelled KV term (0.254 MB/tok) **1.13×**.
+
+**Sensitivity check — excluding S=513** (§3's other flagged noise point, the one that undershoots
+its neighbours): **0.2645 MB/token**, intercept 0.6865 G, ratio **1.04×**. Same direction as
+Qwen3-235B's check above: the flagged point pulls the all-point fit away from ~1×, though less
+drastically here since the excluded point's transient is LOW rather than the predicted-side outlier
+Qwen's S=512 was.
 
 ### Slope summary, all four geometries (flash_attention_2, this task)
 
-| geometry | fitted slope MB/tok | modeled KV term MB/tok | ratio |
-|---|---|---|---|
-| llama-3.2-1b | 0.0340 | 0.0330 | 1.03x |
-| llama-3.3-70b | 0.3740 | 0.3280 | 1.14x |
-| qwen3-235b | 0.2533 | 0.1930 | 1.31x |
-| minimax-m2.7 | 0.2879 | 0.2540 | 1.13x |
+| geometry | fitted slope MB/tok (all pts) | ratio (all pts) | fitted slope MB/tok (excl. flagged pt) | ratio (excl. flagged pt) |
+|---|---|---|---|---|
+| llama-3.2-1b | 0.0340 | 1.03x | — (no flagged point) | — |
+| llama-3.3-70b | 0.3740 | 1.14x | — (no flagged point) | — |
+| qwen3-235b | 0.2533 | 1.31x | 0.2012 (excl. S=512) | 1.04x |
+| minimax-m2.7 | 0.2879 | 1.13x | 0.2645 (excl. S=513) | 1.04x |
 
-Under flash_attention_2, the honest slope is within roughly 1.0-1.3× of the modeled KV term on all
-four geometries — nothing close to the 2.2×/6.2× ratios recorded under sdpa (§2). The systematic
-under-prediction visible in the two dense tables above is concentrated in a roughly flat,
-S-independent gap (§6's verdict), not primarily a slope error.
+Under flash_attention_2, once the two points §3 already flags as first-sweep allocator/warm-up
+noise are excluded from their respective fits, the honest slope on all four geometries lands within
+roughly **1.0-1.14×** of the modeled KV term — nothing close to the 2.2×/6.2× ratios recorded under
+sdpa (§2), and tighter than the raw all-point fits above suggest (the qwen3-235b all-point 1.31×
+in particular is a single noisy point's artifact, not a property of the forward). The systematic
+under-prediction visible in the two dense tables is not primarily a slope error either — see §7 for
+what it tracks instead.
 
 ## 5. Before/after against the OLD `MEASURED` table (untouched, per the brief)
 
@@ -425,23 +441,60 @@ Once the reset is honestly gone, `KV(at capacity) + max(last-chunk logits, resid
 much closer to right than the pre-fix "6.2×/2.2× off" framing suggested — but that framing itself
 turns out to describe a different attention kernel (sdpa, §2), not a bigger form error. Under the
 kernel this task's arms and the *existing* `MEASURED` table both actually run
-(`flash_attention_2`), the fitted slope on every one of the four geometries lands within 1.0-1.3×
-of the modelled KV term (§4's summary table) — nowhere near the score/mask-shaped multiple
-(5.2×/5.9× of `n_heads · chunk · elem_bytes`) that the earlier sdpa-based hand measurements
-implied. What the honest data shows instead is a roughly S-independent **intercept gap**: the two
-dense geometries under-predict by a fairly flat ~0.3-0.9 GB across their whole sweep (relative
-error shrinking from -50-90% at small S down to -12-18% at the largest S purely because the same
-absolute gap becomes a smaller fraction of a bigger number), while both MoE geometries land inside
-or near the ±10% bar once the KV-capacity-boundary sampling artifact (§5) is accounted for. That
-points Phase 2 at a fixed unmodelled residency term for the dense forwards specifically — something
-closer in shape to Qwen3-235B's already-modelled `resident_expert_bytes` than to a per-token
-activation slope — rather than at the `KV + logits` form's linear structure, which this data
-mostly vindicates. The two MoE geometries did not move (§5), confirming the stated expectation;
-the two dense geometries did move, in the expected direction, though by far less than the sdpa-era
-figures suggested, because those figures were never describing the same kernel. **The single
-biggest open question for Phase 2 is not the form — it's that none of this calibration data, old
-or new, describes the attention kernel (`sdpa`) that the engine's actual batched-decode path
-requires.**
+(`flash_attention_2`), the fitted slope on every one of the four geometries lands within roughly
+**1.0-1.14×** of the modelled KV term, once §4's sensitivity check excludes the two points §3
+already flags as first-sweep allocator/warm-up noise (Qwen3-235B: 1.31×→1.04× dropping S=512;
+MiniMax-M2.7: 1.13×→1.04× dropping S=513). Both raw all-point fits and the excl-noise fits are in
+§4; the excl-noise numbers are the ones this verdict rests on, since the all-point Qwen3-235B
+figure is a single noisy point's artifact, not a property of the forward. None of the four come
+close to the score/mask-shaped multiple (5.2×/5.9× of `n_heads · chunk · elem_bytes`) that the
+earlier sdpa-based hand measurements implied.
+
+**What the residual actually tracks.** The two dense geometries under-predict throughout their
+sweep, but the gap is not the flat, S-independent offset an initial read of the tables suggests —
+computing `transient − predicted` per point (excluding each geometry's flagged first-sweep point)
+and grouping by **trailing-chunk length** (`_trailing_chunk_tokens`, the same quantity
+`predict_peak_vram`'s own sawtooth intercept term already keys on) shows two tight, phase-locked
+clusters instead of one flat band:
+
+| geometry | FULL trailing chunk (S a multiple of 512) | 1-token trailing chunk (S = multiple+1) | ratio |
+|---|---|---|---|
+| llama-3.2-1b | ~0.529-0.566 G (mean 0.539 G; n=4: S=4096,16384,32768,70656) | ~0.792 G (mean 0.792 G; n=2: S=4097,65537) | 1.47× |
+| llama-3.3-70b | ~0.569-0.665 G (mean 0.641 G; n=4: S=1024,2048,4096,8192) | ~0.713-0.718 G (mean 0.716 G; n=2: S=2049,4097) | 1.12× |
+
+(Llama-3.2-1B's S=106987 has a 491-token trailing chunk, neither bucket; its residual, 0.524 G,
+sits with the FULL cluster rather than the 1-token one, consistent with the pattern.)
+
+A ~47% swing on the 1B, ~12% on the 70B, both in the same direction (1-token trailing chunk
+residual HIGHER than full-trailing-chunk residual) and both phase-locked to the SAME S-mod-chunk
+structure `predict_peak_vram`'s existing sawtooth term already encodes. **This does not
+distinguish between two materially different Phase 2 diagnoses, and this data does not rule either
+out:**
+
+1. **A fixed, roughly-constant unmodelled residency term** for the dense forwards (something
+   closer in shape to Qwen3-235B's already-modelled `resident_expert_bytes` than to a per-token
+   activation slope) — under this hypothesis the phase-locking would need a second, smaller
+   explanation, since a truly S-independent constant would not correlate with trailing-chunk
+   length at all.
+2. **The existing sawtooth last-chunk-logits term is under-sized or mis-shaped** — `predict_peak_vram`'s
+   own intercept charges MOST at a full trailing chunk (512 tokens' worth of logits) and LEAST at a
+   1-token trailing chunk (near zero). The residual runs the opposite way: it is SMALLER at a full
+   trailing chunk (where the model already charges the most) and LARGER at a 1-token trailing chunk
+   (where the model charges almost nothing). That is consistent with the sawtooth's floor being set
+   too low — under-charging specifically where the trailing chunk is short — rather than the whole
+   term simply being scaled by the wrong constant throughout.
+
+Neither hypothesis is fit or ruled out here; both are stated because this task's job is
+measurement, not diagnosis. Phase 2 should test them directly (e.g. hold S fixed at a KV-capacity
+plateau and vary only trailing-chunk length) rather than assume either.
+
+Both MoE geometries land inside or near the ±10% bar once the KV-capacity-boundary sampling
+artifact (§5) is accounted for, and did not move versus the old table (§5), confirming the stated
+expectation. The two dense geometries did move, in the expected direction, though by far less than
+the sdpa-era figures suggested, because those figures were never describing the same kernel.
+**The single biggest open question for Phase 2 is not the form — it's that none of this
+calibration data, old or new, describes the attention kernel (`sdpa`) that the engine's actual
+batched-decode path requires.**
 
 ---
 

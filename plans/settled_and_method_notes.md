@@ -773,20 +773,33 @@ the LAST CHUNK ONLY, not of the prefill.
 `MEASURED` said 2.409 GB, an independent post-`generate` read said 2.426 GB, and the in-loop chunk
 log for the same run said 8.13 GB.
 
-Measured "true" slope of prefill peak (least-squares over the in-loop chunk series, sdpa-forced —
-see the CLOSED verdict below, this was not understood to be sdpa-specific at the time):
+Measured true slope of prefill peak (least-squares over the in-loop chunk series):
 
 | model | measured | `predict_peak_vram`'s KV term | ratio |
 |---|---|---|---|
 | Llama-3.2-1B | 0.2027 MB/tok (n=120, to S=32768) and 0.2025 (n=275, to S=70656) | 0.0328 MB/tok | 6.2× |
 | Llama-3.3-70B | 0.7149 MB/tok (n=32, to S=8191) | 0.328 MB/tok | 2.2× |
 
+The excess is score/mask-shaped — several copies of `n_heads · chunk · elem_bytes` per token
+(5.2× that quantity on the 1B, 5.9× on the 70B) — i.e. `MATERIALIZES_SCORES = False` and the
+2026-08-15 removal of the S-linear activation term are both consequences of the blind spot, not
+findings about the hardware. Do not re-fit anything until the measurement is fixed.
+
 Design spec: `plans/2026-08-15-vram-peak-measurement-design.md` (approved for Phase 1: drop the
-in-loop reset, re-probe all four geometries, change no prediction).
+in-loop reset, re-probe all four geometries, change no prediction). Two decisions taken with it:
+the fix is deleting the reset (no engine-side peak state), and `max_seq_len` is a derived DEFAULT,
+not a hard cap — so 8193 running to completion is CORRECT and this row's original "must raise
+`VramPlanError`" expectation is retired as wrong, not filed as a bug. **The ±10 % gate is EXPECTED
+to go red after Phase 1; do not tune the form to re-green it.**
 
 Settled 2026-08-15 alongside this: `_assert_context_fits` admitting 8193 is not a defect —
 `max_seq_len` is a derived default, and admission belongs to the headroom predicate. The
 predicate's PREDICTION was the only thing wrong.
+
+*[Editorial note, added when this was archived — not part of the original quote above: the "true"
+slope table just above was later found, during the RESULTS.md re-probe, to have been read from an
+sdpa-forced session, not the flash_attention_2 this task's arms and the old `MEASURED` table both
+ran under. That is the CLOSING VERDICT below's second bullet, not a correction to the quote.]*
 
 **CLOSING VERDICT (2026-08-15, Phase 1 re-probe complete):** All four geometries re-probed with
 the reset removed, one arm per subprocess, `status=ok` throughout (no OOM anywhere, including
