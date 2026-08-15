@@ -754,3 +754,80 @@ measurement defect, now row 2.
 
 
 The defect this exposed is now the scheduled row in `todo.md` (`predict_peak_vram` calibrated against a last-chunk peak).
+
+---
+
+## VRAM peak measurement (todo row 1) — CLOSED 2026-08-15
+
+**Original writeup (moved verbatim from `todo.md`):**
+
+`vaayu_base.py:3334` called `torch.cuda.reset_peak_memory_stats()` after EVERY prefill chunk
+(inside the chunk loop, right after the `[Vaayu] Chunk [...] peak VRAM` print). Any
+`max_memory_allocated()` read taken after a chunked-prefill forward therefore reported the peak of
+the LAST CHUNK ONLY, not of the prefill.
+
+`scripts/probe_vram_curve.py:52` measured exactly that way, so every point in
+`scripts/fit_vram_calibration.py`'s `MEASURED` table was a last-chunk peak. That is why the form
+`KV(capacity) + last-chunk logits` fit with zero fitted constants and why the ±10 % gate passed
+0/26: both sides described the same under-measured quantity. Verified — llama-3.2-1b at S=32768,
+`MEASURED` said 2.409 GB, an independent post-`generate` read said 2.426 GB, and the in-loop chunk
+log for the same run said 8.13 GB.
+
+Measured true slope of prefill peak (least-squares over the in-loop chunk series):
+
+| model | measured | `predict_peak_vram`'s KV term | ratio |
+|---|---|---|---|
+| Llama-3.2-1B | 0.2027 MB/tok (n=120, to S=32768) and 0.2025 (n=275, to S=70656) | 0.0328 MB/tok | 6.2× |
+| Llama-3.3-70B | 0.7149 MB/tok (n=32, to S=8191) | 0.328 MB/tok | 2.2× |
+
+The excess is score/mask-shaped — several copies of `n_heads · chunk · elem_bytes` per token
+(5.2× that quantity on the 1B, 5.9× on the 70B) — i.e. `MATERIALIZES_SCORES = False` and the
+2026-08-15 removal of the S-linear activation term are both consequences of the blind spot, not
+findings about the hardware. Do not re-fit anything until the measurement is fixed.
+
+Design spec: `plans/2026-08-15-vram-peak-measurement-design.md` (approved for Phase 1: drop the
+in-loop reset, re-probe all four geometries, change no prediction). Two decisions taken with it:
+the fix is deleting the reset (no engine-side peak state), and `max_seq_len` is a derived DEFAULT,
+not a hard cap — so 8193 running to completion is CORRECT and this row's original "must raise
+`VramPlanError`" expectation is retired as wrong, not filed as a bug. **The ±10 % gate is EXPECTED
+to go red after Phase 1; do not tune the form to re-green it.**
+
+Settled 2026-08-15 alongside this: `_assert_context_fits` admitting 8193 is not a defect —
+`max_seq_len` is a derived default, and admission belongs to the headroom predicate. The
+predicate's PREDICTION was the only thing wrong.
+
+*[Editorial note, added when this was archived — not part of the original quote above: the "true"
+slope table just above was later found, during the RESULTS.md re-probe, to have been read from an
+sdpa-forced session, not the flash_attention_2 this task's arms and the old `MEASURED` table both
+ran under. That is the CLOSING VERDICT below's second bullet, not a correction to the quote.]*
+
+**CLOSING VERDICT (2026-08-15, Phase 1 re-probe complete):** All four geometries re-probed with
+the reset removed, one arm per subprocess, `status=ok` throughout (no OOM anywhere, including
+Llama-3.2-1B out to its full derived `max_seq_len=106987`). Full data, per-point signed error
+against the unmodified `predict_peak_vram`, and before/after comparison against the old `MEASURED`
+table: **`plans/2026-08-15-vram-peak-RESULTS.md`**.
+
+Headline findings:
+- The two dense geometries moved, as expected (the legacy per-chunk loop held the reset); the two
+  MoE geometries did not move, as expected (the layer-major branch returns before that loop) — a
+  ~31% apparent drop in the closest Qwen3-235B/MiniMax-M2.7 overlap points was checked directly and
+  is fully explained by a known `kv_capacity_tokens` doubling boundary sitting between the old
+  table's S=8200 and this task's S=8192, not a behavioural change.
+- **Unexpected finding, found only after a coordinator cross-check:** every arm in both the old
+  `MEASURED` table and this task's re-probe ran under `flash_attention_2`, not `sdpa` —
+  `scripts/probe_vram_curve.py` passes no `attn_implementation`, so Vaayu's own candidate order
+  picks flash first. But `batched_generate` (the real batched-decode path) hard-requires `sdpa`,
+  and `MATERIALIZES_SCORES=False` was measured for sdpa specifically. Direct comparison,
+  Llama-3.2-1B S=8192: flash_attention_2 1.0974 GB vs sdpa (forced) 2.0967 GB, 1.91×. This also
+  explains the pre-fix "6.2×/2.2×" slopes above: those were read from an sdpa-forced session, not
+  a form error at all. **This reopens as `todo.md` item 10** — Phase 2 cannot re-point `MEASURED`
+  or re-decide the form meaningfully until it is resolved.
+- The ±10 % gate (`scripts/fit_vram_calibration.py`) was run and its output captured as the
+  "before" state in the RESULTS file. It still PASSES (0/26 outside, self-consistent against the
+  untouched `MEASURED` table) — deliberately not fixed by this task. `MEASURED`, `predict_peak_vram`,
+  `MATERIALIZES_SCORES`, and `DEFAULT_ALLOC_FACTOR` are byte-for-byte unchanged.
+- Three on-device gates re-run and PASS: dense smoke (perplexity 8.78, unchanged),
+  `test_moe_accumulator_determinism.py`, `test_batch_prefix_equivalence.py` (both MiniMax-M2.7).
+
+Phase 2 (form, `MATERIALIZES_SCORES`, budget policy, `max_seq_len` re-derivation) is now `todo.md`
+items 6-9, gated behind item 10 (the attention-kernel question).

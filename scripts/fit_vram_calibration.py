@@ -94,6 +94,16 @@ FORWARD = {
 #
 # Every arm ran to completion with status=ok; no OOM at any S, including 16384.
 # ---------------------------------------------------------------------------
+# KNOWN STALE (2026-08-15): the dense rows below (llama-3.3-70b, llama-3.2-1b) are
+# last-chunk peaks, not whole-prefill peaks -- vaayu_base.py's chunked-prefill loop
+# used to reset the CUDA peak counter mid-forward (fixed on the vram-peak-measurement
+# branch). The gate below still reads PASS because it is comparing predict_peak_vram
+# against exactly this truncated table, which is self-consistent but not correct. The
+# honest whole-prefill data already exists (`plans/2026-08-15-vram-peak-RESULTS.md`
+# S3-4) and re-pointing this table at it is Phase 2, tracked as `todo.md` item 10 (and
+# item 6, blocked on it) -- not done here; see `plans/2026-08-15-vram-peak-RESULTS.md`
+# S6 for the full "why this PASS doesn't mean what it looks like" writeup.
+# ---------------------------------------------------------------------------
 MEASURED = {
     "qwen3-235b": [
         (5000, 1810343424, 4701109248), (6000, 1728843776, 4690192384),
@@ -216,6 +226,8 @@ def main() -> int:
     print("=" * 78)
     print(f"GATE: {outside}/{total} points outside +-{GATE:.0%}, worst "
           f"{100*worst:.1f}%  ->  {'PASS' if not outside else 'FAIL'}")
+    print("CAVEAT: MEASURED's dense rows are known last-chunk (not whole-prefill) peaks --")
+    print("  see the comment above MEASURED, plans/2026-08-15-vram-peak-RESULTS.md S6, todo.md item 10.")
     print("=" * 78)
     if not outside:
         print("  Every geometry inside the bar with ZERO fitted constants. The two")

@@ -1,0 +1,137 @@
+"""scripts/probe_vram_curve.py's default S sweep must probe the two places
+predict_peak_vram is piecewise: KV capacity doublings and prefill-chunk
+boundaries. Every point is DERIVED from chunk/growth/s_max (CLAUDE.md S5) --
+no model numbers appear here or in the function under test.
+"""
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+_SPEC = importlib.util.spec_from_file_location(
+    "probe_vram_curve",
+    Path(__file__).resolve().parent.parent / "scripts" / "probe_vram_curve.py",
+)
+probe = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(probe)
+
+
+@pytest.mark.parametrize("chunk,growth,s_max", [
+    (512, 2, 8192),      # a small derived ceiling
+    (512, 2, 131072),    # a large one
+    (256, 3, 20000),     # neither chunk nor growth is the common case
+])
+def test_sweep_is_sorted_unique_and_inside_the_ceiling(chunk, growth, s_max):
+    pts = probe.sweep_points(chunk=chunk, growth=growth, s_max=s_max)
+    assert pts == sorted(set(pts))
+    assert all(0 < s <= s_max for s in pts)
+
+
+@pytest.mark.parametrize("chunk,growth,s_max", [
+    (512, 2, 8192), (512, 2, 131072), (256, 3, 20000),
+])
+def test_sweep_straddles_a_chunk_boundary(chunk, growth, s_max):
+    """At least one exact multiple of chunk (full trailing chunk, where the
+    logits intercept is largest) AND one point just past a multiple (trailing
+    chunk of 1 token, where it is smallest)."""
+    pts = probe.sweep_points(chunk=chunk, growth=growth, s_max=s_max)
+    assert any(s % chunk == 0 for s in pts)
+    assert any(s % chunk == 1 for s in pts)
+
+
+@pytest.mark.parametrize("chunk,growth,s_max", [
+    (512, 2, 8192), (512, 2, 131072), (256, 3, 20000),
+])
+def test_sweep_straddles_a_kv_capacity_doubling(chunk, growth, s_max):
+    """Two points whose allocated KV capacity differs -- the step the KV term
+    takes. Uses the engine's own capacity function so the test cannot drift
+    from the implementation it is checking."""
+    from vaayu.vram_plan import kv_capacity_tokens
+    pts = probe.sweep_points(chunk=chunk, growth=growth, s_max=s_max)
+    caps = {kv_capacity_tokens(s, chunk=chunk, growth=growth, buckets=True)
+            for s in pts}
+    assert len(caps) >= 2
+
+
+def _chunk_boundary_points(chunk: int, s_max: int) -> set[int]:
+    """Mirror of sweep_points' chunk-boundary loop, standalone so the test
+    below can compute what THAT loop alone would emit."""
+    pts: set[int] = set()
+    k = 1
+    while k * chunk <= s_max:
+        pts.add(k * chunk)
+        if k * chunk + 1 <= s_max:
+            pts.add(k * chunk + 1)
+        k *= 2
+    return pts
+
+
+def _kv_boundary_points(chunk: int, growth: int, s_max: int) -> set[int]:
+    """Mirror of sweep_points' KV-doubling loop, standalone so the test below
+    can compute what THAT loop alone would emit."""
+    from vaayu.vram_plan import kv_capacity_tokens
+    pts: set[int] = set()
+    s = chunk
+    while s <= s_max:
+        cap = kv_capacity_tokens(s, chunk=chunk, growth=growth, buckets=True)
+        if cap < s_max:
+            pts.add(min(cap, s_max))
+            pts.add(min(cap + 1, s_max))
+        s = max(s + 1, cap + 1)
+    return pts
+
+
+def test_sweep_hits_points_only_one_loop_can_produce():
+    """I1: the two straddle tests above are mutually satisfiable -- either
+    of sweep_points' two loops alone straddles both a chunk boundary and a
+    KV-capacity doubling for every parametrization above, so deleting either
+    loop still ships green there. Pin points that only ONE loop's own,
+    independently-derived set contains, so dropping that loop is caught.
+
+    chunk=256/growth=3/s_max=20000 is used (rather than the parametrizations
+    above) because with growth=2 the KV-doubling sequence chunk*2^n coincides
+    with the chunk-boundary sequence chunk*2^n -- growth=3 is required for
+    the two loops to diverge at all.
+    """
+    chunk, growth, s_max = 256, 3, 20000
+    pts = set(probe.sweep_points(chunk=chunk, growth=growth, s_max=s_max))
+    chunk_pts = _chunk_boundary_points(chunk, s_max)
+    kv_pts = _kv_boundary_points(chunk, growth, s_max)
+    chunk_only = chunk_pts - kv_pts
+    kv_only = kv_pts - chunk_pts
+    assert chunk_only, "test parameters must yield a chunk-exclusive point"
+    assert kv_only, "test parameters must yield a KV-exclusive point"
+    assert chunk_only & pts, "chunk-boundary loop's own points are missing"
+    assert kv_only & pts, "KV-doubling loop's own points are missing"
+
+
+def test_sweep_degenerates_gracefully_when_the_ceiling_is_tiny():
+    """A ceiling below one chunk still yields a usable, in-range sweep."""
+    pts = probe.sweep_points(chunk=512, growth=2, s_max=300)
+    assert pts and all(0 < s <= 300 for s in pts)
+
+
+@pytest.mark.parametrize("chunk", [0, -1, -512])
+def test_sweep_raises_fast_on_nonpositive_chunk_instead_of_hanging(chunk):
+    """chunk=0 is the documented 'no chunking' sentinel (prefill_chunk_size in
+    vaayu_base.py) -- the chunk-boundary loop's `k * chunk` never clears
+    `s_max` at chunk<=0, so this must raise before entering that loop rather
+    than spin forever. Bounded wall-clock proves it raised, not looped."""
+    import time
+
+    from vaayu.vram_plan import VramPlanError
+
+    t0 = time.monotonic()
+    with pytest.raises(VramPlanError, match="chunk"):
+        probe.sweep_points(chunk=chunk, growth=2, s_max=100)
+    assert time.monotonic() - t0 < 1.0
+
+
+@pytest.mark.parametrize("s_max", [0, -1, -100])
+def test_sweep_raises_on_nonpositive_s_max(s_max):
+    """A non-positive ceiling has no S values to sweep -- fail fast rather
+    than silently returning an empty list."""
+    from vaayu.vram_plan import VramPlanError
+
+    with pytest.raises(VramPlanError, match="s_max"):
+        probe.sweep_points(chunk=512, growth=2, s_max=s_max)
