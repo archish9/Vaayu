@@ -4116,8 +4116,16 @@ class VaayuBaseModel(GenerationMixin):
                   f"prefill only {input_ids.shape[1] - match_len} new positions")
         kwargs["past_key_values"] = kv
 
-        result = super().generate(*args, **kwargs)
         resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
+        try:
+            result = super().generate(*args, **kwargs)
+        except BaseException:
+            # lookup() above POPPED this entry. Without putting it back, an
+            # aborted turn -- an SSE client disconnecting mid-stream, a
+            # cancellation, an OOM -- drains the pool permanently.
+            from .prefix_cache import restore_on_abort
+            restore_on_abort(pc, resolved_sid, ids_list, kv, match_len)
+            raise
         # `kv` was mutated in place through the forward passes -> holds the full
         # final KV.
         self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())

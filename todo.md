@@ -132,7 +132,7 @@ checkboxes are the step-level detail.
 - [x] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
       (`prefix_cache.py:71` gates it on `session_id is None`; naming a session and missing is
       strictly WORSE than not naming it)
-- [ ] **6** engine fix — `restore_on_abort` puts a checked-out entry back after a dead turn.
+- [x] **6** engine fix — `restore_on_abort` puts a checked-out entry back after a dead turn.
       `lookup()` POPS, `store()` only re-inserts after `generate()` returns, so an aborted SSE stream
       drained the pool permanently. Crops the mutated cache to a length whose tokens are KNOWN —
       re-storing against the original token list would corrupt it. Never raises (must not mask the

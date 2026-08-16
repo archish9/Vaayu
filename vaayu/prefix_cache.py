@@ -217,3 +217,37 @@ class PrefixCacheStore:
             self.lookup_tokens = 0
             self.compressions = 0
             self.decompressions = 0
+
+
+def restore_on_abort(store, session_id: str, token_ids: list, cache,
+                     prefix_len: int) -> bool:
+    """Put a checked-out prefix entry back after a turn died mid-flight.
+
+    lookup() POPS an entry and store() only re-inserts it once generate()
+    returns, so an aborted turn -- an SSE client disconnecting, a cancellation,
+    an OOM -- loses that entry PERMANENTLY. A single-user script never hits
+    this; a server hits it constantly.
+
+    The adopted cache was mutated by however many forward passes completed, so
+    it is CROPPED back to a length whose tokens are known before being stored.
+    Re-storing the mutated cache against the original token list would be
+    corruption, which is worse than losing the entry.
+
+    Never raises: this runs on an exception path, and a failure here would
+    replace the real error the caller is about to re-raise. Returns True only
+    when an entry actually went back.
+    """
+    if store is None or prefix_len <= 0:
+        return False
+    try:
+        keep = min(int(prefix_len), int(cache.get_seq_length()))
+        if keep <= 0:
+            return False
+        cache.crop(keep)
+        store.store(session_id, list(token_ids[:keep]), cache)
+        return True
+    except Exception as e:
+        print(f"[Vaayu-Prefix] WARNING: could not restore session {session_id!r} "
+              f"after an aborted turn ({type(e).__name__}: {e}); the pool loses "
+              f"this entry and the next turn will prefill in full.")
+        return False
