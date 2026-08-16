@@ -1071,3 +1071,76 @@ returns to its full 10.6 GB.
   pool to the admitted budget (mem_get_info cannot see it); 12a had to CALL `empty_cache()` so freed
   drafter bytes leave that same pool and become visible again. Same driver-vs-allocator distinction,
   opposite directions.
+
+---
+
+## Vaayu as an inference server (todo row 13) — SHIPPED 2026-08-16
+
+Design: `plans/2026-08-16-vaayu-server-design.md`. Plan: `plans/2026-08-16-vaayu-server-plan.md`.
+
+**What shipped.** `vaayu/server/` — an OpenAI-compatible HTTP server:
+`POST /v1/chat/completions` (streaming and not), `GET /v1/models`, `GET /health`.
+`python -m vaayu.server --model PATH --port 8000`. One model loaded at boot, no hot-swap.
+One request in flight behind a depth-bounded FIFO gate (503 + `Retry-After` past `--queue-depth`,
+default 8). Tool calling wherever the checkpoint's template supports it, with the call format
+found by **probing the template**, never by model name. `vaayu_base.py` was not grown: policy
+lives in three pure modules (`stopping`, `schemas`, `tools`) that unit-test with no GPU.
+
+**The truncation fix, which was the originating question.** Streaming does NOT fix truncation —
+streaming is delivery, truncation is stopping policy. `max_tokens` is now optional and *omitting
+it is the normal case*: the default is `max_seq_len − prompt_len`, derived at load, and `512`
+appears nowhere in `vaayu/server/`. Generation stops on EOS or a stop string, and a client whose
+output really was cut off gets `finish_reason="length"` instead of silently-broken code.
+Demonstrated over live HTTP on Llama-3.2-1B: omitted `max_tokens` → **506 tokens,
+`finish_reason="stop"`, complete function**; `max_tokens=20` → `finish_reason="length"`.
+
+**Two prefix-cache defects the design surfaced, both server-shaped.**
+
+- **An explicit `session_id` that missed did not fall back to auto-prefix-match.**
+  `prefix_cache.lookup` gated the auto-match branch on `session_id is None`, so NAMING a session
+  and missing it produced a full prefill with a usable prefix sitting in the pool — strictly
+  worse than not naming it. One-line gate change.
+- **A client disconnecting mid-stream drained the pool permanently.** `lookup()` POPS and
+  `store()` only re-inserts after `generate()` returns. `restore_on_abort` puts the entry back on
+  the exception path, **cropped to a length whose tokens are known** — re-storing the mutated
+  cache against the original token list would be corruption, which is worse than losing it. It
+  never raises, so it cannot replace the error the caller is re-raising.
+
+**Three defects that every fake-backed test passed over and only the on-device gate caught.**
+This is the row's main method lesson: 114 new tests, all green, while the server could not
+serve a single real token.
+
+- `apply_chat_template` returns a **`BatchEncoding`** on transformers 5.5.4, not a list.
+  `render_prompt` now requests `return_dict=False` and normalises the mapping, nested-batch and
+  tensor shapes, refusing anything else loudly.
+- `vaayu.streaming.stream_generate` **builds `use_cache`/`max_new_tokens`/`do_sample` itself**, so
+  passing them again is `TypeError: dict() got multiple values for keyword argument 'use_cache'`.
+  `STREAM_GENERATE_OWNS` names that set once, and a test asserts it against `stream_generate`'s
+  own source so it cannot drift.
+- **`enable_prefix_cache` defaults OFF in `vaayu_base`**, so the server shipped with its largest
+  measured lever (136–377× TTFT) silently disabled. Now on by default in `ServerConfig`, with
+  `--no-prefix-cache` to opt out.
+
+**A gate that cannot fail is not a gate — again.** The smoke gate's first version asserted only
+that `/health`'s `prefix_cache` field was non-empty. It reported green while the pool was disabled
+entirely. It now asserts reuse actually **fired** (`hits=0` not in stats), and treats `disabled` as
+an explicitly-named non-EXL3 expectation rather than a pass.
+
+**Also learned:** a `StreamingResponse` body runs *after* its handler returns, so an admission slot
+held across the `return` is released before the first token and leaves the model unprotected for
+the whole stream. The slot is acquired inside the SSE generator, with an eager depth check in the
+route so a full queue is still an honest 503 rather than an SSE error event.
+
+**Verification.** Full suite **1006 passed / 3 skipped** (892 before this row). Dense smoke gate
+**PASS, perplexity 8.78 unchanged**. `test_server_smoke.py` **ALL PASS** on Llama-3.2-1B (derived
+`max_seq_len=90639`) and on MiniMax-M2.7 EXL3 MoE (8192; prefix cache 1hit/1miss, **52 of 104
+prompt tokens skipped on turn 2**). `test_batch_prefix_equivalence.py` passes on the
+Llama-3.3-70B EXL3 checkpoint (120.9 s) — it fails on a non-EXL3 one with or without this row's
+changes, which is OPTIONAL row 3, not a regression.
+
+**Standing limitations.** `batched_generate` deliberately unwired (static-batch v1; N≥2 at long
+context is a settled hardware refusal). The speculative path is sampling-blind — it honours
+`temperature` only, and the server WARNS rather than pretending. `_finish` infers
+`hit_stop_string` from `produced < cap` because HF trims the matched stop string before returning.
+No resident-size coder checkpoint is on disk, so the "usable now" target from the design is not
+yet reachable; the server is model-agnostic and does not block on it.

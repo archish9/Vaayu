@@ -468,6 +468,52 @@ DRAFT_TOKENS       = 5
 
 ---
 
+## 🌐 Running Vaayu as a server
+
+```bash
+./venv/bin/python -m vaayu.server --model /path/to/checkpoint --port 8000
+```
+
+OpenAI-compatible: `POST /v1/chat/completions` (streaming and not), `GET /v1/models`,
+`GET /health`. Any client that already speaks the OpenAI API works unchanged.
+
+```bash
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "vaayu",
+  "messages": [{"role": "user", "content": "write a binary search in Python"}]
+}'
+```
+
+**`max_tokens` is optional, and omitting it is the normal case.** The default is the
+whole remaining context window (`max_seq_len - prompt_len`, derived at load), so output
+stops when the model is done rather than at a fixed count. If output really was cut
+off, `finish_reason` is `"length"` — resend the turn to continue rather than writing
+truncated code to a file. There is no fixed `MAX_NEW_TOKENS` here.
+
+**One model per process.** A Vaayu load costs minutes (pinning, slab arena, NVMe
+warmup, expert-cache sizing); swapping a model is a restart, not a request.
+
+**One request at a time**, with a FIFO queue (`--queue-depth`, default 8) and a 503
+past that. The engine is not thread-safe and N≥2 at long context is a hardware refusal
+on 16 GB, not a missing feature.
+
+**Tool calling** works wherever the checkpoint's chat template supports it: pass
+OpenAI `tools`, get `tool_calls` back with `finish_reason="tool_calls"`. The call
+format is detected by probing the template, not by model name. MCP belongs in your
+agent — this server speaks `tools`/`tool_calls` and nothing more.
+
+**Prefix caching is on by default and is the largest lever here** (136–377× TTFT on
+repeated context). Nothing is needed client-side: resend the full history each turn, as
+OpenAI clients already do. Watch it work with `curl localhost:8000/health`, which
+reports hits, misses and the share of prompt tokens skipped. `--no-prefix-cache` opts
+out.
+
+Useful flags: `--served-model-name`, `--device`, `--kv-cache-mode`,
+`--drafter-model-path` (opt-in speculative decoding; measured 5.57× on streamed dense,
+refused by the Fix #9 gate on both MoE targets).
+
+---
+
 ## 🏃 Quickstart Inference Test
 
 Edit the `CONFIG` block at the top of `test_quick.py`, then run:

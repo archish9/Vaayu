@@ -16,10 +16,10 @@ for the three scheduled rows and are self-contained on their own.
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
-- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **880 passed, 3 skipped**
-  (2026-08-16, after row 8's 15 new tests). The **854** figure recorded here on 2026-08-15 was
-  already stale when written: HEAD measured **865 passed, 3 skipped** on 2026-08-16 morning, before
-  any of row 8's work — verified by `git stash`, so the +15 is row 8's and nothing else's.
+- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **1006 passed, 3 skipped**
+  (2026-08-16, after row 13's server work: 892 before it, +114 from it).
+- The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and
+  `pydantic` were already present; `fastapi.testclient` needs `httpx`.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
   literals (16 GB VRAM / **15.47 GiB usable**, 32 GB RAM, ~8.5 GB expert-cache ceiling,
   ~5.5 GB/s NVMe), each commented as such.
@@ -58,9 +58,12 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 |---|---|---|---|
 | dense smoke (CLAUDE.md §0's named guard) | `./venv/bin/python test_batched_dense_smoke.py` | ~2 min | dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged by the day's work |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
-| prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility |
+| prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
+| HTTP server (row 13) | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
 
-**Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`.**
+**Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
+the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
+blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 2026-08-16.
 
 **Two lessons from strengthening these, both of which cost a run to learn:**
 
@@ -86,8 +89,8 @@ _Re-sequenced 2026-08-16 (row 8 closed). Older closed rows live in `plans/settle
 Rows 1, 6, 7, 8 and 10 keep their detail sections BELOW the pending ones even though they are closed —
 rows 9/11/12 all lean on them; move them out once 9 lands._
 
-**SCHEDULED holds row 13** (added 2026-08-16): Vaayu as an inference server. Design approved,
-implementation plan not yet written. OPTIONAL holds everything else and never runs ahead of it.
+**SCHEDULED is EMPTY again** (2026-08-16): row 13, the OpenAI-compatible server, shipped.
+OPTIONAL holds everything that remains.
 
 **Before starting, know what this list can and cannot do.** It is correctness and capability debt,
 not a performance roadmap. Row 8 (closed 2026-08-16) and row 9 RECOVER context that rows 6/7
@@ -97,14 +100,28 @@ throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at 
 INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
 expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
-## SCHEDULED
+## SCHEDULED — EMPTY as of 2026-08-16
 
-# 13 · [~] Vaayu as an inference server (OpenAI-compatible), v1
+Row 13 shipped; its detail is kept below because the server is new and its risks are live.
 
-Design **approved 2026-08-16**: `plans/2026-08-16-vaayu-server-design.md`.
-Implementation plan **written 2026-08-16**: `plans/2026-08-16-vaayu-server-plan.md` — 13 TDD tasks,
-self-contained (every step carries real code, the exact command, and its expected output). Read BOTH
-before touching anything. **Nothing is implemented yet.**
+# 13 · [x] CLOSED 2026-08-16 — Vaayu as an inference server (OpenAI-compatible), v1
+
+**SHIPPED 2026-08-16.** Design `plans/2026-08-16-vaayu-server-design.md`, plan
+`plans/2026-08-16-vaayu-server-plan.md`, all 13 tasks done and verified.
+
+**Measured outcome:** full suite **1006 passed / 3 skipped** (+114 over the 892 baseline);
+dense smoke gate **PASS, perplexity 8.78 unchanged**; `test_server_smoke.py` **ALL PASS** on
+Llama-3.2-1B (derived `max_seq_len=90639`) and on MiniMax-M2.7 EXL3 MoE (8192, prefix cache
+1hit/1miss, 52/104 prompt tokens skipped on turn 2). Live HTTP arm: `max_tokens` omitted →
+**506 tokens, `finish_reason="stop"`, complete code**; `max_tokens=20` → `finish_reason="length"`.
+
+**Three defects the on-device gate caught that every fake-backed test passed over:**
+`apply_chat_template` returns a `BatchEncoding` on transformers 5.5.4, not a list;
+`stream_generate` already builds `use_cache`/`max_new_tokens`/`do_sample` so passing them again
+is a duplicate-keyword `TypeError`; and `enable_prefix_cache` defaults OFF in `vaayu_base`, so
+the server shipped with its largest lever silently disabled. **A gate that cannot fail is not a
+gate** — the smoke gate's first version asserted only that the stats field was non-empty and
+reported green while the pool was off; it now asserts reuse FIRED.
 
 **What it is:** turn Vaayu from a test-script token generator into a long-running HTTP server an
 autonomous coding agent can drive — one `--model` path, OpenAI-shaped requests, streaming, tool
@@ -148,11 +165,30 @@ checkboxes are the step-level detail.
 - [x] **11** `test_server_smoke.py` at repo ROOT — real load, non-stream, stream, oversized-prompt
       refusal, prefix observability. Run on the 1B AND on an EXL3 MoE, each under its own
       `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
-- [ ] **12** README section, close this row, archive entry in `plans/settled_and_method_notes.md`
+- [x] **12** README section, close this row, archive entry in `plans/settled_and_method_notes.md`
 
 **Done means:** full suite green — **892 passed / 3 skipped** at plan time, **984 / 3** projected
 after the plan's 92 new tests; dense smoke gate PASS with perplexity **8.78 unchanged**; and
 `test_server_smoke.py` passing on BOTH the small dense checkpoint and an EXL3 MoE one.
+
+**Standing limitations — live, and the follow-ups this row created:**
+
+- **No resident-size checkpoint on disk.** The "usable now" target needs a ~14B-class coder at
+  4-4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Until then the server runs
+  the streamed big models at their measured ceiling (~0.56 tok/s MoE, 8192 context). **The server
+  itself is model-agnostic and does not block on this.**
+- **OPTIONAL row 3 now has a real consumer.** The prefix pool is disabled for non-EXL3 checkpoints
+  (bare `DynamicCache` has no `to_cpu`/`to_device`/`resident_bytes`), so the server's largest lever
+  is off for every fp16 model — confirmed on-device: 1B reports `prefix_cache: disabled`, MiniMax
+  EXL3 reports real hits.
+- **`_finish` infers `hit_stop_string` from `produced < cap`.** HF trims a matched stop string
+  before returning, so the ids cannot be inspected for one. Fine for the length-vs-stop distinction
+  a client acts on; wrong if anything ever needs to know WHICH stop fired.
+- **Reserve policy vs a resident model** (design §9.3): row 8's floors were tuned for streamed
+  models; on Llama-3.2-1B the clamp drove `pinning_budget -> 0` for a measured -19 % decode. Unmeasured
+  for a resident coder model because none is on disk.
+- **`test_batched_dense_smoke.py` needed `MemoryMax=26G`, not the 22G in the gates table** — OOM-killed
+  at 22G directly after a MiniMax run, because freed pinned host blocks are cached, not returned.
 
 **Named risks carried from the design (§9):** the speculative path is sampling-blind (`top_p`/
 `top_k`/stop-strings silently ignored — must warn, not pretend); row 8's reserve policy may drive
@@ -187,11 +223,14 @@ closing them (11a, 12a, 12b) is fixed.
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): row 13 — write the implementation plan for the server
-> **Row 13 (Vaayu as an inference server) is SCHEDULED and in progress.** Its design is approved and
-> committed at `plans/2026-08-16-vaayu-server-design.md`, and its 13-task TDD implementation plan is
-> written at `plans/2026-08-16-vaayu-server-plan.md`. **Start at plan Task 0 and work down.** No
-> server code exists yet.
+> ### ▶▶ NEXT ACTION (fresh session): nothing scheduled — pick from OPTIONAL
+> **Row 13 shipped 2026-08-16.** Vaayu now runs as an OpenAI-compatible server:
+> `./venv/bin/python -m vaayu.server --model PATH --port 8000`. Suite 1006/3, dense smoke 8.78,
+> on-device server gate ALL PASS on the 1B and on MiniMax EXL3.
+>
+> **The live follow-ups it created are listed in row 13's "Standing limitations" below** — the
+> resident-coder checkpoint (nothing of that size is on disk), the reserve-vs-resident-model
+> interaction, and the fp16 prefix-cache gap (OPTIONAL row 3) which now has a real consumer.
 > Read the design before touching anything — it records WHY the shape is what it is (measured
 > ceiling ~0.86 tok/s at 8192 context, single stream; resident-model default; queue not batch).
 >
