@@ -295,6 +295,11 @@ class ExpertRAMCache:
         # record_read()/acquire() event-sync guards the in-flight-copy window.
         # Guarded by self.lock (same lock as all cache mutations — no new lock).
         self._pinned: dict[tuple, int] = {}
+        # Optional access trace for offline capacity replay (todo row 14). None
+        # when off, which is always unless a probe turns it on: the hot path then
+        # costs one attribute load and one branch, under a lock already held.
+        # See vaayu/expert_sim.py for the replay.
+        self._trace: list | None = None
 
     def pin(self, layer_idx: int, expert_idx: int) -> None:
         """Refcount-pin (layer_idx, expert_idx) so eviction skips it. Safe to
@@ -317,8 +322,21 @@ class ExpertRAMCache:
             else:
                 self._pinned[key] = c - 1
 
+    def enable_trace(self) -> None:
+        """Start recording every (layer_idx, expert_idx) lookup. Diagnostics only."""
+        with self.lock:
+            self._trace = []
+
+    def take_trace(self) -> list:
+        """Return the recorded lookups and stop recording."""
+        with self.lock:
+            t, self._trace = (self._trace or []), None
+            return t
+
     def get(self, layer_idx: int, expert_idx: int, *, pin: bool = False) -> dict | None:
         with self.lock:
+            if self._trace is not None:
+                self._trace.append((layer_idx, expert_idx))
             if self.max_per_layer > 0:
                 lc = self._layer_caches.get(layer_idx)
                 if lc and expert_idx in lc:
