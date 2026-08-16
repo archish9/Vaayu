@@ -137,7 +137,7 @@ checkboxes are the step-level detail.
       drained the pool permanently. Crops the mutated cache to a length whose tokens are KNOWN —
       re-storing against the original token list would corrupt it. Never raises (must not mask the
       real error)
-- [ ] **7** `server/engine.py` — `EngineHandle`: depth-bounded FIFO gate, request→kwargs mapping,
+- [x] **7** `server/engine.py` — `EngineHandle`: depth-bounded FIFO gate, request→kwargs mapping,
       blocking + streaming generation. Carries the CPU `max_seq_len=512` startup warning
       (`vaayu_base.py:1648`) and the speculative-path sampling warning
 - [ ] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
