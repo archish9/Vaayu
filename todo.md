@@ -119,9 +119,9 @@ disk load for a pinned layer, so a fully-pinned model pays no streaming cost.
 **Tasks — one per plan task, in execution order.** Tick each as it lands; the plan's own
 checkboxes are the step-level detail.
 
-- [ ] **0** deps + package skeleton — `fastapi`/`uvicorn` installed and in `requirements.txt`,
+- [x] **0** deps + package skeleton — `fastapi`/`uvicorn` installed and in `requirements.txt`,
       `vaayu/server/__init__.py` with a lazy re-export so `import vaayu` stays cheap
-- [ ] **1** `server/stopping.py` — `resolve_max_tokens` + `finish_reason`. THE truncation fix.
+- [x] **1** `server/stopping.py` — `resolve_max_tokens` + `finish_reason`. THE truncation fix.
       Pure, parametrized over all four on-disk derived windows. `512` must not appear in `vaayu/server/`
 - [ ] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
       real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
