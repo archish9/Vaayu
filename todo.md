@@ -86,9 +86,8 @@ _Re-sequenced 2026-08-16 (row 8 closed). Older closed rows live in `plans/settle
 Rows 1, 6, 7, 8 and 10 keep their detail sections BELOW the pending ones even though they are closed —
 rows 9/11/12 all lean on them; move them out once 9 lands._
 
-**SCHEDULED is now empty** (2026-08-16) — read the NEXT ACTION block below the OPTIONAL table.
-OPTIONAL holds everything left, and it is no longer uniform: two `[bug]` rows found by the closed
-work outrank the rest of it.
+**SCHEDULED holds row 13** (added 2026-08-16): Vaayu as an inference server. Design approved,
+implementation plan not yet written. OPTIONAL holds everything else and never runs ahead of it.
 
 **Before starting, know what this list can and cannot do.** It is correctness and capability debt,
 not a performance roadmap. Row 8 (closed 2026-08-16) and row 9 RECOVER context that rows 6/7
@@ -98,10 +97,73 @@ throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at 
 INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
 expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
-## SCHEDULED — EMPTY as of 2026-08-16
+## SCHEDULED
 
-Every scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found while closing them
-(11a, 12a, 12b) is fixed. **Nothing here is open except the genuinely optional rows below.**
+# 13 · [~] Vaayu as an inference server (OpenAI-compatible), v1
+
+Design **approved 2026-08-16**: `plans/2026-08-16-vaayu-server-design.md`. Implementation plan
+NOT yet written — next step is the writing-plans pass, which replaces the placeholder subtasks
+below with real ones. Nothing is implemented.
+
+**What it is:** turn Vaayu from a test-script token generator into a long-running HTTP server an
+autonomous coding agent can drive — one `--model` path, OpenAI-shaped requests, streaming, tool
+calls. New package `vaayu/server/`; `vaayu_base.py` is not grown (it is already 4564 lines).
+
+**Why now, and what it cannot fix.** With every existing lever on, the ceiling on current
+checkpoints is ~0.86 tok/s at 8192 context, single stream. v1's default deployment is therefore a
+**VRAM-resident** coder model (~8-10 GB weights budget, derived in the design §2), with the
+streamed big-model path staying first-class and selectable. `vaayu_base.py:3698` already skips the
+disk load for a pinned layer, so a fully-pinned model pays no streaming cost.
+
+**Task groups (placeholders until the plan lands):**
+
+- [ ] `server/schemas.py` — OpenAI subset + Vaayu extras (`session_id`, `kv_cache_mode`,
+      `drafter_model_path`), pure, unit-tested
+- [ ] `server/stopping.py` — `resolve_max_tokens` + `finish_reason` table, pure, parametrized over
+      all four on-disk geometries (CLAUDE.md §5)
+- [ ] `server/tools.py` — tool-call parser registry, selected by PROBING the chat template, never
+      by model-name match (§5); Hermes/Qwen `<tool_call>` family + fenced-JSON fallback
+- [ ] `server/chat.py` — `apply_chat_template(..., tools=)`; 400 with a named reason when the
+      template has no tool support (never silently drop `tools`)
+- [ ] `server/engine.py` — single `VaayuBaseModel`, `asyncio.Queue(maxsize=8)`, one worker,
+      `run_in_executor`; 503 + `Retry-After` past depth
+- [ ] `server/app.py` — `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`,
+      `GET /health` (VRAM, queue depth, `PrefixCacheStore.stats()`)
+- [ ] `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
+- [ ] **engine fix (prefix cache):** explicit-`session_id` miss must fall back to auto-prefix-match
+      — `prefix_cache.py:71` gates it on `session_id is None`, so naming a session and missing is
+      strictly worse than not naming it
+- [ ] **engine fix (prefix cache):** client disconnect must not drain the pool — `lookup()` POPS and
+      `store()` only re-inserts after `generate()` returns, so an aborted SSE stream loses the entry
+      PERMANENTLY. `try/finally` re-insert on the abort path
+- [ ] **startup warning:** `vaayu_base.py:1648` falls back to `max_seq_len=512` on the CPU/no-plan
+      path; the server's "default cap = remaining window" would silently inherit a 512-token window
+- [ ] `test_server_smoke.py` at repo root — one real load, then non-stream + stream + tool-call
+      request, under `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
+
+**Done means:** full suite green (892 passed / 3 skipped at design time), dense smoke gate PASS with
+perplexity 8.78 unchanged, and the new on-device server gate passing on a real checkpoint.
+
+**Named risks carried from the design (§9):** the speculative path is sampling-blind (`top_p`/
+`top_k`/stop-strings silently ignored — must warn, not pretend); row 8's reserve policy may drive
+`pinning_budget -> 0` for a resident model as it did on Llama-3.2-1B (-19 % decode); row 4's 2x KV
+ring-doubling becomes the COMMON case once `max_tokens` defaults to the full window;
+`batched_generate` stays deliberately unwired.
+
+**Parallel action item, NOT a blocker:** no resident-size checkpoint is on disk (only two huge MoEs,
+the 70B dense, and 1B/1.5B tinies). The "usable now" target needs a ~14B-class coder at 4-4.5 bpw
+EXL3 (~8 GB). The server is built and tested against what is already on disk — §5 requires it be
+model-agnostic regardless.
+
+**Streaming is NOT the truncation fix** (this was the originating question): streaming is delivery,
+truncation is stopping policy. The fix is stop-on-EOS with the cap derived from the remaining
+context window, plus an honest `finish_reason` so a cut-off client is TOLD rather than handed
+silently-broken code.
+
+---
+
+Every previously scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found while
+closing them (11a, 12a, 12b) is fixed.
 
 
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
@@ -115,8 +177,14 @@ Every scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found wh
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): nothing is scheduled or blocked — pick from OPTIONAL
-> **The whole SCHEDULED sequence closed 2026-08-15/16** (rows 1, 6, 7, 8, 9, 10, 11, 12), and the
+> ### ▶▶ NEXT ACTION (fresh session): row 13 — write the implementation plan for the server
+> **Row 13 (Vaayu as an inference server) is SCHEDULED and in progress.** Its design is approved and
+> committed at `plans/2026-08-16-vaayu-server-design.md`; the next step is the writing-plans pass
+> that turns row 13's placeholder subtasks into real, ordered, TDD tasks. No server code exists yet.
+> Read the design before touching anything — it records WHY the shape is what it is (measured
+> ceiling ~0.86 tok/s at 8192 context, single stream; resident-model default; queue not batch).
+>
+> **The previous sequence closed 2026-08-15/16** (rows 1, 6, 7, 8, 9, 10, 11, 12), and the
 > three bugs those rows uncovered — **11a** (warm-cache admission), **12a** (drafter VRAM
 > unbudgeted), **12b** (no drafter/target vocab check) — are all fixed and verified on-device.
 >
