@@ -105,7 +105,7 @@ We have structured the entire architectural knowledge, installation guides, and 
 * [**📂 Quantization & Pluggable Strategies**](documentation/quantization_and_strategies.md): Explaining our decoupled `LoaderStrategy` pattern (Peeking safetensors headers to auto-detect strategies), compiling custom ExLlamaV3 4-bit CUDA kernels, managing heap memory safety, and executing `quantize.py`.
 * [**🔮 Speculative Decoding & MoE Roadmap**](documentation/speculative_decoding_and_moe.md): Our technical blueprint detailing drafting-verification loops, Mixture-of-Experts routing gates, and expert-aware byte-offset disk streaming.
 * [**🍎 Apple Silicon & The Unified Memory Paradigm**](documentation/mac_unified_memory_paradigm.md): Exploring UMA zero-copy superpowers (`gpu_load` drops to 0s), analyzing the 16 GB MacBook VM swap thrashing constraint, and outlining a Mac manual swap manager using Metal (MPS) and `F_NOCACHE` (via `fcntl`).
-* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on the 1B and 2.0x on MiniMax), and the troubleshooting table.
+* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on the 1B, 2.0x on MiniMax and 1.27x on the 70B), and the troubleshooting table.
 * [**⚙️ Tuning Guide: what to set, and when**](documentation/TUNING.md): The decision guide for the caching knobs — when `prefix_compress` pays (and when it is pure cost), why the pool budget is not free RAM, and which knobs currently do nothing. Pairs with `tune_advisor.py`, which computes the crossover for your own model and box.
 * [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, Gemma4 multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
 
@@ -538,7 +538,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 | `--model` | `$VAAYU_MODEL_PATH` | required. One model per process — a load costs minutes, so swapping is a restart |
 | `--served-model-name` | checkpoint path | short stable `id` for clients to hardcode |
 | `--queue-depth` | `8` | waiting requests before `503`. One runs at a time regardless |
-| `--max-pinned-layers` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax** |
+| `--max-pinned-layers` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
 | `--no-prefix-cache` | *cache is ON* | don't. Reuse is the largest lever here |
 | `--prefix-compress 9` | `None` | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
 | `--drafter-model-path` | `None` | **5.57×** on streamed dense. Refused at load on MoE |

@@ -25,7 +25,8 @@ which overstates the budget several-fold and under-recommends compression.
 > The server's defaults differ from the library's on purpose: `max_pinned_layers` is `-1`
 > (not `0`) and `enable_prefix_cache` is on (not off), because a server holds one model for
 > its whole life and should fill the box. Getting the first one wrong costs **13x** on
-> Llama-3.2-1B and **2.0x** on MiniMax-M2.7, measured.
+> Llama-3.2-1B, **2.0x** on MiniMax-M2.7 and **1.27x** on Llama-3.3-70B, measured — the gain
+> scales with how much of the model fits in the pinning budget.
 
 ## The 30-second version
 
@@ -88,7 +89,7 @@ Anything below 9 prints a warning.
 always bf16. If a single session's KV won't fit in VRAM, this cannot help — that
 needs attention over compressed keys, which is not built.
 
-Full measurements: the compress-on-evict RESULTS doc under `docs/superpowers/plans/`
+Full measurements are summarised above; the raw arms live in this repo's working notes
 (local working notes, not tracked in the repo).
 
 ## 3. `enable_kv_persist` — on, unless disk is precious

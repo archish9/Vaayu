@@ -4,7 +4,8 @@ Vaayu runs as a long-lived, OpenAI-compatible HTTP server. Any client that alrea
 speaks the OpenAI API — a coding agent, Cline, Aider, LiteLLM, the `openai` SDK —
 works against it with no adapter.
 
-**Design:** `plans/2026-08-16-vaayu-server-design.md` · **Plan:** `plans/2026-08-16-vaayu-server-plan.md`
+Every number on this page was measured on the reference box — 16 GB VRAM, 32 GB RAM,
+NVMe — with same-day A/B arms. Where a figure is a refutation rather than a win, it says so.
 
 ---
 
@@ -97,7 +98,7 @@ holds one model for its whole life and should fill the box.
 
 | flag | default | what it does |
 |---|---|---|
-| `--max-pinned-layers` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7** (§7) |
+| `--max-pinned-layers` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
 | `--no-prefix-cache` | *(off — cache is ON)* | disables cross-turn KV reuse. Do not use this for an agent workload; reuse is the largest measured lever here (136–377× TTFT) |
 | `--prefix-compress N` | `None` | packs pooled KV at N bits (**9** is the tested floor) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
 | `--drafter-model-path` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused at load on both MoE targets |
@@ -379,16 +380,22 @@ Measured on this box (16 GB VRAM, 32 GB RAM), same-day A/B.
 `--max-pinned-layers -1` fills the VRAM budget with transformer layers, which then never
 touch the NVMe again. At `0` the budget sits idle and every layer streams per token.
 
-| checkpoint | `--max-pinned-layers 0` | `-1` (default) | gain |
-|---|---|---|---|
-| Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
-| MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
+| checkpoint | `--max-pinned-layers 0` | `-1` (default) | gain | what actually pinned |
+|---|---|---|---|---|
+| Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** | 16 of 16 layers — fully resident |
+| MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** | non-expert parts of all 62 layers |
+| Llama-3.3-70B (dense) | 0.131 tok/s | **0.167 tok/s** | **1.27×** | 1 of 80 layers |
+
+**The gain scales with the fraction of the model that fits**, which is why it ranges from
+13× to 1.27×. Llama-3.3-70B's layers are ~460 MB each against a ~2.6 GB pinning budget, so
+only one stays resident and 79 still stream per token — that model is disk-bound no matter
+what this flag says. The 1B fits entirely and never touches the NVMe again.
 
 On MoE, `-1` pins the *non-expert* parts of every layer (attention, norms, router
 gates) and leaves the experts to the expert cache — the right split, automatically.
 
 **You get this for free; it is the default.** It is documented because the cost of
-overriding it to `0` is enormous and non-obvious.
+overriding it to `0` is large and non-obvious.
 
 ### 7.2 Use a checkpoint that fits in VRAM
 

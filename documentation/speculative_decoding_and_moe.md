@@ -1,6 +1,9 @@
 # Speculative Decoding — As Built (Phase H)
 
-> Implementation complete. For the original blueprint, see `plans/schedule_plan_h_speculative_decoding_part1.md` and `part2.md`.
+> Implementation complete. Measured outcomes: **5.57x** with a drafter and **1.94x** with prompt
+> lookup on streamed dense (Llama-3.3-70B); refused at load on both MoE targets, where a
+> 6-position verify pass needs 53.4 GB (Qwen3-235B) / 26.4 GB (MiniMax-M2.7) of expert working
+> set against a 9.1 GB budget.
 
 ## Status: Implemented
 
