@@ -105,6 +105,7 @@ We have structured the entire architectural knowledge, installation guides, and 
 * [**📂 Quantization & Pluggable Strategies**](documentation/quantization_and_strategies.md): Explaining our decoupled `LoaderStrategy` pattern (Peeking safetensors headers to auto-detect strategies), compiling custom ExLlamaV3 4-bit CUDA kernels, managing heap memory safety, and executing `quantize.py`.
 * [**🔮 Speculative Decoding & MoE Roadmap**](documentation/speculative_decoding_and_moe.md): Our technical blueprint detailing drafting-verification loops, Mixture-of-Experts routing gates, and expert-aware byte-offset disk streaming.
 * [**🍎 Apple Silicon & The Unified Memory Paradigm**](documentation/mac_unified_memory_paradigm.md): Exploring UMA zero-copy superpowers (`gpu_load` drops to 0s), analyzing the 16 GB MacBook VM swap thrashing constraint, and outlining a Mac manual swap manager using Metal (MPS) and `F_NOCACHE` (via `fcntl`).
+* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on the 1B and 2.0x on MiniMax), and the troubleshooting table.
 * [**⚙️ Tuning Guide: what to set, and when**](documentation/TUNING.md): The decision guide for the caching knobs — when `prefix_compress` pays (and when it is pure cost), why the pool budget is not free RAM, and which knobs currently do nothing. Pairs with `tune_advisor.py`, which computes the crossover for your own model and box.
 * [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, Gemma4 multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
 
@@ -248,6 +249,12 @@ MAX_NEW_TOKENS = 512
 | Long-form writing | `1024–2048` |
 
 **Recommendation:** Set to `512` for coding agent workloads. There is no VRAM cost to a high value — it only determines the maximum loop iterations.
+
+> **⚠️ This parameter does not exist on the server, deliberately.** A fixed cap is exactly what
+> truncates code mid-function. `POST /v1/chat/completions` treats `max_tokens` as optional and
+> defaults it to the whole remaining context window (`max_seq_len − prompt_len`, derived at load),
+> so generation stops when the model is done — and reports `finish_reason: "length"` when it
+> genuinely was cut off. See [**Running Vaayu as a Server**](#-running-vaayu-as-a-server-openai-compatible).
 
 ---
 
@@ -468,49 +475,85 @@ DRAFT_TOKENS       = 5
 
 ---
 
-## 🌐 Running Vaayu as a server
+## 🌐 Running Vaayu as a Server (OpenAI-compatible)
+
+> **Full reference:** [**documentation/server.md**](documentation/server.md) — every flag, every
+> request field, curl examples for tool calling and streaming, and the coding-agent
+> integration checklist.
+
+Vaayu runs as a long-lived HTTP server speaking the OpenAI API. Any client that already
+speaks it — a coding agent, Cline, Aider, LiteLLM, the `openai` SDK — works with **no adapter**.
 
 ```bash
 ./venv/bin/python -m vaayu.server --model /path/to/checkpoint --port 8000
 ```
 
-OpenAI-compatible: `POST /v1/chat/completions` (streaming and not), `GET /v1/models`,
-`GET /health`. Any client that already speaks the OpenAI API works unchanged.
-
 ```bash
-curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [{"role": "user", "content": "write a binary search in Python"}]
 }'
 ```
 
-**`max_tokens` is optional, and omitting it is the normal case.** The default is the
-whole remaining context window (`max_seq_len - prompt_len`, derived at load), so output
-stops when the model is done rather than at a fixed count. If output really was cut
-off, `finish_reason` is `"length"` — resend the turn to continue rather than writing
-truncated code to a file. There is no fixed `MAX_NEW_TOKENS` here.
+`POST /v1/chat/completions` (streaming and not) · `GET /v1/models` · `GET /health`.
 
-**One model per process.** A Vaayu load costs minutes (pinning, slab arena, NVMe
-warmup, expert-cache sizing); swapping a model is a restart, not a request.
+### There is no `MAX_NEW_TOKENS` here — omit `max_tokens`
 
-**One request at a time**, with a FIFO queue (`--queue-depth`, default 8) and a 503
-past that. The engine is not thread-safe and N≥2 at long context is a hardware refusal
-on 16 GB, not a missing feature.
+The single most important difference from the test scripts. **Omitting `max_tokens` is the
+normal case**: the cap becomes `max_seq_len − prompt_len`, derived at load, so generation
+stops when the model is **done** rather than at a fixed count. No more code truncated
+mid-function.
 
-**Tool calling** works wherever the checkpoint's chat template supports it: pass
-OpenAI `tools`, get `tool_calls` back with `finish_reason="tool_calls"`. The call
-format is detected by probing the template, not by model name. MCP belongs in your
-agent — this server speaks `tools`/`tool_calls` and nothing more.
+When output genuinely was cut off you are **told**, and an agent must branch on it:
 
-**Prefix caching is on by default and is the largest lever here** (136–377× TTFT on
-repeated context). Nothing is needed client-side: resend the full history each turn, as
-OpenAI clients already do. Watch it work with `curl localhost:8000/health`, which
-reports hits, misses and the share of prompt tokens skipped. `--no-prefix-cache` opts
-out.
+| `finish_reason` | meaning | what your agent does |
+|---|---|---|
+| `stop` | EOS or a stop string | use the output |
+| `length` | cap reached — **output is truncated** | resend to continue; never write it to a file |
+| `tool_calls` | the model called a tool | dispatch, append results, continue |
 
-Useful flags: `--served-model-name`, `--device`, `--kv-cache-mode`,
-`--drafter-model-path` (opt-in speculative decoding; measured 5.57× on streamed dense,
-refused by the Fix #9 gate on both MoE targets).
+Streaming does **not** fix truncation — streaming is delivery, truncation is stopping policy.
+It ships for time-to-first-token visibility, early abort, and mid-stream tool-call detection.
+
+### The five must-knows for a coding agent
+
+1. **Omit `max_tokens`, branch on `finish_reason`.** Most agent frameworks default it to
+   1024 or 4096 — turn that off; a client-side number can only make the window smaller.
+2. **Resend the full history every turn.** That *is* the fast path: prefix caching reuses the
+   longest matching prefix and prefills only the tail (136–377× TTFT). OpenAI clients already
+   do this, so the default is optimal. Don't trim from the front — it breaks the prefix.
+3. **One request at a time.** FIFO queue (`--queue-depth`, default 8), `503` + `Retry-After`
+   past it. Parallel sub-agent calls will serialise; handle `503` with a retry.
+4. **Context is the binding constraint, not speed.** Read the real number from `/v1/models`
+   (8192 on all three big checkpoints). Keep MCP tool schemas terse — they eat it fast.
+5. **MCP belongs in your agent.** Vaayu speaks `tools` / `tool_calls` and nothing more. Tool
+   support is a property of the checkpoint's chat template, detected by **probing the
+   template**, never by model name; a `tools` request against a template that can't render
+   them is a `400` with a named reason rather than a silent drop.
+
+### Key flags
+
+| flag | default | why you care |
+|---|---|---|
+| `--model` | `$VAAYU_MODEL_PATH` | required. One model per process — a load costs minutes, so swapping is a restart |
+| `--served-model-name` | checkpoint path | short stable `id` for clients to hardcode |
+| `--queue-depth` | `8` | waiting requests before `503`. One runs at a time regardless |
+| `--max-pinned-layers` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax** |
+| `--no-prefix-cache` | *cache is ON* | don't. Reuse is the largest lever here |
+| `--prefix-compress 9` | `None` | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
+| `--drafter-model-path` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
+| `--use-prompt-lookup` | off | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
+| `--attn-implementation` | `sdpa` | `flash_attention_2` derives more context at the same reserve |
+
+Full list, request-body reference, tool-calling examples and the troubleshooting table:
+[**documentation/server.md**](documentation/server.md).
+
+### Limits, stated plainly
+
+One model per process, no hot-swap. One request in flight, `n=1` only. No continuous
+batching (N≥2 at long context is a hardware wall on 16 GB, not a missing feature). No
+`/v1/completions`, no MCP client, **no auth or TLS** — bind to `127.0.0.1` or put a proxy in
+front. Prefix caching is disabled for non-EXL3 checkpoints; `/health` reports it.
 
 ---
 

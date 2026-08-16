@@ -32,6 +32,19 @@ class ServerConfig:
     # reuse is this engine's largest measured lever (136-377x TTFT) and an agent
     # resending its history every turn is exactly the workload it was built for.
     enable_prefix_cache: bool = True
+    # -1 (auto-fill) here although vaayu_base defaults it to 0. At 0 the engine
+    # pins the shared layers and NO transformer layers, so every transformer
+    # layer streams from NVMe on every token while the whole pinning budget sits
+    # unused -- measured 11.46 GiB idle on Llama-3.2-1B before this default was
+    # set. A server holds one model for its whole life; not filling that budget
+    # is pure waste.
+    max_pinned_layers: int = -1
+    prefill_chunk_size: int = 512
+    use_prompt_lookup: bool = False
+    draft_tokens: int = 5
+    prefix_compress: int | None = None
+    enable_kv_persist: bool = False
+    attn_implementation: str | None = None
 
 
 def _error(status: int, message: str, kind: str, headers=None):
@@ -62,6 +75,13 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 kv_cache_mode=config.kv_cache_mode,
                 drafter_model_path=config.drafter_model_path or None,
                 enable_prefix_cache=config.enable_prefix_cache,
+                max_pinned_layers=config.max_pinned_layers,
+                prefill_chunk_size=config.prefill_chunk_size,
+                use_prompt_lookup=config.use_prompt_lookup,
+                draft_tokens=config.draft_tokens,
+                prefix_compress=config.prefix_compress,
+                enable_kv_persist=config.enable_kv_persist,
+                attn_implementation=config.attn_implementation,
             )
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")

@@ -19,6 +19,14 @@ which overstates the budget several-fold and under-recommends compression.
 
 ---
 
+
+> **Running the server?** These knobs are all reachable as CLI flags on
+> `python -m vaayu.server` — see [**server.md §3**](server.md#3-cli-parameter-reference).
+> The server's defaults differ from the library's on purpose: `max_pinned_layers` is `-1`
+> (not `0`) and `enable_prefix_cache` is on (not off), because a server holds one model for
+> its whole life and should fill the box. Getting the first one wrong costs **13x** on
+> Llama-3.2-1B and **2.0x** on MiniMax-M2.7, measured.
+
 ## The 30-second version
 
 ```python
