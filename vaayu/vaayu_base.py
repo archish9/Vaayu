@@ -1664,6 +1664,25 @@ class VaayuBaseModel(GenerationMixin):
         else:
             self.ram_cache = None
 
+        # Speculative drafter — built HERE, above the MoE section, because the
+        # expert VRAM cache below sizes itself from `mem_get_info() - reserve`
+        # and the drafter is a real resident cost the cache must not double-spend
+        # (bug 12a: 10.5 GB of cache + 2.47 GB of drafter + a 3.50 GiB reserve
+        # overcommitted 15.47 GiB, and the drafter's first F.linear died with
+        # CUBLAS_STATUS_INTERNAL_ERROR). Loading it first makes the cache's own
+        # measurement account for it, with no size estimate anywhere.
+        # The Fix #9 MoE gate that may DISABLE it runs further down, after the
+        # RAM expert cache it needs exists and before the VRAM cache is sized.
+        self.speculator = None
+        if drafter_model_path or use_prompt_lookup:
+            from .speculative import build_speculator
+            self.speculator = build_speculator(
+                drafter_model_path=drafter_model_path,
+                base_model=self,
+                device=device,
+                use_prompt_lookup=use_prompt_lookup,
+            )
+
         # MoE Expert-Aware Streaming: expert cache and patched forwards.
         # _expert_offset_index is initialized above (before _init_pinned_layers).
         self._expert_history: dict[int, list[int]] = {}
@@ -1858,6 +1877,39 @@ class VaayuBaseModel(GenerationMixin):
                 arena=self._expert_slab_arena,
             )
 
+            # Fix #9 (REPORT §2.4): a verify pass routes (draft_tokens+1) positions
+            # at once — per-layer unique experts ≈ positions × top_k, so the working
+            # set is ~Nx the single-token one. When that cannot fit the expert cache,
+            # speculation guarantees thrash and is ~I/O-neutral per accepted token.
+            # Warn with the derived numbers and disable — loudly, never silently.
+            if (self.speculator is not None and self.is_moe
+                    and getattr(self, '_expert_cache', None) is not None
+                    and getattr(self, '_moe_geometry', None) is not None):
+                if not spec_decode_fits(self._moe_geometry, self.draft_tokens,
+                                        self._expert_cache.budget_bytes):
+                    _sws = compute_spec_working_set(self._moe_geometry, self.draft_tokens + 1)
+                    print(f"[Vaayu-Spec] WARNING: speculative verify working set "
+                          f"{_sws / 1e9:.1f} GB ((draft_tokens={self.draft_tokens}+1) positions × "
+                          f"top-{self._moe_geometry['top_k']}) exceeds expert cache budget "
+                          f"{self._expert_cache.budget_bytes / 1e9:.1f} GB — speculation would "
+                          f"thrash the cache and gains ~nothing per accepted token on this "
+                          f"hardware. DISABLING speculative decoding for this MoE model. "
+                          f"(Reduce draft_tokens or use a smaller model to re-enable.)")
+                    self.speculator = None
+                    # Hand the drafter's VRAM back to the DRIVER before the
+                    # cache is sized below. A plain drop leaves those bytes in
+                    # PyTorch's caching-allocator pool, which mem_get_info()
+                    # cannot see (the same driver-vs-allocator distinction as
+                    # bug 11a, cutting the other way) -- so the expert cache
+                    # would silently shrink by the drafter's footprint to hold
+                    # memory nothing will ever use.
+                    try:
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
                 from .vram_plan import expert_vram_budget_for
@@ -2004,36 +2056,6 @@ class VaayuBaseModel(GenerationMixin):
                 print("[Vaayu-Usage] WARNING: enable_expert_usage is set but no tracker will be "
                       "built — no VRAM expert cache exists on this device, so there would be "
                       "nothing to join eviction data against.")
-
-        self.speculator = None
-        if drafter_model_path or use_prompt_lookup:
-            from .speculative import build_speculator
-            self.speculator = build_speculator(
-                drafter_model_path=drafter_model_path,
-                base_model=self,
-                device=device,
-                use_prompt_lookup=use_prompt_lookup,
-            )
-
-        # Fix #9 (REPORT §2.4): a verify pass routes (draft_tokens+1) positions
-        # at once — per-layer unique experts ≈ positions × top_k, so the working
-        # set is ~Nx the single-token one. When that cannot fit the expert cache,
-        # speculation guarantees thrash and is ~I/O-neutral per accepted token.
-        # Warn with the derived numbers and disable — loudly, never silently.
-        if (self.speculator is not None and self.is_moe
-                and getattr(self, '_expert_cache', None) is not None
-                and getattr(self, '_moe_geometry', None) is not None):
-            if not spec_decode_fits(self._moe_geometry, self.draft_tokens,
-                                    self._expert_cache.budget_bytes):
-                _sws = compute_spec_working_set(self._moe_geometry, self.draft_tokens + 1)
-                print(f"[Vaayu-Spec] WARNING: speculative verify working set "
-                      f"{_sws / 1e9:.1f} GB ((draft_tokens={self.draft_tokens}+1) positions × "
-                      f"top-{self._moe_geometry['top_k']}) exceeds expert cache budget "
-                      f"{self._expert_cache.budget_bytes / 1e9:.1f} GB — speculation would "
-                      f"thrash the cache and gains ~nothing per accepted token on this "
-                      f"hardware. DISABLING speculative decoding for this MoE model. "
-                      f"(Reduce draft_tokens or use a smaller model to re-enable.)")
-                self.speculator = None
 
         # Dense-only (Task 7 re-scope): MoE now gets the expert-range-scoped
         # warm-up above (~:938); this whole-layer version stays for dense so
