@@ -45,3 +45,6 @@ kernels>=0.13.0
 maturin
 
 Pillow
+# HTTP server (vaayu/server) — OpenAI-compatible inference API
+fastapi>=0.115
+uvicorn[standard]>=0.30
