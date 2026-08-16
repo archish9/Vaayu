@@ -356,6 +356,7 @@ from vaayu.vram_plan import (
     _too_big_message,
     admission_headroom,
     expert_vram_budget_for,
+    reserve_floor_bytes,
     plan_vram,
     solve_max_seq_len,
 )
@@ -864,3 +865,81 @@ def test_the_logits_term_charges_fp32_only_not_both_copies():
     """
     sh = _shape_with(vocab=128256, chunk=512, elem_bytes=2)
     assert _peak_intercept_bytes(sh, 4096) == 512 * 128256 * 4
+
+
+# --- kernel-conditional reserve floor (todo row 8) ---------------------
+#
+# Rows 6/7 made the peak form kernel-aware, and that CUT the derived context on
+# every sdpa load (measured 2026-08-15: Llama-3.3-70B 4373 -> 3821, Llama-3.2-1B
+# 106987 -> 14052) while leaving flash loads untouched. Row 8's ruling: a load on
+# a score-materializing kernel raises its reserve floor to the point where it
+# derives the SAME context flash would have derived at the base floor -- paid for
+# out of the expert VRAM cache / pinning budget, which both subtract this same
+# reserve. Flash loads pay nothing.
+#
+# The raised value is DERIVED per geometry (CLAUDE.md §5), not a literal: the
+# alternative was a flat 6.25 GiB read off a table of four checkpoints, which is
+# a model number in disguise.
+
+def _floor(name, impl, **kw):
+    kw.setdefault("base_floor", int(3.5 * GB))
+    kw.setdefault("free_vram", USABLE_VRAM)
+    kw.setdefault("min_resident", EXPERT_BYTES)
+    kw.setdefault("layer_slack", LAYER_SLACK)
+    shape = kw.pop("shape", None) or shape_for(
+        name, score_elem_bytes=score_elem_bytes(impl))
+    return reserve_floor_bytes(shape=shape, **kw)
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_flash_loads_keep_the_base_reserve_floor(name):
+    """flash_attention_2 materializes no S-sized score buffer, so it already
+    derives its full context at the base floor. Raising it there would spend
+    expert-cache VRAM to buy context nothing asked for."""
+    assert _floor(name, "flash_attention_2") == int(3.5 * GB)
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_sdpa_floor_buys_back_the_context_flash_would_have_derived(name):
+    """The parity rule, stated as an equality on the OUTCOME (max_seq_len),
+    not on the floor's byte value -- a floor asserted in bytes would be the
+    per-model literal §5 forbids, and would not notice if the two shapes
+    stopped agreeing about S."""
+    base = int(3.5 * GB)
+    flash = shape_for(name, score_elem_bytes=score_elem_bytes("flash_attention_2"))
+    sdpa = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    parity = _plan(name, shape=flash, reserve_floor=base).max_seq_len
+    floor = _floor(name, "sdpa")
+    assert floor > base, name
+    ceiling = USABLE_VRAM - EXPERT_BYTES - LAYER_SLACK
+    if floor >= ceiling:
+        # Clamped: llama-1b's flash parity is ~90k tokens, whose sdpa peak is
+        # several times this box's whole VRAM. The clamp is what keeps the
+        # floor from swallowing the pinning budget whole.
+        assert floor == ceiling, name
+        return
+    assert _plan(name, shape=sdpa, reserve_floor=floor).max_seq_len == parity, name
+
+
+@pytest.mark.parametrize("impl", ["eager", None, "unknown"])
+def test_unmeasured_kernels_get_the_raised_floor_too(impl):
+    """Same conservative rule row 7 applies to the score coefficient: an
+    unmeasured kernel is charged the largest measured cost, so it must also be
+    given the floor that cost needs -- charging the cost without the floor is
+    the under-reserving half of the pair."""
+    assert _floor("qwen3-235b", impl) == _floor("qwen3-235b", "sdpa")
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_parity_floor_never_starves_pinning_or_undercuts_the_base_floor(name):
+    """On a box too small for parity the floor must clamp, not overrun: it is
+    subtracted by BOTH budget consumers, so a floor above free VRAM would make
+    the arithmetic that vram_plan.py exists to close stop closing."""
+    base = int(3.5 * GB)
+    tight = int(6.0 * GB)      # a smaller box than this one, to force the clamp
+    floor = _floor(name, "sdpa", free_vram=tight)
+    assert floor >= base, name
+    assert floor <= max(base, tight - EXPERT_BYTES - LAYER_SLACK), name
+    p = _plan(name, shape=shape_for(name, score_elem_bytes=score_elem_bytes("sdpa")),
+              free_vram=tight, reserve_floor=floor)
+    assert p.pinning_budget >= 0, name

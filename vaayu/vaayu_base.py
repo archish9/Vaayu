@@ -1506,7 +1506,7 @@ class VaayuBaseModel(GenerationMixin):
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     kv_bytes_per_token, plan_vram,
-                                    score_elem_bytes)
+                                    reserve_floor_bytes, score_elem_bytes)
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
             _head_dim = getattr(self.config, "head_dim", None)
@@ -1596,15 +1596,26 @@ class VaayuBaseModel(GenerationMixin):
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
                 kv_capacity_buckets=self._kv_cache_is_bucketed())
+            _min_resident = (self._moe_geometry["expert_bytes"]
+                             if self._moe_geometry else 0)
+            # Kernel-conditional floor (todo row 8, decided 2026-08-15). Rows
+            # 6/7 made the peak form kernel-aware, which cut every sdpa load's
+            # derived context; this raises the floor just far enough that an
+            # sdpa load derives what flash would have, paid out of the expert
+            # VRAM cache / pinning budget. flash loads keep the base floor
+            # unchanged. Derived per geometry -- see reserve_floor_bytes.
+            _reserve_floor = reserve_floor_bytes(
+                shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                free_vram=_free_vram, min_resident=_min_resident,
+                layer_slack=_layer_slack)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
-                min_resident=(self._moe_geometry["expert_bytes"]
-                              if self._moe_geometry else 0),
+                min_resident=_min_resident,
                 requested_max_seq_len=max_seq_len,
                 position_limit=getattr(self.config, "max_position_embeddings",
                                        2 ** 31 - 1),
                 layer_slack=_layer_slack,
-                reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+                reserve_floor=_reserve_floor)
             self._vram_shape = _shape      # Task 8's predicate re-uses it at N>1
             self.max_seq_len = self._vram_plan.max_seq_len
             # expert_vram_budget_for at this same free-VRAM snapshot -- the

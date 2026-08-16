@@ -865,3 +865,57 @@ S=98304, the other three to S=8192 — one arm per subprocess, same caps as the 
   that path on `predict_peak_vram`.
 
 Rows 6-9 are unblocked and re-scoped onto this verdict (`todo.md`).
+
+---
+
+## Budget policy: reserve vs expert cache (todo row 8) — CLOSED 2026-08-16
+
+**Question:** rows 6/7 made `predict_peak_vram` kernel-aware, which CUT the derived context on every
+sdpa load (Llama-3.3-70B 4373→3821, Llama-3.2-1B 106987→14052, both MoE geometries unchanged at 8192
+on flash). Row 8's decision: grow the reserve at the expert VRAM cache's expense, or accept the
+shorter contexts?
+
+**Decision — grow it, but only on kernels that materialize scores, and by a DERIVED amount.**
+`reserve_floor_bytes` (`vaayu/vram_plan.py`), called from `vaayu_base.__init__` before `plan_vram`:
+
+- Gated on `shape.score_elem_bytes > 0`, not on a kernel name — so `eager` and every unmeasured
+  kernel land on the raised side automatically, matching row 7's conservative coefficient rule.
+  `flash_attention_2` keeps the 3.5 GiB base floor exactly, and pays nothing.
+- The raised value is *flash parity*: the floor that derives the same context flash would have
+  derived at the base floor, `predict_peak_vram(shape, _largest_s_within_budget(flash_shape, base))`.
+  A flat 6.25 GiB literal was rejected — it is the max of what these four checkpoints happen to need
+  for 8192, i.e. a model number in disguise (CLAUDE.md §5), and would under-serve any other geometry.
+- Clamped only by physics (`free − min_resident − layer_slack`), never below `base_floor`.
+
+**Derived floors and what they cost** (checkpoint configs, chunk 512, N=1, KV auto; free 14.2 GiB):
+
+| geometry | flash floor / S | sdpa floor / S | reserve delta | pinning 10.10 GiB → |
+|---|---|---|---|---|
+| Qwen3-235B | 3.50 / 8192 | 5.60 / 8192 | +2.10 GiB | 8.00 GiB |
+| MiniMax-M2.7 | 3.50 / 8192 | 4.79 / 8192 | +1.29 GiB | 8.81 GiB |
+| Llama-3.3-70B | 3.50 / 8192 | 6.20 / 8192 | +2.70 GiB | 7.40 GiB |
+| Llama-3.2-1B | 3.50 / 90639 | clamped 13.60 / 65363 | +10.10 GiB | 0.00 GiB |
+
+The three EXL3 targets recover their full 8192 under sdpa. The MoE cost lands on the expert VRAM
+cache, already priced cheap: Plan K gave 1.22 GB back for a 43%→41% hit rate and +0.4% decode, and
+Audit F8 measured the cache re-saturating in ~4 tokens.
+
+**Llama-3.2-1B hits the clamp, and the price was MEASURED before accepting it** — 1B/sdpa/greedy,
+64 tokens, first touch discarded, same box same day:
+
+| arm | reserve | pinning | max_seq_len | decode |
+|---|---|---|---|---|
+| base floor (control) | 3.50 GiB | 10.24–11.29 GiB | 14052 | 6.38–6.45 tok/s |
+| **physics clamp (shipped)** | 13.74 GiB | **0.00 GiB** | 66074 | **5.19 tok/s (−19 %)** |
+| bounded clamp (rejected) | 11.32 GiB | 3.50 GiB | 53755 | 6.50 tok/s (no regression) |
+
+**Ruling: context over the 19 %.** The `pinning_budget=0` WARNING is EXPECTED on a 1B sdpa load, not
+a bug. The bounded variant (`... − base_floor`) is written down here because it is the cheap way back
+if the 1B ever needs its decode speed — e.g. as row 12's drafter, where −19 % on the draft model
+directly attacks the point of speculative decoding.
+
+**Method note — a framing error caught only by running it.** The clamp question was first put with
+"nothing else competes for VRAM on a small dense model, so the cost is warning noise". That was
+wrong: pinning competes, and the real load showed pinning going 11.29 GiB → 0. A budget claim about
+a path with no unit test is not knowledge until a real load prints it (`todo.md`'s gates table says
+the same thing about `__init__`).

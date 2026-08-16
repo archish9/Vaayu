@@ -23,7 +23,7 @@ BOTH subtract the same `VramPlan.reserve_bytes`, so the arithmetic closes.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 class VramPlanError(RuntimeError):
@@ -455,6 +455,66 @@ def _largest_s_within_budget(shape: VramShape, budget: int) -> int:
         else:
             hi = mid
     return lo
+
+
+def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
+                        min_resident: int, layer_slack: int) -> int:
+    """The reserve floor for THIS load, raised when the kernel materializes
+    attention scores (todo row 8, decided 2026-08-15).
+
+    Rows 6/7 made the peak form kernel-aware and that cut every sdpa load's
+    derived context -- measured, same box, same day: Llama-3.3-70B 4373 -> 3821,
+    Llama-3.2-1B 106987 -> 14052, while both MoE geometries stayed at 8192 on
+    flash. The floor is what buys context back, because `plan_vram` derives
+    max_seq_len as the largest context whose predicted peak fits WITHIN it.
+
+    The ruling: a score-materializing kernel gets the floor it needs to derive
+    the SAME context flash would have derived at `base_floor`; flash pays
+    nothing. The cost is real and lands on the expert VRAM cache (MoE) or the
+    pinning budget (dense), since both subtract this same reserve --
+    2.10/1.29/2.70 GiB on Qwen/MiniMax/Llama-70B respectively. It was priced
+    cheap, not free: Plan K gave 1.22 GB back to Qwen's expert cache for a
+    43%->41% hit rate and +0.4% decode, and Audit F8 measured the cache
+    re-saturating in ~4 tokens.
+
+    DERIVED, never a literal (CLAUDE.md §5). The rejected alternative was a flat
+    6.25 GiB -- the max of what these four checkpoints happen to need for 8192,
+    i.e. a model number in disguise, and one that would silently under-serve any
+    geometry not in that table.
+
+    Gated on `shape.score_elem_bytes > 0` rather than on a kernel name, so
+    `eager` and every unmeasured kernel land on the raised side automatically --
+    they are already charged the largest measured coefficient (row 7), and
+    charging that cost without raising the floor is the under-reserving half.
+
+    Clamped to what is actually free, and NO TIGHTER -- ruled 2026-08-16 with
+    the cost measured, not assumed. The floor is subtracted by BOTH budget
+    consumers, so a floor above free VRAM would re-open the joint overcommit
+    this module exists to close. Llama-3.2-1B hits that clamp: its flash parity
+    is ~90k tokens, whose sdpa peak is several times this box's VRAM, so the
+    floor lands at `free - min_resident - layer_slack` and `plan_vram` reports
+    pinning_budget=0 (the existing WARNING is expected on that load, not a bug).
+    Measured price of accepting it, same box, same day, 1B/sdpa/greedy, first
+    touch discarded: max_seq_len 14052 -> 66074 (4.7x) for decode 6.38 -> 5.19
+    tok/s (-19%), because nothing stays pinned. The rejected alternative
+    (clamping to `... - base_floor`, leaving 3.50 GiB of pinning) measured
+    53755 tokens at 6.50 tok/s -- no decode regression, less context. Context
+    was chosen over the 19%. The three EXL3 geometries are unaffected either
+    way: their parity floors (5.60 / 4.79 / 6.20 GiB) are far below both clamps.
+
+    Never returns less than `base_floor`, which is itself measured (2026-07-24:
+    2 GB covered prefill but not the prefill->decode boundary; 3.5 GB fixed it
+    4/4).
+    """
+    if shape.score_elem_bytes <= 0:
+        return int(base_floor)
+    flash_parity = _largest_s_within_budget(
+        replace(shape, score_elem_bytes=0.0), int(base_floor))
+    if flash_parity <= 0:
+        return int(base_floor)
+    ceiling = int(free_vram) - int(min_resident) - int(layer_slack)
+    return max(int(base_floor),
+               min(predict_peak_vram(shape, flash_parity), ceiling))
 
 
 def _too_big_message(*, requested: int, s_max: int, free_vram: int,

@@ -16,9 +16,10 @@ for the three scheduled rows and are self-contained on their own.
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
-- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **854 passed, 3 skipped**
-  (re-measured 2026-08-15 during the VRAM peak re-probe; supersedes the older 795/2/1 figure —
-  Phase 1's two new tests plus other work since account for the difference).
+- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **880 passed, 3 skipped**
+  (2026-08-16, after row 8's 15 new tests). The **854** figure recorded here on 2026-08-15 was
+  already stale when written: HEAD measured **865 passed, 3 skipped** on 2026-08-16 morning, before
+  any of row 8's work — verified by `git stash`, so the +15 is row 8's and nothing else's.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
   literals (16 GB VRAM / **15.47 GiB usable**, 32 GB RAM, ~8.5 GB expert-cache ceiling,
   ~5.5 GB/s NVMe), each commented as such.
@@ -79,17 +80,17 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 
 # ▶ PENDING SEQUENCE — work top to bottom
 
-_Re-sequenced 2026-08-15 (evening). Older closed rows live in `plans/settled_and_method_notes.md`.
-Rows 1, 6, 7 and 10 keep their detail sections BELOW the pending ones even though they are closed —
-they are this day's verdicts and rows 8/9/11/12 all lean on them; move them out once 8/9 land._
+_Re-sequenced 2026-08-16 (row 8 closed). Older closed rows live in `plans/settled_and_method_notes.md`.
+Rows 1, 6, 7, 8 and 10 keep their detail sections BELOW the pending ones even though they are closed —
+rows 9/11/12 all lean on them; move them out once 9 lands._
 
 **Two groups, and the split is deliberate.** SCHEDULED is the committed sequence — do it in order.
 OPTIONAL is real work with no slot: pick it up when a SCHEDULED row is blocked, or when the mood
 takes you, but never ahead of the sequence.
 
 **Before starting, know what this list can and cannot do.** It is correctness and capability debt,
-not a performance roadmap. Rows 8 and 9 RECOVER context that rows 6/7 removed — repayment, not
-gain. Row 11 buys context, not speed, and may cost speed. **Row 12 is the only row on this file
+not a performance roadmap. Row 8 (closed 2026-08-16) and row 9 RECOVER context that rows 6/7
+removed — repayment, not gain. Row 11 buys context, not speed, and may cost speed. **Row 12 is the only row on this file
 that could make Vaayu faster**, and it is a MEASUREMENT of code that already exists. The historical
 throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at long context is settled
 INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
@@ -99,10 +100,9 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
 | order | # | Item | Status | Cost | Why here |
 |---|---|---|---|---|---|
-| **1st** | **8** | Phase 2 — budget policy: reserve vs expert-cache tradeoff | `[ ]` | user decision | Unblocked 2026-08-15 (row 10 closed). Decide once 6/7 land: if the sdpa-calibrated form says today's derived contexts exceed the reserve, choose explicitly between growing the reserve (at the expert cache's expense) and accepting shorter derived contexts. |
-| **2nd** | **12** | Measure speculative decoding — it is BUILT and apparently never run | `[ ]` | stage 1: 20-30 min · stage 2: 1-2 h | **Highest expected value on this file, and zero new code.** `speculative_generate` exists (`vaayu/vaayu_base.py:4146`), is wired into the prefix cache, and has 11 passing unit tests — but there is NO measurement anywhere in the tracked record: no tok/s, no acceptance rate, no RESULTS doc. Consistent with "exercised by tests, never by a real run" (H7 found a missing `enqueue_truncate` in it on 2026-08-15). EAGLE-3 (Plan H part 2) is NOT built. |
-| **3rd** | **9** | Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm | `[ ]` | GPU | Unblocked 2026-08-15. Re-derive against the sdpa form (rows 6/7), not flash — row 10 directly demonstrated the stakes: on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB) while sdpa OOMs at that same S, same box, same cap. A flash-calibrated ceiling would admit contexts `batched_generate` cannot actually serve. |
-| **4th** | **11** | `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever | `[ ]` | prefill A/B, GPU | Opened 2026-08-15. The sdpa score term is `N·n_heads·**chunk**·C·S`, so halving `prefill_chunk_size` halves it — buying context for free, no reserve fight. Derived, not measured: 1B sdpa 14,052 → 25,408 → 40,910 at chunk 512/256/128. Cost unmeasured and probably per-forward: MoE re-stages experts per chunk. |
+| **1st** | **12** | Measure speculative decoding — it is BUILT and apparently never run | `[ ]` | stage 1: 20-30 min · stage 2: 1-2 h | **Highest expected value on this file, and zero new code.** `speculative_generate` exists (`vaayu/vaayu_base.py:4146`), is wired into the prefix cache, and has 11 passing unit tests — but there is NO measurement anywhere in the tracked record: no tok/s, no acceptance rate, no RESULTS doc. Consistent with "exercised by tests, never by a real run" (H7 found a missing `enqueue_truncate` in it on 2026-08-15). EAGLE-3 (Plan H part 2) is NOT built. |
+| **2nd** | **9** | Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm | `[ ]` | GPU | Unblocked 2026-08-15. Re-derive against the sdpa form (rows 6/7), not flash — row 10 directly demonstrated the stakes: on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB) while sdpa OOMs at that same S, same box, same cap. A flash-calibrated ceiling would admit contexts `batched_generate` cannot actually serve. |
+| **3rd** | **11** | `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever | `[ ]` | prefill A/B, GPU | Opened 2026-08-15. The sdpa score term is `N·n_heads·**chunk**·C·S`, so halving `prefill_chunk_size` halves it — buying context for free, no reserve fight. Derived, not measured: 1B sdpa 14,052 → 25,408 → 40,910 at chunk 512/256/128. Cost unmeasured and probably per-forward: MoE re-stages experts per chunk. |
 
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
 
@@ -115,17 +115,21 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): row 8, then 12, then 9, then 11
-> **Read this block and the SCHEDULED table; that is enough to start.** Rows 6 and 7 closed
-> 2026-08-15 (`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md`) and the sdpa-calibrated
-> form DOES cut today's derived contexts, measured on-device: Llama-3.3-70B 4373 → **3821** (−13 %),
-> Llama-3.2-1B 106987 → **14052** (−87 %), both on sdpa; both MoE geometries unchanged at 8192 on
-> flash. That is exactly the condition **row 8** was written for, so it is a live decision, not a
-> hypothetical — and it is a USER decision, so open it with the numbers, do not pick a default.
+> ### ▶▶ NEXT ACTION (fresh session): row 12, then 9, then 11
+> **Read this block and the SCHEDULED table; that is enough to start.** Row 8 closed 2026-08-16:
+> the reserve floor is now kernel-conditional and DERIVED (`reserve_floor_bytes`,
+> `vaayu/vram_plan.py`), so every sdpa load gets the context flash would have given it —
+> Qwen/MiniMax/Llama-70B all back to **8192** at floors of 5.60 / 4.79 / 6.20 GiB, paid out of the
+> expert VRAM cache and the pinning budget. Verdict and measured costs:
+> `plans/settled_and_method_notes.md` ("Budget policy: reserve vs expert cache (todo row 8)").
 >
-> Then **row 12** (measure speculative decoding — the only row here that could make Vaayu faster,
-> and it needs no new code), then **row 9** (re-derive + on-device arm, which depends on 8's
-> answer), then **row 11** (chunk-size A/B, and its stop rule may refute it).
+> **Row 12** is next (measure speculative decoding — the only row here that could make Vaayu faster,
+> and it needs no new code). **Carry one row-8 result into it:** the 1B drafter on sdpa now runs with
+> `pinning_budget=0` and measured **−19 % decode** (6.38 → 5.19 tok/s), an accepted tradeoff for its
+> 4.7× longer context — but it is a direct tax on drafting, so if stage 2 comes out marginal, re-run
+> it with the bounded clamp written down in the archive entry before concluding anything. Then
+> **row 9** (re-derive + on-device arm), then **row 11** (chunk-size A/B, whose stop rule may refute
+> it).
 >
 > OPTIONAL rows are for when a scheduled row blocks. Row 2 is 10 minutes and unrelated to
 > everything; row 6a is an open-ended GPU investigation that may end in refutation.
@@ -133,21 +137,6 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 ---
 
 ## ── SCHEDULED sections (work these, in this order) ──
-
-# 8 · [ ] Phase 2 — budget policy: reserve vs. expert-cache tradeoff
-
-**Unblocked 2026-08-15 (row 10 closed).** Once item 6/7 land, if the sdpa-calibrated form says
-today's derived contexts exceed the reserve, choose explicitly between growing the reserve at the
-expert VRAM cache's expense (Audit F8: cache re-saturates in ~4 tokens; Plan K: giving back 1.22 GB
-moved a hit rate 43%→41% for +0.4% decode — i.e. cheap) and accepting shorter derived `max_seq_len`
-values. This is a user decision, made with the numbers item 6/7 produce — not a default to pick
-silently.
-
-**File:** wherever `plan_vram`/`solve_max_seq_len`'s reserve floor is set (`vaayu/vram_plan.py`).
-
-**Done means:** an explicit, written choice with the tradeoff numbers beside it.
-
----
 
 # 12 · [ ] Measure speculative decoding — it is BUILT and apparently never run
 
@@ -211,7 +200,7 @@ arithmetic does not have to be re-derived.
 **The claim.** The sdpa score term this repo now charges is `N · n_heads · **chunk** · C · S`
 (`SCORE_ELEM_BYTES`, `vaayu/vram_plan.py`). `chunk` is `prefill_chunk_size` — OUR knob, not the
 model's. Halving it halves the term, which buys admissible context at the SAME reserve, with no
-expert-cache tradeoff (row 8) and no extra VRAM.
+expert-cache tradeoff (row 8's floor, now kernel-conditional) and no extra VRAM.
 
 **Derived (NOT measured) admissible S at the 3.50 GiB reserve floor**, via
 `solve_max_seq_len(free_vram=3.50 GiB, min_resident=0)` on each checkpoint's own shape — a
@@ -358,7 +347,34 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-## ── CLOSED today, kept because 8/9/11/12 lean on them ──
+## ── CLOSED, kept because 9/11/12 lean on them ──
+
+# 8 · [x] CLOSED 2026-08-16 — budget policy: reserve floor is now kernel-conditional and DERIVED
+
+**Choice made, with the numbers beside it** (that is what this row's "done" meant). Grow the
+reserve — but only on kernels that materialize scores, and by a derived amount, never a literal.
+`reserve_floor_bytes` (`vaayu/vram_plan.py`), called from `vaayu_base.__init__` before `plan_vram`:
+gated on `shape.score_elem_bytes > 0` (so `eager`/unmeasured kernels raise too, per row 7's rule),
+raised to *flash parity* — the floor that derives the context flash would have derived at the
+3.5 GiB base — clamped only by `free − min_resident − layer_slack`.
+
+| geometry | flash floor / S | sdpa floor / S | cost to pinning + expert cache |
+|---|---|---|---|
+| Qwen3-235B | 3.50 / 8192 | 5.60 / **8192** | −2.10 GiB |
+| MiniMax-M2.7 | 3.50 / 8192 | 4.79 / **8192** | −1.29 GiB |
+| Llama-3.3-70B | 3.50 / 8192 | 6.20 / **8192** (was 3821) | −2.70 GiB |
+| Llama-3.2-1B | 3.50 / 90639 | clamped 13.60 / 66074 (was 14052) | pinning → 0 |
+
+A flat 6.25 GiB literal was rejected as a model number in disguise (§5). The 1B's clamp costs a
+**measured −19 % decode** (6.38 → 5.19 tok/s) for 4.7× context, accepted deliberately; the bounded
+alternative (6.50 tok/s, 53755 tokens) is written down in the archive as the way back. **Row 12
+must carry that:** the 1B is its drafter.
+
+Verified: full suite **880 passed / 3 skipped** (+15, all row 8's); dense smoke gate **PASS**,
+perplexity 8.78 unchanged, 70B real load printing the 6.20 GiB floor; 1B real loads on both kernels.
+Full writeup: `plans/settled_and_method_notes.md` ("Budget policy: reserve vs expert cache").
+
+---
 
 # 1 · [x] CLOSED — `predict_peak_vram` calibrated against a peak that was never the peak
 
