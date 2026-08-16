@@ -123,7 +123,7 @@ checkboxes are the step-level detail.
       `vaayu/server/__init__.py` with a lazy re-export so `import vaayu` stays cheap
 - [x] **1** `server/stopping.py` — `resolve_max_tokens` + `finish_reason`. THE truncation fix.
       Pure, parametrized over all four on-disk derived windows. `512` must not appear in `vaayu/server/`
-- [ ] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
+- [x] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
       real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
 - [ ] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
       `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
