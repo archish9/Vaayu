@@ -1163,6 +1163,45 @@ def stage_read_expert(shard_file: str, metas: dict, arena):
 
 _pcie_topology_checked: set = set()
 
+# HARDWARE CONSTANT: the worst pinned H2D bandwidth this box tolerates before a
+# slot/riser/BIOS problem is the likely cause. ~8 GB/s sits below the Gen3 x16 /
+# Gen4 x8 class. A property of the machine and its PCIe wiring, not of any model.
+#
+# The health test is MEASURED bandwidth, deliberately NOT link topology: idle
+# GPUs downtrain to Gen1 for power save, and native-x8 cards (e.g. RTX 5060 Ti)
+# can never report x16, so a gen/width rule raises false alarms on healthy
+# hardware. This box measures ~20 GB/s while nvidia-smi reads "Gen1 x8".
+PCIE_MIN_HEALTHY_GBPS = 8.0
+
+
+def pcie_link_label(returncode: int, stdout: str) -> str:
+    """Human-readable link state from nvidia-smi's gen,width row, or "unknown".
+
+    The query asks for `pcie.link.gen.current,pcie.link.width.current` in that
+    order, so the FIRST field is the generation. Never raises: this is a
+    diagnostic and must not become the failure it exists to report.
+    """
+    if returncode != 0:
+        return "unknown"
+    try:
+        gen, width = stdout.strip().splitlines()[0].split(", ")
+        return f"Gen{gen} x{width}"
+    except Exception:
+        return "unknown"
+
+
+def pcie_health_message(h2d_gbps: float, link: str, model_size_gb: float) -> str:
+    """The line(s) the PCIe probe prints. Pure, so the decision is testable
+    without a GPU or a subprocess."""
+    if h2d_gbps < PCIE_MIN_HEALTHY_GBPS:
+        return (f"⚠️  [Vaayu-Warning] Measured pinned H2D only {h2d_gbps:.1f} GB/s "
+                f"(link under load: {link}).\n"
+                f"   Streaming {model_size_gb:.1f}GB models will be PCIe-bound. "
+                f"Check slot/riser/BIOS PCIe generation settings.")
+    return (f"✅ [Vaayu] PCIe measured: {h2d_gbps:.1f} GB/s pinned H2D "
+            f"(link under load: {link})")
+
+
 def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
     """Measure real H2D bandwidth with a pinned burst copy, then report the
     uptrained link state. Idle GPUs downtrain to Gen1 (power save), so probing
@@ -1188,27 +1227,14 @@ def _check_pcie_topology(gpu_index: int = 0, model_size_gb: float = 132.0):
         _h2d_gbps = 3 * _src.nbytes / 1e9 / (time.perf_counter() - _t0)
         del _src, _dst
 
-        _link = "unknown"
         result = subprocess.run(
             ["nvidia-smi", f"-i={gpu_index}",
              "--query-gpu=pcie.link.gen.current,pcie.link.width.current",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0:
-            _g, _w = result.stdout.strip().splitlines()[0].split(", ")
-            _link = f"Gen{_g} x{_w}"
-
-        # 8 GB/s ≈ worst acceptable (below Gen3 x16 / Gen4 x8 class) — a real
-        # config problem (wrong slot, riser, BIOS gen cap), not power-save noise.
-        if _h2d_gbps < 8.0:
-            print(f"⚠️  [Vaayu-Warning] Measured pinned H2D only {_h2d_gbps:.1f} GB/s "
-                  f"(link under load: {_link}).")
-            print(f"   Streaming {model_size_gb:.1f}GB models will be PCIe-bound. "
-                  f"Check slot/riser/BIOS PCIe generation settings.")
-        else:
-            print(f"✅ [Vaayu] PCIe measured: {_h2d_gbps:.1f} GB/s pinned H2D "
-                  f"(link under load: {_link})")
+        _link = pcie_link_label(result.returncode, result.stdout)
+        print(pcie_health_message(_h2d_gbps, _link, model_size_gb))
     except Exception:
         pass
 
