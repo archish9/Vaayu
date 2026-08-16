@@ -919,3 +919,115 @@ directly attacks the point of speculative decoding.
 wrong: pinning competes, and the real load showed pinning going 11.29 GiB → 0. A budget claim about
 a path with no unit test is not knowledge until a real load prints it (`todo.md`'s gates table says
 the same thing about `__init__`).
+
+---
+
+## Speculative decoding (todo row 12) — MEASURED 2026-08-16: MoE refuted, dense 5.57×
+
+**Question:** `speculative_generate` was built, prefix-cache-wired and covered by 11 unit tests, with
+no measurement anywhere in the record. Does it run, and does it beat `generate()`?
+
+**Method:** stage 1 = one load per subprocess, 20 tokens, `models/Llama-3.2-1B-Instruct` as drafter;
+stage 2 = `generate()` vs `speculative_generate()` vs prompt lookup, 100 decode tokens, warm-up
+discarded, code-shaped prompt, `flash_attention_2`. Full data:
+`plans/2026-08-16-row12-speculative-decoding-RESULTS.md`.
+
+**Verdict — two different answers on the two paths, and the split is structural.**
+
+- **MoE: refuted.** `spec_decode_fits` (Fix #9) disables speculation at load on BOTH targets —
+  Qwen3-235B's 6-position verify pass needs 53.4 GB of expert working set, MiniMax-M2.7's 26.4 GB,
+  against a 9.1 GB budget. Largest admissible width: **`draft_tokens ≤ 0` on Qwen, `≤ 1` on
+  MiniMax**. A verify pass widens the per-layer expert union ~linearly in draft width, so
+  speculation makes the MoE bottleneck worse by construction. **EAGLE-3 does not lift this** — its
+  verify pass is exactly as wide; only its drafter is free. Do not re-open on a "zero-VRAM drafter"
+  premise.
+- **Dense: 5.57×, quality-free.** Llama-3.3-70B: 0.155 → **0.864 tok/s**, 5.30 of 6 tokens per
+  round, 86 % of drafted tokens accepted, output byte-identical to the plain arm. Prompt lookup got
+  1.94× (0.301 tok/s) — 43 of its 62 rounds accepted nothing, because n-gram lookup only fires on
+  text already in the context. **The win is a property of weight-streaming decode** (~37 GB read
+  once, settled over 6 positions), which is why it inverts on MoE.
+
+**Not enabled.** `drafter_model_path` is opt-in and streamed-dense perf is deferred (CLAUDE.md §0).
+Recorded as the first lever to reach for when dense work starts. **Blocked by row 12a** (the
+drafter's 2.47 GB is in nobody's budget: the expert VRAM cache is sized from `free − reserve` at
+`vaayu_base.py:1863`, `build_speculator` loads the drafter at `:2008`).
+
+**Method notes.**
+
+- **The gates protocol's 22 GB cgroup cap is too small for dense arms.** Post-load RSS is 21.93 GB
+  (the RAM layer cache alone budgets 17.3 GB), so stage 2 was OOM-killed at exit 137 on all three
+  arms before producing a number. 26 GB works on this 32 GB box. Stage 1's shorter dense arm passed
+  at 22 GB — a cap that holds at one run length says nothing about another.
+- **`CUBLAS_STATUS_INTERNAL_ERROR` out of `F.linear` is VRAM exhaustion**, not a cuBLAS fault. It
+  appeared only where cache + drafter + reserve overcommitted the GPU.
+- **Passing unit tests measured the loop's logic and nothing about fit.** None of the 11 loads a
+  second model beside a 62-layer MoE, which is the only question that mattered here.
+
+---
+
+## sdpa `max_seq_len` verified on-device (todo row 9) — CLOSED 2026-08-16
+
+**Question:** after rows 6/7 (kernel-aware peak form) and row 8 (kernel-conditional reserve floor),
+does each geometry's derived `max_seq_len` actually serve a real prefill+decode at that length?
+
+**Method:** the re-derivation is a read — `plan_vram` derives at every load — so the work was the
+arm. One load per subprocess, forced sdpa, prompt of exactly `max_seq_len − 4` ordinary-English
+tokens, 4 greedy decode tokens, `systemd-run` caps 26G (70B) / 22G (rest).
+
+**Verdict: 4/4 PASS, no code change needed — the form held.**
+
+| geometry | `max_seq_len` | reserve | pinning | peak alloc | peak reserved |
+|---|---|---|---|---|---|
+| Llama-3.2-1B | 71981 | 14.90 GiB | 0.00 GiB | 13.93 GiB | 14.83 GiB (0.64 spare) |
+| Qwen3-235B | 8192 | 5.60 GiB | 7.96 GiB | 10.82 GiB | 11.43 GiB |
+| MiniMax-M2.7 | 8192 | 4.79 GiB | 8.08 GiB | 11.50 GiB | 11.81 GiB |
+| Llama-3.3-70B | 8192 | 6.20 GiB | 8.31 GiB | 8.73 GiB | 9.09 GiB |
+
+The 1B is the only clean reserve-vs-peak comparison (no expert cache sitting under the reserve):
+**14.90 GiB reserved against a 13.93 GiB measured peak — over-predicted ~1.0 GiB, the safe
+direction**, matching row 6's residual finding. It ran at 0.64 GiB of spare reserved VRAM with
+`pinning_budget=0`, at 5.1× any context previously exercised on that checkpoint.
+
+**Phase 2 is closed with this row.** Full data: `plans/2026-08-16-row9-sdpa-limits-RESULTS.md`.
+
+**Carried to row 11:** the same 8188-token sdpa prefill took **286.6 s on MiniMax-M2.7 vs 88.8 s on
+Qwen3-235B** — a 3.2× spread between two MoE geometries, both far above the ~25 s TTFT on record for
+flash runs. Row 11's premise also needs re-deriving: its admissible-S table was computed at the old
+flat 3.50 GiB floor, and row 8 already bought back the 8192 that table was arguing for.
+
+---
+
+## `prefill_chunk_size` lever (todo row 11) — REFUTED 2026-08-16
+
+**Claim:** the sdpa score term is `N · n_heads · chunk · S`, so halving `prefill_chunk_size` halves
+it and buys admissible context for free.
+
+**What changed before it ran:** row 8's kernel-conditional floor already took the context prize —
+every EXL3 geometry derives 8192 at every chunk. The lever's remaining effect is to hand 2.0–2.2 GiB
+of reserve to pinning and the expert VRAM cache.
+
+**Measured** (S=6000, sdpa, warm-up discarded, one subprocess per arm):
+
+| geometry | chunk 512 | 256 | 128 |
+|---|---|---|---|
+| Qwen3-235B TTFT | 61.5 s | 65.6 s (+6.7 %) | 76.7 s (**+24.7 %**) |
+| Qwen3-235B decode | 0.562 tok/s | 0.560 | 0.572 (+1.8 %) |
+| Llama-3.3-70B TTFT | 97.8 s | 168.4 s (+72 %) | 306.5 s (**+213 %**) |
+| Llama-3.3-70B decode | 0.166 tok/s | 0.164 | 0.160 (−3.6 %) |
+
+**Verdict: REFUTED on both forwards — keep `prefill_chunk_size=512`.** The reclaimed VRAM produces
+no measurable decode change (+1.8 % / −3.6 %), exactly as Audit F8 and Plan K already implied, while
+TTFT regresses 1.25× (fused MoE, re-stages experts per chunk) to 3.1× (streamed dense, re-streams
+weights per chunk). On a prefill-heavy fan-out workload that is a clear loss. Not a per-forward
+default either: even the favourable arm pays 24.7 % for +1.8 %.
+Data: `plans/2026-08-16-row11-prefill-chunk-RESULTS.md`.
+
+**Finding that outlived the row — lowering the reserve does not lower peak VRAM.** Qwen's peak
+allocation moved 12.87 → 12.99 GiB while its reserve fell 5.60 → 3.56 GiB: the expert VRAM cache
+expands into whatever the reserve leaves. Ownership changes, total spend does not. Any future plan
+that proposes to "free up" reserve should expect to find the cache has already eaten it.
+
+**METHOD — a limit verified cold is not verified.** Row 9 ran all four geometries at their derived
+`max_seq_len` and passed 4/4 on 2026-08-16; row 11, the same day, found those limits are refused in
+practice (bug 11a) because row 9's arms were COLD single-shot runs and every real turn after the
+first is warm. Any on-device arm against an admission or budget question must run at least two turns.
