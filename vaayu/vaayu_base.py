@@ -2531,9 +2531,20 @@ class VaayuBaseModel(GenerationMixin):
         # exists: it is entitled to everything above the reserve and fills
         # LAZILY, during the very prefill being admitted. See
         # admission_headroom.
+        # ...and mem_get_info() is a DRIVER-level call: it cannot see the
+        # blocks PyTorch's caching allocator holds reserved-but-unallocated,
+        # which are reusable by this very prefill. Measured on Qwen turn 2
+        # (bug 11a): driver free 4.09 GiB with 1.57 GiB sitting in that pool,
+        # refusing a request needing 4.88 that succeeds when admitted.
+        try:
+            reusable_pool = (torch.cuda.memory_reserved()
+                             - torch.cuda.memory_allocated())
+        except Exception:
+            reusable_pool = 0      # D3: a diagnostic must never be the crash
         headroom = admission_headroom(
             free_vram=free_vram, plan=plan,
-            expert_cache_active=getattr(self, "_expert_vram_cache", None) is not None)
+            expert_cache_active=getattr(self, "_expert_vram_cache", None) is not None,
+            reusable_pool=reusable_pool)
         need = predict_peak_vram(shape, int(n_tokens))
         if need > headroom:
             # The floor the load-time plan actually reserved one of (an expert,
