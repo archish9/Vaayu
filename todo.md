@@ -140,7 +140,7 @@ checkboxes are the step-level detail.
 - [x] **7** `server/engine.py` — `EngineHandle`: depth-bounded FIFO gate, request→kwargs mapping,
       blocking + streaming generation. Carries the CPU `max_seq_len=512` startup warning
       (`vaayu_base.py:1648`) and the speculative-path sampling warning
-- [ ] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
+- [x] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
       `PrefixCacheStore.stats()`; 400/503/500 error mapping
 - [ ] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
       split across chunks still recognised; queue-position comment before the first event
