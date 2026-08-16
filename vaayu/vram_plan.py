@@ -536,14 +536,23 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
     ceiling = (f"max_seq_len={int(s_max)} at a batch width of 1"
                if int(shape.N) > 1 else f"max_seq_len={int(s_max)}")
     if headroom is not None and int(headroom) < int(free_vram):
+        # The ceiling must be solved against the budget actually refused on.
+        # This used to print the caller's `s_max` -- solved at LOAD against full
+        # free VRAM -- so a warm-cache refusal read as a contradiction: "does
+        # not fit in 5.59 GiB ... the largest context that fits is
+        # max_seq_len=23415", at an advertised max_seq_len of 8192 (bug 11a).
+        runtime_max = _largest_s_within_budget(shape, int(headroom))
+        runtime_ceiling = (f"max_seq_len={runtime_max} at a batch width of "
+                           f"{int(shape.N)}" if int(shape.N) > 1
+                           else f"max_seq_len={runtime_max}")
         opening = (
             f"Context of {int(requested)} tokens does not fit in the "
             f"{float(headroom) / gb:.2f} GiB this request may use. "
             f"{float(free_vram) / gb:.2f} GiB is free, but the expert VRAM cache "
             f"is entitled to everything above the reserve and fills during "
             f"prefill, so only the reserve is actually available here. "
-            f"The largest context that fits at this configuration is "
-            f"{ceiling}.\n")
+            f"The largest context that fits RIGHT NOW is "
+            f"{runtime_ceiling}.\n")
     else:
         opening = (
             f"Context of {int(requested)} tokens does not fit in "
@@ -625,7 +634,8 @@ def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
 
 
 def admission_headroom(*, free_vram: int, plan: VramPlan,
-                       expert_cache_active: bool) -> int:
+                       expert_cache_active: bool,
+                       reusable_pool: int = 0) -> int:
     """VRAM a single request may actually spend, in bytes.
 
     NOT the same as free VRAM. `expert_vram_budget_for` hands the expert VRAM
@@ -647,6 +657,27 @@ def admission_headroom(*, free_vram: int, plan: VramPlan,
     entitled to the headroom, so free VRAM stands unclamped -- clamping there
     would refuse contexts that genuinely fit.
 
+    `reusable_pool` is what PyTorch's caching allocator holds
+    reserved-but-unallocated (`memory_reserved() - memory_allocated()`), and it
+    COUNTS (bug 11a, fixed 2026-08-16). `torch.cuda.mem_get_info()` is a
+    driver-level call: it reports VRAM free on the device and structurally
+    cannot see those blocks, yet they are reusable by the very prefill being
+    admitted. Measured on Qwen3-235B, sdpa, one process -- driver free /
+    reserved / allocated in GiB: 13.37/1.70/1.69 after load, 5.59/9.44/9.36
+    after warm-up, 4.09/10.94/9.36 after one prefill. On turn 2 this function
+    saw 4.09 GiB and refused a request needing 4.88, while 1.57 GiB sat reusable
+    in the pool -- and the same prefill SUCCEEDS in 63.7 s with the guard
+    bypassed. Every turn after the first has a warm cache, so the pre-fix
+    behaviour refused contexts the plan advertises on essentially every
+    multi-turn MoE session.
+
+    The pool is added BEFORE the reserve clamp, never instead of it: the expert
+    VRAM cache is still entitled to everything above the reserve. Mildly
+    optimistic under fragmentation -- pool blocks are not guaranteed contiguous
+    -- which is accepted deliberately: the blocks were sized by this same
+    process for these same tensors, the reserve still caps the answer, and
+    refusing prefills that provably run is the worse error.
+
     Deliberately NOT reclaim-aware. Plan K's once-per-batch reclaim can hand
     some of the cache back (measured 1.22 GB Qwen / 2.09 GB MiniMax), but it
     runs AFTER this check, and it ships default-off because it was refuted --
@@ -654,9 +685,10 @@ def admission_headroom(*, free_vram: int, plan: VramPlan,
     counting it here would admit batches that still OOM. If reclaim is ever
     moved ahead of admission, this is the function that has to learn about it.
     """
+    usable = int(free_vram) + max(0, int(reusable_pool))
     if not expert_cache_active:
-        return int(free_vram)
-    return min(int(free_vram), int(plan.reserve_bytes))
+        return usable
+    return min(usable, int(plan.reserve_bytes))
 
 
 def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:

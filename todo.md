@@ -37,11 +37,13 @@ for the three scheduled rows and are self-contained on their own.
 |---|---|---|---|---|---|
 | Qwen3-235B | `Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw` | 94 / 4 / 128 / 4096 / 64 / 151936 | 0.193 MB/tok | MoE fused-EXL3 | 8192 |
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
-| Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 3821 (sdpa) |
-| Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 14052 (sdpa) |
+| Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 8192 (sdpa) |
+| Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
 
-(`max_seq_len` is now KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15, row 6/7.
-The two dense figures above are sdpa, measured at load; both MoE geometries derive 8192 on flash.
+(`max_seq_len` is KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15 (rows 6/7), and
+the sdpa reserve floor is raised to flash parity from 2026-08-16 (row 8). Every figure above is
+sdpa, read off a real load and verified on-device at that exact length, 4/4 (row 9,
+`plans/2026-08-16-row9-sdpa-limits-RESULTS.md`); all four geometries also derive these or more on flash.
 KV figures are **decimal** MB. `tests/test_vram_plan.py` has binary `MB`/`GB` for hardware
 constants and decimal `MB_DEC`/`GB_DEC` for these — use the right family.)
 
@@ -84,30 +86,29 @@ _Re-sequenced 2026-08-16 (row 8 closed). Older closed rows live in `plans/settle
 Rows 1, 6, 7, 8 and 10 keep their detail sections BELOW the pending ones even though they are closed —
 rows 9/11/12 all lean on them; move them out once 9 lands._
 
-**Two groups, and the split is deliberate.** SCHEDULED is the committed sequence — do it in order.
-OPTIONAL is real work with no slot: pick it up when a SCHEDULED row is blocked, or when the mood
-takes you, but never ahead of the sequence.
+**SCHEDULED is now empty** (2026-08-16) — read the NEXT ACTION block below the OPTIONAL table.
+OPTIONAL holds everything left, and it is no longer uniform: two `[bug]` rows found by the closed
+work outrank the rest of it.
 
 **Before starting, know what this list can and cannot do.** It is correctness and capability debt,
 not a performance roadmap. Row 8 (closed 2026-08-16) and row 9 RECOVER context that rows 6/7
-removed — repayment, not gain. Row 11 buys context, not speed, and may cost speed. **Row 12 is the only row on this file
-that could make Vaayu faster**, and it is a MEASUREMENT of code that already exists. The historical
+removed — repayment, not gain. Row 11 buys context, not speed, and may cost speed. Row 12 (closed 2026-08-16) WAS the only row here that could make Vaayu faster, and it
+delivered — but on the dense path, which is deferred: 5.57× with the drafter, refuted on MoE. The historical
 throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at long context is settled
 INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
 expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
-## SCHEDULED — the committed sequence
+## SCHEDULED — EMPTY as of 2026-08-16
 
-| order | # | Item | Status | Cost | Why here |
-|---|---|---|---|---|---|
-| **1st** | **12** | Measure speculative decoding — it is BUILT and apparently never run | `[ ]` | stage 1: 20-30 min · stage 2: 1-2 h | **Highest expected value on this file, and zero new code.** `speculative_generate` exists (`vaayu/vaayu_base.py:4146`), is wired into the prefix cache, and has 11 passing unit tests — but there is NO measurement anywhere in the tracked record: no tok/s, no acceptance rate, no RESULTS doc. Consistent with "exercised by tests, never by a real run" (H7 found a missing `enqueue_truncate` in it on 2026-08-15). EAGLE-3 (Plan H part 2) is NOT built. |
-| **2nd** | **9** | Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm | `[ ]` | GPU | Unblocked 2026-08-15. Re-derive against the sdpa form (rows 6/7), not flash — row 10 directly demonstrated the stakes: on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB) while sdpa OOMs at that same S, same box, same cap. A flash-calibrated ceiling would admit contexts `batched_generate` cannot actually serve. |
-| **3rd** | **11** | `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever | `[ ]` | prefill A/B, GPU | Opened 2026-08-15. The sdpa score term is `N·n_heads·**chunk**·C·S`, so halving `prefill_chunk_size` halves it — buying context for free, no reserve fight. Derived, not measured: 1B sdpa 14,052 → 25,408 → 40,910 at chunk 512/256/128. Cost unmeasured and probably per-forward: MoE re-stages experts per chunk. |
+Every scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12; bug 11a fixed the same day. **Row 12a
+below is the one open bug** — it blocks the measured 5.57× dense speculative-decoding win.
+
 
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
 
 | # | Item | Status | Cost | Why optional |
 |---|---|---|---|---|
+| **12a** | `[bug]` The drafter's VRAM is in nobody's budget | `[bug]` | small fix, GPU re-check | Found 2026-08-16 running row 12. `expert_vram_budget_for` sizes the expert VRAM cache from `free − reserve` (`vaayu_base.py:1863`); `build_speculator` loads the drafter ~145 lines LATER (`:2008`), so 10.5 GB of cache + 2.47 GB of drafter + 3.50 GiB reserve overcommit 15.47 GiB and the drafter's first `F.linear` dies with `CUBLAS_STATUS_INTERNAL_ERROR`. Fix = charge the drafter in `plan_vram` (or size the expert cache after it loads). Blocks any MoE speculation even at the one `draft_tokens` the Fix #9 gate admits. |
 | **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
 | **6a** | The intercept residual row 6 could not explain | `[ ]` | GPU round | Opened 2026-08-15 out of row 6. One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
@@ -115,129 +116,31 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): row 12, then 9, then 11
-> **Read this block and the SCHEDULED table; that is enough to start.** Row 8 closed 2026-08-16:
-> the reserve floor is now kernel-conditional and DERIVED (`reserve_floor_bytes`,
-> `vaayu/vram_plan.py`), so every sdpa load gets the context flash would have given it —
-> Qwen/MiniMax/Llama-70B all back to **8192** at floors of 5.60 / 4.79 / 6.20 GiB, paid out of the
-> expert VRAM cache and the pinning budget. Verdict and measured costs:
-> `plans/settled_and_method_notes.md` ("Budget policy: reserve vs expert cache (todo row 8)").
+> ### ▶▶ NEXT ACTION (fresh session): row 12a — the one open bug
+> **SCHEDULED is empty and 11a is fixed.** Rows 1, 6, 7, 8, 9, 10, 11, 12 all closed 2026-08-15/16.
 >
-> **Row 12** is next (measure speculative decoding — the only row here that could make Vaayu faster,
-> and it needs no new code). **Carry one row-8 result into it:** the 1B drafter on sdpa now runs with
-> `pinning_budget=0` and measured **−19 % decode** (6.38 → 5.19 tok/s), an accepted tradeoff for its
-> 4.7× longer context — but it is a direct tax on drafting, so if stage 2 comes out marginal, re-run
-> it with the bounded clamp written down in the archive entry before concluding anything. Then
-> **row 9** (re-derive + on-device arm), then **row 11** (chunk-size A/B, whose stop rule may refute
-> it).
+> **Row 12a — the drafter's VRAM is in nobody's budget.** `expert_vram_budget_for` sizes the expert
+> VRAM cache from `free − reserve` (`vaayu_base.py:1863`); `build_speculator` loads the drafter ~145
+> lines later (`:2008`), so 10.5 GB of cache + 2.47 GB of drafter + a 3.50 GiB reserve overcommit
+> 15.47 GiB and the drafter's first `F.linear` dies with `CUBLAS_STATUS_INTERNAL_ERROR`. Fixing it
+> unblocks the **5.57× dense speculative-decoding win** row 12 measured (0.155 → 0.864 tok/s, 86 %
+> acceptance, byte-identical output) — the largest unclaimed speedup on this file.
 >
-> OPTIONAL rows are for when a scheduled row blocks. Row 2 is 10 minutes and unrelated to
-> everything; row 6a is an open-ended GPU investigation that may end in refutation.
+> Everything else in OPTIONAL is genuinely optional: row 6a is an open-ended GPU investigation that
+> may end in refutation, row 2 is 10 minutes and unrelated.
+>
+> **Two method lessons from 2026-08-16, each paid for with a real run:**
+> - **A limit verified cold is not verified.** Row 9 passed 4/4 at the derived limits; row 11 then
+>   found those limits refused in practice (bug 11a), because row 9's arms were cold single-shot runs
+>   and every real turn after the first is warm. Any arm against an admission or budget question must
+>   run at least two turns.
+> - **A gate that cannot fail is not a gate.** 11a's arm ships a `control` mode that forces the fix
+>   off; it REFUSES on turn 2 where `fixed` passes, at identical VRAM state. Without that arm the
+>   test proves only that nothing crashed.
 
 ---
 
-## ── SCHEDULED sections (work these, in this order) ──
-
-# 12 · [ ] Measure speculative decoding — it is BUILT and apparently never run
-
-Opened 2026-08-15. **No new code is required to start.** The finding that produced this row: the
-implementation exists and nothing in the tracked record shows it was ever run on a GPU.
-
-| piece | state, verified 2026-08-15 |
-|---|---|
-| `speculative_generate` (standard drafter) | **built** — `vaayu/vaayu_base.py:4146`; wired into the prefix cache (`lookup` / `_adopt_prefix_hit`), carries the `_assert_context_fits` guard, sets `_batch_decode_active=False` |
-| unit tests | **11 passing** — `tests/test_drafter_rollback.py`, `tests/test_speculative_prefix_reuse.py`, `tests/test_spec_working_set.py` |
-| EAGLE-3 (Plan H part 2) | **NOT built** — no `eagle` symbol anywhere under `vaayu/` |
-| any measurement | **none** — no tok/s, no acceptance rate, no RESULTS doc anywhere in `plans/` or the settled notes |
-
-Passing unit tests prove the loop's LOGIC, not that a second model fits beside a 94-layer MoE on
-15.47 GiB — and rows 6/7 just made the reserve more expensive, which is the dependency
-`plans/master_plan.md:32` already flagged ("the freed VRAM is needed for speculative decoding").
-H7 found a missing `enqueue_truncate` in this same function on 2026-08-15, which is what a
-never-really-run path looks like.
-
-**Run it in two stages, and let stage 1 decide whether stage 2 is worth funding.**
-
-- **Stage 1 (~20–30 min) — does it run at all?** Read how `self.speculator` gets set, write a
-  minimal harness, load one MoE target + `models/Llama-3.2-1B-Instruct` as drafter (CLAUDE.md §0's
-  suggested drafter), emit ~20 tokens. **If it OOMs, that IS the finding** — record it and stop;
-  the answer is then EAGLE-3 (zero-VRAM drafter, unbuilt) or nothing.
-- **Stage 2 (~1–2 h) — the A/B.** `generate()` vs `speculative_generate()`, same prompt, code-shaped
-  repetitive output (the real workload, CLAUDE.md §0), ~150–200 decode tokens per arm, first touch
-  discarded, each arm its own subprocess under
-  `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`. Report tok/s AND acceptance
-  rate — acceptance rate may need a counter that does not exist yet, and without it a null result
-  cannot be explained.
-
-**Done means:** a RESULTS doc with tok/s for both arms and the acceptance rate, or a recorded
-stage-1 failure. **Stop rule:** if it does not beat plain `generate()` on this box's real workload,
-say so and close the row — a refutation closes a row here (see the file header).
-
----
-
-# 9 · [ ] Phase 2 — re-derive `max_seq_len` on all four geometries + on-device arm
-
-**Unblocked 2026-08-15 (row 10 closed): re-derive against the sdpa form.** Row 10 directly
-demonstrated the stakes of getting this wrong — on Llama-3.2-1B, flash succeeds at S=98304 (4.01 GB
-transient) while sdpa OOMs at that exact same S, same box, same cap
-(`plans/2026-08-15-row10-attention-kernel-RESULTS.md` §3). A flash-calibrated `max_seq_len` would
-admit contexts `batched_generate` cannot actually serve. Re-derive once items 6/7/8 land, against
-sdpa, not flash.
-
-**File:** `vaayu/vram_plan.py` (`solve_max_seq_len`, `plan_vram`).
-
-**Done means:** `max_seq_len` re-derived on all four geometries against the resolved-kernel form,
-plus at least one on-device arm at each new limit for the 1B and the 70B (an on-device arm is what
-caught the original defect — a re-derivation with no on-device check is not trusted here).
-
----
-
-# 11 · [ ] `prefill_chunk_size` vs the sdpa score buffer — an unpriced context lever
-
-Opened 2026-08-15, falling out of rows 6/7. Not scheduled, not measured — recorded so the
-arithmetic does not have to be re-derived.
-
-**The claim.** The sdpa score term this repo now charges is `N · n_heads · **chunk** · C · S`
-(`SCORE_ELEM_BYTES`, `vaayu/vram_plan.py`). `chunk` is `prefill_chunk_size` — OUR knob, not the
-model's. Halving it halves the term, which buys admissible context at the SAME reserve, with no
-expert-cache tradeoff (row 8's floor, now kernel-conditional) and no extra VRAM.
-
-**Derived (NOT measured) admissible S at the 3.50 GiB reserve floor**, via
-`solve_max_seq_len(free_vram=3.50 GiB, min_resident=0)` on each checkpoint's own shape — a
-simplification of the load-time call, so treat these as ratios, not as ceilings to ship:
-
-| geometry | kernel | chunk=512 (today) | chunk=256 | chunk=128 |
-|---|---|---|---|---|
-| llama-3.2-1b | sdpa | 14,052 | 25,408 | 40,910 |
-| llama-3.3-70b | sdpa | 3,821 | 4,096* | 4,096* |
-| qwen3-235b | sdpa | 4,074 | 4,096* | 7,467 |
-| minimax-m2.7 | sdpa | 4,096* | 7,551 | 8,192* |
-| all four | flash_attention_2 | at their caps already | unchanged | unchanged |
-
-`*` = pinned by a KV-bucket/position cap, not by the score term, so the lever is invisible there.
-**The headline: at chunk=128 MiniMax-M2.7 gets its full shipped 8192 back under sdpa, and Qwen
-reaches 7,467 of 8192** — i.e. this lever alone could close most of the gap rows 6/7 opened in the
-batched path, without spending a byte of the expert cache.
-
-**Why it is NOT free, and why this is a row rather than a change.** More chunks = more per-chunk
-work, and that cost is per-forward, not global:
-
-- **fused-EXL3 MoE (Qwen)** — the forward re-stages routed experts per chunk
-  (`_chunk_major_gpu`, the measured 1.514 GB residency term). Halving `chunk` roughly doubles that
-  traffic. This is the geometry the lever helps most AND likely costs most: it must be A/B'd, not
-  assumed.
-- **streamed dense (Llama-3.3-70B)** — weights stream per layer per chunk; prefill is already
-  disk-bandwidth-bound (~5.5 GB/s, `moe_perf_rootcause`), so smaller chunks may cost little or may
-  cost a full re-read. Unknown.
-- **small dense (Llama-3.2-1B)** — nothing streams; probably close to free, and it is where the
-  derived gain is largest (2.9x at chunk=128).
-
-**Done means:** a same-box, same-day prefill-throughput A/B at chunk 512/256/128 on at least one
-MoE and one dense geometry, with TTFT and tok/s beside the admissible-S figures — then either a
-per-forward default, or a written refutation. **Stop rule:** if TTFT regresses more than the
-context gain is worth on the fan-out workload (CLAUDE.md §0), say so and close the row.
-
----
+## ── CLOSED-ROW DETAIL and OPTIONAL sections ──
 
 ## ── OPTIONAL sections ──
 
@@ -347,7 +250,89 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-## ── CLOSED, kept because 9/11/12 lean on them ──
+## ── CLOSED, kept because 11 leans on them ──
+
+# 11a · [x] FIXED 2026-08-16 — warm-cache admission refused contexts the plan advertises
+
+`torch.cuda.mem_get_info()` is a DRIVER-level call and cannot see the blocks PyTorch's caching
+allocator holds reserved-but-unallocated — blocks reusable by the very prefill being admitted. On
+Qwen turn 2: driver free 4.09 GiB, **1.57 GiB sitting in that pool**, request needing 4.88 REFUSED
+at an advertised `max_seq_len=8192`. Fix: `admission_headroom` takes `reusable_pool` and adds it
+before the reserve clamp; `_too_big_message` now names the ceiling solved against the budget it
+actually refused on, instead of the load-time `s_max` (which is why it read "does not fit in
+4.26 GiB … largest that fits is max_seq_len=23415").
+
+**Verified:** 887 passed / 3 skipped (+7); dense smoke PASS, ppl 8.78; and a three-turn warm
+on-device arm with a `control` mode that forces the fix off — Qwen control REFUSES on turn 2 where
+fixed passes turns 2 and 3 at identical VRAM state. MiniMax does not exhibit it on this box (its
+4.79 GiB reserve stays under its 7.86 GiB warm free VRAM); **11a needs reserve > warm free VRAM**,
+which row 8's raised floors made likelier. Full writeup:
+`plans/2026-08-16-row11a-warm-admission-RESULTS.md`.
+
+---
+
+# 11 · [x] CLOSED 2026-08-16 — REFUTED: smaller `prefill_chunk_size` costs TTFT and buys nothing
+
+Measured both forwards, S=6000, sdpa, warm-up discarded.
+Full writeup: `plans/2026-08-16-row11-prefill-chunk-RESULTS.md`.
+
+| geometry | chunk 512 | 256 | 128 |
+|---|---|---|---|
+| Qwen3-235B TTFT | **61.5 s** | 65.6 s (+6.7 %) | 76.7 s (**+24.7 %**) |
+| Qwen3-235B decode | 0.562 tok/s | 0.560 | 0.572 (+1.8 %) |
+| Llama-3.3-70B TTFT | **97.8 s** | 168.4 s (+72 %) | 306.5 s (**+213 %**) |
+| Llama-3.3-70B decode | 0.166 tok/s | 0.164 | 0.160 (−3.6 %) |
+
+**Row 8 had already taken the context prize** — every EXL3 geometry derives 8192 at every chunk — so
+what smaller chunks buy is 2.0–2.2 GiB of reserve handed to pinning and the expert cache, and that
+**buys nothing measurable** (decode +1.8 % / −3.6 %, matching Audit F8 and Plan K). Keep
+`prefill_chunk_size=512`; not a per-forward default either, since even the favourable MoE arm pays
+24.7 % for +1.8 %.
+
+**Outlived the row:** lowering the reserve does NOT lower peak VRAM — Qwen's peak moved 12.87 →
+12.99 GiB while its reserve fell 5.60 → 3.56 GiB, because the expert cache expands into whatever the
+reserve leaves. Ownership changes, spend does not.
+
+---
+
+# 9 · [x] CLOSED 2026-08-16 — sdpa-derived `max_seq_len` verified on-device, 4/4
+
+**No code change was needed — the form held.** `plan_vram` already re-derives at every load, so the
+work was the on-device arm at each limit. All four ran a real prefill+decode at exactly their own
+derived `max_seq_len` under forced sdpa, one subprocess each:
+
+| geometry | `max_seq_len` | reserve | pinning | peak alloc | peak reserved | wall |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B | **71981** | 14.90 GiB | 0.00 GiB | 13.93 GiB | 14.83 GiB (0.64 spare) | 264 s |
+| Qwen3-235B | **8192** | 5.60 GiB | 7.96 GiB | 10.82 GiB | 11.43 GiB | 89 s |
+| MiniMax-M2.7 | **8192** | 4.79 GiB | 8.08 GiB | 11.50 GiB | 11.81 GiB | 287 s |
+| Llama-3.3-70B | **8192** | 6.20 GiB | 8.31 GiB | 8.73 GiB | 9.09 GiB | 157 s |
+
+The three EXL3 geometries recovered their full shipped 8192 (they derived 4074 / 4096 / 3821 under
+sdpa before row 8's floor). The 1B — no expert cache, so the only clean reserve-vs-peak comparison —
+was **over-predicted by ~1.0 GiB, the safe direction**. Full writeup:
+`plans/2026-08-16-row9-sdpa-limits-RESULTS.md`.
+
+---
+
+# 12 · [x] CLOSED 2026-08-16 — speculative decoding measured: MoE refuted, dense 5.57×
+
+Ran, both stages. **`plans/2026-08-16-row12-speculative-decoding-RESULTS.md`.**
+
+- **MoE — refuted, by design not by crash.** `spec_decode_fits` disables speculation at load on
+  both targets: Qwen3-235B needs **53.4 GB** of expert working set for a 6-position verify pass,
+  MiniMax-M2.7 **26.4 GB**, against a 9.1 GB budget. Solved for the largest admissible width:
+  **`draft_tokens ≤ 0` (Qwen), `≤ 1` (MiniMax)**. `use_prompt_lookup` is refused by the same gate —
+  correctly, it widens the verify pass even with no drafter. EAGLE-3 would NOT lift this wall.
+- **Dense — a real 5.57× win, quality-free.** Llama-3.3-70B + the 1B drafter, 100 decode tokens,
+  code-shaped prompt: `generate()` 0.155 → `speculative_generate()` **0.864 tok/s**, 5.30 of 6
+  tokens per round, **86 % of drafted tokens accepted**, output byte-identical to the plain arm.
+  Prompt lookup managed 0.301 tok/s (1.94×). The win is a property of weight-streaming decode —
+  ~37 GB read once, settled over 6 positions — so it does not transfer to MoE.
+- **Not enabled:** `drafter_model_path` is opt-in and dense perf is deferred (CLAUDE.md §0). Row 12a
+  blocks enabling it by default.
+
+---
 
 # 8 · [x] CLOSED 2026-08-16 — budget policy: reserve floor is now kernel-conditional and DERIVED
 

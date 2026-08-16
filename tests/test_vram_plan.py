@@ -353,6 +353,7 @@ def test_predict_peak_vram_is_monotone_across_a_chunk_boundary():
 from vaayu.vaayu_base import _VRAM_RESERVE_FLOOR_BYTES
 from vaayu.vram_plan import (
     VramPlan,
+    _largest_s_within_budget,
     _too_big_message,
     admission_headroom,
     expert_vram_budget_for,
@@ -943,3 +944,103 @@ def test_parity_floor_never_starves_pinning_or_undercuts_the_base_floor(name):
     p = _plan(name, shape=shape_for(name, score_elem_bytes=score_elem_bytes("sdpa")),
               free_vram=tight, reserve_floor=floor)
     assert p.pinning_budget >= 0, name
+
+
+# --- bug 11a: the caching allocator's reusable pool (2026-08-16) ----------
+#
+# `torch.cuda.mem_get_info()` is a DRIVER-level call: it reports VRAM free on
+# the device, and structurally cannot see the blocks PyTorch's caching
+# allocator holds reserved-but-unallocated. Those blocks are reusable by the
+# very prefill being admitted, so charging driver-free alone under-counts.
+#
+# Measured on Qwen3-235B, sdpa, one process, 2026-08-16 -- driver free /
+# reserved / allocated, in GiB:
+#
+#   after load      13.37 / 1.70 / 1.69   -> pool 0.01
+#   after warm-up    5.59 / 9.44 / 9.36   -> pool 0.07
+#   after a prefill  4.09 / 10.94 / 9.36  -> pool 1.57
+#
+# On turn 2 the guard saw 4.09 GiB and refused a request needing 4.88 -- while
+# 1.57 GiB sat reusable in the pool, which is why the same prefill SUCCEEDS in
+# 63.7 s with the guard bypassed. These are decimal-GiB probe readings, so the
+# constants below are scaled from them rather than retyped as model numbers.
+_MEASURED_11A_FREE = int(4.09 * GB)
+_MEASURED_11A_POOL = int(1.57 * GB)
+
+
+def _sdpa_plan(name):
+    """A plan built the way production builds one on the kernel where 11a
+    lives: sdpa shape, row 8's parity floor. That is what makes the reserve
+    (5.60 GiB on Qwen) EXCEED the free VRAM a warm turn reports (4.09), which
+    is the whole precondition of the bug -- on a flash plan the 3.50 GiB floor
+    sits below free VRAM and the clamp binds either way."""
+    shape = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    floor = reserve_floor_bytes(shape=shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                                free_vram=USABLE_VRAM, min_resident=EXPERT_BYTES,
+                                layer_slack=LAYER_SLACK)
+    return _plan(name, shape=shape, reserve_floor=floor)
+
+
+@pytest.mark.parametrize("name", ["qwen3-235b", "minimax-m2.7"])
+def test_reusable_pool_counts_toward_headroom(name):
+    """The fix. Without the pool the request is charged against driver-free
+    alone; with it, against what this process can actually still allocate."""
+    p = _sdpa_plan(name)
+    assert p.reserve_bytes > _MEASURED_11A_FREE, (
+        "premise: 11a needs a reserve ABOVE the warm turn's free VRAM")
+    without = admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                                 expert_cache_active=True)
+    with_pool = admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                                   expert_cache_active=True,
+                                   reusable_pool=_MEASURED_11A_POOL)
+    assert with_pool > without, name
+    assert with_pool == min(_MEASURED_11A_FREE + _MEASURED_11A_POOL,
+                            p.reserve_bytes), name
+
+
+@pytest.mark.parametrize("name", ["qwen3-235b", "minimax-m2.7"])
+def test_the_reserve_still_caps_headroom_however_large_the_pool(name):
+    """The pool is added BEFORE the clamp, never instead of it: the expert VRAM
+    cache is still entitled to everything above the reserve, and a huge pool
+    must not admit a request the reserve was never sized for."""
+    p = _sdpa_plan(name)
+    assert admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                              expert_cache_active=True,
+                              reusable_pool=100 * GB) == p.reserve_bytes, name
+
+
+def test_reusable_pool_counts_on_the_dense_path_too():
+    """Dense has no expert cache and no clamp, but the same driver-vs-allocator
+    blind spot -- so the pool has to count there as well."""
+    p = _plan("llama-70b", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                              expert_cache_active=False,
+                              reusable_pool=_MEASURED_11A_POOL) == (
+        _MEASURED_11A_FREE + _MEASURED_11A_POOL)
+
+
+def test_omitting_the_pool_changes_nothing():
+    """Default 0 -- every pre-existing caller keeps its exact behaviour."""
+    p = _plan("minimax-m2.7", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert (admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                               expert_cache_active=True)
+            == admission_headroom(free_vram=_MEASURED_11A_FREE, plan=p,
+                                  expert_cache_active=True, reusable_pool=0))
+
+
+def test_refusal_reports_the_ceiling_that_applies_now_not_the_load_time_one():
+    """Second half of bug 11a: the message printed `plan.s_max` -- solved at
+    LOAD against full free VRAM -- while refusing on the much smaller runtime
+    headroom, so it read as a contradiction ("does not fit in 5.59 GiB ... the
+    largest context that fits is max_seq_len=23415"). The ceiling named must be
+    the one solved against the budget actually refused on."""
+    sh = shape_for("qwen3-235b")
+    p = _plan("qwen3-235b", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    headroom = _MEASURED_11A_FREE
+    msg = _too_big_message(requested=p.s_max, s_max=p.s_max,
+                           free_vram=int(14.21 * GB), shape=sh,
+                           min_resident=EXPERT_BYTES, headroom=headroom)
+    runtime_ceiling = _largest_s_within_budget(sh, headroom)
+    assert runtime_ceiling < p.s_max, "premise: the runtime ceiling is lower"
+    assert f"max_seq_len={runtime_ceiling}" in msg
+    assert f"max_seq_len={p.s_max}" not in msg.split("Real levers")[0]
