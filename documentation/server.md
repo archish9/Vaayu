@@ -376,6 +376,32 @@ than being lost.
 
 Measured on this box (16 GB VRAM, 32 GB RAM), same-day A/B.
 
+### 7.0 What the defaults are worth, end to end
+
+Measured on Qwen3-235B, 2 concurrent sessions x 3 rounds, ~4.6k-token shared prefix,
+24 decode tokens per turn — an agent-shaped workload. Same box, same day. The only
+difference between the arms is configuration:
+
+| | server's first working config | shipped defaults | |
+|---|---|---|---|
+| layer pinning | 0 transformer layers | auto-fill | |
+| prefix cache | **off** | on | |
+| expert ceiling | 8.5 GiB literal | derived | |
+| **total wall, 6 turns** | **477.0 s** | **198.1 s** | **2.41x** |
+| end-to-end throughput | 0.302 tok/s | **0.727 tok/s** | 2.41x |
+| cold turn | 77.8 s | 41.3 s | 1.88x |
+| warm turn | 80.3 s | **28.9 s** | **2.78x** |
+| expert cache hit | 46.7 % | 61.3 % | |
+| prefix reuse | none | 83 % of prompt tokens skipped | |
+
+In the old configuration warm turns were *slower* than cold ones (80.3 s against
+77.8 s): with no prefix cache every turn is a full prefill, so an agent resending its
+history was punished for doing the right thing.
+
+**None of this made the engine itself faster except the expert ceiling.** The other
+three were the server failing to use capabilities the engine already had. They are
+documented below because each is easy to switch back off by accident.
+
 ### 7.1 Pin the layers — the big one, and it is now the default
 
 `--max-pinned-layers -1` fills the VRAM budget with transformer layers, which then never

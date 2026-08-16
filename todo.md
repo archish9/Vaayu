@@ -213,7 +213,55 @@ closing them (11a, 12a, 12b) is fixed.
 
 ## SCHEDULED
 
-# 14 · [~] Expert cache capacity — the 8.5 GiB ceiling is STALE, +40 % measured
+# 14 · [x] CLOSED 2026-08-16 — expert ceiling now DERIVED; 2.41x end-to-end
+
+**Shipped.** `derive_expert_ceiling` (`vaayu_base.py`) replaces the stale 8.5 GiB literal,
+which becomes a FLOOR. Ceiling = available RAM − 3.5 GiB reserve − (`prefix_sessions` ×
+`max_seq_len` × `kv_bytes_per_token`). The expert arena is pinned BEFORE
+`compute_prefix_cache_budget` measures what is left, so the prefix pool is reserved first;
+`--prefix-sessions` (default 3) is the policy knob. Each model reserves from its OWN KV
+geometry — Qwen 1.58 GB/session, MiniMax 2.08 GB/session — no literals.
+
+**End-to-end A/B, Qwen3-235B, 2 sessions x 3 rounds, ~4.6k-token shared prefix:**
+
+| | server's first working config | shipped defaults | |
+|---|---|---|---|
+| total wall (6 turns) | **477.0 s** | **198.1 s** | **2.41x** |
+| end-to-end | 0.302 tok/s | **0.727 tok/s** | 2.41x |
+| cold / warm turn | 77.8 / 80.3 s | 41.3 / **28.9 s** | 1.88x / **2.78x** |
+| expert hit | 46.7 % | 61.3 % | |
+| prefix reuse | off | 83 % of tokens skipped | |
+
+Warm turns were SLOWER than cold ones in the old config (80.3 vs 77.8 s) — with no prefix
+cache every turn is a full prefill, so an agent resending history was punished for it.
+
+**Attribution, stated honestly: only the expert ceiling made the ENGINE faster.** The other
+three (pinning `-1`, prefix cache on, RAM cache derived) were the server failing to use
+capabilities the engine already had.
+
+**Per-ceiling detail (2 sessions x 3 rounds, real context, MemoryMax=27G):**
+
+| ceiling | expert | prefix pool | expert hit | warm wall |
+|---|---|---|---|---|
+| 8.5 GiB (stale literal) | 9.12 GB | 11.73 GB | 44.9 % | 36.6 s |
+| 13 GiB | 13.95 GB | 7.45 GB | 55.8 % | 32.0 s |
+| 18 GiB | 19.33 GB | 2.00 GB | 64.3 % | 27.3 s |
+| **DERIVED (Qwen)** | 16.57 GB | 4.25 GB | 59.6 % | 29.8 s |
+| **DERIVED (MiniMax)** | 15.42 GB | 6.16 GB | 21.3 % (was 6.6) | 20.6 s |
+
+The derived figure deliberately gives up some decode against a hand-set 18 GiB to keep
+three full-context sessions poolable. Prefix reuse held at 83 % in EVERY arm.
+
+**Superseded:** the original proposal, a pageable L2 expert tier. The same win was available
+by fixing a constant, at full pinned-DMA bandwidth and with no new code path.
+
+**What remains open:** `vaayu/expert_sim.py`'s anchor gap (31.9 % simulated against 43.9 %
+live at Qwen's 9.12 GB budget) is still unexplained — the obvious hypothesis, that it fails
+to model the engine's eviction pinning, was implemented and REJECTED (byte-identical result).
+The gap is confined to the small-budget regime: at 16 GB the simulator predicted 20.3 % for
+MiniMax against a measured 21.3 %. Do not quote its small-budget absolutes.
+
+# 14-CLOSED-DETAIL · original premise and method notes
 
 **Re-scoped 2026-08-16 after measurement. The original proposal (a pageable L2 tier) is
 superseded: the same win is available by fixing a stale constant, at full pinned-DMA

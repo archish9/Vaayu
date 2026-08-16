@@ -531,6 +531,19 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
    template**, never by model name; a `tools` request against a template that can't render
    them is a `400` with a named reason rather than a silent drop.
 
+### What the defaults buy
+
+Measured end-to-end on Qwen3-235B — 2 concurrent sessions x 3 rounds, ~4.6k-token shared
+prefix, agent-shaped. Same box, same day; only configuration differs:
+
+| | first working config | shipped defaults | |
+|---|---|---|---|
+| total wall, 6 turns | 477.0 s | **198.1 s** | **2.41x** |
+| warm turn | 80.3 s | **28.9 s** | 2.78x |
+| prefix reuse | off | 83 % of prompt tokens skipped | |
+
+Full breakdown and the per-lever numbers: [documentation/server.md §7](documentation/server.md#7-making-it-faster).
+
 ### Key flags
 
 | flag | default | why you care |
@@ -544,6 +557,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 | `--drafter-model-path` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
 | `--use-prompt-lookup` | off | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
 | `--ram-cache-budget-gb` | *derived from total RAM* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
+| `--prefix-sessions` | `3` | concurrent sessions the prefix pool must hold before the MoE expert cache claims the rest. Lower = faster decode, fewer cached sessions |
 | `--attn-implementation` | `sdpa` | `flash_attention_2` derives more context at the same reserve |
 
 Full list, request-body reference, tool-calling examples and the troubleshooting table:
