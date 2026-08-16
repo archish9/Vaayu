@@ -125,7 +125,7 @@ checkboxes are the step-level detail.
       Pure, parametrized over all four on-disk derived windows. `512` must not appear in `vaayu/server/`
 - [x] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
       real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
-- [ ] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
+- [x] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
       `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
 - [ ] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
       with no tool support rather than dropping them
