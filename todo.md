@@ -101,9 +101,10 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
 # 13 · [~] Vaayu as an inference server (OpenAI-compatible), v1
 
-Design **approved 2026-08-16**: `plans/2026-08-16-vaayu-server-design.md`. Implementation plan
-NOT yet written — next step is the writing-plans pass, which replaces the placeholder subtasks
-below with real ones. Nothing is implemented.
+Design **approved 2026-08-16**: `plans/2026-08-16-vaayu-server-design.md`.
+Implementation plan **written 2026-08-16**: `plans/2026-08-16-vaayu-server-plan.md` — 13 TDD tasks,
+self-contained (every step carries real code, the exact command, and its expected output). Read BOTH
+before touching anything. **Nothing is implemented yet.**
 
 **What it is:** turn Vaayu from a test-script token generator into a long-running HTTP server an
 autonomous coding agent can drive — one `--model` path, OpenAI-shaped requests, streaming, tool
@@ -115,34 +116,43 @@ checkpoints is ~0.86 tok/s at 8192 context, single stream. v1's default deployme
 streamed big-model path staying first-class and selectable. `vaayu_base.py:3698` already skips the
 disk load for a pinned layer, so a fully-pinned model pays no streaming cost.
 
-**Task groups (placeholders until the plan lands):**
+**Tasks — one per plan task, in execution order.** Tick each as it lands; the plan's own
+checkboxes are the step-level detail.
 
-- [ ] `server/schemas.py` — OpenAI subset + Vaayu extras (`session_id`, `kv_cache_mode`,
-      `drafter_model_path`), pure, unit-tested
-- [ ] `server/stopping.py` — `resolve_max_tokens` + `finish_reason` table, pure, parametrized over
-      all four on-disk geometries (CLAUDE.md §5)
-- [ ] `server/tools.py` — tool-call parser registry, selected by PROBING the chat template, never
-      by model-name match (§5); Hermes/Qwen `<tool_call>` family + fenced-JSON fallback
-- [ ] `server/chat.py` — `apply_chat_template(..., tools=)`; 400 with a named reason when the
-      template has no tool support (never silently drop `tools`)
-- [ ] `server/engine.py` — single `VaayuBaseModel`, `asyncio.Queue(maxsize=8)`, one worker,
-      `run_in_executor`; 503 + `Retry-After` past depth
-- [ ] `server/app.py` — `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`,
-      `GET /health` (VRAM, queue depth, `PrefixCacheStore.stats()`)
-- [ ] `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
-- [ ] **engine fix (prefix cache):** explicit-`session_id` miss must fall back to auto-prefix-match
-      — `prefix_cache.py:71` gates it on `session_id is None`, so naming a session and missing is
-      strictly worse than not naming it
-- [ ] **engine fix (prefix cache):** client disconnect must not drain the pool — `lookup()` POPS and
-      `store()` only re-inserts after `generate()` returns, so an aborted SSE stream loses the entry
-      PERMANENTLY. `try/finally` re-insert on the abort path
-- [ ] **startup warning:** `vaayu_base.py:1648` falls back to `max_seq_len=512` on the CPU/no-plan
-      path; the server's "default cap = remaining window" would silently inherit a 512-token window
-- [ ] `test_server_smoke.py` at repo root — one real load, then non-stream + stream + tool-call
-      request, under `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
+- [ ] **0** deps + package skeleton — `fastapi`/`uvicorn` installed and in `requirements.txt`,
+      `vaayu/server/__init__.py` with a lazy re-export so `import vaayu` stays cheap
+- [ ] **1** `server/stopping.py` — `resolve_max_tokens` + `finish_reason`. THE truncation fix.
+      Pure, parametrized over all four on-disk derived windows. `512` must not appear in `vaayu/server/`
+- [ ] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
+      real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
+- [ ] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
+      `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
+- [ ] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
+      with no tool support rather than dropping them
+- [ ] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
+      (`prefix_cache.py:71` gates it on `session_id is None`; naming a session and missing is
+      strictly WORSE than not naming it)
+- [ ] **6** engine fix — `restore_on_abort` puts a checked-out entry back after a dead turn.
+      `lookup()` POPS, `store()` only re-inserts after `generate()` returns, so an aborted SSE stream
+      drained the pool permanently. Crops the mutated cache to a length whose tokens are KNOWN —
+      re-storing against the original token list would corrupt it. Never raises (must not mask the
+      real error)
+- [ ] **7** `server/engine.py` — `EngineHandle`: depth-bounded FIFO gate, request→kwargs mapping,
+      blocking + streaming generation. Carries the CPU `max_seq_len=512` startup warning
+      (`vaayu_base.py:1648`) and the speculative-path sampling warning
+- [ ] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
+      `PrefixCacheStore.stats()`; 400/503/500 error mapping
+- [ ] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
+      split across chunks still recognised; queue-position comment before the first event
+- [ ] **10** `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
+- [ ] **11** `test_server_smoke.py` at repo ROOT — real load, non-stream, stream, oversized-prompt
+      refusal, prefix observability. Run on the 1B AND on an EXL3 MoE, each under its own
+      `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
+- [ ] **12** README section, close this row, archive entry in `plans/settled_and_method_notes.md`
 
-**Done means:** full suite green (892 passed / 3 skipped at design time), dense smoke gate PASS with
-perplexity 8.78 unchanged, and the new on-device server gate passing on a real checkpoint.
+**Done means:** full suite green — **892 passed / 3 skipped** at plan time, **984 / 3** projected
+after the plan's 92 new tests; dense smoke gate PASS with perplexity **8.78 unchanged**; and
+`test_server_smoke.py` passing on BOTH the small dense checkpoint and an EXL3 MoE one.
 
 **Named risks carried from the design (§9):** the speculative path is sampling-blind (`top_p`/
 `top_k`/stop-strings silently ignored — must warn, not pretend); row 8's reserve policy may drive
@@ -179,8 +189,9 @@ closing them (11a, 12a, 12b) is fixed.
 
 > ### ▶▶ NEXT ACTION (fresh session): row 13 — write the implementation plan for the server
 > **Row 13 (Vaayu as an inference server) is SCHEDULED and in progress.** Its design is approved and
-> committed at `plans/2026-08-16-vaayu-server-design.md`; the next step is the writing-plans pass
-> that turns row 13's placeholder subtasks into real, ordered, TDD tasks. No server code exists yet.
+> committed at `plans/2026-08-16-vaayu-server-design.md`, and its 13-task TDD implementation plan is
+> written at `plans/2026-08-16-vaayu-server-plan.md`. **Start at plan Task 0 and work down.** No
+> server code exists yet.
 > Read the design before touching anything — it records WHY the shape is what it is (measured
 > ceiling ~0.86 tok/s at 8192 context, single stream; resident-model default; queue not batch).
 >
