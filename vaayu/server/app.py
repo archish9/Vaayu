@@ -2,6 +2,7 @@
 
 Everything decidable without a GPU lives in stopping.py / tools.py / schemas.py.
 """
+import json
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -11,7 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
 from .engine import EngineHandle, QueueFull
-from .schemas import (ChatCompletionRequest, ChatCompletionResponse, Choice,
+from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
+                      ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
 
@@ -152,6 +154,83 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     return app
 
 
+def _chunk(cid, created, model_name, *, delta, finish=None, usage=None) -> str:
+    body = ChatCompletionChunk(
+        id=cid, created=created, model=model_name,
+        choices=[ChunkChoice(index=0, delta=Delta(**delta), finish_reason=finish)],
+        usage=usage,
+    ).model_dump(exclude_none=True)
+    return f"data: {json.dumps(body)}\n\n"
+
+
+def _error_event(ex) -> str:
+    payload = {"error": {"message": f"{type(ex).__name__}: {ex}",
+                         "type": "internal_error"}}
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 async def _sse(engine, req, model_name, warning):
-    raise NotImplementedError("streaming lands in Task 9")
-    yield  # pragma: no cover -- makes this an async generator
+    """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
+    once, complete -- partial tool-call JSON breaks clients that parse each
+    delta, and the gain from streaming it is nil."""
+    cid, created = make_completion_id(), int(time.time())
+
+    # A comment line: legal SSE, ignored by every client, and it lets a queued
+    # caller tell "waiting behind N requests" from "hung".
+    yield f": vaayu queue position {engine.depth}\n\n"
+    if warning:
+        yield f": warning {warning}\n\n"
+
+    yield _chunk(cid, created, model_name, delta={"role": "assistant"})
+
+    fmt = engine.tool_format if req.tools else None
+    open_marker = fmt.open_marker if fmt is not None else None
+    held, suppressing = "", False
+    final = None
+    try:
+        # Acquired HERE, not in the route: this generator body runs after the
+        # handler returned, so a slot held around that return would already be
+        # released before the first token.
+        async with engine.slot():
+            async for kind, payload in engine.stream(req):
+                if kind == "final":
+                    final = payload
+                    break
+                if suppressing:
+                    continue
+                held += payload
+                if open_marker and open_marker in held:
+                    # Everything from here belongs to the tool call. Emit the
+                    # prose that preceded it, then go quiet until the final event.
+                    prose = held[:held.index(open_marker)]
+                    if prose:
+                        yield _chunk(cid, created, model_name,
+                                     delta={"content": prose})
+                    held, suppressing = "", True
+                    continue
+                # Hold back a marker-length tail so an open marker split across
+                # two chunks is still recognised.
+                keep = (len(open_marker) - 1) if open_marker else 0
+                if len(held) > keep:
+                    emit, held = held[:len(held) - keep], held[len(held) - keep:]
+                    yield _chunk(cid, created, model_name, delta={"content": emit})
+    except Exception as ex:                            # noqa: BLE001
+        yield _error_event(ex)
+        yield "data: [DONE]\n\n"
+        return
+
+    if held and not suppressing:
+        yield _chunk(cid, created, model_name, delta={"content": held})
+
+    if final is not None and final.tool_calls:
+        yield _chunk(cid, created, model_name, delta={"tool_calls": final.tool_calls})
+
+    usage = None
+    if final is not None and req.stream_options and req.stream_options.include_usage:
+        usage = Usage(prompt_tokens=final.prompt_tokens,
+                      completion_tokens=final.completion_tokens,
+                      total_tokens=final.prompt_tokens + final.completion_tokens)
+    yield _chunk(cid, created, model_name, delta={},
+                 finish=(final.finish_reason if final is not None else "stop"),
+                 usage=usage)
+    yield "data: [DONE]\n\n"

@@ -142,7 +142,7 @@ checkboxes are the step-level detail.
       (`vaayu_base.py:1648`) and the speculative-path sampling warning
 - [x] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
       `PrefixCacheStore.stats()`; 400/503/500 error mapping
-- [ ] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
+- [x] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
       split across chunks still recognised; queue-position comment before the first event
 - [ ] **10** `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
 - [ ] **11** `test_server_smoke.py` at repo ROOT — real load, non-stream, stream, oversized-prompt

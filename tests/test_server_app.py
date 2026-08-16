@@ -8,6 +8,7 @@ from vaayu.server.chat import TemplateLacksToolSupport
 from vaayu.server.engine import GenerationResult, QueueFull
 from vaayu.server.schemas import ToolCall, ToolCallFunction
 from vaayu.server.stopping import ContextTooLong
+from vaayu.server.tools import HERMES as _HERMES
 
 
 class FakeEngine:
@@ -147,3 +148,76 @@ def test_a_speculative_sampling_warning_is_surfaced_on_the_response():
 def test_n_greater_than_one_is_a_422_from_validation():
     r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, n=4))
     assert r.status_code == 422
+
+
+def _sse_events(raw: str):
+    """Parse an SSE body into the list of JSON payloads, dropping [DONE]."""
+    out = []
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload == "[DONE]":
+            continue
+        out.append(json.loads(payload))
+    return out
+
+
+def test_a_stream_emits_role_then_content_then_a_terminating_done():
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.text.rstrip().endswith("data: [DONE]")
+    events = _sse_events(r.text)
+    assert events[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert events[0]["object"] == "chat.completion.chunk"
+    contents = [e["choices"][0]["delta"].get("content") for e in events]
+    assert "".join(c for c in contents if c) == "hello"
+
+
+def test_the_last_stream_event_carries_the_finish_reason():
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, stream=True))
+    events = _sse_events(r.text)
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1]["choices"][0]["delta"] == {}
+
+
+def test_usage_is_omitted_unless_asked_for():
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert all("usage" not in e for e in _sse_events(r.text))
+
+
+def test_usage_is_included_when_stream_options_asks():
+    body = dict(BODY, stream=True, stream_options={"include_usage": True})
+    events = _sse_events(_client(FakeEngine()).post("/v1/chat/completions", json=body).text)
+    assert events[-1]["usage"]["total_tokens"] == 5
+
+
+def test_a_streamed_tool_call_is_emitted_once_and_complete():
+    # Buffered, never emitted as partial JSON -- partial tool-call JSON breaks
+    # clients that try to parse each delta.
+    call = ToolCall(id="call_x", function=ToolCallFunction(name="f", arguments='{"a":1}'))
+    engine = FakeEngine(
+        deltas=["<tool_call>", '{"name":"f",'],
+        result=GenerationResult(text="", prompt_tokens=3, completion_tokens=9,
+                                finish_reason="tool_calls", tool_calls=[call]))
+    engine.tool_format = _HERMES
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    with_calls = [e for e in events if e["choices"][0]["delta"].get("tool_calls")]
+    assert len(with_calls) == 1
+    assert with_calls[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_an_engine_crash_mid_stream_emits_an_error_event_and_closes():
+    engine = FakeEngine(raises=RuntimeError("io_uring read failed"))
+    r = _client(engine).post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert "io_uring read failed" in r.text
+    assert r.text.rstrip().endswith("data: [DONE]")
+
+
+def test_a_queue_position_comment_precedes_the_first_event():
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.text.startswith(": vaayu queue")
