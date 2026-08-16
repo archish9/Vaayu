@@ -23,6 +23,9 @@ def main(argv=None) -> int:
     p.add_argument("--queue-depth", type=int, default=8,
                    help="waiting requests allowed before 503; one runs at a time")
     p.add_argument("--kv-cache-mode", default="auto")
+    p.add_argument("--no-prefix-cache", action="store_true",
+                   help="disable cross-turn KV prefix reuse (on by default; it is "
+                        "the largest measured lever here, 136-377x TTFT)")
     p.add_argument("--drafter-model-path", default=None,
                    help="opt-in speculative decoding. Measured 5.57x on streamed "
                         "dense; refused by the Fix #9 gate on both MoE targets")
@@ -35,7 +38,8 @@ def main(argv=None) -> int:
         model_path=args.model, device=args.device, queue_depth=args.queue_depth,
         host=args.host, port=args.port, kv_cache_mode=args.kv_cache_mode,
         drafter_model_path=args.drafter_model_path,
-        served_model_name=args.served_model_name)
+        served_model_name=args.served_model_name,
+        enable_prefix_cache=not args.no_prefix_cache)
 
     import uvicorn
     uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info")

@@ -193,3 +193,25 @@ def test_a_slot_is_released_even_when_the_body_raises():
             pass
 
     asyncio.run(main())
+
+
+def test_no_kwarg_stream_generate_builds_itself_survives_into_its_kwargs():
+    # stream_generate constructs these; a duplicate arrives as
+    # "TypeError: dict() got multiple values for keyword argument 'use_cache'".
+    # That shipped past every fake-backed test and was caught only on-device.
+    import inspect
+
+    from vaayu.server.engine import STREAM_GENERATE_OWNS
+    from vaayu.streaming import stream_generate
+
+    src = inspect.getsource(stream_generate)
+    for name in STREAM_GENERATE_OWNS:
+        assert f"{name}=" in src, (
+            f"{name} is listed as owned by stream_generate but does not appear "
+            f"in its source -- the set has drifted")
+
+    e = EngineHandle(FakeModel())
+    kw = e.build_generate_kwargs(_req(temperature=0.7, top_p=0.9), [1, 2, 3])
+    for name in STREAM_GENERATE_OWNS:
+        kw.pop(name, None)
+    assert set(kw) <= {"session_id", "top_k", "stop_strings", "tokenizer"}

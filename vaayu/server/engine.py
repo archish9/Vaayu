@@ -16,6 +16,13 @@ from .stopping import finish_reason, resolve_max_tokens
 from .tools import detect_tool_format, parse_tool_calls
 
 
+# Keyword arguments vaayu.streaming.stream_generate constructs itself. Anything
+# here that also arrives via **kwargs is a duplicate-keyword TypeError. Kept as a
+# named set so a change to stream_generate's signature has one place to land.
+STREAM_GENERATE_OWNS = ("input_ids", "streamer", "max_new_tokens", "temperature",
+                        "top_p", "do_sample", "use_cache")
+
+
 class QueueFull(RuntimeError):
     """More requests are waiting than the configured depth allows."""
 
@@ -196,10 +203,13 @@ class EngineHandle:
         prompt_ids, cap = self.prepare(req)
         kwargs = self.build_generate_kwargs(req, prompt_ids, cap)
         input_ids = kwargs.pop("input_ids")
-        kwargs.pop("max_new_tokens", None)
-        kwargs.pop("do_sample", None)               # stream_generate derives it
-        temperature = kwargs.pop("temperature", 0.0)
-        top_p = kwargs.pop("top_p", 1.0)
+        temperature = kwargs.get("temperature", 0.0)
+        top_p = kwargs.get("top_p", 1.0)
+        # stream_generate builds these itself; leaving any of them in **kwargs is
+        # a duplicate-keyword TypeError, which is how `use_cache` shipped broken
+        # past every fake-backed test and was caught only on-device.
+        for k in STREAM_GENERATE_OWNS:
+            kwargs.pop(k, None)
 
         loop = asyncio.get_running_loop()
         bridge: _queue.Queue = _queue.Queue()

@@ -68,3 +68,39 @@ def test_a_non_list_return_from_the_template_is_refused_rather_than_passed_on():
 
     with pytest.raises(TypeError):
         render_prompt(StringTokenizer(PLAIN_TEMPLATE), MESSAGES)
+
+
+def test_return_dict_false_is_requested_so_transformers_5_returns_bare_ids():
+    # transformers 5.x defaults return_dict=True and hands back a BatchEncoding.
+    # Found on-device by test_server_smoke.py, not by these fakes.
+    tok = FakeTokenizer(PLAIN_TEMPLATE)
+    render_prompt(tok, MESSAGES)
+    assert tok.calls[0][1]["return_dict"] is False
+
+
+def test_a_batchencoding_style_mapping_is_unwrapped():
+    class MappingTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kw):
+            return {"input_ids": [[5, 6, 7]], "attention_mask": [[1, 1, 1]]}
+
+    assert render_prompt(MappingTokenizer(PLAIN_TEMPLATE), MESSAGES) == [5, 6, 7]
+
+
+def test_a_nested_batch_of_one_is_flattened():
+    class NestedTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kw):
+            return [[9, 8, 7]]
+
+    assert render_prompt(NestedTokenizer(PLAIN_TEMPLATE), MESSAGES) == [9, 8, 7]
+
+
+def test_a_tensor_like_return_is_converted():
+    class TensorLike:
+        def tolist(self):
+            return [[1, 2]]
+
+    class TensorTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kw):
+            return TensorLike()
+
+    assert render_prompt(TensorTokenizer(PLAIN_TEMPLATE), MESSAGES) == [1, 2]

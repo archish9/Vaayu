@@ -23,7 +23,10 @@ def render_prompt(tokenizer, messages, tools=None):
             "completions cannot render messages for it. Use a chat/instruct "
             "checkpoint, or send an already-formatted single user message.")
 
-    kwargs = {"add_generation_prompt": True, "tokenize": True}
+    # return_dict=False asks for bare ids. transformers 5.x defaults it to True
+    # and hands back a BatchEncoding, which _looks_ list-like enough to travel
+    # several frames before failing -- caught on-device, not by the fakes.
+    kwargs = {"add_generation_prompt": True, "tokenize": True, "return_dict": False}
     if tools:
         if detect_tool_format(template) is None:
             raise TemplateLacksToolSupport(
@@ -35,8 +38,25 @@ def render_prompt(tokenizer, messages, tools=None):
         kwargs["tools"] = tools
 
     ids = tokenizer.apply_chat_template(messages, **kwargs)
-    if not isinstance(ids, list):
+    return _as_token_ids(ids)
+
+
+def _as_token_ids(ids):
+    """Normalise whatever apply_chat_template returned into a flat list of ids.
+
+    Templates and transformers versions disagree here: a bare list, a nested
+    batch of one, or a BatchEncoding/dict keyed on "input_ids" are all seen in
+    the wild. Normalise the shapes we recognise and refuse the rest loudly --
+    a wrong-shaped prompt otherwise surfaces many frames away as a tensor error.
+    """
+    if hasattr(ids, "keys") and "input_ids" in ids:
+        ids = ids["input_ids"]
+    if hasattr(ids, "tolist"):                       # torch tensor / numpy array
+        ids = ids.tolist()
+    if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
+        ids = ids[0]                                 # batch of one
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
         raise TypeError(
-            f"apply_chat_template returned {type(ids).__name__}, expected a list "
-            f"of token ids (tokenize=True was requested)")
+            f"apply_chat_template returned {type(ids).__name__}, expected a flat "
+            f"list of token ids (tokenize=True, return_dict=False were requested)")
     return ids

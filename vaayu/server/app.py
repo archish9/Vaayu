@@ -28,6 +28,10 @@ class ServerConfig:
     kv_cache_mode: str = "auto"
     drafter_model_path: str | None = None
     served_model_name: str | None = None
+    # ON by default here although vaayu_base defaults it OFF. Cross-turn prefix
+    # reuse is this engine's largest measured lever (136-377x TTFT) and an agent
+    # resending its history every turn is exactly the workload it was built for.
+    enable_prefix_cache: bool = True
 
 
 def _error(status: int, message: str, kind: str, headers=None):
@@ -57,6 +61,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 device=config.device,
                 kv_cache_mode=config.kv_cache_mode,
                 drafter_model_path=config.drafter_model_path or None,
+                enable_prefix_cache=config.enable_prefix_cache,
             )
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")
