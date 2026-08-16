@@ -45,6 +45,10 @@ class ServerConfig:
     prefix_compress: int | None = None
     enable_kv_persist: bool = False
     attn_implementation: str | None = None
+    # Bytes for the dense RAM layer cache. None derives it from TOTAL RAM (see
+    # ram_cache.RAM_CACHE_RESERVE) so a server's throughput is reproducible
+    # across restarts instead of depending on what was running at boot.
+    ram_cache_budget: int | None = None
 
 
 def _error(status: int, message: str, kind: str, headers=None):
@@ -82,6 +86,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 prefix_compress=config.prefix_compress,
                 enable_kv_persist=config.enable_kv_persist,
                 attn_implementation=config.attn_implementation,
+                ram_cache_budget=config.ram_cache_budget,
             )
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")

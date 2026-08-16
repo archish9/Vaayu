@@ -543,6 +543,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 | `--prefix-compress 9` | `None` | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
 | `--drafter-model-path` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
 | `--use-prompt-lookup` | off | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
+| `--ram-cache-budget-gb` | *derived from total RAM* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
 | `--attn-implementation` | `sdpa` | `flash_attention_2` derives more context at the same reserve |
 
 Full list, request-body reference, tool-calling examples and the troubleshooting table:

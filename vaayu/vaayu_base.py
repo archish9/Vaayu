@@ -1190,7 +1190,7 @@ class VaayuBaseModel(GenerationMixin):
                  prefix_compress=None,
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
-                 enable_expert_usage=False):
+                 enable_expert_usage=False, ram_cache_budget=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -1653,12 +1653,21 @@ class VaayuBaseModel(GenerationMixin):
         # RAM layer cache — measured AFTER _init_pinned_layers so pinned-layer RAM
         # consumption is already reflected in available memory, preventing over-budget.
         if device.startswith("cuda"):
-            from .persist.ram_cache import LayerRAMCache, auto_detect_cache_budget
+            from .persist.ram_cache import (LayerRAMCache, auto_detect_cache_budget,
+                                            describe_cache_budget)
             # MoE models skip pre-population entirely; the RAM layer cache budget
-            # is wasted allocation. Give that memory to the expert cache instead.
-            _cache_budget = 0 if self.is_moe else auto_detect_cache_budget()
+            # is wasted allocation. Their experts live in the PINNED expert RAM
+            # cache instead, which is a different and much scarcer resource --
+            # page-locked, unswappable, and rounded up to a power of two by the
+            # allocator, hence its own 8.5 GiB ceiling rather than this one.
+            if self.is_moe:
+                _cache_budget = 0
+                _budget_note = "0.0 GB budget (MoE: experts use the pinned expert RAM cache)"
+            else:
+                _cache_budget = auto_detect_cache_budget(override_bytes=ram_cache_budget)
+                _budget_note = describe_cache_budget(override_bytes=ram_cache_budget)
             self.ram_cache = LayerRAMCache(_cache_budget)
-            print(f"[Vaayu-Cache] RAM layer cache: {_cache_budget / 1e9:.1f} GB budget")
+            print(f"[Vaayu-Cache] {_budget_note}")
             self._prepopulate_ram_cache()
             self.loader_strategy._cache = self.ram_cache
         else:

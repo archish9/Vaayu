@@ -107,6 +107,7 @@ holds one model for its whole life and should fill the box.
 | `--prefill-chunk-size` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
 | `--kv-cache-mode` | `auto` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
 | `--attn-implementation` | `sdpa` | `flash_attention_2` derives a larger context at the same reserve. Every shipped `max_seq_len` figure was verified on **sdpa** |
+| `--ram-cache-budget-gb` | *derived from total RAM* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5 |
 | `--enable-kv-persist` | off | persist prefix KV to disk so reuse survives a restart |
 
 > **`--drafter-model-path` requires a vocabulary match.** The drafter and target must
@@ -433,7 +434,55 @@ If you serve several agent sessions, add `--prefix-compress 9`: pooled KV packs 
 path. The first budget-pressure eviction prints a warning naming the capacity — watch
 for it.
 
-### 7.5 What will not help
+### 7.5 RAM layer caching — and why it is dense-only
+
+Layers that do not fit in VRAM are held in **pageable host RAM** rather than re-read
+from NVMe on every token. It is on by default and it works: on Llama-3.3-70B it holds
+**33 of 80 layers (16.1 GB)** and scores **264 hits / 248 misses** during decode.
+
+The budget is derived from **total** system RAM minus a stated hardware reserve
+(`RAM_CACHE_RESERVE`, 16 GiB on the reference box), *then* clamped by what is actually
+free. That matters more than it sounds. The old form keyed off momentary free RAM, so
+two identical runs of the same command gave:
+
+| | budget | layers cached | decode |
+|---|---|---|---|
+| unlucky boot | 9.7 GB | 18 / 80 | 0.167 tok/s |
+| lucky boot | 16.4 GB | 33 / 80 | 0.230 tok/s |
+
+**A 38 % throughput swing decided by what else was running at boot.** The derived form
+now reproduces the good configuration exactly — two consecutive runs: 16.2 GB, 33 layers,
+264/248 hits, **0.232 tok/s** both times. The startup line names which bound applied:
+
+```
+[Vaayu-Cache] RAM layer cache budget 16.2 GB (bound by total RAM; total-derived 16.2 GB, live-derived 22.7 GB)
+```
+
+If it says `bound by available RAM`, something else on the box is eating your throughput.
+
+**Why MoE gets none of this.** It is not an oversight, and it is not that MoE has no RAM
+budget — it has a large one. The two caches use *different kinds of memory*:
+
+| | memory | sized by | on this box |
+|---|---|---|---|
+| dense `LayerRAMCache` | **pageable** | total RAM − reserve | 16.2 GB |
+| MoE `ExpertRAMCache` | **CUDA-pinned / page-locked** | `_EXPERT_CACHE_OOM_CEILING` | 8.5 GiB (9.1 GB) |
+
+Pinned pages cannot be swapped, must be found contiguously by the kernel, and the
+allocator rounds a request up to the next power of two — a 9.13 GB arena is charged
+16 GiB. That, not a policy decision, is where the 8.5 GiB ceiling comes from, and it is
+why raising it is an OOM experiment rather than a config change. MoE's non-expert
+weights are already pinned in **VRAM** (all 62 layers on MiniMax-M2.7), so a pageable
+layer cache would have nothing left to hold.
+
+> **Open question, not yet measured.** On a 32 GB box the MoE path leaves roughly 20 GB
+> of *pageable* RAM idle. A second-tier pageable expert cache behind the pinned one would
+> still be far faster than NVMe. Whether it pays depends on whether the pinned cache is
+> thrashing at all: MiniMax-M2.7's working set is 4.40 GB against a 9.1 GB cache, so it
+> is **not** — but Qwen3-235B's is 8.02 GB against the same ceiling, which is tight. That
+> is a new cache tier, not a flag, and it needs its own measurement first.
+
+### 7.6 What will not help
 
 Do not spend time here; each is measured and settled.
 

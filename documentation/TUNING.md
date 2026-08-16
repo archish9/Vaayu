@@ -27,6 +27,12 @@ which overstates the budget several-fold and under-recommends compression.
 > its whole life and should fill the box. Getting the first one wrong costs **13x** on
 > Llama-3.2-1B, **2.0x** on MiniMax-M2.7 and **1.27x** on Llama-3.3-70B, measured — the gain
 > scales with how much of the model fits in the pinning budget.
+>
+> The dense **RAM** layer cache is likewise derived from TOTAL RAM rather than momentary
+> free RAM, so a server's throughput is reproducible: the old form swung Llama-3.3-70B
+> between 0.167 and 0.232 tok/s (**38 %**) purely on what else was running at boot.
+> Override with `--ram-cache-budget-gb`. MoE is unaffected — its experts live in the
+> **pinned** expert RAM cache, a different and scarcer resource.
 
 ## The 30-second version
 

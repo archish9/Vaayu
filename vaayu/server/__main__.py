@@ -45,6 +45,12 @@ def main(argv=None) -> int:
                    help="sdpa or flash_attention_2. flash derives a larger context "
                         "at the same reserve; sdpa is the default and is what every "
                         "shipped max_seq_len figure was verified on")
+    p.add_argument("--ram-cache-budget-gb", type=float, default=None,
+                   help="GB of pageable RAM for the dense layer cache. Default is "
+                        "derived from TOTAL RAM so it is the same every restart; "
+                        "the old behaviour keyed off momentary free RAM and swung "
+                        "decode 38%% run to run. 0 disables it. No effect on MoE, "
+                        "whose experts use the pinned expert RAM cache instead")
     p.add_argument("--drafter-model-path", default=None,
                    help="opt-in speculative decoding. Measured 5.57x on streamed "
                         "dense; refused by the Fix #9 gate on both MoE targets")
@@ -71,7 +77,9 @@ def main(argv=None) -> int:
         draft_tokens=args.draft_tokens,
         prefix_compress=args.prefix_compress,
         enable_kv_persist=args.enable_kv_persist,
-        attn_implementation=args.attn_implementation)
+        attn_implementation=args.attn_implementation,
+        ram_cache_budget=(None if args.ram_cache_budget_gb is None
+                          else int(args.ram_cache_budget_gb * 1024 ** 3)))
 
     import uvicorn
     uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info")
