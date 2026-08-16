@@ -144,7 +144,7 @@ checkboxes are the step-level detail.
       `PrefixCacheStore.stats()`; 400/503/500 error mapping
 - [x] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
       split across chunks still recognised; queue-position comment before the first event
-- [ ] **10** `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
+- [x] **10** `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
 - [ ] **11** `test_server_smoke.py` at repo ROOT — real load, non-stream, stream, oversized-prompt
       refusal, prefix observability. Run on the 1B AND on an EXL3 MoE, each under its own
       `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
