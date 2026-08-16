@@ -475,12 +475,20 @@ why raising it is an OOM experiment rather than a config change. MoE's non-exper
 weights are already pinned in **VRAM** (all 62 layers on MiniMax-M2.7), so a pageable
 layer cache would have nothing left to hold.
 
-> **Open question, not yet measured.** On a 32 GB box the MoE path leaves roughly 20 GB
-> of *pageable* RAM idle. A second-tier pageable expert cache behind the pinned one would
-> still be far faster than NVMe. Whether it pays depends on whether the pinned cache is
-> thrashing at all: MiniMax-M2.7's working set is 4.40 GB against a 9.1 GB cache, so it
-> is **not** — but Qwen3-235B's is 8.02 GB against the same ceiling, which is tight. That
-> is a new cache tier, not a flag, and it needs its own measurement first.
+> **Measured 2026-08-16, and the answer was not what the working-set figures suggested.**
+> Both MoE targets are **disk-bound on expert reads**: Qwen3-235B pulls **4.99 GB/token**
+> from NVMe (422 expert reads), MiniMax-M2.7 **2.62 GB/token** (295) — roughly **72–74 % of
+> decode time** at ~5.5 GB/s. And the two models sit in different regimes despite an
+> identical 9.12 GB budget and near-identical share of their expert populations:
+>
+> | model | cache share | measured hit rate | locality |
+> |---|---|---|---|
+> | MiniMax-M2.7 | 6.5 % | **6.6 %** | none — rate equals share |
+> | Qwen3-235B | 6.4 % | **44 %** | strong — 6.9× its share |
+>
+> So a pageable L2 tier behind the pinned cache is promising **on Qwen** and close to
+> worthless on MiniMax. `working_set_bytes` was a misleading guide: it counts ONE decode
+> step's experts, while the union across steps is the whole ~141 GB population.
 
 ### 7.6 What will not help
 

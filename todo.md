@@ -100,9 +100,8 @@ throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at 
 INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
 expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
-## SCHEDULED — EMPTY as of 2026-08-16
-
-Row 13 shipped; its detail is kept below because the server is new and its risks are live.
+Row 13 (the server) shipped 2026-08-16; its detail is kept below because the server is new and
+its risks are live. Row 14 is SCHEDULED above.
 
 # 13 · [x] CLOSED 2026-08-16 — Vaayu as an inference server (OpenAI-compatible), v1
 
@@ -211,6 +210,53 @@ silently-broken code.
 Every previously scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found while
 closing them (11a, 12a, 12b) is fixed.
 
+
+## SCHEDULED
+
+# 14 · [ ] Pageable L2 expert cache — MEASURED premise, not yet built
+
+Opened 2026-08-16 after measuring the expert RAM cache under real decode on both MoE targets.
+Probe: decode-only counters (reset after prefill), 64 tokens, one subprocess per model.
+
+**The bottleneck, quantified.** Both models are disk-bound on expert reads:
+
+| model | NVMe expert reads/tok | GB/tok | decode | disk share of decode |
+|---|---|---|---|---|
+| Qwen3-235B | 422 | **4.99 GB** | 0.820 tok/s | ~74 % |
+| MiniMax-M2.7 | 295 | **2.62 GB** | 1.501 tok/s | ~72 % |
+
+**The two models are in DIFFERENT regimes, and that is the whole finding:**
+
+| model | RAM cache share of expert population | measured hit rate | locality |
+|---|---|---|---|
+| MiniMax-M2.7 | 1027 / 15872 = 6.5 % | **6.6 %** (1342hit/18912miss/17920evict) | **none** — rate == share |
+| Qwen3-235B | 770 / 12032 = 6.4 % | **44 %** (21105hit/27023miss/26271evict) | **strong** — 6.9x its share |
+
+Same 9.12 GB budget, same top_k=8, near-identical share. Qwen has 128 experts/layer against
+MiniMax's 256, so MiniMax's routing spreads over twice the population and consecutive tokens
+rarely reuse an expert.
+
+**Proposal:** a second, PAGEABLE expert cache tier behind the pinned one, using the ~20 GB of
+pageable RAM the MoE path currently leaves idle. Pageable RAM needs a staging bounce (no DMA)
+but is still several times faster than 5.5 GB/s NVMe.
+
+**Projected (a MODEL, not a measurement — see the stop rule):** Qwen 0.82 -> ~1.3-1.6 tok/s if
++16 GB pageable lifts its hit rate to 60-70 %; MiniMax ~+4 %, because its rate tracks share.
+
+**Stop rule / how this row can end in refutation.** Two predictions were already made and
+falsified while opening this row: (1) "MiniMax will not thrash, its 4.40 GB working set fits the
+9.1 GB cache" — it thrashes at 6.6 %, because `working_set_bytes` is ONE step's experts while the
+union across steps is the whole 141 GB population; (2) "hit rate tracks cache share" — true on
+MiniMax, false on Qwen by 7x. **Build the smallest prototype that can measure Qwen's hit rate at
+a larger RAM population, and kill the row if the curve saturates.** Do NOT re-scope toward a win.
+
+**Also settled by this probe:** the `_EXPERT_CACHE_OOM_CEILING = 8.5 GiB` is a PINNED-memory
+limit (page-locked, unswappable, allocator rounds to the next power of two -- see
+`expert_cache.py:21`, a 9.13 GB arena charged 16 GiB). It is NOT a statement about how much RAM
+the box has. That is why the dense pageable layer cache can be 16.2 GB while the MoE pinned one
+caps at 9.1 GB.
+
+---
 
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
 
