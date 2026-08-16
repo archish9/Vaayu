@@ -51,6 +51,11 @@ def main(argv=None) -> int:
                         "the old behaviour keyed off momentary free RAM and swung "
                         "decode 38%% run to run. 0 disables it. No effect on MoE, "
                         "whose experts use the pinned expert RAM cache instead")
+    p.add_argument("--prefix-sessions", type=int, default=3,
+                   help="concurrent agent sessions the prefix pool must hold before "
+                        "the MoE expert cache claims the rest. Lower = faster decode, "
+                        "fewer cached sessions; reuse collapses to ZERO (not "
+                        "proportionally) once the pool is over capacity")
     p.add_argument("--drafter-model-path", default=None,
                    help="opt-in speculative decoding. Measured 5.57x on streamed "
                         "dense; refused by the Fix #9 gate on both MoE targets")
@@ -78,6 +83,7 @@ def main(argv=None) -> int:
         prefix_compress=args.prefix_compress,
         enable_kv_persist=args.enable_kv_persist,
         attn_implementation=args.attn_implementation,
+        prefix_sessions=args.prefix_sessions,
         ram_cache_budget=(None if args.ram_cache_budget_gb is None
                           else int(args.ram_cache_budget_gb * 1024 ** 3)))
 

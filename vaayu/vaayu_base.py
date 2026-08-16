@@ -119,7 +119,49 @@ def spec_decode_fits(geometry: dict, draft_tokens: int, budget_bytes: int) -> bo
 # Hardware constant for THIS 32 GB box: max safe expert-cache size before OOM.
 # Model-independent. Raised from the old 7 GB only after shrinking other RAM
 # consumers (below). Do NOT exceed 9 GB — 10 GB caused a confirmed OOM-kill.
+# HARDWARE CONSTANT, and now a FLOOR rather than a cap. Set 2026-07-10, when the
+# pinned host allocator charged the next power of two for every request -- a
+# 9.13 GB arena cost 16 GiB resident. The chunked-arena fix (2026-08-07) made
+# chunks charge exactly, and this figure was never revisited. Measured
+# 2026-08-16 on Qwen3-235B (2 sessions x 3 rounds, real context, MemoryMax=27G):
+#
+#   ceiling  8.5 GiB -> expert  9.12 GB, prefix 11.73 GB, warm wall 36.6 s
+#   ceiling 13   GiB -> expert 13.95 GB, prefix  7.45 GB, warm wall 32.0 s
+#   ceiling 18   GiB -> expert 19.33 GB, prefix  2.00 GB, warm wall 27.3 s
+#
+# -25 % end to end, with prefix reuse unchanged at 83 % in every arm. It is kept
+# as the floor because it is the figure known to run on the smallest box this
+# repo targets; derive_expert_ceiling raises it from available RAM.
 _EXPERT_CACHE_OOM_CEILING = int(8.5 * 1024 ** 3)
+
+# HARDWARE CONSTANT: RAM left for the OS, the CUDA host context and post-sizing
+# host allocations when deriving the expert ceiling. Property of the 32 GB box.
+_EXPERT_CEILING_RESERVE = int(3.5 * 1024 ** 3)
+
+
+def derive_expert_ceiling(available_bytes: int, prefix_sessions: int,
+                          kv_bytes_per_token: int, max_seq_len: int,
+                          prefix_enabled: bool = True) -> int:
+    """Ceiling for the expert RAM cache, derived rather than asserted.
+
+    The expert arena is pinned BEFORE the prefix pool is sized
+    (compute_prefix_cache_budget runs later and measures what is left), so an
+    expert cache that takes everything silently starves cross-turn reuse. Reuse
+    does not degrade gracefully: one session past capacity it collapses to ZERO,
+    because each recomputed session's re-store cascade-evicts the ones before it
+    (Plan I). So room for `prefix_sessions` full-length sessions is subtracted
+    FIRST, and the expert cache gets what remains.
+
+    Every term is derived from geometry (CLAUDE.md §5) -- `kv_bytes_per_token`
+    and `max_seq_len` come from the model, `prefix_sessions` is a policy choice.
+    Only the reserve and the floor are hardware literals.
+    """
+    reserve = _EXPERT_CEILING_RESERVE
+    if prefix_enabled and prefix_sessions > 0:
+        reserve += int(prefix_sessions) * int(max_seq_len) * int(kv_bytes_per_token)
+    derived = int(available_bytes) - reserve
+    # Floor, not cap: 8.5 GiB is the figure known to run everywhere.
+    return max(_EXPERT_CACHE_OOM_CEILING, min(derived, int(available_bytes)))
 
 
 def compute_expert_budget(
@@ -129,6 +171,7 @@ def compute_expert_budget(
     expert_bytes: int,
     moe_top_k: int,
     moe_num_experts: int,
+    ceiling_bytes: int | None = None,
 ):
     """Size the expert RAM cache to exceed the DERIVED decode working set, up to
     the hardware OOM ceiling. Model-agnostic (Fix #1, REPORT §1.5).
@@ -150,8 +193,12 @@ def compute_expert_budget(
         + ne_budget          # non-expert tensor cache
         + 512 * MB           # io_uring expert buffer pool
     )
+    # ceiling_bytes: None keeps the historical literal, so every existing caller
+    # and test is unchanged; vaayu_base passes a figure from
+    # derive_expert_ceiling, which reserves for the prefix pool first.
+    _ceiling = _EXPERT_CACHE_OOM_CEILING if ceiling_bytes is None else int(ceiling_bytes)
     expert_budget = min(
-        _EXPERT_CACHE_OOM_CEILING,               # hardware ceiling, not a model number
+        _ceiling,
         max(1 * GB, available_bytes - overhead),
     )
     # max_per_layer derived from expert_bytes (any quant/model). Clamped so the
@@ -1190,7 +1237,8 @@ class VaayuBaseModel(GenerationMixin):
                  prefix_compress=None,
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
-                 enable_expert_usage=False, ram_cache_budget=None):
+                 enable_expert_usage=False, ram_cache_budget=None,
+                 prefix_sessions=3):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -1261,6 +1309,10 @@ class VaayuBaseModel(GenerationMixin):
         # nothing per token.
         self.prefix_compress = prefix_compress
         self.auto_prefix_match = auto_prefix_match
+        # Concurrent agent sessions the prefix pool must hold before the
+        # expert cache may claim the rest. 3 is a policy default for an
+        # agent with a few parallel streams, not a hardware figure.
+        self.prefix_sessions = prefix_sessions
         self.enable_kv_persist = enable_kv_persist
         self.kv_persist_dir = kv_persist_dir
         self.kv_persist_sync = kv_persist_sync
@@ -1758,6 +1810,33 @@ class VaayuBaseModel(GenerationMixin):
                   f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
 
             _geo = self._moe_geometry
+            # Ceiling DERIVED, not asserted: the expert arena is pinned before
+            # compute_prefix_cache_budget measures what is left, so room for the
+            # sessions we intend to guarantee is subtracted first. Measured
+            # 2026-08-16 on Qwen3-235B: raising the stale 8.5 GiB literal took
+            # the warm wall 36.6 -> 27.3 s with prefix reuse unchanged at 83 %.
+            from .vram_plan import kv_bytes_per_token as _kv_per_tok
+            try:
+                _kv_tok = _kv_per_tok(
+                    num_hidden_layers=self.config.num_hidden_layers,
+                    num_key_value_heads=getattr(self.config, "num_key_value_heads",
+                                                self.config.num_attention_heads),
+                    head_dim=getattr(self.config, "head_dim",
+                                     self.config.hidden_size
+                                     // self.config.num_attention_heads),
+                    kv_cache_mode=self.kv_cache_mode)
+            except Exception:
+                _kv_tok = 0        # D3: a sizing helper must not become the crash
+            _ceiling = derive_expert_ceiling(
+                available_bytes=_mem.available,
+                prefix_sessions=self.prefix_sessions,
+                kv_bytes_per_token=_kv_tok,
+                max_seq_len=self.max_seq_len or 0,
+                prefix_enabled=bool(getattr(self, "enable_prefix_cache", False)))
+            print(f"[Vaayu-MoE] Expert cache ceiling {_ceiling / 1e9:.2f} GB "
+                  f"(derived: available {_mem.available / 1e9:.2f} GB, reserving "
+                  f"{self.prefix_sessions} prefix session(s) of "
+                  f"{(_kv_tok * (self.max_seq_len or 0)) / 1e9:.2f} GB each)")
             _expert_budget, _ne_budget, _max_per_layer = compute_expert_budget(
                 available_bytes=_mem.available,
                 working_set_bytes=_geo["working_set_bytes"],
@@ -1765,6 +1844,7 @@ class VaayuBaseModel(GenerationMixin):
                 expert_bytes=_geo["expert_bytes"],
                 moe_top_k=_geo["top_k"],
                 moe_num_experts=_geo["num_experts"],
+                ceiling_bytes=_ceiling,
             )
             self._non_expert_tensor_cache = LRUTensorCache(_ne_budget)
             print(f"[Vaayu-Cache] Non-expert tensor cache: {_ne_budget / 1e9:.1f} GB budget")

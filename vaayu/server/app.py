@@ -49,6 +49,11 @@ class ServerConfig:
     # ram_cache.RAM_CACHE_RESERVE) so a server's throughput is reproducible
     # across restarts instead of depending on what was running at boot.
     ram_cache_budget: int | None = None
+    # Concurrent agent sessions the prefix pool must hold before the MoE expert
+    # cache may claim the remaining RAM. The expert arena is pinned first, so
+    # without this reservation a large expert cache silently starves cross-turn
+    # reuse -- which collapses to zero, not proportionally, once over capacity.
+    prefix_sessions: int = 3
 
 
 def _error(status: int, message: str, kind: str, headers=None):
@@ -87,6 +92,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 enable_kv_persist=config.enable_kv_persist,
                 attn_implementation=config.attn_implementation,
                 ram_cache_budget=config.ram_cache_budget,
+                prefix_sessions=config.prefix_sessions,
             )
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")
