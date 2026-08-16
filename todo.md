@@ -213,7 +213,93 @@ closing them (11a, 12a, 12b) is fixed.
 
 ## SCHEDULED
 
-# 14 · [ ] Pageable L2 expert cache — MEASURED premise, not yet built
+# 14 · [~] Expert cache capacity — the 8.5 GiB ceiling is STALE, +40 % measured
+
+**Re-scoped 2026-08-16 after measurement. The original proposal (a pageable L2 tier) is
+superseded: the same win is available by fixing a stale constant, at full pinned-DMA
+bandwidth and with no new code path.**
+
+## What is PROVEN
+
+`_EXPERT_CACHE_OOM_CEILING = 8.5 GiB` (`vaayu_base.py:122`) was set **2026-07-10**, when the
+pinned allocator charged the next power of two for every request — a 9.13 GB arena cost
+16 GiB. The chunked-arena fix landed **2026-08-07** ("9.14 GB charged, 9.245 GB resident,
+every slab kept", `expert_cache.py` docstring) and the ceiling was never revisited.
+
+Raising it, on-device, Qwen3-235B, 48 decode tokens, `MemoryMax=27G`, all arms loaded clean:
+
+| ceiling | budget | max/layer | decode | hit rate | post-arena avail RAM |
+|---|---|---|---|---|---|
+| **8.5 GiB (shipped)** | 9.12 GB | 8 | 0.830 tok/s | 44.9 % | 15.04 GB |
+| 14 GiB | 15.03 GB | 13 | 1.014 tok/s | 55.2 % | — |
+| 18 GiB | 19.33 GB | 17 | **1.161 tok/s (+40 %)** | 61.3 % | **5.24 GB** |
+
+## What is NOT proven — do NOT ship 18 GiB on this evidence
+
+- **The 5.24 GB headroom figure came from a 1-TOKEN prefill.** Real 8192-token context needs
+  more, and this is an OOM ceiling on UNSWAPPABLE pinned memory.
+- **It competes directly with the prefix cache.** `compute_prefix_cache_budget` sizes the
+  prefix pool from free RAM at load. Expert cache is a ~40 % DECODE lever; prefix reuse is a
+  136–377× TTFT lever, and Plan I measured prefix reuse collapsing to ZERO (not
+  proportionally) one session past capacity. Trading the larger lever for the smaller one
+  would be a regression that decode-only benchmarking cannot see.
+- **MiniMax-M2.7 is unmeasured at a raised ceiling** (different geometry: 62 layers, 256
+  experts, 8.88 MB each).
+- **Dense is unaffected** — it uses `LayerRAMCache`, a different, pageable cache.
+
+## Next step
+
+Do NOT replace one literal with a bigger literal. Derive the ceiling from available RAM
+minus a stated reserve — the same shape as `ram_cache.RAM_CACHE_RESERVE`, which replaced
+`available - 8 GB` with a reproducible total-derived budget. Then measure **TTFT and decode
+together at real context** with the prefix pool active, on both MoE geometries, and pick the
+split from data.
+
+## Method notes paid for by this row
+
+- **A simulator is worth its cost even when its numbers are wrong.** `vaayu/expert_sim.py`
+  replays a captured access trace at any capacity. Its curve never saturated on either model,
+  which is what justified the on-device ceiling experiment — and the experiment then measured
+  +40 % directly, with no simulator in the loop. But it under-predicts at the one checkable
+  point (31.9 % against a live 43.9 % at Qwen's own budget) and the obvious explanation —
+  that it does not model the engine's eviction pinning — was implemented and **rejected**: the
+  corrected run was byte-identical. **The anchor gap is still unexplained; do not quote the
+  simulator's absolute numbers.**
+- **Four predictions falsified by measurement in one session**: "MiniMax will not thrash"
+  (it thrashes at 6.6 %), "hit rate tracks cache share" (true on MiniMax, false on Qwen by
+  7×), "MiniMax's curve will be shallow" (it reaches 39 % at 28 GB), "eviction pinning
+  explains the anchor gap" (it does not). Every one came from reasoning about derived
+  quantities instead of measuring. `working_set_bytes` was the root of the first: it counts
+  ONE decode step's experts, while the union across steps is the whole ~142 GB population.
+
+## Original premise, kept for the record
+
+Both MoE targets are disk-bound on expert reads. Decode-only, 64 tokens:
+
+| model | NVMe reads/tok | GB/tok | decode | disk share |
+|---|---|---|---|---|
+| Qwen3-235B | 422 | 4.99 GB | 0.820 tok/s | ~74 % |
+| MiniMax-M2.7 | 295 | 2.62 GB | 1.501 tok/s | ~72 % |
+
+| model | cache share | hit rate | random baseline (`top_k²/n_experts`) | router |
+|---|---|---|---|---|
+| Qwen3-235B | 6.4 % | **44 %** | 6.25 % | sticky, 7.0× baseline |
+| MiniMax-M2.7 | 6.5 % | **6.6 %** | 3.1 % | near-random, 2.1× baseline |
+
+Simulator curves (magnitudes CONSERVATIVE — see the anchor gap above; shape is the finding):
+
+| budget | Qwen hit | Qwen NVMe GB/tok | MiniMax hit | MiniMax NVMe GB/tok |
+|---|---|---|---|---|
+| 9.12 GB | 31.9 % | 6.06 | 4.0 % | 2.70 |
+| 16 GB | 53.1 % | 4.18 | 20.3 % | 2.24 |
+| 28 GB | 67.6 % | 2.88 | 39.4 % | 1.70 |
+| ∞ | 86.2 % | 1.23 | 66.1 % | 0.95 |
+
+Traces persisted at `/tmp/l2curve-*-trace.json`; re-sweeping a different policy costs no GPU.
+
+---
+
+# 14-OLD · superseded — Pageable L2 expert cache
 
 Opened 2026-08-16 after measuring the expert RAM cache under real decode on both MoE targets.
 Probe: decode-only counters (reset after prefill), 64 tokens, one subprocess per model.
