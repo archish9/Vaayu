@@ -129,7 +129,7 @@ checkboxes are the step-level detail.
       `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
 - [x] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
       with no tool support rather than dropping them
-- [ ] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
+- [x] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
       (`prefix_cache.py:71` gates it on `session_id is None`; naming a session and missing is
       strictly WORSE than not naming it)
 - [ ] **6** engine fix — `restore_on_abort` puts a checked-out entry back after a dead turn.

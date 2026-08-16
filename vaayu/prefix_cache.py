@@ -66,7 +66,13 @@ class PrefixCacheStore:
             key = None
             if session_id is not None and session_id in self._pool:
                 key = session_id
-            elif self.auto_prefix_match and session_id is None:
+            if key is None and self.auto_prefix_match:
+                # NOT gated on `session_id is None`. An explicit id that misses
+                # used to skip this branch entirely, so NAMING a session and
+                # missing was strictly worse than not naming it -- a full
+                # prefill where a usable prefix was sitting in the pool. Prefix
+                # reuse is this engine's largest measured lever (136-377x TTFT);
+                # a silent path to zero reuse is a defect, not a nuance.
                 best, best_m = None, 0
                 for k, e in self._pool.items():
                     m = longest_common_prefix(e.token_ids, input_ids)
