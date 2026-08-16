@@ -127,7 +127,7 @@ checkboxes are the step-level detail.
       real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
 - [x] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
       `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
-- [ ] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
+- [x] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
       with no tool support rather than dropping them
 - [ ] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
       (`prefix_cache.py:71` gates it on `session_id is None`; naming a session and missing is
