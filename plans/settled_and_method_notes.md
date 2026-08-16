@@ -1031,3 +1031,43 @@ that proposes to "free up" reserve should expect to find the cache has already e
 `max_seq_len` and passed 4/4 on 2026-08-16; row 11, the same day, found those limits are refused in
 practice (bug 11a) because row 9's arms were COLD single-shot runs and every real turn after the
 first is warm. Any on-device arm against an admission or budget question must run at least two turns.
+
+---
+
+## Speculative decoding, the three bugs behind it (todo 12a, 12b, 11a) — FIXED 2026-08-16
+
+Row 12 measured speculative decoding for the first time and found **5.57× on streamed dense**
+(Llama-3.3-70B, 0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output) and a refutation on MoE
+(the Fix #9 gate admits `draft_tokens ≤ 0` on Qwen, `≤ 1` on MiniMax). Verifying that result
+uncovered three defects, all now fixed.
+
+**12a — the drafter's VRAM was in nobody's budget.** `expert_vram_budget_for` sized the expert VRAM
+cache from `mem_get_info() − reserve` ~145 lines before `build_speculator` loaded the drafter, so
+10.5 GB of cache + 2.47 GB of drafter + a 3.50 GiB reserve overcommitted a 15.47 GiB card. Fixed by
+building the drafter above the MoE section — the cache's own measurement then accounts for it, with
+no size estimate anywhere — and moving the self-guarded Fix #9 gate inside that section, where it
+frees the drafter and calls `empty_cache()` if it disables speculation. Measured: MiniMax cache
+10.5 → 8.1 GB, Qwen 10.6 GB unchanged, dense unaffected.
+
+**12b — nothing checked that drafter and target share a vocabulary.** `StandardDrafterDecoder`'s
+docstring required it; no code enforced it. Llama-3.2-1B has 128256 embedding rows, MiniMax-M2.7
+emits ids to 131282 → out-of-bounds gather, reported as `CUBLAS_STATUS_INTERNAL_ERROR`. Now refused
+at build time, config-only, before any weights load — so the refusal is free and MiniMax's cache
+returns to its full 10.6 GB.
+
+**11a — warm-cache admission** is written up separately above.
+
+**Method lessons, each paid for with a real run:**
+
+- **Read the FIRST error, not the last.** 12b's crash was recorded as VRAM exhaustion for a day. The
+  actual first line was a device-side assert; the CUBLAS error was a poisoned context downstream of
+  it. A CUDA error raised after an assert names the symptom, never the cause.
+- **A data-dependent crash will pass your probe.** The same MiniMax pairing ran fine on a 3-line
+  prompt (max token id 109716) and died on a 4-line one (131282). One passing probe proved nothing;
+  re-running the FAILING configuration under instrumentation is what found it.
+- **A requirement stated only in a docstring is not enforced.** Making the contract executable cost
+  one pure function.
+- **The fix for one bug can be the anti-fix for another.** 11a had to ADD PyTorch's caching-allocator
+  pool to the admitted budget (mem_get_info cannot see it); 12a had to CALL `empty_cache()` so freed
+  drafter bytes leave that same pool and become visible again. Same driver-vs-allocator distinction,
+  opposite directions.

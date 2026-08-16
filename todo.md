@@ -100,16 +100,14 @@ expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
 
 ## SCHEDULED — EMPTY as of 2026-08-16
 
-Every scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12; bugs 11a and 12a fixed the same day.
-**Row 12b below is the one open bug** — a vocabulary-compatibility check the drafter path never had,
-found while verifying 12a.
+Every scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found while closing them
+(11a, 12a, 12b) is fixed. **Nothing here is open except the genuinely optional rows below.**
 
 
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
 
 | # | Item | Status | Cost | Why optional |
 |---|---|---|---|---|
-| **12b** | `[bug]` No vocabulary-compatibility check between drafter and target | `[bug]` | small guard | Found 2026-08-16 verifying 12a's fix. `build_speculator` pairs ANY drafter with ANY target. Llama-3.2-1B's embedding has **128256** rows; MiniMax-M2.7's tokenizer emits ids up to **131282** for ordinary code (`vocab=200064`), so the drafter's embedding gathers out of bounds: `vectorized_gather_kernel: Assertion 'ind >= 0 && ind < ind_dim_size' failed`, surfacing later as `CUBLAS_STATUS_INTERNAL_ERROR` from a poisoned CUDA context. **Data-dependent**: the same config succeeds on a prompt whose ids all fall under 128256 (measured: 3-line prompt max id 109716 OK, 4-line 131282 crash). Qwen3-235B (151936) has the same mismatch, masked only by the Fix #9 gate firing first; Llama-3.3-70B works because it shares the drafter's 128256 tokenizer. Fix = compare `drafter.config.vocab_size` against the target's at build time and refuse loudly (CLAUDE.md §5: warn, never silently degrade). **This is what actually killed row 12 stage 1's MiniMax arm — that arm's failure was misattributed to VRAM exhaustion.** |
 | **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
 | **6a** | The intercept residual row 6 could not explain | `[ ]` | GPU round | Opened 2026-08-15 out of row 6. One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
@@ -117,29 +115,32 @@ found while verifying 12a.
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): row 12b — the one open bug
-> **SCHEDULED is empty; 11a and 12a are both fixed** (2026-08-16).
+> ### ▶▶ NEXT ACTION (fresh session): nothing is scheduled or blocked — pick from OPTIONAL
+> **The whole SCHEDULED sequence closed 2026-08-15/16** (rows 1, 6, 7, 8, 9, 10, 11, 12), and the
+> three bugs those rows uncovered — **11a** (warm-cache admission), **12a** (drafter VRAM
+> unbudgeted), **12b** (no drafter/target vocab check) — are all fixed and verified on-device.
 >
-> **Row 12b — no vocabulary-compatibility check between drafter and target.** Llama-3.2-1B's
-> embedding has 128256 rows; MiniMax-M2.7 emits token ids up to 131282, so the drafter gathers out
-> of bounds and the run dies — data-dependently, only when a prompt happens to use a high id. Fix is
-> a small loud guard at `build_speculator`. It does NOT unlock MoE speculation (the Fix #9 gate
-> still refuses, and no vocab-compatible drafter for Qwen or MiniMax exists on this box) — it turns
-> a confusing crash into an honest refusal.
+> **The one banked, unshipped win: speculative decoding on streamed dense.** Row 12 measured
+> **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output) with the
+> Llama-3.2-1B drafter, which shares its tokenizer. It is opt-in via `drafter_model_path` and not
+> enabled by default, because CLAUDE.md §0 defers streamed-dense perf. **When dense work starts,
+> this is the first lever and it already exists.** MoE speculation stays refuted: the Fix #9 gate
+> admits `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible drafter
+> on this box.
 >
-> **What speculative decoding is worth, so the guard is not mistaken for the prize:** row 12
-> measured **5.57× on streamed dense** (Llama-3.3-70B, 0.155 → 0.864 tok/s, 86 % acceptance,
-> byte-identical output) with a drafter that DOES share its tokenizer. That path works today and is
-> opt-in via `drafter_model_path`.
+> OPTIONAL rows are all that remain: **6a** (the intercept residual — open-ended GPU work that may
+> end in refutation), **2** (10-minute linter check), **3** (fp16 prefix-cache gap, no on-device
+> target needs it), **4** (parked), **5** (deferred write-ups, each needing a new premise).
 >
-> **Three method lessons from 2026-08-16, each paid for with a real run:**
-> - **A limit verified cold is not verified.** Row 9 passed 4/4 at the derived limits; row 11 then
->   found those limits refused in practice (bug 11a), because row 9's arms were cold single-shot runs.
+> **Four method lessons from 2026-08-16, each paid for with a real run:**
+> - **A limit verified cold is not verified.** Row 9 passed 4/4 at the derived limits; row 11 found
+>   those same limits refused in practice, because row 9's arms were cold single-shot runs.
 > - **A gate that cannot fail is not a gate.** 11a's arm ships a `control` mode that forces the fix
 >   off and REFUSES where the fixed arm passes, at identical VRAM state.
 > - **Read the FIRST error, not the last.** `CUBLAS_STATUS_INTERNAL_ERROR` was recorded as VRAM
->   exhaustion for a whole day; it was a poisoned context downstream of a device-side index assert.
->   A CUDA error after an assert names the symptom, never the cause.
+>   exhaustion for a day; it was a poisoned context downstream of a device-side index assert.
+> - **A requirement stated only in a docstring is not enforced.** `StandardDrafterDecoder` said
+>   "must share the same tokenizer" — and crashed inside a CUDA kernel when nothing checked it.
 
 ---
 
@@ -254,6 +255,27 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 ---
 
 ## ── CLOSED, kept because 11 leans on them ──
+
+# 12b · [x] FIXED 2026-08-16 — drafter/target vocabulary mismatch is now refused at build time
+
+`build_speculator` paired ANY drafter with ANY target. Llama-3.2-1B's embedding has **128256** rows;
+MiniMax-M2.7 (`vocab=200064`) emits ids up to **131282** for ordinary code, so the drafter's
+embedding gathered out of bounds — `vectorized_gather_kernel: Assertion 'ind >= 0 && ind <
+ind_dim_size' failed`, surfacing as `CUBLAS_STATUS_INTERNAL_ERROR` from the poisoned context.
+**Data-dependent**, which is how it survived a whole measurement round: a 3-line prompt (max id
+109716) ran, a 4-line one (131282) crashed.
+
+Fix: `drafter_vocab_compatible` (pure) + a config-only vocab read, checked BEFORE any weights load,
+so a refusal costs nothing. **Equality, not `drafter >= target`** — a larger drafter vocab is the
+same crash with the models swapped. Unknown sizes pass (D3: the guard must not become the failure).
+
+**Verified:** 892 passed / 3 skipped (+5); on-device, MiniMax + the 1B drafter on the exact prompt
+that crashed now prints the warning, sets `speculator=None` and completes plainly (20 tokens,
+38.4 s), while dense Llama-3.3-70B keeps its speculative path (20 tokens, 32.1 s). Bonus: MiniMax's
+expert VRAM cache returns to **10.6 GB** (from 8.1), because the drafter is never loaded for a
+pairing that was going to be rejected.
+
+---
 
 # 12a · [x] FIXED 2026-08-16 — the drafter's VRAM is now inside the expert cache's budget
 
