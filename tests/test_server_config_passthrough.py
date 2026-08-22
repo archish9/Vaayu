@@ -14,7 +14,8 @@ from fastapi.testclient import TestClient
 from vaayu.server.app import ServerConfig, create_app
 
 # Fields that are the SERVER's own concern and are deliberately not model kwargs.
-NOT_MODEL_KWARGS = {"model_path", "queue_depth", "host", "port", "served_model_name"}
+NOT_MODEL_KWARGS = {"model_path", "queue_depth", "host", "port", "served_model_name",
+                    "require_exclusive_gpu"}
 
 
 @pytest.fixture
@@ -33,6 +34,10 @@ def captured(monkeypatch):
 
     import vaayu.auto_model as am
     monkeypatch.setattr(am, "AutoModel", FakeAutoModel)
+    # These tests are about kwarg passthrough, not the exclusive-GPU gate. Left
+    # unpatched they pass or fail on whatever else happens to hold the GPU.
+    import vaayu.gpu_audit as ga
+    monkeypatch.setattr(ga, "audit", lambda: [])
     return seen
 
 

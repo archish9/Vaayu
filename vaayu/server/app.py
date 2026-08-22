@@ -55,6 +55,11 @@ class ServerConfig:
     # without this reservation a large expert cache silently starves cross-turn
     # reuse -- which collapses to zero, not proportionally, once over capacity.
     prefix_sessions: int = 3
+    # Refuse to load while another process holds GPU memory. Budgets are derived
+    # ONCE at load, so a forgotten container is a permanent per-token tax, not a
+    # transient one -- and it is invisible in the output. Warn-and-degrade was
+    # rejected for exactly that reason (CLAUDE.md §5).
+    require_exclusive_gpu: bool = True
 
 
 # Seconds between disconnect polls on a non-streaming request. Server policy,
@@ -71,6 +76,26 @@ async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
             cancel.cancel()
             return
         await asyncio.sleep(poll_s)
+
+
+def _check_gpu_is_exclusive(config) -> None:
+    """Refuse the load when another process holds GPU memory.
+
+    Raises SystemExit, which uvicorn reports as a failed startup. Warn-and-load
+    was rejected: the penalty is a permanently smaller pinning budget, invisible
+    in the output, and measured at up to 13x on the token rate.
+    """
+    from .. import gpu_audit
+    report = gpu_audit.compose_report(gpu_audit.audit())
+    if not report:
+        return
+    if config is not None and not config.require_exclusive_gpu:
+        print(f"[Vaayu-Server] WARNING: {report}")
+        return
+    # Printed, not folded into the exception: uvicorn wraps a startup exception
+    # in a traceback, and this report is the part worth reading.
+    print(f"[Vaayu-Server] refusing to load -- the GPU is not exclusive:\n{report}")
+    raise SystemExit(f"[Vaayu-Server] refusing to load: {report}")
 
 
 def _install_signal_cancel(engine):
@@ -183,6 +208,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if engine is None:
+            _check_gpu_is_exclusive(config)
             from ..auto_model import AutoModel
             print(f"[Vaayu-Server] loading {config.model_path} ...")
             t0 = time.time()

@@ -14,6 +14,76 @@ This repository is no longer a formal script; it is a weaponized, local-first en
 
 ---
 
+## ⛔ REQUIREMENT: Vaayu needs the machine to itself
+
+**This is not a recommendation. Vaayu's speed is a direct function of how much VRAM and RAM
+are free at the moment it loads — clearing the box first is the end user's responsibility.**
+
+Vaayu streams model weights from NVMe on every token. The only way to avoid that cost is to
+keep weights resident, so at load it fills whatever VRAM is free with pinned transformer
+layers and whatever RAM is free with the layer/expert caches. **Every megabyte another
+process holds is a layer Vaayu must re-read from disk on every single token.**
+
+How much this costs is measured directly by the pinning A/B — the same mechanism a
+crowded GPU triggers, since a smaller budget pins fewer layers:
+
+| checkpoint | nothing pinned | budget filled | penalty |
+|---|---|---|---|
+| Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
+| MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
+| Llama-3.3-70B (dense) | 0.131 tok/s | **0.167 tok/s** | **1.27×** |
+
+A shared GPU lands you somewhere on that scale — the less VRAM free at load, the closer to
+the left column. (One observation, not yet an isolated A/B: MiniMax decoded at 0.631 tok/s
+on a box where 9.3 GiB was held by unrelated containers, against 1.537 tok/s on record.)
+
+**Before starting Vaayu:**
+
+```bash
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv   # who holds VRAM
+free -g                                                                     # who holds RAM
+```
+
+Stop everything that appears there — other model servers, notebooks, training jobs, GPU
+containers (`docker stop <name>`), and any earlier Vaayu process. Then start Vaayu.
+
+**Two things that surprise people:**
+
+- **Budgets are derived once, at load.** Freeing VRAM *after* Vaayu has started does nothing
+  for the running process — it keeps the smaller budget it computed at boot. Clear first,
+  then start. If you clear afterwards, restart Vaayu.
+- **Vaayu will never free another process's memory for you, and cannot.** GPU allocations
+  belong to the owning process; only ending that process releases them. Vaayu reports what
+  is held and by whom — the decision to end your own work stays yours.
+
+**This is enforced, not just documented.** `REQUIRE_EXCLUSIVE_GPU = True` is the default in
+`vaayu/server/config.py`: the server refuses to start while anything else holds GPU memory,
+and prints the exact commands to free it:
+
+```
+[Vaayu-Server] refusing to load -- the GPU is not exclusive:
+5 other process(es) hold 9.45 GiB of GPU memory. ...
+  pid 3179  3.97 GiB  /usr/local/bin/python3.10 (container f599a5d0371c)
+  ...
+Free it with:
+  docker stop f599a5d0371c
+  kill 227646
+```
+
+Only **compute** processes count — your desktop (Xorg, gnome-shell, a browser) holds
+graphics memory in the tens of MiB and is never something an inference engine should tell
+you to kill. Library callers (`AutoModel.from_pretrained`) get the same report as a
+**warning** rather than a refusal, so existing scripts keep working. Set
+`REQUIRE_EXCLUSIVE_GPU = False` for a box you deliberately share.
+
+> **Containers come back by themselves.** A `docker compose` stack with
+> `restart=unless-stopped` restarts seconds into every boot — powering the machine off does
+> not count as stopping it. Use `docker compose down` (or `docker stop`) when you are done,
+> or `docker update --restart=no <container>`; that is why Vaayu prints `docker stop <id>`
+> for a containerised holder instead of `kill <pid>`, which would only respawn it.
+
+---
+
 ## 🚀 Our Engineering Victories & Breakthroughs
 
 Through months of hardware-software co-design, we have systematically targeted and eliminated every major bottleneck. Here are our hard-won victories:

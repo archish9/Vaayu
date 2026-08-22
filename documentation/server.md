@@ -102,6 +102,7 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `PORT` | `8000` | |
 | `DEVICE` | `"cuda:0"` | |
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
+| `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
 
 ### Speed
 
@@ -610,6 +611,7 @@ Do not spend time here; each is measured and settled.
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 | killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |
+| `refusing to load -- the GPU is not exclusive` | something else holds GPU memory | run the commands the message prints, then start again. A container needs `docker stop`, not `kill` — `restart=unless-stopped` respawns it |
 
 ### The on-device gate
 

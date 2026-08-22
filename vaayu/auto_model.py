@@ -46,6 +46,19 @@ def _check_nvme_scheduler(model_path: str) -> None:
         pass
 
 
+def warn_if_gpu_is_shared() -> None:
+    """Say what another process is costing this load. Never refuses.
+
+    The server refuses instead (ServerConfig.require_exclusive_gpu); a refusal
+    here would break every existing script and notebook, and the library caller
+    may have good reason to share.
+    """
+    from . import gpu_audit
+    report = gpu_audit.compose_report(gpu_audit.audit())
+    if report:
+        print(f"[Vaayu Warning] {report}")
+
+
 class AutoModel:
     def __init__(self):
         raise EnvironmentError(
@@ -96,6 +109,7 @@ class AutoModel:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
         _check_nvme_scheduler(pretrained_model_name_or_path)
+        warn_if_gpu_is_shared()
 
         model_cls, extra_kwargs = AutoModel.get_module_class(
             pretrained_model_name_or_path, *inputs, **kwargs

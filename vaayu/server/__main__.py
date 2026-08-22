@@ -32,6 +32,7 @@ def main() -> int:
         enable_kv_persist=config.ENABLE_KV_PERSIST,
         attn_implementation=config.ATTN_IMPLEMENTATION,
         prefix_sessions=config.PREFIX_SESSIONS,
+        require_exclusive_gpu=config.REQUIRE_EXCLUSIVE_GPU,
         ram_cache_budget=(None if config.RAM_CACHE_BUDGET_GB is None
                           else int(config.RAM_CACHE_BUDGET_GB * 1024 ** 3)))
 

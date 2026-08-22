@@ -29,6 +29,13 @@ DEVICE = "cuda:0"
 # Waiting requests allowed before 503. ONE runs at a time regardless.
 QUEUE_DEPTH = 8
 
+# Refuse to start while another process holds GPU memory. Vaayu sizes its
+# pinning and cache budgets ONCE, from what is free at load, so a forgotten
+# container costs every token for the life of the run -- and the loss is
+# invisible in the output. See the REQUIREMENT section in the top-level
+# README.md. Set False for a box you deliberately share; it then only warns.
+REQUIRE_EXCLUSIVE_GPU = True
+
 # --------------------------------------------------------------------------
 # Speed
 # --------------------------------------------------------------------------
