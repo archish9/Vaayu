@@ -20,8 +20,9 @@ which overstates the budget several-fold and under-recommends compression.
 ---
 
 
-> **Running the server?** These knobs are all reachable as CLI flags on
-> `python -m vaayu.server` — see [**server.md §3**](server.md#3-cli-parameter-reference).
+> **Running the server?** These knobs are all set in `vaayu/server/config.py` — the server
+> takes no CLI flags. See [**server.md §3**](server.md#3-configuration-reference) and
+> [**vaayu/server/README.md**](../vaayu/server/README.md).
 > The server's defaults differ from the library's on purpose: `max_pinned_layers` is `-1`
 > (not `0`) and `enable_prefix_cache` is on (not off), because a server holds one model for
 > its whole life and should fill the box. Getting the first one wrong costs **13x** on
@@ -31,7 +32,7 @@ which overstates the budget several-fold and under-recommends compression.
 > The dense **RAM** layer cache is likewise derived from TOTAL RAM rather than momentary
 > free RAM, so a server's throughput is reproducible: the old form swung Llama-3.3-70B
 > between 0.167 and 0.232 tok/s (**38 %**) purely on what else was running at boot.
-> Override with `--ram-cache-budget-gb`. MoE is unaffected — its experts live in the
+> Override with `RAM_CACHE_BUDGET_GB`. MoE is unaffected — its experts live in the
 > **pinned** expert RAM cache, a different and scarcer resource.
 
 ## The 30-second version

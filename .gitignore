@@ -27,3 +27,4 @@ run-delorig-*.log
 # Working docs: plans, specs, RESULTS. Local-only.
 docs/
 plan*
+vaayu/server/config_local.py

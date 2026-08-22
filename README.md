@@ -477,15 +477,19 @@ DRAFT_TOKENS       = 5
 
 ## 🌐 Running Vaayu as a Server (OpenAI-compatible)
 
-> **Full reference:** [**documentation/server.md**](documentation/server.md) — every flag, every
+> **Full reference:** [**documentation/server.md**](documentation/server.md) — every setting, every
 > request field, curl examples for tool calling and streaming, and the coding-agent
 > integration checklist.
 
 Vaayu runs as a long-lived HTTP server speaking the OpenAI API. Any client that already
 speaks it — a coding agent, Cline, Aider, LiteLLM, the `openai` SDK — works with **no adapter**.
 
+The server takes **no command-line arguments** — set `MODEL_PATH` in
+[`vaayu/server/config.py`](vaayu/server/config.py) (or in the gitignored
+`vaayu/server/config_local.py`, which shadows it) and run:
+
 ```bash
-./venv/bin/python -m vaayu.server --model /path/to/checkpoint --port 8000
+./venv/bin/python -m vaayu.server
 ```
 
 ```bash
@@ -522,7 +526,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 2. **Resend the full history every turn.** That *is* the fast path: prefix caching reuses the
    longest matching prefix and prefills only the tail (136–377× TTFT). OpenAI clients already
    do this, so the default is optimal. Don't trim from the front — it breaks the prefix.
-3. **One request at a time.** FIFO queue (`--queue-depth`, default 8), `503` + `Retry-After`
+3. **One request at a time.** FIFO queue (`QUEUE_DEPTH`, default 8), `503` + `Retry-After`
    past it. Parallel sub-agent calls will serialise; handle `503` with a retry.
 4. **Context is the binding constraint, not speed.** Read the real number from `/v1/models`
    (8192 on all three big checkpoints). Keep MCP tool schemas terse — they eat it fast.
@@ -548,17 +552,17 @@ Full breakdown and the per-lever numbers: [documentation/server.md §7](document
 
 | flag | default | why you care |
 |---|---|---|
-| `--model` | `$VAAYU_MODEL_PATH` | required. One model per process — a load costs minutes, so swapping is a restart |
-| `--served-model-name` | checkpoint path | short stable `id` for clients to hardcode |
-| `--queue-depth` | `8` | waiting requests before `503`. One runs at a time regardless |
-| `--max-pinned-layers` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
-| `--no-prefix-cache` | *cache is ON* | don't. Reuse is the largest lever here |
-| `--prefix-compress 9` | `None` | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
-| `--drafter-model-path` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
-| `--use-prompt-lookup` | off | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
-| `--ram-cache-budget-gb` | *derived from total RAM* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
+| `MODEL_PATH` | `""` | required. One model per process — a load costs minutes, so swapping is a restart |
+| `SERVED_MODEL_NAME` | `None` (checkpoint path) | short stable `id` for clients to hardcode |
+| `QUEUE_DEPTH` | `8` | waiting requests before `503`. One runs at a time regardless |
+| `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
+| `ENABLE_PREFIX_CACHE` | **`True`** | leave it on. Reuse is the largest lever here |
+| `PREFIX_COMPRESS` | `None` (set `9`) | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
+| `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
+| `USE_PROMPT_LOOKUP` | `False` | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
+| `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
 | `--prefix-sessions` | `3` | concurrent sessions the prefix pool must hold before the MoE expert cache claims the rest. Lower = faster decode, fewer cached sessions |
-| `--attn-implementation` | `sdpa` | `flash_attention_2` derives more context at the same reserve |
+| `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives more context at the same reserve |
 
 Full list, request-body reference, tool-calling examples and the troubleshooting table:
 [**documentation/server.md**](documentation/server.md).

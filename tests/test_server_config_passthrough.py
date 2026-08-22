@@ -75,15 +75,6 @@ def test_explicit_values_win(captured):
     assert captured["attn_implementation"] == "flash_attention_2"
 
 
-def test_the_cli_defaults_match_the_serverconfig_defaults():
-    # A CLI default that drifts from the dataclass default means `--flag`-less
-    # runs and library callers behave differently.
-    from vaayu.server.__main__ import main
-    import inspect
-    src = inspect.getsource(main)
-    for name, default in (("--max-pinned-layers", "-1"),
-                          ("--prefill-chunk-size", "512"),
-                          ("--draft-tokens", "5")):
-        assert f'"{name}"' in src, f"{name} missing from the CLI"
-    cfg = ServerConfig(model_path="/x")
-    assert (cfg.max_pinned_layers, cfg.prefill_chunk_size, cfg.draft_tokens) == (-1, 512, 5)
+# The old test here asserted the argparse defaults matched this dataclass. There
+# are no CLI flags any more -- `vaayu/server/config.py` is the only input, and
+# tests/test_server_config_module.py holds that same defaults-must-not-drift gate.

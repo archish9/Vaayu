@@ -1,0 +1,97 @@
+"""Vaayu server configuration -- edit this file, there are no CLI flags.
+
+    ./venv/bin/python -m vaayu.server
+
+Every value below is documented in `vaayu/server/README.md`, with the measured
+cost of getting it wrong. The defaults are already the fast ones and differ from
+`vaayu_base`'s library defaults on purpose: a server holds one model for its
+whole life and should fill the box.
+
+Machine-specific values (MODEL_PATH above all) belong in `config_local.py`,
+which is gitignored and shadows anything set here -- see the tail of this file.
+"""
+
+# --------------------------------------------------------------------------
+# Serving
+# --------------------------------------------------------------------------
+
+# Checkpoint directory. REQUIRED -- the server refuses to start without it.
+MODEL_PATH = ""
+
+# The `id` reported by /v1/models and echoed in responses. None uses the
+# checkpoint path; set something short and stable so clients can hardcode it.
+SERVED_MODEL_NAME = None
+
+HOST = "127.0.0.1"          # "0.0.0.0" to expose on the LAN
+PORT = 8000
+DEVICE = "cuda:0"
+
+# Waiting requests allowed before 503. ONE runs at a time regardless.
+QUEUE_DEPTH = 8
+
+# --------------------------------------------------------------------------
+# Speed
+# --------------------------------------------------------------------------
+
+# -1 auto-fills the VRAM budget with transformer layers. 0 pins the shared
+# layers only, so every transformer layer streams from NVMe on every token
+# while the pinning budget sits idle: measured 13x on Llama-3.2-1B, 2.0x on
+# MiniMax-M2.7, 1.27x on Llama-3.3-70B. N pins the first N.
+MAX_PINNED_LAYERS = -1
+
+# Cross-turn KV prefix reuse -- the largest measured lever here (136-377x TTFT)
+# and exactly the workload an agent resending its history every turn creates.
+ENABLE_PREFIX_CACHE = True
+
+# Tokens per prefill chunk. 512 is measured best; smaller costs TTFT
+# (+24.7% MoE, +213% dense at 128) and buys nothing.
+PREFILL_CHUNK_SIZE = 512
+
+# Pack pooled KV at N bits (9 is the tested floor) so the same RAM budget holds
+# ~2x the sessions. Reuse collapses to ZERO, not proportionally, once the pool
+# is over capacity -- so this matters when serving several agent sessions.
+PREFIX_COMPRESS = None
+
+# Concurrent agent sessions the prefix pool must hold before the MoE expert
+# cache claims the rest. Lower = faster decode, fewer cached sessions.
+PREFIX_SESSIONS = 3
+
+# "auto" picks bf16 for EXL3. "fp8" is 1.5x LARGER, not smaller -- it keeps a
+# dequantized mirror.
+KV_CACHE_MODE = "auto"
+
+# None uses sdpa, which every shipped max_seq_len figure was verified on.
+# "flash_attention_2" derives a larger context at the same reserve.
+ATTN_IMPLEMENTATION = None
+
+# GB of PAGEABLE RAM for the dense layer cache. None derives it from TOTAL RAM
+# so throughput is reproducible across restarts (keying off momentary free RAM
+# swung Llama-3.3-70B decode 38% run to run). 0 disables it. No effect on MoE,
+# whose experts live in the pinned expert RAM cache instead.
+RAM_CACHE_BUDGET_GB = None
+
+# Persist prefix KV to disk so reuse survives a restart.
+ENABLE_KV_PERSIST = False
+
+# --------------------------------------------------------------------------
+# Speculative decoding (opt-in; refused at load on both MoE targets)
+# --------------------------------------------------------------------------
+
+# Small drafter model. Measured 5.57x on streamed dense. Vocab sizes must match
+# the target exactly or the pairing is refused before any weights are read.
+DRAFTER_MODEL_PATH = None
+
+# n-gram speculative decoding, zero VRAM. Measured 1.94x on streamed dense.
+USE_PROMPT_LOOKUP = False
+
+# Candidates per speculative round. 5-8 with a drafter, 10-15 with lookup.
+DRAFT_TOKENS = 5
+
+# --------------------------------------------------------------------------
+# Machine-local overrides. Keep this last: config_local.py is gitignored and
+# anything it defines shadows the values above.
+# --------------------------------------------------------------------------
+try:
+    from .config_local import *  # noqa: F401,F403
+except ImportError:
+    pass

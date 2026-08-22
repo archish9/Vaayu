@@ -13,7 +13,7 @@ NVMe — with same-day A/B arms. Where a figure is a refutation rather than a wi
 
 1. [Starting the server](#1-starting-the-server)
 2. [Endpoints](#2-endpoints)
-3. [CLI parameter reference](#3-cli-parameter-reference)
+3. [Configuration reference](#3-configuration-reference)
 4. [Request body reference](#4-request-body-reference)
 5. [curl examples](#5-curl-examples)
 6. [**Integrating a coding agent — the must-knows**](#6-integrating-a-coding-agent--the-must-knows)
@@ -25,15 +25,15 @@ NVMe — with same-day A/B arms. Where a figure is a refutation rather than a wi
 
 ## 1. Starting the server
 
-```bash
-./venv/bin/python -m vaayu.server --model /path/to/checkpoint --port 8000
-```
-
-or set the path in the environment:
+The server takes **no command-line arguments**. Set `MODEL_PATH` in
+`vaayu/server/config.py` — or in `vaayu/server/config_local.py`, which is gitignored and
+shadows it — then:
 
 ```bash
-VAAYU_MODEL_PATH=/path/to/checkpoint ./venv/bin/python -m vaayu.server
+./venv/bin/python -m vaayu.server
 ```
+
+With `MODEL_PATH` empty the server exits and names the file to edit.
 
 The load is **not** instant — pinning, slab arena, NVMe warmup and expert-cache
 sizing all happen at boot. Expect seconds for a small dense checkpoint and minutes
@@ -77,18 +77,23 @@ and ~98 s time-to-first-token:
 
 ---
 
-## 3. CLI parameter reference
+## 3. Configuration reference
+
+Every value below is a constant in [`vaayu/server/config.py`](../vaayu/server/config.py).
+There are no flags: edit the file (or shadow a value in the gitignored
+`vaayu/server/config_local.py`) and restart. The same table lives next to the code in
+[`vaayu/server/README.md`](../vaayu/server/README.md).
 
 ### Serving
 
-| flag | default | what it does |
+| constant | default | what it does |
 |---|---|---|
-| `--model` | `$VAAYU_MODEL_PATH` | checkpoint directory. **Required.** |
-| `--served-model-name` | the checkpoint path | the `id` reported by `/v1/models` and echoed in responses. Set it to something short and stable so clients can hardcode it |
-| `--host` | `127.0.0.1` | bind address. `0.0.0.0` to expose on the LAN |
-| `--port` | `8000` | |
-| `--device` | `cuda:0` | |
-| `--queue-depth` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
+| `MODEL_PATH` | `""` | checkpoint directory. **Required.** |
+| `SERVED_MODEL_NAME` | `None` (the checkpoint path) | the `id` reported by `/v1/models` and echoed in responses. Set it to something short and stable so clients can hardcode it |
+| `HOST` | `"127.0.0.1"` | bind address. `0.0.0.0` to expose on the LAN |
+| `PORT` | `8000` | |
+| `DEVICE` | `"cuda:0"` | |
+| `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
 
 ### Speed
 
@@ -96,21 +101,21 @@ These are the knobs that change throughput. Defaults are already the fast ones �
 they differ deliberately from `vaayu_base`'s library defaults, because a server
 holds one model for its whole life and should fill the box.
 
-| flag | default | what it does |
+| constant | default | what it does |
 |---|---|---|
-| `--max-pinned-layers` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
-| `--no-prefix-cache` | *(off — cache is ON)* | disables cross-turn KV reuse. Do not use this for an agent workload; reuse is the largest measured lever here (136–377× TTFT) |
-| `--prefix-compress N` | `None` | packs pooled KV at N bits (**9** is the tested floor) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
-| `--drafter-model-path` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused at load on both MoE targets |
-| `--use-prompt-lookup` | off | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
-| `--draft-tokens` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
-| `--prefill-chunk-size` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
-| `--kv-cache-mode` | `auto` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
-| `--attn-implementation` | `sdpa` | `flash_attention_2` derives a larger context at the same reserve. Every shipped `max_seq_len` figure was verified on **sdpa** |
-| `--ram-cache-budget-gb` | *derived from total RAM* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5 |
-| `--enable-kv-persist` | off | persist prefix KV to disk so reuse survives a restart |
+| `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
+| `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT) |
+| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9** is the tested floor) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
+| `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused at load on both MoE targets |
+| `USE_PROMPT_LOOKUP` | `False` | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
+| `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
+| `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
+| `KV_CACHE_MODE` | `"auto"` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
+| `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives a larger context at the same reserve. Every shipped `max_seq_len` figure was verified on **sdpa** |
+| `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5 |
+| `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart |
 
-> **`--drafter-model-path` requires a vocabulary match.** The drafter and target must
+> **`DRAFTER_MODEL_PATH` requires a vocabulary match.** The drafter and target must
 > have identical vocab sizes; the server refuses the pairing at load otherwise, before
 > any weights are read. Llama-3.2-1B drafts for Llama-3.3-70B (both 128256). It does
 > **not** draft for MiniMax (200064) — that mismatch used to surface as a CUDA
@@ -316,7 +321,7 @@ so it can only help.
 ### 6.3 One request at a time — design your fan-out around it
 
 The engine is not thread-safe and N≥2 at long context is a hardware refusal on 16 GB,
-not a missing feature. Requests queue (FIFO, `--queue-depth`, default 8) and get `503`
+not a missing feature. Requests queue (FIFO, `QUEUE_DEPTH`, default 8) and get `503`
 + `Retry-After` beyond that.
 
 If your agent issues parallel sub-agent calls, they will **serialise**. Either accept
@@ -336,7 +341,7 @@ Check `/v1/models` at startup and budget against the real number:
 
 8192 is **tight** for a tool-using agent: system prompt plus a few MCP tool schemas can
 be 1.5–3k before any code is read. Keep tool schemas terse, and read files in slices.
-`--attn-implementation flash_attention_2` derives more context at the same reserve.
+`ATTN_IMPLEMENTATION = "flash_attention_2"` derives more context at the same reserve.
 
 ### 6.5 MCP belongs in your agent, not here
 
@@ -404,10 +409,10 @@ documented below because each is easy to switch back off by accident.
 
 ### 7.1 Pin the layers — the big one, and it is now the default
 
-`--max-pinned-layers -1` fills the VRAM budget with transformer layers, which then never
+`MAX_PINNED_LAYERS = -1` fills the VRAM budget with transformer layers, which then never
 touch the NVMe again. At `0` the budget sits idle and every layer streams per token.
 
-| checkpoint | `--max-pinned-layers 0` | `-1` (default) | gain | what actually pinned |
+| checkpoint | `MAX_PINNED_LAYERS = 0` | `-1` (default) | gain | what actually pinned |
 |---|---|---|---|---|
 | Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** | 16 of 16 layers — fully resident |
 | MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** | non-expert parts of all 62 layers |
@@ -435,10 +440,10 @@ Vaayu is model-agnostic; this needs no code change, only a checkpoint.
 
 ### 7.3 Speculative decoding — dense only
 
-| mode | flag | measured |
+| mode | setting | measured |
 |---|---|---|
-| drafter | `--drafter-model-path /path/to/Llama-3.2-1B-Instruct` | **5.57×** on Llama-3.3-70B (86 % acceptance, byte-identical output) |
-| prompt lookup | `--use-prompt-lookup --draft-tokens 15` | **1.94×** on the same, zero VRAM |
+| drafter | `DRAFTER_MODEL_PATH = "/path/to/Llama-3.2-1B-Instruct"` | **5.57×** on Llama-3.3-70B (86 % acceptance, byte-identical output) |
+| prompt lookup | `USE_PROMPT_LOOKUP = True`, `DRAFT_TOKENS = 15` | **1.94×** on the same, zero VRAM |
 
 Both are **refused at load on MoE** — a 6-position verify pass needs 53.4 GB (Qwen) /
 26.4 GB (MiniMax) of expert working set against a 9.1 GB budget. That is a wall, not a
@@ -455,7 +460,7 @@ collapses to **zero**, not proportionally, because each recomputed session's re-
 cascade-evicts the ones before it. TTFT went from 9.8 s back to 352 s at one session
 past capacity.
 
-If you serve several agent sessions, add `--prefix-compress 9`: pooled KV packs to
+If you serve several agent sessions, set `PREFIX_COMPRESS = 9`: pooled KV packs to
 ~0.55×, so the same RAM holds roughly twice the sessions, at ~0.7 s of TTFT on the hit
 path. The first budget-pressure eviction prints a warning naming the capacity — watch
 for it.
@@ -523,7 +528,7 @@ Do not spend time here; each is measured and settled.
 | idea | verdict |
 |---|---|
 | batching / higher concurrency | N≥2 at long context is a hardware wall (peak 14.17–15.57 GiB of 15.47) |
-| smaller `--prefill-chunk-size` | costs TTFT (+24.7 % MoE, +213 % dense at 128), buys nothing measurable |
+| smaller `PREFILL_CHUNK_SIZE` | costs TTFT (+24.7 % MoE, +213 % dense at 128), buys nothing measurable |
 | expert pinning | refuted: eviction share is linear in N and always 2–4× below the pin's cost |
 | TurboQuant KV in the live cache | failed its quality gate 2–7× on both models at 4 bits |
 | speculative decoding on MoE | refused by the working-set gate; EAGLE-3 would not lift it |
@@ -555,14 +560,14 @@ Do not spend time here; each is measured and settled.
 | symptom | cause | fix |
 |---|---|---|
 | `"prefix_cache": "disabled"` in `/health` | non-EXL3 checkpoint | use an EXL3 build; the fp16 adapter is unbuilt |
-| generation is ~10× slower than expected | `--max-pinned-layers 0` | drop the flag; the default `-1` is what you want |
+| generation is ~10× slower than expected | `MAX_PINNED_LAYERS = 0` | set it back to `-1`, the default |
 | `400` naming a token count | prompt exceeds the derived window | shorten by the number the message gives |
 | `400` mentioning tool support | the checkpoint's template cannot render `tools` | use a tool-capable checkpoint |
-| `503` + `Retry-After` | queue full | retry; raise `--queue-depth`; reduce client concurrency |
+| `503` + `Retry-After` | queue full | retry; raise `QUEUE_DEPTH`; reduce client concurrency |
 | `422` on `n` | `n>1` requested | this server returns one choice |
-| `warnings` on the response | speculative decoding is ignoring your sampling params | drop `--drafter-model-path`/`--use-prompt-lookup`, or drop `top_p`/`top_k`/`stop` |
+| `warnings` on the response | speculative decoding is ignoring your sampling params | unset `DRAFTER_MODEL_PATH` / `USE_PROMPT_LOOKUP`, or drop `top_p`/`top_k`/`stop` |
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
-| server exits on startup, no VRAM plan warning | loaded on CPU | check `--device` |
+| server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 
 ### The on-device gate
 
