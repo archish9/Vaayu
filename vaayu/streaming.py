@@ -55,7 +55,11 @@ def stream_generate(
             caught.append(e)
             streamer.text_queue.put(streamer.stop_signal)
 
-    thread = Thread(target=_run)
+    # daemon: a non-daemon worker keeps the interpreter alive after SIGTERM
+    # until generation finishes -- which is how a killed server went on holding
+    # the GPU for the rest of an uncapped run. The caller joins it below on the
+    # normal path, so nothing is lost by letting the process win at exit.
+    thread = Thread(target=_run, daemon=True)
     thread.start()
 
     for text_chunk in streamer:

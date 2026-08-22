@@ -4317,6 +4317,7 @@ class VaayuBaseModel(GenerationMixin):
         streamer=None,
         temperature: float = 0.0,
         session_id=None,
+        stopping_criteria=None,
         **kwargs,
     ) -> torch.LongTensor:
         """
@@ -4392,6 +4393,12 @@ class VaayuBaseModel(GenerationMixin):
             return generated
 
         while tokens_generated < max_new_tokens:
+            # This loop is hand-written, so transformers' criteria machinery
+            # never runs here: check it ourselves or a cancelled request keeps
+            # drafting and verifying with nobody left to read the tokens.
+            if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
+                break
+
             # Step 2: Draft K tokens
             draft_ids, draft_state = self.speculator.draft(
                 generated, past_key_values, num_tokens=self.draft_tokens

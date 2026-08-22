@@ -5,6 +5,7 @@ ServerConfig field with no constant in config.py is unreachable for the user,
 and a constant whose value never lands in ServerConfig silently does nothing.
 Both are indistinguishable from a knob that works until someone measures.
 """
+import ast
 import dataclasses
 import inspect
 
@@ -19,6 +20,23 @@ CONST_NAME = {"ram_cache_budget": "RAM_CACHE_BUDGET_GB"}
 
 def const_for(field_name: str) -> str:
     return CONST_NAME.get(field_name, field_name.upper())
+
+
+def tracked_defaults() -> dict:
+    """Constants as they are written in config.py, ignoring config_local.py.
+
+    Reading the imported module instead would fold in the machine-local file, so
+    a developer's own MODEL_PATH or PORT would decide whether the suite passes.
+    """
+    tree = ast.parse(inspect.getsource(config))
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                out[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass          # not a literal; nothing to compare against
+    return out
 
 
 @pytest.fixture
@@ -42,20 +60,21 @@ def test_every_serverconfig_field_is_configurable(monkeypatch):
             f"there are no CLI flags, so the user cannot set it at all")
 
 
-def test_config_defaults_match_the_serverconfig_defaults():
-    # A config.py default that drifts from the dataclass default means the
-    # server and every library caller behave differently for no stated reason.
-    for f in dataclasses.fields(ServerConfig):
-        if f.name in ("model_path", "ram_cache_budget"):
-            continue  # required / unit-converted, both covered below
-        assert getattr(config, const_for(f.name)) == f.default, (
-            f"config.{const_for(f.name)} != ServerConfig.{f.name} default")
+def test_the_fast_shipped_defaults_survive():
+    # The three whose wrong value is expensive and silent. Checked against the
+    # TRACKED file: a user is free to override any of them in config_local.py.
+    tracked = tracked_defaults()
+    assert tracked["MAX_PINNED_LAYERS"] == -1, "0 streams every layer from NVMe per token"
+    assert tracked["ENABLE_PREFIX_CACHE"] is True, "reuse is the largest lever here"
+    assert tracked["PREFILL_CHUNK_SIZE"] == 512
 
 
-def test_the_fast_server_defaults_survive():
-    assert config.MAX_PINNED_LAYERS == -1, "0 streams every layer from NVMe per token"
-    assert config.ENABLE_PREFIX_CACHE is True, "reuse is the largest lever here"
-    assert config.PREFILL_CHUNK_SIZE == 512
+def test_config_declares_no_constant_that_is_not_a_serverconfig_field():
+    # The other half of the wiring gate: an orphan constant (a typo, or a knob
+    # that was removed from ServerConfig) reads as configurable and does nothing.
+    fields = {const_for(f.name) for f in dataclasses.fields(ServerConfig)}
+    orphans = {name for name in tracked_defaults() if name.isupper()} - fields
+    assert not orphans, f"config.py declares {sorted(orphans)}, which reach nothing"
 
 
 def test_main_builds_serverconfig_from_the_config_module(monkeypatch, launched):

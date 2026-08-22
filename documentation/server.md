@@ -44,6 +44,14 @@ for a large MoE one. The server is ready when it prints:
 INFO:     Uvicorn running on http://127.0.0.1:8000
 ```
 
+**Stopping it.** `Ctrl-C` or `SIGTERM` stops generation immediately and the process
+exits within about a second, even mid-generation — measured 0.46 s with ~200 s of tokens
+still to run. That is not free behaviour: uvicorn's graceful shutdown waits for in-flight
+requests *before* it runs the app's shutdown hook, and with no `timeout_graceful_shutdown`
+it waits for the whole cap, so Vaayu cancels from the signal handler itself and chains to
+uvicorn's. Anything the server held — GPU memory, pinned RAM, the io_uring reader — is
+released when the process exits, and the disk KV writer is flushed on the way out.
+
 **One model per process.** There is no hot-swap endpoint and there will not be one:
 a Vaayu load costs minutes, so swapping a model is a restart, not a request. Run one
 server per model and route in front of them if you need several.
@@ -158,6 +166,12 @@ This is the single most important difference from a fixed-`MAX_NEW_TOKENS` scrip
 - **Given:** clamped to that same remaining window.
 - **Prompt already fills the window:** `400`, with a message naming both numbers and
   how many tokens to cut.
+
+> **Omit it *with* `stream: true`.** A non-streaming response sends nothing until the
+> last token, so an uncapped one can sit silent for as long as the cap takes — on a
+> reasoning model at ~1.5 tok/s, an 8k window is over an hour, and every HTTP client
+> gives up long before that. The server logs a WARNING naming the number of tokens the
+> request may run for. Streaming has no such problem: bytes flow from the first token.
 
 `finish_reason` tells you what happened, and an agent must act on it:
 
@@ -385,14 +399,21 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 
 A `400` mentioning tool support means: pick a checkpoint whose template renders tools.
 
-### 6.7 Streaming gives you early-abort, and buffers tool calls
+### 6.7 Abandoning a request stops it, and streaming buffers tool calls
 
 Content arrives as OpenAI deltas. A **tool call is buffered and emitted once, complete** —
 never as partial JSON, because partial tool-call JSON breaks clients that parse each
 delta. Do not expect incremental `function.arguments` fragments.
 
-Aborting a stream is safe: the prefix-cache entry is restored on the abort path rather
-than being lost.
+**Closing the connection stops generation** — client timeout, `Ctrl-C`, a cancelled task —
+on the streaming *and* non-streaming paths, within about a second. The slot frees for the
+next request and the server logs how many tokens it got through.
+
+That matters more here than on a normal server: concurrency is 1, so a generation that
+outlives its client holds the GPU for the rest of its cap while everything behind it
+queues. Aborting is also safe for the cache: the prefix entry is restored on the abort
+path rather than lost, and the partial KV a cancelled turn leaves in the pool is real KV
+the next turn can reuse.
 
 ---
 
@@ -583,10 +604,12 @@ Do not spend time here; each is measured and settled.
 | `400` naming a token count | prompt exceeds the derived window | shorten by the number the message gives |
 | `400` mentioning tool support | the checkpoint's template cannot render `tools` | use a tool-capable checkpoint |
 | `503` + `Retry-After` | queue full | retry; raise `QUEUE_DEPTH`; reduce client concurrency |
+| a non-streaming request never returns; the client times out with no status | uncapped generation on a slow model — nothing is sent until the last token | set `max_tokens`, or `stream: true`. The startup log carries a WARNING naming the token count |
 | `422` on `n` | `n>1` requested | this server returns one choice |
 | `warnings` on the response | speculative decoding is ignoring your sampling params | unset `DRAFTER_MODEL_PATH` / `USE_PROMPT_LOOKUP`, or drop `top_p`/`top_k`/`stop` |
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
+| killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |
 
 ### The on-device gate
 

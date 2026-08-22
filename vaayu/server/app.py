@@ -2,16 +2,17 @@
 
 Everything decidable without a GPU lives in stopping.py / tools.py / schemas.py.
 """
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
-from .engine import EngineHandle, QueueFull
+from .engine import CancelToken, EngineHandle, QueueFull
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
@@ -54,6 +55,102 @@ class ServerConfig:
     # without this reservation a large expert cache silently starves cross-turn
     # reuse -- which collapses to zero, not proportionally, once over capacity.
     prefix_sessions: int = 3
+
+
+# Seconds between disconnect polls on a non-streaming request. Server policy,
+# not a model number: a token costs ~0.65 s on the slowest target here, so this
+# adds nothing measurable and still frees the slot within a token or two.
+DISCONNECT_POLL_S = 1.0
+
+
+async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
+    """Cancel `cancel` when the client goes away. Returns when it does, or when
+    the token is cancelled by whoever owns it (generation finished)."""
+    while not cancel.cancelled:
+        if await request.is_disconnected():
+            cancel.cancel()
+            return
+        await asyncio.sleep(poll_s)
+
+
+def _install_signal_cancel(engine):
+    """Stop generating the moment SIGINT/SIGTERM arrives. Returns a restore fn.
+
+    This cannot live in the lifespan shutdown. uvicorn's Server.shutdown()
+    awaits _wait_tasks_to_complete() BEFORE sending the lifespan shutdown, and
+    timeout_graceful_shutdown defaults to None -- so with a generation in flight
+    it waits for the whole cap (measured: still alive 20 s after SIGTERM, with
+    200 s of tokens left) and the teardown never gets to run. The signal handler
+    is the only hook that fires early enough.
+
+    uvicorn installs its own handlers with signal.signal, so chain to them
+    rather than replacing them: ours stops the work, uvicorn's still drives the
+    graceful shutdown.
+    """
+    import signal
+
+    previous = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            prev = signal.getsignal(sig)
+
+            def handler(signum, frame, _prev=prev):
+                engine.cancel_all()
+                if callable(_prev):
+                    _prev(signum, frame)
+
+            signal.signal(sig, handler)
+            previous[sig] = prev
+        except ValueError:
+            # Not the main thread (TestClient, embedded use). Nothing to install
+            # and nothing to restore.
+            pass
+
+    def restore():
+        for sig, prev in previous.items():
+            try:
+                signal.signal(sig, prev)
+            except ValueError:
+                pass
+
+    return restore
+
+
+def _teardown(app) -> None:
+    """Release everything the server holds. Runs on lifespan shutdown.
+
+    Order matters: stop generating first, or the disk writer flushes underneath
+    a live run and the model reference cannot be dropped. CUDA memory would be
+    reclaimed by the OS on exit anyway -- what this buys is that the process
+    CAN exit (nothing is still generating) and that the last KV appends are on
+    disk rather than in a queue.
+    """
+    engine = getattr(app.state, "engine", None)
+    if engine is None:
+        return
+    engine.cancel_all()
+
+    writer = getattr(getattr(engine, "model", None), "_kv_writer", None)
+    if writer is not None:
+        try:
+            writer.close()
+        except Exception as ex:                       # noqa: BLE001
+            print(f"[Vaayu-Server] KV writer close failed: "
+                  f"{type(ex).__name__}: {ex}")
+
+    app.state.engine = None
+    try:
+        import gc
+
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            before = torch.cuda.memory_reserved() / 1024 ** 3
+            torch.cuda.empty_cache()
+            after = torch.cuda.memory_reserved() / 1024 ** 3
+            print(f"[Vaayu-Server] released VRAM: {before:.2f} -> {after:.2f} GiB reserved")
+    except Exception:
+        pass          # shutdown must never be the thing that fails
 
 
 def _error(status: int, message: str, kind: str, headers=None):
@@ -110,7 +207,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             app.state.engine = EngineHandle(model, queue_depth=config.queue_depth)
         else:
             app.state.engine = engine
-        yield
+        restore_signals = _install_signal_cancel(app.state.engine)
+        try:
+            yield
+        finally:
+            restore_signals()
+            _teardown(app)
 
     app = FastAPI(title="Vaayu", lifespan=lifespan)
     app.state.config = config
@@ -148,7 +250,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                           "owned_by": "vaayu", "max_seq_len": e.max_seq_len}]}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest, request: Request):
         e = app.state.engine
         warning = e.warn_if_speculative_sampling_ignored(req)
         if warning:
@@ -167,20 +269,32 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                    f"one request at a time.",
                               "server_busy", headers={"Retry-After": "5"})
             return StreamingResponse(
-                _sse(e, req, _served_name(app), warning),
+                _sse(e, req, _served_name(app), warning, CancelToken()),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)})
 
+        cancel = CancelToken()
+        watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
         try:
             async with e.slot():
-                result = await e.generate(req)
+                result = await e.generate(req, cancel=cancel)
         except QueueFull as ex:
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
+        finally:
+            watchdog.cancel()
+
+        if cancel.cancelled:
+            # Nobody is listening -- this response is discarded by the server.
+            # It exists so the shape is honest and the log line has a reason.
+            print(f"[Vaayu-Server] client disconnected; generation stopped after "
+                  f"{result.completion_tokens} tokens")
+            return _error(499, "client closed the connection; generation was "
+                               "stopped", "client_closed_request")
 
         body = ChatCompletionResponse(
             id=make_completion_id(), created=int(time.time()),
@@ -217,11 +331,13 @@ def _error_event(ex) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _sse(engine, req, model_name, warning):
+async def _sse(engine, req, model_name, warning, cancel=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
     cid, created = make_completion_id(), int(time.time())
+    if cancel is None:
+        cancel = CancelToken()
 
     # A comment line: legal SSE, ignored by every client, and it lets a queued
     # caller tell "waiting behind N requests" from "hung".
@@ -240,7 +356,7 @@ async def _sse(engine, req, model_name, warning):
         # handler returned, so a slot held around that return would already be
         # released before the first token.
         async with engine.slot():
-            async for kind, payload in engine.stream(req):
+            async for kind, payload in engine.stream(req, cancel=cancel):
                 if kind == "final":
                     final = payload
                     break
@@ -266,6 +382,11 @@ async def _sse(engine, req, model_name, warning):
         yield _error_event(ex)
         yield "data: [DONE]\n\n"
         return
+    finally:
+        # Starlette closes this generator when the client goes away, so this is
+        # where an abandoned SSE stream stops generating. Cancelling after a
+        # normal finish is harmless -- the token is already spent.
+        cancel.cancel()
 
     if held and not suppressing:
         yield _chunk(cid, created, model_name, delta={"content": held})

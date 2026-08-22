@@ -25,6 +25,8 @@ class FakeEngine:
         self._deltas = deltas or ["hel", "lo"]
         self.warned = None
         self.tool_format = None
+        self.cancel = None          # the CancelToken the route handed us
+        self.cancelled_all = False  # set by shutdown
 
     def warn_if_speculative_sampling_ignored(self, req):
         return self.warned
@@ -42,17 +44,22 @@ class FakeEngine:
 
         return _Slot()
 
-    async def generate(self, req):
+    async def generate(self, req, cancel=None):
+        self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
         return self._result
 
-    async def stream(self, req):
+    async def stream(self, req, cancel=None):
+        self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
         for d in self._deltas:
             yield ("delta", d)
         yield ("final", self._result)
+
+    def cancel_all(self):
+        self.cancelled_all = True
 
     def prefix_stats(self):
         return "hits=1 misses=0"

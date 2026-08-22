@@ -23,7 +23,7 @@ MODEL_PATH = ""
 SERVED_MODEL_NAME = None
 
 HOST = "127.0.0.1"          # "0.0.0.0" to expose on the LAN
-PORT = 8000
+PORT = 9999
 DEVICE = "cuda:0"
 
 # Waiting requests allowed before 503. ONE runs at a time regardless.

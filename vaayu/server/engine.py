@@ -27,6 +27,45 @@ class QueueFull(RuntimeError):
     """More requests are waiting than the configured depth allows."""
 
 
+class CancelToken:
+    """Set from the event loop, read from the generation thread.
+
+    A blocking generate() in an executor thread cannot be killed from outside,
+    so cancellation is cooperative: this flag is checked once per token. Without
+    it a client that walks away leaves generation running -- measured holding
+    the GPU and the single slot with no connection left on the port.
+    """
+
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+def cancel_criteria(token: CancelToken):
+    """A transformers StoppingCriteriaList that stops when `token` is cancelled.
+
+    Imports live here rather than at module scope so `import vaayu.server` stays
+    as cheap as it was. The criteria must answer per batch ROW -- StoppingCriteria
+    List ORs the results into a (batch,) tensor, and a bare bool works right up
+    until something batches.
+    """
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _Cancelled(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            return torch.full((input_ids.shape[0],), token.cancelled,
+                              dtype=torch.bool, device=input_ids.device)
+
+    return StoppingCriteriaList([_Cancelled()])
+
+
 @dataclass
 class GenerationResult:
     text: str
@@ -42,6 +81,9 @@ class EngineHandle:
         self.queue_depth = queue_depth
         self._lock = asyncio.Lock()
         self._inflight = 0
+        # The token of the request currently generating, so shutdown can stop
+        # it. Concurrency is 1 by construction, so one slot is the whole set.
+        self._live_cancel = None
 
         # vaayu_base falls back to max_seq_len=512 when it built no VramPlan
         # (CPU / no CUDA). This server defaults the generation cap to "the
@@ -67,6 +109,17 @@ class EngineHandle:
     @property
     def depth(self) -> int:
         return self._inflight
+
+    @property
+    def live_cancel(self):
+        """The running request's CancelToken, or None when idle."""
+        return self._live_cancel
+
+    def cancel_all(self) -> None:
+        """Stop whatever is generating. Idempotent, and a no-op when idle."""
+        token = self._live_cancel
+        if token is not None:
+            token.cancel()
 
     def prefix_stats(self) -> str:
         """One grep-able line from the prefix pool, or a note that it is off.
@@ -132,7 +185,7 @@ class EngineHandle:
                 f"only, so {', '.join(ignored)} will be IGNORED for this request. "
                 f"Load without drafter_model_path to use them.")
 
-    def build_generate_kwargs(self, req, prompt_ids, cap=None) -> dict:
+    def build_generate_kwargs(self, req, prompt_ids, cap=None, cancel=None) -> dict:
         import torch
         kwargs = {
             "input_ids": torch.tensor([prompt_ids], dtype=torch.long,
@@ -160,7 +213,20 @@ class EngineHandle:
         if stops:
             kwargs["stop_strings"] = stops
             kwargs["tokenizer"] = self.model.tokenizer   # HF requires it with stop_strings
+        if cancel is not None:
+            # Honoured by transformers' loop AND by speculative_generate, which
+            # has no criteria machinery of its own and checks this per round.
+            kwargs["stopping_criteria"] = cancel_criteria(cancel)
         return kwargs
+
+    @asynccontextmanager
+    async def _running(self, cancel):
+        """Publish this request's token for the lifetime of the generation."""
+        self._live_cancel = cancel
+        try:
+            yield
+        finally:
+            self._live_cancel = None
 
     # ── generation ───────────────────────────────────────────────────────────
 
@@ -181,11 +247,21 @@ class EngineHandle:
             hit_tool_call=bool(tool_calls),
             produced=len(new_ids), cap=cap)
 
-    async def generate(self, req) -> GenerationResult:
+    async def generate(self, req, cancel=None) -> GenerationResult:
         prompt_ids, cap = self.prepare(req)
-        kwargs = self.build_generate_kwargs(req, prompt_ids, cap)
+        if req.max_tokens is None:
+            # Non-streaming sends NOTHING until the last token, so this request
+            # can sit silent for as long as `cap` tokens take -- measured at 15+
+            # minutes and counting on MiniMax-M2.7 before a client gave up and
+            # the run looked hung. It is not hung; it is uncapped.
+            print(f"[Vaayu-Server] WARNING: non-streaming request with no "
+                  f"max_tokens: up to {cap} tokens will be generated before ANY "
+                  f"bytes are sent. Set max_tokens, or use stream=true.")
+        kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
         loop = asyncio.get_running_loop()
-        out = await loop.run_in_executor(None, lambda: self.model.generate(**kwargs))
+        async with self._running(cancel):
+            out = await loop.run_in_executor(
+                None, lambda: self.model.generate(**kwargs))
         new_ids, text = self._decode_new(out, len(prompt_ids))
         cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None)
         return GenerationResult(
@@ -193,7 +269,7 @@ class EngineHandle:
             prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
             finish_reason=self._finish(new_ids, cap, calls))
 
-    async def stream(self, req):
+    async def stream(self, req, cancel=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
 
         Bridges vaayu.streaming's worker thread onto the event loop through a
@@ -202,7 +278,7 @@ class EngineHandle:
         from ..streaming import stream_generate
 
         prompt_ids, cap = self.prepare(req)
-        kwargs = self.build_generate_kwargs(req, prompt_ids, cap)
+        kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
         input_ids = kwargs.pop("input_ids")
         temperature = kwargs.get("temperature", 0.0)
         top_p = kwargs.get("top_p", 1.0)
@@ -229,18 +305,22 @@ class EngineHandle:
                 bridge.put((DONE, None))
 
         thread = threading.Thread(target=_pump, daemon=True)
+        self._live_cancel = cancel
         thread.start()
 
         parts, error = [], None
-        while True:
-            kind, payload = await loop.run_in_executor(None, bridge.get)
-            if kind is DONE:
-                break
-            if kind == "error":
-                error = payload
-                break
-            parts.append(payload)
-            yield ("delta", payload)
+        try:
+            while True:
+                kind, payload = await loop.run_in_executor(None, bridge.get)
+                if kind is DONE:
+                    break
+                if kind == "error":
+                    error = payload
+                    break
+                parts.append(payload)
+                yield ("delta", payload)
+        finally:
+            self._live_cancel = None
         thread.join()
         if error is not None:
             raise error
