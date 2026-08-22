@@ -563,11 +563,19 @@ The server takes **no command-line arguments** — set `MODEL_PATH` in
 ```
 
 ```bash
-curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+# streams by default (DEFAULT_STREAM = True) -- -N keeps curl from buffering it
+curl -sN localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [{"role": "user", "content": "write a binary search in Python"}]
 }'
+
+# add "stream": false for one JSON body -- but nothing arrives until the LAST
+# token, which on a slow checkpoint with no max_tokens can be an hour
 ```
+
+Two server defaults differ from OpenAI's on purpose: **`stream` defaults to true**, and
+**`ENABLE_THINKING` defaults to false** — a reasoning trace costs the same tok/s as the
+answer, so it is suppressed unless a request asks for it with `"enable_thinking": true`.
 
 `POST /v1/chat/completions` (streaming and not) · `GET /v1/models` · `GET /health`.
 

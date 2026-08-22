@@ -17,7 +17,9 @@ def test_minimal_request_parses_and_max_tokens_defaults_to_none():
     # None, NOT a number: the cap is resolved later against the model's derived
     # window (stopping.resolve_max_tokens). A default here would be a literal.
     assert r.max_tokens is None
-    assert r.stream is False
+    # None, not False: "the server decides" (ServerConfig.default_stream, which
+    # is True here). An explicit false in the request still wins.
+    assert r.stream is None
     assert r.messages[0].role == "user"
 
 

@@ -36,6 +36,18 @@ QUEUE_DEPTH = 8
 # README.md. Set False for a box you deliberately share; it then only warns.
 REQUIRE_EXCLUSIVE_GPU = True
 
+# Let the model emit a reasoning block before its answer. OFF by default: the
+# trace costs the same tok/s as the answer and the caller did not ask for it.
+# Templates that expose their own flag are told; one that hard-codes an open
+# `<think>` (MiniMax-M2.7) gets the block closed for it. A request may override
+# per call with `"enable_thinking": true`.
+ENABLE_THINKING = False
+
+# What `stream` means when a request omits it. True, NOT OpenAI's false: a
+# non-streaming response sends nothing until the last token. An explicit
+# `"stream": false` in the request still wins.
+DEFAULT_STREAM = True
+
 # --------------------------------------------------------------------------
 # Speed
 # --------------------------------------------------------------------------

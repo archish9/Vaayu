@@ -6,6 +6,46 @@ formatting table here, and there must not be one (CLAUDE.md §5).
 from .tools import detect_tool_format
 
 
+# Opening/closing pairs seen in the wild. This is a table of CONVENTIONS, not of
+# models: which one applies is decided by probing the rendered generation prompt,
+# exactly as tools.detect_tool_format probes for tool markers. A checkpoint whose
+# template spells thinking some other way simply matches nothing and is left
+# alone -- never mis-prompted.
+THINKING_MARKERS = (
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<|thinking|>", "<|/thinking|>"),
+)
+
+
+def unclosed_thinking_marker(text: str) -> str | None:
+    """The closing marker `text` still owes, or None if it owes nothing."""
+    for opening, closing in THINKING_MARKERS:
+        opened = text.rfind(opening)
+        if opened != -1 and text.rfind(closing) < opened:
+            return closing
+    return None
+
+
+def generation_tail(tokenizer, messages, tools=None, **template_kwargs) -> str:
+    """Just the generation prompt -- what `add_generation_prompt=True` appends.
+
+    Rendered twice and diffed rather than scanned whole: a user message that
+    happens to contain the literal `<think>` must not decide how the model is
+    prompted.
+
+    `template_kwargs` must match what the real render will send. Probing without
+    them reports the block a flag-honouring template was about to drop, and the
+    caller then injects a close tag for a block that no longer opens.
+    """
+    kwargs = {"tokenize": False, **template_kwargs}
+    if tools:
+        kwargs["tools"] = tools
+    full = tokenizer.apply_chat_template(messages, add_generation_prompt=True, **kwargs)
+    body = tokenizer.apply_chat_template(messages, add_generation_prompt=False, **kwargs)
+    return full[len(body):] if full.startswith(body) else full
+
+
 class NoChatTemplate(ValueError):
     """The tokenizer ships no chat template, so messages cannot be rendered."""
 
@@ -14,8 +54,14 @@ class TemplateLacksToolSupport(ValueError):
     """The request carries `tools` but the template cannot render them."""
 
 
-def render_prompt(tokenizer, messages, tools=None):
-    """messages: list[dict] as sent on the wire. Returns a list of token ids."""
+def render_prompt(tokenizer, messages, tools=None, enable_thinking=True):
+    """messages: list[dict] as sent on the wire. Returns a list of token ids.
+
+    `enable_thinking=False` suppresses a reasoning block two ways, because
+    templates disagree: the template's own flag when it has one (Qwen3), and
+    closing a block the template hard-codes when it does not (MiniMax-M2.7,
+    whose generation prompt ends with a bare `<think>` and offers no flag).
+    """
     template = getattr(tokenizer, "chat_template", None)
     if not template:
         raise NoChatTemplate(
@@ -36,6 +82,22 @@ def render_prompt(tokenizer, messages, tools=None):
                 "the tools exist and the agent would wait for a call that can "
                 "never come.")
         kwargs["tools"] = tools
+
+    if not enable_thinking:
+        # Templates that know the flag drop the block themselves; the rest
+        # ignore an unknown Jinja variable, which costs nothing.
+        kwargs["enable_thinking"] = False
+        closing = unclosed_thinking_marker(
+            generation_tail(tokenizer, messages, tools=tools if tools else None,
+                            enable_thinking=False))
+        if closing is not None:
+            # Nothing else can close it: the block is already open when
+            # generation starts. Render as text, close it, re-tokenize --
+            # verified byte-identical to the tokenize=True path on-device.
+            text_kwargs = {k: v for k, v in kwargs.items() if k != "tokenize"}
+            text = tokenizer.apply_chat_template(messages, tokenize=False, **text_kwargs)
+            return _as_token_ids(
+                tokenizer(text + closing + "\n\n", add_special_tokens=False))
 
     ids = tokenizer.apply_chat_template(messages, **kwargs)
     return _as_token_ids(ids)

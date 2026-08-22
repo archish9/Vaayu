@@ -102,6 +102,8 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `PORT` | `8000` | |
 | `DEVICE` | `"cuda:0"` | |
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
+| `DEFAULT_STREAM` | **`True`** | what `stream` means when the request omits it. Not OpenAI's `false` — a non-streaming response sends nothing until the last token |
+| `ENABLE_THINKING` | **`False`** | suppress the model's reasoning block. Detected from the rendered generation prompt: a template with its own flag is told, one that hard-codes `<think>` has it closed. Per-request override available |
 | `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
 
 ### Speed
@@ -146,13 +148,14 @@ holds one model for its whole life and should fill the box.
 | `top_p` | 0.0–1.0 | `1.0` | only applied when `temperature > 0` |
 | `top_k` | int ≥ 0 | `0` | only applied when `temperature > 0` |
 | `stop` | string \| array | `[]` | a string is normalised to a one-element list |
-| `stream` | bool | `false` | SSE when true |
+| `stream` | bool | *server default* (`DEFAULT_STREAM`, **`true`**) | SSE when true. Omitting it means "the server decides" — this server streams, unlike OpenAI's `false` default, because nothing is sent until the last token otherwise. An explicit `false` still wins |
 | `stream_options.include_usage` | bool | `false` | adds `usage` to the final chunk |
 | `tools` | array | `null` | OpenAI function-tool definitions |
 | `tool_choice` | any | `null` | accepted and passed through the template |
 | `seed` | int | `null` | |
 | `n` | int | `1` | **must be 1.** `n>1` is a 422 with a named reason — concurrency is 1 on this hardware |
 | `session_id` | string | `null` | **Vaayu extra.** Pins this turn to a prefix-cache session. Omit it and auto-prefix-match picks the best match itself |
+| `enable_thinking` | bool | *server default* (`ENABLE_THINKING`, **`false`**) | **Vaayu extra.** Let the model reason before answering. Suppressed by default; set `true` per request to get it back |
 | `user` | string | `null` | OpenAI's end-user tag. Used as `session_id` when that is absent, so an OpenAI-native client pins sessions with no Vaayu-specific field. `session_id` wins when both are sent |
 | `kv_cache_mode` | string | `null` | Vaayu extra |
 | `drafter_model_path` | string | `null` | Vaayu extra |

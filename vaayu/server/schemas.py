@@ -77,7 +77,11 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] = Field(default_factory=list)
     n: int = 1
     seed: int | None = None
-    stream: bool = False
+    # None means "the server decides" (ServerConfig.default_stream). OpenAI's
+    # own default is false; this server's is streaming, because a non-streaming
+    # request sends nothing until the last token and an uncapped one on a slow
+    # checkpoint outlives every client's patience.
+    stream: bool | None = None
     stream_options: StreamOptions | None = None
 
     tools: list[ToolDef] | None = None
@@ -89,6 +93,8 @@ class ChatCompletionRequest(BaseModel):
 
     # ── Vaayu extras. Optional; OpenAI clients never send them. ──
     session_id: str | None = None
+    # None means "use the server default" (ServerConfig.enable_thinking).
+    enable_thinking: bool | None = None
     kv_cache_mode: str | None = None
     drafter_model_path: str | None = None
 

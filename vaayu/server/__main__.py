@@ -33,6 +33,8 @@ def main() -> int:
         attn_implementation=config.ATTN_IMPLEMENTATION,
         prefix_sessions=config.PREFIX_SESSIONS,
         require_exclusive_gpu=config.REQUIRE_EXCLUSIVE_GPU,
+        enable_thinking=config.ENABLE_THINKING,
+        default_stream=config.DEFAULT_STREAM,
         ram_cache_budget=(None if config.RAM_CACHE_BUDGET_GB is None
                           else int(config.RAM_CACHE_BUDGET_GB * 1024 ** 3)))
 

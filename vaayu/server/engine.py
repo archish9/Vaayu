@@ -76,9 +76,12 @@ class GenerationResult:
 
 
 class EngineHandle:
-    def __init__(self, model, queue_depth: int = 8):
+    def __init__(self, model, queue_depth: int = 8, enable_thinking: bool = True):
         self.model = model
         self.queue_depth = queue_depth
+        # Library default stays True (render exactly what the template wrote);
+        # the server passes its own, which is False.
+        self.enable_thinking = enable_thinking
         self._lock = asyncio.Lock()
         self._inflight = 0
         # The token of the request currently generating, so shutdown can stop
@@ -158,11 +161,18 @@ class EngineHandle:
 
     # ── request mapping ──────────────────────────────────────────────────────
 
+    def resolve_thinking(self, req) -> bool:
+        """The request's choice if it made one, else the server's."""
+        if getattr(req, "enable_thinking", None) is not None:
+            return req.enable_thinking
+        return self.enable_thinking
+
     def prepare(self, req):
         """(prompt_ids, resolved_cap). Raises ContextTooLong / TemplateLacksToolSupport."""
         messages = [m.model_dump(exclude_none=True) for m in req.messages]
         tools = [t.model_dump(exclude_none=True) for t in req.tools] if req.tools else None
-        prompt_ids = render_prompt(self.model.tokenizer, messages, tools=tools)
+        prompt_ids = render_prompt(self.model.tokenizer, messages, tools=tools,
+                                   enable_thinking=self.resolve_thinking(req))
         cap = resolve_max_tokens(req.max_tokens, len(prompt_ids), self.max_seq_len)
         return prompt_ids, cap
 

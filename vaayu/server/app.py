@@ -60,6 +60,12 @@ class ServerConfig:
     # transient one -- and it is invisible in the output. Warn-and-degrade was
     # rejected for exactly that reason (CLAUDE.md §5).
     require_exclusive_gpu: bool = True
+    # Suppress the model's reasoning block. Off by default: a reasoning trace is
+    # tokens the caller did not ask for, at the same tok/s as the answer.
+    enable_thinking: bool = False
+    # What `stream` means when the request omits it. True here, NOT OpenAI's
+    # false: nothing is sent until the last token otherwise.
+    default_stream: bool = True
 
 
 # Seconds between disconnect polls on a non-streaming request. Server policy,
@@ -76,6 +82,18 @@ async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
             cancel.cancel()
             return
         await asyncio.sleep(poll_s)
+
+
+def resolve_stream(req, config) -> bool:
+    """Explicit `stream` wins; otherwise the server's default.
+
+    With no ServerConfig (an injected engine -- embedded or test use) the OpenAI
+    spec default applies: surprising such a caller with SSE is worse than being
+    slow.
+    """
+    if req.stream is not None:
+        return req.stream
+    return bool(config.default_stream) if config is not None else False
 
 
 def _check_gpu_is_exclusive(config) -> None:
@@ -230,7 +248,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             )
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")
-            app.state.engine = EngineHandle(model, queue_depth=config.queue_depth)
+            app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
+                                            enable_thinking=config.enable_thinking)
         else:
             app.state.engine = engine
         restore_signals = _install_signal_cancel(app.state.engine)
@@ -282,7 +301,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         if warning:
             print(f"[Vaayu-Server] WARNING: {warning}")
 
-        if req.stream:
+        if resolve_stream(req, getattr(app.state, "config", None)):
             # The slot is acquired INSIDE _sse, not here: a StreamingResponse's
             # body runs after this handler returns, so holding the slot across
             # the `return` would release it before a single token was generated

@@ -15,7 +15,7 @@ from vaayu.server.app import ServerConfig, create_app
 
 # Fields that are the SERVER's own concern and are deliberately not model kwargs.
 NOT_MODEL_KWARGS = {"model_path", "queue_depth", "host", "port", "served_model_name",
-                    "require_exclusive_gpu"}
+                    "require_exclusive_gpu", "enable_thinking", "default_stream"}
 
 
 @pytest.fixture
