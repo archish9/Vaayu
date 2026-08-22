@@ -61,6 +61,17 @@ def _error(status: int, message: str, kind: str, headers=None):
                         content={"error": {"message": message, "type": kind}})
 
 
+def _session_header(req) -> dict:
+    """Echo the session the prefix cache will actually key on.
+
+    Unknown fields are ignored by the request model (extra="ignore", which
+    off-the-shelf clients need), so a misspelled session field pins nothing and
+    the client cannot tell. "(auto)" is deliberate rather than an absent header:
+    absent is indistinguishable from a server too old to send it.
+    """
+    return {"X-Vaayu-Session-Id": req.session_key or "(auto)"}
+
+
 def _served_name(app) -> str:
     cfg = getattr(app.state, "config", None)
     if cfg is not None and cfg.served_model_name:
@@ -158,7 +169,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                         **_session_header(req)})
 
         try:
             async with e.slot():
@@ -185,7 +197,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         ).model_dump(exclude_none=True)
         if warning:
             body["warnings"] = [warning]
-        return body
+        return JSONResponse(content=body, headers=_session_header(req))
 
     return app
 

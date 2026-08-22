@@ -144,6 +144,7 @@ holds one model for its whole life and should fill the box.
 | `seed` | int | `null` | |
 | `n` | int | `1` | **must be 1.** `n>1` is a 422 with a named reason — concurrency is 1 on this hardware |
 | `session_id` | string | `null` | **Vaayu extra.** Pins this turn to a prefix-cache session. Omit it and auto-prefix-match picks the best match itself |
+| `user` | string | `null` | OpenAI's end-user tag. Used as `session_id` when that is absent, so an OpenAI-native client pins sessions with no Vaayu-specific field. `session_id` wins when both are sent |
 | `kv_cache_mode` | string | `null` | Vaayu extra |
 | `drafter_model_path` | string | `null` | Vaayu extra |
 
@@ -258,13 +259,24 @@ curl -s localhost:8000/v1/chat/completions \
 ### Pinning a session for prefix reuse
 
 ```bash
-curl -s localhost:8000/v1/chat/completions \
+curl -is localhost:8000/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "session_id": "agent-7",
   "messages": [{"role": "user", "content": "…"}]
 }'
 ```
+
+Every completion — streaming and not — answers with the session it actually keyed on:
+
+```
+x-vaayu-session-id: agent-7
+```
+
+`(auto)` there means **no usable id arrived** and the pool fell back to scanning. Unknown
+request fields are ignored rather than rejected (off-the-shelf clients depend on that), so
+a misspelled `sessionId` is silently dropped — this header is the only way to see it from
+outside the process.
 
 ### Watching the cache and the queue
 
@@ -316,7 +328,14 @@ never the beginning.
 
 Pass `session_id` when you have several independent agent streams: it makes the match
 exact instead of a scan. An unrecognised `session_id` still falls back to auto-match,
-so it can only help.
+so it can only help. Check `x-vaayu-session-id` on the response once when wiring a client
+up: `(auto)` means the id never arrived.
+
+An OpenAI-native client that has no `session_id` can use the standard `user` field
+instead — Vaayu keys on it when `session_id` is absent. It is a coarser key by nature:
+`user` names a **person**, not a conversation, so two concurrent streams from one user
+share a pool entry and evict each other. For fan-out, give each stream its own
+`session_id`.
 
 ### 6.3 One request at a time — design your fan-out around it
 

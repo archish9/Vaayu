@@ -215,3 +215,15 @@ def test_no_kwarg_stream_generate_builds_itself_survives_into_its_kwargs():
     for name in STREAM_GENERATE_OWNS:
         kw.pop(name, None)
     assert set(kw) <= {"session_id", "top_k", "stop_strings", "tokenizer"}
+
+
+def test_user_reaches_the_prefix_cache_as_the_session_id():
+    e = EngineHandle(FakeModel())
+    kw = e.build_generate_kwargs(_req(user="agent-7"), [1, 2, 3])
+    assert kw["session_id"] == "agent-7"
+
+
+def test_session_id_still_wins_over_user():
+    e = EngineHandle(FakeModel())
+    kw = e.build_generate_kwargs(_req(user="alice", session_id="agent-7"), [1, 2, 3])
+    assert kw["session_id"] == "agent-7"

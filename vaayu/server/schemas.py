@@ -83,10 +83,25 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ToolDef] | None = None
     tool_choice: Any = None
 
+    # OpenAI's own end-user tag. Declared, not ignored, because it is the only
+    # per-stream id an off-the-shelf client sends -- see `session_key`.
+    user: str | None = None
+
     # ── Vaayu extras. Optional; OpenAI clients never send them. ──
     session_id: str | None = None
     kv_cache_mode: str | None = None
     drafter_model_path: str | None = None
+
+    @property
+    def session_key(self) -> str | None:
+        """The prefix-cache session for this turn, or None to auto-match.
+
+        `session_id` wins: it names one conversation. `user` is OpenAI's stable
+        END-USER id, so two concurrent conversations from one user share a pool
+        entry and evict each other -- a real cost, but a smaller one than the
+        silent drop it replaces, which cost exact matching with no way to tell.
+        """
+        return self.session_id or self.user or None
 
     @field_validator("stop", mode="before")
     @classmethod

@@ -139,7 +139,8 @@ class EngineHandle:
                                       device=self.model.running_device),
             "max_new_tokens": cap if cap is not None else 1,
             "use_cache": True,
-            "session_id": req.session_id,     # None -> auto-prefix-match
+            # session_id, else OpenAI's `user`, else None -> auto-prefix-match.
+            "session_id": req.session_key,
         }
         if req.temperature > 0.0:
             kwargs["do_sample"] = True

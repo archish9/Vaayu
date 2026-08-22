@@ -96,3 +96,21 @@ def test_response_serialises_with_the_openai_field_names():
     assert d["usage"]["total_tokens"] == 5
     # tool_calls is absent, not null, when there are none.
     assert "tool_calls" not in d["choices"][0]["message"]
+
+
+def test_openai_user_is_the_session_id_fallback():
+    # OpenAI-native clients tag streams with `user`, never with Vaayu's
+    # `session_id`. Dropping it silently cost them exact prefix matching with
+    # no way to tell from the response.
+    assert _req(user="agent-7").session_key == "agent-7"
+
+
+def test_an_explicit_session_id_wins_over_user():
+    # `user` is a stable END-USER id; session_id names one conversation. When
+    # both arrive the narrower one is the right pool key.
+    assert _req(user="alice", session_id="agent-7-turn-3").session_key == "agent-7-turn-3"
+
+
+def test_session_key_is_none_when_neither_is_sent_so_auto_match_runs():
+    assert _req().session_key is None
+    assert _req(user="").session_key is None, "an empty user is not a session"

@@ -221,3 +221,50 @@ def test_an_engine_crash_mid_stream_emits_an_error_event_and_closes():
 def test_a_queue_position_comment_precedes_the_first_event():
     r = _client(FakeEngine()).post("/v1/chat/completions", json=dict(BODY, stream=True))
     assert r.text.startswith(": vaayu queue")
+
+
+# ── the resolved session id is echoed, so a dropped one is visible ────────────
+# A misspelled or unsupported session field is silently ignored by pydantic
+# (extra="ignore", which off-the-shelf clients need), so a client could pin
+# every turn to nothing and never know. The header is the only outside tell.
+
+def test_the_resolved_session_id_comes_back_on_a_header():
+    r = _client(FakeEngine()).post("/v1/chat/completions",
+                                   json={**BODY, "session_id": "agent-7"})
+    assert r.headers["x-vaayu-session-id"] == "agent-7"
+
+
+def test_the_header_reports_the_user_fallback_that_was_actually_used():
+    r = _client(FakeEngine()).post("/v1/chat/completions",
+                                   json={**BODY, "user": "agent-7"})
+    assert r.headers["x-vaayu-session-id"] == "agent-7"
+
+
+def test_no_usable_session_id_is_reported_as_auto_not_omitted():
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=BODY)
+    assert r.headers["x-vaayu-session-id"] == "(auto)", (
+        "a missing header is indistinguishable from an old server; say (auto) "
+        "so a client that meant to pin a session can see that it did not")
+
+
+def test_a_misspelled_session_field_shows_up_as_auto():
+    r = _client(FakeEngine()).post("/v1/chat/completions",
+                                   json={**BODY, "sessionId": "agent-7"})
+    assert r.status_code == 200, "extra fields stay ignored, not 422"
+    assert r.headers["x-vaayu-session-id"] == "(auto)"
+
+
+def test_the_streaming_path_carries_the_same_header():
+    with _client(FakeEngine()).stream(
+            "POST", "/v1/chat/completions",
+            json={**BODY, "stream": True, "user": "agent-7"}) as r:
+        assert r.headers["x-vaayu-session-id"] == "agent-7"
+        r.read()
+
+
+def test_the_body_is_unchanged_by_the_header():
+    # The response stays OpenAI-shaped: the echo lives in the header precisely
+    # so no client has to tolerate a non-standard field.
+    body = _client(FakeEngine()).post("/v1/chat/completions",
+                                      json={**BODY, "user": "agent-7"}).json()
+    assert "session_id" not in body
