@@ -564,8 +564,10 @@ The server takes **no command-line arguments** — set `MODEL_PATH` in
 
 ```bash
 # streams by default (DEFAULT_STREAM = True) -- -N keeps curl from buffering it
+# session_id is REQUIRED: give each independent agent stream its own
 curl -sN localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "vaayu",
+  "session_id": "agent-7",
   "messages": [{"role": "user", "content": "write a binary search in Python"}]
 }'
 
@@ -573,7 +575,13 @@ curl -sN localhost:8000/v1/chat/completions -H 'content-type: application/json' 
 # token, which on a slow checkpoint with no max_tokens can be an hour
 ```
 
-Two server defaults differ from OpenAI's on purpose: **`stream` defaults to true**, and
+**`session_id` is required** (`REQUIRE_SESSION_ID`, default on): without one the prefix
+cache keys on a hash of the prompt's first 64 tokens, so two agents sharing a system
+prompt collide on a single pool entry and reuse collapses to zero. OpenAI's `user` field
+counts as a session, so an OpenAI-native client is not locked out. The session comes back
+on the `x-vaayu-session-id` header, in the response body, and on every stream chunk.
+
+Two more server defaults differ from OpenAI's on purpose: **`stream` defaults to true**, and
 **`ENABLE_THINKING` defaults to false** — a reasoning trace costs the same tok/s as the
 answer, so it is suppressed unless a request asks for it with `"enable_thinking": true`.
 

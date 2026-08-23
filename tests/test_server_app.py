@@ -269,9 +269,12 @@ def test_the_streaming_path_carries_the_same_header():
         r.read()
 
 
-def test_the_body_is_unchanged_by_the_header():
-    # The response stays OpenAI-shaped: the echo lives in the header precisely
-    # so no client has to tolerate a non-standard field.
-    body = _client(FakeEngine()).post("/v1/chat/completions",
-                                      json={**BODY, "user": "agent-7"}).json()
-    assert "session_id" not in body
+def test_the_session_is_echoed_in_the_body_as_well_as_the_header():
+    # Was "the body stays OpenAI-shaped, the echo lives only in the header".
+    # Superseded: the session is now reported in both, so a client that never
+    # reads headers can still confirm which session it was served under. The
+    # extra key is additive -- OpenAI clients ignore unknown response fields.
+    r = _client(FakeEngine()).post("/v1/chat/completions",
+                                   json={**BODY, "user": "agent-7"})
+    assert r.json()["session_id"] == "agent-7"
+    assert r.headers["x-vaayu-session-id"] == "agent-7"

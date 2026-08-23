@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from .chat import render_prompt
+from .logs import session_event
 from .stopping import finish_reason, resolve_max_tokens
 from .tools import detect_tool_format, parse_tool_calls
 
@@ -76,9 +77,13 @@ class GenerationResult:
 
 
 class EngineHandle:
-    def __init__(self, model, queue_depth: int = 8, enable_thinking: bool = True):
+    def __init__(self, model, queue_depth: int = 8, enable_thinking: bool = True,
+                 log_dir=None):
         self.model = model
         self.queue_depth = queue_depth
+        # None for library callers: a library that starts writing files into the
+        # caller's working directory is a surprise. The server passes its own.
+        self.log_dir = log_dir
         # Library default stays True (render exactly what the template wrote);
         # the server passes its own, which is False.
         self.enable_thinking = enable_thinking
@@ -160,6 +165,15 @@ class EngineHandle:
             self._inflight -= 1
 
     # ── request mapping ──────────────────────────────────────────────────────
+
+    def _log(self, req, event, **fields) -> None:
+        if self.log_dir is not None:
+            session_event(self.log_dir, getattr(req, "session_key", None),
+                          event, **fields)
+
+    def _prefix_hits(self) -> int:
+        pc = getattr(self.model, "_prefix_cache", None)
+        return getattr(pc, "hits", 0) if pc is not None else 0
 
     def resolve_thinking(self, req) -> bool:
         """The request's choice if it made one, else the server's."""
@@ -258,7 +272,11 @@ class EngineHandle:
             produced=len(new_ids), cap=cap)
 
     async def generate(self, req, cancel=None) -> GenerationResult:
+        import time
+        started, hits_before = time.time(), self._prefix_hits()
         prompt_ids, cap = self.prepare(req)
+        self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
+                  thinking=("on" if self.resolve_thinking(req) else "off"))
         if req.max_tokens is None:
             # Non-streaming sends NOTHING until the last token, so this request
             # can sit silent for as long as `cap` tokens take -- measured at 15+
@@ -274,10 +292,16 @@ class EngineHandle:
                 None, lambda: self.model.generate(**kwargs))
         new_ids, text = self._decode_new(out, len(prompt_ids))
         cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None)
+        finish = self._finish(new_ids, cap, calls)
+        wall = time.time() - started
+        self._log(req, "DONE", tokens=len(new_ids), finish=finish,
+                  prefix_hit=self._prefix_hits() > hits_before,
+                  wall=f"{wall:.1f}s",
+                  decode=f"{(len(new_ids) - 1) / wall:.3f}tok/s" if wall > 0 and len(new_ids) > 1 else "n/a")
         return GenerationResult(
             text=cleaned, tool_calls=calls,
             prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
-            finish_reason=self._finish(new_ids, cap, calls))
+            finish_reason=finish)
 
     async def stream(self, req, cancel=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
@@ -285,9 +309,15 @@ class EngineHandle:
         Bridges vaayu.streaming's worker thread onto the event loop through a
         thread-safe queue.
         """
+        import time
+
         from ..streaming import stream_generate
 
+        started, hits_before = time.time(), self._prefix_hits()
         prompt_ids, cap = self.prepare(req)
+        self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
+                  thinking=("on" if self.resolve_thinking(req) else "off"))
+        ttft_logged = False
         kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
         input_ids = kwargs.pop("input_ids")
         temperature = kwargs.get("temperature", 0.0)
@@ -328,6 +358,9 @@ class EngineHandle:
                     error = payload
                     break
                 parts.append(payload)
+                if not ttft_logged:
+                    ttft_logged = True
+                    self._log(req, "TTFT", at=f"{time.time() - started:.1f}s")
                 yield ("delta", payload)
         finally:
             self._live_cancel = None
@@ -338,6 +371,10 @@ class EngineHandle:
         full = "".join(parts)
         cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None)
         produced = len(self.model.tokenizer(full, add_special_tokens=False)["input_ids"])
+        wall = time.time() - started
+        self._log(req, "DONE", tokens=produced,
+                  prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
+                  decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
         yield ("final", GenerationResult(
             text=cleaned, tool_calls=calls,
             prompt_tokens=len(prompt_ids), completion_tokens=produced,

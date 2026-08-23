@@ -45,6 +45,11 @@ Keeping `MODEL_PATH` there means your checkpoint paths never land in a diff.
 | `PORT` | `8000` | |
 | `DEVICE` | `"cuda:0"` | |
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
+| `LOG_DIR` | `"logs"` | `<LOG_DIR>/server.log` gets **everything** the process emits — Python prints, uvicorn, and the `[vaayu_rust]` io_uring lines (captured at fd level, since Rust writes them straight to fd 2). `<LOG_DIR>/sessions/<session_id>.log` gets one line per request lifecycle event |
+| `CAPTURE_STDIO` | `True` | `False` leaves the console untouched and writes only the per-session files |
+| `LOG_ROTATE_MB` | `50` | `server.log` rolls to `server.log.1` past this. The io_uring trace is verbose — 230 MB in 30 minutes was measured on a MoE run |
+| `DELETE_ORIGINAL` | **`True`** | after Vaayu's split copy of a checkpoint is verified complete (every layer has its `.safetensors` **and** its `.done` marker), delete the source shards it was split from — **39–66 GB per checkpoint** on the reference box. A server holds one checkpoint for its whole life, so the duplicate is pure waste. **Irreversible**: recovery is a re-download, and the removal follows symlinks, so a shard linked into the shared HuggingFace cache takes the cached blob with it. Set `False` if another framework reads the same checkpoint. The server prints a line naming this before every load |
+| `REQUIRE_SESSION_ID` | **`True`** | refuse a request naming neither `session_id` nor `user`. An unnamed request still gets reuse, but it keys on a hash of the prompt's first 64 tokens — so two agents sharing a system prompt land on one pool entry and evict each other, and reuse collapses to **zero**, not gradually. `False` allows unnamed requests |
 | `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory, naming each holder and the command that frees it. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×** and invisible in the output. `False` warns and loads anyway. Compute processes only; your desktop is never listed |
 | `DEFAULT_STREAM` | **`True`** | what `stream` means when a request omits it. **Not** OpenAI's `false`: a non-streaming response sends nothing until the last token, and an uncapped one on a slow checkpoint outlives every client. An explicit `"stream": false` still wins |
 | `ENABLE_THINKING` | **`False`** | let the model emit a reasoning block before the answer. Off: the trace costs the same tok/s as the answer. Templates with their own flag are told; one that hard-codes an open `<think>` (MiniMax-M2.7) gets the block closed for it — detected from the rendered generation prompt, never from a model name. Per-request override: `"enable_thinking": true` |
@@ -82,6 +87,30 @@ streamed-dense wins.
 > weights are read. Llama-3.2-1B drafts for Llama-3.3-70B (both 128256). It does **not**
 > draft for MiniMax (200064) — that mismatch used to surface as a CUDA
 > `CUBLAS_STATUS_INTERNAL_ERROR` several frames away.
+
+---
+
+## Reading the logs
+
+```
+logs/
+  server.log                  # everything, rotated at LOG_ROTATE_MB
+  sessions/agent-7.log        # one line per lifecycle event
+  sessions/_unnamed.log       # requests that sent no session_id
+```
+
+```
+2026-08-22T16:57:11 REQ    prompt=3 cap=16 stream=False thinking=on
+2026-08-22T16:57:11 DONE   tokens=4 finish=stop prefix_hit=False wall=0.2s decode=14.8tok/s
+```
+
+Streaming requests add a `TTFT at=…` line between the two. `prefix_hit` is the one to
+watch across turns of the same session: `False` on turn 2 means the prefix cache is not
+being reused and TTFT is paying full prefill.
+
+Filenames are sanitized — `session_id` arrives in an HTTP body, so it is untrusted input
+that becomes a path. A hostile id lands inside `sessions/` with a hash suffix
+(`../../etc/pwned` → `____etc_pwned-bf73a33346.log`), never outside it.
 
 ---
 

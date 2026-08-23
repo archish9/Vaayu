@@ -104,6 +104,11 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
 | `DEFAULT_STREAM` | **`True`** | what `stream` means when the request omits it. Not OpenAI's `false` — a non-streaming response sends nothing until the last token |
 | `ENABLE_THINKING` | **`False`** | suppress the model's reasoning block. Detected from the rendered generation prompt: a template with its own flag is told, one that hard-codes `<think>` has it closed. Per-request override available |
+| `LOG_DIR` | `"logs"` | `server.log` (everything, fd-level so the `[vaayu_rust]` lines are included) plus `sessions/<session_id>.log`, one line per request lifecycle event |
+| `CAPTURE_STDIO` | `True` | `False` writes only the per-session files and leaves the console alone |
+| `LOG_ROTATE_MB` | `50` | when `server.log` rolls to `server.log.1` |
+| `DELETE_ORIGINAL` | **`True`** | delete the ORIGINAL shards once the split copy is verified complete, reclaiming **39–66 GB per checkpoint**. **Irreversible** — recovery is a re-download, and it follows symlinks into the shared HF cache. `False` keeps them for other tools |
+| `REQUIRE_SESSION_ID` | **`True`** | refuse a request that names neither `session_id` nor `user`. Unnamed requests still get reuse, but they key on a hash of the prompt's first 64 tokens, so agents sharing a system prompt collide on one pool entry and reuse collapses to zero. `False` allows them |
 | `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
 
 ### Speed
@@ -154,9 +159,9 @@ holds one model for its whole life and should fill the box.
 | `tool_choice` | any | `null` | accepted and passed through the template |
 | `seed` | int | `null` | |
 | `n` | int | `1` | **must be 1.** `n>1` is a 422 with a named reason — concurrency is 1 on this hardware |
-| `session_id` | string | `null` | **Vaayu extra.** Pins this turn to a prefix-cache session. Omit it and auto-prefix-match picks the best match itself |
+| `session_id` | string | — | **Vaayu extra, and REQUIRED** (`REQUIRE_SESSION_ID`, default on). Pins this turn to a prefix-cache session. A request naming no session is a `400`; OpenAI's `user` satisfies it |
 | `enable_thinking` | bool | *server default* (`ENABLE_THINKING`, **`false`**) | **Vaayu extra.** Let the model reason before answering. Suppressed by default; set `true` per request to get it back |
-| `user` | string | `null` | OpenAI's end-user tag. Used as `session_id` when that is absent, so an OpenAI-native client pins sessions with no Vaayu-specific field. `session_id` wins when both are sent |
+| `user` | string | — | OpenAI's end-user tag. Used as `session_id` when that is absent, so an OpenAI-native client satisfies the requirement with no Vaayu-specific field. `session_id` wins when both are sent |
 | `kv_cache_mode` | string | `null` | Vaayu extra |
 | `drafter_model_path` | string | `null` | Vaayu extra |
 
@@ -276,14 +281,23 @@ curl -s localhost:8000/v1/chat/completions \
 
 ### Pinning a session for prefix reuse
 
+`session_id` is **required** — this is the shape every request takes:
+
 ```bash
-curl -is localhost:8000/v1/chat/completions \
+curl -isN localhost:8000/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "session_id": "agent-7",
   "messages": [{"role": "user", "content": "…"}]
 }'
 ```
+
+Without one the server answers `400` and says why. An OpenAI-native client that has no
+`session_id` can send `"user": "agent-7"` instead — it is used as the session.
+
+The session comes back three ways, so a client can confirm what it was served under:
+the `x-vaayu-session-id` header, `session_id` in a non-streaming body, and `session_id`
+on **every** streaming chunk.
 
 Every completion — streaming and not — answers with the session it actually keyed on:
 
@@ -344,8 +358,8 @@ Do not try to "optimise" by trimming or summarising history mid-conversation —
 breaks the prefix and forces a full prefill. If you must trim, trim from the **end**,
 never the beginning.
 
-Pass `session_id` when you have several independent agent streams: it makes the match
-exact instead of a scan. An unrecognised `session_id` still falls back to auto-match,
+`session_id` is required (see §4). Give each independent agent stream its own: it makes
+the match exact instead of a scan. An unrecognised `session_id` still falls back to auto-match,
 so it can only help. Check `x-vaayu-session-id` on the response once when wiring a client
 up: `(auto)` means the id never arrived.
 

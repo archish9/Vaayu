@@ -28,3 +28,6 @@ run-delorig-*.log
 docs/
 plan*
 vaayu/server/config_local.py
+
+# Server logs (server.log + per-session files)
+logs/

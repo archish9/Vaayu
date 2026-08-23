@@ -5,6 +5,7 @@ Everything decidable without a GPU lives in stopping.py / tools.py / schemas.py.
 import asyncio
 import json
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
 from .engine import CancelToken, EngineHandle, QueueFull
+from .logs import capture_stdio
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
@@ -59,6 +61,24 @@ class ServerConfig:
     # ONCE at load, so a forgotten container is a permanent per-token tax, not a
     # transient one -- and it is invisible in the output. Warn-and-degrade was
     # rejected for exactly that reason (CLAUDE.md §5).
+    # Delete the ORIGINAL downloaded shards once Vaayu's split copy is verified
+    # complete, reclaiming 39-66 GB per checkpoint. IRREVERSIBLE: recovery is a
+    # re-download, and the removal follows symlinks, so a shard linked into the
+    # shared HF cache takes the cached blob with it. On by default because a
+    # server holds one checkpoint for its whole life and the duplicate is pure
+    # waste; set False to keep the originals for other tools.
+    # Where logs land. `server.log` gets EVERYTHING the process emits (fd-level,
+    # so the vaayu_rust io_uring lines are in it too); sessions/<id>.log gets one
+    # line per lifecycle event for that session.
+    log_dir: str = "logs"
+    capture_stdio: bool = True
+    log_rotate_mb: int = 50
+    delete_original: bool = True
+    # Refuse a request that names no session. Without one the prefix pool keys
+    # on a hash of the prompt's first 64 tokens, so two agents sharing a system
+    # prompt collide on a single entry and evict each other -- and concurrent
+    # calls on one id mutate the same cache object. OpenAI's `user` counts.
+    require_session_id: bool = True
     require_exclusive_gpu: bool = True
     # Suppress the model's reasoning block. Off by default: a reasoning trace is
     # tokens the caller did not ask for, at the same tok/s as the answer.
@@ -225,13 +245,27 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        restore_stdio = None
+        if config is not None and config.capture_stdio:
+            # Before the load, so pinning and NVMe warmup end up in the file too.
+            restore_stdio = capture_stdio(
+                Path(config.log_dir) / "server.log", rotate_mb=config.log_rotate_mb)
+            print(f"[Vaayu-Server] logging to {config.log_dir}/server.log and "
+                  f"{config.log_dir}/sessions/<session_id>.log")
         if engine is None:
             _check_gpu_is_exclusive(config)
             from ..auto_model import AutoModel
+            if config.delete_original:
+                print("[Vaayu-Server] DELETE_ORIGINAL is ON: the source shards "
+                      "this checkpoint was split from will be removed once the "
+                      "split is verified complete. This is irreversible -- "
+                      "recovery is a re-download. Set DELETE_ORIGINAL = False "
+                      "in vaayu/server/config.py to keep them.")
             print(f"[Vaayu-Server] loading {config.model_path} ...")
             t0 = time.time()
             model = AutoModel.from_pretrained(
                 config.model_path,
+                delete_original=config.delete_original,
                 device=config.device,
                 kv_cache_mode=config.kv_cache_mode,
                 drafter_model_path=config.drafter_model_path or None,
@@ -249,7 +283,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                   f"derived max_seq_len={model.max_seq_len}")
             app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
-                                            enable_thinking=config.enable_thinking)
+                                            enable_thinking=config.enable_thinking,
+                                            log_dir=config.log_dir)
         else:
             app.state.engine = engine
         restore_signals = _install_signal_cancel(app.state.engine)
@@ -258,6 +293,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         finally:
             restore_signals()
             _teardown(app)
+            if restore_stdio is not None:
+                restore_stdio()
 
     app = FastAPI(title="Vaayu", lifespan=lifespan)
     app.state.config = config
@@ -297,6 +334,17 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
         e = app.state.engine
+        cfg = getattr(app.state, "config", None)
+        if cfg is not None and cfg.require_session_id and not req.session_key:
+            return _error(400,
+                          "this request names no session. Send `session_id` (or "
+                          "OpenAI's `user`, which is used as one). Without it the "
+                          "prefix cache keys on a hash of the prompt's first 64 "
+                          "tokens, so two agents sharing a system prompt collide "
+                          "on one entry and evict each other -- reuse then "
+                          "collapses to zero rather than degrading. Set "
+                          "REQUIRE_SESSION_ID = False to allow unnamed requests.",
+                          "invalid_request_error")
         warning = e.warn_if_speculative_sampling_ignored(req)
         if warning:
             print(f"[Vaayu-Server] WARNING: {warning}")
@@ -314,7 +362,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                    f"one request at a time.",
                               "server_busy", headers={"Retry-After": "5"})
             return StreamingResponse(
-                _sse(e, req, _served_name(app), warning, CancelToken()),
+                _sse(e, req, _served_name(app), warning, CancelToken(),
+                     session_id=req.session_key),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)})
@@ -353,6 +402,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             usage=Usage(prompt_tokens=result.prompt_tokens,
                         completion_tokens=result.completion_tokens,
                         total_tokens=result.prompt_tokens + result.completion_tokens),
+            session_id=req.session_key,
         ).model_dump(exclude_none=True)
         if warning:
             body["warnings"] = [warning]
@@ -361,11 +411,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     return app
 
 
-def _chunk(cid, created, model_name, *, delta, finish=None, usage=None) -> str:
+def _chunk(cid, created, model_name, *, delta, finish=None, usage=None,
+           session_id=None) -> str:
     body = ChatCompletionChunk(
         id=cid, created=created, model=model_name,
         choices=[ChunkChoice(index=0, delta=Delta(**delta), finish_reason=finish)],
-        usage=usage,
+        usage=usage, session_id=session_id,
     ).model_dump(exclude_none=True)
     return f"data: {json.dumps(body)}\n\n"
 
@@ -376,7 +427,7 @@ def _error_event(ex) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _sse(engine, req, model_name, warning, cancel=None):
+async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
@@ -390,7 +441,7 @@ async def _sse(engine, req, model_name, warning, cancel=None):
     if warning:
         yield f": warning {warning}\n\n"
 
-    yield _chunk(cid, created, model_name, delta={"role": "assistant"})
+    yield _chunk(cid, created, model_name, session_id=session_id, delta={"role": "assistant"})
 
     fmt = engine.tool_format if req.tools else None
     open_marker = fmt.open_marker if fmt is not None else None
@@ -413,7 +464,7 @@ async def _sse(engine, req, model_name, warning, cancel=None):
                     # prose that preceded it, then go quiet until the final event.
                     prose = held[:held.index(open_marker)]
                     if prose:
-                        yield _chunk(cid, created, model_name,
+                        yield _chunk(cid, created, model_name, session_id=session_id,
                                      delta={"content": prose})
                     held, suppressing = "", True
                     continue
@@ -422,7 +473,7 @@ async def _sse(engine, req, model_name, warning, cancel=None):
                 keep = (len(open_marker) - 1) if open_marker else 0
                 if len(held) > keep:
                     emit, held = held[:len(held) - keep], held[len(held) - keep:]
-                    yield _chunk(cid, created, model_name, delta={"content": emit})
+                    yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
     except Exception as ex:                            # noqa: BLE001
         yield _error_event(ex)
         yield "data: [DONE]\n\n"
@@ -434,17 +485,17 @@ async def _sse(engine, req, model_name, warning, cancel=None):
         cancel.cancel()
 
     if held and not suppressing:
-        yield _chunk(cid, created, model_name, delta={"content": held})
+        yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
 
     if final is not None and final.tool_calls:
-        yield _chunk(cid, created, model_name, delta={"tool_calls": final.tool_calls})
+        yield _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
 
     usage = None
     if final is not None and req.stream_options and req.stream_options.include_usage:
         usage = Usage(prompt_tokens=final.prompt_tokens,
                       completion_tokens=final.completion_tokens,
                       total_tokens=final.prompt_tokens + final.completion_tokens)
-    yield _chunk(cid, created, model_name, delta={},
+    yield _chunk(cid, created, model_name, session_id=session_id, delta={},
                  finish=(final.finish_reason if final is not None else "stop"),
                  usage=usage)
     yield "data: [DONE]\n\n"

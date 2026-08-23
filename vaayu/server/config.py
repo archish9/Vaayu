@@ -34,7 +34,25 @@ QUEUE_DEPTH = 8
 # container costs every token for the life of the run -- and the loss is
 # invisible in the output. See the REQUIREMENT section in the top-level
 # README.md. Set False for a box you deliberately share; it then only warns.
+# Refuse a request that names no session. An unnamed request still gets prefix
+# reuse (the pool auto-matches), but its key is a hash of the prompt's first 64
+# tokens -- so two agents sharing a system prompt land on ONE entry and evict
+# each other, and reuse collapses to zero rather than degrading. OpenAI's `user`
+# field counts as a session, so an OpenAI-native client is not locked out.
+REQUIRE_SESSION_ID = True
+
 REQUIRE_EXCLUSIVE_GPU = True
+
+# Delete the ORIGINAL downloaded shards once Vaayu's own split copy is verified
+# complete (every layer has its .safetensors AND its .done marker), reclaiming
+# 39-66 GB per checkpoint. A server holds one checkpoint for its whole life, so
+# the duplicate is pure waste -- hence ON by default.
+#
+# IRREVERSIBLE. Recovery is a re-download. The removal follows symlinks, so a
+# shard linked into the shared HuggingFace cache takes the cached blob with it,
+# which affects every other tool sharing that cache. Set False to keep the
+# originals -- for example if another framework reads the same checkpoint.
+DELETE_ORIGINAL = True
 
 # Let the model emit a reasoning block before its answer. OFF by default: the
 # trace costs the same tok/s as the answer and the caller did not ask for it.
@@ -47,6 +65,15 @@ ENABLE_THINKING = False
 # non-streaming response sends nothing until the last token. An explicit
 # `"stream": false` in the request still wins.
 DEFAULT_STREAM = True
+
+# Where logs are written. `<LOG_DIR>/server.log` receives EVERYTHING the process
+# emits -- Python prints, uvicorn, and the vaayu_rust io_uring lines, which are
+# captured at the file-descriptor level because Rust writes them straight to
+# fd 2. `<LOG_DIR>/sessions/<session_id>.log` gets one line per request
+# lifecycle event, which is the file to read when one session misbehaves.
+LOG_DIR = "logs"
+CAPTURE_STDIO = True        # False leaves the console alone; only session logs
+LOG_ROTATE_MB = 50          # server.log rolls to server.log.1 past this
 
 # --------------------------------------------------------------------------
 # Speed

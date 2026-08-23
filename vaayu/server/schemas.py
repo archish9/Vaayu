@@ -160,6 +160,9 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage | None = None
+    # Vaayu extra: the session the prefix cache actually keyed on. Echoed so a
+    # client can see that the id it meant to pin was the id that was used.
+    session_id: str | None = None
 
 
 class Delta(BaseModel):
@@ -184,3 +187,6 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChunkChoice]
     usage: Usage | None = None
+    # On every chunk, not just the first: a client that reconnects or drops the
+    # opening frame can still tell which session it is reading.
+    session_id: str | None = None
