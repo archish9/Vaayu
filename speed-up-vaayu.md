@@ -1,7 +1,7 @@
 # Speeding up Vaayu token generation with Rust
 
 Written 2026-08-23. Self-contained: every number below is either read off this
-repo's own recorded measurements (`todo.md`, `plans/`) or derived from them in
+repo's own recorded measurements (`todo.md`, `plans/settled_and_method_notes.md`) or derived from them in
 one line of arithmetic, and each item says how to falsify it.
 
 **Read this first.** Vaayu's MoE decode is **72-74 % disk-bound**. Rust cannot
@@ -15,7 +15,7 @@ Everything else in this document is a rounding error, and is labelled as such.
 
 ## 0. The one number that decides everything
 
-Recorded decode figures (`todo.md`, row 14 / row 14-OLD, measured on-device,
+Recorded decode figures (archived rows 14 / 14-OLD in `plans/settled_and_method_notes.md`, measured on-device,
 decode-only counters, 64 tokens):
 
 | model | NVMe expert reads/tok | bytes/tok | decode | **achieved read bandwidth** |
@@ -23,7 +23,7 @@ decode-only counters, 64 tokens):
 | Qwen3-235B | 422 | 4.99 GB | 0.820 tok/s | **4.09 GB/s** |
 | MiniMax-M2.7 | 295 | 2.62 GB | 1.501 tok/s | **3.93 GB/s** |
 
-The box's NVMe peak, stated as a hardware constant in `todo.md`, is **~5.5 GB/s**.
+The box's NVMe peak, stated as a hardware constant in `todo.md`'s Environment section, is **~5.5 GB/s**.
 
 So the disk path is running at **71-74 % of the drive's rate** while being the
 thing that costs 72-74 % of the token. **That gap is the entire Rust
@@ -39,7 +39,7 @@ per `todo.md`'s stop rule, do not re-scope to find a win.
 
 Dense (Llama-3.3-70B, ~37 GB read per token, 0.155 tok/s = ~5.7 GB/s) is
 already at the wall. **Rust has nothing to offer streamed dense.** Its lever is
-speculative decoding, already built and measured at 5.57x (`todo.md` row 12).
+speculative decoding, already built and measured at 5.57x (archived row 12; carried in `todo.md`'s CARRIED FORWARD).
 
 ---
 
@@ -187,7 +187,7 @@ dispatches/token to **~94 (one per layer)**.
   do not re-scope.**
 * **Watch for:** the SQ is sized at `queue_depth` (32). A layer's descriptor
   list can exceed it — submit in SQ-sized waves inside the one call, and fix the
-  `SQ full` leak first (see Bug B3 in `todo.md`).
+  `SQ full` leak first (Bug **B6** in `todo.md`; B3 — short reads counted as success — is the other prerequisite).
 
 ### R3 — Move the expert-cache miss path into Rust ("get-or-read")
 
@@ -202,7 +202,7 @@ indices — Rust only needs the base pointer, the slab stride, and the
 LRU/eviction state, none of which needs to be a Python object.
 
 * **Effort:** high. This is the largest item here and it touches the eviction
-  policy that `todo.md` row 14 tuned against measured hit rates. Do it **only**
+  policy that archived row 14 tuned against measured hit rates. Do it **only**
   if §1's GIL test says contention is real.
 * **Composes with R2:** together they turn "422 Python dispatches + 750 LRU
   operations" into "94 Rust calls".
@@ -268,8 +268,8 @@ arm, so the Rust numbers are not credited with them.
 * **Bigger `queue_depth` on the ring.** `persistent_read` already splits one
   ~11 MB expert read into `qd` (32) chunked SQEs, so a single read already fills
   the ring. The idle time is *between* reads, which is what R2 targets.
-* **Raising the expert cache further.** Already done and closed — `todo.md`
-  row 14, ceiling now derived, 2.41x end-to-end, and the trade against the
+* **Raising the expert cache further.** Already done and closed — see
+  archived row 14, ceiling now derived, 2.41x end-to-end, and the trade against the
   prefix pool is measured. Do not re-open it as a Rust item.
 
 ---

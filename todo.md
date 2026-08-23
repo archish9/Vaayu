@@ -1,69 +1,120 @@
 # TODO — Vaayu pending work
 
-**Everything in this file is PENDING.** Nothing finished lives here. Closed rows, settled
-verdicts and the method notes moved to **`plans/settled_and_method_notes.md`** (tracked in git)
-on 2026-08-15; older history is in `git log -- todo.md` and `docs/superpowers/plans/*-RESULTS.md`
-(`docs/` is **gitignored** — may not exist on a fresh clone; `plans/` is tracked).
+**Everything in this file is PENDING. Nothing finished lives here.** Closed rows, settled verdicts
+and the method notes are in **`plans/settled_and_method_notes.md`**.
+
+**Both `plans/` and `docs/` are GITIGNORED** (`.gitignore:29` matches `plan*`), so neither exists on
+a fresh clone — the archive is on this disk only. **This file is the tracked one**, so the durable
+copy of everything ever moved out of it is `git log -p -- todo.md`. Closed detail was last moved out
+on 2026-08-23; the commit before that (`f3869b3`) still holds it in full.
 
 Protocol: `CLAUDE.md` §6 — update this as work happens, never after.
 Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open bug/regression.
 
-**Every item below carries the detail needed to fix it: file, symbol, what is wrong, what
-"done" means, and the stop rule.** The `plans/next_*.md` briefs hold the long-form background
-for the three scheduled rows and are self-contained on their own.
+**Reading this cold, in a fresh session, is the intended way to use it.** Read in this order:
+
+1. **FIX SEQUENCE** (below) — what to do, in order. Start at the first unticked row.
+2. **Environment** — how to run anything here. `python` is not on PATH; every on-device arm needs
+   its own `systemd-run` scope. Skipping this section is how arms get thrown away.
+3. **On-device gates** — what each gate can actually catch, and which ones a change obliges you to run.
+4. The detail section for the row you picked. Every row carries its own file, symbol, what is
+   wrong, what "done" means, and its stop rule — you should not need any other document except
+   the two named in the FIX SEQUENCE.
+
+Two documents outside this file are load-bearing, and both are self-contained:
+**`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
+one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
+it only to check whether something was already refuted, never for a task.
 
 ---
 
 # ▶▶ FIX SEQUENCE — opened 2026-08-23 by code review of the server work
 
-**Do these top to bottom.** Ordering rule: destructive-default first, then
-correctness bugs that make the server LIE to an agent, then the concurrency
-bug, then anything perf. Rust work comes LAST and is gated on one measurement.
-Full bug detail: **`# BUGS-2026-08-23`** below. Rust plan:
-**`speed-up-vaayu.md`** at the repo root (self-contained).
+**Do these top to bottom.** Ordering rule: correctness bugs that make the server LIE to an agent
+first, then the concurrency bug, then the rest of the correctness debt, then perf. Rust work comes
+LAST and is gated on one measurement.
 
-Baseline at review time: **1191 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`).
+Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
+the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
+
+**Suite baseline: 1196 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-23 after B1. It was 1191/3 at review time; B1's fix added 5 tests. **None of the bugs below
+are caught by `tests/` today** — the suite was green while every one of them was live.
 
 | # | do this | why here | where |
 |---|---|---|---|
-| 1 | **B1** — [x] FIXED 2026-08-23 — a fresh split no longer deletes mid-split; `DELETE_ORIGINAL` stays **True** | the flag is wanted (39-66 GB per checkpoint); what was wrong was WHERE it deleted | `vaayu/utils.py` |
-| 2 | **B2** — stop counting stream tokens by re-tokenizing the decoded text | `finish_reason="stop"` on a TRUNCATED answer is the exact bug row 13 exists to fix; an agent commits broken code | `vaayu/server/engine.py:373,382` |
-| 3 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
-| 4 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
-| 5 | **B5** — cancellation reported as `finish_reason="stop"` | same lie as B2, different trigger | `engine.py:270,382` |
-| 6 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
-| 7 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
-| 8 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
-| 9 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
-| 10 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
-| 11 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
-| 12 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
-| 13 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
-| 14 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
-| 15 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
-| 16 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
-| 17 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 -> ~1.10 tok/s, MiniMax 1.501 -> ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
-| 18 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
-| 19 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136-377x off TTFT | `safetensor_model_persister.py` |
+| 1 | **B2** — stop counting stream tokens by re-tokenizing the decoded text | `finish_reason="stop"` on a TRUNCATED answer is the exact bug the server was built to fix; an agent commits broken code | `vaayu/server/engine.py:373,382` |
+| 2 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
+| 3 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
+| 4 | **B5** — cancellation reported as `finish_reason="stop"` | same lie as B2, different trigger | `engine.py:270,382` |
+| 5 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
+| 6 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
+| 7 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
+| 8 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
+| 9 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
+| 10 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
+| 11 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
+| 12 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
+| 13 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
+| 14 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
+| 15 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
+| 16 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 → ~1.10 tok/s, MiniMax 1.501 → ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
+| 17 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
+| 18 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
 
-**Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3:
-if decode already achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows
-close** — record the verdict, do not re-scope to find a win. R3 additionally
-requires M1's GIL probe to show real contention. R1 and P1 are worth doing
-regardless of M1's result.
+**Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3: if decode already
+achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows close** — record the verdict, do not
+re-scope to find a win. R3 additionally requires M1's GIL probe to show real contention. R1 and P1
+are worth doing regardless of M1's result. B3 and B6 are prerequisites for R2 (it submits more SQEs
+per call, which is exactly what both bugs mishandle).
 
-**What Rust cannot do, so nobody re-derives it:** MoE decode is 72-74 %
-disk-bound and the rest is CUDA; streamed dense already reads at ~5.7 GB/s,
-i.e. at the wall. Rewriting the decode loop, replacing PyTorch, or raising the
-ring's `queue_depth` are all dead ends — reasons in `speed-up-vaayu.md` §4.
+**What Rust cannot do, so nobody re-derives it:** MoE decode is 72–74 % disk-bound and the rest is
+CUDA; streamed dense already reads at ~5.7 GB/s, i.e. at the wall. Rewriting the decode loop,
+replacing PyTorch, or raising the ring's `queue_depth` are all dead ends — reasons in
+`speed-up-vaayu.md` §4.
 
+---
+
+# ▶ CARRIED FORWARD — live items left behind by rows that closed
+
+These are the only things still open from the closed work. Their full context is in
+`plans/settled_and_method_notes.md`; what is here is what is still actionable.
+
+- **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
+  coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size
+  is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
+  server runs the streamed big models at their measured ceiling (~0.56–0.86 tok/s MoE at 8192,
+  single stream). **Not a blocker:** the server is model-agnostic and does not wait on this.
+- **[ ] Reserve policy vs a resident model.** The reserve floors were tuned for STREAMED models; on
+  Llama-3.2-1B the clamp drove `pinning_budget → 0` for a measured **−19 % decode**. Unmeasured for
+  a resident coder model because none is on disk. Re-check the moment one lands.
+- **[ ] `_finish` infers `hit_stop_string` from `produced < cap`.** HF trims a matched stop string
+  before returning, so the ids cannot be inspected for one. Fine for the length-vs-stop distinction
+  a client acts on; wrong if anything ever needs to know WHICH stop fired. **Overlaps B5** — fix
+  them together.
+- **[ ] `vaayu/expert_sim.py`'s anchor gap is unexplained.** 31.9 % simulated against 43.9 % live at
+  Qwen's 9.12 GB budget. The obvious hypothesis — that it fails to model the engine's eviction
+  pinning — was implemented and **REJECTED** (byte-identical result). The gap is confined to the
+  small-budget regime (at 16 GB it predicted 20.3 % for MiniMax against a measured 21.3 %).
+  **Do not quote its small-budget absolutes.**
+- **[!] Speculative decoding on streamed dense is BANKED and unshipped.** Measured **5.57×** on
+  Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output) with the Llama-3.2-1B
+  drafter, which shares its tokenizer. Opt-in via `drafter_model_path`, off by default because
+  CLAUDE.md §0 defers streamed-dense perf. **Unblocked by: dense work starting. Then this is the
+  first lever, and it already exists.** MoE speculation stays refuted — the gate admits
+  `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible drafter here.
+- **[ ] The speculative path is sampling-blind.** `top_p` / `top_k` / stop-strings are silently
+  ignored when a drafter is active. It must WARN rather than pretend. Bites the moment the row above
+  ships.
+
+---
 
 ## Environment (applies to every item)
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
 - Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **1006 passed, 3 skipped**
-  (2026-08-16, after row 13's server work: 892 before it, +114 from it).
+  (2026-08-16, after the server work: 892 before it, +114 from it).
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and
   `pydantic` were already present; `fastapi.testclient` needs `httpx`.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
@@ -87,8 +138,8 @@ ring's `queue_depth` are all dead ends — reasons in `speed-up-vaayu.md` §4.
 | Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
 
 (`max_seq_len` is KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15 (rows 6/7), and
-the sdpa reserve floor is raised to flash parity from 2026-08-16 (row 8). Every figure above is
-sdpa, read off a real load and verified on-device at that exact length, 4/4 (row 9,
+the sdpa reserve floor is raised to flash parity from 2026-08-16 (archived row 8). Every figure above is
+sdpa, read off a real load and verified on-device at that exact length, 4/4 (archived row 9,
 `plans/2026-08-16-row9-sdpa-limits-RESULTS.md`); all four geometries also derive these or more on flash.
 KV figures are **decimal** MB. `tests/test_vram_plan.py` has binary `MB`/`GB` for hardware
 constants and decimal `MB_DEC`/`GB_DEC` for these — use the right family.)
@@ -105,7 +156,7 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | dense smoke (CLAUDE.md §0's named guard) | `./venv/bin/python test_batched_dense_smoke.py` | ~2 min | dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged by the day's work |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
-| HTTP server (row 13) | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
+| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
@@ -129,356 +180,12 @@ blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 202
 
 ---
 
-# ▶ PENDING SEQUENCE — work top to bottom
-
-_Re-sequenced 2026-08-16 (row 8 closed). Older closed rows live in `plans/settled_and_method_notes.md`.
-Rows 1, 6, 7, 8 and 10 keep their detail sections BELOW the pending ones even though they are closed —
-rows 9/11/12 all lean on them; move them out once 9 lands._
-
-**SCHEDULED is EMPTY again** (2026-08-16): row 13, the OpenAI-compatible server, shipped.
-OPTIONAL holds everything that remains.
-
-**Before starting, know what this list can and cannot do.** It is correctness and capability debt,
-not a performance roadmap. Row 8 (closed 2026-08-16) and row 9 RECOVER context that rows 6/7
-removed — repayment, not gain. Row 11 buys context, not speed, and may cost speed. Row 12 (closed 2026-08-16) WAS the only row here that could make Vaayu faster, and it
-delivered — but on the dense path, which is deferred: 5.57× with the drafter, refuted on MoE. The historical
-throughput levers are spent: prefix caching landed (136–377× TTFT), N≥2 at long context is settled
-INFEASIBLE on this box (hardware wall, not calibration — `plans/settled_and_method_notes.md`),
-expert pinning is refuted, TurboQuant KV ships dark on a failed quality gate.
-
-Row 13 (the server) shipped 2026-08-16; its detail is kept below because the server is new and
-its risks are live. Row 14 is SCHEDULED above.
-
-# 13 · [x] CLOSED 2026-08-16 — Vaayu as an inference server (OpenAI-compatible), v1
-
-**SHIPPED 2026-08-16.** Design `plans/2026-08-16-vaayu-server-design.md`, plan
-`plans/2026-08-16-vaayu-server-plan.md`, all 13 tasks done and verified.
-
-**Measured outcome:** full suite **1006 passed / 3 skipped** (+114 over the 892 baseline);
-dense smoke gate **PASS, perplexity 8.78 unchanged**; `test_server_smoke.py` **ALL PASS** on
-Llama-3.2-1B (derived `max_seq_len=90639`) and on MiniMax-M2.7 EXL3 MoE (8192, prefix cache
-1hit/1miss, 52/104 prompt tokens skipped on turn 2). Live HTTP arm: `max_tokens` omitted →
-**506 tokens, `finish_reason="stop"`, complete code**; `max_tokens=20` → `finish_reason="length"`.
-
-**Three defects the on-device gate caught that every fake-backed test passed over:**
-`apply_chat_template` returns a `BatchEncoding` on transformers 5.5.4, not a list;
-`stream_generate` already builds `use_cache`/`max_new_tokens`/`do_sample` so passing them again
-is a duplicate-keyword `TypeError`; and `enable_prefix_cache` defaults OFF in `vaayu_base`, so
-the server shipped with its largest lever silently disabled. **A gate that cannot fail is not a
-gate** — the smoke gate's first version asserted only that the stats field was non-empty and
-reported green while the pool was off; it now asserts reuse FIRED.
-
-**What it is:** turn Vaayu from a test-script token generator into a long-running HTTP server an
-autonomous coding agent can drive — one `--model` path, OpenAI-shaped requests, streaming, tool
-calls. New package `vaayu/server/`; `vaayu_base.py` is not grown (it is already 4564 lines).
-
-**Why now, and what it cannot fix.** With every existing lever on, the ceiling on current
-checkpoints is ~0.86 tok/s at 8192 context, single stream. v1's default deployment is therefore a
-**VRAM-resident** coder model (~8-10 GB weights budget, derived in the design §2), with the
-streamed big-model path staying first-class and selectable. `vaayu_base.py:3698` already skips the
-disk load for a pinned layer, so a fully-pinned model pays no streaming cost.
-
-**Tasks — one per plan task, in execution order.** Tick each as it lands; the plan's own
-checkboxes are the step-level detail.
-
-- [x] **0** deps + package skeleton — `fastapi`/`uvicorn` installed and in `requirements.txt`,
-      `vaayu/server/__init__.py` with a lazy re-export so `import vaayu` stays cheap
-- [x] **1** `server/stopping.py` — `resolve_max_tokens` + `finish_reason`. THE truncation fix.
-      Pure, parametrized over all four on-disk derived windows. `512` must not appear in `vaayu/server/`
-- [x] **2** `server/schemas.py` — OpenAI subset, `extra="ignore"` so unimplemented fields do not 422
-      real clients; `max_tokens` defaults to None; `n>1` refused with a named reason
-- [x] **3** `server/tools.py` — format detection by PROBING the chat template (§5), Hermes/Qwen
-      `<tool_call>` + fenced-JSON fallback; unparseable output degrades to plain text
-- [x] **4** `server/chat.py` — `apply_chat_template(..., tools=)`; refuse `tools` against a template
-      with no tool support rather than dropping them
-- [x] **5** engine fix — explicit-`session_id` miss falls back to auto-prefix-match
-      (`prefix_cache.py:71` gates it on `session_id is None`; naming a session and missing is
-      strictly WORSE than not naming it)
-- [x] **6** engine fix — `restore_on_abort` puts a checked-out entry back after a dead turn.
-      `lookup()` POPS, `store()` only re-inserts after `generate()` returns, so an aborted SSE stream
-      drained the pool permanently. Crops the mutated cache to a length whose tokens are KNOWN —
-      re-storing against the original token list would corrupt it. Never raises (must not mask the
-      real error)
-- [x] **7** `server/engine.py` — `EngineHandle`: depth-bounded FIFO gate, request→kwargs mapping,
-      blocking + streaming generation. Carries the CPU `max_seq_len=512` startup warning
-      (`vaayu_base.py:1648`) and the speculative-path sampling warning
-- [x] **8** `server/app.py` — `/v1/chat/completions` (non-stream), `/v1/models`, `/health` with
-      `PrefixCacheStore.stats()`; 400/503/500 error mapping
-- [x] **9** SSE streaming — OpenAI deltas; tool calls BUFFERED and emitted once complete; open marker
-      split across chunks still recognised; queue-position comment before the first event
-- [x] **10** `server/__main__.py` — `python -m vaayu.server --model PATH --port 8000`
-- [x] **11** `test_server_smoke.py` at repo ROOT — real load, non-stream, stream, oversized-prompt
-      refusal, prefix observability. Run on the 1B AND on an EXL3 MoE, each under its own
-      `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`
-- [x] **12** README section, close this row, archive entry in `plans/settled_and_method_notes.md`
-
-**Done means:** full suite green — **892 passed / 3 skipped** at plan time, **984 / 3** projected
-after the plan's 92 new tests; dense smoke gate PASS with perplexity **8.78 unchanged**; and
-`test_server_smoke.py` passing on BOTH the small dense checkpoint and an EXL3 MoE one.
-
-**Standing limitations — live, and the follow-ups this row created:**
-
-- **No resident-size checkpoint on disk.** The "usable now" target needs a ~14B-class coder at
-  4-4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Until then the server runs
-  the streamed big models at their measured ceiling (~0.56 tok/s MoE, 8192 context). **The server
-  itself is model-agnostic and does not block on this.**
-- **OPTIONAL row 3 now has a real consumer.** The prefix pool is disabled for non-EXL3 checkpoints
-  (bare `DynamicCache` has no `to_cpu`/`to_device`/`resident_bytes`), so the server's largest lever
-  is off for every fp16 model — confirmed on-device: 1B reports `prefix_cache: disabled`, MiniMax
-  EXL3 reports real hits.
-- **`_finish` infers `hit_stop_string` from `produced < cap`.** HF trims a matched stop string
-  before returning, so the ids cannot be inspected for one. Fine for the length-vs-stop distinction
-  a client acts on; wrong if anything ever needs to know WHICH stop fired.
-- **Reserve policy vs a resident model** (design §9.3): row 8's floors were tuned for streamed
-  models; on Llama-3.2-1B the clamp drove `pinning_budget -> 0` for a measured -19 % decode. Unmeasured
-  for a resident coder model because none is on disk.
-- **`test_batched_dense_smoke.py` needed `MemoryMax=26G`, not the 22G in the gates table** — OOM-killed
-  at 22G directly after a MiniMax run, because freed pinned host blocks are cached, not returned.
-
-**Named risks carried from the design (§9):** the speculative path is sampling-blind (`top_p`/
-`top_k`/stop-strings silently ignored — must warn, not pretend); row 8's reserve policy may drive
-`pinning_budget -> 0` for a resident model as it did on Llama-3.2-1B (-19 % decode); row 4's 2x KV
-ring-doubling becomes the COMMON case once `max_tokens` defaults to the full window;
-`batched_generate` stays deliberately unwired.
-
-**Parallel action item, NOT a blocker:** no resident-size checkpoint is on disk (only two huge MoEs,
-the 70B dense, and 1B/1.5B tinies). The "usable now" target needs a ~14B-class coder at 4-4.5 bpw
-EXL3 (~8 GB). The server is built and tested against what is already on disk — §5 requires it be
-model-agnostic regardless.
-
-**Streaming is NOT the truncation fix** (this was the originating question): streaming is delivery,
-truncation is stopping policy. The fix is stop-on-EOS with the cap derived from the remaining
-context window, plus an honest `finish_reason` so a cut-off client is TOLD rather than handed
-silently-broken code.
-
----
-
-Every previously scheduled row is closed: 1, 6, 7, 8, 9, 10, 11, 12, and every bug found while
-closing them (11a, 12a, 12b) is fixed.
-
-
-## SCHEDULED
-
-# 14 · [x] CLOSED 2026-08-16 — expert ceiling now DERIVED; 2.41x end-to-end
-
-**Shipped.** `derive_expert_ceiling` (`vaayu_base.py`) replaces the stale 8.5 GiB literal,
-which becomes a FLOOR. Ceiling = available RAM − 3.5 GiB reserve − (`prefix_sessions` ×
-`max_seq_len` × `kv_bytes_per_token`). The expert arena is pinned BEFORE
-`compute_prefix_cache_budget` measures what is left, so the prefix pool is reserved first;
-`--prefix-sessions` (default 3) is the policy knob. Each model reserves from its OWN KV
-geometry — Qwen 1.58 GB/session, MiniMax 2.08 GB/session — no literals.
-
-**End-to-end A/B, Qwen3-235B, 2 sessions x 3 rounds, ~4.6k-token shared prefix:**
-
-| | server's first working config | shipped defaults | |
-|---|---|---|---|
-| total wall (6 turns) | **477.0 s** | **198.1 s** | **2.41x** |
-| end-to-end | 0.302 tok/s | **0.727 tok/s** | 2.41x |
-| cold / warm turn | 77.8 / 80.3 s | 41.3 / **28.9 s** | 1.88x / **2.78x** |
-| expert hit | 46.7 % | 61.3 % | |
-| prefix reuse | off | 83 % of tokens skipped | |
-
-Warm turns were SLOWER than cold ones in the old config (80.3 vs 77.8 s) — with no prefix
-cache every turn is a full prefill, so an agent resending history was punished for it.
-
-**Attribution, stated honestly: only the expert ceiling made the ENGINE faster.** The other
-three (pinning `-1`, prefix cache on, RAM cache derived) were the server failing to use
-capabilities the engine already had.
-
-**Per-ceiling detail (2 sessions x 3 rounds, real context, MemoryMax=27G):**
-
-| ceiling | expert | prefix pool | expert hit | warm wall |
-|---|---|---|---|---|
-| 8.5 GiB (stale literal) | 9.12 GB | 11.73 GB | 44.9 % | 36.6 s |
-| 13 GiB | 13.95 GB | 7.45 GB | 55.8 % | 32.0 s |
-| 18 GiB | 19.33 GB | 2.00 GB | 64.3 % | 27.3 s |
-| **DERIVED (Qwen)** | 16.57 GB | 4.25 GB | 59.6 % | 29.8 s |
-| **DERIVED (MiniMax)** | 15.42 GB | 6.16 GB | 21.3 % (was 6.6) | 20.6 s |
-
-The derived figure deliberately gives up some decode against a hand-set 18 GiB to keep
-three full-context sessions poolable. Prefix reuse held at 83 % in EVERY arm.
-
-**Superseded:** the original proposal, a pageable L2 expert tier. The same win was available
-by fixing a constant, at full pinned-DMA bandwidth and with no new code path.
-
-**What remains open:** `vaayu/expert_sim.py`'s anchor gap (31.9 % simulated against 43.9 %
-live at Qwen's 9.12 GB budget) is still unexplained — the obvious hypothesis, that it fails
-to model the engine's eviction pinning, was implemented and REJECTED (byte-identical result).
-The gap is confined to the small-budget regime: at 16 GB the simulator predicted 20.3 % for
-MiniMax against a measured 21.3 %. Do not quote its small-budget absolutes.
-
-# 14-CLOSED-DETAIL · original premise and method notes
-
-**Re-scoped 2026-08-16 after measurement. The original proposal (a pageable L2 tier) is
-superseded: the same win is available by fixing a stale constant, at full pinned-DMA
-bandwidth and with no new code path.**
-
-## What is PROVEN
-
-`_EXPERT_CACHE_OOM_CEILING = 8.5 GiB` (`vaayu_base.py:122`) was set **2026-07-10**, when the
-pinned allocator charged the next power of two for every request — a 9.13 GB arena cost
-16 GiB. The chunked-arena fix landed **2026-08-07** ("9.14 GB charged, 9.245 GB resident,
-every slab kept", `expert_cache.py` docstring) and the ceiling was never revisited.
-
-Raising it, on-device, Qwen3-235B, 48 decode tokens, `MemoryMax=27G`, all arms loaded clean:
-
-| ceiling | budget | max/layer | decode | hit rate | post-arena avail RAM |
-|---|---|---|---|---|---|
-| **8.5 GiB (shipped)** | 9.12 GB | 8 | 0.830 tok/s | 44.9 % | 15.04 GB |
-| 14 GiB | 15.03 GB | 13 | 1.014 tok/s | 55.2 % | — |
-| 18 GiB | 19.33 GB | 17 | **1.161 tok/s (+40 %)** | 61.3 % | **5.24 GB** |
-
-## What is NOT proven — do NOT ship 18 GiB on this evidence
-
-- **The 5.24 GB headroom figure came from a 1-TOKEN prefill.** Real 8192-token context needs
-  more, and this is an OOM ceiling on UNSWAPPABLE pinned memory.
-- **It competes directly with the prefix cache.** `compute_prefix_cache_budget` sizes the
-  prefix pool from free RAM at load. Expert cache is a ~40 % DECODE lever; prefix reuse is a
-  136–377× TTFT lever, and Plan I measured prefix reuse collapsing to ZERO (not
-  proportionally) one session past capacity. Trading the larger lever for the smaller one
-  would be a regression that decode-only benchmarking cannot see.
-- **MiniMax-M2.7 is unmeasured at a raised ceiling** (different geometry: 62 layers, 256
-  experts, 8.88 MB each).
-- **Dense is unaffected** — it uses `LayerRAMCache`, a different, pageable cache.
-
-## Next step
-
-Do NOT replace one literal with a bigger literal. Derive the ceiling from available RAM
-minus a stated reserve — the same shape as `ram_cache.RAM_CACHE_RESERVE`, which replaced
-`available - 8 GB` with a reproducible total-derived budget. Then measure **TTFT and decode
-together at real context** with the prefix pool active, on both MoE geometries, and pick the
-split from data.
-
-## Method notes paid for by this row
-
-- **A simulator is worth its cost even when its numbers are wrong.** `vaayu/expert_sim.py`
-  replays a captured access trace at any capacity. Its curve never saturated on either model,
-  which is what justified the on-device ceiling experiment — and the experiment then measured
-  +40 % directly, with no simulator in the loop. But it under-predicts at the one checkable
-  point (31.9 % against a live 43.9 % at Qwen's own budget) and the obvious explanation —
-  that it does not model the engine's eviction pinning — was implemented and **rejected**: the
-  corrected run was byte-identical. **The anchor gap is still unexplained; do not quote the
-  simulator's absolute numbers.**
-- **Four predictions falsified by measurement in one session**: "MiniMax will not thrash"
-  (it thrashes at 6.6 %), "hit rate tracks cache share" (true on MiniMax, false on Qwen by
-  7×), "MiniMax's curve will be shallow" (it reaches 39 % at 28 GB), "eviction pinning
-  explains the anchor gap" (it does not). Every one came from reasoning about derived
-  quantities instead of measuring. `working_set_bytes` was the root of the first: it counts
-  ONE decode step's experts, while the union across steps is the whole ~142 GB population.
-
-## Original premise, kept for the record
-
-Both MoE targets are disk-bound on expert reads. Decode-only, 64 tokens:
-
-| model | NVMe reads/tok | GB/tok | decode | disk share |
-|---|---|---|---|---|
-| Qwen3-235B | 422 | 4.99 GB | 0.820 tok/s | ~74 % |
-| MiniMax-M2.7 | 295 | 2.62 GB | 1.501 tok/s | ~72 % |
-
-| model | cache share | hit rate | random baseline (`top_k²/n_experts`) | router |
-|---|---|---|---|---|
-| Qwen3-235B | 6.4 % | **44 %** | 6.25 % | sticky, 7.0× baseline |
-| MiniMax-M2.7 | 6.5 % | **6.6 %** | 3.1 % | near-random, 2.1× baseline |
-
-Simulator curves (magnitudes CONSERVATIVE — see the anchor gap above; shape is the finding):
-
-| budget | Qwen hit | Qwen NVMe GB/tok | MiniMax hit | MiniMax NVMe GB/tok |
-|---|---|---|---|---|
-| 9.12 GB | 31.9 % | 6.06 | 4.0 % | 2.70 |
-| 16 GB | 53.1 % | 4.18 | 20.3 % | 2.24 |
-| 28 GB | 67.6 % | 2.88 | 39.4 % | 1.70 |
-| ∞ | 86.2 % | 1.23 | 66.1 % | 0.95 |
-
-Traces persisted at `/tmp/l2curve-*-trace.json`; re-sweeping a different policy costs no GPU.
-
----
-
-# 14-OLD · superseded — Pageable L2 expert cache
-
-Opened 2026-08-16 after measuring the expert RAM cache under real decode on both MoE targets.
-Probe: decode-only counters (reset after prefill), 64 tokens, one subprocess per model.
-
-**The bottleneck, quantified.** Both models are disk-bound on expert reads:
-
-| model | NVMe expert reads/tok | GB/tok | decode | disk share of decode |
-|---|---|---|---|---|
-| Qwen3-235B | 422 | **4.99 GB** | 0.820 tok/s | ~74 % |
-| MiniMax-M2.7 | 295 | **2.62 GB** | 1.501 tok/s | ~72 % |
-
-**The two models are in DIFFERENT regimes, and that is the whole finding:**
-
-| model | RAM cache share of expert population | measured hit rate | locality |
-|---|---|---|---|
-| MiniMax-M2.7 | 1027 / 15872 = 6.5 % | **6.6 %** (1342hit/18912miss/17920evict) | **none** — rate == share |
-| Qwen3-235B | 770 / 12032 = 6.4 % | **44 %** (21105hit/27023miss/26271evict) | **strong** — 6.9x its share |
-
-Same 9.12 GB budget, same top_k=8, near-identical share. Qwen has 128 experts/layer against
-MiniMax's 256, so MiniMax's routing spreads over twice the population and consecutive tokens
-rarely reuse an expert.
-
-**Proposal:** a second, PAGEABLE expert cache tier behind the pinned one, using the ~20 GB of
-pageable RAM the MoE path currently leaves idle. Pageable RAM needs a staging bounce (no DMA)
-but is still several times faster than 5.5 GB/s NVMe.
-
-**Projected (a MODEL, not a measurement — see the stop rule):** Qwen 0.82 -> ~1.3-1.6 tok/s if
-+16 GB pageable lifts its hit rate to 60-70 %; MiniMax ~+4 %, because its rate tracks share.
-
-**Stop rule / how this row can end in refutation.** Two predictions were already made and
-falsified while opening this row: (1) "MiniMax will not thrash, its 4.40 GB working set fits the
-9.1 GB cache" — it thrashes at 6.6 %, because `working_set_bytes` is ONE step's experts while the
-union across steps is the whole 141 GB population; (2) "hit rate tracks cache share" — true on
-MiniMax, false on Qwen by 7x. **Build the smallest prototype that can measure Qwen's hit rate at
-a larger RAM population, and kill the row if the curve saturates.** Do NOT re-scope toward a win.
-
-**Also settled by this probe:** the `_EXPERT_CACHE_OOM_CEILING = 8.5 GiB` is a PINNED-memory
-limit (page-locked, unswappable, allocator rounds to the next power of two -- see
-`expert_cache.py:21`, a 9.13 GB arena charged 16 GiB). It is NOT a statement about how much RAM
-the box has. That is why the dense pageable layer cache can be 16.2 GB while the MoE pinned one
-caps at 9.1 GB.
-
----
-
 # BUGS-2026-08-23 · [bug] open bugs from the server-work code review
 
-Found reviewing `1a938b7..b124320` (the six server commits: config module, token
-generation logic, exclusive GPU, thinking switch, session ids + logs). Suite was
-green throughout — **1191 passed, 3 skipped** — so none of these are caught by
-`tests/`. Sequence to fix them: the **FIX SEQUENCE** table at the top of this file.
-
-### B1 · [x] FIXED 2026-08-23 — a fresh split deleted source shards it had not finished replacing
-`vaayu/utils.py`, `split_and_save_layers`. **The flag itself was never the bug**,
-and it stays `True` (`config.py`): a server holds one checkpoint for its whole
-life, so 39-66 GB of duplicate is pure waste. Two paths reached a deletion and
-only ONE was verified.
-
-- **Already-split path** (`utils.py:311-323`) — gated on `all(found_layers.values())`,
-  i.e. every expected layer has both its `.safetensors` and its `.done` marker,
-  then `delete_original_shards()`. Correct, and this is what the startup banner
-  and the docstring described.
-- **Fresh-split path** — deleted source shard N-1 the moment the write loop
-  advanced to shard N, with the rest of the split still unwritten, and
-  `utils.py:328` read `if not delete_original: check_space(...)`, so the
-  free-space pre-flight was skipped in exactly this mode. Crash / Ctrl-C / ENOSPC
-  at shard 5 of 9 left shards 1-4 deleted AND the split unusable; the next boot
-  hits `some layer splits found, some are not` and re-splits from sources that
-  are gone. `remove_real_and_linked_file` follows symlinks, so an HF-cache blob
-  went with them. Recovery is a 39-66 GB re-download. It also never reclaimed
-  the LAST shard — nothing advances past it — so the flag under-delivered even
-  on the happy path.
-
-**Fix:** the in-loop deletion is gone; `check_space` now runs in both modes; a
-fresh split falls through to one `delete_original_shards()` call at the end,
-gated on the same per-layer `.safetensors` + `.done` check the already-split path
-uses, and an incomplete split prints a WARNING and keeps the originals. The
-single-file special case at the end of the function is subsumed (the index names
-the source file for every weight either way), so `single_modelfile` went with it.
-
-**Verified:** `tests/test_delete_original.py` +5 tests (crash mid-split keeps
-both shards; unverified-but-silent split keeps both; a verified split reclaims
-every shard INCLUDING the last; flag off keeps both; `check_space` runs with the
-flag on). All 5 fail on `b124320`, pass after. Full suite **1191 -> 1196 passed,
-3 skipped**. Deleted-symlink risk is unchanged and still documented in
-`config.py` — it is inherent to reclaiming the shards at all.
+Found reviewing `1a938b7..b124320` (the six server commits: config module, token generation logic,
+exclusive GPU, thinking switch, session ids + logs). The suite was **green throughout** — 1191
+passed, 3 skipped — so **none of these is caught by `tests/`**. Order to fix them: the **FIX
+SEQUENCE** table at the top of this file. B1 from this review is fixed (2026-08-23) and archived.
 
 ### B2 · [bug] stream token count is a re-tokenization, so a TRUNCATED answer reports `finish_reason="stop"`
 `vaayu/server/engine.py:373` — `produced = len(tokenizer(full, add_special_tokens=False)["input_ids"])`.
@@ -487,7 +194,7 @@ not reproduce the generated id count (EOS is gone; merges differ across a decode
 boundary). Both `usage.completion_tokens` and `finish_reason` (line 382,
 `hit_eos=produced < cap`) are derived from it. A stream that ran to exactly `cap`
 but whose retokenization yields `cap-1` is reported **`"stop"`** — the client is
-told its cut-off code is complete. That is precisely the failure row 13 was
+told its cut-off code is complete. That is precisely the failure the server row was
 opened to fix, reintroduced on the streaming path, which is now the DEFAULT
 (`DEFAULT_STREAM = True`).
 **Done means:** count real generated ids (from the streamer / generate output),
@@ -601,65 +308,113 @@ fails against a default install.
 
 ---
 
-## OPTIONAL — real work, no slot. Never ahead of the sequence.
+
+# PERF — the Rust / token-generation rows (R1–R4, P1, M1)
+
+**The full argument, arithmetic and probes are in `speed-up-vaayu.md` at the repo root, which is
+self-contained.** What follows is one paragraph per row so this file stays usable on its own, plus
+the section of that document to open.
+
+**The one number the whole thing turns on.** Decode-only counters, 64 tokens, measured on-device:
+Qwen3-235B reads 4.99 GB/tok at 0.820 tok/s = **4.09 GB/s**; MiniMax-M2.7 reads 2.62 GB/tok at
+1.501 tok/s = **3.93 GB/s**. The box's NVMe does **~5.5 GB/s** (hardware constant). So the disk path
+costs 72–74 % of the token while running at 71–74 % of the drive's rate. Closing that gap is worth
+Qwen 0.820 → ~1.10 tok/s and MiniMax 1.501 → ~2.05 tok/s — **ceilings, not predictions.**
+
+### R1 · [ ] Strip the hot-path `eprintln!` from `persistent_read` — do this first
+`vaayu_rust/src/lib.rs:322,392`. Two unconditional lines per read, on the decode hot path: at
+Qwen's 422 reads/token that is ~850 unbuffered `write(2)` syscalls per token, each taking the
+stderr lock the I/O threads contend on. It is why the logs run 300 MB – 1.3 GB and must be
+`grep -a`'d, never `cat`'d. **The server made it worse:** `vaayu/server/logs.py` now redirects fd 2
+into a pipe read by a Python pump thread that takes the GIL for every chunk it tees.
+**Fix:** gate both behind a once-resolved `VAAYU_RUST_TRACE` or the `log` crate at `trace`.
+**Expected:** ~0.5–1 % on its own — but **a prerequisite for R2, R3 and M1**, because a path that
+logs twice per read cannot be honestly profiled. **Refuted if:** removing it moves neither tok/s
+nor achieved bandwidth. Keep the change anyway; the log volume alone justifies it.
+→ `speed-up-vaayu.md` §2 R1.
+
+### P1 · [ ] Free Python wins, to land in the SAME arm as R1
+Cheaper than every Rust item; measure them together so Rust is not later credited with them.
+(1) `gc.freeze()` after load — one line, drops the permanent module tree and cache view graph out
+of every gen-2 traversal. (2) Precompute the expert-tensor role table at load:
+`_group_exl3_tensors_by_weight` / `_classify_expert_tensors` (`vaayu/moe_patch.py`) run
+`_EXPERT_WEIGHT_ROLES` pattern matching per expert, per layer, **per token**, for a mapping fixed
+when the checkpoint is opened. (3) `EngineHandle.tool_format` is a property that re-scans the whole
+chat template on every access, touched 2–3× per request — compute it once in `__init__`.
+(4) Killing B2's re-tokenization also deletes a full tokenizer pass per request.
+→ `speed-up-vaayu.md` §3.
+
+### M1 · [ ] THE GATING MEASUREMENT — run before writing any Rust
+One arm, decode-only (reset counters after prefill), 64 tokens, per model, each under its own
+`systemd-run --user --scope -p MemoryMax=27G -p MemorySwapMax=0`. Four numbers:
+**(1) achieved read bandwidth** = NVMe bytes read during decode ÷ decode wall, against ~5.5 GB/s —
+**this single number decides R2 and R3**; **(2) GC fraction** from `gc.callbacks` accumulated
+seconds ÷ decode wall — if under 2 %, the GC hypothesis closes; **(3) GIL sensitivity** = tok/s at
+`sys.setswitchinterval(0.0005)` vs `0.02`, which is what tells GC and GIL apart; **(4) ring idle
+fraction** with R1's trace deliberately re-enabled for this one arm.
+**Constraint, already paid for:** never attach py-spy — ptrace-based profilers corrupt
+`vaayu_rust`'s io_uring state (`MEMORY.md`). In-process instrumentation only.
+**Write the verdict back into the row it settles, including a refutation.**
+→ `speed-up-vaayu.md` §1 and §5.
+
+### R2 · [ ] `io_uring_read_many` — one submission per LAYER, not per expert group
+**The flagship item, aimed squarely at the 4.09-vs-5.5 GB/s gap.** Today one contiguous tensor
+group = one blocking `io_uring_read_into` from a `ThreadPoolExecutor` worker
+(`_dispatch_expert_misses` in `vaayu/moe_patch.py`; `load_expert_into_slab` / `load_expert_sparse`
+in `vaayu/persist/safetensor_model_persister.py`), each holding one ring's mutex across its own
+`submit_and_wait`. **Between a worker's completion and its next submission the ring goes idle**, and
+that window is a Python future resolving, a buffer-pool get/put, LRU bookkeeping and a GIL
+acquisition — ~422 such windows per token.
+**Proposal:** `read_many(Vec<(fd_or_path, offset, len, buf_ptr)>)` pushing a whole layer's misses
+onto one ring and waiting for all CQEs inside one `allow_threads`. Python drops from ~422
+dispatches/token to **~94, one per layer**. **Effort:** moderate — the submission loop exists; it
+becomes a loop over descriptors instead of over chunks of one descriptor.
+**Refuted if:** M1 shows decode already at ~5.4 GB/s, or a prototype's achieved bandwidth does not
+move. **Close the row on that result; do not re-scope.**
+**Watch for:** the SQ is sized at `queue_depth` (32) and a layer's descriptor list can exceed it —
+submit in SQ-sized waves inside the one call, and **fix B6 first** (the `SQ full` early-return leak).
+→ `speed-up-vaayu.md` §2 R2.
+
+### R3 · [ ] Move the expert-cache miss path into Rust ("get-or-read"), GIL-free
+`ExpertRAMCache.get` / `acquire_slab` / `put_slab` / `_evict_global_oldest`
+(`vaayu/persist/expert_cache.py`) are Python `OrderedDict` LRU operations run **~750× per token**
+(94 layers × 8 experts), each holding the GIL while the forward loop wants it. Fold lookup + slab
+acquisition + read + admission into one GIL-free Rust entry point — the `SlabArena` is already one
+pinned allocation with integer slab indices, so Rust needs only the base pointer, the slab stride
+and the LRU state, none of which must be a Python object.
+**Effort:** high, and it touches the eviction policy that was tuned against measured hit rates.
+**Do it ONLY if M1's GIL probe shows real contention.** **Composes with R2:** together they turn
+"422 Python dispatches + 750 LRU operations" into "94 Rust calls".
+**Refuted if:** switch-interval changes do not move the token rate.
+→ `speed-up-vaayu.md` §2 R3.
+
+### R4 · [ ] Prefill repack memcpys into Rust — low priority
+`load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
+`dst_slice.copy_(chunk)` in Python, and `gpu_repack_aligned` does the same into a fresh buffer. This
+is the **prefill stager's** path, not decode's — decode's miss path is already zero-copy straight
+into the slab. A Rust `memcpy` under `allow_threads` lets the repack overlap the H2D stream instead
+of serialising against it. **TTFT lever only**, and prefix caching already took 136–377× off TTFT,
+so it only bites on a cold turn. **Effort:** low-moderate. **Priority:** low, for that reason.
+→ `speed-up-vaayu.md` §2 R4.
+
+### Already Rust, or beyond Rust's reach — do not re-open
+HF `tokenizers` is already Rust. Sampling / top-k / top-p are GPU tensors (Rust would add a D2H
+round trip). EXL3 matmuls, the router GEMM and attention are CUDA kernels. Streamed dense already
+reads at ~5.7 GB/s, i.e. at the wall — **Rust has nothing to offer it**; its lever is speculative
+decoding, already built and measured at 5.57× (see CARRIED FORWARD). `safetensors` header parse and
+offset-index build are load-time, once. → `speed-up-vaayu.md` §2 R5 and §4.
+
+---
+
+# OPTIONAL — real work, no slot. Never ahead of the FIX SEQUENCE.
 
 | # | Item | Status | Cost | Why optional |
 |---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
-| **6a** | The intercept residual row 6 could not explain | `[ ]` | GPU round | Opened 2026-08-15 out of row 6. One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
-| **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. |
+| **6a** | The intercept residual the VRAM calibration could not explain | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
+| **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
----
-
-> ### ▶▶ NEXT ACTION (fresh session): work the **FIX SEQUENCE** at the top of this file
-> **Superseded 2026-08-23.** A code review of the six server commits opened 13 bugs
-> (`# BUGS-2026-08-23` below) and a Rust plan (`speed-up-vaayu.md`).
-> **B1 is fixed (2026-08-23); start at B2.** Suite baseline is now 1196 passed, 3 skipped.
-> The note below is the pre-review state, kept for its method lessons.
->
-> ### (superseded) nothing scheduled — pick from OPTIONAL
-> **Row 13 shipped 2026-08-16.** Vaayu now runs as an OpenAI-compatible server:
-> `./venv/bin/python -m vaayu.server --model PATH --port 8000`. Suite 1006/3, dense smoke 8.78,
-> on-device server gate ALL PASS on the 1B and on MiniMax EXL3.
->
-> **The live follow-ups it created are listed in row 13's "Standing limitations" below** — the
-> resident-coder checkpoint (nothing of that size is on disk), the reserve-vs-resident-model
-> interaction, and the fp16 prefix-cache gap (OPTIONAL row 3) which now has a real consumer.
-> Read the design before touching anything — it records WHY the shape is what it is (measured
-> ceiling ~0.86 tok/s at 8192 context, single stream; resident-model default; queue not batch).
->
-> **The previous sequence closed 2026-08-15/16** (rows 1, 6, 7, 8, 9, 10, 11, 12), and the
-> three bugs those rows uncovered — **11a** (warm-cache admission), **12a** (drafter VRAM
-> unbudgeted), **12b** (no drafter/target vocab check) — are all fixed and verified on-device.
->
-> **The one banked, unshipped win: speculative decoding on streamed dense.** Row 12 measured
-> **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output) with the
-> Llama-3.2-1B drafter, which shares its tokenizer. It is opt-in via `drafter_model_path` and not
-> enabled by default, because CLAUDE.md §0 defers streamed-dense perf. **When dense work starts,
-> this is the first lever and it already exists.** MoE speculation stays refuted: the Fix #9 gate
-> admits `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible drafter
-> on this box.
->
-> OPTIONAL rows are all that remain: **6a** (the intercept residual — open-ended GPU work that may
-> end in refutation), **2** (10-minute linter check), **3** (fp16 prefix-cache gap, no on-device
-> target needs it), **4** (parked), **5** (deferred write-ups, each needing a new premise).
->
-> **Four method lessons from 2026-08-16, each paid for with a real run:**
-> - **A limit verified cold is not verified.** Row 9 passed 4/4 at the derived limits; row 11 found
->   those same limits refused in practice, because row 9's arms were cold single-shot runs.
-> - **A gate that cannot fail is not a gate.** 11a's arm ships a `control` mode that forces the fix
->   off and REFUSES where the fixed arm passes, at identical VRAM state.
-> - **Read the FIRST error, not the last.** `CUBLAS_STATUS_INTERNAL_ERROR` was recorded as VRAM
->   exhaustion for a day; it was a poisoned context downstream of a device-side index assert.
-> - **A requirement stated only in a docstring is not enforced.** `StandardDrafterDecoder` said
->   "must share the same tokenizer" — and crashed inside a CUDA kernel when nothing checked it.
-
----
-
-## ── CLOSED-ROW DETAIL and OPTIONAL sections ──
-
-## ── OPTIONAL sections ──
 
 # 2 · [ ] Static check for unbound locals / import order
 
@@ -676,9 +431,9 @@ touching `__init__`").
 
 ---
 
-# 6a · [ ] The intercept residual row 6 could not explain
+# 6a · [ ] The intercept residual the VRAM calibration could not explain
 
-Opened 2026-08-15 out of row 6, with the data already in hand
+Opened 2026-08-15 out of the kernel-aware-calibration row (archived; `plans/settled_and_method_notes.md`), with the data already in hand
 (`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md` §7).
 
 **One intercept rule cannot be right for both forwards.** `transient − KV(capacity)`, flash arm:
@@ -697,7 +452,7 @@ and on sdpa the score term and the intercept are summed although they do not ful
 (charging `max()` instead was tested and is worse in the DANGEROUS direction: −38 % on Qwen at
 S=4096).
 
-**The decisive experiment**, already named in row 6's old brief: hold S fixed at one KV-capacity
+**The decisive experiment**, already named in that row's old brief: hold S fixed at one KV-capacity
 plateau and vary only trailing-chunk length, plus per-chunk allocation instrumentation to find
 which chunk sets the peak in the module-list forward. GPU round, own row.
 
@@ -767,225 +522,3 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-## ── CLOSED, kept because 11 leans on them ──
-
-# 12b · [x] FIXED 2026-08-16 — drafter/target vocabulary mismatch is now refused at build time
-
-`build_speculator` paired ANY drafter with ANY target. Llama-3.2-1B's embedding has **128256** rows;
-MiniMax-M2.7 (`vocab=200064`) emits ids up to **131282** for ordinary code, so the drafter's
-embedding gathered out of bounds — `vectorized_gather_kernel: Assertion 'ind >= 0 && ind <
-ind_dim_size' failed`, surfacing as `CUBLAS_STATUS_INTERNAL_ERROR` from the poisoned context.
-**Data-dependent**, which is how it survived a whole measurement round: a 3-line prompt (max id
-109716) ran, a 4-line one (131282) crashed.
-
-Fix: `drafter_vocab_compatible` (pure) + a config-only vocab read, checked BEFORE any weights load,
-so a refusal costs nothing. **Equality, not `drafter >= target`** — a larger drafter vocab is the
-same crash with the models swapped. Unknown sizes pass (D3: the guard must not become the failure).
-
-**Verified:** 892 passed / 3 skipped (+5); on-device, MiniMax + the 1B drafter on the exact prompt
-that crashed now prints the warning, sets `speculator=None` and completes plainly (20 tokens,
-38.4 s), while dense Llama-3.3-70B keeps its speculative path (20 tokens, 32.1 s). Bonus: MiniMax's
-expert VRAM cache returns to **10.6 GB** (from 8.1), because the drafter is never loaded for a
-pairing that was going to be rejected.
-
----
-
-# 12a · [x] FIXED 2026-08-16 — the drafter's VRAM is now inside the expert cache's budget
-
-`expert_vram_budget_for` sized the expert VRAM cache from `mem_get_info() − reserve` ~145 lines
-BEFORE `build_speculator` loaded the drafter, so the drafter's 2.47 GB was in nobody's budget. Fix:
-the drafter is built above the MoE section (its cost is then measured by the cache's own
-`mem_get_info`, with no size estimate anywhere), and the self-guarded Fix #9 gate moved inside that
-section — after the RAM cache it needs, before the VRAM cache is sized — freeing the drafter and
-calling `empty_cache()` when it disables speculation, so those bytes return to the DRIVER rather
-than sitting invisible in PyTorch's pool.
-
-**Measured, on-device:** MiniMax's expert cache 10.5 → **8.1 GB** (the drafter now accounted for),
-Qwen's **10.6 GB** unchanged after the gate drops the drafter (the `empty_cache` path works), dense
-Llama-3.3-70B still runs its speculative path (20 tokens, 33.5 s). Suite 887 passed / 3 skipped.
-
-**What this fix does NOT do:** MiniMax at `draft_tokens=1` still fails — for an unrelated reason
-(row 12b, vocabulary mismatch) that was misattributed to VRAM exhaustion when row 12 stage 1 ran.
-
----
-
-# 11a · [x] FIXED 2026-08-16 — warm-cache admission refused contexts the plan advertises
-
-`torch.cuda.mem_get_info()` is a DRIVER-level call and cannot see the blocks PyTorch's caching
-allocator holds reserved-but-unallocated — blocks reusable by the very prefill being admitted. On
-Qwen turn 2: driver free 4.09 GiB, **1.57 GiB sitting in that pool**, request needing 4.88 REFUSED
-at an advertised `max_seq_len=8192`. Fix: `admission_headroom` takes `reusable_pool` and adds it
-before the reserve clamp; `_too_big_message` now names the ceiling solved against the budget it
-actually refused on, instead of the load-time `s_max` (which is why it read "does not fit in
-4.26 GiB … largest that fits is max_seq_len=23415").
-
-**Verified:** 887 passed / 3 skipped (+7); dense smoke PASS, ppl 8.78; and a three-turn warm
-on-device arm with a `control` mode that forces the fix off — Qwen control REFUSES on turn 2 where
-fixed passes turns 2 and 3 at identical VRAM state. MiniMax does not exhibit it on this box (its
-4.79 GiB reserve stays under its 7.86 GiB warm free VRAM); **11a needs reserve > warm free VRAM**,
-which row 8's raised floors made likelier. Full writeup:
-`plans/2026-08-16-row11a-warm-admission-RESULTS.md`.
-
----
-
-# 11 · [x] CLOSED 2026-08-16 — REFUTED: smaller `prefill_chunk_size` costs TTFT and buys nothing
-
-Measured both forwards, S=6000, sdpa, warm-up discarded.
-Full writeup: `plans/2026-08-16-row11-prefill-chunk-RESULTS.md`.
-
-| geometry | chunk 512 | 256 | 128 |
-|---|---|---|---|
-| Qwen3-235B TTFT | **61.5 s** | 65.6 s (+6.7 %) | 76.7 s (**+24.7 %**) |
-| Qwen3-235B decode | 0.562 tok/s | 0.560 | 0.572 (+1.8 %) |
-| Llama-3.3-70B TTFT | **97.8 s** | 168.4 s (+72 %) | 306.5 s (**+213 %**) |
-| Llama-3.3-70B decode | 0.166 tok/s | 0.164 | 0.160 (−3.6 %) |
-
-**Row 8 had already taken the context prize** — every EXL3 geometry derives 8192 at every chunk — so
-what smaller chunks buy is 2.0–2.2 GiB of reserve handed to pinning and the expert cache, and that
-**buys nothing measurable** (decode +1.8 % / −3.6 %, matching Audit F8 and Plan K). Keep
-`prefill_chunk_size=512`; not a per-forward default either, since even the favourable MoE arm pays
-24.7 % for +1.8 %.
-
-**Outlived the row:** lowering the reserve does NOT lower peak VRAM — Qwen's peak moved 12.87 →
-12.99 GiB while its reserve fell 5.60 → 3.56 GiB, because the expert cache expands into whatever the
-reserve leaves. Ownership changes, spend does not.
-
----
-
-# 9 · [x] CLOSED 2026-08-16 — sdpa-derived `max_seq_len` verified on-device, 4/4
-
-**No code change was needed — the form held.** `plan_vram` already re-derives at every load, so the
-work was the on-device arm at each limit. All four ran a real prefill+decode at exactly their own
-derived `max_seq_len` under forced sdpa, one subprocess each:
-
-| geometry | `max_seq_len` | reserve | pinning | peak alloc | peak reserved | wall |
-|---|---|---|---|---|---|---|
-| Llama-3.2-1B | **71981** | 14.90 GiB | 0.00 GiB | 13.93 GiB | 14.83 GiB (0.64 spare) | 264 s |
-| Qwen3-235B | **8192** | 5.60 GiB | 7.96 GiB | 10.82 GiB | 11.43 GiB | 89 s |
-| MiniMax-M2.7 | **8192** | 4.79 GiB | 8.08 GiB | 11.50 GiB | 11.81 GiB | 287 s |
-| Llama-3.3-70B | **8192** | 6.20 GiB | 8.31 GiB | 8.73 GiB | 9.09 GiB | 157 s |
-
-The three EXL3 geometries recovered their full shipped 8192 (they derived 4074 / 4096 / 3821 under
-sdpa before row 8's floor). The 1B — no expert cache, so the only clean reserve-vs-peak comparison —
-was **over-predicted by ~1.0 GiB, the safe direction**. Full writeup:
-`plans/2026-08-16-row9-sdpa-limits-RESULTS.md`.
-
----
-
-# 12 · [x] CLOSED 2026-08-16 — speculative decoding measured: MoE refuted, dense 5.57×
-
-Ran, both stages. **`plans/2026-08-16-row12-speculative-decoding-RESULTS.md`.**
-
-- **MoE — refuted, by design not by crash.** `spec_decode_fits` disables speculation at load on
-  both targets: Qwen3-235B needs **53.4 GB** of expert working set for a 6-position verify pass,
-  MiniMax-M2.7 **26.4 GB**, against a 9.1 GB budget. Solved for the largest admissible width:
-  **`draft_tokens ≤ 0` (Qwen), `≤ 1` (MiniMax)**. `use_prompt_lookup` is refused by the same gate —
-  correctly, it widens the verify pass even with no drafter. EAGLE-3 would NOT lift this wall.
-- **Dense — a real 5.57× win, quality-free.** Llama-3.3-70B + the 1B drafter, 100 decode tokens,
-  code-shaped prompt: `generate()` 0.155 → `speculative_generate()` **0.864 tok/s**, 5.30 of 6
-  tokens per round, **86 % of drafted tokens accepted**, output byte-identical to the plain arm.
-  Prompt lookup managed 0.301 tok/s (1.94×). The win is a property of weight-streaming decode —
-  ~37 GB read once, settled over 6 positions — so it does not transfer to MoE.
-- **Not enabled:** `drafter_model_path` is opt-in and dense perf is deferred (CLAUDE.md §0). Row 12a
-  blocks enabling it by default.
-
----
-
-# 8 · [x] CLOSED 2026-08-16 — budget policy: reserve floor is now kernel-conditional and DERIVED
-
-**Choice made, with the numbers beside it** (that is what this row's "done" meant). Grow the
-reserve — but only on kernels that materialize scores, and by a derived amount, never a literal.
-`reserve_floor_bytes` (`vaayu/vram_plan.py`), called from `vaayu_base.__init__` before `plan_vram`:
-gated on `shape.score_elem_bytes > 0` (so `eager`/unmeasured kernels raise too, per row 7's rule),
-raised to *flash parity* — the floor that derives the context flash would have derived at the
-3.5 GiB base — clamped only by `free − min_resident − layer_slack`.
-
-| geometry | flash floor / S | sdpa floor / S | cost to pinning + expert cache |
-|---|---|---|---|
-| Qwen3-235B | 3.50 / 8192 | 5.60 / **8192** | −2.10 GiB |
-| MiniMax-M2.7 | 3.50 / 8192 | 4.79 / **8192** | −1.29 GiB |
-| Llama-3.3-70B | 3.50 / 8192 | 6.20 / **8192** (was 3821) | −2.70 GiB |
-| Llama-3.2-1B | 3.50 / 90639 | clamped 13.60 / 66074 (was 14052) | pinning → 0 |
-
-A flat 6.25 GiB literal was rejected as a model number in disguise (§5). The 1B's clamp costs a
-**measured −19 % decode** (6.38 → 5.19 tok/s) for 4.7× context, accepted deliberately; the bounded
-alternative (6.50 tok/s, 53755 tokens) is written down in the archive as the way back. **Row 12
-must carry that:** the 1B is its drafter.
-
-Verified: full suite **880 passed / 3 skipped** (+15, all row 8's); dense smoke gate **PASS**,
-perplexity 8.78 unchanged, 70B real load printing the 6.20 GiB floor; 1B real loads on both kernels.
-Full writeup: `plans/settled_and_method_notes.md` ("Budget policy: reserve vs expert cache").
-
----
-
-# 1 · [x] CLOSED — `predict_peak_vram` calibrated against a peak that was never the peak
-
-Re-probed 2026-08-15 with the reset removed. Full writeup moved to
-`plans/settled_and_method_notes.md` ("VRAM peak measurement (todo row 1) — CLOSED 2026-08-15");
-data and verdict in `plans/2026-08-15-vram-peak-RESULTS.md`. Phase 2 continues as items 6-9
-below (item 10, the attention-kernel question, closed 2026-08-15) — do not re-open this row itself.
-
----
-
-# 6 · [x] CLOSED — Phase 2, `MEASURED` re-pointed and the form corrected (with row 7)
-
-Done 2026-08-15, **together with row 7** — measured, not assumed: re-pointing `MEASURED` at sdpa
-data alone leaves the form under-predicting by 20–82 %, so the gate cannot pass for row 6 without
-row 7's kernel-gated score term in the same edit.
-
-Full writeup: `plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md`. What shipped:
-
-- `MEASURED` keyed by kernel first (`{impl: {model: [...]}}`), flash = the honest whole-prefill data
-  from `plans/2026-08-15-vram-peak-RESULTS.md` §3 (STALE last-chunk caveat gone), sdpa = fresh arms
-  on **explicit** S lists. Excluded points live in `NOISY_FIRST_POINTS` with a reason and are
-  printed, never silently dropped.
-- `MATERIALIZES_SCORES` bool → `SCORE_ELEM_BYTES` per-kernel dict + `score_elem_bytes(impl)`;
-  `VramShape.materializes_scores` → `score_elem_bytes: float`; call site reads
-  `model._active_attn_impl`. sdpa = 10.9 B/elem, the mean of four per-geometry paired slope
-  estimates (10.35 / 10.52 / 11.33 / 11.42) — fitted from measurement, NOT tuned to the gate.
-- **Intercept corrected, which was not in the brief:** the trailing-chunk sawtooth was an artefact
-  of last-chunk-only peaks. `_peak_intercept_bytes` now charges `head_bytes + min(S, chunk)·vocab·4`,
-  `head_bytes` being a file stat on the checkpoint's head shard (embedding shard when
-  `tie_word_embeddings`). This took Llama-3.2-1B flash from −12…−97 % to −2.2…+0.3 % at S ≥ 4096.
-  `_trailing_chunk_tokens` and its tests are gone with it; `predict_peak_vram` is now monotone, and
-  `solve_max_seq_len`'s exhaustive check was KEPT (redundant, not wrong — the sawtooth already came
-  and went once).
-
-**Two method lessons worth the cost of learning them:**
-
-- **Never derive a probe's sweep grid from the quantity being calibrated.** The first sdpa arms used
-  `sweep_points`, whose ceiling comes from `model.max_seq_len` — which `predict_peak_vram` decides.
-  Changing the form moved the grid. Caught mid-run, arms discarded, relaunched with explicit lists.
-- **A residual with structure is a form error, not noise.** Llama-3.2-1B's transient at S=4096 and
-  S=4097 is byte-identical, and `transient − KV` is flat at 0.7922 G across five S values spanning
-  26× — which decomposes exactly as tied fp16 head (0.5253) + full-chunk fp32 logits (0.2627).
-
-**Gate: still FAILS, 44/77 outside ±10 %, and that is left visible on purpose.** Every failure but
-two (−2.2 %, −0.5 %) is over-prediction, the safe direction. What remains is row 6a.
-
----
-
-# 7 · [x] CLOSED — `MATERIALIZES_SCORES` is now kernel-aware
-
-Shipped inside row 6's change; see above and the RESULTS file. `SCORE_ELEM_BYTES` in
-`vaayu/vram_plan.py`. Unmeasured kernels (`eager`, BetterTransformer, `None`) take the LARGEST
-measured coefficient rather than 0 — `eager` materializes scores by construction, and
-under-reserving is the dangerous direction.
-
----
-
-# 10 · [x] CLOSED — Calibration data was `flash_attention_2`; the batched-decode path requires `sdpa`
-
-Paired flash-vs-sdpa sweeps run on all four geometries (1B out to S=98304). **Verdict: sdpa,
-kernel-aware — calibrate `MEASURED` against sdpa, make `MATERIALIZES_SCORES` gate on
-`model._active_attn_impl` rather than being one global value.** The flash-vs-sdpa ratio grows with
-S on every geometry (1B reaches 3.774× at S=32768, matching the ~3.7× the "gap explains the
-pre-fix 6.2×/2.2× slopes" hypothesis needed), sdpa's own slopes reproduce those pre-fix
-hand-measured figures almost exactly (1B 0.2028 vs 0.2027 MB/tok; 70B 0.6984 vs 0.7149 MB/tok), and
-the flash-to-sdpa slope gap implies a per-element byte cost clustered 10.4–11.4 bytes across all
-four architecturally-unrelated geometries — consistent with sdpa's masked call materializing an
-`n_heads · chunk · S`-shaped score buffer that `MATERIALIZES_SCORES = False` says does not exist.
-**Full writeup:** `plans/2026-08-15-row10-attention-kernel-RESULTS.md`. Archive entry:
-`plans/settled_and_method_notes.md` ("Attention-kernel calibration question (todo row 10)").
-
----
