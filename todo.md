@@ -12,6 +12,52 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 "done" means, and the stop rule.** The `plans/next_*.md` briefs hold the long-form background
 for the three scheduled rows and are self-contained on their own.
 
+---
+
+# ▶▶ FIX SEQUENCE — opened 2026-08-23 by code review of the server work
+
+**Do these top to bottom.** Ordering rule: destructive-default first, then
+correctness bugs that make the server LIE to an agent, then the concurrency
+bug, then anything perf. Rust work comes LAST and is gated on one measurement.
+Full bug detail: **`# BUGS-2026-08-23`** below. Rust plan:
+**`speed-up-vaayu.md`** at the repo root (self-contained).
+
+Baseline at review time: **1191 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`).
+
+| # | do this | why here | where |
+|---|---|---|---|
+| 1 | **B1** — [x] FIXED 2026-08-23 — a fresh split no longer deletes mid-split; `DELETE_ORIGINAL` stays **True** | the flag is wanted (39-66 GB per checkpoint); what was wrong was WHERE it deleted | `vaayu/utils.py` |
+| 2 | **B2** — stop counting stream tokens by re-tokenizing the decoded text | `finish_reason="stop"` on a TRUNCATED answer is the exact bug row 13 exists to fix; an agent commits broken code | `vaayu/server/engine.py:373,382` |
+| 3 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
+| 4 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
+| 5 | **B5** — cancellation reported as `finish_reason="stop"` | same lie as B2, different trigger | `engine.py:270,382` |
+| 6 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
+| 7 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
+| 8 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
+| 9 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
+| 10 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
+| 11 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
+| 12 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
+| 13 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
+| 14 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
+| 15 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
+| 16 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
+| 17 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 -> ~1.10 tok/s, MiniMax 1.501 -> ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
+| 18 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
+| 19 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136-377x off TTFT | `safetensor_model_persister.py` |
+
+**Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3:
+if decode already achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows
+close** — record the verdict, do not re-scope to find a win. R3 additionally
+requires M1's GIL probe to show real contention. R1 and P1 are worth doing
+regardless of M1's result.
+
+**What Rust cannot do, so nobody re-derives it:** MoE decode is 72-74 %
+disk-bound and the rest is CUDA; streamed dense already reads at ~5.7 GB/s,
+i.e. at the wall. Rewriting the decode loop, replacing PyTorch, or raising the
+ring's `queue_depth` are all dead ends — reasons in `speed-up-vaayu.md` §4.
+
+
 ## Environment (applies to every item)
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
@@ -392,6 +438,169 @@ caps at 9.1 GB.
 
 ---
 
+# BUGS-2026-08-23 · [bug] open bugs from the server-work code review
+
+Found reviewing `1a938b7..b124320` (the six server commits: config module, token
+generation logic, exclusive GPU, thinking switch, session ids + logs). Suite was
+green throughout — **1191 passed, 3 skipped** — so none of these are caught by
+`tests/`. Sequence to fix them: the **FIX SEQUENCE** table at the top of this file.
+
+### B1 · [x] FIXED 2026-08-23 — a fresh split deleted source shards it had not finished replacing
+`vaayu/utils.py`, `split_and_save_layers`. **The flag itself was never the bug**,
+and it stays `True` (`config.py`): a server holds one checkpoint for its whole
+life, so 39-66 GB of duplicate is pure waste. Two paths reached a deletion and
+only ONE was verified.
+
+- **Already-split path** (`utils.py:311-323`) — gated on `all(found_layers.values())`,
+  i.e. every expected layer has both its `.safetensors` and its `.done` marker,
+  then `delete_original_shards()`. Correct, and this is what the startup banner
+  and the docstring described.
+- **Fresh-split path** — deleted source shard N-1 the moment the write loop
+  advanced to shard N, with the rest of the split still unwritten, and
+  `utils.py:328` read `if not delete_original: check_space(...)`, so the
+  free-space pre-flight was skipped in exactly this mode. Crash / Ctrl-C / ENOSPC
+  at shard 5 of 9 left shards 1-4 deleted AND the split unusable; the next boot
+  hits `some layer splits found, some are not` and re-splits from sources that
+  are gone. `remove_real_and_linked_file` follows symlinks, so an HF-cache blob
+  went with them. Recovery is a 39-66 GB re-download. It also never reclaimed
+  the LAST shard — nothing advances past it — so the flag under-delivered even
+  on the happy path.
+
+**Fix:** the in-loop deletion is gone; `check_space` now runs in both modes; a
+fresh split falls through to one `delete_original_shards()` call at the end,
+gated on the same per-layer `.safetensors` + `.done` check the already-split path
+uses, and an incomplete split prints a WARNING and keeps the originals. The
+single-file special case at the end of the function is subsumed (the index names
+the source file for every weight either way), so `single_modelfile` went with it.
+
+**Verified:** `tests/test_delete_original.py` +5 tests (crash mid-split keeps
+both shards; unverified-but-silent split keeps both; a verified split reclaims
+every shard INCLUDING the last; flag off keeps both; `check_space` runs with the
+flag on). All 5 fail on `b124320`, pass after. Full suite **1191 -> 1196 passed,
+3 skipped**. Deleted-symlink risk is unchanged and still documented in
+`config.py` — it is inherent to reclaiming the shards at all.
+
+### B2 · [bug] stream token count is a re-tokenization, so a TRUNCATED answer reports `finish_reason="stop"`
+`vaayu/server/engine.py:373` — `produced = len(tokenizer(full, add_special_tokens=False)["input_ids"])`.
+`full` is text decoded with `skip_special_tokens=True`, so re-tokenizing it does
+not reproduce the generated id count (EOS is gone; merges differ across a decode
+boundary). Both `usage.completion_tokens` and `finish_reason` (line 382,
+`hit_eos=produced < cap`) are derived from it. A stream that ran to exactly `cap`
+but whose retokenization yields `cap-1` is reported **`"stop"`** — the client is
+told its cut-off code is complete. That is precisely the failure row 13 was
+opened to fix, reintroduced on the streaming path, which is now the DEFAULT
+(`DEFAULT_STREAM = True`).
+**Done means:** count real generated ids (from the streamer / generate output),
+not a re-tokenization. Fixing it also deletes a full extra tokenizer pass per request.
+
+### B3 · [bug] short io_uring reads are counted as success — silent weight corruption
+`vaayu_rust/src/lib.rs:377-386`, `persistent_read`. The CQE loop tests only
+`cqe.result() < 0`. A **short read** (`0 <= result < this_len`) is legal — and
+O_DIRECT NVMe reads under memory pressure or at EOF do it — and is counted as a
+completed chunk. The tail of the destination keeps whatever the previous expert
+left in that pinned slab. Result: an expert's weights are partially garbage, the
+forward proceeds, tokens are wrong, and **nothing raises**.
+**Done means:** compare `cqe.result()` against the submitted length for that
+`user_data` and resubmit the remainder (or error loudly).
+
+### B4 · [bug] SSE releases the engine slot before generation actually stops
+`vaayu/server/app.py:454-485`, `_sse`. On client disconnect Starlette closes the
+generator: `GeneratorExit` is a `BaseException`, so the `except Exception` does
+not catch it, `async with engine.slot()`'s `__aexit__` runs **first** (lock
+released, `_inflight` decremented), and only then does the outer
+`finally: cancel.cancel()` run. Meanwhile `stream_generate`'s worker thread is
+still inside `model.generate`. A queued request is admitted immediately and calls
+`model.generate` on an engine whose own docstring says concurrency is 1 by
+construction, sharing the KV cache, the expert VRAM cache and the slab arena.
+**Done means:** cancel and join the worker inside the slot, so the slot outlives
+the generation on every exit path.
+
+### B5 · [bug] cancellation is reported as `finish_reason="stop"`
+`vaayu/server/engine.py:270` (`hit_stop_string=len(new_ids) < cap`) and `:382`
+(`hit_eos=produced < cap`). Both infer "the model chose to stop" from "fewer
+tokens than the cap arrived". A generation halted by `cancel_criteria` — client
+disconnect, SIGTERM, `_teardown` — satisfies that test, so a deliberately
+truncated response is labelled complete. Same lie as B2, different trigger.
+**Done means:** the cancel token's state is consulted; a cancelled run never
+reports `"stop"`.
+
+### B6 · [bug] `SQ full` early-return leaves stale SQEs on a POOLED ring
+`vaayu_rust/src/lib.rs:365`. `push(&entry)` failing returns `Err` immediately,
+leaving every SQE already pushed in this call sitting in the submission queue.
+The ring is not per-call — it is one slot of `RING_POOL`, reused by the next
+caller, whose `submit_and_wait(n)` will submit those orphans. They point at a
+pinned buffer that has since been returned to `_EXPERT_BUF_POOL` and handed to a
+different expert: a DMA write into a live buffer, plus a CQE accounting mismatch
+(`completed != submitted`) on an unrelated read.
+**Done means:** drain/reset the SQ before returning the error.
+
+### B7 · [bug] the fenced-JSON tool fallback eats ordinary JSON answers
+`vaayu/server/tools.py:115-135`, `_parse_fenced`, reached via `GENERIC_JSON`
+whenever `detect_tool_format` finds the substring `"tools"` anywhere in the chat
+template (`tools.py:56`). `_build` accepts any object with a non-empty string
+`name`. So a coding agent that asks for a `package.json` and gets
+```` ```json {"name": "my-app", ...} ``` ```` has that block **deleted from the
+prose** and returned as a fabricated tool call `my-app`, with
+`finish_reason="tool_calls"`. The docstring's claim that it "only accepts one
+that actually looks like a call" is not implemented.
+**Done means:** the parsed `name` must match one of the request's declared tool
+names; anything else stays prose.
+
+### B8 · [bug] streaming errors are not status-mapped
+`vaayu/server/app.py:352-369` vs `:376-381`. The non-streaming path maps
+`ContextTooLong` / `TemplateLacksToolSupport` / `NoChatTemplate` to **400** and
+`QueueFull` to **503**. The streaming path raises all of them inside `_sse`,
+where `except Exception` turns each into a **200** carrying an SSE event typed
+`internal_error`. `prepare()` (and therefore `ContextTooLong`) runs inside the
+generator, and `DEFAULT_STREAM = True`, so **an oversized prompt reports
+"internal_error" to every default client**.
+**Done means:** `prepare()` runs in the route before the `StreamingResponse` is
+returned, or the generator maps these to their honest SSE error types.
+
+### B9 · [bug] `_live_cancel` is cleared before the generation thread stops
+`vaayu/server/engine.py:348,365-367`. `stream()` sets `_live_cancel` directly
+(bypassing `_running`) and clears it in the `finally` around the consume loop —
+which runs on `GeneratorExit` while the pump thread is still generating. From
+that instant `cancel_all()` (SIGTERM handler, `_teardown`) sees `None` and
+reports idle, so shutdown proceeds with a generation still on the GPU.
+`thread.join()` on line 367 is also skipped entirely on that path.
+**Done means:** the token is published until the worker has actually exited.
+
+### B10 · [bug] `capture_stdio` is never restored when startup fails
+`vaayu/server/app.py:246-297`. `restore_stdio` is created before
+`_check_gpu_is_exclusive` and the model load, but `restore_stdio()` lives in the
+`finally` **after** `yield`. A `SystemExit` from the GPU audit — or any load
+error — skips it: fds 1 and 2 stay pointed at the pipe, `saved_out`/`saved_err`
+leak, and the traceback uvicorn prints reaches the console only via a daemon
+pump thread that may die before flushing. The refusal message is the part worth
+reading, and it is the part at risk.
+**Done means:** the pre-`yield` section restores stdio on its own failure path.
+
+### B11 · [bug] the exclusive-GPU refusal has no device filter and no threshold
+`vaayu/gpu_audit.py:105-115` + `app.py:119-136`. `audit()` returns every foreign
+compute process on **every** GPU and `_check_gpu_is_exclusive` refuses on any of
+them at any size. A job on `cuda:1` blocks a `cuda:0` load; a 30 MiB CUDA
+process refuses the boot outright. `parse_compute_apps` also splits on `,`, so a
+process name containing a comma is silently skipped.
+**Done means:** filter to the configured device index and apply a MiB threshold.
+
+### B12 · [bug] `REQUIRE_EXCLUSIVE_GPU`'s comment block documents the wrong knob
+`vaayu/server/config.py:44-56`. The `REQUIRE_SESSION_ID` explanation is pasted
+**inside** the `REQUIRE_EXCLUSIVE_GPU` comment, so `REQUIRE_EXCLUSIVE_GPU = True`
+— the single setting that makes the server refuse to boot — has no documentation
+next to it, and the text above it reads as if it were about session ids. Anyone
+opening this file to share a GPU will not find the knob. Same paste appears in
+`ServerConfig` (`app.py:60-82`).
+
+### B13 · [bug] docs table `PORT` as 8000; the code ships 9999
+`vaayu/server/config.py:29` sets `PORT = 9999` (and `ServerConfig.port` still
+defaults to `8000`). `documentation/server.md:102` and
+`vaayu/server/README.md:45` both table the default as `8000`, and every curl
+example in both docs plus `README.md:568` targets 8000. Copy-paste from the docs
+fails against a default install.
+
+---
+
 ## OPTIONAL — real work, no slot. Never ahead of the sequence.
 
 | # | Item | Status | Cost | Why optional |
@@ -403,7 +612,13 @@ caps at 9.1 GB.
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 ---
 
-> ### ▶▶ NEXT ACTION (fresh session): nothing scheduled — pick from OPTIONAL
+> ### ▶▶ NEXT ACTION (fresh session): work the **FIX SEQUENCE** at the top of this file
+> **Superseded 2026-08-23.** A code review of the six server commits opened 13 bugs
+> (`# BUGS-2026-08-23` below) and a Rust plan (`speed-up-vaayu.md`).
+> **B1 is fixed (2026-08-23); start at B2.** Suite baseline is now 1196 passed, 3 skipped.
+> The note below is the pre-review state, kept for its method lessons.
+>
+> ### (superseded) nothing scheduled — pick from OPTIONAL
 > **Row 13 shipped 2026-08-16.** Vaayu now runs as an OpenAI-compatible server:
 > `./venv/bin/python -m vaayu.server --model PATH --port 8000`. Suite 1006/3, dense smoke 8.78,
 > on-device server gate ALL PASS on the 1B and on MiniMax EXL3.

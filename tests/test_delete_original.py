@@ -69,3 +69,116 @@ def test_the_config_module_exposes_it():
     assert hasattr(config, "DELETE_ORIGINAL")
     names = {f.name for f in dataclasses.fields(ServerConfig)}
     assert "delete_original" in names
+
+
+# ---------------------------------------------------------------------------
+# The splitter half: WHEN the originals are allowed to go.
+#
+# Two paths reach a deletion, and only one of them used to be verified. An
+# already-split checkpoint is gated on `all(found_layers.values())` -- every
+# layer has its .safetensors AND its .done marker. A FRESH split deleted source
+# shard N-1 the moment the loop advanced to shard N, with four more shards still
+# unwritten, and skipped `check_space` entirely because the flag was on. A crash
+# at shard 5 of 9 left the originals for 1-4 gone and the split unusable, and
+# `remove_real_and_linked_file` follows symlinks, so an HF-cache blob went with
+# them. Recovery is a 39-66 GB re-download.
+#
+# These pin the contract: deletion happens ONCE, AFTER the split verifies.
+# ---------------------------------------------------------------------------
+import json
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+from vaayu import utils
+from vaayu.persist.model_persister import ModelPersister
+
+SHARD_1 = "model-00001-of-00002.safetensors"
+SHARD_2 = "model-00002-of-00002.safetensors"
+
+
+def _sharded_checkpoint(root: Path) -> Path:
+    """A two-shard checkpoint, small enough to split in milliseconds.
+
+    Layer 0 lives in shard 1 and layer 1 in shard 2, so the write loop must
+    cross a shard boundary -- that crossing is where the old code deleted.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    first = {"model.embed_tokens.weight": torch.zeros(2, 2),
+             "model.layers.0.w": torch.zeros(2, 2)}
+    second = {"model.layers.1.w": torch.zeros(2, 2),
+              "model.norm.weight": torch.zeros(2),
+              "lm_head.weight": torch.zeros(2, 2)}
+    save_file(first, str(root / SHARD_1))
+    save_file(second, str(root / SHARD_2))
+    index = {k: SHARD_1 for k in first} | {k: SHARD_2 for k in second}
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+    return root
+
+
+def test_a_crash_mid_split_leaves_every_original_shard(tmp_path, monkeypatch):
+    """The failure that costs a re-download: die after shard 1, before the end."""
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    persister = ModelPersister.get_model_persister()
+    real_persist = persister.persist_model
+
+    def die_on_the_second_layer(state_dict, layer_name, saving_path):
+        if layer_name == "model.layers.1":
+            raise RuntimeError("disk full")
+        return real_persist(state_dict, layer_name, saving_path)
+
+    monkeypatch.setattr(persister, "persist_model", die_on_the_second_layer)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert (ckpt / SHARD_1).exists(), "shard 1 was deleted before the split finished"
+    assert (ckpt / SHARD_2).exists()
+
+
+def test_an_incomplete_split_keeps_the_originals(tmp_path, monkeypatch):
+    """No exception, but a layer never landed. Silence is not verification."""
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    persister = ModelPersister.get_model_persister()
+    real_persist = persister.persist_model
+
+    def skip_the_norm(state_dict, layer_name, saving_path):
+        if layer_name == "model.norm":
+            return None
+        return real_persist(state_dict, layer_name, saving_path)
+
+    monkeypatch.setattr(persister, "persist_model", skip_the_norm)
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert (ckpt / SHARD_1).exists()
+    assert (ckpt / SHARD_2).exists()
+
+
+def test_a_verified_split_reclaims_every_shard_including_the_last(tmp_path):
+    """The point of the flag. The LAST shard counts -- nothing advances past it."""
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert not (ckpt / SHARD_1).exists()
+    assert not (ckpt / SHARD_2).exists()
+    assert (ckpt / "model.safetensors.index.json").exists(), "the index still gets read"
+    assert (ckpt / "splitted_model" / "model.layers.1.safetensors").exists()
+
+
+def test_the_originals_survive_when_the_flag_is_off(tmp_path):
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    utils.split_and_save_layers(ckpt, delete_original=False)
+
+    assert (ckpt / SHARD_1).exists()
+    assert (ckpt / SHARD_2).exists()
+
+
+def test_free_space_is_checked_even_when_the_flag_is_on(tmp_path, monkeypatch):
+    """Deleting as you go was the reason to skip the pre-flight. It no longer does."""
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    calls = []
+    monkeypatch.setattr(utils, "check_space", lambda *a, **k: calls.append(a))
+
+    utils.split_and_save_layers(ckpt, delete_original=True)
+    assert calls, "check_space was skipped in exactly the mode with the least margin"

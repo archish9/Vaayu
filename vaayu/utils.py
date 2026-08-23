@@ -325,8 +325,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         else:
             print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
 
-    if not delete_original:
-        check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
+    # Checked in BOTH modes. This used to be skipped when delete_original was on,
+    # because the split freed shards as it went and so never needed 2x the model
+    # on disk. It no longer deletes mid-split (see the end of this function), so
+    # the pre-flight is what it always should have been: the mode that can lose
+    # data is not the mode that gets no free-space check.
+    check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
 
     shard = -1
@@ -350,7 +354,6 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         #os.makedirs(saving_path)
         saving_path.mkdir(parents=True, exist_ok=True)
 
-    single_modelfile = None
 
     for layer in tqdm(layers):
 
@@ -362,15 +365,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             if len(shards) > 0:
                 target_shard = max(shards)
                 if target_shard != shard:
-                    # optinoally delete original file
-                    if delete_original and shard != -1:
-                        if not safetensors_format:
-                            to_delete = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                        else:
-                            to_delete = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
-
-                        print(f"deleting original file: {to_delete}")
-                        remove_real_and_linked_file(to_delete)
+                    # No deletion here. Deleting shard N-1 on the way to shard N
+                    # destroyed sources while the split was still unfinished: a
+                    # crash at shard 5 of 9 left 1-4 gone AND the split unusable,
+                    # and it never reclaimed the last shard, which nothing
+                    # advances past. Deletion now happens once, at the end, gated
+                    # on the same completeness check the already-split path uses.
                     shard = target_shard
                     print(f'Loading shard {shard}/{n_shards}')
 
@@ -402,8 +402,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 if len(shards) == 0:
                     # No weights for this layer in index, skip it
                     continue
-                single_modelfile = shards[0]
-                to_load = checkpoint_path / single_modelfile
+                to_load = checkpoint_path / shards[0]
                 # check if to_load exist, if not downloaad it...
                 if not os.path.exists(to_load):
                     assert repo_id is not None
@@ -438,12 +437,24 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         del layer_state_dict
         clean_memory()
 
-    # deleting single modelfile if only a single modelfile was existing in hf repo 
-    # and deletion of single modelfile should happen in the end if delete_original=True
-    if delete_original and single_modelfile != None:
-        to_delete = checkpoint_path / single_modelfile
-        print(f"deleting original file: {to_delete}")
-        remove_real_and_linked_file(to_delete)
+    # The ONE place a fresh split deletes anything, and it runs after every layer
+    # is written. Gated on the same completeness check the already-split path at
+    # the top of this function uses: every expected layer has both its
+    # .safetensors and its .done marker. Covers sharded and single-file sources
+    # alike -- `index` names the source file for every weight either way.
+    # IRREVERSIBLE, and remove_real_and_linked_file follows symlinks, so a shard
+    # linked into the shared HF cache takes the cached blob with it.
+    if delete_original:
+        persister = ModelPersister.get_model_persister()
+        missing = [l for l in layers
+                   if not persister.model_persist_exist(l.rstrip('.'), saving_path)]
+        if missing:
+            # A real limit, not something to hide (CLAUDE.md §5): the disk stays
+            # full, and the next load re-splits from sources that still exist.
+            print(f"WARNING: keeping the original shards -- the split under "
+                  f"{saving_path} is INCOMPLETE, missing: {', '.join(missing)}")
+        else:
+            delete_original_shards(checkpoint_path, index, safetensors_format)
 
     return str(saving_path)
 
