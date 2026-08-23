@@ -3,12 +3,39 @@ from threading import Thread
 from typing import Generator
 
 
+class _IdCountingStreamer(TextIteratorStreamer):
+    """A TextIteratorStreamer that also records the real generated token ids.
+
+    Callers that need a token COUNT cannot get one by re-tokenizing the streamed
+    text: it is decoded with skip_special_tokens=True, so EOS is gone, and the
+    merges differ across a decode boundary. generate() already hands every
+    generated id to put(), so recording them here is exact and costs nothing.
+    """
+
+    def __init__(self, tokenizer, sink: list, **kwargs):
+        super().__init__(tokenizer, **kwargs)
+        self._sink = sink
+
+    def put(self, value):
+        # Read the prompt flag BEFORE super().put(), which clears it and returns
+        # early. Recording after would count the whole prompt as generated.
+        is_prompt = self.skip_prompt and self.next_tokens_are_prompt
+        super().put(value)
+        if is_prompt:
+            return
+        # Same normalisation TextStreamer.put does: a (1, N) batch -- what
+        # speculative_generate puts for a whole accepted run -- becomes (N,).
+        ids = value[0] if getattr(value, "ndim", 1) > 1 else value
+        self._sink.extend(ids.tolist())
+
+
 def stream_generate(
     model,
     input_ids,
     max_new_tokens: int = 128,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    token_ids_out: list | None = None,
     **kwargs
 ) -> Generator[str, None, None]:
     """
@@ -17,12 +44,24 @@ def stream_generate(
     Usage:
         for chunk in stream_generate(model, input_ids):
             print(chunk, end="", flush=True)
+
+    Pass `token_ids_out` to also collect the real generated token ids into it --
+    the only honest source for a token count, since the yielded text cannot be
+    re-tokenized back into one.
     """
-    streamer = TextIteratorStreamer(
-        model.tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True,
-    )
+    if token_ids_out is None:
+        streamer = TextIteratorStreamer(
+            model.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+    else:
+        streamer = _IdCountingStreamer(
+            model.tokenizer,
+            token_ids_out,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
 
     generation_kwargs = dict(
         input_ids=input_ids,

@@ -227,3 +227,98 @@ def test_session_id_still_wins_over_user():
     e = EngineHandle(FakeModel())
     kw = e.build_generate_kwargs(_req(user="alice", session_id="agent-7"), [1, 2, 3])
     assert kw["session_id"] == "agent-7"
+
+
+# ── streaming reports real generated ids (B2) and honours cancellation (B5) ──
+
+
+class _Config:
+    def __init__(self, eos_token_id=2):
+        self.eos_token_id = eos_token_id
+
+
+class _CountingTokenizer(FakeTokenizer):
+    """A tokenizer whose re-tokenization of decoded text is SHORTER than the
+    ids that produced it -- which is what really happens, since the streamed
+    text is decoded with skip_special_tokens=True (EOS gone) and merges differ
+    across a decode boundary. The old code counted tokens this way.
+    """
+
+    def __call__(self, text, **kw):
+        return {"input_ids": [0] * (len(text.split()) - 1)}
+
+
+def _streaming_engine(generated_ids, *, eos_token_id=2, chunks=("a b c d e",)):
+    """An EngineHandle whose stream_generate is replaced by a fake that emits
+    `chunks` and reports `generated_ids` as the ids it actually produced."""
+    import vaayu.streaming as streaming_mod
+
+    model = FakeModel(max_seq_len=100)
+    model.tokenizer = _CountingTokenizer()
+    model.config = _Config(eos_token_id)
+
+    def _fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        if token_ids_out is not None:
+            token_ids_out.extend(generated_ids)
+        yield from chunks
+
+    return EngineHandle(model), streaming_mod, _fake
+
+
+async def _run_stream(engine, req, cancel=None):
+    final = None
+    async for kind, payload in engine.stream(req, cancel=cancel):
+        if kind == "final":
+            final = payload
+    return final
+
+
+def test_stream_counts_real_generated_ids_not_a_retokenization(monkeypatch):
+    e, mod, fake = _streaming_engine([10, 11, 12, 13, 14])
+    monkeypatch.setattr(mod, "stream_generate", fake)
+    final = asyncio.run(_run_stream(e, _req(max_tokens=5)))
+    # Re-tokenizing "a b c d e" through _CountingTokenizer gives 4. The model
+    # generated 5.
+    assert final.completion_tokens == 5
+
+
+def test_a_stream_that_ran_to_the_cap_reports_length_not_stop(monkeypatch):
+    # THE B2 REGRESSION. Five ids generated against cap=5, none of them EOS:
+    # the answer IS cut off. The old count (a re-tokenization yielding 4) made
+    # `produced < cap` true and reported "stop" -- telling a coding agent its
+    # truncated file was complete.
+    e, mod, fake = _streaming_engine([10, 11, 12, 13, 14])
+    monkeypatch.setattr(mod, "stream_generate", fake)
+    final = asyncio.run(_run_stream(e, _req(max_tokens=5)))
+    assert final.finish_reason == "length"
+
+
+def test_a_stream_that_ended_on_eos_reports_stop(monkeypatch):
+    e, mod, fake = _streaming_engine([10, 11, 2], eos_token_id=2)
+    monkeypatch.setattr(mod, "stream_generate", fake)
+    final = asyncio.run(_run_stream(e, _req(max_tokens=5)))
+    assert final.finish_reason == "stop"
+
+
+def test_a_cancelled_stream_is_not_reported_as_stop(monkeypatch):
+    from vaayu.server.engine import CancelToken
+
+    e, mod, fake = _streaming_engine([10, 11])
+    monkeypatch.setattr(mod, "stream_generate", fake)
+    cancel = CancelToken()
+    cancel.cancel()
+    final = asyncio.run(_run_stream(e, _req(max_tokens=5), cancel=cancel))
+    assert final.finish_reason == "length"
+
+
+def test_a_cancelled_non_stream_run_is_not_reported_as_stop():
+    from vaayu.server.engine import CancelToken
+
+    model = FakeModel()
+    model.config = _Config()
+    e = EngineHandle(model)
+    cancel = CancelToken()
+    cancel.cancel()
+    assert e._finish([10, 11], cap=5, tool_calls=[], cancel=cancel) == "length"
+    assert e._finish([10, 11], cap=5, tool_calls=[]) == "stop", (
+        "an uncancelled short run is still a stop-string stop")

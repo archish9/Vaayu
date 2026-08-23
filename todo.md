@@ -32,35 +32,39 @@ it only to check whether something was already refuted, never for a task.
 
 **Do these top to bottom.** Ordering rule: correctness bugs that make the server LIE to an agent
 first, then the concurrency bug, then the rest of the correctness debt, then perf. Rust work comes
-LAST and is gated on one measurement.
+LAST and is gated on one measurement. **B14 is placed at row 0 by the agent that found it** (not by
+the original review) because it is the only row that destroys data on disk — move it if you disagree
+with that ranking.
 
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1196 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-23 after B1. It was 1191/3 at review time; B1's fix added 5 tests. **None of the bugs below
-are caught by `tests/` today** — the suite was green while every one of them was live.
+**Suite baseline: 1211 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-23 after B2+B5. It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15. **None of the
+bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
+why each fix ships with a test verified to FAIL against the code it replaces.
 
 | # | do this | why here | where |
 |---|---|---|---|
-| 1 | **B2** — stop counting stream tokens by re-tokenizing the decoded text | `finish_reason="stop"` on a TRUNCATED answer is the exact bug the server was built to fix; an agent commits broken code | `vaayu/server/engine.py:373,382` |
-| 2 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
-| 3 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
-| 4 | **B5** — cancellation reported as `finish_reason="stop"` | same lie as B2, different trigger | `engine.py:270,382` |
-| 5 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
-| 6 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
-| 7 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
-| 8 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
-| 9 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
-| 10 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
-| 11 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
-| 12 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
-| 13 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
-| 14 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
-| 15 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
-| 16 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 → ~1.10 tok/s, MiniMax 1.501 → ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
-| 17 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
-| 18 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
+| ~~1~~ | ~~**B2**~~ — **DONE 2026-08-23**, fixed together with B5 | | |
+| 0 | **B14** — `DELETE_ORIGINAL` makes a SINGLE-FILE checkpoint unloadable after the first load | irreversible deletion whose damage is only visible on the NEXT run; measured on Llama-3.2-1B 2026-08-23 | `vaayu/utils.py:509-513` |
+| 1 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
+| 2 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
+| ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
+| 3 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
+| 4 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
+| 5 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
+| 6 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
+| 7 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
+| 8 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
+| 9 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
+| 10 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
+| 11 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
+| 12 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
+| 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
+| 14 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 → ~1.10 tok/s, MiniMax 1.501 → ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
+| 15 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
+| 16 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
 
 **Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3: if decode already
 achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows close** — record the verdict, do not
@@ -88,10 +92,13 @@ These are the only things still open from the closed work. Their full context is
 - **[ ] Reserve policy vs a resident model.** The reserve floors were tuned for STREAMED models; on
   Llama-3.2-1B the clamp drove `pinning_budget → 0` for a measured **−19 % decode**. Unmeasured for
   a resident coder model because none is on disk. Re-check the moment one lands.
-- **[ ] `_finish` infers `hit_stop_string` from `produced < cap`.** HF trims a matched stop string
-  before returning, so the ids cannot be inspected for one. Fine for the length-vs-stop distinction
-  a client acts on; wrong if anything ever needs to know WHICH stop fired. **Overlaps B5** — fix
-  them together.
+- **[ ] `_finish` cannot report WHICH stop string fired.** HF trims a matched stop string before
+  returning, so the ids cannot be inspected for one; `_finish` infers `hit_stop_string` from
+  `produced < cap`. The dangerous half of this closed with B5 (2026-08-23) — a cancelled run no
+  longer satisfies that inference. What remains is only the stop string's IDENTITY, which no client
+  acts on. **Needs a new premise before it means anything**: something must actually require the
+  identity. Fixing it means not trusting HF's trim and matching stop strings ourselves — a
+  behaviour change, not a patch.
 - **[ ] `vaayu/expert_sim.py`'s anchor gap is unexplained.** 31.9 % simulated against 43.9 % live at
   Qwen's 9.12 GB budget. The obvious hypothesis — that it fails to model the engine's eviction
   pinning — was implemented and **REJECTED** (byte-identical result). The gap is confined to the
@@ -103,6 +110,16 @@ These are the only things still open from the closed work. Their full context is
   CLAUDE.md §0 defers streamed-dense perf. **Unblocked by: dense work starting. Then this is the
   first lever, and it already exists.** MoE speculation stays refuted — the gate admits
   `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible drafter here.
+- **[!] The speculative path drops its first generated token from streamed text.** Found
+  2026-08-23 while fixing B2. `stream_generate` builds its streamer with `skip_prompt=True`, which
+  makes `TextStreamer.put` swallow the FIRST call — correct under `generate()`, which puts the
+  prompt first, but `speculative_generate` never puts a prompt, so its
+  `streamer.put(first_token)` (`vaayu/vaayu_base.py:4380`) is the one that gets eaten. Streamed text
+  and B2's id count are both short by exactly one token. Only bites with a drafter loaded, which is
+  off by default. **Not fixed with B2 deliberately:** the fix is a contract change (either the
+  streamer learns which caller it has, or `speculative_generate` puts the prompt), and verifying it
+  needs a real drafter run on streamed dense, which CLAUDE.md §0 defers. **Unblocked by: speculative
+  decoding shipping** — fix it with the sampling-blind row below, same trigger, same file.
 - **[ ] The speculative path is sampling-blind.** `top_p` / `top_k` / stop-strings are silently
   ignored when a drafter is active. It must WARN rather than pretend. Bites the moment the row above
   ships.
@@ -113,8 +130,8 @@ These are the only things still open from the closed work. Their full context is
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
-- Full suite: `./venv/bin/python -m pytest tests/ -q` → baseline **1006 passed, 3 skipped**
-  (2026-08-16, after the server work: 892 before it, +114 from it).
+- Full suite: `./venv/bin/python -m pytest tests/ -q`. The current baseline is the one stated once
+  at the top of the FIX SEQUENCE — do not duplicate it here; it went stale twice that way.
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and
   `pydantic` were already present; `fastapi.testclient` needs `httpx`.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
@@ -156,11 +173,26 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | dense smoke (CLAUDE.md §0's named guard) | `./venv/bin/python test_batched_dense_smoke.py` | ~2 min | dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged by the day's work |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
-| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
+| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream **incl. its finish_reason and completion_tokens**, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
 blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 2026-08-16.
+
+**The server gate had been dead for two commits — repaired 2026-08-23.** It failed at its FIRST
+call and had done so since `b124320`, so nothing it claims to cover was actually covered in between.
+Three independent breakages, none of them in the engine:
+
+- `REQUIRE_SESSION_ID` went on and the gate sent no `session_id`, so every request was a **400**.
+  Its oversized-prompt check went on "passing" — on the wrong 400.
+- `DEFAULT_STREAM` went to `True`, so the gate's "non-streaming" step got SSE back and died in
+  `r.json()`. Both steps now set `stream` explicitly rather than relying on the default.
+- The gate ran with the server's `delete_original=True` default and **destroyed the checkpoint it
+  was testing** (B14). It now passes `delete_original=False`: a gate may not consume its own input.
+
+It also never checked the streamed `finish_reason` or `completion_tokens` — the exact blind spot B2
+lived in, on the DEFAULT path. It does now. **The lesson is the one below, again: a gate nobody has
+seen fail is not known to work.** Run it after any change to config defaults, not just to the engine.
 
 **Two lessons from strengthening these, both of which cost a run to learn:**
 
@@ -182,23 +214,60 @@ blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 202
 
 # BUGS-2026-08-23 · [bug] open bugs from the server-work code review
 
-Found reviewing `1a938b7..b124320` (the six server commits: config module, token generation logic,
-exclusive GPU, thinking switch, session ids + logs). The suite was **green throughout** — 1191
-passed, 3 skipped — so **none of these is caught by `tests/`**. Order to fix them: the **FIX
-SEQUENCE** table at the top of this file. B1 from this review is fixed (2026-08-23) and archived.
+B2-B13 were found reviewing `1a938b7..b124320` (the six server commits: config module, token
+generation logic, exclusive GPU, thinking switch, session ids + logs). The suite was **green
+throughout** — 1191 passed, 3 skipped — so **none of them was caught by `tests/`**. **B14 is not
+from that review**: it was found on 2026-08-23 by RUNNING the server smoke gate while verifying
+B2+B5, which is also how the gate's own three breakages surfaced (see "On-device gates" above).
+Reading found twelve bugs; running found four more.
 
-### B2 · [bug] stream token count is a re-tokenization, so a TRUNCATED answer reports `finish_reason="stop"`
-`vaayu/server/engine.py:373` — `produced = len(tokenizer(full, add_special_tokens=False)["input_ids"])`.
-`full` is text decoded with `skip_special_tokens=True`, so re-tokenizing it does
-not reproduce the generated id count (EOS is gone; merges differ across a decode
-boundary). Both `usage.completion_tokens` and `finish_reason` (line 382,
-`hit_eos=produced < cap`) are derived from it. A stream that ran to exactly `cap`
-but whose retokenization yields `cap-1` is reported **`"stop"`** — the client is
-told its cut-off code is complete. That is precisely the failure the server row was
-opened to fix, reintroduced on the streaming path, which is now the DEFAULT
-(`DEFAULT_STREAM = True`).
-**Done means:** count real generated ids (from the streamer / generate output),
-not a re-tokenization. Fixing it also deletes a full extra tokenizer pass per request.
+Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
+B5 (all 2026-08-23). B1's detail is archived; B2's and B5's closures are kept in place below,
+because both are load-bearing for the P1/R5 perf rows.
+
+### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
+`vaayu/server/engine.py` counted stream tokens as
+`len(tokenizer(full, add_special_tokens=False)["input_ids"])`, where `full` is
+text decoded with `skip_special_tokens=True`. That does not reproduce the
+generated id count — EOS is gone, and merges differ across a decode boundary —
+yet both `usage.completion_tokens` and `finish_reason` were derived from it, so
+a stream that ran to exactly `cap` could report **`"stop"`** on a truncated
+answer, on what is now the DEFAULT path (`DEFAULT_STREAM = True`).
+
+**Fix:** `_IdCountingStreamer` in `vaayu/streaming.py` — a `TextIteratorStreamer`
+that records the real ids in `put()` (reading `next_tokens_are_prompt` BEFORE
+`super().put()`, which clears it). `stream_generate` gained one optional
+`token_ids_out=` kwarg; omitted, it behaves exactly as before, so `test_generate.py`
+/ `test_quick.py` / `test_multiturn.py` are untouched. `engine.stream` passes a
+sink and now shares `_finish` with the non-streaming path, so one policy serves
+both. The re-tokenization is deleted, which also banks P1 item (4).
+**Verified:** 5 engine tests + 5 streaming tests; the 4 that distinguish the
+behaviour were confirmed to FAIL against the pre-fix `engine.py`.
+
+### B14 · [bug] `DELETE_ORIGINAL` leaves a SINGLE-FILE checkpoint unloadable
+Found 2026-08-23 by running the server smoke gate; it deleted 2.3 GB off
+Llama-3.2-1B and the NEXT load then failed.
+
+`delete_original_shards` (`vaayu/utils.py:190`) deliberately keeps config,
+tokenizer and the index — "every subsequent load still reads them". That
+reasoning holds for a MULTI-shard checkpoint, where `model.safetensors.index.json`
+survives. It does not hold for a **single-file** checkpoint, which has no index:
+`find_or_create_local_splitted_path` (`utils.py:509-513`) recognises a local
+directory only by `model.safetensors.index.json`, `pytorch_model.bin.index.json`,
+`model.safetensors` or `pytorch_model.bin`, and for a single-file checkpoint the
+deleted `model.safetensors` was the ONLY one of the four. The next load prints
+"didn't find downloaded model", treats the absolute path as a HF repo id, and
+dies in `validate_repo_id` — with a complete, valid `splitted_model/` sitting
+right there.
+
+**The damage is invisible in the run that causes it** (that run already holds the
+split) and only appears on the next one, which is what makes it worth a row.
+Recovered here with `git checkout -- model.safetensors`, which worked only
+because that checkpoint happens to be an HF git clone with its LFS objects still
+local. A plain download has no such recovery.
+**Done means:** discovery also accepts a directory containing a complete
+`splitted_model/`, or the delete is refused when it would remove the last
+discoverable file. **Not:** turning the feature off — it is doing what it says.
 
 ### B3 · [bug] short io_uring reads are counted as success — silent weight corruption
 `vaayu_rust/src/lib.rs:377-386`, `persistent_read`. The CQE loop tests only
@@ -222,14 +291,21 @@ construction, sharing the KV cache, the expert VRAM cache and the slab arena.
 **Done means:** cancel and join the worker inside the slot, so the slot outlives
 the generation on every exit path.
 
-### B5 · [bug] cancellation is reported as `finish_reason="stop"`
-`vaayu/server/engine.py:270` (`hit_stop_string=len(new_ids) < cap`) and `:382`
-(`hit_eos=produced < cap`). Both infer "the model chose to stop" from "fewer
-tokens than the cap arrived". A generation halted by `cancel_criteria` — client
-disconnect, SIGTERM, `_teardown` — satisfies that test, so a deliberately
-truncated response is labelled complete. Same lie as B2, different trigger.
-**Done means:** the cancel token's state is consulted; a cancelled run never
-reports `"stop"`.
+### B5 · [x] cancellation reported as `finish_reason="stop"` — **FIXED 2026-08-23** (with B2)
+`hit_stop_string` / `hit_eos` were both inferred from "fewer tokens than the cap
+arrived", which a run halted by `cancel_criteria` — client disconnect, SIGTERM,
+`_teardown` — satisfies. A deliberately truncated response was labelled complete.
+
+**Fix:** `finish_reason` (`vaayu/server/stopping.py`) takes `cancelled: bool = False`
+and consults it **after** `hit_tool_call` and `hit_eos` but **before** the
+`hit_stop_string` inference. A cancelled run reports **`"length"`** — the OpenAI
+vocabulary's existing "this answer is incomplete", which every client already
+handles; which of the two truncations it was is in the server log. A real EOS
+still outranks it: cancelling after the model finished changes nothing. Both
+`generate()` and `stream()` pass their token through `_finish`. `app.py`'s SSE
+tail also defaulted a missing final event to `"stop"` and now says `"length"`.
+**Verified:** 5 stopping tests + 2 engine tests, confirmed to FAIL against the
+pre-fix code (the `_finish` one as a `TypeError`, the rest as `"stop"`).
 
 ### B6 · [bug] `SQ full` early-return leaves stale SQEs on a POOLED ring
 `vaayu_rust/src/lib.rs:365`. `push(&entry)` failing returns `Err` immediately,
@@ -263,6 +339,11 @@ generator, and `DEFAULT_STREAM = True`, so **an oversized prompt reports
 "internal_error" to every default client**.
 **Done means:** `prepare()` runs in the route before the `StreamingResponse` is
 returned, or the generator maps these to their honest SSE error types.
+**Confirmed on-device 2026-08-23:** an oversized prompt with no explicit
+`stream` key returns **200** with an `internal_error` event. `test_server_smoke.py`
+now sends `stream=False` for that check so the gate tests the mapped path;
+**add the streaming assertion to it when this row lands** — it is the only place
+that would have caught this.
 
 ### B9 · [bug] `_live_cancel` is cleared before the generation thread stops
 `vaayu/server/engine.py:348,365-367`. `stream()` sets `_live_cancel` directly
@@ -341,7 +422,8 @@ of every gen-2 traversal. (2) Precompute the expert-tensor role table at load:
 `_EXPERT_WEIGHT_ROLES` pattern matching per expert, per layer, **per token**, for a mapping fixed
 when the checkpoint is opened. (3) `EngineHandle.tool_format` is a property that re-scans the whole
 chat template on every access, touched 2–3× per request — compute it once in `__init__`.
-(4) Killing B2's re-tokenization also deletes a full tokenizer pass per request.
+(4) ~~Killing B2's re-tokenization also deletes a full tokenizer pass per request.~~ **Already
+banked** — B2's fix (2026-08-23) removed that tokenizer pass. Do not credit it to this row or to Rust.
 → `speed-up-vaayu.md` §3.
 
 ### M1 · [ ] THE GATING MEASUREMENT — run before writing any Rust

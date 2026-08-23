@@ -55,3 +55,73 @@ def test_stream_generate_propagates_exception_instead_of_hanging():
     assert not t.is_alive(), "stream_generate hung instead of propagating the exception"
     assert isinstance(result.get("exc"), RuntimeError)
     assert str(result["exc"]) == "boom"
+
+
+# ── real generated-id capture (B2) ───────────────────────────────────────────
+# The server cannot count generated tokens by re-tokenizing the decoded text:
+# the text is decoded with skip_special_tokens=True, so EOS is gone, and merges
+# differ across a decode boundary. generate() hands every real id to the
+# streamer's put(), so capturing them there is exact and costs nothing.
+
+import torch
+
+from vaayu.streaming import _IdCountingStreamer
+
+
+class _FakeIdTokenizer:
+    """Enough of a tokenizer for TextStreamer.put(): decode() only."""
+
+    def decode(self, ids, **kw):
+        return "".join(f"<{i}>" for i in ids)
+
+
+def _sink_streamer(**kw):
+    sink = []
+    return sink, _IdCountingStreamer(_FakeIdTokenizer(), sink, **kw)
+
+
+def test_id_sink_records_the_real_generated_ids():
+    sink, s = _sink_streamer(skip_prompt=False)
+    s.put(torch.tensor([11]))
+    s.put(torch.tensor([12]))
+    s.end()
+    assert sink == [11, 12]
+
+
+def test_id_sink_excludes_the_prompt_when_skip_prompt_is_set():
+    # generate() puts the prompt first; TextStreamer.put swallows that one call
+    # and clears the flag. The sink must skip exactly the same call, or every
+    # count is long by a whole prompt.
+    sink, s = _sink_streamer(skip_prompt=True)
+    s.put(torch.tensor([[1, 2, 3, 4]]))     # the prompt
+    s.put(torch.tensor([99]))
+    s.end()
+    assert sink == [99]
+
+
+def test_id_sink_records_every_id_of_a_multi_token_put():
+    # speculative_generate puts a whole accepted run at once, shaped (1, N).
+    sink, s = _sink_streamer(skip_prompt=False)
+    s.put(torch.tensor([[7, 8, 9]]))
+    s.end()
+    assert sink == [7, 8, 9]
+
+
+def _puts_ids(streamer):
+    streamer.put(torch.tensor([[1, 2]]))    # prompt, skipped
+    streamer.put(torch.tensor([41]))
+    streamer.put(torch.tensor([42]))
+    streamer.end()
+
+
+def test_stream_generate_fills_token_ids_out_when_asked():
+    model = _FakeModel(_puts_ids)
+    model.tokenizer = _FakeIdTokenizer()
+    ids = []
+    list(stream_generate(model, input_ids=None, max_new_tokens=2, token_ids_out=ids))
+    assert ids == [41, 42]
+
+
+def test_stream_generate_is_unchanged_when_no_sink_is_passed():
+    model = _FakeModel(_happy_path)
+    assert list(stream_generate(model, input_ids=None, max_new_tokens=1)) == ["hello ", "world"]

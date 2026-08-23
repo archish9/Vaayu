@@ -226,9 +226,10 @@ turn.
 ### R5 — Things that are already Rust, or that Rust cannot help
 
 * **Tokenizer / detokenizer** — HF `tokenizers` is already Rust. No win.
-  (But see Bug B2 in `todo.md`: the streaming path re-tokenizes the *entire*
-  output once per request purely to count tokens. Fixing that bug deletes the
-  work outright — a strictly better outcome than making it fast.)
+  (The streaming path used to re-tokenize the *entire* output once per request
+  purely to count tokens. That was Bug B2, **fixed 2026-08-23**: the ids are now
+  captured from the streamer as they are generated, so the pass is gone rather
+  than made fast. Nothing left here for Rust.)
 * **Sampling / top-k / top-p** — GPU tensors. Rust would add a D2H round trip.
 * **EXL3 matmuls, the router GEMM, attention** — CUDA kernels. Out of scope.
 * **Streamed dense decode** — already at ~5.7 GB/s, i.e. at the wall (§0).
@@ -239,7 +240,9 @@ turn.
 ## 3. Free Python wins to take before any Rust
 
 These are cheaper than every item in §2 and should be measured in the same
-arm, so the Rust numbers are not credited with them.
+arm, so the Rust numbers are not credited with them. **One of the four (item 4)
+has already landed** — the arm must therefore be measured against a tree that
+already contains it, or B2's fix gets counted twice.
 
 1. **`gc.freeze()` after load** (§1). One line. Removes the permanent module
    tree and the cache view graph from every gen-2 traversal.
@@ -252,8 +255,10 @@ arm, so the Rust numbers are not credited with them.
 3. **`EngineHandle.tool_format` is a property that re-scans the whole chat
    template string on every access**, and `generate()`/`stream()` touch it 2-3
    times per request. Compute once in `__init__`.
-4. **Kill the `len(tokenizer(full))` re-tokenization** in
-   `vaayu/server/engine.py` — it is both a bug (Bug B2) and per-request work.
+4. ~~**Kill the `len(tokenizer(full))` re-tokenization** in `vaayu/server/engine.py`.~~ **DONE
+   2026-08-23** as Bug B2's fix — one full tokenizer pass per request deleted. Listed here so it is
+   not re-counted: this win is already in the tree, and neither R1's arm nor any Rust row may claim
+   it. Items 1-3 remain open.
 
 ---
 

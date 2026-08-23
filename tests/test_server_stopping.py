@@ -81,3 +81,38 @@ def test_cap_reached_and_eos_together_reports_stop():
     # The model finished ON the last admissible token: not a truncation.
     assert finish_reason(hit_eos=True, hit_stop_string=False, hit_tool_call=False,
                          produced=100, cap=100) == "stop"
+
+
+# ── cancellation (B5) ────────────────────────────────────────────────────────
+# A run halted by cancel_criteria -- client disconnect, SIGTERM, _teardown --
+# produces fewer tokens than the cap, which every other signal here reads as
+# "the model chose to stop". It did not. The client is handed a deliberately
+# truncated answer, so it must be told the answer is incomplete.
+
+
+def test_a_cancelled_run_never_reports_stop():
+    assert finish_reason(hit_eos=False, hit_stop_string=False, hit_tool_call=False,
+                         produced=17, cap=100, cancelled=True) == "length"
+
+
+def test_cancellation_outranks_the_stop_string_inference():
+    # hit_stop_string is inferred from `produced < cap`, which a cancelled run
+    # satisfies. Cancellation must be consulted first or the inference lies.
+    assert finish_reason(hit_eos=False, hit_stop_string=True, hit_tool_call=False,
+                         produced=17, cap=100, cancelled=True) == "length"
+
+
+def test_real_eos_outranks_cancellation():
+    # Cancel fired, but the model had already emitted EOS: it genuinely stopped.
+    assert finish_reason(hit_eos=True, hit_stop_string=False, hit_tool_call=False,
+                         produced=17, cap=100, cancelled=True) == "stop"
+
+
+def test_a_completed_tool_call_outranks_cancellation():
+    assert finish_reason(hit_eos=False, hit_stop_string=False, hit_tool_call=True,
+                         produced=17, cap=100, cancelled=True) == "tool_calls"
+
+
+def test_cancelled_defaults_to_false_so_existing_callers_are_unchanged():
+    assert finish_reason(hit_eos=False, hit_stop_string=True, hit_tool_call=False,
+                         produced=17, cap=100) == "stop"

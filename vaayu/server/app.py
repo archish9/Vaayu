@@ -496,6 +496,9 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
                       completion_tokens=final.completion_tokens,
                       total_tokens=final.prompt_tokens + final.completion_tokens)
     yield _chunk(cid, created, model_name, session_id=session_id, delta={},
-                 finish=(final.finish_reason if final is not None else "stop"),
+                 # No final event means the stream did not run to completion.
+                 # "stop" there would tell the client its truncated answer is
+                 # whole -- the same lie B5 fixed inside the engine.
+                 finish=(final.finish_reason if final is not None else "length"),
                  usage=usage)
     yield "data: [DONE]\n\n"

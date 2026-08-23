@@ -259,17 +259,26 @@ class EngineHandle:
         text = self.model.tokenizer.decode(new_ids, skip_special_tokens=True)
         return new_ids, text
 
-    def _finish(self, new_ids, cap, tool_calls):
+    def _finish(self, new_ids, cap, tool_calls, cancel=None):
+        """finish_reason for a run, from its real generated ids.
+
+        Shared by both paths. `new_ids` must be the ids the model actually
+        generated -- the streaming path used to re-tokenize its own decoded
+        output here, which does not reproduce them.
+        """
         eos = self.model.config.eos_token_id
         eos_set = set(eos) if isinstance(eos, (list, tuple, set)) else {eos}
         return finish_reason(
             hit_eos=bool(new_ids) and new_ids[-1] in eos_set,
             # HF trims a matched stop string before returning, so the returned
-            # ids cannot be inspected for one. `produced < cap` below covers it:
-            # the only distinction a client acts on is length vs stop.
+            # ids cannot be inspected for one. `produced < cap` covers it: the
+            # only distinction a client acts on is length vs stop. A CANCELLED
+            # run also satisfies `produced < cap`, which is why the token is
+            # passed too -- finish_reason consults it before this inference.
             hit_stop_string=len(new_ids) < cap,
             hit_tool_call=bool(tool_calls),
-            produced=len(new_ids), cap=cap)
+            produced=len(new_ids), cap=cap,
+            cancelled=cancel is not None and cancel.cancelled)
 
     async def generate(self, req, cancel=None) -> GenerationResult:
         import time
@@ -292,7 +301,7 @@ class EngineHandle:
                 None, lambda: self.model.generate(**kwargs))
         new_ids, text = self._decode_new(out, len(prompt_ids))
         cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None)
-        finish = self._finish(new_ids, cap, calls)
+        finish = self._finish(new_ids, cap, calls, cancel=cancel)
         wall = time.time() - started
         self._log(req, "DONE", tokens=len(new_ids), finish=finish,
                   prefix_hit=self._prefix_hits() > hits_before,
@@ -331,13 +340,20 @@ class EngineHandle:
         loop = asyncio.get_running_loop()
         bridge: _queue.Queue = _queue.Queue()
         DONE = object()
+        # The real generated ids, filled by the streamer as they are produced.
+        # Re-tokenizing the decoded text does not reproduce them -- it is decoded
+        # with skip_special_tokens=True, so EOS is gone and merges differ across
+        # a decode boundary -- and both completion_tokens and finish_reason are
+        # derived from the count.
+        new_ids: list = []
 
         def _pump():
             try:
                 for chunk in stream_generate(self.model, input_ids,
                                              max_new_tokens=cap,
                                              temperature=temperature,
-                                             top_p=top_p, **kwargs):
+                                             top_p=top_p,
+                                             token_ids_out=new_ids, **kwargs):
                     bridge.put(("delta", chunk))
             except BaseException as e:              # noqa: BLE001 -- re-raised below
                 bridge.put(("error", e))
@@ -370,14 +386,13 @@ class EngineHandle:
 
         full = "".join(parts)
         cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None)
-        produced = len(self.model.tokenizer(full, add_special_tokens=False)["input_ids"])
+        produced = len(new_ids)
+        finish = self._finish(new_ids, cap, calls, cancel=cancel)
         wall = time.time() - started
-        self._log(req, "DONE", tokens=produced,
+        self._log(req, "DONE", tokens=produced, finish=finish,
                   prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
                   decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
         yield ("final", GenerationResult(
             text=cleaned, tool_calls=calls,
             prompt_tokens=len(prompt_ids), completion_tokens=produced,
-            finish_reason=finish_reason(
-                hit_eos=produced < cap, hit_stop_string=False,
-                hit_tool_call=bool(calls), produced=produced, cap=cap)))
+            finish_reason=finish))
