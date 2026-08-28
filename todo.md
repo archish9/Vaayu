@@ -40,7 +40,8 @@ Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
 **Suite baseline: 1217 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B14. It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6. **None of the
+2026-08-28 after B14 — B3 added no Python tests (its 7 are `cargo test` in `vaayu_rust`: 6 → 13).
+It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -48,7 +49,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 |---|---|---|---|
 | ~~1~~ | ~~**B2**~~ — **DONE 2026-08-23**, fixed together with B5 | | |
 | ~~0~~ | ~~**B14**~~ — **DONE 2026-08-28** | | |
-| 1 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
+| ~~1~~ | ~~**B3**~~ — **DONE 2026-08-28** | | |
 | 2 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
 | ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
 | 3 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
@@ -222,7 +223,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14 and B3 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -276,15 +277,42 @@ refusing means the flag silently reclaims nothing on single-file checkpoints.
 confirmed to FAIL against the pre-fix `utils.py` (the key one as the exact
 `FileNotFoundError` above). Suite 1211/3 → **1217/3**.
 
-### B3 · [bug] short io_uring reads are counted as success — silent weight corruption
-`vaayu_rust/src/lib.rs:377-386`, `persistent_read`. The CQE loop tests only
-`cqe.result() < 0`. A **short read** (`0 <= result < this_len`) is legal — and
-O_DIRECT NVMe reads under memory pressure or at EOF do it — and is counted as a
-completed chunk. The tail of the destination keeps whatever the previous expert
-left in that pinned slab. Result: an expert's weights are partially garbage, the
-forward proceeds, tokens are wrong, and **nothing raises**.
-**Done means:** compare `cqe.result()` against the submitted length for that
-`user_data` and resubmit the remainder (or error loudly).
+### B3 · [x] short io_uring reads were counted as success — **FIXED 2026-08-28**
+`vaayu_rust/src/lib.rs`, `persistent_read` (and `legacy_read`, which had the
+identical loop and is the live fallback when `RING_POOL` is unset). The CQE loop
+tested only `cqe.result() < 0`, so a short read was counted as a completed chunk
+and the tail of the destination kept whatever the previous read left in that
+pinned slab — wrong weights, no error raised.
+
+**What the row got wrong, found by running it.** Short reads at EOF are NOT a
+defect here: `_load_pinned` deliberately over-requests, `aligned_length =
+_align_up(total_size + prefix_pad)` (`safetensor_model_persister.py:376`), so the
+last chunk of every layer legitimately comes back up to 4095 bytes short. The
+first draft errored on that and broke **53 suite tests** at once
+(`io_uring short read CQE[31] offset=525336688 got 16289904/16293888 bytes`) —
+that was the fix being wrong, not the engine. The real defect is a short read
+with **file bytes still behind it**.
+
+**Fix:** the submission loop now builds a `ReadChunk { file_off, buf_off, len }`
+list once and keys `user_data` to its index, so each CQE is measured against its
+own request; `done[i]` accumulates and any incomplete chunk is resubmitted from
+where it stopped, in waves, until every chunk is satisfied. `chunk_outcome()`
+classifies one completion as `Complete` / `Resubmit` / `Truncated`: complete when
+the chunk is full **or** the read reached EOF (the aligned over-request above),
+`Truncated` — a loud `PyIOError` — when no progress was made yet the file says
+bytes remain. The file size is fetched lazily on the first short read only, so
+the all-complete path adds no syscall. A CQE whose `user_data` is not a known
+chunk now errors instead of panicking through FFI.
+**Verified:** `cargo test` 6 → 13. The three integration tests are EOF-behaviour
+guards (they are what caught the wrong first draft); the four `chunk_outcome`
+tests carry the corruption logic and were confirmed to FAIL when the classifier
+is mutated to the pre-fix behaviour ("always complete"). Suite 1217/3 unchanged.
+Server smoke gate PASSes on Qwen3-235B (`ALL PASS`, real decode, no short-read
+errors). **Not covered by a test:** the resubmit-succeeds branch — a regular file
+never short-reads mid-file, so it cannot be provoked from a test; the unit test
+of `chunk_outcome` is what stands behind it.
+**B6 is still open** — the `SQ full` early-return still leaves stale SQEs, and the
+wave loop pushes through the same path.
 
 ### B4 · [bug] SSE releases the engine slot before generation actually stops
 `vaayu/server/app.py:454-485`, `_sse`. On client disconnect Starlette closes the
