@@ -182,3 +182,102 @@ def test_free_space_is_checked_even_when_the_flag_is_on(tmp_path, monkeypatch):
 
     utils.split_and_save_layers(ckpt, delete_original=True)
     assert calls, "check_space was skipped in exactly the mode with the least margin"
+
+
+# ---------------------------------------------------------------------------
+# B14: a SINGLE-FILE checkpoint must survive its own deletion.
+#
+# A multi-shard checkpoint stays loadable after the delete because
+# `model.safetensors.index.json` is not a weight file and is left behind --
+# discovery finds it, `split_and_save_layers` reads its weight_map, sees a
+# complete split and returns it. A single-file checkpoint has no index: the
+# deleted `model.safetensors` was the only one of the four names
+# `find_or_create_local_splitted_path` recognises, so the NEXT load printed
+# "didn't find downloaded model", treated the absolute path as a HF repo id and
+# died in validate_repo_id -- with a complete splitted_model/ sitting right
+# there. The damage is invisible in the run that causes it.
+#
+# The fix gives the single-file case the same survivor: an index synthesised
+# from the map the splitter already built. Nothing downstream is new.
+# ---------------------------------------------------------------------------
+
+def _single_file_checkpoint(root: Path, name: str = "model.safetensors") -> Path:
+    """One weight file, no index -- the shape that had no survivor."""
+    root.mkdir(parents=True, exist_ok=True)
+    weights = {"model.embed_tokens.weight": torch.zeros(2, 2),
+               "model.layers.0.w": torch.zeros(2, 2),
+               "model.layers.1.w": torch.zeros(2, 2),
+               "model.norm.weight": torch.zeros(2),
+               "lm_head.weight": torch.zeros(2, 2)}
+    if name.endswith(".safetensors"):
+        save_file(weights, str(root / name))
+    else:
+        torch.save(weights, str(root / name))
+    return root
+
+
+def test_a_single_file_checkpoint_is_still_discoverable_after_the_delete(tmp_path):
+    """THE regression: load, then load again. The second one used to be fatal."""
+    ckpt = _single_file_checkpoint(tmp_path / "ckpt")
+    saved = utils.split_and_save_layers(ckpt, delete_original=True)
+    assert not (ckpt / "model.safetensors").exists(), "the flag reclaimed nothing"
+
+    # Same call the next process makes. Before the fix this raised
+    # FileNotFoundError("No model files found") from split_and_save_layers,
+    # and find_or_create_local_splitted_path never even got here.
+    again = utils.split_and_save_layers(ckpt, delete_original=True)
+    assert Path(again) == Path(saved)
+    assert (ckpt / "splitted_model" / "model.layers.1.safetensors").exists()
+
+
+def test_the_delete_leaves_an_index_behind(tmp_path):
+    ckpt = _single_file_checkpoint(tmp_path / "ckpt")
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    left = ckpt / "model.safetensors.index.json"
+    assert left.exists(), "nothing survived to make the directory discoverable"
+    weight_map = json.loads(left.read_text())["weight_map"]
+    assert weight_map["model.layers.1.w"] == "model.safetensors"
+
+
+def test_a_single_file_torch_checkpoint_gets_the_torch_index(tmp_path):
+    """The other single-file shape. Its index has the other name."""
+    ckpt = _single_file_checkpoint(tmp_path / "ckpt", name="pytorch_model.bin")
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert not (ckpt / "pytorch_model.bin").exists()
+    assert (ckpt / "pytorch_model.bin.index.json").exists()
+    assert not (ckpt / "model.safetensors.index.json").exists()
+    assert Path(utils.split_and_save_layers(ckpt, delete_original=True)).name == "splitted_model"
+
+
+def test_an_existing_index_is_never_overwritten(tmp_path):
+    """The sharded case already had a survivor. Do not touch the real one."""
+    ckpt = _sharded_checkpoint(tmp_path / "ckpt")
+    before = (ckpt / "model.safetensors.index.json").read_bytes()
+
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert (ckpt / "model.safetensors.index.json").read_bytes() == before
+
+
+def test_the_reclaim_is_given_up_rather_than_stranding_the_checkpoint(tmp_path, monkeypatch):
+    """If the index cannot be written, the weight file must NOT go."""
+    ckpt = _single_file_checkpoint(tmp_path / "ckpt")
+    monkeypatch.setattr(Path, "write_text",
+                        lambda self, *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+
+    utils.split_and_save_layers(ckpt, delete_original=True)
+
+    assert (ckpt / "model.safetensors").exists(), "deleted the only discoverable file anyway"
+
+
+def test_discovery_itself_still_finds_the_directory_after_the_delete(tmp_path):
+    """The exact call the next process makes -- and the one that used to fall
+    through to `validate_repo_id` on an absolute path."""
+    ckpt = _single_file_checkpoint(tmp_path / "ckpt")
+    utils.find_or_create_local_splitted_path(str(ckpt), delete_original=True)
+
+    local, split = utils.find_or_create_local_splitted_path(str(ckpt), delete_original=True)
+    assert Path(local) == ckpt
+    assert Path(split) == ckpt / "splitted_model"

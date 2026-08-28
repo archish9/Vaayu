@@ -39,15 +39,15 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1211 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-23 after B2+B5. It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15. **None of the
+**Suite baseline: 1217 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-28 after B14. It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
 | # | do this | why here | where |
 |---|---|---|---|
 | ~~1~~ | ~~**B2**~~ — **DONE 2026-08-23**, fixed together with B5 | | |
-| 0 | **B14** — `DELETE_ORIGINAL` makes a SINGLE-FILE checkpoint unloadable after the first load | irreversible deletion whose damage is only visible on the NEXT run; measured on Llama-3.2-1B 2026-08-23 | `vaayu/utils.py:509-513` |
+| ~~0~~ | ~~**B14**~~ — **DONE 2026-08-28** | | |
 | 1 | **B3** — short reads counted as success in the CQE loop | silent weight corruption, no error, wrong tokens | `vaayu_rust/src/lib.rs:377` |
 | 2 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
 | ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
@@ -222,8 +222,8 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23). B1's detail is archived; B2's and B5's closures are kept in place below,
-because both are load-bearing for the P1/R5 perf rows.
+B5 (all 2026-08-23), B14 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
+place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
 `vaayu/server/engine.py` counted stream tokens as
@@ -244,30 +244,37 @@ both. The re-tokenization is deleted, which also banks P1 item (4).
 **Verified:** 5 engine tests + 5 streaming tests; the 4 that distinguish the
 behaviour were confirmed to FAIL against the pre-fix `engine.py`.
 
-### B14 · [bug] `DELETE_ORIGINAL` leaves a SINGLE-FILE checkpoint unloadable
+### B14 · [x] `DELETE_ORIGINAL` left a SINGLE-FILE checkpoint unloadable — **FIXED 2026-08-28**
 Found 2026-08-23 by running the server smoke gate; it deleted 2.3 GB off
-Llama-3.2-1B and the NEXT load then failed.
+Llama-3.2-1B and the NEXT load then failed with
+`FileNotFoundError: No model files found`, having first printed "didn't find
+downloaded model" and tried the absolute path as a HF repo id — with a complete
+`splitted_model/` sitting right there.
 
-`delete_original_shards` (`vaayu/utils.py:190`) deliberately keeps config,
-tokenizer and the index — "every subsequent load still reads them". That
-reasoning holds for a MULTI-shard checkpoint, where `model.safetensors.index.json`
-survives. It does not hold for a **single-file** checkpoint, which has no index:
-`find_or_create_local_splitted_path` (`utils.py:509-513`) recognises a local
-directory only by `model.safetensors.index.json`, `pytorch_model.bin.index.json`,
-`model.safetensors` or `pytorch_model.bin`, and for a single-file checkpoint the
-deleted `model.safetensors` was the ONLY one of the four. The next load prints
-"didn't find downloaded model", treats the absolute path as a HF repo id, and
-dies in `validate_repo_id` — with a complete, valid `splitted_model/` sitting
-right there.
+**Root cause:** a SHARDED checkpoint survives its own delete only because
+`model.safetensors.index.json` is not a weight file and is left behind —
+`find_or_create_local_splitted_path` (`utils.py:509-513`) recognises the
+directory by it. A single-file checkpoint has no index, so the deleted
+`model.safetensors` was the ONLY one of the four names discovery looks for. The
+damage is invisible in the run that causes it (that run already holds the split).
 
-**The damage is invisible in the run that causes it** (that run already holds the
-split) and only appears on the next one, which is what makes it worth a row.
-Recovered here with `git checkout -- model.safetensors`, which worked only
-because that checkpoint happens to be an HF git clone with its LFS objects still
-local. A plain download has no such recovery.
-**Done means:** discovery also accepts a directory containing a complete
-`splitted_model/`, or the delete is refused when it would remove the last
-discoverable file. **Not:** turning the feature off — it is doing what it says.
+**Fix:** `_leave_an_index_behind` (`vaayu/utils.py`), called from
+`delete_original_shards` before it unlinks anything: when the directory has
+neither index json, write `{"weight_map": index}` — the map the splitter already
+built — as `model.safetensors.index.json` or `pytorch_model.bin.index.json` per
+`safetensors_format`. The single-file case then walks the sharded case's proven
+path: discovery finds the index, `split_and_save_layers` reads its weight_map,
+`all(found_layers.values())` holds, `splitted_model/` is returned, and the
+re-run delete is a no-op. Safe because only `AutoConfig` / `AutoTokenizer` /
+`GenerationConfig.from_pretrained` ever read that directory afterwards
+(`vaayu_base.py:1410,2267,2277-2280`) — no weight loader does. An existing index
+is never overwritten, and if the index cannot be written the reclaim is GIVEN UP
+rather than stranding the checkpoint.
+**Chose this over refusing the delete** (the row's other permitted ending):
+refusing means the flag silently reclaims nothing on single-file checkpoints.
+**Verified:** 6 tests in `tests/test_delete_original.py`; the 5 behavioural ones
+confirmed to FAIL against the pre-fix `utils.py` (the key one as the exact
+`FileNotFoundError` above). Suite 1211/3 → **1217/3**.
 
 ### B3 · [bug] short io_uring reads are counted as success — silent weight corruption
 `vaayu_rust/src/lib.rs:377-386`, `persistent_read`. The CQE loop tests only

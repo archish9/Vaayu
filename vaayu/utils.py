@@ -187,18 +187,61 @@ def remove_real_and_linked_file(to_delete):
 
 
 
+def _leave_an_index_behind(checkpoint_path, index, safetensors_format):
+    """Synthesise the index a SINGLE-FILE checkpoint never had, before deleting.
+
+    A sharded checkpoint survives its own delete because
+    `model.safetensors.index.json` is not a weight file: it stays, and
+    `find_or_create_local_splitted_path` recognises the directory by it. A
+    single-file checkpoint has no index -- the `model.safetensors` about to be
+    deleted is the ONLY one of the four names that discovery looks for -- so the
+    next load called the path undiscoverable, treated it as a HF repo id and
+    died, with a complete `splitted_model/` sitting right there (B14).
+
+    Writing the map the splitter already built puts the single-file case on the
+    sharded case's proven path: discovery finds the index, `split_and_save_layers`
+    reads its weight_map, `all(found_layers.values())` holds, and the split is
+    returned. Only config/tokenizer/generation-config are ever read from this
+    directory afterwards -- no weight loader touches it -- so an index naming a
+    file that is about to go is exactly as true as the sharded one.
+
+    A checkpoint that already has an index keeps it untouched. Returns whether
+    the delete may proceed.
+    """
+    if any((checkpoint_path / n).exists() for n in
+           ('model.safetensors.index.json', 'pytorch_model.bin.index.json')):
+        return True
+    name = 'model.safetensors.index.json' if safetensors_format else 'pytorch_model.bin.index.json'
+    try:
+        (checkpoint_path / name).write_text(json.dumps({"weight_map": index}))
+    except OSError as e:
+        # A real limit, not something to hide (CLAUDE.md §5): without the index
+        # the delete strands the checkpoint, so give up the reclaim instead --
+        # the split is already written and usable, and the disk stays full.
+        print(f"WARNING: keeping the original files -- could not write {name} ({e}), "
+              f"and deleting the only weight file would leave {checkpoint_path} undiscoverable")
+        return False
+    print(f"delete_original: wrote {name} so this checkpoint stays discoverable")
+    return True
+
+
 def delete_original_shards(checkpoint_path, index, safetensors_format):
     """Delete the source checkpoint shards a completed split has replaced.
 
     Only the weight files named by `index` are removed -- config, tokenizer and
-    the index itself stay, since every subsequent load still reads them. Missing
-    files are skipped (already reclaimed by an earlier run).
+    the index stay, since every subsequent load still reads them. A single-file
+    checkpoint has no index of its own, so one is synthesised first
+    (`_leave_an_index_behind`); without it the delete leaves the directory
+    undiscoverable. Missing files are skipped (already reclaimed by an earlier
+    run).
 
     Callers MUST have verified the split is complete first: this is
     irreversible, and `remove_real_and_linked_file` follows symlinks, so a shard
     linked into the shared HF cache takes the cached blob with it.
     """
     checkpoint_path = Path(checkpoint_path)
+    if not _leave_an_index_behind(checkpoint_path, index, safetensors_format):
+        return 0
     freed = 0
     for name in sorted(set(index.values())):
         f = checkpoint_path / name
