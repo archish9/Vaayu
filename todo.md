@@ -40,7 +40,8 @@ Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
 **Suite baseline: 1219 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B4 — B3 added no Python tests (its 7 are `cargo test` in `vaayu_rust`: 6 → 13).
+2026-08-28 after B6 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
+which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
@@ -52,7 +53,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~1~~ | ~~**B3**~~ — **DONE 2026-08-28** | | |
 | ~~2~~ | ~~**B4**~~ — **DONE 2026-08-28** | | |
 | ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
-| 3 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
+| ~~3~~ | ~~**B6**~~ — **DONE 2026-08-28** | | |
 | 4 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
 | 5 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
 | 6 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
@@ -70,8 +71,8 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 **Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3: if decode already
 achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows close** — record the verdict, do not
 re-scope to find a win. R3 additionally requires M1's GIL probe to show real contention. R1 and P1
-are worth doing regardless of M1's result. B3 and B6 are prerequisites for R2 (it submits more SQEs
-per call, which is exactly what both bugs mishandle).
+are worth doing regardless of M1's result. B3 and B6 were prerequisites for R2 (it submits more SQEs
+per call, which is exactly what both bugs mishandled); both closed 2026-08-28.
 
 **What Rust cannot do, so nobody re-derives it:** MoE decode is 72–74 % disk-bound and the rest is
 CUDA; streamed dense already reads at ~5.7 GB/s, i.e. at the wall. Rewriting the decode loop,
@@ -223,7 +224,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14, B3 and B4 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14, B3, B4 and B6 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -311,8 +312,7 @@ Server smoke gate PASSes on Qwen3-235B (`ALL PASS`, real decode, no short-read
 errors). **Not covered by a test:** the resubmit-succeeds branch — a regular file
 never short-reads mid-file, so it cannot be provoked from a test; the unit test
 of `chunk_outcome` is what stands behind it.
-**B6 is still open** — the `SQ full` early-return still leaves stale SQEs, and the
-wave loop pushes through the same path.
+B6 (closed the same day) covers the wave loop's own error exits.
 
 ### B4 · [x] SSE released the engine slot before generation stopped — **FIXED 2026-08-28**
 `vaayu/server/app.py:454-485`, `_sse`. On client disconnect Starlette closes the
@@ -369,15 +369,54 @@ tail also defaulted a missing final event to `"stop"` and now says `"length"`.
 **Verified:** 5 stopping tests + 2 engine tests, confirmed to FAIL against the
 pre-fix code (the `_finish` one as a `TypeError`, the rest as `"stop"`).
 
-### B6 · [bug] `SQ full` early-return leaves stale SQEs on a POOLED ring
-`vaayu_rust/src/lib.rs:365`. `push(&entry)` failing returns `Err` immediately,
-leaving every SQE already pushed in this call sitting in the submission queue.
-The ring is not per-call — it is one slot of `RING_POOL`, reused by the next
-caller, whose `submit_and_wait(n)` will submit those orphans. They point at a
-pinned buffer that has since been returned to `_EXPERT_BUF_POOL` and handed to a
-different expert: a DMA write into a live buffer, plus a CQE accounting mismatch
-(`completed != submitted`) on an unrelated read.
-**Done means:** drain/reset the SQ before returning the error.
+### B6 · [x] error exits abandoned a POOLED ring dirty — **FIXED 2026-08-28**
+`vaayu_rust/src/lib.rs`, `persistent_read`. `push(&entry)` failing returned `Err`
+immediately, leaving every SQE already pushed in this call sitting in the
+submission queue. The ring is not per-call — it is one slot of `RING_POOL`,
+reused by the next caller, whose `submit_and_wait(n)` submits those orphans
+against a pinned buffer that has since gone back to `_EXPERT_BUF_POOL`.
+
+**What the row understated, found by reading the crate.** The leak is not
+confined to the `SQ full` push. `SubmissionQueue`'s `Drop` stores the tail
+unconditionally (`squeue.rs:353`), so the current code — which builds a fresh
+guard per `push` — has already published every earlier SQE to the shared tail by
+the time one fails. And the SQ is only half of it: `CompletionQueue`'s `Drop`
+stores the head, so returning mid-iteration releases only the CQEs consumed so
+far and **leaves the rest for the next caller**, whose loop reads their
+`user_data` as an index into ITS `chunks` and credits their bytes to a chunk that
+was never read — silent wrong weights, the same corruption from the other end.
+Seven error paths exited that way, not one. Measured on the pre-fix code: an
+EFAULT wave left **7 unreaped CQEs**, an `SQ full` return left **8 orphan SQEs**.
+
+**Fix:** `drain_ring(&mut IoUring, outstanding)` — submit whatever is queued,
+then wait out every completion the kernel still owes, then discard residue. The
+wait is not politeness: those reads are DMAing into `buf_ptr`, which is only ours
+until the call returns. The wave loop no longer returns from inside itself; it
+CAPTURES the error (`failure: Option<PyErr>`, labelled `break 'waves`) so there
+is exactly ONE exit, which drains and then raises. `outstanding` is tracked
+exactly — from `submit_and_wait`'s returned count, decremented per reaped CQE,
+and on a failed submit from the SQ-length difference, so the drain can never wait
+for a completion that was never submitted. If a drain itself fails the slot is
+marked `dirty` and refuses further reads: a loud dead slot beats a silent DMA
+into someone else's buffer.
+**Beyond the row's literal "done means":** `legacy_read` got the same
+capture-then-drain treatment. It owns its ring, so it leaks nothing to a next
+caller, but returning while reads are in flight lets the kernel write into the
+caller's buffer after the call — same root cause, same helper. The CQE
+bookkeeping both loops had duplicated since B3 is now one `apply_cqe`.
+**Verified:** `cargo test` 13 → 19. The two behavioural tests (a mid-wave EFAULT,
+and a pre-filled SQ) were confirmed to FAIL against the pre-fix code with the
+exact residue counts above; the two `drain_ring` tests and the dirty-slot test
+were each confirmed to fail with their mechanism mutated out.
+`legacy_read_reports_a_failing_cqe` is a plain guard and passes either way.
+Suite **1219/3 unchanged**. Server smoke gate `ALL PASS` on Qwen3-235B (real MoE
+decode); dense smoke gate PASS on Llama-3.3-70B, **ppl 8.78** unchanged.
+**Not covered by a test:** the failed-drain branch that sets `dirty` — it needs
+`io_uring_enter` to fail unrecoverably, which cannot be provoked from a test; the
+flag's effect is tested by setting it directly.
+**Does NOT do R2's job:** the read still submits `pending.len()` SQEs in one
+wave. R2 must still split a layer's descriptor list into SQ-sized waves — B6 only
+guarantees that when a wave does not fit, the ring is left clean.
 
 ### B7 · [bug] the fenced-JSON tool fallback eats ordinary JSON answers
 `vaayu/server/tools.py:115-135`, `_parse_fenced`, reached via `GENERIC_JSON`
@@ -521,7 +560,10 @@ becomes a loop over descriptors instead of over chunks of one descriptor.
 **Refuted if:** M1 shows decode already at ~5.4 GB/s, or a prototype's achieved bandwidth does not
 move. **Close the row on that result; do not re-scope.**
 **Watch for:** the SQ is sized at `queue_depth` (32) and a layer's descriptor list can exceed it —
-submit in SQ-sized waves inside the one call, and **fix B6 first** (the `SQ full` early-return leak).
+submit in SQ-sized waves inside the one call. **B6 is done** (2026-08-28), so an
+over-full wave now fails cleanly instead of poisoning the next caller — but B6 did not add the wave
+splitting, and R2 still must. Note also that the submission loop builds a fresh `SubmissionQueue`
+guard per `push`, i.e. one tail store per SQE; batching the pushes under one guard is R2's to take.
 → `speed-up-vaayu.md` §2 R2.
 
 ### R3 · [ ] Move the expert-cache miss path into Rust ("get-or-read"), GIL-free
