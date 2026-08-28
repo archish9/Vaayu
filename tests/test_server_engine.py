@@ -4,6 +4,7 @@ Exercised against a fake model. No torch model, no checkpoint -- the parts that
 need a real GPU are covered by test_server_smoke.py at the repo root.
 """
 import asyncio
+import time
 
 import pytest
 
@@ -322,3 +323,83 @@ def test_a_cancelled_non_stream_run_is_not_reported_as_stop():
     assert e._finish([10, 11], cap=5, tool_calls=[], cancel=cancel) == "length"
     assert e._finish([10, 11], cap=5, tool_calls=[]) == "stop", (
         "an uncancelled short run is still a stop-string stop")
+
+
+# ── the slot outlives the generation on every exit path (B4) ─────────────────
+
+
+def _blocking_fake(engine, cancel, record, *, tick=0.02):
+    """A stream_generate stand-in that keeps producing until `cancel` fires. It
+    records its own thread, and whether the engine lock was still held at the
+    moment it stopped."""
+    import threading
+
+    def _fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        record["thread"] = threading.current_thread()
+        try:
+            while not cancel.cancelled:
+                yield "tok "
+                time.sleep(tick)
+        finally:
+            if token_ids_out is not None:
+                token_ids_out.extend([10, 11])
+            record["lock_at_exit"] = engine._lock.locked()
+    return _fake
+
+
+def test_sse_holds_the_slot_until_the_abandoned_worker_thread_has_stopped(monkeypatch):
+    # B4. Starlette closes the SSE generator when the client goes away.
+    # GeneratorExit is a BaseException, so `except Exception` misses it,
+    # `engine.slot().__aexit__` runs FIRST -- lock released, _inflight
+    # decremented -- and only then the outer `finally: cancel.cancel()`.
+    # Meanwhile stream_generate's worker is still inside model.generate, so the
+    # next queued request calls generate() on an engine whose own docstring says
+    # concurrency is 1 by construction.
+    from vaayu.server.app import _sse
+    from vaayu.server.engine import CancelToken
+
+    e, mod, _ = _streaming_engine([10, 11])
+    cancel = CancelToken()
+    record = {}
+    monkeypatch.setattr(mod, "stream_generate", _blocking_fake(e, cancel, record))
+
+    async def main():
+        agen = _sse(e, _req(max_tokens=50), "vaayu", None, cancel=cancel)
+        seen = 0
+        async for _ in agen:
+            seen += 1
+            if seen >= 4:
+                break
+        await agen.aclose()             # exactly what Starlette does on disconnect
+        return record["thread"].is_alive(), e.depth
+
+    alive_after_close, depth_after_close = asyncio.run(main())
+    record["thread"].join(timeout=5)
+    assert not alive_after_close, (
+        "the SSE generator returned while the generation worker was still "
+        "running -- the slot is free and a queued request will be admitted")
+    assert record["lock_at_exit"] is True, (
+        f"the engine lock was {record['lock_at_exit']} when the worker stopped; "
+        f"it must still be held, or two generations can overlap")
+    assert depth_after_close == 0
+
+
+def test_a_stream_that_finishes_normally_still_releases_the_slot(monkeypatch):
+    # Guards the fix above: quiescing at slot exit must not wait on a worker
+    # that has already gone, and must leave the gate reusable.
+    from vaayu.server.app import _sse
+    from vaayu.server.engine import CancelToken
+
+    e, mod, fake = _streaming_engine([10, 11, 2], eos_token_id=2)
+    monkeypatch.setattr(mod, "stream_generate", fake)
+
+    async def main():
+        events = [ev async for ev in _sse(e, _req(max_tokens=5), "vaayu", None,
+                                          cancel=CancelToken())]
+        async with e.slot():            # the gate is usable again
+            pass
+        return events
+
+    events = asyncio.run(main())
+    assert events[-1] == "data: [DONE]\n\n"
+    assert e.depth == 0

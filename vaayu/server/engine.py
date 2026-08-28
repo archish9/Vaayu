@@ -92,6 +92,10 @@ class EngineHandle:
         # The token of the request currently generating, so shutdown can stop
         # it. Concurrency is 1 by construction, so one slot is the whole set.
         self._live_cancel = None
+        # The worker thread that token belongs to. The token alone cannot say
+        # whether generation has actually STOPPED -- cancellation is cooperative
+        # and is only checked once per token -- so `quiesce` needs the thread.
+        self._live_thread = None
 
         # vaayu_base falls back to max_seq_len=512 when it built no VramPlan
         # (CPU / no CUDA). This server defaults the generation cap to "the
@@ -129,6 +133,22 @@ class EngineHandle:
         if token is not None:
             token.cancel()
 
+    def quiesce(self) -> None:
+        """Cancel the running generation and WAIT for its worker to exit.
+
+        Deliberately synchronous. It runs on the teardown path of a cancelled
+        request, where `await` is not dependable: the ASGI server cancels the
+        task, so an anyio cancel scope re-raises CancelledError at every
+        checkpoint and the wait would be skipped -- which is the whole bug. A
+        blocking join always runs. It costs at most the one forward pass the
+        cancel flag is checked after, and the GPU is busy for that time anyway.
+        """
+        self.cancel_all()
+        thread = self._live_thread
+        if thread is not None:
+            thread.join()
+            self._live_thread = None
+
     def prefix_stats(self) -> str:
         """One grep-able line from the prefix pool, or a note that it is off.
 
@@ -160,7 +180,17 @@ class EngineHandle:
         self._inflight += 1
         try:
             async with self._lock:
-                yield
+                try:
+                    yield
+                finally:
+                    # The slot must outlive the generation on EVERY exit path.
+                    # A client disconnect closes the SSE generator with
+                    # GeneratorExit, which unwinds through here while
+                    # stream_generate's worker is still inside model.generate;
+                    # releasing the lock now admits a second generate() onto an
+                    # engine that is not thread-safe and shares the KV cache,
+                    # the expert VRAM cache and the slab arena.
+                    self.quiesce()
         finally:
             self._inflight -= 1
 
@@ -362,6 +392,7 @@ class EngineHandle:
 
         thread = threading.Thread(target=_pump, daemon=True)
         self._live_cancel = cancel
+        self._live_thread = thread
         thread.start()
 
         parts, error = [], None

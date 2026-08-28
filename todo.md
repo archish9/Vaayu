@@ -39,9 +39,9 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1217 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B14 — B3 added no Python tests (its 7 are `cargo test` in `vaayu_rust`: 6 → 13).
-It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6. **None of the
+**Suite baseline: 1219 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-28 after B4 — B3 added no Python tests (its 7 are `cargo test` in `vaayu_rust`: 6 → 13).
+It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -50,7 +50,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~1~~ | ~~**B2**~~ — **DONE 2026-08-23**, fixed together with B5 | | |
 | ~~0~~ | ~~**B14**~~ — **DONE 2026-08-28** | | |
 | ~~1~~ | ~~**B3**~~ — **DONE 2026-08-28** | | |
-| 2 | **B4** — SSE releases the slot before generation stops | two concurrent `generate()` on a non-thread-safe engine | `vaayu/server/app.py:454` |
+| ~~2~~ | ~~**B4**~~ — **DONE 2026-08-28** | | |
 | ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
 | 3 | **B6** — `SQ full` early-return leaves stale SQEs on a pooled ring | next caller DMAs into a recycled pinned buffer | `vaayu_rust/src/lib.rs:365` |
 | 4 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
@@ -223,7 +223,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14 and B3 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14, B3 and B4 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -314,17 +314,44 @@ of `chunk_outcome` is what stands behind it.
 **B6 is still open** — the `SQ full` early-return still leaves stale SQEs, and the
 wave loop pushes through the same path.
 
-### B4 · [bug] SSE releases the engine slot before generation actually stops
+### B4 · [x] SSE released the engine slot before generation stopped — **FIXED 2026-08-28**
 `vaayu/server/app.py:454-485`, `_sse`. On client disconnect Starlette closes the
-generator: `GeneratorExit` is a `BaseException`, so the `except Exception` does
-not catch it, `async with engine.slot()`'s `__aexit__` runs **first** (lock
-released, `_inflight` decremented), and only then does the outer
-`finally: cancel.cancel()` run. Meanwhile `stream_generate`'s worker thread is
-still inside `model.generate`. A queued request is admitted immediately and calls
-`model.generate` on an engine whose own docstring says concurrency is 1 by
+generator: `GeneratorExit` is a `BaseException`, so the `except Exception` did
+not catch it, `async with engine.slot()`'s `__aexit__` ran **first** (lock
+released, `_inflight` decremented), and only then the outer
+`finally: cancel.cancel()`. Meanwhile `stream_generate`'s worker thread was
+still inside `model.generate`. A queued request was admitted immediately and
+called `model.generate` on an engine whose own docstring says concurrency is 1 by
 construction, sharing the KV cache, the expert VRAM cache and the slab arena.
-**Done means:** cancel and join the worker inside the slot, so the slot outlives
-the generation on every exit path.
+
+**Fix:** `EngineHandle.quiesce()` (`vaayu/server/engine.py`) — cancel the live
+token, then `join()` the live worker thread — called from `slot()` in a `finally`
+**inside** `async with self._lock`, so it runs before the lock is released on
+every exit path, `GeneratorExit` included. `stream()` now publishes its worker as
+`self._live_thread` next to `_live_cancel`; the token alone cannot say whether
+generation has STOPPED, since cancellation is cooperative and checked once per
+token. **Fixed in `slot()`, not in `_sse`:** the invariant belongs to the gate,
+so it holds for the non-streaming route and any future caller, and `_sse` needed
+no change.
+**`quiesce` is deliberately synchronous.** It runs on a cancelled request's
+teardown, where `await` is not dependable — the ASGI server cancels the task, so
+an anyio cancel scope re-raises `CancelledError` at every checkpoint and the wait
+would be skipped, which is the whole bug. A blocking join always runs. It costs at
+most the one forward pass the cancel flag is checked after, and the GPU is busy
+for exactly that time anyway.
+**Verified:** 2 tests in `tests/test_server_engine.py`. The reproducer was
+confirmed to FAIL against the pre-fix `engine.py` (`the SSE generator returned
+while the generation worker was still running`); its second assertion — the
+engine lock is still held at the instant the worker exits — is the invariant
+itself. The other test is a guard that the new join does not stall or wedge the
+gate on a normally-finished stream. Suite 1217/3 → **1219/3**. Server smoke gate
+`ALL PASS` on Llama-3.2-1B.
+**Couples to B9:** `quiesce` cancels through `_live_cancel`. B9 (`_live_cancel`
+cleared before the worker stops) is still open, and if that clear ever landed
+BEFORE `slot()`'s exit, `quiesce` would still join but would no longer cancel
+first — i.e. it would wait for the full uncancelled generation. Fixing B9 must
+keep the token published until the worker has exited, which is already what B9's
+"done means" says.
 
 ### B5 · [x] cancellation reported as `finish_reason="stop"` — **FIXED 2026-08-23** (with B2)
 `hit_stop_string` / `hit_eos` were both inferred from "fewer tokens than the cap
@@ -388,6 +415,11 @@ that instant `cancel_all()` (SIGTERM handler, `_teardown`) sees `None` and
 reports idle, so shutdown proceeds with a generation still on the GPU.
 `thread.join()` on line 367 is also skipped entirely on that path.
 **Done means:** the token is published until the worker has actually exited.
+**B4 (2026-08-28) now depends on this:** `slot()` calls `quiesce()`, which cancels
+via `_live_cancel` and then joins `_live_thread`. Today the ordering saves it —
+on disconnect `stream()`'s `finally` has not run yet, because an `async for` does
+not close its iterator — but any change that clears the token earlier turns
+`quiesce` into an uncancelled wait for the whole generation.
 
 ### B10 · [bug] `capture_stdio` is never restored when startup fails
 `vaayu/server/app.py:246-297`. `restore_stdio` is created before
