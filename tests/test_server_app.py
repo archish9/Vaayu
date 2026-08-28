@@ -4,11 +4,15 @@ import json
 from fastapi.testclient import TestClient
 
 from vaayu.server.app import create_app
-from vaayu.server.chat import TemplateLacksToolSupport
+from vaayu.server.chat import NoChatTemplate, TemplateLacksToolSupport
 from vaayu.server.engine import GenerationResult, QueueFull
 from vaayu.server.schemas import ToolCall, ToolCallFunction
 from vaayu.server.stopping import ContextTooLong
+from vaayu.server.tools import GENERIC_JSON as _GENERIC_JSON
 from vaayu.server.tools import HERMES as _HERMES
+
+
+_PREPARE_ERRORS = (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate)
 
 
 class FakeEngine:
@@ -31,6 +35,14 @@ class FakeEngine:
     def warn_if_speculative_sampling_ignored(self, req):
         return self.warned
 
+    # The real EngineHandle raises ContextTooLong / TemplateLacksToolSupport /
+    # NoChatTemplate from HERE, and generate()/stream() call it. Modelling that
+    # is what makes the streaming path's status mapping testable at all.
+    def prepare(self, req):
+        if isinstance(self._raises, _PREPARE_ERRORS):
+            raise self._raises
+        return [1, 2, 3], 16
+
     def slot(self):
         engine = self
 
@@ -50,7 +62,7 @@ class FakeEngine:
             raise self._raises
         return self._result
 
-    async def stream(self, req, cancel=None):
+    async def stream(self, req, cancel=None, prepared=None):
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
@@ -218,6 +230,41 @@ def test_a_streamed_tool_call_is_emitted_once_and_complete():
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def _streamed_content(events):
+    return "".join(e["choices"][0]["delta"].get("content", "") for e in events)
+
+
+def test_a_fenced_json_answer_survives_the_stream_intact():
+    # B7, streaming half: for GENERIC_JSON the "open marker" is a plain ```json
+    # fence, which an ordinary code answer opens too. Suppressing from there on
+    # deleted the block AND everything after it, and the final event carries no
+    # content -- so the client never saw it at all.
+    txt = 'Here is package.json:\n```json\n{"name": "my-app"}\n```\ndone'
+    engine = FakeEngine(deltas=[txt], result=GenerationResult(
+        text=txt, prompt_tokens=3, completion_tokens=9, finish_reason="stop"))
+    engine.tool_format = _GENERIC_JSON
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert _streamed_content(events) == txt
+
+
+def test_a_real_fenced_tool_call_is_still_not_duplicated_as_content():
+    # The other side of the same buffer: when the block DID parse as a call it
+    # is delivered as tool_calls, so it must not also appear in the prose.
+    call = ToolCall(id="call_y", function=ToolCallFunction(name="read_file", arguments='{}'))
+    txt = 'Sure.\n```json\n{"name": "read_file", "arguments": {}}\n```'
+    engine = FakeEngine(deltas=[txt], result=GenerationResult(
+        text="Sure.", prompt_tokens=3, completion_tokens=9,
+        finish_reason="tool_calls", tool_calls=[call]))
+    engine.tool_format = _GENERIC_JSON
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert _streamed_content(events) == "Sure.\n"
+    assert len([e for e in events if e["choices"][0]["delta"].get("tool_calls")]) == 1
+
+
 def test_an_engine_crash_mid_stream_emits_an_error_event_and_closes():
     engine = FakeEngine(raises=RuntimeError("io_uring read failed"))
     r = _client(engine).post("/v1/chat/completions", json=dict(BODY, stream=True))
@@ -278,3 +325,57 @@ def test_the_session_is_echoed_in_the_body_as_well_as_the_header():
                                    json={**BODY, "user": "agent-7"})
     assert r.json()["session_id"] == "agent-7"
     assert r.headers["x-vaayu-session-id"] == "agent-7"
+
+
+# ── B8: the streaming path must map request errors to the same statuses ──────
+#
+# `prepare()` used to run INSIDE `_sse`, i.e. after the StreamingResponse was
+# returned, so every one of these arrived as a 200 carrying an SSE event typed
+# "internal_error". DEFAULT_STREAM is True, so that is what a default client saw
+# for a prompt that is simply too long.
+
+def test_an_oversized_prompt_is_a_400_when_streaming_too():
+    engine = FakeEngine(raises=ContextTooLong("prompt is 9000 tokens but the window is 8192"))
+    r = _client(engine).post("/v1/chat/completions", json={**BODY, "stream": True})
+    assert r.status_code == 400, "a too-long prompt is the client's error on both paths"
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    assert "9000" in r.json()["error"]["message"]
+
+
+def test_streamed_tools_against_a_template_without_tool_support_is_a_400():
+    engine = FakeEngine(raises=TemplateLacksToolSupport("no tool support"))
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    r = _client(engine).post("/v1/chat/completions", json=body)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_a_streamed_request_with_no_chat_template_is_a_400():
+    engine = FakeEngine(raises=NoChatTemplate("this tokenizer has no chat template"))
+    r = _client(engine).post("/v1/chat/completions", json={**BODY, "stream": True})
+    assert r.status_code == 400
+
+
+def test_a_queue_full_losing_the_admission_race_is_an_honest_sse_error_type():
+    # The route's eager depth check catches the ordinary full queue with a real
+    # 503. This is the race it cannot catch: depth was under the limit at the
+    # check and slot() raised anyway. Headers are long gone by then, so the
+    # status cannot be fixed -- but the event type can be honest.
+    engine = FakeEngine(raises=QueueFull("8 requests are already queued"))
+    engine.depth = 0
+    r = _client(engine).post("/v1/chat/completions", json={**BODY, "stream": True})
+    assert r.status_code == 200, "headers were already sent; only the event type is left"
+    errors = [e for e in _sse_events(r.text) if "error" in e]
+    assert errors, "the stream must say something went wrong"
+    assert errors[0]["error"]["type"] == "server_busy", \
+        "a busy engine is not an internal error"
+
+
+def test_a_real_engine_crash_still_streams_as_internal_error():
+    # Guard: the mapping must not swallow genuine faults into a client error.
+    engine = FakeEngine(raises=RuntimeError("CUDA error"))
+    r = _client(engine).post("/v1/chat/completions", json={**BODY, "stream": True})
+    assert r.status_code == 200
+    errors = [e for e in _sse_events(r.text) if "error" in e]
+    assert errors[0]["error"]["type"] == "internal_error"

@@ -121,12 +121,17 @@ def main() -> int:
         # ── 3. an oversized prompt is refused, not truncated ──
         huge = {"model": "vaayu-smoke", "session_id": "smoke-huge",
                 "messages": [{"role": "user", "content": "x " * (h["max_seq_len"] + 1000)}]}
-        # stream=False for the same reason step 1 needs it. The STREAMING form of
-        # this refusal is Bug B8: prepare() runs inside the generator, so
-        # ContextTooLong becomes a 200 carrying an "internal_error" SSE event --
-        # confirmed here on 2026-08-23. Add the streaming assertion when B8 lands.
+        # stream=False for the same reason step 1 needs it.
         r = client.post("/v1/chat/completions", json=dict(huge, stream=False))
         check("an oversized prompt is a 400", r.status_code == 400, r.text[:200])
+        # The STREAMING form was B8: prepare() ran inside the generator, so the
+        # response was already a 200 by the time ContextTooLong was raised and
+        # it arrived as an "internal_error" SSE event -- on the DEFAULT path,
+        # since DEFAULT_STREAM is True. This is the only gate that would have
+        # caught it, so it asserts the streamed refusal too (fixed 2026-08-28).
+        r = client.post("/v1/chat/completions", json=dict(huge, stream=True))
+        check("an oversized prompt is a 400 when streaming too",
+              r.status_code == 400, r.text[:200])
 
         # ── 4. the prefix pool was exercised by the two identical turns ──
         stats = client.get("/health").json()["prefix_cache"]

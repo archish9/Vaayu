@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from .chat import render_prompt
 from .logs import session_event
 from .stopping import finish_reason, resolve_max_tokens
-from .tools import detect_tool_format, parse_tool_calls
+from .tools import declared_tool_names, detect_tool_format, parse_tool_calls
 
 
 # Keyword arguments vaayu.streaming.stream_generate constructs itself. Anything
@@ -330,7 +330,8 @@ class EngineHandle:
             out = await loop.run_in_executor(
                 None, lambda: self.model.generate(**kwargs))
         new_ids, text = self._decode_new(out, len(prompt_ids))
-        cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None)
+        cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None,
+                                  declared_tool_names(req.tools))
         finish = self._finish(new_ids, cap, calls, cancel=cancel)
         wall = time.time() - started
         self._log(req, "DONE", tokens=len(new_ids), finish=finish,
@@ -342,18 +343,23 @@ class EngineHandle:
             prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
             finish_reason=finish)
 
-    async def stream(self, req, cancel=None):
+    async def stream(self, req, cancel=None, prepared=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
 
         Bridges vaayu.streaming's worker thread onto the event loop through a
         thread-safe queue.
+
+        `prepared` is `prepare(req)`'s result, already computed by the caller.
+        The HTTP route computes it BEFORE returning its StreamingResponse so
+        that ContextTooLong and friends can still become a 400 (B8); accepting
+        it here is what keeps that from costing a second render + tokenize pass.
         """
         import time
 
         from ..streaming import stream_generate
 
         started, hits_before = time.time(), self._prefix_hits()
-        prompt_ids, cap = self.prepare(req)
+        prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
         self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
                   thinking=("on" if self.resolve_thinking(req) else "off"))
         ttft_logged = False
@@ -416,7 +422,8 @@ class EngineHandle:
             raise error
 
         full = "".join(parts)
-        cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None)
+        cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None,
+                                  declared_tool_names(req.tools))
         produced = len(new_ids)
         finish = self._finish(new_ids, cap, calls, cancel=cancel)
         wall = time.time() - started

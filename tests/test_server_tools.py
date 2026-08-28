@@ -97,9 +97,39 @@ def test_missing_arguments_become_an_empty_json_object():
 
 def test_generic_json_parses_a_fenced_block():
     out = 'Sure.\n```json\n{"name": "read_file", "arguments": {"path": "a.py"}}\n```'
-    text, calls = parse_tool_calls(out, GENERIC_JSON)
+    text, calls = parse_tool_calls(out, GENERIC_JSON, {"read_file"})
     assert calls[0].function.name == "read_file"
     assert text == "Sure."
+
+
+def test_generic_json_leaves_a_block_naming_an_UNDECLARED_tool_as_prose():
+    # B7: a coding agent asks for a package.json. The fence carries a perfectly
+    # good `name`, so the old fallback deleted it from the prose and returned a
+    # fabricated tool call `my-app`. The request declared `read_file` and
+    # nothing else, so this is a code answer, not a call.
+    out = 'Here is package.json:\n```json\n{"name": "my-app", "version": "1.0.0"}\n```\ndone'
+    text, calls = parse_tool_calls(out, GENERIC_JSON, {"read_file"})
+    assert calls == []
+    assert text == out
+
+
+def test_generic_json_with_no_declared_names_can_never_produce_a_call():
+    # Fail-safe default: with nothing declared, no fenced block can be a call.
+    # The worst case of getting this wrong is destroyed prose, so the default
+    # errs towards keeping the text.
+    out = 'x\n```json\n{"name": "read_file", "arguments": {}}\n```'
+    text, calls = parse_tool_calls(out, GENERIC_JSON)
+    assert calls == []
+    assert text == out
+
+
+def test_generic_json_strips_only_the_declared_call_and_keeps_the_other_block():
+    out = ('call:\n```json\n{"name": "read_file", "arguments": {"path": "a.py"}}\n```\n'
+           'and config:\n```json\n{"name": "my-app"}\n```')
+    text, calls = parse_tool_calls(out, GENERIC_JSON, {"read_file"})
+    assert [c.function.name for c in calls] == ["read_file"]
+    assert '"my-app"' in text
+    assert "read_file" not in text
 
 
 def test_generic_json_ignores_a_fenced_block_that_is_not_a_tool_call():

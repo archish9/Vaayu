@@ -39,10 +39,11 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1219 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B6 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
+**Suite baseline: 1229 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-28 after B8 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
 which went 6 → 13 (B3) → 19 (B6).
-It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2. **None of the
+It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
+B8 added 5. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -54,13 +55,14 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~2~~ | ~~**B4**~~ — **DONE 2026-08-28** | | |
 | ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
 | ~~3~~ | ~~**B6**~~ — **DONE 2026-08-28** | | |
-| 4 | **B7** — fenced-JSON fallback eats ordinary JSON code answers | a coding agent's `package.json` is deleted and returned as a fake tool call | `vaayu/server/tools.py:115` |
-| 5 | **B8** — streaming errors are not status-mapped | `DEFAULT_STREAM=True`, so a too-long prompt reports `internal_error` to every default client | `vaayu/server/app.py:352` |
+| ~~4~~ | ~~**B7**~~ — **DONE 2026-08-28** | | |
+| ~~5~~ | ~~**B8**~~ — **DONE 2026-08-28** | | |
 | 6 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
 | 7 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
 | 8 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
 | 9 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
 | 10 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
+| 10b | **B15** — a stream drops the prose that FOLLOWS a real tool call | non-streaming returns it; the stream does not. Found while fixing B7, pre-dates it | `vaayu/server/app.py:452-495` |
 | 11 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
 | 12 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
 | 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
@@ -224,7 +226,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14, B3, B4 and B6 (2026-08-28). B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14, B3, B4, B6, B7 and B8 (2026-08-28). **B15 was opened by B7's investigation.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -418,33 +420,106 @@ flag's effect is tested by setting it directly.
 wave. R2 must still split a layer's descriptor list into SQ-sized waves — B6 only
 guarantees that when a wave does not fit, the ring is left clean.
 
-### B7 · [bug] the fenced-JSON tool fallback eats ordinary JSON answers
-`vaayu/server/tools.py:115-135`, `_parse_fenced`, reached via `GENERIC_JSON`
-whenever `detect_tool_format` finds the substring `"tools"` anywhere in the chat
-template (`tools.py:56`). `_build` accepts any object with a non-empty string
-`name`. So a coding agent that asks for a `package.json` and gets
-```` ```json {"name": "my-app", ...} ``` ```` has that block **deleted from the
-prose** and returned as a fabricated tool call `my-app`, with
-`finish_reason="tool_calls"`. The docstring's claim that it "only accepts one
-that actually looks like a call" is not implemented.
-**Done means:** the parsed `name` must match one of the request's declared tool
-names; anything else stays prose.
+### B7 · [x] the fenced-JSON tool fallback ate ordinary JSON answers — **FIXED 2026-08-28**
+Reproduced exactly as written: with `GENERIC_JSON` active, `"Here is
+package.json:\n```json\n{"name": "my-app", "version": "1.0.0"}\n```\ndone"`
+came back as prose `"Here is package.json:\n\ndone"` plus a fabricated tool
+call `my-app`.
 
-### B8 · [bug] streaming errors are not status-mapped
-`vaayu/server/app.py:352-369` vs `:376-381`. The non-streaming path maps
-`ContextTooLong` / `TemplateLacksToolSupport` / `NoChatTemplate` to **400** and
-`QueueFull` to **503**. The streaming path raises all of them inside `_sse`,
-where `except Exception` turns each into a **200** carrying an SSE event typed
-`internal_error`. `prepare()` (and therefore `ContextTooLong`) runs inside the
-generator, and `DEFAULT_STREAM = True`, so **an oversized prompt reports
-"internal_error" to every default client**.
-**Done means:** `prepare()` runs in the route before the `StreamingResponse` is
-returned, or the generator maps these to their honest SSE error types.
-**Confirmed on-device 2026-08-23:** an oversized prompt with no explicit
-`stream` key returns **200** with an `internal_error` event. `test_server_smoke.py`
-now sends `stream=False` for that check so the gate tests the mapped path;
-**add the streaming assertion to it when this row lands** — it is the only place
-that would have caught this.
+**Two root causes, not one — found by running it.** Fixing `tools.py` alone does
+NOT make the row's harm go away, because the streaming half is an independent
+defect: `_sse` (`app.py`) took `fmt.open_marker` as proof a call had begun and
+set `suppressing = True`, after which every delta was **dropped permanently** —
+and the final event carries no content, so the client never saw the block at
+all. Confirmed on a payload containing NO `name` key, i.e. one the parser
+already returned zero calls for: streamed content was `'Here:\n'` and the rest
+was gone. `DEFAULT_STREAM = True`, so that is the path a coding agent is on.
+
+**Fix 1 — `vaayu/server/tools.py`.** `parse_tool_calls` takes `allowed_names`;
+`_parse_fenced` accepts a block only if its `name` is one the REQUEST declared.
+`declared_tool_names(req.tools)` supplies it from both engine call sites
+(`engine.py:334,421`). The default is **empty**, not "allow all": a caller that
+forgets it loses tool calls, never prose — the failure that costs nothing versus
+the one that deletes the answer. **Gated for `GENERIC_JSON` only.** `_parse_marked`
+is untouched: `<tool_call>` is a wrapper the model had to emit deliberately, and
+narrowing the actively-tested Qwen path was not this row's ask.
+
+**Fix 2 — `vaayu/server/app.py`.** `_sse` BUFFERS from the open marker instead of
+discarding, and flushes the buffer after the loop unless the final event actually
+carried `tool_calls`. Applied to both formats rather than special-casing
+`GENERIC_JSON`: for HERMES it also repairs a marked block whose JSON did not
+parse, which `_parse_marked` deliberately returns verbatim and the stream was
+silently eating. Cost: a fenced block now arrives as one chunk at the end rather
+than incrementally, for tools-carrying requests only.
+**Verified:** 5 tests (4 in `tests/test_server_tools.py`, 1 in
+`tests/test_server_app.py`), each confirmed to FAIL against the pre-fix code —
+the app one behaviourally, `..._no_declared_names_...` behaviourally, the rest on
+the new argument. `test_a_real_fenced_tool_call_is_still_not_duplicated_as_content`
+is a guard that PASSED before and after. Suite 1219/3 → **1224/3**. Server smoke
+gate `ALL PASS` on Llama-3.2-1B.
+**Not covered by the gate:** `test_server_smoke.py` sends no `tools`, so it
+exercises neither path; making it would need a real model to emit a fence on
+demand, which is not deterministic. The fake-engine tests are what stand behind
+this — the parsing is pure, so they cover it fully.
+**Opened B15:** the buffer is dropped when a call IS parsed, which is today's
+behaviour and also drops any prose that FOLLOWED the call. Pre-existing, not
+introduced here — see B15.
+
+### B15 · [bug] a stream drops the prose that FOLLOWS a real tool call
+`vaayu/server/app.py:452-495`. Once `_sse` starts buffering at the open marker it
+stays buffering to the end, so when the final event does carry `tool_calls` the
+buffer is discarded whole — including anything the model wrote AFTER the call.
+Measured with `deltas=['<tool_call>{"name":"f"}</tool_call>', ' trailing prose']`:
+streamed content `''`, while `final.text` (what the NON-streaming route returns)
+is `'trailing prose'`. So the two routes disagree about the same generation.
+**Pre-dates B7** — the old code dropped it too, by never emitting it; B7 only
+made the drop explicit. Found 2026-08-28 while fixing B7.
+**Done means:** the stream emits the cleaned prose the final event carries but
+that was never sent, so streaming and non-streaming agree. Note `final.text` is
+`.strip()`ed by the parser while the streamed prefix is not, so a naive
+"emit `final.text[len(emitted):]`" is not correct — that is the actual work here.
+
+### B8 · [x] streaming errors were not status-mapped — **FIXED 2026-08-28**
+The non-streaming path mapped `ContextTooLong` / `TemplateLacksToolSupport` /
+`NoChatTemplate` to **400** and `QueueFull` to **503**. The streaming path raised
+all of them inside `_sse`, where `except Exception` turned each into a **200**
+carrying an SSE event typed `internal_error`. `prepare()` — and therefore
+`ContextTooLong` — ran inside the generator, and `DEFAULT_STREAM = True`, so **an
+oversized prompt reported "internal_error" to every default client**.
+
+**Root cause, in one line:** a `StreamingResponse`'s body runs AFTER the route
+handler returns, so by the time `_sse` first iterates `engine.stream` the status
+line is already sent — nothing raised in there can ever be anything but a 200.
+
+**Fix 1 — prepare before responding (`app.py`).** The route now calls
+`e.prepare(req)` itself, inside a `try`, BEFORE constructing the
+`StreamingResponse`, and maps the three request-shaped errors to the same 400 the
+non-streaming route gives. The result is threaded through as
+`_sse(..., prepared=...)` → `engine.stream(req, cancel=..., prepared=...)`
+(`engine.py`), which uses it instead of calling `prepare` again — so the honest
+status costs no second chat-template render + tokenize pass. **Chose this over
+"map to honest SSE types"** (the row's other permitted ending): the SSE variant
+leaves a client parsing a 200 body to discover its own request was malformed,
+and the whole point is that a coding agent on the default path gets told.
+
+**Fix 2 — the types `_sse` still cannot avoid raising.** `_error_event` takes a
+`kind`. `QueueFull` from `slot()` now emits **`server_busy`**, not
+`internal_error`: the route's eager depth check turns the ordinary full queue
+into a real 503, but the admission RACE (depth under the limit at the check,
+`slot()` raising anyway) reaches the generator, and `internal_error` tells a
+client to stop retrying when retrying is exactly right. The three 400-class
+errors also map to `invalid_request_error` there — unreachable from the route
+now, kept for any other caller of `_sse`.
+**Verified:** 5 tests in `tests/test_server_app.py`; the 4 behavioural ones were
+confirmed to FAIL against the pre-fix code (the oversized-prompt one exactly as
+the bug: `assert 200 == 400`). `test_a_real_engine_crash_still_streams_as_internal_error`
+is a guard that the mapping does not relabel genuine faults as client errors; it
+passed before and after. `FakeEngine` grew a `prepare()` so it models where the
+real engine raises. Suite 1224/3 → **1229/3**.
+**Gate:** the row's own instruction is done — `test_server_smoke.py` now asserts
+the STREAMING refusal as well as the non-streaming one. `ALL PASS` on
+Llama-3.2-1B, the streamed oversized prompt returning a real 400 with
+`"type":"invalid_request_error"`.
 
 ### B9 · [bug] `_live_cancel` is cleared before the generation thread stops
 `vaayu/server/engine.py:348,365-367`. `stream()` sets `_live_cancel` directly

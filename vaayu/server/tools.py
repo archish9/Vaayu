@@ -31,7 +31,9 @@ class ToolCallFormat:
 HERMES = ToolCallFormat("hermes", "<tool_call>", "</tool_call>")
 
 # A template that accepts `tools` but ships no distinctive marker. Falls back to
-# a fenced JSON block, and only accepts one that actually looks like a call.
+# a fenced JSON block, and only accepts one NAMING A TOOL THE REQUEST DECLARED
+# -- the fence itself is no evidence at all, since an ordinary code answer
+# opens exactly the same one.
 GENERIC_JSON = ToolCallFormat("generic_json", "```json", "```")
 
 _KNOWN = (HERMES,)
@@ -112,7 +114,7 @@ def _parse_marked(text: str, fmt: ToolCallFormat):
     return "".join(cleaned).strip(), calls
 
 
-def _parse_fenced(text: str):
+def _parse_fenced(text: str, allowed_names):
     calls, spans, index = [], [], 0
     for m in _FENCED_JSON.finditer(text):
         try:
@@ -120,7 +122,7 @@ def _parse_fenced(text: str):
         except ValueError:
             continue
         call = _build(index, obj)
-        if call is None:
+        if call is None or call.function.name not in allowed_names:
             continue        # ordinary JSON in a code answer -- not a tool call
         calls.append(call)
         index += 1
@@ -135,15 +137,27 @@ def _parse_fenced(text: str):
     return "".join(out).strip(), calls
 
 
-def parse_tool_calls(text: str, fmt):
+def declared_tool_names(tools):
+    """The tool names carried by THIS request -- the only names a fenced block
+    may claim. `tools` is the request's `list[ToolDef]`, or None."""
+    return frozenset(t.function.name for t in (tools or []))
+
+
+def parse_tool_calls(text: str, fmt, allowed_names=frozenset()):
     """Split generated text into (prose, tool_calls).
 
     Returns the text UNCHANGED and an empty list whenever nothing parseable was
     found, so a parsing failure degrades to "the model wrote some text" rather
     than to a swallowed response.
+
+    `allowed_names` gates the GENERIC_JSON fallback only: the marked formats
+    carry an unambiguous wrapper the model had to emit deliberately, but a
+    ```json fence is what an ordinary code answer opens. It DEFAULTS TO EMPTY,
+    so a caller that forgets it loses tool calls rather than prose -- the
+    failure that costs nothing, versus the one that deletes the answer.
     """
     if fmt is None:
         return text, []
     if fmt is GENERIC_JSON:
-        return _parse_fenced(text)
+        return _parse_fenced(text, allowed_names)
     return _parse_marked(text, fmt)

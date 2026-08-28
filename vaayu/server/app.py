@@ -361,9 +361,19 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                    f"(depth {e.queue_depth}). This engine runs "
                                    f"one request at a time.",
                               "server_busy", headers={"Retry-After": "5"})
+            try:
+                # Build the prompt HERE rather than inside the generator. A
+                # StreamingResponse's body runs after this handler returns, so
+                # anything raised there can only be a 200 carrying an SSE error
+                # event -- and DEFAULT_STREAM is True, so an oversized prompt
+                # reported "internal_error" to every default client (B8). The
+                # result is handed to _sse so it is not built twice.
+                prepared = e.prepare(req)
+            except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
+                return _error(400, str(ex), "invalid_request_error")
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
-                     session_id=req.session_key),
+                     session_id=req.session_key, prepared=prepared),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)})
@@ -421,13 +431,14 @@ def _chunk(cid, created, model_name, *, delta, finish=None, usage=None,
     return f"data: {json.dumps(body)}\n\n"
 
 
-def _error_event(ex) -> str:
+def _error_event(ex, kind: str = "internal_error") -> str:
     payload = {"error": {"message": f"{type(ex).__name__}: {ex}",
-                         "type": "internal_error"}}
+                         "type": kind}}
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
+async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
+               prepared=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
@@ -445,28 +456,36 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
 
     fmt = engine.tool_format if req.tools else None
     open_marker = fmt.open_marker if fmt is not None else None
-    held, suppressing = "", False
+    # `buffered` is everything from the open marker on. It is NOT dropped:
+    # for GENERIC_JSON the marker is a plain ```json fence, which an ordinary
+    # code answer opens too, and only the final event knows whether the parse
+    # actually produced a call (B7). Held back rather than emitted so a real
+    # call is never also delivered as prose.
+    held, buffered, suppressing = "", "", False
     final = None
     try:
         # Acquired HERE, not in the route: this generator body runs after the
         # handler returned, so a slot held around that return would already be
         # released before the first token.
         async with engine.slot():
-            async for kind, payload in engine.stream(req, cancel=cancel):
+            async for kind, payload in engine.stream(req, cancel=cancel,
+                                                     prepared=prepared):
                 if kind == "final":
                     final = payload
                     break
                 if suppressing:
+                    buffered += payload
                     continue
                 held += payload
                 if open_marker and open_marker in held:
-                    # Everything from here belongs to the tool call. Emit the
-                    # prose that preceded it, then go quiet until the final event.
-                    prose = held[:held.index(open_marker)]
-                    if prose:
+                    # Everything from here MIGHT belong to a tool call. Emit the
+                    # prose that preceded it and buffer the rest until the final
+                    # event says which it was.
+                    cut = held.index(open_marker)
+                    if held[:cut]:
                         yield _chunk(cid, created, model_name, session_id=session_id,
-                                     delta={"content": prose})
-                    held, suppressing = "", True
+                                     delta={"content": held[:cut]})
+                    held, buffered, suppressing = "", held[cut:], True
                     continue
                 # Hold back a marker-length tail so an open marker split across
                 # two chunks is still recognised.
@@ -474,6 +493,22 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
                 if len(held) > keep:
                     emit, held = held[:len(held) - keep], held[len(held) - keep:]
                     yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+    except QueueFull as ex:
+        # The route's eager depth check turns the ordinary full queue into a
+        # real 503; this is the admission race it cannot see. The headers are
+        # already sent, so the status cannot be corrected -- but the event type
+        # can be honest, and "internal_error" tells a client to stop retrying
+        # when retrying is exactly the right response.
+        yield _error_event(ex, "server_busy")
+        yield "data: [DONE]\n\n"
+        return
+    except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
+        # Unreachable from the route, which now prepares before responding.
+        # Kept for any other caller of _sse, and so this class of error is
+        # never again reported as a fault of the server's.
+        yield _error_event(ex, "invalid_request_error")
+        yield "data: [DONE]\n\n"
+        return
     except Exception as ex:                            # noqa: BLE001
         yield _error_event(ex)
         yield "data: [DONE]\n\n"
@@ -486,6 +521,14 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None):
 
     if held and not suppressing:
         yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
+
+    if suppressing and not (final is not None and final.tool_calls):
+        # The marker did not open a tool call after all -- it was ordinary text
+        # (a ```json code answer, or a marked block whose JSON did not parse,
+        # which the non-streaming path also returns verbatim). Emitting it here
+        # rather than dropping it is the whole point of buffering.
+        yield _chunk(cid, created, model_name, session_id=session_id,
+                     delta={"content": buffered})
 
     if final is not None and final.tool_calls:
         yield _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
