@@ -403,3 +403,96 @@ def test_a_stream_that_finishes_normally_still_releases_the_slot(monkeypatch):
     events = asyncio.run(main())
     assert events[-1] == "data: [DONE]\n\n"
     assert e.depth == 0
+
+
+# ── the cancel token stays published until the worker exits (B9) ─────────────
+
+
+def _self_cancelling_fake(engine, record, *, tick=0.01, rounds=400):
+    """A stream_generate stand-in that can ONLY be stopped through the token the
+    engine has published -- whatever the caller passed in. It records that token
+    at the moment it exits. Bounded so a worker that never gets cancelled cannot
+    outlive the test."""
+    import threading
+
+    def _fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        record["thread"] = threading.current_thread()
+        try:
+            for _ in range(rounds):
+                token = engine.live_cancel
+                if token is not None and token.cancelled:
+                    return
+                yield "tok "
+                time.sleep(tick)
+        finally:
+            record["live_cancel_at_exit"] = engine.live_cancel
+            if token_ids_out is not None:
+                token_ids_out.extend([10, 11])
+    return _fake
+
+
+def test_an_abandoned_stream_keeps_its_token_published_until_the_worker_exits(monkeypatch):
+    # B9. Closing the stream raises GeneratorExit at its `yield`, and the
+    # `finally` used to clear _live_cancel there and skip thread.join()
+    # entirely -- so cancel_all() (the SIGTERM handler, _teardown) saw None and
+    # reported idle with a generation still on the GPU.
+    e, mod, _ = _streaming_engine([10, 11])
+    record = {}
+    monkeypatch.setattr(mod, "stream_generate", _self_cancelling_fake(e, record))
+
+    async def main():
+        agen = e.stream(_req(max_tokens=50))
+        seen = 0
+        async for _kind, _payload in agen:
+            seen += 1
+            if seen >= 3:
+                break
+        await agen.aclose()             # what closing an abandoned stream does
+        return record["thread"].is_alive(), e.live_cancel
+
+    alive_after_close, live_after_close = asyncio.run(main())
+    record["thread"].join(timeout=5)
+    assert not alive_after_close, (
+        "the stream returned while its generation worker was still running -- "
+        "the token was cleared and the join skipped, so shutdown sees an idle "
+        "engine with the GPU busy")
+    assert record["live_cancel_at_exit"] is not None, (
+        "the token was already cleared when the worker exited; anything asking "
+        "cancel_all() in that window is told the engine is idle")
+    assert live_after_close is None, "and it must be cleared once the worker is gone"
+
+
+def test_cancel_all_stops_a_stream_started_without_a_caller_token(monkeypatch):
+    # A stream published whatever it was handed, so a caller that passed no
+    # token published None -- cancel_all() then had nothing to cancel and
+    # reported idle for the whole generation.
+    e, mod, _ = _streaming_engine([10, 11])
+    record = {}
+    monkeypatch.setattr(mod, "stream_generate", _self_cancelling_fake(e, record))
+
+    async def main():
+        agen = e.stream(_req(max_tokens=50))
+        try:
+            async for _kind, _payload in agen:
+                break
+            assert e.live_cancel is not None, (
+                "nothing is published, so cancel_all() cannot stop this run")
+            e.cancel_all()
+            async for _kind, _payload in agen:
+                pass
+        finally:
+            await agen.aclose()
+
+    asyncio.run(main())
+    record["thread"].join(timeout=5)
+    assert not record["thread"].is_alive()
+
+
+def test_a_normally_finished_stream_clears_its_published_token(monkeypatch):
+    # Guard: the token the stream now creates for itself must not read back as
+    # cancelled, or every normal answer would be labelled "length".
+    e, mod, fake = _streaming_engine([10, 11, 2], eos_token_id=2)
+    monkeypatch.setattr(mod, "stream_generate", fake)
+    final = asyncio.run(_run_stream(e, _req(max_tokens=5)))
+    assert final.finish_reason == "stop"
+    assert e.live_cancel is None and e._live_thread is None

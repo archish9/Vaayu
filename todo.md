@@ -39,11 +39,11 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1229 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B8 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
+**Suite baseline: 1232 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-28 after B9 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
 which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
-B8 added 5. **None of the
+B8 added 5, B9 added 3. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -57,12 +57,13 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~3~~ | ~~**B6**~~ — **DONE 2026-08-28** | | |
 | ~~4~~ | ~~**B7**~~ — **DONE 2026-08-28** | | |
 | ~~5~~ | ~~**B8**~~ — **DONE 2026-08-28** | | |
-| 6 | **B9** — `_live_cancel` cleared before the worker thread stops | `cancel_all()` on SIGTERM reports idle while the GPU is still busy | `engine.py:365` |
+| ~~6~~ | ~~**B9**~~ — **DONE 2026-08-28** | | |
 | 7 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
 | 8 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
 | 9 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
 | 10 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
 | 10b | **B15** — a stream drops the prose that FOLLOWS a real tool call | non-streaming returns it; the stream does not. Found while fixing B7, pre-dates it | `vaayu/server/app.py:452-495` |
+| 10c | **B16** — `generate()` clears its token while the executor thread may still run | B9's shape on the NON-streaming route; `quiesce()` has no thread to join there. Found while fixing B9 | `vaayu/server/engine.py`, `_running` |
 | 11 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
 | 12 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
 | 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
@@ -226,7 +227,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14, B3, B4, B6, B7 and B8 (2026-08-28). **B15 was opened by B7's investigation.** B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -348,12 +349,10 @@ engine lock is still held at the instant the worker exits — is the invariant
 itself. The other test is a guard that the new join does not stall or wedge the
 gate on a normally-finished stream. Suite 1217/3 → **1219/3**. Server smoke gate
 `ALL PASS` on Llama-3.2-1B.
-**Couples to B9:** `quiesce` cancels through `_live_cancel`. B9 (`_live_cancel`
-cleared before the worker stops) is still open, and if that clear ever landed
-BEFORE `slot()`'s exit, `quiesce` would still join but would no longer cancel
-first — i.e. it would wait for the full uncancelled generation. Fixing B9 must
-keep the token published until the worker has exited, which is already what B9's
-"done means" says.
+**Couples to B9, now CLOSED (2026-08-28):** `quiesce` cancels through
+`_live_cancel`, and B9's fix is what guarantees the token is still published
+when `slot()` exits — the ordering this row relied on is now an invariant
+rather than an accident.
 
 ### B5 · [x] cancellation reported as `finish_reason="stop"` — **FIXED 2026-08-23** (with B2)
 `hit_stop_string` / `hit_eos` were both inferred from "fewer tokens than the cap
@@ -521,19 +520,52 @@ the STREAMING refusal as well as the non-streaming one. `ALL PASS` on
 Llama-3.2-1B, the streamed oversized prompt returning a real 400 with
 `"type":"invalid_request_error"`.
 
-### B9 · [bug] `_live_cancel` is cleared before the generation thread stops
-`vaayu/server/engine.py:348,365-367`. `stream()` sets `_live_cancel` directly
-(bypassing `_running`) and clears it in the `finally` around the consume loop —
-which runs on `GeneratorExit` while the pump thread is still generating. From
-that instant `cancel_all()` (SIGTERM handler, `_teardown`) sees `None` and
-reports idle, so shutdown proceeds with a generation still on the GPU.
-`thread.join()` on line 367 is also skipped entirely on that path.
-**Done means:** the token is published until the worker has actually exited.
-**B4 (2026-08-28) now depends on this:** `slot()` calls `quiesce()`, which cancels
-via `_live_cancel` and then joins `_live_thread`. Today the ordering saves it —
-on disconnect `stream()`'s `finally` has not run yet, because an `async for` does
-not close its iterator — but any change that clears the token earlier turns
-`quiesce` into an uncancelled wait for the whole generation.
+### B9 · [x] `_live_cancel` was cleared before the generation thread stopped — **FIXED 2026-08-28**
+`vaayu/server/engine.py`, `stream()`. The `finally` around the consume loop
+cleared `_live_cancel`, and `thread.join()` sat AFTER that try/finally — so
+closing the generator (`GeneratorExit` at its `yield`) cleared the token and
+skipped the join entirely, with the pump thread still inside `model.generate`.
+From that instant `cancel_all()` — the SIGTERM handler and `_teardown` — saw
+`None` and reported idle with a generation on the GPU.
+
+**A second hole on the same line, found while fixing it.** `stream()` published
+whatever it was handed, so a caller passing no token published `None`:
+`cancel_all()` then had nothing to cancel for the WHOLE generation, not merely
+its teardown window. The fix needs a real token to cancel through anyway, so
+both close together.
+
+**Fix:** `stream()` mints its own `CancelToken()` when the caller passes none,
+and the teardown became `except BaseException: cancel.cancel(); raise` plus
+`finally: try: thread.join() finally: _live_cancel = _live_thread = None`. The
+cancel must PRECEDE the join — an uncancelled join on the abandoned path would
+block for the whole remaining cap — and the clear must FOLLOW it, which is this
+row's "done means". Safe for the normal path because `_finish` reads the LOCAL
+`cancel`, not the attribute, and the pre-cancel runs only while unwinding, so a
+normally-finished stream still reports `"stop"` and not `"length"`.
+**Verified:** 3 tests in `tests/test_server_engine.py`, all three confirmed to
+FAIL against the pre-fix `engine.py` — the abandoned-stream one exactly as the
+bug (`the stream returned while its generation worker was still running`), the
+no-token one as `assert None is not None`, the third on the uncleared
+`_live_thread`. That third test's FIRST assertion (`finish_reason == "stop"`)
+is the guard that the self-minted token does not relabel every normal answer;
+it passed before and after. Suite 1229/3 → **1232/3**. Server smoke gate
+`ALL PASS` on Llama-3.2-1B.
+**Opened B16:** `generate()`'s `_running` has the same shape and is NOT fixed
+here — deliberately, it is a different route and a different trigger.
+
+### B16 · [bug] `generate()` clears its token while the executor thread may still run
+`vaayu/server/engine.py`, `_running`. Same shape as B9, other route: the async
+`finally` clears `_live_cancel` when `await loop.run_in_executor(...)` raises,
+and a cancelled handler task raises `CancelledError` there while the executor
+thread is still inside `model.generate`. `generate()` also publishes no
+`_live_thread`, so `slot()`'s `quiesce()` (B4) finds nothing to join and
+releases the lock under a live generation — B4's fix covers only `stream()`.
+**Narrower than B9:** the ordinary disconnect path does NOT trigger it, because
+`_watch_disconnect` only cancels the TOKEN and `generate` then returns normally;
+it needs the handler task itself to be cancelled (uvicorn's graceful-shutdown
+timeout, lifespan teardown). Found 2026-08-28 while fixing B9.
+**Done means:** `generate()` publishes something `quiesce()` can wait on, and
+the token outlives the executor work on the cancelled path.
 
 ### B10 · [bug] `capture_stdio` is never restored when startup fails
 `vaayu/server/app.py:246-297`. `restore_stdio` is created before

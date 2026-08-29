@@ -358,6 +358,14 @@ class EngineHandle:
 
         from ..streaming import stream_generate
 
+        if cancel is None:
+            # Always publish a REAL token. `cancel_all()` reads it to answer
+            # "is anything generating?", so a None there tells the SIGTERM
+            # handler and `_teardown` the engine is idle while the GPU is busy
+            # -- and the teardown below would then have nothing to cancel
+            # before it waits for the worker (B9).
+            cancel = CancelToken()
+
         started, hits_before = time.time(), self._prefix_hits()
         prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
         self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
@@ -415,9 +423,26 @@ class EngineHandle:
                     ttft_logged = True
                     self._log(req, "TTFT", at=f"{time.time() - started:.1f}s")
                 yield ("delta", payload)
+        except BaseException:                   # noqa: BLE001 -- re-raised
+            # The consumer went away -- Starlette closes this generator with
+            # GeneratorExit, which is a BaseException -- or threw in. The
+            # worker is still inside model.generate, so cancel it before the
+            # `finally` waits: an uncancelled join here would block for the
+            # whole remaining cap.
+            cancel.cancel()
+            raise
         finally:
-            self._live_cancel = None
-        thread.join()
+            # The token stays published until the worker has ACTUALLY exited.
+            # Clearing it first -- which this `finally` used to do, on a path
+            # that also skipped the join entirely -- makes `cancel_all()`
+            # report idle with a generation still on the GPU, so a SIGTERM
+            # shutdown proceeds underneath it (B9). It is also the token
+            # `slot()`'s `quiesce()` cancels through (B4).
+            try:
+                thread.join()
+            finally:
+                self._live_cancel = None
+                self._live_thread = None
         if error is not None:
             raise error
 
