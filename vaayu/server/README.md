@@ -42,7 +42,7 @@ Keeping `MODEL_PATH` there means your checkpoint paths never land in a diff.
 | `MODEL_PATH` | `""` | checkpoint directory. **Required.** |
 | `SERVED_MODEL_NAME` | `None` | the `id` reported by `/v1/models` and echoed in responses. `None` uses the checkpoint path — set something short and stable so clients can hardcode it |
 | `HOST` | `"127.0.0.1"` | bind address. `"0.0.0.0"` to expose on the LAN |
-| `PORT` | `8000` | |
+| `PORT` | `9999` | |
 | `DEVICE` | `"cuda:0"` | |
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
 | `LOG_DIR` | `"logs"` | `<LOG_DIR>/server.log` gets **everything** the process emits — Python prints, uvicorn, and the `[vaayu_rust]` io_uring lines (captured at fd level, since Rust writes them straight to fd 2). `<LOG_DIR>/sessions/<session_id>.log` gets one line per request lifecycle event |
@@ -125,7 +125,7 @@ The server is ready when it prints:
 
 ```
 [Vaayu-Server] loaded in 15.8s; derived max_seq_len=8192
-INFO:     Uvicorn running on http://127.0.0.1:8000
+INFO:     Uvicorn running on http://127.0.0.1:9999
 ```
 
 ---

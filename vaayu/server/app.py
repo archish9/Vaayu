@@ -27,7 +27,7 @@ class ServerConfig:
     device: str = "cuda:0"
     queue_depth: int = 8
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 9999
     kv_cache_mode: str = "auto"
     drafter_model_path: str | None = None
     served_model_name: str | None = None
@@ -493,6 +493,11 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # actually produced a call (B7). Held back rather than emitted so a real
     # call is never also delivered as prose.
     held, buffered, suppressing = "", "", False
+    # Everything already delivered as a content delta. The final event carries
+    # the CLEANED text -- prose before the call plus whatever followed it -- and
+    # the tail of that was never sent (B15), so the emitter needs to know where
+    # it got to.
+    sent = ""
     final = None
     try:
         # Acquired HERE, not in the route: this generator body runs after the
@@ -514,6 +519,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     # event says which it was.
                     cut = held.index(open_marker)
                     if held[:cut]:
+                        sent += held[:cut]
                         yield _chunk(cid, created, model_name, session_id=session_id,
                                      delta={"content": held[:cut]})
                     held, buffered, suppressing = "", held[cut:], True
@@ -523,6 +529,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 keep = (len(open_marker) - 1) if open_marker else 0
                 if len(held) > keep:
                     emit, held = held[:len(held) - keep], held[len(held) - keep:]
+                    sent += emit
                     yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
@@ -562,6 +569,23 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                      delta={"content": buffered})
 
     if final is not None and final.tool_calls:
+        # The prose that FOLLOWED the call. It is in `final.text` -- which the
+        # non-streaming route returns -- but sat unsent in `buffered`, which
+        # this branch discards along with the call itself (B15).
+        #
+        # `final.text` is the PARSER's output: the segments outside every call
+        # span, joined and `.strip()`ed. `sent` is the raw prefix, so it is not
+        # a literal prefix of `final.text` -- the strip ate its leading
+        # whitespace. Aligning on `sent.lstrip()` puts the cut in the right
+        # place. A prefix that does not match means the strip also took `sent`'s
+        # TRAILING whitespace, which can only happen when nothing followed the
+        # call: there is no remainder, and guessing one would duplicate prose.
+        head = sent.lstrip()
+        text = final.text or ""
+        pending = text[len(head):] if text.startswith(head) else ""
+        if pending:
+            yield _chunk(cid, created, model_name, session_id=session_id,
+                         delta={"content": pending})
         yield _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
 
     usage = None

@@ -455,3 +455,89 @@ def test_a_failed_startup_restores_fd_1_and_2(tmp_path):
         capture_output=True, text=True, timeout=120)
     assert verdict.exists(), f"the probe died before deciding:\n{out.stdout}\n{out.stderr}"
     assert verdict.read_text() == "OK", verdict.read_text()
+
+
+# ── the stream emits the prose that FOLLOWS a real tool call (B15) ───────────
+
+
+def _content_and_call_order(events):
+    """The delta kinds in order, so a prose chunk emitted AFTER the tool_calls
+    chunk is distinguishable from one emitted before it."""
+    out = []
+    for e in events:
+        d = e["choices"][0]["delta"]
+        if d.get("content"):
+            out.append("content")
+        if d.get("tool_calls"):
+            out.append("tool_calls")
+    return out
+
+
+def test_prose_after_a_marked_tool_call_is_streamed_not_dropped():
+    # B15. Once _sse starts buffering at the open marker it buffers to the end,
+    # and the buffer is discarded whole when the final event carries a call --
+    # taking anything the model wrote AFTER the call with it. The non-streaming
+    # route returns that prose, so the two routes disagreed about the same
+    # generation.
+    call = ToolCall(id="call_z", function=ToolCallFunction(name="f", arguments='{}'))
+    engine = FakeEngine(
+        deltas=['Sure. ', '<tool_call>{"name":"f","arguments":{}}</tool_call>',
+                ' trailing prose'],
+        result=GenerationResult(text="Sure.  trailing prose", prompt_tokens=3,
+                                completion_tokens=9, finish_reason="tool_calls",
+                                tool_calls=[call]))
+    engine.tool_format = _HERMES
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert _streamed_content(events) == "Sure.  trailing prose"
+    assert _content_and_call_order(events) == ["content", "content", "tool_calls"], (
+        "the trailing prose must arrive before the tool_calls chunk")
+
+
+def test_prose_after_a_fenced_tool_call_is_streamed_not_dropped():
+    call = ToolCall(id="call_w", function=ToolCallFunction(name="read_file", arguments='{}'))
+    txt = 'Sure.\n```json\n{"name": "read_file", "arguments": {}}\n```\nAfterwards, done.'
+    engine = FakeEngine(deltas=[txt], result=GenerationResult(
+        text="Sure.\n\nAfterwards, done.", prompt_tokens=3, completion_tokens=9,
+        finish_reason="tool_calls", tool_calls=[call]))
+    engine.tool_format = _GENERIC_JSON
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert _streamed_content(events) == "Sure.\n\nAfterwards, done."
+
+
+def test_a_call_with_no_prose_before_it_still_streams_the_prose_after_it():
+    # Nothing was emitted before the marker, so the whole cleaned text is the
+    # remainder -- and it must be sent exactly once.
+    call = ToolCall(id="call_v", function=ToolCallFunction(name="f", arguments='{}'))
+    engine = FakeEngine(
+        deltas=['<tool_call>{"name":"f","arguments":{}}</tool_call>', ' tail'],
+        result=GenerationResult(text="tail", prompt_tokens=3, completion_tokens=9,
+                                finish_reason="tool_calls", tool_calls=[call]))
+    engine.tool_format = _HERMES
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert _streamed_content(events) == "tail"
+
+
+def test_leading_whitespace_before_a_call_does_not_misalign_the_remainder():
+    # The parser strips the JOINED string, so the prefix the stream already sent
+    # is not a literal prefix of final.text. A naive final.text[len(sent):] cuts
+    # in the wrong place; this is the case that catches it.
+    call = ToolCall(id="call_u", function=ToolCallFunction(name="f", arguments='{}'))
+    engine = FakeEngine(
+        deltas=['  \nHi\n', '<tool_call>{"name":"f","arguments":{}}</tool_call>',
+                '\nbye'],
+        result=GenerationResult(text="Hi\n\nbye", prompt_tokens=3,
+                                completion_tokens=9, finish_reason="tool_calls",
+                                tool_calls=[call]))
+    engine.tool_format = _HERMES
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    streamed = _streamed_content(events)
+    assert streamed.strip() == "Hi\n\nbye"
+    assert streamed.count("bye") == 1, "the remainder must not be sent twice"

@@ -41,7 +41,7 @@ for a large MoE one. The server is ready when it prints:
 
 ```
 [Vaayu-Server] loaded in 15.8s; derived max_seq_len=8192
-INFO:     Uvicorn running on http://127.0.0.1:8000
+INFO:     Uvicorn running on http://127.0.0.1:9999
 ```
 
 **Stopping it.** `Ctrl-C` or `SIGTERM` stops generation immediately and the process
@@ -99,7 +99,7 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `MODEL_PATH` | `""` | checkpoint directory. **Required.** |
 | `SERVED_MODEL_NAME` | `None` (the checkpoint path) | the `id` reported by `/v1/models` and echoed in responses. Set it to something short and stable so clients can hardcode it |
 | `HOST` | `"127.0.0.1"` | bind address. `0.0.0.0` to expose on the LAN |
-| `PORT` | `8000` | |
+| `PORT` | `9999` | |
 | `DEVICE` | `"cuda:0"` | |
 | `QUEUE_DEPTH` | `8` | waiting requests allowed before `503`. **One runs at a time regardless** |
 | `DEFAULT_STREAM` | **`True`** | what `stream` means when the request omits it. Not OpenAI's `false` — a non-streaming response sends nothing until the last token |
@@ -198,7 +198,7 @@ This is the single most important difference from a fixed-`MAX_NEW_TOKENS` scrip
 ### Basic completion
 
 ```bash
-curl -s localhost:8000/v1/chat/completions \
+curl -s localhost:9999/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [{"role": "user", "content": "write a binary search in Python"}]
@@ -210,7 +210,7 @@ curl -s localhost:8000/v1/chat/completions \
 ### Streaming
 
 ```bash
-curl -sN localhost:8000/v1/chat/completions \
+curl -sN localhost:9999/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [{"role": "user", "content": "write a quicksort"}],
@@ -237,7 +237,7 @@ it, and it lets a waiting caller tell "queued behind N" from "hung".
 ### Tool calling
 
 ```bash
-curl -s localhost:8000/v1/chat/completions \
+curl -s localhost:9999/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [{"role": "user", "content": "what is in src/main.py?"}],
@@ -268,7 +268,7 @@ curl -s localhost:8000/v1/chat/completions \
 Then send the result back as a `tool` message and continue:
 
 ```bash
-curl -s localhost:8000/v1/chat/completions \
+curl -s localhost:9999/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "messages": [
@@ -285,7 +285,7 @@ curl -s localhost:8000/v1/chat/completions \
 `session_id` is **required** — this is the shape every request takes:
 
 ```bash
-curl -isN localhost:8000/v1/chat/completions \
+curl -isN localhost:9999/v1/chat/completions \
   -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "session_id": "agent-7",
@@ -314,8 +314,8 @@ outside the process.
 ### Watching the cache and the queue
 
 ```bash
-curl -s localhost:8000/health
-curl -s localhost:8000/v1/models
+curl -s localhost:9999/health
+curl -s localhost:9999/v1/models
 ```
 
 ### With the `openai` Python SDK
@@ -323,7 +323,7 @@ curl -s localhost:8000/v1/models
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-used")
+client = OpenAI(base_url="http://localhost:9999/v1", api_key="not-used")
 
 r = client.chat.completions.create(
     model="vaayu",
@@ -411,7 +411,7 @@ waiting for a call the model was never told about.
 Check before you rely on it:
 
 ```bash
-curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+curl -s localhost:9999/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"vaayu","messages":[{"role":"user","content":"hi"}],
        "tools":[{"type":"function","function":{"name":"t","parameters":{}}}]}'
 ```

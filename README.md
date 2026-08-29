@@ -570,7 +570,7 @@ The server takes **no command-line arguments** — set `MODEL_PATH` in
 ```bash
 # streams by default (DEFAULT_STREAM = True) -- -N keeps curl from buffering it
 # session_id is REQUIRED: give each independent agent stream its own
-curl -sN localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+curl -sN localhost:9999/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "vaayu",
   "session_id": "agent-7",
   "messages": [{"role": "user", "content": "write a binary search in Python"}]

@@ -274,13 +274,35 @@ class EngineHandle:
         return kwargs
 
     @asynccontextmanager
-    async def _running(self, cancel):
-        """Publish this request's token for the lifetime of the generation."""
+    async def _running(self, cancel, thread=None):
+        """Publish this request's token -- and its worker -- for the lifetime of
+        the generation, and do not clear either until that worker has EXITED.
+
+        Same contract as `stream()`'s teardown (B9), for the non-streaming route
+        (B16). Clearing on the way out of a raising `await` leaves `cancel_all()`
+        reporting idle with a generation still on the GPU, and leaves
+        `slot()`'s `quiesce()` with no thread to join -- so the lock is released
+        under a live generation. The cancel must PRECEDE the join: an
+        uncancelled join on the abandoned path would block for the whole
+        remaining cap.
+        """
         self._live_cancel = cancel
+        self._live_thread = thread
         try:
             yield
+        except BaseException:                   # noqa: BLE001 -- re-raised
+            # The handler task was cancelled (uvicorn's graceful-shutdown
+            # timeout, lifespan teardown) while the worker is still inside
+            # model.generate.
+            cancel.cancel()
+            raise
         finally:
-            self._live_cancel = None
+            try:
+                if thread is not None:
+                    thread.join()
+            finally:
+                self._live_cancel = None
+                self._live_thread = None
 
     # ── generation ───────────────────────────────────────────────────────────
 
@@ -312,6 +334,12 @@ class EngineHandle:
 
     async def generate(self, req, cancel=None) -> GenerationResult:
         import time
+        if cancel is None:
+            # Always publish a REAL token, for the same reason stream() does
+            # (B9): `cancel_all()` reads it to answer "is anything generating?",
+            # and the teardown below has to have something to cancel before it
+            # waits for the worker (B16).
+            cancel = CancelToken()
         started, hits_before = time.time(), self._prefix_hits()
         prompt_ids, cap = self.prepare(req)
         self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
@@ -326,9 +354,24 @@ class EngineHandle:
                   f"bytes are sent. Set max_tokens, or use stream=true.")
         kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
         loop = asyncio.get_running_loop()
-        async with self._running(cancel):
-            out = await loop.run_in_executor(
-                None, lambda: self.model.generate(**kwargs))
+        # An OWN thread, not a run_in_executor pool worker: `quiesce()` joins
+        # what is published here, and a pool thread never exits, so joining one
+        # would hang forever. The bridge mirrors stream()'s pump.
+        bridge: _queue.Queue = _queue.Queue()
+
+        def _work():
+            try:
+                bridge.put(("out", self.model.generate(**kwargs)))
+            except BaseException as ex:         # noqa: BLE001 -- re-raised below
+                bridge.put(("error", ex))
+
+        thread = threading.Thread(target=_work, daemon=True)
+        async with self._running(cancel, thread):
+            thread.start()
+            kind, payload = await loop.run_in_executor(None, bridge.get)
+        if kind == "error":
+            raise payload
+        out = payload
         new_ids, text = self._decode_new(out, len(prompt_ids))
         cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None,
                                   declared_tool_names(req.tools))

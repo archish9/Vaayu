@@ -496,3 +496,134 @@ def test_a_normally_finished_stream_clears_its_published_token(monkeypatch):
     final = asyncio.run(_run_stream(e, _req(max_tokens=5)))
     assert final.finish_reason == "stop"
     assert e.live_cancel is None and e._live_thread is None
+
+
+# ── the non-streaming route publishes a joinable worker too (B16) ────────────
+
+
+class _Ids(list):
+    """A stand-in for the generate() output tensor: sliceable, and the slice
+    still answers .tolist() the way _decode_new expects."""
+
+    def __getitem__(self, key):
+        got = list.__getitem__(self, key)
+        return _Ids(got) if isinstance(key, slice) else got
+
+    def tolist(self):
+        return list(self)
+
+
+class _DecodingTokenizer(FakeTokenizer):
+    def decode(self, ids, **kw):
+        return " ".join(str(i) for i in ids)
+
+
+def _blocking_generate_engine(record, *, rounds=400, tick=0.01):
+    """An EngineHandle whose model.generate blocks until the token the ENGINE
+    published is cancelled -- not one the test holds. Bounded so a worker that
+    never gets cancelled cannot outlive the test."""
+    import threading
+
+    model = FakeModel(max_seq_len=100)
+    model.tokenizer = _DecodingTokenizer()
+    model.config = _Config()
+    engine = EngineHandle(model)
+
+    def _generate(**kwargs):
+        record["thread"] = threading.current_thread()
+        record["live_thread_while_running"] = engine._live_thread
+        record["live_cancel_while_running"] = engine.live_cancel
+        try:
+            for _ in range(rounds):
+                token = engine.live_cancel
+                if token is not None and token.cancelled:
+                    break
+                time.sleep(tick)
+        finally:
+            record["live_cancel_at_exit"] = engine.live_cancel
+        return _Ids([_Ids([1] * 10 + [10, 11])])
+
+    model.generate = _generate
+    return engine, record
+
+
+def test_a_cancelled_non_stream_handler_waits_for_its_worker_to_exit():
+    # B16, B9's shape on the other route. The async `finally` cleared
+    # _live_cancel when `await run_in_executor(...)` raised, and a handler task
+    # cancelled by uvicorn's graceful-shutdown timeout raises CancelledError
+    # there while the executor thread is still inside model.generate. The token
+    # was gone, so nothing could stop it, and slot()'s quiesce() had no thread
+    # to join -- it released the lock under a live generation.
+    e, record = _blocking_generate_engine({})
+
+    async def main():
+        async def call():
+            async with e.slot():
+                return await e.generate(_req(max_tokens=50))
+
+        task = asyncio.create_task(call())
+        while "thread" not in record:
+            await asyncio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return record["thread"].is_alive(), e.live_cancel, e._lock.locked()
+
+    alive_after_cancel, live_after_cancel, locked_after = asyncio.run(main())
+    record["thread"].join(timeout=10)
+    assert not alive_after_cancel, (
+        "the cancelled handler returned while its generation worker was still "
+        "running -- the slot is free and a queued request will be admitted")
+    assert record["live_cancel_at_exit"] is not None, (
+        "the token was already cleared when the worker exited; anything asking "
+        "cancel_all() in that window is told the engine is idle")
+    assert live_after_cancel is None, "and it must be cleared once the worker is gone"
+    assert locked_after is False
+
+
+def test_cancel_all_stops_a_generate_started_without_a_caller_token():
+    # generate() published whatever it was handed, so a caller passing no token
+    # published None: cancel_all() had nothing to cancel for the WHOLE run.
+    e, record = _blocking_generate_engine({})
+
+    async def main():
+        task = asyncio.create_task(e.generate(_req(max_tokens=50)))
+        while "thread" not in record:
+            await asyncio.sleep(0.005)
+        assert e.live_cancel is not None, (
+            "nothing is published, so cancel_all() cannot stop this run")
+        e.cancel_all()
+        await task
+
+    asyncio.run(main())
+    record["thread"].join(timeout=10)
+    assert not record["thread"].is_alive()
+
+
+def test_generate_publishes_a_thread_quiesce_can_join():
+    # quiesce() waits on _live_thread. generate() published none, so B4's fix
+    # covered only stream(): the lock was released under a live generation.
+    e, record = _blocking_generate_engine({})
+
+    async def main():
+        task = asyncio.create_task(e.generate(_req(max_tokens=50)))
+        while "thread" not in record:
+            await asyncio.sleep(0.005)
+        e.cancel_all()
+        await task
+
+    asyncio.run(main())
+    record["thread"].join(timeout=10)
+    assert record["live_thread_while_running"] is record["thread"], (
+        "quiesce() has nothing to join while generate() is running")
+    assert e._live_thread is None, "and it must be cleared once the worker is gone"
+
+
+def test_a_normally_finished_generate_still_reports_stop():
+    # Guard: the token generate() now creates for itself must not read back as
+    # cancelled, or every normal answer would be labelled "length".
+    e, record = _blocking_generate_engine({}, rounds=0)
+    result = asyncio.run(e.generate(_req(max_tokens=5)))
+    assert result.finish_reason == "stop"
+    assert result.completion_tokens == 2
+    assert e.live_cancel is None and e._live_thread is None

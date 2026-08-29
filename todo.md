@@ -39,11 +39,11 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1246 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-29 after B11+B12 — neither B3 nor B6 added Python tests; both are `cargo test` in
+**Suite baseline: 1257 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-29 after B16+B15+B13 — neither B3 nor B6 added Python tests; both are `cargo test` in
 `vaayu_rust`, which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
-B8 added 5, B9 added 3, B10 added 2, B11 added 12. **None of the
+B8 added 5, B9 added 3, B10 added 2, B11 added 12, B16 added 4, B15 added 4, B13 added 3. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -61,9 +61,9 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~7~~ | ~~**B10**~~ — **DONE 2026-08-29** | | |
 | ~~8~~ | ~~**B11**~~ — **DONE 2026-08-29** | | |
 | ~~9~~ | ~~**B12**~~ — **DONE 2026-08-29**, fixed together with B11 | | |
-| 10 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
-| 10b | **B15** — a stream drops the prose that FOLLOWS a real tool call | non-streaming returns it; the stream does not. Found while fixing B7, pre-dates it | `vaayu/server/app.py:452-495` |
-| 10c | **B16** — `generate()` clears its token while the executor thread may still run | B9's shape on the NON-streaming route; `quiesce()` has no thread to join there. Found while fixing B9 | `vaayu/server/engine.py`, `_running` |
+| ~~10~~ | ~~**B13**~~ — **DONE 2026-08-29** | | |
+| ~~10b~~ | ~~**B15**~~ — **DONE 2026-08-29** | | |
+| ~~10c~~ | ~~**B16**~~ — **DONE 2026-08-29** | | |
 | 11 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
 | 12 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
 | 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
@@ -226,9 +226,12 @@ from that review**: it was found on 2026-08-23 by RUNNING the server smoke gate 
 B2+B5, which is also how the gate's own three breakages surfaced (see "On-device gates" above).
 Reading found twelve bugs; running found four more.
 
-Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11 and B12 (2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
+Order to fix them: the **FIX SEQUENCE** table at the top of this file. **ALL CLOSED:** B1, B2,
+B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11, B12, B16, B15 and B13
+(2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
+**Nothing in this section is open. The next unticked FIX SEQUENCE row is R1**, the first of the
+perf rows — R1 and P1 land in one arm, then M1 gates R2 and R3.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
 `vaayu/server/engine.py` counted stream tokens as
@@ -464,7 +467,7 @@ this — the parsing is pure, so they cover it fully.
 behaviour and also drops any prose that FOLLOWED the call. Pre-existing, not
 introduced here — see B15.
 
-### B15 · [bug] a stream drops the prose that FOLLOWS a real tool call
+### B15 · [x] a stream drops the prose that FOLLOWS a real tool call — **FIXED 2026-08-29**
 `vaayu/server/app.py:452-495`. Once `_sse` starts buffering at the open marker it
 stays buffering to the end, so when the final event does carry `tool_calls` the
 buffer is discarded whole — including anything the model wrote AFTER the call.
@@ -477,6 +480,30 @@ made the drop explicit. Found 2026-08-28 while fixing B7.
 that was never sent, so streaming and non-streaming agree. Note `final.text` is
 `.strip()`ed by the parser while the streamed prefix is not, so a naive
 "emit `final.text[len(emitted):]`" is not correct — that is the actual work here.
+
+**Fix — `vaayu/server/app.py`, `_sse`.** The generator now accumulates `sent`,
+everything already delivered as a content delta (both emit sites: the
+incremental one and the flush at the open marker). In the `final.tool_calls`
+branch it emits the remainder of `final.text` before the `tool_calls` chunk.
+**The alignment is the whole row.** `final.text` is the parser's output — the
+segments outside every call span, joined and `.strip()`ed — so `sent` is NOT a
+literal prefix of it: the strip ate `sent`'s leading whitespace. Cutting at
+`len(sent.lstrip())` puts the boundary in the right place. When `final.text` does
+not start with `sent.lstrip()` the strip must also have taken `sent`'s TRAILING
+whitespace, which happens only when nothing followed the call — so the remainder
+is empty, and the code emits nothing rather than guessing and duplicating prose.
+An empty `sent` (a call with no prose before it) falls out of the same
+expression: `head == ""`, so the whole cleaned text is the remainder.
+**Verified:** 4 tests in `tests/test_server_app.py`, each confirmed to FAIL
+against the pre-fix code exactly as the bug (`assert 'Sure. ' == 'Sure.  trailing
+prose'`, `assert '' == 'tail'`, …). They cover HERMES and GENERIC_JSON, a call
+with no prose before it, and the leading-whitespace case that catches the naive
+slice. `test_a_real_fenced_tool_call_is_still_not_duplicated_as_content` is the
+standing guard that a parsed call is not ALSO delivered as prose; it passed
+before and after. Suite 1250/3 → **1254/3**.
+**Not covered by the gate:** `test_server_smoke.py` sends no `tools`, same blind
+spot B7 recorded — making it would need a real model to emit a call on demand,
+which is not deterministic. The fake-engine tests are what stand behind this.
 
 ### B8 · [x] streaming errors were not status-mapped — **FIXED 2026-08-28**
 The non-streaming path mapped `ContextTooLong` / `TemplateLacksToolSupport` /
@@ -553,7 +580,7 @@ it passed before and after. Suite 1229/3 → **1232/3**. Server smoke gate
 **Opened B16:** `generate()`'s `_running` has the same shape and is NOT fixed
 here — deliberately, it is a different route and a different trigger.
 
-### B16 · [bug] `generate()` clears its token while the executor thread may still run
+### B16 · [x] `generate()` clears its token while the executor thread may still run — **FIXED 2026-08-29**
 `vaayu/server/engine.py`, `_running`. Same shape as B9, other route: the async
 `finally` clears `_live_cancel` when `await loop.run_in_executor(...)` raises,
 and a cancelled handler task raises `CancelledError` there while the executor
@@ -566,6 +593,37 @@ it needs the handler task itself to be cancelled (uvicorn's graceful-shutdown
 timeout, lifespan teardown). Found 2026-08-28 while fixing B9.
 **Done means:** `generate()` publishes something `quiesce()` can wait on, and
 the token outlives the executor work on the cancelled path.
+
+**Fix — `vaayu/server/engine.py`.** Three parts, B9's shape on this route:
+- `generate()` mints its own `CancelToken()` when the caller passes none, so
+  `cancel_all()` is never told the engine is idle mid-run (B9's second hole,
+  same line of reasoning).
+- The executor call became an **own `threading.Thread` + `_queue.Queue` bridge**,
+  mirroring `stream()`'s `_pump`, awaited through `run_in_executor(None,
+  bridge.get)`. **A `run_in_executor` pool worker could not be published**: pool
+  threads never exit, so `quiesce()`'s `thread.join()` would block forever. That
+  is why the row could not be fixed by publishing `current_thread()`.
+- `_running(cancel, thread=None)` grew the teardown `stream()` already has:
+  `except BaseException: cancel.cancel(); raise` plus `finally: try:
+  thread.join() finally: clear both`. Cancel PRECEDES join (an uncancelled join
+  on the abandoned path blocks for the whole remaining cap); the clear FOLLOWS
+  it, which is this row's "done means". It now also publishes `_live_thread`, so
+  `slot()`'s `quiesce()` (B4) has something to wait on — B4 covered only
+  `stream()` before this.
+Safe for the normal path for B9's reason: `_finish` reads the LOCAL `cancel`,
+and the pre-cancel runs only while unwinding, so a normal answer still reports
+`"stop"`.
+**Verified:** 4 tests in `tests/test_server_engine.py`; the 3 behavioural ones
+were confirmed to FAIL against the pre-fix code — the cancelled-handler one
+exactly as the bug (`the cancelled handler returned while its generation worker
+was still running`), the no-token one as `assert None is not None`, the third as
+`quiesce() has nothing to join while generate() is running`.
+`test_a_normally_finished_generate_still_reports_stop` is the guard that the
+self-minted token does not relabel every normal answer; it passed before and
+after. Suite 1246/3 → **1250/3**.
+**Gate:** `test_server_smoke.py` `ALL PASS` on Llama-3.2-1B — its non-streaming
+step is exactly the route rewritten here, so the thread/bridge swap is proven
+against a real model, not only the fake.
 
 ### B10 · [x] `capture_stdio` was never restored when startup failed — **FIXED 2026-08-29**
 `vaayu/server/app.py`, `lifespan`. `restore_stdio` was created before
@@ -693,12 +751,25 @@ that both are still reported.
 **Verified:** no test — it is comments and docs. `test_the_threshold_default_is_above_a_bare_cuda_context`
 is what pins the knob itself.
 
-### B13 · [bug] docs table `PORT` as 8000; the code ships 9999
+### B13 · [x] docs table `PORT` as 8000; the code ships 9999 — **FIXED 2026-08-29**
 `vaayu/server/config.py:29` sets `PORT = 9999` (and `ServerConfig.port` still
 defaults to `8000`). `documentation/server.md:102` and
 `vaayu/server/README.md:45` both table the default as `8000`, and every curl
 example in both docs plus `README.md:568` targets 8000. Copy-paste from the docs
 fails against a default install.
+
+**Fix.** `ServerConfig.port` default → `9999` (the third disagreeing answer;
+dead for the server because `__main__` always passes `config.PORT`, but live for
+every library caller and for the tests). All 13 doc sites rewritten to 9999 —
+`documentation/server.md` (11), `vaayu/server/README.md` (2), `README.md` (1).
+`tests/test_server_tools.py:137` keeps its `{"port": 8000}` — that is sample
+JSON payload, not a URL.
+**Verified: `tests/test_docs_ports.py`, 3 tests, a standing GUARD rather than a
+one-off fix.** It reads the expected value from `config.PORT` — a literal there
+would just be a fourth place to forget — and scans the three docs for
+`localhost|127.0.0.1|0.0.0.0:<port>` URLs and for the `| \`PORT\` |` table row.
+All three confirmed to FAIL first, the URL one listing every stale site by
+`file:line`. Suite 1254/3 → **1257/3**.
 
 ---
 
