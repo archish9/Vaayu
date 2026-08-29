@@ -72,7 +72,12 @@ Free it with:
 
 Only **compute** processes count — your desktop (Xorg, gnome-shell, a browser) holds
 graphics memory in the tens of MiB and is never something an inference engine should tell
-you to kill. Library callers (`AutoModel.from_pretrained`) get the same report as a
+you to kill. Two more things are excluded from the refusal, because neither costs the load
+anything: holders on a **different GPU** than `DEVICE` (rows are matched on the GPU's UUID,
+not on nvidia-smi's index, which does not track `cuda:N`), and holders under
+`EXCLUSIVE_GPU_MIN_MIB` — a bare CUDA context is 128 MiB, so without a threshold any
+process that merely imports torch refuses the boot. Both are still **reported**; only the
+refusal is narrowed. Library callers (`AutoModel.from_pretrained`) get the same report as a
 **warning** rather than a refusal, so existing scripts keep working. Set
 `REQUIRE_EXCLUSIVE_GPU = False` for a box you deliberately share.
 

@@ -57,10 +57,6 @@ class ServerConfig:
     # without this reservation a large expert cache silently starves cross-turn
     # reuse -- which collapses to zero, not proportionally, once over capacity.
     prefix_sessions: int = 3
-    # Refuse to load while another process holds GPU memory. Budgets are derived
-    # ONCE at load, so a forgotten container is a permanent per-token tax, not a
-    # transient one -- and it is invisible in the output. Warn-and-degrade was
-    # rejected for exactly that reason (CLAUDE.md §5).
     # Delete the ORIGINAL downloaded shards once Vaayu's split copy is verified
     # complete, reclaiming 39-66 GB per checkpoint. IRREVERSIBLE: recovery is a
     # re-download, and the removal follows symlinks, so a shard linked into the
@@ -79,7 +75,16 @@ class ServerConfig:
     # prompt collide on a single entry and evict each other -- and concurrent
     # calls on one id mutate the same cache object. OpenAI's `user` counts.
     require_session_id: bool = True
+    # Refuse to load while another process holds GPU memory on `device`. Budgets
+    # are derived ONCE at load, so a forgotten container is a permanent
+    # per-token tax, not a transient one -- and it is invisible in the output.
+    # Warn-and-degrade was rejected for exactly that reason (CLAUDE.md §5).
     require_exclusive_gpu: bool = True
+    # How much a foreign process must hold to be worth refusing over. A bare
+    # CUDA context is 128 MiB on this box, so at 0 anything that merely imports
+    # torch blocks the boot while costing nothing. Under this it is reported,
+    # not blocked.
+    exclusive_gpu_min_mib: int = 256
     # Suppress the model's reasoning block. Off by default: a reasoning trace is
     # tokens the caller did not ask for, at the same tok/s as the answer.
     enable_thinking: bool = False
@@ -117,15 +122,26 @@ def resolve_stream(req, config) -> bool:
 
 
 def _check_gpu_is_exclusive(config) -> None:
-    """Refuse the load when another process holds GPU memory.
+    """Refuse the load when another process holds GPU memory on our device.
 
     Raises SystemExit, which uvicorn reports as a failed startup. Warn-and-load
     was rejected: the penalty is a permanently smaller pinning budget, invisible
     in the output, and measured at up to 13x on the token rate.
+
+    Two things it does NOT refuse over, because neither costs this load
+    anything: a holder on a different GPU, and one under
+    `exclusive_gpu_min_mib` -- a bare CUDA context is 128 MiB. Both are still
+    printed; only the refusal is narrowed (B11).
     """
     from .. import gpu_audit
-    report = gpu_audit.compose_report(gpu_audit.audit())
+    device = getattr(config, "device", None)
+    min_mib = getattr(config, "exclusive_gpu_min_mib", 0)
+    users = gpu_audit.audit(device=device)
+    report = gpu_audit.compose_report(users, min_mib=min_mib)
     if not report:
+        return
+    if not gpu_audit.blocking_users(users, min_mib):
+        print(f"[Vaayu-Server] {report}")
         return
     if config is not None and not config.require_exclusive_gpu:
         print(f"[Vaayu-Server] WARNING: {report}")
@@ -246,48 +262,63 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         restore_stdio = None
-        if config is not None and config.capture_stdio:
-            # Before the load, so pinning and NVMe warmup end up in the file too.
-            restore_stdio = capture_stdio(
-                Path(config.log_dir) / "server.log", rotate_mb=config.log_rotate_mb)
-            print(f"[Vaayu-Server] logging to {config.log_dir}/server.log and "
-                  f"{config.log_dir}/sessions/<session_id>.log")
-        if engine is None:
-            _check_gpu_is_exclusive(config)
-            from ..auto_model import AutoModel
-            if config.delete_original:
-                print("[Vaayu-Server] DELETE_ORIGINAL is ON: the source shards "
-                      "this checkpoint was split from will be removed once the "
-                      "split is verified complete. This is irreversible -- "
-                      "recovery is a re-download. Set DELETE_ORIGINAL = False "
-                      "in vaayu/server/config.py to keep them.")
-            print(f"[Vaayu-Server] loading {config.model_path} ...")
-            t0 = time.time()
-            model = AutoModel.from_pretrained(
-                config.model_path,
-                delete_original=config.delete_original,
-                device=config.device,
-                kv_cache_mode=config.kv_cache_mode,
-                drafter_model_path=config.drafter_model_path or None,
-                enable_prefix_cache=config.enable_prefix_cache,
-                max_pinned_layers=config.max_pinned_layers,
-                prefill_chunk_size=config.prefill_chunk_size,
-                use_prompt_lookup=config.use_prompt_lookup,
-                draft_tokens=config.draft_tokens,
-                prefix_compress=config.prefix_compress,
-                enable_kv_persist=config.enable_kv_persist,
-                attn_implementation=config.attn_implementation,
-                ram_cache_budget=config.ram_cache_budget,
-                prefix_sessions=config.prefix_sessions,
-            )
-            print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
-                  f"derived max_seq_len={model.max_seq_len}")
-            app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
-                                            enable_thinking=config.enable_thinking,
-                                            log_dir=config.log_dir)
-        else:
-            app.state.engine = engine
-        restore_signals = _install_signal_cancel(app.state.engine)
+        try:
+            if config is not None and config.capture_stdio:
+                # Before the load, so pinning and NVMe warmup end up in the file too.
+                restore_stdio = capture_stdio(
+                    Path(config.log_dir) / "server.log", rotate_mb=config.log_rotate_mb)
+                print(f"[Vaayu-Server] logging to {config.log_dir}/server.log and "
+                      f"{config.log_dir}/sessions/<session_id>.log")
+            if engine is None:
+                _check_gpu_is_exclusive(config)
+                from ..auto_model import AutoModel
+                if config.delete_original:
+                    print("[Vaayu-Server] DELETE_ORIGINAL is ON: the source shards "
+                          "this checkpoint was split from will be removed once the "
+                          "split is verified complete. This is irreversible -- "
+                          "recovery is a re-download. Set DELETE_ORIGINAL = False "
+                          "in vaayu/server/config.py to keep them.")
+                print(f"[Vaayu-Server] loading {config.model_path} ...")
+                t0 = time.time()
+                model = AutoModel.from_pretrained(
+                    config.model_path,
+                    delete_original=config.delete_original,
+                    device=config.device,
+                    kv_cache_mode=config.kv_cache_mode,
+                    drafter_model_path=config.drafter_model_path or None,
+                    enable_prefix_cache=config.enable_prefix_cache,
+                    max_pinned_layers=config.max_pinned_layers,
+                    prefill_chunk_size=config.prefill_chunk_size,
+                    use_prompt_lookup=config.use_prompt_lookup,
+                    draft_tokens=config.draft_tokens,
+                    prefix_compress=config.prefix_compress,
+                    enable_kv_persist=config.enable_kv_persist,
+                    attn_implementation=config.attn_implementation,
+                    ram_cache_budget=config.ram_cache_budget,
+                    prefix_sessions=config.prefix_sessions,
+                )
+                print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
+                      f"derived max_seq_len={model.max_seq_len}")
+                app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
+                                                enable_thinking=config.enable_thinking,
+                                                log_dir=config.log_dir)
+            else:
+                app.state.engine = engine
+            restore_signals = _install_signal_cancel(app.state.engine)
+        except BaseException:                   # noqa: BLE001 -- re-raised
+            # Startup failed BEFORE the `yield`, so the `finally` below never
+            # runs and fds 1 and 2 would stay pointed at the log pipe. What is
+            # printed next -- uvicorn's "Application startup failed", and the
+            # GPU-audit refusal report that is the whole reason this path
+            # exists -- would then reach the console only through a daemon pump
+            # thread the interpreter is about to kill (B10). Restoring also
+            # flushes the pump and closes the saved console fds, which this path
+            # otherwise leaked. BaseException, not Exception:
+            # _check_gpu_is_exclusive raises SystemExit, which is exactly the
+            # case that has to work.
+            if restore_stdio is not None:
+                restore_stdio()
+            raise
         try:
             yield
         finally:

@@ -29,11 +29,6 @@ DEVICE = "cuda:0"
 # Waiting requests allowed before 503. ONE runs at a time regardless.
 QUEUE_DEPTH = 8
 
-# Refuse to start while another process holds GPU memory. Vaayu sizes its
-# pinning and cache budgets ONCE, from what is free at load, so a forgotten
-# container costs every token for the life of the run -- and the loss is
-# invisible in the output. See the REQUIREMENT section in the top-level
-# README.md. Set False for a box you deliberately share; it then only warns.
 # Refuse a request that names no session. An unnamed request still gets prefix
 # reuse (the pool auto-matches), but its key is a hash of the prompt's first 64
 # tokens -- so two agents sharing a system prompt land on ONE entry and evict
@@ -41,7 +36,19 @@ QUEUE_DEPTH = 8
 # field counts as a session, so an OpenAI-native client is not locked out.
 REQUIRE_SESSION_ID = True
 
+# Refuse to start while another process holds GPU memory on DEVICE. Vaayu sizes
+# its pinning and cache budgets ONCE, from what is free at load, so a forgotten
+# container costs every token for the life of the run -- and the loss is
+# invisible in the output. See the REQUIREMENT section in the top-level
+# README.md. Set False for a box you deliberately share; it then only warns.
 REQUIRE_EXCLUSIVE_GPU = True
+
+# How much VRAM another process must hold before it is worth refusing over.
+# A bare CUDA context is 128 MiB on this box, so at 0 a stray notebook -- or any
+# process merely importing torch -- refuses the boot while costing nothing.
+# Anything under this is still REPORTED, just not treated as a blocker. Only
+# processes on DEVICE count at all; a job on another GPU is not Vaayu's problem.
+EXCLUSIVE_GPU_MIN_MIB = 256
 
 # Delete the ORIGINAL downloaded shards once Vaayu's own split copy is verified
 # complete (every layer has its .safetensors AND its .done marker), reclaiming

@@ -29,7 +29,7 @@ def captured(monkeypatch):
     import vaayu.auto_model as am
     import vaayu.gpu_audit as ga
     monkeypatch.setattr(am, "AutoModel", FakeAutoModel)
-    monkeypatch.setattr(ga, "audit", lambda: [])
+    monkeypatch.setattr(ga, "audit", lambda **kw: [])
     return seen
 
 

@@ -109,7 +109,8 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `LOG_ROTATE_MB` | `50` | when `server.log` rolls to `server.log.1` |
 | `DELETE_ORIGINAL` | **`True`** | delete the ORIGINAL shards once the split copy is verified complete, reclaiming **39–66 GB per checkpoint**. **Irreversible** — recovery is a re-download, and it follows symlinks into the shared HF cache. `False` keeps them for other tools |
 | `REQUIRE_SESSION_ID` | **`True`** | refuse a request that names neither `session_id` nor `user`. Unnamed requests still get reuse, but they key on a hash of the prompt's first 64 tokens, so agents sharing a system prompt collide on one pool entry and reuse collapses to zero. `False` allows them |
-| `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
+| `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory **on `DEVICE`**, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
+| `EXCLUSIVE_GPU_MIN_MIB` | **`256`** | how much a holder must hold before it is worth refusing over. A bare CUDA context is 128 MiB, so `0` refuses the boot over any process that merely imports torch. Anything smaller is still reported, just not treated as a blocker |
 
 ### Speed
 

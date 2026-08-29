@@ -39,11 +39,11 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1232 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-28 after B9 — neither B3 nor B6 added Python tests; both are `cargo test` in `vaayu_rust`,
-which went 6 → 13 (B3) → 19 (B6).
+**Suite baseline: 1246 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
+2026-08-29 after B11+B12 — neither B3 nor B6 added Python tests; both are `cargo test` in
+`vaayu_rust`, which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
-B8 added 5, B9 added 3. **None of the
+B8 added 5, B9 added 3, B10 added 2, B11 added 12. **None of the
 bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
 why each fix ships with a test verified to FAIL against the code it replaces.
 
@@ -58,9 +58,9 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~4~~ | ~~**B7**~~ — **DONE 2026-08-28** | | |
 | ~~5~~ | ~~**B8**~~ — **DONE 2026-08-28** | | |
 | ~~6~~ | ~~**B9**~~ — **DONE 2026-08-28** | | |
-| 7 | **B10** — `capture_stdio` never restored on a failed startup | fd 1/2 stay in the pipe; the startup traceback can be lost | `app.py:246` |
-| 8 | **B11** — exclusive-GPU refusal has no device filter and no size threshold | a 30 MiB process on `cuda:1` blocks a `cuda:0` load | `vaayu/gpu_audit.py:105` |
-| 9 | **B12** — `REQUIRE_EXCLUSIVE_GPU` comment block is pasted into the wrong knob | the one setting that refuses to boot is undocumented in place | `config.py:44` |
+| ~~7~~ | ~~**B10**~~ — **DONE 2026-08-29** | | |
+| ~~8~~ | ~~**B11**~~ — **DONE 2026-08-29** | | |
+| ~~9~~ | ~~**B12**~~ — **DONE 2026-08-29**, fixed together with B11 | | |
 | 10 | **B13** — docs table `PORT` as `8000`; the code ships `9999` | every curl example in the docs fails against a default install | `config.py:29` vs `documentation/server.md:102` |
 | 10b | **B15** — a stream drops the prose that FOLLOWS a real tool call | non-streaming returns it; the stream does not. Found while fixing B7, pre-dates it | `vaayu/server/app.py:452-495` |
 | 10c | **B16** — `generate()` clears its token while the executor thread may still run | B9's shape on the NON-streaming route; `quiesce()` has no thread to join there. Found while fixing B9 | `vaayu/server/engine.py`, `_running` |
@@ -227,7 +227,7 @@ B2+B5, which is also how the gate's own three breakages surfaced (see "On-device
 Reading found twelve bugs; running found four more.
 
 Order to fix them: the **FIX SEQUENCE** table at the top of this file. **Closed so far:** B1, B2,
-B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
+B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11 and B12 (2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
@@ -567,31 +567,131 @@ timeout, lifespan teardown). Found 2026-08-28 while fixing B9.
 **Done means:** `generate()` publishes something `quiesce()` can wait on, and
 the token outlives the executor work on the cancelled path.
 
-### B10 · [bug] `capture_stdio` is never restored when startup fails
-`vaayu/server/app.py:246-297`. `restore_stdio` is created before
-`_check_gpu_is_exclusive` and the model load, but `restore_stdio()` lives in the
+### B10 · [x] `capture_stdio` was never restored when startup failed — **FIXED 2026-08-29**
+`vaayu/server/app.py`, `lifespan`. `restore_stdio` was created before
+`_check_gpu_is_exclusive` and the model load, but `restore_stdio()` lived in the
 `finally` **after** `yield`. A `SystemExit` from the GPU audit — or any load
-error — skips it: fds 1 and 2 stay pointed at the pipe, `saved_out`/`saved_err`
-leak, and the traceback uvicorn prints reaches the console only via a daemon
-pump thread that may die before flushing. The refusal message is the part worth
-reading, and it is the part at risk.
-**Done means:** the pre-`yield` section restores stdio on its own failure path.
+error — skipped it: fds 1 and 2 stayed pointed at the pipe, `saved_out`/`saved_err`
+leaked, and what uvicorn printed next reached the console only via a daemon pump
+thread the interpreter is about to kill.
 
-### B11 · [bug] the exclusive-GPU refusal has no device filter and no threshold
-`vaayu/gpu_audit.py:105-115` + `app.py:119-136`. `audit()` returns every foreign
-compute process on **every** GPU and `_check_gpu_is_exclusive` refuses on any of
-them at any size. A job on `cuda:1` blocks a `cuda:0` load; a 30 MiB CUDA
-process refuses the boot outright. `parse_compute_apps` also splits on `,`, so a
-process name containing a comma is silently skipped.
-**Done means:** filter to the configured device index and apply a MiB threshold.
+**Fix 1 — `app.py`.** The whole pre-`yield` section (capture, GPU audit, load,
+`EngineHandle`, **and `_install_signal_cancel`**, which the row did not name but
+sits in the same unguarded stretch) is now inside a `try`, with
+`except BaseException: restore_stdio() if not None; raise`. `BaseException`, not
+`Exception`: the audit raises `SystemExit`, which is exactly the case that has to
+work. Re-raising means the second `try/finally` is never entered, so no
+double-restore.
+**Deliberate tradeoff:** restoring in the handler means uvicorn's
+"Application startup failed" traceback reaches the **console** but not
+`server.log`. That is the row's stated priority — console delivery is what it
+names as at risk. The refusal report itself is printed BEFORE the failure and
+`restore()` joins the pump, so it still lands in the log file.
 
-### B12 · [bug] `REQUIRE_EXCLUSIVE_GPU`'s comment block documents the wrong knob
-`vaayu/server/config.py:44-56`. The `REQUIRE_SESSION_ID` explanation is pasted
-**inside** the `REQUIRE_EXCLUSIVE_GPU` comment, so `REQUIRE_EXCLUSIVE_GPU = True`
-— the single setting that makes the server refuse to boot — has no documentation
-next to it, and the text above it reads as if it were about session ids. Anyone
-opening this file to share a GPU will not find the knob. Same paste appears in
-`ServerConfig` (`app.py:60-82`).
+**Fix 2 — `vaayu/server/logs.py`, `restore()`. Beyond the row's literal "done
+means", same harm.** `sys.stdout`/`sys.stderr` are flushed BEFORE the `dup2`s.
+`print()` to a non-tty is block-buffered, so on a server started with its output
+redirected to a file — the shape this repo's own Environment section prescribes —
+the refusal message was still in Python's buffer at restore time and flushed to
+the console AFTER the dup2, never reaching the log. Flush order is the mirror of
+the join order already commented there.
+
+**Verified:** 2 tests, both confirmed to FAIL against the pre-fix code —
+`test_a_failed_startup_restores_fd_1_and_2` (`tests/test_server_app.py`) as
+`FAIL: fd 1 is still in the log pipe after a failed startup`, and
+`test_restore_flushes_python_buffered_output_into_the_log` (`tests/test_logs.py`)
+on the missing log line. Both run in a **subprocess**, matching `test_logs.py`'s
+existing capture tests: they rewire fd 1/2 for real, and pre-fix they leave them
+rewired — in-process that would put pytest's own output down a pipe for the rest
+of the run. The app one asserts fd identity (`st_dev`/`st_ino`) for fds 1 and 2
+plus no leaked entries in `/proc/self/fd`, and reports through a verdict FILE
+because stdout is the thing under test. Suite 1232/3 → **1234/3**. Server smoke
+gate `ALL PASS` on Llama-3.2-1B (the success path, which Fix 2 also touches).
+**Not covered by a test:** a failure in the model LOAD rather than the audit —
+provoking it needs a real checkpoint; the handler is the same one either way.
+
+### B11 · [x] the exclusive-GPU refusal had no device filter and no threshold — **FIXED 2026-08-29**
+`vaayu/gpu_audit.py` + `app.py`. `audit()` returned every foreign compute process
+on **every** GPU and `_check_gpu_is_exclusive` refused on any of them at any
+size. `parse_compute_apps` also split on `,` and required exactly 3 fields, so a
+process name containing a comma was silently skipped — under-reporting, which is
+the one thing this module must not do.
+
+**The row's own numbers, measured rather than assumed.** A bare CUDA context on
+this box is **128 MiB** (a `torch.zeros(1, device='cuda:0')` child, live
+`nvidia-smi`), so the row's "a 30 MiB process refuses the boot" is if anything
+understated: *any* process that merely imports torch did. That measurement is
+what sets the threshold default.
+
+**Fix 1 — WHICH GPU, joined on UUID not index.** The query gained a `gpu_uuid`
+column and `foreign_gpu_users` gained a `uuid=` filter; `device_uuid("cuda:1")`
+resolves it through `torch.cuda.get_device_properties(i).uuid`, prefixed `GPU-`
+to match nvidia-smi. **Not the index:** nvidia-smi's index is its own
+enumeration and neither `CUDA_DEVICE_ORDER` nor `CUDA_VISIBLE_DEVICES` moves it
+in step with torch's `cuda:N`; the UUID is the one identifier both sides agree
+on (verified live: torch `a6e6ee6b-…` ↔ nvidia-smi `GPU-a6e6ee6b-…`).
+`device_uuid` **fails OPEN** — cpu, a malformed string, no torch, no driver, an
+absent device all return None, i.e. no filter. Over-reporting costs a warning;
+failing closed would silently audit nothing.
+
+**Fix 2 — HOW BIG.** `blocking_users(users, min_mib)` is separate from
+`compose_report`, because "does this refuse the boot" and "is this worth saying"
+are different questions. Under-threshold holders are **reported and never
+dropped**: `compose_report` lists them, but leaves them out of the total and out
+of the commands — the total is the argument for refusing so it must be the
+memory the refusal is about, and nobody should be told to kill a bare CUDA
+context. New knob `EXCLUSIVE_GPU_MIN_MIB = 256`, a POLICY constant sited by the
+128 MiB measurement, not a model number (CLAUDE.md §5).
+
+**Fix 3 — the parse.** uuid is `raw[0]`, pid `raw[1]`, memory `raw[-1]`, and the
+name is everything between, joined. nvidia-smi does not quote its CSV, so this
+is what a comma in a process name needs.
+
+**Verified:** 12 tests in `tests/test_gpu_audit.py`. Rather than a
+whole-file revert (which only produces a collection error, a weak signal), each
+mechanism was **mutated out individually** and the exact test that dies with it
+recorded: uuid filter ignored → `..._holder_on_another_gpu_does_not_count`;
+threshold ignored → 4 tests incl. the gate one; fixed-field parse → the comma
+test; gate stops passing `device` → `..._audits_the_configured_device`;
+`device_uuid` failing closed → `..._falls_back_to_auditing_everything`.
+Also verified END-TO-END against live `nvidia-smi` with real child processes: a
+154 MiB context is reported and does NOT block, a 1.55 GiB holder still raises
+`SystemExit` with `kill <pid>`. Suite 1234/3 → **1246/3**. Server smoke gate
+`ALL PASS` on Llama-3.2-1B with `max_seq_len=90639`, **identical to the pre-change
+run** — so `device_uuid` initialising CUDA before the load does not shrink the
+derived budget.
+**Test churn this forced, deliberately:** the parser's input format gained a
+column, so `SAMPLE` and 2 existing parse tests were updated; `audit()` gained a
+kwarg, so the `lambda: []` fakes in `test_delete_original.py` and
+`test_server_config_passthrough.py` became `lambda **kw: []`, and
+`exclusive_gpu_min_mib` joined `NOT_MODEL_KWARGS`.
+**Unchanged on purpose:** the LIBRARY path (`auto_model.py:57`) still calls
+`audit()` with no device and `compose_report` with no threshold — it warns about
+the whole box and never refuses, which is its contract.
+**Noticed, not touched (CLAUDE.md §3):** `_MIB` in `gpu_audit.py` was already
+dead before this change (definition only, no use).
+**Not covered by a test:** the real `_torch_device_uuid` call — it needs a GPU;
+`device_uuid`'s logic is tested with it monkeypatched, and the live run above is
+what stands behind the call itself. The two-GPU case is likewise unit-tested
+only: this box has one GPU.
+
+### B12 · [x] `REQUIRE_EXCLUSIVE_GPU`'s comment block documented the wrong knob — **FIXED 2026-08-29** (with B11)
+`vaayu/server/config.py`. The `REQUIRE_SESSION_ID` explanation was pasted
+**inside** the `REQUIRE_EXCLUSIVE_GPU` comment, so the single setting that makes
+the server refuse to boot had no documentation next to it and the text above it
+read as if it were about session ids. The same paste was in `ServerConfig`
+(`app.py`), where the exclusive-GPU comment sat stranded above
+`delete_original`'s.
+**Fixed with B11 rather than separately:** comment-only, in the exact lines B11
+already edits; keeping it apart meant editing the same block twice.
+**Fix:** the two comments are split and each sits on its own knob, in both
+files. Both now say the refusal is scoped to `DEVICE`, which is B11's change.
+**Docs, beyond the row:** `EXCLUSIVE_GPU_MIN_MIB` is tabled in
+`vaayu/server/README.md` and `documentation/server.md`, and `README.md`'s
+enforcement section now states both exclusions (other GPU, under threshold) and
+that both are still reported.
+**Verified:** no test — it is comments and docs. `test_the_threshold_default_is_above_a_bare_cuda_context`
+is what pins the knob itself.
 
 ### B13 · [bug] docs table `PORT` as 8000; the code ships 9999
 `vaayu/server/config.py:29` sets `PORT = 9999` (and `ServerConfig.port` still

@@ -379,3 +379,79 @@ def test_a_real_engine_crash_still_streams_as_internal_error():
     assert r.status_code == 200
     errors = [e for e in _sse_events(r.text) if "error" in e]
     assert errors[0]["error"]["type"] == "internal_error"
+
+
+# ── startup failure must not leave fd 1/2 in the log pipe (B10) ──────────────
+#
+# Subprocess, for the reason test_logs.py's capture tests are: this rewires fd 1
+# and 2 for real, and against the pre-fix app.py it leaves them rewired -- which
+# in-process would put pytest's own output down a pipe for the rest of the run.
+# The verdict goes to a FILE rather than stdout: stdout is the thing under test,
+# and the log pump interleaves its tee with anything written there.
+
+FAILED_STARTUP_SCRIPT = """
+import os, sys
+sys.path.insert(0, {repo!r})
+
+def say(msg):
+    with open({verdict!r}, "w") as f:
+        f.write(msg)
+    sys.exit(0 if msg == "OK" else 1)
+
+def fds():
+    return set(os.listdir("/proc/self/fd"))
+
+from fastapi.testclient import TestClient
+from vaayu.server import app as app_mod
+
+def refuse(config):
+    # What _check_gpu_is_exclusive does: print the report, then SystemExit. It
+    # is the FIRST thing after capture_stdio, so nothing else can have failed.
+    print("[Vaayu-Server] refusing to load -- the GPU is not exclusive")
+    raise SystemExit("refusing")
+
+app_mod._check_gpu_is_exclusive = refuse
+
+cfg = app_mod.ServerConfig(model_path="/nonexistent", log_dir={log_dir!r})
+app = app_mod.create_app(cfg)        # engine=None -> the real startup path runs
+
+before_stat, before_fds = (os.fstat(1), os.fstat(2)), fds()
+try:
+    # TestClient re-raises a lifespan SystemExit as CancelledError out of the
+    # portal task group, so catch broadly: the exception TYPE is not what this
+    # test is about, the fd table is.
+    with TestClient(app):
+        pass
+except BaseException:
+    pass
+else:
+    say("FAIL: the startup did not fail")
+
+after_stat, after_fds = (os.fstat(1), os.fstat(2)), fds()
+for fd, (b, a) in enumerate(zip(before_stat, after_stat), start=1):
+    if (b.st_dev, b.st_ino) != (a.st_dev, a.st_ino):
+        say("FAIL: fd %d is still in the log pipe after a failed startup" % fd)
+if after_fds - before_fds:
+    say("FAIL: leaked fds %s" % sorted(after_fds - before_fds))
+say("OK")
+"""
+
+
+def test_a_failed_startup_restores_fd_1_and_2(tmp_path):
+    # The pre-yield section -- the GPU audit, the load, EngineHandle -- sits
+    # outside any try, so a failure there skips restore_stdio() entirely: fds 1
+    # and 2 stay in the pipe, saved_out/saved_err leak, and whatever uvicorn
+    # prints next reaches the console only through a daemon pump thread the
+    # interpreter is about to kill.
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    verdict = tmp_path / "verdict.txt"
+    out = subprocess.run(
+        [_sys.executable, "-c", FAILED_STARTUP_SCRIPT.format(
+            repo=str(_Path(__file__).resolve().parents[1]),
+            log_dir=str(tmp_path), verdict=str(verdict))],
+        capture_output=True, text=True, timeout=120)
+    assert verdict.exists(), f"the probe died before deciding:\n{out.stdout}\n{out.stderr}"
+    assert verdict.read_text() == "OK", verdict.read_text()

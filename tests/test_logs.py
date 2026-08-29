@@ -217,3 +217,30 @@ def test_no_log_dir_means_no_files_and_no_errors(tmp_path):
     asyncio.run(e.generate(ChatCompletionRequest(
         model="v", max_tokens=8, messages=[{"role": "user", "content": "hi"}])))
     assert not list(tmp_path.iterdir())
+
+
+# `print()` to a non-tty is block-buffered, so a message can still be sitting in
+# Python's buffer when restore() detaches -- and then it flushes to the console
+# the dup2 just restored, never reaching the log. That is the failure mode on a
+# server started with its output redirected to a file, which is how this one is
+# meant to be run (B10 Fix 2).
+BUFFERED_SCRIPT = """
+import os, sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio
+restore = capture_stdio({path!r})
+print("buffered-before-restore")          # deliberately NOT flushed
+restore()
+"""
+
+
+def test_restore_flushes_python_buffered_output_into_the_log(tmp_path):
+    log = tmp_path / "server.log"
+    out = subprocess.run(
+        [sys.executable, "-c", BUFFERED_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]), path=str(log))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "buffered-before-restore" in log.read_text(), (
+        "restore() detached before flushing, so the message went to the console "
+        "instead of the log")

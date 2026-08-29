@@ -37,6 +37,7 @@ def main() -> int:
         log_rotate_mb=config.LOG_ROTATE_MB,
         require_session_id=config.REQUIRE_SESSION_ID,
         require_exclusive_gpu=config.REQUIRE_EXCLUSIVE_GPU,
+        exclusive_gpu_min_mib=config.EXCLUSIVE_GPU_MIN_MIB,
         enable_thinking=config.ENABLE_THINKING,
         default_stream=config.DEFAULT_STREAM,
         ram_cache_budget=(None if config.RAM_CACHE_BUDGET_GB is None

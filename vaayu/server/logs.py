@@ -17,6 +17,7 @@ sanitized rather than trusted -- `"../../etc/cron.d/x"` must not be a path.
 import hashlib
 import os
 import re
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -120,6 +121,16 @@ def capture_stdio(log_path, rotate_mb: int = 50):
         # what lets the pump see EOF -- so JOIN before closing the saved console
         # fds. Closing them first raced the pump onto a dead descriptor and the
         # last lines were lost with an Errno 9 traceback.
+        #
+        # Flush FIRST, for the same reason in the other direction: `print()` to a
+        # non-tty is block-buffered, so a message can still be in Python's buffer
+        # here, and after the dup2 it would flush to the console rather than into
+        # the log. That is exactly the case a failed startup hits.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass                            # already closed or detached
         os.dup2(saved_out, 1)
         os.dup2(saved_err, 2)
         thread.join(timeout=5)
