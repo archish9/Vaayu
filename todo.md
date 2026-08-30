@@ -30,6 +30,14 @@ environment, the preserved probe harness (`plans/probes/`), the seven measuremen
 numbers not to re-derive. **It is self-contained: you should not need this file or any other to
 start work from it.**
 
+**2026-08-30, later: its row P1 is DONE** — the prefetcher measured under parallel fan-out (Qwen,
+N=1/2/3, 12 interleaved arms). `VAAYU_LOOKAHEAD` helps at every N but the gain decays
+**+12.8 % → +6.7 % → +2.2 %** while its byte cost rises to +24.6 %, and N=3 is inside the
+unexplained-drift band. Batching alone is the bigger free lever (**1.61×** aggregate at N=3, with
+bytes/token FALLING). P2 stands but is now bounded; **P3 (tiny reads) is promoted** — it holds a
+ring 91.7 % of decode at N=3 for 0.3 % of the bytes. Full trail:
+`plans/2026-08-30-P1-fanout-RESULTS.md`; harness `plans/probes/probe_fanout.py`.
+
 Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
 one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
