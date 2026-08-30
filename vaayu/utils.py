@@ -61,6 +61,25 @@ def save_quant_state_to_dict(self, packed=True):
 
 
 
+def freeze_after_load():
+    """Move the loaded model's object graph out of the GC's reach.
+
+    A loaded model is a large, PERMANENT graph -- module tree, expert-cache
+    views, pinned-slab bookkeeping -- that every gen-2 collection re-traverses
+    for objects that will never be freed. `gc.freeze()` moves everything that
+    already exists into a permanent generation the collector skips.
+
+    Collect first: whatever is frozen is retained for the life of the process,
+    so freezing over load-time garbage leaks it permanently. For the same
+    reason this belongs to a process that loads one model and then serves --
+    call it again after a second load and the first model's garbage is pinned.
+    """
+    gc.collect()
+    gc.freeze()
+    print(f"[Vaayu] gc.freeze(): {gc.get_freeze_count()} objects moved out of "
+          f"the collector's reach")
+
+
 class NotEnoughSpaceException(Exception):
     pass
 

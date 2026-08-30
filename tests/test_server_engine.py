@@ -627,3 +627,10 @@ def test_a_normally_finished_generate_still_reports_stop():
     assert result.finish_reason == "stop"
     assert result.completion_tokens == 2
     assert e.live_cancel is None and e._live_thread is None
+
+
+# ── a template without tool support must still refuse tools ─────────────────
+
+def test_tool_format_is_none_for_a_template_without_tool_support():
+    e = EngineHandle(FakeModel(chat_template=PLAIN_TEMPLATE))
+    assert e.tool_format is None, "a plain template must still refuse tools"

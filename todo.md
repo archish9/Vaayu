@@ -64,8 +64,8 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~10~~ | ~~**B13**~~ — **DONE 2026-08-29** | | |
 | ~~10b~~ | ~~**B15**~~ — **DONE 2026-08-29** | | |
 | ~~10c~~ | ~~**B16**~~ — **DONE 2026-08-29** | | |
-| 11 | **R1** — strip the two hot-path `eprintln!` from `persistent_read` | ~850 unbuffered `write(2)`/token, and `logs.py` now tees fd 2 through a GIL-taking Python thread. **Prerequisite for measuring anything else** | `vaayu_rust/src/lib.rs:322,392` |
-| 12 | **P1** — free Python wins: `gc.freeze()` after load; precompute the expert-role table; cache `EngineHandle.tool_format` | cheaper than every Rust item; must land in the same arm so Rust is not credited with them | `speed-up-vaayu.md` §3 |
+| ~~11~~ | ~~**R1**~~ — **DONE 2026-08-30**. Perf REFUTED (+0.05 % Qwen, −0.13 % MiniMax, both inside a 0.23–0.36 % noise floor); KEPT, as the row itself directs — log volume 18 MB → 364 KB per 71 tokens, and M1 cannot profile a path that logs twice per read | | |
+| ~~12~~ | ~~**P1**~~ — **DONE 2026-08-30**. Item (1) `gc.freeze()` CONFIRMED **+1.19 % Qwen / +2.46 % MiniMax**; items (2) and (3) REFUTED on measurement and REVERTED | | |
 | 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
 | 14 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 → ~1.10 tok/s, MiniMax 1.501 → ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
 | 15 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
@@ -230,8 +230,8 @@ Order to fix them: the **FIX SEQUENCE** table at the top of this file. **ALL CLO
 B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11, B12, B16, B15 and B13
 (2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
-**Nothing in this section is open. The next unticked FIX SEQUENCE row is R1**, the first of the
-perf rows — R1 and P1 land in one arm, then M1 gates R2 and R3.
+**Nothing in this section is open. R1 and P1 closed 2026-08-30; the next unticked FIX SEQUENCE
+row is M1**, which gates R2 and R3.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
 `vaayu/server/engine.py` counted stream tokens as
@@ -786,29 +786,63 @@ Qwen3-235B reads 4.99 GB/tok at 0.820 tok/s = **4.09 GB/s**; MiniMax-M2.7 reads 
 costs 72–74 % of the token while running at 71–74 % of the drive's rate. Closing that gap is worth
 Qwen 0.820 → ~1.10 tok/s and MiniMax 1.501 → ~2.05 tok/s — **ceilings, not predictions.**
 
-### R1 · [ ] Strip the hot-path `eprintln!` from `persistent_read` — do this first
-`vaayu_rust/src/lib.rs:322,392`. Two unconditional lines per read, on the decode hot path: at
-Qwen's 422 reads/token that is ~850 unbuffered `write(2)` syscalls per token, each taking the
-stderr lock the I/O threads contend on. It is why the logs run 300 MB – 1.3 GB and must be
-`grep -a`'d, never `cat`'d. **The server made it worse:** `vaayu/server/logs.py` now redirects fd 2
-into a pipe read by a Python pump thread that takes the GIL for every chunk it tees.
-**Fix:** gate both behind a once-resolved `VAAYU_RUST_TRACE` or the `log` crate at `trace`.
-**Expected:** ~0.5–1 % on its own — but **a prerequisite for R2, R3 and M1**, because a path that
-logs twice per read cannot be honestly profiled. **Refuted if:** removing it moves neither tok/s
-nor achieved bandwidth. Keep the change anyway; the log volume alone justifies it.
-→ `speed-up-vaayu.md` §2 R1.
+### R1 · [x] Strip the hot-path `eprintln!` from `persistent_read` — **DONE 2026-08-30**
+`vaayu_rust/src/lib.rs`. Six per-read / per-wave lines were gated, not two: the row's line
+numbers were stale after B3/B6 moved them. `persistent_read`'s per-call pair, plus `legacy_read`'s
+two per-call and **two per-WAVE** lines, which the row had missed. Once-per-process init /
+registration lines and the two failure lines (dirty ring, drain failure) stay unconditional — they
+are not the read path.
+**How:** `trace_from_env()` (pure, unit-tested) behind a `OnceLock`, wrapped in an `rtrace!` macro.
+Resolved ONCE per process: the hot path must not touch the environment per read. A gate and not a
+deletion because **M1 needs the per-read timings back** — `VAAYU_RUST_TRACE=1` restores them exactly.
+**Perf verdict: REFUTED.** Two replicates per endpoint, per model, own scope each:
+Qwen 0.5352 → 0.5354 tok/s (+0.05 %), MiniMax 0.8114 → 0.8103 (−0.13 %) — both inside the
+0.23–0.36 % noise floor measured from the baseline replicates. The row's own stop rule says to
+**keep the change anyway**, and the log volume alone earns it: a 71-token run went **18 MB → 364 KB**
+(215,007 trace lines → 0), so the logs no longer need `grep -a` to be readable.
+**Tests:** `vaayu_rust` cargo 19 → 21 (`trace_from_env` truth table);
+`tests/test_rust_trace_gate.py` (4) drives a REAL io_uring read in a subprocess — both the
+persistent and legacy paths, silent by default and tracing under the env var. Verified failing
+against the unconditional code first.
 
-### P1 · [ ] Free Python wins, to land in the SAME arm as R1
-Cheaper than every Rust item; measure them together so Rust is not later credited with them.
-(1) `gc.freeze()` after load — one line, drops the permanent module tree and cache view graph out
-of every gen-2 traversal. (2) Precompute the expert-tensor role table at load:
-`_group_exl3_tensors_by_weight` / `_classify_expert_tensors` (`vaayu/moe_patch.py`) run
-`_EXPERT_WEIGHT_ROLES` pattern matching per expert, per layer, **per token**, for a mapping fixed
-when the checkpoint is opened. (3) `EngineHandle.tool_format` is a property that re-scans the whole
-chat template on every access, touched 2–3× per request — compute it once in `__init__`.
-(4) ~~Killing B2's re-tokenization also deletes a full tokenizer pass per request.~~ **Already
-banked** — B2's fix (2026-08-23) removed that tokenizer pass. Do not credit it to this row or to Rust.
-→ `speed-up-vaayu.md` §3.
+### P1 · [x] Free Python wins — **DONE 2026-08-30**, one CONFIRMED and two REFUTED
+Landed in the same arm as R1 so Rust could never be credited with them. That was the right call:
+**two of the three items do not exist as perf.**
+
+**(1) `gc.freeze()` after load — CONFIRMED, and the only real win in either row.**
+`freeze_after_load()` in `vaayu/utils.py` (`gc.collect()` then `gc.freeze()`); moves **766,689
+objects** out of every later gen-2 traversal on Qwen. Measured, two replicates per endpoint:
+**Qwen 0.5352 → 0.5415 tok/s (+1.19 %)**, **MiniMax 0.8114 → 0.8313 (+2.46 %)**. Both replicates of
+the treated arm beat both replicates of the baseline on both models, and the arena
+(1447–1452 / 1892–1899 slabs) and bytes-per-token (8.434–8.440 / 3.819–3.823 GB) were held
+identical across arms, so it is not a cache-size artefact.
+**Wired into the SERVER's startup only**, on the branch that actually loaded — an injected engine
+belongs to a caller that keeps using the process, and freezing its objects would retain them for
+that process's life. **A library caller (`test_generate.py`, the gates) does NOT get this win**
+unless it calls the helper itself, as the arm did. Deliberate: freezing after a SECOND load in one
+process pins the first model's garbage permanently.
+
+**(2) Precompute the expert-role table — REFUTED on arithmetic, reverted.**
+The row is right that `_group_exl3_tensors_by_weight` runs per expert, per layer, per token, and
+wrong about what that costs. Measured on the real key shapes from both checkpoints' index files:
+**2.12 µs/expert (Qwen), 2.14 µs (MiniMax)** → 752 and 496 calls/token → **1.60 ms and 1.06 ms per
+token = 0.131 % and 0.160 %** of a token. The whole function is a tenth of a percent; the best
+rewrite found (one `rsplit`, segment-keyed dict) measured 1.52× / 1.14× and would bank
+**0.045 % / 0.020 %**. Worse, the first version shipped was **0.77× on MiniMax** — its `.w1.` is the
+FIRST entry in `_EXPERT_WEIGHT_ROLES`, so the old scan hits on try #1 and two `rsplit`s cost more
+than the substring search they replaced. Refutation closes the row; nothing was re-scoped.
+**Kept:** `tests/test_expert_role_lookup.py` (9), which is the first coverage either function has
+had across BOTH expert layouts (Qwen fused-EXL3 and MiniMax module-list key shapes, real prefixes
+and component names).
+
+**(3) Cache `EngineHandle.tool_format` — REFUTED, reverted.**
+`detect_tool_format` measures **0.11 µs/call** on Qwen's 4,049-char template: the first
+`open_marker in template` matches immediately, so the "re-scans the whole chat template" premise
+does not hold. 3 accesses/request = 0.3 µs. Not worth an `__init__`-time invariant, and the
+`# properties read off the model, never cached` comment block stands unamended.
+**Kept:** one test that a template without tool support still yields `None` (the refusal contract).
+
+**(4)** was already banked by B2 (2026-08-23) before this row ran.
 
 ### M1 · [ ] THE GATING MEASUREMENT — run before writing any Rust
 One arm, decode-only (reset counters after prefill), 64 tokens, per model, each under its own
@@ -822,6 +856,24 @@ fraction** with R1's trace deliberately re-enabled for this one arm.
 `vaayu_rust`'s io_uring state (`MEMORY.md`). In-process instrumentation only.
 **Write the verdict back into the row it settles, including a refutation.**
 → `speed-up-vaayu.md` §1 and §5.
+
+**Partial data already in hand from the R1/P1 arm (2026-08-30) — an INPUT to M1, not its verdict.**
+Achieved decode read bandwidth, `/proc/self/io` `read_bytes` over the decode window only:
+**Qwen 4.51–4.57 GB/s, MiniMax 3.10–3.18 GB/s** against the ~5.5 GB/s drive — 82–83 % and 56–58 %.
+So M1's stop rule ("refuted if decode already achieves ~5.4 GB/s") is **not** met by either model on
+this evidence, and R2/R3 stay open. Caveats that stop this from BEING M1: it measures only number
+(1) of M1's four — no GC fraction, no GIL sensitivity, no ring-idle fraction — and it ran with the
+expert arena deliberately held small (~17.2 GB, 1447 Qwen / 1892 MiniMax slabs) by a RAM ballast, so
+its hit rate is lower and its GB/token higher than an unconstrained run's. Reproduce at the real
+budget before quoting these as M1's answer.
+
+**A methodology trap this arm hit, which M1 will hit too.** The expert slab arena is sized from
+`psutil.virtual_memory().available` AT LOAD, and this box frees a little more RAM after each
+consecutive run: four back-to-back arms sized **1928 → 1964 → 1974 → 1987 slabs**, and the last was
+OOM-killed at `MemoryMax=30G`. A cache that grows between arms is not an A/B — it changes the hit
+rate, which is the thing being measured. Pin `available` with touched ballast held across the load
+and dropped immediately after (the arm script does this; `ARM_AVAIL_GB`), then CHECK that every arm
+reports the same slab count and the same bytes-per-token before comparing their tok/s.
 
 ### R2 · [ ] `io_uring_read_many` — one submission per LAYER, not per expert group
 **The flagship item, aimed squarely at the 4.09-vs-5.5 GB/s gap.** Today one contiguous tensor

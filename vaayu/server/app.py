@@ -19,6 +19,7 @@ from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
+from ..utils import freeze_after_load
 
 
 @dataclass
@@ -302,6 +303,10 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
                                                 enable_thinking=config.enable_thinking,
                                                 log_dir=config.log_dir)
+                # Only on the path that actually loaded: an injected engine
+                # belongs to a caller that keeps using this process, and
+                # freezing its objects would retain them for the process's life.
+                freeze_after_load()
             else:
                 app.state.engine = engine
             restore_signals = _install_signal_cancel(app.state.engine)
