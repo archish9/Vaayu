@@ -230,13 +230,81 @@ def test_record_read_is_noop_without_cuda():
     assert arena.acquire() == idx                    # acquire still works (no event to sync)
 
 
-def test_put_slab_duplicate_key_releases_new_slab():
+def test_put_slab_duplicate_key_does_not_release_the_callers_slab():
+    """A declined insert must NOT hand the caller's slab to the next acquire().
+
+    This test previously asserted the opposite (`arena.acquire() == i1`), to
+    prove a duplicate insert did not LEAK the slab. That release was the
+    VAAYU_LOOKAHEAD memory corruption: the caller still holds views into the
+    slab it passed in (`_load_one` returns them to the forward, which then DMAs
+    from them), so releasing here hands a live buffer to the next acquirer. The
+    no-leak property it was guarding is still required, and is now the caller's
+    job -- see test_orphaned_slab_is_released_on_unpin.
+    """
+    arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
+    cache = ExpertRAMCache(budget_bytes=4 * _ALIGN, arena=arena)
+    i0 = cache.acquire_slab()
+    assert cache.put_slab(3, 7, _views_for(arena, i0), i0) is True
+    i1 = cache.acquire_slab()
+    assert cache.put_slab(3, 7, _views_for(arena, i1), i1) is False   # duplicate
+    assert arena.acquire() is None, (
+        "a declined slab must stay out of the free list -- the caller still "
+        "holds views into it")
+
+
+def test_declined_slab_is_not_handed_to_the_next_acquirer():
+    """The corruption itself, deterministically: no CUDA, no threads."""
+    arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
+    cache = ExpertRAMCache(budget_bytes=4 * _ALIGN, arena=arena)
+    winner = cache.acquire_slab()
+    arena.tensor(winner).fill_(0xAA)
+    cache.put_slab(0, 7, _views_for(arena, winner), winner)
+
+    # The loser loaded the same expert into its own slab (stager vs decode) and,
+    # like _load_one, keeps using its views after the failed insert.
+    loser = cache.acquire_slab()
+    arena.tensor(loser).fill_(0xBB)
+    loser_views = _views_for(arena, loser)
+    cache.put_slab(0, 7, loser_views, loser)
+
+    nxt = cache.acquire_slab()
+    if nxt is not None:                      # must not be the loser's slab
+        arena.tensor(nxt).fill_(0xCC)
+    assert int(loser_views["w"][0]) == 0xBB, (
+        f"slab {loser} was reused while the caller still held views into it")
+
+
+def test_orphan_slab_without_a_pin_leaks_rather_than_reuses(caplog):
+    """The safety branch: with no pin, orphan_slab cannot know the caller's read
+    window is over, so it must LEAK the slab rather than hand it out again.
+    Losing a slab of capacity is recoverable; reusing a live buffer is the bug.
+    """
     arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
     cache = ExpertRAMCache(budget_bytes=4 * _ALIGN, arena=arena)
     i0 = cache.acquire_slab(); cache.put_slab(3, 7, _views_for(arena, i0), i0)
-    i1 = cache.acquire_slab(); cache.put_slab(3, 7, _views_for(arena, i1), i1)  # duplicate
-    # duplicate insert must give i1 back to the arena, not leak it
-    assert arena.acquire() == i1
+    i1 = cache.acquire_slab()
+    assert cache.put_slab(3, 7, _views_for(arena, i1), i1) is False
+    with caplog.at_level("WARNING"):
+        cache.orphan_slab(3, 7, i1)          # key was never pinned
+    assert arena.acquire() is None, "an unpinned orphan must not be handed out"
+    assert any("orphan_slab" in r.getMessage() for r in caplog.records), (
+        "the leak must be visible in the log")
+
+
+def test_orphaned_slab_is_released_on_unpin():
+    """No-leak half of the contract: a declined slab whose key is pinned comes
+    back to the arena when the caller drops its pin -- which the forwards do in
+    the same finally that already unpins, after their H2D copy is issued."""
+    arena = SlabArena(n_slabs=2, slab_bytes=_ALIGN, pin=False)
+    cache = ExpertRAMCache(budget_bytes=4 * _ALIGN, arena=arena)
+    i0 = cache.acquire_slab(); cache.put_slab(3, 7, _views_for(arena, i0), i0)
+    cache.pin(3, 7)
+    i1 = cache.acquire_slab()
+    assert cache.put_slab(3, 7, _views_for(arena, i1), i1) is False
+    cache.orphan_slab(3, 7, i1)
+    assert arena.acquire() is None            # still held while pinned
+    cache.unpin(3, 7)
+    assert arena.acquire() == i1              # returned exactly once, no leak
 
 
 def test_legacy_clone_put_still_works_without_arena():

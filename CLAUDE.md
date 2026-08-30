@@ -157,6 +157,15 @@ them without edits — never assume EXL3, never assume CUDA, never assume MoE.
   (32 GB), the ~8.5 GB expert-cache OOM ceiling, PCIe/NVMe bandwidth. Those are
   properties of the machine, not the model. They stay literal (and commented as
   hardware constants).
+  **NVMe, stated properly (corrected 2026-08-30, row C1):** the drive is a Samsung
+  SSD 990 PRO 1TB, **sequential-read spec 7.45 GB/s**, and its delivered rate
+  depends on how many reads are in flight — measured on-device at 3.3 GB/s with 1
+  outstanding read, 5.3 at 2, 6.5 at 3, **6.9 at 4**, still rising. **The
+  ~5.5 GB/s figure used before this date was a measured-path number (roughly what
+  the expert path achieves at 2-3 reads in flight) that got promoted to a hardware
+  constant and then used as a denominator.** Never quote a single-stream rate as
+  the drive's limit; say which concurrency a bandwidth figure was taken at.
+  (`plans/2026-08-30-R2-structural-probe-RESULTS.md`.)
 - **Detection over assumption.** Find MoE blocks, router names, and expert tensor
   roles by probing the module tree / checkpoint keys (as `moe_patch.py` already
   does), not by matching an architecture string.

@@ -763,36 +763,71 @@ def compute_warmup_ranges(offset_index, checkpoint_path, warm_bytes: int):
 
 
 def check_lookahead_flag_safe() -> None:
-    """Hard-block guard (Task 5 follow-up): VAAYU_LOOKAHEAD=1 is confirmed to
-    cause on-device memory corruption (CUDA device-side assert / "probability
-    tensor contains inf, nan") in the lookahead prefetch path. Reproduced
-    across two independent race-fix rounds (SlabArena event-guard, then a
-    pin/refcount mechanism) without resolving the crash — a third, unaudited
-    hazard is suspected: worker-vs-worker races inside the multi-worker
-    _stager_executor's concurrent put_slab()/eviction calls. Needs a
-    stager-pool worker-concurrency audit before re-enabling. See
-    docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md Task 5
-    and .superpowers/sdd/task-5-report.md for details.
+    """Hard-block guard for VAAYU_LOOKAHEAD=1. **The reason changed on
+    2026-08-30: the corruption is FIXED. The block now stands on performance.**
+
+    History, because the previous version of this message sent readers to the
+    wrong subsystem for six weeks. It claimed the cause was "worker-vs-worker
+    races inside the multi-worker _stager_executor" and asked for a stager-pool
+    concurrency audit. That was wrong. The bug was stager-vs-MAIN-thread, in
+    ExpertRAMCache.put_slab's DECLINED-INSERT path: on a duplicate key or when
+    no room could be freed, it called arena.release(slab_idx) and returned
+    normally, while the caller was still holding views into that slab and about
+    to DMA from them (moe_patch._load_one returns exactly those views to the
+    forward). The next acquire() handed the live buffer out and io_uring
+    overwrote it mid-copy -> torn expert weights -> NaN logits -> multinomial's
+    "probability tensor contains inf, nan" assert. record_read()'s event guard
+    could not help: the slab was freed BEFORE any read event existed. Both
+    earlier fix rounds hardened the evict->reuse window; this was a different
+    one, which is why neither found it. Fixed by making put_slab report
+    ownership and never release a declined slab -- see put_slab() and
+    ExpertRAMCache.orphan_slab() in vaayu/persist/expert_cache.py, and
+    plans/2026-08-30-R2-structural-probe-RESULTS.md for the measurement trail.
+
+    **Why it is still blocked.** With the corruption fixed the flag runs clean,
+    and it does what it was built to do: decode's dead time (no read outstanding
+    on any ring) falls 37.6% -> 15.1% and aggregate NVMe bandwidth rises 36%
+    (3.765 -> 5.129 GB/s) on Qwen3-235B. But it reads **60% more bytes** to get
+    there (188.6 -> 302.0 GB per 64 tokens) because prefetched layer-N+1 experts
+    evict layer-N experts that are still needed and both get re-read, so decode
+    comes out at **1.070 tok/s against 1.258 with the flag off -- a 15%
+    REGRESSION**. Turning this on today makes the engine slower.
+
+    Two further limits, neither a corruption risk:
+    - The predictor is wired ONLY into _make_fused_sparse_forward_exl3. The
+      module-list forward (MiniMax) has no lookahead at all, so this flag is a
+      no-op there (CLAUDE.md section 0's single-forward trap).
+    - The stager and the decode path race to load the same expert and one of
+      them always loses the insert: ~200 wasted expert reads per token against
+      345 accepted, i.e. real NVMe bandwidth spent on bytes that are discarded.
+
+    **What would lift this block:** a prefetch admission policy that cannot
+    evict the on-path working set (a reserved sub-budget, or admitting
+    prefetched entries LRU-cold rather than MRU-warm), re-measured against the
+    same gate this row has always used -- bytes/token unchanged AND coverage up,
+    never coverage alone.
 
     Called from __init__ before any MoE cache/executor/prefetch object is
-    created, so a set flag fails fast and loud at engine construction instead
-    of silently corrupting memory mid-generation. No-op (dead code) when the
-    flag is unset — the default path is unaffected.
+    created, so a set flag fails fast at engine construction. No-op (dead code)
+    when the flag is unset -- the default path is unaffected.
     """
     if os.environ.get("VAAYU_LOOKAHEAD") == "1":
         raise RuntimeError(
-            "VAAYU_LOOKAHEAD=1 is disabled: it causes confirmed on-device "
-            "memory corruption (CUDA device-side assert / NaN-Inf routing "
-            "probabilities) in the lookahead prefetch path. Reproduced across "
-            "two independent race-fix rounds (SlabArena event-guard, then a "
-            "pin/refcount mechanism) without resolving the crash — a third, "
-            "unaudited hazard is suspected: worker-vs-worker races inside the "
-            "multi-worker _stager_executor's concurrent put_slab()/eviction "
-            "calls. Needs a stager-pool worker-concurrency audit before "
-            "re-enabling. See "
-            "docs/superpowers/plans/2026-07-12-vaayu-perf-fixes-and-features.md "
-            "Task 5 and .superpowers/sdd/task-5-report.md for details. Unset "
-            "VAAYU_LOOKAHEAD (or set it to anything other than \"1\") to proceed."
+            "VAAYU_LOOKAHEAD=1 is disabled because it is SLOWER, not because it "
+            "is unsafe. The memory corruption this guard used to describe was "
+            "root-caused and fixed on 2026-08-30 (ExpertRAMCache.put_slab "
+            "released a declined slab that the caller was still reading; see "
+            "check_lookahead_flag_safe.__doc__ for the full account -- and note "
+            "that this message previously blamed _stager_executor worker "
+            "concurrency, which was wrong). Measured on Qwen3-235B with the fix "
+            "in place: decode dead time 37.6% -> 15.1% and NVMe bandwidth "
+            "3.765 -> 5.129 GB/s, but 60% more bytes read (cache thrashing "
+            "between prefetched and on-path experts) and decode 1.258 -> 1.070 "
+            "tok/s, a 15% regression. It is also a no-op on the module-list "
+            "forward (MiniMax), where no lookahead is wired. Lifting this needs "
+            "a prefetch admission policy that cannot evict the on-path working "
+            "set. Unset VAAYU_LOOKAHEAD (or set it to anything other than \"1\") "
+            "to proceed."
         )
 
 

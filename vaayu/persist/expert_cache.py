@@ -1,9 +1,12 @@
+import logging
 import threading
 from collections import Counter, OrderedDict
 
 import torch
 
 from .safetensor_model_persister import _ALIGN, chunk_decomposition
+
+_log = logging.getLogger(__name__)
 
 
 class SlabArena:
@@ -300,6 +303,55 @@ class ExpertRAMCache:
         # costs one attribute load and one branch, under a lock already held.
         # See vaayu/expert_sim.py for the replay.
         self._trace: list | None = None
+        # Slabs whose put_slab() was DECLINED and which the caller therefore
+        # still owns. Keyed by the cache key whose pin keeps them alive; the
+        # final unpin() of that key returns them to the arena. See put_slab()
+        # and orphan_slab().
+        self._orphan_slabs: dict[tuple, int] = {}
+
+    def orphan_slab(self, layer_idx: int, expert_idx: int, slab_idx: int) -> None:
+        """Hand a DECLINED slab back to the cache for release at final unpin().
+
+        put_slab() returning False leaves the caller owning `slab_idx` while it
+        still holds views into it. Rather than make every caller thread its own
+        release through the forward, the release is tied to the pin the decode
+        miss path already takes: `_dispatch_expert_misses` pins every miss key
+        before dispatching, and both forwards unpin in a finally that runs after
+        their H2D copy is issued and record_read() has armed the arena's event
+        guard. So the slab stays out of the free list for exactly the window the
+        caller is reading it, and comes back exactly once.
+
+        Callers that do no further reads (the lookahead stager) should just call
+        arena.release() directly instead — they have no pin to hang this on.
+        """
+        if self.arena is None:
+            return
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            prev = self._orphan_slabs.get(key)
+            if prev is not None and prev != slab_idx:
+                # Two declines against one pinned key would strand `prev`. Not
+                # reachable today (one _load_one per expert per dispatch), but
+                # releasing it here is strictly better than leaking it silently.
+                self.arena.release(prev)
+            self._orphan_slabs[key] = slab_idx
+            if key not in self._pinned:
+                # No pin to hang the release on, so nothing will ever collect
+                # this slab: it leaks one slab of arena capacity, and it warns.
+                # Deliberately NOT released here. Releasing a slab whose caller
+                # may still be reading it is precisely the bug this method
+                # exists to fix, and an unpinned key means we cannot know
+                # whether the read window is over. Losing capacity is
+                # recoverable; handing out a live buffer is not.
+                # Unreachable on the decode path today: reaching put_slab
+                # implies an arena and a non-prefill pass, which is exactly the
+                # condition under which _dispatch_expert_misses pins the key.
+                _log.warning(
+                    "[Vaayu-MoE] orphan_slab: slab %d declined for unpinned key "
+                    "%s — leaking one slab rather than risk reuse under a live "
+                    "read. This should be unreachable; if it appears, the "
+                    "decode miss path stopped pinning before dispatch.",
+                    slab_idx, key)
 
     def pin(self, layer_idx: int, expert_idx: int) -> None:
         """Refcount-pin (layer_idx, expert_idx) so eviction skips it. Safe to
@@ -319,6 +371,12 @@ class ExpertRAMCache:
                 return
             if c <= 1:
                 del self._pinned[key]
+                # Last pin gone: any slab whose insert was declined while this
+                # key was checked out is now safe to reuse — the caller's H2D
+                # copy has been issued and record_read() armed the arena event.
+                orphan = self._orphan_slabs.pop(key, None)
+                if orphan is not None:
+                    self.arena.release(orphan)
             else:
                 self._pinned[key] = c - 1
 
@@ -435,50 +493,61 @@ class ExpertRAMCache:
         return idx
 
     def put_slab(self, layer_idx: int, expert_idx: int, views: dict, slab_idx: int,
-                 *, prefetch: bool = False) -> None:
+                 *, prefetch: bool = False) -> bool:
         """Adopt slab-backed tensor views WITHOUT cloning (zero-copy insert).
-        On duplicate key the new slab is released back to the arena. Byte
-        accounting uses slab_bytes — the real resident footprint.
+        Byte accounting uses slab_bytes — the real resident footprint.
+
+        Returns True when the cache ADOPTED `slab_idx` (it now owns the slab and
+        releases it on eviction), False when the insert was declined — duplicate
+        key, or no evictable room — in which case **the caller still owns the
+        slab and must release it once its own reads of that slab are done**.
+
+        This method must NEVER release a declined slab itself. The caller is
+        still holding views into it: `moe_patch._load_one` returns exactly those
+        views to the forward, which then DMAs from them. Releasing here put a
+        live buffer back in the free list, where the next acquire() handed it out
+        to be overwritten mid-read — the VAAYU_LOOKAHEAD corruption (torn expert
+        weights -> NaN logits -> multinomial's inf/nan assert). The lookahead
+        stager is what made declines common: it races the decode path on the same
+        keys, so one of the two always loses the insert. Declines were measured at
+        190 per token with the stager on and 0 with it off.
 
         NOTE: a caller that intends to DMA this slab to GPU shortly should pin()
         the key BEFORE the read completes (the decode miss path pins in the main
         thread before submitting the load) so a concurrent evictor can't
-        reuse the slab in the checked-out-but-not-yet-copied window."""
+        reuse the slab in the checked-out-but-not-yet-copied window. That pin is
+        also how a declined slab gets released — see orphan_slab()."""
         key = (layer_idx, expert_idx)
         size = self.arena.slab_bytes
         with self.lock:
             if self.max_per_layer > 0:
                 lc = self._layer_caches.setdefault(layer_idx, OrderedDict())
                 if expert_idx in lc:
-                    self.arena.release(slab_idx)
-                    return
+                    return False
                 while len(lc) >= self.max_per_layer:
                     if not self._evict_layer_oldest(layer_idx, lc):
-                        self.arena.release(slab_idx)
-                        return
+                        return False
                 while self.current_usage + size > self.budget_bytes:
                     if not self._evict_global_oldest():
-                        self.arena.release(slab_idx)
-                        return
+                        return False
                 lc[expert_idx] = views
                 self.current_usage += size
                 self._global_lru[key] = None
                 self._slab_of[key] = slab_idx
                 self._note_prefetch(layer_idx, expert_idx, prefetch)
-                return
+                return True
             if key in self.cache:
-                self.arena.release(slab_idx)
-                return
+                return False
             while self.current_usage + size > self.budget_bytes:
                 if not self._evict_global_oldest():
                     break
             if self.current_usage + size > self.budget_bytes:
-                self.arena.release(slab_idx)
-                return
+                return False
             self.cache[key] = views
             self.current_usage += size
             self._slab_of[key] = slab_idx
             self._note_prefetch(layer_idx, expert_idx, prefetch)
+            return True
 
     def _account_evict(self, layer_idx: int, expert_idx: int, evicted: dict) -> None:
         """Shared eviction bookkeeping: usage, counters, prefetch set, slab release.

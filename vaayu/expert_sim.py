@@ -132,7 +132,15 @@ def simulate_lru(trace, capacity: int, max_per_layer: int = 0,
 
 def sweep_capacity(trace, budgets_bytes, num_moe_layers: int, expert_bytes: int,
                    top_k: int, num_experts: int, tokens: int | None = None,
-                   nvme_bytes_per_s: float = 5.5e9,
+                   # HARDWARE constant, corrected 2026-08-30 (todo.md row C1):
+                   # Samsung SSD 990 PRO 1TB, spec 7.45 GB/s, delivering 6.9 GB/s
+                   # at 4 reads in flight (measured, still rising; k>=5 figures
+                   # exceed spec and are instrument artifact). The previous 5.5e9
+                   # was what the expert path achieves at 2-3 reads in flight, not
+                   # the drive. This is a CEILING: the live path achieves
+                   # 3.7-3.8 GB/s today, because a third of decode has no read
+                   # outstanding at all.
+                   nvme_bytes_per_s: float = 6.9e9,
                    group_protect: bool = True) -> list[dict]:
     """One row per budget: derived geometry, hit rate, and what it implies.
 

@@ -39,8 +39,9 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1257 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), as of
-2026-08-29 after B16+B15+B13 — neither B3 nor B6 added Python tests; both are `cargo test` in
+**Suite baseline: 1275 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-08-30 against HEAD with the day's edits stashed. It read 1257/3 until then, a figure written
+2026-08-29 after B16+B15+B13 and left stale by the 18 tests R1 and P1 added on 2026-08-30 — neither B3 nor B6 added Python tests; both are `cargo test` in
 `vaayu_rust`, which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
 B8 added 5, B9 added 3, B10 added 2, B11 added 12, B16 added 4, B15 added 4, B13 added 3. **None of the
@@ -66,21 +67,26 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~10c~~ | ~~**B16**~~ — **DONE 2026-08-29** | | |
 | ~~11~~ | ~~**R1**~~ — **DONE 2026-08-30**. Perf REFUTED (+0.05 % Qwen, −0.13 % MiniMax, both inside a 0.23–0.36 % noise floor); KEPT, as the row itself directs — log volume 18 MB → 364 KB per 71 tokens, and M1 cannot profile a path that logs twice per read | | |
 | ~~12~~ | ~~**P1**~~ — **DONE 2026-08-30**. Item (1) `gc.freeze()` CONFIRMED **+1.19 % Qwen / +2.46 % MiniMax**; items (2) and (3) REFUTED on measurement and REVERTED | | |
-| 13 | **M1** — **THE GATING MEASUREMENT**: achieved NVMe read bandwidth during decode, GC fraction, GIL sensitivity | decode runs at **4.09 / 3.93 GB/s against a ~5.5 GB/s drive**. That gap is the whole Rust prize | `speed-up-vaayu.md` §5 |
-| 14 | **R2** — `io_uring_read_many`: one submission per LAYER, not per expert group | ceiling if the gap closes: Qwen 0.820 → ~1.10 tok/s, MiniMax 1.501 → ~2.05 tok/s | `vaayu_rust/src/lib.rs` + `_dispatch_expert_misses` |
-| 15 | **R3** — expert-cache miss path ("get-or-read") into Rust, GIL-free | ~750 Python LRU ops/token contending with the forward loop | `vaayu/persist/expert_cache.py` |
-| 16 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
+| ~~13~~ | ~~**M1**~~ — **DONE 2026-08-30**. Bandwidth **4.018 / 3.912 GB/s** (73 % / 71 % of the drive) → gap CONFIRMED, R2 stays open. GC **0.26 % / 0.41 %** → §1 closes. GIL **0.11 % / 0.72 %** over a 40× switch-interval swing → **R3 REFUTED**. Ring idle **71.3 % / 70.2 %** | | |
+| ~~13b~~ | ~~**R3**~~ — **REFUTED 2026-08-30 by M1's GIL probe, row CLOSED** | | |
+| ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
+| ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
+| ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
+| 17 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
 
-**Stop rules, carried from this file's standing protocol.** M1 gates R2 and R3: if decode already
-achieves ~5.4 GB/s, **R2 and R3 are refuted and their rows close** — record the verdict, do not
-re-scope to find a win. R3 additionally requires M1's GIL probe to show real contention. R1 and P1
-are worth doing regardless of M1's result. B3 and B6 were prerequisites for R2 (it submits more SQEs
-per call, which is exactly what both bugs mishandled); both closed 2026-08-28.
+**Stop rules — M1 has now been run, and here is what it did to them.** M1 gated R2 and R3: decode
+came back at **73.1 % / 71.1 %** of the drive, not the ~98 % that would have refuted both, so **R2
+survives its gate**. R3's extra condition — that M1's GIL probe show real contention — **failed on
+both models**, so R3 is refuted and closed per the standing protocol (a refutation closes its row;
+it is not re-scoped). R1 and P1 were worth doing regardless and both landed 2026-08-30. B3 and B6
+were prerequisites for R2; both closed 2026-08-28.
 
 **What Rust cannot do, so nobody re-derives it:** MoE decode is 72–74 % disk-bound and the rest is
 CUDA; streamed dense already reads at ~5.7 GB/s, i.e. at the wall. Rewriting the decode loop,
 replacing PyTorch, or raising the ring's `queue_depth` are all dead ends — reasons in
-`speed-up-vaayu.md` §4.
+`speed-up-vaayu.md` §4. **Add to that list from M1 (2026-08-30): the garbage collector (0.26 % /
+0.41 % of decode) and the GIL (a 40× switch-interval swing moves 0.11 % / 0.72 %). Neither is worth
+a line of code.**
 
 ---
 
@@ -141,7 +147,14 @@ These are the only things still open from the closed work. Their full context is
   `pydantic` were already present; `fastapi.testclient` needs `httpx`.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
   literals (16 GB VRAM / **15.47 GiB usable**, 32 GB RAM, ~8.5 GB expert-cache ceiling,
-  ~5.5 GB/s NVMe), each commented as such.
+  NVMe bandwidth), each commented as such.
+- **NVMe is concurrency-dependent — do not use a single number (corrected 2026-08-30, row C1).**
+  Samsung SSD 990 PRO 1TB, **spec 7.45 GB/s**. Measured on-device by reads in flight:
+  1 → 3.3 GB/s, 2 → 5.3, 3 → 6.5, **4 → 6.9**, still rising. The **~5.5 GB/s** this file used
+  before that date was what the expert path achieves at 2–3 reads in flight, not the drive.
+  **Every "% of the drive" written before 2026-08-30 is against the wrong denominator** — decode's
+  3.70–3.83 GB/s is 50–51 % of the drive, not the 71–73 % on record. Archived `plans/` documents
+  keep their original wording; this file and `CLAUDE.md` carry the correction.
 - GPU arms: one arm per subprocess under `systemd-run --user --scope -p MemoryMax=<charge+2GB>
   -p MemorySwapMax=0`; never attach py-spy (corrupts `vaayu_rust`'s io_uring state); discard each
   checkpoint's first touch; redirect stdout to a file; `grep -a` logs, never `cat` (300 MB–1.3 GB).
@@ -780,11 +793,17 @@ All three confirmed to FAIL first, the URL one listing every stale site by
 self-contained.** What follows is one paragraph per row so this file stays usable on its own, plus
 the section of that document to open.
 
-**The one number the whole thing turns on.** Decode-only counters, 64 tokens, measured on-device:
-Qwen3-235B reads 4.99 GB/tok at 0.820 tok/s = **4.09 GB/s**; MiniMax-M2.7 reads 2.62 GB/tok at
-1.501 tok/s = **3.93 GB/s**. The box's NVMe does **~5.5 GB/s** (hardware constant). So the disk path
-costs 72–74 % of the token while running at 71–74 % of the drive's rate. Closing that gap is worth
-Qwen 0.820 → ~1.10 tok/s and MiniMax 1.501 → ~2.05 tok/s — **ceilings, not predictions.**
+**The one number the whole thing turns on — re-measured by M1, 2026-08-30.** Decode-only, greedy,
+arena ballast-pinned, 6 arms per model: Qwen3-235B **4.018 GB/s**, MiniMax-M2.7 **3.912 GB/s**
+against the box's **~5.5 GB/s** NVMe (hardware constant) — **73.1 % and 71.1 % of the drive**.
+(The older 4.09 / 3.93 GB/s figures, derived from 0.820 / 1.501 tok/s at a smaller arena, are
+superseded; the ratio they implied held up.)
+
+**M1 also decomposed it, which is what makes it actionable:**
+`aggregate = (one read's rate) × (rings busy on average)` — Qwen `1.76 × 2.30`, MiniMax
+`1.64 × 2.39`, both closing to 2 decimals. **The shortfall is CONCURRENCY, not per-read speed:**
+only ~2.3 of 8 rings are busy at any instant, and the drive's rate needs ~3.2 (**1.36–1.40×**).
+Full detail: `plans/2026-08-30-M1-gating-measurement-RESULTS.md`.
 
 ### R1 · [x] Strip the hot-path `eprintln!` from `persistent_read` — **DONE 2026-08-30**
 `vaayu_rust/src/lib.rs`. Six per-read / per-wave lines were gated, not two: the row's line
@@ -844,39 +863,115 @@ does not hold. 3 accesses/request = 0.3 µs. Not worth an `__init__`-time invari
 
 **(4)** was already banked by B2 (2026-08-23) before this row ran.
 
-### M1 · [ ] THE GATING MEASUREMENT — run before writing any Rust
-One arm, decode-only (reset counters after prefill), 64 tokens, per model, each under its own
-`systemd-run --user --scope -p MemoryMax=27G -p MemorySwapMax=0`. Four numbers:
-**(1) achieved read bandwidth** = NVMe bytes read during decode ÷ decode wall, against ~5.5 GB/s —
-**this single number decides R2 and R3**; **(2) GC fraction** from `gc.callbacks` accumulated
-seconds ÷ decode wall — if under 2 %, the GC hypothesis closes; **(3) GIL sensitivity** = tok/s at
-`sys.setswitchinterval(0.0005)` vs `0.02`, which is what tells GC and GIL apart; **(4) ring idle
-fraction** with R1's trace deliberately re-enabled for this one arm.
-**Constraint, already paid for:** never attach py-spy — ptrace-based profilers corrupt
-`vaayu_rust`'s io_uring state (`MEMORY.md`). In-process instrumentation only.
-**Write the verdict back into the row it settles, including a refutation.**
-→ `speed-up-vaayu.md` §1 and §5.
+### M1 · [x] THE GATING MEASUREMENT — **DONE 2026-08-30.** R2 stays open, **R3 REFUTED**
+Full write-up: `plans/2026-08-30-M1-gating-measurement-RESULTS.md`. 16 arms (one warmup +
+`base ×2`, `gil-lo ×2`, `gil-hi ×2`, `trace ×1`) per model, greedy decode, arena ballast-pinned to
+27.0 GB, replicates interleaved, one `systemd-run` scope each. No py-spy.
 
-**Partial data already in hand from the R1/P1 arm (2026-08-30) — an INPUT to M1, not its verdict.**
-Achieved decode read bandwidth, `/proc/self/io` `read_bytes` over the decode window only:
-**Qwen 4.51–4.57 GB/s, MiniMax 3.10–3.18 GB/s** against the ~5.5 GB/s drive — 82–83 % and 56–58 %.
-So M1's stop rule ("refuted if decode already achieves ~5.4 GB/s") is **not** met by either model on
-this evidence, and R2/R3 stay open. Caveats that stop this from BEING M1: it measures only number
-(1) of M1's four — no GC fraction, no GIL sensitivity, no ring-idle fraction — and it ran with the
-expert arena deliberately held small (~17.2 GB, 1447 Qwen / 1892 MiniMax slabs) by a RAM ballast, so
-its hit rate is lower and its GB/token higher than an unconstrained run's. Reproduce at the real
-budget before quoting these as M1's answer.
+All four numbers, both models, both MoE forwards:
 
-**A methodology trap this arm hit, which M1 will hit too.** The expert slab arena is sized from
-`psutil.virtual_memory().available` AT LOAD, and this box frees a little more RAM after each
-consecutive run: four back-to-back arms sized **1928 → 1964 → 1974 → 1987 slabs**, and the last was
-OOM-killed at `MemoryMax=30G`. A cache that grows between arms is not an A/B — it changes the hit
-rate, which is the thing being measured. Pin `available` with touched ballast held across the load
-and dropped immediately after (the arm script does this; `ARM_AVAIL_GB`), then CHECK that every arm
-reports the same slab count and the same bytes-per-token before comparing their tok/s.
+| # | Qwen3-235B (fused-EXL3) | MiniMax-M2.7 (module-list) | what it settles |
+|---|---|---|---|
+| (1) achieved read bandwidth | **4.018 GB/s** = 73.1 % of the drive | **3.912 GB/s** = 71.1 % | stop rule NOT met → **R2 stays open** |
+| (2) GC fraction | **0.26 %** | **0.41 %** | under the 2 % bar → **`speed-up-vaayu.md` §1 CLOSES** |
+| (3) GIL sensitivity (0.0005 vs 0.02) | **0.11 %** tok/s, 0.04 % bandwidth | **0.72 %** tok/s, 0.66 % bandwidth | no contention → **R3 REFUTED, row closes** |
+| (4) ring idle | **71.3 %** | **70.2 %** | the window R2 is trying to reclaim |
 
-### R2 · [ ] `io_uring_read_many` — one submission per LAYER, not per expert group
-**The flagship item, aimed squarely at the 4.09-vs-5.5 GB/s gap.** Today one contiguous tensor
+**The decomposition that makes (4) actionable** — `aggregate = (one read's rate) × (rings busy on
+average)`, closing to 2 decimals on both: Qwen `1.76 × 2.30 = 4.04`, MiniMax `1.64 × 2.39 = 3.92`.
+**Only ~2.3 of 8 rings are busy at any instant.** Reaching ~5.5 GB/s needs concurrency 2.30 → 3.13
+(Qwen) / 2.39 → 3.35 (MiniMax) — **1.36–1.40×, on a pool that already exists.**
+
+**Supersedes** the R1/P1 arm's partial figures (Qwen 4.51–4.57, MiniMax 3.10–3.18 GB/s), which this
+row flagged as needing reproduction at the real budget. They are reproduced and replaced above.
+
+**NOT measured — do not assume otherwise:** only 64 decode tokens at a 439-token prompt; single
+stream only (fan-out ring concurrency is the number that would matter for aggregate throughput, and
+it is not this one); MoE only; `gc.freeze()` was ON for every arm, so (2) is the GC that remains
+*after* P1's win.
+
+**Three methodology traps, each of which cost a whole matrix** (kept because the next measurement
+will hit them):
+1. **Decode greedily.** Sampling changes routing → changes bytes/token → changes tok/s. Measured
+   corr(GB/tok, tok/s) = **−0.997** on Qwen; the first matrix's 21.9 % GB/tok spread made a
+   tok/s-based GIL test meaningless. (That correlation is itself a finding: decode throughput is
+   very nearly a pure function of bytes read.)
+2. **Make the ballast target reachable, and HARD-FAIL when it is not.** The second matrix used the
+   29.0 GB target that had worked an hour earlier; the box had since freed less RAM, so *every arm
+   silently held no ballast* and sized its arena off whatever was free. The arm script now
+   `sys.exit`s instead of warning — a gate that can only warn is not a gate.
+3. **Gate on bytes/token, not slab count.** The arena is the cause, bytes/token is the channel; a
+   2.6 % slab spread landing as 0.19 % of bytes/token cannot move a comparison.
+
+### R2 · [x] `io_uring_read_many` — **REFUTED 2026-08-30, row CLOSED**
+**The reads are BIMODAL, and R2's raw material was an artifact of not seeing that.**
+Full write-up: `plans/2026-08-30-R2-structural-probe-RESULTS.md` (main body + ADDENDUM).
+
+| | bulk reads | tiny reads |
+|---|---|---|
+| Qwen3-235B | 15942 × **11.80 MB**, 5.84 ms | 15942 × **0.04 MB**, 0.17 ms |
+| MiniMax-M2.7 | 14729 × **8.85 MB**, 5.04 ms | 29458 × **0.02 MB**, 0.11 ms |
+
+Ratios are exactly 1:1 and 1:2 against the miss counts (15942 / 14729), so **every expert has ONE
+bulk contiguous group** (the trellis weights) plus 1–2 tiny groups holding scales/bias. The tiny
+reads carry **0.3–0.4 % of the bytes**.
+
+- R2's gate looked cleared because a layer offers 5.47 / 11.50 *descriptors*. **Counting tiny reads.**
+  In bytes there is one read per miss, and `_dispatch_expert_misses` already submits one future per
+  miss across 8 workers and 8 rings — **bulk concurrency is already at its structural ceiling**
+  (measured 1.89 / 2.12 against a ceiling of 2.74 / 3.83; the shortfall is dead time, not batching).
+- The one mechanism left is dropping the tiny group's blocking round-trip: 91 × 0.17 ms = **15.5 ms
+  of a 770 ms token** (Qwen), 60 × 2 × 0.11 ms = **13.2 ms of 548 ms** (MiniMax) — **~1.02×**. Not
+  worth a Rust entry point, wave splitting and new lock discipline.
+- **Where the earlier 1.36–1.40× and 1.16–1.25× came from:** the k=1 bandwidth bucket mixes 4540
+  tiny reads with 1279 bulk ones and reads 3.32 GB/s. A *lone bulk* read does **5.21 GB/s**. The
+  polluted low buckets made the concurrency curve look far steeper than it is.
+
+**Recorded, not actioned:** the tiny tensors are the same scales/bias on every read of an expert,
+and all of them together are only ~0.5 GB on Qwen — small enough to hold resident and never read
+again, which beats R2's 1.02× outright. Not costed, not a row.
+
+<details><summary>original row and its earlier probe preamble, kept for the record</summary>
+
+**PROBE 2026-08-30 (`plans/2026-08-30-R2-structural-probe-RESULTS.md`) — read this FIRST; it
+corrects M1, which corrected the original row.** 4 arms, both models, both forwards, replicates
+within 0.06 % / 0.8 %.
+
+- **R2 is NOT refuted.** Its gate ("raise average in-flight above ~2.3") is cleared on raw
+  material: a layer offers **5.47** descriptors on Qwen and **11.50** on MiniMax against a current
+  in-flight of 2.74 / 3.83.
+- **But it is re-costed to ~1.16–1.25×**, not 1.36–1.40×: batching shortens the read burst without
+  touching compute, so coverage falls as width rises. M1's figure assumed that trade was free.
+- **The real serialization point is `load_expert_into_slab` (`safetensor_model_persister.py:856`)**,
+  whose `for group in _group_contiguous_ranges(...)` loop issues ONE blocking `io_uring_read_into`
+  per contiguous group. An expert's 2nd/3rd groups never overlap its 1st. On MiniMax (3 groups per
+  expert) that alone caps in-flight at a third of what the layer could offer. R2 must fix this loop,
+  not only `_dispatch_expert_misses`.
+- **Mechanism corrected a second time.** M1 said the win was Python round-trips between reads.
+  The gaps are **1–10 ms** (88–89 % of all dead time), and R3's refutation already priced Python/GIL
+  bookkeeping at 0.11–0.72 %. 1–10 ms is a layer computing with no read outstanding, not Python.
+  R2's win is width DURING a burst; the dead time is row L1's, not R2's.
+- **The drive is not saturated and is not a 5.5 GB/s drive** — see row C1.
+
+**M1 (2026-08-30) CONFIRMED the gap and CORRECTED the mechanism — read this before costing the
+work.** Decode achieves 4.018 / 3.912 GB/s against ~5.5 GB/s, and the shortfall is a **concurrency**
+gap, not a per-read-speed one: only **~2.3 of 8 rings** are busy at any instant, and reaching the
+drive's rate needs ~3.2 (**1.36–1.40×**).
+
+**The row's implied mechanism is WRONG, and a prototype built on it should be expected to do
+nothing.** M1's trace shows every `persistent_read` already logs `qd=32 chunk=372736
+total_chunks=32` — it splits its own tensor group into 32 chunks and submits **32 SQEs, exactly the
+queue depth**. The ring is already full *during* a read. So the win is not "more SQEs in flight per
+call"; it is removing the Python-side round-trips *between* reads (future resolution, buffer-pool
+get/put, LRU bookkeeping). Batching a layer's reads is still the right change — the reason it helps
+is just not the one written below. **R2 and R3 were aimed at the same 70 % idle from two
+directions**, and R3 is now refuted, which leaves R2 holding that target alone.
+
+**Sharper refutation condition than "does bandwidth move":** a prototype must raise **average ring
+concurrency above ~2.3**, measurable with M1's own parser (`m1_ring_idle.py`) on the same arm shape,
+*before* any tok/s is quoted.
+
+**The flagship item, aimed squarely at the 4.02-vs-5.5 GB/s gap.** Today one contiguous tensor
 group = one blocking `io_uring_read_into` from a `ThreadPoolExecutor` worker
 (`_dispatch_expert_misses` in `vaayu/moe_patch.py`; `load_expert_into_slab` / `load_expert_sparse`
 in `vaayu/persist/safetensor_model_persister.py`), each holding one ring's mutex across its own
@@ -887,8 +982,10 @@ acquisition — ~422 such windows per token.
 onto one ring and waiting for all CQEs inside one `allow_threads`. Python drops from ~422
 dispatches/token to **~94, one per layer**. **Effort:** moderate — the submission loop exists; it
 becomes a loop over descriptors instead of over chunks of one descriptor.
-**Refuted if:** M1 shows decode already at ~5.4 GB/s, or a prototype's achieved bandwidth does not
-move. **Close the row on that result; do not re-scope.**
+**Refuted if:** a prototype's achieved bandwidth does not move, or its ring concurrency does not
+rise above ~2.3. (M1's half of this condition — "decode already at ~5.4 GB/s" — was tested
+2026-08-30 and NOT met: 73.1 % / 71.1 % of the drive.) **Close the row on that result; do not
+re-scope.**
 **Watch for:** the SQ is sized at `queue_depth` (32) and a layer's descriptor list can exceed it —
 submit in SQ-sized waves inside the one call. **B6 is done** (2026-08-28), so an
 over-full wave now fails cleanly instead of poisoning the next caller — but B6 did not add the wave
@@ -896,7 +993,209 @@ splitting, and R2 still must. Note also that the submission loop builds a fresh 
 guard per `push`, i.e. one tail store per SQE; batching the pushes under one guard is R2's to take.
 → `speed-up-vaayu.md` §2 R2.
 
-### R3 · [ ] Move the expert-cache miss path into Rust ("get-or-read"), GIL-free
+### L1 · [x] Reads outstanding during a layer's COMPUTE — **corruption FIXED + soaked; FEATURE stays off (−15 %)**
+**ROOT CAUSE FOUND AND FIXED 2026-08-30. The hard block's stated suspect was wrong.**
+
+`check_lookahead_flag_safe()` blamed "worker-vs-worker races inside the multi-worker
+`_stager_executor`". It is **stager-vs-MAIN-thread**, through the expert cache's *declined-insert*
+path — which is why two prior fix rounds (SlabArena event guard, pin refcount) both missed it: both
+hardened the **evict→reuse** window, and this is a different one.
+
+`ExpertRAMCache.put_slab` had four decline paths (duplicate key, layer-evict failure, global-evict
+failure, budget failure). Each called `arena.release(slab_idx)` and returned normally — but the
+caller keeps using the views it passed in:
+
+```python
+expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
+return eidx, views          # -> the forward DMAs from these
+```
+
+So a declined insert put a live buffer back in the free list, the next `acquire()` handed it out,
+and io_uring overwrote it mid-DMA. `record_read()` could not help: the slab was freed *before* any
+read event existed, so `acquire()` had nothing to synchronise on. Torn expert weights -> NaN logits
+-> `multinomial`'s `probability tensor contains inf, nan` assert. **The stager is what makes
+declines common** — it races decode on the same keys, so one of the two always loses the insert.
+
+**Evidence (three independent confirmations):**
+
+| | result |
+|---|---|
+| deterministic unit repro (no CUDA, no threads) | loser's views read `0xCC` after writing `0xBB` |
+| on-device, `VAAYU_LOOKAHEAD=0` | **0** decode declines, 16957 accepts, clean 64/64 |
+| on-device, `VAAYU_LOOKAHEAD=1` | **190** decode declines, CRASH at token 1 |
+| on-device, `=1` + decline-path release suppressed | 870 declines, **clean 64/64** (arena starved by the leak — diagnostic only) |
+
+**Fix:** `put_slab` now returns whether it adopted the slab and **never releases a declined one**.
+The decode path hands the declined slab to `ExpertRAMCache.orphan_slab()`, which ties its release to
+the pin that key already holds — `_dispatch_expert_misses` pins every miss before dispatch and both
+forwards unpin in a `finally` that runs after the H2D copy is issued and `record_read()` has armed
+the event guard. The stager releases immediately instead (it takes no further read and holds no pin).
+Suite **1277 passed, 3 skipped**. Three tests added in `tests/test_slab_arena.py`; the existing
+`test_put_slab_duplicate_key_releases_new_slab` asserted the buggy behaviour and was rewritten —
+its real concern (no leak) is now `test_orphaned_slab_is_released_on_unpin`.
+
+**The predictor itself is good:** 96 % accuracy (714/744) measured during the crashing run, so the
+feature is worth having.
+
+## On-device gate — the CORRUPTION FIX PASSES, the FEATURE FAILS its own gate
+
+Greedy A/B, Qwen, same box same day, one `systemd-run` scope each, ballast pinned to 27.0 GB:
+
+| | lookahead OFF | lookahead ON |
+|---|---|---|
+| result | 64/64 clean | **64/64 clean** (was: CRASH at token 1) |
+| **coverage** (>=1 bulk read in flight) | 62.4 % | **84.9 %** |
+| dead time | 37.6 % | **15.1 %** |
+| aggregate bandwidth | 3.765 GB/s | **5.129 GB/s** (+36 %) |
+| bandwidth while covered | 6.032 GB/s | 6.042 GB/s |
+| **bulk bytes read** | 188.57 GB | **302.04 GB (+60 %)** |
+| bulk reads | 15980 | 25595 |
+| tiny-read occupancy | 2.83 s (0.18 ms each) | **31.30 s (1.22 ms each)** |
+| **decode** | **1.258 tok/s** | **1.070 tok/s (−15 %)** |
+
+**The mechanism does exactly what L1 predicted** — dead time 37.6 % → 15.1 %, aggregate bandwidth
++36 %, and bandwidth-while-covered unchanged (6.03 vs 6.04), which is the signature of "the disk was
+idle, now it is not" rather than "the disk got faster".
+
+**And it still loses, on the exact criterion this row wrote down in advance:** *"gate on bytes/token
+unchanged AND coverage up, never on coverage alone."* Bytes went UP 60 %. Predictor accuracy is
+91.6 % (42945/46872) and 9288 of 13251 prefetch inserts were used, so the prefetch is not simply
+wrong — **it is thrashing the cache**: prefetched layer-N+1 experts evict layer-N experts that are
+still needed, and both get re-read. The tiny reads tell the same story from the other side — 0.18 ms
+→ 1.22 ms each, 53 % of decode spent in tiny-read occupancy, i.e. queueing behind a ring pool that
+is now 60 % busier for no extra useful bytes.
+
+**Verdict: the corruption fix ships (it is a real bug on a shipped code path, independent of this
+flag). The FEATURE stays off.** Per the standing protocol this result closes the row as written.
+What it does NOT close is the observation underneath it — 37.6 % of decode has no read outstanding,
+and that is still worth ~1.58x if it can be filled without buying the bytes twice. Any successor row
+must attack the eviction interaction, not the prefetch trigger:
+
+- prefetch must not be allowed to evict on-path entries (a reserved sub-budget, or admitting
+  prefetched entries at LRU-cold rather than MRU-warm)
+- the stager/decode duplicate races waste real disk: 200 stager declines against 345 accepts per
+  token, each a full expert read thrown away
+- neither is a re-scope of this row; both are new work with their own gates.
+
+**STILL OPEN on this row:**
+- [ ] **Decide what to do with `check_lookahead_flag_safe()`'s hard block.** Its stated reason
+  ("causes confirmed on-device memory corruption") is now FALSE — the corruption is found, fixed and
+  verified. But the flag it guards is measured at **−15 %**, so removing the block would unblock a
+  feature nobody should switch on yet. Leaving the message as written is worse: it sends the next
+  reader to audit `_stager_executor` worker concurrency, which is not where the bug was.
+  **Not done unilaterally — this is a safety guard and the call is the user's.**
+- [x] **SOAK DONE 2026-08-30 — passed on both detectors.** 4 arms x 256 tokens = 1024 tokens,
+  Qwen, guard bypassed for the measurement:
+
+  | arm | mode | stager | tokens | tok/s |
+  |---|---|---|---|---|
+  | ref | greedy, lookahead OFF | 2 | 256/256 | 1.095 |
+  | cmp | greedy, lookahead ON | 2 | 256/256 | 0.957 |
+  | stress1 | sampling, ON | **8** (4x default) | 256/256 | 0.895 |
+  | stress2 | sampling, ON, seed 99 | 2 | 256/256 | 0.922 |
+
+  **Zero crashes** where the unfixed code died at token 1 reproducibly. **And greedy ids are
+  BYTE-IDENTICAL across all 256 tokens, lookahead on vs off** — the stronger of the two detectors:
+  the crash assert only fires when a torn slab happens to produce a NaN, while a corrupted weight
+  that merely shifts a logit would pass it silently. Identical ids say the path is semantically
+  transparent, not merely non-fatal. Stress arms add ~190k routing decisions under sampling at 4x
+  stager width.
+  **Bound on the claim:** 1024 tokens, ONE model, ONE prompt. The mechanism was proved
+  deterministically (`test_declined_slab_is_not_handed_to_the_next_acquirer`), so the soak is
+  confirmation, not the primary evidence — but it does not establish "no race remains in this path".
+  The −12.6 % greedy regression (0.957 vs 1.095) reproduces the 64-token −15 %, so the guard's
+  quoted numbers hold at 4x the token count.
+- [x] **Guard message rewritten 2026-08-30.** `check_lookahead_flag_safe()` still refuses, now on
+  PERFORMANCE, and states the real root cause. It also records that the previous message blamed
+  `_stager_executor` worker concurrency and sent readers to the wrong subsystem. Docstring in
+  `tests/test_lookahead_guard.py` corrected to match; the three surviving "worker-vs-worker"
+  mentions in the tree are all explicitly-labelled history.
+- [ ] **Unexplained drift, NOT attributed.** Lookahead-off decode read 1.278/1.279 tok/s in the
+  morning probes and 1.258 in the afternoon A/B (64 tokens, same config) — 1.6 %, above this box's
+  0.23–0.36 % noise floor. The declined-insert path is provably never reached with lookahead off
+  (0 declines measured), so it should not be the fix. Left open rather than explained away.
+- [ ] **MiniMax gets nothing from this row as written.** The lookahead predictor lives ONLY in
+  `_make_fused_sparse_forward_exl3`; `_make_modulelist_sparse_forward` has no lookahead at all
+  (verified by source inspection). This is exactly CLAUDE.md §0's single-forward trap. Wiring the
+  module-list forward is separate work and is NOT done.
+- [ ] The stager wastes real disk bandwidth on lost races: 200 stager declines per token against
+  345 accepts in the instrumented run. Each decline is an expert read off NVMe that is thrown away.
+  Worth a reservation so only one of stager/decode loads a given key.
+
+**Opened 2026-08-30 by the R2 structural probe. With R2 refuted the same day, this is the ONLY disk
+lever left — and on bulk reads alone it is worth ~1.58× (Qwen) / ~1.64× (MiniMax).**
+
+**33.6 % (Qwen) / 34.7 % (MiniMax) of decode has ZERO reads in flight on any of the 8 rings.** Not
+"the rings are partly idle" — nothing is being read at all, for 16.6 s of a 49.3 s decode. It is
+**~160 gaps per token**, ~1.7 per layer, and **88–89 % of that dead time sits in 1–10 ms gaps**; only
+two gaps per run exceed 50 ms. So it is not a handful of stalls to hunt — it is the read burst
+ending before the layer does, every layer, every token.
+
+Counting only the BULK reads that carry the bytes (see R2's row for why that distinction matters),
+coverage is **63.2 % (Qwen) / 61.0 % (MiniMax)** and bandwidth WHILE covered is already **6.04 /
+6.10 GB/s**. Holding that across 100 % of decode is the 1.58–1.64×. **Nothing about the disk path
+needs to get faster — it needs to stop stopping.**
+
+**Do not scope this as new work.** Decode-time cross-layer prefetch is already implemented — the
+Task 12 lookahead routing predictor at `moe_patch.py:1523-1559`, which runs the next layer's router
+on the current hidden state and submits predicted misses to `_stager_executor`.
+
+**(Superseded 2026-08-30 — kept because it is the framing this row was opened with.)** This
+paragraph used to say the feature was hard-blocked for memory corruption whose "leading unaudited
+suspect" was worker-vs-worker races inside `_stager_executor`, and that this row WAS that audit.
+**Both halves were wrong.** The corruption was stager-vs-MAIN-thread in `put_slab`'s declined-insert
+path (see the top of this row), and it is now fixed. The block remains, but on PERFORMANCE: the
+feature costs 15 % of decode. Cost this row as a cache-admission problem, not a thread audit.
+
+**Refuted if:** the audit clears the races and a prefetching arm's coverage does not rise above
+~66 %, or aggregate bandwidth does not move. Close the row on that result; do not re-scope.
+**Watch for:** prefetch that merely relocates the reads (predicting wrong, then reading again) will
+raise bytes/token — gate on **bytes/token unchanged AND coverage up**, never on coverage alone.
+
+### C1 · [x] The `~5.5 GB/s` NVMe figure is not a hardware constant — **DONE 2026-08-30**
+**Four places corrected:** `CLAUDE.md` §5 (the constant list every other document cites),
+this file's Environment section, `speed-up-vaayu.md` (its §0 gap arithmetic rewritten — the gap is
+LARGER than it argued, 50–51 % of the drive not 71–74 % — and its §5 probe list marked done), and
+`vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, commented as a ceiling; no test
+exercises it, since `nvme_s_per_token` is only computed when a caller passes `tokens=` and none
+does). Archived `plans/` documents keep their original wording — they are the record of what was
+believed at the time.
+
+**Opened 2026-08-30 by the R2 structural probe.** The drive is a **Samsung SSD 990 PRO 1TB,
+sequential-read spec 7.45 GB/s**. Measured on-device, decode's own reads deliver **6.88 GB/s (Qwen)
+/ 6.70 GB/s (MiniMax) at 4 reads in flight**, still rising at the edge of the credible range.
+~5.5 GB/s is roughly what this path achieves at 2–3 reads in flight — a measured-path figure that
+got promoted to a hardware constant and then used as a denominator.
+
+Consequences, all of which are live in documents today:
+- Decode's 3.70–3.83 GB/s is **50–51 % of the drive**, not M1's 71–73 %.
+- M1's "concurrency needed for 5.5 GB/s = 3.13 / 3.35" understates the available headroom.
+- `CLAUDE.md` §5 lists ~5.5 GB/s among the HARDWARE limits that "stay literal"; the Environment
+  section of this file repeats it.
+
+**Done means:** both documents carry the drive model, its 7.45 GB/s spec, and the measured
+concurrency-dependent figure, with a note that a single-stream number is not the drive's limit.
+Every "% of the drive" claim in `plans/` stays as written — it is archive — but this file and
+`CLAUDE.md` must not keep handing the wrong denominator to the next session.
+
+</details>
+
+### R3 · [x] Move the expert-cache miss path into Rust — **REFUTED 2026-08-30, row CLOSED**
+**M1's GIL probe, which this row named as its own gate, came back flat on BOTH models.** Two
+replicates per switch interval, greedy decode (identical tokens), arena pinned, interleaved:
+`sys.setswitchinterval(0.0005)` vs `0.02` — a **40× swing** — moved decode by **0.11 % (Qwen)** and
+**0.72 % (MiniMax)** on tok/s, and 0.04 % / 0.66 % on achieved bandwidth. Both are at or under this
+box's 0.23–0.36 % noise floor. On MiniMax the *longer* interval was fractionally slower, the
+opposite of what GIL starvation of the I/O threads would produce.
+
+The premise — ~750 Python LRU ops/token contending with the forward loop for the GIL — is not
+supported: the I/O threads already release the GIL inside `vaayu_rust`, and the Python bookkeeping
+on either side of that call is not what the token waits on. This row's stated stop rule
+("Refuted if: switch-interval changes do not move the token rate") is met. **Closed on the
+refutation; NOT re-scoped.** Details: `plans/2026-08-30-M1-gating-measurement-RESULTS.md` §(3).
+
+<details><summary>original row, kept for the record</summary>
+
 `ExpertRAMCache.get` / `acquire_slab` / `put_slab` / `_evict_global_oldest`
 (`vaayu/persist/expert_cache.py`) are Python `OrderedDict` LRU operations run **~750× per token**
 (94 layers × 8 experts), each holding the GIL while the forward loop wants it. Fold lookup + slab
@@ -908,6 +1207,7 @@ and the LRU state, none of which must be a Python object.
 "422 Python dispatches + 750 LRU operations" into "94 Rust calls".
 **Refuted if:** switch-interval changes do not move the token rate.
 → `speed-up-vaayu.md` §2 R3.
+</details>
 
 ### R4 · [ ] Prefill repack memcpys into Rust — low priority
 `load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor

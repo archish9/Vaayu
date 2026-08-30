@@ -23,19 +23,27 @@ decode-only counters, 64 tokens):
 | Qwen3-235B | 422 | 4.99 GB | 0.820 tok/s | **4.09 GB/s** |
 | MiniMax-M2.7 | 295 | 2.62 GB | 1.501 tok/s | **3.93 GB/s** |
 
-The box's NVMe peak, stated as a hardware constant in `todo.md`'s Environment section, is **~5.5 GB/s**.
+**CORRECTED 2026-08-30 (row C1). The ~5.5 GB/s "NVMe peak" this section was
+built on is not the drive.** It is what the expert path achieves at 2-3 reads in
+flight. The drive is a **Samsung SSD 990 PRO 1TB, spec 7.45 GB/s**, and its
+delivered rate rises with concurrency: 1 read in flight -> 3.3 GB/s, 2 -> 5.3,
+3 -> 6.5, **4 -> 6.9**, still rising at the edge of the credible range
+(`plans/2026-08-30-R2-structural-probe-RESULTS.md`).
 
-So the disk path is running at **71-74 % of the drive's rate** while being the
-thing that costs 72-74 % of the token. **That gap is the entire Rust
-opportunity, and it is worth ~1.25-1.4x on MoE decode if it closes completely.**
+So the disk path is running at **50-51 % of the drive's rate** — not the 71-74 %
+this document claimed — while being the thing that costs 72-74 % of the token.
+The gap is therefore LARGER than argued below, and the ceiling arithmetic is:
 
-    Qwen   0.820 tok/s at 4.09 GB/s  ->  ~1.10 tok/s at 5.5 GB/s
-    MiniMax 1.501 tok/s at 3.93 GB/s ->  ~2.05 tok/s at 5.5 GB/s
+    Qwen   0.820 tok/s at 4.09 GB/s  ->  ~1.38 tok/s at 6.9 GB/s
+    MiniMax 1.501 tok/s at 3.93 GB/s ->  ~2.64 tok/s at 6.9 GB/s
 
-Those are ceilings, not predictions. **Measure the achieved bandwidth first**
-(§5). If a fresh measurement shows decode already sitting at ~5.4 GB/s, then
-R1 and R2 below are refuted and this whole document closes with them —
-per `todo.md`'s stop rule, do not re-scope to find a win.
+Those are ceilings, not predictions, and **the 2026-08-30 probe splits them into
+two levers that are NOT the one this document argues for**: ~1.5x from filling
+the 33-35 % of decode with zero reads outstanding (`todo.md` row L1), and
+~1.16-1.25x from widening the bursts (row R2). The measurement §5 asks for has
+been run twice — M1 (2026-08-30) and the structural probe (2026-08-30). Decode
+is not at ~5.4 GB/s, so R1/R2 are not refuted; read both results documents
+before costing anything below.
 
 Dense (Llama-3.3-70B, ~37 GB read per token, 0.155 tok/s = ~5.7 GB/s) is
 already at the wall. **Rust has nothing to offer streamed dense.** Its lever is
@@ -291,7 +299,10 @@ systemd-run --user --scope -p MemoryMax=27G -p MemorySwapMax=0 \
 Instrument, decode-only (reset counters after prefill), 64 tokens, per model:
 
 1. **Achieved read bandwidth** = (bytes read from NVMe during decode) / (decode
-   wall). Compare against ~5.5 GB/s. **This single number decides R2 and R3.**
+   wall). Compare against the drive's **concurrency-dependent** rate, NOT a single
+   number: 6.9 GB/s at 4 reads in flight, 7.45 GB/s spec (row C1). **DONE** — M1
+   and the structural probe, both 2026-08-30. Decode sits at 50-51 % of the drive.
+   Neither R2 nor R3 turned on this number alone; R3 was refuted by the GIL probe.
 2. **GC fraction** = `gc.callbacks` accumulated seconds / decode wall (§1).
 3. **GIL sensitivity** = tok/s at `sys.setswitchinterval(0.0005)` vs `0.02`.
 4. **Ring idle fraction** = with R1's trace *enabled deliberately for this one

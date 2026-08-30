@@ -1337,7 +1337,13 @@ def _dispatch_expert_misses(
             except Exception:
                 expert_cache.arena.release(slab_idx)
                 raise
-            expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
+            if not expert_cache.put_slab(layer_idx, eidx, views, slab_idx):
+                # Declined (duplicate key — the lookahead stager loaded this same
+                # expert first — or no evictable room). We still own the slab AND
+                # we are about to hand `views` into it to the forward, which DMAs
+                # from them. Hang its release on the pin this key already holds:
+                # the caller's finally unpins after the copy is issued.
+                expert_cache.orphan_slab(layer_idx, eidx, slab_idx)
             return eidx, views
 
         # Submit and DON'T wait: hit experts compute while these reads run.
@@ -1460,7 +1466,12 @@ def _make_fused_sparse_forward_exl3(
             except Exception:
                 expert_cache.arena.release(slab_idx)
                 raise
-            expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx, prefetch=True)
+            if not expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx,
+                                         prefetch=True):
+                # Declined (decode raced us to this key, or no room). This thread
+                # takes no further read of `views`, and holds no pin to hang a
+                # deferred release on, so give the slab back now.
+                expert_cache.arena.release(slab_idx)
         except Exception as e:
             _log.warning(
                 f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"
