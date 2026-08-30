@@ -21,6 +21,15 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
    wrong, what "done" means, and its stop rule — you should not need any other document except
    the two named in the FIX SEQUENCE.
 
+**▶ START HERE IF YOU ARE PICKING THIS UP COLD: [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md)**
+(repo root, **tracked in git**). It carries EVERY pending item from the 2026-08-30 MoE disk-path
+work — fan-out measurement, the MiniMax module-list wiring that gates a measured +11.4 %, the
+unexplained tiny-read inflation, the admission policy, and the banked 5.57× dense speculative
+decoding — each with its file, symbol, done-condition and stop rule. It also carries the
+environment, the preserved probe harness (`plans/probes/`), the seven measurement traps, and the
+numbers not to re-derive. **It is self-contained: you should not need this file or any other to
+start work from it.**
+
 Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
 one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
@@ -29,6 +38,9 @@ it only to check whether something was already refuted, never for a task.
 ---
 
 # ▶▶ FIX SEQUENCE — opened 2026-08-23 by code review of the server work
+
+**Rows 14–16 closed 2026-08-30. Everything they left open lives in
+[`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md), not below.**
 
 **Do these top to bottom.** Ordering rule: correctness bugs that make the server LIE to an agent
 first, then the concurrency bug, then the rest of the correctness debt, then perf. Rust work comes
