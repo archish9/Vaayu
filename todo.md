@@ -47,6 +47,13 @@ removing them made the read pattern bursty (dead time 24.8 → 29.9 %, per-bulk-
 ceiling P1 found is NOT the tiny reads and remains unexplained. Trail:
 `plans/2026-08-30-P3-tiny-store-RESULTS.md`.
 
+**The pending rows were RESEQUENCED and audited the same day** — row numbers are fixed identifiers,
+never the order, and `HANDOFF-2026-08-30.md` §2 now opens with the do-order table. Short version:
+**P5 (control drift, escalated 1.6 % → 22 % at N=3) and P8 (the ~5.12 GB/s ceiling, a NEW row that
+had no home) come FIRST**, because every implementation row left closes on a same-day A/B and at
+N=3 the controls no longer hold still. Then P2, then P4 (which gained the file/symbol detail it was
+missing, and whose ~2.0 tok/s headroom is now marked SUSPECT pending P8), then P7, then P6.
+
 Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
 one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
