@@ -38,6 +38,15 @@ bytes/token FALLING). P2 stands but is now bounded; **P3 (tiny reads) is promote
 ring 91.7 % of decode at N=3 for 0.3 % of the bytes. Full trail:
 `plans/2026-08-30-P1-fanout-RESULTS.md`; harness `plans/probes/probe_fanout.py`.
 
+**2026-08-30, later still: P3 was BUILT and is REFUTED — row CLOSED.** Holding the scale/bias
+groups resident removes 100 % of the tiny reads and returns byte-identical output, and costs
+**−2.7 % at N=1, −11.3 %/−14.5 % at N=3** (every store-off arm beat every store-on arm, no
+overlap). The tiny reads were STAGGERING the 8-worker ring pool, not stealing capacity from it;
+removing them made the read pattern bursty (dead time 24.8 → 29.9 %, per-bulk-read latency
+9.12 → 10.36 ms). **Occupancy is not contention, and read COUNT is a resource** — the ~5.12 GB/s
+ceiling P1 found is NOT the tiny reads and remains unexplained. Trail:
+`plans/2026-08-30-P3-tiny-store-RESULTS.md`.
+
 Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
 one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
