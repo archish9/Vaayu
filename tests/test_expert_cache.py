@@ -308,3 +308,61 @@ def test_ram_cache_resident_set():
     assert cache.resident_set(2) == set()
     # resident_set must NOT perturb hit/miss stats (non-mutating probe)
     assert cache.hits == 0 and cache.misses == 0
+
+
+# ── in-flight load reservation ───────────────────────────────────────────────
+# The lookahead stager and the decode miss path both check "is it cached?", then
+# spend ~5.8ms reading an expert, then insert. Classic check-then-act: measured
+# at ~200 stager + ~190 decode duplicate reads per token, each a full expert
+# read off NVMe that one of the two then throws away. A claim taken before the
+# read makes the loser skip (stager) or wait (decode) instead of re-reading.
+
+def test_claim_load_is_exclusive():
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    first = cache.claim_load(0, 3, "decode")
+    assert first is not None, "the first caller must win the claim"
+    assert cache.claim_load(0, 3, "stager") is None, "the second must lose it"
+    # a different key is unaffected
+    assert cache.claim_load(0, 4, "stager") is not None
+
+
+def test_finish_load_frees_the_key_and_wakes_waiters():
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    claim = cache.claim_load(1, 9, "stager")
+    assert not claim.done.is_set()
+    cache.finish_load(claim)
+    assert claim.done.is_set(), "finish must wake anyone waiting on this load"
+    assert cache.peek_load(1, 9) is None, "the key must be claimable again"
+    assert cache.claim_load(1, 9, "decode") is not None
+
+
+def test_peek_load_reports_running_state():
+    """Decode waits only on a load that has actually STARTED. A claim that is
+    merely queued behind other prefetches must be distinguishable, or decode
+    would block on the stager's backlog and invert CR-2 (prefetch must never
+    preempt on-path decode-miss reads)."""
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    claim = cache.claim_load(2, 5, "stager")
+    seen = cache.peek_load(2, 5)
+    assert seen is claim
+    assert seen.running is False, "a fresh claim is queued, not running"
+    cache.mark_running(claim)
+    assert cache.peek_load(2, 5).running is True
+
+
+def test_finish_load_is_safe_when_the_winner_raised():
+    """A failed load must not strand the key: the waiter has to be able to fall
+    back to loading it itself rather than block until the timeout."""
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    claim = cache.claim_load(3, 1, "decode")
+    cache.mark_running(claim)
+    cache.finish_load(claim)          # what the worker's finally does on a raise
+    assert cache.peek_load(3, 1) is None
+    assert cache.claim_load(3, 1, "stager") is not None
+
+
+def test_finish_load_tolerates_a_none_claim():
+    """_load_one calls finish_load unconditionally in its finally, including on
+    the path where it proceeded without a claim (loser, queued-only holder)."""
+    cache = ExpertRAMCache(budget_bytes=10 * 1024 * 1024)
+    cache.finish_load(None)           # must not raise

@@ -9,6 +9,19 @@ from .safetensor_model_persister import _ALIGN, chunk_decomposition
 _log = logging.getLogger(__name__)
 
 
+class _LoadClaim:
+    """One in-flight expert load. See ExpertRAMCache.claim_load()."""
+    __slots__ = ("key", "owner", "running", "done")
+
+    def __init__(self, key: tuple, owner: str):
+        self.key = key
+        self.owner = owner
+        # False until the worker actually begins the read. Decode waits only on
+        # a RUNNING load, never on a queued one.
+        self.running = False
+        self.done = threading.Event()
+
+
 class SlabArena:
     """Fixed-size slab pool backing the expert RAM cache (zero-clone path).
 
@@ -308,6 +321,56 @@ class ExpertRAMCache:
         # final unpin() of that key returns them to the arena. See put_slab()
         # and orphan_slab().
         self._orphan_slabs: dict[tuple, int] = {}
+        # (layer, expert) -> _LoadClaim for a read that is in flight right now.
+        # Stops the stager and the decode path reading the same expert twice.
+        self._loading: dict[tuple, "_LoadClaim"] = {}
+
+    def claim_load(self, layer_idx: int, expert_idx: int, owner: str) -> "_LoadClaim | None":
+        """Claim the right to load (layer_idx, expert_idx), or None if taken.
+
+        The lookahead stager and the decode miss path both do "is it cached? no
+        -> read ~5.8ms of expert off NVMe -> insert", which is check-then-act:
+        measured at ~200 stager and ~190 decode duplicate reads per token, each
+        one a full expert read that the loser of the insert race then discards.
+        Whoever wins this claim does the read; the loser skips it (stager, which
+        is opportunistic) or waits for the winner (decode, which needs the
+        weights this layer) — see moe_patch._load_one.
+
+        The winner MUST call finish_load() in a finally, so a failed load frees
+        the key instead of stranding a waiter until its timeout.
+        """
+        with self.lock:
+            key = (layer_idx, expert_idx)
+            if key in self._loading:
+                return None
+            claim = _LoadClaim(key, owner)
+            self._loading[key] = claim
+            return claim
+
+    def peek_load(self, layer_idx: int, expert_idx: int) -> "_LoadClaim | None":
+        """The in-flight claim for this key, or None. Read `.running` before
+        deciding to wait: a claim that is only QUEUED belongs to a stager worker
+        that may sit behind other prefetches, and waiting on it would let
+        prefetch preempt an on-path decode read (the exact inversion the
+        dedicated _stager_executor exists to prevent)."""
+        with self.lock:
+            return self._loading.get((layer_idx, expert_idx))
+
+    def mark_running(self, claim: "_LoadClaim | None") -> None:
+        """Called by the worker at the moment the read actually starts."""
+        if claim is not None:
+            claim.running = True
+
+    def finish_load(self, claim: "_LoadClaim | None") -> None:
+        """Release the claim and wake any waiter. Tolerates None so callers can
+        call it unconditionally in a finally, including on the path where they
+        proceeded without a claim."""
+        if claim is None:
+            return
+        with self.lock:
+            if self._loading.get(claim.key) is claim:
+                del self._loading[claim.key]
+        claim.done.set()
 
     def orphan_slab(self, layer_idx: int, expert_idx: int, slab_idx: int) -> None:
         """Hand a DECLINED slab back to the cache for release at final unpin().

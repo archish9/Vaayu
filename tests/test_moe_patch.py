@@ -2142,3 +2142,96 @@ def test_cache_bias_inert_warning_is_per_model_instance(caplog):
         _warn_cache_bias_inert(b, "reason B")
         _warn_cache_bias_inert(a, "reason A")
     assert len(caplog.records) == 2
+
+
+# ── in-flight load reservation (decode side) ────────────────────────────────
+# The stager and the decode miss path both used to read the same expert off
+# NVMe and throw one copy away. These two tests pin the decision rule: decode
+# waits for a load that is RUNNING, and refuses to wait for one that is only
+# QUEUED (which would let prefetch preempt an on-path read).
+
+def _arena_cache_for(tmp_path, monkeypatch):
+    """Arena-backed cache + a real one-layer EXL3 checkpoint. The reservation
+    lives on the zero-clone slab path, which is skipped entirely when
+    `expert_cache.arena is None` -- so the no-arena fixture used by the older
+    dispatch tests cannot reach this code at all."""
+    import threading, time
+    from vaayu.persist.expert_cache import SlabArena
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    arena = SlabArena(n_slabs=4, slab_bytes=1 << 20, pin=False)
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024, arena=arena)
+    reads = []
+    import vaayu.persist.safetensor_model_persister as _sp
+    _real = _sp.load_expert_into_slab
+
+    def _counting(file_path, metas, slab, **kw):
+        reads.append(1)
+        return _real(file_path, metas, slab, **kw)
+
+    monkeypatch.setattr(_sp, "load_expert_into_slab", _counting)
+    return idx, cache, reads
+
+
+def test_decode_waits_for_a_running_load_instead_of_re_reading(tmp_path, monkeypatch):
+    import threading, time
+    from vaayu.moe_patch import _dispatch_expert_misses, _iter_expert_loads
+    idx, cache, reads = _arena_cache_for(tmp_path, monkeypatch)
+    vaayu_ref = MockVaayuRef()
+
+    # A stager worker is mid-read on expert 2.
+    claim = cache.claim_load(0, 2, "stager")
+    cache.mark_running(claim)
+
+    def _finisher():
+        time.sleep(0.05)
+        cache.put(0, 2, _make_mock_exl3_raw("layers.0", 2, in_dim=8, out_dim=16))
+        cache.finish_load(claim)
+
+    t = threading.Thread(target=_finisher); t.start()
+    try:
+        tensors, futures, pinned = _dispatch_expert_misses(
+            [2], layer_idx=0, layer_name="layers.0",
+            shard_file=str(tmp_path / "layers.0.safetensors"),
+            offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref)
+        got = dict(_iter_expert_loads(tensors, futures, vaayu_ref))
+    finally:
+        t.join()
+        for k in pinned:
+            cache.unpin(*k)
+
+    assert got.get(2) is not None, "decode must still come away with the expert"
+    assert reads == [], (
+        "decode re-read an expert the stager was already loading -- the whole "
+        "point of the reservation is that this read does not happen")
+
+
+def test_decode_does_not_wait_on_a_merely_queued_load(tmp_path, monkeypatch):
+    """A queued claim belongs to a stager worker that may be stuck behind other
+    prefetches. Waiting on it would invert CR-2 (prefetch must never preempt an
+    on-path decode read), so decode must load it itself. Nobody ever finishes
+    this claim: if decode waits, it eats the full backstop and the elapsed-time
+    assertion fires."""
+    import time
+    from vaayu.moe_patch import _dispatch_expert_misses, _iter_expert_loads
+    from vaayu.moe_patch import _LOAD_WAIT_BACKSTOP_S
+    idx, cache, reads = _arena_cache_for(tmp_path, monkeypatch)
+    vaayu_ref = MockVaayuRef()
+
+    cache.claim_load(0, 2, "stager")          # claimed, never marked running
+
+    t0 = time.perf_counter()
+    tensors, futures, pinned = _dispatch_expert_misses(
+        [2], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref)
+    got = dict(_iter_expert_loads(tensors, futures, vaayu_ref))
+    elapsed = time.perf_counter() - t0
+    for k in pinned:
+        cache.unpin(*k)
+
+    assert got.get(2) is not None
+    assert reads, "decode must load it itself rather than wait on a queued claim"
+    assert elapsed < _LOAD_WAIT_BACKSTOP_S / 2, (
+        f"decode blocked {elapsed:.2f}s on a claim that never started running")

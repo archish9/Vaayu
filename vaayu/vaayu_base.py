@@ -784,28 +784,41 @@ def check_lookahead_flag_safe() -> None:
     ExpertRAMCache.orphan_slab() in vaayu/persist/expert_cache.py, and
     plans/2026-08-30-R2-structural-probe-RESULTS.md for the measurement trail.
 
-    **Why it is still blocked.** With the corruption fixed the flag runs clean,
-    and it does what it was built to do: decode's dead time (no read outstanding
-    on any ring) falls 37.6% -> 15.1% and aggregate NVMe bandwidth rises 36%
-    (3.765 -> 5.129 GB/s) on Qwen3-235B. But it reads **60% more bytes** to get
-    there (188.6 -> 302.0 GB per 64 tokens) because prefetched layer-N+1 experts
-    evict layer-N experts that are still needed and both get re-read, so decode
-    comes out at **1.070 tok/s against 1.258 with the flag off -- a 15%
-    REGRESSION**. Turning this on today makes the engine slower.
+    **Status 2026-08-30 (second revision, same day): the flag is now a WIN and
+    this block is stale.** When the corruption was first fixed, the flag ran
+    clean but read 60% more bytes and cost 15% of decode, because the stager and
+    the decode miss path both read the same expert and one of the two threw its
+    copy away. An in-flight load reservation (ExpertRAMCache.claim_load and
+    friends) removed 6796 duplicate expert reads per 64 tokens, and the flag
+    inverted from a regression to a gain:
 
-    Two further limits, neither a corruption risk:
-    - The predictor is wired ONLY into _make_fused_sparse_forward_exl3. The
-      module-list forward (MiniMax) has no lookahead at all, so this flag is a
-      no-op there (CLAUDE.md section 0's single-forward trap).
-    - The stager and the decode path race to load the same expert and one of
-      them always loses the insert: ~200 wasted expert reads per token against
-      345 accepted, i.e. real NVMe bandwidth spent on bytes that are discarded.
+        lookahead OFF                1.277 tok/s   (3 arms, 1.267-1.284)
+        lookahead ON, no reservation 1.070 tok/s   (-15%)
+        lookahead ON, reservation    1.422 tok/s   (+11.4%, 3 arms, 1.420-1.425)
 
-    **What would lift this block:** a prefetch admission policy that cannot
-    evict the on-path working set (a reserved sub-budget, or admitting
-    prefetched entries LRU-cold rather than MRU-warm), re-measured against the
-    same gate this row has always used -- bytes/token unchanged AND coverage up,
-    never coverage alone.
+    Interleaved same-box same-day arms; the two distributions do not overlap
+    (worst ON beats best OFF by 10.6%). Coverage 62.6% -> 82.8%, NVMe bandwidth
+    3.786 -> 5.009 GB/s, bulk bytes still +17.8% over baseline (the residual is
+    eviction churn, not duplicate reads). Soaked at 1024 tokens with the stager
+    at 4x width: no crashes, and greedy token ids byte-identical to a
+    lookahead-off run across 256 tokens.
+
+    **It is nonetheless still blocked, deliberately, on two grounds that are
+    about coverage rather than merit:**
+      - Every number above is Qwen3-235B. The predictor is wired ONLY into
+        _make_fused_sparse_forward_exl3; _make_modulelist_sparse_forward
+        (MiniMax) has no lookahead at all, so this flag is a silent no-op there
+        (CLAUDE.md section 0's single-forward trap). Turning it on by default
+        would ship a win for one of the two actively-tested models and nothing
+        for the other, which is exactly the asymmetry section 5 forbids.
+      - Everything here is single-stream. Vaayu's workload is parallel fan-out
+        (CLAUDE.md section 0), and a prefetcher that competes with N concurrent
+        decode streams for the same cache and the same 8 rings has not been
+        measured at all.
+
+    **To lift it:** wire the module-list forward and re-measure on MiniMax, then
+    measure both under fan-out. If both hold, this guard should be deleted and
+    the flag defaulted ON rather than merely permitted.
 
     Called from __init__ before any MoE cache/executor/prefetch object is
     created, so a set flag fails fast at engine construction. No-op (dead code)
@@ -813,21 +826,19 @@ def check_lookahead_flag_safe() -> None:
     """
     if os.environ.get("VAAYU_LOOKAHEAD") == "1":
         raise RuntimeError(
-            "VAAYU_LOOKAHEAD=1 is disabled because it is SLOWER, not because it "
-            "is unsafe. The memory corruption this guard used to describe was "
-            "root-caused and fixed on 2026-08-30 (ExpertRAMCache.put_slab "
-            "released a declined slab that the caller was still reading; see "
-            "check_lookahead_flag_safe.__doc__ for the full account -- and note "
-            "that this message previously blamed _stager_executor worker "
-            "concurrency, which was wrong). Measured on Qwen3-235B with the fix "
-            "in place: decode dead time 37.6% -> 15.1% and NVMe bandwidth "
-            "3.765 -> 5.129 GB/s, but 60% more bytes read (cache thrashing "
-            "between prefetched and on-path experts) and decode 1.258 -> 1.070 "
-            "tok/s, a 15% regression. It is also a no-op on the module-list "
-            "forward (MiniMax), where no lookahead is wired. Lifting this needs "
-            "a prefetch admission policy that cannot evict the on-path working "
-            "set. Unset VAAYU_LOOKAHEAD (or set it to anything other than \"1\") "
-            "to proceed."
+            "VAAYU_LOOKAHEAD=1 is disabled pending model coverage, NOT because "
+            "it is unsafe or slow -- both of those were true earlier on 2026-08-30 "
+            "and neither is now. The memory corruption was root-caused and fixed "
+            "(ExpertRAMCache.put_slab released a declined slab the caller was "
+            "still reading), and an in-flight load reservation then turned the "
+            "flag's 15% regression into a measured +11.4% on Qwen3-235B (1.277 "
+            "-> 1.422 tok/s, 3 interleaved arms each, non-overlapping; 1024-token "
+            "soak clean, greedy ids byte-identical). It stays off because it is "
+            "wired ONLY into the fused-EXL3 forward -- it is a silent no-op on "
+            "the module-list forward (MiniMax) -- and because it has never been "
+            "measured under the parallel fan-out this engine is built for. See "
+            "check_lookahead_flag_safe.__doc__. Unset VAAYU_LOOKAHEAD (or set it "
+            "to anything other than \"1\") to proceed."
         )
 
 

@@ -1233,6 +1233,13 @@ def _make_fused_sparse_forward(
     return sparse_forward
 
 
+# Backstop for a decode worker waiting on an in-flight load it lost the claim
+# to. NOT a performance knob: it exists so a worker that dies without running
+# its finally cannot hang the layer. A healthy wait is one expert read off NVMe
+# (single-digit ms); anything near this value means something is wrong.
+_LOAD_WAIT_BACKSTOP_S = 5.0
+
+
 def _dispatch_expert_misses(
     unique_experts,
     *,
@@ -1314,6 +1321,37 @@ def _dispatch_expert_misses(
                 raw = load_expert_sparse(shard_file, metas)
                 expert_cache.put(layer_idx, eidx, raw)
                 return eidx, raw
+            # Reservation: the lookahead stager may already be reading this
+            # exact expert. Losing that race used to mean reading it twice off
+            # NVMe and discarding one copy (~190 decode + ~200 stager duplicate
+            # reads per token, measured). Wait for the in-flight read instead —
+            # but ONLY if it has actually started. A claim that is merely queued
+            # belongs to a stager worker that may sit behind other prefetches,
+            # and blocking on that would let prefetch preempt an on-path decode
+            # read, which is the inversion the dedicated _stager_executor exists
+            # to prevent. The key is already pinned (dispatch pins every miss
+            # before submitting), so a waited-for entry cannot be evicted out
+            # from under us between the wait and the H2D copy.
+            _claim = expert_cache.claim_load(layer_idx, eidx, "decode")
+            if _claim is None:
+                _other = expert_cache.peek_load(layer_idx, eidx)
+                if _other is not None and _other.running:
+                    # Backstop only, not a tuning knob: bounds the wait if the
+                    # winning worker dies without running its finally. A healthy
+                    # read is ~one expert off NVMe.
+                    _other.done.wait(timeout=_LOAD_WAIT_BACKSTOP_S)
+                    _cached = expert_cache.get(layer_idx, eidx)
+                    if _cached is not None:
+                        return eidx, _cached
+                # Queued-only holder, or the winner failed and cached nothing:
+                # fall through and read it ourselves, exactly as before.
+            try:
+                expert_cache.mark_running(_claim)
+                return _load_one_uncontended(eidx, metas)
+            finally:
+                expert_cache.finish_load(_claim)
+
+        def _load_one_uncontended(eidx: int, metas):
             # Zero-clone decode path: io_uring reads straight into a pinned
             # slab; the cache adopts views (no clone anywhere disk→RAM→GPU).
             slab_idx = expert_cache.acquire_slab()
@@ -1453,25 +1491,38 @@ def _make_fused_sparse_forward_exl3(
                 raw = load_expert_sparse(_shard, metas)
                 expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
                 return
-            slab_idx = expert_cache.acquire_slab()
-            if slab_idx is None:
-                raw = load_expert_sparse(_shard, metas)
-                expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+            # Reservation: if anyone is already loading this expert, skip
+            # entirely. Prefetch is opportunistic — re-reading bytes another
+            # thread is already fetching costs real NVMe bandwidth and buys
+            # nothing. Unlike decode, the stager never waits: it has nothing to
+            # deliver and no caller blocked on it, and waiting here would put a
+            # prefetch worker to sleep on the on-path reader.
+            _claim = expert_cache.claim_load(next_layer_idx, eidx, "stager")
+            if _claim is None:
                 return
-            slab = expert_cache.arena.tensor(slab_idx)
             try:
-                views = load_expert_into_slab(
-                    _shard, metas, slab,
-                    allow_direct=expert_cache.arena.pin, tensor_align=False)
-            except Exception:
-                expert_cache.arena.release(slab_idx)
-                raise
-            if not expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx,
-                                         prefetch=True):
-                # Declined (decode raced us to this key, or no room). This thread
-                # takes no further read of `views`, and holds no pin to hang a
-                # deferred release on, so give the slab back now.
-                expert_cache.arena.release(slab_idx)
+                expert_cache.mark_running(_claim)
+                slab_idx = expert_cache.acquire_slab()
+                if slab_idx is None:
+                    raw = load_expert_sparse(_shard, metas)
+                    expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+                    return
+                slab = expert_cache.arena.tensor(slab_idx)
+                try:
+                    views = load_expert_into_slab(
+                        _shard, metas, slab,
+                        allow_direct=expert_cache.arena.pin, tensor_align=False)
+                except Exception:
+                    expert_cache.arena.release(slab_idx)
+                    raise
+                if not expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx,
+                                             prefetch=True):
+                    # Declined (no room). This thread takes no further read of
+                    # `views`, and holds no pin to hang a deferred release on,
+                    # so give the slab back now.
+                    expert_cache.arena.release(slab_idx)
+            finally:
+                expert_cache.finish_load(_claim)
         except Exception as e:
             _log.warning(
                 f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"

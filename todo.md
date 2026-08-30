@@ -74,9 +74,12 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
 | 17 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
 
-**Stop rules — M1 has now been run, and here is what it did to them.** M1 gated R2 and R3: decode
-came back at **73.1 % / 71.1 %** of the drive, not the ~98 % that would have refuted both, so **R2
-survives its gate**. R3's extra condition — that M1's GIL probe show real contention — **failed on
+**Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
+SUPERSEDED the same day; see row 14.)** M1 gated R2 and R3: decode
+came back at **73.1 % / 71.1 %** of the drive, not the ~98 % that would have refuted both, so R2
+survived *that* gate — **but it was refuted hours later by the structural probe**, which showed the
+reads are bimodal and M1's percentages were against the wrong denominator (row 15/C1). Both R2 and
+R3 are now closed. R3's extra condition — that M1's GIL probe show real contention — **failed on
 both models**, so R3 is refuted and closed per the standing protocol (a refutation closes its row;
 it is not re-scoped). R1 and P1 were worth doing regardless and both landed 2026-08-30. B3 and B6
 were prerequisites for R2; both closed 2026-08-28.
@@ -1078,12 +1081,11 @@ must attack the eviction interaction, not the prefetch trigger:
 - neither is a re-scope of this row; both are new work with their own gates.
 
 **STILL OPEN on this row:**
-- [ ] **Decide what to do with `check_lookahead_flag_safe()`'s hard block.** Its stated reason
-  ("causes confirmed on-device memory corruption") is now FALSE — the corruption is found, fixed and
-  verified. But the flag it guards is measured at **−15 %**, so removing the block would unblock a
-  feature nobody should switch on yet. Leaving the message as written is worse: it sends the next
-  reader to audit `_stager_executor` worker concurrency, which is not where the bug was.
-  **Not done unilaterally — this is a safety guard and the call is the user's.**
+- [x] **`check_lookahead_flag_safe()`'s hard block: RESOLVED 2026-08-30 — it still refuses, but on
+  PERFORMANCE.** Its old reason ("causes confirmed on-device memory corruption") became false once
+  the corruption was fixed, and its old message sent readers to audit `_stager_executor` worker
+  concurrency, which is not where the bug was. Rewritten to state the real cause, the measured
+  −15 %, the module-list no-op, and what would lift it.
 - [x] **SOAK DONE 2026-08-30 — passed on both detectors.** 4 arms x 256 tokens = 1024 tokens,
   Qwen, guard bypassed for the measurement:
 
@@ -1118,9 +1120,57 @@ must attack the eviction interaction, not the prefetch trigger:
   `_make_fused_sparse_forward_exl3`; `_make_modulelist_sparse_forward` has no lookahead at all
   (verified by source inspection). This is exactly CLAUDE.md §0's single-forward trap. Wiring the
   module-list forward is separate work and is NOT done.
-- [ ] The stager wastes real disk bandwidth on lost races: 200 stager declines per token against
-  345 accepts in the instrumented run. Each decline is an expert read off NVMe that is thrown away.
-  Worth a reservation so only one of stager/decode loads a given key.
+- [x] **RESERVATION LANDED 2026-08-30, and it FLIPS L1 from −15 % to +12.2 %.** `ExpertRAMCache`
+  gained an in-flight claim (`claim_load`/`peek_load`/`mark_running`/`finish_load`, `_LoadClaim`).
+  The stager yields unconditionally on a claimed key; decode waits only on a claim already marked
+  RUNNING and loads it itself when the holder is merely QUEUED — that distinction is what keeps
+  CR-2 (prefetch must never preempt an on-path read) intact, and it is mutation-tested.
+
+  | | lookahead OFF | ON, pre-reservation | **ON, with reservation** |
+  |---|---|---|---|
+  | decode | 1.267 tok/s | 1.070 (−15 %) | **1.422 (+12.2 %)** |
+  | bulk bytes | 188.24 GB | 302.04 GB (+60 %) | **221.84 GB (+17.8 %)** |
+  | bulk reads | 15952 | 25595 | **18799** |
+  | coverage | 62.6 % | 84.9 % | 82.8 % |
+  | bandwidth while covered | 6.044 GB/s | 6.042 | 6.049 GB/s |
+
+  **6796 duplicate expert reads per 64 tokens removed** (−26.6 % bytes vs the pre-reservation arm)
+  with coverage held. So duplicate reads, not eviction churn, were the dominant term in the +60 % —
+  the opposite of what this row predicted before the work. Control arm confirms the baseline did
+  not drift (1.267 against the morning's 1.258–1.279).
+
+  **The stated gate is still NOT met on its letter:** bytes/token are +17.8 %, not unchanged. The
+  gate was a proxy for "does this come out ahead", and the outcome is now measured directly, so its
+  PURPOSE is satisfied — but do not record this as "gate passed". Suite 1285 passed, 3 skipped.
+- [x] **REPLICATED + RE-SOAKED, guard updated 2026-08-30.** Interleaved A/B (on,off,on,off) so
+  block drift cannot masquerade as the treatment:
+
+  | | arms | mean | spread |
+  |---|---|---|---|
+  | lookahead ON | 1.422 / 1.420 / 1.425 | **1.422** | 0.35 % |
+  | lookahead OFF | 1.267 / 1.284 / 1.279 | **1.277** | 1.33 % |
+
+  **+11.4 %**, distributions non-overlapping (worst ON beats best OFF by 10.6 %). The single-arm
+  +12.2 % was slightly optimistic; **11.4 % is the number, and it is what the guard now states.**
+  Re-soaked on the RESERVATION code (the earlier soak predates it and never exercised the new wait
+  path): 1024 tokens, 0 crashes, stager forced to 8 workers on one arm to maximise claim
+  contention, and **greedy ids byte-identical across 256 tokens** — the detector that matters here,
+  since the reservation makes decode consume the STAGER's slab on a won race.
+- [ ] **The guard still refuses, now purely on COVERAGE — and this is the remaining work.**
+  Every number is Qwen3-235B single-stream. Two gaps, both of which must close before the flag can
+  default ON (at which point the guard should be deleted, not relaxed):
+  - **Wire the module-list forward.** The predictor lives only in `_make_fused_sparse_forward_exl3`,
+    so the flag is a silent no-op on MiniMax. Defaulting it ON now would ship a win for one of the
+    two actively-tested models and nothing for the other — the exact asymmetry CLAUDE.md §5 forbids.
+  - **Measure under fan-out.** CLAUDE.md §0 says aggregate throughput under parallel streams is the
+    workload. A prefetcher competing with N decode streams for one cache and 8 rings is unmeasured.
+- [ ] **Tiny reads are now the largest unexplained inefficiency.** 20.56 s of ring/worker occupancy
+  = **46.4 % of decode**, at 1.09 ms each against 0.18 ms with lookahead off, for 0.7 GB of the
+  222 GB read. Queueing behind a busier pool, but a 6× per-read inflation is not obviously all
+  queueing. Not chased.
+- [ ] **Residual headroom.** At 6.05 GB/s while covered and baseline bytes, full coverage implies
+  ~2.0 tok/s against today's 1.422. The remaining +17.8 % bytes is the eviction churn the admission
+  policy row was written for.
 
 **Opened 2026-08-30 by the R2 structural probe. With R2 refuted the same day, this is the ONLY disk
 lever left — and on bulk reads alone it is worth ~1.58× (Qwen) / ~1.64× (MiniMax).**

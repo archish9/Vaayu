@@ -1,19 +1,21 @@
 """Hard-block guard for VAAYU_LOOKAHEAD=1.
 
-**The reason changed on 2026-08-30 and this docstring changed with it.** The
-guard used to exist because the prefetch path corrupted memory (device-side
-assert / NaN-Inf routing probabilities). That was root-caused and fixed:
-ExpertRAMCache.put_slab released a DECLINED slab while the caller still held
-views into it and was about to DMA from them. See
-check_lookahead_flag_safe.__doc__ and tests/test_slab_arena.py's
-test_declined_slab_is_not_handed_to_the_next_acquirer.
+**The reason has changed TWICE on 2026-08-30; this docstring tracks the third
+and current one.** The guard originally existed because the prefetch path
+corrupted memory. That was root-caused and fixed (ExpertRAMCache.put_slab
+released a DECLINED slab the caller was still reading — see
+tests/test_slab_arena.py::test_declined_slab_is_not_handed_to_the_next_acquirer).
+It then stood on performance, because the flag cost 15% of decode. An in-flight
+load reservation removed the duplicate stager/decode reads behind that cost and
+the flag became a measured **+11.4%** on Qwen3-235B.
 
-The guard still refuses, on PERFORMANCE: with the corruption fixed the flag
-runs clean and cuts decode's dead time 37.6% -> 15.1%, but reads 60% more bytes
-(prefetched experts evict the on-path working set) and costs 15% of decode
-throughput on Qwen3-235B. So the assertions below are unchanged -- it must
-still refuse, and still be a no-op when the flag is unset -- but a reader
-coming here for the reason must get the true one.
+It still refuses, now purely on COVERAGE: the predictor is wired only into the
+fused-EXL3 forward, so it is a silent no-op on the module-list forward
+(MiniMax), and it has never been measured under parallel fan-out. The
+assertions below are unchanged across all three revisions — refuse when set,
+no-op when unset — because what the guard DOES has never been the thing in
+question. What changes is why, and a reader who comes here for the reason must
+get the current one.
 """
 import os
 import pytest
