@@ -35,7 +35,9 @@ N=1/2/3, 12 interleaved arms). `VAAYU_LOOKAHEAD` helps at every N but the gain d
 **+12.8 % → +6.7 % → +2.2 %** while its byte cost rises to +24.6 %, and N=3 is inside the
 unexplained-drift band. Batching alone is the bigger free lever (**1.61×** aggregate at N=3, with
 bytes/token FALLING). P2 stands but is now bounded; **P3 (tiny reads) is promoted** — it holds a
-ring 91.7 % of decode at N=3 for 0.3 % of the bytes. Full trail:
+ring 91.7 % of decode at N=3 for 0.3 % of the bytes. **(That promotion was WRONG and is reversed by
+the next paragraph — occupancy was read as contention. Kept because it is what P1 concluded.)**
+Full trail:
 `plans/2026-08-30-P1-fanout-RESULTS.md`; harness `plans/probes/probe_fanout.py`.
 
 **2026-08-30, later still: P3 was BUILT and is REFUTED — row CLOSED.** Holding the scale/bias
@@ -108,7 +110,17 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
 | ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
-| 17 | **R4** — prefill repack memcpys into Rust | TTFT lever only, and prefix caching already took 136–377× off TTFT | `safetensor_model_persister.py` |
+| 17 | **P5** — control drift, 1.6 % → **22 % at N=3** | every row below closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
+| 18 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
+| 19 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
+| 20 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **Blocked by P5, P8** (headroom unknown until the ceiling is attributed) **and P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
+| 21 | **P7** — dense speculative decoding, banked **5.57×** | largest measured win on the board; waits on a DECISION, not engineering. Drags the two spec bugs in CARRIED FORWARD with it | `vaayu_base.py:4380` |
+| 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
+
+**Row numbers are FIXED IDENTIFIERS, never the order** — the `do` column is the order. The P-rows'
+full detail (file, symbol, done-condition, stop rule) is in
+[`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
+disagree, HANDOFF §2 is the one that was resequenced against measurements.
 
 **Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
 SUPERSEDED the same day; see row 14.)** M1 gated R2 and R3: decode
@@ -282,8 +294,9 @@ Order to fix them: the **FIX SEQUENCE** table at the top of this file. **ALL CLO
 B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11, B12, B16, B15 and B13
 (2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
-**Nothing in this section is open. R1 and P1 closed 2026-08-30; the next unticked FIX SEQUENCE
-row is M1**, which gates R2 and R3.
+**Nothing in this section is open, and no bug row is.** Every B row is closed; so is every R/M
+row except R4. **The next work is not a bug** — it is the P-row do-order in the FIX SEQUENCE table
+at the top of this file, which starts at **P5**.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
 `vaayu/server/engine.py` counted stream tokens as
@@ -826,7 +839,7 @@ All three confirmed to FAIL first, the URL one listing every stale site by
 ---
 
 
-# PERF — the Rust / token-generation rows (R1–R4, P1, M1)
+# PERF — the Rust rows (R1–R4, M1, C1, L1) and the P-rows (P1–P8)
 
 **The full argument, arithmetic and probes are in `speed-up-vaayu.md` at the repo root, which is
 self-contained.** What follows is one paragraph per row so this file stays usable on its own, plus
@@ -834,7 +847,9 @@ the section of that document to open.
 
 **The one number the whole thing turns on — re-measured by M1, 2026-08-30.** Decode-only, greedy,
 arena ballast-pinned, 6 arms per model: Qwen3-235B **4.018 GB/s**, MiniMax-M2.7 **3.912 GB/s**
-against the box's **~5.5 GB/s** NVMe (hardware constant) — **73.1 % and 71.1 % of the drive**.
+against the drive measured **through this same path** at 4 reads in flight (6.88 Qwen / 6.70
+MiniMax GB/s; sequential spec 7.45) — **50–51 % of the drive**. **The "73.1 % / 71.1 %" this
+paragraph used to quote came from the refuted ~5.5 GB/s denominator; see row C1.**
 (The older 4.09 / 3.93 GB/s figures, derived from 0.820 / 1.501 tok/s at a smaller arena, are
 superseded; the ratio they implied held up.)
 
@@ -1200,13 +1215,29 @@ must attack the eviction interaction, not the prefetch trigger:
     two actively-tested models and nothing for the other — the exact asymmetry CLAUDE.md §5 forbids.
   - **Measure under fan-out.** CLAUDE.md §0 says aggregate throughput under parallel streams is the
     workload. A prefetcher competing with N decode streams for one cache and 8 rings is unmeasured.
-- [ ] **Tiny reads are now the largest unexplained inefficiency.** 20.56 s of ring/worker occupancy
-  = **46.4 % of decode**, at 1.09 ms each against 0.18 ms with lookahead off, for 0.7 GB of the
-  222 GB read. Queueing behind a busier pool, but a 6× per-read inflation is not obviously all
-  queueing. Not chased.
-- [ ] **Residual headroom.** At 6.05 GB/s while covered and baseline bytes, full coverage implies
-  ~2.0 tok/s against today's 1.422. The remaining +17.8 % bytes is the eviction churn the admission
-  policy row was written for.
+- [x] **Tiny reads (P3) — BUILT and REFUTED 2026-08-30, row CLOSED. Do not rebuild the store.**
+  The occupancy is real (20.56 s = **46.4 % of decode**, 1.09 ms each vs 0.18 ms lookahead-off, for
+  0.7 GB of the 222 GB read) but it is **not waste**. Holding the scale/bias groups resident removes
+  100 % of the tiny reads (21168 / 42956 / 51190 → 0) and returns byte-identical greedy ids — and
+  costs **−2.7 % at N=1, −11.3 % / −14.5 % at N=3**, every store-off arm beating every store-on arm
+  with no overlap. Mechanism: the tiny reads were **STAGGERING** the 8-worker ring pool, not
+  stealing capacity from it. Remove them and the workers synchronise — dead time 24.8 → 29.9 %,
+  per-bulk-read latency 9.12 → 10.36 ms, aggregate 4.267 → 3.877 GB/s. NVMe bandwidth is
+  concurrency-dependent, so a burstier pattern reads the same bytes slower.
+  **The lesson this row cost, which generalises: occupancy is not contention, and read COUNT is a
+  resource.** A small interleaved read that keeps the drive's queue non-empty is worth more than the
+  ring-time it holds. Any future change that removes reads must measure the
+  bandwidth-vs-concurrency curve, not bytes and occupancy alone. It also sharpens the ordering rule:
+  *a measurement promotes a build only when it identifies a CONSTRAINT, not merely a large number.*
+  **The ~5.12 GB/s ceiling is therefore still unexplained — it is NOT the tiny reads (see P8).**
+  Trail: `plans/2026-08-30-P3-tiny-store-RESULTS.md`.
+- [ ] **Residual headroom — this is P4, and its number is now SUSPECT.** At 6.05 GB/s while
+  covered and baseline bytes, full coverage implies ~2.0 tok/s against today's 1.422. The remaining
+  +17.8 % bytes is the eviction churn the admission policy row was written for. **But that ~2.0
+  extrapolates a single-stream while-covered rate, and P8 found every lookahead-ON arm pinned at
+  5.073–5.126 GB/s aggregate with bandwidth-while-covered FALLING as N rises (6.03 → 5.77 → 5.75).
+  Do not quote ~2.0 tok/s until P8 attributes the ceiling.** P4 is blocked on P5 and P8, and on P2
+  to measure it on MiniMax at all.
 
 **Opened 2026-08-30 by the R2 structural probe. With R2 refuted the same day, this is the ONLY disk
 lever left — and on bulk reads alone it is worth ~1.58× (Qwen) / ~1.64× (MiniMax).**
@@ -1294,6 +1325,32 @@ and the LRU state, none of which must be a Python object.
 **Refuted if:** switch-interval changes do not move the token rate.
 → `speed-up-vaayu.md` §2 R3.
 </details>
+
+### P8 · [ ] The ~5.12 GB/s aggregate ceiling — **NEW 2026-08-30, unexplained, no owner**
+Opened because it had no row: **P1 found it, P3 eliminated the leading suspect, and it currently
+caps what P4 can be worth.** Every lookahead-ON arm in the P1 block read **5.073–5.126 GB/s
+aggregate** — six arms across N=1/2/3, a 1 % band — while lookahead-OFF arms sat at 3.86–4.04.
+Against the corrected drive figure (6.9 GB/s at 4 reads in flight, spec 7.45) that is 74 %, so it
+is not obviously the hardware. Two facts say "more reads" is not the fix:
+
+- **Bandwidth WHILE COVERED falls as N rises** — 6.03 → 5.77 → 5.75 (lookahead on), 5.95 → 5.60 →
+  5.57 (off). The reads get slower; they do not get scarcer.
+- **Removing reads made it WORSE** (P3): deleting 100 % of the tiny reads dropped aggregate from
+  4.267 to 3.877 GB/s and raised per-bulk-read latency 9.12 → 10.36 ms.
+
+**Candidates, none tested:** the 8-worker ring pool's own dispatch (does k ever exceed 8, and is 8
+the right number?); O_DIRECT read size vs the drive's optimal queue shape at 11.80 MB; the
+pinned-buffer pool (`_EXPERT_BUF_POOL`, `_EXPERT_POOL_N` = worker count) serialising acquisition; or
+a genuine device limit at this access pattern that C1's microbenchmark never hit. **C1's curve was
+measured with a standalone prober, NOT through the expert path — closing that gap is the first
+thing to do.**
+**Where:** `plans/probes/probe_split.py` gives the time-weighted bandwidth-vs-k curve per arm;
+`vaayu/persist/safetensor_model_persister.py` holds the pool and the read call.
+**Done means:** the ceiling is attributed to a named component, with a measurement that moves it —
+or a statement that it is the device, with a same-path microbenchmark to prove it.
+**Refuted if:** a same-path microbenchmark at k=8 with 11.80 MB reads also tops out near 5.1 GB/s.
+Then it IS the device at this access pattern, P4's headroom shrinks accordingly, and this row closes
+with that number recorded.
 
 ### R4 · [ ] Prefill repack memcpys into Rust — low priority
 `load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
