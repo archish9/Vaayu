@@ -77,8 +77,11 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1275 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-08-30 against HEAD with the day's edits stashed. It read 1257/3 until then, a figure written
+**Suite baseline: 1293 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-02 after P7's two streamer/drafter fixes (+8 tests). **The `1275/3` written here on
+2026-08-30 was already stale by 10 when it was read on 2026-09-02** — HEAD measured 1285/3 with the
+day's edits stashed. Re-measure against a stashed HEAD before quoting it; this figure has now gone
+stale three times. It read 1257/3 before 2026-08-30, a figure written
 2026-08-29 after B16+B15+B13 and left stale by the 18 tests R1 and P1 added on 2026-08-30 — neither B3 nor B6 added Python tests; both are `cargo test` in
 `vaayu_rust`, which went 6 → 13 (B3) → 19 (B6).
 It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
@@ -125,10 +128,17 @@ detail (file, symbol, done-condition, stop rule) is in
 [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
 disagree, HANDOFF §2 is the one that was resequenced against measurements.
 
-**P7 is not one row, it is three.** Shipping it means landing the 5.57× AND fixing the two
-speculative bugs in CARRIED FORWARD below, which are latent only because the drafter is off by
-default. The moment it defaults on, both are user-visible: streamed text short by one token, and
-`top_p`/`top_k`/stop-strings silently ignored. Do not ship the win without them.
+**P7 was three rows; it is FOUR, and two of them closed 2026-09-02.** Shipping it means landing the
+5.57× AND fixing the speculative bugs in CARRIED FORWARD below, latent only because the drafter is
+off by default. Status:
+- **[x] first generated token dropped from streamed text** — FIXED 2026-09-02, off-device + on-device.
+- **[x] the drafter's KV cache survived a call** — a FOURTH bug, not on this ledger before; found by
+  the determinism probe run alongside that fix, and the worse of the two. Every generation after the
+  first in a process returned different, degraded output. FIXED 2026-09-02.
+- **[ ] sampling-blind (`top_p`/`top_k`/stop-strings silently ignored)** — still open, must WARN.
+- **[ ] the 5.57× itself**, plus the reserve-policy check above. **Re-measure it**: it was banked
+  before the drafter-cache fix, so its "byte-identical output" was a first-generation-only property.
+Do not ship the win without the rest.
 
 **Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
 SUPERSEDED the same day; see row 14.)** M1 gated R2 and R3: decode
@@ -190,22 +200,39 @@ These are the only things still open from the closed work. Their full context is
   a resident small dense model, and it is the exact model whose clamp drove `pinning_budget → 0` for
   a measured −19 % decode. The 5.57× was measured with this pair, so the clamp evidently did not
   block the win; verify it, do not assume it.
-- **[ ] The speculative path drops its first generated token from streamed text — UNBLOCKED
-  2026-09-02, ships with P7.** Found
-  2026-08-23 while fixing B2. `stream_generate` builds its streamer with `skip_prompt=True`, which
-  makes `TextStreamer.put` swallow the FIRST call — correct under `generate()`, which puts the
-  prompt first, but `speculative_generate` never puts a prompt, so its
-  `streamer.put(first_token)` (`vaayu/vaayu_base.py:4380`) is the one that gets eaten. Streamed text
-  and B2's id count are both short by exactly one token. Only bites with a drafter loaded, which is
-  off by default. **Not fixed with B2 deliberately:** the fix is a contract change (either the
-  streamer learns which caller it has, or `speculative_generate` puts the prompt), and verifying it
-  needs a real drafter run on streamed dense — which CLAUDE.md §0 no longer defers. **Its unblock
-  condition is met:** fix it with the sampling-blind row below, same trigger, same file. **The line
-  number above is stale by design — grep for `streamer.put(first_token`; it drifted `:4380` → `:4426`
-  inside a single session.**
-- **[ ] The speculative path is sampling-blind — ships with P7.** `top_p` / `top_k` / stop-strings
-  are silently ignored when a drafter is active. It must WARN rather than pretend. **Bites the moment
-  the row above ships, which is now do-1.**
+- **[x] The speculative path drops its first generated token from streamed text — FIXED 2026-09-02.**
+  Root cause confirmed at source, not inferred: `TextStreamer.__init__` sets
+  `next_tokens_are_prompt = True` and `put()` returns early on the first call when
+  `skip_prompt=True` (transformers 5.5.4). `generate()` spends that call on the prompt;
+  `speculative_generate` had no prompt put, so the eaten call was `streamer.put(first_token)` — the
+  token seeded from prefill logits. Streamed text and B2's id sink were both short by exactly one.
+  **Fix:** `speculative_generate` now puts `input_ids` before `first_token`, i.e. it obeys
+  `generate()`'s streamer contract rather than the streamer learning who called it.
+  **Verified:** 4 tests in `tests/test_streaming.py` (each seen to FAIL against the old code),
+  plus an on-device arm — Llama-3.2-1B as its own drafter, a REAL drafter run on the real
+  speculative path, one call, streamer sink `==` the ids `speculative_generate` itself returned,
+  byte-identical. (The 70B was not needed to prove a streamer contract; the 1B shares its tokenizer
+  so the vocab gate admits it.)
+- **[x] The drafter's KV cache survived a `speculative_generate` call — NEW BUG, found and FIXED
+  2026-09-02.** Not on this ledger before; found by the determinism probe run alongside the fix
+  above. **Measured on-device:** three back-to-back greedy calls, same prompt, one process returned
+  three DIFFERENT sequences and only the FIRST was coherent — later ones degraded into repeated
+  fragments (`" Paris. Paris. The capital of France is Paris. …"`). Clearing the drafter cache
+  between calls made 3/3 byte-identical **and** equal to the first-ever run, so the carry-over is
+  the whole cause. `StandardDrafterDecoder` keeps `_drafter_past`/`_drafter_seen` across draft
+  rounds by design (Fix #9, which avoids an O(seq) re-prefill per rejection), but nothing cleared
+  them at the START of a generation, so call 2 sliced a NEW prompt with a length belonging to call
+  1's sequence and drafted from the previous prompt's context. **Fix:** `SpeculativeDecoder.reset()`
+  on the base (default no-op — prompt lookup is stateless and must still answer), overridden in
+  `StandardDrafterDecoder`, called by `speculative_generate` at entry. **Verified:** 4 tests in
+  `tests/test_speculative_reset.py` (all seen to FAIL first) + the same on-device arm now 6/6
+  identical with no manual reset. **This one bit P7's headline claim:** "byte-identical output"
+  held only for the first generation in a process, and every request after the first in a server
+  process was wrong. Re-measure the 5.57× on top of this fix before quoting it.
+- **[ ] The speculative path is sampling-blind — ships with P7. THE ONLY ONE OF THE THREE STILL
+  OPEN.** `top_p` / `top_k` / stop-strings are silently ignored when a drafter is active. It must
+  WARN rather than pretend. `vaayu/server/engine.py:224` already documents the behaviour in a
+  docstring; the engine does not warn. **Bites the moment the row above ships, which is now do-1.**
 
 ---
 

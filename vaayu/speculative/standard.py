@@ -96,6 +96,13 @@ class StandardDrafterDecoder(SpeculativeDecoder):
     def vram_usage_bytes(self) -> int:
         return self._vram_bytes
 
+    def reset(self) -> None:
+        """Drop the cross-generation cache. `_drafter_seen` is a length into ONE
+        sequence, so carrying either into the next generation makes draft() feed
+        a new prompt's tail on top of the previous prompt's KV."""
+        self._drafter_past = None
+        self._drafter_seen = 0
+
     def rollback_cache(self, draft_state: object, num_accepted: int) -> None:
         """Crop the drafter cache to the accepted prefix (Fix #9). Never resets
         to None — the old full re-prefill was O(seq) per rejection."""

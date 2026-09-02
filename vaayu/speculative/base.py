@@ -47,3 +47,12 @@ class SpeculativeDecoder(ABC):
     @abstractmethod
     def rollback_cache(self, draft_state: object, num_accepted: int) -> None:
         """Trim drafter KV cache so it aligns with accepted token count."""
+
+    def reset(self) -> None:
+        """Drop all state carried between generations.
+
+        rollback_cache aligns the drafter WITHIN one generation loop; this
+        clears what must not survive INTO the next one, where input_ids is a
+        different sequence. Default no-op: a stateless decoder (prompt lookup)
+        has nothing to drop and must still answer the call.
+        """

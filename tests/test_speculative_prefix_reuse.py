@@ -52,6 +52,11 @@ class _FakeSpeculator:
     def rollback_cache(self, draft_state, num_accepted) -> None:
         pass
 
+    def reset(self) -> None:
+        # Stateless fake, but it must answer the contract speculative_generate
+        # calls at entry -- see tests/test_speculative_reset.py.
+        pass
+
 
 class _FakeSpecModel:
     """Just enough of VaayuBaseModel's surface for speculative_generate to

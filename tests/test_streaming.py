@@ -125,3 +125,54 @@ def test_stream_generate_fills_token_ids_out_when_asked():
 def test_stream_generate_is_unchanged_when_no_sink_is_passed():
     model = _FakeModel(_happy_path)
     assert list(stream_generate(model, input_ids=None, max_new_tokens=1)) == ["hello ", "world"]
+
+
+# ── the speculative path's first token (P7) ──────────────────────────────────
+# TextStreamer.put() swallows its FIRST call when skip_prompt=True, and
+# stream_generate always sets skip_prompt=True. generate() spends that call on
+# the prompt; speculative_generate has no prompt put, so the call that gets
+# eaten is its first GENERATED token -- the one seeded from prefill logits.
+# Latent only because the drafter is off by default.
+
+from vaayu.vaayu_base import VaayuBaseModel
+
+from .test_speculative_prefix_reuse import _FakeSpecModel
+from vaayu.prefix_cache import PrefixCacheStore
+
+
+def _spec_run(streamer, max_new_tokens=3):
+    model = _FakeSpecModel(PrefixCacheStore(budget_bytes=10 ** 9))
+    return VaayuBaseModel.speculative_generate(
+        model, torch.tensor([[1, 2, 3, 4, 5]]),
+        max_new_tokens=max_new_tokens, streamer=streamer, session_id="s1")
+
+
+def test_speculative_streams_every_generated_id_under_skip_prompt():
+    sink, s = _sink_streamer(skip_prompt=True)
+    out = _spec_run(s)
+    generated = out[0, 5:].tolist()
+    assert len(generated) == 3, "premise: 3 tokens were generated"
+    assert sink == generated, "the prefill-seeded first token never reached the streamer"
+
+
+def test_speculative_streams_every_generated_token_as_text():
+    from transformers import TextIteratorStreamer
+    s = TextIteratorStreamer(_FakeIdTokenizer(), skip_prompt=True)
+    out = _spec_run(s)
+    text = "".join(list(s))
+    assert text == "".join(f"<{i}>" for i in out[0, 5:].tolist())
+
+
+def test_speculative_still_skips_the_prompt_under_skip_prompt():
+    # The fix must not swing the other way: the prompt is not generated text.
+    sink, s = _sink_streamer(skip_prompt=True)
+    out = _spec_run(s)
+    assert 1 not in sink and 5 not in sink, "prompt ids leaked into the sink"
+    assert len(sink) == out.shape[1] - 5
+
+
+def test_speculative_with_skip_prompt_off_streams_prompt_then_generated():
+    # skip_prompt=False is generate()'s contract: prompt first, then tokens.
+    sink, s = _sink_streamer(skip_prompt=False)
+    out = _spec_run(s)
+    assert sink == out[0].tolist()

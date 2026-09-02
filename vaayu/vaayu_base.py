@@ -4378,6 +4378,14 @@ class VaayuBaseModel(GenerationMixin):
         """
         assert self.speculator is not None, "speculative_generate called with no speculator"
 
+        # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
+        # only correct within one generation: `_drafter_seen` is a length into
+        # THIS input_ids. Carried into the next call it slices a different
+        # sequence, and the drafter drafts from another prompt's context.
+        # Measured: three identical greedy calls in one process returned three
+        # different sequences; resetting made them byte-identical.
+        self.speculator.reset()
+
         self._batch_decode_active = False
         self._batch_n = 1
 
@@ -4423,6 +4431,12 @@ class VaayuBaseModel(GenerationMixin):
         tokens_generated = 1
 
         if streamer is not None:
+            # Put the PROMPT first, exactly as generate() does. A streamer built
+            # with skip_prompt=True (what stream_generate always builds) swallows
+            # its first put() and clears the flag; without this line the call it
+            # eats is `first_token` -- the first GENERATED token -- so streamed
+            # text and the id sink are both short by exactly one token.
+            streamer.put(input_ids.cpu())
             streamer.put(first_token.cpu())
 
         eos_ids = self.config.eos_token_id
