@@ -77,8 +77,8 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1293 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-02 after P7's two streamer/drafter fixes (+8 tests). **The `1275/3` written here on
+**Suite baseline: 1303 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-02 after P7's three fixes — streamer, drafter reset, sampling-blind (+18 tests). **The `1275/3` written here on
 2026-08-30 was already stale by 10 when it was read on 2026-09-02** — HEAD measured 1285/3 with the
 day's edits stashed. Re-measure against a stashed HEAD before quoting it; this figure has now gone
 stale three times. It read 1257/3 before 2026-08-30, a figure written
@@ -113,7 +113,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
 | ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
-| 17 | **P7** — dense speculative decoding, banked **5.57×** — **AND the two spec bugs with it** | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
+| 17 | **P7** — dense speculative decoding, banked **5.57×** — **all three spec bugs are now FIXED (2026-09-02); what is left is the RE-MEASURE and the reserve-policy check** | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
 | 18 | **P5** — control drift, 1.6 % → **22 % at N=3** | first among the MoE fan-out rows: every one of them closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
 | 19 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
 | 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
@@ -128,14 +128,29 @@ detail (file, symbol, done-condition, stop rule) is in
 [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
 disagree, HANDOFF §2 is the one that was resequenced against measurements.
 
-**P7 was three rows; it is FOUR, and two of them closed 2026-09-02.** Shipping it means landing the
+**P7 was three rows; it is FOUR, and three of them closed 2026-09-02.** Shipping it means landing the
 5.57× AND fixing the speculative bugs in CARRIED FORWARD below, latent only because the drafter is
 off by default. Status:
 - **[x] first generated token dropped from streamed text** — FIXED 2026-09-02, off-device + on-device.
 - **[x] the drafter's KV cache survived a call** — a FOURTH bug, not on this ledger before; found by
   the determinism probe run alongside that fix, and the worse of the two. Every generation after the
   first in a process returned different, degraded output. FIXED 2026-09-02.
-- **[ ] sampling-blind (`top_p`/`top_k`/stop-strings silently ignored)** — still open, must WARN.
+- **[x] sampling-blind — FIXED 2026-09-02, and it was WIDER than this row said.** The row named
+  `top_p`/`top_k`/stop-strings; `temperature` is dropped too — it is a declared parameter of
+  `speculative_generate` that nothing reads, and every token in that loop is an argmax (prefill
+  seed, drafter, verifier, in both speculators). So the server's own warning was built on a false
+  premise ("honours temperature only") and stayed SILENT on the common case: `temperature>0` with
+  default top_p/top_k got greedy text and no warning at all. **Fix:** one helper,
+  `speculative_ignored_sampling(temperature, kwargs)` in `vaayu_base.py`, printed at
+  `speculative_generate` entry (so the library path warns too, not only the server) and asked by
+  `EngineHandle.warn_if_speculative_sampling_ignored` against the kwargs the request would run
+  with, so the two can never disagree. `top_p`/`top_k` are named only when sampling was actually
+  requested (HF ignores them under `do_sample=False` too); `stopping_criteria` is never named —
+  it IS honoured per round, and it carries cancellation. **Verified:** 9 tests in
+  `tests/test_speculative_sampling_warning.py` + 1 in `tests/test_server_engine.py` (all seen to
+  FAIL first), plus an on-device arm — Llama-3.2-1B as its own drafter through `stream_generate`,
+  sampled call warns exactly once naming `temperature, top_p`, greedy call silent, and both
+  returned the SAME text, which is the symptom itself. Suite **1303 passed, 3 skipped**.
 - **[ ] the 5.57× itself**, plus the reserve-policy check above. **Re-measure it**: it was banked
   before the drafter-cache fix, so its "byte-identical output" was a first-generation-only property.
 Do not ship the win without the rest.
@@ -229,10 +244,14 @@ These are the only things still open from the closed work. Their full context is
   identical with no manual reset. **This one bit P7's headline claim:** "byte-identical output"
   held only for the first generation in a process, and every request after the first in a server
   process was wrong. Re-measure the 5.57× on top of this fix before quoting it.
-- **[ ] The speculative path is sampling-blind — ships with P7. THE ONLY ONE OF THE THREE STILL
-  OPEN.** `top_p` / `top_k` / stop-strings are silently ignored when a drafter is active. It must
-  WARN rather than pretend. `vaayu/server/engine.py:224` already documents the behaviour in a
-  docstring; the engine does not warn. **Bites the moment the row above ships, which is now do-1.**
+- **[x] The speculative path is sampling-blind — FIXED 2026-09-02.** The row read "`top_p`/`top_k`/
+  stop-strings" and "the engine does not warn"; both were off. **`temperature` is dropped too**
+  (declared, unread; the loop argmaxes everywhere), and the server DID warn — with a message
+  claiming temperature was the one thing honoured, so a plain `temperature=0.7` request got
+  greedy text in silence. Both layers now ask one helper,
+  `speculative_ignored_sampling` in `vaayu_base.py`, and `speculative_generate` prints the
+  warning itself so library callers (`stream_generate` defaults to `temperature=0.7, top_p=0.9`)
+  are told too. Detail and evidence in the P7 status block above.
 
 ---
 

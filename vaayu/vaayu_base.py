@@ -664,6 +664,36 @@ def compute_prefill_pass(seq_len: int, has_speculator: bool, draft_tokens: int) 
     return seq_len > verify_cap
 
 
+def speculative_ignored_sampling(temperature, kwargs) -> list:
+    """Names the sampling controls a `speculative_generate` call asked for and
+    will NOT get, so the caller can be told instead of guessing from the text.
+
+    That loop is GREEDY at every decision point -- the prefill seed, the
+    drafter, and the verifier all argmax -- and it takes `temperature` only to
+    swallow it unread, so temperature belongs in this list like the rest.
+    `top_p`/`top_k` are named only when sampling was actually requested, since
+    HF's generate() ignores them under do_sample=False too and naming them
+    there would fire on every greedy request carrying the defaults along.
+    `stop_strings` is dropped regardless (this hand-written loop has no such
+    machinery); `stopping_criteria` IS honoured per round, so it is never named.
+    """
+    ignored = []
+    if bool(kwargs.get("do_sample")) or (temperature or 0.0) > 0.0:
+        if (temperature or 0.0) > 0.0:
+            ignored.append("temperature")
+        top_p = kwargs.get("top_p")
+        if top_p is not None and top_p != 1.0:
+            ignored.append("top_p")
+        top_k = kwargs.get("top_k")
+        if top_k not in (None, 0):
+            ignored.append("top_k")
+        if not ignored:
+            ignored.append("do_sample")
+    if kwargs.get("stop_strings"):
+        ignored.append("stop_strings")
+    return ignored
+
+
 def compute_stage_gate(seq_len: int, geometry: dict) -> bool:
     """Enable prefill expert staging only when the prompt is long enough that
     routing touches ~all experts per layer (expected coverage >= ~86% at
@@ -4377,6 +4407,15 @@ class VaayuBaseModel(GenerationMixin):
             generated: (1, prompt_len + new_tokens) tensor of all token IDs
         """
         assert self.speculator is not None, "speculative_generate called with no speculator"
+
+        # This loop honours NOTHING about sampling -- say so rather than hand
+        # back greedy text under a sampled request's name (CLAUDE.md: warn, do
+        # not silently degrade).
+        _ignored = speculative_ignored_sampling(temperature, kwargs)
+        if _ignored:
+            print(f"[Vaayu-Spec] WARNING: speculative decoding is greedy; "
+                  f"{', '.join(_ignored)} IGNORED for this generation. "
+                  f"Load without drafter_model_path to use them.")
 
         # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
         # only correct within one generation: `_drafter_seen` is a length into

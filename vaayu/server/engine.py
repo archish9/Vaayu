@@ -221,22 +221,28 @@ class EngineHandle:
         return prompt_ids, cap
 
     def warn_if_speculative_sampling_ignored(self, req):
-        """speculative_generate honours `temperature` only; top_p/top_k/stop fall
-        into **kwargs and are silently discarded. Return a message when this
-        request asks for something that path will drop, else None."""
+        """speculative_generate is GREEDY -- temperature included, though it is a
+        declared parameter and this docstring used to claim it was honoured.
+        Return a message when this request asks for something that path will
+        drop, else None.
+
+        Asked of the same helper the engine warns with, against the kwargs this
+        request would actually be run with, so the two can never disagree.
+        """
+        from ..vaayu_base import speculative_ignored_sampling
+
         if getattr(self.model, "speculator", None) is None:
             return None
-        ignored = []
-        if req.top_p != 1.0:
-            ignored.append("top_p")
-        if req.top_k != 0:
-            ignored.append("top_k")
+        kwargs = {}
+        if req.temperature > 0.0:
+            kwargs.update(do_sample=True, top_p=req.top_p, top_k=req.top_k)
         if req.stop:
-            ignored.append("stop")
+            kwargs["stop_strings"] = list(req.stop)
+        ignored = speculative_ignored_sampling(req.temperature, kwargs)
         if not ignored:
             return None
-        return (f"speculative decoding is active and its loop honours temperature "
-                f"only, so {', '.join(ignored)} will be IGNORED for this request. "
+        return (f"speculative decoding is active and its loop is greedy, so "
+                f"{', '.join(ignored)} will be IGNORED for this request. "
                 f"Load without drafter_model_path to use them.")
 
     def build_generate_kwargs(self, req, prompt_ids, cap=None, cancel=None) -> dict:

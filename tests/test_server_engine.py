@@ -634,3 +634,13 @@ def test_a_normally_finished_generate_still_reports_stop():
 def test_tool_format_is_none_for_a_template_without_tool_support():
     e = EngineHandle(FakeModel(chat_template=PLAIN_TEMPLATE))
     assert e.tool_format is None, "a plain template must still refuse tools"
+
+
+def test_a_speculator_plus_temperature_warns_because_the_loop_is_greedy():
+    # The docstring here used to say "honours temperature only". It does not:
+    # `temperature` is a declared, unread parameter and every token in that
+    # loop is an argmax. A sampled request with default top_p/top_k -- the
+    # common case -- got greedy text and no warning at all.
+    e = EngineHandle(FakeModel(speculator=object()))
+    msg = e.warn_if_speculative_sampling_ignored(_req(temperature=0.7))
+    assert msg is not None and "temperature" in msg
