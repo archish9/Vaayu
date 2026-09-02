@@ -53,7 +53,8 @@ ceiling P1 found is NOT the tiny reads and remains unexplained. Trail:
 never the order, and `HANDOFF-2026-08-30.md` §2 now opens with the do-order table. Short version:
 **P5 (control drift, escalated 1.6 % → 22 % at N=3) and P8 (the ~5.12 GB/s ceiling, a NEW row that
 had no home) come FIRST**, because every implementation row left closes on a same-day A/B and at
-N=3 the controls no longer hold still. Then P2, then P4 (which gained the file/symbol detail it was
+N=3 the controls no longer hold still. **P5 CLOSED 2026-09-02 — the drift does not reproduce and
+N=3 A/Bs are trustworthy again (0.06–0.18 % across seven arms, both models); P8 is now first.** Then P2, then P4 (which gained the file/symbol detail it was
 missing, and whose ~2.0 tok/s headroom is now marked SUSPECT pending P8), then P7, then P6.
 
 Two documents outside this file are load-bearing, and both are self-contained:
@@ -114,10 +115,10 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
 | ~~17~~ | ~~**P7**~~ — **DONE 2026-09-02.** All three spec bugs FIXED; the win RE-MEASURED on top of them at **5.54× / 5.47× / 5.47×** over three generations (0.149 → 0.828 tok/s), all byte-identical to the greedy baseline; reserve-policy risk CHECKED and it does not fire. Remaining is a shipping decision, not evidence | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
-| 18 | **P5** — control drift, 1.6 % → **22 % at N=3** | first among the MoE fan-out rows: every one of them closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
+| ~~18~~ | ~~**P5**~~ — **DONE 2026-09-02: drift does NOT reproduce, the ~20 % unfalsifiability rule is LIFTED.** Seven arms, both models: Qwen 1.739/1.738/1.739 (0.06 %), Qwen@ballast-27 1.901/1.903 (0.10 %), MiniMax 2.762/2.767 (0.18 %), greedy ids byte-identical in every pair. The suspected cause (arena sizing off psutil avail at load) is CONFIRMED to wobble — 1473/1469/1463 slabs, 43 vs 41 cached layers — and REFUTED as the mechanism: it moves throughput 0.06 %. **New rule: `BALLAST_GB` is an arm variable, not hygiene** — 25→27 GB is +9.4 % tok/s (arena +10.4 %, bytes/token −8.3 %); never compare across targets. The 22 % most probably belonged to P3's uncommitted store build, live in that block and now gone — unretestable, recorded as probable not confirmed | `plans/2026-09-02-P5-control-drift-RESULTS.md`; comparator `plans/probes/p5_drift.py` |
 | 19 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
-| 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
-| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **Blocked by P5, P8** (headroom unknown until the ceiling is attributed) **and P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
+| 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **UNBLOCKED 2026-09-02: P5 closed, N=3 replicates hold to 0.2 % on MiniMax itself** | `moe_patch.py` `_make_modulelist_sparse_forward` |
+| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **P5 cleared 2026-09-02**; still blocked by **P8** (headroom unknown until the ceiling is attributed) and **P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
 | 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
 
 **The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
@@ -295,6 +296,15 @@ These are the only things still open from the closed work. Their full context is
   checkpoint's first touch; redirect stdout to a file; `grep -a` logs, never `cat` (300 MB–1.3 GB).
 - **Same-box, same-day A/B or it does not count.** `main` itself has fallen below two historical
   gate bars on unchanged code.
+- **`BALLAST_GB` is an ARM VARIABLE — state it, hold it fixed across a comparison, never compare
+  across targets (P5, 2026-09-02).** It sets the expert slab arena, and the arena sets throughput:
+  25 → 27 GB grew the arena 1469 → 1622 slabs (+10.4 %), cut bytes/token 8.3 %, and raised N=3
+  aggregate **+9.4 %** — larger than most effects these probes exist to detect. The ballast pins
+  avail BEFORE the load; the arena is sized DURING it, so identical arms still land on arenas a few
+  slabs apart (harmless: 0.06 % on throughput).
+- **N=3 A/Bs are trustworthy again (P5, 2026-09-02).** Replicates hold to **0.06–0.18 %** on both
+  MoE models. The old "treat any N=3 A/B inside ~20 % as unfalsifiable" rule is LIFTED. Still check
+  greedy ids match across arms before believing any throughput delta (trap #6).
 - **A plan ending in refutation CLOSES its row.** Record the verdict in the archive and move on;
   do not re-scope a plan to find a win.
 
