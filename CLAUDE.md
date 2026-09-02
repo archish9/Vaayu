@@ -12,12 +12,17 @@ model-agnostic engine — MoE or dense, EXL3-quantized or not, CUDA or CPU compu
 — the user selects what to load** (see the dispatch table below). MoE-EXL3 on
 CUDA is the actively-tested / perf-tuned area much of the current work targets —
 but note it spans **two different forwards**, one per expert layout (table below).
-Dense must keep working: **large streamed-dense performance is a planned FUTURE
-target**, deferred until the MoE path is solid. When that work starts, optimize
+Dense must keep working, and **large streamed-dense performance is now ON THE
+ROADMAP — the deferral was lifted 2026-09-02.** (It previously read "a planned
+FUTURE target, deferred until the MoE path is solid"; that is no longer the
+policy, and anything still citing the deferral as a reason to sit on dense work
+is stale.) The first dense item is already banked and measured: speculative
+decoding, **5.57×** on Llama-3.3-70B with the Llama-3.2-1B drafter — `todo.md`
+row P7, which ships with two known bugs that bite on the day it lands. Optimize
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
 the MoE tests green, and treat any change to shared infra (staging, prefix
-cache, NVMe warmup, io_uring) as touching both paths. Until then, MoE changes
-must not silently break dense — `test_batched_dense_smoke.py` guards that.
+cache, NVMe warmup, io_uring) as touching both paths. MoE changes still must not
+silently break dense — `test_batched_dense_smoke.py` guards that.
 
 **Dense reference checkpoint (on-device):**
 `/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` —

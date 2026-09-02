@@ -110,17 +110,25 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
 | ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
-| 17 | **P5** — control drift, 1.6 % → **22 % at N=3** | every row below closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
-| 18 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
-| 19 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
-| 20 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **Blocked by P5, P8** (headroom unknown until the ceiling is attributed) **and P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
-| 21 | **P7** — dense speculative decoding, banked **5.57×** | largest measured win on the board; waits on a DECISION, not engineering. Drags the two spec bugs in CARRIED FORWARD with it | `vaayu_base.py:4380` |
+| 17 | **P7** — dense speculative decoding, banked **5.57×** — **AND the two spec bugs with it** | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
+| 18 | **P5** — control drift, 1.6 % → **22 % at N=3** | first among the MoE fan-out rows: every one of them closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
+| 19 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
+| 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
+| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **Blocked by P5, P8** (headroom unknown until the ceiling is attributed) **and P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
 | 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
 
-**Row numbers are FIXED IDENTIFIERS, never the order** — the `do` column is the order. The P-rows'
-full detail (file, symbol, done-condition, stop rule) is in
+**The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
+the name P7 — the names are referenced from `HANDOFF-2026-08-30.md` and the results docs and are
+never renumbered. **RESEQUENCED 2026-09-02** when dense went on the roadmap: P7 moved from last-but-one
+to first, because the only thing holding it was a decision that has now been made. The P-rows' full
+detail (file, symbol, done-condition, stop rule) is in
 [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
 disagree, HANDOFF §2 is the one that was resequenced against measurements.
+
+**P7 is not one row, it is three.** Shipping it means landing the 5.57× AND fixing the two
+speculative bugs in CARRIED FORWARD below, which are latent only because the drafter is off by
+default. The moment it defaults on, both are user-visible: streamed text short by one token, and
+`top_p`/`top_k`/stop-strings silently ignored. Do not ship the win without them.
 
 **Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
 SUPERSEDED the same day; see row 14.)** M1 gated R2 and R3: decode
@@ -151,9 +159,12 @@ These are the only things still open from the closed work. Their full context is
   is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
   server runs the streamed big models at their measured ceiling (~0.56–0.86 tok/s MoE at 8192,
   single stream). **Not a blocker:** the server is model-agnostic and does not wait on this.
-- **[ ] Reserve policy vs a resident model.** The reserve floors were tuned for STREAMED models; on
-  Llama-3.2-1B the clamp drove `pinning_budget → 0` for a measured **−19 % decode**. Unmeasured for
-  a resident coder model because none is on disk. Re-check the moment one lands.
+- **[ ] Reserve policy vs a resident model — PREMISE CHANGED 2026-09-02, re-check now.** The reserve
+  floors were tuned for STREAMED models; on Llama-3.2-1B the clamp drove `pinning_budget → 0` for a
+  measured **−19 % decode**. This row said "unmeasured for a resident coder model because none is on
+  disk" — **that is no longer true.** P7 (do-1) loads Llama-3.2-1B as a RESIDENT drafter alongside a
+  streamed 70B, which is exactly the configuration the clamp misbehaved in. It is no longer waiting
+  on a checkpoint; it is a live risk to P7's shipped numbers. Check it as part of P7.
 - **[ ] `_finish` cannot report WHICH stop string fired.** HF trims a matched stop string before
   returning, so the ids cannot be inspected for one; `_finish` infers `hit_stop_string` from
   `produced < cap`. The dangerous half of this closed with B5 (2026-08-23) — a cancelled run no
@@ -166,13 +177,21 @@ These are the only things still open from the closed work. Their full context is
   pinning — was implemented and **REJECTED** (byte-identical result). The gap is confined to the
   small-budget regime (at 16 GB it predicted 20.3 % for MiniMax against a measured 21.3 %).
   **Do not quote its small-budget absolutes.**
-- **[!] Speculative decoding on streamed dense is BANKED and unshipped.** Measured **5.57×** on
-  Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output) with the Llama-3.2-1B
-  drafter, which shares its tokenizer. Opt-in via `drafter_model_path`, off by default because
-  CLAUDE.md §0 defers streamed-dense perf. **Unblocked by: dense work starting. Then this is the
-  first lever, and it already exists.** MoE speculation stays refuted — the gate admits
-  `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible drafter here.
-- **[!] The speculative path drops its first generated token from streamed text.** Found
+- **[ ] Speculative decoding on streamed dense — UNBLOCKED 2026-09-02, and it is now do-1 (P7).**
+  Measured **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output)
+  with the Llama-3.2-1B drafter, which shares its tokenizer. Opt-in via `drafter_model_path`, and it
+  was off by default only because CLAUDE.md §0 deferred streamed-dense perf. **That deferral was
+  LIFTED 2026-09-02 — dense is on the roadmap — so the stated unblock condition ("dense work
+  starting") is met and this is the first lever, already built.** MoE speculation stays refuted: the
+  gate admits `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible
+  drafter here. **Ships with the two rows below — they are the cost of turning it on, not follow-up.**
+  **Check before trusting 5.57× in a shipped config:** the reserve-policy row above was filed as
+  "unmeasured because no resident model is on disk", and that premise is now FALSE — the drafter IS
+  a resident small dense model, and it is the exact model whose clamp drove `pinning_budget → 0` for
+  a measured −19 % decode. The 5.57× was measured with this pair, so the clamp evidently did not
+  block the win; verify it, do not assume it.
+- **[ ] The speculative path drops its first generated token from streamed text — UNBLOCKED
+  2026-09-02, ships with P7.** Found
   2026-08-23 while fixing B2. `stream_generate` builds its streamer with `skip_prompt=True`, which
   makes `TextStreamer.put` swallow the FIRST call — correct under `generate()`, which puts the
   prompt first, but `speculative_generate` never puts a prompt, so its
@@ -180,11 +199,13 @@ These are the only things still open from the closed work. Their full context is
   and B2's id count are both short by exactly one token. Only bites with a drafter loaded, which is
   off by default. **Not fixed with B2 deliberately:** the fix is a contract change (either the
   streamer learns which caller it has, or `speculative_generate` puts the prompt), and verifying it
-  needs a real drafter run on streamed dense, which CLAUDE.md §0 defers. **Unblocked by: speculative
-  decoding shipping** — fix it with the sampling-blind row below, same trigger, same file.
-- **[ ] The speculative path is sampling-blind.** `top_p` / `top_k` / stop-strings are silently
-  ignored when a drafter is active. It must WARN rather than pretend. Bites the moment the row above
-  ships.
+  needs a real drafter run on streamed dense — which CLAUDE.md §0 no longer defers. **Its unblock
+  condition is met:** fix it with the sampling-blind row below, same trigger, same file. **The line
+  number above is stale by design — grep for `streamer.put(first_token`; it drifted `:4380` → `:4426`
+  inside a single session.**
+- **[ ] The speculative path is sampling-blind — ships with P7.** `top_p` / `top_k` / stop-strings
+  are silently ignored when a drafter is active. It must WARN rather than pretend. **Bites the moment
+  the row above ships, which is now do-1.**
 
 ---
 
