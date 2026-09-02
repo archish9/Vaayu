@@ -113,7 +113,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
 | ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
-| 17 | **P7** — dense speculative decoding, banked **5.57×** — **all three spec bugs are now FIXED (2026-09-02); what is left is the RE-MEASURE and the reserve-policy check** | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
+| ~~17~~ | ~~**P7**~~ — **DONE 2026-09-02.** All three spec bugs FIXED; the win RE-MEASURED on top of them at **5.54× / 5.47× / 5.47×** over three generations (0.149 → 0.828 tok/s), all byte-identical to the greedy baseline; reserve-policy risk CHECKED and it does not fire. Remaining is a shipping decision, not evidence | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
 | 18 | **P5** — control drift, 1.6 % → **22 % at N=3** | first among the MoE fan-out rows: every one of them closes on a same-day A/B, and at N=3 the controls no longer hold still. Measurement, no new code | `plans/probes/probe_fanout.py`; detail: L1's bullets below |
 | 19 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
 | 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **Blocked by P5** (same-day A/B) | `moe_patch.py` `_make_modulelist_sparse_forward` |
@@ -128,9 +128,10 @@ detail (file, symbol, done-condition, stop rule) is in
 [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
 disagree, HANDOFF §2 is the one that was resequenced against measurements.
 
-**P7 was three rows; it is FOUR, and three of them closed 2026-09-02.** Shipping it means landing the
-5.57× AND fixing the speculative bugs in CARRIED FORWARD below, latent only because the drafter is
-off by default. Status:
+**P7 was three rows; it is FOUR, and ALL FOUR closed 2026-09-02.** The row is DONE: the three
+speculative bugs are fixed and the win was re-measured on top of them. What remains is a shipping
+decision (whether `drafter_model_path` defaults on for dense), which is policy, not evidence.
+Status:
 - **[x] first generated token dropped from streamed text** — FIXED 2026-09-02, off-device + on-device.
 - **[x] the drafter's KV cache survived a call** — a FOURTH bug, not on this ledger before; found by
   the determinism probe run alongside that fix, and the worse of the two. Every generation after the
@@ -151,8 +152,19 @@ off by default. Status:
   FAIL first), plus an on-device arm — Llama-3.2-1B as its own drafter through `stream_generate`,
   sampled call warns exactly once naming `temperature, top_p`, greedy call silent, and both
   returned the SAME text, which is the symptom itself. Suite **1303 passed, 3 skipped**.
-- **[ ] the 5.57× itself**, plus the reserve-policy check above. **Re-measure it**: it was banked
-  before the drafter-cache fix, so its "byte-identical output" was a first-generation-only property.
+- **[x] the 5.57× itself — RE-MEASURED 2026-09-02, CONFIRMED, and the reserve-policy check with
+  it.** Same box, same day, one arm per subprocess: `generate()` **0.149 tok/s** vs
+  `speculative_generate()` **0.828 / 0.817 / 0.816** over three back-to-back generations =
+  **5.54× / 5.47× / 5.47×**, 18 rounds each, 5.50 tokens/round, **90 % drafted-token acceptance**
+  (81/90). **All three generations are byte-identical to each other AND to the greedy baseline** —
+  which is the property the drafter-cache bug used to break after gen 1. Banked was 0.155 → 0.864;
+  both arms are ~4 % slower today and move together, so the ratio holds.
+  **Reserve policy does NOT bite this pair:** pinning_budget 10.75 GiB (base) vs 10.73 (drafter
+  resident), pinning 2.89 GB / 3 shared modules in BOTH, drafter 2.47 GB. The −19 % clamp case was
+  Llama-3.2-1B as the TARGET model, not as a resident drafter beside a streamed 70B; bug 12a's fix
+  (drafter built at `vaayu_base.py:1830`, above the expert-cache sizing) is why the cache does not
+  double-spend it. Trail: `plans/2026-09-02-P7-remeasure-RESULTS.md`; harness
+  `plans/probes/arm_p7_remeasure.py`, raw `plans/probes/p7-{base,spec}.json`.
 Do not ship the win without the rest.
 
 **Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
@@ -184,7 +196,12 @@ These are the only things still open from the closed work. Their full context is
   is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
   server runs the streamed big models at their measured ceiling (~0.56–0.86 tok/s MoE at 8192,
   single stream). **Not a blocker:** the server is model-agnostic and does not wait on this.
-- **[ ] Reserve policy vs a resident model — PREMISE CHANGED 2026-09-02, re-check now.** The reserve
+- **[x] Reserve policy vs a resident model — CHECKED 2026-09-02 as part of P7, does NOT fire.**
+  Measured on the exact configuration this row feared (Llama-3.2-1B resident as drafter beside the
+  streamed 70B): pinning_budget 10.73 GiB vs the no-drafter arm's 10.75, and BOTH arms pinned the
+  same 2.89 GB / 3 shared modules. The −19 % clamp was Llama-3.2-1B as the TARGET model — a
+  different premise. Detail in `plans/2026-09-02-P7-remeasure-RESULTS.md`. Original text follows.
+- **[ ] (superseded, kept for the reasoning) Reserve policy vs a resident model.** The reserve
   floors were tuned for STREAMED models; on Llama-3.2-1B the clamp drove `pinning_budget → 0` for a
   measured **−19 % decode**. This row said "unmeasured for a resident coder model because none is on
   disk" — **that is no longer true.** P7 (do-1) loads Llama-3.2-1B as a RESIDENT drafter alongside a
