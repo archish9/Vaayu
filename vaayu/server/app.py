@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
 from .engine import CancelToken, EngineHandle, QueueFull
-from .logs import capture_stdio
+from .logs import capture_stdio, new_run_dir
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
@@ -263,13 +263,20 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         restore_stdio = None
+        run_dir = None
         try:
+            if config is not None:
+                # One directory per process, created BEFORE the load so pinning
+                # and NVMe warmup land in this run's file rather than the last
+                # one's. `config.log_dir` stays the ROOT; runs live beneath it.
+                run_dir = new_run_dir(config.log_dir)
+                app.state.run_dir = run_dir
             if config is not None and config.capture_stdio:
-                # Before the load, so pinning and NVMe warmup end up in the file too.
                 restore_stdio = capture_stdio(
-                    Path(config.log_dir) / "server.log", rotate_mb=config.log_rotate_mb)
-                print(f"[Vaayu-Server] logging to {config.log_dir}/server.log and "
-                      f"{config.log_dir}/sessions/<session_id>.log")
+                    run_dir / "server.log", rotate_mb=config.log_rotate_mb)
+                print(f"[Vaayu-Server] logging to {run_dir}/ "
+                      f"(server.log, sessions/<session_id>.log; "
+                      f"logs/latest points here)")
             if engine is None:
                 _check_gpu_is_exclusive(config)
                 from ..auto_model import AutoModel
@@ -302,7 +309,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                       f"derived max_seq_len={model.max_seq_len}")
                 app.state.engine = EngineHandle(model, queue_depth=config.queue_depth,
                                                 enable_thinking=config.enable_thinking,
-                                                log_dir=config.log_dir)
+                                                log_dir=run_dir)
                 # Only on the path that actually loaded: an injected engine
                 # belongs to a caller that keeps using this process, and
                 # freezing its objects would retain them for the process's life.

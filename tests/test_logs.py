@@ -244,3 +244,46 @@ def test_restore_flushes_python_buffered_output_into_the_log(tmp_path):
     assert "buffered-before-restore" in log.read_text(), (
         "restore() detached before flushing, so the message went to the console "
         "instead of the log")
+
+
+# ── run directories ──────────────────────────────────────────────────────────
+
+def test_a_run_directory_is_created_with_a_sessions_subdir(tmp_path):
+    from vaayu.server.logs import new_run_dir
+    run = new_run_dir(tmp_path)
+    assert run.is_dir() and run.name.startswith("run-")
+    assert (run / "sessions").is_dir()
+    assert run.parent == tmp_path
+
+
+def test_two_starts_get_two_directories(tmp_path):
+    from vaayu.server.logs import new_run_dir
+    a, b = new_run_dir(tmp_path), new_run_dir(tmp_path)
+    assert a != b, "a second start must not append to the first run's files"
+
+
+def test_latest_points_at_the_newest_run(tmp_path):
+    from vaayu.server.logs import new_run_dir
+    new_run_dir(tmp_path)
+    b = new_run_dir(tmp_path)
+    link = tmp_path / "latest"
+    assert link.is_symlink() and link.resolve() == b.resolve()
+
+
+def test_latest_is_a_relative_link_so_the_bundle_survives_being_moved(tmp_path):
+    # The whole point is that a user zips this directory and mails it. An
+    # absolute target would resolve to the maintainer's disk, or to nothing.
+    import os
+    from vaayu.server.logs import new_run_dir
+    run = new_run_dir(tmp_path)
+    assert os.readlink(tmp_path / "latest") == run.name
+
+
+def test_a_failed_symlink_does_not_stop_the_run(tmp_path, monkeypatch, capsys):
+    import os
+    from vaayu.server import logs
+    monkeypatch.setattr(os, "symlink",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+    run = logs.new_run_dir(tmp_path)             # must not raise
+    assert run.is_dir()
+    assert "WARNING" in capsys.readouterr().out

@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 UNNAMED = "_unnamed"
@@ -138,3 +138,44 @@ def capture_stdio(log_path, rotate_mb: int = 50):
         os.close(saved_err)
 
     return restore
+
+
+def new_run_dir(root) -> Path:
+    """One directory per server process: `<root>/run-<UTC>/`, with `sessions/`.
+
+    A run is never split across directories and two runs never share one, which
+    is what makes "which byte range of server.log was that run?" -- the question
+    that cost the 2026-09-03 diagnosis a `grep` and an `awk` -- stop existing.
+    """
+    root = Path(root)
+    stamp = datetime.now(timezone.utc).strftime("run-%Y-%m-%dT%H-%M-%SZ")
+    run, n = root / stamp, 0
+    while run.exists():                 # two starts inside one second
+        n += 1
+        run = root / f"{stamp}-{n}"
+    run.mkdir(parents=True)
+    (run / "sessions").mkdir()
+    _point_latest(root, run)
+    return run
+
+
+def _point_latest(root: Path, run: Path) -> None:
+    """Repoint `<root>/latest` at `run`, atomically, with a RELATIVE target.
+
+    Relative because this directory gets zipped and mailed: an absolute target
+    would point at the reporter's disk. Atomic because `tail -f logs/latest/...`
+    must never observe the link missing.
+
+    A failure here is not fatal -- the run directory is the artifact; the
+    symlink is a convenience for the person watching the console.
+    """
+    link, tmp = root / "latest", root / ".latest.tmp"
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(run.name, tmp)
+        os.replace(tmp, link)
+    except OSError as e:
+        print(f"[Vaayu-Server] WARNING: could not point {link} at {run.name} "
+              f"({type(e).__name__}: {e}). The run directory itself is fine; "
+              f"use it directly instead of logs/latest.")
