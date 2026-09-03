@@ -287,3 +287,76 @@ def test_a_failed_symlink_does_not_stop_the_run(tmp_path, monkeypatch, capsys):
     run = logs.new_run_dir(tmp_path)             # must not raise
     assert run.is_dir()
     assert "WARNING" in capsys.readouterr().out
+
+
+# ── line treatment ───────────────────────────────────────────────────────────
+
+def test_every_line_gets_a_timestamp_and_a_session_field():
+    from vaayu.server.logs import format_line
+    out = format_line("hello", session=None, stamp="2026-09-03T17:03:11.000Z")
+    assert out == "2026-09-03T17:03:11.000Z session=- hello\n"
+
+
+def test_a_named_session_is_recorded_on_the_line():
+    from vaayu.server.logs import format_line
+    out = format_line("hello", session="agent-7", stamp="S")
+    assert out == "S session=agent-7 hello\n"
+
+
+def test_tqdm_redraws_collapse_to_the_final_frame():
+    # A prefill emits hundreds of \r-framed progress redraws. Kept raw they
+    # collapse into one unreadable megaline in any editor.
+    from vaayu.server.logs import format_line
+    raw = "layers  1%|  | 1/94\rlayers 50%|##| 47/94\rlayers 100%|####| 94/94"
+    out = format_line(raw, stamp="S")
+    assert "94/94" in out
+    assert "1/94" not in out and "47/94" not in out
+    assert out.count("\n") == 1
+
+
+def test_ansi_colour_is_stripped():
+    from vaayu.server.logs import format_line
+    out = format_line("\x1b[31mred\x1b[0m", stamp="S")
+    assert out == "S session=- red\n"
+    assert "\x1b" not in out
+
+
+def test_a_line_that_is_empty_after_treatment_is_dropped():
+    from vaayu.server.logs import format_line
+    assert format_line("\r", stamp="S") == ""
+    assert format_line("   ", stamp="S") == ""
+
+
+def test_a_real_timestamp_is_iso8601_utc():
+    from vaayu.server.logs import format_line
+    out = format_line("x")
+    stamp = out.split(" ", 1)[0]
+    assert stamp.endswith("Z") and stamp[4] == "-" and stamp[10] == "T"
+
+
+CAPTURE_SCRIPT_TQDM = """
+import os, sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio
+restore = capture_stdio({path!r})
+sys.stdout.write("frame 1/3\\rframe 2/3\\rframe 3/3\\n")
+sys.stdout.flush()
+restore()
+"""
+
+
+def test_the_file_is_treated_but_the_console_is_not(tmp_path):
+    import subprocess, sys
+    from pathlib import Path
+    log = tmp_path / "server.log"
+    out = subprocess.run(
+        [sys.executable, "-c", CAPTURE_SCRIPT_TQDM.format(
+            repo=str(Path(__file__).resolve().parents[1]), path=str(log))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    written = log.read_text()
+    assert "frame 3/3" in written and "frame 1/3" not in written, written
+    assert written.splitlines()[0][:4].isdigit(), "file lines must be stamped"
+    # The console keeps its live animation: a user watching the server must not
+    # have their terminal degraded to buy a readable log file.
+    assert "frame 1/3" in out.stdout, "the console tee must stay raw"

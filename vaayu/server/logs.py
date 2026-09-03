@@ -27,6 +27,40 @@ _MAX_NAME = 120
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 _write_lock = threading.Lock()
 
+# CSI sequences: colour, cursor moves, erase-line. tqdm and rich emit these on
+# every redraw; in a file they are noise that breaks grep and line counting.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def format_line(raw: str, session: str | None = None,
+                stamp: str | None = None) -> str:
+    """One captured line, ready for the log FILE. Returns "" to drop it.
+
+    Pure apart from reading the clock when `stamp` is None, so the whole of the
+    treatment is testable without rewiring a file descriptor.
+
+    Three things happen, and all three are for the file only -- the console tee
+    is written raw, upstream of this (spec 9.4):
+
+      * `\\r`-framed redraws collapse to the final frame. A 512-token prefill
+        emits hundreds of them; kept raw they become one unreadable megaline.
+      * ANSI CSI sequences are stripped.
+      * The line is prefixed `<ISO8601 UTC> session=<id|->`, which is what makes
+        `server.log` alignable against a session file, and what makes a stall
+        visible as a gap.
+    """
+    line = raw.rstrip("\r\n")
+    if "\r" in line:
+        frames = [f for f in line.split("\r") if f.strip()]
+        line = frames[-1] if frames else ""
+    line = _ANSI.sub("", line)
+    if not line.strip():
+        return ""
+    if stamp is None:
+        stamp = (datetime.now(timezone.utc)
+                 .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    return f"{stamp} session={session or '-'} {line}\n"
+
 
 def sanitize_session(session_id) -> str:
     """A session id turned into one safe filename stem.
@@ -91,26 +125,40 @@ def capture_stdio(log_path, rotate_mb: int = 50):
     limit = rotate_mb * 1024 ** 2
     state = {"sink": sink, "size": log_path.stat().st_size if log_path.exists() else 0}
 
+    def _emit(raw: str) -> None:
+        """One assembled line -> the log file. Never raises."""
+        text = format_line(raw)
+        if not text:
+            return
+        data = text.encode("utf-8", "replace")
+        try:
+            if state["size"] + len(data) > limit:
+                state["sink"].close()
+                os.replace(log_path, log_path.with_suffix(".log.1"))
+                state["sink"] = open(log_path, "ab", buffering=0)
+                state["size"] = 0
+            state["sink"].write(data)
+            state["size"] += len(data)
+        except OSError:
+            pass
+
     def pump():
+        buf = b""
         with os.fdopen(read_fd, "rb", buffering=0) as pipe:
             while True:
                 chunk = pipe.read(4096)
                 if not chunk:
                     break
                 try:
-                    os.write(saved_out, chunk)      # keep the console alive
-                except OSError:
-                    pass                            # console already gone
-                try:
-                    if state["size"] + len(chunk) > limit:
-                        state["sink"].close()
-                        os.replace(log_path, log_path.with_suffix(".log.1"))
-                        state["sink"] = open(log_path, "ab", buffering=0)
-                        state["size"] = 0
-                    state["sink"].write(chunk)
-                    state["size"] += len(chunk)
-                except OSError:
-                    pass
+                    os.write(saved_out, chunk)  # RAW: the console keeps its
+                except OSError:                 # animation and its colour
+                    pass                        # console already gone
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for raw in lines:
+                    _emit(raw.decode("utf-8", "replace"))
+        if buf:                                 # a last line with no newline
+            _emit(buf.decode("utf-8", "replace"))
         state["sink"].close()
 
     thread = threading.Thread(target=pump, daemon=True, name="vaayu-log-pump")
