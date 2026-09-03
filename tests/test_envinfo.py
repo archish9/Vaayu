@@ -9,10 +9,14 @@ available. This module is the fix, so these tests care about two things:
     from the model rather than assumed (CLAUDE.md 5), and
   * it never, under any failure, prevents a server from booting.
 """
+import ast
 import json
 import os
 import platform
 import re
+import sys
+from dataclasses import fields as dc_fields
+from pathlib import Path
 
 import pytest
 
@@ -158,6 +162,10 @@ def test_absolute_paths_are_redacted_to_a_basename_and_a_hash():
     for pattern in (r"/home/[^\"\\]*", r"/Users/[^\"\\]*", r"/root/[^\"\\]*"):
         assert not re.search(pattern, dumped), (
             f"a raw absolute path matching {pattern!r} leaked into the report")
+    # Checkout-location independent (review round 2, item 6): a CI box at
+    # /builds/... or /workspace/... contains none of the literals above, so
+    # this is the assertion that holds regardless of where the repo sits.
+    assert sys.executable not in dumped
     assert data["config"]["model_path"]["name"] == "Big-Model-exl3"
     assert len(data["config"]["model_path"]["hash"]) == 10
 
@@ -172,6 +180,45 @@ def test_redacting_nothing_yields_nothing():
     assert envinfo.redact_path(None) is None
 
 
+def test_redact_path_is_insensitive_to_a_trailing_slash():
+    # MODEL_PATH is hand-typed in config_local.py -- a trailing slash must
+    # not make one checkpoint look like two (review round 2, item 7).
+    a = envinfo.redact_path("/home/a/models/Big-exl3")
+    b = envinfo.redact_path("/home/a/models/Big-exl3/")
+    assert a["name"] == b["name"] and a["hash"] == b["hash"]
+
+
+def test_a_colon_joined_path_list_is_fully_scrubbed():
+    # The colon hole (review round 2, item 1): a colon-separated list like
+    # PYTHONPATH puts its second path right after a ':', which import-error
+    # text quotes verbatim.
+    data = envinfo.collect(_model(is_moe=False), _config(),
+                           warnings=["PYTHONPATH=/home/a/x:/home/b/y"])
+    assert "/home/" not in data["warnings"][0]
+
+
+def test_urls_are_not_mangled_by_the_scrubber():
+    url = "https://huggingface.co/archish9/Model-exl3"
+    data = envinfo.collect(_model(is_moe=False), _config(),
+                           warnings=[f"downloading {url}"])
+    assert url in data["warnings"][0], "a URL is public; scrubbing it breaks it"
+
+
+def test_sysfs_paths_are_left_alone():
+    p = "/sys/module/nvme_core/parameters/default_ps_max_latency_us"
+    data = envinfo.collect(_model(is_moe=False), _config(),
+                           warnings=[f"read {p}"])
+    assert p in data["warnings"][0], "sysfs paths name no user and no checkpoint"
+
+
+def test_trailing_punctuation_is_not_folded_into_the_redacted_path():
+    data = envinfo.collect(_model(is_moe=False), _config(),
+                           warnings=["missing /home/a/models/x/y.json."])
+    w = data["warnings"][0]
+    assert w.endswith("."), "the sentence's full stop must survive outside the match"
+    assert "/home/" not in w
+
+
 # ── fail-soft: a log file may never stop a boot ──────────────────────────────
 
 def test_a_model_missing_everything_still_produces_a_report():
@@ -183,6 +230,19 @@ def test_a_model_missing_everything_still_produces_a_report():
         "Path('') is Path('.'), the server's cwd -- a missing checkpoint_path "
         "must not fall through to walking the filesystem and reporting the "
         "cwd's size as the checkpoint's")
+
+
+def test_on_disk_gb_reads_a_real_checkpoint_not_the_cwd(tmp_path):
+    # `on_disk_gb is None` (above) is also what the ORIGINAL BUG produced --
+    # re-break the read to model.ckpt_path and that assertion still passes.
+    # This pins the fix with a real, non-None number (review round 2, item 5).
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "shard.safetensors").write_bytes(b"x" * 2_000_000)  # exactly 2 MB
+    m = _model(is_moe=False)
+    m.checkpoint_path = str(ckpt)
+    data = envinfo.collect(m, _config())
+    assert data["model"]["on_disk_gb"] == round(2_000_000 / 1e9, 2)
 
 
 def test_a_malformed_device_string_does_not_crash_collect():
@@ -271,6 +331,20 @@ def test_writing_to_an_unwritable_place_does_not_raise(tmp_path):
     envinfo.write(blocker / "env.json", {"a": 1})     # must not raise
 
 
+def test_writing_something_that_blows_the_recursion_limit_does_not_raise(tmp_path):
+    # RecursionError is not a subclass of OSError/TypeError/ValueError -- the
+    # old three-tuple except clause in write() let it straight through
+    # (review round 2, item 5). 10,000 levels reliably exceeds the default
+    # recursion limit (1000) inside json.dumps without needing to touch it.
+    deep = []
+    cur = deep
+    for _ in range(10_000):
+        nxt = []
+        cur.append(nxt)
+        cur = nxt
+    envinfo.write(tmp_path / "env.json", {"deep": deep})     # must not raise
+
+
 def test_the_host_and_storage_sections_are_present():
     data = envinfo.collect(_model(is_moe=False), _config())
     for section in ("vaayu", "python", "host", "gpu", "storage", "model",
@@ -286,9 +360,11 @@ def test_the_host_and_storage_sections_are_present():
 # ── conformance: the fakes above must match the real classes ─────────────────
 
 def test_envinfo_dependencies_exist_on_the_real_classes():
-    """Ties the fakes above to reality. `on_disk_gb` reading a `name_or_path`
-    attribute that does not exist on the real model is exactly the class of
-    bug this test exists to catch before a stranger's zip does.
+    """Ties the fakes above to reality for VramPlan, MoEBlockInfo and the
+    three cache classes. It does NOT check the model class itself -- see
+    test_envinfo_model_attrs_exist_on_the_real_init below for that; a
+    `name_or_path` attribute that does not exist on the real model would not
+    have been caught here.
     """
     from vaayu.vram_plan import VramPlan
     from vaayu.moe_patch import MoEBlockInfo
@@ -315,3 +391,66 @@ def test_envinfo_dependencies_exist_on_the_real_classes():
 
     prefix = PrefixCacheStore(1000)
     assert hasattr(prefix, "budget_bytes")
+
+
+def test_envinfo_model_attrs_exist_on_the_real_init():
+    """ast-walks VaayuBaseModel.__init__ (no checkpoint, no GPU needed) --
+    plus any `self.<method>()` it calls, transitively (e.g. `is_moe` is set
+    inside `_detect_moe()`, which `__init__` calls at construction time, not
+    inline) -- for every `self.X = ...` / `self.X: T = ...` assignment
+    target, and asserts that every attribute envinfo._model_section /
+    _budgets_section reads is among them. This is exactly the check that
+    would have caught `name_or_path` -- which is not one of them -- before a
+    stranger's zip did (review round 2, item 4).
+    """
+    import vaayu.vaayu_base as vaayu_base_mod
+
+    tree = ast.parse(Path(vaayu_base_mod.__file__).read_text())
+    class_def = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.ClassDef) and n.name == "VaayuBaseModel")
+    methods = {n.name: n for n in class_def.body if isinstance(n, ast.FunctionDef)}
+
+    def self_attrs(target):
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"):
+            yield target.attr
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                yield from self_attrs(elt)
+
+    def self_calls(fn_node):
+        for n in ast.walk(fn_node):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "self"):
+                yield n.func.attr
+
+    names, visited, queue = set(), set(), ["__init__"]
+    while queue:
+        mname = queue.pop()
+        if mname in visited or mname not in methods:
+            continue
+        visited.add(mname)
+        fn = methods[mname]
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    names.update(self_attrs(t))
+            elif isinstance(node, ast.AnnAssign):
+                names.update(self_attrs(node.target))
+        queue.extend(self_calls(fn))
+
+    required = {"is_moe", "config", "loader_strategy", "_vram_plan",
+               "_expert_cache", "_expert_vram_cache", "_prefix_cache",
+               "_moe_geometry", "_moe_blocks", "max_seq_len", "kv_cache_mode",
+               "checkpoint_path", "model_local_path"}
+    missing = required - names
+    assert not missing, (
+        f"envinfo reads attribute(s) VaayuBaseModel.__init__ never sets "
+        f"(directly or via a method it calls): {missing}")
+
+
+def test_path_fields_allowlist_is_tied_to_the_real_config():
+    from vaayu.server.app import ServerConfig
+    assert set(envinfo._PATH_FIELDS) <= {f.name for f in dc_fields(ServerConfig)}

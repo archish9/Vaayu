@@ -15,24 +15,35 @@ Two rules govern everything here:
     forward in particular is read from the tag `_make_sparse_moe_forward`
     leaves behind, never re-derived -- a second copy of that dispatch table
     would drift and then misreport which forward ran.
-  * **Nothing here may stop a boot.** Every field is collected through
-    `_Collector.safe`, which records the failure in `collect_errors` and
-    yields None. A partial report that names what it could not collect beats
-    no server. That includes imports (`torch`, the persister module) and any
-    string-to-int parsing (a device index off a typo'd `config_local.py`) --
-    nothing that can raise runs outside the wrapper, anywhere in this file.
+  * **Nothing here may stop a boot.** Every value read off the model, config
+    or environment goes through `_Collector.safe`, which records the failure
+    in `collect_errors` and yields None -- imports (`torch`, the persister
+    module) and string-to-int parsing (a device index off a typo'd
+    `config_local.py`) included. The one thing that runs outside that
+    per-field wrapper is `_scrub_paths` itself (below): it only rewrites
+    values already collected, carries its own depth/cycle guards so it
+    cannot blow the recursion limit, and its one external call in `collect()`
+    is wrapped separately.
 
-A third rule, added after review round 1: **this file gets zipped and mailed
-to a stranger, so it must never leak the machine it ran on.** Every value
-passes through `_scrub_paths` just before `collect()` returns -- one regex
-pass over the whole report that rewrites any absolute-path-shaped substring
-(whole field or embedded in a sentence, e.g. an exception message or a
-warning) into `redact_path()`'s basename+hash form. The per-field
-`_PATH_FIELDS` redaction below still runs first and stays: it is defence in
-depth, not replaced by the scrub -- a known path field gets the clean
-{"name", "hash"} shape, and the scrub is the net under it that catches
-whatever the allowlist misses (a future config field, an OSError's `strerror`
-naming a path, `sys.executable`).
+A third rule, added after review round 1 and sharpened in round 2: **this
+file gets zipped and mailed to a stranger, so it must not leak the
+filesystem it ran on** -- usernames and absolute paths, never the machine's
+identity as a whole. Every value passes through `_scrub_paths` just before
+`collect()` returns -- one regex pass over the whole report that rewrites any
+absolute-path-shaped substring (whole field or embedded in a sentence, e.g.
+an exception message or a warning) into `redact_path()`'s basename+hash form.
+The per-field `_PATH_FIELDS` redaction below still runs first and stays: it
+is defence in depth, not replaced by the scrub -- a known path field gets the
+clean {"name", "hash"} shape, and the scrub is the net under it that catches
+whatever the allowlist misses (a future config field, an OSError's
+`strerror` naming a path, `sys.executable`). It deliberately does NOT touch
+`https://`/`http://` URLs (public, and a maintainer needs the real host) or
+paths under `/sys/`, `/proc/`, `/dev/` (kernel-owned, name no user). And it
+deliberately KEEPS the checkpoint's basename -- on this box that is
+`archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw`, the user's own model-hub
+handle. That is correct: triage needs to know what checkpoint this is, and a
+public hub handle is not privacy-sensitive the way a home directory is. What
+never survives the scrub is the PATH to it.
 """
 import hashlib
 import json
@@ -61,11 +72,31 @@ _KNOWN_VAAYU_VARS = (
 _PATH_FIELDS = ("model_path", "drafter_model_path", "log_dir")
 
 # An absolute unix path, standalone or embedded in a sentence: a leading "/"
-# not itself preceded by a word/`:`/`.`/`-` character (so it doesn't fire
-# inside a ratio like "3/10" or "hit/miss"), followed by at least one more
-# "/" (so a bare "/" is never mistaken for a path). Matches the whole
-# substring so it can be cut out of prose, not just a whole field value.
-_PATH_RE = re.compile(r'(?<![\w:.\-])/(?:[\w.\-]+/)+[\w.\-]*')
+# not itself preceded by a word/`.`/`-` character (so it doesn't fire inside
+# a ratio like "3/10" or "hit/miss"), followed by at least one more "/" (so a
+# bare "/" is never mistaken for a path). Deliberately does NOT exclude `:`
+# in the lookbehind (review round 2, item 1): a colon-joined path list like
+# "PYTHONPATH=/home/a/x:/home/b/y" has its second element starting right
+# after a ':', and import-error text is exactly where colon-joined search
+# paths show up. `https://` and `file:///` still match starting at their
+# second/third slash regardless -- URLs are protected separately, below.
+_PATH_RE = re.compile(r'(?<![\w.\-])/(?:[\w.\-]+/)+[\w.\-]*')
+
+# Public information a maintainer needs verbatim -- never redacted.
+_URL_RE = re.compile(r'https?://\S+')
+
+# Kernel-owned paths. None of them names a user or a checkpoint; redacting
+# them only makes a storage-section failure harder to read (two APST sysfs
+# candidates that would otherwise collide on the same basename).
+_UNSCRUBBED_PREFIXES = ("/sys/", "/proc/", "/dev/")
+
+# Trailing punctuation that prose puts after a path but that isn't PART of
+# the path -- swallowing it into the match would make "…/y.json" and
+# "…/y.json." (end of a sentence) hash differently.
+_TRAILING_PUNCT = ".,;:)]"
+
+_MAX_SCRUB_DEPTH = 50   # generous for a report this shallow; a cycle guard,
+                        # not a real limit -- see _scrub_paths.
 
 
 def redact_path(p):
@@ -73,29 +104,81 @@ def redact_path(p):
 
     The basename identifies the checkpoint; the hash distinguishes two
     different paths with the same basename. Neither leaks a username.
+    Trailing "/" is stripped before BOTH are computed (not just the name) --
+    otherwise a hand-typed `MODEL_PATH=.../Big-exl3/` in config_local.py
+    hashes differently from the same checkpoint without the trailing slash,
+    and one checkpoint looks like two in a bundle.
     """
     if not p:
         return None
     p = str(p)
-    return {"name": os.path.basename(p.rstrip("/")) or p,
-            "hash": hashlib.sha1(p.encode("utf-8", "replace")).hexdigest()[:10]}
+    stripped = p.rstrip("/") or p          # "/" itself stays "/"
+    return {"name": os.path.basename(stripped) or stripped,
+            "hash": hashlib.sha1(stripped.encode("utf-8", "replace")).hexdigest()[:10]}
 
 
-def _scrub_paths(value):
+def _redact_match(m):
+    raw = m.group(0)
+    trail = ""
+    while raw and raw[-1] in _TRAILING_PUNCT:
+        trail = raw[-1] + trail
+        raw = raw[:-1]
+    if not raw or raw.startswith(_UNSCRUBBED_PREFIXES):
+        return m.group(0)
+    r = redact_path(raw)
+    return f"<{r['name']}:{r['hash']}>{trail}" if r else m.group(0)
+
+
+def _scrub_string(s):
+    # Mask URLs out before the path regex runs, then restore them verbatim --
+    # https://host/a/b is public and reads as broken once its scheme/host is
+    # torn away from its path.
+    urls = []
+
+    def stash(m):
+        urls.append(m.group(0))
+        return f"\0URL{len(urls) - 1}\0"
+
+    masked = _URL_RE.sub(stash, s)
+    scrubbed = _PATH_RE.sub(_redact_match, masked)
+    for i, u in enumerate(urls):
+        scrubbed = scrubbed.replace(f"\0URL{i}\0", u)
+    return scrubbed
+
+
+def _scrub_paths(value, _seen=None, _depth=0):
     """Recursively rewrite any absolute-path-shaped substring in `value` into
     `redact_path()`'s basename+hash form, serialised inline as `<name:hash>`
     so it still reads as a sentence when the match is embedded in one (a
-    `collect_errors` message, a `warnings` line). See the module docstring."""
-    if isinstance(value, dict):
-        return {k: _scrub_paths(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_scrub_paths(v) for v in value]
+    `collect_errors` message, a `warnings` line). See the module docstring.
+
+    Bounded on two axes so it can never itself be the thing that makes
+    `collect()` raise: `_depth` caps recursion (nothing this module builds is
+    remotely this deep; a cycle or pathological input gets a placeholder
+    instead of a RecursionError), and `_seen` (by object id) catches a
+    self-referential container the same way.
+    """
+    if _seen is None:
+        _seen = set()
+    if _depth > _MAX_SCRUB_DEPTH:
+        return "<max-depth-exceeded>"
+    if isinstance(value, (dict, list, tuple, set)):
+        vid = id(value)
+        if vid in _seen:
+            return "<cyclic-reference>"
+        _seen = _seen | {vid}
+        if isinstance(value, dict):
+            return {k: _scrub_paths(v, _seen, _depth + 1) for k, v in value.items()}
+        return [_scrub_paths(v, _seen, _depth + 1) for v in value]
     if isinstance(value, str):
-        def sub(m):
-            r = redact_path(m.group(0))
-            return f"<{r['name']}:{r['hash']}>" if r else m.group(0)
-        return _PATH_RE.sub(sub, value)
-    return value
+        return _scrub_string(value)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    # An unknown leaf -- Path, bytes, or any object whose repr names a path.
+    # write()'s json.dumps(default=str) would stringify this too, but only
+    # AFTER this scrub runs, which is exactly how a raw path used to slip
+    # through untouched (review round 2, item 2).
+    return _scrub_paths(str(value), _seen, _depth + 1)
 
 
 class _Collector:
@@ -116,7 +199,9 @@ class _Collector:
 
 
 def _vaayu_section(c):
-    repo = Path(__file__).resolve().parents[2]
+    repo = c.safe("vaayu._repo_path", lambda: Path(__file__).resolve().parents[2])
+    if repo is None:
+        return {"commit": None, "dirty": None, "branch": None}
 
     def git(*args):
         return subprocess.run(["git", "-C", str(repo), *args],
@@ -399,7 +484,8 @@ def _env_section(c):
 def collect(model, config, warnings=()) -> dict:
     """The whole snapshot. Never raises."""
     c = _Collector()
-    device = getattr(config, "device", None) or "cuda:0"
+    device = c.safe("config.device",
+                    lambda: getattr(config, "device", None)) or "cuda:0"
     data = {
         "vaayu": _vaayu_section(c),
         "python": _python_section(c),
@@ -416,7 +502,14 @@ def collect(model, config, warnings=()) -> dict:
     # Scrub LAST, over the whole tree: collect_errors and warnings are prose
     # that can embed a path (an exception's message, an engine warning
     # naming a checkpoint), so this cannot be folded into any one section.
-    return _scrub_paths(data)
+    # _scrub_paths has its own depth/cycle guards, but it still gets its own
+    # try/except here -- this module promises collect() never raises, and
+    # that promise has to survive even a bug in the scrubber itself. If it
+    # somehow fails, a report that says so beats one that leaked or crashed.
+    try:
+        return _scrub_paths(data)
+    except Exception as e:                      # noqa: BLE001 -- recorded, not raised
+        return {"collect_errors": c.errors + [f"_scrub_paths: {type(e).__name__}: {e}"]}
 
 
 def write(path, data) -> None:
