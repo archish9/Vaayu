@@ -12,8 +12,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
+from . import envinfo
 from .engine import CancelToken, EngineHandle, QueueFull
-from .logs import capture_stdio, new_run_dir
+from .logs import capture_stdio, collected_warnings, new_run_dir
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
@@ -315,6 +316,15 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 freeze_after_load()
             else:
                 app.state.engine = engine
+            if run_dir is not None:
+                # AFTER the load: env.json's whole value is that its numbers are
+                # DERIVED ones -- the geometry the loader found, the budgets the
+                # VRAM plan solved, the forward the dispatch chose. Written
+                # before serving so a request that hangs still leaves a
+                # describable machine behind.
+                envinfo.write(run_dir / "env.json",
+                              envinfo.collect(app.state.engine.model, config,
+                                              warnings=collected_warnings()))
             restore_signals = _install_signal_cancel(app.state.engine)
         except BaseException:                   # noqa: BLE001 -- re-raised
             # Startup failed BEFORE the `yield`, so the `finally` below never

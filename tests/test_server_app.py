@@ -541,3 +541,23 @@ def test_leading_whitespace_before_a_call_does_not_misalign_the_remainder():
     streamed = _streamed_content(events)
     assert streamed.strip() == "Hi\n\nbye"
     assert streamed.count("bye") == 1, "the remainder must not be sent twice"
+
+
+def test_a_started_server_writes_env_json_into_its_run_directory(tmp_path):
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from vaayu.server.app import ServerConfig, create_app
+    from .test_server_engine import FakeModel
+    from vaayu.server.engine import EngineHandle
+
+    cfg = ServerConfig(model_path="/x", log_dir=str(tmp_path), capture_stdio=False)
+    app = create_app(cfg, engine=EngineHandle(FakeModel()))
+    with TestClient(app):
+        pass
+    runs = [p for p in tmp_path.iterdir() if p.name.startswith("run-")]
+    assert len(runs) == 1
+    data = json.loads((runs[0] / "env.json").read_text())
+    assert "model" in data and "budgets" in data and "collect_errors" in data
+    assert data["config"]["model_path"]["name"] == "x"
