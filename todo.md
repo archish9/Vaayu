@@ -1,74 +1,51 @@
 # TODO — Vaayu pending work
 
-**Everything in this file is PENDING. Nothing finished lives here.** Closed rows, settled verdicts
-and the method notes are in **`plans/settled_and_method_notes.md`**.
+**Everything with a `[ ]`, `[~]` or `[!]` in this file is PENDING. Closed rows are not kept here.**
 
-**Both `plans/` and `docs/` are GITIGNORED** (`.gitignore:29` matches `plan*`), so neither exists on
-a fresh clone — the archive is on this disk only. **This file is the tracked one**, so the durable
-copy of everything ever moved out of it is `git log -p -- todo.md`. Closed detail was last moved out
-on 2026-08-23; the commit before that (`f3869b3`) still holds it in full.
+**Pruned 2026-09-03:** every `[x]` row was removed — all 16 B-rows (the 2026-08-23 server-review
+bugs), the whole FIX SEQUENCE table, and every closed R/M/C/P perf row. Two things survive that
+prune and you should not go looking for the originals: the **SETTLED** index below, which is the
+anti-regression record of what was REFUTED and must not be rebuilt, and the reference sections
+(Environment, Checkpoints, On-device gates), which were never tasks.
 
-Protocol: `CLAUDE.md` §6 — update this as work happens, never after.
+**Where the removed text went.** Full pre-prune text: `docs/2026-09-03-todo-archive-preprune.md`
+(**gitignored — this disk only**). The durable copy is `git log -p -- todo.md`; the commit before
+the prune holds it in full. Older closed detail was moved out on 2026-08-23 (commit `f3869b3`).
+
+Protocol: `CLAUDE.md` §6 (ledger) and §7 (all planning/investigation/spec work lives in `docs/`).
 Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open bug/regression.
 
 **Reading this cold, in a fresh session, is the intended way to use it.** Read in this order:
 
-1. **OPEN — server logging & drafter** (below, opened 2026-09-03) — **the only unticked rows in
-   this file.** Each links a self-contained doc in `docs/` (gitignored). The FIX SEQUENCE under it is
-   fully closed and is kept for its reasoning, not for work.
-2. **Environment** — how to run anything here. `python` is not on PATH; every on-device arm needs
+1. **OPEN** — the two live rows, each linking a self-contained doc in `docs/`.
+2. **STILL OPEN, carried forward** — live items left behind by rows that closed.
+3. **SETTLED — DO NOT RE-OPEN** — read this BEFORE proposing any perf work. It is the list of
+   things already built and refuted, with the number that killed each one.
+4. **Environment** — how to run anything here. `python` is not on PATH; every on-device arm needs
    its own `systemd-run` scope. Skipping this section is how arms get thrown away.
-3. **On-device gates** — what each gate can actually catch, and which ones a change obliges you to run.
-4. The detail section for the row you picked. Every row carries its own file, symbol, what is
-   wrong, what "done" means, and its stop rule — you should not need any other document except
-   the two named in the FIX SEQUENCE.
+5. **On-device gates** — what each gate can actually catch, and which ones a change obliges you to run.
+6. **OPTIONAL** — real work, no slot. Never ahead of the rows above.
 
-**▶ START HERE IF YOU ARE PICKING THIS UP COLD: [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md)**
-(repo root, **tracked in git**). It carries EVERY pending item from the 2026-08-30 MoE disk-path
-work — fan-out measurement, the MiniMax module-list wiring that gates a measured +11.4 %, the
-unexplained tiny-read inflation, the admission policy, and the banked 5.57× dense speculative
-decoding — each with its file, symbol, done-condition and stop rule. It also carries the
-environment, the preserved probe harness (`plans/probes/`), the seven measurement traps, and the
-numbers not to re-derive. **It is self-contained: you should not need this file or any other to
-start work from it.**
+**▶ HISTORICAL CONTEXT, STILL TRACKED: [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md)** (repo
+root, in git). It carries the 2026-08-30 MoE disk-path work with each row's file, symbol,
+done-condition and stop rule, plus the preserved probe harness, the seven measurement traps, and
+the numbers not to re-derive. **Every P-row it lists is now closed** (P6 last, REFUTED 2026-09-03) —
+read it for method and for the traps, not for work.
 
-**2026-08-30, later: its row P1 is DONE** — the prefetcher measured under parallel fan-out (Qwen,
-N=1/2/3, 12 interleaved arms). `VAAYU_LOOKAHEAD` helps at every N but the gain decays
-**+12.8 % → +6.7 % → +2.2 %** while its byte cost rises to +24.6 %, and N=3 is inside the
-unexplained-drift band. Batching alone is the bigger free lever (**1.61×** aggregate at N=3, with
-bytes/token FALLING). P2 stands but is now bounded; **P3 (tiny reads) is promoted** — it holds a
-ring 91.7 % of decode at N=3 for 0.3 % of the bytes. **(That promotion was WRONG and is reversed by
-the next paragraph — occupancy was read as contention. Kept because it is what P1 concluded.)**
-Full trail:
-`plans/2026-08-30-P1-fanout-RESULTS.md`; harness `plans/probes/probe_fanout.py`.
+**`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument. `plans/` and `docs/` are
+GITIGNORED, so neither survives a fresh clone; `plans/settled_and_method_notes.md` is the older
+archive, on this disk only.
 
-**2026-08-30, later still: P3 was BUILT and is REFUTED — row CLOSED.** Holding the scale/bias
-groups resident removes 100 % of the tiny reads and returns byte-identical output, and costs
-**−2.7 % at N=1, −11.3 %/−14.5 % at N=3** (every store-off arm beat every store-on arm, no
-overlap). The tiny reads were STAGGERING the 8-worker ring pool, not stealing capacity from it;
-removing them made the read pattern bursty (dead time 24.8 → 29.9 %, per-bulk-read latency
-9.12 → 10.36 ms). **Occupancy is not contention, and read COUNT is a resource** — the ~5.12 GB/s
-ceiling P1 found is NOT the tiny reads and remains unexplained. Trail:
-`plans/2026-08-30-P3-tiny-store-RESULTS.md`.
-
-**The pending rows were RESEQUENCED and audited the same day** — row numbers are fixed identifiers,
-never the order, and `HANDOFF-2026-08-30.md` §2 now opens with the do-order table. Short version:
-**P5 (control drift, escalated 1.6 % → 22 % at N=3) and P8 (the ~5.12 GB/s ceiling, a NEW row that
-had no home) come FIRST**, because every implementation row left closes on a same-day A/B and at
-N=3 the controls no longer hold still. **P5 CLOSED 2026-09-02 — the drift does not reproduce and
-N=3 A/Bs are trustworthy again (0.06–0.18 % across seven arms, both models); P8 is now first.** Then P2, then P4 (which gained the file/symbol detail it was
-missing, and whose ~2.0 tok/s headroom is now marked SUSPECT pending P8), then P7, then P6. **All of them are now closed — P6 last, REFUTED 2026-09-03; the FIX SEQUENCE has no unticked row left.**
-
-Two documents outside this file are load-bearing, and both are self-contained:
-**`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
-one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
-it only to check whether something was already refuted, never for a task.
+**Suite baseline: 1322 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-03 after P4. **This figure has gone stale four times.** Re-measure against a stashed HEAD
+before quoting it; do not trust the number written here.
 
 ---
 
 # ▶▶ OPEN — server logging & drafter, opened 2026-09-03
 
-**These are the only unticked rows in this file. The FIX SEQUENCE below is fully closed.**
+**These are the two live rows. Everything below them is either carried-forward work, the
+SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
 Both rows carry a self-contained document in **`docs/`** — each is meant to be picked up cold in a
 fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
@@ -119,223 +96,111 @@ active (`scripts/vaayu_optimize_os.sh`, one-time, needs sudo) — Qwen is 47 % d
 is the one hardware tax landing on the dominant cost; and `rustdesk` holds 0.14 GiB of GPU, below
 the 256 MiB refusal threshold but permanent, because budgets are sized once at load.
 
----
-
-# ▶▶ FIX SEQUENCE — opened 2026-08-23 by code review of the server work
-
-**Rows 14–16 closed 2026-08-30. Everything they left open lives in
-[`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md), not below.**
-
-**Do these top to bottom.** Ordering rule: correctness bugs that make the server LIE to an agent
-first, then the concurrency bug, then the rest of the correctness debt, then perf. Rust work comes
-LAST and is gated on one measurement. **B14 is placed at row 0 by the agent that found it** (not by
-the original review) because it is the only row that destroys data on disk — move it if you disagree
-with that ranking.
-
-Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
-the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
-
-**Suite baseline: 1322 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-03 after P4 (+7 tests, `tests/test_lookahead_tail_drop.py`; it read 1315/3 after P2). **The `1303/3` written here on
-2026-09-02 was already stale by 5 when it was read on 2026-09-03** — HEAD measured 1308/3 with the
-day's edits stashed (P8 added 5 and did not update this line). Re-measure against a stashed HEAD
-before quoting it; this figure has now gone stale four times. It read 1257/3 before 2026-08-30, a figure written
-2026-08-29 after B16+B15+B13 and left stale by the 18 tests R1 and P1 added on 2026-08-30 — neither B3 nor B6 added Python tests; both are `cargo test` in
-`vaayu_rust`, which went 6 → 13 (B3) → 19 (B6).
-It was 1191/3 at review time; B1 added 5 tests, B2+B5 added 15, B14 added 6, B4 added 2, B7 added 5,
-B8 added 5, B9 added 3, B10 added 2, B11 added 12, B16 added 4, B15 added 4, B13 added 3. **None of the
-bugs below were caught by `tests/`** — the suite was green while every one of them was live, which is
-why each fix ships with a test verified to FAIL against the code it replaces.
-
-| # | do this | why here | where |
-|---|---|---|---|
-| ~~1~~ | ~~**B2**~~ — **DONE 2026-08-23**, fixed together with B5 | | |
-| ~~0~~ | ~~**B14**~~ — **DONE 2026-08-28** | | |
-| ~~1~~ | ~~**B3**~~ — **DONE 2026-08-28** | | |
-| ~~2~~ | ~~**B4**~~ — **DONE 2026-08-28** | | |
-| ~~3~~ | ~~**B5**~~ — **DONE 2026-08-23**, fixed together with B2 | | |
-| ~~3~~ | ~~**B6**~~ — **DONE 2026-08-28** | | |
-| ~~4~~ | ~~**B7**~~ — **DONE 2026-08-28** | | |
-| ~~5~~ | ~~**B8**~~ — **DONE 2026-08-28** | | |
-| ~~6~~ | ~~**B9**~~ — **DONE 2026-08-28** | | |
-| ~~7~~ | ~~**B10**~~ — **DONE 2026-08-29** | | |
-| ~~8~~ | ~~**B11**~~ — **DONE 2026-08-29** | | |
-| ~~9~~ | ~~**B12**~~ — **DONE 2026-08-29**, fixed together with B11 | | |
-| ~~10~~ | ~~**B13**~~ — **DONE 2026-08-29** | | |
-| ~~10b~~ | ~~**B15**~~ — **DONE 2026-08-29** | | |
-| ~~10c~~ | ~~**B16**~~ — **DONE 2026-08-29** | | |
-| ~~11~~ | ~~**R1**~~ — **DONE 2026-08-30**. Perf REFUTED (+0.05 % Qwen, −0.13 % MiniMax, both inside a 0.23–0.36 % noise floor); KEPT, as the row itself directs — log volume 18 MB → 364 KB per 71 tokens, and M1 cannot profile a path that logs twice per read | | |
-| ~~12~~ | ~~**P1**~~ — **DONE 2026-08-30**. Item (1) `gc.freeze()` CONFIRMED **+1.19 % Qwen / +2.46 % MiniMax**; items (2) and (3) REFUTED on measurement and REVERTED | | |
-| ~~13~~ | ~~**M1**~~ — **DONE 2026-08-30**. Bandwidth **4.018 / 3.912 GB/s** (73 % / 71 % of the drive) → gap CONFIRMED, R2 stays open. GC **0.26 % / 0.41 %** → §1 closes. GIL **0.11 % / 0.72 %** over a 40× switch-interval swing → **R3 REFUTED**. Ring idle **71.3 % / 70.2 %** | | |
-| ~~13b~~ | ~~**R3**~~ — **REFUTED 2026-08-30 by M1's GIL probe, row CLOSED** | | |
-| ~~14~~ | ~~**R2**~~ — **REFUTED 2026-08-30, row CLOSED.** Reads are bimodal: exactly ONE bulk group per expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of bytes. The "5.47 / 11.50 descriptors per layer" that cleared its gate counted the tiny reads; in BYTES there is one read per miss, and misses are already dispatched one-future-each across 8 workers. Bulk concurrency is already at its ceiling. All R2 could still do is drop the tiny round-trip = **~1.02×** | | |
-| ~~15~~ | ~~**C1**~~ — **DONE 2026-08-30.** Corrected in `CLAUDE.md` §5, this file's Environment, `speed-up-vaayu.md` (§0 arithmetic + §5 probe list) and `vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, untested by `tests/` — no caller passes `tokens=`). Suite 1275/3 | | |
-| ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
-| ~~17~~ | ~~**P7**~~ — **DONE 2026-09-02.** All three spec bugs FIXED; the win RE-MEASURED on top of them at **5.54× / 5.47× / 5.47×** over three generations (0.149 → 0.828 tok/s), all byte-identical to the greedy baseline; reserve-policy risk CHECKED and it does not fire. Remaining is a shipping decision, not evidence | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
-| ~~18~~ | ~~**P5**~~ — **DONE 2026-09-02: drift does NOT reproduce, the ~20 % unfalsifiability rule is LIFTED.** Seven arms, both models: Qwen 1.739/1.738/1.739 (0.06 %), Qwen@ballast-27 1.901/1.903 (0.10 %), MiniMax 2.762/2.767 (0.18 %), greedy ids byte-identical in every pair. The suspected cause (arena sizing off psutil avail at load) is CONFIRMED to wobble — 1473/1469/1463 slabs, 43 vs 41 cached layers — and REFUTED as the mechanism: it moves throughput 0.06 %. **New rule: `BALLAST_GB` is an arm variable, not hygiene** — 25→27 GB is +9.4 % tok/s (arena +10.4 %, bytes/token −8.3 %); never compare across targets. The 22 % most probably belonged to P3's uncommitted store build, live in that block and now gone — unretestable, recorded as probable not confirmed | `plans/2026-09-02-P5-control-drift-RESULTS.md`; comparator `plans/probes/p5_drift.py` |
-| ~~19~~ | ~~**P8**~~ — **DONE 2026-09-03. ATTRIBUTED and FIXED.** The ceiling is the io_uring ring pool sized to the CALLER pool (8) instead of to the drive — 8 concurrent O_DIRECT readers is past this NVMe's knee. Pool → 3: decode **+4.8 % Qwen / +9.7 % MiniMax**, aggregate **+3.7 % / +9.6 %**, per-read latency **−14.1 % / −18.7 %**, TTFT **−2.7 % / −4.1 %**, all NO OVERLAP; dense unmoved. **P4 is unblocked** | | |
-| ~~20~~ | ~~**P2**~~ — **DONE 2026-09-03. WIRED, and the flag is REFUTED as a default.** The predictor is now one shared implementation (`moe_patch._lookahead_step`) that both forwards call, and it fires on MiniMax: 76.6 % accuracy, on-path misses **28 484 → 24 098 (−15.4 %)**, greedy ids byte-identical. It does not pay: **MiniMax N=1 +0.6 % (arms OVERLAP: OFF 1.798/1.792/1.808 vs ON 1.804/1.815/1.809), N=3 −5.7 % (no overlap)** against **Qwen N=1 +10.6 %** on the same box the same hour, post-P8. MiniMax predicts worse (0.766 vs 0.902) and wastes more of what it stages (28 % vs 12 %), paying **+18.0 % bytes/token at N=1, +26.4 % at N=3** — the P4 residual, priced. The guard STAYS, on a rewritten reason (its old one — "wired only into the fused forward" — is now false in `check_lookahead_flag_safe`). `plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md` | |
-| ~~21~~ | ~~**P4**~~ — **DONE 2026-09-03. The row's PREMISE is refuted; a different rule pays.** Eviction churn is NOT the residual: a 12-slot/layer prefetch reservation removes **99.96 %** of prefetch-caused history evictions (10 239 → 4) and makes both models WORSE (MiniMax +11.9 % reads, Qwen +70.4 %); LRU-cold admission and prefetch-preferred eviction are +22 % / +27 % (a prefetched entry's useful life is ONE layer-visit, so demoting it evicts it before use); a VRAM-residency check at stage time covers 0.9 % / 0.0 % of stages. **What pays is dropping each routed row's LOWEST-WEIGHT prediction from the STAGING set** — marginal misses removed per prefetch read is flat down the weight order then cliffs at the last rank (Qwen 0.607 → **0.418**, MiniMax 0.654 → **0.312**). Measured: **+2.4 % MiniMax N=1, +2.6 % MiniMax N=3, +1.6 % Qwen N=1** aggregate tok/s, NO OVERLAP in all three blocks, decode reads **−6.6 / −7.0 / −3.2 %** and on-path misses **−9.3 / −5.8 / −4.8 %** at the same time, greedy ids byte-identical. The row's gate (bytes down AND coverage held) is met and beaten — coverage rose too. **The flag still cannot default ON: MiniMax N=3 is −3.7 % vs lookahead-off (was −6.1 %), so the guard STAYS.** The remaining gap is prediction QUALITY (0.766 vs 0.902), not admission. `plans/2026-09-03-P4-admission-RESULTS.md` | |
-| ~~22~~ | ~~**P6 = R4**~~ — **REFUTED 2026-09-03, row CLOSED. Nothing built.** Both named targets are gone. (1) `load_expert_into_slab(tensor_align=True)` — the per-tensor Python `copy_` the row is about — has had **ZERO production callers since 2026-07-13** (`c5014cd`, B1 zero-copy staging); all three prod sites pass `False`, only `tests/` pass `True`. R4 was written **six weeks later**, off the function's stale docstring. (2) `gpu_repack_aligned` is **CUDA tensors** — D2D copies on the compute stream, so a Rust `memcpy` under `allow_threads` does not apply; it belongs in R5. It is also **Qwen-only** (`_prefill_staged_slabs` is read only inside `_make_fused_sparse_forward_exl3`; the module-list forward never calls it, so MiniMax never runs this path). (3) The residual it could have meant — per-tensor H2D straight into aligned GPU slices, deleting the D2D duplicate — is **30.2 µs/expert = 0.364 s/prefill = 4.7 %** on Qwen (MiniMax geometry 35.2 µs / 7.2 %, hypothetical), against a **7.8 s** staged-consume that is PCIe-bound: 142 GB must cross either way. Cold-turn only. NOT re-scoped — refutation closes the row. `plans/2026-09-03-P6-repack-RESULTS.md`; probe `plans/probes/p6_repack_bench.py` | | |
-
-**The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
-the name P7 — the names are referenced from `HANDOFF-2026-08-30.md` and the results docs and are
-never renumbered. **RESEQUENCED 2026-09-02** when dense went on the roadmap: P7 moved from last-but-one
-to first, because the only thing holding it was a decision that has now been made. The P-rows' full
-detail (file, symbol, done-condition, stop rule) is in
-[`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md) §2, which this table mirrors; if the two ever
-disagree, HANDOFF §2 is the one that was resequenced against measurements.
-
-**P7 was three rows; it is FOUR, and ALL FOUR closed 2026-09-02.** The row is DONE: the three
-speculative bugs are fixed and the win was re-measured on top of them. What remains is a shipping
-decision (whether `drafter_model_path` defaults on for dense), which is policy, not evidence.
-Status:
-- **[x] first generated token dropped from streamed text** — FIXED 2026-09-02, off-device + on-device.
-- **[x] the drafter's KV cache survived a call** — a FOURTH bug, not on this ledger before; found by
-  the determinism probe run alongside that fix, and the worse of the two. Every generation after the
-  first in a process returned different, degraded output. FIXED 2026-09-02.
-- **[x] sampling-blind — FIXED 2026-09-02, and it was WIDER than this row said.** The row named
-  `top_p`/`top_k`/stop-strings; `temperature` is dropped too — it is a declared parameter of
-  `speculative_generate` that nothing reads, and every token in that loop is an argmax (prefill
-  seed, drafter, verifier, in both speculators). So the server's own warning was built on a false
-  premise ("honours temperature only") and stayed SILENT on the common case: `temperature>0` with
-  default top_p/top_k got greedy text and no warning at all. **Fix:** one helper,
-  `speculative_ignored_sampling(temperature, kwargs)` in `vaayu_base.py`, printed at
-  `speculative_generate` entry (so the library path warns too, not only the server) and asked by
-  `EngineHandle.warn_if_speculative_sampling_ignored` against the kwargs the request would run
-  with, so the two can never disagree. `top_p`/`top_k` are named only when sampling was actually
-  requested (HF ignores them under `do_sample=False` too); `stopping_criteria` is never named —
-  it IS honoured per round, and it carries cancellation. **Verified:** 9 tests in
-  `tests/test_speculative_sampling_warning.py` + 1 in `tests/test_server_engine.py` (all seen to
-  FAIL first), plus an on-device arm — Llama-3.2-1B as its own drafter through `stream_generate`,
-  sampled call warns exactly once naming `temperature, top_p`, greedy call silent, and both
-  returned the SAME text, which is the symptom itself. Suite **1303 passed, 3 skipped**.
-- **[x] the 5.57× itself — RE-MEASURED 2026-09-02, CONFIRMED, and the reserve-policy check with
-  it.** Same box, same day, one arm per subprocess: `generate()` **0.149 tok/s** vs
-  `speculative_generate()` **0.828 / 0.817 / 0.816** over three back-to-back generations =
-  **5.54× / 5.47× / 5.47×**, 18 rounds each, 5.50 tokens/round, **90 % drafted-token acceptance**
-  (81/90). **All three generations are byte-identical to each other AND to the greedy baseline** —
-  which is the property the drafter-cache bug used to break after gen 1. Banked was 0.155 → 0.864;
-  both arms are ~4 % slower today and move together, so the ratio holds.
-  **Reserve policy does NOT bite this pair:** pinning_budget 10.75 GiB (base) vs 10.73 (drafter
-  resident), pinning 2.89 GB / 3 shared modules in BOTH, drafter 2.47 GB. The −19 % clamp case was
-  Llama-3.2-1B as the TARGET model, not as a resident drafter beside a streamed 70B; bug 12a's fix
-  (drafter built at `vaayu_base.py:1830`, above the expert-cache sizing) is why the cache does not
-  double-spend it. Trail: `plans/2026-09-02-P7-remeasure-RESULTS.md`; harness
-  `plans/probes/arm_p7_remeasure.py`, raw `plans/probes/p7-{base,spec}.json`.
-Do not ship the win without the rest.
-
-**Stop rules — M1 has now been run, and here is what it did to them. (R2's line below was
-SUPERSEDED the same day; see row 14.)** M1 gated R2 and R3: decode
-came back at **73.1 % / 71.1 %** of the drive, not the ~98 % that would have refuted both, so R2
-survived *that* gate — **but it was refuted hours later by the structural probe**, which showed the
-reads are bimodal and M1's percentages were against the wrong denominator (row 15/C1). Both R2 and
-R3 are now closed. R3's extra condition — that M1's GIL probe show real contention — **failed on
-both models**, so R3 is refuted and closed per the standing protocol (a refutation closes its row;
-it is not re-scoped). R1 and P1 were worth doing regardless and both landed 2026-08-30. B3 and B6
-were prerequisites for R2; both closed 2026-08-28.
-
-**What Rust cannot do, so nobody re-derives it:** MoE decode is 72–74 % disk-bound and the rest is
-CUDA; streamed dense already reads at ~5.7 GB/s, i.e. at the wall. Rewriting the decode loop,
-replacing PyTorch, or raising the ring's `queue_depth` are all dead ends — reasons in
-`speed-up-vaayu.md` §4. **Add to that list from M1 (2026-08-30): the garbage collector (0.26 % /
-0.41 % of decode) and the GIL (a 40× switch-interval swing moves 0.11 % / 0.72 %). Neither is worth
-a line of code.**
 
 ---
 
-# ▶ CARRIED FORWARD — live items left behind by rows that closed
+# ▶ STILL OPEN — carried forward from rows that closed
 
-These are the only things still open from the closed work. Their full context is in
-`plans/settled_and_method_notes.md`; what is here is what is still actionable.
+Four live items. Everything else in the old CARRIED FORWARD block was `[x]` and is gone.
 
+- **[ ] Speculative decoding on streamed dense — BUILT, MEASURED, unshipped. A DECISION, not
+  evidence.** **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical)
+  with the Llama-3.2-1B drafter, which shares its tokenizer. Re-measured 2026-09-02 on top of its
+  three fixed bugs: **5.54× / 5.47× / 5.47×** over three back-to-back generations (0.149 → 0.828),
+  18 rounds each, 90 % drafted-token acceptance, all three byte-identical to each other AND to the
+  greedy baseline. Reserve-policy risk CHECKED and it does **not** fire (pinning_budget 10.75 GiB
+  base vs 10.73 with the drafter resident; the −19 % clamp case was Llama-3.2-1B as the TARGET,
+  a different premise). **All four P7 sub-bugs are fixed.** What remains is one policy call:
+  whether `drafter_model_path` defaults on for dense. Opt-in works today.
+  **MoE speculation stays refuted** — see SETTLED.
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size
   is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
   server runs the streamed big models at their measured ceiling (~0.56–0.86 tok/s MoE at 8192,
   single stream). **Not a blocker:** the server is model-agnostic and does not wait on this.
-- **[x] Reserve policy vs a resident model — CHECKED 2026-09-02 as part of P7, does NOT fire.**
-  Measured on the exact configuration this row feared (Llama-3.2-1B resident as drafter beside the
-  streamed 70B): pinning_budget 10.73 GiB vs the no-drafter arm's 10.75, and BOTH arms pinned the
-  same 2.89 GB / 3 shared modules. The −19 % clamp was Llama-3.2-1B as the TARGET model — a
-  different premise. Detail in `plans/2026-09-02-P7-remeasure-RESULTS.md`. Original text follows.
-- **[ ] (superseded, kept for the reasoning) Reserve policy vs a resident model.** The reserve
-  floors were tuned for STREAMED models; on Llama-3.2-1B the clamp drove `pinning_budget → 0` for a
-  measured **−19 % decode**. This row said "unmeasured for a resident coder model because none is on
-  disk" — **that is no longer true.** P7 (do-1) loads Llama-3.2-1B as a RESIDENT drafter alongside a
-  streamed 70B, which is exactly the configuration the clamp misbehaved in. It is no longer waiting
-  on a checkpoint; it is a live risk to P7's shipped numbers. Check it as part of P7.
 - **[ ] `_finish` cannot report WHICH stop string fired.** HF trims a matched stop string before
   returning, so the ids cannot be inspected for one; `_finish` infers `hit_stop_string` from
-  `produced < cap`. The dangerous half of this closed with B5 (2026-08-23) — a cancelled run no
-  longer satisfies that inference. What remains is only the stop string's IDENTITY, which no client
-  acts on. **Needs a new premise before it means anything**: something must actually require the
-  identity. Fixing it means not trusting HF's trim and matching stop strings ourselves — a
-  behaviour change, not a patch.
+  `produced < cap`. The dangerous half closed with B5 (2026-08-23) — a cancelled run no longer
+  satisfies that inference. What remains is only the stop string's IDENTITY, which no client acts
+  on. **Needs a new premise before it means anything.** Fixing it means not trusting HF's trim and
+  matching stop strings ourselves — a behaviour change, not a patch.
 - **[ ] `vaayu/expert_sim.py`'s anchor gap is unexplained.** 31.9 % simulated against 43.9 % live at
   Qwen's 9.12 GB budget. The obvious hypothesis — that it fails to model the engine's eviction
   pinning — was implemented and **REJECTED** (byte-identical result). The gap is confined to the
   small-budget regime (at 16 GB it predicted 20.3 % for MiniMax against a measured 21.3 %).
   **Do not quote its small-budget absolutes.**
-- **[ ] Speculative decoding on streamed dense — UNBLOCKED 2026-09-02, and it is now do-1 (P7).**
-  Measured **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical output)
-  with the Llama-3.2-1B drafter, which shares its tokenizer. Opt-in via `drafter_model_path`, and it
-  was off by default only because CLAUDE.md §0 deferred streamed-dense perf. **That deferral was
-  LIFTED 2026-09-02 — dense is on the roadmap — so the stated unblock condition ("dense work
-  starting") is met and this is the first lever, already built.** MoE speculation stays refuted: the
-  gate admits `draft_tokens ≤ 0` on Qwen and `≤ 1` on MiniMax, and neither has a vocab-compatible
-  drafter here. **Ships with the two rows below — they are the cost of turning it on, not follow-up.**
-  **Check before trusting 5.57× in a shipped config:** the reserve-policy row above was filed as
-  "unmeasured because no resident model is on disk", and that premise is now FALSE — the drafter IS
-  a resident small dense model, and it is the exact model whose clamp drove `pinning_budget → 0` for
-  a measured −19 % decode. The 5.57× was measured with this pair, so the clamp evidently did not
-  block the win; verify it, do not assume it.
-- **[x] The speculative path drops its first generated token from streamed text — FIXED 2026-09-02.**
-  Root cause confirmed at source, not inferred: `TextStreamer.__init__` sets
-  `next_tokens_are_prompt = True` and `put()` returns early on the first call when
-  `skip_prompt=True` (transformers 5.5.4). `generate()` spends that call on the prompt;
-  `speculative_generate` had no prompt put, so the eaten call was `streamer.put(first_token)` — the
-  token seeded from prefill logits. Streamed text and B2's id sink were both short by exactly one.
-  **Fix:** `speculative_generate` now puts `input_ids` before `first_token`, i.e. it obeys
-  `generate()`'s streamer contract rather than the streamer learning who called it.
-  **Verified:** 4 tests in `tests/test_streaming.py` (each seen to FAIL against the old code),
-  plus an on-device arm — Llama-3.2-1B as its own drafter, a REAL drafter run on the real
-  speculative path, one call, streamer sink `==` the ids `speculative_generate` itself returned,
-  byte-identical. (The 70B was not needed to prove a streamer contract; the 1B shares its tokenizer
-  so the vocab gate admits it.)
-- **[x] The drafter's KV cache survived a `speculative_generate` call — NEW BUG, found and FIXED
-  2026-09-02.** Not on this ledger before; found by the determinism probe run alongside the fix
-  above. **Measured on-device:** three back-to-back greedy calls, same prompt, one process returned
-  three DIFFERENT sequences and only the FIRST was coherent — later ones degraded into repeated
-  fragments (`" Paris. Paris. The capital of France is Paris. …"`). Clearing the drafter cache
-  between calls made 3/3 byte-identical **and** equal to the first-ever run, so the carry-over is
-  the whole cause. `StandardDrafterDecoder` keeps `_drafter_past`/`_drafter_seen` across draft
-  rounds by design (Fix #9, which avoids an O(seq) re-prefill per rejection), but nothing cleared
-  them at the START of a generation, so call 2 sliced a NEW prompt with a length belonging to call
-  1's sequence and drafted from the previous prompt's context. **Fix:** `SpeculativeDecoder.reset()`
-  on the base (default no-op — prompt lookup is stateless and must still answer), overridden in
-  `StandardDrafterDecoder`, called by `speculative_generate` at entry. **Verified:** 4 tests in
-  `tests/test_speculative_reset.py` (all seen to FAIL first) + the same on-device arm now 6/6
-  identical with no manual reset. **This one bit P7's headline claim:** "byte-identical output"
-  held only for the first generation in a process, and every request after the first in a server
-  process was wrong. Re-measure the 5.57× on top of this fix before quoting it.
-- **[x] The speculative path is sampling-blind — FIXED 2026-09-02.** The row read "`top_p`/`top_k`/
-  stop-strings" and "the engine does not warn"; both were off. **`temperature` is dropped too**
-  (declared, unread; the loop argmaxes everywhere), and the server DID warn — with a message
-  claiming temperature was the one thing honoured, so a plain `temperature=0.7` request got
-  greedy text in silence. Both layers now ask one helper,
-  `speculative_ignored_sampling` in `vaayu_base.py`, and `speculative_generate` prints the
-  warning itself so library callers (`stream_generate` defaults to `temperature=0.7, top_p=0.9`)
-  are told too. Detail and evidence in the P7 status block above.
 
 ---
+
+# ▶ SETTLED — DO NOT RE-OPEN
+
+**Read this before proposing any perf work.** Each line is something that was BUILT or MEASURED and
+then refuted. A refutation closes its row; it is not re-scoped. Full text in
+`docs/2026-09-03-todo-archive-preprune.md` and `git log -p -- todo.md`.
+
+**Rust rewrites — all dead ends.**
+- **R2 `io_uring_read_many`** — REFUTED 2026-08-30. Reads are bimodal: exactly ONE bulk group per
+  expert (11.80 MB Qwen / 8.85 MB MiniMax) plus 1–2 tiny scale/bias groups carrying 0.3–0.4 % of
+  bytes. In BYTES there is one read per miss, already dispatched one-future-each across the workers.
+  Best case was ~1.02×.
+- **R3 expert-cache miss path into Rust** — REFUTED 2026-08-30 by M1's GIL probe. A 40× switch-interval
+  swing moves decode **0.11 % / 0.72 %**. There is no GIL contention to recover.
+- **R4 = P6 prefill repack memcpys into Rust** — REFUTED 2026-09-03, nothing built. Its target
+  (`load_expert_into_slab(tensor_align=True)`) has had **zero production callers since 2026-07-13**;
+  the row was written six weeks later off a stale docstring. `gpu_repack_aligned` is CUDA D2D, not
+  reachable from Rust, and Qwen-only. The real residual is 4.7 % of a PCIe-bound prefill.
+- **R1 hot-path `eprintln!`** — perf REFUTED (inside the noise floor) but the change was KEPT: log
+  volume 18 MB → 364 KB per 71 tokens.
+- **Also dead, from M1:** the garbage collector is 0.26 % / 0.41 % of decode. Rewriting the decode
+  loop, replacing PyTorch, and raising the ring `queue_depth` are all covered in
+  `speed-up-vaayu.md` §4. MoE decode is 72–74 % disk-bound and the rest is CUDA; streamed dense
+  already reads at ~5.7 GB/s, i.e. at the wall.
+
+**Expert caching and prefetch.**
+- **Expert pinning (Plan F top_n sweep)** — REFUTED 2026-08-02. No viable pin N on either model:
+  share is linear in N and 2–4× below the cost line.
+- **P3 tiny-read store** — BUILT and REFUTED 2026-08-30. Holding scale/bias groups resident removes
+  100 % of the tiny reads and returns byte-identical output, and costs **−2.7 % at N=1, −11.3 % /
+  −14.5 % at N=3** — every store-off arm beat every store-on arm. **Occupancy is not contention,
+  and read COUNT is a resource.** Do not rebuild the store.
+- **`VAAYU_CACHE_BIAS` / `cache_aware_topk`** — dead code; never executes under transformers 5.5.4
+  (0 calls, both models).
+- **`VAAYU_LOOKAHEAD=1` — still hard-blocked, and the block is CORRECT.** Its two old grounds are
+  both false now (P2 wired the module-list forward; P1/P2 measured fan-out on both models), so the
+  guard stands on a NEW reason: post-P4 it is **Qwen N=1 +11.7 %** against **MiniMax N=3 −3.7 %**.
+  Defaulting it ON ships a win to one actively-tested model and a loss to the other at the fan-out
+  this engine exists for — the asymmetry `CLAUDE.md` §5 forbids. P4 exhausted admission as a lever
+  (a 12-slot/layer reservation removes 99.96 % of prefetch-caused evictions and makes BOTH models
+  worse); what is left is prediction QUALITY (0.766 vs 0.902). **Do not "turn it on to go faster".**
+- **Speculative decoding on MoE** — refused at load on both targets by the Fix-#9 gate. See the
+  live row `S1` in OPEN: the gate's 53.4 GB figure is a zero-overlap upper bound and is worth
+  measuring, but the most likely outcome is that it is right for a better reason.
+
+**Measurement rules that cost real time to learn.**
+- **P5 control drift — does NOT reproduce (2026-09-02); the ~20 % unfalsifiability rule is LIFTED.**
+  Seven arms, both models, 0.06–0.18 %, greedy ids byte-identical in every pair. **New rule:
+  `BALLAST_GB` is an arm variable, not hygiene** — 25 → 27 GB is +9.4 % tok/s. Never compare across
+  targets.
+- **P8 — the ~5.12 GB/s ceiling was the ring pool, and it is FIXED (2026-09-03).** The pool was
+  sized to the CALLER pool (8) instead of to the drive; 8 concurrent O_DIRECT readers is past this
+  NVMe's knee. Pool → 3: decode **+4.8 % Qwen / +9.7 % MiniMax**, per-read latency −14.1 % / −18.7 %,
+  no overlap; dense unmoved. See `CLAUDE.md` §5 for the corrected bandwidth ladder.
+- **C1 — `~5.5 GB/s` is NOT a hardware constant.** It was a measured-path number promoted to one
+  and then used as a denominator. Never quote a single-stream rate as the drive's limit; always say
+  which concurrency a bandwidth figure was taken at, and never assume more concurrency helps.
+- **The token-summary buckets are a partition by construction** and `expert_disk` is a STALL, not
+  read time. Both traps are written up in
+  [`docs/2026-09-03-slow-generation-verdict.md`](docs/2026-09-03-slow-generation-verdict.md).
+- **None of the 16 B-row bugs was caught by `tests/`** — the suite was green while every one of them
+  was live. That is why each fix shipped with a test verified to FAIL against the code it replaced.
+
 
 ## Environment (applies to every item)
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
 - Full suite: `./venv/bin/python -m pytest tests/ -q`. The current baseline is the one stated once
-  at the top of the FIX SEQUENCE — do not duplicate it here; it went stale twice that way.
+  at the top of this file — do not duplicate it here; it went stale four times that way.
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and
   `pydantic` were already present; `fastapi.testclient` needs `httpx`.
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
@@ -439,1136 +304,8 @@ seen fail is not known to work.** Run it after any change to config defaults, no
   freed pinned host blocks are cached, not returned. A module-scoped fixture shares one load and
   halves the wall time.
 
----
 
-# BUGS-2026-08-23 · [bug] open bugs from the server-work code review
-
-B2-B13 were found reviewing `1a938b7..b124320` (the six server commits: config module, token
-generation logic, exclusive GPU, thinking switch, session ids + logs). The suite was **green
-throughout** — 1191 passed, 3 skipped — so **none of them was caught by `tests/`**. **B14 is not
-from that review**: it was found on 2026-08-23 by RUNNING the server smoke gate while verifying
-B2+B5, which is also how the gate's own three breakages surfaced (see "On-device gates" above).
-Reading found twelve bugs; running found four more.
-
-Order to fix them: the **FIX SEQUENCE** table at the top of this file. **ALL CLOSED:** B1, B2,
-B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11, B12, B16, B15 and B13
-(2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
-place below, because both are load-bearing for the P1/R5 perf rows.
-**Nothing in this section is open, and no bug row is.** Every B row is closed, **and so is every R/M row — R4 (= P6) was the last, REFUTED 2026-09-03**. **The next work is not a bug** — it is the P-row do-order in the FIX SEQUENCE table
-at the top of this file — **and as of 2026-09-03 that table has no unticked row either.** The next work must come from **OPTIONAL** below or from a new premise.
-
-### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
-`vaayu/server/engine.py` counted stream tokens as
-`len(tokenizer(full, add_special_tokens=False)["input_ids"])`, where `full` is
-text decoded with `skip_special_tokens=True`. That does not reproduce the
-generated id count — EOS is gone, and merges differ across a decode boundary —
-yet both `usage.completion_tokens` and `finish_reason` were derived from it, so
-a stream that ran to exactly `cap` could report **`"stop"`** on a truncated
-answer, on what is now the DEFAULT path (`DEFAULT_STREAM = True`).
-
-**Fix:** `_IdCountingStreamer` in `vaayu/streaming.py` — a `TextIteratorStreamer`
-that records the real ids in `put()` (reading `next_tokens_are_prompt` BEFORE
-`super().put()`, which clears it). `stream_generate` gained one optional
-`token_ids_out=` kwarg; omitted, it behaves exactly as before, so `test_generate.py`
-/ `test_quick.py` / `test_multiturn.py` are untouched. `engine.stream` passes a
-sink and now shares `_finish` with the non-streaming path, so one policy serves
-both. The re-tokenization is deleted, which also banks P1 item (4).
-**Verified:** 5 engine tests + 5 streaming tests; the 4 that distinguish the
-behaviour were confirmed to FAIL against the pre-fix `engine.py`.
-
-### B14 · [x] `DELETE_ORIGINAL` left a SINGLE-FILE checkpoint unloadable — **FIXED 2026-08-28**
-Found 2026-08-23 by running the server smoke gate; it deleted 2.3 GB off
-Llama-3.2-1B and the NEXT load then failed with
-`FileNotFoundError: No model files found`, having first printed "didn't find
-downloaded model" and tried the absolute path as a HF repo id — with a complete
-`splitted_model/` sitting right there.
-
-**Root cause:** a SHARDED checkpoint survives its own delete only because
-`model.safetensors.index.json` is not a weight file and is left behind —
-`find_or_create_local_splitted_path` (`utils.py:509-513`) recognises the
-directory by it. A single-file checkpoint has no index, so the deleted
-`model.safetensors` was the ONLY one of the four names discovery looks for. The
-damage is invisible in the run that causes it (that run already holds the split).
-
-**Fix:** `_leave_an_index_behind` (`vaayu/utils.py`), called from
-`delete_original_shards` before it unlinks anything: when the directory has
-neither index json, write `{"weight_map": index}` — the map the splitter already
-built — as `model.safetensors.index.json` or `pytorch_model.bin.index.json` per
-`safetensors_format`. The single-file case then walks the sharded case's proven
-path: discovery finds the index, `split_and_save_layers` reads its weight_map,
-`all(found_layers.values())` holds, `splitted_model/` is returned, and the
-re-run delete is a no-op. Safe because only `AutoConfig` / `AutoTokenizer` /
-`GenerationConfig.from_pretrained` ever read that directory afterwards
-(`vaayu_base.py:1410,2267,2277-2280`) — no weight loader does. An existing index
-is never overwritten, and if the index cannot be written the reclaim is GIVEN UP
-rather than stranding the checkpoint.
-**Chose this over refusing the delete** (the row's other permitted ending):
-refusing means the flag silently reclaims nothing on single-file checkpoints.
-**Verified:** 6 tests in `tests/test_delete_original.py`; the 5 behavioural ones
-confirmed to FAIL against the pre-fix `utils.py` (the key one as the exact
-`FileNotFoundError` above). Suite 1211/3 → **1217/3**.
-
-### B3 · [x] short io_uring reads were counted as success — **FIXED 2026-08-28**
-`vaayu_rust/src/lib.rs`, `persistent_read` (and `legacy_read`, which had the
-identical loop and is the live fallback when `RING_POOL` is unset). The CQE loop
-tested only `cqe.result() < 0`, so a short read was counted as a completed chunk
-and the tail of the destination kept whatever the previous read left in that
-pinned slab — wrong weights, no error raised.
-
-**What the row got wrong, found by running it.** Short reads at EOF are NOT a
-defect here: `_load_pinned` deliberately over-requests, `aligned_length =
-_align_up(total_size + prefix_pad)` (`safetensor_model_persister.py:376`), so the
-last chunk of every layer legitimately comes back up to 4095 bytes short. The
-first draft errored on that and broke **53 suite tests** at once
-(`io_uring short read CQE[31] offset=525336688 got 16289904/16293888 bytes`) —
-that was the fix being wrong, not the engine. The real defect is a short read
-with **file bytes still behind it**.
-
-**Fix:** the submission loop now builds a `ReadChunk { file_off, buf_off, len }`
-list once and keys `user_data` to its index, so each CQE is measured against its
-own request; `done[i]` accumulates and any incomplete chunk is resubmitted from
-where it stopped, in waves, until every chunk is satisfied. `chunk_outcome()`
-classifies one completion as `Complete` / `Resubmit` / `Truncated`: complete when
-the chunk is full **or** the read reached EOF (the aligned over-request above),
-`Truncated` — a loud `PyIOError` — when no progress was made yet the file says
-bytes remain. The file size is fetched lazily on the first short read only, so
-the all-complete path adds no syscall. A CQE whose `user_data` is not a known
-chunk now errors instead of panicking through FFI.
-**Verified:** `cargo test` 6 → 13. The three integration tests are EOF-behaviour
-guards (they are what caught the wrong first draft); the four `chunk_outcome`
-tests carry the corruption logic and were confirmed to FAIL when the classifier
-is mutated to the pre-fix behaviour ("always complete"). Suite 1217/3 unchanged.
-Server smoke gate PASSes on Qwen3-235B (`ALL PASS`, real decode, no short-read
-errors). **Not covered by a test:** the resubmit-succeeds branch — a regular file
-never short-reads mid-file, so it cannot be provoked from a test; the unit test
-of `chunk_outcome` is what stands behind it.
-B6 (closed the same day) covers the wave loop's own error exits.
-
-### B4 · [x] SSE released the engine slot before generation stopped — **FIXED 2026-08-28**
-`vaayu/server/app.py:454-485`, `_sse`. On client disconnect Starlette closes the
-generator: `GeneratorExit` is a `BaseException`, so the `except Exception` did
-not catch it, `async with engine.slot()`'s `__aexit__` ran **first** (lock
-released, `_inflight` decremented), and only then the outer
-`finally: cancel.cancel()`. Meanwhile `stream_generate`'s worker thread was
-still inside `model.generate`. A queued request was admitted immediately and
-called `model.generate` on an engine whose own docstring says concurrency is 1 by
-construction, sharing the KV cache, the expert VRAM cache and the slab arena.
-
-**Fix:** `EngineHandle.quiesce()` (`vaayu/server/engine.py`) — cancel the live
-token, then `join()` the live worker thread — called from `slot()` in a `finally`
-**inside** `async with self._lock`, so it runs before the lock is released on
-every exit path, `GeneratorExit` included. `stream()` now publishes its worker as
-`self._live_thread` next to `_live_cancel`; the token alone cannot say whether
-generation has STOPPED, since cancellation is cooperative and checked once per
-token. **Fixed in `slot()`, not in `_sse`:** the invariant belongs to the gate,
-so it holds for the non-streaming route and any future caller, and `_sse` needed
-no change.
-**`quiesce` is deliberately synchronous.** It runs on a cancelled request's
-teardown, where `await` is not dependable — the ASGI server cancels the task, so
-an anyio cancel scope re-raises `CancelledError` at every checkpoint and the wait
-would be skipped, which is the whole bug. A blocking join always runs. It costs at
-most the one forward pass the cancel flag is checked after, and the GPU is busy
-for exactly that time anyway.
-**Verified:** 2 tests in `tests/test_server_engine.py`. The reproducer was
-confirmed to FAIL against the pre-fix `engine.py` (`the SSE generator returned
-while the generation worker was still running`); its second assertion — the
-engine lock is still held at the instant the worker exits — is the invariant
-itself. The other test is a guard that the new join does not stall or wedge the
-gate on a normally-finished stream. Suite 1217/3 → **1219/3**. Server smoke gate
-`ALL PASS` on Llama-3.2-1B.
-**Couples to B9, now CLOSED (2026-08-28):** `quiesce` cancels through
-`_live_cancel`, and B9's fix is what guarantees the token is still published
-when `slot()` exits — the ordering this row relied on is now an invariant
-rather than an accident.
-
-### B5 · [x] cancellation reported as `finish_reason="stop"` — **FIXED 2026-08-23** (with B2)
-`hit_stop_string` / `hit_eos` were both inferred from "fewer tokens than the cap
-arrived", which a run halted by `cancel_criteria` — client disconnect, SIGTERM,
-`_teardown` — satisfies. A deliberately truncated response was labelled complete.
-
-**Fix:** `finish_reason` (`vaayu/server/stopping.py`) takes `cancelled: bool = False`
-and consults it **after** `hit_tool_call` and `hit_eos` but **before** the
-`hit_stop_string` inference. A cancelled run reports **`"length"`** — the OpenAI
-vocabulary's existing "this answer is incomplete", which every client already
-handles; which of the two truncations it was is in the server log. A real EOS
-still outranks it: cancelling after the model finished changes nothing. Both
-`generate()` and `stream()` pass their token through `_finish`. `app.py`'s SSE
-tail also defaulted a missing final event to `"stop"` and now says `"length"`.
-**Verified:** 5 stopping tests + 2 engine tests, confirmed to FAIL against the
-pre-fix code (the `_finish` one as a `TypeError`, the rest as `"stop"`).
-
-### B6 · [x] error exits abandoned a POOLED ring dirty — **FIXED 2026-08-28**
-`vaayu_rust/src/lib.rs`, `persistent_read`. `push(&entry)` failing returned `Err`
-immediately, leaving every SQE already pushed in this call sitting in the
-submission queue. The ring is not per-call — it is one slot of `RING_POOL`,
-reused by the next caller, whose `submit_and_wait(n)` submits those orphans
-against a pinned buffer that has since gone back to `_EXPERT_BUF_POOL`.
-
-**What the row understated, found by reading the crate.** The leak is not
-confined to the `SQ full` push. `SubmissionQueue`'s `Drop` stores the tail
-unconditionally (`squeue.rs:353`), so the current code — which builds a fresh
-guard per `push` — has already published every earlier SQE to the shared tail by
-the time one fails. And the SQ is only half of it: `CompletionQueue`'s `Drop`
-stores the head, so returning mid-iteration releases only the CQEs consumed so
-far and **leaves the rest for the next caller**, whose loop reads their
-`user_data` as an index into ITS `chunks` and credits their bytes to a chunk that
-was never read — silent wrong weights, the same corruption from the other end.
-Seven error paths exited that way, not one. Measured on the pre-fix code: an
-EFAULT wave left **7 unreaped CQEs**, an `SQ full` return left **8 orphan SQEs**.
-
-**Fix:** `drain_ring(&mut IoUring, outstanding)` — submit whatever is queued,
-then wait out every completion the kernel still owes, then discard residue. The
-wait is not politeness: those reads are DMAing into `buf_ptr`, which is only ours
-until the call returns. The wave loop no longer returns from inside itself; it
-CAPTURES the error (`failure: Option<PyErr>`, labelled `break 'waves`) so there
-is exactly ONE exit, which drains and then raises. `outstanding` is tracked
-exactly — from `submit_and_wait`'s returned count, decremented per reaped CQE,
-and on a failed submit from the SQ-length difference, so the drain can never wait
-for a completion that was never submitted. If a drain itself fails the slot is
-marked `dirty` and refuses further reads: a loud dead slot beats a silent DMA
-into someone else's buffer.
-**Beyond the row's literal "done means":** `legacy_read` got the same
-capture-then-drain treatment. It owns its ring, so it leaks nothing to a next
-caller, but returning while reads are in flight lets the kernel write into the
-caller's buffer after the call — same root cause, same helper. The CQE
-bookkeeping both loops had duplicated since B3 is now one `apply_cqe`.
-**Verified:** `cargo test` 13 → 19. The two behavioural tests (a mid-wave EFAULT,
-and a pre-filled SQ) were confirmed to FAIL against the pre-fix code with the
-exact residue counts above; the two `drain_ring` tests and the dirty-slot test
-were each confirmed to fail with their mechanism mutated out.
-`legacy_read_reports_a_failing_cqe` is a plain guard and passes either way.
-Suite **1219/3 unchanged**. Server smoke gate `ALL PASS` on Qwen3-235B (real MoE
-decode); dense smoke gate PASS on Llama-3.3-70B, **ppl 8.78** unchanged.
-**Not covered by a test:** the failed-drain branch that sets `dirty` — it needs
-`io_uring_enter` to fail unrecoverably, which cannot be provoked from a test; the
-flag's effect is tested by setting it directly.
-**Does NOT do R2's job:** the read still submits `pending.len()` SQEs in one
-wave. R2 must still split a layer's descriptor list into SQ-sized waves — B6 only
-guarantees that when a wave does not fit, the ring is left clean.
-
-### B7 · [x] the fenced-JSON tool fallback ate ordinary JSON answers — **FIXED 2026-08-28**
-Reproduced exactly as written: with `GENERIC_JSON` active, `"Here is
-package.json:\n```json\n{"name": "my-app", "version": "1.0.0"}\n```\ndone"`
-came back as prose `"Here is package.json:\n\ndone"` plus a fabricated tool
-call `my-app`.
-
-**Two root causes, not one — found by running it.** Fixing `tools.py` alone does
-NOT make the row's harm go away, because the streaming half is an independent
-defect: `_sse` (`app.py`) took `fmt.open_marker` as proof a call had begun and
-set `suppressing = True`, after which every delta was **dropped permanently** —
-and the final event carries no content, so the client never saw the block at
-all. Confirmed on a payload containing NO `name` key, i.e. one the parser
-already returned zero calls for: streamed content was `'Here:\n'` and the rest
-was gone. `DEFAULT_STREAM = True`, so that is the path a coding agent is on.
-
-**Fix 1 — `vaayu/server/tools.py`.** `parse_tool_calls` takes `allowed_names`;
-`_parse_fenced` accepts a block only if its `name` is one the REQUEST declared.
-`declared_tool_names(req.tools)` supplies it from both engine call sites
-(`engine.py:334,421`). The default is **empty**, not "allow all": a caller that
-forgets it loses tool calls, never prose — the failure that costs nothing versus
-the one that deletes the answer. **Gated for `GENERIC_JSON` only.** `_parse_marked`
-is untouched: `<tool_call>` is a wrapper the model had to emit deliberately, and
-narrowing the actively-tested Qwen path was not this row's ask.
-
-**Fix 2 — `vaayu/server/app.py`.** `_sse` BUFFERS from the open marker instead of
-discarding, and flushes the buffer after the loop unless the final event actually
-carried `tool_calls`. Applied to both formats rather than special-casing
-`GENERIC_JSON`: for HERMES it also repairs a marked block whose JSON did not
-parse, which `_parse_marked` deliberately returns verbatim and the stream was
-silently eating. Cost: a fenced block now arrives as one chunk at the end rather
-than incrementally, for tools-carrying requests only.
-**Verified:** 5 tests (4 in `tests/test_server_tools.py`, 1 in
-`tests/test_server_app.py`), each confirmed to FAIL against the pre-fix code —
-the app one behaviourally, `..._no_declared_names_...` behaviourally, the rest on
-the new argument. `test_a_real_fenced_tool_call_is_still_not_duplicated_as_content`
-is a guard that PASSED before and after. Suite 1219/3 → **1224/3**. Server smoke
-gate `ALL PASS` on Llama-3.2-1B.
-**Not covered by the gate:** `test_server_smoke.py` sends no `tools`, so it
-exercises neither path; making it would need a real model to emit a fence on
-demand, which is not deterministic. The fake-engine tests are what stand behind
-this — the parsing is pure, so they cover it fully.
-**Opened B15:** the buffer is dropped when a call IS parsed, which is today's
-behaviour and also drops any prose that FOLLOWED the call. Pre-existing, not
-introduced here — see B15.
-
-### B15 · [x] a stream drops the prose that FOLLOWS a real tool call — **FIXED 2026-08-29**
-`vaayu/server/app.py:452-495`. Once `_sse` starts buffering at the open marker it
-stays buffering to the end, so when the final event does carry `tool_calls` the
-buffer is discarded whole — including anything the model wrote AFTER the call.
-Measured with `deltas=['<tool_call>{"name":"f"}</tool_call>', ' trailing prose']`:
-streamed content `''`, while `final.text` (what the NON-streaming route returns)
-is `'trailing prose'`. So the two routes disagree about the same generation.
-**Pre-dates B7** — the old code dropped it too, by never emitting it; B7 only
-made the drop explicit. Found 2026-08-28 while fixing B7.
-**Done means:** the stream emits the cleaned prose the final event carries but
-that was never sent, so streaming and non-streaming agree. Note `final.text` is
-`.strip()`ed by the parser while the streamed prefix is not, so a naive
-"emit `final.text[len(emitted):]`" is not correct — that is the actual work here.
-
-**Fix — `vaayu/server/app.py`, `_sse`.** The generator now accumulates `sent`,
-everything already delivered as a content delta (both emit sites: the
-incremental one and the flush at the open marker). In the `final.tool_calls`
-branch it emits the remainder of `final.text` before the `tool_calls` chunk.
-**The alignment is the whole row.** `final.text` is the parser's output — the
-segments outside every call span, joined and `.strip()`ed — so `sent` is NOT a
-literal prefix of it: the strip ate `sent`'s leading whitespace. Cutting at
-`len(sent.lstrip())` puts the boundary in the right place. When `final.text` does
-not start with `sent.lstrip()` the strip must also have taken `sent`'s TRAILING
-whitespace, which happens only when nothing followed the call — so the remainder
-is empty, and the code emits nothing rather than guessing and duplicating prose.
-An empty `sent` (a call with no prose before it) falls out of the same
-expression: `head == ""`, so the whole cleaned text is the remainder.
-**Verified:** 4 tests in `tests/test_server_app.py`, each confirmed to FAIL
-against the pre-fix code exactly as the bug (`assert 'Sure. ' == 'Sure.  trailing
-prose'`, `assert '' == 'tail'`, …). They cover HERMES and GENERIC_JSON, a call
-with no prose before it, and the leading-whitespace case that catches the naive
-slice. `test_a_real_fenced_tool_call_is_still_not_duplicated_as_content` is the
-standing guard that a parsed call is not ALSO delivered as prose; it passed
-before and after. Suite 1250/3 → **1254/3**.
-**Not covered by the gate:** `test_server_smoke.py` sends no `tools`, same blind
-spot B7 recorded — making it would need a real model to emit a call on demand,
-which is not deterministic. The fake-engine tests are what stand behind this.
-
-### B8 · [x] streaming errors were not status-mapped — **FIXED 2026-08-28**
-The non-streaming path mapped `ContextTooLong` / `TemplateLacksToolSupport` /
-`NoChatTemplate` to **400** and `QueueFull` to **503**. The streaming path raised
-all of them inside `_sse`, where `except Exception` turned each into a **200**
-carrying an SSE event typed `internal_error`. `prepare()` — and therefore
-`ContextTooLong` — ran inside the generator, and `DEFAULT_STREAM = True`, so **an
-oversized prompt reported "internal_error" to every default client**.
-
-**Root cause, in one line:** a `StreamingResponse`'s body runs AFTER the route
-handler returns, so by the time `_sse` first iterates `engine.stream` the status
-line is already sent — nothing raised in there can ever be anything but a 200.
-
-**Fix 1 — prepare before responding (`app.py`).** The route now calls
-`e.prepare(req)` itself, inside a `try`, BEFORE constructing the
-`StreamingResponse`, and maps the three request-shaped errors to the same 400 the
-non-streaming route gives. The result is threaded through as
-`_sse(..., prepared=...)` → `engine.stream(req, cancel=..., prepared=...)`
-(`engine.py`), which uses it instead of calling `prepare` again — so the honest
-status costs no second chat-template render + tokenize pass. **Chose this over
-"map to honest SSE types"** (the row's other permitted ending): the SSE variant
-leaves a client parsing a 200 body to discover its own request was malformed,
-and the whole point is that a coding agent on the default path gets told.
-
-**Fix 2 — the types `_sse` still cannot avoid raising.** `_error_event` takes a
-`kind`. `QueueFull` from `slot()` now emits **`server_busy`**, not
-`internal_error`: the route's eager depth check turns the ordinary full queue
-into a real 503, but the admission RACE (depth under the limit at the check,
-`slot()` raising anyway) reaches the generator, and `internal_error` tells a
-client to stop retrying when retrying is exactly right. The three 400-class
-errors also map to `invalid_request_error` there — unreachable from the route
-now, kept for any other caller of `_sse`.
-**Verified:** 5 tests in `tests/test_server_app.py`; the 4 behavioural ones were
-confirmed to FAIL against the pre-fix code (the oversized-prompt one exactly as
-the bug: `assert 200 == 400`). `test_a_real_engine_crash_still_streams_as_internal_error`
-is a guard that the mapping does not relabel genuine faults as client errors; it
-passed before and after. `FakeEngine` grew a `prepare()` so it models where the
-real engine raises. Suite 1224/3 → **1229/3**.
-**Gate:** the row's own instruction is done — `test_server_smoke.py` now asserts
-the STREAMING refusal as well as the non-streaming one. `ALL PASS` on
-Llama-3.2-1B, the streamed oversized prompt returning a real 400 with
-`"type":"invalid_request_error"`.
-
-### B9 · [x] `_live_cancel` was cleared before the generation thread stopped — **FIXED 2026-08-28**
-`vaayu/server/engine.py`, `stream()`. The `finally` around the consume loop
-cleared `_live_cancel`, and `thread.join()` sat AFTER that try/finally — so
-closing the generator (`GeneratorExit` at its `yield`) cleared the token and
-skipped the join entirely, with the pump thread still inside `model.generate`.
-From that instant `cancel_all()` — the SIGTERM handler and `_teardown` — saw
-`None` and reported idle with a generation on the GPU.
-
-**A second hole on the same line, found while fixing it.** `stream()` published
-whatever it was handed, so a caller passing no token published `None`:
-`cancel_all()` then had nothing to cancel for the WHOLE generation, not merely
-its teardown window. The fix needs a real token to cancel through anyway, so
-both close together.
-
-**Fix:** `stream()` mints its own `CancelToken()` when the caller passes none,
-and the teardown became `except BaseException: cancel.cancel(); raise` plus
-`finally: try: thread.join() finally: _live_cancel = _live_thread = None`. The
-cancel must PRECEDE the join — an uncancelled join on the abandoned path would
-block for the whole remaining cap — and the clear must FOLLOW it, which is this
-row's "done means". Safe for the normal path because `_finish` reads the LOCAL
-`cancel`, not the attribute, and the pre-cancel runs only while unwinding, so a
-normally-finished stream still reports `"stop"` and not `"length"`.
-**Verified:** 3 tests in `tests/test_server_engine.py`, all three confirmed to
-FAIL against the pre-fix `engine.py` — the abandoned-stream one exactly as the
-bug (`the stream returned while its generation worker was still running`), the
-no-token one as `assert None is not None`, the third on the uncleared
-`_live_thread`. That third test's FIRST assertion (`finish_reason == "stop"`)
-is the guard that the self-minted token does not relabel every normal answer;
-it passed before and after. Suite 1229/3 → **1232/3**. Server smoke gate
-`ALL PASS` on Llama-3.2-1B.
-**Opened B16:** `generate()`'s `_running` has the same shape and is NOT fixed
-here — deliberately, it is a different route and a different trigger.
-
-### B16 · [x] `generate()` clears its token while the executor thread may still run — **FIXED 2026-08-29**
-`vaayu/server/engine.py`, `_running`. Same shape as B9, other route: the async
-`finally` clears `_live_cancel` when `await loop.run_in_executor(...)` raises,
-and a cancelled handler task raises `CancelledError` there while the executor
-thread is still inside `model.generate`. `generate()` also publishes no
-`_live_thread`, so `slot()`'s `quiesce()` (B4) finds nothing to join and
-releases the lock under a live generation — B4's fix covers only `stream()`.
-**Narrower than B9:** the ordinary disconnect path does NOT trigger it, because
-`_watch_disconnect` only cancels the TOKEN and `generate` then returns normally;
-it needs the handler task itself to be cancelled (uvicorn's graceful-shutdown
-timeout, lifespan teardown). Found 2026-08-28 while fixing B9.
-**Done means:** `generate()` publishes something `quiesce()` can wait on, and
-the token outlives the executor work on the cancelled path.
-
-**Fix — `vaayu/server/engine.py`.** Three parts, B9's shape on this route:
-- `generate()` mints its own `CancelToken()` when the caller passes none, so
-  `cancel_all()` is never told the engine is idle mid-run (B9's second hole,
-  same line of reasoning).
-- The executor call became an **own `threading.Thread` + `_queue.Queue` bridge**,
-  mirroring `stream()`'s `_pump`, awaited through `run_in_executor(None,
-  bridge.get)`. **A `run_in_executor` pool worker could not be published**: pool
-  threads never exit, so `quiesce()`'s `thread.join()` would block forever. That
-  is why the row could not be fixed by publishing `current_thread()`.
-- `_running(cancel, thread=None)` grew the teardown `stream()` already has:
-  `except BaseException: cancel.cancel(); raise` plus `finally: try:
-  thread.join() finally: clear both`. Cancel PRECEDES join (an uncancelled join
-  on the abandoned path blocks for the whole remaining cap); the clear FOLLOWS
-  it, which is this row's "done means". It now also publishes `_live_thread`, so
-  `slot()`'s `quiesce()` (B4) has something to wait on — B4 covered only
-  `stream()` before this.
-Safe for the normal path for B9's reason: `_finish` reads the LOCAL `cancel`,
-and the pre-cancel runs only while unwinding, so a normal answer still reports
-`"stop"`.
-**Verified:** 4 tests in `tests/test_server_engine.py`; the 3 behavioural ones
-were confirmed to FAIL against the pre-fix code — the cancelled-handler one
-exactly as the bug (`the cancelled handler returned while its generation worker
-was still running`), the no-token one as `assert None is not None`, the third as
-`quiesce() has nothing to join while generate() is running`.
-`test_a_normally_finished_generate_still_reports_stop` is the guard that the
-self-minted token does not relabel every normal answer; it passed before and
-after. Suite 1246/3 → **1250/3**.
-**Gate:** `test_server_smoke.py` `ALL PASS` on Llama-3.2-1B — its non-streaming
-step is exactly the route rewritten here, so the thread/bridge swap is proven
-against a real model, not only the fake.
-
-### B10 · [x] `capture_stdio` was never restored when startup failed — **FIXED 2026-08-29**
-`vaayu/server/app.py`, `lifespan`. `restore_stdio` was created before
-`_check_gpu_is_exclusive` and the model load, but `restore_stdio()` lived in the
-`finally` **after** `yield`. A `SystemExit` from the GPU audit — or any load
-error — skipped it: fds 1 and 2 stayed pointed at the pipe, `saved_out`/`saved_err`
-leaked, and what uvicorn printed next reached the console only via a daemon pump
-thread the interpreter is about to kill.
-
-**Fix 1 — `app.py`.** The whole pre-`yield` section (capture, GPU audit, load,
-`EngineHandle`, **and `_install_signal_cancel`**, which the row did not name but
-sits in the same unguarded stretch) is now inside a `try`, with
-`except BaseException: restore_stdio() if not None; raise`. `BaseException`, not
-`Exception`: the audit raises `SystemExit`, which is exactly the case that has to
-work. Re-raising means the second `try/finally` is never entered, so no
-double-restore.
-**Deliberate tradeoff:** restoring in the handler means uvicorn's
-"Application startup failed" traceback reaches the **console** but not
-`server.log`. That is the row's stated priority — console delivery is what it
-names as at risk. The refusal report itself is printed BEFORE the failure and
-`restore()` joins the pump, so it still lands in the log file.
-
-**Fix 2 — `vaayu/server/logs.py`, `restore()`. Beyond the row's literal "done
-means", same harm.** `sys.stdout`/`sys.stderr` are flushed BEFORE the `dup2`s.
-`print()` to a non-tty is block-buffered, so on a server started with its output
-redirected to a file — the shape this repo's own Environment section prescribes —
-the refusal message was still in Python's buffer at restore time and flushed to
-the console AFTER the dup2, never reaching the log. Flush order is the mirror of
-the join order already commented there.
-
-**Verified:** 2 tests, both confirmed to FAIL against the pre-fix code —
-`test_a_failed_startup_restores_fd_1_and_2` (`tests/test_server_app.py`) as
-`FAIL: fd 1 is still in the log pipe after a failed startup`, and
-`test_restore_flushes_python_buffered_output_into_the_log` (`tests/test_logs.py`)
-on the missing log line. Both run in a **subprocess**, matching `test_logs.py`'s
-existing capture tests: they rewire fd 1/2 for real, and pre-fix they leave them
-rewired — in-process that would put pytest's own output down a pipe for the rest
-of the run. The app one asserts fd identity (`st_dev`/`st_ino`) for fds 1 and 2
-plus no leaked entries in `/proc/self/fd`, and reports through a verdict FILE
-because stdout is the thing under test. Suite 1232/3 → **1234/3**. Server smoke
-gate `ALL PASS` on Llama-3.2-1B (the success path, which Fix 2 also touches).
-**Not covered by a test:** a failure in the model LOAD rather than the audit —
-provoking it needs a real checkpoint; the handler is the same one either way.
-
-### B11 · [x] the exclusive-GPU refusal had no device filter and no threshold — **FIXED 2026-08-29**
-`vaayu/gpu_audit.py` + `app.py`. `audit()` returned every foreign compute process
-on **every** GPU and `_check_gpu_is_exclusive` refused on any of them at any
-size. `parse_compute_apps` also split on `,` and required exactly 3 fields, so a
-process name containing a comma was silently skipped — under-reporting, which is
-the one thing this module must not do.
-
-**The row's own numbers, measured rather than assumed.** A bare CUDA context on
-this box is **128 MiB** (a `torch.zeros(1, device='cuda:0')` child, live
-`nvidia-smi`), so the row's "a 30 MiB process refuses the boot" is if anything
-understated: *any* process that merely imports torch did. That measurement is
-what sets the threshold default.
-
-**Fix 1 — WHICH GPU, joined on UUID not index.** The query gained a `gpu_uuid`
-column and `foreign_gpu_users` gained a `uuid=` filter; `device_uuid("cuda:1")`
-resolves it through `torch.cuda.get_device_properties(i).uuid`, prefixed `GPU-`
-to match nvidia-smi. **Not the index:** nvidia-smi's index is its own
-enumeration and neither `CUDA_DEVICE_ORDER` nor `CUDA_VISIBLE_DEVICES` moves it
-in step with torch's `cuda:N`; the UUID is the one identifier both sides agree
-on (verified live: torch `a6e6ee6b-…` ↔ nvidia-smi `GPU-a6e6ee6b-…`).
-`device_uuid` **fails OPEN** — cpu, a malformed string, no torch, no driver, an
-absent device all return None, i.e. no filter. Over-reporting costs a warning;
-failing closed would silently audit nothing.
-
-**Fix 2 — HOW BIG.** `blocking_users(users, min_mib)` is separate from
-`compose_report`, because "does this refuse the boot" and "is this worth saying"
-are different questions. Under-threshold holders are **reported and never
-dropped**: `compose_report` lists them, but leaves them out of the total and out
-of the commands — the total is the argument for refusing so it must be the
-memory the refusal is about, and nobody should be told to kill a bare CUDA
-context. New knob `EXCLUSIVE_GPU_MIN_MIB = 256`, a POLICY constant sited by the
-128 MiB measurement, not a model number (CLAUDE.md §5).
-
-**Fix 3 — the parse.** uuid is `raw[0]`, pid `raw[1]`, memory `raw[-1]`, and the
-name is everything between, joined. nvidia-smi does not quote its CSV, so this
-is what a comma in a process name needs.
-
-**Verified:** 12 tests in `tests/test_gpu_audit.py`. Rather than a
-whole-file revert (which only produces a collection error, a weak signal), each
-mechanism was **mutated out individually** and the exact test that dies with it
-recorded: uuid filter ignored → `..._holder_on_another_gpu_does_not_count`;
-threshold ignored → 4 tests incl. the gate one; fixed-field parse → the comma
-test; gate stops passing `device` → `..._audits_the_configured_device`;
-`device_uuid` failing closed → `..._falls_back_to_auditing_everything`.
-Also verified END-TO-END against live `nvidia-smi` with real child processes: a
-154 MiB context is reported and does NOT block, a 1.55 GiB holder still raises
-`SystemExit` with `kill <pid>`. Suite 1234/3 → **1246/3**. Server smoke gate
-`ALL PASS` on Llama-3.2-1B with `max_seq_len=90639`, **identical to the pre-change
-run** — so `device_uuid` initialising CUDA before the load does not shrink the
-derived budget.
-**Test churn this forced, deliberately:** the parser's input format gained a
-column, so `SAMPLE` and 2 existing parse tests were updated; `audit()` gained a
-kwarg, so the `lambda: []` fakes in `test_delete_original.py` and
-`test_server_config_passthrough.py` became `lambda **kw: []`, and
-`exclusive_gpu_min_mib` joined `NOT_MODEL_KWARGS`.
-**Unchanged on purpose:** the LIBRARY path (`auto_model.py:57`) still calls
-`audit()` with no device and `compose_report` with no threshold — it warns about
-the whole box and never refuses, which is its contract.
-**Noticed, not touched (CLAUDE.md §3):** `_MIB` in `gpu_audit.py` was already
-dead before this change (definition only, no use).
-**Not covered by a test:** the real `_torch_device_uuid` call — it needs a GPU;
-`device_uuid`'s logic is tested with it monkeypatched, and the live run above is
-what stands behind the call itself. The two-GPU case is likewise unit-tested
-only: this box has one GPU.
-
-### B12 · [x] `REQUIRE_EXCLUSIVE_GPU`'s comment block documented the wrong knob — **FIXED 2026-08-29** (with B11)
-`vaayu/server/config.py`. The `REQUIRE_SESSION_ID` explanation was pasted
-**inside** the `REQUIRE_EXCLUSIVE_GPU` comment, so the single setting that makes
-the server refuse to boot had no documentation next to it and the text above it
-read as if it were about session ids. The same paste was in `ServerConfig`
-(`app.py`), where the exclusive-GPU comment sat stranded above
-`delete_original`'s.
-**Fixed with B11 rather than separately:** comment-only, in the exact lines B11
-already edits; keeping it apart meant editing the same block twice.
-**Fix:** the two comments are split and each sits on its own knob, in both
-files. Both now say the refusal is scoped to `DEVICE`, which is B11's change.
-**Docs, beyond the row:** `EXCLUSIVE_GPU_MIN_MIB` is tabled in
-`vaayu/server/README.md` and `documentation/server.md`, and `README.md`'s
-enforcement section now states both exclusions (other GPU, under threshold) and
-that both are still reported.
-**Verified:** no test — it is comments and docs. `test_the_threshold_default_is_above_a_bare_cuda_context`
-is what pins the knob itself.
-
-### B13 · [x] docs table `PORT` as 8000; the code ships 9999 — **FIXED 2026-08-29**
-`vaayu/server/config.py:29` sets `PORT = 9999` (and `ServerConfig.port` still
-defaults to `8000`). `documentation/server.md:102` and
-`vaayu/server/README.md:45` both table the default as `8000`, and every curl
-example in both docs plus `README.md:568` targets 8000. Copy-paste from the docs
-fails against a default install.
-
-**Fix.** `ServerConfig.port` default → `9999` (the third disagreeing answer;
-dead for the server because `__main__` always passes `config.PORT`, but live for
-every library caller and for the tests). All 13 doc sites rewritten to 9999 —
-`documentation/server.md` (11), `vaayu/server/README.md` (2), `README.md` (1).
-`tests/test_server_tools.py:137` keeps its `{"port": 8000}` — that is sample
-JSON payload, not a URL.
-**Verified: `tests/test_docs_ports.py`, 3 tests, a standing GUARD rather than a
-one-off fix.** It reads the expected value from `config.PORT` — a literal there
-would just be a fourth place to forget — and scans the three docs for
-`localhost|127.0.0.1|0.0.0.0:<port>` URLs and for the `| \`PORT\` |` table row.
-All three confirmed to FAIL first, the URL one listing every stale site by
-`file:line`. Suite 1254/3 → **1257/3**.
-
----
-
-
-# PERF — the Rust rows (R1–R4, M1, C1, L1) and the P-rows (P1–P8)
-
-**The full argument, arithmetic and probes are in `speed-up-vaayu.md` at the repo root, which is
-self-contained.** What follows is one paragraph per row so this file stays usable on its own, plus
-the section of that document to open.
-
-**The one number the whole thing turns on — re-measured by M1, 2026-08-30.** Decode-only, greedy,
-arena ballast-pinned, 6 arms per model: Qwen3-235B **4.018 GB/s**, MiniMax-M2.7 **3.912 GB/s**
-against the drive measured **through this same path** at 4 reads in flight (6.88 Qwen / 6.70
-MiniMax GB/s; sequential spec 7.45) — **50–51 % of the drive**. **The "73.1 % / 71.1 %" this
-paragraph used to quote came from the refuted ~5.5 GB/s denominator; see row C1.**
-(The older 4.09 / 3.93 GB/s figures, derived from 0.820 / 1.501 tok/s at a smaller arena, are
-superseded; the ratio they implied held up.)
-
-**M1 also decomposed it, which is what makes it actionable:**
-`aggregate = (one read's rate) × (rings busy on average)` — Qwen `1.76 × 2.30`, MiniMax
-`1.64 × 2.39`, both closing to 2 decimals. **The shortfall is CONCURRENCY, not per-read speed:**
-only ~2.3 of 8 rings are busy at any instant, and the drive's rate needs ~3.2 (**1.36–1.40×**).
-Full detail: `plans/2026-08-30-M1-gating-measurement-RESULTS.md`.
-
-### R1 · [x] Strip the hot-path `eprintln!` from `persistent_read` — **DONE 2026-08-30**
-`vaayu_rust/src/lib.rs`. Six per-read / per-wave lines were gated, not two: the row's line
-numbers were stale after B3/B6 moved them. `persistent_read`'s per-call pair, plus `legacy_read`'s
-two per-call and **two per-WAVE** lines, which the row had missed. Once-per-process init /
-registration lines and the two failure lines (dirty ring, drain failure) stay unconditional — they
-are not the read path.
-**How:** `trace_from_env()` (pure, unit-tested) behind a `OnceLock`, wrapped in an `rtrace!` macro.
-Resolved ONCE per process: the hot path must not touch the environment per read. A gate and not a
-deletion because **M1 needs the per-read timings back** — `VAAYU_RUST_TRACE=1` restores them exactly.
-**Perf verdict: REFUTED.** Two replicates per endpoint, per model, own scope each:
-Qwen 0.5352 → 0.5354 tok/s (+0.05 %), MiniMax 0.8114 → 0.8103 (−0.13 %) — both inside the
-0.23–0.36 % noise floor measured from the baseline replicates. The row's own stop rule says to
-**keep the change anyway**, and the log volume alone earns it: a 71-token run went **18 MB → 364 KB**
-(215,007 trace lines → 0), so the logs no longer need `grep -a` to be readable.
-**Tests:** `vaayu_rust` cargo 19 → 21 (`trace_from_env` truth table);
-`tests/test_rust_trace_gate.py` (4) drives a REAL io_uring read in a subprocess — both the
-persistent and legacy paths, silent by default and tracing under the env var. Verified failing
-against the unconditional code first.
-
-### P1 · [x] Free Python wins — **DONE 2026-08-30**, one CONFIRMED and two REFUTED
-Landed in the same arm as R1 so Rust could never be credited with them. That was the right call:
-**two of the three items do not exist as perf.**
-
-**(1) `gc.freeze()` after load — CONFIRMED, and the only real win in either row.**
-`freeze_after_load()` in `vaayu/utils.py` (`gc.collect()` then `gc.freeze()`); moves **766,689
-objects** out of every later gen-2 traversal on Qwen. Measured, two replicates per endpoint:
-**Qwen 0.5352 → 0.5415 tok/s (+1.19 %)**, **MiniMax 0.8114 → 0.8313 (+2.46 %)**. Both replicates of
-the treated arm beat both replicates of the baseline on both models, and the arena
-(1447–1452 / 1892–1899 slabs) and bytes-per-token (8.434–8.440 / 3.819–3.823 GB) were held
-identical across arms, so it is not a cache-size artefact.
-**Wired into the SERVER's startup only**, on the branch that actually loaded — an injected engine
-belongs to a caller that keeps using the process, and freezing its objects would retain them for
-that process's life. **A library caller (`test_generate.py`, the gates) does NOT get this win**
-unless it calls the helper itself, as the arm did. Deliberate: freezing after a SECOND load in one
-process pins the first model's garbage permanently.
-
-**(2) Precompute the expert-role table — REFUTED on arithmetic, reverted.**
-The row is right that `_group_exl3_tensors_by_weight` runs per expert, per layer, per token, and
-wrong about what that costs. Measured on the real key shapes from both checkpoints' index files:
-**2.12 µs/expert (Qwen), 2.14 µs (MiniMax)** → 752 and 496 calls/token → **1.60 ms and 1.06 ms per
-token = 0.131 % and 0.160 %** of a token. The whole function is a tenth of a percent; the best
-rewrite found (one `rsplit`, segment-keyed dict) measured 1.52× / 1.14× and would bank
-**0.045 % / 0.020 %**. Worse, the first version shipped was **0.77× on MiniMax** — its `.w1.` is the
-FIRST entry in `_EXPERT_WEIGHT_ROLES`, so the old scan hits on try #1 and two `rsplit`s cost more
-than the substring search they replaced. Refutation closes the row; nothing was re-scoped.
-**Kept:** `tests/test_expert_role_lookup.py` (9), which is the first coverage either function has
-had across BOTH expert layouts (Qwen fused-EXL3 and MiniMax module-list key shapes, real prefixes
-and component names).
-
-**(3) Cache `EngineHandle.tool_format` — REFUTED, reverted.**
-`detect_tool_format` measures **0.11 µs/call** on Qwen's 4,049-char template: the first
-`open_marker in template` matches immediately, so the "re-scans the whole chat template" premise
-does not hold. 3 accesses/request = 0.3 µs. Not worth an `__init__`-time invariant, and the
-`# properties read off the model, never cached` comment block stands unamended.
-**Kept:** one test that a template without tool support still yields `None` (the refusal contract).
-
-**(4)** was already banked by B2 (2026-08-23) before this row ran.
-
-### M1 · [x] THE GATING MEASUREMENT — **DONE 2026-08-30.** R2 stays open, **R3 REFUTED**
-Full write-up: `plans/2026-08-30-M1-gating-measurement-RESULTS.md`. 16 arms (one warmup +
-`base ×2`, `gil-lo ×2`, `gil-hi ×2`, `trace ×1`) per model, greedy decode, arena ballast-pinned to
-27.0 GB, replicates interleaved, one `systemd-run` scope each. No py-spy.
-
-All four numbers, both models, both MoE forwards:
-
-| # | Qwen3-235B (fused-EXL3) | MiniMax-M2.7 (module-list) | what it settles |
-|---|---|---|---|
-| (1) achieved read bandwidth | **4.018 GB/s** = 73.1 % of the drive | **3.912 GB/s** = 71.1 % | stop rule NOT met → **R2 stays open** |
-| (2) GC fraction | **0.26 %** | **0.41 %** | under the 2 % bar → **`speed-up-vaayu.md` §1 CLOSES** |
-| (3) GIL sensitivity (0.0005 vs 0.02) | **0.11 %** tok/s, 0.04 % bandwidth | **0.72 %** tok/s, 0.66 % bandwidth | no contention → **R3 REFUTED, row closes** |
-| (4) ring idle | **71.3 %** | **70.2 %** | the window R2 is trying to reclaim |
-
-**The decomposition that makes (4) actionable** — `aggregate = (one read's rate) × (rings busy on
-average)`, closing to 2 decimals on both: Qwen `1.76 × 2.30 = 4.04`, MiniMax `1.64 × 2.39 = 3.92`.
-**Only ~2.3 of 8 rings are busy at any instant.** Reaching ~5.5 GB/s needs concurrency 2.30 → 3.13
-(Qwen) / 2.39 → 3.35 (MiniMax) — **1.36–1.40×, on a pool that already exists.**
-
-**Supersedes** the R1/P1 arm's partial figures (Qwen 4.51–4.57, MiniMax 3.10–3.18 GB/s), which this
-row flagged as needing reproduction at the real budget. They are reproduced and replaced above.
-
-**NOT measured — do not assume otherwise:** only 64 decode tokens at a 439-token prompt; single
-stream only (fan-out ring concurrency is the number that would matter for aggregate throughput, and
-it is not this one); MoE only; `gc.freeze()` was ON for every arm, so (2) is the GC that remains
-*after* P1's win.
-
-**Three methodology traps, each of which cost a whole matrix** (kept because the next measurement
-will hit them):
-1. **Decode greedily.** Sampling changes routing → changes bytes/token → changes tok/s. Measured
-   corr(GB/tok, tok/s) = **−0.997** on Qwen; the first matrix's 21.9 % GB/tok spread made a
-   tok/s-based GIL test meaningless. (That correlation is itself a finding: decode throughput is
-   very nearly a pure function of bytes read.)
-2. **Make the ballast target reachable, and HARD-FAIL when it is not.** The second matrix used the
-   29.0 GB target that had worked an hour earlier; the box had since freed less RAM, so *every arm
-   silently held no ballast* and sized its arena off whatever was free. The arm script now
-   `sys.exit`s instead of warning — a gate that can only warn is not a gate.
-3. **Gate on bytes/token, not slab count.** The arena is the cause, bytes/token is the channel; a
-   2.6 % slab spread landing as 0.19 % of bytes/token cannot move a comparison.
-
-### R2 · [x] `io_uring_read_many` — **REFUTED 2026-08-30, row CLOSED**
-**The reads are BIMODAL, and R2's raw material was an artifact of not seeing that.**
-Full write-up: `plans/2026-08-30-R2-structural-probe-RESULTS.md` (main body + ADDENDUM).
-
-| | bulk reads | tiny reads |
-|---|---|---|
-| Qwen3-235B | 15942 × **11.80 MB**, 5.84 ms | 15942 × **0.04 MB**, 0.17 ms |
-| MiniMax-M2.7 | 14729 × **8.85 MB**, 5.04 ms | 29458 × **0.02 MB**, 0.11 ms |
-
-Ratios are exactly 1:1 and 1:2 against the miss counts (15942 / 14729), so **every expert has ONE
-bulk contiguous group** (the trellis weights) plus 1–2 tiny groups holding scales/bias. The tiny
-reads carry **0.3–0.4 % of the bytes**.
-
-- R2's gate looked cleared because a layer offers 5.47 / 11.50 *descriptors*. **Counting tiny reads.**
-  In bytes there is one read per miss, and `_dispatch_expert_misses` already submits one future per
-  miss across 8 workers and 8 rings — **bulk concurrency is already at its structural ceiling**
-  (measured 1.89 / 2.12 against a ceiling of 2.74 / 3.83; the shortfall is dead time, not batching).
-- The one mechanism left is dropping the tiny group's blocking round-trip: 91 × 0.17 ms = **15.5 ms
-  of a 770 ms token** (Qwen), 60 × 2 × 0.11 ms = **13.2 ms of 548 ms** (MiniMax) — **~1.02×**. Not
-  worth a Rust entry point, wave splitting and new lock discipline.
-- **Where the earlier 1.36–1.40× and 1.16–1.25× came from:** the k=1 bandwidth bucket mixes 4540
-  tiny reads with 1279 bulk ones and reads 3.32 GB/s. A *lone bulk* read does **5.21 GB/s**. The
-  polluted low buckets made the concurrency curve look far steeper than it is.
-
-**Recorded, not actioned:** the tiny tensors are the same scales/bias on every read of an expert,
-and all of them together are only ~0.5 GB on Qwen — small enough to hold resident and never read
-again, which beats R2's 1.02× outright. Not costed, not a row.
-
-<details><summary>original row and its earlier probe preamble, kept for the record</summary>
-
-**PROBE 2026-08-30 (`plans/2026-08-30-R2-structural-probe-RESULTS.md`) — read this FIRST; it
-corrects M1, which corrected the original row.** 4 arms, both models, both forwards, replicates
-within 0.06 % / 0.8 %.
-
-- **R2 is NOT refuted.** Its gate ("raise average in-flight above ~2.3") is cleared on raw
-  material: a layer offers **5.47** descriptors on Qwen and **11.50** on MiniMax against a current
-  in-flight of 2.74 / 3.83.
-- **But it is re-costed to ~1.16–1.25×**, not 1.36–1.40×: batching shortens the read burst without
-  touching compute, so coverage falls as width rises. M1's figure assumed that trade was free.
-- **The real serialization point is `load_expert_into_slab` (`safetensor_model_persister.py:856`)**,
-  whose `for group in _group_contiguous_ranges(...)` loop issues ONE blocking `io_uring_read_into`
-  per contiguous group. An expert's 2nd/3rd groups never overlap its 1st. On MiniMax (3 groups per
-  expert) that alone caps in-flight at a third of what the layer could offer. R2 must fix this loop,
-  not only `_dispatch_expert_misses`.
-- **Mechanism corrected a second time.** M1 said the win was Python round-trips between reads.
-  The gaps are **1–10 ms** (88–89 % of all dead time), and R3's refutation already priced Python/GIL
-  bookkeeping at 0.11–0.72 %. 1–10 ms is a layer computing with no read outstanding, not Python.
-  R2's win is width DURING a burst; the dead time is row L1's, not R2's.
-- **The drive is not saturated and is not a 5.5 GB/s drive** — see row C1.
-
-**M1 (2026-08-30) CONFIRMED the gap and CORRECTED the mechanism — read this before costing the
-work.** Decode achieves 4.018 / 3.912 GB/s against ~5.5 GB/s, and the shortfall is a **concurrency**
-gap, not a per-read-speed one: only **~2.3 of 8 rings** are busy at any instant, and reaching the
-drive's rate needs ~3.2 (**1.36–1.40×**).
-
-**The row's implied mechanism is WRONG, and a prototype built on it should be expected to do
-nothing.** M1's trace shows every `persistent_read` already logs `qd=32 chunk=372736
-total_chunks=32` — it splits its own tensor group into 32 chunks and submits **32 SQEs, exactly the
-queue depth**. The ring is already full *during* a read. So the win is not "more SQEs in flight per
-call"; it is removing the Python-side round-trips *between* reads (future resolution, buffer-pool
-get/put, LRU bookkeeping). Batching a layer's reads is still the right change — the reason it helps
-is just not the one written below. **R2 and R3 were aimed at the same 70 % idle from two
-directions**, and R3 is now refuted, which leaves R2 holding that target alone.
-
-**Sharper refutation condition than "does bandwidth move":** a prototype must raise **average ring
-concurrency above ~2.3**, measurable with M1's own parser (`m1_ring_idle.py`) on the same arm shape,
-*before* any tok/s is quoted.
-
-**The flagship item, aimed squarely at the 4.02-vs-5.5 GB/s gap.** Today one contiguous tensor
-group = one blocking `io_uring_read_into` from a `ThreadPoolExecutor` worker
-(`_dispatch_expert_misses` in `vaayu/moe_patch.py`; `load_expert_into_slab` / `load_expert_sparse`
-in `vaayu/persist/safetensor_model_persister.py`), each holding one ring's mutex across its own
-`submit_and_wait`. **Between a worker's completion and its next submission the ring goes idle**, and
-that window is a Python future resolving, a buffer-pool get/put, LRU bookkeeping and a GIL
-acquisition — ~422 such windows per token.
-**Proposal:** `read_many(Vec<(fd_or_path, offset, len, buf_ptr)>)` pushing a whole layer's misses
-onto one ring and waiting for all CQEs inside one `allow_threads`. Python drops from ~422
-dispatches/token to **~94, one per layer**. **Effort:** moderate — the submission loop exists; it
-becomes a loop over descriptors instead of over chunks of one descriptor.
-**Refuted if:** a prototype's achieved bandwidth does not move, or its ring concurrency does not
-rise above ~2.3. (M1's half of this condition — "decode already at ~5.4 GB/s" — was tested
-2026-08-30 and NOT met: 73.1 % / 71.1 % of the drive.) **Close the row on that result; do not
-re-scope.**
-**Watch for:** the SQ is sized at `queue_depth` (32) and a layer's descriptor list can exceed it —
-submit in SQ-sized waves inside the one call. **B6 is done** (2026-08-28), so an
-over-full wave now fails cleanly instead of poisoning the next caller — but B6 did not add the wave
-splitting, and R2 still must. Note also that the submission loop builds a fresh `SubmissionQueue`
-guard per `push`, i.e. one tail store per SQE; batching the pushes under one guard is R2's to take.
-→ `speed-up-vaayu.md` §2 R2.
-
-### L1 · [x] Reads outstanding during a layer's COMPUTE — **corruption FIXED + soaked; FEATURE stays off (−15 %)**
-**ROOT CAUSE FOUND AND FIXED 2026-08-30. The hard block's stated suspect was wrong.**
-
-`check_lookahead_flag_safe()` blamed "worker-vs-worker races inside the multi-worker
-`_stager_executor`". It is **stager-vs-MAIN-thread**, through the expert cache's *declined-insert*
-path — which is why two prior fix rounds (SlabArena event guard, pin refcount) both missed it: both
-hardened the **evict→reuse** window, and this is a different one.
-
-`ExpertRAMCache.put_slab` had four decline paths (duplicate key, layer-evict failure, global-evict
-failure, budget failure). Each called `arena.release(slab_idx)` and returned normally — but the
-caller keeps using the views it passed in:
-
-```python
-expert_cache.put_slab(layer_idx, eidx, views, slab_idx)
-return eidx, views          # -> the forward DMAs from these
-```
-
-So a declined insert put a live buffer back in the free list, the next `acquire()` handed it out,
-and io_uring overwrote it mid-DMA. `record_read()` could not help: the slab was freed *before* any
-read event existed, so `acquire()` had nothing to synchronise on. Torn expert weights -> NaN logits
--> `multinomial`'s `probability tensor contains inf, nan` assert. **The stager is what makes
-declines common** — it races decode on the same keys, so one of the two always loses the insert.
-
-**Evidence (three independent confirmations):**
-
-| | result |
-|---|---|
-| deterministic unit repro (no CUDA, no threads) | loser's views read `0xCC` after writing `0xBB` |
-| on-device, `VAAYU_LOOKAHEAD=0` | **0** decode declines, 16957 accepts, clean 64/64 |
-| on-device, `VAAYU_LOOKAHEAD=1` | **190** decode declines, CRASH at token 1 |
-| on-device, `=1` + decline-path release suppressed | 870 declines, **clean 64/64** (arena starved by the leak — diagnostic only) |
-
-**Fix:** `put_slab` now returns whether it adopted the slab and **never releases a declined one**.
-The decode path hands the declined slab to `ExpertRAMCache.orphan_slab()`, which ties its release to
-the pin that key already holds — `_dispatch_expert_misses` pins every miss before dispatch and both
-forwards unpin in a `finally` that runs after the H2D copy is issued and `record_read()` has armed
-the event guard. The stager releases immediately instead (it takes no further read and holds no pin).
-Suite **1277 passed, 3 skipped**. Three tests added in `tests/test_slab_arena.py`; the existing
-`test_put_slab_duplicate_key_releases_new_slab` asserted the buggy behaviour and was rewritten —
-its real concern (no leak) is now `test_orphaned_slab_is_released_on_unpin`.
-
-**The predictor itself is good:** 96 % accuracy (714/744) measured during the crashing run, so the
-feature is worth having.
-
-## On-device gate — the CORRUPTION FIX PASSES, the FEATURE FAILS its own gate
-
-Greedy A/B, Qwen, same box same day, one `systemd-run` scope each, ballast pinned to 27.0 GB:
-
-| | lookahead OFF | lookahead ON |
-|---|---|---|
-| result | 64/64 clean | **64/64 clean** (was: CRASH at token 1) |
-| **coverage** (>=1 bulk read in flight) | 62.4 % | **84.9 %** |
-| dead time | 37.6 % | **15.1 %** |
-| aggregate bandwidth | 3.765 GB/s | **5.129 GB/s** (+36 %) |
-| bandwidth while covered | 6.032 GB/s | 6.042 GB/s |
-| **bulk bytes read** | 188.57 GB | **302.04 GB (+60 %)** |
-| bulk reads | 15980 | 25595 |
-| tiny-read occupancy | 2.83 s (0.18 ms each) | **31.30 s (1.22 ms each)** |
-| **decode** | **1.258 tok/s** | **1.070 tok/s (−15 %)** |
-
-**The mechanism does exactly what L1 predicted** — dead time 37.6 % → 15.1 %, aggregate bandwidth
-+36 %, and bandwidth-while-covered unchanged (6.03 vs 6.04), which is the signature of "the disk was
-idle, now it is not" rather than "the disk got faster".
-
-**And it still loses, on the exact criterion this row wrote down in advance:** *"gate on bytes/token
-unchanged AND coverage up, never on coverage alone."* Bytes went UP 60 %. Predictor accuracy is
-91.6 % (42945/46872) and 9288 of 13251 prefetch inserts were used, so the prefetch is not simply
-wrong — **it is thrashing the cache**: prefetched layer-N+1 experts evict layer-N experts that are
-still needed, and both get re-read. The tiny reads tell the same story from the other side — 0.18 ms
-→ 1.22 ms each, 53 % of decode spent in tiny-read occupancy, i.e. queueing behind a ring pool that
-is now 60 % busier for no extra useful bytes.
-
-**Verdict: the corruption fix ships (it is a real bug on a shipped code path, independent of this
-flag). The FEATURE stays off.** Per the standing protocol this result closes the row as written.
-What it does NOT close is the observation underneath it — 37.6 % of decode has no read outstanding,
-and that is still worth ~1.58x if it can be filled without buying the bytes twice. Any successor row
-must attack the eviction interaction, not the prefetch trigger:
-
-- prefetch must not be allowed to evict on-path entries (a reserved sub-budget, or admitting
-  prefetched entries at LRU-cold rather than MRU-warm)
-- the stager/decode duplicate races waste real disk: 200 stager declines against 345 accepts per
-  token, each a full expert read thrown away
-- neither is a re-scope of this row; both are new work with their own gates.
-
-**STILL OPEN on this row:**
-- [x] **`check_lookahead_flag_safe()`'s hard block: RESOLVED 2026-08-30 — it still refuses, but on
-  PERFORMANCE.** Its old reason ("causes confirmed on-device memory corruption") became false once
-  the corruption was fixed, and its old message sent readers to audit `_stager_executor` worker
-  concurrency, which is not where the bug was. Rewritten to state the real cause, the measured
-  −15 %, the module-list no-op, and what would lift it.
-- [x] **SOAK DONE 2026-08-30 — passed on both detectors.** 4 arms x 256 tokens = 1024 tokens,
-  Qwen, guard bypassed for the measurement:
-
-  | arm | mode | stager | tokens | tok/s |
-  |---|---|---|---|---|
-  | ref | greedy, lookahead OFF | 2 | 256/256 | 1.095 |
-  | cmp | greedy, lookahead ON | 2 | 256/256 | 0.957 |
-  | stress1 | sampling, ON | **8** (4x default) | 256/256 | 0.895 |
-  | stress2 | sampling, ON, seed 99 | 2 | 256/256 | 0.922 |
-
-  **Zero crashes** where the unfixed code died at token 1 reproducibly. **And greedy ids are
-  BYTE-IDENTICAL across all 256 tokens, lookahead on vs off** — the stronger of the two detectors:
-  the crash assert only fires when a torn slab happens to produce a NaN, while a corrupted weight
-  that merely shifts a logit would pass it silently. Identical ids say the path is semantically
-  transparent, not merely non-fatal. Stress arms add ~190k routing decisions under sampling at 4x
-  stager width.
-  **Bound on the claim:** 1024 tokens, ONE model, ONE prompt. The mechanism was proved
-  deterministically (`test_declined_slab_is_not_handed_to_the_next_acquirer`), so the soak is
-  confirmation, not the primary evidence — but it does not establish "no race remains in this path".
-  The −12.6 % greedy regression (0.957 vs 1.095) reproduces the 64-token −15 %, so the guard's
-  quoted numbers hold at 4x the token count.
-- [x] **Guard message rewritten 2026-08-30.** `check_lookahead_flag_safe()` still refuses, now on
-  PERFORMANCE, and states the real root cause. It also records that the previous message blamed
-  `_stager_executor` worker concurrency and sent readers to the wrong subsystem. Docstring in
-  `tests/test_lookahead_guard.py` corrected to match; the three surviving "worker-vs-worker"
-  mentions in the tree are all explicitly-labelled history.
-- [ ] **Unexplained drift, NOT attributed.** Lookahead-off decode read 1.278/1.279 tok/s in the
-  morning probes and 1.258 in the afternoon A/B (64 tokens, same config) — 1.6 %, above this box's
-  0.23–0.36 % noise floor. The declined-insert path is provably never reached with lookahead off
-  (0 declines measured), so it should not be the fix. Left open rather than explained away.
-- [ ] **MiniMax gets nothing from this row as written.** The lookahead predictor lives ONLY in
-  `_make_fused_sparse_forward_exl3`; `_make_modulelist_sparse_forward` has no lookahead at all
-  (verified by source inspection). This is exactly CLAUDE.md §0's single-forward trap. Wiring the
-  module-list forward is separate work and is NOT done.
-- [x] **RESERVATION LANDED 2026-08-30, and it FLIPS L1 from −15 % to +12.2 %.** `ExpertRAMCache`
-  gained an in-flight claim (`claim_load`/`peek_load`/`mark_running`/`finish_load`, `_LoadClaim`).
-  The stager yields unconditionally on a claimed key; decode waits only on a claim already marked
-  RUNNING and loads it itself when the holder is merely QUEUED — that distinction is what keeps
-  CR-2 (prefetch must never preempt an on-path read) intact, and it is mutation-tested.
-
-  | | lookahead OFF | ON, pre-reservation | **ON, with reservation** |
-  |---|---|---|---|
-  | decode | 1.267 tok/s | 1.070 (−15 %) | **1.422 (+12.2 %)** |
-  | bulk bytes | 188.24 GB | 302.04 GB (+60 %) | **221.84 GB (+17.8 %)** |
-  | bulk reads | 15952 | 25595 | **18799** |
-  | coverage | 62.6 % | 84.9 % | 82.8 % |
-  | bandwidth while covered | 6.044 GB/s | 6.042 | 6.049 GB/s |
-
-  **6796 duplicate expert reads per 64 tokens removed** (−26.6 % bytes vs the pre-reservation arm)
-  with coverage held. So duplicate reads, not eviction churn, were the dominant term in the +60 % —
-  the opposite of what this row predicted before the work. Control arm confirms the baseline did
-  not drift (1.267 against the morning's 1.258–1.279).
-
-  **The stated gate is still NOT met on its letter:** bytes/token are +17.8 %, not unchanged. The
-  gate was a proxy for "does this come out ahead", and the outcome is now measured directly, so its
-  PURPOSE is satisfied — but do not record this as "gate passed". Suite 1285 passed, 3 skipped.
-- [x] **REPLICATED + RE-SOAKED, guard updated 2026-08-30.** Interleaved A/B (on,off,on,off) so
-  block drift cannot masquerade as the treatment:
-
-  | | arms | mean | spread |
-  |---|---|---|---|
-  | lookahead ON | 1.422 / 1.420 / 1.425 | **1.422** | 0.35 % |
-  | lookahead OFF | 1.267 / 1.284 / 1.279 | **1.277** | 1.33 % |
-
-  **+11.4 %**, distributions non-overlapping (worst ON beats best OFF by 10.6 %). The single-arm
-  +12.2 % was slightly optimistic; **11.4 % is the number, and it is what the guard now states.**
-  Re-soaked on the RESERVATION code (the earlier soak predates it and never exercised the new wait
-  path): 1024 tokens, 0 crashes, stager forced to 8 workers on one arm to maximise claim
-  contention, and **greedy ids byte-identical across 256 tokens** — the detector that matters here,
-  since the reservation makes decode consume the STAGER's slab on a won race.
-- [ ] **The guard still refuses, now purely on COVERAGE — and this is the remaining work.**
-  Every number is Qwen3-235B single-stream. Two gaps, both of which must close before the flag can
-  default ON (at which point the guard should be deleted, not relaxed):
-  - **Wire the module-list forward.** The predictor lives only in `_make_fused_sparse_forward_exl3`,
-    so the flag is a silent no-op on MiniMax. Defaulting it ON now would ship a win for one of the
-    two actively-tested models and nothing for the other — the exact asymmetry CLAUDE.md §5 forbids.
-  - **Measure under fan-out.** CLAUDE.md §0 says aggregate throughput under parallel streams is the
-    workload. A prefetcher competing with N decode streams for one cache and 8 rings is unmeasured.
-- [x] **Tiny reads (P3) — BUILT and REFUTED 2026-08-30, row CLOSED. Do not rebuild the store.**
-  The occupancy is real (20.56 s = **46.4 % of decode**, 1.09 ms each vs 0.18 ms lookahead-off, for
-  0.7 GB of the 222 GB read) but it is **not waste**. Holding the scale/bias groups resident removes
-  100 % of the tiny reads (21168 / 42956 / 51190 → 0) and returns byte-identical greedy ids — and
-  costs **−2.7 % at N=1, −11.3 % / −14.5 % at N=3**, every store-off arm beating every store-on arm
-  with no overlap. Mechanism: the tiny reads were **STAGGERING** the 8-worker ring pool, not
-  stealing capacity from it. Remove them and the workers synchronise — dead time 24.8 → 29.9 %,
-  per-bulk-read latency 9.12 → 10.36 ms, aggregate 4.267 → 3.877 GB/s. NVMe bandwidth is
-  concurrency-dependent, so a burstier pattern reads the same bytes slower.
-  **The lesson this row cost, which generalises: occupancy is not contention, and read COUNT is a
-  resource.** A small interleaved read that keeps the drive's queue non-empty is worth more than the
-  ring-time it holds. Any future change that removes reads must measure the
-  bandwidth-vs-concurrency curve, not bytes and occupancy alone. It also sharpens the ordering rule:
-  *a measurement promotes a build only when it identifies a CONSTRAINT, not merely a large number.*
-  **The ~5.12 GB/s ceiling is therefore still unexplained — it is NOT the tiny reads (see P8).**
-  Trail: `plans/2026-08-30-P3-tiny-store-RESULTS.md`.
-- [x] **Residual headroom — P4, CLOSED 2026-09-03, and this bullet's own theory is REFUTED.**
-  It read: "the remaining +17.8 % bytes is the eviction churn the admission policy row was written
-  for." It is not. Protecting history from the prefetcher to the limit — a 12-slot/layer reservation
-  that removes 99.96 % of prefetch-caused history evictions — makes BOTH models worse. What the
-  bytes actually buy is priced rank by rank: the marginal misses a prefetch read removes is flat
-  down the router's WEIGHT order and cliffs at the last rank on both models. Dropping that one pick
-  per routed row is +2.4 / +2.6 / +1.6 % tok/s with reads AND misses both down.
-  **The ~2.0 tok/s extrapolation is retired, not inherited:** P8 attributed the ceiling to the ring
-  pool and fixed it, and this row's own arms are the current numbers. Full trail:
-  `plans/2026-09-03-P4-admission-RESULTS.md`.
-
-**Opened 2026-08-30 by the R2 structural probe. With R2 refuted the same day, this is the ONLY disk
-lever left — and on bulk reads alone it is worth ~1.58× (Qwen) / ~1.64× (MiniMax).**
-
-**33.6 % (Qwen) / 34.7 % (MiniMax) of decode has ZERO reads in flight on any of the 8 rings.** Not
-"the rings are partly idle" — nothing is being read at all, for 16.6 s of a 49.3 s decode. It is
-**~160 gaps per token**, ~1.7 per layer, and **88–89 % of that dead time sits in 1–10 ms gaps**; only
-two gaps per run exceed 50 ms. So it is not a handful of stalls to hunt — it is the read burst
-ending before the layer does, every layer, every token.
-
-Counting only the BULK reads that carry the bytes (see R2's row for why that distinction matters),
-coverage is **63.2 % (Qwen) / 61.0 % (MiniMax)** and bandwidth WHILE covered is already **6.04 /
-6.10 GB/s**. Holding that across 100 % of decode is the 1.58–1.64×. **Nothing about the disk path
-needs to get faster — it needs to stop stopping.**
-
-**Do not scope this as new work.** Decode-time cross-layer prefetch is already implemented — the
-Task 12 lookahead routing predictor at `moe_patch.py:1523-1559`, which runs the next layer's router
-on the current hidden state and submits predicted misses to `_stager_executor`.
-
-**(Superseded 2026-08-30 — kept because it is the framing this row was opened with.)** This
-paragraph used to say the feature was hard-blocked for memory corruption whose "leading unaudited
-suspect" was worker-vs-worker races inside `_stager_executor`, and that this row WAS that audit.
-**Both halves were wrong.** The corruption was stager-vs-MAIN-thread in `put_slab`'s declined-insert
-path (see the top of this row), and it is now fixed. The block remains, but on PERFORMANCE: the
-feature costs 15 % of decode. Cost this row as a cache-admission problem, not a thread audit.
-
-**Refuted if:** the audit clears the races and a prefetching arm's coverage does not rise above
-~66 %, or aggregate bandwidth does not move. Close the row on that result; do not re-scope.
-**Watch for:** prefetch that merely relocates the reads (predicting wrong, then reading again) will
-raise bytes/token — gate on **bytes/token unchanged AND coverage up**, never on coverage alone.
-
-### C1 · [x] The `~5.5 GB/s` NVMe figure is not a hardware constant — **DONE 2026-08-30**
-**Four places corrected:** `CLAUDE.md` §5 (the constant list every other document cites),
-this file's Environment section, `speed-up-vaayu.md` (its §0 gap arithmetic rewritten — the gap is
-LARGER than it argued, 50–51 % of the drive not 71–74 % — and its §5 probe list marked done), and
-`vaayu/expert_sim.py`'s `nvme_bytes_per_s` default (5.5e9 → 6.9e9, commented as a ceiling; no test
-exercises it, since `nvme_s_per_token` is only computed when a caller passes `tokens=` and none
-does). Archived `plans/` documents keep their original wording — they are the record of what was
-believed at the time.
-
-**Opened 2026-08-30 by the R2 structural probe.** The drive is a **Samsung SSD 990 PRO 1TB,
-sequential-read spec 7.45 GB/s**. Measured on-device, decode's own reads deliver **6.88 GB/s (Qwen)
-/ 6.70 GB/s (MiniMax) at 4 reads in flight**, still rising at the edge of the credible range.
-~5.5 GB/s is roughly what this path achieves at 2–3 reads in flight — a measured-path figure that
-got promoted to a hardware constant and then used as a denominator.
-
-Consequences, all of which are live in documents today:
-- Decode's 3.70–3.83 GB/s is **50–51 % of the drive**, not M1's 71–73 %.
-- M1's "concurrency needed for 5.5 GB/s = 3.13 / 3.35" understates the available headroom.
-- `CLAUDE.md` §5 lists ~5.5 GB/s among the HARDWARE limits that "stay literal"; the Environment
-  section of this file repeats it.
-
-**Done means:** both documents carry the drive model, its 7.45 GB/s spec, and the measured
-concurrency-dependent figure, with a note that a single-stream number is not the drive's limit.
-Every "% of the drive" claim in `plans/` stays as written — it is archive — but this file and
-`CLAUDE.md` must not keep handing the wrong denominator to the next session.
-
-</details>
-
-### R3 · [x] Move the expert-cache miss path into Rust — **REFUTED 2026-08-30, row CLOSED**
-**M1's GIL probe, which this row named as its own gate, came back flat on BOTH models.** Two
-replicates per switch interval, greedy decode (identical tokens), arena pinned, interleaved:
-`sys.setswitchinterval(0.0005)` vs `0.02` — a **40× swing** — moved decode by **0.11 % (Qwen)** and
-**0.72 % (MiniMax)** on tok/s, and 0.04 % / 0.66 % on achieved bandwidth. Both are at or under this
-box's 0.23–0.36 % noise floor. On MiniMax the *longer* interval was fractionally slower, the
-opposite of what GIL starvation of the I/O threads would produce.
-
-The premise — ~750 Python LRU ops/token contending with the forward loop for the GIL — is not
-supported: the I/O threads already release the GIL inside `vaayu_rust`, and the Python bookkeeping
-on either side of that call is not what the token waits on. This row's stated stop rule
-("Refuted if: switch-interval changes do not move the token rate") is met. **Closed on the
-refutation; NOT re-scoped.** Details: `plans/2026-08-30-M1-gating-measurement-RESULTS.md` §(3).
-
-<details><summary>original row, kept for the record</summary>
-
-`ExpertRAMCache.get` / `acquire_slab` / `put_slab` / `_evict_global_oldest`
-(`vaayu/persist/expert_cache.py`) are Python `OrderedDict` LRU operations run **~750× per token**
-(94 layers × 8 experts), each holding the GIL while the forward loop wants it. Fold lookup + slab
-acquisition + read + admission into one GIL-free Rust entry point — the `SlabArena` is already one
-pinned allocation with integer slab indices, so Rust needs only the base pointer, the slab stride
-and the LRU state, none of which must be a Python object.
-**Effort:** high, and it touches the eviction policy that was tuned against measured hit rates.
-**Do it ONLY if M1's GIL probe shows real contention.** **Composes with R2:** together they turn
-"422 Python dispatches + 750 LRU operations" into "94 Rust calls".
-**Refuted if:** switch-interval changes do not move the token rate.
-→ `speed-up-vaayu.md` §2 R3.
-</details>
-
-### P8 · [x] The ~5.12 GB/s aggregate ceiling — **CLOSED 2026-09-03, attributed and fixed**
-**It was the ring pool, not the device.** `init_model_io` built the io_uring pool with
-`_init_iouring_ring(get_expert_pool_size(), 32)` — the CALLER pool, 8 on this box. The ring pool is
-what actually throttles DEVICE concurrency (a caller queues on a ring's `Mutex`), and 8 concurrent
-O_DIRECT readers is past this drive's read-concurrency knee. **The row's own refutation condition
-did not fire:** the same-path microbenchmark it asked for does NOT top out near 5.1 at k=8 — it
-reaches **7.09 GB/s** there once the ring pool is 2–4.
-
-The measured curve at ring pool 8 (Qwen, 11.80 MB reads, qd=32) is **non-monotonic**, and the 5.12
-that had no explanation is simply k=8 on it:
-
-| k | 1 | 2 | 3 | 4 | 5 | 6 | **8** | 12 | 16 |
-|---|---|---|---|---|---|---|---|---|---|
-| GB/s | 6.09 | **7.11** | 7.11 | 7.00 | 6.21 | 5.45 | **5.18** | 5.27 | 5.12 |
-
-At ring pool 2–4 it is **flat at 7.09 GB/s from k=2 to k=16**, on both models. Three candidates the
-row listed were killed first: **not** the queue depth (identical curve at qd=1,2,4,8,16,32 — qd=1 at
-k=8 is only 8 outstanding requests and still collapses), **not** file locality (file-adjacent reads
-match scattered ones to 0.3 %), **not** an inability of the drive to serve 8 readers (8 buffered
-`pread`s reach 4.79 GB/s and are still rising).
-
-**Fix:** `_NVME_READ_CONCURRENCY = 3` + `_ring_pool_size()` in
-`vaayu/persist/safetensor_model_persister.py`, capped at `get_expert_pool_size()`, overridable with
-`VAAYU_RING_POOL_N` (=8 reproduces the old behaviour). Caller-side concurrency — buffer pool, MoE
-executor width, in-flight staging slabs — is a RAM budget and is untouched.
-
-**On-device A/B** (5 interleaved pairs Qwen, 3 MiniMax, `BALLAST_GB=27.0`): decode
-**1.257 → 1.317 tok/s (+4.8 %)** and **1.780 → 1.952 (+9.7 %)**; aggregate **+3.7 % / +9.6 %**;
-per-bulk-read latency **−14.1 % / −18.7 %**; TTFT **−2.7 % / −4.1 %**. Every bandwidth figure is
-NO OVERLAP. Workload identical (MiniMax misses −0.03 %, GB/tok identical to 3 dp; Qwen's miss counts
-overlap at −1.0 %). Decode banks less than the microbenchmark's +36 % because it only reaches k≥5 in
-bursts. **Streamed dense is unmoved** (ppl 8.78, per-token io_wait 3.5 s under both) — it loads
-layers at k=1, where the curve is flat.
-
-**Tests:** `tests/test_ring_pool_sizing.py`, 5, all seen to FAIL first. Suite **1308 passed, 3
-skipped**. Gates: dense smoke PASS, accumulator 8/8 both models, prefix reuse 1 passed, server smoke
-ALL PASS. Trail: `plans/2026-09-03-P8-ring-pool-RESULTS.md`; harness `plans/probes/p8_samepath.py`.
-
-### R4 (= P6) · [x] Prefill repack memcpys into Rust — **REFUTED 2026-09-03, CLOSED, nothing built**
-The row said: `load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
-`dst_slice.copy_(chunk)` in Python and `gpu_repack_aligned` does the same into a fresh buffer, so a
-Rust `memcpy` under `allow_threads` could overlap the H2D stream. **Both halves are wrong.**
-
-- **`tensor_align=True` is production-dead** and has been since **2026-07-13** (`c5014cd`, B1
-  zero-copy prefill staging). All three production call sites — `vaayu_base.py:1267`
-  (`stage_read_expert`), `moe_patch.py:357`, `moe_patch.py:1543` — pass `tensor_align=False`; the
-  only `True` callers are 5 sites in `tests/`. **R4 was written 2026-08-23, six weeks after that
-  commit**, from the function's docstring rather than its call sites.
-- **`gpu_repack_aligned` is on the GPU.** Its `torch.empty(..., device=device)` is CUDA (EXL3 forces
-  it) and its `copy_`s are D2D on the compute stream. Rust has nothing to offer — it belongs in the
-  R5 list below. It is also **Qwen-only**: `_prefill_staged_slabs` is read only at
-  `moe_patch.py:1753/1846/1984`, all inside `_make_fused_sparse_forward_exl3`.
-  `_make_modulelist_sparse_forward` never calls it, so **MiniMax never executes this path.**
-- **The residual, measured** (`plans/probes/p6_repack_bench.py`, geometry derived from each
-  checkpoint header): replacing "1 H2D of the raw slab + N D2D repack copies" with "N H2D straight
-  into 16-aligned GPU slices" saves **30.2 µs/expert → 0.364 s/prefill → 4.7 %** on Qwen (MiniMax
-  geometry 35.2 µs / 0.558 s / 7.2 %, hypothetical since it never runs this). The staged consume
-  costs **7.8 s/prefill** and is **PCIe-bound** — 142 GB crosses either way; the repack is 4.7 % of
-  it, cold-turn only (prefix caching = 136–377× off TTFT), on one model. Below every closed row's
-  bar, and not what R4 proposed. Per the Environment rule, refutation closes the row; not re-scoped.
-
-**Left behind, NOT fixed (CLAUDE.md §3):** `load_expert_into_slab`'s `tensor_align=True` branch and
-its `_EXPERT_BUF_POOL` draw are dead in production and kept alive only by tests, while the docstring
-at `safetensor_model_persister.py:851` still advertises it as "the prefill stager, via
-stage_read_expert" — **that stale docstring is what produced this row** — and
-`_group_layout`/`expert_span_bytes` still size every slab `max(raw_aligned_length, packed_span)` to
-cover a mode nothing calls. Recorded under OPTIONAL, not deleted: the sizing is load-bearing for
-slab-arena arithmetic and four tests assert the mode's behaviour.
-Trail: `plans/2026-09-03-P6-repack-RESULTS.md`. → `speed-up-vaayu.md` §2 R4.
-
-### Already Rust, or beyond Rust's reach — do not re-open
-**`gpu_repack_aligned` joined this list 2026-09-03** (from R4): CUDA tensors, D2D on the compute
-stream — Rust would have to move them to the CPU first. HF `tokenizers` is already Rust. Sampling / top-k / top-p are GPU tensors (Rust would add a D2H
-round trip). EXL3 matmuls, the router GEMM and attention are CUDA kernels. Streamed dense already
-reads at ~5.7 GB/s, i.e. at the wall — **Rust has nothing to offer it**; its lever is speculative
-decoding, already built and measured at 5.57× (see CARRIED FORWARD). `safetensors` header parse and
-offset-index build are load-time, once. → `speed-up-vaayu.md` §2 R5 and §4.
-
----
-
-# OPTIONAL — real work, no slot. Never ahead of the FIX SEQUENCE.
+# OPTIONAL — real work, no slot. Never ahead of OPEN or STILL OPEN.
 
 | # | Item | Status | Cost | Why optional |
 |---|---|---|---|---|
@@ -1716,4 +453,3 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   early layers on both models — exactly what the split addresses.
 
 ---
-
