@@ -360,3 +360,191 @@ def test_the_file_is_treated_but_the_console_is_not(tmp_path):
     # The console keeps its live animation: a user watching the server must not
     # have their terminal degraded to buy a readable log file.
     assert "frame 1/3" in out.stdout, "the console tee must stay raw"
+
+
+# ── the current-session marker ───────────────────────────────────────────────
+
+def test_the_marker_starts_clear_and_round_trips():
+    from vaayu.server import logs
+    logs.clear_current_session()
+    assert logs.current_session() is None
+    logs.set_current_session("agent-7")
+    assert logs.current_session() == "agent-7"
+    logs.clear_current_session()
+    assert logs.current_session() is None
+
+
+def test_the_marker_sanitizes_like_a_filename_does():
+    from vaayu.server import logs
+    logs.clear_current_session()
+    logs.set_current_session("../../etc/passwd")
+    marker = logs.current_session()
+    assert "/" not in marker and ".." not in marker
+    logs.clear_current_session()
+
+
+def test_a_second_overlapping_session_warns_and_degrades_but_never_raises(capsys):
+    # This is the batched-decode (Feature B, N>1) tripwire. It must be visible
+    # and it must NOT take a live request down: logging never raises on the
+    # generation path.
+    from vaayu.server import logs
+    logs.clear_current_session()
+    logs.set_current_session("a")
+    logs.set_current_session("b")                 # must not raise
+    assert logs.current_session() == "*", "ambiguous attribution must not guess"
+    assert "WARNING" in capsys.readouterr().out
+    logs.clear_current_session()
+
+
+def test_the_overlap_warning_is_printed_once_not_per_line(capsys):
+    from vaayu.server import logs
+    logs.clear_current_session()
+    logs._overlap_warned = False
+    logs.set_current_session("a")
+    logs.set_current_session("b")
+    capsys.readouterr()
+    logs.set_current_session("c")
+    assert "WARNING" not in capsys.readouterr().out
+    logs.clear_current_session()
+
+
+DUAL_WRITE_SCRIPT = """
+import sys, time
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, set_current_session, clear_current_session
+restore = capture_stdio({path!r})
+# The pump that drains fd 1/2 into the log files runs on a daemon thread reading
+# a pipe; a burst of prints with no real work between them can complete in well
+# under a millisecond -- under Linux's scheduler preemption granularity -- so the
+# pump thread never gets CPU time to drain and attribute a line before the next
+# marker change. Real generation always has actual work (model compute, disk
+# reads) between prints, giving the pump a real scheduling opportunity; a flush
+# plus a short sleep after each line reproduces that here instead of relying on
+# a race between this script and the pump thread.
+def emit(line):
+    print(line)
+    sys.stdout.flush()
+    time.sleep(0.05)
+emit("startup-line")
+set_current_session("agent-a")
+emit("line-for-a")
+clear_current_session()
+set_current_session("agent-b")
+emit("line-for-b")
+clear_current_session()
+emit("teardown-line")
+restore()
+"""
+
+
+def test_each_session_file_holds_only_its_own_lines(tmp_path):
+    import subprocess, sys
+    from pathlib import Path
+    from vaayu.server.logs import session_log_path
+    run = tmp_path
+    (run / "sessions").mkdir()
+    out = subprocess.run(
+        [sys.executable, "-c", DUAL_WRITE_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(run / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    a = session_log_path(run, "agent-a").read_text()
+    b = session_log_path(run, "agent-b").read_text()
+    assert "line-for-a" in a and "line-for-b" not in a, a
+    assert "line-for-b" in b and "line-for-a" not in b, b
+
+
+def test_idle_lines_go_to_the_server_log_only(tmp_path):
+    import subprocess, sys
+    from pathlib import Path
+    from vaayu.server.logs import session_log_path
+    run = tmp_path
+    (run / "sessions").mkdir()
+    subprocess.run(
+        [sys.executable, "-c", DUAL_WRITE_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(run / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    server = (run / "server.log").read_text()
+    assert "startup-line" in server and "teardown-line" in server
+    assert "session=-" in server
+    a = session_log_path(run, "agent-a").read_text()
+    assert "startup-line" not in a and "teardown-line" not in a
+
+
+def test_the_session_line_carries_the_session_in_the_server_log_too(tmp_path):
+    import subprocess, sys
+    from pathlib import Path
+    run = tmp_path
+    (run / "sessions").mkdir()
+    subprocess.run(
+        [sys.executable, "-c", DUAL_WRITE_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(run / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    for line in (run / "server.log").read_text().splitlines():
+        if "line-for-a" in line:
+            assert "session=agent-a" in line, line
+            break
+    else:
+        raise AssertionError("line-for-a never reached server.log")
+
+
+def test_the_engine_marks_and_clears_the_session_around_a_generation(tmp_path):
+    import asyncio
+
+    import torch
+
+    from vaayu.server import logs
+    from vaayu.server.engine import EngineHandle
+    from .test_server_engine import FakeModel
+
+    seen = []
+
+    class M(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.tokenizer.decode = lambda ids, **k: "x"
+            self.config = type("C", (), {"eos_token_id": 2})()
+
+        def generate(self, **kw):
+            seen.append(logs.current_session())
+            return torch.cat([kw["input_ids"], torch.tensor([[7]])], dim=1)
+
+    logs.clear_current_session()
+    e = EngineHandle(M(), log_dir=tmp_path)
+
+    async def run():
+        from vaayu.server.schemas import ChatCompletionRequest
+        req = ChatCompletionRequest(model="v", session_id="agent-9", max_tokens=4,
+                                    messages=[{"role": "user", "content": "hi"}])
+        async with e.slot(req.session_key):
+            await e.generate(req)
+
+    asyncio.run(run())
+    assert seen == ["agent-9"], seen
+    assert logs.current_session() is None, "the marker must be cleared on exit"
+
+
+def test_the_marker_is_cleared_even_when_generation_raises(tmp_path):
+    import asyncio
+
+    import pytest as _pytest
+
+    from vaayu.server import logs
+    from vaayu.server.engine import EngineHandle
+    from .test_server_engine import FakeModel
+
+    logs.clear_current_session()
+    e = EngineHandle(FakeModel(), log_dir=tmp_path)
+
+    async def run():
+        async with e.slot("agent-9"):
+            raise RuntimeError("boom")
+
+    with _pytest.raises(RuntimeError):
+        asyncio.run(run())
+    assert logs.current_session() is None, (
+        "a marker left set would attribute the NEXT request's startup lines, "
+        "and every idle line after it, to a session that already ended")

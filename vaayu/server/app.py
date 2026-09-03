@@ -5,7 +5,6 @@ Everything decidable without a GPU lives in stopping.py / tools.py / schemas.py.
 import asyncio
 import json
 import time
-from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -424,7 +423,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         cancel = CancelToken()
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
         try:
-            async with e.slot():
+            async with e.slot(req.session_key):
                 result = await e.generate(req, cancel=cancel)
         except QueueFull as ex:
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
@@ -515,7 +514,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # Acquired HERE, not in the route: this generator body runs after the
         # handler returned, so a slot held around that return would already be
         # released before the first token.
-        async with engine.slot():
+        async with engine.slot(req.session_key):
             async for kind, payload in engine.stream(req, cancel=cancel,
                                                      prepared=prepared):
                 if kind == "final":

@@ -27,6 +27,60 @@ _MAX_NAME = 120
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 _write_lock = threading.Lock()
 
+_marker_lock = threading.Lock()
+_current_session: str | None = None
+_overlap_warned = False
+
+# The one session generating right now, or None when the engine is idle.
+#
+# This is sound ONLY because ServerEngine.slot() runs exactly one generation at
+# a time under its lock (vaayu/server/engine.py) -- deliberately, because the
+# engine is not thread-safe across the KV cache, the expert VRAM cache and the
+# slab arena. That is what lets the whole process-wide stream, including
+# print() from inside vaayu_base and eprintln! from vaayu_rust -- neither of
+# which carries any session context -- be attributed to one request.
+#
+# >>> THIS ASSUMPTION HAS AN EXPIRY DATE. <<<
+# Batched decode (Feature B, N>1) breaks it: several sessions would then share
+# one forward and one output stream. When that lands, this marker must become a
+# SET, and any line that cannot be attributed to exactly one session must be
+# tagged `session=*` rather than guessed. The overlap path below already tags
+# `*` and warns, so the day it happens is visible in the log rather than silent
+# -- but the fix is a set, not a louder warning.
+
+
+def set_current_session(session_id) -> None:
+    """Mark the session that owns the output stream from here until cleared."""
+    global _current_session, _overlap_warned
+    with _marker_lock:
+        marker = sanitize_session(session_id) if session_id else UNNAMED
+        if _current_session is not None and _current_session != marker:
+            # Two generations in flight. Do NOT raise: this runs on the
+            # generation path, and a logging failure must never become a 500.
+            # Do NOT guess either -- attribute to nobody.
+            if not _overlap_warned:
+                _overlap_warned = True
+                print(f"[Vaayu-Server] WARNING: session {marker!r} started "
+                      f"while {_current_session!r} was still generating. "
+                      f"Per-session log attribution is no longer sound and "
+                      f"lines are being tagged `session=*`. This is the "
+                      f"batched-decode tripwire: the marker needs to become a "
+                      f"set (see vaayu/server/logs.py).")
+            _current_session = "*"
+            return
+        _current_session = marker
+
+
+def clear_current_session() -> None:
+    global _current_session
+    with _marker_lock:
+        _current_session = None
+
+
+def current_session() -> str | None:
+    with _marker_lock:
+        return _current_session
+
 # CSI sequences: colour, cursor moves, erase-line. tqdm and rich emit these on
 # every redraw; in a file they are noise that breaks grep and line counting.
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -103,6 +157,29 @@ def session_event(log_dir, session_id, event: str, **fields) -> None:
         pass
 
 
+_session_sink: dict = {"id": None, "fh": None}
+
+
+def _session_write(run_dir: Path, session: str, data: bytes) -> None:
+    """Append one already-formatted line to `sessions/<session>.log`.
+
+    One cached handle rather than open-append-close per line: a decode emits
+    thousands of lines and the reopen cost lands on the generation path.
+    Never raises, for the same reason session_event does not.
+    """
+    try:
+        if _session_sink["id"] != session:
+            if _session_sink["fh"] is not None:
+                _session_sink["fh"].close()
+            path = run_dir / "sessions" / f"{session}.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _session_sink["id"] = session
+            _session_sink["fh"] = open(path, "ab", buffering=0)
+        _session_sink["fh"].write(data)
+    except OSError:
+        _session_sink["id"], _session_sink["fh"] = None, None
+
+
 def capture_stdio(log_path, rotate_mb: int = 50):
     """Tee fd 1 and 2 into `log_path`. Returns a restore callable.
 
@@ -124,10 +201,12 @@ def capture_stdio(log_path, rotate_mb: int = 50):
 
     limit = rotate_mb * 1024 ** 2
     state = {"sink": sink, "size": log_path.stat().st_size if log_path.exists() else 0}
+    run_dir = log_path.parent
 
     def _emit(raw: str) -> None:
-        """One assembled line -> the log file. Never raises."""
-        text = format_line(raw)
+        """One assembled line -> the log file, and the session file if any."""
+        session = current_session()
+        text = format_line(raw, session=session)
         if not text:
             return
         data = text.encode("utf-8", "replace")
@@ -141,6 +220,8 @@ def capture_stdio(log_path, rotate_mb: int = 50):
             state["size"] += len(data)
         except OSError:
             pass
+        if session and session != "*":
+            _session_write(run_dir, session, data)
 
     def pump():
         buf = b""

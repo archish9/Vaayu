@@ -43,7 +43,7 @@ class FakeEngine:
             raise self._raises
         return [1, 2, 3], 16
 
-    def slot(self):
+    def slot(self, session_key=None):
         engine = self
 
         class _Slot:

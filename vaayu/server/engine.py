@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from .chat import render_prompt
-from .logs import session_event
+from .logs import clear_current_session, session_event, set_current_session
 from .stopping import finish_reason, resolve_max_tokens
 from .tools import declared_tool_names, detect_tool_format, parse_tool_calls
 
@@ -166,7 +166,7 @@ class EngineHandle:
     # ── admission ────────────────────────────────────────────────────────────
 
     @asynccontextmanager
-    async def slot(self):
+    async def slot(self, session_key=None):
         """Admit one request. Raises QueueFull past `queue_depth`.
 
         The counter is incremented BEFORE awaiting the lock, so it counts
@@ -180,6 +180,11 @@ class EngineHandle:
         self._inflight += 1
         try:
             async with self._lock:
+                # INSIDE the lock, not before it: that is what makes the
+                # marker's overlap check assert the real invariant (one
+                # generation at a time) rather than something about the
+                # admission queue.
+                set_current_session(session_key)
                 try:
                     yield
                 finally:
@@ -190,7 +195,12 @@ class EngineHandle:
                     # releasing the lock now admits a second generate() onto an
                     # engine that is not thread-safe and shares the KV cache,
                     # the expert VRAM cache and the slab arena.
-                    self.quiesce()
+                    try:
+                        self.quiesce()
+                    finally:
+                        # After quiesce: lines emitted while the worker is
+                        # being joined still belong to this session.
+                        clear_current_session()
         finally:
             self._inflight -= 1
 
