@@ -409,30 +409,19 @@ def test_the_overlap_warning_is_printed_once_not_per_line(capsys):
 
 
 DUAL_WRITE_SCRIPT = """
-import sys, time
+import sys
 sys.path.insert(0, {repo!r})
 from vaayu.server.logs import capture_stdio, set_current_session, clear_current_session
 restore = capture_stdio({path!r})
-# The pump that drains fd 1/2 into the log files runs on a daemon thread reading
-# a pipe; a burst of prints with no real work between them can complete in well
-# under a millisecond -- under Linux's scheduler preemption granularity -- so the
-# pump thread never gets CPU time to drain and attribute a line before the next
-# marker change. Real generation always has actual work (model compute, disk
-# reads) between prints, giving the pump a real scheduling opportunity; a flush
-# plus a short sleep after each line reproduces that here instead of relying on
-# a race between this script and the pump thread.
-def emit(line):
-    print(line)
-    sys.stdout.flush()
-    time.sleep(0.05)
-emit("startup-line")
+print("startup-line")
 set_current_session("agent-a")
-emit("line-for-a")
+print("line-for-a")
 clear_current_session()
 set_current_session("agent-b")
-emit("line-for-b")
+print("line-for-b")
 clear_current_session()
-emit("teardown-line")
+print("teardown-line")
+sys.stdout.flush()
 restore()
 """
 
@@ -489,6 +478,64 @@ def test_the_session_line_carries_the_session_in_the_server_log_too(tmp_path):
             break
     else:
         raise AssertionError("line-for-a never reached server.log")
+
+
+# ── the drain barrier ────────────────────────────────────────────────────────
+
+BOUNDARY_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, set_current_session, clear_current_session
+restore = capture_stdio({path!r})
+set_current_session("agent-a")
+print("line-for-a")
+clear_current_session()
+set_current_session("agent-b")
+print("line-for-b")
+clear_current_session()
+restore()
+"""
+
+
+def test_a_line_is_not_misattributed_across_a_marker_switch_with_no_pacing(tmp_path):
+    # No sleeps, no explicit flush -- this is the exact boundary drain() exists
+    # for. _emit() reads the marker when a line is DRAINED from the pipe, not
+    # when it was written, so without a barrier inside set_current_session()
+    # the pump is not guaranteed to have read "line-for-a" before the marker
+    # moves to "agent-b". The failure mode is not merely losing the line --
+    # it is landing in the WRONG session's file (see Finding 1, T3 review
+    # round 1): a real request in the fan-out workload this engine exists for
+    # would see session B's trailing lines poisoned with session A's output.
+    import subprocess, sys
+    from pathlib import Path
+    from vaayu.server.logs import session_log_path
+    run = tmp_path
+    (run / "sessions").mkdir()
+    out = subprocess.run(
+        [sys.executable, "-c", BOUNDARY_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(run / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    a = session_log_path(run, "agent-a").read_text()
+    b = session_log_path(run, "agent-b").read_text()
+    assert "line-for-a" in a, a
+    assert "line-for-a" not in b, b
+    assert "line-for-b" not in a, a
+
+
+def test_drain_returns_promptly_when_no_pump_is_active():
+    # Every in-process test in this file (as opposed to the subprocess
+    # scripts above) never calls capture_stdio, so _pump_active is False
+    # here. Writing the drain token to fd 1 in that state would print
+    # garbage to the real console and then block for the whole timeout --
+    # drain() must recognise "no pump" and return immediately instead.
+    import time
+    from vaayu.server import logs
+    logs._pump_active = False
+    t0 = time.monotonic()
+    assert logs.drain() is True
+    assert time.monotonic() - t0 < 0.1, "drain() waited despite no pump being active"
 
 
 def test_the_engine_marks_and_clears_the_session_around_a_generation(tmp_path):

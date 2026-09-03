@@ -49,9 +49,62 @@ _overlap_warned = False
 # -- but the fix is a set, not a louder warning.
 
 
+_pump_active = False
+# True only while a capture_stdio pump thread is actually reading fd 1/2.
+# drain() below is a no-op unless this is set: with no pump installed
+# (CAPTURE_STDIO=False, or any library caller of EngineHandle that never
+# wired up capture_stdio at all) fd 1 is not our pipe -- writing the drain
+# token would print garbage straight to the real console and then block for
+# the whole timeout on every marker change, on every request.
+_drain_lock = threading.Lock()
+_drain_event = threading.Event()
+_DRAIN_TOKEN = "\x00__vaayu_drain__\x00"
+
+# Bounded so a stuck or dead pump can never turn a marker change into a
+# stalled request -- this runs on the generation path, at every set/clear of
+# the session marker. 2s is generous next to how fast an uncontended pipe
+# actually drains (microseconds, in practice) and small next to the
+# multi-second-per-request scale this engine runs at.
+_DRAIN_TIMEOUT = 2.0
+
+
+def drain(timeout: float = _DRAIN_TIMEOUT) -> bool:
+    """Block until every byte written to fd 1 so far has been read by the pump.
+
+    `_emit` reads the session marker when a line is DRAINED from the pipe, not
+    when it was WRITTEN -- the writers (print() inside vaayu_base, eprintln!
+    in vaayu_rust) carry no session context at all, which is the entire
+    reason the marker exists. Without this barrier the marker can move to the
+    next session while the previous session's last lines are still sitting
+    unread in the pipe, and they get attributed to whoever holds the marker
+    when the pump is finally scheduled -- wrong, not just late.
+
+    The pipe is FIFO: everything written before this sentinel is read before
+    it, so writing one unique token and waiting for `_emit` to see it is a
+    correct drain barrier with no new synchronisation between writer and
+    reader required.
+
+    A no-op when no pump is installed (see `_pump_active` above). Never
+    raises; returns whether the drain was observed within `timeout`.
+    """
+    if not _pump_active:
+        return True
+    with _drain_lock:
+        _drain_event.clear()
+        try:
+            print(_DRAIN_TOKEN, flush=True)
+        except OSError:
+            return False
+        return _drain_event.wait(timeout)
+
+
 def set_current_session(session_id) -> None:
     """Mark the session that owns the output stream from here until cleared."""
     global _current_session, _overlap_warned
+    # BEFORE the lock, always: _emit() calls current_session(), which takes
+    # _marker_lock too, so draining while holding it would deadlock the pump
+    # against this thread and hang the server on every request.
+    drain()
     with _marker_lock:
         marker = sanitize_session(session_id) if session_id else UNNAMED
         if _current_session is not None and _current_session != marker:
@@ -60,12 +113,15 @@ def set_current_session(session_id) -> None:
             # Do NOT guess either -- attribute to nobody.
             if not _overlap_warned:
                 _overlap_warned = True
-                print(f"[Vaayu-Server] WARNING: session {marker!r} started "
-                      f"while {_current_session!r} was still generating. "
-                      f"Per-session log attribution is no longer sound and "
-                      f"lines are being tagged `session=*`. This is the "
-                      f"batched-decode tripwire: the marker needs to become a "
-                      f"set (see vaayu/server/logs.py).")
+                try:
+                    print(f"[Vaayu-Server] WARNING: session {marker!r} started "
+                          f"while {_current_session!r} was still generating. "
+                          f"Per-session log attribution is no longer sound and "
+                          f"lines are being tagged `session=*`. This is the "
+                          f"batched-decode tripwire: the marker needs to become a "
+                          f"set (see vaayu/server/logs.py).")
+                except OSError:
+                    pass  # same rule as everywhere else on this path: never raise
             _current_session = "*"
             return
         _current_session = marker
@@ -73,6 +129,7 @@ def set_current_session(session_id) -> None:
 
 def clear_current_session() -> None:
     global _current_session
+    drain()  # same deadlock note as set_current_session -- before the lock
     with _marker_lock:
         _current_session = None
 
@@ -205,6 +262,12 @@ def capture_stdio(log_path, rotate_mb: int = 50):
 
     def _emit(raw: str) -> None:
         """One assembled line -> the log file, and the session file if any."""
+        if raw == _DRAIN_TOKEN:
+            # drain()'s barrier: the pipe is FIFO, so seeing this means every
+            # byte written before drain() was called has now been read. Not a
+            # real line -- never formatted, never logged.
+            _drain_event.set()
+            return
         session = current_session()
         text = format_line(raw, session=session)
         if not text:
@@ -244,8 +307,12 @@ def capture_stdio(log_path, rotate_mb: int = 50):
 
     thread = threading.Thread(target=pump, daemon=True, name="vaayu-log-pump")
     thread.start()
+    global _pump_active
+    _pump_active = True
 
     def restore():
+        global _pump_active
+        _pump_active = False
         # Order matters. Restoring fd 1/2 closes the pipe's write ends, which is
         # what lets the pump see EOF -- so JOIN before closing the saved console
         # fds. Closing them first raced the pump onto a dead descriptor and the
