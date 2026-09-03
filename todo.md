@@ -61,7 +61,7 @@ Read it before either row — it is what both rows cite.
 
 What the pass actually found:
 
-- **[ ] L1 · `logs/` is not a self-sufficient triage bundle** — 12-item audit, target layout,
+- **[~] L1 · `logs/` is not a self-sufficient triage bundle** — 12-item audit, target layout,
   and a 9-task plan in
   **[`docs/issue-L1-triage-logging.md`](docs/issue-L1-triage-logging.md)**.
   Vaayu is going open-source and the support loop is "user zips `logs/`, maintainer debugs here".
@@ -74,6 +74,22 @@ What the pass actually found:
   decode (Feature B, N>1) lands** — the doc says what to do then.
   **Stop rule:** T1–T4 close the loop; T5–T9 are additive. Do not change the token-summary bucket
   semantics while doing it — archived measurements are stated in those terms.
+  **Design approved 2026-09-03, T1–T4 only** — decisions recorded as §9 of that doc, and they WIN
+  where they differ from §3–§6. The two that are not obvious: the forward name is **tagged at the
+  dispatch** (`_make_sparse_moe_forward` sets `fn.__vaayu_forward__`) rather than re-derived in
+  `envinfo.py`, because a second copy of the dispatch table drifts and then misreports which of the
+  four forwards ran; and `warnings` is **harvested by the `capture_stdio` pump** (bounded ring
+  buffer of `WARNING` lines, drained after load) rather than plumbed from a dozen print sites — the
+  pump is fd-level, so it also catches the `vaayu_rust` warnings no Python hook can see. Console tee
+  stays RAW; `env.json` is fail-soft (`collect_errors`, never blocks a boot); no auto-prune of run
+  dirs. Verified by unit tests over all FOUR forwards plus real loads of all THREE checkpoints.
+  **Plan: [`docs/superpowers/plans/2026-09-03-L1-triage-logging-T1-T4.md`](docs/superpowers/plans/2026-09-03-L1-triage-logging-T1-T4.md)**
+  — 8 tasks, 58 TDD steps, every test and every implementation written out. Task order: run dir →
+  pump line-treatment → session marker → WARNING buffer → forward tag in `moe_patch.py` → `envinfo.py`
+  → lifespan wiring → docs + the three on-device gates. **Task 8 is the gate; everything before it is
+  unproven on real weights.** One recorded deviation from the issue doc: §5 asks for an assertion on
+  marker overwrite, §8 forbids logging from raising on the generation path — the plan warns once and
+  tags `session=*` instead, which is what §5 itself prescribes for unattributable lines.
 - **[ ] S1 · a configured drafter is dead weight on every MoE target** —
   **[`docs/issue-S1-drafter-dead-weight.md`](docs/issue-S1-drafter-dead-weight.md)**.
   Qwen2.5-Coder-1.5B loads fully to VRAM (1544M, 3.09 GB) and is then discarded by the Fix-#9 gate
