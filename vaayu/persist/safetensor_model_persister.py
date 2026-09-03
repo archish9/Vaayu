@@ -751,13 +751,16 @@ def _group_layout(group: list) -> tuple[int, int, int, int, int]:
     once did in this codebase (see commit ef24551).
 
     load_expert_into_slab has TWO write modes (see its docstring for why):
-    `tensor_align=True` (prefill staging) individually re-packs each tensor
-    onto a _TENSOR_ALIGN boundary in a transient scratch buffer, writing
-    only `packed_span` bytes into the persistent slab; `tensor_align=False`
-    (decode's cache-miss path, which never needs the alignment guarantee)
+    `tensor_align=True` individually re-packs each tensor onto a
+    _TENSOR_ALIGN boundary in a transient scratch buffer, writing only
+    `packed_span` bytes into the persistent slab; `tensor_align=False`
     writes the raw group read directly into the persistent slab, needing
-    `raw_aligned_length` bytes there. Sizing must cover BOTH possible modes
-    for the same slab (arena slabs are shared between decode and prefill),
+    `raw_aligned_length` bytes there. **Every production caller passes
+    `tensor_align=False`** — the repacking mode is exercised only by
+    `tests/` (see load_expert_into_slab's docstring). Sizing still covers
+    BOTH modes: the same arena slabs back both callers, the mode is a
+    per-call argument, and under-sizing for a mode a future caller turns
+    on would overflow the slab silently,
     so `slab_span = max(raw_aligned_length, packed_span)` and both
     functions always advance by `slab_span` regardless of which mode a
     given call actually uses.
@@ -840,16 +843,31 @@ def load_expert_into_slab(
     equals the sum of each group's own slab_span, per expert_span_bytes /
     compute_slab_bytes / _group_layout).
 
-    tensor_align selects one of two write modes, because only ONE of this
-    function's two callers actually needs the stronger alignment guarantee,
-    and paying for it unconditionally regressed decode throughput in
-    real-hardware testing (2026-07-12: avg decode token time rose from
-    ~1.0-1.2s to ~1.56s after tensor_align was applied unconditionally,
-    from added _EXPERT_BUF_POOL contention + per-tensor copy_ overhead on
-    decode's cache-miss path, which is hit 350-400x/token):
+    tensor_align selects one of two write modes.
 
-    - tensor_align=True (the prefill stager, via stage_read_expert): the raw
-      group read lands in a TRANSIENT scratch buffer drawn from
+    **NO PRODUCTION CALLER PASSES tensor_align=True** (verified 2026-09-03,
+    row P6). All three — stage_read_expert (vaayu_base.py), and both sites
+    in moe_patch.py — pass False; the True branch below is live only in
+    tests/. It stopped being the prefill stager's mode in commit c5014cd
+    (2026-07-13, "zero-copy prefill staging + GPU-side 16-byte alignment",
+    bug B1): the stager now reads RAW like decode does, and the 16-byte
+    alignment EXL3's uint4* kernel needs is applied on the GPU instead, by
+    gpu_repack_aligned in moe_patch.py's staged-consume path. This
+    docstring claimed otherwise for six weeks and is what produced (and
+    wasted) perf row R4/P6 — do not re-stale it. The branch is kept because
+    the two modes' sizing is shared (see _group_layout) and four tests
+    assert its behaviour.
+
+    The mode exists at all because only ONE caller ever needed the stronger
+    alignment guarantee, and paying for it unconditionally regressed decode
+    throughput in real-hardware testing (2026-07-12: avg decode token time
+    rose from ~1.0-1.2s to ~1.56s after tensor_align was applied
+    unconditionally, from added _EXPERT_BUF_POOL contention + per-tensor
+    copy_ overhead on decode's cache-miss path, which is hit 350-400x/token):
+
+    - tensor_align=True (TEST-ONLY since 2026-07-13; formerly the prefill
+      stager, via stage_read_expert): the raw group read lands in a
+      TRANSIENT scratch buffer drawn from
       _EXPERT_BUF_POOL (the same pinned-buffer pool load_expert_sparse
       already uses, bounded by the shared _moe_executor's worker count — no
       oversubscription), and each tensor is individually re-packed (one
@@ -858,24 +876,28 @@ def load_expert_into_slab(
       guarantees each tensor is itemsize-aligned (safe for .view(dtype)),
       not _TENSOR_ALIGN-aligned, since that position is derived from the
       file's own byte layout and is essentially arbitrary mod
-      _TENSOR_ALIGN — invisible on CPU, but Task 9's one-copy GPU rebuild
-      (views_from_packed_copy) reslices these exact views straight into a
-      CUDA tensor for EXL3's kernel, which dereferences the weight buffer
-      as uint4* — a misaligned slice there faults with
-      cudaErrorMisalignedAddress. Keeping the raw region OUT of `slab`
+      _TENSOR_ALIGN — invisible on CPU, but until B1 (2026-07-13) Task 9's
+      one-copy GPU rebuild (views_from_packed_copy) resliced these exact
+      views straight into a CUDA tensor for EXL3's kernel, which
+      dereferences the weight buffer as uint4* — a misaligned slice there
+      faults with cudaErrorMisalignedAddress. That is what this mode
+      existed for; gpu_repack_aligned now stands between the two and does
+      the aligning on the GPU. Keeping the raw region OUT of `slab`
       matters because `slab` is a long-lived, cache-capacity-counted
       buffer, while the raw region is only needed for this one read.
 
-    - tensor_align=False (decode's cache-miss path): the raw group read
-      lands DIRECTLY in `slab` at its natural file-relative offset — zero
-      extra copies, no scratch pool. Safe because decode's cached experts
-      are only ever consumed via the per-component `.to(device)` copies in
-      the compute loop (Task 7), which always allocate a fresh, naturally
-      aligned GPU destination regardless of the CPU source's alignment —
-      decode's cached slab entries are never routed through
-      views_from_packed_copy (that path only ever reads
-      vaayu_ref._prefill_staged_slabs, populated exclusively by the
-      background prefill stager).
+    - tensor_align=False (EVERY production caller: decode's cache-miss path
+      AND, since 2026-07-13, the prefill stager): the raw group read lands
+      DIRECTLY in `slab` at its natural file-relative offset — zero extra
+      copies, no scratch pool. Views into it are itemsize-aligned only, NOT
+      _TENSOR_ALIGN-aligned, so they are safe as copy SOURCES but not as
+      EXL3 kernel inputs. Both consumers respect that: decode's cached
+      experts go through per-component `.to(device)` copies in the compute
+      loop (Task 7), which always allocate a fresh, naturally aligned GPU
+      destination; the prefill stager's slabs go through
+      views_from_packed_copy (which preserves the raw, unaligned offsets)
+      and then gpu_repack_aligned, which is what re-packs onto 16-byte CUDA
+      offsets for the kernel.
 
     Either mode advances by the SAME per-group `slab_span` (see
     _group_layout) so the two modes can safely share the same arena/slab
@@ -1005,16 +1027,20 @@ def views_from_packed_copy(src_views: dict, src_base: "torch.Tensor", dst: "torc
     (typically a single H2D transfer of a pinned slab). Each view keeps its
     byte offset relative to src_base; dtype/shape are re-applied.
 
-    _TENSOR_ALIGN-alignment is guaranteed by construction, not just
-    itemsize-alignment: the source views were built by
-    load_expert_into_slab, which individually re-packs each tensor onto a
-    _TENSOR_ALIGN boundary (see its docstring) specifically so that
-    preserving `off` verbatim here keeps every reconstructed view aligned
-    in `dst` too — true as long as dst's own base pointer is at least
-    _TENSOR_ALIGN-aligned, which holds for any CUDA allocation. A weaker
-    (itemsize-only) alignment guarantee here previously produced GPU
-    tensors that crashed EXL3's kernel with cudaErrorMisalignedAddress on
-    real hardware (the kernel dereferences its weight buffer as uint4*)."""
+    **This function preserves the SOURCE's alignment; it does not create
+    any.** `off` is carried over verbatim, so each returned view is exactly
+    as aligned as its source view was. Production sources come from
+    load_expert_into_slab(tensor_align=False) — raw reads, whose offsets
+    are derived from the file's own byte layout and are itemsize-aligned
+    only. **The results are therefore valid as copy SOURCES but NOT as EXL3
+    kernel inputs**, which need 16 bytes because the kernel dereferences its
+    weight buffer as uint4* and faults with cudaErrorMisalignedAddress
+    otherwise. moe_patch.py's staged-consume path passes every dict from
+    here through gpu_repack_aligned before the kernel sees it; that is where
+    the alignment comes from (B1, 2026-07-13). An earlier version of this
+    docstring claimed alignment was guaranteed here by construction —
+    true only while the stager still used tensor_align=True, which it has
+    not since B1."""
     assert src_base.dtype == torch.uint8 and dst.dtype == torch.uint8, \
         f"views_from_packed_copy requires uint8 buffers (byte-offset arithmetic); got src_base={src_base.dtype}, dst={dst.dtype}"
     base_ptr = src_base.data_ptr()
