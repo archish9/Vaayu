@@ -10,6 +10,9 @@ available. This module is the fix, so these tests care about two things:
   * it never, under any failure, prevents a server from booting.
 """
 import json
+import os
+import platform
+import re
 
 import pytest
 
@@ -144,9 +147,17 @@ def test_budgets_come_off_the_vram_plan_and_the_caches():
 # ── redaction ────────────────────────────────────────────────────────────────
 
 def test_absolute_paths_are_redacted_to_a_basename_and_a_hash():
-    data = envinfo.collect(_model(is_moe=False), _config())
+    # Regression for the review finding: the fake config path was checked,
+    # but real absolute paths (sys.executable, collect_errors messages,
+    # warnings) leaked straight through on the SAME call. Scan the whole
+    # dumped report, not one known literal.
+    data = envinfo.collect(_model(is_moe=False), _config(),
+                           warnings=[f"[Vaayu] saw {__file__}"])
     dumped = json.dumps(data)
     assert "/home/someone" not in dumped, "a username must not ship in the bundle"
+    for pattern in (r"/home/[^\"\\]*", r"/Users/[^\"\\]*", r"/root/[^\"\\]*"):
+        assert not re.search(pattern, dumped), (
+            f"a raw absolute path matching {pattern!r} leaked into the report")
     assert data["config"]["model_path"]["name"] == "Big-Model-exl3"
     assert len(data["config"]["model_path"]["hash"]) == 10
 
@@ -168,6 +179,47 @@ def test_a_model_missing_everything_still_produces_a_report():
     data = envinfo.collect(broken, _config())     # must not raise
     assert data["collect_errors"], "a failure must be NAMED, not silently null"
     assert data["model"]["forward"] is None
+    assert data["model"]["on_disk_gb"] is None, (
+        "Path('') is Path('.'), the server's cwd -- a missing checkpoint_path "
+        "must not fall through to walking the filesystem and reporting the "
+        "cwd's size as the checkpoint's")
+
+
+def test_a_malformed_device_string_does_not_crash_collect():
+    # A typo in the user-editable config_local.py -- device="cuda:abc" --
+    # must not take down an otherwise-bootable server.
+    data = envinfo.collect(_model(is_moe=False), _config(device="cuda:abc"))
+    assert data["gpu"]["device"] == "cuda:abc"
+    assert data["model"]["is_moe"] is False        # the rest still collected
+    assert any("gpu.device_index" in e for e in data["collect_errors"])
+
+
+def test_an_unpatched_moe_block_records_why_forward_is_null():
+    # forward_name is the single most load-bearing field in the file; a null
+    # here must never look the same as "this model is dense".
+    m = _model(is_moe=True, style="fused", forward=None)
+    data = envinfo.collect(m, _config())
+    assert data["model"]["forward"] is None
+    assert any("forward_name" in e for e in data["collect_errors"])
+
+
+def test_python_executable_is_redacted_not_raw():
+    data = envinfo.collect(_model(is_moe=False), _config())
+    exe = data["python"]["executable"]
+    assert exe["name"] and exe["hash"]
+    assert isinstance(data["python"]["is_venv"], bool)
+
+
+def test_one_broken_config_field_does_not_null_the_whole_config_section():
+    cfg = _config()
+    del cfg.model_path      # simulate an attribute access failure
+    data = envinfo.collect(_model(is_moe=False), cfg)
+    assert data["config"]["model_path"] is None
+    assert data["config"]["log_dir"]["name"] == "logs", (
+        "a per-field wrapper, not a per-section one -- otherwise one broken "
+        "config attribute costs the whole config section, which is the most "
+        "load-bearing section in the file")
+    assert any("model_path" in e for e in data["collect_errors"])
 
 
 def test_one_broken_field_does_not_null_its_whole_section():
@@ -224,3 +276,42 @@ def test_the_host_and_storage_sections_are_present():
     for section in ("vaayu", "python", "host", "gpu", "storage", "model",
                     "budgets", "config", "env", "warnings", "collect_errors"):
         assert section in data, section
+    # These resolve from stdlib/module globals, not sysfs, so they hold on
+    # any box -- unlike the fields above, this can actually fail.
+    assert data["host"]["kernel"] == platform.release()
+    assert data["host"]["cpu_count"] == os.cpu_count()
+    assert isinstance(data["storage"]["o_direct"], bool)
+
+
+# ── conformance: the fakes above must match the real classes ─────────────────
+
+def test_envinfo_dependencies_exist_on_the_real_classes():
+    """Ties the fakes above to reality. `on_disk_gb` reading a `name_or_path`
+    attribute that does not exist on the real model is exactly the class of
+    bug this test exists to catch before a stranger's zip does.
+    """
+    from vaayu.vram_plan import VramPlan
+    from vaayu.moe_patch import MoEBlockInfo
+    from vaayu.persist.expert_cache import ExpertRAMCache, ExpertVRAMCache
+    from vaayu.prefix_cache import PrefixCacheStore
+
+    plan = VramPlan(max_seq_len=8192, reserve_bytes=1, pinning_budget=1,
+                    s_max=8192, reason="x")
+    for attr in ("reserve_bytes", "pinning_budget", "s_max", "reason"):
+        assert hasattr(plan, attr)
+
+    block = MoEBlockInfo(layer_idx=0, layer_name="model.layers.0",
+                         module_path="model.layers.0.block_sparse_moe",
+                         moe_module=object(), router_attr="gate",
+                         experts_attr="experts", expert_style="fused")
+    for attr in ("expert_style", "forward_name", "layer_idx"):
+        assert hasattr(block, attr)
+
+    ram = ExpertRAMCache(1000, max_per_layer=1)
+    assert hasattr(ram, "budget_bytes") and hasattr(ram, "max_per_layer")
+
+    vram = ExpertVRAMCache(1000)
+    assert hasattr(vram, "budget_bytes")
+
+    prefix = PrefixCacheStore(1000)
+    assert hasattr(prefix, "budget_bytes")
