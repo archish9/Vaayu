@@ -237,6 +237,40 @@ def _session_write(run_dir: Path, session: str, data: bytes) -> None:
         _session_sink["id"], _session_sink["fh"] = None, None
 
 
+# Startup warnings print ONCE, so a tailed log -- which is what users paste --
+# shows none of them, including the APST and foreign-GPU-process warnings that
+# are the two live hardware taxes on this box. env.json captures them
+# structurally instead.
+#
+# Harvested here rather than plumbed from the print sites for two reasons: the
+# sites are scattered through vaayu_base.py and moe_patch.py and editing a dozen
+# of them to call into the server package is exactly the coupling CLAUDE.md 3
+# forbids -- and it would STILL miss every vaayu_rust warning, which reaches
+# fd 2 directly where no Python hook can see it. The pump sees all of it.
+_WARNING_LIMIT = 200
+_warnings: list = []
+
+
+def note_if_warning(formatted: str) -> None:
+    """Record `formatted` if it looks like a warning. Cheap, called per line."""
+    if "WARNING" not in formatted:
+        return
+    # Drop the `<stamp> session=<id> ` prefix format_line added: env.json wants
+    # the message, and the timestamp is already in server.log.
+    parts = formatted.rstrip("\n").split(" ", 2)
+    message = parts[2] if len(parts) == 3 else formatted.rstrip("\n")
+    if message in _warnings:
+        return
+    _warnings.append(message)
+    if len(_warnings) > _WARNING_LIMIT:
+        del _warnings[0]
+
+
+def collected_warnings() -> list:
+    """Every distinct WARNING line seen so far, oldest first."""
+    return list(_warnings)
+
+
 def capture_stdio(log_path, rotate_mb: int = 50):
     """Tee fd 1 and 2 into `log_path`. Returns a restore callable.
 
@@ -272,6 +306,7 @@ def capture_stdio(log_path, rotate_mb: int = 50):
         text = format_line(raw, session=session)
         if not text:
             return
+        note_if_warning(text)
         data = text.encode("utf-8", "replace")
         try:
             if state["size"] + len(data) > limit:

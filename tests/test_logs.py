@@ -595,3 +595,45 @@ def test_the_marker_is_cleared_even_when_generation_raises(tmp_path):
     assert logs.current_session() is None, (
         "a marker left set would attribute the NEXT request's startup lines, "
         "and every idle line after it, to a session that already ended")
+
+
+# ── warning capture ──────────────────────────────────────────────────────────
+
+def test_warning_lines_are_collected_for_env_json():
+    from vaayu.server import logs
+    logs._warnings.clear()
+    logs.note_if_warning("2026-01-01T00:00:00.000Z session=- "
+                         "[Vaayu-NVMe] WARNING: APST is active\n")
+    logs.note_if_warning("2026-01-01T00:00:00.000Z session=- ordinary line\n")
+    assert logs.collected_warnings() == ["[Vaayu-NVMe] WARNING: APST is active"]
+
+
+def test_rust_warnings_are_collected_too():
+    # eprintln! from vaayu_rust reaches fd 2 directly; no Python-level hook can
+    # see it, which is why this is harvested at the pump rather than plumbed
+    # from the print sites.
+    from vaayu.server import logs
+    logs._warnings.clear()
+    logs.note_if_warning("S session=- [vaayu_rust] WARNING: ring pool "
+                         "fell back to pread\n")
+    assert len(logs.collected_warnings()) == 1
+
+
+def test_the_warning_buffer_is_bounded():
+    from vaayu.server import logs
+    logs._warnings.clear()
+    for i in range(1000):
+        logs.note_if_warning(f"S session=- WARNING: {i}\n")
+    got = logs.collected_warnings()
+    assert len(got) <= logs._WARNING_LIMIT
+    assert got[-1].endswith("999"), "the buffer must keep the NEWEST warnings"
+
+
+def test_duplicate_warnings_are_not_repeated():
+    # A warning printed once per layer would otherwise fill the buffer and
+    # push the startup warnings -- the ones that matter -- out of it.
+    from vaayu.server import logs
+    logs._warnings.clear()
+    for _ in range(10):
+        logs.note_if_warning("S session=- WARNING: same thing\n")
+    assert logs.collected_warnings() == ["WARNING: same thing"]
