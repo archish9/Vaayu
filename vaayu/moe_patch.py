@@ -257,6 +257,143 @@ def lookahead_accuracy_update(state: dict, predicted, layer_idx: int, actual: se
     state["total"] += len(actual)
 
 
+def predict_next_expert_set(next_block: "MoEBlockInfo", hidden_states, top_k: int) -> set:
+    """Expert ids the NEXT MoE layer is predicted to route to, scored the way
+    that layer itself scores (CLAUDE.md §5: detection over assumption).
+
+    Three cases, in the same order the on-path forwards resolve them:
+      * a router that returns its own (logits, weights, indices) — believe it;
+      * a model that owns its scoring function — `route_experts` delegates to
+        `route_tokens_to_experts` (MiniMax: sigmoid + e_score_correction_bias,
+        group routing). A hardcoded topk-on-logits is simply WRONG there;
+      * everything else — plain softmax-topk, which is what Qwen3-MoE and
+        Mixtral genuinely do. softmax is monotonic, so the predicted SET is
+        identical to the topk-on-logits this used to compute for them.
+
+    `hidden_states` may be (N, H) or (B, S, H): the fused forward passes its
+    flat view, the module-list forward the 3-D states, and both the routers and
+    `route_experts` accept either. This is the CURRENT layer's hidden states —
+    the next layer's input is not known yet, and that approximation is the
+    predictor's whole premise, not a defect introduced here."""
+    router = getattr(next_block.moe_module, next_block.router_attr)
+    res = router(hidden_states)
+    if isinstance(res, tuple) and len(res) >= 3:
+        idx = res[2]
+    else:
+        logits = res[0] if isinstance(res, tuple) else res
+        _, idx = route_experts(next_block.moe_module, logits, top_k)
+    return set(int(x) for x in idx.flatten().cpu().unique().tolist())
+
+
+def _stage_predicted_expert(expert_cache, offset_index, checkpoint_path: Path,
+                            next_layer_name: str, next_layer_idx: int, eidx: int) -> None:
+    """Phase-B prefetch: load a predicted next-layer expert into the RAM cache
+    ahead of its layer via the SAME zero-clone slab path decode's on-path misses
+    use (CR-2 fix: no double-clone). prefetch=True so the prefetch_used telemetry
+    measures usefulness. Never raises.
+
+    Layout-agnostic: it reads bytes by (layer_name, expert id) through the
+    offset index, which both expert layouts share, so the fused-EXL3 and
+    module-list forwards stage identically."""
+    from .persist.safetensor_model_persister import (
+        load_expert_sparse, load_expert_into_slab)
+    try:
+        if expert_cache.has(next_layer_idx, eidx):
+            return
+        metas = offset_index.get_expert_offsets(next_layer_name, eidx)
+        if metas is None:
+            return
+        _shard = str(checkpoint_path / f"{next_layer_name}.safetensors")
+        if expert_cache.arena is None:
+            # No arena (unit-test / CUDA-less) — legacy clone path.
+            raw = load_expert_sparse(_shard, metas)
+            expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+            return
+        # Reservation: if anyone is already loading this expert, skip
+        # entirely. Prefetch is opportunistic — re-reading bytes another
+        # thread is already fetching costs real NVMe bandwidth and buys
+        # nothing. Unlike decode, the stager never waits: it has nothing to
+        # deliver and no caller blocked on it, and waiting here would put a
+        # prefetch worker to sleep on the on-path reader.
+        _claim = expert_cache.claim_load(next_layer_idx, eidx, "stager")
+        if _claim is None:
+            return
+        try:
+            expert_cache.mark_running(_claim)
+            slab_idx = expert_cache.acquire_slab()
+            if slab_idx is None:
+                raw = load_expert_sparse(_shard, metas)
+                expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
+                return
+            slab = expert_cache.arena.tensor(slab_idx)
+            try:
+                views = load_expert_into_slab(
+                    _shard, metas, slab,
+                    allow_direct=expert_cache.arena.pin, tensor_align=False)
+            except Exception:
+                expert_cache.arena.release(slab_idx)
+                raise
+            if not expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx,
+                                         prefetch=True):
+                # Declined (no room). This thread takes no further read of
+                # `views`, and holds no pin to hang a deferred release on,
+                # so give the slab back now.
+                expert_cache.arena.release(slab_idx)
+        finally:
+            expert_cache.finish_load(_claim)
+    except Exception as e:
+        _log.warning(
+            f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"
+        )
+
+
+def _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path: Path,
+                    layer_idx: int, hidden_states, top_k: int, actual_experts) -> None:
+    """Lookahead routing predictor (Task 12, decode only) — ONE implementation,
+    called by BOTH MoE forwards.
+
+    It lived only in `_make_fused_sparse_forward_exl3` until 2026-09-03, which
+    made `VAAYU_LOOKAHEAD=1` a silent no-op on every module-list model (MiniMax)
+    — CLAUDE.md §0's single-forward trap, the same one that left VAAYU_CACHE_BIAS
+    doing nothing. Anything added here reaches both layouts by construction.
+
+    Phase A (accounting) and Phase B (prefetch) are BOTH gated behind
+    VAAYU_LOOKAHEAD=1 (CR-1): the extra next-layer router GEMM + the prediction's
+    D2H sync are per-layer/per-token decode overhead that only Phase B consumes.
+    Default off → steady-state decode pays nothing. Reads
+    vaayu_ref._lookahead_enabled (captured ONCE at init, not a live os.environ
+    read) so mutating the env var after engine construction can't bypass the
+    hard-block guard in vaayu_base.py — see check_lookahead_flag_safe()."""
+    if (getattr(vaayu_ref, "_moe_prefill_pass", False)
+            or not getattr(vaayu_ref, "_lookahead_enabled", False)):
+        return
+    state = getattr(vaayu_ref, "_lookahead_state", None)
+    if state is not None:
+        lookahead_accuracy_update(
+            state, getattr(vaayu_ref, "_lookahead_pred", None),
+            layer_idx, set(actual_experts))
+    blocks = getattr(vaayu_ref, "_moe_block_by_idx", None)
+    next_block = blocks.get(layer_idx + 1) if isinstance(blocks, dict) else None
+    if next_block is None:
+        return
+    try:
+        pred_set = predict_next_expert_set(next_block, hidden_states, top_k)
+        vaayu_ref._lookahead_pred = (layer_idx + 1, pred_set)
+        stager = getattr(vaayu_ref, "_stager_executor", None)
+        if stager is None:
+            return
+        next_name = next_block.layer_name
+        for _pe in pred_set:
+            if not expert_cache.has(layer_idx + 1, _pe):
+                stager.submit(_stage_predicted_expert, expert_cache, offset_index,
+                              checkpoint_path, next_name, layer_idx + 1, _pe)
+    except Exception as e:
+        _log.warning(
+            f"Lookahead router probe failed for layer {layer_idx + 1}: {e}"
+        )
+        vaayu_ref._lookahead_pred = None
+
+
 def _classify_expert_tensors(
     raw: dict,
 ) -> "tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]":
@@ -874,6 +1011,15 @@ def _make_modulelist_sparse_forward(
         # split of the same row-major layout.
         if _prof:
             _t0 = time.perf_counter()
+        # Lookahead routing predictor (Task 12, decode only) — the SAME
+        # _lookahead_step the fused-EXL3 forward calls, so VAAYU_LOOKAHEAD is
+        # not a no-op on this layout (P2). Placed before the miss dispatch
+        # below so predicted reads are queued ahead of this layer's own, and
+        # inside 'mask_sync' so profiling still accounts for every window.
+        # Layers in pinned_layer_names return above and predict nothing: their
+        # experts are resident, so there is no read for a prefetch to hide.
+        _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path,
+                        layer_idx, hidden_states, top_k, unique_experts)
         B, S, H = hidden_states.shape
         _pair, _starts, _counts_l = compute_expert_dispatch(
             expert_indices.cpu().reshape(-1, top_k), len(experts_list))
@@ -1465,68 +1611,13 @@ def _make_fused_sparse_forward_exl3(
     """
     import torch.nn.functional as F
     from .persist.safetensor_model_persister import (
-        load_expert_sparse, load_expert_into_slab, views_from_packed_copy,
-        gpu_repack_aligned)
+        views_from_packed_copy, gpu_repack_aligned)
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
 
     def shard_file_for(name: str) -> str:
         return str(checkpoint_path / f"{name}.safetensors")
-
-    def _load_predicted_expert(next_layer_name: str, next_layer_idx: int, eidx: int):
-        """Phase-B prefetch: load a predicted next-layer expert into the RAM
-        cache ahead of its layer via the SAME zero-clone slab path decode's
-        on-path misses use (CR-2 fix: no double-clone). prefetch=True so the
-        prefetch_used telemetry measures usefulness. Never raises."""
-        try:
-            if expert_cache.has(next_layer_idx, eidx):
-                return
-            metas = offset_index.get_expert_offsets(next_layer_name, eidx)
-            if metas is None:
-                return
-            _shard = shard_file_for(next_layer_name)
-            if expert_cache.arena is None:
-                # No arena (unit-test / CUDA-less) — legacy clone path.
-                raw = load_expert_sparse(_shard, metas)
-                expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
-                return
-            # Reservation: if anyone is already loading this expert, skip
-            # entirely. Prefetch is opportunistic — re-reading bytes another
-            # thread is already fetching costs real NVMe bandwidth and buys
-            # nothing. Unlike decode, the stager never waits: it has nothing to
-            # deliver and no caller blocked on it, and waiting here would put a
-            # prefetch worker to sleep on the on-path reader.
-            _claim = expert_cache.claim_load(next_layer_idx, eidx, "stager")
-            if _claim is None:
-                return
-            try:
-                expert_cache.mark_running(_claim)
-                slab_idx = expert_cache.acquire_slab()
-                if slab_idx is None:
-                    raw = load_expert_sparse(_shard, metas)
-                    expert_cache.put(next_layer_idx, eidx, raw, prefetch=True)
-                    return
-                slab = expert_cache.arena.tensor(slab_idx)
-                try:
-                    views = load_expert_into_slab(
-                        _shard, metas, slab,
-                        allow_direct=expert_cache.arena.pin, tensor_align=False)
-                except Exception:
-                    expert_cache.arena.release(slab_idx)
-                    raise
-                if not expert_cache.put_slab(next_layer_idx, eidx, views, slab_idx,
-                                             prefetch=True):
-                    # Declined (no room). This thread takes no further read of
-                    # `views`, and holds no pin to hang a deferred release on,
-                    # so give the slab back now.
-                    expert_cache.arena.release(slab_idx)
-            finally:
-                expert_cache.finish_load(_claim)
-        except Exception as e:
-            _log.warning(
-                f"Lookahead prefetch failed for layer {next_layer_idx} expert {eidx}: {e}"
-            )
 
     def sparse_forward(hidden_states, **kwargs):
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
@@ -1582,43 +1673,10 @@ def _make_fused_sparse_forward_exl3(
             vaayu_ref.telemetry.record_batch_overlap(
                 layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
 
-        # ── Lookahead routing predictor (Task 12, decode only) ──────────────
-        # Phase A (accounting) and Phase B (prefetch) are BOTH gated behind
-        # VAAYU_LOOKAHEAD=1 (CR-1): the extra next-layer router GEMM +
-        # _pred_idx.cpu() D2H sync are per-layer/per-token decode overhead
-        # that only Phase B consumes. Default off → steady-state decode
-        # pays nothing. Reads vaayu_ref._lookahead_enabled (captured ONCE at
-        # init, not a live os.environ read) so mutating the env var after
-        # engine construction can't bypass the hard-block guard in
-        # vaayu_base.py — see check_lookahead_flag_safe()'s docstring.
-        if (not getattr(vaayu_ref, "_moe_prefill_pass", False)
-                and getattr(vaayu_ref, "_lookahead_enabled", False)):
-            _la_state = getattr(vaayu_ref, "_lookahead_state", None)
-            if _la_state is not None:
-                lookahead_accuracy_update(
-                    _la_state, getattr(vaayu_ref, "_lookahead_pred", None),
-                    layer_idx, set(unique_experts))
-            _next_block = getattr(vaayu_ref, "_moe_block_by_idx", {}).get(layer_idx + 1) \
-                if isinstance(getattr(vaayu_ref, "_moe_block_by_idx", None), dict) else None
-            if _next_block is not None:
-                try:
-                    _next_router = getattr(_next_block.moe_module, _next_block.router_attr)
-                    _nr = _next_router(flat_hidden)
-                    _nl = _nr[0] if isinstance(_nr, tuple) else _nr
-                    _, _pred_idx = torch.topk(_nl.float(), top_k, dim=-1)
-                    _pred_set = set(int(x) for x in _pred_idx.flatten().cpu().unique().tolist())
-                    vaayu_ref._lookahead_pred = (layer_idx + 1, _pred_set)
-                    if getattr(vaayu_ref, "_lookahead_enabled", False):
-                        _next_name = _next_block.layer_name
-                        for _pe in _pred_set:
-                            if not expert_cache.has(layer_idx + 1, _pe):
-                                vaayu_ref._stager_executor.submit(
-                                    _load_predicted_expert, _next_name, layer_idx + 1, _pe)
-                except Exception as e:
-                    _log.warning(
-                        f"Lookahead router probe failed for layer {layer_idx + 1}: {e}"
-                    )
-                    vaayu_ref._lookahead_pred = None
+        # Lookahead routing predictor (Task 12, decode only) — shared with the
+        # module-list forward, see _lookahead_step. Timed inside 'mask_sync'.
+        _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path,
+                        layer_idx, flat_hidden, top_k, unique_experts)
 
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0

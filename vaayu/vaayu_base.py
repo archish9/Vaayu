@@ -833,22 +833,37 @@ def check_lookahead_flag_safe() -> None:
     at 4x width: no crashes, and greedy token ids byte-identical to a
     lookahead-off run across 256 tokens.
 
-    **It is nonetheless still blocked, deliberately, on two grounds that are
-    about coverage rather than merit:**
-      - Every number above is Qwen3-235B. The predictor is wired ONLY into
-        _make_fused_sparse_forward_exl3; _make_modulelist_sparse_forward
-        (MiniMax) has no lookahead at all, so this flag is a silent no-op there
-        (CLAUDE.md section 0's single-forward trap). Turning it on by default
-        would ship a win for one of the two actively-tested models and nothing
-        for the other, which is exactly the asymmetry section 5 forbids.
-      - Everything here is single-stream. Vaayu's workload is parallel fan-out
-        (CLAUDE.md section 0), and a prefetcher that competes with N concurrent
-        decode streams for the same cache and the same 8 rings has not been
-        measured at all.
+    **Status 2026-09-03 (P2): both coverage gaps are now CLOSED BY MEASUREMENT,
+    and the flag is refuted as a default. The guard stays on a new reason.**
+    The two grounds it used to stand on were "the predictor is wired ONLY into
+    _make_fused_sparse_forward_exl3, so the flag is a silent no-op on the
+    module-list forward (MiniMax)" and "everything is single-stream". Neither is
+    true any more:
 
-    **To lift it:** wire the module-list forward and re-measure on MiniMax, then
-    measure both under fan-out. If both hold, this guard should be deleted and
-    the flag defaulted ON rather than merely permitted.
+      - The module-list forward IS wired (moe_patch._lookahead_step, one
+        implementation called by both forwards) and the predictor demonstrably
+        fires on MiniMax: 76.6% accuracy, 13 000 prefetch inserts per 64-token
+        arm, on-path misses 28 484 -> 24 098 (-15.4%), greedy ids byte-identical.
+      - Fan-out was measured on both models (P1 for Qwen, P2 for MiniMax).
+
+    **What the measurement says, same box, same hour, 64 tokens greedy,
+    BALLAST_GB=25, ring pool 3 (post-P8):**
+
+        MiniMax N=1  OFF 1.798/1.792/1.808   ON 1.804/1.815/1.809   +0.6% (OVERLAPS)
+        MiniMax N=3  OFF 2.784/2.775         ON 2.639/2.607         -5.7% (no overlap)
+        Qwen    N=1  OFF 1.083/1.122         ON 1.219/1.220        +10.6% (no overlap)
+
+    MiniMax predicts worse (0.766 vs Qwen's 0.902) and wastes more of what it
+    stages (28% vs 12%), so it pays +18.0% bytes/token at N=1 and +26.4% at N=3
+    to remove 15% of its misses -- and the trade nets out negative under fan-out.
+    Defaulting the flag ON would ship +10.6% to one actively-tested model and
+    -5.7% to the other at the fan-out this engine exists for: the asymmetry
+    CLAUDE.md section 5 forbids, now measured rather than assumed.
+
+    **To lift it:** fix the byte residual first (row P4, prefetch admission that
+    cannot evict the on-path working set) and re-run P2's arms. The flag is a
+    default only if MiniMax stops LOSING at N>1; it is not gated on wiring any
+    more. Full trail: plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md.
 
     Called from __init__ before any MoE cache/executor/prefetch object is
     created, so a set flag fails fast at engine construction. No-op (dead code)
@@ -863,10 +878,12 @@ def check_lookahead_flag_safe() -> None:
             "still reading), and an in-flight load reservation then turned the "
             "flag's 15% regression into a measured +11.4% on Qwen3-235B (1.277 "
             "-> 1.422 tok/s, 3 interleaved arms each, non-overlapping; 1024-token "
-            "soak clean, greedy ids byte-identical). It stays off because it is "
-            "wired ONLY into the fused-EXL3 forward -- it is a silent no-op on "
-            "the module-list forward (MiniMax) -- and because it has never been "
-            "measured under the parallel fan-out this engine is built for. See "
+            "soak clean, greedy ids byte-identical). It stays off because the win "
+            "is Qwen's, not the flag's: the module-list forward IS wired now "
+            "(P2, 2026-09-03) and MiniMax measures +0.6% at N=1 (overlapping arms) "
+            "and -5.7% at N=3, against Qwen's +10.6% at N=1 on the same box the "
+            "same hour -- it costs MiniMax +18-26% bytes/token to remove 15% of "
+            "its misses. Fix the byte residual (row P4) before revisiting. See "
             "check_lookahead_flag_safe.__doc__. Unset VAAYU_LOOKAHEAD (or set it "
             "to anything other than \"1\") to proceed."
         )
