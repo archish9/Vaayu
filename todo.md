@@ -13,7 +13,9 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 
 **Reading this cold, in a fresh session, is the intended way to use it.** Read in this order:
 
-1. **FIX SEQUENCE** (below) — what to do, in order. Start at the first unticked row.
+1. **OPEN — server logging & drafter** (below, opened 2026-09-03) — **the only unticked rows in
+   this file.** Each links a self-contained doc in `docs/` (gitignored). The FIX SEQUENCE under it is
+   fully closed and is kept for its reasoning, not for work.
 2. **Environment** — how to run anything here. `python` is not on PATH; every on-device arm needs
    its own `systemd-run` scope. Skipping this section is how arms get thrown away.
 3. **On-device gates** — what each gate can actually catch, and which ones a change obliges you to run.
@@ -61,6 +63,61 @@ Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
 one-line summary of a section in it. **`plans/settled_and_method_notes.md`** is the archive (on-disk only, not in git); consult
 it only to check whether something was already refuted, never for a task.
+
+---
+
+# ▶▶ OPEN — server logging & drafter, opened 2026-09-03
+
+**These are the only unticked rows in this file. The FIX SEQUENCE below is fully closed.**
+Both rows carry a self-contained document in **`docs/`** — each is meant to be picked up cold in a
+fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
+on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
+copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
+planning, investigation and spec work goes in `docs/` — see `CLAUDE.md` §7.
+
+Opened by a `/systematic-debugging` pass on a "the server is too slow" report. **The report was
+NOT a bug** — both models ran inside their own recorded benchmark bands (MiniMax 1.794 tok/s
+against a 1.798–1.811 band; Qwen 0.937 tok/s against 1.083–1.122, the gap explained by an 809-token
+run vs the bench's 64). Verdict, evidence and the two reading traps:
+**[`docs/2026-09-03-slow-generation-verdict.md`](docs/2026-09-03-slow-generation-verdict.md)**.
+Read it before either row — it is what both rows cite.
+
+What the pass actually found:
+
+- **[ ] L1 · `logs/` is not a self-sufficient triage bundle** — 12-item audit, target layout,
+  and a 9-task plan in
+  **[`docs/issue-L1-triage-logging.md`](docs/issue-L1-triage-logging.md)**.
+  Vaayu is going open-source and the support loop is "user zips `logs/`, maintainer debugs here".
+  That loop does not close today: `server.log` has **no timestamps and no run boundaries**, and
+  every load-bearing fact in the 2026-09-03 diagnosis came from OUTSIDE `logs/` — above all the
+  gitignored `config_local.py`, which is where the user's real problem turned out to live.
+  Includes the user's explicit ask, **per-session logs**, which WORKS: `ServerEngine.slot()` runs
+  one generation at a time under `self._lock` (`vaayu/server/engine.py:180`), so a current-session
+  marker attributes the whole process stream unambiguously. **That assumption dies the day batched
+  decode (Feature B, N>1) lands** — the doc says what to do then.
+  **Stop rule:** T1–T4 close the loop; T5–T9 are additive. Do not change the token-summary bucket
+  semantics while doing it — archived measurements are stated in those terms.
+- **[ ] S1 · a configured drafter is dead weight on every MoE target** —
+  **[`docs/issue-S1-drafter-dead-weight.md`](docs/issue-S1-drafter-dead-weight.md)**.
+  Qwen2.5-Coder-1.5B loads fully to VRAM (1544M, 3.09 GB) and is then discarded by the Fix-#9 gate
+  on every start, on both actively-tested models. **The VRAM IS correctly released — verified by
+  arithmetic on the load logs (12.01 GB vs 12.10 GB); there is no leak, do not go looking for one.**
+  Three separable defects: the gate structurally runs after the load (circular on the cache budget);
+  the 53.4 GB figure is a zero-overlap upper bound, not a measurement; and nothing tells the user
+  speculation is off.
+  **Stop rule:** S1a/S1b are small unconditional wins — ship them. S1c is a MEASUREMENT whose most
+  likely outcome is confirming the refusal on better grounds; do not let it become "build
+  speculative decoding for MoE" without the number first. The dense path (P7, 5.57×) must not weaken.
+
+**Applied on the spot 2026-09-03, no row needed:** `DEFAULT_STREAM = True` in
+`vaayu/server/config_local.py`. It was `False`, and with a client sending no `max_tokens` that meant
+**864 s of silence** for an 809-token answer — most of the reported "slowness" was this, not tok/s.
+The server already warns about the combination; nobody was reading the warning.
+
+**Still unfixed on this box, both warned at every boot, neither a code row:** NVMe **APST** is
+active (`scripts/vaayu_optimize_os.sh`, one-time, needs sudo) — Qwen is 47 % disk-stall, so this
+is the one hardware tax landing on the dominant cost; and `rustdesk` holds 0.14 GiB of GPU, below
+the 256 MiB refusal threshold but permanent, because budgets are sized once at load.
 
 ---
 

@@ -226,4 +226,33 @@ Status keys: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked �
 
 ---
 
+## 7. Where Written Work Goes (NON-NEGOTIABLE)
+
+**Every planning, investigation, design, spec, handoff and RESULTS document goes in `docs/`.**
+No exceptions, and the fact that `docs/` is gitignored (`.gitignore:28`) is not one — that is a
+deliberate choice, not an oversight to route around.
+
+| Directory | Holds | Tracked? |
+|---|---|---|
+| `docs/` | plans, specs, investigations, RESULTS, verdicts, handoffs, probe notes | **no** (`.gitignore:28`) |
+| `documentation/` | Vaayu's own product documentation — what the engine is and how to use it (`architecture.md`, `server.md`, `TUNING.md`, …) | yes |
+| `todo.md` | the task ledger (§6) | yes |
+
+**`documentation/` is user-facing product docs only.** Do not put a plan, an investigation, a
+review verdict or a task list there because it "should ship" — that is the exact mistake this
+section exists to stop. If a finding must reach users, the finding gets folded into the relevant
+`documentation/` page as documentation; the working document that produced it still lives in
+`docs/`.
+
+**Because `docs/` does not survive a fresh clone, `todo.md` is the durable record.** A row in
+`todo.md` must carry enough of its own summary — the numbers, the verdict, the stop rule — that
+the row is still actionable when its `docs/` file is missing. The linked document is the detail,
+never the only copy of the conclusion. The durable history of everything ever moved out is
+`git log -p -- todo.md`.
+
+Repo-root `.md` files (`HANDOFF-*.md`, `speed-up-vaayu.md`, `notes.md`) are grandfathered where
+they already exist; do not add new ones — new work goes in `docs/`.
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
