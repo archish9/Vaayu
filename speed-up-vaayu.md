@@ -25,10 +25,18 @@ decode-only counters, 64 tokens):
 
 **CORRECTED 2026-08-30 (row C1). The ~5.5 GB/s "NVMe peak" this section was
 built on is not the drive.** It is what the expert path achieves at 2-3 reads in
-flight. The drive is a **Samsung SSD 990 PRO 1TB, spec 7.45 GB/s**, and its
-delivered rate rises with concurrency: 1 read in flight -> 3.3 GB/s, 2 -> 5.3,
-3 -> 6.5, **4 -> 6.9**, still rising at the edge of the credible range
-(`plans/2026-08-30-R2-structural-probe-RESULTS.md`).
+flight. The drive is a **Samsung SSD 990 PRO 1TB, spec 7.45 GB/s**.
+
+**RE-CORRECTED 2026-09-03 (row P8).** C1's concurrency ladder — 1 read in flight
+-> 3.3 GB/s, 2 -> 5.3, 3 -> 6.5, 4 -> 6.9, "still rising" — was INFERRED from
+overlapping in-path reads, not measured, and is superseded. Measured directly
+through the expert path (`plans/probes/p8_samepath.py`): **1 reader -> 6.0-6.4
+GB/s, 2 -> ~7.1, and ~7.1 is the PLATEAU**, held to 16 callers so long as no more
+than ~4 reads reach the device at once — past which it FALLS, to ~5.15 GB/s at 8.
+The engine was sitting on the wrong side of that knee (its ring pool was sized to
+the caller pool, 8); fixing it banked decode +4.8 % on Qwen and +9.7 % on MiniMax.
+**Use ~7.1 GB/s, not 6.9, as the ceiling denominator, and never assume more
+concurrency helps** (`plans/2026-09-03-P8-ring-pool-RESULTS.md`).
 
 So the disk path is running at **50-51 % of the drive's rate** — not the 71-74 %
 this document claimed — while being the thing that costs 72-74 % of the token.

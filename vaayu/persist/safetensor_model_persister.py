@@ -163,6 +163,23 @@ _EXPERT_POOL_N = 8  # cap on pool size; actual size is RAM-budgeted, see init_mo
                     # moe_perf_rootcause memory for the live investigation.
 _EXPERT_POOL_ACTUAL_N = 1  # actual buffer count allocated, set by init_model_io
 
+# HARDWARE constant (CLAUDE.md §5) — the NVMe's READ-CONCURRENCY knee, not a
+# model number. Samsung SSD 990 PRO 1TB, measured 2026-09-03 through THIS path
+# (plans/probes/p8_samepath.py: real expert byte ranges, O_DIRECT, registered
+# fds, pinned buffers — the only difference from decode is that nothing computes
+# between reads). Aggregate bandwidth is FLAT at ~7.09 GB/s for 2-4 rings at
+# every caller concurrency k from 2 to 16, and collapses to ~5.15 GB/s at 8
+# rings — reproduced on both models (Qwen 11.80 MB reads, MiniMax 8.85 MB) and
+# independent of the ring queue depth (identical curve at qd=1,2,4,8,16,32) and
+# of file locality (identical for scattered and file-adjacent reads).
+#
+# The ring pool is what actually throttles DEVICE concurrency: a caller queues on
+# a ring's Mutex. Sizing it to get_expert_pool_size() therefore over-drove the
+# drive past its knee, and was the ~5.12 GB/s aggregate ceiling row P8 was opened
+# to explain. Caller-side concurrency (buffer pool, MoE executor width, in-flight
+# staging slabs) is a RAM budget and stays at get_expert_pool_size().
+_NVME_READ_CONCURRENCY = 3
+
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring_pool() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds
 _BUFREG_DISABLED = False    # True after first EFAULT — CUDA-pinned memory is
@@ -245,10 +262,10 @@ def _register_iouring_files(model_dir: str, use_direct_io: bool = True) -> bool:
 def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     """Called once at model load. Initializes ring pool and registers files explicitly.
 
-    Buffer-pool sizing runs BEFORE ring init: the ring pool is sized to match
-    get_expert_pool_size() (real concurrency is capped there regardless, since
-    every load_expert_sparse() call blocks on _EXPERT_BUF_POOL.get() before it
-    ever reaches io_uring_read_into), so that number must be known first.
+    Buffer-pool sizing runs BEFORE ring init: the ring pool is capped at
+    get_expert_pool_size(), since a ring no caller can reach is dead weight, so
+    that number must be known first. It is otherwise sized to the DRIVE — see
+    _NVME_READ_CONCURRENCY for why matching the caller pool was the P8 ceiling.
     """
     global _RING_INITIALIZED, _FILES_REGISTERED, _USE_DIRECT_IO
     _USE_DIRECT_IO = use_direct_io
@@ -291,7 +308,7 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
         )
 
     if _USE_IOURING and not _RING_INITIALIZED:
-        _RING_INITIALIZED = _init_iouring_ring(get_expert_pool_size(), 32)
+        _RING_INITIALIZED = _init_iouring_ring(_ring_pool_size(), 32)
     if _USE_IOURING and _RING_INITIALIZED and not _FILES_REGISTERED:
         _FILES_REGISTERED = _register_iouring_files(model_dir, use_direct_io)
 
@@ -305,6 +322,26 @@ def get_expert_pool_size() -> int:
     worker count at this value.
     """
     return max(1, _EXPERT_POOL_ACTUAL_N)
+
+
+def _ring_pool_size() -> int:
+    """How many io_uring rings to build = how many reads the DRIVE sees at once.
+
+    Sized to _NVME_READ_CONCURRENCY (a hardware constant), capped at the caller
+    pool so a RAM-tight box does not build rings nothing can reach.
+    `VAAYU_RING_POOL_N` overrides it — the knob P8's A/B arms were run with, and
+    the way to reproduce the pre-fix behaviour (`VAAYU_RING_POOL_N=8`).
+    """
+    n = _NVME_READ_CONCURRENCY
+    raw = os.environ.get("VAAYU_RING_POOL_N")
+    if raw:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = _NVME_READ_CONCURRENCY
+        if n < 1:
+            n = _NVME_READ_CONCURRENCY
+    return max(1, min(n, get_expert_pool_size()))
 
 
 import atexit

@@ -162,15 +162,28 @@ them without edits — never assume EXL3, never assume CUDA, never assume MoE.
   (32 GB), the ~8.5 GB expert-cache OOM ceiling, PCIe/NVMe bandwidth. Those are
   properties of the machine, not the model. They stay literal (and commented as
   hardware constants).
-  **NVMe, stated properly (corrected 2026-08-30, row C1):** the drive is a Samsung
-  SSD 990 PRO 1TB, **sequential-read spec 7.45 GB/s**, and its delivered rate
-  depends on how many reads are in flight — measured on-device at 3.3 GB/s with 1
-  outstanding read, 5.3 at 2, 6.5 at 3, **6.9 at 4**, still rising. **The
-  ~5.5 GB/s figure used before this date was a measured-path number (roughly what
-  the expert path achieves at 2-3 reads in flight) that got promoted to a hardware
-  constant and then used as a denominator.** Never quote a single-stream rate as
-  the drive's limit; say which concurrency a bandwidth figure was taken at.
-  (`plans/2026-08-30-R2-structural-probe-RESULTS.md`.)
+  **NVMe, stated properly (corrected 2026-09-03, row P8; this SUPERSEDES C1's
+  ladder of 2026-08-30):** the drive is a Samsung SSD 990 PRO 1TB, **sequential-read
+  spec 7.45 GB/s**, and its delivered rate depends on how many reads are in flight
+  — but **NOT monotonically**. Measured directly through the expert path
+  (`plans/probes/p8_samepath.py`: real expert byte ranges, O_DIRECT, registered fds,
+  pinned buffers, wall-clock, no delivery model): **1 reader → 6.0-6.4 GB/s, 2 →
+  ~7.1, and ~7.1 IS THE PLATEAU.** It holds up to 16 concurrent callers so long as
+  no more than ~4 reads reach the device at once; past that it **costs** throughput,
+  down to **~5.15 GB/s at 8**. Reproduced on both models, at every io_uring queue
+  depth (qd=1…32), and for scattered and file-adjacent reads alike. That knee is why
+  `_NVME_READ_CONCURRENCY` exists in `safetensor_model_persister.py`.
+  **C1's `3.3 at 1, 5.3 at 2, 6.5 at 3, 6.9 at 4, still rising` is superseded** — it
+  was inferred from overlapping in-path reads under a uniform-delivery assumption
+  (its own k>=5 buckets exceed spec), and it is wrong in both directions: it
+  understates one reader by ~2x and implies a rise that in fact reverses. C1's
+  headline stands — 5.5 GB/s is not the drive. **The ~5.5 GB/s figure used before
+  2026-08-30 was a measured-path number (roughly what the expert path achieves at
+  2-3 reads in flight) that got promoted to a hardware constant and then used as a
+  denominator.** Never quote a single-stream rate as the drive's limit; say which
+  concurrency a bandwidth figure was taken at, and never assume more concurrency
+  helps. (`plans/2026-09-03-P8-ring-pool-RESULTS.md`, superseding
+  `plans/2026-08-30-R2-structural-probe-RESULTS.md`.)
 - **Detection over assumption.** Find MoE blocks, router names, and expert tensor
   roles by probing the module tree / checkpoint keys (as `moe_patch.py` already
   does), not by matching an architecture string.

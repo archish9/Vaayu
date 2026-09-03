@@ -116,9 +116,9 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~16~~ | ~~**L1**~~ — **2026-08-30: corruption ROOT-CAUSED, FIXED and SOAKED (1024 tok, 0 crashes, greedy ids byte-identical). FEATURE stays blocked — it costs 15 % of decode.** Mechanism confirmed (dead time 37.6 %→15.1 %, bandwidth +36 %) but it reads 60 % more bytes, failing this row's own bytes/token gate. Successor work = prefetch admission that cannot evict the on-path working set. 33.6 % / 34.7 % of decode has ZERO reads in flight on any of the 8 rings. **Not a green field:** the implementation exists (Task 12 lookahead predictor) and is hard-blocked for confirmed memory corruption — this row IS that audit | `moe_patch.py:1523` + `vaayu_base.py:765` + `_stager_executor` |
 | ~~17~~ | ~~**P7**~~ — **DONE 2026-09-02.** All three spec bugs FIXED; the win RE-MEASURED on top of them at **5.54× / 5.47× / 5.47×** over three generations (0.149 → 0.828 tok/s), all byte-identical to the greedy baseline; reserve-policy risk CHECKED and it does not fire. Remaining is a shipping decision, not evidence | **UNBLOCKED 2026-09-02: dense is on the roadmap, which is the decision this row waited on.** Largest measured win on the board and it already exists. Does NOT wait on P5 — that row's drift is an N=3 fan-out problem, and P7's A/B is dense single-stream, where replicates held to 0.0 % | `vaayu/vaayu_base.py` — **grep for `streamer.put(first_token`, do not trust a line number; it drifted `:4380`→`:4426` inside one session** |
 | ~~18~~ | ~~**P5**~~ — **DONE 2026-09-02: drift does NOT reproduce, the ~20 % unfalsifiability rule is LIFTED.** Seven arms, both models: Qwen 1.739/1.738/1.739 (0.06 %), Qwen@ballast-27 1.901/1.903 (0.10 %), MiniMax 2.762/2.767 (0.18 %), greedy ids byte-identical in every pair. The suspected cause (arena sizing off psutil avail at load) is CONFIRMED to wobble — 1473/1469/1463 slabs, 43 vs 41 cached layers — and REFUTED as the mechanism: it moves throughput 0.06 %. **New rule: `BALLAST_GB` is an arm variable, not hygiene** — 25→27 GB is +9.4 % tok/s (arena +10.4 %, bytes/token −8.3 %); never compare across targets. The 22 % most probably belonged to P3's uncommitted store build, live in that block and now gone — unretestable, recorded as probable not confirmed | `plans/2026-09-02-P5-control-drift-RESULTS.md`; comparator `plans/probes/p5_drift.py` |
-| 19 | **P8** — the ~5.12 GB/s aggregate ceiling | caps what P4 can be worth; P3 already killed the leading suspect. Measurement, no new code | `# P8` below; `probe_split.py` + `safetensor_model_persister.py` |
+| ~~19~~ | ~~**P8**~~ — **DONE 2026-09-03. ATTRIBUTED and FIXED.** The ceiling is the io_uring ring pool sized to the CALLER pool (8) instead of to the drive — 8 concurrent O_DIRECT readers is past this NVMe's knee. Pool → 3: decode **+4.8 % Qwen / +9.7 % MiniMax**, aggregate **+3.7 % / +9.6 %**, per-read latency **−14.1 % / −18.7 %**, TTFT **−2.7 % / −4.1 %**, all NO OVERLAP; dense unmoved. **P4 is unblocked** | | |
 | 20 | **P2** — lookahead into the MODULE-LIST forward (MiniMax) | the only thing gating `VAAYU_LOOKAHEAD`'s default; bounded value after P1. **UNBLOCKED 2026-09-02: P5 closed, N=3 replicates hold to 0.2 % on MiniMax itself** | `moe_patch.py` `_make_modulelist_sparse_forward` |
-| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **P5 cleared 2026-09-02**; still blocked by **P8** (headroom unknown until the ceiling is attributed) and **P2** (to measure it on MiniMax) | `expert_cache.py` + `moe_patch.py:1523` |
+| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **P5 cleared 2026-09-02; P8 cleared 2026-09-03** — the ceiling was the ring pool and is fixed, so P4's headroom is no longer SUSPECT, but **re-measure it: the disk floor moved** (aggregate +3.7 %/+9.6 %). Still waits on **P2** to measure it on MiniMax | `expert_cache.py` + `moe_patch.py:1523` |
 | 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
 
 **The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
@@ -284,10 +284,19 @@ These are the only things still open from the closed work. Their full context is
 - **CLAUDE.md §5 is non-negotiable:** no literal model numbers; only HARDWARE constants may be
   literals (16 GB VRAM / **15.47 GiB usable**, 32 GB RAM, ~8.5 GB expert-cache ceiling,
   NVMe bandwidth), each commented as such.
-- **NVMe is concurrency-dependent — do not use a single number (corrected 2026-08-30, row C1).**
-  Samsung SSD 990 PRO 1TB, **spec 7.45 GB/s**. Measured on-device by reads in flight:
-  1 → 3.3 GB/s, 2 → 5.3, 3 → 6.5, **4 → 6.9**, still rising. The **~5.5 GB/s** this file used
-  before that date was what the expert path achieves at 2–3 reads in flight, not the drive.
+- **NVMe is concurrency-dependent, and MORE CONCURRENCY IS NOT MONOTONICALLY BETTER
+  (corrected 2026-09-03, row P8; supersedes C1's ladder).** Samsung SSD 990 PRO 1TB, **spec
+  7.45 GB/s**. Measured **directly through the expert path** (`plans/probes/p8_samepath.py`, real
+  expert byte ranges, O_DIRECT, registered fds, pinned buffers, wall-clock — no delivery model):
+  **1 reader → 6.0–6.4 GB/s, 2 → ~7.1, and ~7.1 IS THE PLATEAU.** It holds to 16 concurrent callers
+  as long as no more than ~4 reads reach the device at once; past that it **costs** throughput,
+  falling to **~5.15 GB/s at 8**. Reproduced on both models, at every ring queue depth
+  (qd=1…32), and for scattered and file-adjacent reads alike.
+  **C1's `1 → 3.3, 2 → 5.3, 3 → 6.5, 4 → 6.9, still rising` is SUPERSEDED**: it was inferred from
+  overlapping in-path reads under a uniform-delivery assumption (its own k≥5 buckets exceed spec),
+  and it is wrong in both directions — it understates k=1 by ~2× and implies a rise that reverses.
+  C1's headline survives: 5.5 GB/s is not the drive. The **~5.5 GB/s** this file used before
+  2026-08-30 was what the expert path achieved at 2–3 reads in flight.
   **Every "% of the drive" written before 2026-08-30 is against the wrong denominator** — decode's
   3.70–3.83 GB/s is 50–51 % of the drive, not the 71–73 % on record. Archived `plans/` documents
   keep their original wording; this file and `CLAUDE.md` carry the correction.
@@ -1420,31 +1429,43 @@ and the LRU state, none of which must be a Python object.
 → `speed-up-vaayu.md` §2 R3.
 </details>
 
-### P8 · [ ] The ~5.12 GB/s aggregate ceiling — **NEW 2026-08-30, unexplained, no owner**
-Opened because it had no row: **P1 found it, P3 eliminated the leading suspect, and it currently
-caps what P4 can be worth.** Every lookahead-ON arm in the P1 block read **5.073–5.126 GB/s
-aggregate** — six arms across N=1/2/3, a 1 % band — while lookahead-OFF arms sat at 3.86–4.04.
-Against the corrected drive figure (6.9 GB/s at 4 reads in flight, spec 7.45) that is 74 %, so it
-is not obviously the hardware. Two facts say "more reads" is not the fix:
+### P8 · [x] The ~5.12 GB/s aggregate ceiling — **CLOSED 2026-09-03, attributed and fixed**
+**It was the ring pool, not the device.** `init_model_io` built the io_uring pool with
+`_init_iouring_ring(get_expert_pool_size(), 32)` — the CALLER pool, 8 on this box. The ring pool is
+what actually throttles DEVICE concurrency (a caller queues on a ring's `Mutex`), and 8 concurrent
+O_DIRECT readers is past this drive's read-concurrency knee. **The row's own refutation condition
+did not fire:** the same-path microbenchmark it asked for does NOT top out near 5.1 at k=8 — it
+reaches **7.09 GB/s** there once the ring pool is 2–4.
 
-- **Bandwidth WHILE COVERED falls as N rises** — 6.03 → 5.77 → 5.75 (lookahead on), 5.95 → 5.60 →
-  5.57 (off). The reads get slower; they do not get scarcer.
-- **Removing reads made it WORSE** (P3): deleting 100 % of the tiny reads dropped aggregate from
-  4.267 to 3.877 GB/s and raised per-bulk-read latency 9.12 → 10.36 ms.
+The measured curve at ring pool 8 (Qwen, 11.80 MB reads, qd=32) is **non-monotonic**, and the 5.12
+that had no explanation is simply k=8 on it:
 
-**Candidates, none tested:** the 8-worker ring pool's own dispatch (does k ever exceed 8, and is 8
-the right number?); O_DIRECT read size vs the drive's optimal queue shape at 11.80 MB; the
-pinned-buffer pool (`_EXPERT_BUF_POOL`, `_EXPERT_POOL_N` = worker count) serialising acquisition; or
-a genuine device limit at this access pattern that C1's microbenchmark never hit. **C1's curve was
-measured with a standalone prober, NOT through the expert path — closing that gap is the first
-thing to do.**
-**Where:** `plans/probes/probe_split.py` gives the time-weighted bandwidth-vs-k curve per arm;
-`vaayu/persist/safetensor_model_persister.py` holds the pool and the read call.
-**Done means:** the ceiling is attributed to a named component, with a measurement that moves it —
-or a statement that it is the device, with a same-path microbenchmark to prove it.
-**Refuted if:** a same-path microbenchmark at k=8 with 11.80 MB reads also tops out near 5.1 GB/s.
-Then it IS the device at this access pattern, P4's headroom shrinks accordingly, and this row closes
-with that number recorded.
+| k | 1 | 2 | 3 | 4 | 5 | 6 | **8** | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| GB/s | 6.09 | **7.11** | 7.11 | 7.00 | 6.21 | 5.45 | **5.18** | 5.27 | 5.12 |
+
+At ring pool 2–4 it is **flat at 7.09 GB/s from k=2 to k=16**, on both models. Three candidates the
+row listed were killed first: **not** the queue depth (identical curve at qd=1,2,4,8,16,32 — qd=1 at
+k=8 is only 8 outstanding requests and still collapses), **not** file locality (file-adjacent reads
+match scattered ones to 0.3 %), **not** an inability of the drive to serve 8 readers (8 buffered
+`pread`s reach 4.79 GB/s and are still rising).
+
+**Fix:** `_NVME_READ_CONCURRENCY = 3` + `_ring_pool_size()` in
+`vaayu/persist/safetensor_model_persister.py`, capped at `get_expert_pool_size()`, overridable with
+`VAAYU_RING_POOL_N` (=8 reproduces the old behaviour). Caller-side concurrency — buffer pool, MoE
+executor width, in-flight staging slabs — is a RAM budget and is untouched.
+
+**On-device A/B** (5 interleaved pairs Qwen, 3 MiniMax, `BALLAST_GB=27.0`): decode
+**1.257 → 1.317 tok/s (+4.8 %)** and **1.780 → 1.952 (+9.7 %)**; aggregate **+3.7 % / +9.6 %**;
+per-bulk-read latency **−14.1 % / −18.7 %**; TTFT **−2.7 % / −4.1 %**. Every bandwidth figure is
+NO OVERLAP. Workload identical (MiniMax misses −0.03 %, GB/tok identical to 3 dp; Qwen's miss counts
+overlap at −1.0 %). Decode banks less than the microbenchmark's +36 % because it only reaches k≥5 in
+bursts. **Streamed dense is unmoved** (ppl 8.78, per-token io_wait 3.5 s under both) — it loads
+layers at k=1, where the curve is flat.
+
+**Tests:** `tests/test_ring_pool_sizing.py`, 5, all seen to FAIL first. Suite **1308 passed, 3
+skipped**. Gates: dense smoke PASS, accumulator 8/8 both models, prefix reuse 1 passed, server smoke
+ALL PASS. Trail: `plans/2026-09-03-P8-ring-pool-RESULTS.md`; harness `plans/probes/p8_samepath.py`.
 
 ### R4 · [ ] Prefill repack memcpys into Rust — low priority
 `load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
