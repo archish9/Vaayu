@@ -257,9 +257,21 @@ def lookahead_accuracy_update(state: dict, predicted, layer_idx: int, actual: se
     state["total"] += len(actual)
 
 
-def predict_next_expert_set(next_block: "MoEBlockInfo", hidden_states, top_k: int) -> set:
-    """Expert ids the NEXT MoE layer is predicted to route to, scored the way
-    that layer itself scores (CLAUDE.md §5: detection over assumption).
+def predict_next_experts(next_block: "MoEBlockInfo", hidden_states,
+                         top_k: int) -> "tuple[set, set]":
+    """(predicted, to_stage) for the NEXT MoE layer, scored the way that layer
+    itself scores (CLAUDE.md §5: detection over assumption).
+
+    `predicted` is the whole predicted set — what the accuracy telemetry scores.
+    `to_stage` is the prefetch ADMISSION set: it drops each routed row's
+    LOWEST-weight pick. Measured 2026-09-03 on both models, the marginal misses
+    removed per prefetch read is flat down the weight order and then falls off a
+    cliff at the last rank (Qwen 0.607 -> 0.418, MiniMax 0.654 -> 0.312): the
+    prediction routes the next layer on the CURRENT layer's hidden state, and
+    the weakest pick is the first to fall out of the true top-k. Dropping it
+    removes ~11 % of decode reads. Per ROW, not globally — batched decode routes
+    N rows, and one global drop would leave N-1 of them staging a full top-k.
+    See tests/test_lookahead_tail_drop.py for the measurement this encodes.
 
     Three cases, in the same order the on-path forwards resolve them:
       * a router that returns its own (logits, weights, indices) — believe it;
@@ -278,11 +290,26 @@ def predict_next_expert_set(next_block: "MoEBlockInfo", hidden_states, top_k: in
     router = getattr(next_block.moe_module, next_block.router_attr)
     res = router(hidden_states)
     if isinstance(res, tuple) and len(res) >= 3:
-        idx = res[2]
+        # (logits, weights, indices) in some order — told apart by dtype, never
+        # by position, for the reason route_experts documents.
+        a, b = res[1], res[2]
+        idx, w = (a, b) if not a.is_floating_point() else (b, a)
     else:
         logits = res[0] if isinstance(res, tuple) else res
-        _, idx = route_experts(next_block.moe_module, logits, top_k)
-    return set(int(x) for x in idx.flatten().cpu().unique().tolist())
+        w, idx = route_experts(next_block.moe_module, logits, top_k)
+    idx = idx.reshape(-1, idx.shape[-1])
+    # One D2H for both sets: the narrowing is a gather on device, so admission
+    # costs no extra sync on the per-layer decode path.
+    keep = idx
+    if idx.shape[-1] > 1:
+        _, order = torch.topk(w.reshape(-1, w.shape[-1]).float(),
+                              idx.shape[-1] - 1, dim=-1)
+        keep = torch.gather(idx, -1, order)
+    both = torch.cat((idx.reshape(-1), keep.reshape(-1))).cpu()
+    n_all = idx.numel()
+    predicted = set(int(x) for x in both[:n_all].unique().tolist())
+    to_stage = set(int(x) for x in both[n_all:].unique().tolist())
+    return predicted, to_stage
 
 
 def _stage_predicted_expert(expert_cache, offset_index, checkpoint_path: Path,
@@ -377,13 +404,13 @@ def _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path: Path
     if next_block is None:
         return
     try:
-        pred_set = predict_next_expert_set(next_block, hidden_states, top_k)
+        pred_set, stage_set = predict_next_experts(next_block, hidden_states, top_k)
         vaayu_ref._lookahead_pred = (layer_idx + 1, pred_set)
         stager = getattr(vaayu_ref, "_stager_executor", None)
         if stager is None:
             return
         next_name = next_block.layer_name
-        for _pe in pred_set:
+        for _pe in stage_set:
             if not expert_cache.has(layer_idx + 1, _pe):
                 stager.submit(_stage_predicted_expert, expert_cache, offset_index,
                               checkpoint_path, next_name, layer_idx + 1, _pe)

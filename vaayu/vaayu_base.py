@@ -828,8 +828,9 @@ def check_lookahead_flag_safe() -> None:
 
     Interleaved same-box same-day arms; the two distributions do not overlap
     (worst ON beats best OFF by 10.6%). Coverage 62.6% -> 82.8%, NVMe bandwidth
-    3.786 -> 5.009 GB/s, bulk bytes still +17.8% over baseline (the residual is
-    eviction churn, not duplicate reads). Soaked at 1024 tokens with the stager
+    3.786 -> 5.009 GB/s, bulk bytes still +17.8% over baseline (that residual is
+    attributed to eviction churn here; P4 REFUTED that attribution on 2026-09-03
+    -- see below). Soaked at 1024 tokens with the stager
     at 4x width: no crashes, and greedy token ids byte-identical to a
     lookahead-off run across 256 tokens.
 
@@ -860,10 +861,27 @@ def check_lookahead_flag_safe() -> None:
     -5.7% to the other at the fan-out this engine exists for: the asymmetry
     CLAUDE.md section 5 forbids, now measured rather than assumed.
 
-    **To lift it:** fix the byte residual first (row P4, prefetch admission that
-    cannot evict the on-path working set) and re-run P2's arms. The flag is a
-    default only if MiniMax stops LOSING at N>1; it is not gated on wiring any
-    more. Full trail: plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md.
+    **Status 2026-09-03 (P4): the byte residual is REDUCED and its stated cause
+    was WRONG. The guard still stays -- MiniMax still loses at N=3.**
+    P4 was written on the theory that the residual is eviction churn. It is not:
+    a 12-slot-per-layer prefetch reservation removes 99.96% of prefetch-caused
+    history evictions and makes BOTH models worse, and LRU-cold admission costs
+    +22-27% reads because a prefetched entry's useful life is ONE layer-visit.
+    What pays is not staging each routed row's LOWEST-WEIGHT prediction (the
+    marginal misses a prefetch read removes cliffs at the last weight rank:
+    Qwen 0.607 -> 0.418, MiniMax 0.654 -> 0.312). Re-measured on that code, same
+    box, same hour, interleaved, ring pool 3, BALLAST_GB=25:
+
+        MiniMax N=1  OFF 1.811   ON 1.873/1.838   +2.5% (no overlap vs OFF)
+        MiniMax N=3  OFF 2.777   ON 2.672/2.677   -3.7% (was -6.1% pre-P4)
+        Qwen    N=1  OFF 1.104   ON 1.229/1.238  +11.7% (was  +9.9% pre-P4)
+
+    **To lift it:** MiniMax has to stop LOSING at N>1, and admission is no longer
+    the lever -- P4 exhausted it. What is left is prediction QUALITY: MiniMax
+    predicts 76.6% of its routed set against Qwen's 90.2%, so it still reads
+    +30% bytes at N=3 to remove its misses. Full trail:
+    plans/2026-09-03-P4-admission-RESULTS.md and
+    plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md.
 
     Called from __init__ before any MoE cache/executor/prefetch object is
     created, so a set flag fails fast at engine construction. No-op (dead code)
@@ -880,10 +898,12 @@ def check_lookahead_flag_safe() -> None:
             "-> 1.422 tok/s, 3 interleaved arms each, non-overlapping; 1024-token "
             "soak clean, greedy ids byte-identical). It stays off because the win "
             "is Qwen's, not the flag's: the module-list forward IS wired now "
-            "(P2, 2026-09-03) and MiniMax measures +0.6% at N=1 (overlapping arms) "
-            "and -5.7% at N=3, against Qwen's +10.6% at N=1 on the same box the "
-            "same hour -- it costs MiniMax +18-26% bytes/token to remove 15% of "
-            "its misses. Fix the byte residual (row P4) before revisiting. See "
+            "(P2, 2026-09-03) and after P4's admission fix the same day MiniMax "
+            "measures +2.5% at N=1 but STILL -3.7% at N=3, against Qwen's +11.7% "
+            "at N=1 on the same box the same hour -- it costs MiniMax +30% "
+            "bytes/token at N=3 to remove its misses. P4 exhausted the admission "
+            "lever (its eviction-churn premise was refuted); what is left is "
+            "prediction QUALITY, 0.766 against Qwen's 0.902. See "
             "check_lookahead_flag_safe.__doc__. Unset VAAYU_LOOKAHEAD (or set it "
             "to anything other than \"1\") to proceed."
         )

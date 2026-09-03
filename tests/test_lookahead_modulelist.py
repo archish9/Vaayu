@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-from vaayu.moe_patch import patch_moe_blocks, predict_next_expert_set
+from vaayu.moe_patch import patch_moe_blocks, predict_next_experts
 from vaayu.persist.expert_cache import ExpertRAMCache
 from vaayu.persist.expert_offset_index import ExpertOffsetIndex
 
@@ -73,13 +73,18 @@ def test_modulelist_forward_predicts_next_layer(tmp_path):
 
 
 def test_modulelist_forward_prefetches_predicted_experts(tmp_path):
-    """Phase B: predicted next-layer experts are staged into the RAM cache."""
+    """Phase B: the ADMITTED next-layer experts are staged into the RAM cache.
+
+    Not the whole predicted set — P4's admission rule drops each row's
+    lowest-weight pick (tests/test_lookahead_tail_drop.py).
+    """
     model, vaayu_ref, cache = _patch_for_lookahead(tmp_path)
     model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, 8))
 
-    _, predicted = vaayu_ref._lookahead_pred
     assert vaayu_ref._stager_executor.calls, "nothing submitted to the stager"
-    for eidx in predicted:
+    staged = {args[-1] for args in vaayu_ref._stager_executor.calls}
+    assert staged, "stager was submitted no expert ids"
+    for eidx in staged:
         assert cache.has(1, eidx), f"layer-1 expert {eidx} was not prefetched"
 
 
@@ -150,7 +155,7 @@ def test_prediction_uses_model_scoring_function():
         router_attr="gate", experts_attr="experts", expert_style="module_list")
 
     hidden = torch.randn(1, 1, 8)
-    got = predict_next_expert_set(block, hidden, top_k=2)
+    got, _staged = predict_next_experts(block, hidden, top_k=2)
 
     logits = moe.gate(hidden)
     _, own_idx = route_experts(moe, logits, 2)
@@ -182,4 +187,5 @@ def test_prediction_uses_router_returned_topk():
         layer_idx=1, layer_name="layers.1",
         module_path="layers.1.block_sparse_moe", moe_module=_MoE(),
         router_attr="gate", experts_attr="experts", expert_style="module_list")
-    assert predict_next_expert_set(block, torch.randn(1, 1, 8), top_k=2) == {5, 6}
+    got, _staged = predict_next_experts(block, torch.randn(1, 1, 8), top_k=2)
+    assert got == {5, 6}

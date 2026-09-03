@@ -78,8 +78,8 @@ with that ranking.
 Bug detail: **`# BUGS-2026-08-23`** below, one section per row. Perf detail: **`# PERF`** below for
 the one-liners, and **`speed-up-vaayu.md`** for the full argument, the arithmetic, and the probes.
 
-**Suite baseline: 1315 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-03 after P2 (+7 tests, `tests/test_lookahead_modulelist.py`). **The `1303/3` written here on
+**Suite baseline: 1322 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-03 after P4 (+7 tests, `tests/test_lookahead_tail_drop.py`; it read 1315/3 after P2). **The `1303/3` written here on
 2026-09-02 was already stale by 5 when it was read on 2026-09-03** — HEAD measured 1308/3 with the
 day's edits stashed (P8 added 5 and did not update this line). Re-measure against a stashed HEAD
 before quoting it; this figure has now gone stale four times. It read 1257/3 before 2026-08-30, a figure written
@@ -118,7 +118,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~18~~ | ~~**P5**~~ — **DONE 2026-09-02: drift does NOT reproduce, the ~20 % unfalsifiability rule is LIFTED.** Seven arms, both models: Qwen 1.739/1.738/1.739 (0.06 %), Qwen@ballast-27 1.901/1.903 (0.10 %), MiniMax 2.762/2.767 (0.18 %), greedy ids byte-identical in every pair. The suspected cause (arena sizing off psutil avail at load) is CONFIRMED to wobble — 1473/1469/1463 slabs, 43 vs 41 cached layers — and REFUTED as the mechanism: it moves throughput 0.06 %. **New rule: `BALLAST_GB` is an arm variable, not hygiene** — 25→27 GB is +9.4 % tok/s (arena +10.4 %, bytes/token −8.3 %); never compare across targets. The 22 % most probably belonged to P3's uncommitted store build, live in that block and now gone — unretestable, recorded as probable not confirmed | `plans/2026-09-02-P5-control-drift-RESULTS.md`; comparator `plans/probes/p5_drift.py` |
 | ~~19~~ | ~~**P8**~~ — **DONE 2026-09-03. ATTRIBUTED and FIXED.** The ceiling is the io_uring ring pool sized to the CALLER pool (8) instead of to the drive — 8 concurrent O_DIRECT readers is past this NVMe's knee. Pool → 3: decode **+4.8 % Qwen / +9.7 % MiniMax**, aggregate **+3.7 % / +9.6 %**, per-read latency **−14.1 % / −18.7 %**, TTFT **−2.7 % / −4.1 %**, all NO OVERLAP; dense unmoved. **P4 is unblocked** | | |
 | ~~20~~ | ~~**P2**~~ — **DONE 2026-09-03. WIRED, and the flag is REFUTED as a default.** The predictor is now one shared implementation (`moe_patch._lookahead_step`) that both forwards call, and it fires on MiniMax: 76.6 % accuracy, on-path misses **28 484 → 24 098 (−15.4 %)**, greedy ids byte-identical. It does not pay: **MiniMax N=1 +0.6 % (arms OVERLAP: OFF 1.798/1.792/1.808 vs ON 1.804/1.815/1.809), N=3 −5.7 % (no overlap)** against **Qwen N=1 +10.6 %** on the same box the same hour, post-P8. MiniMax predicts worse (0.766 vs 0.902) and wastes more of what it stages (28 % vs 12 %), paying **+18.0 % bytes/token at N=1, +26.4 % at N=3** — the P4 residual, priced. The guard STAYS, on a rewritten reason (its old one — "wired only into the fused forward" — is now false in `check_lookahead_flag_safe`). `plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md` | |
-| 21 | **P4** — prefetch admission policy, the +17.8 % byte residual | why P1's gain decays with N. **P5 cleared 2026-09-02; P8 cleared 2026-09-03; P2 cleared 2026-09-03 and handed it a target** — MiniMax pays +18.0 % bytes at N=1 and +26.4 % at N=3, which is the whole reason lookahead nets −5.7 % there while Qwen nets +10.6 %. P4 is now the row that decides whether the flag can ever default ON. **Re-measure: the disk floor moved** (P8 aggregate +3.7 %/+9.6 %) | `expert_cache.py` + `moe_patch.py` `_lookahead_step` / `_stage_predicted_expert` |
+| ~~21~~ | ~~**P4**~~ — **DONE 2026-09-03. The row's PREMISE is refuted; a different rule pays.** Eviction churn is NOT the residual: a 12-slot/layer prefetch reservation removes **99.96 %** of prefetch-caused history evictions (10 239 → 4) and makes both models WORSE (MiniMax +11.9 % reads, Qwen +70.4 %); LRU-cold admission and prefetch-preferred eviction are +22 % / +27 % (a prefetched entry's useful life is ONE layer-visit, so demoting it evicts it before use); a VRAM-residency check at stage time covers 0.9 % / 0.0 % of stages. **What pays is dropping each routed row's LOWEST-WEIGHT prediction from the STAGING set** — marginal misses removed per prefetch read is flat down the weight order then cliffs at the last rank (Qwen 0.607 → **0.418**, MiniMax 0.654 → **0.312**). Measured: **+2.4 % MiniMax N=1, +2.6 % MiniMax N=3, +1.6 % Qwen N=1** aggregate tok/s, NO OVERLAP in all three blocks, decode reads **−6.6 / −7.0 / −3.2 %** and on-path misses **−9.3 / −5.8 / −4.8 %** at the same time, greedy ids byte-identical. The row's gate (bytes down AND coverage held) is met and beaten — coverage rose too. **The flag still cannot default ON: MiniMax N=3 is −3.7 % vs lookahead-off (was −6.1 %), so the guard STAYS.** The remaining gap is prediction QUALITY (0.766 vs 0.902), not admission. `plans/2026-09-03-P4-admission-RESULTS.md` | |
 | 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
 
 **The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
@@ -1334,13 +1334,16 @@ must attack the eviction interaction, not the prefetch trigger:
   *a measurement promotes a build only when it identifies a CONSTRAINT, not merely a large number.*
   **The ~5.12 GB/s ceiling is therefore still unexplained — it is NOT the tiny reads (see P8).**
   Trail: `plans/2026-08-30-P3-tiny-store-RESULTS.md`.
-- [ ] **Residual headroom — this is P4, and its number is now SUSPECT.** At 6.05 GB/s while
-  covered and baseline bytes, full coverage implies ~2.0 tok/s against today's 1.422. The remaining
-  +17.8 % bytes is the eviction churn the admission policy row was written for. **But that ~2.0
-  extrapolates a single-stream while-covered rate, and P8 found every lookahead-ON arm pinned at
-  5.073–5.126 GB/s aggregate with bandwidth-while-covered FALLING as N rises (6.03 → 5.77 → 5.75).
-  Do not quote ~2.0 tok/s until P8 attributes the ceiling.** P4 is blocked on P5 and P8, and on P2
-  to measure it on MiniMax at all.
+- [x] **Residual headroom — P4, CLOSED 2026-09-03, and this bullet's own theory is REFUTED.**
+  It read: "the remaining +17.8 % bytes is the eviction churn the admission policy row was written
+  for." It is not. Protecting history from the prefetcher to the limit — a 12-slot/layer reservation
+  that removes 99.96 % of prefetch-caused history evictions — makes BOTH models worse. What the
+  bytes actually buy is priced rank by rank: the marginal misses a prefetch read removes is flat
+  down the router's WEIGHT order and cliffs at the last rank on both models. Dropping that one pick
+  per routed row is +2.4 / +2.6 / +1.6 % tok/s with reads AND misses both down.
+  **The ~2.0 tok/s extrapolation is retired, not inherited:** P8 attributed the ceiling to the ring
+  pool and fixed it, and this row's own arms are the current numbers. Full trail:
+  `plans/2026-09-03-P4-admission-RESULTS.md`.
 
 **Opened 2026-08-30 by the R2 structural probe. With R2 refuted the same day, this is the ONLY disk
 lever left — and on bulk reads alone it is worth ~1.58× (Qwen) / ~1.64× (MiniMax).**
@@ -1494,6 +1497,38 @@ offset-index build are load-time, once. → `speed-up-vaayu.md` §2 R5 and §4.
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
+| **7** | Fused-EXL3 forward reads experts the VRAM cache already holds | `[ ]` | GPU round | Found 2026-09-03 by P4's trace. See below. |
+
+# 7 · [ ] The fused-EXL3 forward reads experts the VRAM cache already holds
+
+Opened 2026-09-03 by P4's trace probe — NOT part of P4, recorded here so it is not lost.
+
+The **module-list** forward filters VRAM-resident experts out of the RAM/disk dispatch:
+`_vram_resident` is built first and `_to_load = [e for e in unique_experts if e not in
+_vram_resident]` (`vaayu/moe_patch.py:1066`). The **fused-EXL3** forward does not — it passes the
+whole `unique_experts` to `_dispatch_expert_misses` (`:1730`) and only consults
+`_vram.get(layer_idx, eidx)` inside the compute loop (`:1807`), after the RAM lookup and any disk
+read that lookup caused have already happened.
+
+Measured on the same day, 64-token greedy decode, one row per layer-visit:
+
+| forward | model | routed / visit | asked of the RAM cache / visit |
+|---|---|---|---|
+| module-list | MiniMax-M2.7 | 8.00 | **5.86** |
+| fused-EXL3 | Qwen3-235B | 8.00 | **8.00** |
+
+Qwen asks the RAM cache for every routed expert, including the ones its own VRAM cache is about to
+serve. Its VRAM cache is not idle (`vram=...hit` is non-zero in every token summary), so some of
+those lookups miss RAM and issue an 11.9 MB read for weights already on the GPU.
+
+**Done means:** the size of the waste is measured first (count `unique_experts ∩ vram_resident` per
+visit on Qwen, and how many of those were RAM misses), then the filter is moved above the dispatch
+if the count justifies it. **Refuted if** the intersection is near zero — the VRAM cache may simply
+not hold what the layer re-routes to. Do not assume the module-list behaviour is the correct one
+without that count: `_vram.get()` promotes in the VRAM LRU, and hoisting it changes which entries
+survive.
+
+---
 
 # 2 · [ ] Static check for unbound locals / import order
 
