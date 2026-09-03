@@ -2235,3 +2235,48 @@ def test_decode_does_not_wait_on_a_merely_queued_load(tmp_path, monkeypatch):
     assert reads, "decode must load it itself rather than wait on a queued claim"
     assert elapsed < _LOAD_WAIT_BACKSTOP_S / 2, (
         f"decode blocked {elapsed:.2f}s on a claim that never started running")
+
+
+def test_the_dispatch_records_which_forward_it_returned(monkeypatch):
+    # env.json reports this. Re-deriving it from expert_style + is_exl3 would
+    # be a SECOND copy of the dispatch table, and a copy drifts -- silently,
+    # and precisely when triage depends on knowing which of the four forwards
+    # ran (CLAUDE.md 0).
+    #
+    # The three factories are stubbed out because the TAG does not depend on
+    # anything they need: building a real forward wants an expert cache, an
+    # offset index and a checkpoint on disk, none of which this behaviour
+    # touches. What the stub cannot prove -- that a real closure carries the
+    # attribute through patch_moe_blocks onto the MoEBlockInfo -- is verified
+    # on three really-loaded models in Task 8.
+    from types import SimpleNamespace
+
+    from vaayu import moe_patch
+
+    for name in ("_make_fused_sparse_forward_exl3", "_make_fused_sparse_forward",
+                 "_make_modulelist_sparse_forward"):
+        monkeypatch.setattr(moe_patch, name,
+                            lambda *a, **k: (lambda *_a, **_k: None))
+
+    cases = {
+        ("fused", True): "_make_fused_sparse_forward_exl3",
+        ("fused", False): "_make_fused_sparse_forward",
+        ("module_list", True): "_make_modulelist_sparse_forward",
+        ("module_list", False): "_make_modulelist_sparse_forward",
+    }
+    for (style, is_exl3), expected in cases.items():
+        fwd = moe_patch._make_sparse_moe_forward(
+            block_info=SimpleNamespace(expert_style=style),
+            expert_cache=None, offset_index=None, checkpoint_path=None,
+            top_k=8, device="cpu", dtype=None, vaayu_ref=None,
+            is_exl3=is_exl3)
+        assert fwd.__vaayu_forward__ == expected, (style, is_exl3)
+    assert len(set(cases.values())) == 3, "three distinct forwards exist"
+
+
+def test_a_block_info_carries_the_forward_name_field():
+    from vaayu.moe_patch import MoEBlockInfo
+    assert "forward_name" in MoEBlockInfo.__dataclass_fields__
+    assert MoEBlockInfo.__dataclass_fields__["forward_name"].default is None, (
+        "it must default to None -- a block that has not been patched has no "
+        "forward name, and positional construction elsewhere must keep working")

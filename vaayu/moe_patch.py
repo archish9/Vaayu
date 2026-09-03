@@ -543,6 +543,10 @@ class MoEBlockInfo:
     router_attr: str       # attribute on moe_module holding the gate Linear
     experts_attr: str      # attribute on moe_module holding the experts ModuleList
     expert_style: str      # "module_list" or "fused"
+    # Which forward factory actually produced this block's forward, recorded by
+    # _make_sparse_moe_forward. None until the block is patched. env.json reports
+    # it; nothing at runtime branches on it.
+    forward_name: str | None = None
 
 
 def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
@@ -836,6 +840,7 @@ def patch_moe_blocks(
         )
         # Fix 1: direct assignment — no __get__ binding needed
         block_info.moe_module.forward = sparse_fwd
+        block_info.forward_name = getattr(sparse_fwd, "__vaayu_forward__", None)
         experts_mod = getattr(block_info.moe_module, block_info.experts_attr)
         if hasattr(experts_mod, 'num_experts'):
             n_experts = experts_mod.num_experts
@@ -865,22 +870,33 @@ def _make_sparse_moe_forward(
 ):
     """
     Returns a replacement forward() for the MoE block, dispatching based on expert_style.
+
+    The returned function is tagged `__vaayu_forward__` with the name of the
+    factory that produced it. env.json reports that tag rather than re-deriving
+    the choice from expert_style + is_exl3: a second copy of this dispatch table
+    drifts, and when it drifts it misreports which of the four forwards ran --
+    which is triage step one (CLAUDE.md 0).
     """
     if block_info.expert_style == "fused":
         if is_exl3:
-            return _make_fused_sparse_forward_exl3(
+            fwd = _make_fused_sparse_forward_exl3(
                 block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
             )
-        return _make_fused_sparse_forward(
+            fwd.__vaayu_forward__ = "_make_fused_sparse_forward_exl3"
+            return fwd
+        fwd = _make_fused_sparse_forward(
             block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
             compute_device=compute_device,
             original_forward=original_forward,
         )
-    else:
-        return _make_modulelist_sparse_forward(
-            block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
-            original_forward=original_forward,
-        )
+        fwd.__vaayu_forward__ = "_make_fused_sparse_forward"
+        return fwd
+    fwd = _make_modulelist_sparse_forward(
+        block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref,
+        original_forward=original_forward,
+    )
+    fwd.__vaayu_forward__ = "_make_modulelist_sparse_forward"
+    return fwd
 
 
 # Hardware constant: free VRAM to guarantee before each MoE layer DURING PREFILL,
