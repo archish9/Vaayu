@@ -55,7 +55,7 @@ never the order, and `HANDOFF-2026-08-30.md` §2 now opens with the do-order tab
 had no home) come FIRST**, because every implementation row left closes on a same-day A/B and at
 N=3 the controls no longer hold still. **P5 CLOSED 2026-09-02 — the drift does not reproduce and
 N=3 A/Bs are trustworthy again (0.06–0.18 % across seven arms, both models); P8 is now first.** Then P2, then P4 (which gained the file/symbol detail it was
-missing, and whose ~2.0 tok/s headroom is now marked SUSPECT pending P8), then P7, then P6.
+missing, and whose ~2.0 tok/s headroom is now marked SUSPECT pending P8), then P7, then P6. **All of them are now closed — P6 last, REFUTED 2026-09-03; the FIX SEQUENCE has no unticked row left.**
 
 Two documents outside this file are load-bearing, and both are self-contained:
 **`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument — every R and M row below is a
@@ -119,7 +119,7 @@ why each fix ships with a test verified to FAIL against the code it replaces.
 | ~~19~~ | ~~**P8**~~ — **DONE 2026-09-03. ATTRIBUTED and FIXED.** The ceiling is the io_uring ring pool sized to the CALLER pool (8) instead of to the drive — 8 concurrent O_DIRECT readers is past this NVMe's knee. Pool → 3: decode **+4.8 % Qwen / +9.7 % MiniMax**, aggregate **+3.7 % / +9.6 %**, per-read latency **−14.1 % / −18.7 %**, TTFT **−2.7 % / −4.1 %**, all NO OVERLAP; dense unmoved. **P4 is unblocked** | | |
 | ~~20~~ | ~~**P2**~~ — **DONE 2026-09-03. WIRED, and the flag is REFUTED as a default.** The predictor is now one shared implementation (`moe_patch._lookahead_step`) that both forwards call, and it fires on MiniMax: 76.6 % accuracy, on-path misses **28 484 → 24 098 (−15.4 %)**, greedy ids byte-identical. It does not pay: **MiniMax N=1 +0.6 % (arms OVERLAP: OFF 1.798/1.792/1.808 vs ON 1.804/1.815/1.809), N=3 −5.7 % (no overlap)** against **Qwen N=1 +10.6 %** on the same box the same hour, post-P8. MiniMax predicts worse (0.766 vs 0.902) and wastes more of what it stages (28 % vs 12 %), paying **+18.0 % bytes/token at N=1, +26.4 % at N=3** — the P4 residual, priced. The guard STAYS, on a rewritten reason (its old one — "wired only into the fused forward" — is now false in `check_lookahead_flag_safe`). `plans/2026-09-03-P2-modulelist-lookahead-RESULTS.md` | |
 | ~~21~~ | ~~**P4**~~ — **DONE 2026-09-03. The row's PREMISE is refuted; a different rule pays.** Eviction churn is NOT the residual: a 12-slot/layer prefetch reservation removes **99.96 %** of prefetch-caused history evictions (10 239 → 4) and makes both models WORSE (MiniMax +11.9 % reads, Qwen +70.4 %); LRU-cold admission and prefetch-preferred eviction are +22 % / +27 % (a prefetched entry's useful life is ONE layer-visit, so demoting it evicts it before use); a VRAM-residency check at stage time covers 0.9 % / 0.0 % of stages. **What pays is dropping each routed row's LOWEST-WEIGHT prediction from the STAGING set** — marginal misses removed per prefetch read is flat down the weight order then cliffs at the last rank (Qwen 0.607 → **0.418**, MiniMax 0.654 → **0.312**). Measured: **+2.4 % MiniMax N=1, +2.6 % MiniMax N=3, +1.6 % Qwen N=1** aggregate tok/s, NO OVERLAP in all three blocks, decode reads **−6.6 / −7.0 / −3.2 %** and on-path misses **−9.3 / −5.8 / −4.8 %** at the same time, greedy ids byte-identical. The row's gate (bytes down AND coverage held) is met and beaten — coverage rose too. **The flag still cannot default ON: MiniMax N=3 is −3.7 % vs lookahead-off (was −6.1 %), so the guard STAYS.** The remaining gap is prediction QUALITY (0.766 vs 0.902), not admission. `plans/2026-09-03-P4-admission-RESULTS.md` | |
-| 22 | **P6 = R4** — prefill repack memcpys into Rust | lowest value; TTFT already 136–377× better from prefix caching | `safetensor_model_persister.py` |
+| ~~22~~ | ~~**P6 = R4**~~ — **REFUTED 2026-09-03, row CLOSED. Nothing built.** Both named targets are gone. (1) `load_expert_into_slab(tensor_align=True)` — the per-tensor Python `copy_` the row is about — has had **ZERO production callers since 2026-07-13** (`c5014cd`, B1 zero-copy staging); all three prod sites pass `False`, only `tests/` pass `True`. R4 was written **six weeks later**, off the function's stale docstring. (2) `gpu_repack_aligned` is **CUDA tensors** — D2D copies on the compute stream, so a Rust `memcpy` under `allow_threads` does not apply; it belongs in R5. It is also **Qwen-only** (`_prefill_staged_slabs` is read only inside `_make_fused_sparse_forward_exl3`; the module-list forward never calls it, so MiniMax never runs this path). (3) The residual it could have meant — per-tensor H2D straight into aligned GPU slices, deleting the D2D duplicate — is **30.2 µs/expert = 0.364 s/prefill = 4.7 %** on Qwen (MiniMax geometry 35.2 µs / 7.2 %, hypothetical), against a **7.8 s** staged-consume that is PCIe-bound: 142 GB must cross either way. Cold-turn only. NOT re-scoped — refutation closes the row. `plans/2026-09-03-P6-repack-RESULTS.md`; probe `plans/probes/p6_repack_bench.py` | | |
 
 **The `#` column is the DO-ORDER; the P-names are the fixed identifiers.** P7 is done first but keeps
 the name P7 — the names are referenced from `HANDOFF-2026-08-30.md` and the results docs and are
@@ -397,9 +397,8 @@ Order to fix them: the **FIX SEQUENCE** table at the top of this file. **ALL CLO
 B5 (all 2026-08-23), B14, B3, B4, B6, B7, B8 and B9 (2026-08-28), B10, B11, B12, B16, B15 and B13
 (2026-08-29). **B15 was opened by B7's investigation, B16 by B9's.** B1's detail is archived; B2's and B5's closures are kept in
 place below, because both are load-bearing for the P1/R5 perf rows.
-**Nothing in this section is open, and no bug row is.** Every B row is closed; so is every R/M
-row except R4. **The next work is not a bug** — it is the P-row do-order in the FIX SEQUENCE table
-at the top of this file, which starts at **P5**.
+**Nothing in this section is open, and no bug row is.** Every B row is closed, **and so is every R/M row — R4 (= P6) was the last, REFUTED 2026-09-03**. **The next work is not a bug** — it is the P-row do-order in the FIX SEQUENCE table
+at the top of this file — **and as of 2026-09-03 that table has no unticked row either.** The next work must come from **OPTIONAL** below or from a new premise.
 
 ### B2 · [x] stream token count was a re-tokenization — **FIXED 2026-08-23** (with B5)
 `vaayu/server/engine.py` counted stream tokens as
@@ -1470,17 +1469,41 @@ layers at k=1, where the curve is flat.
 skipped**. Gates: dense smoke PASS, accumulator 8/8 both models, prefix reuse 1 passed, server smoke
 ALL PASS. Trail: `plans/2026-09-03-P8-ring-pool-RESULTS.md`; harness `plans/probes/p8_samepath.py`.
 
-### R4 · [ ] Prefill repack memcpys into Rust — low priority
-`load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
-`dst_slice.copy_(chunk)` in Python, and `gpu_repack_aligned` does the same into a fresh buffer. This
-is the **prefill stager's** path, not decode's — decode's miss path is already zero-copy straight
-into the slab. A Rust `memcpy` under `allow_threads` lets the repack overlap the H2D stream instead
-of serialising against it. **TTFT lever only**, and prefix caching already took 136–377× off TTFT,
-so it only bites on a cold turn. **Effort:** low-moderate. **Priority:** low, for that reason.
-→ `speed-up-vaayu.md` §2 R4.
+### R4 (= P6) · [x] Prefill repack memcpys into Rust — **REFUTED 2026-09-03, CLOSED, nothing built**
+The row said: `load_expert_into_slab`'s aligned mode (`tensor_align=True`) does a per-tensor
+`dst_slice.copy_(chunk)` in Python and `gpu_repack_aligned` does the same into a fresh buffer, so a
+Rust `memcpy` under `allow_threads` could overlap the H2D stream. **Both halves are wrong.**
+
+- **`tensor_align=True` is production-dead** and has been since **2026-07-13** (`c5014cd`, B1
+  zero-copy prefill staging). All three production call sites — `vaayu_base.py:1267`
+  (`stage_read_expert`), `moe_patch.py:357`, `moe_patch.py:1543` — pass `tensor_align=False`; the
+  only `True` callers are 5 sites in `tests/`. **R4 was written 2026-08-23, six weeks after that
+  commit**, from the function's docstring rather than its call sites.
+- **`gpu_repack_aligned` is on the GPU.** Its `torch.empty(..., device=device)` is CUDA (EXL3 forces
+  it) and its `copy_`s are D2D on the compute stream. Rust has nothing to offer — it belongs in the
+  R5 list below. It is also **Qwen-only**: `_prefill_staged_slabs` is read only at
+  `moe_patch.py:1753/1846/1984`, all inside `_make_fused_sparse_forward_exl3`.
+  `_make_modulelist_sparse_forward` never calls it, so **MiniMax never executes this path.**
+- **The residual, measured** (`plans/probes/p6_repack_bench.py`, geometry derived from each
+  checkpoint header): replacing "1 H2D of the raw slab + N D2D repack copies" with "N H2D straight
+  into 16-aligned GPU slices" saves **30.2 µs/expert → 0.364 s/prefill → 4.7 %** on Qwen (MiniMax
+  geometry 35.2 µs / 0.558 s / 7.2 %, hypothetical since it never runs this). The staged consume
+  costs **7.8 s/prefill** and is **PCIe-bound** — 142 GB crosses either way; the repack is 4.7 % of
+  it, cold-turn only (prefix caching = 136–377× off TTFT), on one model. Below every closed row's
+  bar, and not what R4 proposed. Per the Environment rule, refutation closes the row; not re-scoped.
+
+**Left behind, NOT fixed (CLAUDE.md §3):** `load_expert_into_slab`'s `tensor_align=True` branch and
+its `_EXPERT_BUF_POOL` draw are dead in production and kept alive only by tests, while the docstring
+at `safetensor_model_persister.py:851` still advertises it as "the prefill stager, via
+stage_read_expert" — **that stale docstring is what produced this row** — and
+`_group_layout`/`expert_span_bytes` still size every slab `max(raw_aligned_length, packed_span)` to
+cover a mode nothing calls. Recorded under OPTIONAL, not deleted: the sizing is load-bearing for
+slab-arena arithmetic and four tests assert the mode's behaviour.
+Trail: `plans/2026-09-03-P6-repack-RESULTS.md`. → `speed-up-vaayu.md` §2 R4.
 
 ### Already Rust, or beyond Rust's reach — do not re-open
-HF `tokenizers` is already Rust. Sampling / top-k / top-p are GPU tensors (Rust would add a D2H
+**`gpu_repack_aligned` joined this list 2026-09-03** (from R4): CUDA tensors, D2D on the compute
+stream — Rust would have to move them to the CPU first. HF `tokenizers` is already Rust. Sampling / top-k / top-p are GPU tensors (Rust would add a D2H
 round trip). EXL3 matmuls, the router GEMM and attention are CUDA kernels. Streamed dense already
 reads at ~5.7 GB/s, i.e. at the wall — **Rust has nothing to offer it**; its lever is speculative
 decoding, already built and measured at 5.57× (see CARRIED FORWARD). `safetensors` header parse and
@@ -1498,6 +1521,7 @@ offset-index build are load-time, once. → `speed-up-vaayu.md` §2 R5 and §4.
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
 | **7** | Fused-EXL3 forward reads experts the VRAM cache already holds | `[ ]` | GPU round | Found 2026-09-03 by P4's trace. See below. |
+| **8** | `tensor_align=True` is production-dead code with a docstring that still claims it is the prefill stager | `[ ]` | ~30 min | Opened 2026-09-03 by P6. Nothing calls it since `c5014cd` (2026-07-13); **the stale docstring at `safetensor_model_persister.py:851` is what produced row R4/P6 and cost that row its premise.** Fix the docstring at minimum. Deleting the branch is bigger than it looks: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it. |
 
 # 7 · [ ] The fused-EXL3 forward reads experts the VRAM cache already holds
 

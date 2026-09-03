@@ -225,19 +225,34 @@ LRU/eviction state, none of which needs to be a Python object.
 * **Refuted if:** the GIL probe in §1 shows switch-interval changes do not move
   the token rate.
 
-### R4 — Prefill repack memcpys (`gpu_repack_aligned`, `tensor_align=True`)
+### R4 — Prefill repack memcpys — **REFUTED 2026-09-03. Do not re-open.**
 
-`load_expert_into_slab`'s aligned mode does a per-tensor `dst_slice.copy_(chunk)`
-in Python, and `gpu_repack_aligned` does the same into a fresh buffer. This is
-the **prefill stager's** path, not decode's (decode's miss path is already
-zero-copy straight into the slab — see the function's docstring).
+The row said `load_expert_into_slab`'s aligned mode does a per-tensor
+`dst_slice.copy_(chunk)` in Python and `gpu_repack_aligned` does the same into a
+fresh buffer, so a Rust `memcpy` under `allow_threads` could overlap the H2D
+stream. **Both halves were already false when this was written.**
 
-A Rust `memcpy` under `allow_threads` lets the repack overlap the H2D stream
-instead of serialising against it. **TTFT lever, not a decode lever** — and
-prefix caching already took 136-377x off TTFT, so this only bites on a cold
-turn.
+* **`tensor_align=True` has had no production caller since 2026-07-13**
+  (`c5014cd`, B1 zero-copy prefill staging). `stage_read_expert`
+  (`vaayu_base.py:1267`) and both `moe_patch.py` sites pass `tensor_align=False`;
+  the only `True` callers are 5 sites in `tests/`. This row was written
+  2026-08-23 off the function's **stale docstring**, which still calls that mode
+  "the prefill stager".
+* **`gpu_repack_aligned` is a GPU-side copy.** Its buffer is
+  `torch.empty(..., device=device)` with `device` the EXL3-forced CUDA device,
+  and its `copy_`s run D2D on the compute stream. Rust cannot touch it — see §2
+  R5, where it now belongs. It is also **Qwen-only**: `_prefill_staged_slabs` is
+  read only inside `_make_fused_sparse_forward_exl3`, so MiniMax's module-list
+  forward never runs this path at all.
+* **The residual is small and PCIe-bound.** Replacing "1 H2D of the raw slab +
+  N D2D repack copies" with "N H2D straight into 16-aligned GPU slices" measures
+  **30.2 us/expert -> 0.364 s/prefill -> 4.7 %** on Qwen (MiniMax geometry
+  35.2 us / 7.2 %, hypothetical). The staged consume itself is **7.8 s/prefill**
+  and moves 142 GB across PCIe either way. Cold-turn only, one model, below every
+  closed row's bar.
 
-* **Effort:** low-moderate. **Priority:** low, for that reason.
+Trail: `plans/2026-09-03-P6-repack-RESULTS.md`; probe
+`plans/probes/p6_repack_bench.py`.
 
 ### R5 — Things that are already Rust, or that Rust cannot help
 
@@ -250,6 +265,8 @@ turn.
 * **EXL3 matmuls, the router GEMM, attention** — CUDA kernels. Out of scope.
 * **Streamed dense decode** — already at ~5.7 GB/s, i.e. at the wall (§0).
 * **`safetensors` header parse, offset index build** — load-time, once.
+* **`gpu_repack_aligned` (the prefill staged-consume repack)** — CUDA
+  tensors, D2D on the compute stream. Moved here from R4, **2026-09-03**.
 
 ---
 
