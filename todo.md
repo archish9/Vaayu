@@ -231,6 +231,22 @@ What the pass actually found:
   whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
   whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
   `log_dir` at `tmp_path` unless a test explicitly overrides it.
+- **[bug] `avg_nvme_throughput` is inflated by RAM-cache hits on DENSE models.** Found
+  2026-09-04 by Task 3's review, in the branch `l1-t5-t10-triage-additive`. Task 3 fixed this
+  defect for the MoE non-expert cache (`_non_expert_tensor_cache`, via `_non_expert_from_cache`),
+  but the SIBLING cache has the identical shape and was deliberately left alone:
+  `_load_from_strategy` → `loader_strategy.load_from_disk` (`StandardSafetensorsStrategy:143`,
+  `EXL3LoaderStrategy:477`) returns from its own `self._cache` with zero disk I/O, reached through
+  `future.result()` at the SAME two layer-loop sites Task 3 changed — and the layer is still
+  recorded with full `file_bytes` and `cache_hit=False`. **Dormant on MoE, live on dense:**
+  `is_moe` forces that cache's budget to 0 (`vaayu_base.py:1870-1871`) and `LayerRAMCache.put()`
+  rejects every insert at budget 0, so `.get()` never hits; on dense, `auto_detect_cache_budget`
+  is non-zero and the cache genuinely hits. **Not load-bearing for the T5–T10 work** — `gb_tok`
+  and `requests.jsonl`'s `bytes_read_gb` both come from the persister's read-site counter, which
+  a cache hit never reaches, so neither is affected. This bug is confined to
+  `TokenTiming.avg_nvme_throughput` (and `LayerTiming.nvme_throughput_gbps`, which has no
+  `cache_hit` guard at all). Fix sketch: give the strategy caches the same per-layer-name hit
+  signal Task 3 gave the non-expert cache.
 - **[x] L1 final fix wave — 2026-09-04.** A whole-branch review of `l1-triage-logging` (11 commits,
   `f585014`..`a4e2e7a`) returned "merge with fixes"; this row is that pass. Fixed, each with a new
   regression test in `tests/test_logs.py` / `tests/test_envinfo.py` unless noted: **C1** `new_run_dir`
