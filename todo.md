@@ -198,8 +198,12 @@ What the pass actually found:
   `max_tokens`).
   T9 `documentation/server.md` + `README.md` "Reporting a problem" section (server.md's half landed
   as part of Task 8; `README.md`'s does not exist yet).
-  Progress: T5a (the monotonic NVMe byte counter in the persister) landed as `55ea63b`. The rest
-  are not started; do not let them silently vanish the way T1–T4's own predecessor work nearly did.
+  Progress: plan Task 1 (byte counter) landed as `55ea63b`; Task 2 (`bytes=`/`gb_tok=`) as
+  `4a5d2c4`; Task 3 (`_lt_cache_hit` fix) as `1a0c299`; Task 4 (`reqlog.py`) as `595da20`+`c342086`;
+  **Task 5 (the engine writes a `requests.jsonl` row for every generation — success, raise, and
+  client-disconnect via `GeneratorExit`) landed as `8c114a1`**, 6 new tests in
+  `tests/test_reqlog_engine.py`, full suite 1433 passed / 3 skipped. Plan Tasks 6–10 not started;
+  do not let them silently vanish the way T1–T4's own predecessor work nearly did.
 - **[x] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts — docs FIXED**
   **2026-09-04 (I6/M3, final fix wave); scripts stay deleted, deliberately.** Eight files were
   removed on 2026-09-03, before Task 8 of this L1 work ran: `test_server_smoke.py`,
