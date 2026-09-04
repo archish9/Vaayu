@@ -93,6 +93,28 @@ def client_requiring_session(run_dir, no_real_load):
     yield from _client(run_dir, require_session_id=True)
 
 
+def _full_queue_client(run_dir):
+    """Same as `_client`, but the engine is built with `queue_depth=0` so the
+    ordinary admission check trips on the very first request -- an honest
+    QueueFull trigger rather than a monkeypatched exception, since one is
+    available (`EngineHandle.slot` / the route's own eager depth check both
+    key off `queue_depth`, see engine.py:172-183 and app.py's streaming
+    branch).
+    """
+    cfg = ServerConfig(model_path="/ckpt", log_dir=str(run_dir.parent),
+                       capture_stdio=False, require_session_id=False,
+                       default_stream=False)
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        app.state.engine = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
+        yield c
+
+
+@pytest.fixture
+def full_queue_client(run_dir, no_real_load):
+    yield from _full_queue_client(run_dir)
+
+
 def test_a_missing_session_id_writes_a_refusal_row(client_requiring_session, run_dir):
     r = client_requiring_session.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "hi"}]})
@@ -128,3 +150,49 @@ def test_a_successful_request_writes_exactly_one_row(client, run_dir):
         "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200
     assert len(rows(run_dir)) == 1              # the engine's, not two
+
+
+def test_a_logging_failure_does_not_turn_a_refusal_into_a_500(
+        client_requiring_session, run_dir, monkeypatch):
+    """`_refusal_row` must swallow its own failures -- see the docstring on
+    `_refusal_row` in app.py. Patching `reqlog.write_row` itself (rather than
+    e.g. `resolve_stream`) is what actually lands inside `_refusal_row`'s own
+    try/except: `resolve_stream(req, cfg)` is evaluated as a call-site
+    argument in `chat_completions`, one frame up, so it is not what this
+    function's wrapper protects -- this is the failure this helper's own
+    body IS responsible for.
+    """
+    import vaayu.server.app as app_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(app_mod.reqlog, "write_row", boom)
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    # write_row was replaced outright, so nothing landed on disk either --
+    # the point is only that the client still got its clean refusal.
+    assert rows(run_dir) == []
+
+
+def test_a_full_queue_writes_a_refusal_row_non_streaming(full_queue_client, run_dir):
+    r = full_queue_client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 503
+    rs = rows(run_dir)
+    assert len(rs) == 1
+    assert rs[0]["finish"] == "refused"
+    assert rs[0]["error"]["type"] == "QueueFull"
+
+
+def test_a_full_queue_writes_a_refusal_row_streaming(full_queue_client, run_dir):
+    r = full_queue_client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 503
+    rs = rows(run_dir)
+    assert len(rs) == 1
+    assert rs[0]["finish"] == "refused"
+    assert rs[0]["error"]["type"] == "QueueFull"

@@ -247,18 +247,33 @@ def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> N
     than an SSE internal_error (B8). Without this, a support bundle is silent
     about exactly the requests it most needs to explain.
 
-    Never raises -- `reqlog.write_row` swallows, and this is on a path that is
-    already returning an error to the client.
+    The whole body is wrapped in its own try/except, the same pattern as
+    `EngineHandle._write_request_row`: `reqlog.write_row`'s own swallow covers
+    only its file I/O, not `datetime.now().isoformat()`, the `getattr` calls,
+    or the dict literal built here. This is called from a sibling `except`
+    clause on the route's main try, not from a `finally` -- so an exception
+    raised HERE would propagate unhandled and turn a clean 400/503 into an
+    unhandled 500, which is exactly the failure this task exists to prevent.
+    A lost log line is cheaper than a refusal that stops being a refusal.
+
+    NOTE: `stream` is a plain bool the caller already computed -- for the
+    session-id refusal that means evaluating `resolve_stream(req, cfg)`
+    *before* this call, in `chat_completions`'s own frame. This try/except
+    does not reach back to protect that call-site expression; only what runs
+    inside this function's body.
     """
-    from datetime import datetime, timezone
-    reqlog.write_row(getattr(engine, "log_dir", None), {
-        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "session": getattr(req, "session_key", None),
-        "prompt_tokens": None, "cap": None, "stream": stream,
-        "tokens": 0, "finish": "refused", "wall_s": 0.0,
-        "decode": None,
-        "error": {"type": exc_type, "message": message, "traceback": None},
-    })
+    try:
+        from datetime import datetime, timezone
+        reqlog.write_row(getattr(engine, "log_dir", None), {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "session": getattr(req, "session_key", None),
+            "prompt_tokens": None, "cap": None, "stream": stream,
+            "tokens": 0, "finish": "refused", "wall_s": 0.0,
+            "decode": None,
+            "error": {"type": exc_type, "message": message, "traceback": None},
+        })
+    except Exception:                           # noqa: BLE001 -- never displaces
+        pass
 
 
 def _session_header(req) -> dict:
