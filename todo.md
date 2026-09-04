@@ -138,8 +138,8 @@ What the pass actually found:
   the `_WARNING_LIMIT` FIFO used to drop the OLDEST warning past the cap, which is backwards — startup
   warnings (APST, foreign-GPU) are the oldest lines and the ones that matter most; it now drops the
   newest instead (`test_the_warning_buffer_is_bounded` updated to assert that).
-- **[~] L1 T5–T9 (+T10) · additive half of the triage-logging work. DESIGN APPROVED 2026-09-04;
-  IN PROGRESS on branch `l1-t5-t10-triage-additive` from 2026-09-04.** Spec:
+- **[x] L1 T5–T9 (+T10) · additive half of the triage-logging work. DONE 2026-09-04,
+  branch `l1-t5-t10-triage-additive`.** Spec:
   [`docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md`](docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md)
   (**gitignored — this disk only**; the decisions below are the durable copy).
   **Plan: [`docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md`](docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md)**
@@ -198,12 +198,41 @@ What the pass actually found:
   `max_tokens`).
   T9 `documentation/server.md` + `README.md` "Reporting a problem" section (server.md's half landed
   as part of Task 8; `README.md`'s does not exist yet).
-  Progress: plan Task 1 (byte counter) landed as `55ea63b`; Task 2 (`bytes=`/`gb_tok=`) as
-  `4a5d2c4`; Task 3 (`_lt_cache_hit` fix) as `1a0c299`; Task 4 (`reqlog.py`) as `595da20`+`c342086`;
-  **Task 5 (the engine writes a `requests.jsonl` row for every generation — success, raise, and
-  client-disconnect via `GeneratorExit`) landed as `8c114a1`**, 6 new tests in
-  `tests/test_reqlog_engine.py`, full suite 1433 passed / 3 skipped. Plan Tasks 6–10 not started;
-  do not let them silently vanish the way T1–T4's own predecessor work nearly did.
+  Progress: Task 1 (byte counter) `55ea63b`; Task 2 (`bytes=`/`gb_tok=`) `4a5d2c4`; Task 3
+  (`_lt_cache_hit` fix) `1a0c299`; Task 4 (`reqlog.py`) `595da20`+`c342086`; Task 5 (engine
+  `requests.jsonl` rows incl. errors/disconnects, plus `stream()`'s outer error-capture gap and
+  the `cancelled` finish) `8c114a1`+`75e155e`; Task 6 (route-refusal rows) `30048c8`+`fc17d02`; Task 7 (`session_event` failure
+  warning) `ccfb719`; Task 8 (`python -m vaayu.server.diagnose`) `a108bbe`+`002a114`; Task 9
+  (README/server.md "Reporting a problem") `ba5f278`; **Task 10 (the committed on-device gate)
+  `ee72e61`** — all ten landed, nothing silently dropped.
+
+  **T10 close-out.** Restored `tests/test_server_smoke.py` from `7d806e7^`, converted to a pytest
+  module skipped unless `SERVER_CKPT` is set. Default suite: **1468 passed, 12 skipped** (was 1467
+  passed, 3 skipped; the whole new module — 9 tests — skips cleanly with no `SERVER_CKPT`, +1 from
+  a `test_envinfo.py` regression test). Gate command:
+  `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q` (see the
+  On-device gates table below for the per-checkpoint invocation and memory cap). The brief's given
+  `gb_tok > 0` assertion turned out to assume every dense checkpoint streams; it does not — a
+  checkpoint small enough to fully pin (Llama-3.2-1B: 3.00 GB against an 11.06 GiB pinning budget)
+  legitimately reads nothing from NVMe per token. Fixed to derive its expectation from the run's own
+  `[Vaayu-Pin]` summary line instead of a hardcoded direction. Measured `gb_tok` per checkpoint (all
+  four arms 9/9 passed):
+  - **Llama-3.2-1B** (fully pinned, 16/16 transformer layers): every value **0.00** — correct, not a
+    regression; this checkpoint cannot exercise the streamed-dense byte path on this hardware, so it
+    cannot stand in for the 70B arm when verifying this feature.
+  - **Qwen3-235B** (0/94 pinned, all non-expert-pinned): **1.65–59.77 GB** across 96 tokens; agrees
+    with `expert misses × expert_bytes` (11,830,272 B, from this run's own `env.json`) to **0.34%**
+    max / 0.07% mean relative difference.
+  - **MiniMax-M2.7** (0/62 pinned, all non-expert-pinned): **1.37–74.56 GB** across 34 tokens; agrees
+    with `expert misses × expert_bytes` (8,875,020 B) to **0.37%** max / 0.17% mean.
+  - **Llama-3.3-70B** (16/80 pinned, 64 stream — the load-bearing arm): constant **13.86 GB** on all
+    96 tokens (dense reads the same fixed set of non-pinned layers every token, so no per-token
+    variance is expected). This is the arm that actually proves the byte counter fires on a streamed
+    dense model.
+  Also fixed, authorized as an in-task deviation: `envinfo.py`'s `budgets.prefix_cache_gb` read
+  `model._prefix_cache.budget_bytes` unguarded (crashed into `collect_errors` whenever prefix reuse
+  auto-disables, e.g. any non-EXL3 checkpoint) — routed through the same `cache_gb()` null-check
+  helper its sibling fields already use; regression test added to `tests/test_envinfo.py`.
 - **[x] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts — docs FIXED**
   **2026-09-04 (I6/M3, final fix wave); scripts stay deleted, deliberately.** Eight files were
   removed on 2026-09-03, before Task 8 of this L1 work ran: `test_server_smoke.py`,
