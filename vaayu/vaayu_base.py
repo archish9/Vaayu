@@ -1908,6 +1908,7 @@ class VaayuBaseModel(GenerationMixin):
         # non-pinned MoE layer per token. Capped to prevent unbounded RAM growth
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
+        self._non_expert_from_cache = {}  # records whether each layer's last load was a cache hit
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         # Expert usage histogram (measurement only, ships dark). Default None
         # so the attribute always exists, on every load path (dense, CPU, or
@@ -3254,11 +3255,22 @@ class VaayuBaseModel(GenerationMixin):
         After the first token, most non-expert reads are cache hits with no disk I/O.
         On RAM-constrained machines, LRU eviction keeps the working set warm.
         """
+        # Whether THIS layer's last fetch came from the cache, keyed by layer
+        # name so the prefetch thread (which fetches layer i+1 while layer i
+        # computes) cannot mis-attribute it. Read by the layer loop below to
+        # set LayerTiming.cache_hit: a hit reads nothing from NVMe, and
+        # avg_nvme_throughput divides real read time by file_bytes, so a hit
+        # reported as a miss inflates the throughput figure -- on both MoE
+        # models, from the second token onward.
+        if getattr(self, "_non_expert_from_cache", None) is None:
+            self._non_expert_from_cache = {}
         cache = getattr(self, '_non_expert_tensor_cache', None)
         if cache is not None:
             cached = cache.get(layer_name)
             if cached is not None:
+                self._non_expert_from_cache[layer_name] = True
                 return cached
+        self._non_expert_from_cache[layer_name] = False
         from .persist.safetensor_model_persister import load_non_expert_tensors
         from pathlib import Path as _Path
         file_path = str(_Path(self.checkpoint_path) / (layer_name + ".safetensors"))
@@ -3985,7 +3997,10 @@ class VaayuBaseModel(GenerationMixin):
                         _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
                         _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
                         _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                        _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
+                        _lt_cache_hit = getattr(self, "_non_expert_from_cache", {}).get(
+                            layer_name, False)
+                        _lt_file_bytes = (0 if _lt_cache_hit else
+                                          sum(v.nbytes for v in state_dict.values()))
 
                         # Submit next non-pinned layer's load BEFORE GPU transfer
                         # so disk read and GPU H2D transfer overlap.
@@ -4038,7 +4053,10 @@ class VaayuBaseModel(GenerationMixin):
                         _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
                         _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
                         _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                        _lt_file_bytes = sum(v.nbytes for v in state_dict.values())
+                        _lt_cache_hit = getattr(self, "_non_expert_from_cache", {}).get(
+                            layer_name, False)
+                        _lt_file_bytes = (0 if _lt_cache_hit else
+                                          sum(v.nbytes for v in state_dict.values()))
                         if self.profiling_mode:
                             t = time.time()
                         _tl = time.perf_counter()
