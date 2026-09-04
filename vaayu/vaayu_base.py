@@ -909,6 +909,22 @@ def check_lookahead_flag_safe() -> None:
         )
 
 
+def format_byte_fields(read_bytes_delta: int) -> str:
+    """The token summary's `bytes=` / `gb_tok=` fields, as one substring.
+
+    A module-level function rather than an inline f-string fragment so the
+    formatting is testable without loading a model -- the summary line itself
+    lives inside a forward pass and cannot be reached from a unit test.
+
+    GB is DECIMAL, matching every other GB figure this engine prints. The two
+    fields are the fix for audit item 7: `expert_disk` is a STALL, not read
+    time, and GB/token appeared nowhere, so it was being reconstructed by hand
+    from miss counts -- which is how ~5.5 GB/s once got promoted to a hardware
+    constant (CLAUDE.md 5).
+    """
+    return f"  bytes={read_bytes_delta}  gb_tok={read_bytes_delta / 1e9:.2f}"
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -3809,8 +3825,20 @@ class VaayuBaseModel(GenerationMixin):
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
+        # Fold the PREVIOUS token's stall into a monotonic total before zeroing
+        # it. `_expert_disk_s` is a per-TOKEN value; the server needs a
+        # per-REQUEST window (requests.jsonl), and diffing a value that resets
+        # itself every token would report a fraction of one token as a whole
+        # request. Same reasoning as the byte counter below.
+        self._expert_disk_total_s = (getattr(self, "_expert_disk_total_s", 0.0)
+                                     + getattr(self, "_expert_disk_s", 0.0))
         self._expert_disk_s = 0.0   # Fix #6: real expert NVMe time this token
                                     # (accumulated by sparse_forward in moe_patch)
+        # Baseline for this token's NVMe bytes. The counter itself is monotonic
+        # and shared with the server (see note_read_bytes in the persister); we
+        # take a window over it rather than resetting it.
+        from .persist.safetensor_model_persister import read_bytes as _read_bytes
+        self._token_read_bytes_base = _read_bytes()
 
         # MoE dispatch sub-timing (mask sync / disk load / H2D / object construct / GEMM),
         # gated behind profiling_mode so it's zero-cost when disabled.
@@ -4233,7 +4261,10 @@ class VaayuBaseModel(GenerationMixin):
         except OSError:
             _rss_kb = 0
         _rss_str = f"  rss={_rss_kb / 1e6:.2f}GB"
-        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}{_rss_str}")
+        from .persist.safetensor_model_persister import read_bytes as _read_bytes
+        _bytes_str = format_byte_fields(
+            _read_bytes() - getattr(self, "_token_read_bytes_base", 0))
+        print(f"[VAAYU-IO] token summary: total={_total:.1f}s  io_wait={_io_wait_s:.1f}s  expert_disk={_expert_disk_s:.1f}s  gpu_load={_gpu_load_s:.1f}s  compute={_compute_only_s:.1f}s  other={_other_s:.1f}s  cache={_cache_stats}  expert_cache={_expert_cache_stats}  this_token={_expert_cache_delta}  vram={_vram_stats}{_la_str}{_rss_str}{_bytes_str}")
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s  route={_mp['route']:.3f}s  attach={_mp['attach']:.3f}s  detach={_mp['detach']:.3f}s  scatter={_mp['scatter']:.3f}s")
