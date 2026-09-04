@@ -315,6 +315,30 @@ What the pass actually found:
   whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
   whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
   `log_dir` at `tmp_path` unless a test explicitly overrides it.
+- **[bug] a client that disconnects in `_sse`'s pre-`try` window leaves NO `requests.jsonl` row.**
+  Found 2026-09-04 by the whole-branch re-review, confirmed empirically; **pre-existing, not
+  introduced by the T5–T10 branch**, and the one spot its fix wave did not reach. `_sse`
+  (`vaayu/server/app.py`) yields three times — the queue-position comment, the optional warning,
+  and the role chunk — **before** entering the `try` that owns row-writing. A disconnect in that
+  window produces no row at all. Same class as the three findings the branch's own fix wave
+  closed (`prepare()` outside the try, the `QueueFull` admission race, break-then-finalize), so
+  the fix is the same shape: widen the `try` to cover those yields. Until then the contract
+  "a request never ends without a row" — stated in `README.md` and `documentation/server.md` —
+  has one known exception.
+- **[bug] the `finish` vocabulary in `requests.jsonl` is path-dependent for the same failure.**
+  Introduced 2026-09-04 by the final fix wave (`9aa3a1f`), flagged by its re-review, not blocking
+  merge. A template/Jinja failure out of `prepare()` records `finish="refused"` on the STREAMING
+  path (the route's `_refusal_row` hardcodes it) but `finish="error"` on the NON-streaming path
+  (`generate()`'s `finally`). `documentation/server.md` defines `refused` as "rejected before
+  generation started — an oversized prompt, a missing `session_id`, a full queue" and `error` as
+  "the request raised", so a 500-producing template failure is currently filed as `refused` on one
+  path only. Two shipped tests bake the asymmetry in. **Fix sketch:** let `_refusal_row` take the
+  `finish` value rather than hardcoding it, and pass `"error"` from the widened `except Exception`.
+  Two smaller siblings recorded with it: `generate()` tags the three refusal types `finish="refused"`
+  while `stream()`'s fallback `prepare()` still leaves `"error"` (unreachable from HTTP today, since
+  the route always passes `prepared=`); and a cancelled NON-streaming request now prints
+  `finish=length` in `server.log`'s DONE line while its row says `cancelled` — defensible, since the
+  row is the richer record, but undocumented.
 - **[bug] `avg_nvme_throughput` is inflated by RAM-cache hits on DENSE models.** Found
   2026-09-04 by Task 3's review, in the branch `l1-t5-t10-triage-additive`. Task 3 fixed this
   defect for the MoE non-expert cache (`_non_expert_tensor_cache`, via `_non_expert_from_cache`),
