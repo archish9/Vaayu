@@ -52,21 +52,27 @@ def test_snapshot_never_resets_cuda_peak_stats():
 
 
 def test_decode_block_diffs_two_snapshots():
+    """`bytes_read_gb`/`gb_per_token`/`mean_expert_stall_s` are diffs -- their
+    two sources are genuinely monotonic. The expert-cache fields are NOT
+    diffed (see test_cache_counters_are_reported_point_in_time_not_diffed):
+    with `decode_stats_reset` True, they read `after`'s point-in-time value."""
     before = {"read_bytes": 1_000_000_000, "expert_disk_total_s": 1.0,
               "expert_ram_hits": 10, "expert_ram_misses": 5,
               "expert_vram_hits": 3, "expert_vram_misses": 7,
-              "peak_rss_gb": 20.0, "peak_vram_gb_process": 15.0}
+              "peak_rss_gb": 20.0, "peak_vram_gb_process": 15.0,
+              "decode_stats_reset": True}
     after = {"read_bytes": 5_410_000_000, "expert_disk_total_s": 6.0,
              "expert_ram_hits": 110, "expert_ram_misses": 105,
              "expert_vram_hits": 43, "expert_vram_misses": 67,
-             "peak_rss_gb": 20.7, "peak_vram_gb_process": 15.1}
+             "peak_rss_gb": 20.7, "peak_vram_gb_process": 15.1,
+             "decode_stats_reset": True}
     d = reqlog.decode_block(before, after, tokens=1000)
     assert d["bytes_read_gb"] == pytest.approx(4.41, abs=0.01)
     assert d["gb_per_token"] == pytest.approx(0.00441, abs=1e-5)
     assert d["mean_expert_stall_s"] == pytest.approx(0.005, abs=1e-6)
-    assert d["expert_misses"] == 100
-    assert d["expert_ram_hit_rate"] == pytest.approx(0.5, abs=1e-6)
-    assert d["expert_vram_hit_rate"] == pytest.approx(0.4, abs=1e-6)
+    assert d["expert_misses"] == 105
+    assert d["expert_ram_hit_rate"] == pytest.approx(110 / 215, abs=1e-6)
+    assert d["expert_vram_hit_rate"] == pytest.approx(43 / 110, abs=1e-6)
 
 
 def test_decode_block_survives_null_sources():
@@ -128,3 +134,45 @@ def test_error_block_carries_type_message_and_traceback():
 
 def test_error_block_of_none_is_none():
     assert reqlog.error_block(None) is None
+
+
+def test_cache_counters_are_reported_point_in_time_not_diffed():
+    """The engine resets the expert-cache counters at the prefill->decode
+    boundary INSIDE each request (vaayu_base.decode_stats_reset), so `before`
+    holds the PREVIOUS request's totals. Diffing them yields a number that can
+    be negative or plausibly wrong; `after` alone is this request's decode
+    window."""
+    before = {"read_bytes": 0, "expert_disk_total_s": 0.0,
+              "expert_ram_hits": 900, "expert_ram_misses": 900,
+              "expert_vram_hits": 400, "expert_vram_misses": 600,
+              "peak_rss_gb": None, "peak_vram_gb_process": None,
+              "decode_stats_reset": True}
+    after = dict(before, expert_ram_hits=30, expert_ram_misses=70,
+                 expert_vram_hits=20, expert_vram_misses=80)
+    d = reqlog.decode_block(before, after, tokens=100)
+    assert d["expert_misses"] == 70, "a diff would have given -830"
+    assert d["expert_ram_hit_rate"] == pytest.approx(0.3)
+    assert d["expert_vram_hit_rate"] == pytest.approx(0.2)
+
+
+def test_cache_counters_are_null_when_no_reset_fired_this_request():
+    """A request that failed during prefill never reached a decode pass, so no
+    reset fired and the counters still describe the previous request. Report
+    nothing rather than someone else's numbers."""
+    before = {"read_bytes": 0, "expert_disk_total_s": 0.0,
+              "expert_ram_hits": 900, "expert_ram_misses": 900,
+              "expert_vram_hits": 400, "expert_vram_misses": 600,
+              "peak_rss_gb": None, "peak_vram_gb_process": None,
+              "decode_stats_reset": False}
+    d = reqlog.decode_block(before, dict(before), tokens=0)
+    assert d["expert_misses"] is None
+    assert d["expert_ram_hit_rate"] is None
+    assert d["expert_vram_hit_rate"] is None
+
+
+def test_a_dense_model_snapshot_has_no_reset_latch_and_does_not_raise():
+    class _Dense:
+        pass
+    snap = reqlog.snapshot(_Dense())
+    assert snap["decode_stats_reset"] is None
+    assert snap["expert_ram_hits"] is None

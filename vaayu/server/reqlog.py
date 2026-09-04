@@ -33,12 +33,23 @@ def _safe(fn):
 
 
 def snapshot(model) -> dict:
-    """Every monotonic counter this row needs, read once.
+    """Every counter this row needs, read once.
 
-    Take one before `generate()` and one after; `decode_block` diffs them.
-    Each source is monotonic BY CONTRACT -- see the persister's
-    `note_read_bytes` and vaayu_base's `_expert_disk_total_s`. A counter that
-    resets itself per token cannot be windowed per request.
+    Take one before `generate()` and one after. Only TWO of these fields are
+    monotonic and diffable by `decode_block`: `read_bytes` (the persister's
+    `note_read_bytes`) and `expert_disk_total_s` (vaayu_base's running total).
+
+    The four expert-cache counters (`expert_ram_hits/misses`,
+    `expert_vram_hits/misses`) are NOT monotonic: the engine resets them at
+    the prefill->decode boundary, inside each request (vaayu_base's
+    `decode_stats_reset`, called from the forward pass), specifically so
+    decode hit-rate telemetry excludes prefill's ~100%-miss pollution. That
+    makes a diff across requests wrong -- `before` can hold the PREVIOUS
+    request's totals -- but it makes the point-in-time `after` value exactly
+    the right per-request figure, the same way `peak_rss_gb` and
+    `peak_vram_gb_process` are already point-in-time rather than diffed.
+    `decode_stats_reset` (the latch, read below) tells `decode_block` whether
+    that reset actually fired during this request.
     """
     from ..persist.safetensor_model_persister import read_bytes
 
@@ -55,9 +66,10 @@ def snapshot(model) -> dict:
         import torch
         if not torch.cuda.is_available():
             return None
-        # READ ONLY. Never reset peak stats: vaayu_base.py:3628-3637 -- the
-        # counter is process-global and belongs to whoever reset it last, and
-        # clearing it once truncated every dense point in
+        # READ ONLY. Never reset peak stats -- see the comment above
+        # `torch.cuda.max_memory_allocated()` in vaayu_base's chunked-prefill
+        # loop: the counter is process-global and belongs to whoever reset it
+        # last, and clearing it once truncated every dense point in
         # scripts/fit_vram_calibration.py's MEASURED table to a last-chunk
         # peak. tests/test_vram_peak_measurement.py scans for the reset call
         # by name. Hence the field's name: it is a PROCESS high-water mark and
@@ -80,6 +92,7 @@ def snapshot(model) -> dict:
         "expert_vram_misses": vram_misses,
         "peak_rss_gb": _safe(peak_rss),
         "peak_vram_gb_process": _safe(peak_vram),
+        "decode_stats_reset": _safe(lambda: model._decode_stats_reset),
     }
 
 
@@ -91,12 +104,25 @@ def _rate(hits, misses):
 
 
 def decode_block(before: dict, after: dict, tokens: int) -> dict:
-    """The `decode` object of one row: `after` minus `before`.
+    """The `decode` object of one row.
 
-    A None on either side yields a None field rather than an error -- see
-    `_safe`. `tokens` of 0 (a request that produced nothing, which is exactly
-    what a failed one did) yields None for the per-token means rather than a
-    ZeroDivisionError on the error path.
+    `bytes_read_gb`/`gb_per_token`/`mean_expert_stall_s` are `after` minus
+    `before` -- `read_bytes` and `expert_disk_total_s` are genuinely
+    monotonic (see `snapshot`), so a diff is correct there. A None on either
+    side yields a None field rather than an error -- see `_safe`. `tokens` of
+    0 (a request that produced nothing, which is exactly what a failed one
+    did) yields None for the per-token means rather than a ZeroDivisionError
+    on the error path.
+
+    The expert-cache fields (`expert_misses`, `expert_ram_hit_rate`,
+    `expert_vram_hit_rate`) are NOT diffed -- see `snapshot`'s docstring for
+    why. They come from `after`'s point-in-time values, and only when
+    `after["decode_stats_reset"]` is True: that latch is False when this
+    request never reached a decode pass (it failed during prefill, or
+    produced no tokens), in which case the counters still describe the
+    PREVIOUS request and reporting them would be a stale number that looks
+    measured -- exactly the failure this file exists to prevent. None is the
+    correct answer there, not a diff.
     """
     def delta(key):
         a, b = after.get(key), before.get(key)
@@ -104,15 +130,23 @@ def decode_block(before: dict, after: dict, tokens: int) -> dict:
 
     read = delta("read_bytes")
     stall = delta("expert_disk_total_s")
-    misses = delta("expert_ram_misses")
+
+    if after.get("decode_stats_reset") is True:
+        misses = after.get("expert_ram_misses")
+        ram_hit_rate = _rate(after.get("expert_ram_hits"), misses)
+        vram_hit_rate = _rate(after.get("expert_vram_hits"), after.get("expert_vram_misses"))
+    else:
+        misses = None
+        ram_hit_rate = None
+        vram_hit_rate = None
+
     return {
         "bytes_read_gb": None if read is None else read / 1e9,
         "gb_per_token": None if (read is None or not tokens) else read / 1e9 / tokens,
         "mean_expert_stall_s": None if (stall is None or not tokens) else stall / tokens,
         "expert_misses": misses,
-        "expert_ram_hit_rate": _rate(delta("expert_ram_hits"), misses),
-        "expert_vram_hit_rate": _rate(delta("expert_vram_hits"),
-                                      delta("expert_vram_misses")),
+        "expert_ram_hit_rate": ram_hit_rate,
+        "expert_vram_hit_rate": vram_hit_rate,
         "peak_rss_gb": after.get("peak_rss_gb"),
         # PROCESS high-water mark, not this request's -- see snapshot().
         "peak_vram_gb_process": after.get("peak_vram_gb_process"),
