@@ -193,6 +193,41 @@ _PINNED_TIMINGS_LOCK = threading.Lock()
 
 _USE_DIRECT_IO: bool = True  # safe default; overridden by init_model_io() (Plan 5)
 
+# Total bytes this process has read from the checkpoint, for the token
+# summary's gb_tok= field and the server's requests.jsonl.
+#
+# MONOTONIC ON PURPOSE -- there is deliberately no reset. Two consumers take
+# different windows over this one counter: vaayu_base subtracts a baseline it
+# recorded at the top of a forward (per TOKEN), and the server subtracts one it
+# recorded before generate() (per REQUEST). A counter that reset itself per
+# token would leave the server reporting a fraction of one token as a whole
+# request's disk traffic.
+#
+# Counted HERE, inside the functions that actually issue the reads, rather than
+# at their callers: every caller-side cache (LoaderStrategy._cache,
+# _non_expert_tensor_cache, ExpertRAMCache) returns before reaching this
+# module, so a cache hit contributes zero by construction instead of by a flag
+# someone has to remember to set.
+#
+# Locked because these run on ThreadPoolExecutor workers and `+=` on a module
+# global is a load-add-store, not an atomic. One uncontended acquisition per
+# read (~190/token) is nothing beside an 11.9 MB O_DIRECT read.
+_read_bytes = 0
+_read_bytes_lock = threading.Lock()
+
+
+def note_read_bytes(n: int) -> None:
+    """Record `n` bytes read from the checkpoint."""
+    global _read_bytes
+    with _read_bytes_lock:
+        _read_bytes += n
+
+
+def read_bytes() -> int:
+    """Total checkpoint bytes read by this process so far. Monotonic."""
+    with _read_bytes_lock:
+        return _read_bytes
+
 
 def _should_use_direct_io(model_dir: str) -> bool:
     """
@@ -541,6 +576,7 @@ def load_non_expert_tensors(
         aligned_offset = _align_down(group_start)
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
+        note_read_bytes(aligned_length)
 
         with _BUF_LOCK:
             buf_idx = _BUF_IDX
@@ -612,6 +648,7 @@ class SafetensorModelPersister(ModelPersister):
             elapsed = time.time() - t
             tag = "iouring" if _USE_IOURING else "pinned"
             size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+            note_read_bytes(sum(v.nbytes for v in result.values()))
             gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
             print(f"[VAAYU-IO] {tag}  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result
@@ -620,6 +657,7 @@ class SafetensorModelPersister(ModelPersister):
             result = load_file(file_path, device="cpu")
             elapsed = time.time() - t
             size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+            note_read_bytes(sum(v.nbytes for v in result.values()))
             gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
             print(f"[VAAYU-IO] python  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result
@@ -692,6 +730,7 @@ def load_expert_sparse(
         aligned_offset = _align_down(group_start)
         prefix_pad = group_start - aligned_offset
         aligned_length = _align_up(read_len + prefix_pad)
+        note_read_bytes(aligned_length)     # what the read below actually asks for
 
         # Acquire a pinned buffer from the pool (blocks until one is available).
         # Pool has _EXPERT_POOL_N buffers = max_workers, so no starvation.
@@ -915,6 +954,7 @@ def load_expert_into_slab(
     for group in _group_contiguous_ranges(expert_metas):
         group_start = group[0][1].file_offset
         aligned_offset, prefix_pad, raw_aligned_length, packed_span, slab_span = _group_layout(group)
+        note_read_bytes(raw_aligned_length)  # both write modes read this much
         if slab_off + slab_span > slab.nbytes:
             raise RuntimeError(
                 f"expert span {slab_off + slab_span}B exceeds slab {slab.nbytes}B "
