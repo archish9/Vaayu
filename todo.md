@@ -138,7 +138,54 @@ What the pass actually found:
   the `_WARNING_LIMIT` FIFO used to drop the OLDEST warning past the cap, which is backwards — startup
   warnings (APST, foreign-GPU) are the oldest lines and the ones that matter most; it now drops the
   newest instead (`test_the_warning_buffer_is_bounded` updated to assert that).
-- **[ ] L1 T5–T9 · additive half of the triage-logging work, not started.** Self-contained one-liners
+- **[ ] L1 T5–T9 (+T10) · additive half of the triage-logging work. DESIGN APPROVED 2026-09-04,
+  not yet implemented.** Spec:
+  [`docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md`](docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md)
+  (**gitignored — this disk only**; the decisions below are the durable copy).
+  **Plan: [`docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md`](docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md)**
+  — 10 tasks, every test and every implementation written out, a suite-count ladder per task
+  (baseline re-measured 2026-09-04: **1397 passed, 3 skipped**, confirmed against HEAD, not quoted).
+  Task order: persister byte counter → `bytes=`/`gb_tok=` → `_lt_cache_hit` fix → `reqlog.py` →
+  engine rows → route refusal rows → `session_event` warning → `diagnose` → docs → the committed
+  gate. **Three deviations from the spec, all recorded in the plan's header:** (a) the spec's
+  telemetry-summation for layer bytes is dropped — every layer read funnels through
+  `SafetensorModelPersister.load_model`, so ONE more increment on the same counter covers dense,
+  and a cache hit then contributes zero by construction rather than by a flag; (b) the
+  `_lt_cache_hit` fix is kept but demoted to its own task, since `gb_tok` no longer depends on it
+  (what still does is `avg_nvme_throughput`, wrong on both MoE models from token 2); (c) **T6 needs
+  a SECOND write site the spec did not name** — a request refused before generation
+  (`REQUIRE_SESSION_ID`, `ContextTooLong` on the streaming path, `QueueFull`) never reaches the
+  engine, so the engine's `finally` alone does not satisfy the spec's own "a request must never end
+  without a row".
+  **Six decisions that are not obvious and cost exploration to reach:**
+  (1) **`bytes=`/`gb_tok=` mean NVMe bytes, not materialised bytes** — which obliges a fix to
+  `_load_non_expert_strategy` (`vaayu_base.py:3234`): it serves from `_non_expert_tensor_cache`
+  with no disk read, yet callers still sum the state dict into `_lt_file_bytes` and leave
+  `_lt_cache_hit` False, so today's `file_bytes` overcounts on both MoE models. Same line fixes
+  `TokenTiming.avg_nvme_throughput`, wrong for the same reason.
+  (2) **T5 needs TWO sources.** Expert bytes come from a counter inside the persister's
+  `load_expert_sparse`/`load_expert_into_slab`, NOT from `_dispatch_expert_misses` — there are
+  eight call sites (`moe_patch.py:336,352,357,1357,1505,1510,1549,1559`, `vaayu_base.py:1267,1274`)
+  and dispatch covers four, missing both stagers. Layer bytes are ALREADY measured
+  (`LayerTiming.file_bytes`, summable off `telemetry.tokens[-1]` since `end_token()` fires at
+  `:4198`, 38 lines above the print) and are the ONLY non-zero source on streamed **dense** — a
+  MoE-only counter reports `gb_tok=0` on Llama-3.3-70B, a wrong number that looks like a feature.
+  (3) **Both counters are MONOTONIC, never reset per token.** T5 wants a per-token window and T6 a
+  per-request one over the same counter; only monotonic serves both. Adds `_expert_disk_total_s`
+  beside the per-token `_expert_disk_s` (which IS reset, at `:3812`).
+  (4) **T6 reads `torch.cuda.max_memory_allocated()` and NEVER resets peak stats** —
+  `vaayu_base.py:3628-3637` and `tests/test_vram_peak_measurement.py`. The field is a process
+  high-water mark and is named so.
+  (5) **T8 is `python -m vaayu.server.diagnose`, a separate module** — `__main__.py`'s "No flags"
+  docstring stands. `envinfo.collect(model=None)` OMITS the `model`/`budgets` sections rather than
+  filling `collect_errors`.
+  (6) **T10, added: a COMMITTED on-device gate.** Restore `git show 7d806e7^:test_server_smoke.py`
+  (155 lines, already correct on `session_id`/explicit `stream`/`delete_original=False`/premise
+  assert) as `tests/test_server_smoke.py`, skipped unless `SERVER_CKPT` is set, plus assertions on
+  `requests.jsonl`, `env.json` and **`gb_tok` > 0** (the assertion that catches T5 reading zero on
+  dense). T1–T4's arm ran from an uncommitted scratchpad because `7d806e7` deleted the gates;
+  twice makes it permanent.
+  Order: T5 → T6 → T7 → T8 → T9 → T10. Original one-liners
   (full text: `docs/issue-L1-triage-logging.md`, on this disk only):
   T5 byte counters — accumulate bytes at the expert read site into a per-token counter, add
   `bytes=`/`gb_tok=` to the `[VAAYU-IO] token summary` line (`vaayu/vaayu_base.py:4236`).
