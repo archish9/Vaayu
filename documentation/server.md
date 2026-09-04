@@ -769,9 +769,26 @@ banner — a check that always has something to say stops being useful.
 
 ### The on-device gate
 
-**Deleted 2026-09-03** (commit `7d806e7`), along with the other on-device gate
-scripts -- deliberate, not restored here. It ran a real load, non-streaming,
-streaming, an oversized-prompt refusal, and a check that prefix reuse actually
-**fired**, reporting `ALL PASS` or a named failure list. See `todo.md`'s
-on-device gates section for the current state of server verification; there is
-no committed replacement as of this writing.
+`tests/test_server_smoke.py` -- restored 2026-09-04 (was deleted 2026-09-03,
+commit `7d806e7`, along with the other on-device gate scripts; that gap is why
+this one is committed rather than left as a scratchpad script). Skipped unless
+`SERVER_CKPT` is set:
+
+```
+SERVER_CKPT=<checkpoint dir> \
+  systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0 \
+  ./venv/bin/python -m pytest tests/test_server_smoke.py -q
+```
+
+It runs a real load, non-streaming, streaming (checking `finish_reason` and
+`completion_tokens` on both), an oversized-prompt refusal on both paths, a
+check that prefix reuse actually **fired**, `env.json` is clean, `requests.jsonl`
+has one row per request including the refusals, no absolute path leaked into
+either file, and that the token summary's `gb_tok=` figures are consistent with
+what the run's own `[Vaayu-Pin]` output says it did -- nonzero if some layers
+stream, zero if every transformer layer was VRAM-pinned (a checkpoint small
+enough to fully pin, e.g. Llama-3.2-1B on a 16 GB box, legitimately reads
+nothing from NVMe per token; that is not a bug). It does **not** run a
+teacher-forced perplexity check -- see `todo.md`'s on-device gates section for
+that gate's status. See `todo.md`'s on-device gates section for the full
+command per checkpoint and expected run time.

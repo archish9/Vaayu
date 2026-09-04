@@ -481,7 +481,7 @@ def _budgets_section(c, model):
         "max_per_layer": lambda: (model._expert_cache.max_per_layer
                                   if model._expert_cache is not None else None),
         "expert_vram_cache_gb": lambda: cache_gb(model._expert_vram_cache),
-        "prefix_cache_gb": lambda: round(model._prefix_cache.budget_bytes / _GB, 2),
+        "prefix_cache_gb": lambda: cache_gb(model._prefix_cache),
     })
 
 

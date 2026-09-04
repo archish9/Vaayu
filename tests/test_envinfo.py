@@ -178,6 +178,25 @@ def test_budgets_come_off_the_vram_plan_and_the_caches():
     assert b["expert_vram_cache_gb"] > 0 and b["prefix_cache_gb"] > 0
 
 
+def test_a_model_with_no_prefix_cache_reports_clean_not_as_an_error():
+    # Prefix reuse auto-disables on a non-EXL3 / dense checkpoint (the bare
+    # DynamicCache has no to_cpu/to_device/resident_bytes), leaving
+    # _prefix_cache legitimately None -- the same "unset, not broken"
+    # condition Item 7 already covers for the expert caches. Before this fix,
+    # prefix_cache_gb was the one budgets.* field that skipped the null-check
+    # helper, so a perfectly healthy run reported an AttributeError.
+    m = _model(is_moe=False, layers=80)
+    m._prefix_cache = None
+    # checkpoint_path: unrelated to this test's subject, but on_disk_gb()
+    # reads it unconditionally -- give the fixture one so the full
+    # collect_errors assertion below isn't tripped by a different, already
+    # -covered field.
+    m.checkpoint_path = "/nonexistent/fake-checkpoint"
+    data = envinfo.collect(m, _config())
+    assert data["budgets"]["prefix_cache_gb"] is None
+    assert data["collect_errors"] == [], data["collect_errors"]
+
+
 def test_a_dense_models_null_caches_report_clean_not_as_errors():
     # Item 7: on a dense model, vaayu_base.py sets _expert_cache and
     # _expert_vram_cache to None (the attribute EXISTS, it is legitimately
