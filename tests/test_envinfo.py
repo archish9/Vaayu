@@ -502,3 +502,54 @@ def test_envinfo_model_attrs_exist_on_the_real_init():
 def test_path_fields_allowlist_is_tied_to_the_real_config():
     from vaayu.server.app import ServerConfig
     assert set(envinfo._PATH_FIELDS) <= {f.name for f in dc_fields(ServerConfig)}
+
+
+def test_collect_with_no_model_omits_the_model_sections():
+    """--diagnose runs before any weights are loaded. A report full of
+    AttributeErrors reads as a broken tool, which is the opposite of the
+    point."""
+    from vaayu.server import envinfo
+
+    class _Cfg:
+        device = "cuda:0"
+        model_path = "/models/x"
+
+    data = envinfo.collect(None, _Cfg())
+    assert "model" not in data
+    assert "budgets" not in data
+    assert data["collect_errors"] == []
+    assert "host" in data and "storage" in data
+
+
+def test_gpu_section_reports_foreign_processes(monkeypatch):
+    """Not in the Task 8 brief's given code, added while validating it end to
+    end: `_gpu_section` had no field at all for another process's VRAM, so
+    `diagnose`'s foreign-GPU tax could never fire against a real box (it did
+    not, until this landed -- see task-8-report.md). A holder under
+    `exclusive_gpu_min_mib` never reaches `collected_warnings()` (app.py's
+    `_check_gpu_is_exclusive` only prints the literal word "WARNING" for a
+    BLOCKING holder), so this has to be read as data, not scraped from a log
+    line."""
+    from vaayu import gpu_audit
+
+    class _FakeUser:
+        pid = 1229945
+        name = "rustdesk"          # no leading "/" -- keeps this test clear
+        mib = 148                  # of the separate path-scrubbing behaviour
+
+        @property
+        def gib(self):
+            return self.mib / 1024
+
+    monkeypatch.setattr(gpu_audit, "audit", lambda device=None: [_FakeUser()])
+    data = envinfo.collect(_model(is_moe=False), _config())
+    assert data["gpu"]["foreign_processes"] == [
+        {"pid": 1229945, "cmd": "rustdesk", "gib": round(148 / 1024, 2)}]
+
+
+def test_gpu_section_foreign_processes_is_empty_on_a_clean_box(monkeypatch):
+    from vaayu import gpu_audit
+
+    monkeypatch.setattr(gpu_audit, "audit", lambda device=None: [])
+    data = envinfo.collect(_model(is_moe=False), _config())
+    assert data["gpu"]["foreign_processes"] == []

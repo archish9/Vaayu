@@ -286,18 +286,36 @@ def _gpu_section(c, device):
     gpu_fields = ("available", "name", "vram_total_gb", "vram_free_now_gb",
                   "compute_capability", "driver", "cuda")
 
+    # Every other process holding VRAM on this device -- app.py's own
+    # `_check_gpu_is_exclusive` refuses/warns off this same audit at boot, but
+    # that report only reaches `collected_warnings()` (and so `env.json`) when
+    # it is a BLOCKING holder printed with the literal word "WARNING". A
+    # holder under `exclusive_gpu_min_mib` (a bare CUDA context is 128 MiB) is
+    # still a permanent tax on the pinning budget -- gpu_audit.py's own
+    # docstring -- so `diagnose`'s foreign-GPU tax needs it as DATA, not as a
+    # log line it would have to re-parse. `gpu_audit.audit` never raises (it
+    # already fails closed to `[]` with no nvidia-smi/GPU/driver), but it is
+    # still routed through `c.safe` like every other field here.
+    def foreign_processes():
+        from .. import gpu_audit
+        return [{"pid": u.pid, "cmd": u.name, "gib": round(u.gib, 2)}
+                for u in gpu_audit.audit(device=device)]
+
+    fp = c.safe("gpu.foreign_processes", foreign_processes)
+
     def import_torch():
         import torch
         return torch
 
     torch = c.safe("gpu._import_torch", import_torch)
     if torch is None:
-        return {"device": device, **{k: None for k in gpu_fields}}
+        return {"device": device, "foreign_processes": fp or [],
+                **{k: None for k in gpu_fields}}
 
     def props():
         return torch.cuda.get_device_properties(idx)
 
-    return {"device": device, **c.section("gpu", {
+    return {"device": device, "foreign_processes": fp or [], **c.section("gpu", {
         "available": lambda: torch.cuda.is_available(),
         "name": lambda: props().name,
         "vram_total_gb": lambda: round(props().total_memory / _GB, 2),
@@ -475,7 +493,14 @@ def _config_section(c, config):
     def field_names():
         if is_dataclass(config):
             return [f.name for f in dc_fields(config)]
-        return list(vars(config).keys())
+        # `diagnose.main()` passes the `config` MODULE, not a ServerConfig
+        # instance -- vars(module) is the whole namespace (imports, dunders,
+        # helper functions), not just the settings. config.py's own
+        # convention (README.md, every value in the file) is that a setting
+        # is an UPPERCASE module-level name; filtering to that is what keeps
+        # this section to the settings a maintainer actually set, instead of
+        # dumping `__name__`/`__builtins__`/imported modules as "config".
+        return [k for k in vars(config).keys() if k.isupper()]
 
     names = c.safe("config._field_names", field_names) or []
 
@@ -510,13 +535,20 @@ def collect(model, config, warnings=()) -> dict:
         "host": _host_section(c),
         "gpu": _gpu_section(c, device),
         "storage": _storage_section(c),
-        "model": _model_section(c, model),
-        "budgets": _budgets_section(c, model),
         "config": _config_section(c, config),
         "env": _env_section(c),
         "warnings": list(warnings),
-        "collect_errors": c.errors,
     }
+    # `model=None` is `diagnose`'s case: no weights are loaded, so there is
+    # nothing to derive. OMIT the two sections rather than filling
+    # collect_errors with an AttributeError per field -- a report that reads
+    # as broken is worse than a shorter one. (Same principle Item 7 of the L1
+    # fix wave applied inside _budgets_section for a dense model's absent
+    # expert caches.)
+    if model is not None:
+        data["model"] = _model_section(c, model)
+        data["budgets"] = _budgets_section(c, model)
+    data["collect_errors"] = c.errors
     # Scrub LAST, over the whole tree: collect_errors and warnings are prose
     # that can embed a path (an exception's message, an engine warning
     # naming a checkpoint), so this cannot be folded into any one section.
