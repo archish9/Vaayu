@@ -130,6 +130,12 @@ logs/
 at the newest, so `tail -f logs/latest/server.log` works across restarts. Old
 run directories are never deleted automatically — they are yours to prune.
 
+**Retention:** `sessions/<id>.log` carries the whole process stream for that
+session, not just lifecycle events, so it rotates at the same `LOG_ROTATE_MB`
+boundary as `server.log` (rolling to `<id>.log.1`) rather than growing
+unbounded — this matters most for `sessions/_unnamed.log`, where every
+request from a client that sends neither `session_id` nor `user` lands.
+
 `server.log` captures at the file-descriptor level, so it includes the
 `vaayu_rust` io_uring lines that a Python-level logger cannot see. Every line
 carries an ISO8601 UTC timestamp and a `session=` field (`-` while the engine
@@ -668,11 +674,9 @@ Do not spend time here; each is measured and settled.
 
 ### The on-device gate
 
-```bash
-SERVER_CKPT=/path/to/checkpoint \
-  systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0 \
-  ./venv/bin/python test_server_smoke.py
-```
-
-Real load, non-streaming, streaming, an oversized-prompt refusal, and a check that
-prefix reuse actually **fired**. `ALL PASS` or a named failure list.
+**Deleted 2026-09-03** (commit `7d806e7`), along with the other on-device gate
+scripts -- deliberate, not restored here. It ran a real load, non-streaming,
+streaming, an oversized-prompt refusal, and a check that prefix reuse actually
+**fired**, reporting `ALL PASS` or a named failure list. See `todo.md`'s
+on-device gates section for the current state of server verification; there is
+no committed replacement as of this writing.

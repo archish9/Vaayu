@@ -279,6 +279,45 @@ def test_latest_is_a_relative_link_so_the_bundle_survives_being_moved(tmp_path):
     assert os.readlink(tmp_path / "latest") == run.name
 
 
+def test_an_unwritable_root_returns_none_instead_of_raising(tmp_path, capsys):
+    # C1: a read-only `logs/` root (a read-only container mount, a `logs/`
+    # left owned by root from an earlier sudo run, a full disk) must not
+    # prevent a boot -- `mkdir` used to be unguarded here, inverting the
+    # capture_stdio no-op-on-OSError guarantee logging depends on elsewhere.
+    from vaayu.server.logs import new_run_dir
+    unwritable = tmp_path / "readonly"
+    unwritable.mkdir()
+    unwritable.chmod(0o555)
+    try:
+        run = new_run_dir(unwritable)             # must not raise
+        assert run is None
+        assert "WARNING" in capsys.readouterr().out
+    finally:
+        unwritable.chmod(0o755)                    # let tmp_path clean up
+
+
+def test_a_readonly_log_root_still_boots_the_server(tmp_path):
+    # Full boot path (C1): app.py must skip capture_stdio and env.json, not
+    # just tolerate new_run_dir() returning None in isolation.
+    from fastapi.testclient import TestClient
+
+    from vaayu.server.app import ServerConfig, create_app
+
+    from .test_server_app import FakeEngine
+
+    unwritable = tmp_path / "readonly"
+    unwritable.mkdir()
+    unwritable.chmod(0o555)
+    try:
+        cfg = ServerConfig(model_path="/ckpt", log_dir=str(unwritable))
+        app = create_app(cfg, engine=FakeEngine())
+        with TestClient(app) as client:            # runs lifespan; must not raise
+            assert app.state.run_dir is None
+            assert client.get("/health").status_code == 200
+    finally:
+        unwritable.chmod(0o755)
+
+
 def test_a_failed_symlink_does_not_stop_the_run(tmp_path, monkeypatch, capsys):
     import os
     from vaayu.server import logs
@@ -480,6 +519,85 @@ def test_the_session_line_carries_the_session_in_the_server_log_too(tmp_path):
         raise AssertionError("line-for-a never reached server.log")
 
 
+TWO_RUNS_SAME_SESSION_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, set_current_session, clear_current_session
+restore1 = capture_stdio({path1!r})
+set_current_session("agent-7")
+print("line-for-run-a")
+clear_current_session()
+restore1()
+restore2 = capture_stdio({path2!r})
+set_current_session("agent-7")
+print("line-for-run-b")
+clear_current_session()
+restore2()
+"""
+
+
+def test_two_runs_with_the_same_session_id_get_separate_files(tmp_path):
+    # I1: _session_sink used to be keyed on session id alone, so a second
+    # capture_stdio() in the SAME process (create_app() called twice, which
+    # every TestClient test that reuses a session id does) appended run B's
+    # lines onto run A's sessions/agent-7.log and never created run B's own
+    # file -- breaking the promise that a run directory is self-contained.
+    import subprocess, sys
+    from pathlib import Path
+    from vaayu.server.logs import session_log_path
+    run_a, run_b = tmp_path / "run-a", tmp_path / "run-b"
+    (run_a / "sessions").mkdir(parents=True)
+    (run_b / "sessions").mkdir(parents=True)
+    out = subprocess.run(
+        [sys.executable, "-c", TWO_RUNS_SAME_SESSION_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path1=str(run_a / "server.log"), path2=str(run_b / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    a_path = session_log_path(run_a, "agent-7")
+    b_path = session_log_path(run_b, "agent-7")
+    assert a_path.exists(), "run A's own session file must exist"
+    assert b_path.exists(), "run B's own session file must be created, not skipped"
+    a = a_path.read_text()
+    b = b_path.read_text()
+    assert "line-for-run-a" in a and "line-for-run-b" not in a, a
+    assert "line-for-run-b" in b and "line-for-run-a" not in b, b
+
+
+ROTATE_SESSION_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, set_current_session, clear_current_session
+restore = capture_stdio({path!r}, rotate_mb=0)
+set_current_session("agent-7")
+print("first line")
+print("second line")
+clear_current_session()
+sys.stdout.flush()
+restore()
+"""
+
+
+def test_session_logs_rotate_at_the_configured_size(tmp_path):
+    # I4: sessions/<id>.log had no cap at all, and since these files now
+    # carry the whole process stream (not just lifecycle events) they are
+    # near-duplicates of server.log -- apply the same rotate_mb boundary.
+    import subprocess, sys
+    from pathlib import Path
+    from vaayu.server.logs import session_log_path
+    run = tmp_path
+    (run / "sessions").mkdir()
+    out = subprocess.run(
+        [sys.executable, "-c", ROTATE_SESSION_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(run / "server.log"))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    session_path = session_log_path(run, "agent-7")
+    assert session_path.with_suffix(".log.1").exists(), (
+        "session logs must rotate the same way server.log does")
+
+
 # ── the drain barrier ────────────────────────────────────────────────────────
 
 BOUNDARY_SCRIPT = """
@@ -522,6 +640,132 @@ def test_a_line_is_not_misattributed_across_a_marker_switch_with_no_pacing(tmp_p
     assert "line-for-a" in a, a
     assert "line-for-a" not in b, b
     assert "line-for-b" not in a, a
+
+
+PARTIAL_LINE_SCRIPT = """
+import sys, time
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, drain
+restore = capture_stdio({path!r})
+sys.stdout.write("progress 42%")      # deliberately no trailing newline
+sys.stdout.flush()
+t0 = time.monotonic()
+ok = drain(timeout=1.5)
+elapsed = time.monotonic() - t0
+with open({result!r}, "w") as f:
+    f.write(f"{{ok}} {{elapsed}}")
+restore()
+"""
+
+
+def test_drain_fires_even_with_a_partial_line_ahead_of_it(tmp_path):
+    # C2 (A): a writer with no trailing newline made `raw` equal
+    # "progress 42%\\x00__vaayu_drain__\\x00", which the old equality check
+    # against the bare token never matched: drain() burned the full timeout
+    # AND the marker moved anyway -- the exact bug the barrier exists to
+    # prevent. Substring matching must fire, and the real text must still
+    # reach the log rather than being swallowed with the sentinel.
+    log = tmp_path / "server.log"
+    result_file = tmp_path / "result.txt"
+    out = subprocess.run(
+        [sys.executable, "-c", PARTIAL_LINE_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(log), result=str(result_file))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    ok, elapsed = result_file.read_text().split()
+    assert ok == "True", "the sentinel must be recognised despite the partial line"
+    assert float(elapsed) < 1.0, f"drain() burned the timeout: {elapsed}s"
+    written = log.read_text()
+    assert "progress 42%" in written, "real text sharing the line must still be logged"
+    assert "__vaayu_drain__" not in written, "the sentinel must never land in server.log"
+
+
+REDIRECT_STDOUT_SCRIPT = """
+import io, sys, time
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, drain
+restore = capture_stdio({path!r})
+sys.stdout = io.StringIO()   # Jupyter/ipykernel, redirect_stdout, capsys, ...
+t0 = time.monotonic()
+ok = drain(timeout=1.5)
+elapsed = time.monotonic() - t0
+with open({result!r}, "w") as f:
+    f.write(f"{{ok}} {{elapsed}}")
+sys.stdout = sys.__stdout__
+restore()
+"""
+
+
+def test_drain_still_works_when_sys_stdout_is_rebound(tmp_path):
+    # C2 (B): print()-based drain() went through sys.stdout, which any
+    # embedder rebinding it (Jupyter/ipykernel, contextlib.redirect_stdout,
+    # pytest's capsys) sends somewhere that is not fd 1 -- the token never
+    # reached the pipe, burning ~4s per request with the barrier silently
+    # gone. os.write(1, ...) talks to the real fd regardless of what sys.stdout
+    # currently points at.
+    log = tmp_path / "server.log"
+    result_file = tmp_path / "result.txt"
+    out = subprocess.run(
+        [sys.executable, "-c", REDIRECT_STDOUT_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            path=str(log), result=str(result_file))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    ok, elapsed = result_file.read_text().split()
+    assert ok == "True", "drain() must still see the sentinel via the real fd"
+    assert float(elapsed) < 1.0, f"drain() burned the timeout: {elapsed}s"
+
+
+DRAIN_ONLY_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, drain
+restore = capture_stdio({path!r})
+drain(timeout=1.5)
+restore()
+"""
+
+
+def test_the_drain_sentinel_never_reaches_the_console(tmp_path):
+    # Fold-in: the sentinel used to be teed raw to the operator's terminal
+    # ~2x per request. pump() must strip it before the raw console tee.
+    log = tmp_path / "server.log"
+    out = subprocess.run(
+        [sys.executable, "-c", DRAIN_ONLY_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]), path=str(log))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "__vaayu_drain__" not in out.stdout, (
+        "the sentinel must be stripped from the console tee, not flashed at "
+        "the operator")
+
+
+def test_a_nested_capture_does_not_disable_drain_for_the_outer_pump(tmp_path):
+    # I2: _pump_active used to be a bool, so a nested capture_stdio() (an
+    # embedder wrapping this process, or a second create_app() call while the
+    # first is still live) had its INNER restore() set the single global to
+    # False while the OUTER pump was still running -- drain() then returned
+    # True immediately and silently for the rest of the process's life, with
+    # no warning and no symptom until attribution went wrong in a bundle.
+    from vaayu.server import logs
+    outer_log = tmp_path / "outer.log"
+    inner_log = tmp_path / "inner.log"
+    restore_outer = logs.capture_stdio(outer_log)
+    try:
+        before = logs._pump_active
+        restore_inner = logs.capture_stdio(inner_log)
+        assert logs._pump_active == before + 1
+        restore_inner()
+        assert logs._pump_active == before, (
+            "the counter must drop back to what it was before nesting, not to 0")
+        # The outer pump is still running -- drain() must still see it, fast.
+        import time
+        t0 = time.monotonic()
+        assert logs.drain(timeout=1.5) is True
+        assert time.monotonic() - t0 < 1.0, "drain() should not have burned the timeout"
+    finally:
+        restore_outer()
 
 
 def test_drain_returns_promptly_when_no_pump_is_active():
@@ -619,14 +863,29 @@ def test_rust_warnings_are_collected_too():
     assert len(logs.collected_warnings()) == 1
 
 
+def test_title_case_warning_is_collected_too():
+    # I7: auto_model.py's APST warning -- the box's own live hardware tax --
+    # prints "[Vaayu Warning]" (title case), which the old all-caps "WARNING"
+    # match never caught, regardless of the drain race fix.
+    from vaayu.server import logs
+    logs._warnings.clear()
+    logs.note_if_warning("S session=- [Vaayu Warning] APST is active\n")
+    assert logs.collected_warnings() == ["[Vaayu Warning] APST is active"]
+
+
 def test_the_warning_buffer_is_bounded():
+    # I7: the cap drops the NEWEST past the limit, not the oldest. Startup
+    # warnings (APST, foreign-GPU) are the oldest lines in the buffer and are
+    # exactly the ones a maintainer needs -- dropping the oldest under a noisy
+    # load evicted precisely those. This inverts the pre-I7 contract on
+    # purpose; see logs.note_if_warning.
     from vaayu.server import logs
     logs._warnings.clear()
     for i in range(1000):
         logs.note_if_warning(f"S session=- WARNING: {i}\n")
     got = logs.collected_warnings()
     assert len(got) <= logs._WARNING_LIMIT
-    assert got[-1].endswith("999"), "the buffer must keep the NEWEST warnings"
+    assert got[0].endswith(": 0"), "the buffer must keep the OLDEST warnings"
 
 
 def test_duplicate_warnings_are_not_repeated():

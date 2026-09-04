@@ -22,13 +22,16 @@ row P7, which ships with two known bugs that bite on the day it lands. Optimize
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
 the MoE tests green, and treat any change to shared infra (staging, prefix
 cache, NVMe warmup, io_uring) as touching both paths. MoE changes still must not
-silently break dense — `test_batched_dense_smoke.py` guards that.
+silently break dense — the dense smoke gate used to guard that
+(`test_batched_dense_smoke.py`, deleted 2026-09-03; see `todo.md`'s on-device
+gates section, no committed replacement).
 
 **Dense reference checkpoint (on-device):**
 `/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` —
 Llama-3.3-70B-Instruct, EXL3 4.5 bpw (head 6 bits), 80 layers, 39 GB on disk, so
-it exercises the real streamed-dense path (~37 GB read per token). This is
-`test_batched_dense_smoke.py`'s default; override with `DENSE_CKPT=`.
+it exercises the real streamed-dense path (~37 GB read per token). This was
+`test_batched_dense_smoke.py`'s default (script deleted 2026-09-03, see
+`todo.md`), read via `DENSE_CKPT=`.
 `models/Llama-3.2-1B-Instruct` is the small unquantized dense checkpoint (and the
 README's suggested speculative-decoding drafter) — use it when you need a dense
 run in seconds rather than minutes.
@@ -147,7 +150,8 @@ Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5
 `test_generate.py` — but on **different forwards**: Qwen is fused-layout (EXL3
 fused forward), MiniMax is module-list layout (module-list forward). See §0.
 Dense is also an on-device target — Llama-3.3-70B-Instruct EXL3 4.5 bpw (80
-layers), path in §0, gated by `test_batched_dense_smoke.py`. Non-EXL3 and
+layers), path in §0 — the gate that covered it (`test_batched_dense_smoke.py`)
+was deleted 2026-09-03, see `todo.md`. Non-EXL3 and
 CPU-compute paths are architecturally supported (gated by `is_exl3` and the
 `compute_device` switch) but not actively tested on-device today. Any code, plan, or fix you produce MUST work for all of
 them without edits — never assume EXL3, never assume CUDA, never assume MoE.

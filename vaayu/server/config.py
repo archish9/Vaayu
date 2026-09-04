@@ -73,11 +73,14 @@ ENABLE_THINKING = False
 # `"stream": false` in the request still wins.
 DEFAULT_STREAM = True
 
-# Where logs are written. `<LOG_DIR>/server.log` receives EVERYTHING the process
-# emits -- Python prints, uvicorn, and the vaayu_rust io_uring lines, which are
-# captured at the file-descriptor level because Rust writes them straight to
-# fd 2. `<LOG_DIR>/sessions/<session_id>.log` gets one line per request
-# lifecycle event, which is the file to read when one session misbehaves.
+# Where logs are written. One directory per process, `<LOG_DIR>/run-<UTC>/`,
+# with `<LOG_DIR>/latest` always pointing at the newest. Within it,
+# `server.log` receives EVERYTHING the process emits -- Python prints,
+# uvicorn, and the vaayu_rust io_uring lines, which are captured at the
+# file-descriptor level because Rust writes them straight to fd 2.
+# `sessions/<session_id>.log` gets the whole process stream for that session
+# (not just lifecycle events), which is the file to read when one session
+# misbehaves.
 LOG_DIR = "logs"
 CAPTURE_STDIO = True        # False leaves the console alone; only session logs
 LOG_ROTATE_MB = 50          # server.log rolls to server.log.1 past this

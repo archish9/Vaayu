@@ -200,7 +200,16 @@ class _Collector:
 
 def _vaayu_section(c):
     repo = c.safe("vaayu._repo_path", lambda: Path(__file__).resolve().parents[2])
-    if repo is None:
+    # I5: `git -C <path> ...` does not require `path` itself to be a repo --
+    # if it is not, git walks UP the directory tree looking for one. A pip
+    # install ships setup.py, so this path is real, but for a venv nested
+    # inside a user's OWN project that walk finds the user's `.git` instead:
+    # env.json would then report the user's application branch and commit as
+    # Vaayu's -- misleading for triage, and a privacy leak the path scrubber
+    # does not touch (branch names carry ticket ids and employer names).
+    # Trust the result only if `repo` is itself a checkout root; otherwise
+    # "installed, not a checkout" is the honest answer.
+    if repo is None or not (repo / ".git").exists():
         return {"commit": None, "dirty": None, "branch": None}
 
     def git(*args):
@@ -434,6 +443,15 @@ def _model_section(c, model):
 
 
 def _budgets_section(c, model):
+    # Item 7: on a dense model, _expert_cache/_expert_vram_cache are
+    # LEGITIMATELY None (vaayu_base.py sets them None and only the MoE path
+    # ever assigns a real cache) -- a supported configuration, not a broken
+    # one. Guard on that the same way _model_section guards _moe_geometry, so
+    # a dense report gets a clean null with no collect_errors entry rather
+    # than three AttributeErrors on a machine that ran fine.
+    def cache_gb(cache):
+        return round(cache.budget_bytes / _GB, 2) if cache is not None else None
+
     return c.section("budgets", {
         "max_seq_len": lambda: model.max_seq_len,
         "kv_cache_mode": lambda: model.kv_cache_mode,
@@ -441,10 +459,10 @@ def _budgets_section(c, model):
         "pinning_budget_gib": lambda: round(model._vram_plan.pinning_budget / _GIB, 2),
         "s_max": lambda: model._vram_plan.s_max,
         "plan_reason": lambda: model._vram_plan.reason,
-        "expert_ram_cache_gb": lambda: round(model._expert_cache.budget_bytes / _GB, 2),
-        "max_per_layer": lambda: model._expert_cache.max_per_layer,
-        "expert_vram_cache_gb": lambda: round(
-            model._expert_vram_cache.budget_bytes / _GB, 2),
+        "expert_ram_cache_gb": lambda: cache_gb(model._expert_cache),
+        "max_per_layer": lambda: (model._expert_cache.max_per_layer
+                                  if model._expert_cache is not None else None),
+        "expert_vram_cache_gb": lambda: cache_gb(model._expert_vram_cache),
         "prefix_cache_gb": lambda: round(model._prefix_cache.budget_bytes / _GB, 2),
     })
 

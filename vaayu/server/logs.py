@@ -49,13 +49,19 @@ _overlap_warned = False
 # -- but the fix is a set, not a louder warning.
 
 
-_pump_active = False
-# True only while a capture_stdio pump thread is actually reading fd 1/2.
-# drain() below is a no-op unless this is set: with no pump installed
-# (CAPTURE_STDIO=False, or any library caller of EngineHandle that never
-# wired up capture_stdio at all) fd 1 is not our pipe -- writing the drain
-# token would print garbage straight to the real console and then block for
-# the whole timeout on every marker change, on every request.
+_pump_active = 0
+# Count of capture_stdio pump threads currently reading fd 1/2 -- a counter,
+# not a bool (I2). A nested capture_stdio() (an embedder like Jupyter wrapping
+# this process, or a second create_app() in one process) is fine at the fd
+# level, but a bool here meant the INNER restore()'s `= False` disabled
+# drain() for the rest of the process's life even while the OUTER pump was
+# still running -- no warning, no symptom until attribution was silently
+# wrong in a bundle. drain() is a no-op only once the count reaches zero:
+# with no pump installed at all (CAPTURE_STDIO=False, or any library caller
+# of EngineHandle that never wired up capture_stdio) fd 1 is not our pipe --
+# writing the drain token would print garbage straight to the real console
+# and then block for the whole timeout on every marker change, on every
+# request.
 _drain_lock = threading.Lock()
 _drain_event = threading.Event()
 _DRAIN_TOKEN = "\x00__vaayu_drain__\x00"
@@ -92,7 +98,20 @@ def drain(timeout: float = _DRAIN_TIMEOUT) -> bool:
     with _drain_lock:
         _drain_event.clear()
         try:
-            print(_DRAIN_TOKEN, flush=True)
+            # os.write(1, ...) rather than print(): print() goes through
+            # sys.stdout, which an embedder (Jupyter/ipykernel,
+            # contextlib.redirect_stdout, pytest's capsys) may have rebound
+            # away from the real fd 1 the pump reads -- the token would then
+            # never reach the pipe, and every call here would silently burn
+            # the full timeout with the barrier gone. Flush first so nothing
+            # buffered ahead of the token in Python's own stream objects
+            # arrives at the pipe AFTER it.
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass                        # already closed or detached
+            os.write(1, (_DRAIN_TOKEN + "\n").encode())
         except OSError:
             return False
         return _drain_event.wait(timeout)
@@ -214,27 +233,51 @@ def session_event(log_dir, session_id, event: str, **fields) -> None:
         pass
 
 
-_session_sink: dict = {"id": None, "fh": None}
+_session_sink: dict = {"key": None, "fh": None, "size": 0}
 
 
-def _session_write(run_dir: Path, session: str, data: bytes) -> None:
+def _session_write(run_dir: Path, session: str, data: bytes, rotate_mb: int = 50) -> None:
     """Append one already-formatted line to `sessions/<session>.log`.
 
     One cached handle rather than open-append-close per line: a decode emits
     thousands of lines and the reopen cost lands on the generation path.
+
+    Keyed on `(run_dir, session)`, not `session` alone: two runs in one
+    process (two `capture_stdio()` calls -- `create_app()` invoked twice by
+    an embedder, or by the test suite) can reuse the same session id, and
+    keying on the id alone appended the second run's lines onto the FIRST
+    run's file while the second run's own file was never created, silently
+    breaking the promise that a run directory is self-contained.
+
+    Rotates at the same `rotate_mb` boundary `server.log` does (I4): these
+    files now carry the whole process stream, not just lifecycle events, so
+    they are near-duplicates of `server.log` and an unbounded default would
+    let one of them -- above all `sessions/_unnamed.log`, where every request
+    from an OpenAI-shaped client sending neither `session_id` nor `user`
+    lands -- grow without limit on this engine's fan-out workload.
+
     Never raises, for the same reason session_event does not.
     """
+    key = (run_dir, session)
+    limit = rotate_mb * 1024 ** 2
+    path = run_dir / "sessions" / f"{session}.log"
     try:
-        if _session_sink["id"] != session:
+        if _session_sink["key"] != key:
             if _session_sink["fh"] is not None:
                 _session_sink["fh"].close()
-            path = run_dir / "sessions" / f"{session}.log"
             path.parent.mkdir(parents=True, exist_ok=True)
-            _session_sink["id"] = session
+            _session_sink["key"] = key
             _session_sink["fh"] = open(path, "ab", buffering=0)
+            _session_sink["size"] = path.stat().st_size if path.exists() else 0
+        if _session_sink["size"] + len(data) > limit:
+            _session_sink["fh"].close()
+            os.replace(path, path.with_suffix(".log.1"))
+            _session_sink["fh"] = open(path, "ab", buffering=0)
+            _session_sink["size"] = 0
         _session_sink["fh"].write(data)
+        _session_sink["size"] += len(data)
     except OSError:
-        _session_sink["id"], _session_sink["fh"] = None, None
+        _session_sink["key"], _session_sink["fh"] = None, None
 
 
 # Startup warnings print ONCE, so a tailed log -- which is what users paste --
@@ -253,7 +296,13 @@ _warnings: list = []
 
 def note_if_warning(formatted: str) -> None:
     """Record `formatted` if it looks like a warning. Cheap, called per line."""
-    if "WARNING" not in formatted:
+    # I7: case-insensitive. The all-caps "WARNING" match missed the buffer's
+    # own headline case -- auto_model.py's APST warning (and five other
+    # sites) print "[Vaayu Warning]" (title case), so they were invisible to
+    # env.json regardless of the drain fix. Not reworded at the print sites
+    # on purpose: this buffer harvests at the pump so new sites keep working
+    # without anyone having to know it exists.
+    if "warning" not in formatted.lower():
         return
     # Drop the `<stamp> session=<id> ` prefix format_line added: env.json wants
     # the message, and the timestamp is already in server.log.
@@ -261,9 +310,13 @@ def note_if_warning(formatted: str) -> None:
     message = parts[2] if len(parts) == 3 else formatted.rstrip("\n")
     if message in _warnings:
         return
-    _warnings.append(message)
-    if len(_warnings) > _WARNING_LIMIT:
-        del _warnings[0]
+    # Drop the NEWEST past the limit, not the oldest: startup warnings (APST,
+    # foreign-GPU) are the oldest lines in the buffer and are exactly the
+    # ones a maintainer needs, so evicting them under a noisy load hides the
+    # warnings that matter most. Going case-insensitive raises volume, which
+    # made this worth fixing now rather than leaving the FIFO as it was.
+    if len(_warnings) < _WARNING_LIMIT:
+        _warnings.append(message)
 
 
 def collected_warnings() -> list:
@@ -306,12 +359,19 @@ def capture_stdio(log_path, rotate_mb: int = 50):
 
     def _emit(raw: str) -> None:
         """One assembled line -> the log file, and the session file if any."""
-        if raw == _DRAIN_TOKEN:
+        if _DRAIN_TOKEN in raw:
             # drain()'s barrier: the pipe is FIFO, so seeing this means every
-            # byte written before drain() was called has now been read. Not a
-            # real line -- never formatted, never logged.
+            # byte written before drain() was called has now been read. Match
+            # by substring, not equality: a writer that leaves a line without
+            # a trailing newline (a tqdm \r-frame, a partial print) makes this
+            # line the token PLUS that text, and equality would miss it --
+            # burning the full timeout and letting the marker move anyway,
+            # which is the exact bug this barrier exists to prevent. Strip the
+            # token and still emit whatever real text shares the line with it.
             _drain_event.set()
-            return
+            raw = raw.replace(_DRAIN_TOKEN, "")
+            if not raw:
+                return
         session = current_session()
         text = format_line(raw, session=session)
         if not text:
@@ -329,7 +389,9 @@ def capture_stdio(log_path, rotate_mb: int = 50):
         except OSError:
             pass
         if session and session != "*":
-            _session_write(run_dir, session, data)
+            _session_write(run_dir, session, data, rotate_mb)
+
+    drain_bytes = _DRAIN_TOKEN.encode()
 
     def pump():
         buf = b""
@@ -338,10 +400,22 @@ def capture_stdio(log_path, rotate_mb: int = 50):
                 chunk = pipe.read(4096)
                 if not chunk:
                     break
-                try:
-                    os.write(saved_out, chunk)  # RAW: the console keeps its
-                except OSError:                 # animation and its colour
-                    pass                        # console already gone
+                console_chunk = chunk
+                if b"\x00" in chunk:
+                    # The drain sentinel (C2) travels through this same pipe.
+                    # \x00 never appears in real console output, so this check
+                    # is cheap on every ordinary chunk -- strip the token
+                    # before the raw console tee so the operator does not see
+                    # it flash on their terminal ~2x per request. Per-chunk,
+                    # not line-buffered: the console tee must stay live for
+                    # tqdm's \r-framed redraws, which _emit()'s line treatment
+                    # deliberately does not apply to (spec 9.4).
+                    console_chunk = chunk.replace(drain_bytes, b"")
+                if console_chunk:
+                    try:
+                        os.write(saved_out, console_chunk)  # RAW: the console
+                    except OSError:             # keeps its animation/colour
+                        pass                     # console already gone
                 buf += chunk
                 *lines, buf = buf.split(b"\n")
                 for raw in lines:
@@ -353,11 +427,11 @@ def capture_stdio(log_path, rotate_mb: int = 50):
     thread = threading.Thread(target=pump, daemon=True, name="vaayu-log-pump")
     thread.start()
     global _pump_active
-    _pump_active = True
+    _pump_active += 1
 
     def restore():
         global _pump_active
-        _pump_active = False
+        _pump_active -= 1
         # Order matters. Restoring fd 1/2 closes the pipe's write ends, which is
         # what lets the pump see EOF -- so JOIN before closing the saved console
         # fds. Closing them first raced the pump onto a dead descriptor and the
@@ -377,16 +451,33 @@ def capture_stdio(log_path, rotate_mb: int = 50):
         thread.join(timeout=5)
         os.close(saved_out)
         os.close(saved_err)
+        # The session sink handle is never closed otherwise (I1): only close
+        # THIS run's, if it is the one currently cached -- a concurrent
+        # capture for a different run_dir must not have its open handle
+        # yanked out from under it. Safe after the join above: the pump that
+        # could still be writing through it has now stopped.
+        if _session_sink["key"] is not None and _session_sink["key"][0] == run_dir:
+            try:
+                _session_sink["fh"].close()
+            except OSError:
+                pass
+            _session_sink["key"], _session_sink["fh"] = None, None
 
     return restore
 
 
-def new_run_dir(root) -> Path:
+def new_run_dir(root) -> Path | None:
     """One directory per server process: `<root>/run-<UTC>/`, with `sessions/`.
 
     A run is never split across directories and two runs never share one, which
     is what makes "which byte range of server.log was that run?" -- the question
     that cost the 2026-09-03 diagnosis a `grep` and an `awk` -- stop existing.
+
+    Returns None, with a printed warning, if the directory cannot be created --
+    a read-only `logs/` root (a read-only container mount, a `logs/` left owned
+    by root from an earlier sudo run, a full disk) must not prevent a boot.
+    `capture_stdio` already returns a no-op restore on the same OSError for the
+    same reason; this used to be the unguarded call in front of that guard.
     """
     root = Path(root)
     stamp = datetime.now(timezone.utc).strftime("run-%Y-%m-%dT%H-%M-%SZ")
@@ -394,8 +485,14 @@ def new_run_dir(root) -> Path:
     while run.exists():                 # two starts inside one second
         n += 1
         run = root / f"{stamp}-{n}"
-    run.mkdir(parents=True)
-    (run / "sessions").mkdir()
+    try:
+        run.mkdir(parents=True)
+        (run / "sessions").mkdir()
+    except OSError as e:
+        print(f"[Vaayu-Server] WARNING: could not create {run} "
+              f"({type(e).__name__}: {e}). Logging is OFF for this run -- "
+              f"the server still boots.")
+        return None
     _point_latest(root, run)
     return run
 

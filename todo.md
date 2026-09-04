@@ -32,13 +32,14 @@ done-condition and stop rule, plus the preserved probe harness, the seven measur
 the numbers not to re-derive. **Every P-row it lists is now closed** (P6 last, REFUTED 2026-09-03) —
 read it for method and for the traps, not for work.
 
-**`speed-up-vaayu.md`** (repo root) is the whole Rust/perf argument. `plans/` and `docs/` are
-GITIGNORED, so neither survives a fresh clone; `plans/settled_and_method_notes.md` is the older
-archive, on this disk only.
+**`speed-up-vaayu.md`** (repo root) was the whole Rust/perf argument — **deleted 2026-09-03**
+(`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
+survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1322 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-03 after P4. **This figure has gone stale four times.** Re-measure against a stashed HEAD
-before quoting it; do not trust the number written here.
+**Suite baseline: 1397 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-04 after the L1 final fix wave (was 1385 + 12 new regression tests). **This figure has gone
+stale five times now.** Re-measure against a stashed HEAD before quoting it; do not trust the number
+written here.
 
 ---
 
@@ -127,15 +128,16 @@ What the pass actually found:
   deterministically (subprocess, live `capture_stdio` pump, prints a WARNING, reads
   `collected_warnings()` immediately with **no sleep**) — confirmed failing before the fix (3/3
   runs), passing after. Full suite 1385 passed, 3 skipped (was 1384 + this one new test).
-- **[bug] L1-B1b · case mismatch — still open, NOT fixed by B1a.** `note_if_warning()`
-  (`vaayu/server/logs.py`) filters on the literal substring `"WARNING"` (all caps). The three
-  warning prints in `vaayu/auto_model.py` (lines 24, 39, 59 — including the box's APST warning, the
-  one Task 8's on-device gate calls out by name) use `"[Vaayu Warning]"` (title case), so they can
-  **never** be harvested regardless of the drain fix above. Only warning sites that happen to spell
-  it `WARNING:` in all caps (e.g. `vaayu/vaayu_base.py:2274`, the VRAM-cache-budget line) are even
-  eligible. Out of scope for this session (asked-for fix was the race only, CLAUDE.md §3). Fix
-  sketch: reword `auto_model.py`'s three sites to say `WARNING`, or make `note_if_warning`'s match
-  case-insensitive (also matching `"Warning"`).
+- **[x] L1-B1b · case mismatch — FIXED 2026-09-04 (I7, final fix wave).** `note_if_warning()`
+  (`vaayu/server/logs.py`) filtered on the literal substring `"WARNING"` (all caps), so the six
+  title-case `"[Vaayu Warning]"`/`"[Vaayu-MoE] WARNING"`-adjacent sites (`auto_model.py:24,39,59`,
+  `moe_key_remap.py:98,110`, `vaayu_base.py:1310,3369`) — including the box's own APST warning —
+  were never harvested. Fixed by making the match case-insensitive (`"warning" in formatted.lower()`)
+  rather than rewording the print sites, so future sites keep working without plumbing
+  (`tests/test_logs.py::test_title_case_warning_is_collected_too`). **Folded in at the same time:**
+  the `_WARNING_LIMIT` FIFO used to drop the OLDEST warning past the cap, which is backwards — startup
+  warnings (APST, foreign-GPU) are the oldest lines and the ones that matter most; it now drops the
+  newest instead (`test_the_warning_buffer_is_bounded` updated to assert that).
 - **[ ] L1 T5–T9 · additive half of the triage-logging work, not started.** Self-contained one-liners
   (full text: `docs/issue-L1-triage-logging.md`, on this disk only):
   T5 byte counters — accumulate bytes at the expert read site into a per-token counter, add
@@ -151,19 +153,21 @@ What the pass actually found:
   as part of Task 8; `README.md`'s does not exist yet).
   None of these are started; do not let them silently vanish the way T1–T4's own predecessor work
   nearly did.
-- **[bug] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts this ledger and**
-  **CLAUDE.md still name.** Eight files removed on 2026-09-03, before Task 8 of this L1 work ran:
-  `test_server_smoke.py`, `test_batched_dense_smoke.py`, `test_batched_decode.py`,
-  `test_kv_persist_coherence.py`, `test_quick.py`, `control_single_stream_repro.py`,
-  `exllamav3-server.py` and `speed-up-vaayu.md`. That deletion is deliberate and not this row's to
-  reverse. But `CLAUDE.md` §0 still names the dense smoke gate ("`test_batched_dense_smoke.py`,
-  which ships with two known bugs") as P7's guard, and the **On-device gates** table below (in this
-  same file) still lists both `test_server_smoke.py` and `test_batched_dense_smoke.py` as runnable
-  commands. Neither exists on disk. That is a live docs-vs-reality gap: anyone following either
-  document verbatim will get `FileNotFoundError`. Task 8 worked around it with a one-off script in
-  the scratchpad (not committed, not a replacement) — see the T1–T4 row above. Whoever next touches
-  the on-device gates should either restore equivalent scripts (as committed, reviewed gates, not
-  scratchpad throwaways) or edit both documents to stop naming them.
+- **[x] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts — docs FIXED**
+  **2026-09-04 (I6/M3, final fix wave); scripts stay deleted, deliberately.** Eight files were
+  removed on 2026-09-03, before Task 8 of this L1 work ran: `test_server_smoke.py`,
+  `test_batched_dense_smoke.py`, `test_batched_decode.py`, `test_kv_persist_coherence.py`,
+  `test_quick.py`, `control_single_stream_repro.py`, `exllamav3-server.py` and `speed-up-vaayu.md`.
+  That deletion is deliberate and was never this row's to reverse — only the stale documentation
+  was. Fixed: `CLAUDE.md` (lines formerly 25, 31, 150) no longer presents `test_batched_dense_smoke.py`
+  as a runnable guard, both naming its deletion instead; the **On-device gates** table below now
+  marks the `dense smoke` and `HTTP server` rows **DELETED** rather than listing them as commands;
+  `documentation/server.md`'s "The on-device gate" section (was the worst instance — tracked,
+  shipping, user-facing) says the same; and the two `speed-up-vaayu.md` citations above (was lines
+  35, 262) now say the file is gone rather than pointing a reader at nothing. No replacement gate was
+  invented anywhere, per the finding's own instruction. Whoever next touches the on-device gates
+  should restore equivalent scripts, committed and reviewed — Task 8's scratchpad one-off is still
+  not a replacement.
 - **[bug] `env.json`'s `kv_cache_mode` reports the requested value, not the resolved one.** When the
   config says `kv_cache_mode="auto"`, `env.json` records `"auto"` verbatim — the wrong side of this
   file's own premise (§4: every field is a DERIVED fact, never the raw request echoed back). The
@@ -180,6 +184,49 @@ What the pass actually found:
   whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
   whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
   `log_dir` at `tmp_path` unless a test explicitly overrides it.
+- **[x] L1 final fix wave — 2026-09-04.** A whole-branch review of `l1-triage-logging` (11 commits,
+  `f585014`..`a4e2e7a`) returned "merge with fixes"; this row is that pass. Fixed, each with a new
+  regression test in `tests/test_logs.py` / `tests/test_envinfo.py` unless noted: **C1** `new_run_dir`
+  no longer lets an unwritable `logs/` root prevent a boot — it warns and returns `None`, and
+  `app.py` now skips `capture_stdio` when `run_dir is None` (env.json and `log_dir=` were already
+  guarded). **C2** the drain barrier: `drain()` now writes the sentinel via `os.write(1, ...)` instead
+  of `print()` (survives `sys.stdout` being rebound — Jupyter, `redirect_stdout`, capsys) and
+  `_emit()` matches it by substring instead of equality (survives a partial line with no trailing
+  newline sharing it); folded in the console-tee guard so the sentinel no longer flashes on the
+  operator's terminal. **I1** `_session_sink` is now keyed on `(run_dir, session)`, not `session`
+  alone, and is closed in `restore()`. **I2** `_pump_active` is now a counter, not a bool, so a
+  nested `capture_stdio()` no longer disables `drain()` for the outer pump's whole remaining life.
+  **I4** `_session_write` now rotates at `rotate_mb` like `server.log` does; `documentation/server.md`
+  gained a retention sentence. **I5** `envinfo.py`'s `_vaayu_section` now requires `(repo/".git")`
+  to exist before trusting `git -C repo`, so a venv nested inside a user's own project reports `null`
+  instead of that project's branch/commit. **I7 / L1-B1b** and the FIFO direction — see the row
+  above, now closed. **Item 7** `_budgets_section` guards `_expert_cache`/`_expert_vram_cache` being
+  `None` (legitimate on a dense model) so a healthy dense report no longer carries three
+  `AttributeError`s in `collect_errors`. **I6/M3** stale doc references to the deleted on-device gate
+  scripts — see the `7d806e7` row above, now closed. Full suite **1385 passed, 3 skipped** before
+  and after (unchanged; every new test is additive).
+  **Recorded, not fixed (explicitly out of scope per the review) — do not build without re-reading
+  the review first:**
+  - **The `logs.py` module-global consolidation.** `_pump_active`, `_session_sink`, `_warnings`,
+    `_current_session`, `_overlap_warned`, `_drain_event` are module globals while the resources they
+    describe (pump thread, `run_dir`, sink) are closures inside one `capture_stdio` call — nothing
+    owns the pair, which is the ROOT CAUSE of C1/I1/I2 above and of tests having to poke
+    `logs._pump_active` by hand. Collapsing them into one `_Capture` object is ~30 lines and turns
+    those into structural impossibilities. Worth doing before this is anyone's reference
+    implementation — but it is a refactor, not a fix, and pairs naturally with the
+    `tests/conftest.py` autouse fixture in the row above (both touch the same capture lifecycle).
+  - `_URL_RE` (`envinfo.py`) is greedy (`https?://[^\s<>"]+` would close it cheaply).
+  - `drain()` can return `True` on a PREVIOUS timed-out drain's leftover sentinel still sitting in
+    the pipe (only reachable once C2's own timeout has already fired once — a numbered token would
+    close it).
+  - `_host_section` (`envinfo.py`) reads `/proc/meminfo`, which reports HOST ram, not the cgroup
+    limit, inside a container.
+  - `on_disk_gb` (`envinfo.py`) walks the checkpoint with `rglob` + `stat` per file at EVERY startup
+    — expensive on a large checkpoint, and re-walks the same bytes every restart.
+  - A refused boot still creates a run directory and repoints `latest` at a run that never served —
+    `new_run_dir`/`_point_latest` run before the load can fail.
+  - `_session_write` re-`mkdir`s and re-`open`s once per line after a write failure (resets `key` to
+    `None` inside the `except OSError`) instead of backing off by remembering the failed session.
 - **[ ] S1 · a configured drafter is dead weight on every MoE target** —
   **[`docs/issue-S1-drafter-dead-weight.md`](docs/issue-S1-drafter-dead-weight.md)**.
   Qwen2.5-Coder-1.5B loads fully to VRAM (1544M, 3.09 GB) and is then discarded by the Fix-#9 gate
@@ -258,8 +305,9 @@ then refuted. A refutation closes its row; it is not re-scoped. Full text in
 - **R1 hot-path `eprintln!`** — perf REFUTED (inside the noise floor) but the change was KEPT: log
   volume 18 MB → 364 KB per 71 tokens.
 - **Also dead, from M1:** the garbage collector is 0.26 % / 0.41 % of decode. Rewriting the decode
-  loop, replacing PyTorch, and raising the ring `queue_depth` are all covered in
-  `speed-up-vaayu.md` §4. MoE decode is 72–74 % disk-bound and the rest is CUDA; streamed dense
+  loop, replacing PyTorch, and raising the ring `queue_depth` were all covered in
+  `speed-up-vaayu.md` §4 (file deleted 2026-09-03, `7d806e7` — see the bug row below; the argument
+  is not reproduced here). MoE decode is 72–74 % disk-bound and the rest is CUDA; streamed dense
   already reads at ~5.7 GB/s, i.e. at the wall.
 
 **Expert caching and prefetch.**
@@ -370,10 +418,10 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 
 | gate | invoke | ~time | catches |
 |---|---|---|---|
-| dense smoke (CLAUDE.md §0's named guard) | `./venv/bin/python test_batched_dense_smoke.py` | ~2 min | dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged by the day's work |
+| dense smoke (CLAUDE.md §0's named guard) | **DELETED** 2026-09-03 (`7d806e7`) — `test_batched_dense_smoke.py` no longer exists. No committed replacement | -- | *was:* dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged as of its last real run |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
-| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python test_server_smoke.py` | 30 s (1B) – 4 min (MoE) | server broken end-to-end: load, non-stream, SSE stream **incl. its finish_reason and completion_tokens**, oversized-prompt refusal, prefix reuse actually firing. Repo ROOT, not `tests/` |
+| HTTP server | **DELETED** 2026-09-03 (`7d806e7`) — `test_server_smoke.py` no longer exists. No committed replacement | -- | *was:* server broken end-to-end: load, non-stream, SSE stream **incl. its finish_reason and completion_tokens**, oversized-prompt refusal, prefix reuse actually firing |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host

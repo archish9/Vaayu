@@ -271,7 +271,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # one's. `config.log_dir` stays the ROOT; runs live beneath it.
                 run_dir = new_run_dir(config.log_dir)
                 app.state.run_dir = run_dir
-            if config is not None and config.capture_stdio:
+            if config is not None and config.capture_stdio and run_dir is not None:
                 restore_stdio = capture_stdio(
                     run_dir / "server.log", rotate_mb=config.log_rotate_mb)
                 print(f"[Vaayu-Server] logging to {run_dir}/ "

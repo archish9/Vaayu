@@ -134,6 +134,36 @@ def test_the_quant_strategy_is_named():
     assert data["model"]["loader_strategy"] == "EXL3LoaderStrategy"
 
 
+# ── vaayu's own commit/branch ─────────────────────────────────────────────────
+
+def test_vaayu_commit_and_branch_are_reported_for_a_real_checkout():
+    import subprocess
+    data = envinfo.collect(_model(is_moe=False), _config())
+    expected_branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=5).stdout.strip()
+    assert data["vaayu"]["branch"] == expected_branch
+    assert data["vaayu"]["commit"]
+
+
+def test_vaayu_section_is_null_without_a_dot_git(tmp_path, monkeypatch):
+    # I5: `git -C <path> ...` does not require `path` itself to hold a repo --
+    # if it does not, git walks UP the tree and finds whatever `.git` is
+    # first, which for a venv nested inside a user's OWN project is the
+    # user's application repo, not Vaayu's. Simulate the pip-installed case
+    # (a real setup.py path with no `.git` two levels up) and require the
+    # honest "installed, not a checkout" null rather than a foreign commit.
+    from vaayu.server import envinfo as envinfo_mod
+    fake_file = tmp_path / "installed" / "vaayu" / "server" / "envinfo.py"
+    fake_file.parent.mkdir(parents=True)
+    fake_file.write_text("")
+    monkeypatch.setattr(envinfo_mod, "__file__", str(fake_file))
+    c = envinfo_mod._Collector()
+    result = envinfo_mod._vaayu_section(c)
+    assert result == {"commit": None, "dirty": None, "branch": None}
+    assert c.errors == []
+
+
 # ── budgets ──────────────────────────────────────────────────────────────────
 
 def test_budgets_come_off_the_vram_plan_and_the_caches():
@@ -146,6 +176,24 @@ def test_budgets_come_off_the_vram_plan_and_the_caches():
     assert b["max_per_layer"] == 13
     assert b["kv_cache_mode"] == "bf16"
     assert b["expert_vram_cache_gb"] > 0 and b["prefix_cache_gb"] > 0
+
+
+def test_a_dense_models_null_caches_report_clean_not_as_errors():
+    # Item 7: on a dense model, vaayu_base.py sets _expert_cache and
+    # _expert_vram_cache to None (the attribute EXISTS, it is legitimately
+    # unset) -- not missing, and not broken. Before this fix, accessing
+    # `.budget_bytes` off None raised AttributeError three times, so a
+    # perfectly healthy dense report looked exactly like something was wrong.
+    m = _model(is_moe=False, layers=80)
+    m._expert_cache = None
+    m._expert_vram_cache = None
+    data = envinfo.collect(m, _config())
+    b = data["budgets"]
+    assert b["expert_ram_cache_gb"] is None
+    assert b["max_per_layer"] is None
+    assert b["expert_vram_cache_gb"] is None
+    budget_errors = [e for e in data["collect_errors"] if e.startswith("budgets.")]
+    assert budget_errors == [], budget_errors
 
 
 # ── redaction ────────────────────────────────────────────────────────────────
