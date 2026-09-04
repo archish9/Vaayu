@@ -203,8 +203,11 @@ What the pass actually found:
   above, now closed. **Item 7** `_budgets_section` guards `_expert_cache`/`_expert_vram_cache` being
   `None` (legitimate on a dense model) so a healthy dense report no longer carries three
   `AttributeError`s in `collect_errors`. **I6/M3** stale doc references to the deleted on-device gate
-  scripts — see the `7d806e7` row above, now closed. Full suite **1385 passed, 3 skipped** before
-  and after (unchanged; every new test is additive).
+  scripts — see the `7d806e7` row above, now closed. Full suite **1385 → 1397 passed, 3 skipped**:
+  every one of the 12 new tests is additive, and each encodes a named invariant from a specific
+  finding rather than asserting whatever the code now does (the one changed assertion,
+  `test_the_warning_buffer_is_bounded`, was flipped deliberately to match I7's new eviction
+  direction and asserts that the OLDEST warnings survive).
   **Recorded, not fixed (explicitly out of scope per the review) — do not build without re-reading
   the review first:**
   - **The `logs.py` module-global consolidation.** `_pump_active`, `_session_sink`, `_warnings`,
