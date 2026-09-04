@@ -637,3 +637,39 @@ def test_duplicate_warnings_are_not_repeated():
     for _ in range(10):
         logs.note_if_warning("S session=- WARNING: same thing\n")
     assert logs.collected_warnings() == ["WARNING: same thing"]
+
+
+RACE_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+from vaayu.server.logs import capture_stdio, collected_warnings
+restore = capture_stdio({log!r})
+print("[Vaayu-NVMe] WARNING: race test line")
+sys.stdout.flush()
+immediate = collected_warnings()
+with open({result!r}, "w") as f:
+    f.write(repr(immediate))
+restore()
+"""
+
+
+def test_a_just_printed_warning_is_visible_with_no_sleep(tmp_path):
+    # The same race Task 3 solved for the session marker: a warning printed at
+    # the very end of the load travels to the pump thread asynchronously
+    # through a pipe, and collected_warnings() must not read _warnings before
+    # the pump has drained that line. No sleep here on purpose -- a fixed
+    # sleep would make this test slow AND still flaky; the fix is a barrier,
+    # not a delay.
+    log = tmp_path / "server.log"
+    result_file = tmp_path / "result.txt"
+    out = subprocess.run(
+        [sys.executable, "-c", RACE_SCRIPT.format(
+            repo=str(Path(__file__).resolve().parents[1]),
+            log=str(log), result=str(result_file))],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    immediate = result_file.read_text()
+    assert "race test line" in immediate, (
+        "collected_warnings() must see a just-printed WARNING immediately, "
+        "with no sleep -- without draining the pump first this is a race "
+        f"(got {immediate!r}); see logs.drain()")

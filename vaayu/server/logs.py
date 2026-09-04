@@ -267,7 +267,17 @@ def note_if_warning(formatted: str) -> None:
 
 
 def collected_warnings() -> list:
-    """Every distinct WARNING line seen so far, oldest first."""
+    """Every distinct WARNING line seen so far, oldest first.
+
+    Drains the pump first: a warning printed at the very end of the load is
+    still asynchronously in flight through the pipe at the instant the load
+    returns, and reading `_warnings` before the pump has caught up would
+    silently miss it -- the same race `set_current_session`/
+    `clear_current_session` solve for the session marker. `drain()` takes no
+    lock `collected_warnings()` itself holds and is a no-op with no pump
+    active, so this is safe for every caller, library or test alike.
+    """
+    drain()
     return list(_warnings)
 
 

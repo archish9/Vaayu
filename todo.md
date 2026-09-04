@@ -61,7 +61,7 @@ Read it before either row — it is what both rows cite.
 
 What the pass actually found:
 
-- **[~] L1 · `logs/` is not a self-sufficient triage bundle** — 12-item audit, target layout,
+- **[x] L1 T1–T4 · `logs/` is not a self-sufficient triage bundle** — 12-item audit, target layout,
   and a 9-task plan in
   **[`docs/issue-L1-triage-logging.md`](docs/issue-L1-triage-logging.md)**.
   Vaayu is going open-source and the support loop is "user zips `logs/`, maintainer debugs here".
@@ -90,6 +90,96 @@ What the pass actually found:
   unproven on real weights.** One recorded deviation from the issue doc: §5 asks for an assertion on
   marker overwrite, §8 forbids logging from raising on the generation path — the plan warns once and
   tags `session=*` instead, which is what §5 itself prescribes for unattributable lines.
+  **Task 8 (the gate) run 2026-09-03 — real loads of all three checkpoints**, driven by a script in
+  the scratchpad (not committed — the repo's own gate scripts for this were gone, see the bug row
+  below), `delete_original=False` on every run. Full detail + side-by-side numbers:
+  `.superpowers/sdd/2026-09-03-L1-triage-logging-T1-T4/task-8-report.md`
+  (gitignored — this disk only). Verified, per run: exactly one new `logs/run-*` dir with `latest`
+  pointing at it; `env.json`'s `forward`/`expert_style` matched the dispatch table row
+  (Qwen3-235B `fused`/`_make_fused_sparse_forward_exl3`, MiniMax-M2.7 `module_list`/
+  `_make_modulelist_sparse_forward`, Llama-3.3-70B `dense`/`is_moe: false`); Qwen (94 layers/128
+  experts/11830272 expert_bytes) and MiniMax (62/256/8875020) reported **different** geometry, so
+  no literal crept in (CLAUDE.md §5); every geometry/budget field matched that run's own startup
+  print, field by field; `grep -c '/home/a' env.json` was 0 on all three; every `server.log` line
+  was timestamped; the single real prefill collapsed to one (dense: two, from an interleaved
+  `vaayu_rust` line — still not "hundreds") `running layers` progress line, not tqdm spam;
+  `sessions/l1-verify.log` held exactly that session's lines on every run; dense's three MoE budget
+  fields were null with a named `collect_errors` entry each (`AttributeError:
+  'NoneType' object has no attribute ...`), the only `collect_errors` on any run.
+  **The dense teacher-forced-perplexity check (8.78) was NOT re-run — its gate script is deleted
+  (see bug row below).** What Task 8 verified on the dense checkpoint instead was a real load
+  through the server (health, one chat completion, 200 OK, correct derived geometry) — a weaker
+  claim than the ppl gate and should not be read as re-confirming 8.78.
+- **[x] L1-B1a · race half FIXED 2026-09-04 — `collected_warnings()` now drains the pump first.**
+  `env.json`'s `warnings` array was empty on all three Task 8 on-device runs even though
+  `server.log` correctly contained the box's `[Vaayu Warning]  APST (power management) is active...`
+  line and, on both MoE loads, a correctly-cased `[Vaayu-MoE] WARNING: VRAM cache budget ...` line.
+  Root cause: `env.json`'s lifespan called `collected_warnings()` (`vaayu/server/app.py:326`)
+  immediately after the load returned, with no `logs.drain()` call first — unlike
+  `set_current_session`/`clear_current_session`, which both drain before touching the marker. A
+  warning still in flight through the pipe at that instant was silently absent even though it landed
+  correctly in `server.log` moments later. Fix: `drain()` is now called **inside**
+  `collected_warnings()` itself (`vaayu/server/logs.py`), not at the `app.py` call site, so a future
+  caller cannot forget it and library/test callers are unaffected (`drain()` is a no-op with no pump
+  active, and takes no lock `collected_warnings()` holds — `note_if_warning`/`collected_warnings`
+  touch no lock at all, so there is no deadlock with `_marker_lock`). New regression test
+  `tests/test_logs.py::test_a_just_printed_warning_is_visible_with_no_sleep` reproduces the race
+  deterministically (subprocess, live `capture_stdio` pump, prints a WARNING, reads
+  `collected_warnings()` immediately with **no sleep**) — confirmed failing before the fix (3/3
+  runs), passing after. Full suite 1385 passed, 3 skipped (was 1384 + this one new test).
+- **[bug] L1-B1b · case mismatch — still open, NOT fixed by B1a.** `note_if_warning()`
+  (`vaayu/server/logs.py`) filters on the literal substring `"WARNING"` (all caps). The three
+  warning prints in `vaayu/auto_model.py` (lines 24, 39, 59 — including the box's APST warning, the
+  one Task 8's on-device gate calls out by name) use `"[Vaayu Warning]"` (title case), so they can
+  **never** be harvested regardless of the drain fix above. Only warning sites that happen to spell
+  it `WARNING:` in all caps (e.g. `vaayu/vaayu_base.py:2274`, the VRAM-cache-budget line) are even
+  eligible. Out of scope for this session (asked-for fix was the race only, CLAUDE.md §3). Fix
+  sketch: reword `auto_model.py`'s three sites to say `WARNING`, or make `note_if_warning`'s match
+  case-insensitive (also matching `"Warning"`).
+- **[ ] L1 T5–T9 · additive half of the triage-logging work, not started.** Self-contained one-liners
+  (full text: `docs/issue-L1-triage-logging.md`, on this disk only):
+  T5 byte counters — accumulate bytes at the expert read site into a per-token counter, add
+  `bytes=`/`gb_tok=` to the `[VAAYU-IO] token summary` line (`vaayu/vaayu_base.py:4236`).
+  T6 `requests.jsonl` incl. the ERROR path — wrap the `BaseException` handlers at
+  `vaayu/server/engine.py:371,451` so a failed request still writes a row.
+  T7 `session_event` failure must not be silent (audit item 12) — one-time warning naming the path
+  and errno on the first `OSError`.
+  T8 `python -m vaayu.server --diagnose` — print §4 without loading weights, plus the actionable
+  taxes (APST, foreign GPU processes, I/O scheduler, drafter-on-MoE, `DEFAULT_STREAM=False` with no
+  `max_tokens`).
+  T9 `documentation/server.md` + `README.md` "Reporting a problem" section (server.md's half landed
+  as part of Task 8; `README.md`'s does not exist yet).
+  None of these are started; do not let them silently vanish the way T1–T4's own predecessor work
+  nearly did.
+- **[bug] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts this ledger and**
+  **CLAUDE.md still name.** Eight files removed on 2026-09-03, before Task 8 of this L1 work ran:
+  `test_server_smoke.py`, `test_batched_dense_smoke.py`, `test_batched_decode.py`,
+  `test_kv_persist_coherence.py`, `test_quick.py`, `control_single_stream_repro.py`,
+  `exllamav3-server.py` and `speed-up-vaayu.md`. That deletion is deliberate and not this row's to
+  reverse. But `CLAUDE.md` §0 still names the dense smoke gate ("`test_batched_dense_smoke.py`,
+  which ships with two known bugs") as P7's guard, and the **On-device gates** table below (in this
+  same file) still lists both `test_server_smoke.py` and `test_batched_dense_smoke.py` as runnable
+  commands. Neither exists on disk. That is a live docs-vs-reality gap: anyone following either
+  document verbatim will get `FileNotFoundError`. Task 8 worked around it with a one-off script in
+  the scratchpad (not committed, not a replacement) — see the T1–T4 row above. Whoever next touches
+  the on-device gates should either restore equivalent scripts (as committed, reviewed gates, not
+  scratchpad throwaways) or edit both documents to stop naming them.
+- **[bug] `env.json`'s `kv_cache_mode` reports the requested value, not the resolved one.** When the
+  config says `kv_cache_mode="auto"`, `env.json` records `"auto"` verbatim — the wrong side of this
+  file's own premise (§4: every field is a DERIVED fact, never the raw request echoed back). The
+  resolved mode (`"bf16"` per `docs/plans/plan_e_kv_bf16_mode.md` — `auto` flips to bf16) is computed
+  elsewhere and never makes it into `env.json`. A maintainer reading a mailed bundle cannot tell
+  which KV dtype actually ran without re-deriving it themselves. Fix sketch: `envinfo.py`'s config
+  section should read the resolved mode off wherever the `auto`→`bf16` decision is made (the KV
+  cache constructor), not off the raw `ServerConfig` field.
+- **[bug] the test suite creates real `logs/run-*` directories inside the repo.** Several tests
+  start a `TestClient` on a `ServerConfig` with no explicit `log_dir`, so it defaults into the repo's
+  own `logs/` root: `tests/test_delete_original.py:41,54,62`, `tests/test_gpu_audit.py:130`,
+  `tests/test_shutdown.py`. ~9 stray `run-*` dirs per full suite run. Harmless — `logs/` is
+  gitignored, nothing is committed — but they accumulate on disk and dilute real runs (the ones this
+  whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
+  whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
+  `log_dir` at `tmp_path` unless a test explicitly overrides it.
 - **[ ] S1 · a configured drafter is dead weight on every MoE target** —
   **[`docs/issue-S1-drafter-dead-weight.md`](docs/issue-S1-drafter-dead-weight.md)**.
   Qwen2.5-Coder-1.5B loads fully to VRAM (1544M, 3.09 GB) and is then discarded by the Fix-#9 gate

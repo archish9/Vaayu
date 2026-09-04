@@ -112,6 +112,41 @@ There are no flags: edit the file (or shadow a value in the gitignored
 | `REQUIRE_EXCLUSIVE_GPU` | **`True`** | refuse to start while another process holds GPU memory **on `DEVICE`**, naming the holders and the commands that free them. Budgets are derived once at load, so sharing is a permanent per-token tax — up to **13×**, and invisible in the output. `False` warns and loads anyway. Counts compute processes only; the desktop is never included |
 | `EXCLUSIVE_GPU_MIN_MIB` | **`256`** | how much a holder must hold before it is worth refusing over. A bare CUDA context is 128 MiB, so `0` refuses the boot over any process that merely imports torch. Anything smaller is still reported, just not treated as a blocker |
 
+### Logs
+
+One directory per server process:
+
+```
+logs/
+  run-2026-09-03T17-03-11Z/
+    env.json          # the machine, the effective config, the derived model
+    server.log        # every line the process emitted, timestamped, session-tagged
+    sessions/
+      agent-7.log     # only the lines emitted while agent-7 was generating
+  latest -> run-2026-09-03T17-03-11Z
+```
+
+`LOG_DIR` names the ROOT; runs live beneath it and `logs/latest` always points
+at the newest, so `tail -f logs/latest/server.log` works across restarts. Old
+run directories are never deleted automatically — they are yours to prune.
+
+`server.log` captures at the file-descriptor level, so it includes the
+`vaayu_rust` io_uring lines that a Python-level logger cannot see. Every line
+carries an ISO8601 UTC timestamp and a `session=` field (`-` while the engine
+is idle).
+
+**Reporting a problem:** zip `logs/run-<timestamp>/` and attach it. That
+directory is self-contained — `env.json` records the commit, the library
+versions, the CPU/RAM/kernel, the GPU and its free VRAM, the NVMe devices with
+their I/O scheduler and APST state, which of Vaayu's four forwards your model
+selected, the derived MoE geometry, every budget the VRAM plan solved, your
+effective configuration (including anything set in the gitignored
+`config_local.py`) and every `VAAYU_*` variable.
+
+Absolute paths are redacted before they are written: a checkpoint path is
+recorded as its directory name plus a hash, never in full, so no username
+leaves your machine.
+
 ### Speed
 
 These are the knobs that change throughput. Defaults are already the fast ones —
