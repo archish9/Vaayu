@@ -1436,6 +1436,11 @@ class VaayuBaseModel(GenerationMixin):
         self.profiler = LayeredProfiler()
         self.telemetry = VaayuTelemetry()
         self._token_count = 0
+        # Monotonic expert-disk stall, folded from the per-token
+        # `_expert_disk_s` at the END of each forward pass. The server diffs it
+        # per request (requests.jsonl); left uninitialised, the first request of
+        # a process had no `before` value and reported a null stall.
+        self._expert_disk_total_s = 0.0
 
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
@@ -3837,11 +3842,11 @@ class VaayuBaseModel(GenerationMixin):
         _io_wait_s = 0.0    # time blocked on future.result() / load_layer_to_cpu
         _gpu_load_s = 0.0   # time spent on move_layer_to_device (CPU→GPU transfer)
         _compute_s = 0.0    # time spent on actual layer.forward() GPU compute
-        # Fold the PREVIOUS token's stall into a monotonic total before zeroing
-        # it. `_expert_disk_s` is a per-TOKEN value; the server needs a
-        # per-REQUEST window (requests.jsonl), and diffing a value that resets
-        # itself every token would report a fraction of one token as a whole
-        # request. Same reasoning as the byte counter below.
+        # Catch-up fold, normally a no-op: this pass's own stall is folded at
+        # the END (see `_exec_end` below), which zeroes `_expert_disk_s` there.
+        # It is non-zero here only when the PREVIOUS pass raised before reaching
+        # that fold, and dropping that stall on the floor would understate the
+        # request that failed.
         self._expert_disk_total_s = (getattr(self, "_expert_disk_total_s", 0.0)
                                      + getattr(self, "_expert_disk_s", 0.0))
         self._expert_disk_s = 0.0   # Fix #6: real expert NVMe time this token
@@ -4268,6 +4273,15 @@ class VaayuBaseModel(GenerationMixin):
         _expert_cache_delta = self._expert_cache.delta_stats() if self._expert_cache is not None else "n/a"
         _vram_stats = self._expert_vram_cache.delta_stats() if getattr(self, '_expert_vram_cache', None) else "n/a"
         _expert_disk_s = getattr(self, '_expert_disk_s', 0.0)
+        # Fold THIS pass's stall into the monotonic total here, at the end,
+        # rather than at the top of the next pass. Folding on entry shifted the
+        # server's per-request window by one forward: a request's diff covered
+        # the PREVIOUS request's last token plus its own tokens 1..N-1, so a
+        # one-token request reported somebody else's stall entirely. `tokens` in
+        # requests.jsonl and this total must count the same passes.
+        self._expert_disk_total_s = (getattr(self, "_expert_disk_total_s", 0.0)
+                                     + _expert_disk_s)
+        self._expert_disk_s = 0.0
         _compute_only_s = max(0.0, _compute_s - _expert_disk_s)
         _other_s = _total - _io_wait_s - _gpu_load_s - _compute_s
         _la = getattr(self, "_lookahead_state", None)

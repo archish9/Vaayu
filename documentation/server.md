@@ -161,9 +161,10 @@ request never ends without a row, which is the point of the file — a `server.l
 traceback used to be the only trace of a failed request, with nothing that said
 which request it belonged to.
 
-Each row carries the prompt and completion token counts, wall time and tok/s,
-the prefix-cache outcome, the resolved `finish` value, and a `decode` object
-with the request's own disk traffic and cache telemetry. `finish` is one of:
+Each row carries the prompt and completion token counts (`prompt_tokens` and
+`tokens`), wall time and tok/s, the prefix-cache outcome, the resolved `finish`
+value, and a `decode` object with the request's own disk traffic and cache
+telemetry. `finish` is one of:
 
 | `finish` | when |
 |---|---|
@@ -179,7 +180,11 @@ disconnected never receives an OpenAI-vocabulary `finish_reason` for the
 request it abandoned, so this row is the only place the outcome is recorded.
 
 An `error`/`refused` row also carries an `error` object (`type`, `message`,
-`traceback`).
+`traceback`). A `refused` row has the **same keys** as every other row — the
+fields that are unknowable before generation starts (`prompt_tokens`, `cap`,
+`prefix_hit`, `ttft_s`, `decode_tok_s`, `decode`) are `null` rather than absent,
+so a script can index any field on any row without checking which kind of row it
+is.
 
 Inside `decode`: `bytes_read_gb` and `gb_per_token` are this request's own NVMe
 traffic — the difference between the persister's read-byte counter at the end
@@ -207,9 +212,13 @@ model's true ceiling being reached once and remembered.
 
 **The `bytes=`/`gb_tok=` fields on `server.log`'s `[VAAYU-IO] token summary`
 line.** These count bytes **requested of the NVMe drive** for that one token —
-counted where the read is submitted, at its sector-aligned length, not where
-it completes, so the figure is what was asked of the device rather than a
-confirmed-delivered byte count. They are decimal GB (`gb_tok`), matching every
+counted where the read is submitted, not where it completes, so the figure is
+what was asked of the device rather than a confirmed-delivered byte count. The
+length counted is whichever one the submitting call has to hand, and they are
+not uniform: the O_DIRECT paths count the sector-aligned length they actually
+ask the kernel for, the preadv fallback counts the unaligned request length, and
+the non-pinned `safetensors` load counts the materialised tensor bytes. Read it
+as an account of disk traffic, not a block-exact one. They are decimal GB (`gb_tok`), matching every
 other GB figure this engine prints.
 
 Anything a cache serves — the expert RAM cache, the expert VRAM cache, the

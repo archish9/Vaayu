@@ -5,8 +5,6 @@ asserted as TEXT: one line, the existing fields untouched, two new ones.
 """
 import re
 
-from vaayu.persist import safetensor_model_persister as smp
-
 
 def format_summary_fields(read_bytes_delta: int) -> str:
     """The exact substring vaayu_base appends. Kept here so the formatting is
@@ -35,10 +33,3 @@ def test_byte_fields_parse_out_of_a_summary_line():
     m = re.search(r"gb_tok=([0-9.]+)", line)
     assert m and abs(float(m.group(1)) - 0.01) < 1e-9
 
-
-def test_counter_delta_is_the_token_window():
-    """What vaayu_base does: record a baseline, read again, subtract. This is
-    the whole reason Task 1's counter is monotonic."""
-    base = smp.read_bytes()
-    smp.note_read_bytes(11_830_272)
-    assert smp.read_bytes() - base == 11_830_272

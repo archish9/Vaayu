@@ -42,8 +42,11 @@ def test_snapshot_on_a_dense_model_is_nulls_not_errors():
 
 
 def test_snapshot_never_resets_cuda_peak_stats():
-    """vaayu_base.py:3628-3637 -- the peak counter belongs to whoever reset it
-    last, and the engine must not touch it."""
+    """The peak counter belongs to whoever reset it last, and the engine must
+    not touch it. The reasoning lives on the comment above
+    `torch.cuda.max_memory_allocated()` in vaayu_base's chunked-prefill loop --
+    named rather than cited by line number, which is what the production
+    counterpart in reqlog.snapshot already does."""
     src = (reqlog.__file__).replace(".pyc", ".py")
     with open(src) as f:
         text = f.read()
@@ -176,3 +179,32 @@ def test_a_dense_model_snapshot_has_no_reset_latch_and_does_not_raise():
     snap = reqlog.snapshot(_Dense())
     assert snap["decode_stats_reset"] is None
     assert snap["expert_ram_hits"] is None
+
+
+def test_cache_fields_are_null_when_the_request_produced_no_tokens():
+    """The latch is STICKY: a request that raised before any forward pass ran
+    never touched it, so it still carries the previous request's True. Without
+    the `tokens > 0` requirement, decode_block published the previous
+    request's hit rates as this one's -- a stale number that looks measured."""
+    before = {"read_bytes": 0, "expert_disk_total_s": 0.0,
+              "expert_ram_hits": 90, "expert_ram_misses": 10,
+              "expert_vram_hits": 5, "expert_vram_misses": 5,
+              "peak_rss_gb": 1.0, "peak_vram_gb_process": 1.0,
+              "decode_stats_reset": True}
+    d = reqlog.decode_block(before, dict(before), tokens=0)
+    assert d["expert_misses"] is None
+    assert d["expert_ram_hit_rate"] is None
+    assert d["expert_vram_hit_rate"] is None
+
+
+def test_diff_refuses_a_non_monotonic_key():
+    """The diffed/point-in-time split is now enforced, not merely documented:
+    wiring an expert-cache counter through `diff()` is the exact
+    miscategorisation a mid-branch review already caught once."""
+    assert reqlog.MONOTONIC_KEYS == {"read_bytes", "expert_disk_total_s"}
+    snap = {"read_bytes": 10, "expert_ram_hits": 3}
+    assert reqlog.diff(snap, {"read_bytes": 40}, "read_bytes") == 30
+    with pytest.raises(AssertionError):
+        reqlog.diff(snap, snap, "expert_ram_hits")
+    with pytest.raises(AssertionError):
+        reqlog.diff(snap, snap, "peak_vram_gb_process")

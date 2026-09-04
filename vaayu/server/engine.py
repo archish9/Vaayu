@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import reqlog
-from .chat import render_prompt
+from .chat import NoChatTemplate, TemplateLacksToolSupport, render_prompt
 from .logs import clear_current_session, session_event, set_current_session
-from .stopping import finish_reason, resolve_max_tokens
+from .stopping import ContextTooLong, finish_reason, resolve_max_tokens
 from .tools import declared_tool_names, detect_tool_format, parse_tool_calls
 
 
@@ -409,19 +409,28 @@ class EngineHandle:
             cancel = CancelToken()
         started, hits_before = time.time(), self._prefix_hits()
         snap_before = reqlog.snapshot(self.model)
-        prompt_ids, cap = self.prepare(req)
-        self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
-                  thinking=("on" if self.resolve_thinking(req) else "off"))
-        if req.max_tokens is None:
-            # Non-streaming sends NOTHING until the last token, so this request
-            # can sit silent for as long as `cap` tokens take -- measured at 15+
-            # minutes and counting on MiniMax-M2.7 before a client gave up and
-            # the run looked hung. It is not hung; it is uncapped.
-            print(f"[Vaayu-Server] WARNING: non-streaming request with no "
-                  f"max_tokens: up to {cap} tokens will be generated before ANY "
-                  f"bytes are sent. Set max_tokens, or use stream=true.")
         row = {"tokens": 0, "finish": "error", "error": None}
+        # Same defaults, and for the same reason, as stream()'s below: prepare()
+        # is INSIDE the try so that a failure there still reaches the row-writing
+        # `finally`. It raises more than the three types the route names --
+        # apply_chat_template runs Jinja over the messages, and a malformed
+        # sequence (a `tool` message with no matching call, an unexpected role
+        # order) raises whatever the template raises. That used to skip the row
+        # entirely on both paths, against this file's one contract.
+        prompt_ids, cap = [], 0
         try:
+            prompt_ids, cap = self.prepare(req)
+            self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
+                      thinking=("on" if self.resolve_thinking(req) else "off"))
+            if req.max_tokens is None:
+                # Non-streaming sends NOTHING until the last token, so this
+                # request can sit silent for as long as `cap` tokens take --
+                # measured at 15+ minutes and counting on MiniMax-M2.7 before a
+                # client gave up and the run looked hung. It is not hung; it is
+                # uncapped.
+                print(f"[Vaayu-Server] WARNING: non-streaming request with no "
+                      f"max_tokens: up to {cap} tokens will be generated before "
+                      f"ANY bytes are sent. Set max_tokens, or use stream=true.")
             kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
             loop = asyncio.get_running_loop()
             # An OWN thread, not a run_in_executor pool worker: `quiesce()` joins
@@ -452,12 +461,28 @@ class EngineHandle:
                       wall=f"{wall:.1f}s",
                       decode=f"{(len(new_ids) - 1) / wall:.3f}tok/s" if wall > 0 and len(new_ids) > 1 else "n/a")
             row["tokens"], row["finish"] = len(new_ids), finish
+            if cancel.cancelled:
+                # `finish_reason` maps cancelled -> "length" on purpose: the
+                # OpenAI wire vocabulary has no other word for it. requests.jsonl
+                # is NOT the wire, and documentation/server.md's table promises
+                # `cancelled` there. Without this, a non-streaming disconnect is
+                # indistinguishable from a truncated answer. The wire value
+                # returned below is untouched -- stream() already does the same.
+                row["finish"] = "cancelled"
             return GenerationResult(
                 text=cleaned, tool_calls=calls,
                 prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
                 finish_reason=finish)
         except BaseException as ex:              # noqa: BLE001 -- re-raised
             row["error"] = ex
+            if isinstance(ex, (ContextTooLong, TemplateLacksToolSupport,
+                               NoChatTemplate)):
+                # Rejected before generation started, so the row says `refused`
+                # -- the vocabulary documentation/server.md promises, and what
+                # the route's own `_refusal_row` wrote for these three before
+                # prepare() moved inside this try. The route no longer writes
+                # one for them; that would now be two rows for one request.
+                row["finish"] = "refused"
             raise
         finally:
             self._write_request_row(

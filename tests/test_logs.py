@@ -960,6 +960,11 @@ def test_session_event_warns_once_on_oserror(tmp_path, capsys, monkeypatch):
 def test_session_event_still_never_raises(tmp_path, monkeypatch):
     from vaayu.server import logs
 
+    # Same reset as the sibling test above: the warn-once latch is module
+    # level, so tripping it here without restoring it silently disarms every
+    # later test of that warning in the same process.
+    monkeypatch.setattr(logs, "_session_event_warned", False)
+
     def boom(*a, **kw):
         raise OSError(28, "No space left on device")
 

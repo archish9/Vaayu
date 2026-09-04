@@ -36,10 +36,10 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1397 passed, 3 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-04 after the L1 final fix wave (was 1385 + 12 new regression tests). **This figure has gone
-stale five times now.** Re-measure against a stashed HEAD before quoting it; do not trust the number
-written here.
+**Suite baseline: 1482 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-04 after the L1 T5–T10 final fix wave (was 1468 + 15 new regression tests − 1 deleted
+duplicate). **This figure has gone stale six times now.** Re-measure against a stashed HEAD before
+quoting it; do not trust the number written here.
 
 ---
 
@@ -233,6 +233,57 @@ What the pass actually found:
   `model._prefix_cache.budget_bytes` unguarded (crashed into `collect_errors` whenever prefix reuse
   auto-disables, e.g. any non-EXL3 checkpoint) — routed through the same `cache_gb()` null-check
   helper its sibling fields already use; regression test added to `tests/test_envinfo.py`.
+- **[x] L1 T5–T10 branch · FINAL whole-branch review fix wave — DONE 2026-09-04.** Ten findings
+  (2 Important on the "a request never ends without a row" contract, 1 Important lock-scope, 7
+  Minor) plus 4 cheap test-hygiene carries and 1 structural hardening, all in one pass.
+  Suite **1482 passed, 12 skipped** (was 1468 + 15 new tests − 1 deleted duplicate).
+  Report: `.superpowers/sdd/2026-09-04-L1-T5-T10-triage-logging-additive/final-fix-report.md`
+  (**gitignored — this disk only**; the substance is here).
+  - **F1** `prepare()` sat OUTSIDE `generate()`'s row-writing try, so any Jinja error from
+    `apply_chat_template` (a `tool` message with no matching call, an unexpected role order) ended
+    with NO row on both paths; on the streaming path it escaped the route's three-type `except`
+    entirely. Moved inside the try (matching `stream()`), route's streaming `except` widened to
+    write a refusal row and re-raise. **Consequence handled:** with `prepare()` inside the try, the
+    non-streaming route's `ContextTooLong` handler would have written a SECOND row — `generate()`
+    now tags those three types `finish="refused"` itself and the route no longer writes one.
+  - **F2** the `slot()` admission race in `_sse` (`QueueFull` raised before `engine.stream` is ever
+    entered) emitted an SSE `server_busy` and no row. One `_refusal_row` call.
+  - **F3** `_sse` `break`s out of `async for … engine.stream(…)`, and Python does not close a
+    generator on `break` — the row was written at asyncio-finalizer time, AFTER the slot's lock was
+    released, so `wall_s` disagreed with `server.log`'s DONE line and the `after` counter snapshot
+    could bill the next request's NVMe reads to this one. Now an explicit `try/finally: await
+    gen.aclose()` inside the `async with`. New test drives the production shape (break, then read
+    the file with no await in between).
+  - **F4** `_expert_disk_total_s` was folded at the TOP of each forward, shifting a request's stall
+    window by one pass (a 1-token request reported another request's number), and was never
+    initialised in `__init__` (first request of a process reported `null`). Now initialised, and
+    folded at the END; the top-of-pass fold stays as a catch-up for a pass that raised.
+  - **F5** a non-streaming disconnect recorded `finish:"length"` (the OpenAI wire vocabulary's
+    word). `requests.jsonl` is not the wire — the row now says `cancelled`, matching `stream()`
+    and `documentation/server.md`. The wire value is unchanged.
+  - **F6** refusal rows omitted 7 keys instead of nulling them (`row["prefix_hit"]` was a KeyError
+    depending on which kind of row a script hit). Same key set now; server.md corrected —
+    the fields are `prompt_tokens` and `tokens`, and the null-key rule is documented.
+  - **F7** the `decode_stats_reset` latch is sticky, so a request that raised before any forward
+    published the PREVIOUS request's hit rates. `decode_block` now requires `tokens > 0` too.
+  - **F8** `test_no_absolute_paths_leaked_into_the_bundle` asserted `"/home/" not in text` for
+    `requests.jsonl`, which is NOT scrubbed (`error_block` embeds a full traceback). Scoped to
+    `env.json`; README now says the file is unfiltered, as it already said of `server.log`.
+  - **F9** server.md claimed the byte counters uniformly use sector-aligned lengths at submission;
+    true at 2 of 4 sites (`_load_pinned`'s preadv fallback counts unaligned `total_size`, the
+    non-pinned `load_model` branch counts materialised `nbytes`). Wording softened; counting
+    unchanged.
+  - **F10** `_checkpoint_looks_like_moe` used `isinstance(v, int)`, which is True for `False` — a
+    dense config with `"expert_parallel": false` or `"num_experts": 0` tripped the drafter-on-MoE
+    tax. Now `and not isinstance(v, bool) and v > 0`.
+  - **Hardening:** `reqlog.MONOTONIC_KEYS` + a module-level `diff()` that asserts against it, so a
+    future field wired through it by mistake fails loudly instead of being silently
+    miscategorised (the exact Critical a mid-branch review already caught once).
+  - **Carries:** stale `vaayu_base.py:3628-3637` anchor in `test_reqlog.py` replaced with a
+    searchable one; `test_session_event_still_never_raises` now resets `_session_event_warned`;
+    `test_docs_reporting.py`'s docstring says what it does (substring checks, not live-code
+    assertions); deleted `test_token_summary_bytes.py::test_counter_delta_is_the_token_window`
+    (duplicate of `test_read_bytes_counter.py::test_note_read_bytes_accumulates`).
 - **[x] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts — docs FIXED**
   **2026-09-04 (I6/M3, final fix wave); scripts stay deleted, deliberately.** Eight files were
   removed on 2026-09-03, before Task 8 of this L1 work ran: `test_server_smoke.py`,

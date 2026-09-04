@@ -120,3 +120,30 @@ def test_a_clean_box_has_no_taxes():
 def test_module_imports_without_cuda():
     import importlib
     importlib.reload(diagnose)      # must not raise on a CUDA-less box
+
+
+def _write_config(tmp_path, payload):
+    (tmp_path / "config.json").write_text(json.dumps(payload))
+    return str(tmp_path)
+
+
+def test_a_real_moe_config_is_detected(tmp_path):
+    path = _write_config(tmp_path, {"num_local_experts": 256,
+                                    "num_experts_per_tok": 8})
+    assert diagnose._checkpoint_looks_like_moe(path) is True
+
+
+def test_a_boolean_expert_flag_is_not_evidence_of_moe(tmp_path):
+    """`bool` is a subclass of `int`, so a dense config carrying
+    "expert_parallel": false used to read as MoE and bill the
+    drafter-on-MoE tax to a model that has no experts at all."""
+    path = _write_config(tmp_path, {"expert_parallel": False,
+                                    "hidden_size": 8192})
+    assert diagnose._checkpoint_looks_like_moe(path) is False
+
+
+def test_zero_experts_is_not_evidence_of_moe(tmp_path):
+    """A dense config that spells out `"num_experts": 0` is stating it has
+    none. Counting it as MoE inverted the answer."""
+    path = _write_config(tmp_path, {"num_experts": 0, "hidden_size": 8192})
+    assert diagnose._checkpoint_looks_like_moe(path) is False

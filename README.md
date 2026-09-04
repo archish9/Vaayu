@@ -690,7 +690,9 @@ It contains:
 **What is redacted.** Absolute paths are replaced by a basename plus a hash of
 the full path, so `env.json` does not carry your username or your directory
 layout. Nothing else in the bundle is filtered — skim `server.log` before
-sending it if your prompts are sensitive.
+sending it if your prompts are sensitive. `requests.jsonl` is not filtered
+either: an `error` row carries the exception's message and full traceback, and
+those frames name absolute paths on your machine.
 
 **If the server will not start**, there is no run directory to send. Run this
 instead and paste the output:

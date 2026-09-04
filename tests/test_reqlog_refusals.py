@@ -196,3 +196,124 @@ def test_a_full_queue_writes_a_refusal_row_streaming(full_queue_client, run_dir)
     assert len(rs) == 1
     assert rs[0]["finish"] == "refused"
     assert rs[0]["error"]["type"] == "QueueFull"
+
+
+def _sse_req(**over):
+    from vaayu.server.schemas import ChatCompletionRequest
+    base = {"model": "m", "session_id": "s", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]}
+    base.update(over)
+    return ChatCompletionRequest(**base)
+
+
+def test_the_sse_admission_race_writes_a_refusal_row(run_dir):
+    """`EngineHandle.slot` raises QueueFull BEFORE it yields, so engine.stream
+    is never entered and its row-writing `finally` never runs. The route's
+    eager depth check cannot see this race -- it is the reason _sse has a
+    QueueFull handler at all -- so the row is that handler's to write."""
+    import asyncio
+
+    import vaayu.server.app as app_mod
+
+    e = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
+
+    async def main():
+        return [c async for c in app_mod._sse(e, _sse_req(), "m", None)]
+
+    chunks = asyncio.run(main())
+    assert any("server_busy" in c for c in chunks)
+    rs = rows(run_dir)
+    assert len(rs) == 1, "the request that lost the admission race left no row"
+    assert rs[0]["finish"] == "refused"
+    assert rs[0]["error"]["type"] == "QueueFull"
+    assert rs[0]["stream"] is True
+
+
+def test_the_streaming_row_is_written_before_the_loop_finalizes(run_dir):
+    """The production shape: _sse `break`s out of `async for ... engine.stream`
+    on the final event. Python does not close a generator on `break`, so
+    engine.stream stayed suspended at its last yield until GC dropped it and
+    asyncio scheduled the finalizer -- i.e. AFTER `async with engine.slot`
+    released the lock. wall_s then disagreed with server.log's DONE line, and
+    the row's `after` counter snapshot could pick up the next admitted
+    request's NVMe reads. Reading the file with no await in between is what
+    makes this fail before the fix: the finalizer cannot have run yet.
+
+    The existing tests both run the generator to exhaustion or call aclose()
+    explicitly; neither reproduces this shape.
+    """
+    import asyncio
+    import time
+
+    import vaayu.server.app as app_mod
+
+    from .test_reqlog_engine import M as StreamingM
+
+    # This file's M returns straight from generate(); only test_reqlog_engine's
+    # feeds the streamer stream_generate's consumer loop blocks on.
+    e = EngineHandle(StreamingM(), log_dir=run_dir)
+
+    async def main():
+        t0 = time.perf_counter()
+        async for _chunk in app_mod._sse(e, _sse_req(), "m", None):
+            pass
+        elapsed = time.perf_counter() - t0
+        return rows(run_dir), elapsed
+
+    rs, elapsed = asyncio.run(main())
+    assert len(rs) == 1, "the row was still pending in the event loop's finalizer"
+    assert rs[0]["stream"] is True
+    # Timed inside the slot, so it cannot exceed the whole consumption.
+    assert rs[0]["wall_s"] is not None and rs[0]["wall_s"] <= elapsed
+
+
+def test_a_jinja_error_on_the_streaming_path_writes_a_row(run_dir, no_real_load,
+                                                          monkeypatch):
+    """prepare() raises more than the three types the route names:
+    apply_chat_template runs Jinja over the messages, and a malformed sequence
+    raises whatever the template raises. On the streaming path that lands
+    BEFORE any StreamingResponse exists, so it left a 500 with no row and no
+    SSE generator at all."""
+    cfg = ServerConfig(model_path="/ckpt", log_dir=str(run_dir.parent),
+                       capture_stdio=False, require_session_id=False,
+                       default_stream=False)
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        m = M()
+
+        def boom(messages, **kw):
+            raise ValueError("Jinja: unknown role 'tool' with no matching call")
+
+        m.tokenizer.apply_chat_template = boom
+        app.state.engine = EngineHandle(m, log_dir=run_dir)
+        with pytest.raises(ValueError, match="Jinja"):
+            c.post("/v1/chat/completions", json={
+                "model": "m", "session_id": "s", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]})
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a Jinja error on the streaming path left no row"
+    assert rs[0]["finish"] == "refused"
+    assert rs[0]["error"]["type"] == "ValueError"
+
+
+def test_a_refusal_row_has_the_same_keys_as_an_engine_row(client_requiring_session,
+                                                          client, run_dir):
+    """A maintainer's script does row["prefix_hit"]. Omitting the key on a
+    refusal row rather than nulling it made that a KeyError depending on which
+    kind of row it hit -- and documentation/server.md documents only the
+    engine row's shape."""
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+
+    refusal, engine_row = rows(run_dir)
+    assert refusal["finish"] == "refused"
+    assert set(refusal) == set(engine_row), (
+        f"only in one: {set(refusal) ^ set(engine_row)}")
+    for k in ("prefix_hit", "ttft_s", "decode_tok_s", "prompt_tokens", "cap",
+              "decode"):
+        assert refusal[k] is None

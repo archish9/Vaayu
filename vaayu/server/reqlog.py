@@ -12,11 +12,24 @@ nothing here instruments the generation path. That is deliberate: this file is
 read by the server, and the engine's hot loop must not grow a second
 bookkeeping system it can get wrong.
 
-Nothing in this module raises. A lost log line is cheaper than a lost response.
+Nothing in this module raises on any input a running server can produce. A lost
+log line is cheaper than a lost response. The one exception is `diff()`'s
+assert, which fires only on a coding error (diffing a non-monotonic counter) and
+is caught by `EngineHandle._write_request_row`'s own wrapper regardless.
 """
 import json
 import traceback
 from pathlib import Path
+
+
+# The ONLY keys of `snapshot()` that are monotonic across a request and may
+# therefore be diffed. Everything else in that dict is point-in-time -- the four
+# expert-cache counters reset at the prefill->decode boundary INSIDE a request,
+# and the two peak gauges are process high-water marks. `diff()` asserts
+# against this set: a future field wired through `diff()` by mistake is exactly
+# the miscategorisation a mid-branch review already caught once, and a rule that
+# is only documented is a rule that gets broken.
+MONOTONIC_KEYS = frozenset({"read_bytes", "expert_disk_total_s"})
 
 
 def _safe(fn):
@@ -96,6 +109,18 @@ def snapshot(model) -> dict:
     }
 
 
+def diff(before: dict, after: dict, key: str):
+    """`after[key] - before[key]`, for a MONOTONIC key only.
+
+    Module level rather than a closure inside `decode_block` so the guard is
+    directly testable -- the point of the guard is that it cannot be bypassed
+    by accident, and a rule nothing exercises is a rule nobody trusts.
+    """
+    assert key in MONOTONIC_KEYS, f"{key} is not monotonic; do not diff it"
+    a, b = after.get(key), before.get(key)
+    return None if (a is None or b is None) else a - b
+
+
 def _rate(hits, misses):
     if hits is None or misses is None:
         return None
@@ -123,15 +148,16 @@ def decode_block(before: dict, after: dict, tokens: int) -> dict:
     PREVIOUS request and reporting them would be a stale number that looks
     measured -- exactly the failure this file exists to prevent. None is the
     correct answer there, not a diff.
+
+    `tokens > 0` is required as well as the latch, because the latch is sticky:
+    a request that raised BEFORE any forward pass ran never touched it, so it
+    still holds the previous request's True and would have published the
+    previous request's hit rates as this one's.
     """
-    def delta(key):
-        a, b = after.get(key), before.get(key)
-        return None if (a is None or b is None) else a - b
+    read = diff(before, after, "read_bytes")
+    stall = diff(before, after, "expert_disk_total_s")
 
-    read = delta("read_bytes")
-    stall = delta("expert_disk_total_s")
-
-    if after.get("decode_stats_reset") is True:
+    if after.get("decode_stats_reset") is True and tokens > 0:
         misses = after.get("expert_ram_misses")
         ram_hit_rate = _rate(after.get("expert_ram_hits"), misses)
         vram_hit_rate = _rate(after.get("expert_vram_hits"), after.get("expert_vram_misses"))

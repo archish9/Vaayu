@@ -241,6 +241,11 @@ def test_the_token_summary_reports_nvme_bytes_consistent_with_pinning(client):
 
 
 def test_no_absolute_paths_leaked_into_the_bundle(client):
-    for name in ("env.json", "requests.jsonl"):
-        text = (_run_dir() / name).read_text(errors="replace")
-        assert "/home/" not in text, f"{name} leaked an absolute path"
+    """`env.json` ONLY. It is the one artifact that promises scrubbed paths.
+    `requests.jsonl` writes raw and its `error` block embeds a full
+    `traceback.format_exception()`, whose frames name absolute repo paths --
+    asserting on it here passed only because no request on any checkpoint
+    happened to error, and would have failed the moment one did. README says
+    the file is unfiltered; this gate must not contradict it."""
+    text = (_run_dir() / "env.json").read_text(errors="replace")
+    assert "/home/" not in text, "env.json leaked an absolute path"

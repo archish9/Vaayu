@@ -264,11 +264,30 @@ def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> N
     """
     try:
         from datetime import datetime, timezone
+        # `thinking` is the one generation-time field that IS resolvable here.
+        # Guarded separately: a refusal row is worth more than one field, and
+        # the wrapper below would drop the whole row rather than this value.
+        thinking = None
+        try:
+            thinking = engine.resolve_thinking(req)
+        except Exception:                       # noqa: BLE001 -- field, not row
+            pass
+        # The SAME key set as EngineHandle._write_request_row, with null where
+        # the value is genuinely unknown at refusal time. Omitting keys instead
+        # made `row["prefix_hit"]` a KeyError in a maintainer's script depending
+        # on which kind of row it hit -- and documentation/server.md describes
+        # only the engine row's shape.
         reqlog.write_row(getattr(engine, "log_dir", None), {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "session": getattr(req, "session_key", None),
             "prompt_tokens": None, "cap": None, "stream": stream,
-            "tokens": 0, "finish": "refused", "wall_s": 0.0,
+            "thinking": thinking,
+            "max_tokens": getattr(req, "max_tokens", None),
+            "temperature": getattr(req, "temperature", None),
+            "tools": len(getattr(req, "tools", None) or []),
+            "prefix_hit": None, "ttft_s": None, "wall_s": 0.0,
+            "tokens": 0, "finish": "refused",
+            "decode_tok_s": None,
             "decode": None,
             "error": {"type": exc_type, "message": message, "traceback": None},
         })
@@ -468,6 +487,16 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
                 return _error(400, str(ex), "invalid_request_error")
+            except Exception as ex:                   # noqa: BLE001 -- re-raised
+                # prepare() raises more than those three. render_prompt runs the
+                # tokenizer's Jinja template over the messages, and a malformed
+                # sequence raises whatever the template raises. Here that lands
+                # BEFORE any StreamingResponse exists, so it propagates out of
+                # the route as a bare 500 -- and the SSE generator that would
+                # have written the row is never created. The row is this
+                # handler's to write; the 500 is still correct, so re-raise.
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
+                raise
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
                      session_id=req.session_key, prepared=prepared),
@@ -484,12 +513,20 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             _refusal_row(e, req, "QueueFull", str(ex), stream=False)
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
-            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
+            # No row: prepare() now runs inside generate()'s try, so generate()
+            # already wrote one -- with finish="refused", the same value this
+            # handler used to write. Writing a second here would double-count
+            # every oversized prompt on the non-streaming path.
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
-            # No row here: this came out of e.generate(), which already wrote
-            # one from its own `finally`. A second row would double-count the
-            # only case anyone would actually be counting.
+            # No row here: everything that can raise inside the `async with`
+            # above -- prepare() included, since it now runs inside generate()'s
+            # own try -- reaches generate()'s row-writing `finally` first. A
+            # second row would double-count the only case anyone would actually
+            # be counting. What this does NOT cover is a failure of `e.slot`
+            # itself other than QueueFull (handled above); there is no such
+            # failure mode today, and inventing a row for it would be the
+            # double-count.
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
         finally:
             watchdog.cancel()
@@ -575,39 +612,58 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # handler returned, so a slot held around that return would already be
         # released before the first token.
         async with engine.slot(req.session_key):
-            async for kind, payload in engine.stream(req, cancel=cancel,
-                                                     prepared=prepared):
-                if kind == "final":
-                    final = payload
-                    break
-                if suppressing:
-                    buffered += payload
-                    continue
-                held += payload
-                if open_marker and open_marker in held:
-                    # Everything from here MIGHT belong to a tool call. Emit the
-                    # prose that preceded it and buffer the rest until the final
-                    # event says which it was.
-                    cut = held.index(open_marker)
-                    if held[:cut]:
-                        sent += held[:cut]
-                        yield _chunk(cid, created, model_name, session_id=session_id,
-                                     delta={"content": held[:cut]})
-                    held, buffered, suppressing = "", held[cut:], True
-                    continue
-                # Hold back a marker-length tail so an open marker split across
-                # two chunks is still recognised.
-                keep = (len(open_marker) - 1) if open_marker else 0
-                if len(held) > keep:
-                    emit, held = held[:len(held) - keep], held[len(held) - keep:]
-                    sent += emit
-                    yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+            gen = engine.stream(req, cancel=cancel, prepared=prepared)
+            try:
+                async for kind, payload in gen:
+                    if kind == "final":
+                        final = payload
+                        break
+                    if suppressing:
+                        buffered += payload
+                        continue
+                    held += payload
+                    if open_marker and open_marker in held:
+                        # Everything from here MIGHT belong to a tool call. Emit
+                        # the prose that preceded it and buffer the rest until
+                        # the final event says which it was.
+                        cut = held.index(open_marker)
+                        if held[:cut]:
+                            sent += held[:cut]
+                            yield _chunk(cid, created, model_name, session_id=session_id,
+                                         delta={"content": held[:cut]})
+                        held, buffered, suppressing = "", held[cut:], True
+                        continue
+                    # Hold back a marker-length tail so an open marker split
+                    # across two chunks is still recognised.
+                    keep = (len(open_marker) - 1) if open_marker else 0
+                    if len(held) > keep:
+                        emit, held = held[:len(held) - keep], held[len(held) - keep:]
+                        sent += emit
+                        yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+            finally:
+                # EVERY real streaming request leaves this loop by `break` on
+                # the "final" event, and Python does not close a generator on
+                # `break`: engine.stream stays suspended at its last yield until
+                # GC drops it and asyncio schedules the finalizer. Its
+                # row-writing `finally` therefore ran AFTER this `async with`
+                # released the slot -- so `wall_s`/`decode_tok_s` disagreed with
+                # server.log's DONE line, and the row's `after` counter snapshot
+                # picked up the NEXT admitted request's NVMe reads as this
+                # request's bytes_read_gb. Closing here puts the row inside the
+                # lock, where its `before` edge already was.
+                await gen.aclose()
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
         # real 503; this is the admission race it cannot see. The headers are
         # already sent, so the status cannot be corrected -- but the event type
         # can be honest, and "internal_error" tells a client to stop retrying
         # when retrying is exactly the right response.
+        #
+        # `slot` raises BEFORE it yields, so engine.stream() is never entered
+        # and its row-writing `finally` never runs. Without this call the
+        # request that lost the admission race is the one kind of request that
+        # ends with no row at all.
+        _refusal_row(engine, req, "QueueFull", str(ex), stream=True)
         yield _error_event(ex, "server_busy")
         yield "data: [DONE]\n\n"
         return

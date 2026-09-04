@@ -46,7 +46,12 @@ def _checkpoint_looks_like_moe(model_path) -> bool:
         return False
     if not isinstance(data, dict):
         return False
+    # `not isinstance(v, bool)`: bool IS an int in Python, so a dense config
+    # carrying "expert_parallel": false read as MoE. `v > 0`: "num_experts": 0
+    # is a dense model spelling out that it has none. Either one used to bill
+    # the drafter-on-MoE tax to a model that is not MoE at all.
     return any("expert" in k.lower() and isinstance(v, int)
+               and not isinstance(v, bool) and v > 0
                for k, v in data.items())
 
 

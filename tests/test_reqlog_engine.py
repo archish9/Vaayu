@@ -185,3 +185,59 @@ def test_a_logging_failure_does_not_replace_the_real_exception(tmp_path, monkeyp
     e = EngineHandle(M(raise_on_generate=RuntimeError("CUDA OOM")), log_dir=tmp_path)
     with pytest.raises(RuntimeError, match="CUDA OOM"):
         asyncio.run(e.generate(_req()))
+
+
+def test_a_prepare_failure_still_writes_a_row_non_streaming(tmp_path):
+    """prepare() -> render_prompt() -> apply_chat_template() runs Jinja over
+    the messages, and a malformed sequence raises whatever the template
+    raises -- none of the three types the route names. It used to sit OUTSIDE
+    generate()'s try, so this class of failure ended with no row at all, on
+    the one path whose whole contract is that a request never ends without
+    one."""
+    m = M()
+    def boom(messages, **kw):
+        raise ValueError("Jinja: unknown role 'tool' with no matching call")
+    m.tokenizer.apply_chat_template = boom
+    e = EngineHandle(m, log_dir=tmp_path)
+
+    with pytest.raises(ValueError, match="Jinja"):
+        asyncio.run(e.generate(_req()))
+    r = rows(tmp_path)
+    assert len(r) == 1, "a prepare() failure left no row"
+    assert r[0]["finish"] == "error"
+    assert r[0]["error"]["type"] == "ValueError"
+    assert r[0]["prompt_tokens"] == 0     # never got one; not a NameError
+
+
+def test_a_prepare_failure_still_writes_a_row_streaming(tmp_path):
+    """stream()'s own fallback path, for callers that do not pass `prepared`."""
+    m = M()
+    def boom(messages, **kw):
+        raise ValueError("Jinja: unknown role")
+    m.tokenizer.apply_chat_template = boom
+    e = EngineHandle(m, log_dir=tmp_path)
+
+    async def main():
+        async for _kind, _payload in e.stream(_req()):
+            pass
+
+    with pytest.raises(ValueError, match="Jinja"):
+        asyncio.run(main())
+    assert len(rows(tmp_path)) == 1
+
+
+def test_a_cancelled_non_streaming_request_records_finish_cancelled(tmp_path):
+    """`finish_reason()` maps cancelled -> "length" on purpose: the OpenAI wire
+    vocabulary has no other word. requests.jsonl is NOT the wire, and
+    documentation/server.md promises `cancelled` there -- otherwise a
+    disconnect is indistinguishable from a truncated answer."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    cancel = engine_mod.CancelToken()
+    cancel.cancel()
+
+    result = asyncio.run(e.generate(_req(), cancel=cancel))
+    # The WIRE value is unchanged -- that is the OpenAI vocabulary's problem.
+    assert result.finish_reason == "length"
+    r = rows(tmp_path)
+    assert len(r) == 1
+    assert r[0]["finish"] == "cancelled"
