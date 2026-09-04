@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
-from . import envinfo
+from . import envinfo, reqlog
 from .engine import CancelToken, EngineHandle, QueueFull
 from .logs import capture_stdio, collected_warnings, new_run_dir
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
@@ -238,6 +238,29 @@ def _error(status: int, message: str, kind: str, headers=None):
                         content={"error": {"message": message, "type": kind}})
 
 
+def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> None:
+    """A row for a request refused BEFORE generation.
+
+    The engine writes rows from its own `finally`, but these never reach it:
+    the session-id check and (for the streaming path) `prepare()` both run in
+    the route, the latter deliberately so an oversized prompt is a 400 rather
+    than an SSE internal_error (B8). Without this, a support bundle is silent
+    about exactly the requests it most needs to explain.
+
+    Never raises -- `reqlog.write_row` swallows, and this is on a path that is
+    already returning an error to the client.
+    """
+    from datetime import datetime, timezone
+    reqlog.write_row(getattr(engine, "log_dir", None), {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "session": getattr(req, "session_key", None),
+        "prompt_tokens": None, "cap": None, "stream": stream,
+        "tokens": 0, "finish": "refused", "wall_s": 0.0,
+        "decode": None,
+        "error": {"type": exc_type, "message": message, "traceback": None},
+    })
+
+
 def _session_header(req) -> dict:
     """Echo the session the prefix cache will actually key on.
 
@@ -388,6 +411,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         e = app.state.engine
         cfg = getattr(app.state, "config", None)
         if cfg is not None and cfg.require_session_id and not req.session_key:
+            _refusal_row(e, req, "MissingSessionId",
+                         "no session_id and REQUIRE_SESSION_ID is on",
+                         stream=resolve_stream(req, cfg))
             return _error(400,
                           "this request names no session. Send `session_id` (or "
                           "OpenAI's `user`, which is used as one). Without it the "
@@ -409,6 +435,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # depth check keeps a full queue an honest 503 rather than an SSE
             # error event.
             if e.depth >= e.queue_depth:
+                _refusal_row(e, req, "QueueFull",
+                             f"{e.depth} queued, depth {e.queue_depth}",
+                             stream=True)
                 return _error(503, f"{e.depth} requests are already queued "
                                    f"(depth {e.queue_depth}). This engine runs "
                                    f"one request at a time.",
@@ -422,6 +451,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # result is handed to _sse so it is not built twice.
                 prepared = e.prepare(req)
             except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
                 return _error(400, str(ex), "invalid_request_error")
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
@@ -436,10 +466,15 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             async with e.slot(req.session_key):
                 result = await e.generate(req, cancel=cancel)
         except QueueFull as ex:
+            _refusal_row(e, req, "QueueFull", str(ex), stream=False)
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
+            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
+            # No row here: this came out of e.generate(), which already wrote
+            # one from its own `finally`. A second row would double-count the
+            # only case anyone would actually be counting.
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
         finally:
             watchdog.cancel()
