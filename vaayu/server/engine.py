@@ -7,10 +7,13 @@ is deliberately not wired in: it is static-batch v1 and would admit nothing here
 """
 import asyncio
 import queue as _queue
+import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
+from . import reqlog
 from .chat import render_prompt
 from .logs import clear_current_session, session_event, set_current_session
 from .stopping import finish_reason, resolve_max_tokens
@@ -211,6 +214,43 @@ class EngineHandle:
             session_event(self.log_dir, getattr(req, "session_key", None),
                           event, **fields)
 
+    def _write_request_row(self, req, *, stream: bool, started: float,
+                           prompt_tokens: int, cap: int, snap_before: dict,
+                           tokens: int = 0, finish: str = "error",
+                           ttft_s=None, hits_before: int = 0, error=None) -> None:
+        """One `requests.jsonl` row. Called from a `finally`, so it runs on the
+        success path, the raise path, and the client-disconnect path alike --
+        which is the point: audit item 9 was that a failed request left a REQ
+        line with no DONE and an unattributed traceback in server.log.
+
+        Never raises (reqlog.write_row swallows), and never computes anything
+        it cannot: a request that produced no tokens gets None per-token means
+        rather than a ZeroDivisionError on top of whatever already failed.
+        """
+        import time
+        wall = time.time() - started
+        snap_after = reqlog.snapshot(self.model)
+        reqlog.write_row(self.log_dir, {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "session": getattr(req, "session_key", None),
+            "prompt_tokens": prompt_tokens,
+            "cap": cap,
+            "stream": stream,
+            "thinking": self.resolve_thinking(req),
+            "max_tokens": getattr(req, "max_tokens", None),
+            "temperature": getattr(req, "temperature", None),
+            "tools": len(getattr(req, "tools", None) or []),
+            "prefix_hit": self._prefix_hits() > hits_before,
+            "ttft_s": ttft_s,
+            "wall_s": wall,
+            "tokens": tokens,
+            "finish": finish,
+            "decode_tok_s": ((tokens - 1) / wall
+                             if wall > 0 and tokens > 1 else None),
+            "decode": reqlog.decode_block(snap_before, snap_after, tokens),
+            "error": reqlog.error_block(error),
+        })
+
     def _prefix_hits(self) -> int:
         pc = getattr(self.model, "_prefix_cache", None)
         return getattr(pc, "hits", 0) if pc is not None else 0
@@ -357,6 +397,7 @@ class EngineHandle:
             # waits for the worker (B16).
             cancel = CancelToken()
         started, hits_before = time.time(), self._prefix_hits()
+        snap_before = reqlog.snapshot(self.model)
         prompt_ids, cap = self.prepare(req)
         self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
                   thinking=("on" if self.resolve_thinking(req) else "off"))
@@ -368,39 +409,51 @@ class EngineHandle:
             print(f"[Vaayu-Server] WARNING: non-streaming request with no "
                   f"max_tokens: up to {cap} tokens will be generated before ANY "
                   f"bytes are sent. Set max_tokens, or use stream=true.")
-        kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
-        loop = asyncio.get_running_loop()
-        # An OWN thread, not a run_in_executor pool worker: `quiesce()` joins
-        # what is published here, and a pool thread never exits, so joining one
-        # would hang forever. The bridge mirrors stream()'s pump.
-        bridge: _queue.Queue = _queue.Queue()
+        row = {"tokens": 0, "finish": "error", "error": None}
+        try:
+            kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
+            loop = asyncio.get_running_loop()
+            # An OWN thread, not a run_in_executor pool worker: `quiesce()` joins
+            # what is published here, and a pool thread never exits, so joining one
+            # would hang forever. The bridge mirrors stream()'s pump.
+            bridge: _queue.Queue = _queue.Queue()
 
-        def _work():
-            try:
-                bridge.put(("out", self.model.generate(**kwargs)))
-            except BaseException as ex:         # noqa: BLE001 -- re-raised below
-                bridge.put(("error", ex))
+            def _work():
+                try:
+                    bridge.put(("out", self.model.generate(**kwargs)))
+                except BaseException as ex:         # noqa: BLE001 -- re-raised below
+                    bridge.put(("error", ex))
 
-        thread = threading.Thread(target=_work, daemon=True)
-        async with self._running(cancel, thread):
-            thread.start()
-            kind, payload = await loop.run_in_executor(None, bridge.get)
-        if kind == "error":
-            raise payload
-        out = payload
-        new_ids, text = self._decode_new(out, len(prompt_ids))
-        cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None,
-                                  declared_tool_names(req.tools))
-        finish = self._finish(new_ids, cap, calls, cancel=cancel)
-        wall = time.time() - started
-        self._log(req, "DONE", tokens=len(new_ids), finish=finish,
-                  prefix_hit=self._prefix_hits() > hits_before,
-                  wall=f"{wall:.1f}s",
-                  decode=f"{(len(new_ids) - 1) / wall:.3f}tok/s" if wall > 0 and len(new_ids) > 1 else "n/a")
-        return GenerationResult(
-            text=cleaned, tool_calls=calls,
-            prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
-            finish_reason=finish)
+            thread = threading.Thread(target=_work, daemon=True)
+            async with self._running(cancel, thread):
+                thread.start()
+                kind, payload = await loop.run_in_executor(None, bridge.get)
+            if kind == "error":
+                raise payload
+            out = payload
+            new_ids, text = self._decode_new(out, len(prompt_ids))
+            cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None,
+                                      declared_tool_names(req.tools))
+            finish = self._finish(new_ids, cap, calls, cancel=cancel)
+            wall = time.time() - started
+            self._log(req, "DONE", tokens=len(new_ids), finish=finish,
+                      prefix_hit=self._prefix_hits() > hits_before,
+                      wall=f"{wall:.1f}s",
+                      decode=f"{(len(new_ids) - 1) / wall:.3f}tok/s" if wall > 0 and len(new_ids) > 1 else "n/a")
+            row["tokens"], row["finish"] = len(new_ids), finish
+            return GenerationResult(
+                text=cleaned, tool_calls=calls,
+                prompt_tokens=len(prompt_ids), completion_tokens=len(new_ids),
+                finish_reason=finish)
+        except BaseException as ex:              # noqa: BLE001 -- re-raised
+            row["error"] = ex
+            raise
+        finally:
+            self._write_request_row(
+                req, stream=False, started=started,
+                prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
+                tokens=row["tokens"], finish=row["finish"],
+                hits_before=hits_before, error=row["error"])
 
     async def stream(self, req, cancel=None, prepared=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
@@ -426,95 +479,115 @@ class EngineHandle:
             cancel = CancelToken()
 
         started, hits_before = time.time(), self._prefix_hits()
-        prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
-        self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
-                  thinking=("on" if self.resolve_thinking(req) else "off"))
-        ttft_logged = False
-        kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
-        input_ids = kwargs.pop("input_ids")
-        temperature = kwargs.get("temperature", 0.0)
-        top_p = kwargs.get("top_p", 1.0)
-        # stream_generate builds these itself; leaving any of them in **kwargs is
-        # a duplicate-keyword TypeError, which is how `use_cache` shipped broken
-        # past every fake-backed test and was caught only on-device.
-        for k in STREAM_GENERATE_OWNS:
-            kwargs.pop(k, None)
-
-        loop = asyncio.get_running_loop()
-        bridge: _queue.Queue = _queue.Queue()
-        DONE = object()
-        # The real generated ids, filled by the streamer as they are produced.
-        # Re-tokenizing the decoded text does not reproduce them -- it is decoded
-        # with skip_special_tokens=True, so EOS is gone and merges differ across
-        # a decode boundary -- and both completion_tokens and finish_reason are
-        # derived from the count.
-        new_ids: list = []
-
-        def _pump():
-            try:
-                for chunk in stream_generate(self.model, input_ids,
-                                             max_new_tokens=cap,
-                                             temperature=temperature,
-                                             top_p=top_p,
-                                             token_ids_out=new_ids, **kwargs):
-                    bridge.put(("delta", chunk))
-            except BaseException as e:              # noqa: BLE001 -- re-raised below
-                bridge.put(("error", e))
-            finally:
-                bridge.put((DONE, None))
-
-        thread = threading.Thread(target=_pump, daemon=True)
-        self._live_cancel = cancel
-        self._live_thread = thread
-        thread.start()
-
-        parts, error = [], None
+        snap_before = reqlog.snapshot(self.model)
+        row = {"tokens": 0, "finish": "error", "error": None, "ttft_s": None}
+        # Defaults for the `finally` below, in case `prepare()` itself raises
+        # (the fallback path only -- the HTTP route normally passes `prepared`
+        # already computed, per the docstring above): the row must still be
+        # buildable rather than raising a NameError that replaces the real
+        # exception on its way out.
+        prompt_ids, cap = [], 0
         try:
-            while True:
-                kind, payload = await loop.run_in_executor(None, bridge.get)
-                if kind is DONE:
-                    break
-                if kind == "error":
-                    error = payload
-                    break
-                parts.append(payload)
-                if not ttft_logged:
-                    ttft_logged = True
-                    self._log(req, "TTFT", at=f"{time.time() - started:.1f}s")
-                yield ("delta", payload)
-        except BaseException:                   # noqa: BLE001 -- re-raised
-            # The consumer went away -- Starlette closes this generator with
-            # GeneratorExit, which is a BaseException -- or threw in. The
-            # worker is still inside model.generate, so cancel it before the
-            # `finally` waits: an uncancelled join here would block for the
-            # whole remaining cap.
-            cancel.cancel()
-            raise
-        finally:
-            # The token stays published until the worker has ACTUALLY exited.
-            # Clearing it first -- which this `finally` used to do, on a path
-            # that also skipped the join entirely -- makes `cancel_all()`
-            # report idle with a generation still on the GPU, so a SIGTERM
-            # shutdown proceeds underneath it (B9). It is also the token
-            # `slot()`'s `quiesce()` cancels through (B4).
-            try:
-                thread.join()
-            finally:
-                self._live_cancel = None
-                self._live_thread = None
-        if error is not None:
-            raise error
+            prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
+            self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
+                      thinking=("on" if self.resolve_thinking(req) else "off"))
+            ttft_logged = False
+            kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
+            input_ids = kwargs.pop("input_ids")
+            temperature = kwargs.get("temperature", 0.0)
+            top_p = kwargs.get("top_p", 1.0)
+            # stream_generate builds these itself; leaving any of them in **kwargs is
+            # a duplicate-keyword TypeError, which is how `use_cache` shipped broken
+            # past every fake-backed test and was caught only on-device.
+            for k in STREAM_GENERATE_OWNS:
+                kwargs.pop(k, None)
 
-        full = "".join(parts)
-        cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None,
-                                  declared_tool_names(req.tools))
-        produced = len(new_ids)
-        finish = self._finish(new_ids, cap, calls, cancel=cancel)
-        wall = time.time() - started
-        self._log(req, "DONE", tokens=produced, finish=finish,
-                  prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
-                  decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
-        yield ("final", GenerationResult(
-            text=cleaned, tool_calls=calls,
-            prompt_tokens=len(prompt_ids), completion_tokens=produced,
-            finish_reason=finish))
+            loop = asyncio.get_running_loop()
+            bridge: _queue.Queue = _queue.Queue()
+            DONE = object()
+            # The real generated ids, filled by the streamer as they are produced.
+            # Re-tokenizing the decoded text does not reproduce them -- it is decoded
+            # with skip_special_tokens=True, so EOS is gone and merges differ across
+            # a decode boundary -- and both completion_tokens and finish_reason are
+            # derived from the count.
+            new_ids: list = []
+
+            def _pump():
+                try:
+                    for chunk in stream_generate(self.model, input_ids,
+                                                 max_new_tokens=cap,
+                                                 temperature=temperature,
+                                                 top_p=top_p,
+                                                 token_ids_out=new_ids, **kwargs):
+                        bridge.put(("delta", chunk))
+                except BaseException as e:              # noqa: BLE001 -- re-raised below
+                    bridge.put(("error", e))
+                finally:
+                    bridge.put((DONE, None))
+
+            thread = threading.Thread(target=_pump, daemon=True)
+            self._live_cancel = cancel
+            self._live_thread = thread
+            thread.start()
+
+            parts, error = [], None
+            try:
+                while True:
+                    kind, payload = await loop.run_in_executor(None, bridge.get)
+                    if kind is DONE:
+                        break
+                    if kind == "error":
+                        error = payload
+                        break
+                    parts.append(payload)
+                    if not ttft_logged:
+                        ttft_logged = True
+                        row["ttft_s"] = time.time() - started
+                        self._log(req, "TTFT", at=f"{row['ttft_s']:.1f}s")
+                    yield ("delta", payload)
+            except BaseException:                   # noqa: BLE001 -- re-raised
+                # The consumer went away -- Starlette closes this generator with
+                # GeneratorExit, which is a BaseException -- or threw in. The
+                # worker is still inside model.generate, so cancel it before the
+                # `finally` waits: an uncancelled join here would block for the
+                # whole remaining cap.
+                row["error"] = None if isinstance(sys.exc_info()[1], GeneratorExit) \
+                               else sys.exc_info()[1]
+                cancel.cancel()
+                raise
+            finally:
+                # The token stays published until the worker has ACTUALLY exited.
+                # Clearing it first -- which this `finally` used to do, on a path
+                # that also skipped the join entirely -- makes `cancel_all()`
+                # report idle with a generation still on the GPU, so a SIGTERM
+                # shutdown proceeds underneath it (B9). It is also the token
+                # `slot()`'s `quiesce()` cancels through (B4).
+                try:
+                    thread.join()
+                finally:
+                    self._live_cancel = None
+                    self._live_thread = None
+            if error is not None:
+                row["error"] = error
+                raise error
+
+            full = "".join(parts)
+            cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None,
+                                      declared_tool_names(req.tools))
+            produced = len(new_ids)
+            finish = self._finish(new_ids, cap, calls, cancel=cancel)
+            wall = time.time() - started
+            self._log(req, "DONE", tokens=produced, finish=finish,
+                      prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
+                      decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
+            row["tokens"], row["finish"] = produced, finish
+            yield ("final", GenerationResult(
+                text=cleaned, tool_calls=calls,
+                prompt_tokens=len(prompt_ids), completion_tokens=produced,
+                finish_reason=finish))
+        finally:
+            self._write_request_row(
+                req, stream=True, started=started,
+                prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
+                tokens=row["tokens"], finish=row["finish"], ttft_s=row["ttft_s"],
+                hits_before=hits_before, error=row["error"])
