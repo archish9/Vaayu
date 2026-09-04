@@ -121,6 +121,7 @@ logs/
   run-2026-09-03T17-03-11Z/
     env.json          # the machine, the effective config, the derived model
     server.log        # every line the process emitted, timestamped, session-tagged
+    requests.jsonl    # one JSON row per request, appended when it ends
     sessions/
       agent-7.log     # only the lines emitted while agent-7 was generating
   latest -> run-2026-09-03T17-03-11Z
@@ -152,6 +153,71 @@ effective configuration (including anything set in the gitignored
 Absolute paths are redacted before they are written: a checkpoint path is
 recorded as its directory name plus a hash, never in full, so no username
 leaves your machine.
+
+**`requests.jsonl`** is the per-request companion to `server.log`: one JSON
+object, appended when the request ends — whether it completed, was refused
+before generation, raised, or was abandoned mid-stream by the client. A
+request never ends without a row, which is the point of the file — a `server.log`
+traceback used to be the only trace of a failed request, with nothing that said
+which request it belonged to.
+
+Each row carries the prompt and completion token counts, wall time and tok/s,
+the prefix-cache outcome, the resolved `finish` value, and a `decode` object
+with the request's own disk traffic and cache telemetry. `finish` is one of:
+
+| `finish` | when |
+|---|---|
+| `stop` | EOS or a stop string |
+| `length` | the token cap was hit — **output is truncated** |
+| `tool_calls` | the model called a tool |
+| `cancelled` | the client disconnected before the stream finished |
+| `error` | the request raised |
+| `refused` | rejected before generation started — an oversized prompt, a missing `session_id`, a full queue |
+
+`cancelled` is a `requests.jsonl`-only value: a client that has already
+disconnected never receives an OpenAI-vocabulary `finish_reason` for the
+request it abandoned, so this row is the only place the outcome is recorded.
+
+An `error`/`refused` row also carries an `error` object (`type`, `message`,
+`traceback`).
+
+Inside `decode`: `bytes_read_gb` and `gb_per_token` are this request's own NVMe
+traffic — the difference between the persister's read-byte counter at the end
+of the request and at its start (see the `bytes=`/`gb_tok=` fields below for
+what that counter does and does not count). `mean_expert_stall_s` is the same
+kind of diff over the engine's expert-disk-stall total.
+
+`expert_misses`, `expert_ram_hit_rate` and `expert_vram_hit_rate` are **not**
+diffs — they are the engine's counters read once, at the end of the request.
+That is deliberate: the engine resets those specific counters at the
+prefill→decode boundary, inside each request, so a decode pass's hit rate is
+not polluted by prefill's near-100%-miss cost. The point-in-time reading is
+therefore the correct per-request figure, not a shortcut. When a request never
+reached a decode pass — it failed during prefill, or produced no tokens — that
+reset never fired, and these three fields come back `null` rather than the
+*previous* request's numbers dressed up as this one's.
+
+`peak_rss_gb` and `peak_vram_gb_process` are high-water marks, not this
+request's own peak. `peak_vram_gb_process` in particular is a **process**
+figure: CUDA's peak-memory counter is process-global, and Vaayu deliberately
+never resets it, because resetting it would corrupt the VRAM calibration
+measurements that read the same counter elsewhere. Expect it to only ever hold
+steady or climb across a run — a rising number here is not a leak, it is the
+model's true ceiling being reached once and remembered.
+
+**The `bytes=`/`gb_tok=` fields on `server.log`'s `[VAAYU-IO] token summary`
+line.** These count bytes **requested of the NVMe drive** for that one token —
+counted where the read is submitted, at its sector-aligned length, not where
+it completes, so the figure is what was asked of the device rather than a
+confirmed-delivered byte count. They are decimal GB (`gb_tok`), matching every
+other GB figure this engine prints.
+
+Anything a cache serves — the expert RAM cache, the expert VRAM cache, the
+non-expert tensor cache — contributes zero to this pair, because the counting
+happens inside the persister's own read functions, which a cache hit never
+reaches. Do not confuse `gb_tok` with `expert_disk` on the same line:
+`expert_disk` is a **stall duration** (seconds spent waiting on those reads),
+not a byte count.
 
 ### Speed
 
@@ -671,6 +737,35 @@ Do not spend time here; each is measured and settled.
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 | killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |
 | `refusing to load -- the GPU is not exclusive` | something else holds GPU memory | run the commands the message prints, then start again. A container needs `docker stop`, not `kill` — `restart=unless-stopped` respawns it |
+
+### Diagnosing without starting the server
+
+```bash
+./venv/bin/python -m vaayu.server.diagnose
+```
+
+When the server will not start at all, there is no `logs/run-*/env.json` to
+read — this prints the same environment snapshot in seconds, without loading
+any weights, then flags the settings worth checking on this box:
+
+- **NVMe APST is active.** The drive drops into a low-power state between
+  reads, which fights decode's disk-stall-dominated cost.
+- **Another process holds GPU memory.** Budgets are sized once at load, so
+  this is subtracted from the expert cache for the whole run even if the
+  process exits later.
+- **The NVMe I/O scheduler is not `none`.** Reads are already O_DIRECT +
+  io_uring; a scheduler in front of them adds latency without reordering
+  anything useful.
+- **A drafter is configured against an MoE checkpoint.** Speculative decoding
+  is refused at load on MoE targets, so the drafter loads to VRAM and is then
+  discarded on every start. This check reads the checkpoint's own
+  `config.json` for an expert count, since `diagnose` never loads weights and
+  so can't ask the loaded model whether it is MoE.
+- **`DEFAULT_STREAM` is `False`.** A client that sends no `max_tokens` then
+  gets nothing until the whole answer is generated.
+
+A box with nothing to flag prints `nothing to flag on this box.` rather than a
+banner — a check that always has something to say stops being useful.
 
 ### The on-device gate
 

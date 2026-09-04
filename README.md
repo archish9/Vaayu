@@ -667,6 +667,43 @@ front. Prefix caching is disabled for non-EXL3 checkpoints; `/health` reports it
 
 ---
 
+## Reporting a problem
+
+Zip the newest run directory and attach it:
+
+```bash
+zip -r vaayu-report.zip logs/run-2026-09-04T12-00-00Z/
+```
+
+`logs/latest` is a symlink to that directory, so `ls -l logs/latest` tells you
+which one it is.
+
+It contains:
+
+| file | what it holds |
+|---|---|
+| `env.json` | the machine, the GPU, the NVMe, the effective config, the derived model geometry and budgets, and every startup warning |
+| `server.log` | the whole run's output, timestamped, one line per line |
+| `requests.jsonl` | one row per request — completed, refused before generation, raised, or abandoned mid-stream by the client. A request never ends without a row |
+| `sessions/<id>.log` | the same stream, split per session |
+
+**What is redacted.** Absolute paths are replaced by a basename plus a hash of
+the full path, so `env.json` does not carry your username or your directory
+layout. Nothing else in the bundle is filtered — skim `server.log` before
+sending it if your prompts are sensitive.
+
+**If the server will not start**, there is no run directory to send. Run this
+instead and paste the output:
+
+```bash
+./venv/bin/python -m vaayu.server.diagnose
+```
+
+It prints the same environment snapshot without loading any weights, and flags
+the settings that commonly cause trouble.
+
+---
+
 ## 🏃 Quickstart Inference Test
 
 Edit the `CONFIG` block at the top of `test_quick.py`, then run:
