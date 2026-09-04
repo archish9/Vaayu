@@ -226,30 +226,41 @@ class EngineHandle:
         Never raises (reqlog.write_row swallows), and never computes anything
         it cannot: a request that produced no tokens gets None per-token means
         rather than a ZeroDivisionError on top of whatever already failed.
+
+        The whole body is additionally wrapped in its own try/except: this
+        runs from a `finally` on the generation path, and an exception raised
+        HERE -- reqlog.snapshot, decode_block, error_block, or the dict
+        literal itself, none of which `reqlog.write_row`'s own swallow covers
+        -- would replace whatever real exception was already propagating (a
+        CUDA OOM becoming a confusing logging traceback instead). A lost log
+        line is cheaper than a lost diagnosis of the thing that actually failed.
         """
         import time
-        wall = time.time() - started
-        snap_after = reqlog.snapshot(self.model)
-        reqlog.write_row(self.log_dir, {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "session": getattr(req, "session_key", None),
-            "prompt_tokens": prompt_tokens,
-            "cap": cap,
-            "stream": stream,
-            "thinking": self.resolve_thinking(req),
-            "max_tokens": getattr(req, "max_tokens", None),
-            "temperature": getattr(req, "temperature", None),
-            "tools": len(getattr(req, "tools", None) or []),
-            "prefix_hit": self._prefix_hits() > hits_before,
-            "ttft_s": ttft_s,
-            "wall_s": wall,
-            "tokens": tokens,
-            "finish": finish,
-            "decode_tok_s": ((tokens - 1) / wall
-                             if wall > 0 and tokens > 1 else None),
-            "decode": reqlog.decode_block(snap_before, snap_after, tokens),
-            "error": reqlog.error_block(error),
-        })
+        try:
+            wall = time.time() - started
+            snap_after = reqlog.snapshot(self.model)
+            reqlog.write_row(self.log_dir, {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "session": getattr(req, "session_key", None),
+                "prompt_tokens": prompt_tokens,
+                "cap": cap,
+                "stream": stream,
+                "thinking": self.resolve_thinking(req),
+                "max_tokens": getattr(req, "max_tokens", None),
+                "temperature": getattr(req, "temperature", None),
+                "tools": len(getattr(req, "tools", None) or []),
+                "prefix_hit": self._prefix_hits() > hits_before,
+                "ttft_s": ttft_s,
+                "wall_s": wall,
+                "tokens": tokens,
+                "finish": finish,
+                "decode_tok_s": ((tokens - 1) / wall
+                                 if wall > 0 and tokens > 1 else None),
+                "decode": reqlog.decode_block(snap_before, snap_after, tokens),
+                "error": reqlog.error_block(error),
+            })
+        except Exception:                            # noqa: BLE001 -- never displaces
+            pass
 
     def _prefix_hits(self) -> int:
         pc = getattr(self.model, "_prefix_cache", None)
@@ -551,8 +562,17 @@ class EngineHandle:
                 # worker is still inside model.generate, so cancel it before the
                 # `finally` waits: an uncancelled join here would block for the
                 # whole remaining cap.
-                row["error"] = None if isinstance(sys.exc_info()[1], GeneratorExit) \
-                               else sys.exc_info()[1]
+                exc = sys.exc_info()[1]
+                if isinstance(exc, GeneratorExit):
+                    # A disconnect is not an error, and `finish` must say so
+                    # too: it is still at its "error" default here (the
+                    # success line below is never reached on this path), and
+                    # a row reading finish="error", error=null is incoherent
+                    # to a maintainer reading it cold.
+                    row["error"] = None
+                    row["finish"] = "cancelled"
+                else:
+                    row["error"] = exc
                 cancel.cancel()
                 raise
             finally:
@@ -585,6 +605,29 @@ class EngineHandle:
                 text=cleaned, tool_calls=calls,
                 prompt_tokens=len(prompt_ids), completion_tokens=produced,
                 finish_reason=finish))
+        except BaseException as ex:              # noqa: BLE001 -- re-raised
+            # An OUTER net, not a replacement for the inner handler above:
+            # that one still cancels the in-flight generation before
+            # re-raising, and an uncancelled join would block for the whole
+            # remaining token budget -- this one does not touch that. It
+            # exists because setup (build_generate_kwargs, thread creation)
+            # and finalize (parse_tool_calls, _finish) both run OUTSIDE the
+            # inner consumer-loop try, so a failure there used to reach the
+            # `finally` below with row["error"] still None -- a real
+            # traceback logged as a clean request, exactly the defect this
+            # file exists to eliminate. Idempotent when the inner handler
+            # already ran: same exception, same GeneratorExit check.
+            if isinstance(ex, GeneratorExit):
+                row["error"] = None
+                if row["finish"] == "error":
+                    # Only overwrite the default -- a GeneratorExit landing
+                    # HERE after the success line already ran (the client
+                    # vanished right at the final yield) must not clobber a
+                    # real finish_reason with "cancelled".
+                    row["finish"] = "cancelled"
+            else:
+                row["error"] = ex
+            raise
         finally:
             self._write_request_row(
                 req, stream=True, started=started,

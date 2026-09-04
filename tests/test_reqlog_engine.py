@@ -10,6 +10,7 @@ import json
 import pytest
 import torch
 
+import vaayu.server.engine as engine_mod
 from vaayu.server.engine import EngineHandle
 from vaayu.server.schemas import ChatCompletionRequest
 
@@ -124,3 +125,63 @@ def test_a_completed_stream_records_ttft(tmp_path):
     r = rows(tmp_path)
     assert len(r) == 1
     assert r[0]["ttft_s"] is not None and r[0]["ttft_s"] >= 0
+
+
+def test_a_finalize_phase_failure_in_stream_is_recorded_as_an_error(tmp_path, monkeypatch):
+    """parse_tool_calls runs AFTER the consumer loop's own try/except -- in
+    the finalize phase stream()'s outer except now covers. Before that outer
+    except existed, a failure here reached the row-writing `finally` with
+    `error` still None: a real traceback, logged as a clean request."""
+    def boom(*a, **kw):
+        raise RuntimeError("boom in finalize")
+    monkeypatch.setattr(engine_mod, "parse_tool_calls", boom)
+    e = EngineHandle(M(), log_dir=tmp_path)
+
+    async def main():
+        async for _kind, _payload in e.stream(_req()):
+            pass
+
+    with pytest.raises(RuntimeError, match="boom in finalize"):
+        asyncio.run(main())
+    r = rows(tmp_path)
+    assert len(r) == 1
+    assert r[0]["finish"] == "error"
+    assert r[0]["error"]["type"] == "RuntimeError"
+    assert "boom in finalize" in r[0]["error"]["message"]
+
+
+def test_an_abandoned_stream_reports_finish_cancelled(tmp_path):
+    """finish="error" beside error=null is incoherent to a maintainer reading
+    the row cold. A disconnect is not an error, but it IS a cancellation."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+
+    async def main():
+        gen = e.stream(_req())
+        await gen.__anext__()
+        await gen.aclose()
+
+    asyncio.run(main())
+    r = rows(tmp_path)
+    assert len(r) == 1
+    assert r[0]["finish"] == "cancelled"
+    assert r[0]["error"] is None
+
+
+def test_a_logging_failure_does_not_replace_the_real_exception(tmp_path, monkeypatch):
+    """_write_request_row runs from a `finally` on the generation path. If
+    building the row raises (a counter access blowing up), that must not
+    replace the real exception already propagating -- a CUDA OOM becoming a
+    confusing logging traceback instead."""
+    real_snapshot = engine_mod.reqlog.snapshot
+    calls = {"n": 0}
+
+    def flaky_snapshot(model):
+        calls["n"] += 1
+        if calls["n"] > 1:      # the `before` snapshot is real; `after` blows up
+            raise RuntimeError("counter access exploded")
+        return real_snapshot(model)
+
+    monkeypatch.setattr(engine_mod.reqlog, "snapshot", flaky_snapshot)
+    e = EngineHandle(M(raise_on_generate=RuntimeError("CUDA OOM")), log_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="CUDA OOM"):
+        asyncio.run(e.generate(_req()))
