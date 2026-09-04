@@ -12,8 +12,42 @@ which is exactly when `logs/run-*/env.json` does not exist.
 """
 import json
 import sys
+from pathlib import Path
 
 from . import config, envinfo
+
+
+def _checkpoint_looks_like_moe(model_path) -> bool:
+    """MoE-ness of a checkpoint, read from its `config.json`, WITHOUT loading
+    weights -- `diagnose` never loads the model (that is the point of it), so
+    `data["model"]["is_moe"]` (the field `envinfo._model_section` derives off
+    the loaded model) never exists here. Reading it off disk is the only way
+    this tax can ever fire for real.
+
+    Detect, don't match architecture strings (CLAUDE.md 5): any top-level key
+    whose name contains "expert" and whose value is an int is the honest
+    test. Verified on this box's three checkpoints -- Qwen3-235B carries
+    `num_experts`/`num_experts_per_tok`, MiniMax-M2.7 carries
+    `num_local_experts`/`num_experts_per_tok`, and Llama-3.3-70B (dense)
+    carries neither -- but an allow-list of the specific key names would
+    silently miss the next MoE family's own naming.
+
+    Fail-soft on every axis: no `model_path`, no `config.json`, an unreadable
+    one, or one that isn't valid JSON all resolve to False (not MoE), never
+    raise. This runs in the tool people reach for when the server will not
+    start at all, so it must exit 0 and print a report regardless of what --
+    if anything -- is sitting at MODEL_PATH.
+    """
+    if not model_path:
+        return False
+    try:
+        data = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return any("expert" in k.lower() and isinstance(v, int)
+               for k, v in data.items())
 
 
 def taxes(data: dict, cfg) -> list:
@@ -25,7 +59,6 @@ def taxes(data: dict, cfg) -> list:
     out = []
     storage = data.get("storage") or {}
     gpu = data.get("gpu") or {}
-    model = data.get("model") or {}
 
     if storage.get("apst_active"):
         us = storage.get("apst_ps_max_latency_us")
@@ -49,7 +82,11 @@ def taxes(data: dict, cfg) -> list:
             f"already O_DIRECT + io_uring; a scheduler in front of them adds "
             f"latency without reordering anything useful.")
 
-    if getattr(cfg, "DRAFTER_MODEL_PATH", None) and model.get("is_moe"):
+    # `data["model"]` never exists here (`main()` always calls `collect(None,
+    # ...)`), so MoE-ness has to come from the checkpoint's own config.json,
+    # not from `data`.
+    if (getattr(cfg, "DRAFTER_MODEL_PATH", None)
+            and _checkpoint_looks_like_moe(getattr(cfg, "MODEL_PATH", None))):
         out.append(
             "A drafter is configured and the model is MoE. Speculative decoding "
             "is refused at load on MoE targets (the Fix-#9 working-set gate), so "

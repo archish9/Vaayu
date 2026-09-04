@@ -553,3 +553,28 @@ def test_gpu_section_foreign_processes_is_empty_on_a_clean_box(monkeypatch):
     monkeypatch.setattr(gpu_audit, "audit", lambda device=None: [])
     data = envinfo.collect(_model(is_moe=False), _config())
     assert data["gpu"]["foreign_processes"] == []
+
+
+def test_device_resolves_from_uppercase_DEVICE_on_a_module_shaped_config(monkeypatch):
+    """`diagnose` passes the config MODULE, which defines `DEVICE` (uppercase),
+    not `device` -- collect() must read it rather than silently falling back
+    to `cuda:0` regardless of what the box is actually configured for."""
+    from vaayu import gpu_audit
+    monkeypatch.setattr(gpu_audit, "audit", lambda device=None: [])
+
+    class _Cfg:
+        DEVICE = "cuda:1"
+
+    data = envinfo.collect(None, _Cfg())
+    assert data["gpu"]["device"] == "cuda:1"
+
+
+def test_device_still_resolves_from_lowercase_device_on_a_dataclass_config(monkeypatch):
+    """Regression guard for the real server path: a `ServerConfig` (lowercase
+    `device`) must resolve exactly as it did before the uppercase fallback
+    was added."""
+    from vaayu import gpu_audit
+    monkeypatch.setattr(gpu_audit, "audit", lambda device=None: [])
+
+    data = envinfo.collect(_model(is_moe=False), _config(device="cuda:1"))
+    assert data["gpu"]["device"] == "cuda:1"

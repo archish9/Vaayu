@@ -527,8 +527,16 @@ def _env_section(c):
 def collect(model, config, warnings=()) -> dict:
     """The whole snapshot. Never raises."""
     c = _Collector()
+    # `config` is a ServerConfig dataclass (lowercase `device`) on every real
+    # server boot, but `diagnose` is the first caller to pass the config
+    # MODULE instead (uppercase `DEVICE`) -- accept either spelling here so
+    # `diagnose` audits the GPU actually configured rather than always
+    # falling back to index 0 on a box set up for `cuda:1`. Narrow to this
+    # one read; the module's other lowercase `getattr(config, ...)` reads are
+    # a separate question this fix does not touch.
     device = c.safe("config.device",
-                    lambda: getattr(config, "device", None)) or "cuda:0"
+                    lambda: (getattr(config, "device", None)
+                             or getattr(config, "DEVICE", None))) or "cuda:0"
     data = {
         "vaayu": _vaayu_section(c),
         "python": _python_section(c),
