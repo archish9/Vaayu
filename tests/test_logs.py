@@ -932,3 +932,37 @@ def test_a_just_printed_warning_is_visible_with_no_sleep(tmp_path):
         "collected_warnings() must see a just-printed WARNING immediately, "
         "with no sleep -- without draining the pump first this is a race "
         f"(got {immediate!r}); see logs.drain()")
+
+
+def test_session_event_warns_once_on_oserror(tmp_path, capsys, monkeypatch):
+    """Audit item 12: a read-only logs/ used to yield an empty sessions/ with
+    no hint why. The guard STAYS -- logging must never raise on the generation
+    path -- but the first failure now says so."""
+    from vaayu.server import logs
+
+    monkeypatch.setattr(logs, "_session_event_warned", False)
+
+    def boom(*a, **kw):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(logs.Path, "mkdir", boom)
+
+    logs.session_event(tmp_path, "s", "REQ", prompt=3)
+    first = capsys.readouterr().out
+    assert "session log" in first.lower()
+    assert str(tmp_path) in first
+    assert "30" in first or "Read-only" in first
+
+    logs.session_event(tmp_path, "s", "DONE", tokens=1)
+    assert capsys.readouterr().out == ""     # once per process, not per line
+
+
+def test_session_event_still_never_raises(tmp_path, monkeypatch):
+    from vaayu.server import logs
+
+    def boom(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(logs.Path, "mkdir", boom)
+    logs.session_event(tmp_path, "s", "REQ", prompt=3)      # must not raise
+    logs.session_event(tmp_path, "s", "DONE", tokens=1)     # nor the second time

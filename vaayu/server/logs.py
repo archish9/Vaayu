@@ -30,6 +30,7 @@ _write_lock = threading.Lock()
 _marker_lock = threading.Lock()
 _current_session: str | None = None
 _overlap_warned = False
+_session_event_warned = False
 
 # The one session generating right now, or None when the engine is idle.
 #
@@ -229,8 +230,28 @@ def session_event(log_dir, session_id, event: str, **fields) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _write_lock, open(path, "a") as f:
             f.write(f"{stamp} {event:<6} {body}\n")
-    except OSError:
-        pass
+    except OSError as e:
+        # Audit item 12. The guard STAYS -- logging must never raise on the
+        # generation path -- but a silent one meant a read-only logs/ produced
+        # an empty sessions/ with no hint why, and the user reporting it had
+        # nothing to send.
+        #
+        # ONCE per process, not per line: a read-only mount fails on every
+        # request, and a per-line warning would itself become the flood it is
+        # reporting. This goes through print(), so the pump timestamps it,
+        # server.log keeps it, and note_if_warning harvests it into env.json's
+        # `warnings` array -- which is the point: a user who pastes only a tail
+        # still ships it.
+        global _session_event_warned
+        if not _session_event_warned:
+            _session_event_warned = True
+            try:
+                print(f"[Vaayu-Server] WARNING: cannot write the session log at "
+                      f"{path} (errno {e.errno}: {e.strerror}). Per-session logs "
+                      f"are OFF for this run; server.log is unaffected and the "
+                      f"server keeps serving. This warning prints once.")
+            except OSError:
+                pass        # same rule, one level down: never raise here
 
 
 _session_sink: dict = {"key": None, "fh": None, "size": 0}
