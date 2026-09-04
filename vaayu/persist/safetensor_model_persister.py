@@ -193,8 +193,9 @@ _PINNED_TIMINGS_LOCK = threading.Lock()
 
 _USE_DIRECT_IO: bool = True  # safe default; overridden by init_model_io() (Plan 5)
 
-# Total bytes this process has read from the checkpoint, for the token
-# summary's gb_tok= field and the server's requests.jsonl.
+# Total bytes this process has REQUESTED of the NVMe, for the token
+# summary's gb_tok= field and the server's requests.jsonl. Counted at read
+# submission (aligned lengths), not at completion.
 #
 # MONOTONIC ON PURPOSE -- there is deliberately no reset. Two consumers take
 # different windows over this one counter: vaayu_base subtracts a baseline it
@@ -209,6 +210,9 @@ _USE_DIRECT_IO: bool = True  # safe default; overridden by init_model_io() (Plan
 # module, so a cache hit contributes zero by construction instead of by a flag
 # someone has to remember to set.
 #
+# Note: a read that raises before completing is still counted. This is
+# acceptable because such paths abort the process.
+#
 # Locked because these run on ThreadPoolExecutor workers and `+=` on a module
 # global is a load-add-store, not an atomic. One uncontended acquisition per
 # read (~190/token) is nothing beside an 11.9 MB O_DIRECT read.
@@ -217,14 +221,15 @@ _read_bytes_lock = threading.Lock()
 
 
 def note_read_bytes(n: int) -> None:
-    """Record `n` bytes read from the checkpoint."""
+    """Record `n` bytes requested of the drive (aligned read length at submission)."""
     global _read_bytes
     with _read_bytes_lock:
         _read_bytes += n
 
 
 def read_bytes() -> int:
-    """Total checkpoint bytes read by this process so far. Monotonic."""
+    """Total checkpoint bytes requested of the drive so far (aligned lengths, at
+    submission). Monotonic; never reset."""
     with _read_bytes_lock:
         return _read_bytes
 
@@ -441,11 +446,13 @@ def _load_pinned(file_path: str) -> dict:
 
     buf = _PINNED_BUFS[buf_idx]
 
+    _bytes_read_this_call = 0
     if _USE_IOURING:
         # ── 3a. Rust io_uring read (zero-copy into pinned buffer) ───
         aligned_offset = _align_down(data_start)
         prefix_pad = data_start - aligned_offset
         aligned_length = _align_up(total_size + prefix_pad)
+        _bytes_read_this_call = aligned_length
         print(f"[VAAYU-IO] io  file={os.path.basename(file_path)}"
               f"  data_start={data_start}  total={total_size}  file_size={file_size}")
         print(f"[VAAYU-IO] align  raw_off={data_start}→aligned_off={aligned_offset}"
@@ -481,6 +488,7 @@ def _load_pinned(file_path: str) -> dict:
             _t_io = time.perf_counter()
             list(_EXECUTOR.map(_read_chunk, range(_NUM_IO_THREADS)))
             _io_wait_us = int((time.perf_counter() - _t_io) * 1e6)
+            _bytes_read_this_call = total_size
         finally:
             os.close(fd)
 
@@ -502,6 +510,7 @@ def _load_pinned(file_path: str) -> dict:
             "tensor_reconstruct_us": _tensor_reconstruct_us,
         }
 
+    note_read_bytes(_bytes_read_this_call)
     return result
 
 
@@ -648,7 +657,6 @@ class SafetensorModelPersister(ModelPersister):
             elapsed = time.time() - t
             tag = "iouring" if _USE_IOURING else "pinned"
             size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
-            note_read_bytes(sum(v.nbytes for v in result.values()))
             gbps = (size_mb / 1024) / elapsed if elapsed > 0 else 0
             print(f"[VAAYU-IO] {tag}  {elapsed:.3f}s  {size_mb:.1f}MB  {gbps:.2f}GB/s  {layer_name}")
             return result

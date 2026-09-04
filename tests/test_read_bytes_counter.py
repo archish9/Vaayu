@@ -106,3 +106,16 @@ def test_load_model_counts_its_read(tmp_path):
     result = smp.SafetensorModelPersister().load_model(layer_name, str(tmp_path))
     materialised = sum(v.nbytes for v in result.values())
     assert smp.read_bytes() - before >= materialised
+
+
+def test_the_no_offset_index_fallback_is_counted_too(tmp_path):
+    """load_non_expert_tensors returns early to a full-shard read when it has
+    no offset index. That is a real read and must count -- it was missed when
+    the counter went in per-group, below the early return."""
+    layer_name = "model.layers.0"
+    _make_shard(tmp_path, layer_name)
+    shard = tmp_path / f"{layer_name}.safetensors"
+    before = smp.read_bytes()
+    result = smp.load_non_expert_tensors(str(shard), layer_name, None)
+    assert smp.read_bytes() > before, "the offset_index=None fallback read nothing?"
+    assert result, "the fallback returned no tensors -- wrong premise for this test"

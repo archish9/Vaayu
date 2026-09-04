@@ -138,8 +138,8 @@ What the pass actually found:
   the `_WARNING_LIMIT` FIFO used to drop the OLDEST warning past the cap, which is backwards — startup
   warnings (APST, foreign-GPU) are the oldest lines and the ones that matter most; it now drops the
   newest instead (`test_the_warning_buffer_is_bounded` updated to assert that).
-- **[ ] L1 T5–T9 (+T10) · additive half of the triage-logging work. DESIGN APPROVED 2026-09-04,
-  not yet implemented.** Spec:
+- **[~] L1 T5–T9 (+T10) · additive half of the triage-logging work. DESIGN APPROVED 2026-09-04;
+  IN PROGRESS on branch `l1-t5-t10-triage-additive` from 2026-09-04.** Spec:
   [`docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md`](docs/superpowers/specs/2026-09-04-L1-T5-T9-design.md)
   (**gitignored — this disk only**; the decisions below are the durable copy).
   **Plan: [`docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md`](docs/superpowers/plans/2026-09-04-L1-T5-T10-triage-logging-additive.md)**
@@ -198,8 +198,8 @@ What the pass actually found:
   `max_tokens`).
   T9 `documentation/server.md` + `README.md` "Reporting a problem" section (server.md's half landed
   as part of Task 8; `README.md`'s does not exist yet).
-  None of these are started; do not let them silently vanish the way T1–T4's own predecessor work
-  nearly did.
+  Progress: T5a (the monotonic NVMe byte counter in the persister) landed as `55ea63b`. The rest
+  are not started; do not let them silently vanish the way T1–T4's own predecessor work nearly did.
 - **[x] `7d806e7` ("remove unwanted files") deleted both on-device gate scripts — docs FIXED**
   **2026-09-04 (I6/M3, final fix wave); scripts stay deleted, deliberately.** Eight files were
   removed on 2026-09-03, before Task 8 of this L1 work ran: `test_server_smoke.py`,
