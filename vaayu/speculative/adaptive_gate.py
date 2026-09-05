@@ -78,9 +78,17 @@ def spec_breakeven_acceptance(union_bytes_1: int, union_bytes_k: int,
 # model (CLAUDE.md 5 -- no model numbers in code), and are module constants
 # rather than config knobs because nobody asked for the knobs (CLAUDE.md 2).
 #
-# CALIBRATE_STEPS: must exceed d+1 or there is no window to measure a union
-# over. 8 gives 5 windows at draft_tokens=3 and 7 at draft_tokens=1, and costs
-# nothing -- these steps decode normally.
+# CALIBRATE_STEPS: a FLOOR, not the calibration length itself. It exists so
+# there are enough windows to average over -- 8 gives 5 windows at
+# draft_tokens=3 and 7 at draft_tokens=1 -- and costs nothing, since these
+# steps decode normally. The actual length a gate waits for is
+# max(CALIBRATE_STEPS, draft_tokens + 1) (computed per-instance in __init__,
+# see _calibrate_steps): a window of d+1 snapshots is the thing
+# observed_union_per_layer measures at all, so at draft_tokens >= 8 the floor
+# alone is not enough snapshots for even ONE window, and _decide_union would
+# see union_k == 0 and latch off_union on every load regardless of budget --
+# a silent, permanent, budget-independent refusal (CLAUDE.md 5: never
+# silently degrade).
 CALIBRATE_STEPS = 8
 # TRIAL_DRAFTED_TOKENS: at 48 drafts the binomial standard error is ~0.07, so
 # Qwen's measured 0.286 sits ~3 SE below its 0.520 bar -- decisive without
@@ -108,6 +116,10 @@ class AdaptiveSpecGate:
         self.geometry = geometry
         self.draft_tokens = int(draft_tokens)
         self.budget_bytes = int(budget_bytes)
+        # The calibration length THIS gate needs: never less than the floor,
+        # and never less than one full union window (draft_tokens + 1) --
+        # see CALIBRATE_STEPS's comment above.
+        self._calibrate_steps = max(CALIBRATE_STEPS, self.draft_tokens + 1)
         self.phase = "calibrate"
         self.decision: str | None = None
         self._snapshots: list[dict[int, list[int]]] = []
@@ -132,7 +144,7 @@ class AdaptiveSpecGate:
         if self.phase != "calibrate":
             return
         self._snapshots.append({int(k): list(v) for k, v in history.items()})
-        if len(self._snapshots) >= CALIBRATE_STEPS:
+        if len(self._snapshots) >= self._calibrate_steps:
             self._decide_union()
 
     def record_round(self, drafted: int, accepted: int) -> None:

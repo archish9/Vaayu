@@ -210,3 +210,55 @@ def test_status_reports_the_numbers_it_decided_on():
     assert s["observed_union_gb"] > 0
     assert s["breakeven_acceptance"] is not None and s["breakeven_acceptance"] >= 0
     assert "measured_acceptance" in s and "drafting_rounds" in s
+
+
+def _calibrate_needed(gate, draft_tokens):
+    """Feed exactly the calibration length THIS gate needs -- never less than
+    the CALIBRATE_STEPS floor, never less than one union window
+    (draft_tokens + 1) -- using the same overlapping routing as
+    _calibrate_with_overlap so the union is a real, non-degenerate number
+    rather than the all-identical-routing case above."""
+    from vaayu.speculative import adaptive_gate as ag
+    needed = max(ag.CALIBRATE_STEPS, draft_tokens + 1)
+    for step in range(needed):
+        gate.observe({l: list(range(step, step + 8)) for l in range(62)})
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 8, 12])
+def test_a_wide_verify_window_is_not_starved_of_calibration_data(draft_tokens):
+    """Fix round 1: CALIBRATE_STEPS=8 is a FLOOR, not the calibration length.
+    Before this fix, draft_tokens >= CALIBRATE_STEPS meant _decide_union asked
+    observed_union_per_layer for a (draft_tokens+1)-wide window off only
+    CALIBRATE_STEPS snapshots -- too few for even one window, so it always
+    returned 0.0 and every load at that width latched off_union regardless of
+    budget. A generous budget must reach "trial" at every width, including
+    draft_tokens >= CALIBRATE_STEPS."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=draft_tokens, budget_bytes=10**12)
+    _calibrate_needed(gate, draft_tokens)
+    assert gate.phase == "trial", (
+        f"draft_tokens={draft_tokens} starved of calibration data instead of "
+        f"being judged on budget: {gate.status()}")
+
+
+def test_a_wide_window_that_genuinely_does_not_fit_still_refuses():
+    """The fix must not turn union-fit admission into a rubber stamp: a wide
+    window measured correctly (enough snapshots for its window) but bigger
+    than the budget still latches off_union."""
+    draft_tokens = 12
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=draft_tokens, budget_bytes=1)
+    _calibrate_needed(gate, draft_tokens)
+    assert gate.phase == "off"
+    assert gate.decision == "off_union"
+
+
+def test_an_off_union_refusal_reports_a_real_measurement_not_a_zero():
+    """observed_union_gb == 0.0 used to be indistinguishable between "measured
+    a real union of zero" (impossible) and "never got enough snapshots to
+    measure at all" -- exactly the silent failure mode this fix closes. A
+    refusal on union grounds must report the union it actually measured."""
+    draft_tokens = 12
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=draft_tokens, budget_bytes=1)
+    _calibrate_needed(gate, draft_tokens)
+    s = gate.status()
+    assert s["decision"] == "off_union"
+    assert s["observed_union_gb"] > 0
