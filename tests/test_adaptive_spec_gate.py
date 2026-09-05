@@ -99,6 +99,17 @@ def _calibrate(gate, per_step_experts, layers=None):
         gate.observe({l: list(per_step_experts(step)) for l in layers})
 
 
+def _calibrate_with_overlap(gate, layers):
+    """Feed the gate overlapping expert routing: step i routes range(i, i+8).
+
+    Each step adds one new expert, so union(k) = 7 + k experts per layer.
+    This produces a meaningful (non-zero) break-even, unlike identical routing.
+    """
+    from vaayu.speculative import adaptive_gate as ag
+    for step in range(ag.CALIBRATE_STEPS):
+        gate.observe({l: list(range(step, step + 8)) for l in layers})
+
+
 def test_it_does_not_draft_while_calibrating():
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=14_700_000_000)
     assert gate.should_draft() is False
@@ -124,12 +135,24 @@ def test_routing_that_does_not_fit_latches_off_before_drafting_once():
     assert gate.should_draft() is False
 
 
+def test_overlapping_routing_computes_a_meaningful_breakeven():
+    """With overlapping routing (step i -> range(i, i+8)), union(k) = 7+k.
+    breakeven = (union(k) - union(1)) / union(1) / draft_tokens
+             = ((k+7) - 8) / 8 / draft_tokens
+             = (draft_tokens) / 8 / draft_tokens = 1/8 = 0.125.
+    This holds for any model and draft_tokens (k = draft_tokens+1 always)."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_with_overlap(gate, layers=range(62))
+    assert gate.phase == "trial"
+    assert gate._breakeven == pytest.approx(0.125, abs=0.001)
+
+
 def test_acceptance_below_the_bar_latches_off():
-    """Qwen's measured regime: it fits, but only 0.286 of drafted tokens are
-    accepted against a 0.520 bar, and S1f measured that at 0.836x."""
+    """With overlapping routing (breakeven=0.125), 0 accepted tokens clearly
+    fails the bar and the gate turns off."""
     from vaayu.speculative import adaptive_gate as ag
     gate = AdaptiveSpecGate(QWEN, draft_tokens=1, budget_bytes=15_800_000_000)
-    _calibrate(gate, lambda step: range(8), layers=range(94))
+    _calibrate_with_overlap(gate, layers=range(94))
     assert gate.phase == "trial"
     for _ in range(ag.TRIAL_DRAFTED_TOKENS):
         gate.record_round(drafted=1, accepted=0)
@@ -139,9 +162,11 @@ def test_acceptance_below_the_bar_latches_off():
 
 
 def test_acceptance_above_the_bar_runs():
+    """With overlapping routing (breakeven=0.125), perfect acceptance (1.0)
+    clearly exceeds the bar and the gate runs."""
     from vaayu.speculative import adaptive_gate as ag
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=14_700_000_000)
-    _calibrate(gate, lambda step: range(8), layers=range(62))
+    _calibrate_with_overlap(gate, layers=range(62))
     for _ in range(ag.TRIAL_DRAFTED_TOKENS):
         gate.record_round(drafted=3, accepted=3)
     assert gate.phase == "run"
@@ -180,9 +205,8 @@ def test_status_reports_the_numbers_it_decided_on():
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=14_700_000_000)
     _calibrate(gate, lambda step: range(8), layers=range(62))
     s = gate.status()
-    assert "decision" in s
-    assert "budget_gb" in s
-    assert "observed_union_gb" in s
-    assert "breakeven_acceptance" in s
-    assert "measured_acceptance" in s
-    assert "drafting_rounds" in s
+    assert s["decision"] in {None, "run", "off_union", "off_acceptance"}
+    assert s["budget_gb"] == pytest.approx(14.7, abs=0.05)
+    assert s["observed_union_gb"] > 0
+    assert s["breakeven_acceptance"] is not None and s["breakeven_acceptance"] >= 0
+    assert "measured_acceptance" in s and "drafting_rounds" in s
