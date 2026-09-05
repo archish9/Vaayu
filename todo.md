@@ -534,36 +534,73 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
-  - **[ ] S1d · DESIGN APPROVED and PLAN WRITTEN 2026-09-05, not implemented.**
+  - **[x] S1d · adaptive runtime gate BUILT, WIRED, and MEASURED on-device, 2026-09-05.**
     Design: [`docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md`](docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md).
     Plan: [`docs/superpowers/plans/2026-09-05-S1d-adaptive-spec-gate.md`](docs/superpowers/plans/2026-09-05-S1d-adaptive-spec-gate.md)
-    — 6 tasks, every test and implementation written out; new module
-    `vaayu/speculative/adaptive_gate.py` (two pure helpers + the state machine), wiring in
-    `speculative_generate`, reporting in `envinfo.py`, then the three on-device arms.
-    (Both **gitignored — this disk only**; the decisions below are the durable copy.)
-    **S1d as originally written is REFUTED and must not be built:** "replace the bound with the
-    measured union" admits Qwen's `draft_tokens=1` (13.53 GB against a 15.8 GB budget — it FITS)
-    and S1f measured that configuration at **0.836×**. Bytes-fit is necessary, not sufficient.
-    **And no analytic union rescues a static gate:** the independent-routing estimate
-    `num_experts·(1−(1−top_k/num_experts)^k)` puts MiniMax's 4-position verify at **16.80 GB**
-    against 14.7 and refuses the one configuration worth 1.29×. The union must be OBSERVED.
-    **Approved design — a three-phase runtime machine in `speculative_generate`, MoE only:**
-    (1) **CALIBRATE**, first `W=8` decode steps with the draft call skipped (they decode normally,
-    nothing is wasted), snapshotting `_expert_history` — the field all three forwards already write
-    and nothing has read since audit F7 — to compute the observed `union(d+1)`; over budget → OFF.
-    (2) **TRIAL**, until 48 drafted tokens (cap 64 rounds; at 48 the binomial SE is ~0.07, so Qwen's
-    0.286 sits ~3 SE below its bar), comparing acceptance against a break-even DERIVED from those
-    same observed unions, `(union(d+1)/union(1) − 1)/d` = 0.520 Qwen / 0.635 MiniMax.
-    (3) **RUN.** OFF latches for the process by setting `self.speculator = None`, the mechanism the
-    post-load gate already uses. **Accounting rule that is easy to get wrong: rounds where the
-    proposer drafts nothing are EXCLUDED from the acceptance denominator** — an empty round is a
-    1-wide decode producing one token, economically identical to plain decode.
-    Two pure helpers (`observed_union_per_layer`, `spec_breakeven_acceptance`), parametrized over
-    both geometries. **No config knobs** (§2); `W`/`T` are module constants. Default stays OFF —
-    this gate only governs what happens once a user opts in. **The on-device gate's middle arm is
-    the whole point: Qwen must latch off and land within ~2 % of baseline** (today that config is
-    0.836×); MiniMax must self-enable and reproduce ≥1.25×; dense Llama-3.3-70B must not calibrate
-    at all and must still hit P7's ~5.5×.
+    (both **gitignored — this row is the durable copy**). New module
+    `vaayu/speculative/adaptive_gate.py`: pure helpers `observed_union_per_layer`, `union_bytes`,
+    `spec_breakeven_acceptance`, plus `AdaptiveSpecGate`, a three-phase state machine
+    (CALIBRATE → TRIAL → RUN, or → OFF from either) wired into `speculative_generate` (MoE only,
+    via `_build_spec_gate`) and reported in `speculative_status["calibration"]` (`envinfo.py`,
+    `/v1/models`).
+    **Two refuted alternatives, both measured, neither built:** a static gate that swaps the
+    Fix #9 zero-overlap bound for the OBSERVED union still ADMITS Qwen's `draft_tokens=1`
+    (13.53 GB fits a 15.8 GB budget) and that configuration measures **0.836×** (16 % slower) —
+    bytes-fit is necessary, not sufficient. The obvious analytic escape fails in the OTHER
+    direction: the independent-routing estimate `num_experts·(1−(1−top_k/num_experts)^k)` puts
+    MiniMax's 4-position verify at **16.80 GB** against a 14.7 GB budget and REFUSES the one
+    configuration worth 1.29×. Only an OBSERVED union, from the model's own routing, gets both
+    right — hence a runtime gate.
+    **Phase constants (module constants, no config knobs — CLAUDE.md §2):** `CALIBRATE_STEPS = 8`
+    is a FLOOR, not the calibration length — the gate actually waits `max(8, draft_tokens+1)`
+    steps, because `observed_union_per_layer` needs one full window of `draft_tokens+1` snapshots
+    to measure anything; below that, `draft_tokens ≥ 8` would leave zero windows and latch
+    `off_union` on every load regardless of budget (CLAUDE.md §5: never silently degrade).
+    `TRIAL_DRAFTED_TOKENS = 48` — at 48 drafts the binomial SE is ~0.07, so Qwen's measured
+    acceptance sits ~3 SE below its bar, decisive without over-sampling. `TRIAL_ROUND_CAP = 64` —
+    bounds the case where the proposer rarely drafts at all.
+    **Three on-device arms, own systemd scopes, same box same day:**
+    - **MiniMax-M2.7, `draft_tokens=3`, PLD, NO `VAAYU_SPEC_FORCE`** — self-admitted on its own
+      evidence: `calibration.decision="run"` (`observed_union_gb=12.33` vs `budget_gb=14.75`,
+      `breakeven_acceptance=0.6004`, `measured_acceptance=0.9375`, `drafting_rounds=16`). tok/s
+      **1.8135 (off) → 2.2883 (pld) = 1.26×** (≥1.25× target met). Ids byte-identical.
+    - **Qwen3-235B, `draft_tokens=1`, PLD, NO `VAAYU_SPEC_FORCE` — the anti-regression arm.**
+      `calibration.decision="off_acceptance"` (`observed_union_gb=13.03` vs `budget_gb=16.32`,
+      `breakeven_acceptance=0.4647`, `measured_acceptance=0.3429`, `drafting_rounds=35`). tok/s
+      **1.1152 (off) → 1.0193 (pld) = 0.914×**. Ids byte-identical. **The gate fired and avoided
+      the catastrophic 0.836×/16%-slower regression — but the result is 8.6 % slower, not the
+      ~2 % this row originally targeted, and that is reported as measured, not massaged.** Root
+      cause: `CALIBRATE_STEPS(8) + TRIAL_ROUND_CAP(64)` = up to 72 of the 128 generated tokens pay
+      the cost of finding out speculation does not pay, before latching off; that fixed
+      exploration cost does not amortize over a 128-token run (it would over a longer one — open
+      item below).
+    - **Llama-3.3-70B dense + Llama-3.2-1B drafter:** no `calibration` key in `speculative_status`
+      on either arm (`_build_spec_gate` returns `None` when `not self.is_moe`) — dense builds no
+      gate, confirmed. tok/s **0.166 (base) → 0.805/0.789/0.788 (spec, 3 calls) ≈ 4.8×** — a little
+      under P7's banked 0.83–0.86× band; plausible same-box noise (this box had just run both MoE
+      arms), not attributable to any S1d code path (dense never touches `is_moe`-gated code). Ids
+      byte-identical to the base arm's prefix on all 3 calls — losslessness holds.
+    **Two real bugs found and fixed while measuring — without both, the arms above could not have
+    been produced honestly, so both are carried here rather than left implicit:**
+    1. The OLD Fix #9 / S1a static bound gates (pre-load and post-load, `vaayu_base.py`) still
+       refused to even BUILD a speculator for MoE without `VAAYU_SPEC_FORCE=1`, running before the
+       new runtime gate ever got a chance — exactly the admission test the design says CALIBRATE
+       now performs instead (design doc §2: "this is the admission test the bound used to
+       perform, decided on observation instead of a worst case"). **Fixed** by scoping both static
+       checks to `drafter_model_path` only: a real weighted drafter still has load cost worth
+       avoiding pre-emptively, but a prompt-lookup proposer has zero load cost, so its admission is
+       now decided purely by `AdaptiveSpecGate`.
+    2. `speculative_generate`'s wiring called `gate.record_round(k, num_accepted)` with
+       `num_accepted` straight from `verify_and_accept()` — which is **1..k+1**, always including
+       the bonus/correction token every round guarantees (see `prompt_lookup.py`/`standard.py`
+       docstrings). The gate (and its own tests — `record_round(drafted=3, accepted=3)` meaning
+       "perfect") expects the count of DRAFTED tokens that matched, **0..k**. This inflated
+       `measured_acceptance` by ~1 token/round and is why the FIRST Qwen measurement showed
+       `decision="run"` with `measured_acceptance=1.34` — the anti-regression arm this row exists
+       to prove would have silently passed with the gate never firing. **Fixed** to
+       `gate.record_round(k, max(0, num_accepted - 1))`.
+    Both fixes verified against the full suite: **1604 passed, 12 skipped** (was 1570 at S1's
+    close; +34 new tests from this branch, all green after both fixes).
   - **[ ] S1f · tok/s A/B MEASURED 2026-09-05 — MiniMax-M2.7 **1.285× / 1.293×** faster with PLD
     (1.8166/1.8090 → 2.3337/2.3398 tok/s, two arm pairs), **Qwen3-235B 0.836× — 16 % SLOWER**
     (1.1076 → 0.9261). **Generated ids byte-identical in every arm**, so both are real and neither

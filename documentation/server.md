@@ -821,6 +821,26 @@ configuration the later one would accept. That is also why a refusal that names
 "the largest draft_tokens that could fit" says *could*: the value fits the
 bound, and the post-load gate re-tests it against the real budget.
 
+A third gate runs at generation time on MoE models, because the first two can
+only see bytes. It decodes normally for the first few steps while watching the
+model's real expert routing, admits speculation only if a verify pass fits the
+expert cache, then measures acceptance over the next ~48 drafted tokens against
+a break-even derived from that same routing. Below the bar it disables
+speculation for the rest of the process and records why in `calibration`.
+
+Measured 2026-09-05: on MiniMax-M2.7 with thinking suppressed this
+self-admits (no measurement hatch) and keeps a **1.26×** win, ids
+byte-identical to plain decode. On Qwen3-235B, whose answers open with
+prose, the same shape of configuration measures **0.836×** (16% slower) with
+no gate at all (S1f); with the gate, it correctly detects the low acceptance
+(0.34 against a 0.46 break-even) and latches off — but not for free. The
+gate itself must spend up to `CALIBRATE_STEPS + TRIAL_ROUND_CAP` = 72 rounds
+finding that out, and over a 128-token run that fixed cost does not fully
+amortize: the gated run lands at **0.91×**, not full parity. That is the
+honest number, not the target — it is the difference between shipping a
+known 16% regression and shipping a gate that catches it, at a cost that
+shrinks as a fraction of the run the longer the run is.
+
 ### The on-device gate
 
 `tests/test_server_smoke.py` -- restored 2026-09-04 (was deleted 2026-09-03,

@@ -2011,7 +2011,17 @@ class VaayuBaseModel(GenerationMixin):
             # bound of that budget, so it can never refuse what the real gate
             # would accept). Both write the same status field.
             _pre = None
-            if self.is_moe and self._moe_geometry is not None:
+            # S1d: a prompt-lookup proposer has no load to avoid paying for
+            # (zero VRAM, CPU n-gram search) -- so the "avoid a load that is
+            # certain to fail" argument this bound exists for does not apply
+            # to it. Its admission is decided from OBSERVED routing instead,
+            # by the runtime AdaptiveSpecGate built in _build_spec_gate() once
+            # generation starts (design doc §1: the static bound both over-
+            # and under-admits -- it refuses MiniMax's 1.29x config and admits
+            # Qwen's 0.836x one). A real weighted drafter still has VRAM/time
+            # to lose on a load that is certain to fail, so it keeps this
+            # static pre-check.
+            if drafter_model_path and self.is_moe and self._moe_geometry is not None:
                 try:
                     import psutil as _ps
                     _avail = _ps.virtual_memory().available
@@ -2278,7 +2288,12 @@ class VaayuBaseModel(GenerationMixin):
             # set is ~Nx the single-token one. When that cannot fit the expert cache,
             # speculation guarantees thrash and is ~I/O-neutral per accepted token.
             # Warn with the derived numbers and disable — loudly, never silently.
-            if (self.speculator is not None and self.is_moe
+            # S1d: gated on `drafter_model_path` for the same reason as the
+            # pre-load check above -- a prompt-lookup proposer's admission is
+            # decided from OBSERVED routing by the runtime AdaptiveSpecGate
+            # (_build_spec_gate(), built at the start of speculative_generate)
+            # instead of this zero-overlap worst case.
+            if (self.speculator is not None and self.is_moe and drafter_model_path
                     and getattr(self, '_expert_cache', None) is not None
                     and getattr(self, '_moe_geometry', None) is not None):
                 if (not spec_decode_fits(self._moe_geometry, self.draft_tokens,
@@ -4821,7 +4836,12 @@ class VaayuBaseModel(GenerationMixin):
                 if gate.phase == "calibrate":
                     gate.observe(getattr(self, "_expert_history", {}) or {})
                 else:
-                    gate.record_round(k, num_accepted)
+                    # `num_accepted` (Step 4) is 1..k+1 -- it always includes
+                    # the bonus/correction token verify_and_accept guarantees
+                    # every round. The gate's break-even treats that token as
+                    # the "+1" in "1 + accepted" (design doc §2) and wants only
+                    # the count of DRAFTED tokens that matched, 0..k.
+                    gate.record_round(k, max(0, num_accepted - 1))
                 if gate.decided_off() and self.speculator is not None:
                     s = gate.status()
                     print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
