@@ -534,9 +534,13 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
-  - **[ ] S1d · DESIGN APPROVED 2026-09-05, not implemented.**
-    [`docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md`](docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md)
-    (**gitignored — this disk only**; the decisions below are the durable copy).
+  - **[ ] S1d · DESIGN APPROVED and PLAN WRITTEN 2026-09-05, not implemented.**
+    Design: [`docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md`](docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md).
+    Plan: [`docs/superpowers/plans/2026-09-05-S1d-adaptive-spec-gate.md`](docs/superpowers/plans/2026-09-05-S1d-adaptive-spec-gate.md)
+    — 6 tasks, every test and implementation written out; new module
+    `vaayu/speculative/adaptive_gate.py` (two pure helpers + the state machine), wiring in
+    `speculative_generate`, reporting in `envinfo.py`, then the three on-device arms.
+    (Both **gitignored — this disk only**; the decisions below are the durable copy.)
     **S1d as originally written is REFUTED and must not be built:** "replace the bound with the
     measured union" admits Qwen's `draft_tokens=1` (13.53 GB against a 15.8 GB budget — it FITS)
     and S1f measured that configuration at **0.836×**. Bytes-fit is necessary, not sufficient.
