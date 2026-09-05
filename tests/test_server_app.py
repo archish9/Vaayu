@@ -23,6 +23,10 @@ class FakeEngine:
         self.queue_depth = 8
         self.depth = 0
         self.model = type("M", (), {"name_or_path": "fake"})()
+        # The real model sets this on every load path, so a fake without it
+        # would be testing a shape the server cannot produce (S1b).
+        self.model.speculative_status = {"requested": None, "draft_tokens": 5,
+                                         "active": False, "refused_because": None}
         self._result = result or GenerationResult(
             text="hello", prompt_tokens=3, completion_tokens=2, finish_reason="stop")
         self._raises = raises
@@ -99,6 +103,28 @@ def test_models_lists_the_one_loaded_model_with_its_derived_window():
     assert body["object"] == "list"
     assert len(body["data"]) == 1
     assert body["data"][0]["max_seq_len"] == 8192
+
+
+def test_models_reports_whether_speculation_is_actually_running():
+    """S1b: a user who sets DRAFTER_MODEL_PATH on a MoE target gets it refused
+    at load, and before this had no way to find out short of reading a startup
+    line that has already scrolled away."""
+    e = FakeEngine()
+    e.model.speculative_status = {
+        "requested": "/models/Qwen2.5-Coder-1.5B", "draft_tokens": 5,
+        "active": False, "refused_because": "verify working set exceeds budget"}
+    body = _client(e).get("/v1/models").json()
+    spec = body["data"][0]["speculative"]
+    assert spec["active"] is False
+    assert "exceeds budget" in spec["refused_because"]
+
+
+def test_models_reports_speculation_off_when_none_was_asked_for():
+    """The field must be present and honest on an ordinary load too -- an
+    absent key reads as 'unknown', which is the state this fixes."""
+    body = _client(FakeEngine()).get("/v1/models").json()
+    assert body["data"][0]["speculative"]["active"] is False
+    assert body["data"][0]["speculative"]["requested"] is None
 
 
 def test_a_non_streaming_completion_returns_the_openai_shape():

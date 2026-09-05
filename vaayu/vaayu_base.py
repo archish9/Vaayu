@@ -116,6 +116,104 @@ def spec_decode_fits(geometry: dict, draft_tokens: int, budget_bytes: int) -> bo
     return compute_spec_working_set(geometry, draft_tokens + 1) <= budget_bytes
 
 
+def spec_budget_upper_bound(available_bytes: int, geometry: dict) -> int:
+    """The largest expert RAM cache budget the sizing code below could produce.
+
+    S1a: the Fix #9 gate needs `_expert_cache.budget_bytes`, which only exists
+    after the drafter is resident -- the gate's input depends on the thing the
+    gate may reject. This breaks that circle by asking the REAL sizing helpers
+    what they would return under the most generous assumptions available before
+    the load, rather than re-deriving their arithmetic here (which would drift
+    the moment either changes):
+
+    * `derive_expert_ceiling` with no prefix reservation at all -- the real call
+      subtracts room for `prefix_sessions` full-length sessions, so the real
+      ceiling is never larger than this one;
+    * `compute_expert_budget` against RAM measured BEFORE the drafter is
+      loaded, which is never less than what is free after;
+    * the slab arena's trim, which only ever lowers the budget further.
+
+    Upper bound on purpose: over-stating the budget can only make the pre-load
+    gate more permissive, so it can never refuse a configuration the post-load
+    gate would accept. Under-stating it would silently turn off speculation
+    that works, which is the failure this must not have.
+    """
+    ceiling = derive_expert_ceiling(
+        available_bytes=int(available_bytes), prefix_sessions=0,
+        kv_bytes_per_token=0, max_seq_len=0, prefix_enabled=False)
+    budget, _ne, _per_layer = compute_expert_budget(
+        available_bytes=int(available_bytes),
+        working_set_bytes=geometry["working_set_bytes"],
+        num_moe_layers=geometry["num_moe_layers"],
+        expert_bytes=geometry["expert_bytes"],
+        moe_top_k=geometry["top_k"],
+        moe_num_experts=geometry["num_experts"],
+        ceiling_bytes=ceiling,
+    )
+    return budget
+
+
+def max_draft_tokens_that_fit(geometry: dict, budget_bytes: int) -> int:
+    """Largest `draft_tokens` whose verify pass fits `budget_bytes`. 0 = none.
+
+    The working set is non-decreasing in verify positions and saturates at
+    `num_experts` per layer, so the search space is bounded by the geometry
+    itself -- no literal anywhere (CLAUDE.md 5). Exists so the refusal can say
+    whether ANY value would work instead of telling a user to lower a number
+    that on both on-device targets cannot be lowered far enough.
+    """
+    top_k = max(1, geometry["top_k"])
+    # Past this, another position cannot add an expert on any layer.
+    ceiling_positions = max(1, -(-geometry["num_experts"] // top_k))
+    best = 0
+    for draft_tokens in range(1, ceiling_positions + 1):
+        if not spec_decode_fits(geometry, draft_tokens, budget_bytes):
+            break
+        best = draft_tokens
+    return best
+
+
+def spec_preload_refusal(geometry: dict, draft_tokens: int,
+                         available_bytes: int) -> str | None:
+    """Why speculation cannot fit on this MoE model, or None if it can.
+
+    Decided against `spec_budget_upper_bound`, so it is answerable before the
+    drafter is loaded -- which is the whole point (S1a/D1). A None here is not
+    an acceptance: the post-load gate still runs against the REAL budget and
+    may refuse. This one only avoids paying for a load whose result is already
+    known.
+    """
+    bound = spec_budget_upper_bound(available_bytes, geometry)
+    if spec_decode_fits(geometry, draft_tokens, bound):
+        return None
+    sws = compute_spec_working_set(geometry, draft_tokens + 1)
+    viable = max_draft_tokens_that_fit(geometry, bound)
+    if viable:
+        # Deliberately "could", not "will": this is decided against an UPPER
+        # BOUND of the budget, so a value that fits the bound may still be
+        # refused by the post-load gate against the real one (measured on
+        # Qwen3-235B: bound 20.6 GB names draft_tokens=1, real budget 15.8 GB
+        # refuses it). Naming a value as a fix the user can rely on would send
+        # them to restart into the same refusal.
+        remedy = (f"the largest draft_tokens that could fit is {viable}, "
+                  f"decided against an upper bound of the cache budget — the "
+                  f"post-load check re-tests it against the real one")
+    else:
+        # The case on both on-device MoE targets: even ONE drafted token
+        # doubles the per-layer expert union, so there is no value to fall
+        # back to and saying "reduce draft_tokens" sends the user round a
+        # loop. Name the lever that does apply to this workload instead.
+        remedy = ("no draft_tokens value fits, including 1 — speculation "
+                  "cannot pay on this model on this hardware. Drop the drafter "
+                  "here (keep it for a dense target, where it is worth several "
+                  "times decode) and use batched decode for aggregate "
+                  "throughput instead")
+    return (f"speculative verify working set {sws / 1e9:.1f} GB "
+            f"((draft_tokens={draft_tokens}+1) positions × top-{geometry['top_k']}) "
+            f"exceeds the largest expert cache budget this box could give it, "
+            f"{bound / 1e9:.1f} GB: {remedy}")
+
+
 # Hardware constant for THIS 32 GB box: max safe expert-cache size before OOM.
 # Model-independent. Raised from the old 7 GB only after shrinking other RAM
 # consumers (below). Do NOT exceed 9 GB — 10 GB caused a confirmed OOM-kill.
@@ -1895,14 +1993,46 @@ class VaayuBaseModel(GenerationMixin):
         # The Fix #9 MoE gate that may DISABLE it runs further down, after the
         # RAM expert cache it needs exists and before the VRAM cache is sized.
         self.speculator = None
+        # What was asked for, what is running, and why not (S1b). Always a
+        # dict, on every load path -- dense, CPU, no drafter at all -- so a
+        # reader never has to distinguish "not reported" from "not refused".
+        self.speculative_status = {
+            "requested": (str(drafter_model_path) if drafter_model_path
+                          else ("prompt_lookup" if use_prompt_lookup else None)),
+            "draft_tokens": self.draft_tokens,
+            "active": False,
+            "refused_because": None,
+        }
         if drafter_model_path or use_prompt_lookup:
-            from .speculative import build_speculator
-            self.speculator = build_speculator(
-                drafter_model_path=drafter_model_path,
-                base_model=self,
-                device=device,
-                use_prompt_lookup=use_prompt_lookup,
-            )
+            # S1a: on a MoE model, ask the Fix #9 question BEFORE paying for
+            # the drafter's load. The post-load gate below is the one that
+            # decides against the real budget; this one only declines to load
+            # something whose refusal is already certain (it gates on an upper
+            # bound of that budget, so it can never refuse what the real gate
+            # would accept). Both write the same status field.
+            _pre = None
+            if self.is_moe and self._moe_geometry is not None:
+                try:
+                    import psutil as _ps
+                    _avail = _ps.virtual_memory().available
+                except Exception:            # noqa: BLE001 -- sizing, not correctness
+                    _avail = None
+                if _avail is not None:
+                    _pre = spec_preload_refusal(self._moe_geometry,
+                                                self.draft_tokens, _avail)
+            if _pre is not None:
+                print(f"[Vaayu-Spec] WARNING: {_pre} DISABLING speculative "
+                      f"decoding for this MoE model; the drafter is NOT loaded.")
+                self.speculative_status["refused_because"] = _pre
+            else:
+                from .speculative import build_speculator
+                self.speculator = build_speculator(
+                    drafter_model_path=drafter_model_path,
+                    base_model=self,
+                    device=device,
+                    use_prompt_lookup=use_prompt_lookup,
+                )
+                self.speculative_status["active"] = self.speculator is not None
 
         # MoE Expert-Aware Streaming: expert cache and patched forwards.
         # _expert_offset_index is initialized above (before _init_pinned_layers).
@@ -2146,6 +2276,19 @@ class VaayuBaseModel(GenerationMixin):
                           f"hardware. DISABLING speculative decoding for this MoE model. "
                           f"(Reduce draft_tokens or use a smaller model to re-enable.)")
                     self.speculator = None
+                    # Same field the pre-load gate writes: whichever of the two
+                    # fires, a reader of env.json or /v1/models gets one answer
+                    # in one shape (S1b).
+                    _status = getattr(self, "speculative_status", None)
+                    if _status is not None:
+                        _status["active"] = False
+                        _status["refused_because"] = (
+                            f"speculative verify working set {_sws / 1e9:.1f} GB "
+                            f"((draft_tokens={self.draft_tokens}+1) positions × "
+                            f"top-{self._moe_geometry['top_k']}) exceeds the expert "
+                            f"cache budget "
+                            f"{self._expert_cache.budget_bytes / 1e9:.1f} GB measured "
+                            f"after the load")
                     # Hand the drafter's VRAM back to the DRIVER before the
                     # cache is sized below. A plain drop leaves those bytes in
                     # PyTorch's caching-allocator pool, which mem_get_info()

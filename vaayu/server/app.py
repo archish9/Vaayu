@@ -445,9 +445,16 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @app.get("/v1/models")
     async def models():
         e = app.state.engine
+        # `speculative` is reported here because the refusal that produces it
+        # happens once, at load, and scrolls out of a tailed log (S1b/D3). A
+        # client asking what this server is running gets the answer with the
+        # window it already asks for. Absent on a model this server did not
+        # load: the honest shape is the one the model actually has.
+        spec = getattr(e.model, "speculative_status", None)
         return {"object": "list",
                 "data": [{"id": _served_name(app), "object": "model",
-                          "owned_by": "vaayu", "max_seq_len": e.max_seq_len}]}
+                          "owned_by": "vaayu", "max_seq_len": e.max_seq_len,
+                          "speculative": spec}]}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):

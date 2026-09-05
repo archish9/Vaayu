@@ -251,7 +251,7 @@ holds one model for its whole life and should fill the box.
 | `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
 | `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT) |
 | `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9** is the tested floor) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
-| `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused at load on both MoE targets |
+| `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below |
 | `USE_PROMPT_LOOKUP` | `False` | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
 | `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
@@ -778,8 +778,10 @@ any weights, then flags the settings worth checking on this box:
   io_uring; a scheduler in front of them adds latency without reordering
   anything useful.
 - **A drafter is configured against an MoE checkpoint.** Speculative decoding
-  is refused at load on MoE targets, so the drafter loads to VRAM and is then
-  discarded on every start. This check reads the checkpoint's own
+  is refused on MoE targets. Since 2026-09-05 the refusal happens *before* the
+  drafter is loaded, so the load is no longer paid for and discarded; the
+  setting is still doing nothing and is worth removing. This check reads the
+  checkpoint's own
   `config.json` for an expert count, since `diagnose` never loads weights and
   so can't ask the loaded model whether it is MoE.
 - **`DEFAULT_STREAM` is `False`.** A client that sends no `max_tokens` then
@@ -787,6 +789,37 @@ any weights, then flags the settings worth checking on this box:
 
 A box with nothing to flag prints `nothing to flag on this box.` rather than a
 banner — a check that always has something to say stops being useful.
+
+### Is speculative decoding actually running?
+
+Two places answer it without reading a startup line that has already scrolled
+away: `GET /v1/models` carries a `speculative` object, and `env.json` in the run
+directory carries the same one.
+
+```json
+"speculative": {
+  "requested": "<drafter path, \"prompt_lookup\", or null>",
+  "draft_tokens": 5,
+  "active": false,
+  "refused_because": "speculative verify working set 53.4 GB ... exceeds ..."
+}
+```
+
+`active` is the only field that says whether speculation is running;
+`requested` says what was asked for. On an MoE target the two normally
+disagree, and `refused_because` says why with the numbers the decision used.
+
+There are two gates behind that field, and either may write it:
+
+- **before the drafter loads**, against an *upper bound* of the expert cache
+  budget — this is the one that avoids loading a 3 GB drafter only to discard
+  it (measured on Qwen3-235B: **3.85 s** of load, every start);
+- **after the load**, against the real budget, unchanged from before.
+
+The bound can only over-state the budget, so the early gate never refuses a
+configuration the later one would accept. That is also why a refusal that names
+"the largest draft_tokens that could fit" says *could*: the value fits the
+bound, and the post-load gate re-tests it against the real budget.
 
 ### The on-device gate
 

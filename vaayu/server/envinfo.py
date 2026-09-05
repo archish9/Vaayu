@@ -524,6 +524,26 @@ def _env_section(c):
                              for name in names})
 
 
+def _speculative_section(c, model):
+    """What was asked for, what is running, and why not (S1b).
+
+    Direct attribute access like `_model_section`: a model that never set the
+    field is a model this server did not load, and that belongs in
+    `collect_errors` rather than being flattened into a plausible-looking
+    "speculation is off". The refusal reason is prose written by the gate and
+    can embed the drafter's path -- `_scrub_paths` runs over the whole tree
+    afterwards, so it is redacted with everything else.
+    """
+    status = c.safe("model.speculative_status",
+                    lambda: model.speculative_status) or {}
+    return c.section("speculative", {
+        "requested": lambda: status.get("requested"),
+        "draft_tokens": lambda: status.get("draft_tokens"),
+        "active": lambda: status.get("active"),
+        "refused_because": lambda: status.get("refused_because"),
+    })
+
+
 def collect(model, config, warnings=()) -> dict:
     """The whole snapshot. Never raises."""
     c = _Collector()
@@ -556,6 +576,7 @@ def collect(model, config, warnings=()) -> dict:
     if model is not None:
         data["model"] = _model_section(c, model)
         data["budgets"] = _budgets_section(c, model)
+        data["speculative"] = _speculative_section(c, model)
     data["collect_errors"] = c.errors
     # Scrub LAST, over the whole tree: collect_errors and warnings are prose
     # that can embed a path (an exception's message, an engine warning

@@ -75,7 +75,44 @@ def _model(*, is_moe, style=None, forward=None, strategy=_Strategy,
     else:
         m._moe_geometry = None
         m._moe_blocks = []
+    # The real model sets this on every load path (dense, CPU, no drafter);
+    # a fake that omits it would be testing a shape that cannot occur.
+    m.speculative_status = {"requested": None, "draft_tokens": 5,
+                            "active": False, "refused_because": None}
     return m
+
+
+def test_the_speculative_decision_is_reported_with_its_reason():
+    """S1b/D3: the refusal prints once at startup and vanishes from a tailed
+    log, config.py's comment is invisible to anyone who never opens it, and
+    nothing else said whether speculation was running. A mailed bundle now
+    answers it."""
+    m = _model(is_moe=True, style="fused", forward="_make_fused_sparse_forward_exl3")
+    m.speculative_status = {
+        "requested": "/home/someone/models/Qwen2.5-Coder-1.5B",
+        "draft_tokens": 5, "active": False,
+        "refused_because": "verify working set 53.4 GB exceeds ..."}
+    d = envinfo.collect(m, _config())
+    # This fake has no checkpoint_path, which legitimately lands in
+    # collect_errors -- assert on THIS section's errors, not the whole list.
+    assert not [e for e in d["collect_errors"] if "speculative" in e], \
+        d["collect_errors"]
+    assert d["speculative"]["active"] is False
+    assert d["speculative"]["draft_tokens"] == 5
+    assert "53.4 GB" in d["speculative"]["refused_because"]
+    # Scrubbed like every other path in this file.
+    assert "/home/" not in json.dumps(d["speculative"])
+
+
+def test_a_load_with_no_drafter_reports_a_clean_speculative_section():
+    m = _model(is_moe=False)
+    m.speculative_status = {"requested": None, "draft_tokens": 5,
+                            "active": False, "refused_because": None}
+    d = envinfo.collect(m, _config())
+    assert not [e for e in d["collect_errors"] if "speculative" in e], \
+        d["collect_errors"]
+    assert d["speculative"] == {"requested": None, "draft_tokens": 5,
+                                "active": False, "refused_because": None}
 
 
 def _config(**over):
