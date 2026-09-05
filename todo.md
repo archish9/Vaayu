@@ -601,6 +601,38 @@ What the pass actually found:
        `gate.record_round(k, max(0, num_accepted - 1))`.
     Both fixes verified against the full suite: **1604 passed, 12 skipped** (was 1570 at S1's
     close; +34 new tests from this branch, all green after both fixes).
+    **Fix round 1 (review, 2026-09-05): bug 2's fix had no regression test, and structurally
+    could not get one from the existing fakes** — `_FakeSpeculator`/`_CountingSpeculator` in
+    `tests/test_adaptive_spec_gate_wiring.py` always draft 0 tokens, so `k` is always 0 and the
+    accept-count arithmetic the bug lived in never runs through them, before or after the fix; only
+    the on-device Qwen run caught it. **Closed:** a new `_DraftingSpeculator` fake drafts real
+    `k > 0` tokens and implements `verify_and_accept` with PromptLookupDecoder's OWN algorithm
+    (copied, not hardcoded), so `test_record_round_translates_the_real_accept_contract` drives two
+    real rounds through the actual `speculative_generate` loop — a full accept (drafted=3,
+    accepted=3, not 4) and a reject-AT-POSITION-0 (drafted=3, accepted=0, not 1 — the exact edge
+    `max(0, num_accepted - 1)` exists for) — and asserts the gate's own accumulated
+    `measured_acceptance == 0.5` (would read 0.833 if the off-by-one came back). Verified the test
+    actually catches the bug: reverting the fix locally fails it (`assert 3 == 6`), reapplying the
+    fix passes it. Full suite: **1605 passed, 12 skipped**.
+  - **[bug] a MoE model loaded with `device="cpu"` runs a PLD or drafter speculator with NO gate
+    at all — pre-existing, not introduced by S1d, deferred.** `_moe_geometry` is only computed when
+    `_expert_offset_index` was built, which only happens `if device.startswith("cuda") and
+    self.is_moe` (`vaayu_base.py:1797`); `_expert_cache` is only constructed inside the matching
+    `if self.running_device.startswith("cuda") and self.is_moe:` block (`vaayu_base.py:2078`). On
+    CPU-compute MoE both stay `None`. Consequence, found while reviewing S1d's Task 6: the S1a
+    pre-load bound (needs `_moe_geometry`) and the Fix #9 post-load bound (needs both) silently
+    skip themselves — they always did, this predates S1d — and now `_build_spec_gate()` (S1d) ALSO
+    returns `None` when `geo is None or cache is None`. So `use_prompt_lookup=True` or a
+    `drafter_model_path` on a CPU-compute MoE model builds a speculator that is checked by NEITHER
+    the old static gates NOR the new runtime one — it just runs, unbounded, for the life of the
+    process. **Deferred, not fixed:** CPU-compute MoE is architecturally supported
+    (`CLAUDE.md` §0/§5) but not on-device tested today (both actively-tested MoE targets are
+    CUDA-only EXL3), and no CPU-compute MoE checkpoint exists on this box to verify a fix against —
+    building one unreviewed at the tail of an unrelated branch is exactly the scope creep CLAUDE.md
+    §3 warns against. Fix sketch for whoever picks this up: either gate PLD/drafter construction
+    itself on `_moe_geometry is not None` for MoE regardless of device (refuse rather than run
+    ungated), or compute a CPU-safe `_moe_geometry`/`_expert_cache` pair off the same checkpoint
+    metadata without the CUDA-only `ExpertOffsetIndex` path.
   - **[ ] S1f · tok/s A/B MEASURED 2026-09-05 — MiniMax-M2.7 **1.285× / 1.293×** faster with PLD
     (1.8166/1.8090 → 2.3337/2.3398 tok/s, two arm pairs), **Qwen3-235B 0.836× — 16 % SLOWER**
     (1.1076 → 0.9261). **Generated ids byte-identical in every arm**, so both are real and neither
