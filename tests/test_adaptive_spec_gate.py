@@ -205,7 +205,11 @@ def test_status_reports_the_numbers_it_decided_on():
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=14_700_000_000)
     _calibrate(gate, lambda step: range(8), layers=range(62))
     s = gate.status()
-    assert s["decision"] in {None, "run", "off_union", "off_acceptance"}
+    # Calibration alone (no record_round calls yet) moves the gate to
+    # "trial" without deciding run/off -- identical routing every step keeps
+    # the union well under budget, so this fixture's decision is None, not
+    # yet one of the terminal values.
+    assert s["decision"] is None
     assert s["budget_gb"] == pytest.approx(14.7, abs=0.05)
     assert s["observed_union_gb"] > 0
     assert s["breakeven_acceptance"] is not None and s["breakeven_acceptance"] >= 0
@@ -249,6 +253,25 @@ def test_a_wide_window_that_genuinely_does_not_fit_still_refuses():
     _calibrate_needed(gate, draft_tokens)
     assert gate.phase == "off"
     assert gate.decision == "off_union"
+
+
+def test_empty_routing_history_reports_a_distinct_decision_not_off_union():
+    """A forward that stops writing _expert_history (design doc S8) makes
+    every calibration snapshot {} -- observed_union_per_layer then has no
+    layers to union over and returns 0.0, same as `_decide_union` used to
+    read for a genuinely over-budget union before 800467d's fix covered the
+    starved-window case. This is the OTHER way union_k reads 0: no evidence
+    at all, not "measured zero and it exceeded the budget" (impossible --
+    that requires union_k > budget_bytes > 0). It must not be reported as
+    off_union, which a reader would take as a real budget refusal."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=14_700_000_000)
+    for _ in range(max(8, 3 + 1)):
+        gate.observe({})
+    assert gate.phase == "off"
+    assert gate.decision == "off_no_routing"
+    s = gate.status()
+    assert s["observed_union_gb"] == 0.0
+    assert s["decision"] == "off_no_routing"
 
 
 def test_an_off_union_refusal_reports_a_real_measurement_not_a_zero():

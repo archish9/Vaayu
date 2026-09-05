@@ -4667,6 +4667,17 @@ class VaayuBaseModel(GenerationMixin):
         which is exactly the property MoE lacks, and P7's 5.57x lives on the
         dense path. VAAYU_SPEC_FORCE=1 skips calibration for the same reason
         it skips the load gates -- it is a measurement hatch.
+
+        Cached on `self._spec_gate` and reused across calls: the design's
+        RUN/OFF decision latches for the PROCESS (design doc S2), not per
+        request, so a fresh gate on every speculative_generate() call would
+        restart CALIBRATE/TRIAL at snapshot 0 every request -- a server doing
+        short requests would never accumulate enough drafted tokens to reach
+        the trial threshold, so a bad configuration's regression never
+        latches off. Rebuilt only if what it was constructed from changed
+        (draft_tokens, or the expert cache budget) -- both can move across a
+        load, and a stale gate sized for the old numbers would be silently
+        wrong.
         """
         if not getattr(self, "is_moe", False):
             return None
@@ -4676,6 +4687,11 @@ class VaayuBaseModel(GenerationMixin):
         cache = getattr(self, "_expert_cache", None)
         if geo is None or cache is None:
             return None
+        existing = getattr(self, "_spec_gate", None)
+        if (existing is not None
+                and existing.draft_tokens == self.draft_tokens
+                and existing.budget_bytes == cache.budget_bytes):
+            return existing
         from .speculative.adaptive_gate import AdaptiveSpecGate
         return AdaptiveSpecGate(geo, self.draft_tokens, cache.budget_bytes)
 
@@ -4844,24 +4860,53 @@ class VaayuBaseModel(GenerationMixin):
                     gate.record_round(k, max(0, num_accepted - 1))
                 if gate.decided_off() and self.speculator is not None:
                     s = gate.status()
-                    print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
-                          f"for this MoE model on measured evidence: {s}")
+                    if gate.decision == "off_no_routing":
+                        # 800467d fixed the same ambiguity for a starved
+                        # k-window; this is the other way observed_union_gb
+                        # reads 0.0 -- every calibration snapshot's routing
+                        # dict was empty, i.e. this forward stopped writing
+                        # _expert_history (design doc S8's named risk), not a
+                        # real over-budget refusal. Name the cause, don't let
+                        # it read as a measured union that happened to be 0.
+                        print(f"[Vaayu-Spec] WARNING: no expert routing was "
+                              f"observed during calibration (_expert_history "
+                              f"stayed empty every step) -- this forward is "
+                              f"not writing it, so the gate has no evidence "
+                              f"to size a verify pass against. DISABLING "
+                              f"speculative decoding for this MoE model "
+                              f"rather than guessing: {s}")
+                    else:
+                        print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
+                              f"for this MoE model on measured evidence: {s}")
                     self.speculator = None
                     status = getattr(self, "speculative_status", None)
                     if status is not None:
                         status["active"] = False
                         status["calibration"] = s
                 elif gate.decision == "run":
+                    # Refreshed every round, not written once: with the gate
+                    # now cached across calls (Critical 1), a `run` decision
+                    # keeps accumulating drafted/accepted after it latches, so
+                    # freezing the first generation's numbers here would make
+                    # every later report stale.
                     status = getattr(self, "speculative_status", None)
-                    if status is not None and "calibration" not in status:
+                    if status is not None:
                         status["calibration"] = gate.status()
 
             # Step 5: Trim verifier KV back to past_len + num_accepted
             # (verify pass grew cache by k+1; we only keep num_accepted new positions)
             self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
 
-            # Step 6: Sync drafter cache to match accepted length
-            speculator.rollback_cache(draft_state, num_accepted)
+            # Step 6: Sync drafter cache to match accepted length. Skipped
+            # when draft_state is None -- the suppressed-draft path (gate
+            # calibrating, or latched off) never called speculator.draft(),
+            # so there is no drafter-side state to roll back, and a weighted
+            # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
+            # draft_state unconditionally once its own cache is warm and
+            # crashes on None (PLD's is a no-op `pass`, which is why this was
+            # never reachable through it).
+            if draft_state is not None:
+                speculator.rollback_cache(draft_state, num_accepted)
 
             # Step 7: Extend generated sequence (cap at max_new_tokens)
             remaining = max_new_tokens - tokens_generated

@@ -171,7 +171,18 @@ class AdaptiveSpecGate:
             self.geometry)
         self._breakeven = spec_breakeven_acceptance(
             self._union_1, self._union_k, self.draft_tokens)
-        if self._union_k <= 0 or self._union_k > self.budget_bytes:
+        if self._union_k <= 0:
+            # calibrate_steps is always >= draft_tokens + 1 (see __init__), so
+            # there are always enough snapshots for a full k-window; the only
+            # way observed_union_per_layer still returns 0.0 here is that
+            # every snapshot's routing dict was empty -- a forward that has
+            # stopped writing _expert_history (design doc S8's named risk),
+            # not a real over-budget union. Report it as its own decision so
+            # it is never read as "measured a real union of zero and it
+            # exceeded budget_bytes" -- that reading is impossible, since a
+            # genuine over-budget refusal requires union_k > budget_bytes > 0.
+            self.phase, self.decision = "off", "off_no_routing"
+        elif self._union_k > self.budget_bytes:
             self.phase, self.decision = "off", "off_union"
         else:
             self.phase = "trial"

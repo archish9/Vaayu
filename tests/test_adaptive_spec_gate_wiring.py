@@ -189,3 +189,164 @@ def test_record_round_translates_the_real_accept_contract(monkeypatch):
         "correction token verify_and_accept always appends must not be "
         "counted as a drafted-token match")
     assert gate.status()["measured_acceptance"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review, 2026-09-05: Critical 1, Important 2/3/4.
+# ---------------------------------------------------------------------------
+
+def test_the_gate_is_shared_across_request_boundaries(monkeypatch):
+    """Critical 1. The RUN/OFF decision latches for the PROCESS (design doc
+    S2), not per request. Before this fix, `_build_spec_gate()` built a FRESH
+    gate on every `speculative_generate()` call, so two back-to-back calls
+    each restarted CALIBRATE at snapshot 0 -- a server doing short requests
+    would never accumulate enough evidence to reach a decision at all, and a
+    good configuration would re-pay its calibration cost on every request.
+
+    CALIBRATE_STEPS=4 needs 4 observed snapshots to leave "calibrate". Each
+    call below is capped to exactly 2 calibrate rounds. A gate rebuilt per
+    call would still have only 2 snapshots after the second call and never
+    leave "calibrate"; a gate carried across the boundary reaches 4 and
+    moves to "trial" on the second call -- the assertion a rebuild-per-call
+    bug fails."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    model = _MoEFake(pc)
+    model.speculator = _CountingSpeculator()
+
+    _run(model, max_new_tokens=3)   # prefill (1 tok) + 2 calibrate rounds
+    gate_after_call_1 = model._spec_gate
+    assert gate_after_call_1 is not None
+    assert gate_after_call_1.phase == "calibrate"
+    assert len(gate_after_call_1._snapshots) == 2, \
+        "premise: call 1 must leave the gate exactly 2 snapshots short of done"
+
+    _run(model, max_new_tokens=3)   # 2 more calibrate rounds, on the SAME gate
+    assert model._spec_gate is gate_after_call_1, \
+        "a fresh gate was built on the second call -- the latch cannot " \
+        "survive a request boundary"
+    assert model._spec_gate.phase == "trial", \
+        "the two calls' snapshots did not accumulate on one gate -- a " \
+        "rebuild-per-call gate would still have only 2 snapshots here"
+
+
+def test_a_dense_model_still_never_gets_a_cached_gate():
+    """The caching in _build_spec_gate must not accidentally give dense a
+    gate on a second call -- is_moe is checked before the cache lookup."""
+    model = _FakeSpecModel(PrefixCacheStore(budget_bytes=10 ** 9))
+    model.speculator = _CountingSpeculator()
+    _run(model, max_new_tokens=3)
+    _run(model, max_new_tokens=3)
+    assert getattr(model, "_spec_gate", None) is None
+
+
+class _RaisesOnNoneRollback(_FakeSpeculator):
+    """StandardDrafterDecoder.rollback_cache does `draft_state.get(...)`
+    unconditionally once its own cache is warm (it early-returns only on
+    `_drafter_past is None`, which is not the case once the trial has
+    drafted). This fake reproduces exactly that contract without needing a
+    real weighted drafter: calling it with draft_state=None must never
+    happen, so it raises if it does."""
+
+    def rollback_cache(self, draft_state, num_accepted) -> None:
+        if draft_state is None:
+            raise AttributeError(
+                "rollback_cache(None, ...) -- draft_state.get() on None")
+
+
+def test_rollback_cache_is_skipped_when_draft_state_is_none(monkeypatch):
+    """Important 2. Every calibrate round (and every round after an
+    off_union/off_acceptance latch) takes the suppressed-draft path with
+    draft_state=None -- speculator.draft() is never called, so there is
+    nothing for rollback_cache to roll back. Before this fix, Step 6 called
+    `speculator.rollback_cache(draft_state, num_accepted)` unconditionally,
+    which crashes on any speculator whose rollback_cache is not PLD's `pass`
+    (e.g. StandardDrafterDecoder). Reachable on any MoE + weighted drafter,
+    starting with the very first calibrate round -- no latch required."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    model = _MoEFake(PrefixCacheStore(budget_bytes=10 ** 9))
+    model.speculator = _RaisesOnNoneRollback()
+    _run(model, max_new_tokens=2)   # one calibrate round is enough to hit it
+
+
+def test_rollback_cache_is_also_skipped_after_a_mid_call_latch(monkeypatch):
+    """Same guard, the scenario the finding names explicitly: after an
+    off_union latch, LATER rounds also take the suppressed-draft path with
+    draft_state=None, via the local `speculator` reference captured before
+    self.speculator was set to None."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 2)
+    model = _MoEFake(PrefixCacheStore(budget_bytes=10 ** 9), budget_bytes=1)
+    model.speculator = _RaisesOnNoneRollback()
+    _run(model, max_new_tokens=6)   # must not raise
+    assert model.speculator is None
+
+
+class _CyclingRoutingFake(_MoEFake):
+    """4 disjoint 8-expert sets, cycled every forward() call, so the
+    (draft_tokens+1)-wide union genuinely differs from the 1-wide union and
+    the trial phase gets a non-degenerate (>0) break-even to fail. The other
+    tests' static routing (same experts every step) gives breakeven=0, which
+    ANY positive acceptance clears -- it can only ever produce "run", never
+    "off_acceptance"."""
+
+    def __init__(self, pc, budget_bytes):
+        super().__init__(pc, budget_bytes=budget_bytes)
+        self._route_step = 0
+
+    def forward(self, *args, **kwargs):
+        out = super().forward(*args, **kwargs)
+        base = 8 * (self._route_step % 4)
+        self._expert_history = {layer: list(range(base, base + 8))
+                                 for layer in range(62)}
+        self._route_step += 1
+        return out
+
+
+def test_off_acceptance_latches_through_the_real_loop(monkeypatch):
+    """Important 3. Every existing latch test uses budget_bytes=1, i.e.
+    off_union -- off_acceptance, the path that fires on real models, had
+    never run end-to-end through the real loop, which is exactly what hid
+    Important 2's rollback_cache(None, ...) crash (off_acceptance is reached
+    by mid-call latching from a well-fitting budget, off_union is reached
+    before a single draft is paid for).
+
+    4 disjoint 8-expert sets over 4 calibrate snapshots give union(1)=8,
+    union(4)=32 -> breakeven = (32/8 - 1)/3 = 1.0 (see _CyclingRoutingFake).
+    Each trial round drafts [0, 0, 7]: positions 0-1 match the fake
+    forward's all-zero-argmax verifier, position 2 mismatches -- drafted=3,
+    accepted=2 every round, measured_acceptance settles at 2/3, well under
+    the 1.0 bar.
+    """
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    monkeypatch.setattr(ag, "TRIAL_DRAFTED_TOKENS", 6)
+    monkeypatch.setattr(ag, "TRIAL_ROUND_CAP", 10)
+    model = _CyclingRoutingFake(PrefixCacheStore(budget_bytes=10 ** 9),
+                                budget_bytes=20_000_000_000)
+    model.speculator = _DraftingSpeculator([[0, 0, 7], [0, 0, 7]])
+    # 1 prefill + 4 calibrate rounds (1 tok each) + 2 trial rounds (3 tok
+    # each, drafted=3/accepted=2 -> num_accepted=3 per round) = 11.
+    out = _run(model, max_new_tokens=11)
+    assert model.speculator is None, \
+        "off on measured evidence must disable speculation the same way off_union does"
+    assert model.speculative_status["calibration"]["decision"] == "off_acceptance"
+    assert out.shape[1] == 5 + 11, \
+        "latching mid-call must not truncate the answer"
+
+
+def test_empty_routing_history_latches_distinctly_and_warns(monkeypatch, capsys):
+    """Important 4. A forward that stops writing _expert_history makes every
+    calibration snapshot {}. This must latch off on its own distinct
+    decision (off_no_routing) -- not off_union, which a reader takes as a
+    real budget refusal -- and print a WARNING naming the cause (CLAUDE.md
+    S5: warn, never silently degrade), in the style of the other
+    [Vaayu-Spec] warnings in vaayu_base.py."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 2)
+    model = _MoEFake(PrefixCacheStore(budget_bytes=10 ** 9))
+    model._expert_history = {}
+    model.speculator = _CountingSpeculator()
+    _run(model, max_new_tokens=5)   # prefill(1) + 4 calibrate rounds to decide
+    assert model.speculator is None
+    assert model.speculative_status["calibration"]["decision"] == "off_no_routing"
+    warnings = capsys.readouterr().out
+    assert "[Vaayu-Spec] WARNING" in warnings
+    assert "_expert_history" in warnings
