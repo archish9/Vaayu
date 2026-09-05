@@ -292,8 +292,51 @@ def test_a_jinja_error_on_the_streaming_path_writes_a_row(run_dir, no_real_load,
                 "messages": [{"role": "user", "content": "hi"}]})
     rs = rows(run_dir)
     assert len(rs) == 1, "a Jinja error on the streaming path left no row"
-    assert rs[0]["finish"] == "refused"
+    # V1: it RAISED and produces a 500, so the vocabulary word is `error`.
+    # `refused` is documentation/server.md's word for a rejection before
+    # generation started -- an oversized prompt, a missing session_id, a full
+    # queue, all 400/503 and all client-fixable. This row said `refused` only
+    # because _refusal_row hardcoded it when every caller really was one.
+    assert rs[0]["finish"] == "error"
     assert rs[0]["error"]["type"] == "ValueError"
+
+
+def test_a_jinja_error_gets_the_same_finish_on_both_paths(run_dir, no_real_load):
+    """V1: one failure, one word for it.
+
+    A maintainer filters a mailed bundle by `finish`. While the streaming path
+    said `refused` and the non-streaming path `error` for the SAME template
+    failure, filtering on `error` under-counted them by the streaming share of
+    traffic -- and DEFAULT_STREAM is True, so that is most of it.
+    """
+    cfg = ServerConfig(model_path="/ckpt", log_dir=str(run_dir.parent),
+                       capture_stdio=False, require_session_id=False,
+                       default_stream=False)
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        m = M()
+
+        def boom(messages, **kw):
+            raise ValueError("Jinja: unknown role 'tool' with no matching call")
+
+        m.tokenizer.apply_chat_template = boom
+        app.state.engine = EngineHandle(m, log_dir=run_dir)
+        body = {"model": "m", "session_id": "s",
+                "messages": [{"role": "user", "content": "hi"}]}
+        # Streaming: the route re-raises, so the 500 is TestClient's exception.
+        with pytest.raises(ValueError, match="Jinja"):
+            c.post("/v1/chat/completions", json=dict(body, stream=True))
+        # Non-streaming: generate()'s finally writes the row, the route answers
+        # 500 rather than re-raising.
+        r = c.post("/v1/chat/completions", json=dict(body, stream=False))
+        assert r.status_code == 500, r.text[:200]
+
+    streamed, non_streamed = rows(run_dir)
+    assert streamed["stream"] is True and non_streamed["stream"] is False
+    assert streamed["finish"] == non_streamed["finish"], (
+        f"same failure, two words: streaming={streamed['finish']!r} "
+        f"non-streaming={non_streamed['finish']!r}")
+    assert streamed["finish"] == "error"
 
 
 def test_a_refusal_row_has_the_same_keys_as_an_engine_row(client_requiring_session,

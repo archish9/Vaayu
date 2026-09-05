@@ -175,9 +175,21 @@ telemetry. `finish` is one of:
 | `error` | the request raised |
 | `refused` | rejected before generation started — an oversized prompt, a missing `session_id`, a full queue |
 
+The dividing line between the last two is the **status code, not the moment**:
+`refused` is a 400 or 503 the client can fix (the three cases named above);
+anything that raised and answers 500 is `error`, including a failure inside the
+chat template, which is rejected before generation starts but is not the
+client's to fix. Both values are **path-independent** — the same failure gets
+the same word whether the request was streaming or not.
+
 `cancelled` is a `requests.jsonl`-only value: a client that has already
 disconnected never receives an OpenAI-vocabulary `finish_reason` for the
 request it abandoned, so this row is the only place the outcome is recorded.
+For a **non-streaming** cancellation the row and `server.log` deliberately
+disagree: the log's `DONE` line prints the wire `finish_reason`, which maps a
+cancellation to `length` because the OpenAI vocabulary has no other word for it,
+while the row says `cancelled`. The row is the richer record; when the two
+files differ on a cancelled request, this is why.
 
 An `error`/`refused` row also carries an `error` object (`type`, `message`,
 `traceback`). A `refused` row has the **same keys** as every other row — the

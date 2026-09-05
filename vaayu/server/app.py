@@ -504,7 +504,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # the route as a bare 500 -- and the SSE generator that would
                 # have written the row is never created. The row is this
                 # handler's to write; the 500 is still correct, so re-raise.
-                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
+                # finish="error", NOT _refusal_row's "refused" default: this
+                # RAISED and answers 500, and documentation/server.md keeps
+                # `refused` for a rejection before generation started -- the
+                # 400/503 cases, all client-fixable. The handler above keeps
+                # the default for exactly that reason, and generate() files
+                # this same failure as "error" on the non-streaming path (V1).
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True,
+                             finish="error")
                 raise
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),

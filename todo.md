@@ -36,9 +36,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1489 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-05 after G1's capture guard (was 1486 + 3 new regression tests; the 1486 was measured the
-same day after the `_sse` pre-generation disconnect fix, itself re-measured against a stashed HEAD). **This figure has
+**Suite baseline: 1491 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-05 after V1's `finish`-vocabulary fix (was 1489 + 2 new regression tests, one existing test
+changed not added; the 1489 was the same day's G1 capture guard, itself 1486 + 3). **This figure has
 gone stale six times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
 
@@ -48,11 +48,12 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-05: one task row (**S1**, the drafter) and three `[bug]` rows (G1 closed that
-day). Each of
+Live as of 2026-09-05: one task row (**S1**, the drafter) and two `[bug]` rows — `env.json`'s
+`kv_cache_mode`, and `avg_nvme_throughput` on dense (G1 and V1 both closed that day). Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
-cold in a fresh session with no other context; the two remaining bug rows (`env.json`'s
-`kv_cache_mode`, the suite's stray `logs/run-*` dirs) are short enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
+cold in a fresh session with no other context; the remaining bug rows (`env.json`'s
+`kv_cache_mode`, the suite's stray `logs/run-*` dirs, `avg_nvme_throughput` on dense) are short
+enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
 copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
 planning, investigation and spec work goes in `docs/` — see `CLAUDE.md` §7.
@@ -356,7 +357,7 @@ What the pass actually found:
   figures closely, so the byte counter did not move either: Qwen 1.53–59.77 GB over 96 tokens (was
   1.65–59.77), MiniMax 1.32–74.56 over 34 (was 1.37–74.56), Llama-3.3-70B **constant 13.86 on all
   96** (identical), Llama-3.2-1B all 0.00 (correct — it fully pins).
-- **[bug] V1 · the `finish` vocabulary in `requests.jsonl` is path-dependent for the same failure** —
+- **[x] V1 · the `finish` vocabulary in `requests.jsonl` was path-dependent for the same failure — FIXED 2026-09-05** —
   **[`docs/issue-V1-finish-vocabulary-path-dependent.md`](docs/issue-V1-finish-vocabulary-path-dependent.md)**
   (self-contained; pick up cold).
   Introduced 2026-09-04 by the final fix wave (`9aa3a1f`), flagged by its re-review, not blocking
@@ -367,15 +368,36 @@ What the pass actually found:
   "the request raised", so a 500-producing template failure is currently filed as `refused` on one
   path only. Two shipped tests bake the asymmetry in. **Fix sketch:** let `_refusal_row` take the
   `finish` value rather than hardcoding it, and pass `"error"` from the widened `except Exception`.
-  **Half of that sketch is already built** (2026-09-05, by the disconnect fix above, which needed
-  it): `_refusal_row` now takes `finish=` with default `"refused"`, so no call site changed. What
-  remains is purely the call-site values in `chat_completions`, plus the two tests baking in the
-  old one.
-  Two smaller siblings recorded with it: `generate()` tags the three refusal types `finish="refused"`
-  while `stream()`'s fallback `prepare()` still leaves `"error"` (unreachable from HTTP today, since
-  the route always passes `prepared=`); and a cancelled NON-streaming request now prints
-  `finish=length` in `server.log`'s DONE line while its row says `cancelled` — defensible, since the
-  row is the richer record, but undocumented.
+  **Half of that sketch was already built** (2026-09-05, by the disconnect fix above, which needed
+  it): `_refusal_row` takes `finish=` with default `"refused"`, so no call site changed.
+  **V1a/V1b/V1c DONE 2026-09-05, plus BOTH siblings.** The streaming route's bare-`except Exception`
+  (`vaayu/server/app.py`, the handler whose comment begins "prepare() raises more than those three")
+  now passes `finish="error"`; the `except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate)`
+  handler above it keeps the `"refused"` default, which is correct — those three are 400s and
+  `generate()` already calls them `refused`. **The dividing line is the STATUS CODE, not the moment:**
+  400/503 and client-fixable → `refused`; raised and answers 500 → `error`, template failures
+  included, even though they are rejected before generation starts. That rule is now written into
+  `documentation/server.md`'s `finish` table, because "rejected before generation started" read as
+  covering the template case and is what made the wrong value look right.
+  **Sibling 1 FIXED** (was: `stream()`'s fallback `prepare()` left the three refusal types as
+  `"error"` while `generate()` tagged them `"refused"`): `stream()`'s outer `except BaseException`
+  now mirrors `generate()`'s branch, so the word does not depend on which engine method you called
+  either. Unreachable from HTTP (the route always passes `prepared=`), reachable for every other
+  caller. **Sibling 2 DOCUMENTED, not changed** (a cancelled NON-streaming request prints
+  `finish=length` in `server.log`'s DONE line while its row says `cancelled`): `documentation/server.md`
+  now says the two files disagree there and why — the log line carries the WIRE value, and F5
+  established that split deliberately, so changing it was the riskier option.
+  Tests: `test_a_jinja_error_on_the_streaming_path_writes_a_row` flipped `refused`→`error` (changed,
+  not deleted — it asserted the old value on purpose); new
+  `test_a_jinja_error_gets_the_same_finish_on_both_paths` drives ONE Jinja failure down both HTTP
+  paths and asserts the two rows agree (V1c, the anti-drift test); new
+  `test_stream_tags_the_three_refusal_types_refused_like_generate_does` covers sibling 1 with a
+  genuinely oversized prompt rather than a monkeypatched raise. All three confirmed failing first,
+  each on its assertion message rather than an error. `test_a_prepare_failure_still_writes_a_row_non_streaming`
+  is UNCHANGED — it was the one already right, and stays the reference.
+  Suite **1489 → 1491 passed, 12 skipped**. HTTP on-device gate re-run (route + engine error paths
+  touched): **9/9 on Llama-3.2-1B**, own `systemd-run` scope, `MemoryMax=22G`, `delete_original=False`,
+  checkpoint intact.
 - **[x] G1 · the committed HTTP gate was RED under its own documented invocation — FIXED 2026-09-05** —
   **[`docs/issue-G1-server-smoke-gate-capture-blind-spot.md`](docs/issue-G1-server-smoke-gate-capture-blind-spot.md)**
   (self-contained; pick up cold).

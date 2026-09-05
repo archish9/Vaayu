@@ -652,6 +652,15 @@ class EngineHandle:
                     row["finish"] = "cancelled"
             else:
                 row["error"] = ex
+                if isinstance(ex, (ContextTooLong, TemplateLacksToolSupport,
+                                   NoChatTemplate)):
+                    # Same word generate() uses for these three: rejected
+                    # before generation started. Only the fallback prepare()
+                    # above can raise them here -- the HTTP route passes
+                    # `prepared`, so this is for other callers of stream() --
+                    # but the vocabulary must not depend on which method you
+                    # called any more than on which path you took (V1).
+                    row["finish"] = "refused"
             raise
         finally:
             self._write_request_row(

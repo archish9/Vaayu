@@ -209,6 +209,35 @@ def test_a_prepare_failure_still_writes_a_row_non_streaming(tmp_path):
     assert r[0]["prompt_tokens"] == 0     # never got one; not a NameError
 
 
+def test_stream_tags_the_three_refusal_types_refused_like_generate_does(tmp_path):
+    """V1 sibling 1: same vocabulary on both of the engine's own methods.
+
+    generate() explicitly tags ContextTooLong / TemplateLacksToolSupport /
+    NoChatTemplate as finish="refused"; stream()'s fallback prepare() had no
+    such branch, so the same rejection landed as "error" there. Unreachable
+    from HTTP today (the route always passes `prepared=`), reachable for any
+    other caller of stream() -- and the asymmetry is exactly what V1 is about.
+    The prompt is genuinely oversized rather than a monkeypatched raise, so it
+    is prepare()'s own ContextTooLong.
+    """
+    m = M()
+    m.tokenizer.apply_chat_template = lambda messages, **kw: [1] * 100000
+    e = EngineHandle(m, log_dir=tmp_path)
+
+    async def main():
+        async for _kind, _payload in e.stream(_req()):
+            pass
+
+    with pytest.raises(engine_mod.ContextTooLong):
+        asyncio.run(main())
+    r = rows(tmp_path)
+    assert len(r) == 1
+    assert r[0]["finish"] == "refused", (
+        f"stream() filed a rejection as {r[0]['finish']!r}; generate() calls "
+        f"the same one 'refused'")
+    assert r[0]["error"]["type"] == "ContextTooLong"
+
+
 def test_a_prepare_failure_still_writes_a_row_streaming(tmp_path):
     """stream()'s own fallback path, for callers that do not pass `prepared`."""
     m = M()
