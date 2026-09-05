@@ -46,10 +46,12 @@ number written here.
 
 # ▶▶ OPEN — server logging & drafter, opened 2026-09-03
 
-**These are the two live rows. Everything below them is either carried-forward work, the
+**These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Both rows carry a self-contained document in **`docs/`** — each is meant to be picked up cold in a
-fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
+Live as of 2026-09-05: one task row (**S1**, the drafter) and four `[bug]` rows. Each of
+**S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
+cold in a fresh session with no other context; the two remaining bug rows (`env.json`'s
+`kv_cache_mode`, the suite's stray `logs/run-*` dirs) are short enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
 copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
 planning, investigation and spec work goes in `docs/` — see `CLAUDE.md` §7.
@@ -353,7 +355,9 @@ What the pass actually found:
   figures closely, so the byte counter did not move either: Qwen 1.53–59.77 GB over 96 tokens (was
   1.65–59.77), MiniMax 1.32–74.56 over 34 (was 1.37–74.56), Llama-3.3-70B **constant 13.86 on all
   96** (identical), Llama-3.2-1B all 0.00 (correct — it fully pins).
-- **[bug] the `finish` vocabulary in `requests.jsonl` is path-dependent for the same failure.**
+- **[bug] V1 · the `finish` vocabulary in `requests.jsonl` is path-dependent for the same failure** —
+  **[`docs/issue-V1-finish-vocabulary-path-dependent.md`](docs/issue-V1-finish-vocabulary-path-dependent.md)**
+  (self-contained; pick up cold).
   Introduced 2026-09-04 by the final fix wave (`9aa3a1f`), flagged by its re-review, not blocking
   merge. A template/Jinja failure out of `prepare()` records `finish="refused"` on the STREAMING
   path (the route's `_refusal_row` hardcodes it) but `finish="error"` on the NON-streaming path
@@ -371,7 +375,9 @@ What the pass actually found:
   the route always passes `prepared=`); and a cancelled NON-streaming request now prints
   `finish=length` in `server.log`'s DONE line while its row says `cancelled` — defensible, since the
   row is the richer record, but undocumented.
-- **[bug] the committed HTTP gate is RED under its own documented invocation — it needs `-s`.**
+- **[bug] G1 · the committed HTTP gate is RED under its own documented invocation — it needs `-s`** —
+  **[`docs/issue-G1-server-smoke-gate-capture-blind-spot.md`](docs/issue-G1-server-smoke-gate-capture-blind-spot.md)**
+  (self-contained; pick up cold).
   Found 2026-09-05 while running the gate the `_sse` disconnect fix obliged; **pre-existing,
   reproduced identically on a stashed HEAD** (`1 failed, 8 passed`), so it is not that fix's.
   `tests/test_server_smoke.py::test_the_token_summary_reports_nvme_bytes_consistent_with_pinning`
