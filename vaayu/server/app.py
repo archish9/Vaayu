@@ -238,8 +238,9 @@ def _error(status: int, message: str, kind: str, headers=None):
                         content={"error": {"message": message, "type": kind}})
 
 
-def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> None:
-    """A row for a request refused BEFORE generation.
+def _refusal_row(engine, req, exc_type, message, *, stream: bool,
+                 finish: str = "refused") -> None:
+    """A row for a request that ended BEFORE generation.
 
     The engine writes rows from its own `finally`, but these never reach it:
     the session-id check and (for the streaming path) `prepare()` both run in
@@ -261,6 +262,13 @@ def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> N
     *before* this call, in `chat_completions`'s own frame. This try/except
     does not reach back to protect that call-site expression; only what runs
     inside this function's body.
+
+    `finish` is a parameter because not every pre-generation ending is a
+    refusal: a client that disconnects before generation starts is
+    `cancelled`, which documentation/server.md defines as "the client
+    disconnected before the stream finished". Pass `exc_type=None` with it --
+    that doc says only `error`/`refused` rows carry an `error` object, and
+    `EngineHandle.stream` already nulls the error on its own GeneratorExit.
     """
     try:
         from datetime import datetime, timezone
@@ -286,10 +294,11 @@ def _refusal_row(engine, req, exc_type: str, message: str, *, stream: bool) -> N
             "temperature": getattr(req, "temperature", None),
             "tools": len(getattr(req, "tools", None) or []),
             "prefix_hit": None, "ttft_s": None, "wall_s": 0.0,
-            "tokens": 0, "finish": "refused",
+            "tokens": 0, "finish": finish,
             "decode_tok_s": None,
             "decode": None,
-            "error": {"type": exc_type, "message": message, "traceback": None},
+            "error": (None if exc_type is None else
+                      {"type": exc_type, "message": message, "traceback": None}),
         })
     except Exception:                           # noqa: BLE001 -- never displaces
         pass
@@ -585,14 +594,6 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     if cancel is None:
         cancel = CancelToken()
 
-    # A comment line: legal SSE, ignored by every client, and it lets a queued
-    # caller tell "waiting behind N requests" from "hung".
-    yield f": vaayu queue position {engine.depth}\n\n"
-    if warning:
-        yield f": warning {warning}\n\n"
-
-    yield _chunk(cid, created, model_name, session_id=session_id, delta={"role": "assistant"})
-
     fmt = engine.tool_format if req.tools else None
     open_marker = fmt.open_marker if fmt is not None else None
     # `buffered` is everything from the open marker on. It is NOT dropped:
@@ -607,12 +608,37 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # it got to.
     sent = ""
     final = None
+    # `engine.stream` writes this request's row from its own `finally`, but
+    # only once that generator's BODY has started -- i.e. from the first
+    # `__anext__` below. Everything before that point is unowned: the three
+    # yields, the wait for a slot, `engine.slot` itself. Only QueueFull was
+    # ever plugged, by a typed `except`, so every OTHER way of leaving that
+    # span ended the request with no row at all -- breaking the "a request
+    # never ends without a row" contract README.md and documentation/server.md
+    # both state. `owed` carries what this frame must write; the flag below
+    # hands ownership to the engine at the exact statement where it takes it.
+    owed = None
+    engine_owns_the_row = False
     try:
+        # A comment line: legal SSE, ignored by every client, and it lets a
+        # queued caller tell "waiting behind N requests" from "hung". These
+        # three yields are INSIDE the try because a disconnect suspended on
+        # any of them is exactly the unowned window described above.
+        yield f": vaayu queue position {engine.depth}\n\n"
+        if warning:
+            yield f": warning {warning}\n\n"
+
+        yield _chunk(cid, created, model_name, session_id=session_id,
+                     delta={"role": "assistant"})
+
         # Acquired HERE, not in the route: this generator body runs after the
         # handler returned, so a slot held around that return would already be
         # released before the first token.
         async with engine.slot(req.session_key):
             gen = engine.stream(req, cancel=cancel, prepared=prepared)
+            # No await between here and the loop's first `__anext__`, so no
+            # cancellation can land in between: the handover is exact.
+            engine_owns_the_row = True
             try:
                 async for kind, payload in gen:
                     if kind == "final":
@@ -660,10 +686,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # when retrying is exactly the right response.
         #
         # `slot` raises BEFORE it yields, so engine.stream() is never entered
-        # and its row-writing `finally` never runs. Without this call the
+        # and its row-writing `finally` never runs. Without this row the
         # request that lost the admission race is the one kind of request that
         # ends with no row at all.
-        _refusal_row(engine, req, "QueueFull", str(ex), stream=True)
+        owed = ("QueueFull", str(ex), "refused")
         yield _error_event(ex, "server_busy")
         yield "data: [DONE]\n\n"
         return
@@ -671,18 +697,38 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # Unreachable from the route, which now prepares before responding.
         # Kept for any other caller of _sse, and so this class of error is
         # never again reported as a fault of the server's.
+        owed = (type(ex).__name__, str(ex), "refused")
         yield _error_event(ex, "invalid_request_error")
         yield "data: [DONE]\n\n"
         return
     except Exception as ex:                            # noqa: BLE001
+        owed = (type(ex).__name__, str(ex), "error")
         yield _error_event(ex)
         yield "data: [DONE]\n\n"
         return
+    except BaseException as ex:                        # noqa: BLE001 -- re-raised
+        # GeneratorExit (Starlette closing an abandoned stream) and
+        # CancelledError (the ASGI task cancelled while this request waited on
+        # a slot) are BaseExceptions, so the clause above misses both -- and
+        # neither may be answered with a yield, because there is no longer a
+        # client to yield to. The row is the `finally`'s to write.
+        owed = (None, None,
+                "cancelled" if isinstance(ex, (GeneratorExit,
+                                               asyncio.CancelledError))
+                else "error")
+        raise
     finally:
         # Starlette closes this generator when the client goes away, so this is
         # where an abandoned SSE stream stops generating. Cancelling after a
         # normal finish is harmless -- the token is already spent.
         cancel.cancel()
+        # Guarded on the handover, not on the exception type: once
+        # engine.stream owns the row, writing one here would DOUBLE-count the
+        # request. QueueFull can only be raised before the handover, so its
+        # row is unaffected by moving it into this branch.
+        if owed is not None and not engine_owns_the_row:
+            _refusal_row(engine, req, owed[0], owed[1], stream=True,
+                         finish=owed[2])
 
     if held and not suppressing:
         yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})

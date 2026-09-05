@@ -786,8 +786,14 @@ this one is committed rather than left as a scratchpad script). Skipped unless
 ```
 SERVER_CKPT=<checkpoint dir> \
   systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0 \
-  ./venv/bin/python -m pytest tests/test_server_smoke.py -q
+  ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s
 ```
+
+`-s` is required, not optional. Several of these assertions read `server.log`,
+and pytest's default capture rebinds `sys.stdout` — so the engine's `print()`
+output never reaches fd 1, where `capture_stdio`'s pump tees it from. Without
+`-s` the log holds only the native fd-1 writes (`[vaayu_rust]` lines) and the
+byte-counter check fails as if the counter were broken.
 
 It runs a real load, non-streaming, streaming (checking `finish_reason` and
 `completion_tokens` on both), an oversized-prompt refusal on both paths, a

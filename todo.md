@@ -36,10 +36,11 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1482 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-04 after the L1 T5–T10 final fix wave (was 1468 + 15 new regression tests − 1 deleted
-duplicate). **This figure has gone stale six times now.** Re-measure against a stashed HEAD before
-quoting it; do not trust the number written here.
+**Suite baseline: 1486 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-05 after the `_sse` pre-generation disconnect fix (was 1482 + 4 new regression tests; the
+1482 was itself re-measured against a stashed HEAD that day, not carried over). **This figure has
+gone stale six times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
+number written here.
 
 ---
 
@@ -210,7 +211,7 @@ What the pass actually found:
   module skipped unless `SERVER_CKPT` is set. Default suite: **1468 passed, 12 skipped** (was 1467
   passed, 3 skipped; the whole new module — 9 tests — skips cleanly with no `SERVER_CKPT`, +1 from
   a `test_envinfo.py` regression test). Gate command:
-  `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q` (see the
+  `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` (see the
   On-device gates table below for the per-checkpoint invocation and memory cap). The brief's given
   `gb_tok > 0` assertion turned out to assume every dense checkpoint streams; it does not — a
   checkpoint small enough to fully pin (Llama-3.2-1B: 3.00 GB against an 11.06 GiB pinning budget)
@@ -315,16 +316,43 @@ What the pass actually found:
   whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
   whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
   `log_dir` at `tmp_path` unless a test explicitly overrides it.
-- **[bug] a client that disconnects in `_sse`'s pre-`try` window leaves NO `requests.jsonl` row.**
-  Found 2026-09-04 by the whole-branch re-review, confirmed empirically; **pre-existing, not
-  introduced by the T5–T10 branch**, and the one spot its fix wave did not reach. `_sse`
-  (`vaayu/server/app.py`) yields three times — the queue-position comment, the optional warning,
-  and the role chunk — **before** entering the `try` that owns row-writing. A disconnect in that
-  window produces no row at all. Same class as the three findings the branch's own fix wave
-  closed (`prepare()` outside the try, the `QueueFull` admission race, break-then-finalize), so
-  the fix is the same shape: widen the `try` to cover those yields. Until then the contract
-  "a request never ends without a row" — stated in `README.md` and `documentation/server.md` —
-  has one known exception.
+- **[x] a client that disconnects before generation starts leaves NO `requests.jsonl` row —
+  FIXED 2026-09-05.** Found 2026-09-04 by the whole-branch re-review; **pre-existing, not
+  introduced by the T5–T10 branch**. The contract "a request never ends without a row"
+  (`README.md`, `documentation/server.md`) now holds with no known exception.
+  **The row's own fix sketch — "widen the `try`" — was not sufficient, and a probe found a THIRD
+  window it does not reach.** Measured before the fix (scratchpad probe, one row-count per abandon
+  shape): normal stream → 1 row; disconnect at the 1st pre-`try` yield → **0**; at the role-chunk
+  yield → **0**; **disconnect while QUEUED → 0**, and that one is already *inside* the `try`.
+  **Root cause (deeper than the positional one):** `_sse` delegates row-writing entirely to
+  `engine.stream`'s `finally`, which runs only once that generator's *body* has started. The whole
+  span before it — the three yields, the wait on `engine.slot`'s lock, `slot` itself — was unowned,
+  and exactly one hole in it was plugged, by a typed `except QueueFull`. Every other exit wrote
+  nothing. `CancelledError` (the queued case) and `GeneratorExit` are both `BaseException`, so the
+  route's `except Exception` missed them, and neither may be answered with a yield.
+  **Fix:** the three yields moved inside the `try`, plus an `engine_owns_the_row` flag set at the
+  exact statement where `engine.stream` takes ownership (no await between it and the first
+  `__anext__`, so the handover is exact) and one `finally` that writes the owed row when the
+  engine never took it. Added `except BaseException` classifying `GeneratorExit`/`CancelledError`
+  as `finish="cancelled"`. `_refusal_row` gained a `finish=` parameter (default `"refused"`, so
+  every existing call site is unchanged) and now emits `"error": null` when passed
+  `exc_type=None` — matching `EngineHandle.stream`, which already nulls the error on its own
+  `GeneratorExit`, and `documentation/server.md`, which says only `error`/`refused` rows carry an
+  error object. The `QueueFull` row moved into the same `finally`; it can only be raised before the
+  handover, so its behaviour is unchanged and its shipped test still passes.
+  **Verified:** 4 new tests in `tests/test_reqlog_refusals.py` (pre-`try` window parametrized over
+  all three yield positions, plus the queued/`CancelledError` case), each confirmed failing against
+  the code they replaced with the assertion message, not an error. Suite **1482 → 1486 passed, 12
+  skipped** — baseline re-measured against a stashed HEAD the same day, not quoted. Independent
+  probe re-run after the fix: all four shapes write exactly one row.
+  **HTTP on-device gate: all four arms 9/9**, each in its own `systemd-run` scope, `-s` throughout
+  (see the gate-invocation bug below), every checkpoint verified intact afterwards
+  (`delete_original=False`): Llama-3.2-1B 5.6 s · Qwen3-235B 110 s · MiniMax-M2.7 55 s ·
+  Llama-3.3-70B 405 s at `MemoryMax=26G`. That covers **all four dispatch-table rows** — fused-EXL3,
+  module-list, and dense both fully-pinned and streamed. `gb_tok` reproduced T10's 2026-09-04
+  figures closely, so the byte counter did not move either: Qwen 1.53–59.77 GB over 96 tokens (was
+  1.65–59.77), MiniMax 1.32–74.56 over 34 (was 1.37–74.56), Llama-3.3-70B **constant 13.86 on all
+  96** (identical), Llama-3.2-1B all 0.00 (correct — it fully pins).
 - **[bug] the `finish` vocabulary in `requests.jsonl` is path-dependent for the same failure.**
   Introduced 2026-09-04 by the final fix wave (`9aa3a1f`), flagged by its re-review, not blocking
   merge. A template/Jinja failure out of `prepare()` records `finish="refused"` on the STREAMING
@@ -334,11 +362,30 @@ What the pass actually found:
   "the request raised", so a 500-producing template failure is currently filed as `refused` on one
   path only. Two shipped tests bake the asymmetry in. **Fix sketch:** let `_refusal_row` take the
   `finish` value rather than hardcoding it, and pass `"error"` from the widened `except Exception`.
+  **Half of that sketch is already built** (2026-09-05, by the disconnect fix above, which needed
+  it): `_refusal_row` now takes `finish=` with default `"refused"`, so no call site changed. What
+  remains is purely the call-site values in `chat_completions`, plus the two tests baking in the
+  old one.
   Two smaller siblings recorded with it: `generate()` tags the three refusal types `finish="refused"`
   while `stream()`'s fallback `prepare()` still leaves `"error"` (unreachable from HTTP today, since
   the route always passes `prepared=`); and a cancelled NON-streaming request now prints
   `finish=length` in `server.log`'s DONE line while its row says `cancelled` — defensible, since the
   row is the richer record, but undocumented.
+- **[bug] the committed HTTP gate is RED under its own documented invocation — it needs `-s`.**
+  Found 2026-09-05 while running the gate the `_sse` disconnect fix obliged; **pre-existing,
+  reproduced identically on a stashed HEAD** (`1 failed, 8 passed`), so it is not that fix's.
+  `tests/test_server_smoke.py::test_the_token_summary_reports_nvme_bytes_consistent_with_pinning`
+  fails at `assert values, "no token summary carried a gb_tok= field"`. **Root cause confirmed:**
+  under pytest's default capture, `sys.stdout` is rebound, so Python `print()` never reaches fd 1
+  and `capture_stdio`'s fd-level pump never tees it. The run's `server.log` held **4 lines, all
+  `[vaayu_rust]`** — those are native fd-1 writes, which is exactly why they survive and no
+  `[VAAYU-IO]`/`[Vaayu-*]` line does. Adding `-s` makes the same gate **9/9 on Llama-3.2-1B**.
+  This is what T10's pytest conversion cost: the arm it recorded green on 2026-09-04 was a
+  standalone script, which had no capture to fight. **Gates table below now carries `-s`** — that
+  is the whole fix applied here. **Not fixed, and the better fix:** the module should not depend on
+  the operator remembering a flag; it should detect that capture is on and fail (or skip) with a
+  message naming `-s`, rather than mis-reporting it as a byte-counter defect. Any assertion in this
+  module that reads `server.log` has the same blind spot.
 - **[bug] `avg_nvme_throughput` is inflated by RAM-cache hits on DENSE models.** Found
   2026-09-04 by Task 3's review, in the branch `l1-t5-t10-triage-additive`. Task 3 fixed this
   defect for the MoE non-expert cache (`_non_expert_tensor_cache`, via `_non_expert_from_cache`),
@@ -595,7 +642,7 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | dense smoke (CLAUDE.md §0's named guard) | **DELETED** 2026-09-03 (`7d806e7`) — `test_batched_dense_smoke.py` no longer exists. No committed replacement | -- | *was:* dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged as of its last real run |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
-| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q` | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
+| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host

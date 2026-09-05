@@ -317,3 +317,79 @@ def test_a_refusal_row_has_the_same_keys_as_an_engine_row(client_requiring_sessi
     for k in ("prefix_hit", "ttft_s", "decode_tok_s", "prompt_tokens", "cap",
               "decode"):
         assert refusal[k] is None
+
+
+@pytest.mark.parametrize("consumed,warning", [(1, None), (2, None), (3, "w")])
+def test_a_disconnect_before_generation_starts_still_writes_a_row(
+        run_dir, consumed, warning):
+    """`_sse` yields the queue-position comment, an optional warning and the
+    role chunk BEFORE entering the try that owns row-writing. Starlette closes
+    an abandoned generator with GeneratorExit at whichever of those it is
+    suspended on, so the request ended with no row at all -- the one known
+    exception to the "a request never ends without a row" contract README.md
+    and documentation/server.md both state.
+
+    engine.stream's own row-writing `finally` cannot cover this: it runs only
+    once that generator's BODY has started, which is after all three yields.
+    """
+    import asyncio
+
+    import vaayu.server.app as app_mod
+
+    from .test_reqlog_engine import M as StreamingM
+
+    e = EngineHandle(StreamingM(), log_dir=run_dir)
+
+    async def main():
+        gen = app_mod._sse(e, _sse_req(), "m", warning)
+        for _ in range(consumed):
+            await gen.__anext__()
+        await gen.aclose()          # exactly what Starlette does on disconnect
+
+    asyncio.run(main())
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a client that vanished pre-generation left no row"
+    assert rs[0]["finish"] == "cancelled"
+    assert rs[0]["stream"] is True
+    # documentation/server.md: only `error`/`refused` rows carry an error object.
+    assert rs[0]["error"] is None
+
+
+def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
+    """The same hole, one step further in and INSIDE the try: a request waiting
+    on `engine.slot`'s lock is abandoned by cancelling the ASGI task, which
+    raises CancelledError -- a BaseException that `except Exception` misses --
+    before engine.stream is ever entered. Widening the try does not reach this
+    one; only handing row ownership over at the statement where engine.stream
+    takes it does.
+    """
+    import asyncio
+
+    import vaayu.server.app as app_mod
+
+    from .test_reqlog_engine import M as StreamingM
+
+    e = EngineHandle(StreamingM(), log_dir=run_dir)
+
+    async def main():
+        await e._lock.acquire()             # hold the slot so the request queues
+        gen = app_mod._sse(e, _sse_req(), "m", None)
+        await gen.__anext__()               # queue position
+        await gen.__anext__()               # role chunk
+
+        async def drain():
+            async for _ in gen:
+                pass
+
+        t = asyncio.create_task(drain())
+        await asyncio.sleep(0.05)           # let it block on the lock
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        e._lock.release()
+
+    asyncio.run(main())
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a client that vanished while queued left no row"
+    assert rs[0]["finish"] == "cancelled"
+    assert rs[0]["error"] is None
