@@ -534,7 +534,27 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
-  - **S1e · the re-open conditions are now CLOSED too, measured the same day.** PLD (zero-VRAM
+  - **[bug]/[!] S1e-bis · the S1e verdict below was WRONG — it measured with thinking ON.**
+    `enable_thinking=False` is a **no-op on both checkpoints**: verified by rendering the same
+    messages with and without it (byte-identical), and both chat templates END the assistant turn
+    with a hard-coded `<think>\n`. Every S1e arm therefore generated inside an open think block, and
+    the "forced code fence" arm appended its fence inside that block — so Qwen closing the fence and
+    reverting to prose was a PROMPT ARTIFACT, not a model property. Closing the block explicitly
+    (`</think>\n\n`) flips the result: **MiniMax-M2.7 goes straight to code and accepts 0.907 of
+    drafted tokens (break-even 0.635), 0/43 rounds with no proposal, 3.43 GB/token vs plain decode's
+    4.40 — 1.28× BETTER.** Qwen still writes prose first (0.286, below its 0.520 break-even) but
+    inside the code block accepts **0.927** → 7.05 GB/token vs 8.90 — **1.26× better**.
+    **Consequences:** (a) PLD on MoE is live again for the copy-heavy regime, which IS the agent
+    workload; (b) **S1d is unblocked and now blocking** — the configurations that measure well are
+    refused today by the zero-overlap bound (MiniMax 4-position verify: 17.61 GB by the bound vs
+    **12.78 GB measured**, against a 14.7 GB budget), so union-based sizing must land before any of
+    this can even run; (c) **no tok/s number exists yet** — everything is expert BYTES and round
+    arithmetic, and speculation also cuts forward passes (MiniMax 3.35 tokens per verify pass),
+    which is an argument, not a measurement. **Do not quote a speedup without an on-device A/B.**
+    (d) thinking-mode state is now a first-class variable in any speculation measurement here.
+    Numbers: the S1e-bis section of
+    [`docs/2026-09-05-S1c-routing-union-RESULTS.md`](docs/2026-09-05-S1c-routing-union-RESULTS.md).
+  - **S1e · SUPERSEDED by S1e-bis above — read that first. Measured with thinking ON.** PLD (zero-VRAM
     proposer) acceptance on both MoE targets, by lossless offline replay of the engine's own
     `PromptLookupDecoder.draft` over real greedy runs — no gate relaxed, nothing built. Best
     accepted/drafted: **Qwen 0.306, MiniMax 0.347**, against break-evens of **0.520** and **0.635**.
@@ -552,9 +572,9 @@ What the pass actually found:
     Qwen's k=2 is 9.0 GB/token against plain decode's 8.90 — *worse*; MoE acceptance has never been
     measured (the 86–90 % on record is the DENSE P7 pairing and does not carry). And the drafter
     takes 3.09 GB of a 6.3 GB expert VRAM cache. A ~1.3× ceiling on routes, on a ~47 %-disk-stall
-    decode, spent against a halved VRAM cache. ~~Re-open only on: a measured MoE acceptance ≥ ~0.8, or a zero-VRAM drafter~~ — **both of those
-    were then measured the same day and both FAILED; see S1e above. There is no open re-open
-    condition. Do not re-propose speculation for these MoE checkpoints without a new premise.**
+    decode, spent against a halved VRAM cache. **Re-open condition MET, 2026-09-05: a zero-VRAM proposer (PLD) accepts 0.907 on MiniMax and
+    0.927 on Qwen-in-code with thinking suppressed — see S1e-bis. S1d (union-based sizing) is the
+    unblocking item; the tok/s A/B is the open question.**
   Suite **1491 → 1570 passed, 12 skipped**. `documentation/server.md` documents the two gates, the
   `speculative` field, and why the refusal says "could". The dense path (P7, 5.57×) must not weaken.
 
