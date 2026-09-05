@@ -718,7 +718,7 @@ Do not spend time here; each is measured and settled.
 | smaller `PREFILL_CHUNK_SIZE` | costs TTFT (+24.7 % MoE, +213 % dense at 128), buys nothing measurable |
 | expert pinning | refuted: eviction share is linear in N and always 2–4× below the pin's cost |
 | TurboQuant KV in the live cache | failed its quality gate 2–7× on both models at 4 bits |
-| speculative decoding on MoE | refused by the working-set gate; EAGLE-3 would not lift it |
+| speculative decoding on MoE | refused by the working-set gate, before the drafter loads. The gate's bound is 24–51 % (Qwen) / 14–35 % (MiniMax) pessimistic — measured 2026-09-05 — but the real union still buys at most ~1.3× fewer expert routes per token, best case, against a drafter that takes 3.09 of 6.3 GB of expert VRAM cache. EAGLE-3 would not lift it |
 | `fp8` KV to save VRAM | `fp8` is **1.5× larger** than bf16 here — it keeps a dequantized mirror |
 
 ---

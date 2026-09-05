@@ -36,9 +36,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1491 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-05 after V1's `finish`-vocabulary fix (was 1489 + 2 new regression tests, one existing test
-changed not added; the 1489 was the same day's G1 capture guard, itself 1486 + 3). **This figure has
+**Suite baseline: 1570 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-05 after S1a/S1b (was 1491 + 79, most of them one parametrized invariant test; the 1491 was
+that day's V1 fix, itself 1489 + 2, itself G1's 1486 + 3). **This figure has
 gone stale six times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
 
@@ -48,8 +48,9 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-05: one task row (**S1**, the drafter) and two `[bug]` rows — `env.json`'s
-`kv_cache_mode`, and `avg_nvme_throughput` on dense (G1 and V1 both closed that day). Each of
+Live as of 2026-09-05, end of day: **no task rows** and three `[bug]` rows — `env.json`'s
+`kv_cache_mode`, the suite's stray `logs/run-*` dirs, and `avg_nvme_throughput` on dense (S1, G1 and
+V1 all closed that day). Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
 cold in a fresh session with no other context; the remaining bug rows (`env.json`'s
 `kv_cache_mode`, the suite's stray `logs/run-*` dirs, `avg_nvme_throughput` on dense) are short
@@ -495,17 +496,55 @@ What the pass actually found:
     `new_run_dir`/`_point_latest` run before the load can fail.
   - `_session_write` re-`mkdir`s and re-`open`s once per line after a write failure (resets `key` to
     `None` inside the `except OSError`) instead of backing off by remembering the failed session.
-- **[ ] S1 · a configured drafter is dead weight on every MoE target** —
+- **[x] S1 · a configured drafter was dead weight on every MoE target — S1a+S1b FIXED, S1c
+  MEASURED, S1d REFUTED. DONE 2026-09-05.** —
   **[`docs/issue-S1-drafter-dead-weight.md`](docs/issue-S1-drafter-dead-weight.md)**.
-  Qwen2.5-Coder-1.5B loads fully to VRAM (1544M, 3.09 GB) and is then discarded by the Fix-#9 gate
-  on every start, on both actively-tested models. **The VRAM IS correctly released — verified by
-  arithmetic on the load logs (12.01 GB vs 12.10 GB); there is no leak, do not go looking for one.**
-  Three separable defects: the gate structurally runs after the load (circular on the cache budget);
-  the 53.4 GB figure is a zero-overlap upper bound, not a measurement; and nothing tells the user
-  speculation is off.
-  **Stop rule:** S1a/S1b are small unconditional wins — ship them. S1c is a MEASUREMENT whose most
-  likely outcome is confirming the refusal on better grounds; do not let it become "build
-  speculative decoding for MoE" without the number first. The dense path (P7, 5.57×) must not weaken.
+  Qwen2.5-Coder-1.5B loaded fully to VRAM (1544M, 3.09 GB) and was then discarded by the Fix-#9 gate
+  on every start, on both actively-tested models. **The VRAM WAS correctly released — verified by
+  arithmetic on the load logs (12.01 GB vs 12.10 GB); there was no leak, do not go looking for one.**
+  - **S1a (D1, the circular gate) FIXED.** New pure helpers in `vaayu/vaayu_base.py`:
+    `spec_budget_upper_bound(available_bytes, geometry)` asks the REAL sizing helpers
+    (`derive_expert_ceiling` with no prefix reservation, `compute_expert_budget` against RAM
+    measured before the load) what they could return, rather than re-deriving their arithmetic;
+    `max_draft_tokens_that_fit`; `spec_preload_refusal`. Because the bound can only OVER-state the
+    budget, the pre-load gate can never refuse what the post-load gate would accept — a
+    parametrized invariant test asserts exactly that over four geometries × four RAM figures ×
+    four draft_tokens. The post-load gate is unchanged and still decides against the real budget.
+  - **S1b (D3, nothing told the user) FIXED.** `model.speculative_status` is set on EVERY load path
+    (`{requested, draft_tokens, active, refused_because}`) and is surfaced by `env.json` (new
+    `speculative` section) and `GET /v1/models`. Both gates write the same field, so a reader gets
+    one answer in one shape whichever fired.
+  - **Message honesty, found on-device:** where a `draft_tokens` value fits the BOUND the refusal
+    says it "could fit … the post-load check re-tests it against the real one", never that setting
+    it will work — measured on Qwen, the bound (20.6 GB) names `draft_tokens=1` while the real
+    budget (15.8 GB) still refuses it. On Qwen at `draft_tokens=5` nothing fits at all, and the
+    message names **batched decode** instead of "reduce draft_tokens", which on that geometry is
+    advice that cannot work.
+  - **On-device, Qwen3-235B, three arms, own scopes, same box same day:** before, `[Vaayu-Drafter]`
+    loads for **3.85 s** and is discarded; after, **zero** drafter lines and the refusal names its
+    numbers. Expert VRAM cache **6.3 GB in all three arms**; expert RAM budget 15.9 / 15.8 / 15.8 GB
+    (jitter tracks measured available RAM, 24.32 vs 24.29 GB) — removing the load does not shrink
+    the caches. MiniMax-M2.7 refuses pre-load too, on the other message branch.
+  - **S1c (D2, is the 53.4 GB bound real?) MEASURED — full numbers and method:
+    [`docs/2026-09-05-S1c-routing-union-RESULTS.md`](docs/2026-09-05-S1c-routing-union-RESULTS.md),
+    probe `docs/probes/s1c_routing_union.py` (both gitignored; the durable summary is here).**
+    No new instrumentation was needed: all three MoE forwards already write
+    `_expert_history[layer_idx]`, which has had no production reader since audit F7; a HF
+    `StoppingCriteria` samples it synchronously per decode step. 47 decode steps per model.
+    **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
+    23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
+    that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
+  - **S1d REFUTED — do not build it.** The payoff ceiling is the union ratio: a verify pass reads
+    **0.760×** the routes of 2 decode steps at Qwen's newly-admissible k=2, **0.726×** of 4 at
+    MiniMax's k=4. That is the BEST case, at 100 % acceptance and ignoring cost. At acceptance 0.5
+    Qwen's k=2 is 9.0 GB/token against plain decode's 8.90 — *worse*; MoE acceptance has never been
+    measured (the 86–90 % on record is the DENSE P7 pairing and does not carry). And the drafter
+    takes 3.09 GB of a 6.3 GB expert VRAM cache. A ~1.3× ceiling on routes, on a ~47 %-disk-stall
+    decode, spent against a halved VRAM cache. **Re-open only on: a measured MoE acceptance ≥ ~0.8,
+    or a zero-VRAM drafter (`USE_PROMPT_LOOKUP`) — the union numbers stay valid for the latter,
+    since they are a property of the target's routing.**
+  Suite **1491 → 1570 passed, 12 skipped**. `documentation/server.md` documents the two gates, the
+  `speculative` field, and why the refusal says "could". The dense path (P7, 5.57×) must not weaken.
 
 **Applied on the spot 2026-09-03, no row needed:** `DEFAULT_STREAM = True` in
 `vaayu/server/config_local.py`. It was `False`, and with a client sending no `max_tokens` that meant
