@@ -534,6 +534,32 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
+  - **[ ] S1d · DESIGN APPROVED 2026-09-05, not implemented.**
+    [`docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md`](docs/superpowers/specs/2026-09-05-S1d-adaptive-spec-gate-design.md)
+    (**gitignored — this disk only**; the decisions below are the durable copy).
+    **S1d as originally written is REFUTED and must not be built:** "replace the bound with the
+    measured union" admits Qwen's `draft_tokens=1` (13.53 GB against a 15.8 GB budget — it FITS)
+    and S1f measured that configuration at **0.836×**. Bytes-fit is necessary, not sufficient.
+    **And no analytic union rescues a static gate:** the independent-routing estimate
+    `num_experts·(1−(1−top_k/num_experts)^k)` puts MiniMax's 4-position verify at **16.80 GB**
+    against 14.7 and refuses the one configuration worth 1.29×. The union must be OBSERVED.
+    **Approved design — a three-phase runtime machine in `speculative_generate`, MoE only:**
+    (1) **CALIBRATE**, first `W=8` decode steps with the draft call skipped (they decode normally,
+    nothing is wasted), snapshotting `_expert_history` — the field all three forwards already write
+    and nothing has read since audit F7 — to compute the observed `union(d+1)`; over budget → OFF.
+    (2) **TRIAL**, until 48 drafted tokens (cap 64 rounds; at 48 the binomial SE is ~0.07, so Qwen's
+    0.286 sits ~3 SE below its bar), comparing acceptance against a break-even DERIVED from those
+    same observed unions, `(union(d+1)/union(1) − 1)/d` = 0.520 Qwen / 0.635 MiniMax.
+    (3) **RUN.** OFF latches for the process by setting `self.speculator = None`, the mechanism the
+    post-load gate already uses. **Accounting rule that is easy to get wrong: rounds where the
+    proposer drafts nothing are EXCLUDED from the acceptance denominator** — an empty round is a
+    1-wide decode producing one token, economically identical to plain decode.
+    Two pure helpers (`observed_union_per_layer`, `spec_breakeven_acceptance`), parametrized over
+    both geometries. **No config knobs** (§2); `W`/`T` are module constants. Default stays OFF —
+    this gate only governs what happens once a user opts in. **The on-device gate's middle arm is
+    the whole point: Qwen must latch off and land within ~2 % of baseline** (today that config is
+    0.836×); MiniMax must self-enable and reproduce ≥1.25×; dense Llama-3.3-70B must not calibrate
+    at all and must still hit P7's ~5.5×.
   - **[ ] S1f · tok/s A/B MEASURED 2026-09-05 — MiniMax-M2.7 **1.285× / 1.293×** faster with PLD
     (1.8166/1.8090 → 2.3337/2.3398 tok/s, two arm pairs), **Qwen3-235B 0.836× — 16 % SLOWER**
     (1.1076 → 0.9261). **Generated ids byte-identical in every arm**, so both are real and neither
