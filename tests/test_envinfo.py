@@ -112,7 +112,33 @@ def test_a_load_with_no_drafter_reports_a_clean_speculative_section():
     assert not [e for e in d["collect_errors"] if "speculative" in e], \
         d["collect_errors"]
     assert d["speculative"] == {"requested": None, "draft_tokens": 5,
-                                "active": False, "refused_because": None}
+                                "active": False, "refused_because": None,
+                                "calibration": None}
+
+
+def test_the_runtime_calibration_is_reported_with_its_numbers():
+    """S1d: a maintainer reading a mailed bundle must see WHICH phase the
+    engine stopped in and the numbers it stopped on -- the load-time refusal
+    alone cannot explain a run that started speculating and then stopped."""
+    m = _model(is_moe=True, style="module_list",
+               forward="_make_modulelist_sparse_forward")
+    m.speculative_status = {
+        "requested": "prompt_lookup", "draft_tokens": 3, "active": False,
+        "refused_because": None,
+        "calibration": {"observed_union_gb": 12.9, "budget_gb": 14.7,
+                        "breakeven_acceptance": 0.635,
+                        "measured_acceptance": 0.286,
+                        "drafting_rounds": 21, "decision": "off_acceptance"}}
+    d = envinfo.collect(m, _config())
+    assert not [e for e in d["collect_errors"] if "speculative" in e]
+    assert d["speculative"]["calibration"]["decision"] == "off_acceptance"
+    assert d["speculative"]["calibration"]["measured_acceptance"] == 0.286
+
+
+def test_a_load_that_never_calibrated_reports_calibration_null():
+    m = _model(is_moe=False)
+    d = envinfo.collect(m, _config())
+    assert d["speculative"]["calibration"] is None
 
 
 def _config(**over):
