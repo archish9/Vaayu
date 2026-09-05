@@ -2,7 +2,11 @@
 
     SERVER_CKPT=/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct \
       systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0 \
-      ./venv/bin/python -m pytest tests/test_server_smoke.py -q
+      ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s
+
+`-s` is REQUIRED, and this module refuses to run without it: the assertions
+below read `server.log`, which is written by `capture_stdio`'s fd-level pump,
+and pytest's capture keeps Python `print()` off fd 1 (see the guard fixture).
 
 Point SERVER_CKPT at an EXL3 MoE checkpoint to exercise that path.
 Skipped entirely unless SERVER_CKPT is set -- this must never run as part of
@@ -30,8 +34,47 @@ pytestmark = pytest.mark.skipif(
 PROMPT = "Write a Python function that reverses a string. Reply with code only."
 
 
+_CAPTURE_REFUSAL = "this gate is blind under pytest's capture"
+
+
+def _capture_hides_python_prints(mode: str) -> bool:
+    """True when pytest's `--capture=<mode>` keeps `print()` off fd 1.
+
+    `capture_stdio` (vaayu/server/logs.py) tees fd 1 into server.log, which is
+    what every server.log assertion in this module reads. Pytest rebinds
+    sys.stdout to its own object, so a Python print never reaches the pump --
+    while vaayu_rust's native fd-1 writes still tee, which is why the log
+    looks written rather than empty and the failure reads as a byte-counter
+    defect (G1, 2026-09-05).
+
+    Measured over all four modes, printing through a live pump: only `no`
+    (i.e. `-s`) tees a print. `fd`, `sys` and `tee-sys` all hide it --
+    `tee-sys` included, despite the name. Do not widen this on the name alone.
+    """
+    return mode != "no"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def uncaptured_stdout(pytestconfig):
+    """FAIL, not skip, when run without `-s`.
+
+    A skipped gate is a gate nobody notices is not running -- the failure mode
+    `7d806e7` already caused once by deleting the gate scripts outright. This
+    fails the whole module with one message instead, before any checkpoint is
+    loaded (the `client` fixture depends on it explicitly, so the ordering is
+    not left to autouse resolution).
+    """
+    mode = pytestconfig.getoption("capture")
+    if _capture_hides_python_prints(mode):
+        pytest.fail(
+            f"{_CAPTURE_REFUSAL} (--capture={mode}): pytest rebinds sys.stdout, "
+            f"so server.log gets no [VAAYU-IO]/[Vaayu-*] line and the log-reading "
+            f"assertions here fail for a reason that has nothing to do with the "
+            f"server. re-run with -s.", pytrace=False)
+
+
 @pytest.fixture(scope="module")
-def client():
+def client(uncaptured_stdout):
     """ONE load for the whole module.
 
     Never load a model twice in one pytest process: freed pinned host blocks

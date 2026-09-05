@@ -36,9 +36,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1486 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-05 after the `_sse` pre-generation disconnect fix (was 1482 + 4 new regression tests; the
-1482 was itself re-measured against a stashed HEAD that day, not carried over). **This figure has
+**Suite baseline: 1489 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-05 after G1's capture guard (was 1486 + 3 new regression tests; the 1486 was measured the
+same day after the `_sse` pre-generation disconnect fix, itself re-measured against a stashed HEAD). **This figure has
 gone stale six times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
 
@@ -48,7 +48,8 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-05: one task row (**S1**, the drafter) and four `[bug]` rows. Each of
+Live as of 2026-09-05: one task row (**S1**, the drafter) and three `[bug]` rows (G1 closed that
+day). Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
 cold in a fresh session with no other context; the two remaining bug rows (`env.json`'s
 `kv_cache_mode`, the suite's stray `logs/run-*` dirs) are short enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
@@ -375,7 +376,7 @@ What the pass actually found:
   the route always passes `prepared=`); and a cancelled NON-streaming request now prints
   `finish=length` in `server.log`'s DONE line while its row says `cancelled` — defensible, since the
   row is the richer record, but undocumented.
-- **[bug] G1 · the committed HTTP gate is RED under its own documented invocation — it needs `-s`** —
+- **[x] G1 · the committed HTTP gate was RED under its own documented invocation — FIXED 2026-09-05** —
   **[`docs/issue-G1-server-smoke-gate-capture-blind-spot.md`](docs/issue-G1-server-smoke-gate-capture-blind-spot.md)**
   (self-contained; pick up cold).
   Found 2026-09-05 while running the gate the `_sse` disconnect fix obliged; **pre-existing,
@@ -387,11 +388,29 @@ What the pass actually found:
   `[vaayu_rust]`** — those are native fd-1 writes, which is exactly why they survive and no
   `[VAAYU-IO]`/`[Vaayu-*]` line does. Adding `-s` makes the same gate **9/9 on Llama-3.2-1B**.
   This is what T10's pytest conversion cost: the arm it recorded green on 2026-09-04 was a
-  standalone script, which had no capture to fight. **Gates table below now carries `-s`** — that
-  is the whole fix applied here. **Not fixed, and the better fix:** the module should not depend on
-  the operator remembering a flag; it should detect that capture is on and fail (or skip) with a
-  message naming `-s`, rather than mis-reporting it as a byte-counter defect. Any assertion in this
-  module that reads `server.log` has the same blind spot.
+  standalone script, which had no capture to fight. **Gates table below now carries `-s`.**
+  **G1a/G1b FIXED 2026-09-05 — the module no longer depends on the operator remembering the flag.**
+  A module-scoped autouse guard (`uncaptured_stdout`, `tests/test_server_smoke.py`) reads
+  `pytestconfig.getoption("capture")` and, unless it is `"no"`, calls `pytest.fail(pytrace=False)`
+  with a message naming `-s`. **FAIL, not skip** (G1b): a skipped gate is a gate nobody notices is
+  not running — the failure mode `7d806e7` already caused once. The `client` fixture takes the guard
+  as an explicit argument, so the refusal is ordered BEFORE the load rather than left to autouse
+  resolution — verified on-device: without `-s` the run is `9 errors in 3.20s` and never prints a
+  `loading` line, with `-s` it is **9/9 on Llama-3.2-1B in 5.74 s** (own `systemd-run` scope,
+  `MemoryMax=22G`, `delete_original=False`, checkpoint intact).
+  **The allowlist is `{"no"}` alone, and that was MEASURED, not reasoned:** a probe printed through
+  a live `capture_stdio` pump under all four modes — only `no` tees a Python `print()`; `fd`, `sys`
+  and **`tee-sys`** all hide it (`tee-sys` was the plausible-looking second candidate and it fails,
+  so do not widen the check on the name). A native `os.write(1, ...)` tees under all four, which is
+  exactly why the broken run's `server.log` looked written rather than empty.
+  Three regression tests in `tests/test_server_smoke_guard.py` (the predicate over all four modes;
+  a nested pytest run asserting the refusal message and that no load was attempted; and that the
+  module still SKIPS cleanly with no `SERVER_CKPT`, so the guard cannot turn the default suite red).
+  Suite **1486 → 1489 passed, 12 skipped**. `documentation/server.md`'s "The on-device gate" section
+  records the fail-not-skip decision and the `tee-sys` result.
+  **Note for whoever adds an assertion here:** the blind spot is a property of every `server.log`
+  read in the module, not of the one test that hit it; `env.json` and `requests.jsonl` are written
+  to files directly and are unaffected.
 - **[bug] `avg_nvme_throughput` is inflated by RAM-cache hits on DENSE models.** Found
   2026-09-04 by Task 3's review, in the branch `l1-t5-t10-triage-additive`. Task 3 fixed this
   defect for the MoE non-expert cache (`_non_expert_tensor_cache`, via `_non_expert_from_cache`),
@@ -648,7 +667,7 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | dense smoke (CLAUDE.md §0's named guard) | **DELETED** 2026-09-03 (`7d806e7`) — `test_batched_dense_smoke.py` no longer exists. No committed replacement | -- | *was:* dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged as of its last real run |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity. MoE: first token + warm reproducibility. **Needs an EXL3 checkpoint** — on a non-EXL3 one it fails at its own premise assert (pool disabled at load, OPTIONAL row 3), with or without any change |
-| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
+| HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` (**`-s` is enforced** — without it the module fails every test with a message naming the flag, before loading anything; G1) | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host

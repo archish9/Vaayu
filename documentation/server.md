@@ -795,6 +795,14 @@ output never reaches fd 1, where `capture_stdio`'s pump tees it from. Without
 `-s` the log holds only the native fd-1 writes (`[vaayu_rust]` lines) and the
 byte-counter check fails as if the counter were broken.
 
+The module now refuses to run in that state rather than mis-reporting it: a
+module-scoped guard reads pytest's capture mode and, unless it is `no` (what
+`-s` sets), **fails** every test in the file with a message naming `-s`, before
+any checkpoint is loaded. It fails rather than skips deliberately — a skipped
+gate is a gate nobody notices is not running. Only `-s` passes the guard;
+`--capture=tee-sys` does not, despite the name — measured through a live pump,
+it hides Python prints from fd 1 exactly like `fd` and `sys` do.
+
 It runs a real load, non-streaming, streaming (checking `finish_reason` and
 `completion_tokens` on both), an oversized-prompt refusal on both paths, a
 check that prefix reuse actually **fired**, `env.json` is clean, `requests.jsonl`
