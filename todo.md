@@ -534,15 +534,27 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
+  - **S1e · the re-open conditions are now CLOSED too, measured the same day.** PLD (zero-VRAM
+    proposer) acceptance on both MoE targets, by lossless offline replay of the engine's own
+    `PromptLookupDecoder.draft` over real greedy runs — no gate relaxed, nothing built. Best
+    accepted/drafted: **Qwen 0.306, MiniMax 0.347**, against break-evens of **0.520** and **0.635**.
+    Per-round byte accounting (a round that drafts nothing costs a 1-wide decode, so it is billed at
+    `union(1)`): every arm is WORSE than plain decode — **Qwen 1.11–1.16×, MiniMax 1.34–1.48×**.
+    Root cause is recorded, not inferred: both checkpoints are reasoning models that reason in PROSE
+    with no `<think>` tag, and a forced code-fence arm showed Qwen closing the fence and returning
+    to prose. A standard drafter is refuted a fortiori — same bar, plus 3.09 GB of expert VRAM.
+    **Dense is untouched: P7's 5.57× stands, because a dense verify pass reads the same weights at
+    any width — the property MoE lacks.** Numbers: the S1e section of
+    [`docs/2026-09-05-S1c-routing-union-RESULTS.md`](docs/2026-09-05-S1c-routing-union-RESULTS.md).
   - **S1d REFUTED — do not build it.** The payoff ceiling is the union ratio: a verify pass reads
     **0.760×** the routes of 2 decode steps at Qwen's newly-admissible k=2, **0.726×** of 4 at
     MiniMax's k=4. That is the BEST case, at 100 % acceptance and ignoring cost. At acceptance 0.5
     Qwen's k=2 is 9.0 GB/token against plain decode's 8.90 — *worse*; MoE acceptance has never been
     measured (the 86–90 % on record is the DENSE P7 pairing and does not carry). And the drafter
     takes 3.09 GB of a 6.3 GB expert VRAM cache. A ~1.3× ceiling on routes, on a ~47 %-disk-stall
-    decode, spent against a halved VRAM cache. **Re-open only on: a measured MoE acceptance ≥ ~0.8,
-    or a zero-VRAM drafter (`USE_PROMPT_LOOKUP`) — the union numbers stay valid for the latter,
-    since they are a property of the target's routing.**
+    decode, spent against a halved VRAM cache. ~~Re-open only on: a measured MoE acceptance ≥ ~0.8, or a zero-VRAM drafter~~ — **both of those
+    were then measured the same day and both FAILED; see S1e above. There is no open re-open
+    condition. Do not re-propose speculation for these MoE checkpoints without a new premise.**
   Suite **1491 → 1570 passed, 12 skipped**. `documentation/server.md` documents the two gates, the
   `speculative` field, and why the refusal says "could". The dense path (P7, 5.57×) must not weaken.
 
