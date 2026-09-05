@@ -71,6 +71,10 @@ class _FakeSpecModel:
     # The REAL helper, not a stand-in: it is what owes the enqueue_truncate on a
     # HIT, so a fake copy here would test the fake instead of the engine.
     _adopt_prefix_hit = VaayuBaseModel._adopt_prefix_hit
+    # Also real: speculative_generate calls self._build_spec_gate(), and a
+    # fake copy here would test the fake's gate-building instead of the
+    # engine's is_moe/_moe_geometry/_expert_cache gating (S1d).
+    _build_spec_gate = VaayuBaseModel._build_spec_gate
 
     class _Cfg:
         eos_token_id = -999   # unreachable: fake logits always argmax to 0
@@ -85,6 +89,10 @@ class _FakeSpecModel:
         self.config = self._Cfg()
         self.telemetry = self._Telemetry()
         self.speculator = _FakeSpeculator()
+        # Mirrors the dict VaayuBaseModel.__init__ always builds (S1a); the
+        # S1d latch-off path writes into it the same way the load gate does.
+        self.speculative_status = {"requested": None, "draft_tokens": self.draft_tokens,
+                                    "active": True, "refused_because": None}
         self.forward_calls = []   # input_ids.shape[1] for every forward() call
 
     def _assert_context_fits(self, n_tokens, N=1):

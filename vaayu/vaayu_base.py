@@ -4645,6 +4645,25 @@ class VaayuBaseModel(GenerationMixin):
             self._kv_writer.enqueue_truncate(session_id, match_len)
         return match_len
 
+    def _build_spec_gate(self):
+        """The runtime speculation gate, or None when it does not apply.
+
+        MoE only: dense verify passes read the same weights at any width,
+        which is exactly the property MoE lacks, and P7's 5.57x lives on the
+        dense path. VAAYU_SPEC_FORCE=1 skips calibration for the same reason
+        it skips the load gates -- it is a measurement hatch.
+        """
+        if not getattr(self, "is_moe", False):
+            return None
+        if os.environ.get("VAAYU_SPEC_FORCE") == "1":
+            return None
+        geo = getattr(self, "_moe_geometry", None)
+        cache = getattr(self, "_expert_cache", None)
+        if geo is None or cache is None:
+            return None
+        from .speculative.adaptive_gate import AdaptiveSpecGate
+        return AdaptiveSpecGate(geo, self.draft_tokens, cache.budget_bytes)
+
     @torch.no_grad()
     def speculative_generate(
         self,
@@ -4684,6 +4703,14 @@ class VaayuBaseModel(GenerationMixin):
         # Measured: three identical greedy calls in one process returned three
         # different sequences; resetting made them byte-identical.
         self.speculator.reset()
+
+        # S1d: the runtime gate. `speculator` is held locally because an OFF
+        # decision sets self.speculator = None -- the same mechanism the load
+        # gate uses, so every LATER call takes the ordinary path -- while this
+        # call finishes on the suppressed-draft path below.
+        speculator = self.speculator
+        gate = self._build_spec_gate()
+        self._spec_gate = gate
 
         self._batch_decode_active = False
         self._batch_n = 1
@@ -4758,10 +4785,18 @@ class VaayuBaseModel(GenerationMixin):
             if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
                 break
 
-            # Step 2: Draft K tokens
-            draft_ids, draft_state = self.speculator.draft(
-                generated, past_key_values, num_tokens=self.draft_tokens
-            )
+            # Step 2: Draft K tokens -- unless the gate is still calibrating or
+            # has latched off, in which case this round is an ordinary 1-wide
+            # decode that still produces a token and still shows the gate real
+            # routing.
+            if gate is not None and not gate.should_draft():
+                draft_ids = torch.empty((1, 0), dtype=generated.dtype,
+                                        device=generated.device)
+                draft_state = None
+            else:
+                draft_ids, draft_state = speculator.draft(
+                    generated, past_key_values, num_tokens=self.draft_tokens
+                )
             k = draft_ids.shape[1]
 
             # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
@@ -4778,16 +4813,35 @@ class VaayuBaseModel(GenerationMixin):
             past_key_values = verify_out.past_key_values
 
             # Step 4: Accept/reject longest correct prefix
-            accepted_ids, num_accepted = self.speculator.verify_and_accept(
+            accepted_ids, num_accepted = speculator.verify_and_accept(
                 generated, draft_ids, verifier_logits, draft_state
             )
+
+            if gate is not None:
+                if gate.phase == "calibrate":
+                    gate.observe(getattr(self, "_expert_history", {}) or {})
+                else:
+                    gate.record_round(k, num_accepted)
+                if gate.decided_off() and self.speculator is not None:
+                    s = gate.status()
+                    print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
+                          f"for this MoE model on measured evidence: {s}")
+                    self.speculator = None
+                    status = getattr(self, "speculative_status", None)
+                    if status is not None:
+                        status["active"] = False
+                        status["calibration"] = s
+                elif gate.decision == "run":
+                    status = getattr(self, "speculative_status", None)
+                    if status is not None and "calibration" not in status:
+                        status["calibration"] = gate.status()
 
             # Step 5: Trim verifier KV back to past_len + num_accepted
             # (verify pass grew cache by k+1; we only keep num_accepted new positions)
             self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
 
             # Step 6: Sync drafter cache to match accepted length
-            self.speculator.rollback_cache(draft_state, num_accepted)
+            speculator.rollback_cache(draft_state, num_accepted)
 
             # Step 7: Extend generated sequence (cap at max_new_tokens)
             remaining = max_new_tokens - tokens_generated
