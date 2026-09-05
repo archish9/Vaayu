@@ -2020,6 +2020,22 @@ class VaayuBaseModel(GenerationMixin):
                 if _avail is not None:
                     _pre = spec_preload_refusal(self._moe_geometry,
                                                 self.draft_tokens, _avail)
+            if _pre is not None and os.environ.get("VAAYU_SPEC_FORCE") == "1":
+                # MEASUREMENT ESCAPE HATCH, off by default. The gate decides on
+                # a ZERO-OVERLAP bound; consecutive decode positions measurably
+                # overlap (2026-09-05: MiniMax's 4-position verify is 17.61 GB
+                # by the bound and 12.78 GB measured, against a 14.7 GB budget),
+                # so the configurations worth measuring cannot otherwise be run
+                # at all. This exists to get that A/B number, NOT as a way to
+                # ship speculation on MoE -- if the real working set does not
+                # fit, the expert cache thrashes and decode gets slower, which
+                # is what the gate is for.
+                print(f"[Vaayu-Spec] WARNING: VAAYU_SPEC_FORCE=1 -- OVERRIDING "
+                      f"the refusal below. This is a measurement hatch and the "
+                      f"gate's reasoning still stands unless an A/B says "
+                      f"otherwise: {_pre}")
+                self.speculative_status["forced"] = True
+                _pre = None
             if _pre is not None:
                 print(f"[Vaayu-Spec] WARNING: {_pre} DISABLING speculative "
                       f"decoding for this MoE model; the drafter is NOT loaded.")
@@ -2265,8 +2281,9 @@ class VaayuBaseModel(GenerationMixin):
             if (self.speculator is not None and self.is_moe
                     and getattr(self, '_expert_cache', None) is not None
                     and getattr(self, '_moe_geometry', None) is not None):
-                if not spec_decode_fits(self._moe_geometry, self.draft_tokens,
-                                        self._expert_cache.budget_bytes):
+                if (not spec_decode_fits(self._moe_geometry, self.draft_tokens,
+                                         self._expert_cache.budget_bytes)
+                        and os.environ.get("VAAYU_SPEC_FORCE") != "1"):
                     _sws = compute_spec_working_set(self._moe_geometry, self.draft_tokens + 1)
                     print(f"[Vaayu-Spec] WARNING: speculative verify working set "
                           f"{_sws / 1e9:.1f} GB ((draft_tokens={self.draft_tokens}+1) positions × "

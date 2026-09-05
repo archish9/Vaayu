@@ -534,6 +534,25 @@ What the pass actually found:
     **The bound IS too pessimistic — 24–51 % on Qwen, 14–35 % on MiniMax** (measured union at k=6:
     23.4 experts/layer vs the assumed 48 on Qwen; 31.4 vs 48 on MiniMax). Against the real budgets
     that buys exactly one more `draft_tokens` step per model (Qwen 0→1, MiniMax 2→3).
+  - **[ ] S1f · tok/s A/B MEASURED 2026-09-05 — MiniMax-M2.7 **1.285× / 1.293×** faster with PLD
+    (1.8166/1.8090 → 2.3337/2.3398 tok/s, two arm pairs), **Qwen3-235B 0.836× — 16 % SLOWER**
+    (1.1076 → 0.9261). **Generated ids byte-identical in every arm**, so both are real and neither
+    is a quality trade; replicate spread 0.26–0.42 %. Predicted-vs-measured agrees (MiniMax bytes
+    predicted 1.28×, measured 1.285×), so the two measurements describe the same mechanism.
+    **The split is what the model EMITS, not the forward:** MiniMax with thinking closed copies the
+    file (0/43 rounds without an n-gram, 3.35 tokens per 4-wide verify); Qwen writes prose first, and
+    every n-gram miss still pays a 2-wide verify for one token — that is the 16 % loss.
+    **Trap that cost a run:** `speculative_generate` REPLACES `model.generate()` — calling
+    `generate()` with a speculator attached silently runs ordinary decoding and reports a flat A/B.
+    **NOT a licence to default PLD on for MoE** (a win on one target, a loss on the other, and only
+    with thinking suppressed — the user's quality call). Both arms needed **`VAAYU_SPEC_FORCE=1`**, a
+    measurement hatch added the same day (off by default, warns loudly, NOT a shipping mechanism:
+    with it set a genuinely oversized verify pass thrashes the cache, which is what the gate
+    prevents). **Open item: S1d done properly — sizing on a union the engine DERIVES, not a
+    per-model table (`CLAUDE.md` §5). `_expert_history` already records per-layer routing every
+    decode step, so an online calibration is available in principle. Not built, not designed.**
+    Numbers: the S1f section of
+    [`docs/2026-09-05-S1c-routing-union-RESULTS.md`](docs/2026-09-05-S1c-routing-union-RESULTS.md).
   - **[bug]/[!] S1e-bis · the S1e verdict below was WRONG — it measured with thinking ON.**
     `enable_thinking=False` is a **no-op on both checkpoints**: verified by rendering the same
     messages with and without it (byte-identical), and both chat templates END the assistant turn
