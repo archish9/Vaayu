@@ -561,15 +561,19 @@ What the pass actually found:
     bounds the case where the proposer rarely drafts at all.
     **Three on-device arms, own systemd scopes, same box same day:**
     - **MiniMax-M2.7, `draft_tokens=3`, PLD, NO `VAAYU_SPEC_FORCE`** — self-admitted on its own
-      evidence: `calibration.decision="run"` (`observed_union_gb=12.33` vs `budget_gb=14.75`,
-      `breakeven_acceptance=0.6004`, `measured_acceptance=0.9375`, `drafting_rounds=16`). tok/s
-      **1.8135 (off) → 2.2883 (pld) = 1.26×** (≥1.25× target met). Ids byte-identical.
+      evidence. **RE-MEASURED against the final code** (`calibration.decision="run"`,
+      `observed_union_gb=12.45` vs `budget_gb=14.37`, `breakeven_acceptance=0.6094`,
+      `measured_acceptance=1.0`, `drafting_rounds=16`): tok/s **1.7795 (off) → 2.3253 (pld) =
+      1.307×**, ids byte-identical. (The pre-fix figures were 1.8135 → 2.2883 = 1.26×, taken
+      against a gate that rebuilt itself every request — see the Critical below.)
     - **Qwen3-235B, `draft_tokens=1`, PLD, NO `VAAYU_SPEC_FORCE` — the anti-regression arm.**
-      `calibration.decision="off_acceptance"` (`observed_union_gb=13.03` vs `budget_gb=16.32`,
-      `breakeven_acceptance=0.4647`, `measured_acceptance=0.3429`, `drafting_rounds=35`). tok/s
-      **1.1152 (off) → 1.0193 (pld) = 0.914×**. Ids byte-identical. **The gate fired and avoided
-      the catastrophic 0.836×/16%-slower regression — but the result is 8.6 % slower, not the
-      ~2 % this row originally targeted, and that is reported as measured, not massaged.** Root
+      **RE-MEASURED against the final code:** `calibration.decision="off_acceptance"`
+      (`observed_union_gb=13.59` vs `budget_gb=15.89`, `breakeven_acceptance=0.5277`,
+      `measured_acceptance=0.3514`, `drafting_rounds=37`). tok/s
+      **1.080 (off) → 1.0064 (pld) = 0.932×**. Ids byte-identical. (Pre-fix: 1.1152 → 1.0193 =
+      0.914×.) **The gate fired and avoided the catastrophic 0.836×/16%-slower regression — but
+      the result is 6.8 % slower, not the ~2 % this row originally targeted, and that is
+      reported as measured, not massaged.** Root
       cause: `CALIBRATE_STEPS(8) + TRIAL_ROUND_CAP(64)` = up to 72 of the 128 generated tokens pay
       the cost of finding out speculation does not pay, before latching off; that fixed
       exploration cost does not amortize over a 128-token run (it would over a longer one — open
@@ -790,7 +794,7 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
 - **[ ] S1d's TRIAL phase has a fixed exploration cost that does not amortize on short
   generations.** The Qwen3-235B anti-regression arm (`draft_tokens=1`, 128-token run) paid up to
   `CALIBRATE_STEPS(8) + TRIAL_ROUND_CAP(64)` = 72 non-payoff tokens before `_decide_acceptance`
-  latched `off_acceptance`, landing at **0.914× (8.6 % slower)** instead of the ~2 % the design
+  latched `off_acceptance`, landing at **0.932× (6.8 % slower)** instead of the ~2 % the design
   originally targeted (design doc §7 already names this risk generally; this is the measured
   worst case). The same fixed cost amortizes away on a long-running agentic session — this item
   is to either bound TRIAL's length as a fraction of the caller's `max_new_tokens` when it is

@@ -828,18 +828,28 @@ expert cache, then measures acceptance over the next ~48 drafted tokens against
 a break-even derived from that same routing. Below the bar it disables
 speculation for the rest of the process and records why in `calibration`.
 
-Measured 2026-09-05: on MiniMax-M2.7 with thinking suppressed this
-self-admits (no measurement hatch) and keeps a **1.26×** win, ids
-byte-identical to plain decode. On Qwen3-235B, whose answers open with
-prose, the same shape of configuration measures **0.836×** (16% slower) with
-no gate at all (S1f); with the gate, it correctly detects the low acceptance
-(0.34 against a 0.46 break-even) and latches off — but not for free. The
-gate itself must spend up to `CALIBRATE_STEPS + TRIAL_ROUND_CAP` = 72 rounds
-finding that out, and over a 128-token run that fixed cost does not fully
-amortize: the gated run lands at **0.91×**, not full parity. That is the
-honest number, not the target — it is the difference between shipping a
-known 16% regression and shipping a gate that catches it, at a cost that
-shrinks as a fraction of the run the longer the run is.
+Measured 2026-09-05, re-run against the final code (the first measurements
+were taken against a gate that rebuilt itself every request, so they did not
+describe what ships): on MiniMax-M2.7 with thinking suppressed the gate
+self-admits — no measurement hatch — on a real measured union of 12.45 GB
+against a 14.37 GB budget, sees 1.00 acceptance against a 0.61 break-even,
+and keeps a **1.307×** win (1.7795 → 2.3253 tok/s), ids byte-identical to
+plain decode.
+
+On Qwen3-235B, whose answers open with prose, the same shape of
+configuration measures **0.836×** (16 % slower) with no gate at all. With
+the gate it correctly detects the low acceptance — 0.351 against a 0.528
+break-even, derived from that run's own routing — and latches off. **That
+is not free.** The gate spends its calibration steps and 37 drafting rounds
+finding out, and over a 128-token run that fixed cost does not amortize
+away: the gated run lands at **0.932×** (1.080 → 1.006 tok/s), not parity.
+
+That is the honest number, not the target the design named. What the gate
+buys is the difference between a known 16 % regression that never ends and a
+6.8 % exploration cost paid once per process — and the shorter the
+generation, the worse that trade looks. On a single short request, a
+configuration you already know does not pay is still better switched off by
+hand.
 
 ### The on-device gate
 
