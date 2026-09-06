@@ -660,3 +660,33 @@ def test_device_still_resolves_from_lowercase_device_on_a_dataclass_config(monke
 
     data = envinfo.collect(_model(is_moe=False), _config(device="cuda:1"))
     assert data["gpu"]["device"] == "cuda:1"
+
+
+def _real_exl3():
+    """The REAL strategy class -- this module's own EXL3LoaderStrategy above is
+    a name-only fake, and the resolution under test is an isinstance check
+    against the real one. __new__, not (), because __init__ requires
+    exllamav3 to be importable."""
+    from vaayu.persist.loader_strategy import EXL3LoaderStrategy as Real
+    return Real.__new__(Real)
+
+
+@pytest.mark.parametrize("requested,strategy,resolved", [
+    ("auto", _real_exl3, "bf16"),
+    ("auto", _Strategy, "fp16"),
+    ("bf16", _Strategy, "bf16"),
+])
+def test_kv_cache_mode_is_the_resolved_mode_not_the_requested_one(
+        requested, strategy, resolved):
+    """`auto` is a REQUEST, not a KV dtype: _create_kv_cache resolves it to
+    bf16 on an EXL3 checkpoint and fp16 otherwise. env.json recording "auto"
+    verbatim breaks this module's own premise (every field is DERIVED, read
+    off the loaded model) and leaves a maintainer reading a mailed bundle
+    unable to say which dtype actually ran. The REQUESTED value is not lost:
+    it is the `config` section's own kv_cache_mode field."""
+    m = _model(is_moe=False, layers=80, strategy=strategy)
+    m.kv_cache_mode = requested
+    data = envinfo.collect(m, _config())
+    assert data["budgets"]["kv_cache_mode"] == resolved
+    assert data["config"]["kv_cache_mode"] == "auto", \
+        "the requested value stays readable in the config section"

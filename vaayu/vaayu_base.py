@@ -1023,6 +1023,29 @@ def format_byte_fields(read_bytes_delta: int) -> str:
     return f"  bytes={read_bytes_delta}  gb_tok={read_bytes_delta / 1e9:.2f}"
 
 
+def resolve_kv_cache_mode(mode: str, loader_strategy) -> str:
+    """The mode `_create_kv_cache` will actually honour, given a REQUESTED one.
+
+    `"auto"` is a request, not a KV dtype -- it resolves to bf16 on an EXL3
+    checkpoint and fp16 otherwise -- and `"fp8"` silently becomes fp16 on a
+    PyTorch build without float8. Both resolutions used to live only inside
+    the constructor, copied a second time into `_kv_cache_is_bucketed`, so
+    nothing outside could say which dtype ran: `env.json` reported `"auto"`
+    verbatim, against its own premise that every field is DERIVED. This is
+    the single source of truth for the answer; every reader calls it rather
+    than re-deriving it (a second copy drifts, then misreports).
+
+    An unrecognised mode is passed through unchanged -- `_create_kv_cache`
+    refuses it there, with the message that names the known values.
+    """
+    if mode == "auto":
+        from .persist.loader_strategy import EXL3LoaderStrategy
+        return "bf16" if isinstance(loader_strategy, EXL3LoaderStrategy) else "fp16"
+    if mode == "fp8" and not hasattr(torch, "float8_e4m3fn"):
+        return "fp16"
+    return mode
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -3009,40 +3032,29 @@ class VaayuBaseModel(GenerationMixin):
         ring buffer -- FP8DynamicCache or its TurboQuantKVCache subclass --
         rather than a plain transformers DynamicCache that holds exactly S
         tokens with no over-allocation (VramShape.kv_capacity_buckets,
-        Amendment 1, task-6-brief.md). Mirrors _create_kv_cache's own mode
-        resolution exactly, since the real cache is not constructed until
+        Amendment 1, task-6-brief.md). It has to answer without building one,
+        since the real cache is not constructed until
         first use but the VRAM plan (built at load time, see __init__) needs
-        the answer before that. Not a guess: every branch here matches a
-        branch in _create_kv_cache."""
-        mode = self.kv_cache_mode
-        if mode == "auto":
-            from .persist.loader_strategy import EXL3LoaderStrategy
-            mode = "bf16" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
-        if mode == "fp16":
-            return False
-        if mode == "bf16":
-            return True
-        if mode == "turboquant" or mode.startswith("turboquant:"):
-            return True
-        # fp8 (or a bare/unrecognised passthrough): FP8DynamicCache, unless
-        # this PyTorch build lacks float8 support, in which case
-        # _create_kv_cache falls back to a plain DynamicCache.
-        return hasattr(torch, "float8_e4m3fn")
+        the answer before that. Not a guess: it asks the same resolver
+        _create_kv_cache does, and fp16 is the one resolved mode that yields a
+        plain DynamicCache -- every other (bf16, turboquant, fp8, and an
+        unrecognised passthrough, which _create_kv_cache refuses anyway) is a
+        bucketed FP8DynamicCache."""
+        return resolve_kv_cache_mode(self.kv_cache_mode, self.loader_strategy) != "fp16"
 
     def _create_kv_cache(self):
         """Return a KV cache instance sized and typed for the configured kv_cache_mode."""
-        mode = self.kv_cache_mode
-
-        if mode == "auto":
-            # bf16, not fp8: fp8 mode stores an fp8 copy AND the dequantized
-            # mirror attention actually reads, measured 3.016 bytes/element
-            # against bf16's 2.000. bf16 is lossless, 33.7% smaller, and decodes
-            # slightly faster on both on-device models (Plan E RESULTS). KV disk
-            # persistence handles this layout too (QUANT_SIG_BF16, no scales).
-            from .persist.loader_strategy import EXL3LoaderStrategy
-            mode = "bf16" if isinstance(self.loader_strategy, EXL3LoaderStrategy) else "fp16"
+        # auto -> bf16 on EXL3, fp16 otherwise. bf16, not fp8: fp8 mode stores
+        # an fp8 copy AND the dequantized mirror attention actually reads,
+        # measured 3.016 bytes/element against bf16's 2.000. bf16 is lossless,
+        # 33.7% smaller, and decodes slightly faster on both on-device models
+        # (Plan E RESULTS). KV disk persistence handles this layout too
+        # (QUANT_SIG_BF16, no scales).
+        mode = resolve_kv_cache_mode(self.kv_cache_mode, self.loader_strategy)
 
         if mode == "fp16":
+            if self.kv_cache_mode == "fp8":
+                print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
             return DynamicCache()
 
         if mode == "bf16":
@@ -3063,10 +3075,8 @@ class VaayuBaseModel(GenerationMixin):
             return TurboQuantKVCache(bits_total=bits_total)
 
         if mode == "fp8":
-            if not hasattr(torch, "float8_e4m3fn"):
-                print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
-                return DynamicCache()
-
+            # The float8-unavailable fallback is resolved above, not here, so
+            # env.json reports the fp16 that actually ran (resolve_kv_cache_mode).
             print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
             return FP8DynamicCache()
 

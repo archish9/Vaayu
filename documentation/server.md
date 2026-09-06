@@ -150,6 +150,12 @@ selected, the derived MoE geometry, every budget the VRAM plan solved, your
 effective configuration (including anything set in the gitignored
 `config_local.py`) and every `VAAYU_*` variable.
 
+Everything under `budgets` is what the engine RESOLVED, not what you asked
+for — `budgets.kv_cache_mode` reads `bf16` or `fp16` where you configured
+`"auto"`, because `"auto"` is a request and the KV dtype is decided at load
+time from the loader strategy. The value you set is still there, unchanged,
+under `config`.
+
 Absolute paths are redacted before they are written: a checkpoint path is
 recorded as its directory name plus a hash, never in full, so no username
 leaves your machine.

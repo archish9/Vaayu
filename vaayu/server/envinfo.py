@@ -470,9 +470,20 @@ def _budgets_section(c, model):
     def cache_gb(cache):
         return round(cache.budget_bytes / _GB, 2) if cache is not None else None
 
+    def _resolved_kv_mode(model):
+        # Import inside the field, like every other heavy import here, so a
+        # failure lands in collect_errors instead of nulling the section.
+        from ..vaayu_base import resolve_kv_cache_mode
+        return resolve_kv_cache_mode(model.kv_cache_mode, model.loader_strategy)
+
     return c.section("budgets", {
         "max_seq_len": lambda: model.max_seq_len,
-        "kv_cache_mode": lambda: model.kv_cache_mode,
+        # The RESOLVED mode, not the requested one: "auto" is a request, and
+        # this file's premise is that every field is derived (module
+        # docstring). The requested value stays readable in the `config`
+        # section. Asks vaayu_base's own resolver -- a second copy of that
+        # branch would drift and misreport the dtype that ran.
+        "kv_cache_mode": lambda: _resolved_kv_mode(model),
         "reserve_gib": lambda: round(model._vram_plan.reserve_bytes / _GIB, 2),
         "pinning_budget_gib": lambda: round(model._vram_plan.pinning_budget / _GIB, 2),
         "s_max": lambda: model._vram_plan.s_max,

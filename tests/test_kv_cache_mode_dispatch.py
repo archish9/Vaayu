@@ -12,7 +12,8 @@ import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
-from vaayu.vaayu_base import FP8DynamicCache, TurboQuantKVCache, VaayuBaseModel
+from vaayu.vaayu_base import (FP8DynamicCache, TurboQuantKVCache, VaayuBaseModel,
+                              resolve_kv_cache_mode)
 from vaayu.vram_plan import VramPlanError
 
 
@@ -55,3 +56,76 @@ def test_fp8_is_reachable_explicitly():
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch without float8_e4m3fn takes the documented fp16 fallback")
     assert type(VaayuBaseModel._create_kv_cache(_model("fp8"))) is FP8DynamicCache
+
+
+# ── the resolved mode is a fact three readers share ─────────────────────────
+# `_create_kv_cache` used to resolve "auto" (and fp8-without-float8) inline,
+# with a second copy of the same branch in `_kv_cache_is_bucketed`. Nothing
+# outside could say which dtype ran, so env.json reported the REQUEST verbatim
+# ("auto") -- against its own premise that every field is derived. The
+# resolution is now one pure function; these tests are what stops the three
+# readers drifting apart again.
+
+@pytest.mark.parametrize("mode,exl3,expected", [
+    ("auto", True, "bf16"),
+    ("auto", False, "fp16"),
+    ("bf16", False, "bf16"),
+    ("fp16", False, "fp16"),
+    ("fp8", False, "fp8"),
+    ("turboquant", False, "turboquant"),
+    ("turboquant:9", False, "turboquant:9"),
+    ("bf16_typo", False, "bf16_typo"),   # passed through; _create_kv_cache refuses it
+])
+def test_resolve_names_the_mode_that_will_actually_be_honoured(mode, exl3, expected):
+    if mode == "fp8" and not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("this build takes the documented fp16 fallback")
+    m = _model(mode, exl3=exl3)
+    assert resolve_kv_cache_mode(m.kv_cache_mode, m.loader_strategy) == expected
+
+
+@pytest.mark.parametrize("mode,exl3", [
+    ("auto", True), ("auto", False), ("bf16", False), ("fp16", False),
+    ("fp8", False), ("turboquant", False), ("turboquant:9", False),
+])
+def test_the_resolved_mode_is_the_cache_that_gets_built(mode, exl3):
+    """Resolve, then build with the RESOLVED string: same cache object as
+    building with the requested one. A resolver that disagrees with the
+    constructor would make env.json confidently wrong."""
+    m = _model(mode, exl3=exl3)
+    resolved = resolve_kv_cache_mode(m.kv_cache_mode, m.loader_strategy)
+    direct = VaayuBaseModel._create_kv_cache(m)
+    via_resolved = VaayuBaseModel._create_kv_cache(_model(resolved))
+    assert type(direct) is type(via_resolved)
+    assert getattr(direct, "quantize", None) == getattr(via_resolved, "quantize", None)
+    assert getattr(direct, "bits_total", None) == getattr(via_resolved, "bits_total", None)
+
+
+@pytest.mark.parametrize("mode,exl3", [
+    ("auto", True), ("auto", False), ("bf16", False), ("fp16", False),
+    ("fp8", False), ("turboquant", False),
+])
+def test_bucketed_matches_the_cache_the_resolved_mode_builds(mode, exl3):
+    """`_kv_cache_is_bucketed` answers at load time, before any cache exists;
+    the VRAM plan sizes on it. Bucketed == not a plain DynamicCache."""
+    m = _model(mode, exl3=exl3)
+    built = VaayuBaseModel._create_kv_cache(m)
+    assert VaayuBaseModel._kv_cache_is_bucketed(m) is (type(built) is not DynamicCache)
+
+
+def test_fp8_without_float8_support_resolves_to_fp16_and_still_says_so(monkeypatch, capsys):
+    """The fallback moved from inside _create_kv_cache into the resolver, so
+    env.json reports the fp16 that ran rather than the fp8 that was asked
+    for. The operator-facing warning must survive that move."""
+    monkeypatch.delattr(torch, "float8_e4m3fn", raising=False)
+    m = _model("fp8")
+    assert resolve_kv_cache_mode(m.kv_cache_mode, m.loader_strategy) == "fp16"
+    assert type(VaayuBaseModel._create_kv_cache(m)) is DynamicCache
+    assert "FP8 KV cache unavailable" in capsys.readouterr().out
+    assert VaayuBaseModel._kv_cache_is_bucketed(m) is False
+
+
+def test_a_plain_fp16_request_does_not_claim_an_fp8_fallback(capsys):
+    """The fallback warning is keyed on the REQUESTED mode, so an ordinary
+    fp16 request must not print it."""
+    VaayuBaseModel._create_kv_cache(_model("fp16"))
+    assert "FP8 KV cache unavailable" not in capsys.readouterr().out

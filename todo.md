@@ -48,12 +48,12 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-05, end of day: **no task rows** and three `[bug]` rows — `env.json`'s
-`kv_cache_mode`, the suite's stray `logs/run-*` dirs, and `avg_nvme_throughput` on dense (S1, G1 and
-V1 all closed that day). Each of
+Live as of 2026-09-06: **no task rows** and two `[bug]` rows — the suite's stray `logs/run-*`
+dirs, and `avg_nvme_throughput` on dense (S1, G1 and V1 closed 2026-09-05; `env.json`'s
+`kv_cache_mode` closed 2026-09-06). Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
-cold in a fresh session with no other context; the remaining bug rows (`env.json`'s
-`kv_cache_mode`, the suite's stray `logs/run-*` dirs, `avg_nvme_throughput` on dense) are short
+cold in a fresh session with no other context; the remaining bug rows (the suite's stray
+`logs/run-*` dirs, `avg_nvme_throughput` on dense) are short
 enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
 copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
@@ -305,14 +305,44 @@ What the pass actually found:
   invented anywhere, per the finding's own instruction. Whoever next touches the on-device gates
   should restore equivalent scripts, committed and reviewed — Task 8's scratchpad one-off is still
   not a replacement.
-- **[bug] `env.json`'s `kv_cache_mode` reports the requested value, not the resolved one.** When the
-  config says `kv_cache_mode="auto"`, `env.json` records `"auto"` verbatim — the wrong side of this
-  file's own premise (§4: every field is a DERIVED fact, never the raw request echoed back). The
-  resolved mode (`"bf16"` per `docs/plans/plan_e_kv_bf16_mode.md` — `auto` flips to bf16) is computed
-  elsewhere and never makes it into `env.json`. A maintainer reading a mailed bundle cannot tell
-  which KV dtype actually ran without re-deriving it themselves. Fix sketch: `envinfo.py`'s config
-  section should read the resolved mode off wherever the `auto`→`bf16` decision is made (the KV
-  cache constructor), not off the raw `ServerConfig` field.
+- **[x] `env.json`'s `kv_cache_mode` reported the requested value, not the resolved one — FIXED
+  2026-09-06.** `env.json` recorded `"auto"` verbatim, against that file's own premise (every field
+  is a DERIVED fact, never the raw request echoed back), so a maintainer reading a mailed bundle
+  could not tell which KV dtype actually ran. **Root cause was deeper than the fix sketch
+  ("read the resolved mode off the KV cache constructor"): no resolved value existed anywhere to
+  read.** `envinfo._budgets_section` read the raw ctor arg `model.kv_cache_mode`
+  (`vaayu_base.py:1626`), and the resolution lived INSIDE `_create_kv_cache`, **copied a second
+  time** into `_kv_cache_is_bucketed` — neither stored it, and the cache itself is not built until
+  first use, long after `env.json` is written.
+  **Fix:** one pure module-level `resolve_kv_cache_mode(mode, loader_strategy)` in `vaayu_base.py`,
+  called by all three readers (`_create_kv_cache`, `_kv_cache_is_bucketed`, `envinfo`). Same shape as
+  the `forward` tag: one source of truth, because a second copy of the branch drifts and then
+  misreports. `_kv_cache_is_bucketed` collapses to `resolved != "fp16"`.
+  **Also resolved, same class of defect:** `fp8` on a PyTorch without `float8_e4m3fn` silently
+  becomes fp16 — the resolver now says `fp16`, and the operator-facing "FP8 KV cache unavailable"
+  warning moved with it (keyed on the REQUESTED mode, so a plain `fp16` request never prints it).
+  An unrecognised mode is passed through unchanged; `_create_kv_cache` still raises `VramPlanError`
+  on it. `documentation/server.md` now states that `budgets.*` is resolved and `config.*` is what
+  you asked for — the requested value is NOT lost.
+  **Tests: +26** — 3 in `tests/test_envinfo.py` (the bug: auto+EXL3→bf16, auto+non-EXL3→fp16,
+  explicit bf16 unchanged; asserts the request survives in `config`), 23 in
+  `tests/test_kv_cache_mode_dispatch.py` (resolver output per mode; **the resolved mode builds the
+  same cache the requested one does**; `_kv_cache_is_bucketed` agrees with the cache actually built;
+  the fp8-fallback path under `monkeypatch.delattr(torch, "float8_e4m3fn")`). The envinfo tests were
+  confirmed failing first on their assertion (`+ auto`); the anti-drift tests are new-API, so they
+  were verified by INJECTING drift instead — `auto` forced to bf16 → 3 red, `!= "fp16"` flipped to
+  `!= "bf16"` → 4 red, both clean after revert.
+  **Trap for the next reader:** `tests/test_envinfo.py` defines its own name-only
+  `EXL3LoaderStrategy` fake (used to check the reported strategy NAME); the resolution is an
+  `isinstance` against the REAL class, so a test that uses the local fake silently measures the
+  fp16 branch. Use `Real.__new__(Real)` — `__init__` requires exllamav3 importable.
+  Suite **1612 → 1638 passed, 12 skipped** (baseline re-measured against a stashed HEAD the same
+  day; the 1570 written above was stale, as it warns). **HTTP on-device gate 9/9 on BOTH sides of
+  the resolution**, each in its own `systemd-run` scope (`MemoryMax=22G`, `-s`, `delete_original=False`,
+  checkpoint verified intact): Llama-3.2-1B 5.8 s (`StandardSafetensorsStrategy` → `config` `auto`,
+  `budgets` **fp16**) and MiniMax-M2.7 55.9 s (`EXL3LoaderStrategy`, module-list forward → `config`
+  `auto`, `budgets` **bf16**), the latter cross-checked against that run's own
+  `[Vaayu] KV Cache: bf16 ring buffer` log line. `collect_errors` empty on both.
 - **[bug] the test suite creates real `logs/run-*` directories inside the repo.** Several tests
   start a `TestClient` on a `ServerConfig` with no explicit `log_dir`, so it defaults into the repo's
   own `logs/` root: `tests/test_delete_original.py:41,54,62`, `tests/test_gpu_audit.py:130`,
