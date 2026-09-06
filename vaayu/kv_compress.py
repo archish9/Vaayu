@@ -17,7 +17,21 @@ from . import turboquant
 # 9, not 8: the Plan I on-device gate (2026-08-02) measured worst-layer
 # attention-score error of 0.0612 at 8 bits on MiniMax -- over the 0.05 bar --
 # against 0.0214 at 9. Costs 1.156 B/elem instead of 1.031 (0.578x bf16 rather
-# than 0.516x). Early layers are the outliers on both models.
+# than 0.516x).
+#
+# 9 is also the CEILING, not just the default: make_codebook raises above
+# b_mse=8, so bits_total=10 does not exist and there is no extra bit to spend.
+#
+# What that gate could NOT measure, and the 2026-09-06 re-run did: .vaayu_kv
+# stores K and V but not queries, so both Plan H and Plan I scored the bar with a
+# K-row query PROXY. Against real post-RoPE decode queries at a ~4.16k-token
+# context that proxy is 2.5-13.7x optimistic on Qwen3-235B, whose worst sampled
+# layer lands at 0.0649 -- over the bar -- while MiniMax-M2.7 passes at 0.0426.
+# The 8-vs-9 choice above is CONFIRMED (8 fails both models on real queries too);
+# what is not established is that 9 clears the bar on the fused-EXL3 forward.
+# Keeping the top 8 highest-variance channels exact would (Qwen 0.0333, MiniMax
+# 0.0182, ~1.281 B/elem) -- that mixed-precision outlier split is not built.
+# Separately not established: that failing this bar degrades generated text.
 _DEFAULT_BITS = 9
 _ROT_SEED = 0x5EED
 _QJL_SEED = 0x9317

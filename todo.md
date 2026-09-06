@@ -910,6 +910,15 @@ then refuted. A refutation closes its row; it is not re-scoped. Full text in
 **Expert caching and prefetch.**
 - **Expert pinning (Plan F top_n sweep)** — REFUTED 2026-08-02. No viable pin N on either model:
   share is linear in N and 2–4× below the cost line.
+- **Plan B Phase 2 (Tasks 8–9) live expert re-pin** — REFUTED DIRECTLY 2026-09-06, nothing built.
+  A *realizable* adaptive pin (top-P/layer from the previous window — literally what Phase 2
+  proposes) is worth **−0.082 to +0.011 hit-rate points** at every non-degenerate budget on both
+  models, while the clairvoyant bound is worth **+0.004 to +0.330**. The value is all in a
+  predictor recency does not reach. Do NOT re-open on "a better predictor" — the oracle bound IS
+  that. **Trap:** at Qwen's ~8.5 GB budget `max_per_layer == top_k`, the LRU thrashes to a 0.0000
+  hit rate, and any pin looks like a +0.27 win on that artifact alone. See row 5.
+- **Fold `Π` into the query (Plan H perf follow-up)** — CLOSED 2026-09-06, target gone. Plan I moved
+  compression off the decode path, removing the 5–8 % MiniMax regression it existed to fix.
 - **P3 tiny-read store** — BUILT and REFUTED 2026-08-30. Holding scale/bias groups resident removes
   100 % of the tiny reads and returns byte-identical output, and costs **−2.7 % at N=1, −11.3 % /
   −14.5 % at N=3** — every store-off arm beat every store-on arm. **Occupancy is not contention,
@@ -939,6 +948,11 @@ then refuted. A refutation closes its row; it is not re-scoped. Full text in
 - **C1 — `~5.5 GB/s` is NOT a hardware constant.** It was a measured-path number promoted to one
   and then used as a denominator. Never quote a single-stream rate as the drive's limit; always say
   which concurrency a bandwidth figure was taken at, and never assume more concurrency helps.
+- **A quality proxy validated on one forward does not transfer to the other (2026-09-06).** Plan H/I
+  set the `prefix_compress` 9-bit floor with a K-row query proxy. Against REAL decode queries that
+  proxy is **2.5–13.7× optimistic on Qwen** (which then FAILS the 0.05 bar at 0.0649) and only ~2× on
+  MiniMax (which passes). 9 bits is also the quantizer's CEILING — `make_codebook` raises above
+  `b_mse=8` — so there is no extra bit to spend. See row 5.
 - **The token-summary buckets are a partition by construction** and `expert_disk` is a STALL, not
   read time. Both traps are written up in
   [`docs/2026-09-03-slow-generation-verdict.md`](docs/2026-09-03-slow-generation-verdict.md).
@@ -1064,7 +1078,7 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 | **6a** | The intercept residual the VRAM calibration could not explain | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
-| **5** | Deferred write-ups (Plan B/H follow-ups) | `[ ]` | — | No scheduled slot; each of the four needs a new premise. |
+| **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
 | **7** | Fused-EXL3 forward reads experts the VRAM cache already holds | `[ ]` | GPU round | Found 2026-09-03 by P4's trace. See below. |
 | **8** | `tensor_align=True` is production-dead code | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
@@ -1186,21 +1200,80 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 ---
 
-# 5 · [ ] DEFERRED — written up, no scheduled slot
+# 5 · [ ] DEFERRED write-ups — TRIAGED 2026-09-06, two probes run, two items left
 
-- **Plan B Tasks 8, 9 — Phase 2 live expert re-pin.** The Phase 1 pin it builds on is refuted (no
-  viable pin N: eviction share is linear in N and always 2–4× below the pin's share of the cache,
-  both models), so this needs a **new premise** before it means anything.
-  `docs/superpowers/plans/2026-07-19-vaayu-expert-usage-histogram-plan.md`
-- **Plan H follow-up — real-query quality gate.** Plan I's gate used K-row and Gaussian query
-  proxies because `.vaayu_kv` stores no queries. Both missed the bar widely so the verdict holds,
-  but certifying a specific bit-width needs real queries captured with an attention hook.
-- **Plan H follow-up — fold `Π` into the query** (`⟨q, Πᵀỹ⟩ = ⟨Πq, ỹ⟩`): turns per-token
-  reconstruction from `O(S·d²)` into `O(d²)`, exactly what costs MiniMax its 5–8 % decode. Needs
-  hooking attention itself. **Only worth writing after the quality question is settled** — a fast
-  cache that is 23 % wrong is not worth speeding up.
-- **Mixed-precision outlier split (TurboQuant).** The *only* way the paper reaches fractional
-  bit-widths, so the uniform implementation cannot claim its 3.5-bit LongBench result. Outliers are
-  early layers on both models — exactly what the split addresses.
+Row 5 was never one row. Full evidence:
+**[`docs/2026-09-06-row5-real-query-gate-and-oracle-repin-RESULTS.md`](docs/2026-09-06-row5-real-query-gate-and-oracle-repin-RESULTS.md)**
+(**gitignored — this disk only**; the numbers below are the durable copy, per §7).
+
+Method: one on-device capture per model at a realistic ~4.15k-token agentic context (re-sent
+source + a codegen task), 64-token greedy decode, `MemoryMax=29G`. One run fed both probes —
+real post-RoPE decode queries + stored-layout `K` for 7 quantile-sampled layers, and the ordered
+decode routing trace. **Harness validated against Plan I's own published figure**: the reproduced
+K-row proxy gives 0.0307 at S=694 against Plan I's 0.0372 for Qwen at 9 bits.
+
+**[x] Plan B Tasks 8, 9 — Phase 2 live expert re-pin. REFUTED DIRECTLY 2026-09-06 → SETTLED.**
+Four arms on one decode trace, all paying the same price for the pin, one cache shared across
+window boundaries: `none` / `static` (Phase 1) / **`causal` = pin from the PREVIOUS window, which
+IS Phase 2** / `oracle` = pin from the window being replayed (unrealizable). At every
+non-degenerate budget on both models, **causal − none is between −0.082 and +0.011 hit-rate
+points — negative more often than positive — while oracle − causal is +0.004 to +0.330.** Phase 2's
+entire value sits in a predictor that recent heat does not approach. This no longer rests on Plan
+F's static-sweep inheritance. **Do not re-open on "a better predictor"**: the oracle bound is
+exactly what a better predictor is worth. The short horizon here (~4–8-token windows) *flatters*
+recency; Phase 2's real between-turn horizon can only do worse.
+**TRAP, recorded so this is not "revived" on an artifact:** at Qwen's 8.50/8.90 GB budgets
+`derive_max_per_layer` returns exactly `top_k`, the LRU holds one token's routing per layer and
+thrashes (`none` = 0.0000 at 8.50 GB), so **any** pin appears to win by up to +0.27. A sweep run
+only at Qwen's ~8.5 GB operating budget would have concluded the opposite.
+
+**[x] Plan H follow-up — fold `Π` into the query. CLOSED 2026-09-06, target gone → SETTLED.**
+It existed to remove the 5–8 % MiniMax decode regression from compress-on-READ. **Plan I removed
+that regression** by moving compression to the eviction boundary (Qwen 0.86→0.86, MiniMax
+1.53→1.56). Its only remaining consumer is the dark `kv_cache_mode="turboquant"` mode that Plan H
+§9 already says not to use.
+
+**[x] Plan H follow-up — real-query quality gate. RUN 2026-09-06, docs corrected same day.**
+Pre-stated bar unchanged (score rel-L2 < 0.05), Plan H/I's own statistic (whole `[H,S]` matrix per
+layer). Worst sampled layer at ~4.16k tokens, real decode queries:
+
+| model | forward | 9 bits | 8 bits | K-row proxy @9 | Gaussian @9 |
+|---|---|---|---|---|---|
+| Qwen3-235B | fused EXL3 | **0.0649 FAIL** | 0.0934 FAIL | 0.0413 pass | 0.0878 fail |
+| MiniMax-M2.7 | module-list | **0.0426 PASS** | 0.0546 FAIL | 0.0413 pass | 0.0631 fail |
+
+**Plan I's 8-vs-9 decision is CONFIRMED** (8 fails both models on real queries too). **Its 9-bit
+certification is not.** The K-row proxy is **2.5–13.7× optimistic on Qwen** and only ~2× on
+MiniMax — real queries fail Qwen at *every* S from 256 to 4096, so this is not a long-context
+effect Plan I's short prompt missed, it is **a proxy validated on one forward that does not
+transfer to the other** (§5, again). **`bits_total=9` is the quantizer's CEILING**, not a chosen
+default — `turboquant.make_codebook` raises above `b_mse=8`, so there is no extra bit to spend.
+**Nothing shipped is broken:** `PREFIX_COMPRESS = None` (`vaayu/server/config.py:109`), and no
+size/TTFT/eviction number changes. **Docs corrected 2026-09-06** at all five sites that stated the
+floor without its provenance: `vaayu/kv_compress.py`'s `_DEFAULT_BITS` comment,
+`vaayu/server/README.md`, `documentation/server.md` (table + §6), and `documentation/TUNING.md` §2
+(which carries the full table and the guidance). The 8-vs-9 advice is unchanged — 8 fails both
+models on real queries too.
+**[ ] STILL OPEN, deliberately unscheduled: does failing this bar degrade generated text?** The bar
+is a pre-stated *proxy* for quality; Plan H §6 warns coherent output hides large perturbations (a
+256-token coherence check passed even at the far worse 4-bit setting). Certifying that direction is
+a separate experiment and **nothing here claims it**. Needs a real quality measure (perplexity on a
+prefix-reused turn, or a task score), not another score-error number.
+
+**[ ] Mixed-precision outlier split — PROMOTED, now with a measured operating point.**
+Keep the `m` highest-variance channels exact (bf16), pack the residual at 9 bits. Worst sampled
+layer, real queries: Qwen **0.0646 → 0.0333 PASS** at m=8; MiniMax **0.0428 → 0.0182 PASS**.
+**Operating point: 9 bits + m=8 ≈ 1.281 B/elem, 0.64× bf16**, every sampled layer on both models
+under the bar with ≥33 % margin, against uniform 9-bit's 1.156 B/elem (0.578×) that does not pass —
+~11 % of the saving to buy the gate, the same shape of trade Plan I made going 8→9 and the only one
+left. **Sweep `m`; do NOT take m=2 or m=4** — it is non-monotonic below m=8 (Qwen L0: 0.0414 at
+m=2, *worse* at 0.0560 at m=4). Cost figures are an upper bound (the probe still spends quantizer
+bits on all 128 dims).
+**Correct the mechanism while you are here.** Plan H §7 and Plan I §8.5 both justify this split by
+"both models' outliers are early layers". Measured: the layers that FAIL are the **diffuse-attention**
+ones (Qwen L0 top-1 mass 0.058), and the two highest-kurtosis layers (Qwen L47/L93, 37.3/52.8) do
+**not** fail. The split works anyway — a few channels dominate the inner product softmax sees — but
+not for the stated reason. Nor is the failure a sink artifact: at Qwen L0, **6.5 % of attention
+probability mass moves** (total variation), an independent metric agreeing with the gate.
 
 ---

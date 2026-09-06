@@ -256,7 +256,7 @@ holds one model for its whole life and should fill the box.
 |---|---|---|
 | `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
 | `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT) |
-| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9** is the tested floor) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
+| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling — quality caveat in [TUNING.md §2](TUNING.md)) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
 | `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below |
 | `USE_PROMPT_LOOKUP` | `False` | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
@@ -657,6 +657,11 @@ If you serve several agent sessions, set `PREFIX_COMPRESS = 9`: pooled KV packs 
 ~0.55×, so the same RAM holds roughly twice the sessions, at ~0.7 s of TTFT on the hit
 path. The first budget-pressure eviction prints a warning naming the capacity — watch
 for it.
+
+9 is the highest the quantizer goes, and its quality gate was certified with a query
+proxy that a 2026-09-06 re-run with real queries showed to be optimistic on one of the
+two MoE forwards. Nothing about the size or TTFT numbers changes; see
+[TUNING.md §2](TUNING.md) before turning it on for quality-sensitive work.
 
 ### 7.5 RAM layer caching — and why it is dense-only
 
