@@ -55,6 +55,31 @@ except ImportError:
     cache_utils_installed = False
 
 
+def _disk_timings_for_layer(file_path: str, cache_hit: bool,
+                            wall_io_wait_us: int) -> dict:
+    """The four disk-timing fields of one LayerTiming.
+
+    A cache hit read nothing from NVMe, so it has no header-parse, submit or
+    reconstruct time; its only real cost is the wall-clock wait on the prefetch
+    future. It must not take the persister's per-file record either: that record
+    is written by whichever read last touched the file and is cleared only when
+    consumed, and _prepopulate_ram_cache reads every cacheable layer at LOAD
+    time with nothing to consume it -- so the first token to hit the RAM cache
+    billed itself that load-time read (measured on Llama-3.3-70B: 30 of 33 hit
+    layers on token 0, ~115 ms each, 3.50 s of phantom io_wait; tokens 1-3 were
+    clean because token 0 had already popped them). The stale entry is popped
+    and discarded here so it cannot be attributed to a later read either.
+    """
+    disk = _get_layer_disk_timings(file_path)
+    if cache_hit:
+        return {"header_parse_us": 0, "io_submit_us": 0,
+                "io_wait_us": wall_io_wait_us, "tensor_reconstruct_us": 0}
+    return {"header_parse_us": disk.get("header_parse_us", 0),
+            "io_submit_us": disk.get("io_submit_us", 0),
+            "io_wait_us": disk.get("io_wait_us", wall_io_wait_us),
+            "tensor_reconstruct_us": disk.get("tensor_reconstruct_us", 0)}
+
+
 def _auto_session_id(token_ids: list) -> str:
     """Stable key for a session the caller didn't name — hash of the first
     tokens. Lets auto-prefix-match sequences be stored and re-found."""
@@ -4191,13 +4216,14 @@ class VaayuBaseModel(GenerationMixin):
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
                         _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
-                        _lt_disk = _get_layer_disk_timings(_lt_fpath)
-                        _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
-                        _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
-                        _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
-                        _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
                         _lt_cache_hit = getattr(self, "_layer_from_cache", {}).get(
                             layer_name, False)
+                        _lt_disk = _disk_timings_for_layer(_lt_fpath, _lt_cache_hit,
+                                                           _lt_io_wait_us)
+                        _lt_header_parse_us = _lt_disk["header_parse_us"]
+                        _lt_io_submit_us = _lt_disk["io_submit_us"]
+                        _lt_io_wait_us = _lt_disk["io_wait_us"]
+                        _lt_tensor_reconstruct_us = _lt_disk["tensor_reconstruct_us"]
                         _lt_file_bytes = (0 if _lt_cache_hit else
                                           sum(v.nbytes for v in state_dict.values()))
 
@@ -4247,13 +4273,14 @@ class VaayuBaseModel(GenerationMixin):
                         _io_wait_s += time.time() - _t
                         _lt_io_wait_us = int((time.perf_counter() - _tl) * 1e6)
                         _lt_fpath = str(Path(self.checkpoint_path) / (layer_name + ".safetensors"))
-                        _lt_disk = _get_layer_disk_timings(_lt_fpath)
-                        _lt_header_parse_us = _lt_disk.get("header_parse_us", 0)
-                        _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
-                        _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
-                        _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
                         _lt_cache_hit = getattr(self, "_layer_from_cache", {}).get(
                             layer_name, False)
+                        _lt_disk = _disk_timings_for_layer(_lt_fpath, _lt_cache_hit,
+                                                           _lt_io_wait_us)
+                        _lt_header_parse_us = _lt_disk["header_parse_us"]
+                        _lt_io_submit_us = _lt_disk["io_submit_us"]
+                        _lt_io_wait_us = _lt_disk["io_wait_us"]
+                        _lt_tensor_reconstruct_us = _lt_disk["tensor_reconstruct_us"]
                         _lt_file_bytes = (0 if _lt_cache_hit else
                                           sum(v.nbytes for v in state_dict.values()))
                         if self.profiling_mode:

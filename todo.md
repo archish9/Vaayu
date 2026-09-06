@@ -36,8 +36,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1643 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after the dense `avg_nvme_throughput` fix (1639 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
+**Suite baseline: 1647 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the two dense-telemetry cache-hit fixes (1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
 has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
@@ -49,8 +49,8 @@ number written here.
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
 Live as of 2026-09-06: **no task rows and no open `[bug]` rows** (S1, G1 and V1 closed
-2026-09-05; `env.json`'s `kv_cache_mode`, the suite's stray `logs/run-*` dirs and dense
-`avg_nvme_throughput` closed 2026-09-06). The next work comes from **STILL OPEN** or
+2026-09-05; `env.json`'s `kv_cache_mode`, the suite's stray `logs/run-*` dirs, dense
+`avg_nvme_throughput` and its stale-disk-timings follow-up closed 2026-09-06). The next work comes from **STILL OPEN** or
 **OPTIONAL** below. Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
 cold in a fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
@@ -501,6 +501,17 @@ What the pass actually found:
   `requests.jsonl`'s `bytes_read_gb` were never affected (persister read-site counter).
   Suite **1639 → 1643 passed, 12 skipped**; 4 new tests in `tests/test_telemetry_cache_hit.py`.
   [`docs/2026-09-06-nvme-throughput-cache-hit-dense-RESULTS.md`](docs/2026-09-06-nvme-throughput-cache-hit-dense-RESULTS.md)
+- **[x] Stale disk timings on a cache hit — FIXED 2026-09-06** (follow-up to the row above,
+  same doc). `get_and_clear_pinned_timings` is a POP and `_prepopulate_ram_cache` reads every
+  cacheable layer at LOAD time with nothing to consume those entries, so the first token to hit
+  the RAM cache popped a pre-inference read and billed itself its timings. **Measured on
+  Llama-3.3-70B: 30 of 33 hit layers on token 0, ~115 ms each = 3.50 s of phantom `io_wait`;
+  0/33 after.** Tokens 1+ were always clean — token 0 had already popped the entries, which is
+  the signature to recognise if it ever returns. Fix: `_disk_timings_for_layer()` in
+  `vaayu_base.py` (replaces five duplicated lines at both prefetch branches) returns zeros plus
+  the real wall-clock wait on a hit, and still pops the stale entry so it cannot be attributed
+  to a later read. Affected `TokenTiming.total_seconds` and per-token io_wait analysis only;
+  `avg_nvme_throughput` already excluded hits. Suite **1643 → 1647 passed, 12 skipped**.
 - **[x] L1 final fix wave — 2026-09-04.** A whole-branch review of `l1-triage-logging` (11 commits,
   `f585014`..`a4e2e7a`) returned "merge with fixes"; this row is that pass. Fixed, each with a new
   regression test in `tests/test_logs.py` / `tests/test_envinfo.py` unless noted: **C1** `new_run_dir`

@@ -155,3 +155,60 @@ def test_layer_throughput_is_zero_on_a_cache_hit():
     hit = LayerTiming(layer_name="a", file_bytes=1_000_000_000,
                       io_wait_us=12, cache_hit=True)
     assert hit.nvme_throughput_gbps == 0.0
+
+
+# ── Stale disk timings on a cache hit ────────────────────────────────────────
+# get_and_clear_pinned_timings is a POP: the persister records one entry per
+# file and it is cleared only when consumed. _prepopulate_ram_cache reads every
+# cacheable layer at LOAD time and nothing pops those entries, so the first
+# token to hit the RAM cache popped a read that happened before inference began.
+# Measured on Llama-3.3-70B: 30 of 33 hit layers on token 0 carried ~115 ms of
+# io_wait each -- 3.50 s of phantom wait -- while tokens 1-3 were clean.
+
+
+def _record_a_read(file_path, **fields):
+    from vaayu.persist import safetensor_model_persister as p
+    p._LAST_PINNED_TIMINGS[file_path] = fields
+
+
+def test_a_cache_hit_takes_no_disk_timings_from_the_persister():
+    from vaayu.vaayu_base import _disk_timings_for_layer
+
+    _record_a_read("/ckpt/model.layers.0.safetensors", header_parse_us=180,
+                   io_submit_us=7, io_wait_us=115249, tensor_reconstruct_us=137)
+    out = _disk_timings_for_layer("/ckpt/model.layers.0.safetensors",
+                                  cache_hit=True, wall_io_wait_us=3)
+    assert out == {"header_parse_us": 0, "io_submit_us": 0,
+                   "io_wait_us": 3, "tensor_reconstruct_us": 0}
+
+
+def test_a_cache_hit_discards_the_stale_entry():
+    """Left in place it would be popped by a LATER read of the same file."""
+    from vaayu.persist.safetensor_model_persister import get_and_clear_pinned_timings
+    from vaayu.vaayu_base import _disk_timings_for_layer
+
+    _record_a_read("/ckpt/model.layers.1.safetensors", header_parse_us=180,
+                   io_submit_us=7, io_wait_us=115249, tensor_reconstruct_us=137)
+    _disk_timings_for_layer("/ckpt/model.layers.1.safetensors",
+                            cache_hit=True, wall_io_wait_us=3)
+    assert get_and_clear_pinned_timings("/ckpt/model.layers.1.safetensors") == {}
+
+
+def test_a_real_read_still_reports_the_persister_timings():
+    from vaayu.vaayu_base import _disk_timings_for_layer
+
+    _record_a_read("/ckpt/model.layers.2.safetensors", header_parse_us=180,
+                   io_submit_us=7, io_wait_us=115249, tensor_reconstruct_us=137)
+    out = _disk_timings_for_layer("/ckpt/model.layers.2.safetensors",
+                                  cache_hit=False, wall_io_wait_us=3)
+    assert out == {"header_parse_us": 180, "io_submit_us": 7,
+                   "io_wait_us": 115249, "tensor_reconstruct_us": 137}
+
+
+def test_a_read_the_persister_did_not_record_keeps_its_wall_clock_wait():
+    from vaayu.vaayu_base import _disk_timings_for_layer
+
+    out = _disk_timings_for_layer("/ckpt/model.layers.3.safetensors",
+                                  cache_hit=False, wall_io_wait_us=41)
+    assert out == {"header_parse_us": 0, "io_submit_us": 0,
+                   "io_wait_us": 41, "tensor_reconstruct_us": 0}
