@@ -4764,9 +4764,10 @@ class VaayuBaseModel(GenerationMixin):
         bits = getattr(self, "prefix_compress", None)
         if bits is not None and bits < 9:
             print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
-                  f"bits/channel that passed the quality gate on both on-device "
-                  f"models (see 2026-08-02-compress-on-evict-kv-RESULTS.md; 8 bits "
-                  f"measured 0.0612 worst-layer attention-score error on MiniMax "
+                  f"bits/channel that passes the quality gate on both on-device "
+                  f"models (9 bits plus the mixed-precision outlier split; against "
+                  f"real decode queries 8 bits measured 0.0934 worst-layer "
+                  f"attention-score error on Qwen3-235B and 0.0546 on MiniMax-M2.7, "
                   f"against a 0.05 bar). Restored prefixes will be measurably wrong.")
         # getattr, matching the construction this replaced: callers in tests
         # build partial objects.

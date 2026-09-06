@@ -96,6 +96,29 @@ def test_no_drafting_happens_during_calibration(monkeypatch):
         "the gate must observe real routing before paying for a draft"
 
 
+def test_a_suppressed_round_verifies_exactly_one_position(monkeypatch):
+    """A round the gate suppressed must cost exactly what plain decode costs.
+
+    This is the premise the documented exploration-cost bound rests on (todo.md
+    P4): CALIBRATE's steps, and every TRIAL round where the proposer matched no
+    n-gram, produce `draft_ids` of width 0, so `verify_input` is the single last
+    token and the verify forward is the ordinary 1-position decode. If any of
+    them ever widened, the "only DRAFTING rounds are paid for" accounting -- and
+    the `TRIAL_DRAFTED_TOKENS * breakeven` ceiling derived from it -- would both
+    understate the real cost.
+    """
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    model = _MoEFake(PrefixCacheStore(budget_bytes=10 ** 9))
+    model.speculator = _CountingSpeculator()
+    _run(model, max_new_tokens=4)
+
+    prefill, verifies = model.forward_calls[0], model.forward_calls[1:]
+    assert prefill == 5, "the prompt is prefilled in one pass"
+    assert verifies and set(verifies) == {1}, \
+        (f"a suppressed round must verify 1 position, not {sorted(set(verifies))} "
+         f"-- widening one makes it cost more than the plain decode it replaces")
+
+
 def test_a_dense_model_never_builds_a_gate():
     """P7's 5.57x lives on this path. The gate is MoE-only."""
     model = _FakeSpecModel(PrefixCacheStore(budget_bytes=10 ** 9))

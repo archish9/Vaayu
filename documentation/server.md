@@ -256,7 +256,7 @@ holds one model for its whole life and should fill the box.
 |---|---|---|
 | `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
 | `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT) |
-| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling — quality caveat in [TUNING.md §2](TUNING.md)) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
+| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling) so the same RAM budget holds ~1.6× the sessions. 9 bits plus a mixed-precision outlier split is what clears the quality bar on both MoE forwards — [TUNING.md §2](TUNING.md). Matters when serving several agent sessions — see §6 |
 | `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below |
 | `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` opt a model in or out and always win |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
@@ -663,14 +663,15 @@ cascade-evicts the ones before it. TTFT went from 9.8 s back to 352 s at one ses
 past capacity.
 
 If you serve several agent sessions, set `PREFIX_COMPRESS = 9`: pooled KV packs to
-~0.55×, so the same RAM holds roughly twice the sessions, at ~0.7 s of TTFT on the hit
+~0.61×, so the same RAM holds roughly 1.6× the sessions, at ~0.7 s of TTFT on the hit
 path. The first budget-pressure eviction prints a warning naming the capacity — watch
 for it.
 
-9 is the highest the quantizer goes, and its quality gate was certified with a query
-proxy that a 2026-09-06 re-run with real queries showed to be optimistic on one of the
-two MoE forwards. Nothing about the size or TTFT numbers changes; see
-[TUNING.md §2](TUNING.md) before turning it on for quality-sensitive work.
+9 is the highest the quantizer goes. Packing at 9 bits *uniformly* fails the quality bar
+on the fused-EXL3 forward against real decode queries, so the engine keeps each layer's 8
+highest-variance channels exact and packs the rest — both models then clear the bar with
+margin, at 1.211 bytes/element instead of 1.156. It is automatic, with no knob. See
+[TUNING.md §2](TUNING.md).
 
 ### 7.5 RAM layer caching — and why it is dense-only
 
@@ -860,16 +861,38 @@ On Qwen3-235B, whose answers open with prose, the same shape of
 configuration measures **0.836×** (16 % slower) with no gate at all. With
 the gate it correctly detects the low acceptance — 0.351 against a 0.528
 break-even, derived from that run's own routing — and latches off. **That
-is not free.** The gate spends its calibration steps and 37 drafting rounds
-finding out, and over a 128-token run that fixed cost does not amortize
-away: the gated run lands at **0.932×** (1.080 → 1.006 tok/s), not parity.
+is not free.** Finding out cost 37 drafting rounds, and the gated run lands at
+**0.932×** (1.080 → 1.006 tok/s), not parity.
 
-That is the honest number, not the target the design named. What the gate
-buys is the difference between a known 16 % regression that never ends and a
-6.8 % exploration cost paid once per process — and the shorter the
-generation, the worse that trade looks. On a single short request, a
-configuration you already know does not pay is still better switched off by
-hand.
+**Read that 6.8 % as a fixed cost divided by a short benchmark, not as a rate.**
+The gate pays for exploration exactly once per process — the decision latches,
+and an `off` decision removes the speculator entirely, so every later request
+runs the ordinary path. Only rounds where the proposer actually drafted are
+paid for: calibration steps, and trial rounds where no n-gram matched, verify a
+single position and cost precisely what plain decode costs (27 of the 64 rounds
+above were free for that reason). The whole exploration is worth
+
+    (drafted tokens) x (break-even acceptance - measured acceptance)
+
+token-equivalents of decode, at most `48 x break-even` when nothing is accepted:
+**25.3 tokens on Qwen3-235B, 29.3 on MiniMax-M2.7**. Both numbers come from the
+model's own routing — there is no per-model constant behind them — and both are
+already in the `calibration` object below, so you can compute your own load's
+figure from what the server reports.
+
+Divided over a process that generates `T` tokens, that is `6.8 % x 128/T`:
+**under 1 % once the process has produced ~870 tokens, under 0.1 % past ~8 700.**
+A long-lived server, or an agentic session that reuses one process, is far past
+both. The 6.8 % is what it costs a 128-token benchmark, and quoting it as the
+cost of running the gate is wrong. Where it does bite is a process that starts,
+answers once, and exits — there, a configuration you already know does not pay
+is still better switched off by hand.
+
+The exploration is deliberately not made shorter. The latch is permanent, so a
+wrong decision is permanent in both directions — forfeiting a measured 1.307×,
+or keeping a measured 0.836× — and deciding on fewer drafted tokens makes both
+likelier. Trading a bounded one-time cost for an unbounded permanent one is the
+wrong way round.
 
 ### Turning it on
 
@@ -890,7 +913,7 @@ Three conditions have to hold together, and they are not independent:
 
 | condition | why | if it does not hold |
 |---|---|---|
-| MiniMax-M2.7, not Qwen3-235B | Qwen opens its answers with prose | the gate latches off after paying ~6.8 % on a 128-token run |
+| MiniMax-M2.7, not Qwen3-235B | Qwen opens its answers with prose | the gate latches off, once, after paying ≤25 token-equivalents of decode (6.8 % of a 128-token run; under 1 % of a ~900-token process) |
 | thinking suppressed | the copy phase never starts inside a think block | same — the gate latches off |
 | copy-heavy work (re-emitting a file with an edit) | PLD drafts from n-grams already in the context | no matches, no speedup, near-zero overhead |
 

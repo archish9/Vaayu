@@ -726,7 +726,7 @@ Full breakdown and the per-lever numbers: [documentation/server.md §7](document
 | `QUEUE_DEPTH` | `8` | waiting requests before `503`. One runs at a time regardless |
 | `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
 | `ENABLE_PREFIX_CACHE` | **`True`** | leave it on. Reuse is the largest lever here |
-| `PREFIX_COMPRESS` | `None` (set `9`) | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
+| `PREFIX_COMPRESS` | `None` (set `9`) | ~1.6× the pooled sessions (0.605× bf16: 9 bits plus 8 exact channels per layer, which is what clears the quality bar on both MoE forwards). Reuse collapses to **zero**, not gradually, once the pool is over capacity |
 | `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Still refused at load on MoE (a weighted drafter costs VRAM the expert cache needs) |
 | `USE_PROMPT_LOOKUP` | `"auto"` | `"auto"` = ON for dense, OFF for MoE, resolved at load. **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on MiniMax-M2.7**, correctly refused on Qwen3-235B. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-minimax-m27) |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
