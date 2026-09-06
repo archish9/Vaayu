@@ -48,10 +48,16 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-06: **no task rows and no open `[bug]` rows** (S1, G1 and V1 closed
-2026-09-05; `env.json`'s `kv_cache_mode`, the suite's stray `logs/run-*` dirs, dense
-`avg_nvme_throughput` and its stale-disk-timings follow-up closed 2026-09-06). The next work comes from **STILL OPEN** or
-**OPTIONAL** below. Each of
+Live as of 2026-09-06: **no task rows in THIS section** (S1, G1 and V1 closed 2026-09-05;
+`env.json`'s `kv_cache_mode`, the suite's stray `logs/run-*` dirs, dense `avg_nvme_throughput`
+and its stale-disk-timings follow-up closed 2026-09-06).
+**Two `[bug]` rows ARE open, both carried under closed parents in this section — do not read
+the line above as "no open bugs", which is what it used to say:**
+**C1** (a MoE model loaded with `device="cpu"` runs a speculator with NO gate at all;
+pre-existing, deferred) and **S1e-bis** (`[bug]/[!]` — the S1e verdict was measured with thinking
+ON, `enable_thinking=False` is a no-op on both checkpoints, so that verdict is void until
+re-measured). **S1f** is also still `[ ]`. The next work comes from those, from **STILL OPEN**, or
+from **OPTIONAL** below. Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
 cold in a fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
