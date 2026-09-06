@@ -41,13 +41,28 @@ this section whenever a row opens or closes; do not let it drift.
 
 ## HIGH PRIORITY — can make Vaayu faster. Build in this order.
 
-**P1–P4 are all closed as of 2026-09-06** (P1 refuted, P2 shipped, P3 was already built, P4
-accepted-and-documented). The order now starts at P5; the vacancy bullets below say what happened
-to each, and they are anti-regression notes, not history for its own sake.
+**P1–P4 and P6 are all closed as of 2026-09-06** (P1 refuted, P2 shipped, P3 was already built, P4
+accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
+say what happened to each, and they are anti-regression notes, not history for its own sake.
+
+**Four rows are open, and every one has a SELF-CONTAINED brief in `docs/` (linked in the table).**
+Suggested order if you want the cheapest first: **P7** (machinery exists, ~20 lines + a calibration
+window, stacks on a win already measured) → **P9** (same 20-line shape as P6, on a shipped feature,
+and its trap #1 can refute it in 10 minutes) → **P8** (highest ceiling, highest risk, starts with a
+measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is a
+recommendation, not a dependency: the four are independent and none blocks another.
+
+**`P7`/`P8`/`P9` here are §0 SLOTS in this file's own sequence.** They are NOT the
+HANDOFF-2026-08-30 `P7`/`P8` (that series closed 2026-09-03), NOT the `p7-*`/`p8-*` probe files in
+`plans/probes/`, and NOT the stale "row P7" that `CLAUDE.md` §0 still cites for dense speculative
+decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** |
+| **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
+| **P7** | Tighten the VRAM prefix from the zero-overlap BOUND to the OBSERVED routing union | P6's bound `min(num_experts, N*top_k)`=24 at N=3 is 1.45–1.67× the measured union (14.38 Qwen / 16.51 MiniMax), so the prefix is shorter than the budget affords — 34 of 62 layers on MiniMax where the measured union allows ~51. Stacks on top of P6's +11.9 %. **MiniMax-only:** the fused forward cannot use a longer prefix (see P8). | none — `observed_union_per_layer` already exists in `speculative/adaptive_gate.py`, and `_expert_history` already holds the batch union | OPTIONAL row **11** · [`docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`](docs/2026-09-06-P7-observed-union-prefix-BRIEF.md) |
+| **P8** | Does the FUSED forward leave MiniMax's P6 win on the table? | P6 gave Qwen a 56.9 %-hit VRAM cache worth **+0.2–0.95 % (nothing)** and MiniMax a 48.4 %-hit cache worth **+11.6–12.1 %**. The whole difference: the module-list forward filters VRAM-resident experts BEFORE dispatch (16.52→12.50 routed/visit, −24 %), the fused forward does not (14.38→14.38). Highest ceiling of the open rows. **Highest risk too — P1 refuted the naive hoist and its RAM-refresh warning still binds.** First step is a measurement that can kill the row at zero cost. | none | OPTIONAL row **10** · [`docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`](docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md) |
+| **P9** | The speculative verify pass has P6's bug, unfixed | `_vram_cacheable_layers` is written at load (one stream's `top_k`) and by `batched_generate` (P6) — `speculative_generate` does NEITHER, though a verify pass pushes `(draft_tokens+1)` positions through every MoE layer in one forward. At P3's shipped `draft_tokens=3` that is a **4× under-charge**, worse than the 3× that took Qwen's cache to 0.1 %. Lands on a measured feature (P3: 1.307× on MiniMax-M2.7). Confirmed by reading 2026-09-06; SIZE unmeasured. | none — `compute_spec_working_set` already bounds the same union for admission, and `experts_per_layer=` shipped with P6 | OPTIONAL row **12** · [`docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`](docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
 - **The P1, P2 and P3 slots are VACANT.** P1 was measured 2026-09-06 and **REFUTED** (zero disk reads
@@ -107,7 +122,7 @@ to each, and they are anti-regression notes, not history for its own sake.
   paid before the refusal latches — and P4 closed on the finding that the cost is fixed and
   one-time (see two bullets above).
 
-## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P5.
+## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P5–P9.
 
 Correctness, capability, tooling and hardware. Real work, and some of it matters — none of it moves
 tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
@@ -975,7 +990,7 @@ Three live items (the fourth, speculative decoding on dense, closed 2026-09-06; 
 TRIAL exploration cost, closed the same day; the sixth, the content-blind latch it uncovered,
 opened and REFUTED the same day — see SETTLED). Everything else in the old CARRIED FORWARD block
 was `[x]` and is gone. **All three remaining are OPTIONAL by §0's test — none of them can make
-Vaayu faster. The live perf work is §0's P5.**
+Vaayu faster. The live perf work is §0's P5, P7, P8 and P9.**
 
 - **[x] Speculative decoding on streamed dense — CLOSED 2026-09-06. Both sub-rows below are done:
   the per-request bypass landed, and the dense default shipped as `USE_PROMPT_LOOKUP = "auto"`.
@@ -1409,8 +1424,8 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 
 # OPTIONAL — real work, no slot. Never ahead of OPEN or STILL OPEN.
 
-**This heading predates §0 and is now a LOCATION, not a priority: one row here (6a = P5) is §0's
-top perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
+**This heading predates §0 and is now a LOCATION, not a priority: four rows here (6a = P5, 10 = P8,
+11 = P7, 12 = P9) are §0's top perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
@@ -1419,43 +1434,118 @@ top perf work.** §0 is the order. Read the `§0` column below before picking an
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | **P2** (the outlier split) | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
-| **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-06 by P6's measurement. See below. |
+| **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | **P8** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Qwen has a 56.9 %-hit VRAM cache buying it nothing. Brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`. See below. |
+| **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
+| **12** | `speculative_generate` never re-sizes the VRAM prefix for its verify width | **P9** | `[ ]` | GPU round | Opened 2026-09-06 while scoping P6, confirmed in code. 4× under-charge at `draft_tokens=3`. Brief: `docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`. See below. |
 | **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
-# 10 · [ ] Does the FUSED forward leave MiniMax's P6 win on the table?
+# 10 · [ ] Does the FUSED forward leave MiniMax's P6 win on the table?  (§0 **P8**)
 
-Opened 2026-09-06 by P6's measurement (`docs/2026-09-06-P6-batch-union-vram-prefix-RESULTS.md`
-§5 — **gitignored, this disk only**; the numbers that matter are all restated here).
+**Self-contained brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`** (gitignored, this
+disk only — the numbers and the stop rule are restated here so the row survives without it).
 
-P6 gave both models a working VRAM expert cache at N=3 and only ONE of them got faster:
+Opened 2026-09-06 by P6's measurement. P6 gave both on-device MoE models a working VRAM expert
+cache at N=3 and only ONE got faster:
 
-| forward | model | hit rate after P6 | routed → dispatch / visit | aggregate tok/s |
+| forward | model | hit rate after P6 | routed → dispatch / decode visit | aggregate tok/s |
 |---|---|---|---|---|
 | module-list | MiniMax-M2.7 | 2.35 % → **48.4 %** | 16.52 → **12.50 (−24 %)** | **+11.6–12.1 %** |
 | fused EXL3 | Qwen3-235B | 0.04 % → **56.9 %** | 14.38 → **14.38** | +0.2–0.95 % (noise) |
 
 The module-list forward filters VRAM-resident experts BEFORE dispatch (`_to_load`,
 `moe_patch.py:1108`); the fused forward passes the whole routed set to `_dispatch_expert_misses`
-and only consults `_vram.get()` inside the compute loop. That is the entire difference, and it is
-worth 11.6 % on the model that has it.
+(`:1774`) and consults `_vram.get()` only inside the compute loop (`:1822`). That is the entire
+difference, and on the model that has it, it is worth 11.6 %.
 
-**This is NOT a re-open of P1** (REFUTED 2026-09-06, see SETTLED). P1 asked whether the redundant
-lookup was costing DISK READS and measured exactly zero, on 5922 visits; that answer stands. P1
-also warned that hoisting the filter would stop refreshing the RAM LRU for the hottest experts and
-make them its first eviction candidates — **that warning still stands too, and any attempt here
-must keep the refresh.** What is new is only that P1 measured against a fused cache hitting 0.1 %
-and it now hits 56.9 %, so the thing a pre-dispatch filter would skip is no longer nothing.
+**NOT a re-open of P1** (REFUTED 2026-09-06, SETTLED). P1 asked whether the redundant lookup cost
+DISK READS — measured exactly zero on 5922 visits, and that stands. P1 also priced the lookup
+itself at **0.665 µs/call = 0.012 % of decode**, so *do not build this to remove the lookup*. P1's
+warning binds: the dispatch's RAM lookup is what keeps VRAM ⊆ RAM true, and hoisting the filter
+would make the hottest experts the RAM LRU's first eviction candidates. What is new is only that P1
+measured against a 0.1 %-hit fused cache and it now hits 56.9 %.
 
-**Stop rule:** if the RAM refresh cannot be kept while filtering earlier, say so and close the row —
-trading a 56.9 %-hit VRAM cache for RAM-LRU thrash is the failure P1 already priced.
+**First step is a MEASUREMENT, not a change:** with a working cache, what does
+`_dispatch_expert_misses` actually do for an already-VRAM-resident expert — slab acquire, read
+submit, H2D, or a cheap short-circuit? Copy `plans/probes/p1_trace.py`. **If it short-circuits
+cheaply the row is REFUTED at zero cost.**
 
-**Second, cheaper item in the same row:** P6's union bound `min(num_experts, N*top_k)` = 24 at N=3
-is ~1.7× the measured union (14.38 Qwen / 16.51 MiniMax), so the prefix is shorter than it needs to
-be (14 layers of 94 on Qwen, 34 of 62 on MiniMax; the observed union would give ~24 and ~51).
-`observed_union_per_layer` (`vaayu/speculative/adaptive_gate.py`) already computes it from
-`_expert_history` — the missing piece is only a calibration window inside `batched_generate`.
-Unmeasured whether a longer prefix pays: on the fused forward it cannot (see above), so this is a
-MiniMax-only question.
+**Done means:** on-device A/B on Qwen3-235B at N=3, aggregate tok/s + bytes, greedy ids identical,
+AND RAM misses/decode-visit not rising from the 6.47–6.48 measured under P6. Baseline to beat:
+**1.791 / 1.805 tok/s**, 600.2–600.3 GB, prefix 14/94, hit rate 56.85–56.87 %.
+**Refuted if** the dispatch does no real work for resident experts, or the filter cannot keep the
+RAM refresh, or tok/s does not move.
+
+---
+
+# 11 · [ ] The VRAM prefix is sized on the zero-overlap BOUND, not the observed union  (§0 **P7**)
+
+**Self-contained brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`** (gitignored, this disk
+only — key numbers restated here).
+
+Opened 2026-09-06 by P6, which shipped `batch_union_per_layer = min(num_experts, N*top_k)` — a
+zero-overlap upper bound. The real union is smaller:
+
+| model | bound at N=3 | measured union/visit | prefix now | prefix at measured |
+|---|---|---|---|---|
+| Qwen3-235B | 24 | **14.38** (1.80 × top_k) | 14 of 94 | ~24 of 94 |
+| MiniMax-M2.7 | 24 | **16.51** (2.06 × top_k) | 34 of 62 | ~51 of 62 |
+
+A short prefix is a real cost — layers outside it get no VRAM caching at all. **MiniMax-only
+question:** on the fused forward a working cache buys nothing (see row 10), so a longer prefix
+cannot help Qwen; run a Qwen arm as a no-regression check only.
+
+**Do not rebuild the machinery:** `observed_union_per_layer` and `union_bytes`
+(`vaayu/speculative/adaptive_gate.py`) already compute this from `_expert_history`, which all three
+forwards write (`moe_patch.py:1281`, `:1419`, `:2028`) and which at batched decode ALREADY holds the
+batch union. The missing piece is only a calibration window in `batched_generate` (P3's
+`AdaptiveSpecGate` is the precedent; `CALIBRATE_STEPS = 8`).
+
+**Trap that most threatens this row:** MiniMax's 16.51 is a POST-filter count, taken at a 2.4 % hit
+rate where the filter removed almost nothing. **After P6 the hit rate is 48 %, so a fresh
+measurement reads LOWER than the true union** — sizing on it would lengthen the prefix too far and
+re-create the thrash P6 fixed. Measure pre-filter routing.
+
+**Done means:** prefix derived from observed routing; on-device A/B on MiniMax-M2.7 at N=3 vs the
+P6 build (beat **3.280 / 3.265 tok/s** at 48.4 % hits, 17 539 evictions, 376.5 GB), greedy ids
+identical. **Refuted if** the longer prefix does not beat the bound-sized one.
+
+---
+
+# 12 · [ ] `speculative_generate` never re-sizes the VRAM prefix for its verify width  (§0 **P9**)
+
+**Self-contained brief: `docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`** (gitignored, this
+disk only — the defect and both stop rules are restated here).
+
+Opened 2026-09-06 while scoping P6; **confirmed by reading the code, size unmeasured.**
+`_vram_cacheable_layers` is written in exactly two places: `vaayu_base.py:2610` at load (charging
+ONE stream's `top_k`) and `batched_generate`'s P6 block (batch width N, restored in `finally`).
+`speculative_generate` (`vaayu_base.py:4862`) does neither — yet a verify pass pushes
+`(draft_tokens + 1)` positions through every MoE layer in ONE forward, so its per-layer insert load
+is the union over those positions. At P3's shipped `draft_tokens=3` that is **4 × top_k against the
+top_k charged — a 4× under-charge**, worse than the 3× that took Qwen's cache to 0.1 % and
+MiniMax's to 2.4 %.
+
+The engine already computes this bound: `compute_spec_working_set(geometry, positions)`
+(`vaayu_base.py:122`) uses it for Fix #9 ADMISSION (`:2428-2461`); it is simply never fed to the
+prefix sizing. The fix mirrors P6 and is ~20 lines — `compute_vram_layer_range`'s
+`experts_per_layer=` parameter shipped with P6.
+
+Lands on a MEASURED feature: P3's MiniMax-M2.7 arm ran `draft_tokens=3` at **1.7795 → 2.3253 tok/s
+= 1.307×**. Expect a MiniMax win and a Qwen no-op, for row 10's structural reason.
+
+**Trap #1, do this FIRST — it can refute the row in 10 minutes:** `compute_prefill_pass`
+(`vaayu_base.py:812`) has `verify_cap = (draft_tokens + 1)`. If a verify pass is treated as a
+prefill pass, all three forwards set `_vram = None` and the prefix is irrelevant. Check before
+building anything.
+**Open design question:** verify width is not constant (the adaptive gate's CALIBRATE phase drafts
+nothing = 1 position). Size for `draft_tokens+1` throughout, or re-size on phase change — pick ONE,
+state why, do not build both. Also state what happens if batching and speculation ever combine: the
+correct width is `N * (draft_tokens + 1)`, not the max.
+
+**Done means:** derived sizing, load-time and non-speculative paths byte-identical, tests over both
+geometries driving the real exit paths (incl. abandonment), and an on-device A/B on MiniMax-M2.7 at
+`draft_tokens=3` reporting hit rate AND tok/s with greedy ids identical.
+**Refuted if** the restored hit rate does not move tok/s.
 
 ---
 
@@ -1474,9 +1564,10 @@ touching `__init__`").
 
 ---
 
-# 6a · [ ] The intercept residual the VRAM calibration could not explain
+# 6a · [ ] The intercept residual the VRAM calibration could not explain  (§0 **P5**)
 
-Opened 2026-08-15 out of the kernel-aware-calibration row (archived; `plans/settled_and_method_notes.md`), with the data already in hand
+**Self-contained brief: `docs/2026-09-06-P5-intercept-residual-BRIEF.md`** (gitignored, this disk
+only). Opened 2026-08-15 out of the kernel-aware-calibration row (archived; `plans/settled_and_method_notes.md`), with the data already in hand
 (`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md` §7).
 
 **One intercept rule cannot be right for both forwards.** `transient − KV(capacity)`, flash arm:
