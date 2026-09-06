@@ -65,6 +65,13 @@ DRAFTER_MODEL_PATH = None # "/home/a/code/ai-ml/models/Qwen2.5-Coder-1.5B"
 USE_PROMPT_LOOKUP  = False
 DRAFT_TOKENS       = 5
 
+# Explicit because `stream_generate`'s own defaults are SAMPLING (0.7 / 0.9),
+# and speculation is dispatched per request: a call that asks for sampling
+# takes the ordinary path, so leaving this implicit silently measures the
+# non-speculative arm. Raise it to sample -- and expect no speculation.
+TEMPERATURE        = 0.0
+TOP_P              = 1.0
+
 # ── Shipped optimizations ────────────────────────────────────────────────────
 # Cross-turn RAM prefix cache + disk KV persistence (A1 + Subsystem A). This
 # script does one generate() call, so there's no second turn to actually HIT
@@ -213,6 +220,8 @@ for chunk in stream_generate(
     model,
     input_tokens['input_ids'].to(DEVICE),
     max_new_tokens=MAX_NEW_TOKENS,
+    temperature=TEMPERATURE,
+    top_p=TOP_P,
     session_id=SESSION_ID,
 ):
     if first_token_time is None and chunk:

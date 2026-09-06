@@ -281,14 +281,17 @@ class EngineHandle:
         cap = resolve_max_tokens(req.max_tokens, len(prompt_ids), self.max_seq_len)
         return prompt_ids, cap
 
-    def warn_if_speculative_sampling_ignored(self, req):
-        """speculative_generate is GREEDY -- temperature included, though it is a
-        declared parameter and this docstring used to claim it was honoured.
-        Return a message when this request asks for something that path will
-        drop, else None.
+    def notice_if_speculation_skipped(self, req):
+        """speculative_generate is GREEDY -- temperature included -- and has no
+        stop-string machinery. Return a message when this request asks for
+        something that path would drop, else None.
 
-        Asked of the same helper the engine warns with, against the kwargs this
-        request would actually be run with, so the two can never disagree.
+        Nothing is LOST when this fires: `stream_generate` dispatches per
+        request, so such a request takes the ordinary path and gets what it
+        asked for. The message says which control sent it there, so a caller
+        wondering why speculation did not engage has the answer. It is asked of
+        the same helper that dispatch uses, against the kwargs this request
+        would actually be run with, so the two can never disagree.
         """
         from ..vaayu_base import speculative_ignored_sampling
 
@@ -302,9 +305,10 @@ class EngineHandle:
         ignored = speculative_ignored_sampling(req.temperature, kwargs)
         if not ignored:
             return None
-        return (f"speculative decoding is active and its loop is greedy, so "
-                f"{', '.join(ignored)} will be IGNORED for this request. "
-                f"Load without drafter_model_path to use them.")
+        return (f"speculative decoding is SKIPPED for this request: its loop "
+                f"is greedy and has no stop-string machinery, so it would drop "
+                f"{', '.join(ignored)}. The request runs on the ordinary path, "
+                f"which honours them.")
 
     def build_generate_kwargs(self, req, prompt_ids, cap=None, cancel=None) -> dict:
         import torch

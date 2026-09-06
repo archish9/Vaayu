@@ -176,3 +176,75 @@ def test_speculative_with_skip_prompt_off_streams_prompt_then_generated():
     sink, s = _sink_streamer(skip_prompt=False)
     out = _spec_run(s)
     assert sink == out[0].tolist()
+
+
+# ── per-request speculation bypass ───────────────────────────────────────────
+# `speculative_generate` is greedy and has no stop-string machinery, so loading
+# a speculator used to change EVERY request on the process: a sampled request
+# got greedy text and a tool request ran past its own stop string. Dispatch is
+# per request instead -- speculate only when this call asks for nothing that
+# loop would drop, which is the same question `speculative_ignored_sampling`
+# already answers for the warning, asked once so the two cannot disagree.
+
+class _DispatchRecordingModel:
+    """Records which of the two generate paths stream_generate chose."""
+    tokenizer = object()
+
+    def __init__(self):
+        self.speculator = object()      # loaded, i.e. speculation is available
+        self.called = None
+
+    def generate(self, **kwargs):
+        self.called = "generate"
+        _happy_path(kwargs["streamer"])
+
+    def speculative_generate(self, **kwargs):
+        self.called = "speculative_generate"
+        _happy_path(kwargs["streamer"])
+
+
+def _dispatch(**kwargs):
+    model = _DispatchRecordingModel()
+    list(stream_generate(model, input_ids=None, max_new_tokens=1, **kwargs))
+    return model.called
+
+
+def test_a_greedy_request_speculates():
+    assert _dispatch(temperature=0.0, top_p=1.0) == "speculative_generate"
+
+
+def test_a_sampled_request_takes_the_ordinary_path():
+    # The whole point: temperature was asked for, so it must be HONOURED by
+    # HF's loop rather than swallowed by the greedy one.
+    assert _dispatch(temperature=0.7) == "generate"
+
+
+def test_a_request_with_stop_strings_takes_the_ordinary_path():
+    # The server appends stop strings to every tool-enabled request; the
+    # speculative loop drops them and generates straight past the tool call.
+    assert _dispatch(temperature=0.0, top_p=1.0,
+                     stop_strings=["```"]) == "generate"
+
+
+def test_stream_generates_own_sampling_defaults_bypass_too():
+    # temperature=0.7/top_p=0.9 are this function's defaults, so a caller that
+    # passes neither is asking for sampling and must not be given greedy text.
+    assert _dispatch() == "generate"
+
+
+def test_a_model_with_no_speculator_is_unaffected():
+    model = _FakeModel(_happy_path)
+    assert list(stream_generate(model, input_ids=None, max_new_tokens=1,
+                                temperature=0.7)) == ["hello ", "world"]
+
+
+def test_the_bypass_says_why_it_skipped_speculation(capsys):
+    _dispatch(temperature=0.7, stop_strings=["```"])
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "Vaayu-Spec" in ln]
+    assert len(lines) == 1, f"expected exactly one notice, got: {lines}"
+    assert "temperature" in lines[0] and "stop_strings" in lines[0]
+
+
+def test_a_speculating_request_prints_no_notice(capsys):
+    _dispatch(temperature=0.0, top_p=1.0)
+    assert "Vaayu-Spec" not in capsys.readouterr().out

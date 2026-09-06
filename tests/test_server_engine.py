@@ -98,27 +98,30 @@ def test_an_omitted_session_id_is_none_so_auto_prefix_match_runs():
     assert e.build_generate_kwargs(_req(), [1, 2, 3])["session_id"] is None
 
 
-def test_no_warning_when_there_is_no_speculator():
+def test_no_notice_when_there_is_no_speculator():
     e = EngineHandle(FakeModel(speculator=None))
-    assert e.warn_if_speculative_sampling_ignored(_req(top_p=0.5)) is None
+    assert e.notice_if_speculation_skipped(_req(top_p=0.5)) is None
 
 
-def test_a_speculator_plus_top_p_warns_because_the_path_ignores_it():
-    # speculative_generate honours temperature only; top_p/top_k/stop fall into
-    # **kwargs and vanish. Warn, never pretend (CLAUDE.md §5).
+def test_a_sampled_request_is_told_speculation_is_skipped_for_it():
+    # stream_generate dispatches per request now, so top_p is NOT ignored --
+    # the request takes the ordinary path and gets it. Saying "IGNORED" here
+    # would send the caller to unload a drafter that is costing them nothing.
     e = EngineHandle(FakeModel(speculator=object()))
-    msg = e.warn_if_speculative_sampling_ignored(_req(temperature=0.7, top_p=0.5))
+    msg = e.notice_if_speculation_skipped(_req(temperature=0.7, top_p=0.5))
     assert msg is not None and "top_p" in msg
+    assert "IGNORED" not in msg
+    assert "drafter_model_path" not in msg
 
 
-def test_a_speculator_with_stop_strings_warns_too():
+def test_a_request_with_stop_strings_gets_the_same_notice():
     e = EngineHandle(FakeModel(speculator=object()))
-    assert "stop" in e.warn_if_speculative_sampling_ignored(_req(stop=["```"]))
+    assert "stop" in e.notice_if_speculation_skipped(_req(stop=["```"]))
 
 
-def test_a_speculator_with_defaults_only_does_not_warn():
+def test_a_greedy_request_gets_no_notice_because_it_does_speculate():
     e = EngineHandle(FakeModel(speculator=object()))
-    assert e.warn_if_speculative_sampling_ignored(_req(temperature=0.0)) is None
+    assert e.notice_if_speculation_skipped(_req(temperature=0.0)) is None
 
 
 def test_the_cpu_max_seq_len_fallback_is_reported_at_construction(capsys):
@@ -636,11 +639,10 @@ def test_tool_format_is_none_for_a_template_without_tool_support():
     assert e.tool_format is None, "a plain template must still refuse tools"
 
 
-def test_a_speculator_plus_temperature_warns_because_the_loop_is_greedy():
-    # The docstring here used to say "honours temperature only". It does not:
-    # `temperature` is a declared, unread parameter and every token in that
-    # loop is an argmax. A sampled request with default top_p/top_k -- the
-    # common case -- got greedy text and no warning at all.
+def test_a_speculator_plus_temperature_reports_the_skip_not_a_loss():
+    # `temperature` is a declared, unread parameter of that loop and every
+    # token in it is an argmax, so a sampled request cannot run there. It is
+    # now sent to the ordinary path instead of quietly getting greedy text.
     e = EngineHandle(FakeModel(speculator=object()))
-    msg = e.warn_if_speculative_sampling_ignored(_req(temperature=0.7))
+    msg = e.notice_if_speculation_skipped(_req(temperature=0.7))
     assert msg is not None and "temperature" in msg

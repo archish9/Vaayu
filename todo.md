@@ -36,8 +36,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1647 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after the two dense-telemetry cache-hit fixes (1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
+**Suite baseline: 1654 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the per-request speculation bypass (1647 + 7; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
 has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
@@ -852,8 +852,38 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
   18 rounds each, 90 % drafted-token acceptance, all three byte-identical to each other AND to the
   greedy baseline. Reserve-policy risk CHECKED and it does **not** fire (pinning_budget 10.75 GiB
   base vs 10.73 with the drafter resident; the −19 % clamp case was Llama-3.2-1B as the TARGET,
-  a different premise). **All four P7 sub-bugs are fixed.** What remains is one policy call:
-  whether `drafter_model_path` defaults on for dense. Opt-in works today.
+  a different premise). **All four P7 sub-bugs are fixed.**
+  **Policy call DECIDED 2026-09-06 (with the user): a default is only safe once speculation stops
+  changing requests that did not ask for it — bypass first, then default.**
+  - **[x] Per-request bypass — LANDED 2026-09-06.** A loaded speculator used to change EVERY
+    request on the process: `speculative_generate` is greedy at every decision point and has no
+    stop-string machinery, so a sampled request came back greedy and a tool-enabled one generated
+    straight past its own stop string. Dispatch (`vaayu/streaming.py`, the ONE call site) now asks
+    `speculative_ignored_sampling` per request — the same helper the notice uses, so the two cannot
+    disagree — and falls through to `model.generate` when this call asks for anything that loop
+    would drop, printing one `[Vaayu-Spec] speculation SKIPPED` line naming it.
+    `engine.warn_if_speculative_sampling_ignored` → `notice_if_speculation_skipped`: nothing is
+    ignored any more, so the old "will be IGNORED / Load without drafter_model_path" text would have
+    sent callers to unload a drafter costing them nothing. Wire field `warnings` unchanged.
+    **Cost accepted:** the server appends stop strings to every tool-enabled request, so tool
+    traffic no longer speculates — a correctness win, but it cuts speculation's reach.
+    **Trap found:** `stream_generate`'s own defaults are SAMPLING (`temperature=0.7, top_p=0.9`) and
+    `test_generate.py` passed neither, so the P7 harness would silently have stopped speculating; it
+    now has an explicit `TEMPERATURE`/`TOP_P` knob, defaulting greedy. That also means **every P7/PLD
+    number on record was taken through a harness whose NON-speculative arm ran sampled** — worth
+    knowing before re-quoting a baseline, though the speculative arms were greedy regardless (that
+    loop never read `temperature`).
+    Verified: 7 new unit tests (watched fail first) + full suite **1654 passed, 12 skipped**, and an
+    on-device gate on Llama-3.2-1B with prompt lookup — greedy arm speculates (`accept_rate` to
+    110 %) and is byte-identical across two runs; sampled arm prints the notice, runs NO draft
+    rounds, and its two runs differ from each other and from greedy. Before the fix both sampled
+    runs were greedy and identical.
+  - **[ ] Then the default.** `USE_PROMPT_LOOKUP = "auto"` in `vaayu/server/config.py`, resolved at
+    load where `is_moe` is known: dense → on (**1.94×** streamed dense), MoE → off, explicit
+    `True`/`False` still wins. **MoE deliberately unchanged** — a global `True` hands Qwen the
+    unresolved up-to-8.6 % TRIAL regression (row 5 below).
+    `DRAFTER_MODEL_PATH` stays `None`: a drafter is a checkpoint path needing an exact vocab match,
+    so it cannot be defaulted without baking in a model (CLAUDE.md §5). Opt-in works today.
   **MoE speculation stays refuted** — see SETTLED.
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size

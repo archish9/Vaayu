@@ -36,7 +36,7 @@ class FakeEngine:
         self.cancel = None          # the CancelToken the route handed us
         self.cancelled_all = False  # set by shutdown
 
-    def warn_if_speculative_sampling_ignored(self, req):
+    def notice_if_speculation_skipped(self, req):
         return self.warned
 
     # The real EngineHandle raises ContextTooLong / TemplateLacksToolSupport /

@@ -642,9 +642,12 @@ Both are **refused at load on MoE** — a 6-position verify pass needs 53.4 GB (
 26.4 GB (MiniMax) of expert working set against a 9.1 GB budget. That is a wall, not a
 tuning problem.
 
-> The speculative loop honours `temperature` only. `top_p`, `top_k` and `stop` are
-> ignored on that path — the server logs a warning and puts it in `warnings` on the
-> response rather than pretending.
+> The speculative loop is **greedy at every decision point** — `temperature`
+> included — and has no stop-string machinery. So it is dispatched **per request**:
+> a request asking for `temperature`, `top_p`, `top_k` or `stop` takes the ordinary
+> path and gets them. Nothing is lost; that request simply does not speculate. The
+> server names the control that sent it there, in the log and in `warnings` on the
+> response.
 
 ### 7.4 Keep the prefix pool big enough
 
@@ -764,7 +767,7 @@ Do not spend time here; each is measured and settled.
 | `503` + `Retry-After` | queue full | retry; raise `QUEUE_DEPTH`; reduce client concurrency |
 | a non-streaming request never returns; the client times out with no status | uncapped generation on a slow model — nothing is sent until the last token | set `max_tokens`, or `stream: true`. The startup log carries a WARNING naming the token count |
 | `422` on `n` | `n>1` requested | this server returns one choice |
-| `warnings` on the response | speculative decoding is ignoring your sampling params | unset `DRAFTER_MODEL_PATH` / `USE_PROMPT_LOOKUP`, or drop `top_p`/`top_k`/`stop` |
+| `warnings` on the response naming a sampling param | that request skipped speculation, because the speculative loop would drop the param | nothing to fix — the param was honoured. To speculate instead, send `temperature: 0` and no `top_p`/`top_k`/`stop` |
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 | killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |

@@ -473,9 +473,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                           "collapses to zero rather than degrading. Set "
                           "REQUIRE_SESSION_ID = False to allow unnamed requests.",
                           "invalid_request_error")
-        warning = e.warn_if_speculative_sampling_ignored(req)
+        # `warning` is the WIRE's word for it (SSE `: warning`, and the
+        # non-streaming body's `warnings` array) -- kept, though nothing is
+        # wrong here: the request gets exactly what it asked for.
+        warning = e.notice_if_speculation_skipped(req)
         if warning:
-            print(f"[Vaayu-Server] WARNING: {warning}")
+            print(f"[Vaayu-Server] {warning}")
 
         if resolve_stream(req, getattr(app.state, "config", None)):
             # The slot is acquired INSIDE _sse, not here: a StreamingResponse's
