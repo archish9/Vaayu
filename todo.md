@@ -890,7 +890,11 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
     `DRAFTER_MODEL_PATH` stays `None`: a drafter is a checkpoint path needing an exact vocab match,
     so it cannot be defaulted without baking in a model (CLAUDE.md §5). Opt-in works today.
   **MoE speculation stays refuted** — see SETTLED.
-- **[bug] The non-streaming server route NEVER speculates.** `EngineHandle.generate` calls
+- **[x] The non-streaming server route never speculated — FIXED 2026-09-06** (`56699d0`).
+  Both routes now ask one helper, `choose_speculative_target` (`vaayu/vaayu_base.py`); the
+  non-streaming arm went 0 → 5 draft rounds on the server gate and its text now matches the
+  streamed greedy arm exactly. Original report follows, for the measurement.
+  **[was] The non-streaming server route NEVER speculates.** `EngineHandle.generate` calls
   `self.model.generate(**kwargs)` directly (`vaayu/server/engine.py:442`); only the streaming route
   goes through `stream_generate`, which is where speculation is dispatched. **Measured through the
   server 2026-09-06** (Llama-3.2-1B, prompt lookup on, `temperature=0`): streamed = 10 draft rounds,
@@ -901,6 +905,32 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
   Fix is the same per-request choice of target the streaming path now makes; the two call sites
   should share one helper rather than answer the question twice. `DEFAULT_STREAM = True` is the
   shipped default, so the exposure is limited to clients that ask for `stream:false`.
+
+- **[bug] PROMPT-LOOKUP SPECULATION IS NOT LOSSLESS — it corrupts greedy output.** Measured
+  2026-09-06, Llama-3.2-1B, `use_prompt_lookup=True`, `draft_tokens=10`, one process, one prompt,
+  the ONLY difference being whether `model.speculator` is set
+  (`scratchpad/probe_pld.py`, not committed):
+
+  | prompt | speculative | plain greedy |
+  |---|---|---|
+  | "repeat this list back exactly, then continue it: alpha bravo …" | `The list you delta echo foxtrot hotel alpha bravo charlie delta echo` | `The list you're referring to is the NATO phonetic alphabet, also known as …` |
+  | "copy this function verbatim, then add a docstring" | `Here is the function with_docstring(a, b)` | `Here is the function with a docstring:\n\n```python\ndef add(a, b): …` |
+
+  First divergence at generated index **3** and **5**; the speculative run also terminates early
+  (17 vs 60 ids, 12 vs 60). Tokens are dropped mid-sentence — the accepted run is not a prefix of
+  the greedy one, so this is a wrong-accept, not an early stop. The `accept_rate=117 %` and `110 %`
+  lines in the same logs say the same thing: more tokens accepted than were drafted.
+  **Suspect `PromptLookupDecoder` + the verifier's accept/bonus accounting**, not the standard
+  drafter — P7's 5.57× arms were byte-identical on three back-to-back runs with
+  `StandardDrafterDecoder`, and that claim was independently re-verified. Nothing here re-opens it.
+  **Pre-existing; NOT caused by the per-request bypass or the non-streaming fix** — those made it
+  visible by putting a greedy speculative arm next to a greedy ordinary one in the same process.
+  **BLOCKS the pending `USE_PROMPT_LOOKUP = "auto"` dense default** (row above): defaulting this on
+  would ship corrupted output to every dense user. Do not ship that default until this closes.
+  **Also suspect on their face: the 1.94 % dense and 1.31× MiniMax PLD numbers** in `README.md` and
+  `documentation/server.md` — a proposer that drops tokens finishes sooner, and neither figure is
+  known to have been checked for greedy-id equality (`todo.md`'s own Environment trap #6 is exactly
+  this check). Re-measure before quoting either.
 
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size
