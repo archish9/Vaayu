@@ -36,8 +36,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1654 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after the per-request speculation bypass (1647 + 7; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
+**Suite baseline: 1669 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the KV-trim fix (1647 + 7 bypass + 11 non-streaming + 4 trim; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
 has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
@@ -906,31 +906,31 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
   should share one helper rather than answer the question twice. `DEFAULT_STREAM = True` is the
   shipped default, so the exposure is limited to clients that ask for `stream:false`.
 
-- **[bug] PROMPT-LOOKUP SPECULATION IS NOT LOSSLESS — it corrupts greedy output.** Measured
-  2026-09-06, Llama-3.2-1B, `use_prompt_lookup=True`, `draft_tokens=10`, one process, one prompt,
-  the ONLY difference being whether `model.speculator` is set
-  (`scratchpad/probe_pld.py`, not committed):
-
-  | prompt | speculative | plain greedy |
-  |---|---|---|
-  | "repeat this list back exactly, then continue it: alpha bravo …" | `The list you delta echo foxtrot hotel alpha bravo charlie delta echo` | `The list you're referring to is the NATO phonetic alphabet, also known as …` |
-  | "copy this function verbatim, then add a docstring" | `Here is the function with_docstring(a, b)` | `Here is the function with a docstring:\n\n```python\ndef add(a, b): …` |
-
-  First divergence at generated index **3** and **5**; the speculative run also terminates early
-  (17 vs 60 ids, 12 vs 60). Tokens are dropped mid-sentence — the accepted run is not a prefix of
-  the greedy one, so this is a wrong-accept, not an early stop. The `accept_rate=117 %` and `110 %`
-  lines in the same logs say the same thing: more tokens accepted than were drafted.
-  **Suspect `PromptLookupDecoder` + the verifier's accept/bonus accounting**, not the standard
-  drafter — P7's 5.57× arms were byte-identical on three back-to-back runs with
-  `StandardDrafterDecoder`, and that claim was independently re-verified. Nothing here re-opens it.
-  **Pre-existing; NOT caused by the per-request bypass or the non-streaming fix** — those made it
-  visible by putting a greedy speculative arm next to a greedy ordinary one in the same process.
-  **BLOCKS the pending `USE_PROMPT_LOOKUP = "auto"` dense default** (row above): defaulting this on
-  would ship corrupted output to every dense user. Do not ship that default until this closes.
-  **Also suspect on their face: the 1.94 % dense and 1.31× MiniMax PLD numbers** in `README.md` and
-  `documentation/server.md` — a proposer that drops tokens finishes sooner, and neither figure is
-  known to have been checked for greedy-id equality (`todo.md`'s own Environment trap #6 is exactly
-  this check). Re-measure before quoting either.
+- **[x] Speculative decoding corrupted output on non-EXL3 checkpoints — ROOT-CAUSED AND FIXED
+  2026-09-06.** Symptom: on Llama-3.2-1B with prompt lookup, greedy speculative output diverged from
+  greedy plain output at generated index 3 and 5 on two prompts, dropped tokens mid-sentence
+  (`The list you delta echo foxtrot hotel`) and stopped early (17 vs 60 ids).
+  **Root cause — NOT the proposer, and not PLD-specific.** `_trim_kv_cache`
+  (`vaayu/vaayu_base.py:4576`) branched on `isinstance(cache, FP8DynamicCache)` then
+  `hasattr(cache, 'key_cache')`. Under **transformers 5.5.4 a plain `DynamicCache` has neither** —
+  its layers live in `.layers` — so the method matched no branch and **silently did nothing**. Its
+  one caller is the speculative loop's Step 5, so a verify pass's rejected draft positions stayed in
+  the cache and every later token was decoded against tokens that were never generated. Proof it is
+  upstream of the accept logic: the divergent round was **k=0** (no draft, no accept path at all,
+  just a 1-wide greedy forward) immediately after a 10-wide verify.
+  **Blast radius is `kv_cache_mode` resolving to `fp16`, i.e. NON-EXL3 checkpoints only.**
+  `FP8DynamicCache` (bf16/fp8) and `TurboQuantKVCache` both expose `crop` and took the working
+  branch — verified by the new test, which passes on those two against the code that failed on
+  `DynamicCache`. **The recorded 5.57× / 1.94× / 1.31× speculation numbers are therefore NOT
+  affected**: all three were taken on EXL3 checkpoints (bf16 KV). An earlier note in this file said
+  they were in doubt and blamed `PromptLookupDecoder` — that was wrong, and this row supersedes it.
+  **Fix:** try `crop` first (every cache class this engine builds implements it), keep the
+  `key_cache` slicing as the pre-`crop` fallback, and **raise** rather than fall through — a silent
+  no-op here returns wrong text, which is the failure mode CLAUDE.md §5 forbids.
+  Verified: 4 new tests, parametrized over all three cache classes plus an untrimmable one, watched
+  fail first (`assert 70 == 60`); full suite **1669 passed, 12 skipped**; the losslessness probe now
+  reports **IDENTICAL: True, 60/60 ids on both prompts**; and the server gate's streamed and
+  non-streamed greedy arms return the same coherent text.
 
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size

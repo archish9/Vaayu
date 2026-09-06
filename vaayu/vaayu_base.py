@@ -4574,19 +4574,41 @@ class VaayuBaseModel(GenerationMixin):
         )
 
     def _trim_kv_cache(self, cache, target_seq_len: int) -> None:
-        """Trim KV cache tensors in-place to target_seq_len tokens."""
+        """Trim KV cache tensors in-place to target_seq_len tokens.
+
+        `crop` FIRST, because every cache class this engine builds implements
+        it -- the ring buffers as a length-only update (Fix #8: the retained
+        [0:target_seq_len) tokens are already the valid data, no slicing or copy
+        needed), and transformers' own DynamicCache over its `.layers`.
+
+        The `key_cache` branch below is the fallback for a cache that predates
+        `crop`. It used to be the only non-FP8 branch, and under transformers
+        5.5.4 it matched NOTHING: DynamicCache keeps its layers in `.layers` and
+        has no `key_cache`, so this method silently did nothing for `fp16` mode
+        -- which is every non-EXL3 checkpoint. The one caller is the speculative
+        loop's Step 5, so the rejected draft positions simply stayed in the
+        cache and every later token was decoded against tokens that were never
+        generated. Measured 2026-09-06 on Llama-3.2-1B: the first no-draft round
+        after a 10-wide verify already returned a different token than plain
+        greedy. Never let this fall through silently again -- a cache that
+        cannot be trimmed must raise, because the alternative is wrong text.
+        """
         if cache is None:
             return
-        if isinstance(cache, FP8DynamicCache):
-            # Ring buffer (Fix #8): the retained [0:target_seq_len) tokens are
-            # already the valid data, so trimming the tail is a length-only
-            # update — no tensor slicing/copy needed.
+        if hasattr(cache, 'crop'):
             cache.crop(target_seq_len)
         elif hasattr(cache, 'key_cache'):
             for i in range(len(cache.key_cache)):
                 if len(cache.key_cache[i].shape) >= 3:
                     cache.key_cache[i] = cache.key_cache[i][:, :, :target_seq_len, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, :target_seq_len, :]
+        else:
+            raise TypeError(
+                f"{type(cache).__name__} cannot be trimmed: it has neither "
+                f"`crop` nor `key_cache`. Speculative decoding must drop the "
+                f"KV positions its verify pass wrote for rejected draft tokens; "
+                f"leaving them in place decodes every later token against "
+                f"tokens that were never generated.")
 
     def _trim_kv_cache_front(self, cache, target_seq_len: int) -> None:
         """Remove the oldest tokens from the KV cache to free VRAM."""
