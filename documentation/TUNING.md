@@ -89,8 +89,33 @@ a fraction. Measured: bf16 scored 0/4 and 0/3 hits in the two over-budget tests,
 never a partial score. This is why the crossover matters more than it looks.
 
 **Use 9, not 8.** At 8 bits MiniMax's worst layer measured 0.0612 attention-score
-relative error against a 0.05 bar. 9 bits passed both models (0.0214 / 0.0372).
-Anything below 9 prints a warning.
+relative error against a 0.05 bar. Anything below 9 prints a warning. 9 is also the
+highest the quantizer goes — `bits_total=10` does not exist — so there is no setting
+above this one.
+
+**How well 9 bits holds up, stated honestly.** The original gate (2026-08-02) could not
+use real queries: the persisted KV format stores keys and values but not queries, so the
+bar was scored with a K-row query *proxy*, which passed both models (0.0214 / 0.0372).
+A 2026-09-06 re-run captured **real** post-RoPE decode queries at a ~4.16k-token context
+and found that proxy is 2.5–13.7× optimistic on Qwen3-235B:
+
+| model | forward | 8 bits | 9 bits, real queries |
+|---|---|---|---|
+| MiniMax-M2.7 | module-list | 0.0546 over bar | **0.0426 — under the 0.05 bar** |
+| Qwen3-235B | fused EXL3 | 0.0934 over bar | **0.0649 — over the bar** |
+
+The 8-vs-9 advice above is unaffected — 8 bits fails both models on real queries too, so
+9 remains the setting to use if you use this at all. What is **not** established is that
+9 clears the bar on the fused-EXL3 forward. Two things this does not say: none of the
+size, TTFT or eviction numbers change, and **nobody has shown that failing this bar
+degrades generated text** — the bar is a deliberately strict proxy for quality, and a
+256-token coherence check passed even at the far worse 4-bit setting.
+
+The fix is known and not built: holding the 8 highest-variance key channels exact brings
+both models well under the bar (Qwen 0.0333, MiniMax 0.0182) for ~1.281 B/elem instead
+of 1.156 — about 11 % of the saving. Until then, prefer `None` for quality-sensitive
+work on a fused-EXL3 model, and use `9` when the alternative is the reuse cliff below,
+which costs far more.
 
 **What it does not do:** shrink VRAM for the *in-flight* session. The live cache is
 always bf16. If a single session's KV won't fit in VRAM, this cannot help — that
