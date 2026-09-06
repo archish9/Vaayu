@@ -15,7 +15,9 @@ the prune holds it in full. Older closed detail was moved out on 2026-08-23 (com
 Protocol: `CLAUDE.md` §6 (ledger) and §7 (all planning/investigation/spec work lives in `docs/`).
 Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open bug/regression.
 
-**Reading this cold, in a fresh session, is the intended way to use it.** Read in this order:
+**Reading this cold, in a fresh session, is the intended way to use it.** Read in this order —
+**§0 first: it is the build ORDER and the perf / not-perf split; the sections after it hold the
+detail each entry points to.**
 
 1. **OPEN** — the two live rows, each linking a self-contained doc in `docs/`.
 2. **STILL OPEN, carried forward** — live items left behind by rows that closed.
@@ -25,6 +27,57 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
    its own `systemd-run` scope. Skipping this section is how arms get thrown away.
 5. **On-device gates** — what each gate can actually catch, and which ones a change obliges you to run.
 6. **OPTIONAL** — real work, no slot. Never ahead of the rows above.
+
+**Read §0 below first: it is the ORDER. Everything after it is the DETAIL.**
+
+---
+
+# §0 · EXECUTION ORDER — what to build, in sequence (added 2026-09-06)
+
+**This section is authoritative for ORDER and for the perf/not-perf split. It is NOT a second copy
+of any row: each entry points at the row that owns the detail, and that row stays where it is.**
+Classified by one question — *can this make Vaayu faster on a target actually run here?* Rewrite
+this section whenever a row opens or closes; do not let it drift.
+
+## HIGH PRIORITY — can make Vaayu faster. Build in this order.
+
+| # | item | why it is perf | dependency | where the detail lives |
+|---|---|---|---|---|
+| **P1** | Fused-EXL3 forward filters VRAM-resident experts before dispatch | Qwen asks the RAM cache for **8.00** experts per layer-visit; MiniMax's module-list forward asks **5.86**, because it subtracts VRAM-resident ones first. A miss then issues an **11.9 MB NVMe read for weights already on the GPU**, and MoE decode is 72–74 % disk-bound. | none | OPTIONAL row **7** |
+| **P2** | Mixed-precision KV outlier split (9 bits + `m=8` exact channels) | Uniform 9-bit `prefix_compress` **FAILS** the quality bar on Qwen against real decode queries (0.0649 vs 0.05). The split passes on both models (Qwen 0.0646→**0.0333**, MiniMax 0.0428→**0.0182**) at **1.281 B/elem, 0.64× bf16**. That is what makes prefix compression usable on Qwen at all — and pool capacity is the **34× TTFT lever** (Plan I: 332 s → 9.8 s). | none | OPTIONAL row **5**, "Mixed-precision outlier split — PROMOTED" |
+| **P3** | S1d — size the speculative verify pass on the routing union the engine DERIVES | Today's zero-overlap bound refuses configurations that fit: MiniMax's 4-position verify is **17.61 GB by the bound, 12.78 GB measured**, against a 14.7 GB budget. Unblocking it is worth **1.26–1.28× in expert bytes on BOTH models** (S1e-bis, thinking block closed). `_expert_history` already records the routing needed to size it. | none, but **design first** — the row says "not built, not designed"; brainstorm before coding | S1f + S1e-bis rows in the OPEN section |
+| **P4** | Bound S1d's TRIAL phase, or accept 8.6 % as the documented worst case | TRIAL pays up to `CALIBRATE_STEPS(8) + TRIAL_ROUND_CAP(64)` = 72 non-payoff tokens before latching off — measured **0.932× (6.8 % slower)** on a 128-token Qwen run. | **after P3** — TRIAL only runs once speculation is admitted on MoE | STILL OPEN, "S1d's TRIAL phase" |
+| **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** |
+
+**Two warnings that belong to this order, not to a later surprise:**
+- **P1 starts with a MEASUREMENT and may be REFUTED.** Count `unique_experts ∩ vram_resident` per
+  visit on Qwen first. Its own row says: refuted if the intersection is near zero, and
+  `_vram.get()` promotes in the VRAM LRU, so hoisting it changes which entries survive.
+- **P3 has NO tok/s number.** Everything on record is expert bytes and round arithmetic. Its row
+  says it outright: *do not quote a speedup without an on-device A/B.*
+
+## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P1–P5.
+
+Correctness, capability, tooling and hardware. Real work, and some of it matters — none of it moves
+tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
+
+| item | what it is | why it is not perf | where |
+|---|---|---|---|
+| **C1** `[bug]` | A MoE model on `device="cpu"` builds a speculator with **no gate at all** | Real correctness hole. CUDA is what runs here, so it costs nothing today. | OPEN section |
+| `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
+| `expert_sim.py` anchor gap | 31.9 % simulated vs 43.9 % live | A diagnostic tool's accuracy, not the engine. The obvious hypothesis was built and REJECTED. | STILL OPEN |
+| No resident-size checkpoint | Needs a ~14B coder at 4–4.5 bpw EXL3 | A download, not code. The row says it is **not a blocker**. | STILL OPEN |
+| Static unbound-local check | `ruff`/`pyflakes` for used-before-assign | Reliability: two such bugs shipped GREEN and broke both MoE loads. Prevents crashes, not slowness. | OPTIONAL row **2** |
+| fp16 prefix cache | `DynamicCache` lacks the three methods the pool needs | **Would** be a large win (prefix reuse is 136–377× TTFT) — but only for a **non-EXL3** model, and none is run here. Same class of gap as the `_trim_kv_cache` bug fixed 2026-09-06. | OPTIONAL row **3** |
+| 2× KV overshoot | ~0.83 GB recoverable at Qwen's 8192 | **Would** free real VRAM — **parked by decision**, not by lack of value. Re-open only on new evidence. | OPTIONAL row **4** |
+| Does failing the compression bar degrade TEXT? | Certify the proxy against a real quality measure | Quality certification, deliberately unscheduled. Costs speed if anything. | OPTIONAL row **5** |
+| `tensor_align=True` | Production-dead code | Docstrings fixed 2026-09-03; branch deliberately kept. Effectively closed. | OPTIONAL row **8** |
+
+**S1e-bis `[bug]/[!]` is NOT optional** — it is the evidence P3 rests on (it is what says PLD on MoE
+is 1.26–1.28× once the think block is closed). It stays blocked until P3 lands, and is tracked as
+part of the P3 chain rather than as work of its own.
+
+---
 
 **▶ HISTORICAL CONTEXT, STILL TRACKED: [`HANDOFF-2026-08-30.md`](HANDOFF-2026-08-30.md)** (repo
 root, in git). It carries the 2026-08-30 MoE disk-path work with each row's file, symbol,
@@ -849,10 +902,13 @@ the 256 MiB refusal threshold but permanent, because budgets are sized once at l
 
 # ▶ STILL OPEN — carried forward from rows that closed
 
-Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and is gone.
+Four live items (the fifth, speculative decoding on dense, closed 2026-09-06). Everything else in
+the old CARRIED FORWARD block was `[x]` and is gone. **Three of the four are OPTIONAL by §0's test
+— only the S1d TRIAL row (§0 P4) can make Vaayu faster.**
 
-- **[ ] Speculative decoding on streamed dense — BUILT, MEASURED, unshipped. A DECISION, not
-  evidence.** **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical)
+- **[x] Speculative decoding on streamed dense — CLOSED 2026-09-06. Both sub-rows below are done:
+  the per-request bypass landed, and the dense default shipped as `USE_PROMPT_LOOKUP = "auto"`.
+  Kept here for the measurements and for the decision's reasoning.** **5.57×** on Llama-3.3-70B (0.155 → 0.864 tok/s, 86 % acceptance, byte-identical)
   with the Llama-3.2-1B drafter, which shares its tokenizer. Re-measured 2026-09-02 on top of its
   three fixed bugs: **5.54× / 5.47× / 5.47×** over three back-to-back generations (0.149 → 0.828),
   18 rounds each, 90 % drafted-token acceptance, all three byte-identical to each other AND to the
@@ -1170,15 +1226,18 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 
 # OPTIONAL — real work, no slot. Never ahead of OPEN or STILL OPEN.
 
-| # | Item | Status | Cost | Why optional |
-|---|---|---|---|---|
-| **2** | Static check for unbound locals / import order | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
-| **6a** | The intercept residual the VRAM calibration could not explain | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
-| **3** | Non-EXL3 (fp16) prefix cache is disabled | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
-| **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
-| **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
-| **7** | Fused-EXL3 forward reads experts the VRAM cache already holds | `[ ]` | GPU round | Found 2026-09-03 by P4's trace. See below. |
-| **8** | `tensor_align=True` is production-dead code | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
+**This heading predates §0 and is now a LOCATION, not a priority: three rows here are §0's top
+perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
+
+| # | Item | §0 | Status | Cost | Why it sits here |
+|---|---|---|---|---|---|
+| **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
+| **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
+| **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
+| **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | **P2** (the outlier split) | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
+| **7** | Fused-EXL3 forward reads experts the VRAM cache already holds | **P1** | `[ ]` | GPU round | Found 2026-09-03 by P4's trace. See below. |
+| **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
 # 7 · [ ] The fused-EXL3 forward reads experts the VRAM cache already holds
 
