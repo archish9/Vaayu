@@ -45,12 +45,13 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**Four rows are open, and every one has a SELF-CONTAINED brief in `docs/` (linked in the table).**
-Suggested order if you want the cheapest first: **P7** (machinery exists, ~20 lines + a calibration
-window, stacks on a win already measured) → **P9** (same 20-line shape as P6, on a shipped feature,
-and its trap #1 can refute it in 10 minutes) → **P8** (highest ceiling, highest risk, starts with a
-measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is a
-recommendation, not a dependency: the four are independent and none blocks another.
+**Three rows are open, and every one has a SELF-CONTAINED brief in `docs/` (linked in the table).**
+Suggested order if you want the cheapest first: **P9** (same 20-line shape as P6, on a shipped
+feature, and its trap #1 can refute it in 10 minutes) → **P8** (highest ceiling, highest risk,
+starts with a measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is
+a recommendation, not a dependency: the three are independent and none blocks another.
+**P7 was the cheapest, was built first, and was REFUTED on 2026-09-06 — see the vacancy note
+below before proposing anything that re-sizes the VRAM prefix.**
 
 **`P7`/`P8`/`P9` here are §0 SLOTS in this file's own sequence.** They are NOT the
 HANDOFF-2026-08-30 `P7`/`P8` (that series closed 2026-09-03), NOT the `p7-*`/`p8-*` probe files in
@@ -60,7 +61,6 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
-| **P7** | Tighten the VRAM prefix from the zero-overlap BOUND to the OBSERVED routing union | P6's bound `min(num_experts, N*top_k)`=24 at N=3 is 1.45–1.67× the measured union (14.38 Qwen / 16.51 MiniMax), so the prefix is shorter than the budget affords — 34 of 62 layers on MiniMax where the measured union allows ~51. Stacks on top of P6's +11.9 %. **MiniMax-only:** the fused forward cannot use a longer prefix (see P8). | none — `observed_union_per_layer` already exists in `speculative/adaptive_gate.py`, and `_expert_history` already holds the batch union | OPTIONAL row **11** · [`docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`](docs/2026-09-06-P7-observed-union-prefix-BRIEF.md) |
 | **P8** | Does the FUSED forward leave MiniMax's P6 win on the table? | P6 gave Qwen a 56.9 %-hit VRAM cache worth **+0.2–0.95 % (nothing)** and MiniMax a 48.4 %-hit cache worth **+11.6–12.1 %**. The whole difference: the module-list forward filters VRAM-resident experts BEFORE dispatch (16.52→12.50 routed/visit, −24 %), the fused forward does not (14.38→14.38). Highest ceiling of the open rows. **Highest risk too — P1 refuted the naive hoist and its RAM-refresh warning still binds.** First step is a measurement that can kill the row at zero cost. | none | OPTIONAL row **10** · [`docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`](docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md) |
 | **P9** | The speculative verify pass has P6's bug, unfixed | `_vram_cacheable_layers` is written at load (one stream's `top_k`) and by `batched_generate` (P6) — `speculative_generate` does NEITHER, though a verify pass pushes `(draft_tokens+1)` positions through every MoE layer in one forward. At P3's shipped `draft_tokens=3` that is a **4× under-charge**, worse than the 3× that took Qwen's cache to 0.1 %. Lands on a measured feature (P3: 1.307× on MiniMax-M2.7). Confirmed by reading 2026-09-06; SIZE unmeasured. | none — `compute_spec_working_set` already bounds the same union for admission, and `experts_per_layer=` shipped with P6 | OPTIONAL row **12** · [`docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`](docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md) |
 
@@ -104,6 +104,24 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   as a byte reduction.** `docs/2026-09-06-P6-batch-union-vram-prefix-RESULTS.md`. The bound is
   ~1.7× pessimistic against the measured union and was deliberately NOT tightened; whether a longer
   prefix pays is unmeasured (see OPTIONAL row **10**).
+- **The P7 slot is VACANT — BUILT, MEASURED and REFUTED 2026-09-06, and the code was REVERTED.**
+  Sizing the batch VRAM prefix on the OBSERVED routing union instead of P6's zero-overlap bound
+  measured **−10.85 / −11.54 %** on MiniMax-M2.7 at N=3 (2.913/2.891 against P6's 3.275/3.261) —
+  it hands back P6's entire win, landing exactly on the pre-P6 number. Hit rate 48.4 % → **2.38 %**,
+  evictions 17 533 → **61 278**, greedy ids identical in every arm. **The row's PREMISE failed, not
+  the implementation.** A whole-decode routing trace shows the per-layer union RISES 10.47 → 20.55
+  across 64 decode steps (whole-decode mean 16.91 — the brief's 16.51 was RIGHT), so an 8-step
+  window under-counts steady state by 2.0×; and more decisively, **`compute_vram_layer_range` sets
+  capacity/layer = the charged load, so P6's 1.17× over-charge IS the reuse headroom, not slack.**
+  The union over k=2 consecutive steps is 26.38, already above the bound of 24 — P6's capacity of
+  24.34 sits between the k=1 union (20.55) and the k=2 union (26.38), which is precisely the 48.4 %
+  hit rate. A forced-charge sweep puts the optimum at P6's bound: 24 → 3.257 tok/s, 21 → 3.268
+  (+0.34 %, inside noise), 18 → 3.141 (−3.54 %), ALL 62 → 2.902 (−10.9 %). **Never quote the
+  bound's pessimism as slack, and do not re-open this to "measure the union better" — a
+  perfectly-measured union is the wrong quantity.** OPTIONAL row **11** ·
+  `docs/2026-09-06-P7-observed-union-prefix-RESULTS.md`. It left ONE live question, which is NOT
+  this row: nothing derives the ~1.2× headroom the sizing depends on, so a geometry with a
+  different bound/union ratio has no reason to land right. Open that on its own evidence.
 - **The P4 slot is VACANT too — CLOSED 2026-09-06, "accept and document", its own second option.**
   The exploration cost is **one-time per process** and worth **≤ `TRIAL_DRAFTED_TOKENS` ×
   `breakeven_acceptance` token-equivalents of decode** — 25.3 on Qwen3-235B, 29.3 on
@@ -990,7 +1008,8 @@ Three live items (the fourth, speculative decoding on dense, closed 2026-09-06; 
 TRIAL exploration cost, closed the same day; the sixth, the content-blind latch it uncovered,
 opened and REFUTED the same day — see SETTLED). Everything else in the old CARRIED FORWARD block
 was `[x]` and is gone. **All three remaining are OPTIONAL by §0's test — none of them can make
-Vaayu faster. The live perf work is §0's P5, P7, P8 and P9.**
+Vaayu faster. The live perf work is §0's P5, P8 and P9 (P7 was
+refuted 2026-09-06 — see SETTLED).**
 
 - **[x] Speculative decoding on streamed dense — CLOSED 2026-09-06. Both sub-rows below are done:
   the per-request bypass landed, and the dense default shipped as `USE_PROMPT_LOOKUP = "auto"`.
@@ -1186,6 +1205,35 @@ Vaayu faster. The live perf work is §0's P5, P7, P8 and P9.**
 **Read this before proposing any perf work.** Each line is something that was BUILT or MEASURED and
 then refuted. A refutation closes its row; it is not re-scoped. Full text in
 `docs/2026-09-03-todo-archive-preprune.md` and `git log -p -- todo.md`.
+
+**The VRAM expert cache's prefix sizing — the observed-union idea, killed 2026-09-06.**
+- **Sizing the batch VRAM prefix on the OBSERVED routing union instead of P6's zero-overlap bound —
+  BUILT, MEASURED, REFUTED, and REVERTED 2026-09-06.** MiniMax-M2.7 N=3: **−10.85 / −11.54 %**
+  (2.913/2.891 against P6's 3.275/3.261 — exactly the pre-P6 number), hit rate 48.4 % → 2.38 %,
+  evictions 17 533 → 61 278, greedy ids identical in every arm. Suite returned to 1700 passed / 12
+  skipped after the revert. `docs/2026-09-06-P7-observed-union-prefix-RESULTS.md`, harness
+  `plans/probes/p7_ab.sh` + `p7_sweep.sh` + `p7_union_analysis.py` (**gitignored — this row is the
+  durable copy**). **NOTE the name collision: this is §0's `P7` SLOT. It is NOT the regime-latch
+  item below, whose write-up is also called `...-P7-...` for unrelated reasons.**
+  **What is settled, and it is a fact about the sizing contract, not about one model:**
+  `compute_vram_layer_range` sets capacity/layer = the load it is charged, so charging the TRUE
+  per-layer union leaves capacity ≈ union and an entry cannot survive until its own reuse.
+  **P6's bound over-charges MiniMax's steady-state union by 1.17× and THAT IS THE REUSE HEADROOM,
+  not slack.** Measured: the per-layer union RISES 10.47 → 20.55 across 64 decode steps (whole-decode
+  mean 16.91), the union over k=2 consecutive steps is 26.38 — already above the bound of 24 — and
+  P6's capacity of 24.34 sits between the two, which is precisely why it hits 48.4 %. A forced-charge
+  sweep puts the optimum at the bound: 24 → 3.257 tok/s, 21 → 3.268 (+0.34 %, inside noise), 18 →
+  3.141 (−3.54 %), ALL 62 layers → 2.902 (−10.9 %).
+  **Do not re-open with "a longer calibration window", "measure the union better", or "charge the
+  whole-decode mean" — a perfectly-measured union is the WRONG QUANTITY.** Also settled by the same
+  run, and worth keeping: `_expert_history` is written PRE-filter by all three MoE forwards
+  (`moe_patch.py:1020`, `:1335`, `:1713`; `_to_load` at `:1109` is the separate filtered variable),
+  and it is written during PREFILL too, where a chunk routes **224.23 experts/layer** against a
+  decode union of 9–21 — anything sampling it for decode statistics must sample inside the decode
+  loop.
+  **NOT settled, and deliberately left open as a different question:** nothing derives the ~1.2×
+  headroom the sizing silently depends on, so a geometry whose bound/union ratio differs has no
+  reason to land in the right place.
 
 **Speculation on MoE — the regime-latch idea, killed 2026-09-06.**
 - **Re-entering speculation on a "code regime" — MEASURED and REFUTED 2026-09-06, nothing built.**
@@ -1435,7 +1483,7 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | **P2** (the outlier split) | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
 | **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | **P8** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Qwen has a 56.9 %-hit VRAM cache buying it nothing. Brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`. See below. |
-| **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
+| **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[x]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
 | **12** | `speculative_generate` never re-sizes the VRAM prefix for its verify width | **P9** | `[ ]` | GPU round | Opened 2026-09-06 while scoping P6, confirmed in code. 4× under-charge at `draft_tokens=3`. Brief: `docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`. See below. |
 | **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
@@ -1477,7 +1525,7 @@ RAM refresh, or tok/s does not move.
 
 ---
 
-# 11 · [ ] The VRAM prefix is sized on the zero-overlap BOUND, not the observed union  (§0 **P7**)
+# 11 · [x] **REFUTED 2026-09-06** — the VRAM prefix's bound IS the reuse headroom  (§0 **P7**)
 
 **Self-contained brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`** (gitignored, this disk
 only — key numbers restated here).
@@ -1508,6 +1556,72 @@ re-create the thrash P6 fixed. Measure pre-filter routing.
 **Done means:** prefix derived from observed routing; on-device A/B on MiniMax-M2.7 at N=3 vs the
 P6 build (beat **3.280 / 3.265 tok/s** at 48.4 % hits, 17 539 evictions, 376.5 GB), greedy ids
 identical. **Refuted if** the longer prefix does not beat the bound-sized one.
+
+**BUILT AND MEASURED 2026-09-06 — REFUTED on the target model, and the row's PREMISE is what
+failed, not the implementation.** The calibrated prefix was built exactly as specified
+(`calibrated_union_per_layer` + an 8-step window in `batched_generate`, 16 tests, suite 1716 passed
+/ 12 skipped) and measured on MiniMax-M2.7 at N=3, interleaved 0,1,0,1, greedy ids byte-identical
+across all four arms:
+
+| arm | prefix 1st→last | hit rate | evictions | tok/s | vs P6 |
+|---|---|---|---|---|---|
+| p7=0 (shipped P6) | 34→34/62 | 48.45 / 48.44 % | 17 533 | 3.275 / 3.261 | — |
+| p7=1 (calibrated) | 34→**ALL**/62 | **2.38 %** | **61 278** | 2.913 / 2.891 | **−10.85 / −11.54 %** |
+
+P7 hands back P6's entire win: 2.913/2.891 IS the pre-P6 number (2.940/2.910).
+
+**Root cause, and the number that must not be re-derived.** A `UNION_TRACE=1` arm recorded the
+PRE-filter routing set of every MoE layer at every decode step
+(`plans/probes/probe_fanout.py`, analysed by `plans/probes/p7_union_analysis.py`). Two findings:
+
+1. **The union RISES across the decode: 10.47 → 20.55 per layer over 64 steps** (whole-decode mean
+   16.91, which is the brief's 16.51 — the brief was RIGHT). An 8-step calibration window measures
+   **10.47** and under-counts steady state by 2.0×. Any fixed early window has this problem.
+2. **The bound's over-charge IS the reuse headroom, not slack.** `compute_vram_layer_range` sets
+   capacity/layer = the charged load, so charging the TRUE union leaves capacity ≈ union and an
+   entry cannot survive to its own reuse. Measured, at budget 7.341 GB / `expert_bytes` 8.875 MB:
+
+   | charged | layers | capacity/layer | ÷ steady-state union 20.55 | measured |
+   |---|---|---|---|---|
+   | 24 (P6 bound) | 34 | 24.34 | **1.18×** | 48.4 % hits |
+   | 11 (8-step calibration) | 62 | 13.34 | **0.65×** | 2.38 % hits |
+   | 17 (whole-decode union) | 48 | 17.1 | 0.83× | below one step's routing |
+   | 21 (steady-state union) | 39 | 21.2 | 1.03× | ~zero headroom |
+
+   Independently: the union over **k=2** consecutive steps is **26.38**, already ABOVE the bound of
+   24. P6's capacity of 24.34 sits between the k=1 union (20.55) and the k=2 union (26.38) — an
+   expert recurring at distance 1 survives, longer distances miss. That IS the 48.4 % hit rate.
+
+**The sweep proves the optimum is where P6 put it.** `UNION_FORCE=<n>` charges a fixed per-layer
+load and lets `compute_vram_layer_range` turn it into a prefix (`plans/probes/p7_sweep.sh`,
+`p7sweep_report.py`); two arms each, interleaved, greedy ids identical across all six:
+
+| charge | prefix | hit rate | evictions | tok/s (arms) | mean | vs 24 |
+|---|---|---|---|---|---|---|
+| **24 (P6 bound)** | 34/62 | 48.45 % | 17 533 | 3.269 / 3.245 | 3.257 | +0.00 % |
+| 21 | 39/62 | 45.34 % | 21 367 | 3.277 / 3.258 | 3.268 | **+0.34 %** |
+| 18 | 46/62 | 26.21 % | 34 224 | 3.132 / 3.151 | 3.141 | **−3.54 %** |
+| ~13.3 (ALL) | 62/62 | 2.38 % | 61 278 | 2.913 / 2.891 | 2.902 | **−10.9 %** |
+
++0.34 % at 21 is inside noise (arm spread 0.6 %; P6's own baseline pair spread 1.0 %). Flat from 24
+to 21, monotone collapse below. **No prefix length beats P6's bound.**
+
+**Do not re-open this row to "use a longer calibration window", "measure the union better", or
+"charge the whole-decode mean instead."** A perfectly-measured union is the wrong quantity: sizing
+capacity AT the working set removes the headroom the LRU needs.
+
+**The code was REVERTED** — refuted work does not ship (CLAUDE.md §2/§3), suite back to the
+recorded **1700 passed, 12 skipped**. The 20 lines are described above; do not rebuild them. Qwen
+arms were deliberately not spent: the target regressed 11 %, and per P6 a Qwen no-regression check
+protects nothing. Full detail: `docs/2026-09-06-P7-observed-union-prefix-RESULTS.md` (gitignored,
+this disk only — everything load-bearing is restated here).
+
+**One thing this row did NOT refute, and it is a different question.**
+`compute_vram_layer_range` charges capacity = insert load with no reuse-distance term, and works
+only because a zero-overlap bound happens to supply ~1.2× headroom. **Nothing derives that 1.2×.**
+A geometry whose bound/union ratio differs has no reason to land in the right place. That is a gap
+in the sizing contract, not a prefix-length question — open it on its own evidence, never by
+re-running P7.
 
 ---
 
