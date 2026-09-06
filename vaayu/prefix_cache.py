@@ -143,8 +143,8 @@ class PrefixCacheStore:
         """
         capacity = int(self.budget_bytes // sess_bytes) if sess_bytes else 0
         if self.compress_bits is None:
-            remedy = ("Set prefix_compress=9 to pack pooled KV (~0.55x, so roughly "
-                      "double the sessions) — measured cost is ~0.7s of TTFT on the "
+            remedy = ("Set prefix_compress=9 to pack pooled KV (~0.61x, so roughly "
+                      "1.6x the sessions) — measured cost is ~0.7s of TTFT on the "
                       "hit path, against a full cold prefill if you thrash.")
         else:
             remedy = (f"Pooled KV is already compressed at {self.compress_bits} bits, "

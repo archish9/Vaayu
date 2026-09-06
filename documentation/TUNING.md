@@ -81,41 +81,43 @@ out — once per turn, never per decoded token. Decode throughput is unaffected
 | 1 session, any length | `None` | the pool always keeps one entry regardless of budget — already cached |
 | sessions fit uncompressed | `None` | pure cost (~0.45 s/turn at 2k), no benefit |
 | **sessions don't fit, but fit at 9 bits** | **`9`** | **the case it exists for — measured 34× TTFT** |
-| don't fit even compressed | `9`, plus reduce load | compression widens the range ~1.7×, it does not remove the wall |
+| don't fit even compressed | `9`, plus reduce load | compression widens the range ~1.65×, it does not remove the wall |
 
 **The failure mode is a cliff, not a slope.** A pool one session short of what you
 need evicts each session before its revisit, so reuse collapses to **zero**, not to
 a fraction. Measured: bf16 scored 0/4 and 0/3 hits in the two over-budget tests,
 never a partial score. This is why the crossover matters more than it looks.
 
-**Use 9, not 8.** At 8 bits MiniMax's worst layer measured 0.0612 attention-score
-relative error against a 0.05 bar. Anything below 9 prints a warning. 9 is also the
-highest the quantizer goes — `bits_total=10` does not exist — so there is no setting
+**Use 9, not 8.** At 8 bits both models fail the quality bar against real decode queries
+(Qwen 0.0934, MiniMax 0.0546, against 0.05). Anything below 9 prints a warning. 9 is also
+the highest the quantizer goes — `bits_total=10` does not exist — so there is no setting
 above this one.
 
-**How well 9 bits holds up, stated honestly.** The original gate (2026-08-02) could not
-use real queries: the persisted KV format stores keys and values but not queries, so the
-bar was scored with a K-row query *proxy*, which passed both models (0.0214 / 0.0372).
-A 2026-09-06 re-run captured **real** post-RoPE decode queries at a ~4.16k-token context
-and found that proxy is 2.5–13.7× optimistic on Qwen3-235B:
+**How 9 bits is made to hold up.** The original gate (2026-08-02) could not use real
+queries: the persisted KV format stores keys and values but not queries, so the bar was
+scored with a K-row query *proxy*. A 2026-09-06 re-run with **real** post-RoPE decode
+queries at a ~4.16k-token context found that proxy is 2.5–13.7× optimistic on
+Qwen3-235B, where uniform 9-bit packing **failed**. It is not a long-context effect: it
+failed at every context length from 256 to 4096.
 
-| model | forward | 8 bits | 9 bits, real queries |
+The engine therefore does not pack uniformly. It keeps each layer's **8 highest-variance
+channels** in the cache's own dtype and packs only the remaining 120 — a mixed-precision
+outlier split, on by default whenever `prefix_compress` is set:
+
+| model | forward | uniform 9-bit | **what ships: 9 bits + 8 exact channels** |
 |---|---|---|---|
-| MiniMax-M2.7 | module-list | 0.0546 over bar | **0.0426 — under the 0.05 bar** |
-| Qwen3-235B | fused EXL3 | 0.0934 over bar | **0.0649 — over the bar** |
+| Qwen3-235B | fused EXL3 | 0.0683 — **over the 0.05 bar** | **0.0281 — under it** |
+| MiniMax-M2.7 | module-list | 0.0428 — under | **0.0263 — under** |
+| bytes/element | | 1.156 (0.578×) | **1.211 (0.605×)** |
 
-The 8-vs-9 advice above is unaffected — 8 bits fails both models on real queries too, so
-9 remains the setting to use if you use this at all. What is **not** established is that
-9 clears the bar on the fused-EXL3 forward. Two things this does not say: none of the
-size, TTFT or eviction numbers change, and **nobody has shown that failing this bar
-degrades generated text** — the bar is a deliberately strict proxy for quality, and a
-256-token coherence check passed even at the far worse 4-bit setting.
+That costs about 11 % of the saving and is what makes `prefix_compress=9` usable on a
+fused-EXL3 model at all. There is no knob for it: the channel count is a swept parameter
+whose sweep is non-monotonic, and at head_dim 128 the neighbouring values cost *more than
+bf16* because a 124-wide residual cannot be bit-packed.
 
-The fix is known and not built: holding the 8 highest-variance key channels exact brings
-both models well under the bar (Qwen 0.0333, MiniMax 0.0182) for ~1.281 B/elem instead
-of 1.156 — about 11 % of the saving. Until then, prefer `None` for quality-sensitive
-work on a fused-EXL3 model, and use `9` when the alternative is the reuse cliff below,
-which costs far more.
+One thing this still does not say: **nobody has shown that failing this bar degrades
+generated text.** The bar is a deliberately strict proxy for quality, and a 256-token
+coherence check passed even at the far worse 4-bit setting.
 
 **What it does not do:** shrink VRAM for the *in-flight* session. The live cache is
 always bf16. If a single session's KV won't fit in VRAM, this cannot help — that
@@ -179,7 +181,8 @@ The advisor does this for you, but the arithmetic is simple enough to check:
 ```
 KV bytes per token = layers × 2 × kv_heads × head_dim × bytes_per_element
     bf16                = 2.000 B/elem
-    prefix_compress=9   = 9/8 + 4/head_dim  ≈ 1.156 B/elem  (0.578×)
+    prefix_compress=9   = (head_dim-8)×9/8/head_dim + (4 + 2×8)/head_dim
+                        ≈ 1.211 B/elem  (0.605×)   [8 channels kept exact]
 
 sessions that fit = pool_budget / (tokens_per_session × bytes_per_token)
 ```
@@ -188,9 +191,9 @@ Worked example, MiniMax (62 layers, 8 KV heads, head_dim 128) with a 4.2 GB pool
 
 | | bf16 | 9-bit |
 |---|---|---|
-| per 8k-token session | 1,937 MiB | 1,120 MiB |
+| per 8k-token session | 1,937 MiB | 1,173 MiB |
 | sessions that fit | **2** | **3** |
-| total token ceiling | 17.8k | 30.7k |
+| total token ceiling | 17.8k | 29.4k |
 
 So three 8k sessions need compression; two do not.
 

@@ -77,6 +77,23 @@ def pool_capacity(pool_bytes: float, per_session_bytes: float) -> int:
     return max(0, int(pool_bytes // per_session_bytes))
 
 
+def compressed_rate(bits: int, head_dim: int, outliers: int | None = None) -> float:
+    """Bytes per element of pooled KV at `bits`, matching what the engine packs.
+
+    TurboQuant pooled layout, per (token, head): the `head_dim - m` residual
+    channels cost (bits-1) index bits + 1 QJL sign bit each, plus two fp16
+    norms; the `m` highest-variance channels are kept exact at 2 bytes. `m`
+    comes from the engine so this cannot drift from what is actually stored.
+    The channel index list is O(m) bytes once per layer, shared by every head
+    and not paid per token, so it does not appear here.
+    """
+    if outliers is None:
+        from vaayu.kv_compress import _DEFAULT_OUTLIERS
+        outliers = _DEFAULT_OUTLIERS
+    m = min(outliers, head_dim - 1)
+    return (head_dim - m) * bits / 8 / head_dim + (4 + 2 * m) / head_dim
+
+
 def recommend_compress_bits(pool_bytes: float, per_sess_bf16: float,
                             per_sess_comp: float, k_sessions: int,
                             compress_bits: int) -> int | None:
@@ -111,9 +128,7 @@ def main() -> int:
     # Bytes per token of KV, whole model. K and V, every layer, every KV head.
     elems_per_token = layers * 2 * kv_heads * head_dim
     bf16_rate = 2.0                                     # bytes/element
-    # TurboQuant pooled layout: (bits-1) index bits + 1 QJL sign bit per channel,
-    # plus two fp16 norms per (token, head).
-    comp_rate = COMPRESS_BITS / 8 + 4 / head_dim
+    comp_rate = compressed_rate(COMPRESS_BITS, head_dim)
     bf16_per_tok = elems_per_token * bf16_rate
     comp_per_tok = elems_per_token * comp_rate
 

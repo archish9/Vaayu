@@ -33,17 +33,17 @@ def _per_session_bf16(layers, kv_heads, head_dim, tokens):
 
 
 def _per_session_comp(layers, kv_heads, head_dim, tokens, bits):
-    # TurboQuant pooled layout, mirroring the advisor's comp_rate: (bits-1) index
-    # bits + 1 QJL sign bit per channel, plus two fp16 norms per (token, head).
-    rate = bits / 8 + 4 / head_dim
-    return layers * 2 * kv_heads * head_dim * rate * tokens
+    # The advisor's own rate, not a second copy of it: the mixed-precision
+    # outlier split means the layout is no longer one line of arithmetic, and a
+    # duplicated formula here would silently disagree with what is stored.
+    return layers * 2 * kv_heads * head_dim * ta.compressed_rate(bits, head_dim) * tokens
 
 
 # MiniMax-M2.7: 62 layers, 8 KV heads, head_dim 128, at Plan J's 7 751-token shape.
 _TOKENS = 7751
 _MINIMAX = dict(layers=62, kv_heads=8, head_dim=128, tokens=_TOKENS)
 _SESS_BF16 = _per_session_bf16(**_MINIMAX)              # ~1.968e9 bytes
-_SESS_COMP9 = _per_session_comp(**_MINIMAX, bits=9)     # ~0.578x of the above
+_SESS_COMP9 = _per_session_comp(**_MINIMAX, bits=9)     # ~0.605x of the above
 
 
 def test_gb_constant_matches_what_the_engine_prints():
@@ -57,9 +57,12 @@ def test_derived_session_size_matches_the_measured_one():
     # Guards the fixtures themselves: Plan J measured 1.968 GB/session for this
     # geometry (and 2.03 GB of rss growth per session, which includes overhead).
     assert _SESS_BF16 == pytest.approx(1.968e9, rel=0.01)
-    # 9-bit compression measured 0.55x from rss growth; the analytic rate is
-    # 0.578x. Both are well inside the "roughly half" the advisor claims.
-    assert _SESS_COMP9 / _SESS_BF16 == pytest.approx(0.578, rel=0.01)
+    # 9-bit uniform compression measured 0.55x from rss growth against an
+    # analytic 0.578x. The mixed-precision outlier split that made 9 bits pass
+    # the real-query gate on Qwen moves the analytic rate to 0.605x -- it costs
+    # ~11% of the saving, which is the trade that bought the gate.
+    assert _SESS_COMP9 / _SESS_BF16 == pytest.approx(0.605, rel=0.01)
+    assert ta.compressed_rate(9, 128, outliers=0) / 2.0 == pytest.approx(0.578, rel=0.01)
 
 
 # ── The four on-device points from Plan J Task 4 ──────────────────────────────
@@ -106,11 +109,14 @@ def test_capacity_tracks_the_pool_across_every_measured_budget(pool_gb, expected
     assert ta.pool_capacity(pool_gb * ta.GB, _SESS_BF16) == expected
 
 
-def test_compression_roughly_doubles_capacity():
+def test_compression_nearly_doubles_capacity():
     # The advisor's headline claim for prefix_compress=9. Measured: K=7 fitted
-    # compressed at a pool that held 5 uncompressed.
+    # compressed at a pool that held 5 uncompressed -- and that is still the
+    # claim under the outlier split, which costs capacity (5 -> 9 sessions here,
+    # where uniform 9-bit reached 10). "Roughly doubles" is no longer literally
+    # 2x, so the bound is stated at what the shipped layout actually delivers.
     pool = 11.49 * ta.GB
-    assert ta.pool_capacity(pool, _SESS_COMP9) >= 2 * ta.pool_capacity(pool, _SESS_BF16)
+    assert ta.pool_capacity(pool, _SESS_COMP9) >= 1.7 * ta.pool_capacity(pool, _SESS_BF16)
     assert ta.pool_capacity(pool, _SESS_COMP9) >= 7    # the K that failed uncompressed
 
 
