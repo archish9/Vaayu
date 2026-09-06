@@ -258,7 +258,7 @@ holds one model for its whole life and should fill the box.
 | `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT) |
 | `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling — quality caveat in [TUNING.md §2](TUNING.md)) so the same RAM budget holds ~2× the sessions. Matters when serving several agent sessions — see §6 |
 | `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below |
-| `USE_PROMPT_LOOKUP` | `False` | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
+| `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` opt a model in or out and always win |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
 | `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
 | `KV_CACHE_MODE` | `"auto"` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
@@ -637,6 +637,12 @@ Vaayu is model-agnostic; this needs no code change, only a checkpoint.
 |---|---|---|
 | drafter | `DRAFTER_MODEL_PATH = "/path/to/Llama-3.2-1B-Instruct"` | **5.57×** on Llama-3.3-70B (86 % acceptance, byte-identical output) |
 | prompt lookup | `USE_PROMPT_LOOKUP = True`, `DRAFT_TOKENS = 15` | **1.94×** on the same, zero VRAM |
+
+`USE_PROMPT_LOOKUP` defaults to `"auto"`, which is ON for dense and OFF for MoE. MoE is
+excluded on evidence, not caution: prompt lookup measures **1.285× on MiniMax-M2.7** but
+**0.836× — 16 % slower — on Qwen3-235B**, and the runtime gate's own TRIAL phase costs a
+fixed **0.932×** on short generations. Defaulting it on would hand one actively-tested model
+a win and the other a loss. Set `USE_PROMPT_LOOKUP = True` to opt a MoE model in anyway.
 
 Both are **refused at load on MoE** — a 6-position verify pass needs 53.4 GB (Qwen) /
 26.4 GB (MiniMax) of expert working set against a 9.1 GB budget. That is a wall, not a

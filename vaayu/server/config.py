@@ -138,7 +138,11 @@ ENABLE_KV_PERSIST = False
 DRAFTER_MODEL_PATH = None
 
 # n-gram speculative decoding, zero VRAM. Measured 1.94x on streamed dense.
-USE_PROMPT_LOOKUP = False
+# "auto" resolves at load, where is_moe is known: ON for dense, OFF for MoE.
+# MoE is excluded on evidence, not caution -- PLD is 1.285x on MiniMax-M2.7 and
+# 0.836x on Qwen3-235B, and the runtime gate's TRIAL phase costs a fixed 0.932x
+# on short generations. Set True to opt one in anyway; an explicit value wins.
+USE_PROMPT_LOOKUP = "auto"
 
 # Candidates per speculative round. 5-8 with a drafter, 10-15 with lookup.
 DRAFT_TOKENS = 5

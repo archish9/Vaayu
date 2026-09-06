@@ -1097,6 +1097,34 @@ def resolve_kv_cache_mode(mode: str, loader_strategy) -> str:
     return mode
 
 
+def resolve_use_prompt_lookup(requested, is_moe: bool) -> bool:
+    """The `use_prompt_lookup` this load will actually honour.
+
+    `"auto"` is a REQUEST, not an answer: it means "on where it is known to pay,
+    off where it is not", and that cannot be decided in a config file because
+    `is_moe` is not known until the checkpoint is loaded. Same shape as
+    `resolve_kv_cache_mode`, and resolved in the same place -- once, where the
+    answer exists, so nothing downstream re-derives it and drifts.
+
+    Dense -> ON. Prompt lookup is worth 1.94x on streamed dense and a round that
+    finds no n-gram match drafts nothing, which is an ordinary greedy decode.
+
+    MoE -> OFF, and this is not a performance judgement. The runtime gate's
+    TRIAL phase has a fixed exploration cost that does not amortize on short
+    generations (measured 0.932x on a 128-token Qwen3-235B run) and that row is
+    still open; PLD on MoE is 1.285x on MiniMax-M2.7 and 0.836x on Qwen3-235B,
+    the same one-model-wins asymmetry CLAUDE.md section 5 forbids defaulting into.
+    Opt in per model with an explicit True, which always wins here.
+    """
+    if requested == "auto":
+        return not is_moe
+    if isinstance(requested, bool):
+        return requested
+    raise ValueError(
+        f"use_prompt_lookup={requested!r} is not recognised; pass True, False, "
+        f'or "auto" (on for dense, off for MoE).')
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -2067,6 +2095,14 @@ class VaayuBaseModel(GenerationMixin):
         # The Fix #9 MoE gate that may DISABLE it runs further down, after the
         # RAM expert cache it needs exists and before the VRAM cache is sized.
         self.speculator = None
+        # Resolve BEFORE anything reads it. `"auto"` is a truthy string, so an
+        # unresolved value would sail through the `if ... or use_prompt_lookup`
+        # below and build a speculator on exactly the MoE models this default
+        # exists to spare -- and report `"requested": "prompt_lookup"` for a load
+        # nobody asked it of. Stored so a caller (and env.json) can read what
+        # actually ran rather than what was requested.
+        use_prompt_lookup = resolve_use_prompt_lookup(use_prompt_lookup, self.is_moe)
+        self.use_prompt_lookup = use_prompt_lookup
         # What was asked for, what is running, and why not (S1b). Always a
         # dict, on every load path -- dense, CPU, no drafter at all -- so a
         # reader never has to distinguish "not reported" from "not refused".

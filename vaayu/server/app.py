@@ -44,7 +44,10 @@ class ServerConfig:
     # is pure waste.
     max_pinned_layers: int = -1
     prefill_chunk_size: int = 512
-    use_prompt_lookup: bool = False
+    # "auto" (the shipped default): ON for dense, OFF for MoE, resolved at load
+    # by `resolve_use_prompt_lookup` where `is_moe` is known. True/False opt a
+    # specific model in or out and always win.
+    use_prompt_lookup: bool | str = "auto"
     draft_tokens: int = 5
     prefix_compress: int | None = None
     enable_kv_persist: bool = False

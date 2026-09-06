@@ -36,8 +36,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1669 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after the KV-trim fix (1647 + 7 bypass + 11 non-streaming + 4 trim; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
+**Suite baseline: 1678 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the dense prompt-lookup default (1647 + 7 bypass + 11 non-streaming + 4 trim + 9 auto; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
 has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
@@ -883,12 +883,27 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
     **0 draft rounds**, the notice arrives as an SSE `: warning` comment, and the two calls differ
     from each other and from greedy. Before the fix both sampled calls came back greedy and
     identical. Scripts: `scratchpad/gate_bypass.py`, `scratchpad/gate_server.py` (not committed).
-  - **[ ] Then the default.** `USE_PROMPT_LOOKUP = "auto"` in `vaayu/server/config.py`, resolved at
-    load where `is_moe` is known: dense → on (**1.94×** streamed dense), MoE → off, explicit
-    `True`/`False` still wins. **MoE deliberately unchanged** — a global `True` hands Qwen the
-    unresolved up-to-8.6 % TRIAL regression (row 5 below).
+  - **[x] The dense default — LANDED 2026-09-06.** `USE_PROMPT_LOOKUP = "auto"` is now the shipped
+    value in `vaayu/server/config.py` and `ServerConfig`, resolved once at load by
+    `resolve_use_prompt_lookup` (`vaayu/vaayu_base.py`, beside `resolve_kv_cache_mode`) where
+    `is_moe` is known: **dense → on** (1.94× streamed dense), **MoE → off**, explicit `True`/`False`
+    always wins. Resolved BEFORE the speculator block reads it — `"auto"` is a truthy string, so an
+    unresolved value would build a speculator on the very MoE models the default exists to spare.
+    The resolved bool is kept as `self.use_prompt_lookup`; `speculative_status` is built from it, so
+    nothing reports an unresolved `"auto"`.
+    **MoE is excluded on EVIDENCE, not caution:** PLD is 1.285×/1.293× on MiniMax-M2.7 and **0.836×
+    — 16 % slower — on Qwen3-235B** (S1f row above, ids byte-identical in every arm), and the gate's
+    TRIAL phase costs a fixed 0.932× on short generations (row 5 below, still open). Defaulting it
+    on would hand one actively-tested model a win and the other a loss — the asymmetry §5 forbids.
     `DRAFTER_MODEL_PATH` stays `None`: a drafter is a checkpoint path needing an exact vocab match,
-    so it cannot be defaulted without baking in a model (CLAUDE.md §5). Opt-in works today.
+    so it cannot be defaulted without baking in a model (§5).
+    Verified: 9 new unit tests (watched fail first), full suite **1678 passed, 12 skipped**, and both
+    on-device arms. **Dense** (Llama-3.2-1B through the server, nothing configured): resolved `True`,
+    `PromptLookupDecoder` active, `speculative_status.requested == "prompt_lookup"`, 28 draft rounds,
+    and the answer **byte-identical** to the same request with the speculator forced off. **MoE**
+    (Qwen3-235B + the drafter from `config_local.py`, load only): `is_moe True` → resolved **False**,
+    no speculator, and the pre-existing 53.4 GB drafter refusal unchanged — MoE behaves exactly as
+    it shipped.
   **MoE speculation stays refuted** — see SETTLED.
 - **[x] The non-streaming server route never speculated — FIXED 2026-09-06** (`56699d0`).
   Both routes now ask one helper, `choose_speculative_target` (`vaayu/vaayu_base.py`); the
