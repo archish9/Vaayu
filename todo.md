@@ -873,11 +873,16 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
     number on record was taken through a harness whose NON-speculative arm ran sampled** — worth
     knowing before re-quoting a baseline, though the speculative arms were greedy regardless (that
     loop never read `temperature`).
-    Verified: 7 new unit tests (watched fail first) + full suite **1654 passed, 12 skipped**, and an
-    on-device gate on Llama-3.2-1B with prompt lookup — greedy arm speculates (`accept_rate` to
-    110 %) and is byte-identical across two runs; sampled arm prints the notice, runs NO draft
-    rounds, and its two runs differ from each other and from greedy. Before the fix both sampled
-    runs were greedy and identical.
+    Verified: 7 new unit tests (watched fail first) + full suite **1654 passed, 12 skipped**, and
+    two on-device gates on Llama-3.2-1B with prompt lookup, `delete_original=False`. Direct
+    `stream_generate`: greedy arm speculates (`accept_rate` to 110 %) and is byte-identical across
+    two runs; sampled arm prints the notice, runs NO draft rounds, and its two runs differ from each
+    other and from greedy. **Through the SERVER** (`create_app` + `TestClient`, real routes — the
+    interface that ships, and the one the first gate did not touch): streamed greedy = **10 draft
+    rounds**, identical across two calls, no `: warning` on the wire; streamed `temperature=1.3` =
+    **0 draft rounds**, the notice arrives as an SSE `: warning` comment, and the two calls differ
+    from each other and from greedy. Before the fix both sampled calls came back greedy and
+    identical. Scripts: `scratchpad/gate_bypass.py`, `scratchpad/gate_server.py` (not committed).
   - **[ ] Then the default.** `USE_PROMPT_LOOKUP = "auto"` in `vaayu/server/config.py`, resolved at
     load where `is_moe` is known: dense → on (**1.94×** streamed dense), MoE → off, explicit
     `True`/`False` still wins. **MoE deliberately unchanged** — a global `True` hands Qwen the
@@ -885,6 +890,18 @@ Five live items. Everything else in the old CARRIED FORWARD block was `[x]` and 
     `DRAFTER_MODEL_PATH` stays `None`: a drafter is a checkpoint path needing an exact vocab match,
     so it cannot be defaulted without baking in a model (CLAUDE.md §5). Opt-in works today.
   **MoE speculation stays refuted** — see SETTLED.
+- **[bug] The non-streaming server route NEVER speculates.** `EngineHandle.generate` calls
+  `self.model.generate(**kwargs)` directly (`vaayu/server/engine.py:442`); only the streaming route
+  goes through `stream_generate`, which is where speculation is dispatched. **Measured through the
+  server 2026-09-06** (Llama-3.2-1B, prompt lookup on, `temperature=0`): streamed = 10 draft rounds,
+  non-streamed = **0**, same prompt, same process. Pre-existing, not caused by the per-request
+  bypass — the bypass is what made it visible, because arm C was expected to speculate and did not.
+  Two consequences: `POST /v1/chat/completions` with `stream:false` gets none of the 1.94×/5.57×,
+  and the pending `USE_PROMPT_LOOKUP = "auto"` default would silently do nothing on that route.
+  Fix is the same per-request choice of target the streaming path now makes; the two call sites
+  should share one helper rather than answer the question twice. `DEFAULT_STREAM = True` is the
+  shipped default, so the exposure is limited to clients that ask for `stream:false`.
+
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size
   is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
