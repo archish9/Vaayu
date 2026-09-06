@@ -851,6 +851,38 @@ generation, the worse that trade looks. On a single short request, a
 configuration you already know does not pay is still better switched off by
 hand.
 
+### Turning it on
+
+```python
+# vaayu/server/config_local.py
+USE_PROMPT_LOOKUP = True     # zero VRAM; the runtime gate decides whether it runs
+DRAFT_TOKENS      = 3        # measured best on MiniMax-M2.7
+```
+
+Nothing else. `ENABLE_THINKING` already defaults to `False`, and that default is
+load-bearing here rather than cosmetic: both MoE templates end their assistant
+turn with a hard-coded `<think>` and ignore the `enable_thinking` flag, so
+`render_prompt` closes the block for them. A request that sends
+`"enable_thinking": true` gets a prose answer, prose does not match n-grams, and
+the gate will correctly latch off.
+
+Three conditions have to hold together, and they are not independent:
+
+| condition | why | if it does not hold |
+|---|---|---|
+| MiniMax-M2.7, not Qwen3-235B | Qwen opens its answers with prose | the gate latches off after paying ~6.8 % on a 128-token run |
+| thinking suppressed | the copy phase never starts inside a think block | same — the gate latches off |
+| copy-heavy work (re-emitting a file with an edit) | PLD drafts from n-grams already in the context | no matches, no speedup, near-zero overhead |
+
+Confirm what actually happened with `GET /v1/models` or `logs/latest/env.json`:
+the `speculative.calibration.decision` field reads `run`, `off_acceptance`,
+`off_union`, or `off_no_routing` (that last one means the gate saw no routing
+evidence at all — a bug worth reporting, not a normal outcome).
+
+A weighted drafter (`DRAFTER_MODEL_PATH`) remains refused on MoE: it costs
+3.09 GB of VRAM the expert cache needs, before the acceptance question is even
+reached. This section is about prompt lookup only.
+
 ### The on-device gate
 
 `tests/test_server_smoke.py` -- restored 2026-09-04 (was deleted 2026-09-03,

@@ -472,6 +472,84 @@ USE_PROMPT_LOOKUP  = True
 
 ---
 
+### Speeding up MoE with prompt lookup (1.31× on MiniMax-M2.7)
+
+Speculative decoding used to be refused outright on MoE checkpoints. It is now
+decided at **runtime**, per model, from that model's own behaviour — so on the
+one configuration where it pays, you can have it.
+
+**Measured 2026-09-06, this box, greedy, generated ids byte-identical to plain
+decode in every arm:**
+
+| checkpoint | result | what the gate decided |
+|---|---|---|
+| MiniMax-M2.7 | **1.307×** (1.7795 → 2.3253 tok/s) | `run` — acceptance 1.00 against a 0.61 break-even |
+| Qwen3-235B | **0.932×** (1.080 → 1.0064 tok/s) | `off_acceptance` — acceptance 0.351 against a 0.528 bar |
+
+#### Enabling it
+
+```python
+# vaayu/server/config_local.py
+USE_PROMPT_LOOKUP = True     # zero VRAM; the gate decides whether it runs
+DRAFT_TOKENS      = 3        # measured best on MiniMax-M2.7
+```
+
+That is the whole change. `ENABLE_THINKING` is already `False` on the server,
+which matters more than it looks — see below.
+
+#### The three conditions. All of them, or you get nothing
+
+1. **The right model.** MiniMax-M2.7 wins. **Qwen3-235B loses 6.8 %** — the gate
+   catches it and switches off, but the trial costs something. If you serve
+   Qwen, leave `USE_PROMPT_LOOKUP` off.
+2. **Thinking suppressed.** Both MoE templates end their assistant turn with a
+   hard-coded `<think>`, and ignore the `enable_thinking` flag entirely. The
+   server closes that block for them (`render_prompt`), which is why its
+   `ENABLE_THINKING = False` default is load-bearing here. **A request that
+   sends `"enable_thinking": true` gets prose, and prose kills the match rate.**
+   Calling the library directly rather than through the server does *not* get
+   this — the block-closing lives in the server's prompt path.
+3. **Copy-heavy work.** PLD drafts by finding an n-gram from earlier in the
+   context. Re-emitting a file with a small edit — the agentic loop this engine
+   is built for — matches constantly. Writing novel prose matches nothing.
+
+#### Checking that it actually ran
+
+```bash
+curl -s localhost:9999/v1/models | python -m json.tool
+```
+
+```json
+"speculative": {
+  "requested": "prompt_lookup", "active": true,
+  "calibration": {
+    "observed_union_gb": 12.45, "budget_gb": 14.37,
+    "breakeven_acceptance": 0.6094, "measured_acceptance": 1.0,
+    "drafting_rounds": 16, "decision": "run"
+  }
+}
+```
+
+`decision` is the answer: `run` (it is speculating), `off_acceptance` (it tried
+and this model does not pay), `off_union` (a verify pass does not fit the expert
+cache), or `off_no_routing` (no routing evidence — that one is a bug, report it).
+The same object is written to `logs/latest/env.json` for a support bundle.
+
+#### What it costs when it says no
+
+The gate cannot know a model's acceptance rate without trying, so it spends its
+calibration steps and up to 64 drafting rounds finding out. On Qwen over a
+128-token run that is the 6.8 % above. It is paid **once per process**, not per
+request — but on short generations against a model you already know does not
+pay, switching `USE_PROMPT_LOOKUP` off by hand still beats letting the gate
+discover it.
+
+**A weighted drafter (`DRAFTER_MODEL_PATH`) is still refused on MoE** and that
+has not changed: it costs 3.09 GB of VRAM that the expert cache needs, and the
+same acceptance problem applies on top. This section is about PLD only.
+
+---
+
 #### `DRAFT_TOKENS`
 
 ```python
@@ -649,8 +727,8 @@ Full breakdown and the per-lever numbers: [documentation/server.md §7](document
 | `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
 | `ENABLE_PREFIX_CACHE` | **`True`** | leave it on. Reuse is the largest lever here |
 | `PREFIX_COMPRESS` | `None` (set `9`) | ~2× the pooled sessions. Reuse collapses to **zero**, not gradually, once the pool is over capacity |
-| `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Refused at load on MoE |
-| `USE_PROMPT_LOOKUP` | `False` | **1.94×** on streamed dense, zero VRAM. Refused on MoE |
+| `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Still refused at load on MoE (a weighted drafter costs VRAM the expert cache needs) |
+| `USE_PROMPT_LOOKUP` | `False` | **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on MiniMax-M2.7**, correctly refused on Qwen3-235B. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-minimax-m27) |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
 | `--prefix-sessions` | `3` | concurrent sessions the prefix pool must hold before the MoE expert cache claims the rest. Lower = faster decode, fewer cached sessions |
 | `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives more context at the same reserve |
