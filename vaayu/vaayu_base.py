@@ -618,8 +618,29 @@ def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
     return max(0, int(free_ram_bytes) - _PREFIX_CACHE_RAM_RESERVE)
 
 
+def batch_union_per_layer(geometry: dict, n_streams: int) -> int:
+    """Unique experts ONE MoE layer inserts per decode step at batch width
+    `n_streams` — the zero-overlap upper bound, `min(num_experts, N * top_k)`.
+
+    The N streams of a batch share ONE forward per layer, so what the VRAM LRU
+    must hold for an entry to survive to the next step is the routing UNION
+    across the batch, not one stream's top_k. Same bound `compute_spec_working_set`
+    applies to a verify pass's positions, and pessimistic in the same way:
+    measured 14.38/visit on Qwen at N=3 (1.80 x top_k) against this bound's 24,
+    16.51 on MiniMax (2.06 x) — see docs/2026-09-06-P1-...-RESULTS.md §4.
+    Over-stating the load can only shorten the prefix, which is the safe
+    direction (a too-long prefix is the failure being fixed).
+
+    Every term is derived (CLAUDE.md §5). N < 1 floors at 1 so a degenerate
+    caller gets today's single-stream sizing rather than a zero divisor.
+    """
+    return min(int(geometry["num_experts"]),
+               max(1, int(n_streams)) * int(geometry["top_k"]))
+
+
 def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
-                             moe_layer_ids: list) -> "set | None":
+                             moe_layer_ids: list,
+                             experts_per_layer: "int | None" = None) -> "set | None":
     """Fix #7 sizing gap: a single VRAM LRU walked in layer order self-evicts
     and hits 0% whenever budget < one token's working set (see
     2026-07-10-fix7-vram-cache-zero-hit-report.md §4). Restrict caching to the
@@ -628,10 +649,21 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     cross-token routing-overlap rate. Returns None when the whole working set
     fits (no restriction needed — e.g. MiniMax-M2.5), else the cacheable set.
     Model-agnostic: all inputs derived from _moe_geometry / detected blocks.
+
+    `experts_per_layer` is that per-layer insert load, and defaults to
+    `geometry["top_k"]` — ONE stream, which is all the load-time caller knows.
+    `batched_generate` passes the batch's routing union instead (P6): at N=3 the
+    N=1 sizing left Qwen claiming 7.31 GB of a 4.09 GB budget and left MiniMax
+    unrestricted entirely, measured at 0.1% and 2.4% hit rates against 44.0% and
+    29.0% at N=1. The working-set test scales with it too, since a batch working
+    set that does not fit is exactly the case `None` must stop returning.
     """
-    if vram_budget_bytes >= geometry["working_set_bytes"]:
+    per_layer = (geometry["top_k"] if experts_per_layer is None
+                 else max(1, int(experts_per_layer)))
+    working_set = per_layer * geometry["num_moe_layers"] * geometry["expert_bytes"]
+    if vram_budget_bytes >= working_set:
         return None
-    per_layer_bytes = geometry["top_k"] * geometry["expert_bytes"]
+    per_layer_bytes = per_layer * geometry["expert_bytes"]
     n_fit = int(vram_budget_bytes // max(1, per_layer_bytes))
     return set(sorted(moe_layer_ids)[:n_fit])
 
@@ -5162,6 +5194,38 @@ class VaayuBaseModel(GenerationMixin):
         active = [True] * N
         produced = [0] * N
 
+        # P6: re-size the VRAM cacheable prefix for THIS batch width. The
+        # load-time call (:2578) runs before any batch exists and charges one
+        # stream's top_k, but the N streams share one forward per layer and
+        # insert their routing UNION -- measured 1.80x top_k on Qwen at N=3 and
+        # 2.06x on MiniMax, which collapsed the cache to 0.1% / 2.4% hit rates
+        # against 44.0% / 29.0% at N=1 (docs/2026-09-06-P1-...-RESULTS.md §4).
+        # MiniMax is the case with NO load-time restriction at all, because its
+        # SINGLE-stream working set fits.
+        #
+        # Restored in the finally below: a leaked batch-sized prefix would
+        # shrink caching for every later single-stream call.
+        _vram_c = getattr(self, "_expert_vram_cache", None)
+        _geo = getattr(self, "_moe_geometry", None)
+        _blocks = getattr(self, "_moe_blocks", None)
+        _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
+        _resized_vram_prefix = False
+        if N > 1 and _vram_c is not None and _geo and _blocks:
+            _union = batch_union_per_layer(_geo, N)
+            _batch_layers = compute_vram_layer_range(
+                _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
+                experts_per_layer=_union)
+            if _batch_layers != _saved_vram_layers:
+                self._vram_cacheable_layers = _batch_layers
+                _resized_vram_prefix = True
+                _n_layers = (len(_blocks) if _batch_layers is None
+                             else len(_batch_layers))
+                print(f"[Vaayu-Batch] N={N}: per-layer expert insert load is the "
+                      f"routing union ({_union}), not top_k ({_geo['top_k']}) — "
+                      f"VRAM cache restricted to {_n_layers}/{len(_blocks)} MoE "
+                      f"layers for this batch (was "
+                      f"{len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
+
         # Feature B: only batched_generate ever sets this. It gates the padding
         # mask / per-stream positions / batched-RoPE branches in forward() (Task
         # 5) — without it, forward() silently falls through to the single-stream
@@ -5297,6 +5361,8 @@ class VaayuBaseModel(GenerationMixin):
                     print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
                           f"({e!r}) -- lookup() already popped this entry, so "
                           f"it is now LOST from the pool.")
+            if _resized_vram_prefix:
+                self._vram_cacheable_layers = _saved_vram_layers
             self._batch_decode_active = False
             self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")
