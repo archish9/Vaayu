@@ -666,8 +666,26 @@ What the pass actually found:
     tok/s pair mistaken for a ratio) corrected to the real **5.47–5.57×** band from P7's own rows.
     Full suite after all of the above: **1612 passed, 12 skipped** (was 1605 + 7 new tests, 0
     deleted). Every new test verified to fail without its corresponding fix and pass with it.
-  - **[bug] a MoE model loaded with `device="cpu"` runs a PLD or drafter speculator with NO gate
-    at all — pre-existing, not introduced by S1d, deferred.** `_moe_geometry` is only computed when
+  - **[bug] C1 · a MoE model loaded with `device="cpu"` runs a PLD or drafter speculator with NO
+    gate at all — pre-existing, not introduced by S1d, deferred.** Full brief, self-contained and
+    meant to be picked up cold in a fresh session:
+    **[`docs/issue-C1-cpu-moe-ungated-speculation.md`](docs/issue-C1-cpu-moe-ungated-speculation.md)**
+    (**gitignored — this disk only**; the summary here is the durable copy).
+    **Severity is LOWER than this row's original wording ("runs unbounded") implied — corrected
+    2026-09-06 after checking the code.** `patch_moe_blocks` is called at `vaayu_base.py:2400`,
+    INSIDE the same CUDA block as the expert cache, so on CPU-MoE there is no expert streaming, no
+    expert cache, and `_expert_history` is never written. The Fix #9 premise — a verify pass blows
+    the expert cache budget and thrashes NVMe — **does not apply on this path at all.** What is
+    true is narrower: speculation runs UNMEASURED and SILENTLY (no warning, `calibration` stays
+    null), and a `d+1`-wide verify costs more CPU compute than a 1-wide one, so a low acceptance
+    rate plausibly hurts more here than on CUDA. The silence is the §5 violation, not thrash.
+    **Trap for whoever fixes it:** "just build the gate on CPU too" does not work — the gate
+    calibrates on `_expert_history`, which is never written here, so every snapshot is `{}` and the
+    gate would always latch `off_no_routing`. That is a refusal disguised as a measurement.
+    **Recommended fix (Option A in the brief):** refuse speculator CONSTRUCTION when
+    `self.is_moe and _moe_geometry is None` regardless of device, with a `[Vaayu-Spec]` warning and
+    a `refused_because` entry. Testable with no checkpoint (the existing fakes already have this
+    shape). `_moe_geometry` is only computed when
     `_expert_offset_index` was built, which only happens `if device.startswith("cuda") and
     self.is_moe` (`vaayu_base.py:1797`); `_expert_cache` is only constructed inside the matching
     `if self.running_device.startswith("cuda") and self.is_moe:` block (`vaayu_base.py:2078`). On
