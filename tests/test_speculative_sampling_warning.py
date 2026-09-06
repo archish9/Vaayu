@@ -85,3 +85,65 @@ def test_the_generation_warns_once_naming_what_it_dropped(capsys):
 
 def test_a_greedy_generation_prints_no_warning(capsys):
     assert "WARNING" not in _run(capsys)
+
+
+# ── the shared dispatch decision ─────────────────────────────────────────────
+# The question "does THIS request speculate?" is asked on two call sites -- the
+# streaming path and the non-streaming server route -- and answering it twice is
+# how the two came to disagree in the first place (the non-streaming route never
+# speculated at all). One helper, both callers.
+
+from vaayu.vaayu_base import choose_speculative_target
+
+
+class _TwoPathModel:
+    def __init__(self, speculator=object()):
+        self.speculator = speculator
+
+    def generate(self, **kw):
+        return "generate"
+
+    def speculative_generate(self, **kw):
+        return "speculative_generate"
+
+
+def test_a_greedy_request_gets_the_speculative_path():
+    m = _TwoPathModel()
+    assert choose_speculative_target(m, 0.0, {"do_sample": False})() == \
+        "speculative_generate"
+
+
+def test_a_sampled_request_gets_the_ordinary_path():
+    m = _TwoPathModel()
+    assert choose_speculative_target(m, 0.7, {"do_sample": True})() == "generate"
+
+
+def test_a_stop_string_request_gets_the_ordinary_path():
+    m = _TwoPathModel()
+    assert choose_speculative_target(m, 0.0, {"stop_strings": ["```"]})() == \
+        "generate"
+
+
+def test_a_model_with_no_speculator_always_gets_the_ordinary_path():
+    m = _TwoPathModel(speculator=None)
+    assert choose_speculative_target(m, 0.0, {})() == "generate"
+
+
+def test_the_skip_is_announced_once_with_what_sent_it_there(capsys):
+    choose_speculative_target(_TwoPathModel(), 0.7, {"stop_strings": ["```"]})
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "Vaayu-Spec" in ln]
+    assert len(lines) == 1, f"expected exactly one line, got: {lines}"
+    assert "temperature" in lines[0] and "stop_strings" in lines[0]
+
+
+def test_speculating_announces_nothing(capsys):
+    choose_speculative_target(_TwoPathModel(), 0.0, {})
+    assert "Vaayu-Spec" not in capsys.readouterr().out
+
+
+def test_a_model_with_no_speculator_announces_nothing(capsys):
+    # Nothing was skipped -- there was never a speculator to skip. A line here
+    # would fire on every request of every ordinary load.
+    choose_speculative_target(_TwoPathModel(speculator=None), 0.7,
+                              {"do_sample": True})
+    assert "Vaayu-Spec" not in capsys.readouterr().out

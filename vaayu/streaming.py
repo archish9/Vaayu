@@ -83,21 +83,11 @@ def stream_generate(
     # at every decision point and has no stop-string machinery, so a loaded
     # speculator used to silently change EVERY request: a sampled one came back
     # greedy, a tool-enabled one generated straight past its own stop string.
-    # Asked of the same helper the warning uses, against the kwargs this call
-    # actually runs with, so the two can never disagree.
-    target = model.generate
-    if getattr(model, 'speculator', None) is not None:
-        # Imported here, not at module scope: `vaayu_base` pulls the whole model
-        # stack in, and this module is imported for its streamer alone. Same
-        # local-import pattern as `engine.notice_if_speculation_skipped`.
-        from .vaayu_base import speculative_ignored_sampling
-        dropped = speculative_ignored_sampling(temperature, generation_kwargs)
-        if dropped:
-            print(f"[Vaayu-Spec] speculation SKIPPED for this request: its "
-                  f"loop would drop {', '.join(dropped)}. Running the ordinary "
-                  f"path, which honours them.")
-        else:
-            target = model.speculative_generate
+    # Imported here, not at module scope: `vaayu_base` pulls the whole model
+    # stack in, and this module is imported for its streamer alone. Same
+    # local-import pattern as `engine.notice_if_speculation_skipped`.
+    from .vaayu_base import choose_speculative_target
+    target = choose_speculative_target(model, temperature, generation_kwargs)
 
     # A background-thread exception (e.g. an io_uring read error) otherwise
     # only prints via threading's default excepthook and leaves this generator

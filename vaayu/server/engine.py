@@ -442,9 +442,17 @@ class EngineHandle:
             # would hang forever. The bridge mirrors stream()'s pump.
             bridge: _queue.Queue = _queue.Queue()
 
+            # Per-request, exactly as the streaming route decides it: this
+            # route called `model.generate` unconditionally, so a speculator was
+            # never used here at all -- measured 2026-09-06 as 10 draft rounds
+            # streamed against 0 non-streamed, same greedy prompt, same process.
+            from ..vaayu_base import choose_speculative_target
+            target = choose_speculative_target(
+                self.model, kwargs.get("temperature", 0.0), kwargs)
+
             def _work():
                 try:
-                    bridge.put(("out", self.model.generate(**kwargs)))
+                    bridge.put(("out", target(**kwargs)))
                 except BaseException as ex:         # noqa: BLE001 -- re-raised below
                     bridge.put(("error", ex))
 

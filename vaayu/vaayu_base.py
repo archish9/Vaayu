@@ -817,6 +817,32 @@ def speculative_ignored_sampling(temperature, kwargs) -> list:
     return ignored
 
 
+def choose_speculative_target(model, temperature, kwargs):
+    """The generate callable this ONE request should run on.
+
+    Speculation is a per-request choice, not a per-process one: the speculative
+    loop is greedy at every decision point and has no stop-string machinery, so
+    a request asking for either must run on the ordinary path or silently not
+    get what it asked for. Both call sites -- `stream_generate` and the server's
+    non-streaming route -- ask here rather than each answering it themselves,
+    which is how the non-streaming route came to never speculate at all.
+
+    Announces the skip, once, naming what caused it, so a caller wondering why
+    speculation did not engage is not left guessing. Silent when there is no
+    speculator: nothing was skipped, and a line there would fire on every
+    request of every ordinary load.
+    """
+    if getattr(model, "speculator", None) is None:
+        return model.generate
+    dropped = speculative_ignored_sampling(temperature, kwargs)
+    if not dropped:
+        return model.speculative_generate
+    print(f"[Vaayu-Spec] speculation SKIPPED for this request: its loop would "
+          f"drop {', '.join(dropped)}. Running the ordinary path, which "
+          f"honours them.")
+    return model.generate
+
+
 def compute_stage_gate(seq_len: int, geometry: dict) -> bool:
     """Enable prefill expert staging only when the prompt is long enough that
     routing touches ~all experts per layer (expected coverage >= ~86% at

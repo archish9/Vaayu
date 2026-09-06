@@ -646,3 +646,62 @@ def test_a_speculator_plus_temperature_reports_the_skip_not_a_loss():
     e = EngineHandle(FakeModel(speculator=object()))
     msg = e.notice_if_speculation_skipped(_req(temperature=0.7))
     assert msg is not None and "temperature" in msg
+
+
+# ── the non-streaming route speculates too ───────────────────────────────────
+# It called `model.generate` directly, so speculation -- dispatched inside
+# `stream_generate` -- never applied to it. Measured through the server on
+# 2026-09-06: 10 draft rounds streamed, 0 non-streamed, same greedy prompt in
+# the same process. Both routes now ask `choose_speculative_target`.
+
+class _DecodingTokenizer(_CountingTokenizer):
+    """`generate()`'s route decodes the ids it got back; the streaming fakes
+    never needed that."""
+
+    def decode(self, ids, **kw):
+        return " ".join(str(i) for i in ids)
+
+
+class _TwoPathFakeModel(FakeModel):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.tokenizer = _DecodingTokenizer()
+        self.config = _Config()
+        self.called = None
+
+    def _out(self):
+        import torch
+        return torch.tensor([[1] * 12])         # prompt is 10 ids; 2 generated
+
+    def generate(self, **kwargs):
+        self.called = "generate"
+        return self._out()
+
+    def speculative_generate(self, **kwargs):
+        self.called = "speculative_generate"
+        return self._out()
+
+
+def _nonstreaming_path(**over):
+    model = _TwoPathFakeModel(max_seq_len=100, speculator=object())
+    e = EngineHandle(model)
+    asyncio.run(e.generate(_req(max_tokens=5, **over)))
+    return model.called
+
+
+def test_a_greedy_non_streaming_request_speculates():
+    assert _nonstreaming_path(temperature=0.0) == "speculative_generate"
+
+
+def test_a_sampled_non_streaming_request_takes_the_ordinary_path():
+    assert _nonstreaming_path(temperature=0.7) == "generate"
+
+
+def test_a_non_streaming_request_with_stop_strings_takes_the_ordinary_path():
+    assert _nonstreaming_path(temperature=0.0, stop=["```"]) == "generate"
+
+
+def test_a_non_streaming_request_without_a_speculator_is_unaffected():
+    model = _TwoPathFakeModel(max_seq_len=100, speculator=None)
+    asyncio.run(EngineHandle(model).generate(_req(max_tokens=5)))
+    assert model.called == "generate"
