@@ -49,7 +49,7 @@ def test_load_non_expert_strategy_records_the_hit(monkeypatch, tmp_path):
     obj.checkpoint_path = str(tmp_path)
     obj._expert_offset_index = object()
     obj._non_expert_tensor_cache = _FakeCache()
-    obj._non_expert_from_cache = {}
+    obj._layer_from_cache = {}
 
     calls = []
 
@@ -62,7 +62,96 @@ def test_load_non_expert_strategy_records_the_hit(monkeypatch, tmp_path):
         fake_load)
 
     obj._load_non_expert_strategy("model.layers.0")
-    assert obj._non_expert_from_cache["model.layers.0"] is False
+    assert obj._layer_from_cache["model.layers.0"] is False
     obj._load_non_expert_strategy("model.layers.0")
-    assert obj._non_expert_from_cache["model.layers.0"] is True
+    assert obj._layer_from_cache["model.layers.0"] is True
     assert calls == ["model.layers.0"]          # the second call read nothing
+
+
+# ── The sibling cache: loader_strategy._cache ────────────────────────────────
+# _load_non_expert_strategy is dormant on dense models (is_moe forces the
+# non-expert cache budget to 0). Dense layers go through _load_from_strategy ->
+# loader_strategy.load_from_disk, which returns from its OWN cache with zero
+# disk I/O. That hit has to reach LayerTiming.cache_hit by the same route.
+
+
+def _bare_base(strategy, tmp_path):
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    obj = VaayuBaseModel.__new__(VaayuBaseModel)
+    obj.checkpoint_path = str(tmp_path)
+    obj.loader_strategy = strategy
+    obj._layer_from_cache = {}
+    return obj
+
+
+def test_standard_strategy_load_records_the_hit(monkeypatch, tmp_path):
+    import torch
+    from vaayu.persist.loader_strategy import StandardSafetensorsStrategy
+
+    strategy = StandardSafetensorsStrategy(None)
+    strategy._cache = _FakeCache()
+    obj = _bare_base(strategy, tmp_path)
+
+    calls = []
+
+    def fake_load_layer(checkpoint_path, layer_name, *a, **kw):
+        calls.append(layer_name)
+        return {"w": torch.zeros(4)}
+
+    monkeypatch.setattr("vaayu.utils.load_layer", fake_load_layer)
+
+    obj._load_from_strategy("model.layers.0")
+    assert obj._layer_from_cache["model.layers.0"] is False
+    obj._load_from_strategy("model.layers.0")
+    assert obj._layer_from_cache["model.layers.0"] is True
+    assert calls == ["model.layers.0"]          # the second call read nothing
+
+
+def test_exl3_strategy_load_records_the_hit(monkeypatch, tmp_path):
+    import torch
+    from vaayu.persist.loader_strategy import EXL3LoaderStrategy
+
+    strategy = EXL3LoaderStrategy()
+    strategy._cache = _FakeCache()
+    obj = _bare_base(strategy, tmp_path)
+
+    calls = []
+
+    def fake_load_layer(checkpoint_path, layer_name, *a, **kw):
+        calls.append(layer_name)
+        return {"model.layers.0.q_proj.q_scale": torch.zeros(4, dtype=torch.float32)}
+
+    monkeypatch.setattr("vaayu.utils.load_layer", fake_load_layer)
+
+    obj._load_from_strategy("model.layers.0")
+    assert obj._layer_from_cache["model.layers.0"] is False
+    obj._load_from_strategy("model.layers.0")
+    assert obj._layer_from_cache["model.layers.0"] is True
+    assert calls == ["model.layers.0"]
+
+
+def test_a_second_layer_does_not_overwrite_the_first_signal(monkeypatch, tmp_path):
+    """The prefetch thread loads layer i+1 while the main thread still needs
+    layer i's signal, so the record is keyed by layer name."""
+    import torch
+    from vaayu.persist.loader_strategy import StandardSafetensorsStrategy
+
+    strategy = StandardSafetensorsStrategy(None)
+    strategy._cache = _FakeCache()
+    obj = _bare_base(strategy, tmp_path)
+    monkeypatch.setattr("vaayu.utils.load_layer",
+                        lambda cp, ln, *a, **kw: {"w": torch.zeros(4)})
+
+    obj._load_from_strategy("model.layers.0")   # miss, now cached
+    obj._load_from_strategy("model.layers.0")   # hit
+    obj._load_from_strategy("model.layers.1")   # miss
+    assert obj._layer_from_cache["model.layers.0"] is True
+    assert obj._layer_from_cache["model.layers.1"] is False
+
+
+def test_layer_throughput_is_zero_on_a_cache_hit():
+    """LayerTiming.nvme_throughput_gbps has no cache_hit guard of its own."""
+    hit = LayerTiming(layer_name="a", file_bytes=1_000_000_000,
+                      io_wait_us=12, cache_hit=True)
+    assert hit.nvme_throughput_gbps == 0.0

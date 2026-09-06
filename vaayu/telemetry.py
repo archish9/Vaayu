@@ -24,7 +24,7 @@ class LayerTiming:
 
     @property
     def nvme_throughput_gbps(self) -> float:
-        if self.io_wait_us == 0:
+        if self.cache_hit or self.io_wait_us == 0:
             return 0.0
         return (self.file_bytes / 1e9) / (self.io_wait_us / 1e6)
 

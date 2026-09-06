@@ -2092,7 +2092,7 @@ class VaayuBaseModel(GenerationMixin):
         # non-pinned MoE layer per token. Capped to prevent unbounded RAM growth
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
-        self._non_expert_from_cache = {}  # records whether each layer's last load was a cache hit
+        self._layer_from_cache = {}  # records whether each layer's last load was a cache hit
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         # Expert usage histogram (measurement only, ships dark). Default None
         # so the attribute always exists, on every load path (dense, CPU, or
@@ -3436,7 +3436,16 @@ class VaayuBaseModel(GenerationMixin):
 
     def _load_from_strategy(self, layer_name: str) -> dict:
         """Thin wrapper so ThreadPoolExecutor can call the strategy load."""
-        return self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+        tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+        # The strategy has a RAM cache of its own (loader_strategy._cache, live on
+        # dense models -- is_moe forces its budget to 0). A hit returns with zero
+        # disk I/O, so the layer loop must bill it as a cache hit for the same
+        # reason _load_non_expert_strategy does; see the comment there.
+        if getattr(self, "_layer_from_cache", None) is None:
+            self._layer_from_cache = {}
+        self._layer_from_cache[layer_name] = self.loader_strategy.cache_hits.get(
+            layer_name, False)
+        return tensors
 
     def _load_non_expert_strategy(self, layer_name: str) -> dict:
         """For MoE layers: load only non-expert tensors (~44 MB instead of full layer).
@@ -3452,15 +3461,15 @@ class VaayuBaseModel(GenerationMixin):
         # avg_nvme_throughput divides real read time by file_bytes, so a hit
         # reported as a miss inflates the throughput figure -- on both MoE
         # models, from the second token onward.
-        if getattr(self, "_non_expert_from_cache", None) is None:
-            self._non_expert_from_cache = {}
+        if getattr(self, "_layer_from_cache", None) is None:
+            self._layer_from_cache = {}
         cache = getattr(self, '_non_expert_tensor_cache', None)
         if cache is not None:
             cached = cache.get(layer_name)
             if cached is not None:
-                self._non_expert_from_cache[layer_name] = True
+                self._layer_from_cache[layer_name] = True
                 return cached
-        self._non_expert_from_cache[layer_name] = False
+        self._layer_from_cache[layer_name] = False
         from .persist.safetensor_model_persister import load_non_expert_tensors
         from pathlib import Path as _Path
         file_path = str(_Path(self.checkpoint_path) / (layer_name + ".safetensors"))
@@ -4187,7 +4196,7 @@ class VaayuBaseModel(GenerationMixin):
                         _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
                         _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
                         _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                        _lt_cache_hit = getattr(self, "_non_expert_from_cache", {}).get(
+                        _lt_cache_hit = getattr(self, "_layer_from_cache", {}).get(
                             layer_name, False)
                         _lt_file_bytes = (0 if _lt_cache_hit else
                                           sum(v.nbytes for v in state_dict.values()))
@@ -4243,7 +4252,7 @@ class VaayuBaseModel(GenerationMixin):
                         _lt_io_submit_us = _lt_disk.get("io_submit_us", 0)
                         _lt_io_wait_us = _lt_disk.get("io_wait_us", _lt_io_wait_us)
                         _lt_tensor_reconstruct_us = _lt_disk.get("tensor_reconstruct_us", 0)
-                        _lt_cache_hit = getattr(self, "_non_expert_from_cache", {}).get(
+                        _lt_cache_hit = getattr(self, "_layer_from_cache", {}).get(
                             layer_name, False)
                         _lt_file_bytes = (0 if _lt_cache_hit else
                                           sum(v.nbytes for v in state_dict.values()))

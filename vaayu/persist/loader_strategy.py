@@ -43,6 +43,29 @@ class LoaderStrategy(ABC):
         Returns a {param_name: tensor} dict (tensors are CPU, may be pinned).
         """
 
+    @property
+    def cache_hits(self) -> dict:
+        """Per-layer record of whether the LAST load_from_disk came from `_cache`.
+
+        Keyed by layer name because the prefetch thread loads layer i+1 while the
+        main thread is still reading layer i's signal. Lazily created so an
+        implementation needs no __init__ of its own.
+        """
+        try:
+            return self._cache_hits
+        except AttributeError:
+            self._cache_hits = {}
+            return self._cache_hits
+
+    def _cache_get(self, layer_name: str):
+        """`_cache` lookup that records the hit. A hit reads nothing from NVMe,
+        so billing it as a miss inflates TokenTiming.avg_nvme_throughput.
+        """
+        cache = getattr(self, "_cache", None)
+        cached = cache.get(layer_name) if cache is not None else None
+        self.cache_hits[layer_name] = cached is not None
+        return cached
+
     @abstractmethod
     def inject_to_gpu(
         self,
@@ -141,10 +164,9 @@ class StandardSafetensorsStrategy(LoaderStrategy):
 
     def load_from_disk(self, layer_name: str, checkpoint_path: str) -> dict:
         cache = getattr(self, '_cache', None)
-        if cache is not None:
-            cached = cache.get(layer_name)
-            if cached is not None:
-                return cached
+        cached = self._cache_get(layer_name)
+        if cached is not None:
+            return cached
 
         from ..utils import load_layer
         tensors = load_layer(checkpoint_path, layer_name)
@@ -475,10 +497,9 @@ class EXL3LoaderStrategy(LoaderStrategy):
         Cache stores post-dtype-correction tensors so hits skip correction too.
         """
         cache = getattr(self, '_cache', None)
-        if cache is not None:
-            cached = cache.get(layer_name)
-            if cached is not None:
-                return cached
+        cached = self._cache_get(layer_name)
+        if cached is not None:
+            return cached
 
         from ..utils import load_layer
         raw: dict = load_layer(checkpoint_path, layer_name)

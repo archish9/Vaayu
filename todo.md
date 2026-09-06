@@ -36,8 +36,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1639 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after the stray-`logs/run-*` fix (1638 + 1, the 1638 itself measured against a stashed
+**Suite baseline: 1643 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the dense `avg_nvme_throughput` fix (1639 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
 has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
@@ -48,12 +48,12 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-06: **no task rows** and ONE `[bug]` row — `avg_nvme_throughput` on dense
-(S1, G1 and V1 closed 2026-09-05; `env.json`'s `kv_cache_mode` and the suite's stray `logs/run-*`
-dirs closed 2026-09-06). Each of
+Live as of 2026-09-06: **no task rows and no open `[bug]` rows** (S1, G1 and V1 closed
+2026-09-05; `env.json`'s `kv_cache_mode`, the suite's stray `logs/run-*` dirs and dense
+`avg_nvme_throughput` closed 2026-09-06). The next work comes from **STILL OPEN** or
+**OPTIONAL** below. Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
-cold in a fresh session with no other context; the remaining bug row (`avg_nvme_throughput` on
-dense) is short enough to be its own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
+cold in a fresh session with no other context. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
 copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
 planning, investigation and spec work goes in `docs/` — see `CLAUDE.md` §7.
@@ -486,22 +486,21 @@ What the pass actually found:
   **Note for whoever adds an assertion here:** the blind spot is a property of every `server.log`
   read in the module, not of the one test that hit it; `env.json` and `requests.jsonl` are written
   to files directly and are unaffected.
-- **[bug] `avg_nvme_throughput` is inflated by RAM-cache hits on DENSE models.** Found
-  2026-09-04 by Task 3's review, in the branch `l1-t5-t10-triage-additive`. Task 3 fixed this
-  defect for the MoE non-expert cache (`_non_expert_tensor_cache`, via `_non_expert_from_cache`),
-  but the SIBLING cache has the identical shape and was deliberately left alone:
-  `_load_from_strategy` → `loader_strategy.load_from_disk` (`StandardSafetensorsStrategy:143`,
-  `EXL3LoaderStrategy:477`) returns from its own `self._cache` with zero disk I/O, reached through
-  `future.result()` at the SAME two layer-loop sites Task 3 changed — and the layer is still
-  recorded with full `file_bytes` and `cache_hit=False`. **Dormant on MoE, live on dense:**
-  `is_moe` forces that cache's budget to 0 (`vaayu_base.py:1870-1871`) and `LayerRAMCache.put()`
-  rejects every insert at budget 0, so `.get()` never hits; on dense, `auto_detect_cache_budget`
-  is non-zero and the cache genuinely hits. **Not load-bearing for the T5–T10 work** — `gb_tok`
-  and `requests.jsonl`'s `bytes_read_gb` both come from the persister's read-site counter, which
-  a cache hit never reaches, so neither is affected. This bug is confined to
-  `TokenTiming.avg_nvme_throughput` (and `LayerTiming.nvme_throughput_gbps`, which has no
-  `cache_hit` guard at all). Fix sketch: give the strategy caches the same per-layer-name hit
-  signal Task 3 gave the non-expert cache.
+- **[x] `avg_nvme_throughput` was inflated by RAM-cache hits on DENSE models — FIXED
+  2026-09-06.** The strategy cache (`loader_strategy._cache`, reached through
+  `_load_from_strategy` → `load_from_disk`) was the sibling of the one Task 3 fixed and had no
+  hit signal, so the layer loop billed a zero-I/O hit as a real read with full `file_bytes`.
+  Dormant on MoE (`is_moe` forces that cache's budget to 0), live on dense. Fix: a
+  `_cache_get()` helper + per-layer-name `cache_hits` dict on `LoaderStrategy` (both
+  implementations), copied into the loop's dict by `_load_from_strategy`; that dict renamed
+  `_non_expert_from_cache` → `_layer_from_cache` since it now carries both loaders;
+  `LayerTiming.nvme_throughput_gbps` guarded on `cache_hit`. **Same-box A/B on
+  Llama-3.3-70B, 4 tokens:** before, 3/83 layers billed as hits, 38.53 GB/token,
+  **7.84–8.08 GB/s — above the drive's 7.45 GB/s spec, i.e. impossible**; after, 33/83 hits,
+  22.47 GB/token, 3.94–4.29 GB/s, under the ~7.1 GB/s plateau. `gb_tok` and
+  `requests.jsonl`'s `bytes_read_gb` were never affected (persister read-site counter).
+  Suite **1639 → 1643 passed, 12 skipped**; 4 new tests in `tests/test_telemetry_cache_hit.py`.
+  [`docs/2026-09-06-nvme-throughput-cache-hit-dense-RESULTS.md`](docs/2026-09-06-nvme-throughput-cache-hit-dense-RESULTS.md)
 - **[x] L1 final fix wave — 2026-09-04.** A whole-branch review of `l1-triage-logging` (11 commits,
   `f585014`..`a4e2e7a`) returned "merge with fixes"; this row is that pass. Fixed, each with a new
   regression test in `tests/test_logs.py` / `tests/test_envinfo.py` unless noted: **C1** `new_run_dir`
