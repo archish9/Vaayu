@@ -971,3 +971,25 @@ def test_session_event_still_never_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(logs.Path, "mkdir", boom)
     logs.session_event(tmp_path, "s", "REQ", prompt=3)      # must not raise
     logs.session_event(tmp_path, "s", "DONE", tokens=1)     # nor the second time
+
+
+def test_a_default_config_does_not_write_run_dirs_into_the_repo():
+    # The suite must not litter the repo's own logs/ root: those dirs dilute
+    # the real runs this whole logging body of work exists to make trustworthy,
+    # and `latest` ends up pointing at whichever test ran last. The redirect is
+    # an autouse fixture in conftest.py; this is what stops it being deleted.
+    from fastapi.testclient import TestClient
+
+    from vaayu.server.app import ServerConfig, create_app
+
+    from .test_server_app import FakeEngine
+
+    repo_logs = Path(__file__).resolve().parents[1] / "logs"
+    before = set(repo_logs.glob("run-*"))
+    app = create_app(ServerConfig(model_path="/ckpt"), engine=FakeEngine())
+    with TestClient(app):
+        pass
+    assert set(repo_logs.glob("run-*")) == before
+    # ... by logging somewhere else, NOT by turning logging off -- a fixture
+    # that returned None here would hide every bug in the run-dir path.
+    assert app.state.run_dir is not None
