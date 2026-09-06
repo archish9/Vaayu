@@ -127,6 +127,19 @@ def test_models_reports_speculation_off_when_none_was_asked_for():
     assert body["data"][0]["speculative"]["requested"] is None
 
 
+def test_models_reports_the_runtime_calibration_too():
+    e = FakeEngine()
+    e.model.speculative_status = {
+        "requested": "prompt_lookup", "draft_tokens": 3, "active": True,
+        "refused_because": None,
+        "calibration": {"observed_union_gb": 12.9, "budget_gb": 14.7,
+                        "breakeven_acceptance": 0.635,
+                        "measured_acceptance": 0.907,
+                        "drafting_rounds": 17, "decision": "run"}}
+    spec = _client(e).get("/v1/models").json()["data"][0]["speculative"]
+    assert spec["calibration"]["decision"] == "run"
+
+
 def test_a_non_streaming_completion_returns_the_openai_shape():
     r = _client(FakeEngine()).post("/v1/chat/completions", json=BODY)
     assert r.status_code == 200

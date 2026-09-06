@@ -1,9 +1,24 @@
 # Speculative Decoding — As Built (Phase H)
 
 > Implementation complete. Measured outcomes: **5.57x** with a drafter and **1.94x** with prompt
-> lookup on streamed dense (Llama-3.3-70B); refused at load on both MoE targets, where a
-> 6-position verify pass needs 53.4 GB (Qwen3-235B) / 26.4 GB (MiniMax-M2.7) of expert working
-> set against a 9.1 GB budget.
+> lookup on streamed dense (Llama-3.3-70B).
+>
+> **On MoE, updated 2026-09-06 — the flat "refused at load" is no longer true.** A *weighted
+> drafter* is still refused before it loads: it costs 3.09 GB of VRAM the expert cache needs. But
+> **prompt lookup is now decided at runtime**, per model, by an adaptive gate, because the static
+> refusal was wrong in both directions. The 53.4 GB / 26.4 GB figures below are a **zero-overlap
+> upper bound**: consecutive decode positions overlap 24-51 % (Qwen) and 14-35 % (MiniMax), so the
+> real verify-pass working set is 13.53 GB / 12.78 GB, and the bound was refusing a configuration
+> that fits.
+>
+> Measured with prompt lookup, thinking suppressed, ids byte-identical to plain decode:
+> **MiniMax-M2.7 1.307x** (the gate admits it), **Qwen3-235B 0.932x** (the gate latches off after
+> paying ~6.8 % to find out — Qwen opens its answers with prose, which PLD cannot draft from).
+>
+> Enabling it, the three conditions that must hold together, and how to read the gate's decision:
+> [`server.md` § Turning it on](server.md). Bytes-fit alone is **not** sufficient — Qwen's
+> configuration fits the budget and is still slower, which is why the gate measures acceptance
+> rather than sizing alone.
 
 ## Status: Implemented
 
@@ -11,7 +26,12 @@ See `vaayu/speculative/` for the full source.
 
 ## How to Enable
 
-In `test_quick.py`, set one or both:
+**For the server (MoE prompt lookup, the 1.307x above), see
+[`server.md` § Turning it on](server.md)** — `USE_PROMPT_LOOKUP = True` in
+`config_local.py`, with `ENABLE_THINKING` left at its `False` default.
+
+For a direct library call, set one or both (note `test_quick.py` was deleted on
+2026-09-03; the same keyword arguments go to `AutoModel.from_pretrained`):
 
 ```python
 # Option A: EAGLE-3 head (near-zero VRAM, highest quality)

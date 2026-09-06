@@ -541,6 +541,9 @@ def _speculative_section(c, model):
         "draft_tokens": lambda: status.get("draft_tokens"),
         "active": lambda: status.get("active"),
         "refused_because": lambda: status.get("refused_because"),
+        # S1d: the RUNTIME decision, absent on a load that never speculated.
+        # Null rather than omitted, so a script can index it on any report.
+        "calibration": lambda: status.get("calibration"),
     })
 
 

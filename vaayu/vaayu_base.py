@@ -2011,7 +2011,17 @@ class VaayuBaseModel(GenerationMixin):
             # bound of that budget, so it can never refuse what the real gate
             # would accept). Both write the same status field.
             _pre = None
-            if self.is_moe and self._moe_geometry is not None:
+            # S1d: a prompt-lookup proposer has no load to avoid paying for
+            # (zero VRAM, CPU n-gram search) -- so the "avoid a load that is
+            # certain to fail" argument this bound exists for does not apply
+            # to it. Its admission is decided from OBSERVED routing instead,
+            # by the runtime AdaptiveSpecGate built in _build_spec_gate() once
+            # generation starts (design doc §1: the static bound both over-
+            # and under-admits -- it refuses MiniMax's 1.29x config and admits
+            # Qwen's 0.836x one). A real weighted drafter still has VRAM/time
+            # to lose on a load that is certain to fail, so it keeps this
+            # static pre-check.
+            if drafter_model_path and self.is_moe and self._moe_geometry is not None:
                 try:
                     import psutil as _ps
                     _avail = _ps.virtual_memory().available
@@ -2278,7 +2288,12 @@ class VaayuBaseModel(GenerationMixin):
             # set is ~Nx the single-token one. When that cannot fit the expert cache,
             # speculation guarantees thrash and is ~I/O-neutral per accepted token.
             # Warn with the derived numbers and disable — loudly, never silently.
-            if (self.speculator is not None and self.is_moe
+            # S1d: gated on `drafter_model_path` for the same reason as the
+            # pre-load check above -- a prompt-lookup proposer's admission is
+            # decided from OBSERVED routing by the runtime AdaptiveSpecGate
+            # (_build_spec_gate(), built at the start of speculative_generate)
+            # instead of this zero-overlap worst case.
+            if (self.speculator is not None and self.is_moe and drafter_model_path
                     and getattr(self, '_expert_cache', None) is not None
                     and getattr(self, '_moe_geometry', None) is not None):
                 if (not spec_decode_fits(self._moe_geometry, self.draft_tokens,
@@ -4645,6 +4660,41 @@ class VaayuBaseModel(GenerationMixin):
             self._kv_writer.enqueue_truncate(session_id, match_len)
         return match_len
 
+    def _build_spec_gate(self):
+        """The runtime speculation gate, or None when it does not apply.
+
+        MoE only: dense verify passes read the same weights at any width,
+        which is exactly the property MoE lacks, and P7's 5.57x lives on the
+        dense path. VAAYU_SPEC_FORCE=1 skips calibration for the same reason
+        it skips the load gates -- it is a measurement hatch.
+
+        Cached on `self._spec_gate` and reused across calls: the design's
+        RUN/OFF decision latches for the PROCESS (design doc S2), not per
+        request, so a fresh gate on every speculative_generate() call would
+        restart CALIBRATE/TRIAL at snapshot 0 every request -- a server doing
+        short requests would never accumulate enough drafted tokens to reach
+        the trial threshold, so a bad configuration's regression never
+        latches off. Rebuilt only if what it was constructed from changed
+        (draft_tokens, or the expert cache budget) -- both can move across a
+        load, and a stale gate sized for the old numbers would be silently
+        wrong.
+        """
+        if not getattr(self, "is_moe", False):
+            return None
+        if os.environ.get("VAAYU_SPEC_FORCE") == "1":
+            return None
+        geo = getattr(self, "_moe_geometry", None)
+        cache = getattr(self, "_expert_cache", None)
+        if geo is None or cache is None:
+            return None
+        existing = getattr(self, "_spec_gate", None)
+        if (existing is not None
+                and existing.draft_tokens == self.draft_tokens
+                and existing.budget_bytes == cache.budget_bytes):
+            return existing
+        from .speculative.adaptive_gate import AdaptiveSpecGate
+        return AdaptiveSpecGate(geo, self.draft_tokens, cache.budget_bytes)
+
     @torch.no_grad()
     def speculative_generate(
         self,
@@ -4684,6 +4734,14 @@ class VaayuBaseModel(GenerationMixin):
         # Measured: three identical greedy calls in one process returned three
         # different sequences; resetting made them byte-identical.
         self.speculator.reset()
+
+        # S1d: the runtime gate. `speculator` is held locally because an OFF
+        # decision sets self.speculator = None -- the same mechanism the load
+        # gate uses, so every LATER call takes the ordinary path -- while this
+        # call finishes on the suppressed-draft path below.
+        speculator = self.speculator
+        gate = self._build_spec_gate()
+        self._spec_gate = gate
 
         self._batch_decode_active = False
         self._batch_n = 1
@@ -4758,10 +4816,18 @@ class VaayuBaseModel(GenerationMixin):
             if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
                 break
 
-            # Step 2: Draft K tokens
-            draft_ids, draft_state = self.speculator.draft(
-                generated, past_key_values, num_tokens=self.draft_tokens
-            )
+            # Step 2: Draft K tokens -- unless the gate is still calibrating or
+            # has latched off, in which case this round is an ordinary 1-wide
+            # decode that still produces a token and still shows the gate real
+            # routing.
+            if gate is not None and not gate.should_draft():
+                draft_ids = torch.empty((1, 0), dtype=generated.dtype,
+                                        device=generated.device)
+                draft_state = None
+            else:
+                draft_ids, draft_state = speculator.draft(
+                    generated, past_key_values, num_tokens=self.draft_tokens
+                )
             k = draft_ids.shape[1]
 
             # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
@@ -4778,16 +4844,69 @@ class VaayuBaseModel(GenerationMixin):
             past_key_values = verify_out.past_key_values
 
             # Step 4: Accept/reject longest correct prefix
-            accepted_ids, num_accepted = self.speculator.verify_and_accept(
+            accepted_ids, num_accepted = speculator.verify_and_accept(
                 generated, draft_ids, verifier_logits, draft_state
             )
+
+            if gate is not None:
+                if gate.phase == "calibrate":
+                    gate.observe(getattr(self, "_expert_history", {}) or {})
+                else:
+                    # `num_accepted` (Step 4) is 1..k+1 -- it always includes
+                    # the bonus/correction token verify_and_accept guarantees
+                    # every round. The gate's break-even treats that token as
+                    # the "+1" in "1 + accepted" (design doc §2) and wants only
+                    # the count of DRAFTED tokens that matched, 0..k.
+                    gate.record_round(k, max(0, num_accepted - 1))
+                if gate.decided_off() and self.speculator is not None:
+                    s = gate.status()
+                    if gate.decision == "off_no_routing":
+                        # 800467d fixed the same ambiguity for a starved
+                        # k-window; this is the other way observed_union_gb
+                        # reads 0.0 -- every calibration snapshot's routing
+                        # dict was empty, i.e. this forward stopped writing
+                        # _expert_history (design doc S8's named risk), not a
+                        # real over-budget refusal. Name the cause, don't let
+                        # it read as a measured union that happened to be 0.
+                        print(f"[Vaayu-Spec] WARNING: no expert routing was "
+                              f"observed during calibration (_expert_history "
+                              f"stayed empty every step) -- this forward is "
+                              f"not writing it, so the gate has no evidence "
+                              f"to size a verify pass against. DISABLING "
+                              f"speculative decoding for this MoE model "
+                              f"rather than guessing: {s}")
+                    else:
+                        print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
+                              f"for this MoE model on measured evidence: {s}")
+                    self.speculator = None
+                    status = getattr(self, "speculative_status", None)
+                    if status is not None:
+                        status["active"] = False
+                        status["calibration"] = s
+                elif gate.decision == "run":
+                    # Refreshed every round, not written once: with the gate
+                    # now cached across calls (Critical 1), a `run` decision
+                    # keeps accumulating drafted/accepted after it latches, so
+                    # freezing the first generation's numbers here would make
+                    # every later report stale.
+                    status = getattr(self, "speculative_status", None)
+                    if status is not None:
+                        status["calibration"] = gate.status()
 
             # Step 5: Trim verifier KV back to past_len + num_accepted
             # (verify pass grew cache by k+1; we only keep num_accepted new positions)
             self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
 
-            # Step 6: Sync drafter cache to match accepted length
-            self.speculator.rollback_cache(draft_state, num_accepted)
+            # Step 6: Sync drafter cache to match accepted length. Skipped
+            # when draft_state is None -- the suppressed-draft path (gate
+            # calibrating, or latched off) never called speculator.draft(),
+            # so there is no drafter-side state to roll back, and a weighted
+            # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
+            # draft_state unconditionally once its own cache is warm and
+            # crashes on None (PLD's is a no-op `pass`, which is why this was
+            # never reachable through it).
+            if draft_state is not None:
+                speculator.rollback_cache(draft_state, num_accepted)
 
             # Step 7: Extend generated sequence (cap at max_new_tokens)
             remaining = max_new_tokens - tokens_generated
