@@ -36,10 +36,10 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1570 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-05 after S1a/S1b (was 1491 + 79, most of them one parametrized invariant test; the 1491 was
-that day's V1 fix, itself 1489 + 2, itself G1's 1486 + 3). **This figure has
-gone stale six times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
+**Suite baseline: 1639 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-06 after the stray-`logs/run-*` fix (1638 + 1, the 1638 itself measured against a stashed
+HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
+has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
 
 ---
@@ -48,13 +48,12 @@ number written here.
 
 **These are the live rows. Everything below them is either carried-forward work, the
 SETTLED anti-regression index, reference material, or the unslotted OPTIONAL list.**
-Live as of 2026-09-06: **no task rows** and two `[bug]` rows — the suite's stray `logs/run-*`
-dirs, and `avg_nvme_throughput` on dense (S1, G1 and V1 closed 2026-09-05; `env.json`'s
-`kv_cache_mode` closed 2026-09-06). Each of
+Live as of 2026-09-06: **no task rows** and ONE `[bug]` row — `avg_nvme_throughput` on dense
+(S1, G1 and V1 closed 2026-09-05; `env.json`'s `kv_cache_mode` and the suite's stray `logs/run-*`
+dirs closed 2026-09-06). Each of
 **S1**, **G1** and **V1** carries a self-contained document in **`docs/`**, meant to be picked up
-cold in a fresh session with no other context; the remaining bug rows (the suite's stray
-`logs/run-*` dirs, `avg_nvme_throughput` on dense) are short
-enough to be their own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
+cold in a fresh session with no other context; the remaining bug row (`avg_nvme_throughput` on
+dense) is short enough to be its own brief. **`docs/` is GITIGNORED** (`.gitignore:28`), so those files are
 on this disk only and do not survive a fresh clone; this file is the tracked one, and the durable
 copy of anything moved out of it is `git log -p -- todo.md`. That is the standing convention: all
 planning, investigation and spec work goes in `docs/` — see `CLAUDE.md` §7.
@@ -343,14 +342,37 @@ What the pass actually found:
   `budgets` **fp16**) and MiniMax-M2.7 55.9 s (`EXL3LoaderStrategy`, module-list forward → `config`
   `auto`, `budgets` **bf16**), the latter cross-checked against that run's own
   `[Vaayu] KV Cache: bf16 ring buffer` log line. `collect_errors` empty on both.
-- **[bug] the test suite creates real `logs/run-*` directories inside the repo.** Several tests
-  start a `TestClient` on a `ServerConfig` with no explicit `log_dir`, so it defaults into the repo's
-  own `logs/` root: `tests/test_delete_original.py:41,54,62`, `tests/test_gpu_audit.py:130`,
-  `tests/test_shutdown.py`. ~9 stray `run-*` dirs per full suite run. Harmless — `logs/` is
-  gitignored, nothing is committed — but they accumulate on disk and dilute real runs (the ones this
-  whole L1 body of work exists to make trustworthy) with test noise, and `latest` ends up pointing at
-  whichever ran last. Suggested fix: an autouse fixture in `tests/conftest.py` pointing the default
-  `log_dir` at `tmp_path` unless a test explicitly overrides it.
+- **[x] the test suite creates real `logs/run-*` directories inside the repo — FIXED 2026-09-06.**
+  **Root cause:** `ServerConfig.log_dir` defaults to `"logs"` — a RELATIVE path, so it resolves
+  against the CWD, which for a test run is the repo — and `create_app`'s lifespan calls
+  `new_run_dir(config.log_dir)` for every `config is not None`, injected engine or not
+  (`vaayu/server/app.py:338`). Any test building a bare `ServerConfig` inherits it.
+  **This row's own file list was wrong, measured per-file before the fix** (dirs created by
+  `./venv/bin/python -m pytest tests/<f>.py`): `test_delete_original` **4**,
+  `test_server_config_passthrough` **4** and `test_gc_freeze` **2** — the last two were NOT in this
+  row — `test_gpu_audit` **1**, and `test_shutdown` **0**, which this row named but which passes
+  `engine=` with `config=None`, so it never reaches the call. **11 per full suite run, not ~9.**
+  **Fix:** a new `tests/conftest.py` (the suite had none) with an autouse fixture that monkeypatches
+  `vaayu.server.app.new_run_dir` to swap the root for a `tmp_path_factory` dir **only when it equals
+  the dataclass field's own default** (read off `dataclasses.fields`, not typed as a literal). An
+  explicit `log_dir=` — `test_logs.py`'s read-only root, anything read back — is untouched, and
+  `test_envinfo.py:408`'s assertion that the reported `config.log_dir` is still named `logs` keeps
+  holding, which a fixture that rewrote `cfg.log_dir` would have broken. It **redirects rather than
+  disables**: the run dir is still created, so the run-dir path stays under test.
+  **Verified**, both arms same-box same-day, the baseline re-measured against a stashed HEAD rather
+  than quoted: HEAD **1638 passed, 12 skipped, 11 stray dirs** → branch **1639, 12, 0**. The +1 is
+  one regression test, `test_a_default_config_does_not_write_run_dirs_into_the_repo`
+  (`tests/test_logs.py`), confirmed failing first on its assertion (the extra `run-*` path) and
+  asserting `run_dir is not None` too, so a future fixture that merely turns logging off cannot
+  satisfy it.
+  **Collateral, recorded because it is not recoverable:** clearing the accumulated dirs mid-session
+  used `rm -rf logs/run-* logs/latest`, which took **all 877** — the real on-device runs
+  (2026-09-03 Task 8, 2026-09-05) as well as the test litter. `logs/` is gitignored, so those are
+  gone; `logs/server.log` (594 KB, 2026-09-03) and `logs/sessions/` survive. No row depended on
+  them — every gate result is written up in this file or in `docs/` — but a gate wanting its raw
+  run dir must re-run.
+  The `logs.py` module-global → `_Capture` refactor that the L1 fix-wave row pairs with this one is
+  still NOT done; it was a refactor then and remains one.
 - **[x] a client that disconnects before generation starts leaves NO `requests.jsonl` row —
   FIXED 2026-09-05.** Found 2026-09-04 by the whole-branch re-review; **pre-existing, not
   introduced by the T5–T10 branch**. The contract "a request never ends without a row"
