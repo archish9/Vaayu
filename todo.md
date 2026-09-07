@@ -1517,7 +1517,7 @@ are §0's top perf work.** §0 is the order. Read the `§0` column below before 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
-| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. See below. |
+| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
@@ -1666,6 +1666,12 @@ re-running P7.
 
 # 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock
 
+**Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md)**
+— written to be picked up COLD in a fresh session: the defect, the exact call sites, all 8 arms,
+five open design questions, the stop rule, and six traps. **`docs/` is gitignored, so that file is
+on this disk only**; everything load-bearing is restated below and the durable copy of this row is
+`git log -p -- todo.md`.
+
 **Opened 2026-09-07 by the P9 end-to-end arm** (`plans/probes/p9_e2e.py` + `p9_e2e_ab.sh`,
 8 arms, MiniMax-M2.7, one 128-token code prompt, `draft_tokens=3`, interleaved, BALLAST_GB=25).
 Results: `docs/2026-09-07-P9-e2e-prompt-lookup-RESULTS.md` (gitignored — numbers restated here).
@@ -1698,9 +1704,16 @@ assume code-shaped output is the favourable case for prompt lookup.
 
 **Candidate fix, not designed:** give TRIAL a wall-clock arm — time N drafting rounds against N
 suppressed-draft rounds in the same call and latch on the ratio, instead of (or as well as) the
-byte break-even. **Stop rule:** if a wall-clock TRIAL cannot be made cheap enough to run per
-process, say so and close the row by documenting that `run` is a bytes claim only — the docs
-already say this as of `8bdcbdd`.
+byte break-even. The brief lists the five questions to answer first; the two that decide the shape
+are **what unit is timed** (seconds per ACCEPTED token, not per round — rounds yield a variable
+number of tokens at ~1.5 tok/s) and **whether the byte test stays as a necessary condition**
+(recommended: it is cheap, sound, and it is what refuses Qwen at zero cost).
+**One thing the Done condition needs that this row does not have:** a reference workload where PLD
+genuinely WINS, to prove a fix does not simply refuse everything. The 1.307× prompt was never
+archived — constructing one is part of the work.
+**Stop rule:** if a wall-clock TRIAL cannot be made cheap enough to run per process, say so and
+close the row by documenting that `run` is a bytes claim only — the docs already say this as of
+`5aa9aab`.
 
 # 2 · [ ] Static check for unbound locals / import order
 
