@@ -1517,6 +1517,7 @@ are §0's top perf work.** §0 is the order. Read the `§0` column below before 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. See below. |
 | **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
@@ -1662,6 +1663,44 @@ in the sizing contract, not a prefix-length question — open it on its own evid
 re-running P7.
 
 ---
+
+# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock
+
+**Opened 2026-09-07 by the P9 end-to-end arm** (`plans/probes/p9_e2e.py` + `p9_e2e_ab.sh`,
+8 arms, MiniMax-M2.7, one 128-token code prompt, `draft_tokens=3`, interleaved, BALLAST_GB=25).
+Results: `docs/2026-09-07-P9-e2e-prompt-lookup-RESULTS.md` (gitignored — numbers restated here).
+
+**`AdaptiveSpecGate` decides on EXPERT BYTES, and nothing checks the clock.**
+`spec_breakeven_acceptance(union_bytes_1, union_bytes_k, draft_tokens)`
+(`vaayu/speculative/adaptive_gate.py:61`) asks whether a k-wide verify moves fewer expert bytes
+per token than k separate decodes. It models neither the drafter's own cost nor the dispatch-side
+work a wider pass creates — so a `run` decision is not a claim about tok/s, and was measured
+not to be one:
+
+| regime | acceptance | break-even | gate | total tok/s | decode tok/s |
+|---|---|---|---|---|---|
+| thinking ON | 0.6875 | 0.6259 | **`run`** | 1.4290 → **1.2443 (−12.9 %)** | 1.8890 → **1.5869 (−16.0 %)** |
+| thinking OFF (server default) | **0.14** | 0.6259 | `off_acceptance` | 1.4665 → n/a (refused after ~1 call) | 1.9518 → n/a |
+
+Both regimes reproduce across 2 replicates. **The gate caught the second case and missed the
+first.** In the first it admitted a configuration that costs 16 % of decode throughput, and it
+would keep it for the life of the process — `run` latches exactly as `off` does.
+
+**Two things this row is NOT.** It is not P9: P9 sizes the VRAM prefix correctly *within* the
+speculative path and is worth +4.16 % when that path runs (measured, unaffected). It is not "PLD
+is bad on MoE": an earlier arm on a different prompt measured **1.307×**, so the answer is
+workload-dependent — which is the point, since a byte-only break-even cannot see that.
+
+**Also note the sign flip nobody predicted:** acceptance was HIGHER with thinking ON (0.6875) than
+OFF (0.14). Reasoning prose repeats n-grams; freshly-generated code does not. Any future
+speculation measurement here must state its thinking-mode state (the S1e-bis rule) — and must not
+assume code-shaped output is the favourable case for prompt lookup.
+
+**Candidate fix, not designed:** give TRIAL a wall-clock arm — time N drafting rounds against N
+suppressed-draft rounds in the same call and latch on the ratio, instead of (or as well as) the
+byte break-even. **Stop rule:** if a wall-clock TRIAL cannot be made cheap enough to run per
+process, say so and close the row by documenting that `run` is a bytes claim only — the docs
+already say this as of `8bdcbdd`.
 
 # 2 · [ ] Static check for unbound locals / import order
 

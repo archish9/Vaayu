@@ -85,14 +85,19 @@ adaptive gate, from that model's own routing and acceptance.
 | `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` always win |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
 
-> **Turning it on for MoE is worth it on MiniMax-M2.7 and pointless on Qwen3-235B**, and
-> the split is measured, not guessed. `USE_PROMPT_LOOKUP = True` gives MiniMax-M2.7
-> **1.307×** at `DRAFT_TOKENS = 3`, and the VRAM expert-cache prefix is sized for that
-> verify width once the gate latches `run`, worth a further **+4.16 %**. Qwen3-235B's
-> gate **refuses to draft at all** (`off_union` — its observed verify union is 19.31 GB
-> against a ~17 GB budget, 0 drafting rounds), so the switch buys it nothing. The
-> default stays `"auto"` rather than flipping to ON for MoE because the cost to a model
-> the gate refuses has not been measured.
+> **Measure before opting a MoE model in — it is workload-dependent, not a property
+> of the model.** Qwen3-235B's gate **refuses to draft at all** (`off_union`: observed
+> verify union 19.31 GB against a ~17 GB budget, 0 drafting rounds), so the switch buys
+> it nothing. MiniMax-M2.7 was measured both ways on one 128-token code prompt
+> (2026-09-07): at **server defaults** (`ENABLE_THINKING = False`) acceptance is **0.14**
+> against a 0.6259 break-even, so the gate latches `off_acceptance` after roughly one
+> call — costing ~10 % on that call and nothing after it; with **thinking on** acceptance
+> is 0.6875 and the gate says `run`, yet it still **loses 12.9 % total / 16.0 % decode**.
+> An earlier arm on a different prompt measured **1.307×**.
+>
+> **A `run` decision is not a promise of a speedup.** The gate's break-even is
+> denominated in *expert bytes*, so it can admit a configuration that loses wall-clock.
+> Time your own workload both ways before leaving it on.
 >
 > Watch which one you got in `logs/latest/server.log`:
 > `[Vaayu-Spec] ... DISABLING speculative decoding for this MoE model on measured
