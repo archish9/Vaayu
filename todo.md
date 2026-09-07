@@ -45,8 +45,10 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**ONE row is open — P5** (GPU sweep, may end in "not derivable — close the row"), with a
-SELF-CONTAINED brief in `docs/` linked in the table. **P8 SHIPPED 2026-09-07 at +3.21 % on
+**TWO rows are open — P10 and P5**, each with a SELF-CONTAINED brief in `docs/` linked in
+the table. **Order: P10 first.** It is the only row whose payoff is already built and measured
+(P6 + P8, both stranded at N>1), and its first step is a one-arm measurement that can refute it
+before any code is written. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
 Qwen3-235B — read its vacancy note below before proposing anything that touches the fused
 forward's expert dispatch.**
 **P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
@@ -61,6 +63,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
+| **P10** | Wire batched decode into the SERVER | **P6 (+11.6-12.1 % MiniMax) and P8 (+3.21 % Qwen) are both measured, shipped, green — and deliver ZERO to users, because both effects exist only at N>1 and the server runs one request at a time** (`engine.py:185`, and its docstring says `batched_generate` is deliberately not wired in). Highest banked value on the board: the mechanism is already built and tested; only the server refuses to use it. **Starts with a measurement that can refute it in ONE arm** — does `plan_batch` admit N>=2 at a realistic ~4.15k-token agentic context, or only at the ~690-token prompts every N=3 number on record was taken at? | none | OPTIONAL row **15** · [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -204,6 +207,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
+| **A** | The server reaches 14 of the engine's 28 load parameters | Capability and correctness, not speed. `ENABLE_KV_PERSIST` is exposed while `kv_persist_dir`/`kv_persist_sync` are not, so the feature can be turned on but not aimed. | OPTIONAL row **14** · [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md) |
 | **C1** `[bug]` | A MoE model on `device="cpu"` builds a speculator with **no gate at all** | Real correctness hole. CUDA is what runs here, so it costs nothing today. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
 | `expert_sim.py` anchor gap | 31.9 % simulated vs 43.9 % live | A diagnostic tool's accuracy, not the engine. The obvious hypothesis was built and REJECTED. | STILL OPEN |
@@ -1827,6 +1831,94 @@ archived — constructing one is part of the work.
 close the row by documenting that `run` is a bytes claim only — the docs already say this as of
 `5aa9aab`.
 
+# 14 · [ ] The server reaches 14 of the engine's 28 load parameters  (**A**)
+
+**Self-contained brief: [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md)**
+(gitignored, this disk only — the numbers and the stop rule are restated here so the row survives
+without it). Opened 2026-09-07 by the CLAUDE.md §8 audit. **Capability/correctness, NOT perf.**
+
+`app.py:360` passes **14** kwargs to `AutoModel.from_pretrained`; `VaayuBaseModel.__init__`
+(`vaayu_base.py:1617`) declares **28**. **Every user reaches Vaayu only through the server (§8), so
+an unreachable parameter is a feature that does not exist.** NOT reachable: `dtype`, `max_seq_len`,
+`layer_shards_saving_path`, `profiling_mode`, `compression`, `hf_token`, `prefetching`,
+`use_torch_compile`, `layer_names_dict`, `tokenizer_class`, `auto_prefix_match`, `kv_persist_dir`,
+`kv_persist_sync`, `enable_expert_usage`.
+
+* **Tier 1, a shipped feature is half-wired:** `ENABLE_KV_PERSIST` IS exposed but `kv_persist_dir`
+  (`vaayu_base.py:2694`, defaults to `~/.cache/vaayu/kv`) and `kv_persist_sync` (`:2700`) are not —
+  **it can be turned on but not aimed, and never fsyncs.** Fix these first.
+* **Tier 2, needs a DECISION not a default:** `max_seq_len` (only way to ask for a shorter context
+  and buy VRAM back for the expert cache — but must clamp to the derived value, never above),
+  `auto_prefix_match` (`config.py`'s `REQUIRE_SESSION_ID` comment already describes behaviour the
+  server cannot turn off), `enable_expert_usage` (diagnostic telemetry, MoE-only, ships dark —
+  measure its decode cost before changing its default).
+* **Tier 3, deliberately NOT exposed, and §8 requires that be STATED:** the remaining nine are
+  library/dev-facing loader plumbing, HF auth and profiling.
+* **The durable part:** a test that reads `inspect.signature(VaayuBaseModel.__init__)` and asserts
+  it equals `SERVER_EXPOSED | SERVER_DELIBERATELY_NOT_EXPOSED`, **so a new engine parameter breaks
+  the suite until someone classifies it** — §8's decision, forced when it is cheapest. Assert the
+  plumbing too: a knob `from_pretrained` never receives is decoration.
+
+**Done means** Tier 1 exposed + documented in `vaayu/server/README.md`, a recorded decision per
+Tier 2 parameter (declining is a valid deliverable), Tier 3 written down, the drift test proven to
+fail on an unclassified parameter, suite green. **No on-device arm needed** unless you propose
+changing `enable_expert_usage`'s default. **This row cannot be refuted, only reduced: closing with
+2 knobs and 12 written-down declines is a success.**
+
+---
+
+# 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**)
+
+**Self-contained brief: [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md)**
+(gitignored, this disk only — restated here). Opened 2026-09-07 by the CLAUDE.md §8 audit.
+
+**P6 (+11.6-12.1 % MiniMax) and P8 (+3.21 % Qwen) are measured, shipped, green, and deliver ZERO to
+users.** Both effects exist only at N>1; the server runs one request at a time (`slot()` holds
+`self._lock` around the whole generation, `engine.py:185`) and its module docstring says
+`batched_generate` "is deliberately not wired in". P8's N=1 inertness is measured, not assumed: at
+N=1 the prefix is the load-time 41/94 set → VRAM per-layer capacity 8.1 experts against RAM's 15,
+so the inversion P8 exploits REVERSES, and **P1 counted 0** of the reads P8 removes on 5922 N=1
+visits.
+
+**Read the refusal correctly before trying to defeat it.** `engine.py` cites a real number — N>=2 at
+LONG context peaked **14.17-15.57 GiB of 15.47** (OPTIONAL row 4). It is a long-context refusal, not
+an absolute one: **every P6/P7/P8/P1 probe ran N=3 successfully at ~690-token prompts.** And
+admission for exactly this already exists — `plan_batch` (`batch.py:333`) returns
+**`(admitted, deferred)`**, and `batched_generate` re-checks at the real width
+(`_assert_context_fits(..., N=N)`, `vaayu_base.py:5195`). **The work is replacing an unconditional
+refusal with the admission control that already exists, falling back to today's serialized path for
+whatever it defers; a batch of 1 must be byte-identical to today.**
+
+**FIRST STEP IS A ONE-ARM MEASUREMENT THAT CAN REFUTE THE ROW — do it before writing server code.**
+Every N=3 number on record used ~690-token prompts; realistic agentic context is ~4.15k (row 5).
+Load each model, build 2 and 3 `BatchRequest`s at ~4.15k tokens, call
+`plan_batch(model, reqs, reclaim=True)`, print admitted/deferred (copy `probe_fanout.py`'s load +
+ballast). **Defers everything to N=1 → row REFUTED and P6/P8 stay banked with the reason recorded**
+(house rule: refutation closes the row). Admits N=2 but not N=3 → build for the width that admits.
+
+**What the build actually is** (engine side exists; this is server work): batch formation with a
+short arrival window, one worker driving `batched_generate` fanning `(stream_id, token_id)` to N
+bridges; **the generator contract is the #1 risk** — its docstring says an abandoned generator
+leaves `_batch_decode_active`/`_batch_n` set until GC, and **a client disconnect is exactly that**;
+`batched_generate` asserts `sdpa`, so a `flash_attention_2` operator must get a fallback, never a
+live assert; `BatchRequest.stop_ids` is token ids while `stopping.py` works in strings; **per-session
+logging breaks under N>1 and `docs/issue-L1-triage-logging.md` predicted it and says what to do**;
+`MAX_BATCH_SIZE = 1` knob in `config.py` in the same commit (§8). Per-stream `temperature`/`top_p`
+already exist on `BatchRequest`.
+
+**Done means** the server serves N concurrent requests when admission allows and falls back
+otherwise; **a server-level on-device A/B** (N=2 and N=3 concurrent clients vs today's serialized
+path at the same offered load — an engine probe number does NOT discharge this); greedy ids
+identical to single-stream; no OOM at the real derived context; a disconnect mid-batch leaves the
+engine usable, proven by a test that abandons the generator; suite green; L1 session attribution
+still correct. **Refuted if** admission defers to N=1 at realistic context, or the server-level A/B
+shows no aggregate gain.
+
+**Trap, measured 2026-09-07:** interleave A/B arms BOTH ways. On MiniMax, whichever arm ran SECOND
+was 0.4-0.9 % slower and replicate spreads were 0.44-0.65 % — not the 0.06-0.18 % the Environment
+section still claims. A one-way 0,1,0,1 interleave manufactures a false ~0.5 % effect.
+
+---
 # 2 · [ ] Static check for unbound locals / import order
 
 Two bugs of exactly this shape shipped GREEN today, inside the same edit: `detect_moe_blocks` and
