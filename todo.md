@@ -1870,6 +1870,46 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
+# 18 · [bug] `output_hidden_states=True` crashes the forward
+
+Found 2026-09-07 (incidentally, by a diagnostic probe that asked for hidden states). **Pre-existing
+and untouched by the `fix/gate2-postreclaim-headroom` branch** — `git diff 879f63d..HEAD --
+vaayu/vaayu_base.py` does not mention `all_hidden_states`.
+
+```
+File "/home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py", line 4594, in forward
+    all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
+ValueError: torch.cat(): expected a non-empty list of Tensors
+```
+
+Repro: any `model.forward(input_ids=..., use_cache=False, return_dict=True,
+output_hidden_states=True)`. Seen on Llama-3.2-1B under sdpa; the accumulation list for at least one
+index is empty when the concat runs, so the entry is never appended for some layer class (the
+`norm`/`lm_head`/decoder branches each append under different conditions — read `:4425-4437`).
+
+**Severity: low, and say so.** Nothing in the engine, the server or any gate asks for hidden states;
+this only bites a diagnostic. It is filed because a debugging session that reaches for hidden states
+loses a tool exactly when it needs one — which is how it was found.
+
+---
+# 19 · [ ] Re-measure any drafter number taken under `sdpa` (fallout of row 16)
+
+Row 16 left this consequence OPEN and it must not be lost inside a closed row.
+`models/Llama-3.2-1B-Instruct` is the README's suggested speculative drafter and the dense row's
+fast checkpoint. Before row 16's fix, ANY load whose `pinning_budget` reached 0 left the tied
+`lm_head` on the meta device and drafted **uniform noise** — which would collapse acceptance
+without any error. `sdpa` is what drove the budget to 0 on that checkpoint (measured: sdpa+auto 0,
+flash+auto 10.97 GB).
+
+**Task:** establish which recorded drafter/speculative numbers were taken under `sdpa`, and
+re-measure those. **CLAUDE.md §0 cites 5.57x for dense speculative decoding with the 1B drafter** —
+check that one first. If every such arm ran flash, the numbers stand: **say so explicitly and close
+the row**, because "probably fine" is what this ledger exists to prevent.
+
+Note row **17** interacts: a drafter prompt over `prefill_chunk_size` under sdpa is ALSO garbage,
+independently of row 16. Fix 17 before re-measuring anything under sdpa.
+
+---
 # 17 · [bug] `sdpa` + CHUNKED PREFILL = garbage on MoE — BLOCKS row 15
 
 Found 2026-09-07 while pricing row 15's real cost. **PRE-EXISTING: reproduced byte-identical on
@@ -1900,8 +1940,18 @@ batching means switching the server's kernel — and the server's single-stream 
 every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`.** Fix this first.
 
 **Proposed fix (not built):** build an explicit causal mask for `sdpa` whenever `past_len > 0`,
-instead of passing `None`. The helper already exists for the batched path. Needs a test at 2 chunks
-on both MoE geometries and a dense check, since it touches every prefill.
+instead of passing `None` — and LEAVE flash on the `None` path (it is correct there, and an explicit
+mask would re-introduce the S-sized score buffer `SCORE_ELEM_BYTES` prices at 0.0 for it). Size the
+mask off `past_len + q_len`, never `max_seq_len` — the sibling branch at `:4112` records a
+268 MB / 12.9 GB regression from exactly that mistake. **Minimum reproducer is TWO chunks** (709
+tokens at `prefill_chunk_size=512`); a single-chunk test passes on the broken code. Both MoE
+geometries plus a dense check, since it touches every prefill.
+
+**SELF-CONTAINED BRIEF, written to be picked up cold:**
+[`docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md`](docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md)
+(gitignored, this disk only — this row restates everything load-bearing).
+Repro: `MODEL=minimax ATTN=sdpa PROMPT_TOK=700 NTOK=24 CHUNK=512 plans/probes/p10c_attn_cost.py`,
+control `ATTN=flash_attention_2`.
 
 **Also measured while pricing row 15 (MiniMax, 4165-token prompt), and it belongs to that row's
 decision:** switching flash -> sdpa costs real VRAM before batching pays anything —
