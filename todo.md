@@ -66,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — the greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way: `sdpa` + plain `DynamicCache` = garbage on every non-EXL3 model, and `batched_generate` hard-asserts `sdpa` — see row **16**. | **row 16 blocks non-EXL3 batching (not the two MoE targets)** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — the greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1870,7 +1870,7 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
-# 16 · [bug] `sdpa` + plain `DynamicCache` produces GARBAGE (every non-EXL3 model)
+# 16 · [x] FIXED 2026-09-07 — tied lm_head never materialized on the PREFETCH path
 
 Found 2026-09-07 by P10b's discriminator arm, which needed a dense model and could not get a sane
 one. **Not a batching bug and not a dense bug -- an INTERSECTION.** Measured on
@@ -1900,9 +1900,37 @@ broken". Stock transformers on the same 1B checkpoint is correct, so it is not t
   it is exactly the hole CLAUDE.md §0 names: the dense gate `test_batched_dense_smoke.py` was
   deleted 2026-09-03 with **no committed replacement**, so nothing would have caught this.
 
-**Not root-caused below the pair.** Next step is to find why the mask/position path differs for a
-plain `DynamicCache` under `sdpa` (flash builds its own causal mask, which is the likely reason it
-survives). Repro: the truth table above, or `plans/probes/p10b_ids.py MODEL=dense1b`.
+**ROOT-CAUSED AND FIXED the same day, and the pair above was a SYMPTOM, not the cause.** Neither
+`sdpa` nor `DynamicCache` is at fault. **Llama-3.2-1B has `tie_word_embeddings=True`, so the
+checkpoint ships NO lm_head tensor** and Vaayu's splitter writes a valid-but-EMPTY shard for it
+(bug **D1**). D1's fallback existed in **two** places — `_pin_shared_layers` (`:3254`) and
+`load_layer_to_cpu` (`:3656`) — but **NOT in `_load_from_strategy` (`vaayu_base.py:3568`), the
+PREFETCH route the forward uses for every non-pinned layer.** It came back `{}`, and
+`lm_head.weight` was left **on the meta device**.
+
+**Why `sdpa` looked like the trigger:** sdpa charges a score-buffer term flash does not
+(`SCORE_ELEM_BYTES` 10.9 vs 0.0), which inflates `reserve_bytes` until **`pinning_budget` is
+EXACTLY 0** — so nothing pins, and the head streams through the one unhandled path. Measured
+`pinning_budget`: sdpa+auto **0** (garbage), sdpa+bf16 1.16 GB (correct), flash+auto 10.97 GB
+(correct). **The head is normally pinned, which is why this hid for so long.**
+
+**Evidence chain, all measured:** all 16 decoder layers bit-identical across the three configs
+(final hidden norm 444.9 everywhere) → the body was never wrong; logits std **0.02** vs a correct
+**2.21** → uniform noise; `lm_head.weight.is_meta == True` in the failing config against
+`cuda:0, norm 334.577` in both working ones; `[VAAYU-IO] iouring 0.0MB lm_head`.
+
+**Fix:** `_load_from_strategy` now applies the same `should_use_tied_lm_head` +
+`rekey_embed_as_lm_head` fallback its two siblings already had. **Verified on device:** all 6
+`attn × kv_cache_mode` cells on the 1B now emit `'Red, blue, and yellow.'`, and dense batched decode
+is **token-identical at N=1 vs N=2 with both rows agreeing** — which independently confirms row 15's
+verdict that the batched path is arithmetically sound and the MoE N=1/N=2 difference is routing
+discontinuity alone. Tests: 4 in `tests/test_tied_lm_head.py` (2 were red before the fix). Suite
+**1748 passed, 12 skipped**.
+
+**Consequence still OPEN, not verified here:** `models/Llama-3.2-1B-Instruct` is the README's
+suggested speculative drafter, and any drafter run that hit `pinning_budget == 0` before today was
+drafting from a meta head. **Any drafter acceptance number taken under `sdpa` predates the fix and
+should be re-measured** — including the 5.57x dense speculative figure CLAUDE.md §0 cites.
 `docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
 
 ---

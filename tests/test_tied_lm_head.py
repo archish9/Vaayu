@@ -86,3 +86,88 @@ def test_no_lm_head_in_module_tree_never_falls_back():
     assert should_use_tied_lm_head("model.layers.0", None, {},
                                    load_failed=False) is False
     assert should_use_tied_lm_head(None, None, {}, load_failed=True) is False
+
+
+# --- The THIRD path, found 2026-09-07 (row 16) --------------------------------
+#
+# D1 was fixed in two places: `_pin_shared_layers` and `load_layer_to_cpu`.
+# `_load_from_strategy` -- the PREFETCH route, which is what the forward uses
+# for any non-pinned layer while prefetching is on -- calls
+# `loader_strategy.load_from_disk` directly and had no fallback at all.
+#
+# It only fires when the head is NOT pinned, which is why it hid for so long:
+# the head is normally pinned first (it is in `_pin_shared_layers`' phase-1
+# list). Measured trigger on Llama-3.2-1B: `attn_implementation="sdpa"` charges
+# a score-buffer term flash does not (SCORE_ELEM_BYTES), which inflates
+# `reserve_bytes` until `pinning_budget` reaches EXACTLY 0 -- so nothing is
+# pinned, the head streams through here, and comes back `{}`.
+#
+# Observed end to end: lm_head.weight left on the meta device, logits
+# std 0.02 against a correct 2.21, output ' القرنuthor matching overall...'
+# against 'Red, blue, and yellow.'. Same checkpoint under flash_attention_2
+# (pinning_budget 10.97 GB) is correct, and so is stock transformers.
+class _FakeStrategy:
+    """load_from_disk that mimics the splitter: `{}` for the tied head."""
+
+    def __init__(self, embed_name):
+        self._embed = embed_name
+        self.cache_hits = {}
+        self.calls = []
+
+    def load_from_disk(self, layer_name, checkpoint_path):
+        self.calls.append(layer_name)
+        if layer_name == self._embed:
+            return {f"{self._embed}.weight": "EMBED_TENSOR"}
+        return {}
+
+
+class _FakeModel:
+    """Only the surface _load_from_strategy touches."""
+
+    def __init__(self, names):
+        self.layer_names_dict = names
+        self.loader_strategy = _FakeStrategy(names["embed"])
+        self.checkpoint_path = "/nonexistent"
+        self._layer_from_cache = {}
+
+
+def _names(embed="model.embed_tokens", head="lm_head"):
+    return {"embed": embed, "lm_head": head}
+
+
+def test_prefetch_path_falls_back_to_the_embedding_for_a_tied_head():
+    """The bug. An empty head shard through the prefetch route must come back
+    carrying the embedding's tensors, re-keyed onto the head -- exactly what
+    the pinning path already does."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    out = VaayuBaseModel._load_from_strategy(m, "lm_head")
+    assert out == {"lm_head.weight": "EMBED_TENSOR"}, (
+        "a tied head loaded through the prefetch path came back empty, which "
+        "leaves lm_head.weight on the meta device and emits garbage logits")
+
+
+def test_prefetch_path_leaves_a_populated_head_alone():
+    """An UNTIED checkpoint ships real head weights; they must not be replaced
+    by the embedding, which would silently swap a trained head for a tied one."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    m.loader_strategy.load_from_disk = (
+        lambda layer_name, checkpoint_path: {"lm_head.weight": "REAL_HEAD"})
+    assert VaayuBaseModel._load_from_strategy(m, "lm_head") == {"lm_head.weight": "REAL_HEAD"}
+
+
+def test_prefetch_path_does_not_paper_over_an_empty_decoder_layer():
+    """Only the head may be tied. An empty decoder shard is a real failure and
+    must stay empty rather than be handed embedding weights."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    assert VaayuBaseModel._load_from_strategy(m, "model.layers.3") == {}
+
+
+def test_prefetch_fallback_uses_the_models_own_names():
+    """Names come from layer_names_dict, never assumed to be Llama's (§5)."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names(embed="transformer.wte", head="output_head"))
+    out = VaayuBaseModel._load_from_strategy(m, "output_head")
+    assert out == {"output_head.weight": "EMBED_TENSOR"}

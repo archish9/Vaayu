@@ -82,6 +82,10 @@ def _bare_base(strategy, tmp_path):
     obj.checkpoint_path = str(tmp_path)
     obj.loader_strategy = strategy
     obj._layer_from_cache = {}
+    # _load_from_strategy carries the tied-head fallback (row 16), which reads
+    # these the same way _pin_shared_layers and load_layer_to_cpu do. __init__
+    # always sets them; this bare object has to as well.
+    obj.layer_names_dict = {"embed": "model.embed_tokens", "lm_head": "lm_head"}
     return obj
 
 

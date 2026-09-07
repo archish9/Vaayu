@@ -3566,8 +3566,35 @@ class VaayuBaseModel(GenerationMixin):
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
-        """Thin wrapper so ThreadPoolExecutor can call the strategy load."""
+        """Thin wrapper so ThreadPoolExecutor can call the strategy load.
+
+        Carries the tied-head fallback (bug D1) for the same reason
+        `_pin_shared_layers` and `load_layer_to_cpu` do: a checkpoint with
+        `tie_word_embeddings` ships no lm_head tensor, and Vaayu's splitter
+        writes a VALID but EMPTY shard for it, so this load SUCCEEDS with `{}`
+        and the head is left meta-initialized.
+
+        This is the PREFETCH route -- the one the forward takes for any
+        non-pinned layer while prefetching is on -- and it was the third path
+        with this shape and the only one still unhandled (row 16, 2026-09-07).
+        It hid because the head is normally pinned (it is in
+        `_pin_shared_layers`' phase-1 list) and so never streams. Measured
+        trigger on Llama-3.2-1B: `attn_implementation="sdpa"` charges a
+        score-buffer term flash does not, inflating `reserve_bytes` until
+        `pinning_budget` is EXACTLY 0 -- nothing pins, the head streams through
+        here, and comes back empty. Symptom was logits of std 0.02 against a
+        correct 2.21 (uniform noise), while the same checkpoint under
+        flash_attention_2 was correct.
+        """
         tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+        if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
+                                   tensors, load_failed=False):
+            _embed = self.layer_names_dict["embed"]
+            print(f"{layer_name} shard holds no tensors (tied weights); loading "
+                  f"them from {_embed} instead.")
+            tensors = rekey_embed_as_lm_head(
+                self.loader_strategy.load_from_disk(_embed, self.checkpoint_path),
+                _embed, layer_name)
         # The strategy has a RAM cache of its own (loader_strategy._cache, live on
         # dense models -- is_moe forces its budget to 0). A hit returns with zero
         # disk I/O, so the layer loop must bill it as a cache hit for the same
