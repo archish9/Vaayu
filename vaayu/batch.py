@@ -311,6 +311,42 @@ def reclaimable_expert_vram(model) -> int:
     return max(0, int(getattr(cache, "current_usage", 0)) - floor)
 
 
+def expert_giveback_bytes(model) -> int:
+    """Bytes of expert-VRAM-cache ENTITLEMENT a call may surrender for its own
+    lifetime, so that `admission_headroom` can stop charging them against it.
+
+    This is `budget_bytes`, not `current_usage`, and that is the whole point.
+    `reclaimable_expert_vram` above prices what is resident RIGHT NOW, which is
+    what Plan K's eviction can hand back; admission is blocked by something
+    else -- the cache's ENTITLEMENT to grow into everything above the reserve,
+    which holds even when the cache is cold and its usage is zero. Measured
+    2026-09-07: on a fresh load `reclaimable_expert_vram` is 0 on both MoE
+    checkpoints while their budgets are 6.774 / 3.644 GiB.
+
+    Same floor as `reclaimable_expert_vram`, and for the same reason: one decode
+    step's working set, DERIVED from `_moe_geometry` (§5). Surrendering below it
+    would leave decode streaming every expert from NVMe every token.
+
+    Returns 0 -- surrender nothing -- with no cache (dense, CPU compute) or no
+    geometry, and whenever the budget is already under the floor (Qwen3-235B:
+    3.644 GiB against 8.285 GiB). An unknown entitlement is not a free one.
+
+    The caller must KEEP the promise by lowering `budget_bytes` for the duration
+    (see `batched_generate`); counting it in admission alone moves the OOM from
+    prefill into decode.
+    """
+    cache = getattr(model, "_expert_vram_cache", None)
+    if cache is None:
+        return 0
+    geometry = getattr(model, "_moe_geometry", None)
+    if not geometry:
+        return 0
+    floor = int(geometry.get("working_set_bytes", 0))
+    if floor <= 0:
+        return 0
+    return max(0, int(getattr(cache, "budget_bytes", 0)) - floor)
+
+
 def reclaimable_vram_budget(model, reclaim: bool = False) -> int:
     """Free VRAM, plus — when `reclaim` is on — the part of the expert VRAM
     cache the decode loop can afford to give back.

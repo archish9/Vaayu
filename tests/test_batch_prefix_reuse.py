@@ -250,7 +250,7 @@ class _FakeBatchedModel:
         self.config = self._Cfg()
         self.telemetry = self._Telemetry()
 
-    def _assert_context_fits(self, n_tokens, N=1):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
         # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
         pass
 

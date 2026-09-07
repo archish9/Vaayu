@@ -550,7 +550,8 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
             f"{float(headroom) / gb:.2f} GiB this request may use. "
             f"{float(free_vram) / gb:.2f} GiB is free, but the expert VRAM cache "
             f"is entitled to everything above the reserve and fills during "
-            f"prefill, so only the reserve is actually available here. "
+            f"prefill, so this request is capped at the reserve plus whatever "
+            f"entitlement the caller surrenders for its own lifetime. "
             f"The largest context that fits RIGHT NOW is "
             f"{runtime_ceiling}.\n")
     else:
@@ -635,7 +636,8 @@ def plan_vram(*, free_vram: int, shape: VramShape, min_resident: int,
 
 def admission_headroom(*, free_vram: int, plan: VramPlan,
                        expert_cache_active: bool,
-                       reusable_pool: int = 0) -> int:
+                       reusable_pool: int = 0,
+                       expert_giveback_bytes: int = 0) -> int:
     """VRAM a single request may actually spend, in bytes.
 
     NOT the same as free VRAM. `expert_vram_budget_for` hands the expert VRAM
@@ -678,17 +680,37 @@ def admission_headroom(*, free_vram: int, plan: VramPlan,
     process for these same tensors, the reserve still caps the answer, and
     refusing prefills that provably run is the worse error.
 
-    Deliberately NOT reclaim-aware. Plan K's once-per-batch reclaim can hand
-    some of the cache back (measured 1.22 GB Qwen / 2.09 GB MiniMax), but it
-    runs AFTER this check, and it ships default-off because it was refuted --
-    even reserve + reclaim stays under what N>=2 needs at long context, so
-    counting it here would admit batches that still OOM. If reclaim is ever
-    moved ahead of admission, this is the function that has to learn about it.
+    `expert_giveback_bytes` is the answer to this function's own standing note,
+    which used to read "if reclaim is ever moved ahead of admission, this is the
+    function that has to learn about it" (P10, 2026-09-07). It is the part of the
+    cache's ENTITLEMENT -- its `budget_bytes`, not its current usage -- that the
+    caller surrenders for the lifetime of the call being admitted. The clamp is
+    lifted by exactly that much, because those bytes are no longer promised to
+    anyone.
+
+    It is a PROMISE, and the caller must keep it: passing a giveback without
+    also lowering `ExpertVRAMCache.budget_bytes` for the duration admits a batch
+    and then lets the cache regrow into its KV, which moves the OOM from prefill
+    to decode instead of preventing it. `evict_until_free` alone does NOT keep
+    the promise -- it frees bytes and leaves the budget untouched.
+
+    Zero by default, so every pre-existing caller keeps its exact behaviour.
+    Clamped at zero from below: a cache whose budget is already under one decode
+    step's working set (Qwen3-235B: 3.644 GiB against 8.285 GiB) has nothing to
+    surrender, and charging the negative difference would refuse contexts that
+    fit today.
+
+    Measured 2026-09-07 at a ~4.15k-token agentic context
+    (docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md): with
+    MiniMax-M2.7's giveback of 2.674 GiB the headroom admits the N=2 batch that
+    RAN on device and still refuses the N=3 batch that OOM'd at
+    `model.layers.22`. The old unconditional clamp refused both. The `usable`
+    clamp is what keeps the N=3 refusal honest and must stay outermost.
     """
     usable = int(free_vram) + max(0, int(reusable_pool))
     if not expert_cache_active:
         return usable
-    return min(usable, int(plan.reserve_bytes))
+    return min(usable, int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes)))
 
 
 def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:

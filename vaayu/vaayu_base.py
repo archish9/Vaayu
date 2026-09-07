@@ -3080,17 +3080,27 @@ class VaayuBaseModel(GenerationMixin):
             return 0
         return self._vram_plan.pinning_budget if self._vram_plan else 0
 
-    def _assert_context_fits(self, n_tokens: int, N: int = 1) -> None:
+    def _assert_context_fits(self, n_tokens: int, N: int = 1,
+                             expert_giveback_bytes: int = 0) -> int | None:
         """Refuse an oversized request HERE, where the prompt length is known.
 
         Without this, the wall surfaces as an OOM inside the layer loop ~30
         frames away -- exactly the diagnostic failure D3 fixed for RoPE.
 
         A diagnostic guard, not a source of failure in its own right (D3): it
-        must never itself be the thing that crashes. Returns quietly (does
+        must never itself be the thing that crashes. Returns None (does
         not raise) when there is no plan to check against -- CPU, CUDA
         unavailable, or _vram_shape somehow unset -- rather than raising an
         unrelated error in any of those cases.
+
+        Returns the PREDICTED PEAK in bytes when it did check, so a caller that
+        passed a giveback can charge itself exactly what admission spent
+        (P10) instead of re-deriving `predict_peak_vram` at a second call site
+        and risking the two drifting apart. A `None` return therefore means
+        "nothing was admitted against a giveback", not "it fits".
+
+        `expert_giveback_bytes` is passed straight to `admission_headroom`; see
+        `batch.expert_giveback_bytes` for what the caller owes in exchange.
         """
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)
@@ -3133,18 +3143,20 @@ class VaayuBaseModel(GenerationMixin):
         headroom = admission_headroom(
             free_vram=free_vram, plan=plan,
             expert_cache_active=getattr(self, "_expert_vram_cache", None) is not None,
-            reusable_pool=reusable_pool)
+            reusable_pool=reusable_pool,
+            expert_giveback_bytes=expert_giveback_bytes)
         need = predict_peak_vram(shape, int(n_tokens))
-        if need > headroom:
-            # The floor the load-time plan actually reserved one of (an expert,
-            # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
-            # prints "min_resident=0.00 GiB" even though one expert is resident.
-            _moe_geo = getattr(self, "_moe_geometry", None)
-            _min_resident = _moe_geo["expert_bytes"] if _moe_geo else 0
-            raise VramPlanError(_too_big_message(
-                requested=int(n_tokens), s_max=plan.s_max,
-                free_vram=free_vram, shape=shape,
-                min_resident=_min_resident, headroom=headroom))
+        if need <= headroom:
+            return need
+        # The floor the load-time plan actually reserved one of (an expert,
+        # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
+        # prints "min_resident=0.00 GiB" even though one expert is resident.
+        _moe_geo = getattr(self, "_moe_geometry", None)
+        _min_resident = _moe_geo["expert_bytes"] if _moe_geo else 0
+        raise VramPlanError(_too_big_message(
+            requested=int(n_tokens), s_max=plan.s_max,
+            free_vram=free_vram, shape=shape,
+            min_resident=_min_resident, headroom=headroom))
 
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
@@ -3554,8 +3566,35 @@ class VaayuBaseModel(GenerationMixin):
     # ── Strategy helper ───────────────────────────────────────────────────────
 
     def _load_from_strategy(self, layer_name: str) -> dict:
-        """Thin wrapper so ThreadPoolExecutor can call the strategy load."""
+        """Thin wrapper so ThreadPoolExecutor can call the strategy load.
+
+        Carries the tied-head fallback (bug D1) for the same reason
+        `_pin_shared_layers` and `load_layer_to_cpu` do: a checkpoint with
+        `tie_word_embeddings` ships no lm_head tensor, and Vaayu's splitter
+        writes a VALID but EMPTY shard for it, so this load SUCCEEDS with `{}`
+        and the head is left meta-initialized.
+
+        This is the PREFETCH route -- the one the forward takes for any
+        non-pinned layer while prefetching is on -- and it was the third path
+        with this shape and the only one still unhandled (row 16, 2026-09-07).
+        It hid because the head is normally pinned (it is in
+        `_pin_shared_layers`' phase-1 list) and so never streams. Measured
+        trigger on Llama-3.2-1B: `attn_implementation="sdpa"` charges a
+        score-buffer term flash does not, inflating `reserve_bytes` until
+        `pinning_budget` is EXACTLY 0 -- nothing pins, the head streams through
+        here, and comes back empty. Symptom was logits of std 0.02 against a
+        correct 2.21 (uniform noise), while the same checkpoint under
+        flash_attention_2 was correct.
+        """
         tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
+        if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
+                                   tensors, load_failed=False):
+            _embed = self.layer_names_dict["embed"]
+            print(f"{layer_name} shard holds no tensors (tied weights); loading "
+                  f"them from {_embed} instead.")
+            tensors = rekey_embed_as_lm_head(
+                self.loader_strategy.load_from_disk(_embed, self.checkpoint_path),
+                _embed, layer_name)
         # The strategy has a RAM cache of its own (loader_strategy._cache, live on
         # dense models -- is_moe forces its budget to 0). A hit returns with zero
         # disk I/O, so the layer loop must bill it as a cache hit for the same
@@ -5179,7 +5218,8 @@ class VaayuBaseModel(GenerationMixin):
         from .batch import (sample_step, batch_position_ids, batch_common_prefix,
                             broadcast_cache_rows, slice_cache_row,
                             prefix_store_row, resolve_matched_len,
-                            batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES)
+                            batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES,
+                            expert_giveback_bytes)
         assert self._active_attn_impl == "sdpa", (
             f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
         N = len(requests)
@@ -5192,8 +5232,53 @@ class VaayuBaseModel(GenerationMixin):
         # plan is sized for N=1, and a fan-out of N streams multiplies KV,
         # activations and logits, so admission must re-evaluate rather than
         # assume the load-time answer still holds.
-        self._assert_context_fits(
-            max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N)
+        #
+        # P10: and admission must be told what the expert VRAM cache will
+        # SURRENDER for this batch, or it charges the batch against a
+        # single-stream reserve that no N>1 request at a real agentic context
+        # can fit under. Measured 2026-09-07 at ~4.15k tokens: the guard
+        # refused N=2 and N=3 on both MoE checkpoints, while 3 of those 4 arms
+        # ran fine when forced past it -- and the 4th (MiniMax N=3) OOM'd, so
+        # the guard is right to exist and only its budget was wrong.
+        # `expert_giveback_bytes` is the ENTITLEMENT above one decode step's
+        # working set, which is what blocks admission even on a cold cache;
+        # Plan K's eviction below prices resident USAGE and cannot substitute.
+        #
+        # N=1 claims nothing: that is the path the server runs today and it
+        # stays byte-identical.
+        _giveback = expert_giveback_bytes(self) if N > 1 else 0
+        _need = self._assert_context_fits(
+            max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N,
+            expert_giveback_bytes=_giveback)
+
+        # Keep the promise. Admission counted these bytes as no longer belonging
+        # to the cache, so the cache must really stop taking them -- for the
+        # batch's lifetime, restored in the finally below. Without this the
+        # cache regrows into the KV admission just allocated and the OOM moves
+        # from prefill to decode, which is strictly worse: later, and after the
+        # prefill has already been paid for.
+        #
+        # `evict_until_free` (Plan K, just below) does NOT do this. It frees
+        # bytes once and leaves budget_bytes untouched, so put() keeps admitting
+        # experts up to the old entitlement on the very next decode step.
+        #
+        # Charged at what admission SPENT, not the whole giveback: the surplus
+        # is cache the batch can still use, and cache size sets decode
+        # throughput (P6). `_need` is None when the guard could not check at all
+        # (CPU, no CUDA, no plan) -- nothing was admitted against a giveback
+        # then, so nothing may be taken.
+        _vram_cache = getattr(self, "_expert_vram_cache", None)
+        _saved_budget = None
+        if _giveback > 0 and _need is not None and _vram_cache is not None:
+            _spend = min(_giveback, max(0, int(_need) - self._vram_plan.reserve_bytes))
+            if _spend > 0:
+                _saved_budget = _vram_cache.budget_bytes
+                _vram_cache.budget_bytes = _saved_budget - _spend
+                print(f"[Vaayu-Batch] N={N}: expert VRAM cache budget "
+                      f"{_saved_budget / 1e9:.2f} -> "
+                      f"{_vram_cache.budget_bytes / 1e9:.2f} GB for this batch "
+                      f"(admission spent {_spend / 1e9:.2f} GB of a "
+                      f"{_giveback / 1e9:.2f} GB giveback).")
 
         # Plan K: perform the reclaim this batch was ADMITTED under. Admitting
         # against reclaimable VRAM without reclaiming it just moves the OOM.
@@ -5428,6 +5513,12 @@ class VaayuBaseModel(GenerationMixin):
                           f"it is now LOST from the pool.")
             if _resized_vram_prefix:
                 self._vram_cacheable_layers = _saved_vram_layers
+            if _saved_budget is not None:
+                # P10: a leaked reduction would shrink the expert cache for
+                # every later request in this process -- a permanent throughput
+                # loss from one dropped connection, since a client disconnect
+                # unwinds through here as GeneratorExit.
+                _vram_cache.budget_bytes = _saved_budget
             self._batch_decode_active = False
             self._batch_n = 1
             self.telemetry.dump_json("vaayu_telemetry.json")

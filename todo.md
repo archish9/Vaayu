@@ -46,9 +46,12 @@ accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The 
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
 **TWO rows are open — P10 and P5**, each with a SELF-CONTAINED brief in `docs/` linked in
-the table. **Order: P10 first.** It is the only row whose payoff is already built and measured
-(P6 + P8, both stranded at N>1), and its first step is a one-arm measurement that can refute it
-before any code is written. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
+the table. **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
+measurement ran 2026-09-07 and the row PASSED at **1.48-1.78x end-to-end** at realistic agentic
+context — the largest effect on this board by an order of magnitude, and mostly a PREFILL win, not
+the decode win P6/P8 banked. It also found its own prerequisite: `_assert_context_fits` refuses
+every N>1 at that context, so the server wiring must be preceded by fixing gate 2 or it ships
+inert. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
 Qwen3-235B — read its vacancy note below before proposing anything that touches the fused
 forward's expert dispatch.**
 **P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
@@ -63,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** | Wire batched decode into the SERVER | **P6 (+11.6-12.1 % MiniMax) and P8 (+3.21 % Qwen) are both measured, shipped, green — and deliver ZERO to users, because both effects exist only at N>1 and the server runs one request at a time** (`engine.py:185`, and its docstring says `batched_generate` is deliberately not wired in). Highest banked value on the board: the mechanism is already built and tested; only the server refuses to use it. **Starts with a measurement that can refute it in ONE arm** — does `plan_batch` admit N>=2 at a realistic ~4.15k-token agentic context, or only at the ~690-token prompts every N=3 number on record was taken at? | none | OPTIONAL row **15** · [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[!]` | Wire batched decode into the SERVER — **BLOCKED on row 17** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **BLOCKED 2026-09-07 on row 17: `sdpa` + chunked prefill is garbage on MoE, and `batched_generate` hard-asserts sdpa — switching the server's kernel today would corrupt every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`. Row 17 also prices the switch: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1867,7 +1870,176 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
-# 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**)
+# 18 · [bug] `output_hidden_states=True` crashes the forward
+
+Found 2026-09-07 (incidentally, by a diagnostic probe that asked for hidden states). **Pre-existing
+and untouched by the `fix/gate2-postreclaim-headroom` branch** — `git diff 879f63d..HEAD --
+vaayu/vaayu_base.py` does not mention `all_hidden_states`.
+
+```
+File "/home/a/code/ai-ml/Vaayu/vaayu/vaayu_base.py", line 4594, in forward
+    all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
+ValueError: torch.cat(): expected a non-empty list of Tensors
+```
+
+Repro: any `model.forward(input_ids=..., use_cache=False, return_dict=True,
+output_hidden_states=True)`. Seen on Llama-3.2-1B under sdpa; the accumulation list for at least one
+index is empty when the concat runs, so the entry is never appended for some layer class (the
+`norm`/`lm_head`/decoder branches each append under different conditions — read `:4425-4437`).
+
+**Severity: low, and say so.** Nothing in the engine, the server or any gate asks for hidden states;
+this only bites a diagnostic. It is filed because a debugging session that reaches for hidden states
+loses a tool exactly when it needs one — which is how it was found.
+
+---
+# 19 · [ ] Re-measure any drafter number taken under `sdpa` (fallout of row 16)
+
+Row 16 left this consequence OPEN and it must not be lost inside a closed row.
+`models/Llama-3.2-1B-Instruct` is the README's suggested speculative drafter and the dense row's
+fast checkpoint. Before row 16's fix, ANY load whose `pinning_budget` reached 0 left the tied
+`lm_head` on the meta device and drafted **uniform noise** — which would collapse acceptance
+without any error. `sdpa` is what drove the budget to 0 on that checkpoint (measured: sdpa+auto 0,
+flash+auto 10.97 GB).
+
+**Task:** establish which recorded drafter/speculative numbers were taken under `sdpa`, and
+re-measure those. **CLAUDE.md §0 cites 5.57x for dense speculative decoding with the 1B drafter** —
+check that one first. If every such arm ran flash, the numbers stand: **say so explicitly and close
+the row**, because "probably fine" is what this ledger exists to prevent.
+
+Note row **17** interacts: a drafter prompt over `prefill_chunk_size` under sdpa is ALSO garbage,
+independently of row 16. Fix 17 before re-measuring anything under sdpa.
+
+---
+# 17 · [bug] `sdpa` + CHUNKED PREFILL = garbage on MoE — BLOCKS row 15
+
+Found 2026-09-07 while pricing row 15's real cost. **PRE-EXISTING: reproduced byte-identical on
+`881aaaa`, before any of this branch's code changes** (verified in a clean `git worktree`).
+
+**MiniMax-M2.7, `generate()`, `attn_implementation="sdpa"`, `prefill_chunk_size=512` held fixed:**
+
+| prompt | chunks | output |
+|---|---|---|
+| 325 tok | 1 | coherent — *"The user is asking me to refactor the watcher code..."* |
+| **709 tok** | **2** | **24 null bytes** |
+| 4165 tok | 9 | 64 null bytes |
+
+**Breaks as soon as there is more than one chunk.** `forward` (`vaayu_base.py:~4077`) sets
+`attention_mask = None` for BOTH `flash_attention_2` and `sdpa`. With no mask, sdpa's implicit
+causal masking is **top-left aligned**, which is wrong whenever `q_len < kv_len` — i.e. every
+prefill chunk after the first, which carries past KV. Flash aligns bottom-right and survives.
+Chunk 0 (`q_len == kv_len`) and decode (`q_len == 1`) are both correct, which is why this hid.
+
+**NO recorded measurement is invalidated.** `batched_generate` builds an EXPLICIT 4D mask
+(`build_batch_attention_mask`) and does its own single-forward prefill, so every P6/P7/P8/P10 sdpa
+arm is unaffected; and the server ships `ATTN_IMPLEMENTATION = None` -> flash, so no user is
+affected today. The exposure is exactly the combination row 15 needs.
+
+**Why it BLOCKS row 15:** `batched_generate` hard-asserts `sdpa` (`vaayu_base.py:5194`), so wiring
+batching means switching the server's kernel — and the server's single-stream path is
+`generate()`/`stream_generate`, which chunks. **Switching the server to sdpa today would corrupt
+every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`.** Fix this first.
+
+**Proposed fix (not built):** build an explicit causal mask for `sdpa` whenever `past_len > 0`,
+instead of passing `None` — and LEAVE flash on the `None` path (it is correct there, and an explicit
+mask would re-introduce the S-sized score buffer `SCORE_ELEM_BYTES` prices at 0.0 for it). Size the
+mask off `past_len + q_len`, never `max_seq_len` — the sibling branch at `:4112` records a
+268 MB / 12.9 GB regression from exactly that mistake. **Minimum reproducer is TWO chunks** (709
+tokens at `prefill_chunk_size=512`); a single-chunk test passes on the broken code. Both MoE
+geometries plus a dense check, since it touches every prefill.
+
+**SELF-CONTAINED BRIEF, written to be picked up cold:**
+[`docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md`](docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md)
+(gitignored, this disk only — this row restates everything load-bearing).
+Repro: `MODEL=minimax ATTN=sdpa PROMPT_TOK=700 NTOK=24 CHUNK=512 plans/probes/p10c_attn_cost.py`,
+control `ATTN=flash_attention_2`.
+
+**Also measured while pricing row 15 (MiniMax, 4165-token prompt), and it belongs to that row's
+decision:** switching flash -> sdpa costs real VRAM before batching pays anything —
+`reserve_bytes` **3.758 -> 5.146 GB**, `pinning_budget` **10.201 -> 8.814 GB**, expert VRAM cache
+budget **8.929 -> 7.542 GB (-15.5 %)**. Cache size sets decode throughput (P6), so **row 15's
+honest comparison is flash@N=1 (what users get today) vs sdpa@N=2 — NOT the sdpa-vs-sdpa +18.0 %
+P10a measured.** That comparison does not exist yet and cannot be taken until this bug is fixed.
+
+---
+# 16 · [x] FIXED 2026-09-07 — tied lm_head never materialized on the PREFETCH path
+
+Found 2026-09-07 by P10b's discriminator arm, which needed a dense model and could not get a sane
+one. **Not a batching bug and not a dense bug -- an INTERSECTION.** Measured on
+`models/Llama-3.2-1B-Instruct`, 12 greedy tokens, "Name three primary colors, then stop.":
+
+| attn | `kv_cache_mode` | cache class | output |
+|---|---|---|---|
+| `flash_attention_2` | auto | `DynamicCache` | `'Red, blue, and yellow.'` |
+| `flash_attention_2` | bf16 / fp8 | `FP8DynamicCache` | `'Red, blue, and yellow.'` |
+| **`sdpa`** | **auto** | **`DynamicCache`** | **`' القرنuthor matching overallůjnavigate_ADDRESS...'`** |
+| `sdpa` | bf16 / fp8 | `FP8DynamicCache` | `'Red, blue, and yellow.'` |
+
+**`auto` resolves to `fp16` -> plain `DynamicCache` for every non-EXL3 checkpoint**, so that is the
+pair a non-EXL3 model gets by DEFAULT. **Llama-3.3-70B-exl3 under `sdpa` is CORRECT**
+(`'The three primary colors are:\n1. Red\n2.'`), so it is neither "sdpa is broken" nor "dense is
+broken". Stock transformers on the same 1B checkpoint is correct, so it is not the checkpoint:
+`'Here's a Python function that merges two sorted lists...'`.
+
+**Why it matters even though no on-device target is non-EXL3:**
+- **`batched_generate` hard-asserts `sdpa`** (`vaayu_base.py:5194`), so batched decode on ANY
+  non-EXL3 model is in the broken pair by construction -- and P10's server wiring is batched decode.
+- **`models/Llama-3.2-1B-Instruct` is the README's suggested speculative-decoding drafter** and the
+  dense row's fast checkpoint. A drafter in the broken pair drafts garbage and acceptance collapses.
+  **Check what the speculative path forces before trusting any drafter number taken under `sdpa`** --
+  including the 5.57x dense speculative figure CLAUDE.md §0 cites.
+- It is the same class as OPTIONAL row **3** (the prefix pool cannot use `DynamicCache` either), and
+  it is exactly the hole CLAUDE.md §0 names: the dense gate `test_batched_dense_smoke.py` was
+  deleted 2026-09-03 with **no committed replacement**, so nothing would have caught this.
+
+**ROOT-CAUSED AND FIXED the same day, and the pair above was a SYMPTOM, not the cause.** Neither
+`sdpa` nor `DynamicCache` is at fault. **Llama-3.2-1B has `tie_word_embeddings=True`, so the
+checkpoint ships NO lm_head tensor** and Vaayu's splitter writes a valid-but-EMPTY shard for it
+(bug **D1**). D1's fallback existed in **two** places — `_pin_shared_layers` (`:3254`) and
+`load_layer_to_cpu` (`:3656`) — but **NOT in `_load_from_strategy` (`vaayu_base.py:3568`), the
+PREFETCH route the forward uses for every non-pinned layer.** It came back `{}`, and
+`lm_head.weight` was left **on the meta device**.
+
+**Why `sdpa` looked like the trigger:** sdpa charges a score-buffer term flash does not
+(`SCORE_ELEM_BYTES` 10.9 vs 0.0), which inflates `reserve_bytes` until **`pinning_budget` is
+EXACTLY 0** — so nothing pins, and the head streams through the one unhandled path. Measured
+`pinning_budget`: sdpa+auto **0** (garbage), sdpa+bf16 1.16 GB (correct), flash+auto 10.97 GB
+(correct). **The head is normally pinned, which is why this hid for so long.**
+
+**Evidence chain, all measured:** all 16 decoder layers bit-identical across the three configs
+(final hidden norm 444.9 everywhere) → the body was never wrong; logits std **0.02** vs a correct
+**2.21** → uniform noise; `lm_head.weight.is_meta == True` in the failing config against
+`cuda:0, norm 334.577` in both working ones; `[VAAYU-IO] iouring 0.0MB lm_head`.
+
+**Fix:** `_load_from_strategy` now applies the same `should_use_tied_lm_head` +
+`rekey_embed_as_lm_head` fallback its two siblings already had. **Verified on device:** all 6
+`attn × kv_cache_mode` cells on the 1B now emit `'Red, blue, and yellow.'`, and dense batched decode
+is **token-identical at N=1 vs N=2 with both rows agreeing** — which independently confirms row 15's
+verdict that the batched path is arithmetically sound and the MoE N=1/N=2 difference is routing
+discontinuity alone. Tests: 4 in `tests/test_tied_lm_head.py` (2 were red before the fix). Suite
+**1748 passed, 12 skipped**.
+
+**Consequence still OPEN, not verified here:** `models/Llama-3.2-1B-Instruct` is the README's
+suggested speculative drafter, and any drafter run that hit `pinning_budget == 0` before today was
+drafting from a meta head. **Any drafter acceptance number taken under `sdpa` predates the fix and
+should be re-measured** — including the 5.57x dense speculative figure CLAUDE.md §0 cites.
+`docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
+
+---
+# 15 · [!] Wire batched decode into the SERVER  (§0 **P10**) — BLOCKED on row 17
+
+**[!] BLOCKED 2026-09-07 on row 17** (`sdpa` + chunked prefill = garbage on MoE).
+`batched_generate` hard-asserts `sdpa`; the server runs flash and its single-stream path chunks, so
+switching the kernel today would corrupt every single-stream request with a prompt over
+`PREFILL_CHUNK_SIZE`. **Unblocked by:** fixing row 17.
+
+**Row 17 also carries the other half of this row's economics:** flash -> sdpa costs the expert VRAM
+cache **-15.5 %** (8.929 -> 7.542 GB on MiniMax) before batching pays anything, so this row's real
+comparison is **flash@N=1 vs sdpa@N=2**, not P10a's sdpa-vs-sdpa +18.0 %. Take that A/B before
+building the scheduler; **it can still refute the row.**
+
+**Design note already established (2026-09-07): NO arrival window is needed in v1.** `QUEUE_DEPTH`
+is 8 and `slot()` already queues waiters, so a batch can be formed from requests ALREADY waiting —
+zero added TTFT for anyone. An arrival window is a v2 question, not a v1 requirement.
 
 **Self-contained brief: [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md)**
 (gitignored, this disk only — restated here). Opened 2026-09-07 by the CLAUDE.md §8 audit.
@@ -1889,12 +2061,95 @@ admission for exactly this already exists — `plan_batch` (`batch.py:333`) retu
 refusal with the admission control that already exists, falling back to today's serialized path for
 whatever it defers; a batch of 1 must be byte-identical to today.**
 
-**FIRST STEP IS A ONE-ARM MEASUREMENT THAT CAN REFUTE THE ROW — do it before writing server code.**
-Every N=3 number on record used ~690-token prompts; realistic agentic context is ~4.15k (row 5).
-Load each model, build 2 and 3 `BatchRequest`s at ~4.15k tokens, call
-`plan_batch(model, reqs, reclaim=True)`, print admitted/deferred (copy `probe_fanout.py`'s load +
-ballast). **Defers everything to N=1 → row REFUTED and P6/P8 stay banked with the reason recorded**
-(house rule: refutation closes the row). Admits N=2 but not N=3 → build for the width that admits.
+**[x] THE REFUTING MEASUREMENT RAN 2026-09-07. THE ROW PASSED — and it is worth an order of
+magnitude more than this row claimed.** Full write-up:
+[`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md);
+probe `plans/probes/p10_admit.py`. Arms: ~4.15k-token prompts (system + synthetic file context +
+task), `max_new_tokens=512` charged to KV, 16 tokens consumed then `gen.close()`, `BALLAST_GB=27`,
+sdpa, greedy, one `systemd-run` scope each.
+
+**Two gates, not one — and the brief named only the weaker.** `plan_batch` prices KV alone and
+**admitted N=3 with zero deferrals on BOTH models**. `_assert_context_fits(n_tokens, N=N)`, which
+`batched_generate` itself calls at the real width (`vaayu_base.py:5195`), prices the sdpa score
+transient and **RAISED on every N>1 arm**. A probe checking `plan_batch` alone would have reported
+"admits N=3" and then OOM'd in the prefill.
+
+| model | N | `plan_batch` | gate 2 | forced run | peak VRAM | TTFT | aggregate tok/s |
+|---|---|---|---|---|---|---|---|
+| MiniMax-M2.7 | 1 | 1/0 | **PASS** | ok | 12.972 GB | 205.12 s | 1.634 |
+| MiniMax-M2.7 | 2 | 2/0 | RAISE (max 3331) | **ok** | 15.157 GB | 228.73 s | **2.180** (+33.4 %) |
+| MiniMax-M2.7 | 3 | 3/0 | RAISE (max 2048) | **OOM** `model.layers.22`, 14.93 of 15.47 GiB | — | — | — |
+| Qwen3-235B | 1 | 1/0 | **PASS** | ok | 11.662 GB | 214.25 s | 0.927 |
+| Qwen3-235B | 2 | 2/0 | RAISE (max 4096) | **ok** | 13.367 GB | 214.22 s | **1.582** (+70.7 %) |
+| Qwen3-235B | 3 | 3/0 | RAISE (max 2048) | **ok** | 15.084 GB | 260.11 s | 1.278 (+37.9 %) |
+
+**End-to-end (the number the row exists for): 1.77x / 1.98x / 2.34x at the measured 16 tokens;
+1.48x / 1.78x / 1.57x projected at 512 tokens generated** (MiniMax N=2, Qwen N=2, Qwen N=3). **The
+win is mostly PREFILL, not decode.** Qwen prefilled two 4.18k-token streams in **214.22 s against
+214.25 s for one** — free within 0.02 %; MiniMax paid +11.5 %. Prefill at this context is dominated
+by streaming weights off NVMe, which N streams share. That is CLAUDE.md §0's fan-out argument,
+measured.
+
+**[x] PREREQUISITE DONE 2026-09-07 — the giveback (P10a), BUILT, MEASURED, GREEN, BANKED.**
+`admission_headroom` now takes `expert_giveback_bytes`, `batch.expert_giveback_bytes(model)` prices
+the cache's ENTITLEMENT above one decode step's working set (budget, NOT usage -- usage is 0 on a
+fresh load while the entitlements are 6.774 / 3.644 GiB), `_assert_context_fits` returns the
+predicted peak so the caller charges itself what admission spent, and `batched_generate` at N>1
+lowers `budget_bytes` by that amount for the batch and restores it in the existing `finally`
+(GeneratorExit included). **N=1 is untouched.** **MiniMax-M2.7 at 4.15k, 64 tok/stream: N=1 1.750 ->
+N=2 2.065 tok/s = +18.0 %**, peak VRAM 12.355 GB, budget 7.28 -> 4.48 GB, P6 prefix 62 -> 31/62.
+Keeping the promise costs **3.3 %** against the cap-disabled 2.136 (+22.1 %) and returns **2.8 GB of
+peak VRAM**; greedy ids byte-identical between capped and uncapped N=2. **N=3 still refused, and
+correctly -- forced, it OOMs at `model.layers.22`.** **Qwen: giveback 0.00 GB, every decision
+unchanged** -- its cache budget (3.644 GiB) is already below its working set (8.285), so it has
+nothing to surrender; its false refusals are need-side over-prediction, untouched here. Suite **1744
+passed, 12 skipped**. §8: **no knob needed** (derived from geometry); **NOT reachable** -- the server
+still runs one request at a time, so this is worth 0 to users until the wiring below lands.
+`docs/2026-09-07-P10a-expert-giveback-admission-RESULTS.md`; tests
+`tests/test_batch_expert_giveback.py` + 11 in `tests/test_vram_plan.py`.
+
+**[x] The greedy-id divergence is SETTLED 2026-09-07: BENIGN on MoE, and the CRITERION was wrong.**
+`docs/2026-09-07-P10b-ids-divergence-SETTLED.md`. Nobody had decoded the tokens. MiniMax stream 0,
+same prompt: N=1 *"in the provided **file** context"* vs N=2 *"in the provided context"* -- **one
+word**, both coherent, a near-tie at position 42 resolved differently. Mechanism is the one
+`tests/test_batch_prefix_equivalence.py` documented on 2026-08-15 for the cold/warm prefill pair:
+batch width changes GEMM tiling, tiling perturbs router logits by ~1 ULP, and **top-k selection is
+DISCONTINUOUS**. All properties match -- deterministic per width (3/3 N=1 arms and 4/4 N=2 arms
+bitwise identical, across processes), late divergence, coherent both sides. Padding was excluded by
+construction (the probe uses identical equal-length prompts, zero `max_R` padding).
+**Row 15's criterion "greedy ids identical to the single-stream path" is UNACHIEVABLE on MoE and must
+be replaced** (asserting it asserts a bug that cannot be fixed) with the three the prefix-equivalence
+work already uses: deterministic per configuration; coherent as TEXT, not ids; bitwise identity only
+within a route pair that does not change tiling (P10a's capped-vs-uncapped N=2 is one, and it held).
+Dense may still assert token-identity -- once the bug below is fixed.
+
+**What the gate-2 fix was, for anyone reading this cold:** Its own message says why — *"the expert
+VRAM cache is entitled to everything above the reserve and fills during prefill, so only the reserve
+is actually available here"* — so `admission_headroom` hands the request the reserve (4.79 GiB
+MiniMax / 5.60 GiB Qwen) and refuses against it while 11.57 / 9.26 GiB is free. **But
+`batched_generate` reclaims that cache to its working-set floor immediately AFTER the assert**
+("Plan K", `vaayu_base.py:~5200`), so the assert prices a configuration the batch never runs in.
+Forced past it, 3 of the 4 N>1 arms ran fine. **Gate 2 must price the POST-reclaim configuration**
+(or the two gates must be reconciled into one) BEFORE the server work, or admission defers 100 % of
+the time and the feature is decoration.
+
+**Do NOT delete gate 2 and do NOT replace it with `plan_batch`:** gate 2 was RIGHT once — MiniMax
+N=3 genuinely OOM'd — and `plan_batch` admitted exactly that arm. **And do not "fix" Qwen by
+lowering the giveback floor:** its cache cannot hold one decode step's working set as it is.
+
+**Trap for the next arm:** in `plans/probes/p10_admit.py`, `FORCE_ADMIT=1` replaces the guard
+wholesale, so it returns no `need` and `batched_generate` takes NO giveback — a FORCE_ADMIT arm
+measures the PRE-P10a configuration. `FORCE_N` alone caps the width on the shipped path. Do not mix
+them and call the result shipped.
+
+**Max width is model- and context-dependent, and it is not 3.** MiniMax takes 2 here; Qwen takes 3
+but is FASTER at 2 (1.582 vs 1.278 aggregate — bigger KV starves the expert cache). Any
+`MAX_BATCH_SIZE` is a ceiling, never a target.
+
+**Caveats before quoting any of this:** every forced arm ran with a COLD expert VRAM cache
+(`reclaimable_expert=0.000 GB`, fresh load) — the warm-cache margin is UNMEASURED and the tightest
+arm had ~1.3 GiB of slack; 16 consumed tokens is a short decode window (ranks widths, not a
+P6-grade A/B); TTFT arms were not first-touch-controlled.
 
 **What the build actually is** (engine side exists; this is server work): batch formation with a
 short arrival window, one worker driving `batched_generate` fanning `(stream_id, token_id)` to N
@@ -1906,13 +2161,14 @@ logging breaks under N>1 and `docs/issue-L1-triage-logging.md` predicted it and 
 `MAX_BATCH_SIZE = 1` knob in `config.py` in the same commit (§8). Per-stream `temperature`/`top_p`
 already exist on `BatchRequest`.
 
-**Done means** the server serves N concurrent requests when admission allows and falls back
-otherwise; **a server-level on-device A/B** (N=2 and N=3 concurrent clients vs today's serialized
+**Done means** gate 2 prices the post-reclaim configuration (above) AND the server serves N
+concurrent requests when admission allows and falls back otherwise; **a server-level on-device A/B** (N=2 and N=3 concurrent clients vs today's serialized
 path at the same offered load — an engine probe number does NOT discharge this); greedy ids
 identical to single-stream; no OOM at the real derived context; a disconnect mid-batch leaves the
 engine usable, proven by a test that abandons the generator; suite green; L1 session attribution
-still correct. **Refuted if** admission defers to N=1 at realistic context, or the server-level A/B
-shows no aggregate gain.
+still correct. **Refuted if** the server-level A/B shows no aggregate gain. (The other refutation
+condition — "admission defers to N=1 at realistic context" — was TESTED 2026-09-07 and did NOT
+fire: `plan_batch` admits N=3 on both models.)
 
 **Trap, measured 2026-09-07:** interleave A/B arms BOTH ways. On MiniMax, whichever arm ran SECOND
 was 0.4-0.9 % slower and replicate spreads were 0.44-0.65 % — not the 0.06-0.18 % the Environment

@@ -1044,3 +1044,122 @@ def test_refusal_reports_the_ceiling_that_applies_now_not_the_load_time_one():
     assert runtime_ceiling < p.s_max, "premise: the runtime ceiling is lower"
     assert f"max_seq_len={runtime_ceiling}" in msg
     assert f"max_seq_len={p.s_max}" not in msg.split("Real levers")[0]
+
+
+import dataclasses
+
+# --- P10: the expert VRAM cache's giveback ------------------------------------
+#
+# Measured on device 2026-09-07
+# (docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md). The clamp above
+# hands a MoE request only `reserve_bytes` because the expert VRAM cache is
+# entitled to everything above it -- but batched_generate lowers that
+# entitlement for the batch's lifetime, so the clamp prices a configuration the
+# batch never runs in. Forced past the guard at a ~4.15k-token agentic context,
+# 3 of 4 N>1 arms ran; the 4th (MiniMax N=3) OOM'd, so the clamp cannot simply
+# be dropped either.
+#
+# All six figures below came from one load of each checkpoint on this box.
+_P10_MINIMAX = dict(reserve=5145919753, cache_budget=int(6.774 * GB),
+                    working_set=int(4.100 * GB), free=int(11.567 * GB),
+                    need_n2=int(7.403 * GB), need_n3=int(10.890 * GB))
+_P10_QWEN = dict(reserve=6017279590, cache_budget=int(3.644 * GB),
+                 working_set=int(8.285 * GB), free=int(9.248 * GB),
+                 need_n2=int(7.462 * GB), need_n3=int(10.488 * GB))
+
+
+def _p10_plan(name, m):
+    """A plan carrying the measured reserve, so the arithmetic under test is the
+    one that ran on device rather than a re-derived approximation."""
+    return dataclasses.replace(_plan(name), reserve_bytes=m["reserve"])
+
+
+@pytest.mark.parametrize("name,m", [("minimax-m2.7", _P10_MINIMAX),
+                                    ("qwen3-235b", _P10_QWEN)])
+def test_omitting_the_giveback_changes_nothing(name, m):
+    """Default 0 -- every pre-existing caller keeps its exact behaviour, which
+    is what lets this land without re-measuring the single-stream path."""
+    p = _p10_plan(name, m)
+    assert (admission_headroom(free_vram=m["free"], plan=p,
+                               expert_cache_active=True)
+            == admission_headroom(free_vram=m["free"], plan=p,
+                                  expert_cache_active=True,
+                                  expert_giveback_bytes=0))
+
+
+@pytest.mark.parametrize("name,m", [("minimax-m2.7", _P10_MINIMAX),
+                                    ("qwen3-235b", _P10_QWEN)])
+def test_giveback_raises_headroom_by_exactly_what_the_cache_surrenders(name, m):
+    p = _p10_plan(name, m)
+    give = int(1.5 * GB)
+    assert admission_headroom(free_vram=m["free"], plan=p,
+                              expert_cache_active=True,
+                              expert_giveback_bytes=give) == p.reserve_bytes + give
+
+
+@pytest.mark.parametrize("name,m", [("minimax-m2.7", _P10_MINIMAX),
+                                    ("qwen3-235b", _P10_QWEN)])
+def test_giveback_never_exceeds_the_vram_that_is_actually_free(name, m):
+    """The cache cannot surrender bytes the device does not have. The `usable`
+    clamp is the one thing standing between an over-large giveback and an OOM,
+    so it must survive the new term."""
+    p = _p10_plan(name, m)
+    assert admission_headroom(free_vram=m["free"], plan=p,
+                              expert_cache_active=True,
+                              expert_giveback_bytes=100 * GB) == m["free"]
+
+
+@pytest.mark.parametrize("name,m", [("minimax-m2.7", _P10_MINIMAX),
+                                    ("qwen3-235b", _P10_QWEN)])
+def test_a_negative_giveback_cannot_shrink_the_headroom(name, m):
+    """A cache budget below the working-set floor yields a negative difference
+    at the call site. Charging it here would refuse contexts that fit today --
+    a regression dressed as caution."""
+    p = _p10_plan(name, m)
+    assert admission_headroom(free_vram=m["free"], plan=p,
+                              expert_cache_active=True,
+                              expert_giveback_bytes=-int(4.6 * GB)) == p.reserve_bytes
+
+
+def test_giveback_is_ignored_without_an_expert_cache():
+    """Dense has no cache to surrender anything, and no clamp to lift."""
+    p = _plan("llama-70b", reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    assert admission_headroom(free_vram=FREE_VRAM_COLD_CACHE, plan=p,
+                              expert_cache_active=False,
+                              expert_giveback_bytes=int(2 * GB)) == FREE_VRAM_COLD_CACHE
+
+
+def test_the_measured_minimax_arms_are_decided_correctly():
+    """The anti-regression case, and the whole reason the term exists. With the
+    giveback its cache can really surrender (budget - working set = 2.674 GiB),
+    MiniMax's headroom admits the N=2 arm that RAN on device and refuses the
+    N=3 arm that OOM'd at model.layers.22. Today's clamp refuses both."""
+    m = _P10_MINIMAX
+    p = _p10_plan("minimax-m2.7", m)
+    give = m["cache_budget"] - m["working_set"]
+    assert give > 0, "premise: MiniMax's cache has something to give back"
+
+    today = admission_headroom(free_vram=m["free"], plan=p,
+                               expert_cache_active=True)
+    assert today < m["need_n2"], "premise: today's clamp refuses the N=2 arm"
+
+    headroom = admission_headroom(free_vram=m["free"], plan=p,
+                                  expert_cache_active=True,
+                                  expert_giveback_bytes=give)
+    assert headroom >= m["need_n2"], "the N=2 arm ran on device -- admit it"
+    assert headroom < m["need_n3"], "the N=3 arm OOM'd on device -- refuse it"
+
+
+def test_qwen_gains_nothing_because_its_cache_is_already_under_its_working_set():
+    """Not a bug, and not a case to 'fix' by lowering the floor: Qwen's expert
+    VRAM cache budget (3.644 GiB) is SMALLER than one decode step's working set
+    (8.285 GiB), so there is nothing to surrender. Its two false refusals are a
+    need-side over-prediction, which this change deliberately does not touch --
+    pinned here so a later reader does not mistake the asymmetry for a defect."""
+    m = _P10_QWEN
+    p = _p10_plan("qwen3-235b", m)
+    give = max(0, m["cache_budget"] - m["working_set"])
+    assert give == 0
+    assert admission_headroom(free_vram=m["free"], plan=p,
+                              expert_cache_active=True,
+                              expert_giveback_bytes=give) == p.reserve_bytes
