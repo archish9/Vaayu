@@ -4881,55 +4881,10 @@ class VaayuBaseModel(GenerationMixin):
         """
         assert self.speculator is not None, "speculative_generate called with no speculator"
 
-        # P9: size the VRAM cacheable prefix for THIS call's verify width.
-        # A verify pass is (draft_tokens + 1) positions through every MoE layer
-        # in ONE forward, so its per-layer insert load is the routing union over
-        # those positions -- the same quantity P6 sizes for a batch's N streams,
-        # and the same bound Fix #9 already applies to admission. The load-time
-        # call (:2610) charges one stream's top_k, which under-charges a
-        # draft_tokens=3 verify by 4x: MiniMax caches ALL 62 layers while
-        # inserting 4x what it is charged for -- exactly the configuration P6
-        # measured at a 2.35% hit rate against 48.4% when sized right.
-        #
-        # Sized ONCE for the whole call, not per round. The gate's phase moves
-        # (CALIBRATE drafts nothing, so those rounds are 1-wide), but the
-        # decision latches for the PROCESS and CALIBRATE_STEPS is 8 -- the wide
-        # pass is the steady state and the narrow one is a handful of steps once
-        # per process. Re-sizing per phase would churn the LRU mid-generation
-        # for that. Over-charging can only shorten the prefix, the safe
-        # direction (a too-long prefix is the failure being fixed).
-        #
-        # Restored in the finally below: this loop has several returns and had
-        # no finally at all, and a leaked verify-sized prefix would shrink
-        # caching for every later single-stream call. batched_generate and this
-        # path never run together (this one resets _batch_decode_active below);
-        # if that ever changes, the combined width is N * (draft_tokens + 1)
-        # positions, not the max of the two.
-        _vram_c = getattr(self, "_expert_vram_cache", None)
-        _geo = getattr(self, "_moe_geometry", None)
-        _blocks = getattr(self, "_moe_blocks", None)
+        # Bound before the try: the finally below reads both, so a raise
+        # anywhere inside must not find them unassigned.
         _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
         _resized_vram_prefix = False
-        if _vram_c is not None and _geo and _blocks:
-            _positions = (getattr(self, "draft_tokens", 0) or 0) + 1
-            _union = batch_union_per_layer(_geo, _positions)
-            _verify_layers = compute_vram_layer_range(
-                _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
-                experts_per_layer=_union)
-            if _verify_layers != _saved_vram_layers:
-                self._vram_cacheable_layers = _verify_layers
-                _resized_vram_prefix = True
-                # Once per process: this path runs per REQUEST, and the same
-                # line on every one of them is log spam, not information.
-                if not getattr(self, "_spec_vram_prefix_announced", False):
-                    self._spec_vram_prefix_announced = True
-                    _n = (len(_blocks) if _verify_layers is None
-                          else len(_verify_layers))
-                    print(f"[Vaayu-Spec] a {_positions}-position verify pass "
-                          f"inserts the routing union ({_union}) per MoE layer, "
-                          f"not top_k ({_geo['top_k']}) — VRAM cache restricted "
-                          f"to {_n}/{len(_blocks)} MoE layers while speculating "
-                          f"(was {len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
 
         try:
             # This loop honours NOTHING about sampling -- say so rather than hand
@@ -4956,6 +4911,61 @@ class VaayuBaseModel(GenerationMixin):
             speculator = self.speculator
             gate = self._build_spec_gate()
             self._spec_gate = gate
+
+            # P9: size the VRAM cacheable prefix for THIS call's verify width.
+            # A verify pass is (draft_tokens + 1) positions through every MoE layer
+            # in ONE forward, so its per-layer insert load is the routing union over
+            # those positions -- the same quantity P6 sizes for a batch's N streams,
+            # and the same bound Fix #9 already applies to admission. The load-time
+            # call (:2610) charges one stream's top_k, which under-charges a
+            # draft_tokens=3 verify by 4x: MiniMax caches ALL 62 layers while
+            # inserting 4x what it is charged for -- exactly the configuration P6
+            # measured at a 2.35% hit rate against 48.4% when sized right.
+            #
+            # Sized ONCE for the whole call, and ONLY when the gate will actually
+            # draft. A round the gate refuses is an ordinary 1-wide decode, so the
+            # verify-width charge is simply wrong for it -- and a refusal is not a
+            # brief phase: `off` latches and this call then finishes on the
+            # suppressed-draft path, 1-wide to the end. Measured on Qwen3-235B
+            # 2026-09-07, whose gate latches off_union after calibration and never
+            # drafts: 65/94 layers -> 16/94 and 0.9740 -> 0.9423 tok/s, -3.25%.
+            # `should_draft()` latches for the PROCESS, so it is read once here
+            # rather than re-read per round: only the FIRST call of a process can
+            # change phase mid-flight, and there this errs to the load-time sizing,
+            # which is the status quo. Over-charging a pass that IS wide can only
+            # shorten the prefix, the safe direction (a too-long prefix is the
+            # failure being fixed).
+            #
+            # Restored in the finally below: this loop has several returns and had
+            # no finally at all, and a leaked verify-sized prefix would shrink
+            # caching for every later single-stream call. batched_generate and this
+            # path never run together (this one resets _batch_decode_active below);
+            # if that ever changes, the combined width is N * (draft_tokens + 1)
+            # positions, not the max of the two.
+            _vram_c = getattr(self, "_expert_vram_cache", None)
+            _will_draft = gate is None or gate.should_draft()
+            _geo = getattr(self, "_moe_geometry", None)
+            _blocks = getattr(self, "_moe_blocks", None)
+            if _will_draft and _vram_c is not None and _geo and _blocks:
+                _positions = (getattr(self, "draft_tokens", 0) or 0) + 1
+                _union = batch_union_per_layer(_geo, _positions)
+                _verify_layers = compute_vram_layer_range(
+                    _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
+                    experts_per_layer=_union)
+                if _verify_layers != _saved_vram_layers:
+                    self._vram_cacheable_layers = _verify_layers
+                    _resized_vram_prefix = True
+                    # Once per process: this path runs per REQUEST, and the same
+                    # line on every one of them is log spam, not information.
+                    if not getattr(self, "_spec_vram_prefix_announced", False):
+                        self._spec_vram_prefix_announced = True
+                        _n = (len(_blocks) if _verify_layers is None
+                              else len(_verify_layers))
+                        print(f"[Vaayu-Spec] a {_positions}-position verify pass "
+                              f"inserts the routing union ({_union}) per MoE layer, "
+                              f"not top_k ({_geo['top_k']}) — VRAM cache restricted "
+                              f"to {_n}/{len(_blocks)} MoE layers while speculating "
+                              f"(was {len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
 
             self._batch_decode_active = False
             self._batch_n = 1

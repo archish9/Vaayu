@@ -49,7 +49,7 @@ say what happened to each, and they are anti-regression notes, not history for i
 Suggested order if you want the highest ceiling first: **P8** (highest ceiling, highest risk, starts
 with a measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is a
 recommendation, not a dependency: the two are independent and neither blocks the other.
-**P9 was the cheapest, was built first, and SHIPPED at +4.32 % on 2026-09-07 — see its vacancy note
+**P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
 below before proposing anything that re-sizes the VRAM prefix for a verify pass.**
 **P7 was the cheapest, was built first, and was REFUTED on 2026-09-06 — see the vacancy note
 below before proposing anything that re-sizes the VRAM prefix.**
@@ -122,29 +122,44 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   `docs/2026-09-06-P7-observed-union-prefix-RESULTS.md`. It left ONE live question, which is NOT
   this row: nothing derives the ~1.2× headroom the sizing depends on, so a geometry with a
   different bound/union ratio has no reason to land right. Open that on its own evidence.
-- **The P9 slot is VACANT — BUILT, MEASURED and SHIPPED 2026-09-07 at +4.32 %.**
+- **The P9 slot is VACANT — BUILT, MEASURED and SHIPPED 2026-09-07 at +4.16 %.**
   `speculative_generate` now sizes `_vram_cacheable_layers` on the verify width
   (`batch_union_per_layer(geometry, draft_tokens + 1)` = the same
   `min(num_experts, positions * top_k)` bound Fix #9 uses for admission) and restores the load-time
   set in a new `finally`. **Trap #1 did NOT refute it:** `compute_prefill_pass` sets
   `verify_cap = draft_tokens + 1`, so a verify pass is explicitly DECODE and both MoE forwards do
   consult the VRAM cache during it. **MiniMax-M2.7, `draft_tokens=3`, prompt-lookup, 4 interleaved
-  arms: 1.2044/1.2048/1.2053/1.2065 → 1.2542/1.2592/1.2590/1.2568 tok/s**, mean **1.2053 → 1.2573
-  = +4.32 %** (worst pairing +3.95 %, best +4.55 %; baseline spread 0.18 %). Prefix **ALL 62 →
+  FIRST-CUT arms: 1.2044/1.2048/1.2053/1.2065 → 1.2542/1.2592/1.2590/1.2568 tok/s**, mean
+  **1.2053 → 1.2573 = +4.32 %** (worst pairing +3.95 %, best +4.55 %; baseline spread 0.18 %); the
+  SHIPPED version measured +4.16 % on the same baseline (see the Qwen paragraph below). Prefix **ALL 62 →
   30/62**, decode hit rate **5.4 % → 37.6 %**, evictions **74 961 → 23 721 (−68 %)**, cache lookups
   79 221 → 38 070. Greedy ids byte-identical in every arm, and the gate reported the SAME state in
   all four (`observed_union_gb=12.73`, `measured_acceptance=0.6875`, `decision="run"`) — the
   treatment moved the prefix and nothing else. **The win is dispatch-side work, not I/O** (the
   module-list forward's pre-filter, P6's mechanism); never quote P9 as a byte reduction. Smaller
   than P6's +11.6 % because this is single-stream speculation, not N=3 batched decode — the drafter's
-  own wall-clock is time the cache cannot touch. **NO Qwen arm was run**: P6 measured that the fused
-  forward cannot convert a VRAM hit into less dispatch work, so a no-op is the expectation, but it
-  is an inference, not a measurement (`MODELS=qwen bash plans/probes/p9_ab.sh`). Sized ONCE per call
+  own wall-clock is time the cache cannot touch. Sized ONCE per call
   rather than per gate phase (the gate latches per PROCESS, `CALIBRATE_STEPS=8`); batching and
   speculation still cannot combine, and if that changes the width is `N * (draft_tokens + 1)`, not
   the max. **The bound was deliberately NOT tightened — P7 already refuted that family.**
+  **THE QWEN ARM CAUGHT A REGRESSION, and the fix for it is part of what shipped — read this before
+  touching the sizing again.** Qwen's gate latches `off_union` after calibration (observed union
+  19.31 GB against a 16.79–17.09 GB budget) with `drafting_rounds: 0`, so it NEVER drafts and every
+  round of that call is 1-wide. Sizing unconditionally for 4 positions charged it anyway for the
+  whole call: **65/94 layers → 16/94 and 0.9740 → 0.9423 tok/s, −3.25 %**, every replicate below
+  every baseline replicate. **Note the trap: the losing arm's hit rate was HIGHER (71.6 % vs
+  43.1 %) — 16/94 leaves 78 layers uncached. A hit rate is not a speedup.** The premise that failed
+  was "the narrow phase is a handful of steps once per process": true when the gate reaches RUN,
+  FALSE when it refuses, because `off` latches and the call finishes on the suppressed-draft path
+  1-wide to the end. **Fix: size only when `gate is None or gate.should_draft()`**, read once at the
+  top of the call (the sizing moved inside the `try` to see the gate). Post-fix on device: Qwen back
+  to **65/94 at 0.9671**, inside its 0.9693–0.9786 baseline band; MiniMax's warm call now unsized
+  (ALL 62, 1.2051, matching the p9=0 warm arms) and its timed calls still **30/62 at 1.2573/1.2536 =
+  +4.16 %**. MiniMax forgoes the gain on the FIRST call of a process — bounded, one-time, and in the
+  safe direction. **Qwen's speculative steady state remains unmeasurable here** (its gate refuses
+  before a single draft), so P6's fused-forward finding is untested by this row.
   `docs/2026-09-07-P9-spec-verify-prefix-RESULTS.md`; harness `plans/probes/p9_spec.py` +
-  `p9_ab.sh`; tests `tests/test_spec_vram_prefix.py` (+11).
+  `p9_ab.sh`; tests `tests/test_spec_vram_prefix.py` (+15).
 - **The P4 slot is VACANT too — CLOSED 2026-09-06, "accept and document", its own second option.**
   The exploration cost is **one-time per process** and worth **≤ `TRIAL_DRAFTED_TOKENS` ×
   `breakeven_acceptance` token-equivalents of decode** — 25.3 on Qwen3-235B, 29.3 on
@@ -200,8 +215,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1711 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-07 after P9 shipped (the 1700 measured 2026-09-06 + 11 spec-prefix tests; that 1700 was
+**Suite baseline: 1715 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-07 after P9 shipped (the 1700 measured 2026-09-06 + 15 spec-prefix tests; that 1700 was
 1685 + 6 batch-union sizing + 9 batch-prefix wiring tests; the 1685
 was measured the same day after P4's closure: 1684 + 1 suppressed-round-width test; the 1684 was measured the
 same day after the P2 outlier split: 1678 + 6 split tests; the 1678 was measured the same day

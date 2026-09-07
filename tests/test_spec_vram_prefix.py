@@ -201,3 +201,58 @@ def test_model_without_a_vram_cache_is_untouched():
     _run(model)
     assert model._vram_cacheable_layers is None
     assert all(s is None for s in model.seen_during_forward)
+
+
+class _FakeGate:
+    """The runtime gate's only question this sizing may ask."""
+
+    def __init__(self, drafts):
+        self._drafts = drafts
+        self.phase = "run" if drafts else "calibrate"
+        self.decision = "run" if drafts else None
+
+    def should_draft(self):
+        return self._drafts
+
+    def observe(self, history):
+        pass
+
+    def record_round(self, drafted, accepted):
+        pass
+
+    def decided_off(self):
+        return False
+
+
+@pytest.mark.parametrize("name,geo,budget,layer_ids", GEOMETRIES)
+def test_a_gate_that_will_not_draft_leaves_the_load_time_prefix_alone(
+        name, geo, budget, layer_ids):
+    """A round the gate refuses to draft is an ordinary 1-wide decode, so the
+    verify-width charge is simply wrong for it. Measured on Qwen3-235B
+    2026-09-07: its gate latches off_union after calibration and NEVER drafts,
+    so the whole call ran 1-wide under a 4-wide prefix -- 65/94 layers -> 16/94
+    and 0.9740 -> 0.9423 tok/s, -3.25%."""
+    model, load_time = _model(geo, budget, layer_ids)
+    model._build_spec_gate = lambda: _FakeGate(drafts=False)
+
+    _run(model)
+
+    assert all(s == load_time for s in model.seen_during_forward)
+    assert model._vram_cacheable_layers == load_time
+
+
+@pytest.mark.parametrize("name,geo,budget,layer_ids", GEOMETRIES)
+def test_a_gate_that_drafts_still_gets_the_verify_width_prefix(
+        name, geo, budget, layer_ids):
+    """The steady state: once the gate has latched run it drafts every round,
+    and that is the case the whole row exists for."""
+    model, _ = _model(geo, budget, layer_ids)
+    model._build_spec_gate = lambda: _FakeGate(drafts=True)
+    expected = compute_vram_layer_range(
+        budget, geo, layer_ids,
+        experts_per_layer=batch_union_per_layer(geo, DRAFT_TOKENS + 1))
+
+    _run(model)
+
+    assert DRAFT_TOKENS + 1 in model.verify_widths, "verify pass never ran"
+    assert all(s == expected for s in model.seen_during_forward)
