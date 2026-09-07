@@ -66,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refuses EVERY N>1 at that context, so wiring the server alone would ship the feature INERT.** Fix gate 2 first. | **gate 2 (`admission_headroom`) must price the post-reclaim configuration** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — plus one `[bug]` P10a's arms turned up: greedy ids diverge N=1 vs N=2 from position 42, which contradicts this row's own done-criterion. | **greedy-ids divergence must be settled first** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1921,8 +1921,33 @@ win is mostly PREFILL, not decode.** Qwen prefilled two 4.18k-token streams in *
 by streaming weights off NVMe, which N streams share. That is CLAUDE.md §0's fan-out argument,
 measured.
 
-**`[bug]` PREREQUISITE, and it is why wiring the server alone would ship this INERT: gate 2 is
-over-conservative and refuses N>1 at realistic context.** Its own message says why — *"the expert
+**[x] PREREQUISITE DONE 2026-09-07 — the giveback (P10a), BUILT, MEASURED, GREEN, BANKED.**
+`admission_headroom` now takes `expert_giveback_bytes`, `batch.expert_giveback_bytes(model)` prices
+the cache's ENTITLEMENT above one decode step's working set (budget, NOT usage -- usage is 0 on a
+fresh load while the entitlements are 6.774 / 3.644 GiB), `_assert_context_fits` returns the
+predicted peak so the caller charges itself what admission spent, and `batched_generate` at N>1
+lowers `budget_bytes` by that amount for the batch and restores it in the existing `finally`
+(GeneratorExit included). **N=1 is untouched.** **MiniMax-M2.7 at 4.15k, 64 tok/stream: N=1 1.750 ->
+N=2 2.065 tok/s = +18.0 %**, peak VRAM 12.355 GB, budget 7.28 -> 4.48 GB, P6 prefix 62 -> 31/62.
+Keeping the promise costs **3.3 %** against the cap-disabled 2.136 (+22.1 %) and returns **2.8 GB of
+peak VRAM**; greedy ids byte-identical between capped and uncapped N=2. **N=3 still refused, and
+correctly -- forced, it OOMs at `model.layers.22`.** **Qwen: giveback 0.00 GB, every decision
+unchanged** -- its cache budget (3.644 GiB) is already below its working set (8.285), so it has
+nothing to surrender; its false refusals are need-side over-prediction, untouched here. Suite **1744
+passed, 12 skipped**. §8: **no knob needed** (derived from geometry); **NOT reachable** -- the server
+still runs one request at a time, so this is worth 0 to users until the wiring below lands.
+`docs/2026-09-07-P10a-expert-giveback-admission-RESULTS.md`; tests
+`tests/test_batch_expert_giveback.py` + 11 in `tests/test_vram_plan.py`.
+
+**`[bug]` NEW, found by P10a's arms and NOT fixed: greedy ids diverge between N=1 and N=2 on the
+same prompt**, first at position **42** of 64, 22 of 64 differing after. **Pre-existing** -- the
+cap-disabled arms show it on the same code with the giveback inactive -- and late-onset, the
+signature of batched-sdpa numerics drift, not a wrong result. But **this row's own done-criterion
+says "greedy ids identical to the single-stream path", and as measured it does NOT hold.** Settle it
+BEFORE the server wiring, not after: either the criterion is wrong (say why, in the row) or the
+batched path is.
+
+**What the gate-2 fix was, for anyone reading this cold:** Its own message says why — *"the expert
 VRAM cache is entitled to everything above the reserve and fills during prefill, so only the reserve
 is actually available here"* — so `admission_headroom` hands the request the reserve (4.79 GiB
 MiniMax / 5.60 GiB Qwen) and refuses against it while 11.57 / 9.26 GiB is free. **But
@@ -1933,7 +1958,13 @@ Forced past it, 3 of the 4 N>1 arms ran fine. **Gate 2 must price the POST-recla
 the time and the feature is decoration.
 
 **Do NOT delete gate 2 and do NOT replace it with `plan_batch`:** gate 2 was RIGHT once — MiniMax
-N=3 genuinely OOM'd — and `plan_batch` admitted exactly that arm.
+N=3 genuinely OOM'd — and `plan_batch` admitted exactly that arm. **And do not "fix" Qwen by
+lowering the giveback floor:** its cache cannot hold one decode step's working set as it is.
+
+**Trap for the next arm:** in `plans/probes/p10_admit.py`, `FORCE_ADMIT=1` replaces the guard
+wholesale, so it returns no `need` and `batched_generate` takes NO giveback — a FORCE_ADMIT arm
+measures the PRE-P10a configuration. `FORCE_N` alone caps the width on the shipped path. Do not mix
+them and call the result shipped.
 
 **Max width is model- and context-dependent, and it is not 3.** MiniMax takes 2 here; Qwen takes 3
 but is FASTER at 2 (1.582 vs 1.278 aggregate — bigger KV starves the expert cache). Any

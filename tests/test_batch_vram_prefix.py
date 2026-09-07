@@ -68,7 +68,7 @@ class _FakeMoEModel:
         self.telemetry = self._Telemetry()
         self.seen_during_decode = []
 
-    def _assert_context_fits(self, n_tokens, N=1):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
         pass
 
     def forward(self, input_ids, attention_mask, position_ids, use_cache=True,

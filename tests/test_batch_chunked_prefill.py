@@ -44,7 +44,7 @@ class _ChunkRecorder:
         self.calls = []          # (past, q, mask_width) per forward
         self.chunk_sizes_seen = []
 
-    def _assert_context_fits(self, n_tokens, N=1):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
         # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
         pass
 
