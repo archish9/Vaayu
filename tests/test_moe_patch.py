@@ -2280,3 +2280,126 @@ def test_a_block_info_carries_the_forward_name_field():
     assert MoEBlockInfo.__dataclass_fields__["forward_name"].default is None, (
         "it must default to None -- a block that has not been patched has no "
         "forward name, and positional construction elsewhere must keep working")
+
+
+# ---------------------------------------------------------------------------
+# P8: suppress the disk read for experts the VRAM cache already holds
+#
+# Measured 2026-09-07 (docs/2026-09-07-P8-fused-predispatch-filter-RESULTS.md):
+# on a VRAM-prefix layer the RAM cache's per-layer cap is charged over ALL MoE
+# layers while the VRAM budget is concentrated on the prefix, so RAM evicts
+# first and 17.6 % of VRAM-resident lookups were RAM misses — 1246 real
+# 11.83 MB reads for weights already on the GPU, 2.45 % of decode bytes.
+#
+# The fix keeps P1's RAM-LRU refresh (the get() still runs, so the objection in
+# docs/2026-09-06-P1-vram-resident-dispatch-RESULTS.md §1 cannot bite) and
+# suppresses only the read.
+# ---------------------------------------------------------------------------
+
+def test_dispatch_skips_the_read_for_a_vram_resident_expert(tmp_path):
+    """A routed expert that misses RAM but is already on the GPU must not be
+    read from disk: no future, a sentinel in expert_tensors so the compute loop
+    still runs it, and — critically — the RAM get() must STILL have happened,
+    because that refresh is what P1 measured the cache's residency invariant on.
+    """
+    from vaayu.moe_patch import (_dispatch_expert_misses, VRAM_RESIDENT_NO_RAW)
+
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    expert_tensors, futures, pinned = _dispatch_expert_misses(
+        [2], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref,
+        vram_resident={2},
+    )
+
+    assert futures == [], "a GPU-resident expert must not be read from disk"
+    assert expert_tensors[2] is VRAM_RESIDENT_NO_RAW, (
+        "the expert must still reach the compute loop — dropping it would "
+        "silently remove its contribution to final_hidden"
+    )
+    assert pinned == set(), "nothing was checked out of the RAM cache to pin"
+    assert cache.misses == 1, (
+        "the RAM get() must still run: that LRU refresh is P1's residency "
+        "invariant, and suppressing it is the change P1 refuted"
+    )
+
+
+def test_dispatch_prefers_the_ram_hit_over_the_resident_sentinel(tmp_path):
+    """VRAM-resident AND RAM-cached: the real tensors win. The sentinel is only
+    for the miss case — returning it here would throw away a RAM hit the
+    compute loop's shape/validation path still uses."""
+    from vaayu.moe_patch import (_dispatch_expert_misses, VRAM_RESIDENT_NO_RAW)
+
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    cache.put(0, 1, _make_mock_exl3_raw("layers.0", 1, in_dim=8, out_dim=16))
+    vaayu_ref = MockVaayuRef()
+
+    expert_tensors, futures, _ = _dispatch_expert_misses(
+        [1], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref,
+        vram_resident={1},
+    )
+
+    assert futures == []
+    assert expert_tensors[1] is not VRAM_RESIDENT_NO_RAW
+    assert cache.hits == 1
+
+
+def test_dispatch_without_vram_resident_is_unchanged(tmp_path):
+    """The module-list forward filters these experts out BEFORE dispatch and
+    passes no vram_resident, so its behaviour must be byte-identical: a RAM
+    miss is still a disk read."""
+    from vaayu.moe_patch import _dispatch_expert_misses
+
+    _make_fused_exl3_checkpoint(tmp_path, num_layers=1, hidden=8, out_dim=16)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=50 * 1024 * 1024)
+    vaayu_ref = MockVaayuRef()
+
+    expert_tensors, futures, _ = _dispatch_expert_misses(
+        [2], layer_idx=0, layer_name="layers.0",
+        shard_file=str(tmp_path / "layers.0.safetensors"),
+        offset_index=idx, expert_cache=cache, vaayu_ref=vaayu_ref,
+    )
+
+    assert len(futures) == 1, "no vram_resident => a RAM miss is a disk read"
+    assert expert_tensors == {}
+
+
+def test_iter_expert_loads_yields_the_resident_sentinel(tmp_path):
+    """_iter_expert_loads drops None values; the sentinel must survive it, or
+    the expert vanishes from the layer's output."""
+    from vaayu.moe_patch import (_iter_expert_loads, VRAM_RESIDENT_NO_RAW)
+
+    vaayu_ref = MockVaayuRef()
+    seen = list(_iter_expert_loads({3: VRAM_RESIDENT_NO_RAW, 4: None}, [], vaayu_ref))
+    assert seen == [(3, VRAM_RESIDENT_NO_RAW)]
+
+
+def test_only_the_fused_forward_passes_vram_resident():
+    """Model-agnostic mandate (CLAUDE.md §5): this lands in ONE forward. The
+    module-list forward already filters resident experts out of _to_load, and
+    the non-EXL3 fused forward is untouched."""
+    import inspect
+    from vaayu import moe_patch
+
+    fused = inspect.getsource(moe_patch._make_fused_sparse_forward_exl3)
+    modlist = inspect.getsource(moe_patch._make_modulelist_sparse_forward)
+    plain = inspect.getsource(moe_patch._make_fused_sparse_forward)
+
+    assert "vram_resident=" in fused, (
+        "the fused-EXL3 forward must tell dispatch which experts are already "
+        "on the GPU, or the read suppression never fires"
+    )
+    assert "vram_resident=" not in modlist
+    assert "vram_resident=" not in plain

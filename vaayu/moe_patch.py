@@ -1429,6 +1429,14 @@ def _make_fused_sparse_forward(
 _LOAD_WAIT_BACKSTOP_S = 5.0
 
 
+# Placeholder for a routed expert that is ALREADY resident in the VRAM expert
+# cache and missed the RAM cache. It travels through expert_tensors so the
+# compute loop still runs the expert, but carries no CPU tensors: its weights
+# are on the GPU already, so reading them off NVMe again is pure waste. See
+# _dispatch_expert_misses' vram_resident parameter.
+VRAM_RESIDENT_NO_RAW = object()
+
+
 def _dispatch_expert_misses(
     unique_experts,
     *,
@@ -1439,6 +1447,7 @@ def _dispatch_expert_misses(
     expert_cache,
     vaayu_ref,
     staged_layer=None,
+    vram_resident=None,
 ) -> tuple[dict, list, set]:
     """
     Split this layer's routed experts into RAM/staged hits and disk misses, submit
@@ -1448,6 +1457,15 @@ def _dispatch_expert_misses(
     Returns (expert_tensors, miss_futures, pinned_keys). The caller MUST unpin
     every key in pinned_keys in a finally block; a leaked pin permanently blocks
     that key's eviction (a slow cache-capacity leak).
+
+    `vram_resident` (fused-EXL3 forward only) is the set of routed experts the
+    caller already holds a VRAM cache entry for. Their RAM lookup still runs —
+    that LRU refresh is the residency invariant P1 measured, and dropping it is
+    the change P1 refuted — but on a MISS no disk read is issued: the caller
+    serves those experts from their GPU copies and gets VRAM_RESIDENT_NO_RAW in
+    expert_tensors instead. The module-list forward filters these experts out
+    before it calls this helper and passes nothing, so its behaviour is
+    unchanged.
 
     Shared by the fused-EXL3 and module-list forwards: the slab/pin/arena
     discipline below is subtle enough that a second copy would rot.
@@ -1480,6 +1498,14 @@ def _dispatch_expert_misses(
             expert_tensors[eidx] = cached
             if _do_pin:
                 pinned_keys.add((layer_idx, eidx))
+        elif vram_resident is not None and eidx in vram_resident:
+            # On the GPU already — reading it off NVMe would fill a RAM slot
+            # with a copy of something the compute loop will not look at.
+            # Measured on Qwen3-235B at N=3: 1246 such reads, 2.45 % of decode
+            # bytes, because a VRAM-prefix layer's RAM cap (budget over ALL MoE
+            # layers) sits below its VRAM cap (budget over the prefix only), so
+            # RAM evicts first. The get() above already refreshed the RAM LRU.
+            expert_tensors[eidx] = VRAM_RESIDENT_NO_RAW
         else:
             misses.append(eidx)
 
@@ -1770,11 +1796,35 @@ def _make_fused_sparse_forward_exl3(
                 if _staged_layer is not None and _is_last_call:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
+        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+        # Prefill: don't churn the GPU LRU with a whole-model sweep.
+        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
+            _vram = None
+        # Layer-range restriction (Fix #7 follow-up): only layers in the
+        # cacheable prefix use the VRAM cache; None means no restriction.
+        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
+        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
+            _vram = None
+
+        # Check GPU residency BEFORE dispatching, so a resident expert that has
+        # fallen out of the RAM cache is not read off NVMe for nothing (P8).
+        # The entry is HELD for the whole compute loop, exactly as the
+        # module-list forward holds its _vram_resident entries: eviction only
+        # pops the dict and drops its reference, so a held entry stays valid
+        # even if a later put() in this same layer-visit evicts it.
+        _vram_hold: dict = {}
+        if _vram is not None:
+            for _e in unique_experts:
+                _held = _vram.get(layer_idx, _e)
+                if _held is not None:
+                    _vram_hold[_e] = _held
+
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
             unique_experts,
             layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
             offset_index=offset_index, expert_cache=expert_cache,
             vaayu_ref=vaayu_ref, staged_layer=_staged_layer,
+            vram_resident=set(_vram_hold) or None,
         )
 
         if _prof:
@@ -1813,27 +1863,24 @@ def _make_fused_sparse_forward_exl3(
         _contribs: list = []
         intermediate_size = None  # inferred lazily from the first expert we see
 
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        # Prefill: don't churn the GPU LRU with a whole-model sweep.
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            _vram = None
-        # Layer-range restriction (Fix #7 follow-up): only layers in the
-        # cacheable prefix use the VRAM cache; None means no restriction.
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
-
         if getattr(vaayu_ref, "_overlap_trace", False):
             print(f"[VAAYU-OVERLAP] compute_start layer={layer_idx} "
                   f"t={time.perf_counter():.6f} n_experts={len(unique_experts)}")
         try:
             for eidx, raw in _iter_expert_loads(expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None):
-                groups = _group_exl3_tensors_by_weight(raw)
-                if not groups["gate"] or not groups["down"] or not groups["up"]:
-                    _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
-                    continue
+                # No CPU tensors: dispatch suppressed this expert's read because
+                # it is already in _vram_hold (P8). Its shapes come off the GPU
+                # copy instead — the same tensors, uploaded on an earlier visit.
+                _no_raw = raw is VRAM_RESIDENT_NO_RAW
+                if _no_raw:
+                    groups = None
+                else:
+                    groups = _group_exl3_tensors_by_weight(raw)
+                    if not groups["gate"] or not groups["down"] or not groups["up"]:
+                        _log.warning(f"[Vaayu-MoE-EXL3] layer {layer_idx} expert {eidx}: incomplete EXL3 tensors")
+                        continue
                 if intermediate_size is None:
-                    _t_gate = groups.get("gate", {}).get("trellis")
+                    _t_gate = (_vram_hold[eidx]["gate"] if _no_raw else groups["gate"]).get("trellis")
                     if _t_gate is None:
                         continue
                     intermediate_size = _t_gate.shape[1] * 16
@@ -1847,7 +1894,9 @@ def _make_fused_sparse_forward_exl3(
                 if current_state.dtype != torch.float16:
                     current_state = current_state.to(torch.float16)
 
-                _cached_gpu = _vram.get(layer_idx, eidx) if _vram is not None else None
+                # Held since before dispatch (one LRU promotion per expert per
+                # visit, as before — the lookup simply moved earlier).
+                _cached_gpu = _vram_hold.get(eidx)
                 _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
                 if _cached_gpu is None and _cm_gpu is not None:
                     _cached_gpu = _cm_gpu.get(eidx)   # retained from an earlier chunk

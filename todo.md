@@ -45,10 +45,10 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**Two rows are open, and each has a SELF-CONTAINED brief in `docs/` (linked in the table).**
-Suggested order if you want the highest ceiling first: **P8** (highest ceiling, highest risk, starts
-with a measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is a
-recommendation, not a dependency: the two are independent and neither blocks the other.
+**ONE row is open — P5** (GPU sweep, may end in "not derivable — close the row"), with a
+SELF-CONTAINED brief in `docs/` linked in the table. **P8 SHIPPED 2026-09-07 at +3.21 % on
+Qwen3-235B — read its vacancy note below before proposing anything that touches the fused
+forward's expert dispatch.**
 **P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
 below before proposing anything that re-sizes the VRAM prefix for a verify pass.**
 **P7 was the cheapest, was built first, and was REFUTED on 2026-09-06 — see the vacancy note
@@ -62,7 +62,6 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
-| **P8** | Does the FUSED forward leave MiniMax's P6 win on the table? | P6 gave Qwen a 56.9 %-hit VRAM cache worth **+0.2–0.95 % (nothing)** and MiniMax a 48.4 %-hit cache worth **+11.6–12.1 %**. The whole difference: the module-list forward filters VRAM-resident experts BEFORE dispatch (16.52→12.50 routed/visit, −24 %), the fused forward does not (14.38→14.38). Highest ceiling of the open rows. **Highest risk too — P1 refuted the naive hoist and its RAM-refresh warning still binds.** First step is a measurement that can kill the row at zero cost. | none | OPTIONAL row **10** · [`docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`](docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
 - **The P1, P2 and P3 slots are VACANT.** P1 was measured 2026-09-06 and **REFUTED** (zero disk reads
@@ -160,6 +159,26 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   before a single draft), so P6's fused-forward finding is untested by this row.
   `docs/2026-09-07-P9-spec-verify-prefix-RESULTS.md`; harness `plans/probes/p9_spec.py` +
   `p9_ab.sh`; tests `tests/test_spec_vram_prefix.py` (+15).
+- **The P8 slot is VACANT — MEASURED, BUILT and SHIPPED 2026-09-07 at +3.21 % on Qwen3-235B, and
+  the row's own premise was REFUTED on the way.** The measurement first: dispatch-side work for
+  VRAM-resident experts is **0.021 % of decode** (the WHOLE `_dispatch_expert_misses` call is
+  0.632 %), so **P6's +11.6 % on MiniMax was never dispatch-side work** and **P6 §2 is wrong where it
+  says the module-list filter removes "slab acquire, H2D, per-expert attach/detach" from dispatch** —
+  dispatch does none of those for a resident expert on either forward, and the H2D + QMatrix skip
+  both forwards get happens in the COMPUTE loop. What the probe found instead: **1246 routed experts
+  were VRAM-resident AND a RAM miss = 14.74 GB = 2.45 % of decode bytes read for weights already on
+  the GPU** (P1 measured 0 against its 0.1 %-hit cache). Cause, derived: on a prefix layer RAM's
+  per-layer cap is charged over ALL MoE layers (15 on Qwen) while VRAM's budget is concentrated on
+  the prefix (25.5), so **RAM evicts first** — which is also why the RAM cache returns a **0.04 %**
+  hit rate to non-resident experts there (56.4 % off-prefix). **This ANSWERS P1's objection instead
+  of ignoring it**, and the shipped fix keeps the RAM refresh anyway. Shipped: A/B 1.7909 → 1.8485
+  tok/s **+3.21 %**, bytes −2.44 %, greedy ids byte-identical, MiniMax unchanged. **+3.21 % exceeds
+  the ≤1.8 % the byte saving alone predicts and the excess is NOT attributed — never quote P8 as a
+  byte-to-time conversion.** OPTIONAL row **10** ·
+  `docs/2026-09-07-P8-fused-predispatch-filter-RESULTS.md`. It leaves ONE live question, which is
+  NOT this row: the same measurement shows the RAM expert cache is **strictly dominated by the VRAM
+  cache on every prefix layer** (0.04 % useful hits). Whether prefix layers should keep a RAM cache
+  at all is unmeasured — open it on its own evidence.
 - **The P4 slot is VACANT too — CLOSED 2026-09-06, "accept and document", its own second option.**
   The exploration cost is **one-time per process** and worth **≤ `TRIAL_DRAFTED_TOKENS` ×
   `breakeven_acceptance` token-equivalents of decode** — 25.3 on Qwen3-235B, 29.3 on
@@ -1526,7 +1545,89 @@ are §0's top perf work.** §0 is the order. Read the `§0` column below before 
 | **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[x]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
 | **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
-# 10 · [ ] Does the FUSED forward leave MiniMax's P6 win on the table?  (§0 **P8**)
+# 10 · [x] Does the FUSED forward leave MiniMax's P6 win on the table?  (§0 **P8**)
+
+**MEASURED 2026-09-07. The row's STATED MECHANISM is REFUTED; its PROPOSED CHANGE survives at a
+much smaller, measured ceiling. Results: `docs/2026-09-07-P8-fused-predispatch-filter-RESULTS.md`;
+probe `plans/probes/p8_trace.py`, data `plans/probes/p8-qwen-n3.jsonl` (all gitignored — numbers
+restated here so the row survives without them).**
+
+Qwen3-235B N=3, 5922 decode layer-visits, one attribution arm (NOT an A/B; its 1.777 tok/s carries
+~1 % probe overhead and is not a result).
+
+* **Dispatch-side work is not the prize.** The WHOLE `_dispatch_expert_misses` call costs
+  **0.672 s = 0.632 %** of the 106.3 s decode wall; the part attributable to VRAM-RESIDENT experts
+  is **0.0226 s = 0.021 %** (3.19 us x 7088 lookups, over-counted on purpose). A pre-dispatch filter
+  cannot remove more than 0.021 % of decode. **MiniMax's +11.6 % did not come from dispatch-side
+  work.** This also **corrects P6 §2**, which said the module-list filter removes "slab acquire,
+  H2D, per-expert attach/detach" from dispatch: dispatch does NONE of those for a resident expert on
+  either forward — the H2D + QMatrix skip happens in the COMPUTE loop (`_entry["bc"]`,
+  `moe_patch.py:1938`) and **the fused forward already has it**.
+* **What the probe found instead, and P1 could not see.** Routed experts that are VRAM-resident AND
+  a RAM miss — a real 11.83 MB read for weights already on the GPU. **P1 measured exactly 0 against
+  its 0.1 %-hit cache; against P6's working cache this arm measures 1246** = 14.74 GB =
+  **2.45 % of the 602.3 GB read**. Ceiling **<= ~1.8 % tok/s**.
+* **Root cause, derived — not a model literal.** On a VRAM-prefix layer the two caches have
+  different per-layer capacities: VRAM `vram_budget/prefix_layers/expert_bytes` =
+  3.925 GB/13/11.83 MB = **25.5 experts**, RAM `max_per_layer` (`vaayu_base.py:330`) =
+  `expert_budget/num_moe_layers/expert_bytes` = 16.97 GB/94/11.83 MB = **15**. RAM's cap is charged
+  over ALL layers, VRAM's budget is concentrated on the prefix, so **RAM evicts before VRAM on every
+  prefix layer**. Two measured consequences: 17.6 % of resident lookups are RAM misses (the 1246),
+  and an expert gone from VRAM is already gone from RAM — so **the RAM cache returns a 0.04 % hit
+  rate to the non-resident experts that actually need it** (56.4 % on non-prefix layers). On prefix
+  layers the RAM expert cache is strictly dominated by the VRAM cache.
+* **This ANSWERS P1's blocking objection rather than ignoring it.** P1 warned that hoisting the
+  filter stops refreshing the RAM LRU for the hottest experts, so they need a real read "the moment
+  they fall out of VRAM". By the inequality above that read already happens. P1's mechanism is
+  correct in general and **inert on this geometry** — and the change below **keeps the refresh
+  anyway**, so a geometry where RAM's cap exceeds VRAM's stays safe by construction.
+
+**[x] BUILT, MEASURED and SHIPPED 2026-09-07 at +3.21 % on Qwen3-235B.** NOT the brief's
+pre-dispatch filter (that drops P1's RAM refresh for a 0.021 % prize). In
+`_dispatch_expert_misses`, `get(pin=True)` still runs for every routed expert — **P1's LRU refresh
+is preserved by construction, not by argument** — and only the **disk read** is suppressed, on a
+miss, for an expert the caller already holds on the GPU (`VRAM_RESIDENT_NO_RAW`). The fused-EXL3
+forward hoists its `_vram` gating above the dispatch, holds each routed expert's entry in
+`_vram_hold` (eviction only pops the dict, so a held entry stays valid — the module-list forward
+already relies on this), passes `set(_vram_hold) or None`, and serves the compute loop from the held
+entry instead of a second `_vram.get()` (one LRU promotion per expert per visit, as before). On a
+non-cacheable layer the set is empty -> `None` -> **dispatch is byte-identical to before**;
+module-list and the non-EXL3 fused forward pass nothing and are untouched.
+
+**Qwen3-235B N=3, interleaved 0,1,0,1, `NTOK=64 BALLAST_GB=25 LOOKAHEAD=0`, greedy, same box same
+day: 1.785/1.797 -> 1.849/1.848 tok/s, mean 1.7909 -> 1.8485 = +3.21 %** (worst pairing +2.83 %,
+best +3.60 %; p8=0 replicates 0.71 % apart, p8=1 0.04 %). **Bytes 602.2 -> 587.4 GB = -2.44 %,
+reads 100 998 -> 98 513 = -2.46 %** — 2485 fewer io_uring reads at ~5.95 MB each is ~1242 experts
+against the 1246 the attribution arm counted, so the predicted saving landed exactly. **Greedy ids
+byte-identical in all four arms** (`b8e64e5bb17be1d8`). Prefix 13/94 and TTFT (24.66 -> 24.71 s)
+unchanged — decode only.
+
+**+3.21 % is LARGER than the <= ~1.8 % the byte saving alone predicts and the excess is NOT
+attributed** (a suppressed read also removes a slab acquire, a `put_slab` and the RAM eviction it
+forces, and NVMe is not a linear byte->time converter at this concurrency). **Never quote P8 as
+"-2.44 % bytes => +3.21 % faster".** The one counter-moving number, stated not buried:
+`ExpertRAMCache.misses` rose 38 312/38 337 -> 38 576/38 575 (+0.7 %, 6.47 -> 6.51 per decode visit),
+expected and benign — a suppressed expert is never inserted into RAM, so it misses again next visit
+and is suppressed again. The gate that matters is READS, and reads fell.
+
+**MiniMax-M2.7 no-regression arms (module-list forward, passes no `vram_resident`, so the code it
+runs is unchanged): bytes 378.4 -> 378.3 GB (-0.03 %), greedy ids identical, prefix 34/62
+unchanged.** **MiniMax's tok/s reads -0.42 % across 8 arms, and that is ARM ORDERING, not the change** —
+proved by reversing one pair: whichever arm runs SECOND is slower, whichever arm it is (0-first
+pairs: -0.13/-0.84/-0.90 %; the one 1-first pair: **+0.18 %**). Replicate spreads on the box today
+were 0.44-0.65 %, well outside the ledger's stated 0.06-0.18 % band — **treat that band as stale
+until re-established.** Qwen's arms also ran 0-first in both pairs, so the same drift worked
+AGAINST the treatment there: **+3.21 % is understated, not inflated.**
+
+Tests `tests/test_moe_patch.py` +5; suite **1720 passed, 12 skipped**. Harness
+`plans/probes/p8_trace.py` (attribution), `plans/probes/p8_ab.sh` + a `P8` arm gate in
+`probe_fanout.py` (`P8=0` restores the old dispatch; the `_vram.get()` hoist runs in BOTH arms, so
+the arm variable is the read suppression alone).
+
+---
+
+## Original row text (the premise above supersedes its table's causal reading)
+
 
 **Self-contained brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`** (gitignored, this
 disk only — the numbers and the stop rule are restated here so the row survives without it).
