@@ -66,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — plus one `[bug]` P10a's arms turned up: greedy ids diverge N=1 vs N=2 from position 42, which contradicts this row's own done-criterion. | **greedy-ids divergence must be settled first** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — the greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way: `sdpa` + plain `DynamicCache` = garbage on every non-EXL3 model, and `batched_generate` hard-asserts `sdpa` — see row **16**. | **row 16 blocks non-EXL3 batching (not the two MoE targets)** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1870,6 +1870,42 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
+# 16 · [bug] `sdpa` + plain `DynamicCache` produces GARBAGE (every non-EXL3 model)
+
+Found 2026-09-07 by P10b's discriminator arm, which needed a dense model and could not get a sane
+one. **Not a batching bug and not a dense bug -- an INTERSECTION.** Measured on
+`models/Llama-3.2-1B-Instruct`, 12 greedy tokens, "Name three primary colors, then stop.":
+
+| attn | `kv_cache_mode` | cache class | output |
+|---|---|---|---|
+| `flash_attention_2` | auto | `DynamicCache` | `'Red, blue, and yellow.'` |
+| `flash_attention_2` | bf16 / fp8 | `FP8DynamicCache` | `'Red, blue, and yellow.'` |
+| **`sdpa`** | **auto** | **`DynamicCache`** | **`' القرنuthor matching overallůjnavigate_ADDRESS...'`** |
+| `sdpa` | bf16 / fp8 | `FP8DynamicCache` | `'Red, blue, and yellow.'` |
+
+**`auto` resolves to `fp16` -> plain `DynamicCache` for every non-EXL3 checkpoint**, so that is the
+pair a non-EXL3 model gets by DEFAULT. **Llama-3.3-70B-exl3 under `sdpa` is CORRECT**
+(`'The three primary colors are:\n1. Red\n2.'`), so it is neither "sdpa is broken" nor "dense is
+broken". Stock transformers on the same 1B checkpoint is correct, so it is not the checkpoint:
+`'Here's a Python function that merges two sorted lists...'`.
+
+**Why it matters even though no on-device target is non-EXL3:**
+- **`batched_generate` hard-asserts `sdpa`** (`vaayu_base.py:5194`), so batched decode on ANY
+  non-EXL3 model is in the broken pair by construction -- and P10's server wiring is batched decode.
+- **`models/Llama-3.2-1B-Instruct` is the README's suggested speculative-decoding drafter** and the
+  dense row's fast checkpoint. A drafter in the broken pair drafts garbage and acceptance collapses.
+  **Check what the speculative path forces before trusting any drafter number taken under `sdpa`** --
+  including the 5.57x dense speculative figure CLAUDE.md §0 cites.
+- It is the same class as OPTIONAL row **3** (the prefix pool cannot use `DynamicCache` either), and
+  it is exactly the hole CLAUDE.md §0 names: the dense gate `test_batched_dense_smoke.py` was
+  deleted 2026-09-03 with **no committed replacement**, so nothing would have caught this.
+
+**Not root-caused below the pair.** Next step is to find why the mask/position path differs for a
+plain `DynamicCache` under `sdpa` (flash builds its own causal mask, which is the likely reason it
+survives). Repro: the truth table above, or `plans/probes/p10b_ids.py MODEL=dense1b`.
+`docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
+
+---
 # 15 · [~] Wire batched decode into the SERVER  (§0 **P10**)
 
 **Self-contained brief: [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md)**
@@ -1939,13 +1975,20 @@ still runs one request at a time, so this is worth 0 to users until the wiring b
 `docs/2026-09-07-P10a-expert-giveback-admission-RESULTS.md`; tests
 `tests/test_batch_expert_giveback.py` + 11 in `tests/test_vram_plan.py`.
 
-**`[bug]` NEW, found by P10a's arms and NOT fixed: greedy ids diverge between N=1 and N=2 on the
-same prompt**, first at position **42** of 64, 22 of 64 differing after. **Pre-existing** -- the
-cap-disabled arms show it on the same code with the giveback inactive -- and late-onset, the
-signature of batched-sdpa numerics drift, not a wrong result. But **this row's own done-criterion
-says "greedy ids identical to the single-stream path", and as measured it does NOT hold.** Settle it
-BEFORE the server wiring, not after: either the criterion is wrong (say why, in the row) or the
-batched path is.
+**[x] The greedy-id divergence is SETTLED 2026-09-07: BENIGN on MoE, and the CRITERION was wrong.**
+`docs/2026-09-07-P10b-ids-divergence-SETTLED.md`. Nobody had decoded the tokens. MiniMax stream 0,
+same prompt: N=1 *"in the provided **file** context"* vs N=2 *"in the provided context"* -- **one
+word**, both coherent, a near-tie at position 42 resolved differently. Mechanism is the one
+`tests/test_batch_prefix_equivalence.py` documented on 2026-08-15 for the cold/warm prefill pair:
+batch width changes GEMM tiling, tiling perturbs router logits by ~1 ULP, and **top-k selection is
+DISCONTINUOUS**. All properties match -- deterministic per width (3/3 N=1 arms and 4/4 N=2 arms
+bitwise identical, across processes), late divergence, coherent both sides. Padding was excluded by
+construction (the probe uses identical equal-length prompts, zero `max_R` padding).
+**Row 15's criterion "greedy ids identical to the single-stream path" is UNACHIEVABLE on MoE and must
+be replaced** (asserting it asserts a bug that cannot be fixed) with the three the prefix-equivalence
+work already uses: deterministic per configuration; coherent as TEXT, not ids; bitwise identity only
+within a route pair that does not change tiling (P10a's capped-vs-uncapped N=2 is one, and it held).
+Dense may still assert token-identity -- once the bug below is fixed.
 
 **What the gate-2 fix was, for anyone reading this cold:** Its own message says why — *"the expert
 VRAM cache is entitled to everything above the reserve and fills during prefill, so only the reserve
