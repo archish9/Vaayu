@@ -130,21 +130,45 @@ RAM_CACHE_BUDGET_GB = None
 ENABLE_KV_PERSIST = False
 
 # --------------------------------------------------------------------------
-# Speculative decoding (opt-in; refused at load on both MoE targets)
+# Speculative decoding (opt-in)
 # --------------------------------------------------------------------------
 
 # Small drafter model. Measured 5.57x on streamed dense. Vocab sizes must match
 # the target exactly or the pairing is refused before any weights are read.
+# A WEIGHTED drafter is still refused at load on a MoE model whose verify pass
+# cannot fit the expert cache -- it has real VRAM and load time to lose, so that
+# static pre-check stays. Prompt lookup below has neither and is not refused.
 DRAFTER_MODEL_PATH = None
 
 # n-gram speculative decoding, zero VRAM. Measured 1.94x on streamed dense.
 # "auto" resolves at load, where is_moe is known: ON for dense, OFF for MoE.
-# MoE is excluded on evidence, not caution -- PLD is 1.285x on MiniMax-M2.7 and
-# 0.836x on Qwen3-235B, and the runtime gate's TRIAL phase costs a fixed 0.932x
-# on short generations. Set True to opt one in anyway; an explicit value wins.
+#
+# MoE is excluded by DEFAULT and MEASURE BEFORE OPTING IN -- whether it pays
+# depends on what the model is emitting, not on which model it is:
+#   Qwen3-235B    gate REFUSES to draft at all (off_union: observed verify
+#                 union 19.31 GB against a ~17 GB budget, 0 drafting rounds).
+#                 Turning it on buys nothing.
+#   MiniMax-M2.7  measured BOTH ways on 2026-09-07, one 128-token code prompt:
+#                 * server defaults (ENABLE_THINKING = False): acceptance 0.14
+#                   against a 0.6259 break-even -> gate latches off_acceptance
+#                   after ~1 call, which costs ~10% on THAT call and nothing
+#                   after (self.speculator is dropped, later calls take the
+#                   ordinary path).
+#                 * thinking ON: acceptance 0.6875, gate says run -- and it
+#                   still LOSES 12.9% total / 16.0% decode wall-clock.
+#                 An earlier arm on a different prompt measured 1.307x, so this
+#                 is workload-dependent, not a property of the model.
+# NOTE the second case: the gate's break-even is denominated in EXPERT BYTES,
+# so it can admit a configuration that loses wall-clock. A `run` decision is
+# not a promise of a speedup -- time your own workload both ways.
+# The default stays "auto" because CLAUDE.md section 5 forbids defaulting into
+# a one-model-wins asymmetry. Set True to opt one in; an explicit value wins.
 USE_PROMPT_LOOKUP = "auto"
 
 # Candidates per speculative round. 5-8 with a drafter, 10-15 with lookup.
+# The MoE numbers above were measured at 3 (= a 4-position verify pass), which
+# is also the width the VRAM expert-cache prefix is sized for once the gate
+# latches run (P9, +4.16% on MiniMax-M2.7 on top of the 1.307x).
 DRAFT_TOKENS = 5
 
 # --------------------------------------------------------------------------

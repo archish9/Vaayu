@@ -45,11 +45,12 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**Three rows are open, and every one has a SELF-CONTAINED brief in `docs/` (linked in the table).**
-Suggested order if you want the cheapest first: **P9** (same 20-line shape as P6, on a shipped
-feature, and its trap #1 can refute it in 10 minutes) → **P8** (highest ceiling, highest risk,
-starts with a measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is
-a recommendation, not a dependency: the three are independent and none blocks another.
+**Two rows are open, and each has a SELF-CONTAINED brief in `docs/` (linked in the table).**
+Suggested order if you want the highest ceiling first: **P8** (highest ceiling, highest risk, starts
+with a measurement) → **P5** (GPU sweep, may end in "not derivable — close the row"). That is a
+recommendation, not a dependency: the two are independent and neither blocks the other.
+**P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
+below before proposing anything that re-sizes the VRAM prefix for a verify pass.**
 **P7 was the cheapest, was built first, and was REFUTED on 2026-09-06 — see the vacancy note
 below before proposing anything that re-sizes the VRAM prefix.**
 
@@ -62,7 +63,6 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 |---|---|---|---|---|
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 | **P8** | Does the FUSED forward leave MiniMax's P6 win on the table? | P6 gave Qwen a 56.9 %-hit VRAM cache worth **+0.2–0.95 % (nothing)** and MiniMax a 48.4 %-hit cache worth **+11.6–12.1 %**. The whole difference: the module-list forward filters VRAM-resident experts BEFORE dispatch (16.52→12.50 routed/visit, −24 %), the fused forward does not (14.38→14.38). Highest ceiling of the open rows. **Highest risk too — P1 refuted the naive hoist and its RAM-refresh warning still binds.** First step is a measurement that can kill the row at zero cost. | none | OPTIONAL row **10** · [`docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`](docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md) |
-| **P9** | The speculative verify pass has P6's bug, unfixed | `_vram_cacheable_layers` is written at load (one stream's `top_k`) and by `batched_generate` (P6) — `speculative_generate` does NEITHER, though a verify pass pushes `(draft_tokens+1)` positions through every MoE layer in one forward. At P3's shipped `draft_tokens=3` that is a **4× under-charge**, worse than the 3× that took Qwen's cache to 0.1 %. Lands on a measured feature (P3: 1.307× on MiniMax-M2.7). Confirmed by reading 2026-09-06; SIZE unmeasured. | none — `compute_spec_working_set` already bounds the same union for admission, and `experts_per_layer=` shipped with P6 | OPTIONAL row **12** · [`docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`](docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
 - **The P1, P2 and P3 slots are VACANT.** P1 was measured 2026-09-06 and **REFUTED** (zero disk reads
@@ -122,6 +122,44 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   `docs/2026-09-06-P7-observed-union-prefix-RESULTS.md`. It left ONE live question, which is NOT
   this row: nothing derives the ~1.2× headroom the sizing depends on, so a geometry with a
   different bound/union ratio has no reason to land right. Open that on its own evidence.
+- **The P9 slot is VACANT — BUILT, MEASURED and SHIPPED 2026-09-07 at +4.16 %.**
+  `speculative_generate` now sizes `_vram_cacheable_layers` on the verify width
+  (`batch_union_per_layer(geometry, draft_tokens + 1)` = the same
+  `min(num_experts, positions * top_k)` bound Fix #9 uses for admission) and restores the load-time
+  set in a new `finally`. **Trap #1 did NOT refute it:** `compute_prefill_pass` sets
+  `verify_cap = draft_tokens + 1`, so a verify pass is explicitly DECODE and both MoE forwards do
+  consult the VRAM cache during it. **MiniMax-M2.7, `draft_tokens=3`, prompt-lookup, 4 interleaved
+  FIRST-CUT arms: 1.2044/1.2048/1.2053/1.2065 → 1.2542/1.2592/1.2590/1.2568 tok/s**, mean
+  **1.2053 → 1.2573 = +4.32 %** (worst pairing +3.95 %, best +4.55 %; baseline spread 0.18 %); the
+  SHIPPED version measured +4.16 % on the same baseline (see the Qwen paragraph below). Prefix **ALL 62 →
+  30/62**, decode hit rate **5.4 % → 37.6 %**, evictions **74 961 → 23 721 (−68 %)**, cache lookups
+  79 221 → 38 070. Greedy ids byte-identical in every arm, and the gate reported the SAME state in
+  all four (`observed_union_gb=12.73`, `measured_acceptance=0.6875`, `decision="run"`) — the
+  treatment moved the prefix and nothing else. **The win is dispatch-side work, not I/O** (the
+  module-list forward's pre-filter, P6's mechanism); never quote P9 as a byte reduction. Smaller
+  than P6's +11.6 % because this is single-stream speculation, not N=3 batched decode — the drafter's
+  own wall-clock is time the cache cannot touch. Sized ONCE per call
+  rather than per gate phase (the gate latches per PROCESS, `CALIBRATE_STEPS=8`); batching and
+  speculation still cannot combine, and if that changes the width is `N * (draft_tokens + 1)`, not
+  the max. **The bound was deliberately NOT tightened — P7 already refuted that family.**
+  **THE QWEN ARM CAUGHT A REGRESSION, and the fix for it is part of what shipped — read this before
+  touching the sizing again.** Qwen's gate latches `off_union` after calibration (observed union
+  19.31 GB against a 16.79–17.09 GB budget) with `drafting_rounds: 0`, so it NEVER drafts and every
+  round of that call is 1-wide. Sizing unconditionally for 4 positions charged it anyway for the
+  whole call: **65/94 layers → 16/94 and 0.9740 → 0.9423 tok/s, −3.25 %**, every replicate below
+  every baseline replicate. **Note the trap: the losing arm's hit rate was HIGHER (71.6 % vs
+  43.1 %) — 16/94 leaves 78 layers uncached. A hit rate is not a speedup.** The premise that failed
+  was "the narrow phase is a handful of steps once per process": true when the gate reaches RUN,
+  FALSE when it refuses, because `off` latches and the call finishes on the suppressed-draft path
+  1-wide to the end. **Fix: size only when `gate is None or gate.should_draft()`**, read once at the
+  top of the call (the sizing moved inside the `try` to see the gate). Post-fix on device: Qwen back
+  to **65/94 at 0.9671**, inside its 0.9693–0.9786 baseline band; MiniMax's warm call now unsized
+  (ALL 62, 1.2051, matching the p9=0 warm arms) and its timed calls still **30/62 at 1.2573/1.2536 =
+  +4.16 %**. MiniMax forgoes the gain on the FIRST call of a process — bounded, one-time, and in the
+  safe direction. **Qwen's speculative steady state remains unmeasurable here** (its gate refuses
+  before a single draft), so P6's fused-forward finding is untested by this row.
+  `docs/2026-09-07-P9-spec-verify-prefix-RESULTS.md`; harness `plans/probes/p9_spec.py` +
+  `p9_ab.sh`; tests `tests/test_spec_vram_prefix.py` (+15).
 - **The P4 slot is VACANT too — CLOSED 2026-09-06, "accept and document", its own second option.**
   The exploration cost is **one-time per process** and worth **≤ `TRIAL_DRAFTED_TOKENS` ×
   `breakeven_acceptance` token-equivalents of decode** — 25.3 on Qwen3-235B, 29.3 on
@@ -140,7 +178,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   paid before the refusal latches — and P4 closed on the finding that the cost is fixed and
   one-time (see two bullets above).
 
-## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P5–P9.
+## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P5/P8.
 
 Correctness, capability, tooling and hardware. Real work, and some of it matters — none of it moves
 tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
@@ -177,8 +215,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1700 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-06 after P6 shipped (1685 + 6 batch-union sizing + 9 batch-prefix wiring tests; the 1685
+**Suite baseline: 1715 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-07 after P9 shipped (the 1700 measured 2026-09-06 + 15 spec-prefix tests; that 1700 was
+1685 + 6 batch-union sizing + 9 batch-prefix wiring tests; the 1685
 was measured the same day after P4's closure: 1684 + 1 suppressed-round-width test; the 1684 was measured the
 same day after the P2 outlier split: 1678 + 6 split tests; the 1678 was measured the same day
 after the dense prompt-lookup default: 1647 + 7 bypass + 11 non-streaming + 4 trim + 9 auto; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
@@ -1008,8 +1047,8 @@ Three live items (the fourth, speculative decoding on dense, closed 2026-09-06; 
 TRIAL exploration cost, closed the same day; the sixth, the content-blind latch it uncovered,
 opened and REFUTED the same day — see SETTLED). Everything else in the old CARRIED FORWARD block
 was `[x]` and is gone. **All three remaining are OPTIONAL by §0's test — none of them can make
-Vaayu faster. The live perf work is §0's P5, P8 and P9 (P7 was
-refuted 2026-09-06 — see SETTLED).**
+Vaayu faster. The live perf work is §0's P5 and P8 (P7 was
+refuted 2026-09-06 and P9 SHIPPED 2026-09-07 — see SETTLED and §0's vacancy notes).**
 
 - **[x] Speculative decoding on streamed dense — CLOSED 2026-09-06. Both sub-rows below are done:
   the per-request bypass landed, and the dense default shipped as `USE_PROMPT_LOOKUP = "auto"`.
@@ -1472,19 +1511,19 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 
 # OPTIONAL — real work, no slot. Never ahead of OPEN or STILL OPEN.
 
-**This heading predates §0 and is now a LOCATION, not a priority: four rows here (6a = P5, 10 = P8,
-11 = P7, 12 = P9) are §0's top perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
+**This heading predates §0 and is now a LOCATION, not a priority: two rows here (6a = P5, 10 = P8)
+are §0's top perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | **P2** (the outlier split) | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
 | **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | **P8** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Qwen has a 56.9 %-hit VRAM cache buying it nothing. Brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`. See below. |
 | **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[x]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
-| **12** | `speculative_generate` never re-sizes the VRAM prefix for its verify width | **P9** | `[ ]` | GPU round | Opened 2026-09-06 while scoping P6, confirmed in code. 4× under-charge at `draft_tokens=3`. Brief: `docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`. See below. |
 | **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
 # 10 · [ ] Does the FUSED forward leave MiniMax's P6 win on the table?  (§0 **P8**)
@@ -1625,43 +1664,56 @@ re-running P7.
 
 ---
 
-# 12 · [ ] `speculative_generate` never re-sizes the VRAM prefix for its verify width  (§0 **P9**)
+# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock
 
-**Self-contained brief: `docs/2026-09-06-P9-spec-verify-prefix-sizing-BRIEF.md`** (gitignored, this
-disk only — the defect and both stop rules are restated here).
+**Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md)**
+— written to be picked up COLD in a fresh session: the defect, the exact call sites, all 8 arms,
+five open design questions, the stop rule, and six traps. **`docs/` is gitignored, so that file is
+on this disk only**; everything load-bearing is restated below and the durable copy of this row is
+`git log -p -- todo.md`.
 
-Opened 2026-09-06 while scoping P6; **confirmed by reading the code, size unmeasured.**
-`_vram_cacheable_layers` is written in exactly two places: `vaayu_base.py:2610` at load (charging
-ONE stream's `top_k`) and `batched_generate`'s P6 block (batch width N, restored in `finally`).
-`speculative_generate` (`vaayu_base.py:4862`) does neither — yet a verify pass pushes
-`(draft_tokens + 1)` positions through every MoE layer in ONE forward, so its per-layer insert load
-is the union over those positions. At P3's shipped `draft_tokens=3` that is **4 × top_k against the
-top_k charged — a 4× under-charge**, worse than the 3× that took Qwen's cache to 0.1 % and
-MiniMax's to 2.4 %.
+**Opened 2026-09-07 by the P9 end-to-end arm** (`plans/probes/p9_e2e.py` + `p9_e2e_ab.sh`,
+8 arms, MiniMax-M2.7, one 128-token code prompt, `draft_tokens=3`, interleaved, BALLAST_GB=25).
+Results: `docs/2026-09-07-P9-e2e-prompt-lookup-RESULTS.md` (gitignored — numbers restated here).
 
-The engine already computes this bound: `compute_spec_working_set(geometry, positions)`
-(`vaayu_base.py:122`) uses it for Fix #9 ADMISSION (`:2428-2461`); it is simply never fed to the
-prefix sizing. The fix mirrors P6 and is ~20 lines — `compute_vram_layer_range`'s
-`experts_per_layer=` parameter shipped with P6.
+**`AdaptiveSpecGate` decides on EXPERT BYTES, and nothing checks the clock.**
+`spec_breakeven_acceptance(union_bytes_1, union_bytes_k, draft_tokens)`
+(`vaayu/speculative/adaptive_gate.py:61`) asks whether a k-wide verify moves fewer expert bytes
+per token than k separate decodes. It models neither the drafter's own cost nor the dispatch-side
+work a wider pass creates — so a `run` decision is not a claim about tok/s, and was measured
+not to be one:
 
-Lands on a MEASURED feature: P3's MiniMax-M2.7 arm ran `draft_tokens=3` at **1.7795 → 2.3253 tok/s
-= 1.307×**. Expect a MiniMax win and a Qwen no-op, for row 10's structural reason.
+| regime | acceptance | break-even | gate | total tok/s | decode tok/s |
+|---|---|---|---|---|---|
+| thinking ON | 0.6875 | 0.6259 | **`run`** | 1.4290 → **1.2443 (−12.9 %)** | 1.8890 → **1.5869 (−16.0 %)** |
+| thinking OFF (server default) | **0.14** | 0.6259 | `off_acceptance` | 1.4665 → n/a (refused after ~1 call) | 1.9518 → n/a |
 
-**Trap #1, do this FIRST — it can refute the row in 10 minutes:** `compute_prefill_pass`
-(`vaayu_base.py:812`) has `verify_cap = (draft_tokens + 1)`. If a verify pass is treated as a
-prefill pass, all three forwards set `_vram = None` and the prefix is irrelevant. Check before
-building anything.
-**Open design question:** verify width is not constant (the adaptive gate's CALIBRATE phase drafts
-nothing = 1 position). Size for `draft_tokens+1` throughout, or re-size on phase change — pick ONE,
-state why, do not build both. Also state what happens if batching and speculation ever combine: the
-correct width is `N * (draft_tokens + 1)`, not the max.
+Both regimes reproduce across 2 replicates. **The gate caught the second case and missed the
+first.** In the first it admitted a configuration that costs 16 % of decode throughput, and it
+would keep it for the life of the process — `run` latches exactly as `off` does.
 
-**Done means:** derived sizing, load-time and non-speculative paths byte-identical, tests over both
-geometries driving the real exit paths (incl. abandonment), and an on-device A/B on MiniMax-M2.7 at
-`draft_tokens=3` reporting hit rate AND tok/s with greedy ids identical.
-**Refuted if** the restored hit rate does not move tok/s.
+**Two things this row is NOT.** It is not P9: P9 sizes the VRAM prefix correctly *within* the
+speculative path and is worth +4.16 % when that path runs (measured, unaffected). It is not "PLD
+is bad on MoE": an earlier arm on a different prompt measured **1.307×**, so the answer is
+workload-dependent — which is the point, since a byte-only break-even cannot see that.
 
----
+**Also note the sign flip nobody predicted:** acceptance was HIGHER with thinking ON (0.6875) than
+OFF (0.14). Reasoning prose repeats n-grams; freshly-generated code does not. Any future
+speculation measurement here must state its thinking-mode state (the S1e-bis rule) — and must not
+assume code-shaped output is the favourable case for prompt lookup.
+
+**Candidate fix, not designed:** give TRIAL a wall-clock arm — time N drafting rounds against N
+suppressed-draft rounds in the same call and latch on the ratio, instead of (or as well as) the
+byte break-even. The brief lists the five questions to answer first; the two that decide the shape
+are **what unit is timed** (seconds per ACCEPTED token, not per round — rounds yield a variable
+number of tokens at ~1.5 tok/s) and **whether the byte test stays as a necessary condition**
+(recommended: it is cheap, sound, and it is what refuses Qwen at zero cost).
+**One thing the Done condition needs that this row does not have:** a reference workload where PLD
+genuinely WINS, to prove a fix does not simply refuse everything. The 1.307× prompt was never
+archived — constructing one is part of the work.
+**Stop rule:** if a wall-clock TRIAL cannot be made cheap enough to run per process, say so and
+close the row by documenting that `run` is a bytes claim only — the docs already say this as of
+`5aa9aab`.
 
 # 2 · [ ] Static check for unbound locals / import order
 

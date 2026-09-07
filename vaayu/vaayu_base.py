@@ -4881,222 +4881,286 @@ class VaayuBaseModel(GenerationMixin):
         """
         assert self.speculator is not None, "speculative_generate called with no speculator"
 
-        # This loop honours NOTHING about sampling -- say so rather than hand
-        # back greedy text under a sampled request's name (CLAUDE.md: warn, do
-        # not silently degrade).
-        _ignored = speculative_ignored_sampling(temperature, kwargs)
-        if _ignored:
-            print(f"[Vaayu-Spec] WARNING: speculative decoding is greedy; "
-                  f"{', '.join(_ignored)} IGNORED for this generation. "
-                  f"Load without drafter_model_path to use them.")
+        # Bound before the try: the finally below reads both, so a raise
+        # anywhere inside must not find them unassigned.
+        _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
+        _resized_vram_prefix = False
 
-        # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
-        # only correct within one generation: `_drafter_seen` is a length into
-        # THIS input_ids. Carried into the next call it slices a different
-        # sequence, and the drafter drafts from another prompt's context.
-        # Measured: three identical greedy calls in one process returned three
-        # different sequences; resetting made them byte-identical.
-        self.speculator.reset()
+        try:
+            # This loop honours NOTHING about sampling -- say so rather than hand
+            # back greedy text under a sampled request's name (CLAUDE.md: warn, do
+            # not silently degrade).
+            _ignored = speculative_ignored_sampling(temperature, kwargs)
+            if _ignored:
+                print(f"[Vaayu-Spec] WARNING: speculative decoding is greedy; "
+                      f"{', '.join(_ignored)} IGNORED for this generation. "
+                      f"Load without drafter_model_path to use them.")
 
-        # S1d: the runtime gate. `speculator` is held locally because an OFF
-        # decision sets self.speculator = None -- the same mechanism the load
-        # gate uses, so every LATER call takes the ordinary path -- while this
-        # call finishes on the suppressed-draft path below.
-        speculator = self.speculator
-        gate = self._build_spec_gate()
-        self._spec_gate = gate
+            # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
+            # only correct within one generation: `_drafter_seen` is a length into
+            # THIS input_ids. Carried into the next call it slices a different
+            # sequence, and the drafter drafts from another prompt's context.
+            # Measured: three identical greedy calls in one process returned three
+            # different sequences; resetting made them byte-identical.
+            self.speculator.reset()
 
-        self._batch_decode_active = False
-        self._batch_n = 1
+            # S1d: the runtime gate. `speculator` is held locally because an OFF
+            # decision sets self.speculator = None -- the same mechanism the load
+            # gate uses, so every LATER call takes the ordinary path -- while this
+            # call finishes on the suppressed-draft path below.
+            speculator = self.speculator
+            gate = self._build_spec_gate()
+            self._spec_gate = gate
 
-        # Fail fast here too (Task 8), same entry-point policy as generate().
-        # This loop is single-stream (N=1, the default); the per-step verify
-        # forward routes draft_tokens+1 positions at once, but that transient
-        # is far below a full prefill chunk and the final KV length is capped
-        # by prompt_len + max_new_tokens regardless of how many draft/verify
-        # rounds it takes to get there -- the same total this predicate checks
-        # for generate().
-        self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)
+            # P9: size the VRAM cacheable prefix for THIS call's verify width.
+            # A verify pass is (draft_tokens + 1) positions through every MoE layer
+            # in ONE forward, so its per-layer insert load is the routing union over
+            # those positions -- the same quantity P6 sizes for a batch's N streams,
+            # and the same bound Fix #9 already applies to admission. The load-time
+            # call (:2610) charges one stream's top_k, which under-charges a
+            # draft_tokens=3 verify by 4x: MiniMax caches ALL 62 layers while
+            # inserting 4x what it is charged for -- exactly the configuration P6
+            # measured at a 2.35% hit rate against 48.4% when sized right.
+            #
+            # Sized ONCE for the whole call, and ONLY when the gate will actually
+            # draft. A round the gate refuses is an ordinary 1-wide decode, so the
+            # verify-width charge is simply wrong for it -- and a refusal is not a
+            # brief phase: `off` latches and this call then finishes on the
+            # suppressed-draft path, 1-wide to the end. Measured on Qwen3-235B
+            # 2026-09-07, whose gate latches off_union after calibration and never
+            # drafts: 65/94 layers -> 16/94 and 0.9740 -> 0.9423 tok/s, -3.25%.
+            # `should_draft()` latches for the PROCESS, so it is read once here
+            # rather than re-read per round: only the FIRST call of a process can
+            # change phase mid-flight, and there this errs to the load-time sizing,
+            # which is the status quo. Over-charging a pass that IS wide can only
+            # shorten the prefix, the safe direction (a too-long prefix is the
+            # failure being fixed).
+            #
+            # Restored in the finally below: this loop has several returns and had
+            # no finally at all, and a leaked verify-sized prefix would shrink
+            # caching for every later single-stream call. batched_generate and this
+            # path never run together (this one resets _batch_decode_active below);
+            # if that ever changes, the combined width is N * (draft_tokens + 1)
+            # positions, not the max of the two.
+            _vram_c = getattr(self, "_expert_vram_cache", None)
+            _will_draft = gate is None or gate.should_draft()
+            _geo = getattr(self, "_moe_geometry", None)
+            _blocks = getattr(self, "_moe_blocks", None)
+            if _will_draft and _vram_c is not None and _geo and _blocks:
+                _positions = (getattr(self, "draft_tokens", 0) or 0) + 1
+                _union = batch_union_per_layer(_geo, _positions)
+                _verify_layers = compute_vram_layer_range(
+                    _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
+                    experts_per_layer=_union)
+                if _verify_layers != _saved_vram_layers:
+                    self._vram_cacheable_layers = _verify_layers
+                    _resized_vram_prefix = True
+                    # Once per process: this path runs per REQUEST, and the same
+                    # line on every one of them is log spam, not information.
+                    if not getattr(self, "_spec_vram_prefix_announced", False):
+                        self._spec_vram_prefix_announced = True
+                        _n = (len(_blocks) if _verify_layers is None
+                              else len(_verify_layers))
+                        print(f"[Vaayu-Spec] a {_positions}-position verify pass "
+                              f"inserts the routing union ({_union}) per MoE layer, "
+                              f"not top_k ({_geo['top_k']}) — VRAM cache restricted "
+                              f"to {_n}/{len(_blocks)} MoE layers while speculating "
+                              f"(was {len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
 
-        pc = getattr(self, "_prefix_cache", None)
-        kv, ids_list = None, input_ids[0].tolist()
-        if pc is not None:
-            kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
-            if kv is None:
-                kv = self._create_kv_cache()
-            else:
-                self._adopt_prefix_hit(
-                    kv, match_len, input_ids.shape[1], session_id)
+            self._batch_decode_active = False
+            self._batch_n = 1
 
-        # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
-        # gets away with passing the untouched prompt because HF's own
-        # generate() loop calls prepare_inputs_for_generation (above), which
-        # slices input_ids down to what the cache doesn't already hold. This
-        # loop calls forward() directly with no such step, so do it here: feed
-        # only the tail beyond kv's current length, or forward() would
-        # re-append the already-cached prefix on top of itself.
-        prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
+            # Fail fast here too (Task 8), same entry-point policy as generate().
+            # This loop is single-stream (N=1, the default); the per-step verify
+            # forward routes draft_tokens+1 positions at once, but that transient
+            # is far below a full prefill chunk and the final KV length is capped
+            # by prompt_len + max_new_tokens regardless of how many draft/verify
+            # rounds it takes to get there -- the same total this predicate checks
+            # for generate().
+            self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)
 
-        # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
-        prefill_out = self.forward(
-            input_ids=prefill_ids,
-            past_key_values=kv,
-            use_cache=True,
-            return_dict=True,
-        )
-        past_key_values = prefill_out.past_key_values
-        # Seed the first new token from prefill logits
-        first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
-        generated = torch.cat([input_ids, first_token], dim=1)
-        tokens_generated = 1
+            pc = getattr(self, "_prefix_cache", None)
+            kv, ids_list = None, input_ids[0].tolist()
+            if pc is not None:
+                kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
+                if kv is None:
+                    kv = self._create_kv_cache()
+                else:
+                    self._adopt_prefix_hit(
+                        kv, match_len, input_ids.shape[1], session_id)
 
-        if streamer is not None:
-            # Put the PROMPT first, exactly as generate() does. A streamer built
-            # with skip_prompt=True (what stream_generate always builds) swallows
-            # its first put() and clears the flag; without this line the call it
-            # eats is `first_token` -- the first GENERATED token -- so streamed
-            # text and the id sink are both short by exactly one token.
-            streamer.put(input_ids.cpu())
-            streamer.put(first_token.cpu())
+            # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
+            # gets away with passing the untouched prompt because HF's own
+            # generate() loop calls prepare_inputs_for_generation (above), which
+            # slices input_ids down to what the cache doesn't already hold. This
+            # loop calls forward() directly with no such step, so do it here: feed
+            # only the tail beyond kv's current length, or forward() would
+            # re-append the already-cached prefix on top of itself.
+            prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
 
-        eos_ids = self.config.eos_token_id
-        if isinstance(eos_ids, int):
-            eos_ids = [eos_ids]
-        eos_set = set(eos_ids) if eos_ids else set()
+            # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
+            prefill_out = self.forward(
+                input_ids=prefill_ids,
+                past_key_values=kv,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = prefill_out.past_key_values
+            # Seed the first new token from prefill logits
+            first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
+            generated = torch.cat([input_ids, first_token], dim=1)
+            tokens_generated = 1
 
-        if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+            if streamer is not None:
+                # Put the PROMPT first, exactly as generate() does. A streamer built
+                # with skip_prompt=True (what stream_generate always builds) swallows
+                # its first put() and clears the flag; without this line the call it
+                # eats is `first_token` -- the first GENERATED token -- so streamed
+                # text and the id sink are both short by exactly one token.
+                streamer.put(input_ids.cpu())
+                streamer.put(first_token.cpu())
+
+            eos_ids = self.config.eos_token_id
+            if isinstance(eos_ids, int):
+                eos_ids = [eos_ids]
+            eos_set = set(eos_ids) if eos_ids else set()
+
+            if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+                if streamer is not None:
+                    streamer.end()
+                if pc is not None:
+                    resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+                    self._persist_and_store(pc, resolved, kv, generated[0].tolist())
+                return generated
+
+            while tokens_generated < max_new_tokens:
+                # This loop is hand-written, so transformers' criteria machinery
+                # never runs here: check it ourselves or a cancelled request keeps
+                # drafting and verifying with nobody left to read the tokens.
+                if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
+                    break
+
+                # Step 2: Draft K tokens -- unless the gate is still calibrating or
+                # has latched off, in which case this round is an ordinary 1-wide
+                # decode that still produces a token and still shows the gate real
+                # routing.
+                if gate is not None and not gate.should_draft():
+                    draft_ids = torch.empty((1, 0), dtype=generated.dtype,
+                                            device=generated.device)
+                    draft_state = None
+                else:
+                    draft_ids, draft_state = speculator.draft(
+                        generated, past_key_values, num_tokens=self.draft_tokens
+                    )
+                k = draft_ids.shape[1]
+
+                # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
+                # past_key_values has prompt+accepted tokens; verify adds k+1 more
+                past_len_before = past_key_values.get_seq_length()
+                verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
+                verify_out = self.forward(
+                    input_ids=verify_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
+                past_key_values = verify_out.past_key_values
+
+                # Step 4: Accept/reject longest correct prefix
+                accepted_ids, num_accepted = speculator.verify_and_accept(
+                    generated, draft_ids, verifier_logits, draft_state
+                )
+
+                if gate is not None:
+                    if gate.phase == "calibrate":
+                        gate.observe(getattr(self, "_expert_history", {}) or {})
+                    else:
+                        # `num_accepted` (Step 4) is 1..k+1 -- it always includes
+                        # the bonus/correction token verify_and_accept guarantees
+                        # every round. The gate's break-even treats that token as
+                        # the "+1" in "1 + accepted" (design doc §2) and wants only
+                        # the count of DRAFTED tokens that matched, 0..k.
+                        gate.record_round(k, max(0, num_accepted - 1))
+                    if gate.decided_off() and self.speculator is not None:
+                        s = gate.status()
+                        if gate.decision == "off_no_routing":
+                            # 800467d fixed the same ambiguity for a starved
+                            # k-window; this is the other way observed_union_gb
+                            # reads 0.0 -- every calibration snapshot's routing
+                            # dict was empty, i.e. this forward stopped writing
+                            # _expert_history (design doc S8's named risk), not a
+                            # real over-budget refusal. Name the cause, don't let
+                            # it read as a measured union that happened to be 0.
+                            print(f"[Vaayu-Spec] WARNING: no expert routing was "
+                                  f"observed during calibration (_expert_history "
+                                  f"stayed empty every step) -- this forward is "
+                                  f"not writing it, so the gate has no evidence "
+                                  f"to size a verify pass against. DISABLING "
+                                  f"speculative decoding for this MoE model "
+                                  f"rather than guessing: {s}")
+                        else:
+                            print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
+                                  f"for this MoE model on measured evidence: {s}")
+                        self.speculator = None
+                        status = getattr(self, "speculative_status", None)
+                        if status is not None:
+                            status["active"] = False
+                            status["calibration"] = s
+                    elif gate.decision == "run":
+                        # Refreshed every round, not written once: with the gate
+                        # now cached across calls (Critical 1), a `run` decision
+                        # keeps accumulating drafted/accepted after it latches, so
+                        # freezing the first generation's numbers here would make
+                        # every later report stale.
+                        status = getattr(self, "speculative_status", None)
+                        if status is not None:
+                            status["calibration"] = gate.status()
+
+                # Step 5: Trim verifier KV back to past_len + num_accepted
+                # (verify pass grew cache by k+1; we only keep num_accepted new positions)
+                self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
+
+                # Step 6: Sync drafter cache to match accepted length. Skipped
+                # when draft_state is None -- the suppressed-draft path (gate
+                # calibrating, or latched off) never called speculator.draft(),
+                # so there is no drafter-side state to roll back, and a weighted
+                # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
+                # draft_state unconditionally once its own cache is warm and
+                # crashes on None (PLD's is a no-op `pass`, which is why this was
+                # never reachable through it).
+                if draft_state is not None:
+                    speculator.rollback_cache(draft_state, num_accepted)
+
+                # Step 7: Extend generated sequence (cap at max_new_tokens)
+                remaining = max_new_tokens - tokens_generated
+                if num_accepted > remaining:
+                    accepted_ids = accepted_ids[:, :remaining]
+                    num_accepted = remaining
+                generated = torch.cat([generated, accepted_ids], dim=1)
+                tokens_generated += num_accepted
+
+                if streamer is not None:
+                    streamer.put(accepted_ids.cpu())
+
+                accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
+                print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
+                      f"total_new={tokens_generated}/{max_new_tokens} "
+                      f"accept_rate={accept_rate_str}")
+
+                if accepted_ids[0, -1].item() in eos_set:
+                    break
+
             if streamer is not None:
                 streamer.end()
             if pc is not None:
                 resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                 self._persist_and_store(pc, resolved, kv, generated[0].tolist())
+            self.telemetry.dump_json("vaayu_telemetry.json")
             return generated
-
-        while tokens_generated < max_new_tokens:
-            # This loop is hand-written, so transformers' criteria machinery
-            # never runs here: check it ourselves or a cancelled request keeps
-            # drafting and verifying with nobody left to read the tokens.
-            if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
-                break
-
-            # Step 2: Draft K tokens -- unless the gate is still calibrating or
-            # has latched off, in which case this round is an ordinary 1-wide
-            # decode that still produces a token and still shows the gate real
-            # routing.
-            if gate is not None and not gate.should_draft():
-                draft_ids = torch.empty((1, 0), dtype=generated.dtype,
-                                        device=generated.device)
-                draft_state = None
-            else:
-                draft_ids, draft_state = speculator.draft(
-                    generated, past_key_values, num_tokens=self.draft_tokens
-                )
-            k = draft_ids.shape[1]
-
-            # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
-            # past_key_values has prompt+accepted tokens; verify adds k+1 more
-            past_len_before = past_key_values.get_seq_length()
-            verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
-            verify_out = self.forward(
-                input_ids=verify_input,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
-            verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
-            past_key_values = verify_out.past_key_values
-
-            # Step 4: Accept/reject longest correct prefix
-            accepted_ids, num_accepted = speculator.verify_and_accept(
-                generated, draft_ids, verifier_logits, draft_state
-            )
-
-            if gate is not None:
-                if gate.phase == "calibrate":
-                    gate.observe(getattr(self, "_expert_history", {}) or {})
-                else:
-                    # `num_accepted` (Step 4) is 1..k+1 -- it always includes
-                    # the bonus/correction token verify_and_accept guarantees
-                    # every round. The gate's break-even treats that token as
-                    # the "+1" in "1 + accepted" (design doc §2) and wants only
-                    # the count of DRAFTED tokens that matched, 0..k.
-                    gate.record_round(k, max(0, num_accepted - 1))
-                if gate.decided_off() and self.speculator is not None:
-                    s = gate.status()
-                    if gate.decision == "off_no_routing":
-                        # 800467d fixed the same ambiguity for a starved
-                        # k-window; this is the other way observed_union_gb
-                        # reads 0.0 -- every calibration snapshot's routing
-                        # dict was empty, i.e. this forward stopped writing
-                        # _expert_history (design doc S8's named risk), not a
-                        # real over-budget refusal. Name the cause, don't let
-                        # it read as a measured union that happened to be 0.
-                        print(f"[Vaayu-Spec] WARNING: no expert routing was "
-                              f"observed during calibration (_expert_history "
-                              f"stayed empty every step) -- this forward is "
-                              f"not writing it, so the gate has no evidence "
-                              f"to size a verify pass against. DISABLING "
-                              f"speculative decoding for this MoE model "
-                              f"rather than guessing: {s}")
-                    else:
-                        print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
-                              f"for this MoE model on measured evidence: {s}")
-                    self.speculator = None
-                    status = getattr(self, "speculative_status", None)
-                    if status is not None:
-                        status["active"] = False
-                        status["calibration"] = s
-                elif gate.decision == "run":
-                    # Refreshed every round, not written once: with the gate
-                    # now cached across calls (Critical 1), a `run` decision
-                    # keeps accumulating drafted/accepted after it latches, so
-                    # freezing the first generation's numbers here would make
-                    # every later report stale.
-                    status = getattr(self, "speculative_status", None)
-                    if status is not None:
-                        status["calibration"] = gate.status()
-
-            # Step 5: Trim verifier KV back to past_len + num_accepted
-            # (verify pass grew cache by k+1; we only keep num_accepted new positions)
-            self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
-
-            # Step 6: Sync drafter cache to match accepted length. Skipped
-            # when draft_state is None -- the suppressed-draft path (gate
-            # calibrating, or latched off) never called speculator.draft(),
-            # so there is no drafter-side state to roll back, and a weighted
-            # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
-            # draft_state unconditionally once its own cache is warm and
-            # crashes on None (PLD's is a no-op `pass`, which is why this was
-            # never reachable through it).
-            if draft_state is not None:
-                speculator.rollback_cache(draft_state, num_accepted)
-
-            # Step 7: Extend generated sequence (cap at max_new_tokens)
-            remaining = max_new_tokens - tokens_generated
-            if num_accepted > remaining:
-                accepted_ids = accepted_ids[:, :remaining]
-                num_accepted = remaining
-            generated = torch.cat([generated, accepted_ids], dim=1)
-            tokens_generated += num_accepted
-
-            if streamer is not None:
-                streamer.put(accepted_ids.cpu())
-
-            accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
-            print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
-                  f"total_new={tokens_generated}/{max_new_tokens} "
-                  f"accept_rate={accept_rate_str}")
-
-            if accepted_ids[0, -1].item() in eos_set:
-                break
-
-        if streamer is not None:
-            streamer.end()
-        if pc is not None:
-            resolved = session_id if session_id is not None else _auto_session_id(ids_list)
-            self._persist_and_store(pc, resolved, kv, generated[0].tolist())
-        self.telemetry.dump_json("vaayu_telemetry.json")
-        return generated
+        finally:
+            if _resized_vram_prefix:
+                self._vram_cacheable_layers = _saved_vram_layers
 
     @torch.no_grad()
     def batched_generate(self, requests, reclaim: bool = False):
