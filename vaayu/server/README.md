@@ -74,14 +74,30 @@ library defaults: a server holds one model for its whole life and should fill th
 
 ## Speculative decoding
 
-Opt-in, and **refused at load on both MoE targets** by the Fix #9 gate — these are
-streamed-dense wins.
+Opt-in. A **weighted drafter** is still refused at load on a MoE model whose verify
+pass cannot fit the expert cache — it has VRAM and load time to lose. **Prompt lookup
+has neither and is not refused**: it is admitted at load and decided at runtime by the
+adaptive gate, from that model's own routing and acceptance.
 
 | constant | default | what it does |
 |---|---|---|
 | `DRAFTER_MODEL_PATH` | `None` | small drafter model. Measured **5.57×** on streamed dense |
-| `USE_PROMPT_LOOKUP` | `False` | n-gram speculative decoding, **zero VRAM**. Measured **1.94×** on streamed dense; strongest on code, where identifiers and boilerplate repeat |
+| `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` always win |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
+
+> **Turning it on for MoE is worth it on MiniMax-M2.7 and pointless on Qwen3-235B**, and
+> the split is measured, not guessed. `USE_PROMPT_LOOKUP = True` gives MiniMax-M2.7
+> **1.307×** at `DRAFT_TOKENS = 3`, and the VRAM expert-cache prefix is sized for that
+> verify width once the gate latches `run`, worth a further **+4.16 %**. Qwen3-235B's
+> gate **refuses to draft at all** (`off_union` — its observed verify union is 19.31 GB
+> against a ~17 GB budget, 0 drafting rounds), so the switch buys it nothing. The
+> default stays `"auto"` rather than flipping to ON for MoE because the cost to a model
+> the gate refuses has not been measured.
+>
+> Watch which one you got in `logs/latest/server.log`:
+> `[Vaayu-Spec] ... DISABLING speculative decoding for this MoE model on measured
+> evidence: {...}` is a refusal, and `/v1/models` reports the same under
+> `speculative_status.calibration`.
 
 > **`DRAFTER_MODEL_PATH` requires a vocabulary match.** Drafter and target must have
 > identical vocab sizes; the server refuses the pairing at load otherwise, before any
