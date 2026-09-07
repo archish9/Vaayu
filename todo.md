@@ -66,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — the greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[!]` | Wire batched decode into the SERVER — **BLOCKED on row 17** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **BLOCKED 2026-09-07 on row 17: `sdpa` + chunked prefill is garbage on MoE, and `batched_generate` hard-asserts sdpa — switching the server's kernel today would corrupt every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`. Row 17 also prices the switch: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1870,6 +1870,47 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
+# 17 · [bug] `sdpa` + CHUNKED PREFILL = garbage on MoE — BLOCKS row 15
+
+Found 2026-09-07 while pricing row 15's real cost. **PRE-EXISTING: reproduced byte-identical on
+`881aaaa`, before any of this branch's code changes** (verified in a clean `git worktree`).
+
+**MiniMax-M2.7, `generate()`, `attn_implementation="sdpa"`, `prefill_chunk_size=512` held fixed:**
+
+| prompt | chunks | output |
+|---|---|---|
+| 325 tok | 1 | coherent — *"The user is asking me to refactor the watcher code..."* |
+| **709 tok** | **2** | **24 null bytes** |
+| 4165 tok | 9 | 64 null bytes |
+
+**Breaks as soon as there is more than one chunk.** `forward` (`vaayu_base.py:~4077`) sets
+`attention_mask = None` for BOTH `flash_attention_2` and `sdpa`. With no mask, sdpa's implicit
+causal masking is **top-left aligned**, which is wrong whenever `q_len < kv_len` — i.e. every
+prefill chunk after the first, which carries past KV. Flash aligns bottom-right and survives.
+Chunk 0 (`q_len == kv_len`) and decode (`q_len == 1`) are both correct, which is why this hid.
+
+**NO recorded measurement is invalidated.** `batched_generate` builds an EXPLICIT 4D mask
+(`build_batch_attention_mask`) and does its own single-forward prefill, so every P6/P7/P8/P10 sdpa
+arm is unaffected; and the server ships `ATTN_IMPLEMENTATION = None` -> flash, so no user is
+affected today. The exposure is exactly the combination row 15 needs.
+
+**Why it BLOCKS row 15:** `batched_generate` hard-asserts `sdpa` (`vaayu_base.py:5194`), so wiring
+batching means switching the server's kernel — and the server's single-stream path is
+`generate()`/`stream_generate`, which chunks. **Switching the server to sdpa today would corrupt
+every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`.** Fix this first.
+
+**Proposed fix (not built):** build an explicit causal mask for `sdpa` whenever `past_len > 0`,
+instead of passing `None`. The helper already exists for the batched path. Needs a test at 2 chunks
+on both MoE geometries and a dense check, since it touches every prefill.
+
+**Also measured while pricing row 15 (MiniMax, 4165-token prompt), and it belongs to that row's
+decision:** switching flash -> sdpa costs real VRAM before batching pays anything —
+`reserve_bytes` **3.758 -> 5.146 GB**, `pinning_budget` **10.201 -> 8.814 GB**, expert VRAM cache
+budget **8.929 -> 7.542 GB (-15.5 %)**. Cache size sets decode throughput (P6), so **row 15's
+honest comparison is flash@N=1 (what users get today) vs sdpa@N=2 — NOT the sdpa-vs-sdpa +18.0 %
+P10a measured.** That comparison does not exist yet and cannot be taken until this bug is fixed.
+
+---
 # 16 · [x] FIXED 2026-09-07 — tied lm_head never materialized on the PREFETCH path
 
 Found 2026-09-07 by P10b's discriminator arm, which needed a dense model and could not get a sane
@@ -1934,7 +1975,21 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 `docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
 
 ---
-# 15 · [~] Wire batched decode into the SERVER  (§0 **P10**)
+# 15 · [!] Wire batched decode into the SERVER  (§0 **P10**) — BLOCKED on row 17
+
+**[!] BLOCKED 2026-09-07 on row 17** (`sdpa` + chunked prefill = garbage on MoE).
+`batched_generate` hard-asserts `sdpa`; the server runs flash and its single-stream path chunks, so
+switching the kernel today would corrupt every single-stream request with a prompt over
+`PREFILL_CHUNK_SIZE`. **Unblocked by:** fixing row 17.
+
+**Row 17 also carries the other half of this row's economics:** flash -> sdpa costs the expert VRAM
+cache **-15.5 %** (8.929 -> 7.542 GB on MiniMax) before batching pays anything, so this row's real
+comparison is **flash@N=1 vs sdpa@N=2**, not P10a's sdpa-vs-sdpa +18.0 %. Take that A/B before
+building the scheduler; **it can still refute the row.**
+
+**Design note already established (2026-09-07): NO arrival window is needed in v1.** `QUEUE_DEPTH`
+is 8 and `slot()` already queues waiters, so a batch can be formed from requests ALREADY waiting —
+zero added TTFT for anyone. An arrival window is a v2 question, not a v1 requirement.
 
 **Self-contained brief: [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md)**
 (gitignored, this disk only — restated here). Opened 2026-09-07 by the CLAUDE.md §8 audit.
