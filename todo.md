@@ -46,9 +46,12 @@ accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The 
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
 **TWO rows are open — P10 and P5**, each with a SELF-CONTAINED brief in `docs/` linked in
-the table. **Order: P10 first.** It is the only row whose payoff is already built and measured
-(P6 + P8, both stranded at N>1), and its first step is a one-arm measurement that can refute it
-before any code is written. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
+the table. **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
+measurement ran 2026-09-07 and the row PASSED at **1.48-1.78x end-to-end** at realistic agentic
+context — the largest effect on this board by an order of magnitude, and mostly a PREFILL win, not
+the decode win P6/P8 banked. It also found its own prerequisite: `_assert_context_fits` refuses
+every N>1 at that context, so the server wiring must be preceded by fixing gate 2 or it ships
+inert. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
 Qwen3-235B — read its vacancy note below before proposing anything that touches the fused
 forward's expert dispatch.**
 **P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
@@ -63,7 +66,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** | Wire batched decode into the SERVER | **P6 (+11.6-12.1 % MiniMax) and P8 (+3.21 % Qwen) are both measured, shipped, green — and deliver ZERO to users, because both effects exist only at N>1 and the server runs one request at a time** (`engine.py:185`, and its docstring says `batched_generate` is deliberately not wired in). Highest banked value on the board: the mechanism is already built and tested; only the server refuses to use it. **Starts with a measurement that can refute it in ONE arm** — does `plan_batch` admit N>=2 at a realistic ~4.15k-token agentic context, or only at the ~690-token prompts every N=3 number on record was taken at? | none | OPTIONAL row **15** · [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[~]` | Wire batched decode into the SERVER | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refuses EVERY N>1 at that context, so wiring the server alone would ship the feature INERT.** Fix gate 2 first. | **gate 2 (`admission_headroom`) must price the post-reclaim configuration** | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1867,7 +1870,7 @@ changing `enable_expert_usage`'s default. **This row cannot be refuted, only red
 
 ---
 
-# 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**)
+# 15 · [~] Wire batched decode into the SERVER  (§0 **P10**)
 
 **Self-contained brief: [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md)**
 (gitignored, this disk only — restated here). Opened 2026-09-07 by the CLAUDE.md §8 audit.
@@ -1889,12 +1892,57 @@ admission for exactly this already exists — `plan_batch` (`batch.py:333`) retu
 refusal with the admission control that already exists, falling back to today's serialized path for
 whatever it defers; a batch of 1 must be byte-identical to today.**
 
-**FIRST STEP IS A ONE-ARM MEASUREMENT THAT CAN REFUTE THE ROW — do it before writing server code.**
-Every N=3 number on record used ~690-token prompts; realistic agentic context is ~4.15k (row 5).
-Load each model, build 2 and 3 `BatchRequest`s at ~4.15k tokens, call
-`plan_batch(model, reqs, reclaim=True)`, print admitted/deferred (copy `probe_fanout.py`'s load +
-ballast). **Defers everything to N=1 → row REFUTED and P6/P8 stay banked with the reason recorded**
-(house rule: refutation closes the row). Admits N=2 but not N=3 → build for the width that admits.
+**[x] THE REFUTING MEASUREMENT RAN 2026-09-07. THE ROW PASSED — and it is worth an order of
+magnitude more than this row claimed.** Full write-up:
+[`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md);
+probe `plans/probes/p10_admit.py`. Arms: ~4.15k-token prompts (system + synthetic file context +
+task), `max_new_tokens=512` charged to KV, 16 tokens consumed then `gen.close()`, `BALLAST_GB=27`,
+sdpa, greedy, one `systemd-run` scope each.
+
+**Two gates, not one — and the brief named only the weaker.** `plan_batch` prices KV alone and
+**admitted N=3 with zero deferrals on BOTH models**. `_assert_context_fits(n_tokens, N=N)`, which
+`batched_generate` itself calls at the real width (`vaayu_base.py:5195`), prices the sdpa score
+transient and **RAISED on every N>1 arm**. A probe checking `plan_batch` alone would have reported
+"admits N=3" and then OOM'd in the prefill.
+
+| model | N | `plan_batch` | gate 2 | forced run | peak VRAM | TTFT | aggregate tok/s |
+|---|---|---|---|---|---|---|---|
+| MiniMax-M2.7 | 1 | 1/0 | **PASS** | ok | 12.972 GB | 205.12 s | 1.634 |
+| MiniMax-M2.7 | 2 | 2/0 | RAISE (max 3331) | **ok** | 15.157 GB | 228.73 s | **2.180** (+33.4 %) |
+| MiniMax-M2.7 | 3 | 3/0 | RAISE (max 2048) | **OOM** `model.layers.22`, 14.93 of 15.47 GiB | — | — | — |
+| Qwen3-235B | 1 | 1/0 | **PASS** | ok | 11.662 GB | 214.25 s | 0.927 |
+| Qwen3-235B | 2 | 2/0 | RAISE (max 4096) | **ok** | 13.367 GB | 214.22 s | **1.582** (+70.7 %) |
+| Qwen3-235B | 3 | 3/0 | RAISE (max 2048) | **ok** | 15.084 GB | 260.11 s | 1.278 (+37.9 %) |
+
+**End-to-end (the number the row exists for): 1.77x / 1.98x / 2.34x at the measured 16 tokens;
+1.48x / 1.78x / 1.57x projected at 512 tokens generated** (MiniMax N=2, Qwen N=2, Qwen N=3). **The
+win is mostly PREFILL, not decode.** Qwen prefilled two 4.18k-token streams in **214.22 s against
+214.25 s for one** — free within 0.02 %; MiniMax paid +11.5 %. Prefill at this context is dominated
+by streaming weights off NVMe, which N streams share. That is CLAUDE.md §0's fan-out argument,
+measured.
+
+**`[bug]` PREREQUISITE, and it is why wiring the server alone would ship this INERT: gate 2 is
+over-conservative and refuses N>1 at realistic context.** Its own message says why — *"the expert
+VRAM cache is entitled to everything above the reserve and fills during prefill, so only the reserve
+is actually available here"* — so `admission_headroom` hands the request the reserve (4.79 GiB
+MiniMax / 5.60 GiB Qwen) and refuses against it while 11.57 / 9.26 GiB is free. **But
+`batched_generate` reclaims that cache to its working-set floor immediately AFTER the assert**
+("Plan K", `vaayu_base.py:~5200`), so the assert prices a configuration the batch never runs in.
+Forced past it, 3 of the 4 N>1 arms ran fine. **Gate 2 must price the POST-reclaim configuration**
+(or the two gates must be reconciled into one) BEFORE the server work, or admission defers 100 % of
+the time and the feature is decoration.
+
+**Do NOT delete gate 2 and do NOT replace it with `plan_batch`:** gate 2 was RIGHT once — MiniMax
+N=3 genuinely OOM'd — and `plan_batch` admitted exactly that arm.
+
+**Max width is model- and context-dependent, and it is not 3.** MiniMax takes 2 here; Qwen takes 3
+but is FASTER at 2 (1.582 vs 1.278 aggregate — bigger KV starves the expert cache). Any
+`MAX_BATCH_SIZE` is a ceiling, never a target.
+
+**Caveats before quoting any of this:** every forced arm ran with a COLD expert VRAM cache
+(`reclaimable_expert=0.000 GB`, fresh load) — the warm-cache margin is UNMEASURED and the tightest
+arm had ~1.3 GiB of slack; 16 consumed tokens is a short decode window (ranks widths, not a
+P6-grade A/B); TTFT arms were not first-touch-controlled.
 
 **What the build actually is** (engine side exists; this is server work): batch formation with a
 short arrival window, one worker driving `batched_generate` fanning `(stream_id, token_id)` to N
@@ -1906,13 +1954,14 @@ logging breaks under N>1 and `docs/issue-L1-triage-logging.md` predicted it and 
 `MAX_BATCH_SIZE = 1` knob in `config.py` in the same commit (§8). Per-stream `temperature`/`top_p`
 already exist on `BatchRequest`.
 
-**Done means** the server serves N concurrent requests when admission allows and falls back
-otherwise; **a server-level on-device A/B** (N=2 and N=3 concurrent clients vs today's serialized
+**Done means** gate 2 prices the post-reclaim configuration (above) AND the server serves N
+concurrent requests when admission allows and falls back otherwise; **a server-level on-device A/B** (N=2 and N=3 concurrent clients vs today's serialized
 path at the same offered load — an engine probe number does NOT discharge this); greedy ids
 identical to single-stream; no OOM at the real derived context; a disconnect mid-batch leaves the
 engine usable, proven by a test that abandons the generator; suite green; L1 session attribution
-still correct. **Refuted if** admission defers to N=1 at realistic context, or the server-level A/B
-shows no aggregate gain.
+still correct. **Refuted if** the server-level A/B shows no aggregate gain. (The other refutation
+condition — "admission defers to N=1 at realistic context" — was TESTED 2026-09-07 and did NOT
+fire: `plan_batch` admits N=3 on both models.)
 
 **Trap, measured 2026-09-07:** interleave A/B arms BOTH ways. On MiniMax, whichever arm ran SECOND
 was 0.4-0.9 % slower and replicate spreads were 0.44-0.65 % — not the 0.06-0.18 % the Environment
