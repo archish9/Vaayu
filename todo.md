@@ -1619,6 +1619,17 @@ were 0.44-0.65 %, well outside the ledger's stated 0.06-0.18 % band — **treat 
 until re-established.** Qwen's arms also ran 0-first in both pairs, so the same drift worked
 AGAINST the treatment there: **+3.21 % is understated, not inflated.**
 
+**SERVER REACHABILITY (CLAUDE.md §8): NOT REACHABLE TODAY — this win is BANKED, not delivered.**
+The server runs one request at a time (`engine.py`'s `slot()` under `self._lock`) and
+**`batched_generate` is deliberately not wired in** (its own module docstring: N>=2 at long context
+peaks 14.17-15.57 GiB of 15.47). P8's prize exists only at N>1: at N=1 the prefix is the load-time
+41/94 set, so VRAM per-layer capacity is 3.925/41/11.83 MB = **8.1 experts against RAM's 15** — the
+inversion REVERSES and the suppression never fires. **P1 measured exactly that: 0 wasted reads at
+N=1 on 5922 visits.** Unblocked by either (a) wiring batched decode into the server, or (b) opting
+MoE speculation in (`USE_PROMPT_LOOKUP`), which re-sizes the prefix short enough to recreate the
+inversion. **No config knob is needed or wanted** — the change is unconditional and inert where it
+does not apply.
+
 Tests `tests/test_moe_patch.py` +5; suite **1720 passed, 12 skipped**. Harness
 `plans/probes/p8_trace.py` (attribution), `plans/probes/p8_ab.sh` + a `P8` arm gate in
 `probe_fanout.py` (`P8=0` restores the old dispatch; the `_vram.get()` hoist runs in BOTH arms, so

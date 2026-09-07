@@ -259,4 +259,41 @@ they already exist; do not add new ones — new work goes in `docs/`.
 
 ---
 
+## 8. Every Feature Must Reach the Server (NON-NEGOTIABLE)
+
+**`vaayu/server` is the ONLY interface users have. Nobody imports `AutoModel`. A change that
+works in a library call but is unreachable, unwired, or inert through the server is NOT
+shipped — it is banked.** Say which of those it is, in the same commit, every time.
+
+The engine's `__init__` exposes 28 parameters; `vaayu/server/config.py` reaches 14. That gap is
+where features go to die silently.
+
+**Definition of done, extended. Every change answers all four, in the `todo.md` row AND the
+RESULTS doc:**
+
+1. **Does it need a knob?** If yes, it lands in `vaayu/server/config.py` **in the same commit**,
+   with the measured cost of getting it wrong, and in `vaayu/server/README.md`. "No knob needed"
+   is a valid answer — but it must be *stated*, never assumed.
+2. **Is it plumbed?** A knob that `app.py`'s `from_pretrained(...)` call or `engine.py`'s
+   generation path never passes is decoration. Grep both before claiming it is wired.
+3. **Is it REACHABLE in the server's actual mode?** This is the one that gets missed. The server
+   runs **one request at a time** (`engine.py`'s `slot()` under `self._lock`) and
+   **`batched_generate` is deliberately NOT wired in** — so any win measured at N>1 is worth
+   **zero** to a user until that changes. Same trap for any feature measured under a
+   configuration the server does not default to.
+4. **If it is NOT reachable today, say so in the row, with what unblocks it.** Banked is fine.
+   Silently banked is not.
+
+**The case this rule was written from:** P8 (2026-09-07) measured **+3.21 % on Qwen3-235B at
+N=3**, shipped green, and delivers **0 %** through the server — the capacity inversion it
+exploits only exists at N>1, and at N=1 P1 measured 0 of the wasted reads it removes. Nothing
+about the change was wrong. It was measured in a mode no user can reach, and that was discovered
+*after* it shipped rather than before it was chosen.
+
+**So it also applies BEFORE the work, not just after:** when ranking perf ideas, an effect that
+only exists at N>1 is worth zero today, whatever its size. Weigh it against a single-stream
+effect accordingly, and say which you are choosing.
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
