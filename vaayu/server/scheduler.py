@@ -60,6 +60,12 @@ class Job:
 
 
 class BatchScheduler:
+    # Formation attempts with two or more waiting requests before the "never
+    # admitted" line prints. Enough that a couple of unlucky warm-prefix
+    # pairs do not trigger it; small enough that a misconfigured server says
+    # so in the first minutes rather than in a probe months later.
+    NEVER_ADMITTED_AFTER = 20
+
     def __init__(self, engine, queue_depth: int = 8, max_batch_size: int = 1,
                  prefill_chunk_size: int = 512):
         self.engine = engine
@@ -83,6 +89,25 @@ class BatchScheduler:
         # a feature that ships and quietly does nothing.
         self.formations_refused = 0
         self.batches_run = 0
+        # CLAUDE.md section 8's guard: attempts counted (2+ waiting jobs,
+        # batching enabled) so the on-device probe -- and the latched notice
+        # below -- can tell "never formed a batch" from "formed and did not
+        # help".
+        self._formation_attempts = 0
+        self._never_admitted_warned = False
+        if self.max_batch_size > 1 and not self.batching_enabled:
+            # ATTN_IMPLEMENTATION = None looks like sdpa in a stale config.py
+            # comment but actually prefers flash_attention_2 whenever
+            # flash_attn imports -- so an operator going by that comment gets
+            # this exact silent-inert knob. Name it here so they don't have
+            # to find that out from a probe.
+            print(f"[Vaayu-Server] WARNING: MAX_BATCH_SIZE is "
+                  f"{self.max_batch_size} but this model loaded on "
+                  f"{getattr(engine.model, '_active_attn_impl', None)!r}. "
+                  f"Batched decode requires sdpa, so requests will be served "
+                  f"ONE AT A TIME and the knob is inert. Set "
+                  f"ATTN_IMPLEMENTATION = \"sdpa\" in vaayu/server/config.py "
+                  f"to enable it (the kernel itself costs 2-4 % end-to-end).")
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -281,13 +306,41 @@ class BatchScheduler:
             return []
         if not self.batching_enabled or len(self._waiting) < 2:
             return self._waiting[:1]
+        self._formation_attempts += 1
         cands = [Candidate(prompt_ids=j.prompt_ids, own_match=j.peek_len)
                  for j in self._waiting]
         width = select_width(cands, max_batch_size=self.max_batch_size,
                              chunk=self.prefill_chunk_size)
         if width < 2:
+            self._note_if_never_admitting()
             return self._waiting[:1]
-        return self._admit(self._waiting[:width])
+        admitted = self._admit(self._waiting[:width])
+        if len(admitted) < 2:
+            self._note_if_never_admitting()
+        return admitted
+
+    def _note_if_never_admitting(self) -> None:
+        """Say it ONCE when batching is configured and never forms a batch.
+
+        This is Qwen3-235B today: its admission grants N=1, so an operator
+        who set MAX_BATCH_SIZE > 1 is paying sdpa's 2-4 % for nothing and has
+        no way to know. CLAUDE.md section 8 -- a feature that ships and
+        quietly does nothing -- is exactly what this row exists to end.
+        Latched: a flood of warnings would itself be the failure it reports.
+        """
+        if (self._never_admitted_warned or self.batches_run
+                or self._formation_attempts < self.NEVER_ADMITTED_AFTER):
+            return
+        self._never_admitted_warned = True
+        print(f"[Vaayu-Server] NOTE: batching has never admitted in "
+              f"{self._formation_attempts} attempts with MAX_BATCH_SIZE="
+              f"{self.max_batch_size}. Every request has been served alone, "
+              f"so the sdpa kernel is being paid for (2-4 % end-to-end) with "
+              f"no batching in return. Either this model's admission refuses "
+              f"N>1 at this context, or warm prefix reuse is worth more than "
+              f"batching for this workload -- both are legitimate, and both "
+              f"mean MAX_BATCH_SIZE = 1 plus flash is the faster "
+              f"configuration here.")
 
     def _admit(self, members: list) -> list:
         """KV pricing (plan_batch). Whatever it defers keeps its queue place.
