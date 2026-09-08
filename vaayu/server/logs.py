@@ -28,26 +28,28 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 _write_lock = threading.Lock()
 
 _marker_lock = threading.Lock()
-_current_session: str | None = None
+_current_sessions: tuple = ()
+_attribution_lost = False
 _overlap_warned = False
 _session_event_warned = False
 
-# The one session generating right now, or None when the engine is idle.
+# The sessions generating right now, or () when the engine is idle.
 #
-# This is sound ONLY because ServerEngine.slot() runs exactly one generation at
-# a time under its lock (vaayu/server/engine.py) -- deliberately, because the
-# engine is not thread-safe across the KV cache, the expert VRAM cache and the
-# slab arena. That is what lets the whole process-wide stream, including
-# print() from inside vaayu_base and eprintln! from vaayu_rust -- neither of
-# which carries any session context -- be attributed to one request.
+# A TUPLE, not one id, since P10 wired batched decode into the server: the
+# dispatcher runs a batch of one OR N, and at N>1 several sessions share one
+# forward and one output stream. print() from inside vaayu_base and eprintln!
+# from vaayu_rust carry no session context, so a shared line cannot be
+# attributed to one member -- it is tagged `session=*` and COPIED into every
+# member's own log, which is issue-L1-triage-logging.md section 5's T4. At one
+# member this is exactly what it always was.
 #
-# >>> THIS ASSUMPTION HAS AN EXPIRY DATE. <<<
-# Batched decode (Feature B, N>1) breaks it: several sessions would then share
-# one forward and one output stream. When that lands, this marker must become a
-# SET, and any line that cannot be attributed to exactly one session must be
-# tagged `session=*` rather than guessed. The overlap path below already tags
-# `*` and warns, so the day it happens is visible in the log rather than silent
-# -- but the fix is a set, not a louder warning.
+# `_attribution_lost` is the other case: two generations in flight at once,
+# which the dispatcher makes an invariant violation rather than a race (it is
+# the only setter and it always clears before setting). It stays a WARNING and
+# never a raise -- a logging fault must not become a 500 on the generation
+# path -- and the line then belongs to nobody's session log rather than being
+# guessed at one. The assertion issue L1 asked for is a test
+# (tests/test_logs_multisession.py), not a raise here.
 
 
 _pump_active = 0
@@ -119,44 +121,71 @@ def drain(timeout: float = _DRAIN_TIMEOUT) -> bool:
 
 
 def set_current_session(session_id) -> None:
-    """Mark the session that owns the output stream from here until cleared."""
-    global _current_session, _overlap_warned
-    # BEFORE the lock, always: _emit() calls current_session(), which takes
+    """Mark the ONE session that owns the output stream from here until cleared."""
+    set_current_sessions([session_id])
+
+
+def set_current_sessions(session_ids) -> None:
+    """Mark the sessions sharing the output stream until cleared (P10, N>1)."""
+    global _current_sessions, _attribution_lost, _overlap_warned
+    # BEFORE the lock, always: _emit() calls current_marker(), which takes
     # _marker_lock too, so draining while holding it would deadlock the pump
     # against this thread and hang the server on every request.
     drain()
+    members = tuple(dict.fromkeys(
+        (sanitize_session(s) if s else UNNAMED) for s in session_ids))
     with _marker_lock:
-        marker = sanitize_session(session_id) if session_id else UNNAMED
-        if _current_session is not None and _current_session != marker:
+        if _current_sessions and set(_current_sessions) != set(members):
             # Two generations in flight. Do NOT raise: this runs on the
             # generation path, and a logging failure must never become a 500.
             # Do NOT guess either -- attribute to nobody.
             if not _overlap_warned:
                 _overlap_warned = True
                 try:
-                    print(f"[Vaayu-Server] WARNING: session {marker!r} started "
-                          f"while {_current_session!r} was still generating. "
+                    print(f"[Vaayu-Server] WARNING: sessions {members!r} started "
+                          f"while {_current_sessions!r} was still generating. "
                           f"Per-session log attribution is no longer sound and "
-                          f"lines are being tagged `session=*`. This is the "
-                          f"batched-decode tripwire: the marker needs to become a "
-                          f"set (see vaayu/server/logs.py).")
+                          f"lines are being tagged `session=*`. The dispatcher "
+                          f"is meant to be the only setter (see "
+                          f"vaayu/server/scheduler.py); this is a real "
+                          f"invariant violation, not a batch.")
                 except OSError:
                     pass  # same rule as everywhere else on this path: never raise
-            _current_session = "*"
+            _attribution_lost = True
             return
-        _current_session = marker
+        _attribution_lost = False
+        _current_sessions = members
 
 
 def clear_current_session() -> None:
-    global _current_session
-    drain()  # same deadlock note as set_current_session -- before the lock
+    global _current_sessions, _attribution_lost
+    drain()  # same deadlock note as set_current_sessions -- before the lock
     with _marker_lock:
-        _current_session = None
+        _current_sessions = ()
+        _attribution_lost = False
+
+
+def current_marker():
+    """(tag, members). `tag` is what a line is stamped with; `members` are the
+    session logs it must be copied into.
+
+    A shared line's tag is `*` and its members are every session in the batch.
+    An UNATTRIBUTABLE line's tag is also `*`, but its members are empty -- it
+    belongs to nobody, which is the difference between sharing and guessing.
+    """
+    with _marker_lock:
+        if _attribution_lost:
+            return "*", ()
+        if not _current_sessions:
+            return None, ()
+        if len(_current_sessions) == 1:
+            return _current_sessions[0], _current_sessions
+        return "*", _current_sessions
 
 
 def current_session() -> str | None:
-    with _marker_lock:
-        return _current_session
+    """The tag a line is stamped with. Kept for callers that only need that."""
+    return current_marker()[0]
 
 # CSI sequences: colour, cursor moves, erase-line. tqdm and rich emit these on
 # every redraw; in a file they are noise that breaks grep and line counting.
@@ -393,7 +422,7 @@ def capture_stdio(log_path, rotate_mb: int = 50):
             raw = raw.replace(_DRAIN_TOKEN, "")
             if not raw:
                 return
-        session = current_session()
+        session, members = current_marker()
         text = format_line(raw, session=session)
         if not text:
             return
@@ -409,8 +438,13 @@ def capture_stdio(log_path, rotate_mb: int = 50):
             state["size"] += len(data)
         except OSError:
             pass
-        if session and session != "*":
-            _session_write(run_dir, session, data, rotate_mb)
+        # Every member, not "the" member: at N>1 a shared line is tagged `*`
+        # and copied into each session in the batch, so reading ONE session's
+        # log still shows the engine work its tokens came out of. `members` is
+        # empty when attribution was lost, so an unattributable line reaches
+        # server.log only.
+        for member in members:
+            _session_write(run_dir, member, data, rotate_mb)
 
     drain_bytes = _DRAIN_TOKEN.encode()
 
