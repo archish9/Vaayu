@@ -68,7 +68,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[ ]` | Wire batched decode into the SERVER — **UNBLOCKED 2026-09-08** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **UNBLOCKED 2026-09-08: row 17 is FIXED** — sdpa now builds an explicit bottom-right causal mask at `q_len > 1, past > 0` (verified on all three forwards), so switching the server's kernel no longer corrupts single-stream requests. **Row 17 still prices the switch, and that price is unchanged: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[ ]` | Wire batched decode into the SERVER — **UNBLOCKED 2026-09-08** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **UNBLOCKED 2026-09-08: row 17 is FIXED** — sdpa now builds an explicit bottom-right causal mask at `q_len > 1, past > 0` (verified on all three forwards), so switching the server's kernel no longer corrupts single-stream requests. **Row 17 still prices the switch, and that price is unchanged: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | **BUILD HANDOFF [`docs/2026-09-08-P10-server-batching-HANDOFF.md`](docs/2026-09-08-P10-server-batching-HANDOFF.md) — start here** · OPTIONAL row **15** · [`docs/2026-09-08-P10-kernel-ab-RESULTS.md`](docs/2026-09-08-P10-kernel-ab-RESULTS.md) · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -2079,6 +2079,14 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 ---
 # 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08
 
+**▶ BUILD HANDOFF, written 2026-09-08 to be picked up COLD in a fresh session:
+[`docs/2026-09-08-P10-server-batching-HANDOFF.md`](docs/2026-09-08-P10-server-batching-HANDOFF.md)**
+(gitignored, this disk only — this row restates every load-bearing number). It carries what is
+already built and must NOT be rebuilt, the three measurements that set the design, the 8-item build
+order, the CORRECTED identity criterion, and the environment traps. **Start there, not at the
+2026-09-07 brief** — that brief's §4 measurement is discharged and its economics are superseded.
+
+
 **[ ] UNBLOCKED 2026-09-08 — row 17 is FIXED** (`sdpa` now gets an explicit causal mask at
 `q_len > 1, past > 0`; `docs/2026-09-08-row17-sdpa-causal-mask-RESULTS.md`). The kernel switch is
 now SAFE; it is still not free — see the −15.5 % expert-cache charge below, which row 17 did not
@@ -2108,22 +2116,35 @@ kernel at **-2.3 % MiniMax / -4.1 % Qwen end-to-end**, not -15.5 %. That figure 
 BUDGET percentage and does not convert to time at this context, because prefill dominates and
 prefill is not cache-bound the way decode is. **Never quote it as a throughput cost again.**
 
-**THE REAL BLOCKER IS THAT `batched_generate` NEVER CHUNKS ITS PREFILL.** Measured, not argued:
-`Chunked prefill` appears **2** times in Qwen's sdpa_serial log and **0** times in its sdpa_batch
-log. It forfeits `_chunked_prefill`'s layer-major batching -- whose own comment prices it: chunks as
-batch elements read "every expert once per prefill instead of once per chunk (a chunk-major 4k
-prompt otherwise re-reads the full expert set 8x)". **Qwen TTFT 30.75 -> 212.94 s, 6.9x against 9
-chunks at 4177 tokens.** MiniMax does not collapse (212.40 chunked vs 223.30 single-forward for TWO
-streams) because the **prefill stager is EXL3-fused-only** (`_moe_stager_capable`; the module-list
-forward passes `staged_layer=None`) -- Qwen is the only model that HAS it to lose.
+**THE REAL BLOCKER, CORRECTED — and the fix is one routing rule, not a prefill rewrite.**
+`batched_generate` DOES chunk: it runs its own chunk loop (`vaayu_base.py:5463`,
+`_step = prefill_chunk_size`) and sets `self.prefill_chunk_size = 0` so `forward()` does not also
+chunk. What it cannot do is **layer-major** chunking — `forward`'s layer-major fast path turns
+chunks INTO batch elements and so needs the batch dimension `batched_generate` already owns. The
+comment at `:5455` prices it already: *"the layer-major optimisation that reads each expert once per
+PREFILL rather than once per chunk is the very trick that cannot compose with a batch, so a batched
+chunked prefill re-reads the expert set per chunk. That buys the ability to run at all."*
+**Qwen TTFT 30.75 → 212.94 s, 6.9x against 9 chunks at 4177 tokens.** MiniMax does not collapse
+(212.40 chunked vs 223.30 single-forward for TWO streams) because the **prefill stager is
+EXL3-fused-only** (`_moe_stager_capable`; the module-list forward passes `staged_layer=None`) —
+Qwen is the only model that HAS it to lose.
 
-**So the build order changed. The FIRST item is no longer the scheduler:**
-1. **Give `batched_generate` a chunked prefill.** Qwen's 6.9x lives there and it is worth more than
-   the scheduler on the model that currently loses.
-2. **A global `ATTN_IMPLEMENTATION` flip is REFUTED** (-3.371x on Qwen). The kernel must not switch
-   for a model that cannot batch.
-3. Qwen's admission refusal is the second blocker; P10a already explains it (giveback 0.00 GB), and
-   this A/B is the first time its SERVER-LEVEL cost was priced.
+**BUT QWEN'S −3.371x IS AN ARTIFACT OF THE PROBE'S ROUTING, NOT A PROPERTY OF THE ROW.** Qwen's
+admission grants **N=1**, and the probe still drove that single request through `batched_generate`.
+**The server must not.** This row already requires *"a batch of 1 must be byte-identical to today"*,
+and honouring it routes N=1 to `stream_generate` — the `sdpa_serial` arm, **177.14 s, not 573.88 s**.
+With N=1 served serially, Qwen's real cost of a kernel switch is **−4.1 %** and its batching gain is
+zero; MiniMax keeps **+1.606x**. Nothing refutes the row.
+
+**Build order, corrected:**
+1. **N=1 MUST NOT go through `batched_generate`.** Highest-value rule on this row: already its own
+   stated requirement, worth 3.24x on Qwen, and the difference between shipping and regressing every
+   Qwen user.
+2. **Choose the kernel PER LOAD, not globally.** Qwen cannot batch today (admission refuses N≥2), so
+   flipping its kernel buys nothing and costs 4 %.
+3. **The per-chunk expert re-read is real but UNREACHABLE today.** It bites only at N≥2, and the one
+   model that batches (MiniMax) wins +1.606x with it included. **Do not rebuild
+   layer-major-for-batches on this evidence** — future item, gated on Qwen's admission first.
 4. **MiniMax alone justifies the row** at +1.606x end-to-end through shipped admission, nothing forced.
 
 **NEW FACT, PREVIOUSLY NOWHERE ON RECORD: Qwen3-235B prefills 4177 tokens in 28.23 s on flash.**
