@@ -2128,7 +2128,9 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
 - [ ] T4 `logs.py` session marker becomes a tuple (issue L1 T4)
 - [ ] T5 `_Detok` + `_BatchStream` — per-stream text, stop strings, finish, row
 - [ ] T6 `EngineHandle.run_batch` — fan-out over one worker thread
-- [ ] T7 `vaayu/server/scheduler.py` — the dispatch loop
+- [x] T7 `vaayu/server/scheduler.py` — the dispatch loop (2026-09-08, 6/6 tests
+  green; brief needed 2 more corrections beyond the handoff's 4 — see
+  `docs/2026-09-08-p10-server-batching/task-7-report.md`)
 - [ ] T8 Routes + `MAX_BATCH_SIZE` knob + README + the false sdpa doc lines
 - [ ] T9 Inert notices (startup kernel warning, latched never-admitted line)
 - [ ] T10 Server-level on-device A/B + RESULTS + close the row
