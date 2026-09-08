@@ -376,3 +376,77 @@ def test_an_empty_first_delta_does_not_stall_other_members():
     assert job0_untouched, (
         "job 0 (empty first delta, then nothing until the batch's very end) "
         "must still be untouched when job 1's first real delta arrives")
+
+
+def test_cancelling_the_dispatch_task_ends_it(monkeypatch):
+    """Regression test for review finding B (2026-09-08).
+
+    Task 8 wires this scheduler into the app lifespan; whatever mechanism it
+    uses to stop the dispatcher, a cancelled dispatch task must actually end
+    rather than swallow the CancelledError and keep looping -- otherwise
+    shutdown hangs forever waiting for a task that never finishes.
+
+    `fake_stream` yields one delta then blocks "forever" on `hang`, so the
+    task is genuinely suspended mid-run (inside _run_serial's own stream()
+    consumption) when the test cancels it.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    hang = asyncio.Event()
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        yield ("delta", "x")
+        await hang.wait()
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        job = _job("s0")
+        await sched.submit(job)
+        first = await job.out.get()          # proves _run has actually started
+        sched._task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(sched._task, timeout=5)
+        rest = []
+        while not job.out.empty():
+            rest.append(job.out.get_nowait())
+        return first, rest
+
+    first, rest = asyncio.run(go())
+    assert first == ("delta", "x")
+    assert any(k == "error" for k, _p in rest), (
+        "the batch's own client must still be notified before the "
+        "dispatcher ends")
+    assert None in rest, "and still get a sentinel"
+
+
+def test_a_job_cancelled_while_queued_still_gets_a_sentinel():
+    """Regression test for review finding C (2026-09-08).
+
+    `_form` drops an already-cancelled job before it can become a batch
+    member (it would waste a real batch slot on a stream nobody is
+    listening to). It must still deliver the job's sentinel -- Task 8's
+    non-streaming route awaits `job.out.get()` after its own disconnect
+    watcher fires, and a job dropped with nothing written to its queue
+    would leave that await hanging forever.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+    job = _job("s0")
+    job.cancel.cancel()
+    sched._waiting.append(job)
+
+    async def go():
+        members = await sched._form()
+        out = await asyncio.wait_for(_drain(job), timeout=5)
+        return members, out
+
+    members, out = asyncio.run(go())
+    assert members == []
+    assert sched._waiting == []
+    assert out == []

@@ -804,11 +804,20 @@ class EngineHandle:
         typically -- it is a generator function, so nothing runs until the
         first `next()`), this raises the underlying error instead of fanning
         it out, and no job's queue has anything in it. That is deliberate:
-        the caller (BatchScheduler._run_batched) can then retry the same jobs
+        the caller (BatchScheduler._run) can then retry the same jobs
         serially without any risk of a client seeing output twice. A failure
         that happens AFTER some job already got a real delta still fans out
         to every job exactly as before -- a client waits forever on a queue
-        nobody will write to again.
+        nobody will write to again. (A real cancellation racing with that
+        raise is not swallowed by it either -- see the `sys.exc_info()`
+        guard below.)
+
+        On the raise path, NO requests.jsonl row is written for any of
+        `jobs` here -- `_write_request_row` lives inside the per-job
+        fan-out loop this raise skips. That is correct, not a gap: the
+        caller's serial retry runs each job through stream()/generate(),
+        which write their own row exactly once each. Fanning out AND
+        raising would double-count every retried request.
         """
         import time
 
@@ -930,14 +939,30 @@ class EngineHandle:
             finally:
                 self._live_cancels = []
                 self._live_thread = None
-            if error is not None and not delivered_any:
+            if error is not None and not delivered_any and sys.exc_info()[0] is None:
                 # Nothing reached a real client queue before the failure, so
                 # there is nothing here for a caller to double-deliver: raise
                 # instead of fanning the error out to every job. This is what
                 # lets BatchScheduler._run tell "safe to retry serially" from
                 # "some client already has real output, retrying would risk
                 # sending it twice" without a caller-side peek/buffer of its
-                # own -- see vaayu/server/scheduler.py's _run_batched.
+                # own -- see vaayu/server/scheduler.py's `_run`.
+                #
+                # `sys.exc_info()[0] is None` guards against a DIFFERENT
+                # exception already unwinding through this finally -- a
+                # CancelledError delivered while awaiting the next bridge
+                # item, realistically, once `error` was already set from an
+                # earlier one. Without the guard, `raise error` here would
+                # REPLACE that CancelledError with `error` (a plain
+                # Exception), and BatchScheduler._run's `except Exception`
+                # would then read a real cancellation as an ordinary
+                # formation refusal and run N serial generations inside a
+                # task that was asked to stop -- the opposite of what
+                # cancellation means. Falling through in that case lets the
+                # original exception keep propagating; the per-job fan-out
+                # loop below still runs first (it always does, on every
+                # path, via this same `finally`), so no client is left with
+                # nothing in its queue.
                 raise error
             # A BaseException that is NOT an Exception (CancelledError,
             # KeyboardInterrupt) raised while finalising one job must still

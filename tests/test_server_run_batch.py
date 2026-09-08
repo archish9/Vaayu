@@ -6,6 +6,9 @@ and a client disconnect is exactly that abandonment. run_batch owns the
 generator so no client can abandon it, and closes it explicitly on every path.
 """
 import asyncio
+import queue as _queue_mod
+import threading
+import time
 
 import pytest
 
@@ -362,3 +365,57 @@ def test_every_cancel_token_is_published_for_shutdown():
 
     asyncio.run(go())
     assert seen["live"] == 2
+
+
+def test_a_real_cancellation_racing_the_error_raise_stays_a_cancellation(monkeypatch):
+    """Regression test for review finding A (2026-09-08).
+
+    `run_batch` re-raises the underlying error (instead of fanning it out)
+    when nothing reached a real job queue before the failure -- but if a
+    REAL CancelledError unwinds out of the bridge-reading loop at the exact
+    moment `error` is already set (realistically: cancelled while awaiting
+    the SECOND bridge item, right after an earlier one carried an error),
+    that `raise error` must not substitute for it. A caller reading
+    `except Exception` (BatchScheduler._run) would otherwise treat a real
+    cancellation as an ordinary formation refusal and run N serial
+    generations inside a task that was asked to stop.
+
+    `queue.Queue.get` is patched (scoped to the ONE Queue instance
+    run_batch's own `bridge` turns out to be, identified by the first
+    `Queue.get()` call this test observes -- nothing else in this test uses
+    a queue.Queue) so the SECOND call blocks briefly, giving the test a
+    reliable window to cancel the task while it is genuinely suspended
+    inside that second `await loop.run_in_executor(None, bridge.get)`.
+    """
+    class Boom(BatchModel):
+        def batched_generate(self, requests, reclaim=False, should_stop=None):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover -- makes this a generator function
+
+    e = EngineHandle(Boom([]))
+    jobs = [_Job("s0", [1] * 10, 8)]
+
+    real_get = _queue_mod.Queue.get
+    state = {"bridge_id": None, "calls": 0}
+    ready = threading.Event()
+
+    def patched_get(self, *a, **kw):
+        if state["bridge_id"] is None:
+            state["bridge_id"] = id(self)
+        if id(self) == state["bridge_id"]:
+            state["calls"] += 1
+            if state["calls"] == 2:
+                ready.set()
+                time.sleep(0.2)
+        return real_get(self, *a, **kw)
+
+    monkeypatch.setattr(_queue_mod.Queue, "get", patched_get)
+
+    async def go():
+        task = asyncio.ensure_future(e.run_batch(jobs))
+        await asyncio.get_running_loop().run_in_executor(None, ready.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())

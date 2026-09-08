@@ -147,7 +147,7 @@ class BatchScheduler:
                 await self._arrived.wait()
                 self._arrived.clear()
                 continue
-            members = self._form()
+            members = await self._form()
             for j in members:
                 self._waiting.remove(j)
             if not members:
@@ -157,21 +157,30 @@ class BatchScheduler:
             self._running = members
             try:
                 await self._run(members)
-            except BaseException as ex:      # noqa: BLE001 -- the dispatcher must survive
+            except BaseException as ex:      # noqa: BLE001 -- see below
                 # run_batch's own `pending_base_exc` (a CancelledError /
                 # KeyboardInterrupt surfacing while finalising one job) is a
                 # BaseException `_run`'s `except Exception` does not catch.
                 # Left unguarded this unwinds straight out of the loop and
                 # kills the dispatcher task -- every later request then waits
-                # forever on a queue nobody will ever write to again. A dead
-                # dispatcher must not be a possible end state: deliver what
-                # this batch's own clients can still be told, log it, and
-                # keep serving. (Harmless if some of `members` already got a
-                # real sentinel from `_run` before this fired -- their client
-                # already returned at the first one and never reads a second.)
+                # forever on a queue nobody will ever write to again. Deliver
+                # what this batch's own clients can still be told, on every
+                # such BaseException. (Harmless if some of `members` already
+                # got a real sentinel from `_run` before this fired -- their
+                # client already returned at the first one and never reads a
+                # second.)
                 for j in members:
                     await j.out.put(("error", ex))
                     await j.out.put(None)
+                if isinstance(ex, asyncio.CancelledError):
+                    # A dead dispatcher must not be a possible end state for
+                    # a CRASH -- but cancellation is not a crash, it is a
+                    # request to stop (Task 8 wires this into the app
+                    # lifespan), and swallowing it here would mean a
+                    # cancelled dispatch task never actually ends: shutdown
+                    # would hang waiting for a task that keeps looping.
+                    # Notified above; now let the cancellation through.
+                    raise
                 print(f"[Vaayu-Server] WARNING: the dispatcher caught "
                       f"{type(ex).__name__}: {ex} running a batch of "
                       f"{len(members)}; its members were notified and the "
@@ -179,16 +188,21 @@ class BatchScheduler:
             finally:
                 self._running = []
 
-    def _form(self) -> list:
+    async def _form(self) -> list:
         """Which waiting jobs run together. The head is always a member, so
         head-of-line always progresses and nothing starves.
 
         A job whose client already cancelled while queued is dropped here,
         before it can ever become a batch member -- it would waste a real
         batch slot (and GPU work) on a stream nobody is listening to any
-        more.
+        more. It still gets its sentinel: a route awaiting `job.out.get()`
+        after its own disconnect watcher fires must not hang forever on a
+        queue nobody will ever write to.
         """
+        dropped = [j for j in self._waiting if j.cancel.cancelled]
         self._waiting = [j for j in self._waiting if not j.cancel.cancelled]
+        for j in dropped:
+            await j.out.put(None)
         if not self._waiting:
             return []
         if not self.batching_enabled or len(self._waiting) < 2:
@@ -210,7 +224,7 @@ class BatchScheduler:
         everyone rather than reducing to the head: plan_batch is this
         scheduler's OWN pre-check (gate 1), and `batched_generate` still runs
         its own admission (gate 2) inside run_batch regardless, with the
-        refusal-to-serial fallback in `_run_batched` below as the real safety
+        refusal-to-serial fallback in `_run` below as the real safety
         net. Reducing to the head here would silently disable batching
         wholesale under exactly the condition (no VRAM introspection) where
         gate 2's own check still runs and can be trusted.
@@ -244,17 +258,20 @@ class BatchScheduler:
                     await self._run_serial(members[0])
                 else:
                     try:
-                        await self._run_batched(members)
+                        # run_batch (vaayu/server/engine.py) raises exactly
+                        # when NOTHING reached a real job.out yet: a gate-2
+                        # admission refusal inside batched_generate before it
+                        # ever yielded a token, or thread.start() itself
+                        # failing. Either way this retry is always safe -- a
+                        # fallback to the serialized path, never a 500, and
+                        # never a reason to delete gate 2 or lower the
+                        # giveback floor (it was right once: MiniMax N=3
+                        # genuinely OOM'd). A real cancellation racing with
+                        # that raise is NOT read as a refusal here -- see the
+                        # `sys.exc_info()` guard in run_batch's own finally.
+                        await self.engine.run_batch(members)
                         self.batches_run += 1
                     except Exception as ex:      # noqa: BLE001 -- fallback
-                        # run_batch raises exactly when NOTHING reached a
-                        # real job.out yet: a gate-2 admission refusal inside
-                        # batched_generate before it ever yielded a token, or
-                        # thread.start() itself failing. Either way this
-                        # retry is always safe -- a fallback to the
-                        # serialized path, never a 500, and never a reason to
-                        # delete gate 2 or lower the giveback floor (it was
-                        # right once: MiniMax N=3 genuinely OOM'd).
                         self.formations_refused += 1
                         print(f"[Vaayu-Server] batch of {len(members)} refused "
                               f"({type(ex).__name__}: {ex}) -- running them "
@@ -264,22 +281,6 @@ class BatchScheduler:
                             await self._run_serial(j)
             finally:
                 clear_current_session()
-
-    async def _run_batched(self, members: list) -> None:
-        """Run `members` through run_batch, directly on their real queues.
-
-        `run_batch` (vaayu/server/engine.py) now carries the distinction this
-        method used to have to reconstruct itself: it raises the underlying
-        error when `batched_generate` failed before ANY member received a
-        real delta (a gate-2 admission refusal -- it is a generator function,
-        so nothing runs until the first `next()`), and only fans an
-        ("error", ...) + sentinel out to every job's queue once at least one
-        of them already has real output. So the rule here is one line: call
-        it, and let `_run`'s except handle a raise by retrying serially --
-        which cannot double-deliver, because a raise from here means no real
-        job.out has anything in it yet.
-        """
-        await self.engine.run_batch(members)
 
     async def _run_serial(self, job) -> None:
         """Today's path, unchanged: engine.stream()/engine.generate(), row-
@@ -292,23 +293,45 @@ class BatchScheduler:
         `generate()` for stream=false (its own per-request speculative
         dispatch, and a `stream=false` requests.jsonl row) or `stream()`
         otherwise.
+
+        A plain `Exception` is reported to the client and swallowed here, as
+        before. A `BaseException` that is NOT an `Exception` (CancelledError,
+        KeyboardInterrupt) is reported too, but then RE-RAISED once the
+        client has been told -- mirroring `run_batch`'s own
+        `pending_base_exc` pattern. Without this, a cancellation delivered
+        while a serial job is running (every N=1 job, and every gate-2
+        fallback retry) would be silently absorbed right here and never
+        reach `_dispatch_loop`, which is what actually stops the dispatcher
+        task on a real cancellation (see its `except BaseException` there).
         """
         if not job.stream:
+            base_exc = None
             try:
                 result = await self.engine.generate(job.req, cancel=job.cancel)
-            except BaseException as ex:          # noqa: BLE001 -- reported
+            except Exception as ex:              # noqa: BLE001 -- reported, not re-raised
                 await job.out.put(("error", ex))
+            except BaseException as ex:          # noqa: BLE001 -- reported, then re-raised
+                await job.out.put(("error", ex))
+                base_exc = ex
             else:
                 await job.out.put(("final", result))
             finally:
                 await job.out.put(None)
+            if base_exc is not None:
+                raise base_exc
             return
         gen = self.engine.stream(job.req, cancel=job.cancel, prepared=job.prepared)
+        base_exc = None
         try:
             async for item in gen:
                 await job.out.put(item)
-        except BaseException as ex:              # noqa: BLE001 -- reported
+        except Exception as ex:                  # noqa: BLE001 -- reported, not re-raised
             await job.out.put(("error", ex))
+        except BaseException as ex:              # noqa: BLE001 -- reported, then re-raised
+            await job.out.put(("error", ex))
+            base_exc = ex
         finally:
             await gen.aclose()
             await job.out.put(None)
+        if base_exc is not None:
+            raise base_exc
