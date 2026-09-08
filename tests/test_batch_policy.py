@@ -74,6 +74,21 @@ def test_small_nonzero_own_match_batches_when_cost_favors():
     assert select_width(cands, max_batch_size=2, chunk=CHUNK) == 2
 
 
+def test_arrival_order_preserved_first_failing_candidate_stops_search():
+    """Formation stops at the first candidate that fails the cost comparison,
+    preserving queue position: a failing candidate is not skipped over in favour
+    of later arrivals. Two 100k-token prompts with divergent prefixes and deep
+    own_match: serial costs 1+1=2 (almost all covered by own prefixes), batched
+    costs 196 (full 100k-token delta), so k=2 fails (196 >= 2). Width=1 (only
+    candidate 0). Third candidate (cost 196) would pass if checked (196 < 198),
+    but must not be reached; a buggy `continue` instead of `break` would set
+    width=3, skipping the failing candidate ahead of it."""
+    cands = [Candidate([0] * 100000, own_match=99999),
+             Candidate([1000] * 100000, own_match=99999),
+             Candidate([2000] * 100000, own_match=0)]
+    assert select_width(cands, max_batch_size=3, chunk=CHUNK) == 1
+
+
 def test_chunk_passes_rounds_up_and_floors_at_zero():
     assert chunk_passes(0, 512) == 0
     assert chunk_passes(1, 512) == 1
