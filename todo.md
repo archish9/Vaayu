@@ -2183,6 +2183,25 @@ row to `[x]` or `[bug]`/`[!]` with the verdict.
   dispatcher is live. Restart is unsupported: `_stopping` never resets, and `start()`
   deliberately does not resurrect a dead dispatcher.
 
+### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
+
+* **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO
+  `requests.jsonl` rows.** Found 2026-09-08 by T8's re-review, and **PRE-EXISTING at
+  `3ecaaec`** — it is not a regression from the T8 fix, which closed the adjacent hole.
+  Where: `_dispatch_loop`'s stranded-jobs drain in its `finally`, and `_run`'s
+  `except BaseException` fan-out (`vaayu/server/scheduler.py`). Both hand `_sse` (or the
+  non-streaming route) a REAL item while `engine.stream()`/`generate()` was never entered,
+  so `app.py`'s ownership transfer fires on that item and the engine's row-writing
+  `finally` never runs. **Symptom: shutdown with jobs still queued writes no row for
+  them**, against the "a request never ends without a row" contract that
+  `documentation/server.md` states. Fix sketch: mark synthetic items so the transfer does
+  not fire on them, or have the drain write the row itself.
+* **[bug] No test for the sentinel-only cancel path.** `_sse`'s sentinel-with-no-owner
+  branch (`owed=(None, None, "cancelled")`) has code but no coverage: it is reached when a
+  job's `CancelToken` is set while queued WITHOUT its ASGI task being cancelled — e.g.
+  `cancel_all()` at SIGTERM. The restored `test_a_disconnect_while_queued_still_writes_a_row`
+  exercises the neighbouring `except BaseException` handler instead.
+
 ### Known-open minors (none blocking; recorded so they are not lost)
 
 * `_stopping` is never reset, so `start()` after `stop()` yields a scheduler that refuses
