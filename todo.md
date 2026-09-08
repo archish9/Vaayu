@@ -51,7 +51,9 @@ measurement ran 2026-09-07 and the row PASSED at **1.48-1.78x end-to-end** at re
 context — the largest effect on this board by an order of magnitude, and mostly a PREFILL win, not
 the decode win P6/P8 banked. It also found its own prerequisite: `_assert_context_fits` refuses
 every N>1 at that context, so the server wiring must be preceded by fixing gate 2 or it ships
-inert. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
+inert (**DONE — P10a, 2026-09-07**). Its second blocker, row **17**, is **FIXED 2026-09-08**, so
+P10 is UNBLOCKED and its remaining work is the server wiring plus the flash@N=1 vs sdpa@N=2 A/B
+that can still refute it. P5 is a sweep that may end in "not derivable — close the row". **P8 SHIPPED 2026-09-07 at +3.21 % on
 Qwen3-235B — read its vacancy note below before proposing anything that touches the fused
 forward's expert dispatch.**
 **P9 was the cheapest, was built first, and SHIPPED at +4.16 % on 2026-09-07 — see its vacancy note
@@ -66,7 +68,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[!]` | Wire batched decode into the SERVER — **BLOCKED on row 17** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **BLOCKED 2026-09-07 on row 17: `sdpa` + chunked prefill is garbage on MoE, and `batched_generate` hard-asserts sdpa — switching the server's kernel today would corrupt every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`. Row 17 also prices the switch: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[ ]` | Wire batched decode into the SERVER — **UNBLOCKED 2026-09-08** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **UNBLOCKED 2026-09-08: row 17 is FIXED** — sdpa now builds an explicit bottom-right causal mask at `q_len > 1, past > 0` (verified on all three forwards), so switching the server's kernel no longer corrupts single-stream requests. **Row 17 still prices the switch, and that price is unchanged: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | OPTIONAL row **15** · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -241,14 +243,17 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1715 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1758 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-08 after row 17's sdpa causal-mask fix (+10). **The 1715 written here before that was stale
+by 33** — a stashed-HEAD re-measure the same day returned 1748, exactly as the warning at the end of
+this paragraph says to expect. The 1715 was verified
 2026-09-07 after P9 shipped (the 1700 measured 2026-09-06 + 15 spec-prefix tests; that 1700 was
 1685 + 6 batch-union sizing + 9 batch-prefix wiring tests; the 1685
 was measured the same day after P4's closure: 1684 + 1 suppressed-round-width test; the 1684 was measured the
 same day after the P2 outlier split: 1678 + 6 split tests; the 1678 was measured the same day
 after the dense prompt-lookup default: 1647 + 7 bypass + 11 non-streaming + 4 trim + 9 auto; the 1647 was the two dense-telemetry cache-hit fixes' 1639 + 4 + 4; the 1639 was the stray-`logs/run-*` fix's 1638 + 1, the 1638 itself measured against a stashed
 HEAD the same day — the 1570 written here before that was stale, as this note warns). **This figure
-has gone stale seven times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
+has gone stale EIGHT times now.** Re-measure against a stashed HEAD before quoting it; do not trust the
 number written here.
 
 ---
@@ -1906,11 +1911,17 @@ re-measure those. **CLAUDE.md §0 cites 5.57x for dense speculative decoding wit
 check that one first. If every such arm ran flash, the numbers stand: **say so explicitly and close
 the row**, because "probably fine" is what this ledger exists to prevent.
 
-Note row **17** interacts: a drafter prompt over `prefill_chunk_size` under sdpa is ALSO garbage,
-independently of row 16. Fix 17 before re-measuring anything under sdpa.
+**UNBLOCKED 2026-09-08 — row 17 is fixed — and row 17 made this row WORSE, not lighter.** The
+interaction noted here was "a drafter prompt over `prefill_chunk_size` under sdpa is ALSO garbage".
+The truth is broader: **every sdpa speculative VERIFY pass was corrupted at any prompt length,
+chunked or not**, because a verify pass is `draft_tokens + 1` positions against existing KV and
+`speculative_generate` passed no mask. Measured on a 35-token ONE-CHUNK prompt (row 17): ids
+diverged completely from plain greedy and acceptance fell to 2 of 3, against 3 of 3 after the fix.
+**So `prefill_chunk_size` is NOT the filter for which arms to re-measure** — under sdpa, none of
+them survive, at any prompt length, whatever the `pinning_budget`. Filter on the kernel alone.
 
 ---
-# 17 · [bug] `sdpa` + CHUNKED PREFILL = garbage on MoE — BLOCKS row 15
+# 17 · [x] FIXED 2026-09-08 — `sdpa` had no causal mask at `q_len > 1, past > 0`
 
 Found 2026-09-07 while pricing row 15's real cost. **PRE-EXISTING: reproduced byte-identical on
 `881aaaa`, before any of this branch's code changes** (verified in a clean `git worktree`).
@@ -1934,24 +1945,65 @@ Chunk 0 (`q_len == kv_len`) and decode (`q_len == 1`) are both correct, which is
 arm is unaffected; and the server ships `ATTN_IMPLEMENTATION = None` -> flash, so no user is
 affected today. The exposure is exactly the combination row 15 needs.
 
-**Why it BLOCKS row 15:** `batched_generate` hard-asserts `sdpa` (`vaayu_base.py:5194`), so wiring
-batching means switching the server's kernel — and the server's single-stream path is
-`generate()`/`stream_generate`, which chunks. **Switching the server to sdpa today would corrupt
-every single-stream request with a prompt over `PREFILL_CHUNK_SIZE`.** Fix this first.
+**FIXED 2026-09-08.** `build_sdpa_causal_mask(attn_impl, max_q_len, kv_total, device)` in
+`vaayu_base.py`, wired into `forward`'s mask branch. It returns `None` — keeping flash AND sdpa's
+GQA fast path (`use_gqa_in_sdpa` needs a null mask) — unless the impl is sdpa **and**
+`max_q_len > 1` **and** `kv_total > max_q_len`; otherwise a `[1, 1, max_q_len, kv_total]` bool mask
+whose row `r` is row `kv_total - max_q_len + r` of the causal square, so ONE mask slices correctly
+for every chunk-major element whatever its own past. Rows are only the last `max_q_len` (higher
+rows are unreachable through `get_attention_mask_args`): **2.1 MB instead of the 17.3 MB square**
+at MiniMax's 4165-token prefill, which is how the `:4112` 268 MB / 12.9 GB trap is avoided.
+`kv_total` is `past + this call's tokens`, never `max_seq_len`. Flash stays on `None`.
 
-**Proposed fix (not built):** build an explicit causal mask for `sdpa` whenever `past_len > 0`,
-instead of passing `None` — and LEAVE flash on the `None` path (it is correct there, and an explicit
-mask would re-introduce the S-sized score buffer `SCORE_ELEM_BYTES` prices at 0.0 for it). Size the
-mask off `past_len + q_len`, never `max_seq_len` — the sibling branch at `:4112` records a
-268 MB / 12.9 GB regression from exactly that mistake. **Minimum reproducer is TWO chunks** (709
-tokens at `prefill_chunk_size=512`); a single-chunk test passes on the broken code. Both MoE
-geometries plus a dense check, since it touches every prefill.
+**THE ROW UNDERSTATED ITS OWN SCOPE — there were TWO reachable instances.** The second is
+`speculative_generate`'s verify pass (`vaayu_base.py:5145` calls `self.forward(input_ids=
+verify_input, ...)` with no mask): `draft_tokens + 1` positions against existing KV is the same
+`q_len > 1, past > 0` misalignment **with no chunking at all**. Measured on a 35-token ONE-CHUNK
+prompt, Llama-3.2-1B prompt-lookup `draft_tokens=3`, greedy: **before, the speculative ids diverged
+completely from plain greedy** (`' the capital'` → `' import { capital Object } from ...'`) and the
+one matched round accepted 2 of 3; **after, ids are identical and it accepts 3 of 3.** This is
+row **19**'s blocker and it is INDEPENDENT of row 16's tied-`lm_head` bug — it applies whatever the
+`pinning_budget` was.
 
-**SELF-CONTAINED BRIEF, written to be picked up cold:**
-[`docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md`](docs/2026-09-07-row17-sdpa-chunked-prefill-BRIEF.md)
-(gitignored, this disk only — this row restates everything load-bearing).
-Repro: `MODEL=minimax ATTN=sdpa PROMPT_TOK=700 NTOK=24 CHUNK=512 plans/probes/p10c_attn_cost.py`,
-control `ATTN=flash_attention_2`.
+**Same-day A/B, all three forwards** (`plans/probes/p10c_attn_cost.py`, `PROMPT_TOK=700 NTOK=24
+CHUNK=512 BALLAST_GB=27`, **`MemoryMax=29G` — 22G is OOM-killed at this ballast**):
+
+| model | forward | sdpa BEFORE | sdpa AFTER |
+|---|---|---|---|
+| MiniMax-M2.7 | module-list | 24 null bytes (64 at 4165 tok / 9 chunks) | coherent, tracks the flash control |
+| Qwen3-235B | fused EXL3 | `'2023-10-12 15:30:45,123 -'` — a log line, unrelated to the prompt | **byte-identical to its flash control** |
+| Llama-3.2-1B | dense, LEGACY per-chunk loop | `' The capital of France is Paris. of capital of France...'` | `' Paris.<\|eot_id\|>'`, == flash |
+
+**So it was never MoE-only** — the dense legacy per-chunk loop carries the same defect, and the 1B
+arm is the fastest discriminator on this box (seconds) and is the one in the committed gate.
+
+**Cost:** sdpa post-fix vs its flash control at the same prompt — MiniMax 61.11 s vs 61.35 s
+(equal); Qwen 45.69 s vs 43.83 s, explained by sdpa's smaller expert VRAM cache (3.920 vs
+6.179 GB) = row 15's known −15.5 % kernel charge, not this fix. **Never compare against the
+pre-fix timings**: a null-byte run routes experts degenerately and its wall clock means nothing.
+The one charge added is that a non-null mask disables sdpa's GQA fast path, only on the calls that
+need it, never on flash.
+
+**Nothing on record is invalidated** — every P6/P7/P8/P9/P10 sdpa arm ran `batched_generate` under
+an explicit 4D mask, and the server ships flash. State this when the question comes up; the
+natural assumption on reading "sdpa was broken" is that the perf record is contaminated, and it is
+not.
+
+**Server knob (CLAUDE.md §8):** none needed, and none added — this is a correctness fix on a path
+the server does not currently select (`ATTN_IMPLEMENTATION = None` → flash). It is **not banked**:
+it is inert for today's users by construction, and it is the prerequisite that makes
+`ATTN_IMPLEMENTATION=sdpa` a legal setting at all.
+
+**On-device gates, all three run because this touches EVERY prefill:** accumulator (MiniMax)
+**8 passed**, prefix-reuse (MiniMax EXL3) **1 passed**, server (Llama-3.2-1B) **9 passed**.
+**The gate table's `MemoryMax=22G` is STALE for the MoE gates on this box** — the accumulator gate
+was OOM-killed (exit 137) at 22G today and passed at 29G; same for `p10c_attn_cost.py` at
+`BALLAST_GB=27`. Tests `tests/test_sdpa_chunked_prefill_mask.py` (**+10**; 8 unit on the builder + 2
+subprocess-isolated on-device). Suite **1748 → 1758 passed, 12 skipped** — and **the 1715 recorded
+at the top of this file was stale by 33**; 1748 was re-measured against a stashed HEAD the same day.
+`docs/2026-09-08-row17-sdpa-causal-mask-RESULTS.md`, superseding the
+2026-09-07 brief. Repro kept: `MODEL=minimax ATTN=sdpa PROMPT_TOK=700 NTOK=24 CHUNK=512
+plans/probes/p10c_attn_cost.py`, control `ATTN=flash_attention_2`.
 
 **Also measured while pricing row 15 (MiniMax, 4165-token prompt), and it belongs to that row's
 decision:** switching flash -> sdpa costs real VRAM before batching pays anything —
@@ -2025,12 +2077,18 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 `docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
 
 ---
-# 15 · [!] Wire batched decode into the SERVER  (§0 **P10**) — BLOCKED on row 17
+# 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08
 
-**[!] BLOCKED 2026-09-07 on row 17** (`sdpa` + chunked prefill = garbage on MoE).
-`batched_generate` hard-asserts `sdpa`; the server runs flash and its single-stream path chunks, so
-switching the kernel today would corrupt every single-stream request with a prompt over
-`PREFILL_CHUNK_SIZE`. **Unblocked by:** fixing row 17.
+**[ ] UNBLOCKED 2026-09-08 — row 17 is FIXED** (`sdpa` now gets an explicit causal mask at
+`q_len > 1, past > 0`; `docs/2026-09-08-row17-sdpa-causal-mask-RESULTS.md`). The kernel switch is
+now SAFE; it is still not free — see the −15.5 % expert-cache charge below, which row 17 did not
+change.
+`batched_generate` hard-asserts `sdpa`; the server runs flash and its single-stream path chunks,
+which USED to mean switching the kernel corrupted every single-stream request with a prompt over
+`PREFILL_CHUNK_SIZE`. **Row 17 fixed that on 2026-09-08** — sdpa now builds an explicit
+bottom-right causal mask whenever `q_len > 1` at `past > 0`, verified on all three forwards plus
+the speculative verify pass. The kernel switch is SAFE. It is not FREE: the economics below are
+untouched.
 
 **Row 17 also carries the other half of this row's economics:** flash -> sdpa costs the expert VRAM
 cache **-15.5 %** (8.929 -> 7.542 GB on MiniMax) before batching pays anything, so this row's real

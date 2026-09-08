@@ -904,6 +904,43 @@ def compute_chunk_past_lens(chunk_lens: list, past0: int) -> list:
     return out
 
 
+def build_sdpa_causal_mask(attn_impl: str, max_q_len: int, kv_total: int,
+                           device):
+    """Explicit bottom-right causal mask for `sdpa`, or None when sdpa's own
+    implicit mask is already correct.
+
+    transformers' sdpa_attention_forward sets
+    `is_causal = query.shape[2] > 1 and attention_mask is None`, and torch's
+    `is_causal=True` is TOP-LEFT aligned -- correct only at q_len == kv_len.
+    Every prefill chunk after the first carries past KV (q_len < kv_len), so
+    each query attended the wrong key range and the output was garbage
+    (row 17). flash_attention_2 aligns bottom-right and stays on the None
+    path: it is correct there, and an explicit mask would re-introduce the
+    score buffer vram_plan.SCORE_ELEM_BYTES prices at 0.0 for it.
+
+    Returns None (keeping sdpa's GQA fast path, which needs a null mask) when
+    there is nothing to fix: q_len == kv_total (chunk 0 / unchunked prefill),
+    or max_q_len == 1 (decode, where is_causal is already False).
+
+    Shape is [1, 1, max_q_len, kv_total], sized off (past + THIS call's
+    tokens) -- never off max_seq_len, and only the rows
+    get_attention_mask_args can slice (it reads
+    `[:, :, -len_s:, -len_p-len_s:]`, so rows above the last max_q_len are
+    unreachable). The full kv_total square would be the 268 MB / 12.9 GB
+    transient the eager branch's comment already warns about.
+
+    Row r of the returned mask is row (kv_total - max_q_len + r) of the
+    kv_total-square causal matrix, which is what makes the bottom-right
+    slice come out right for EVERY chunk-major element regardless of its own
+    past length. Model-agnostic: no geometry enters."""
+    if attn_impl != "sdpa" or max_q_len <= 1 or kv_total <= max_q_len:
+        return None
+    q_pos = torch.arange(kv_total - max_q_len, kv_total,
+                         device=device)[:, None]      # [max_q_len, 1]
+    k_pos = torch.arange(kv_total, device=device)[None, :]   # [1, kv_total]
+    return (k_pos <= q_pos)[None, None]               # True == attend
+
+
 def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     """Size of the precomputed RoPE cos/sin cache: must cover every position
     that will be sliced during this forward pass (existing past + ALL new
@@ -4100,6 +4137,8 @@ class VaayuBaseModel(GenerationMixin):
         _seq_total = (sum(_chunk_lens) if _chunk_lens
                       else (input_ids.shape[1] if isinstance(input_ids, torch.Tensor) else 0))
 
+        _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
+                             if past_key_values is not None else 0)
         # Create attention mask for the largest input, and position ids to use KV cache
         if self._active_attn_impl in ("flash_attention_2", "sdpa"):
             if getattr(self, '_batch_decode_active', False) and _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
@@ -4110,11 +4149,17 @@ class VaayuBaseModel(GenerationMixin):
                     _caller_attention_mask, _q_len,
                     dtype=self.running_dtype, device=self.running_device)
             else:
-                attention_mask = None
+                # sdpa's implicit causal mask is top-left aligned and therefore
+                # WRONG whenever this call's queries sit behind past KV --
+                # every chunk after the first, and every speculative verify
+                # pass. flash is bottom-right aligned and stays on None.
+                attention_mask = build_sdpa_causal_mask(
+                    self._active_attn_impl,
+                    max(_chunk_lens) if _chunk_lens else int(_seq_total),
+                    _past_len_for_pos + int(_seq_total),
+                    self.running_device)
         else:
             attention_mask = None
-        _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
-                             if past_key_values is not None else 0)
         # Bug fix: must use _seq_total (already correctly sums ALL chunks for
         # layer-major list-typed input_ids), not re-derive from input_ids.shape
         # which silently evaluates to 0 for a list, undersizing the RoPE cache
