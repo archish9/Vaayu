@@ -799,8 +799,16 @@ class EngineHandle:
 
         Each job receives ("delta", text)*, then one ("final", result) or
         ("error", exc), then None as its end sentinel. Every job gets a
-        sentinel on every path, or a client waits forever on a queue nobody
-        will write to again.
+        sentinel on every path -- EXCEPT one: if `batched_generate` fails
+        before ANY job received a real delta (a gate-2 admission refusal,
+        typically -- it is a generator function, so nothing runs until the
+        first `next()`), this raises the underlying error instead of fanning
+        it out, and no job's queue has anything in it. That is deliberate:
+        the caller (BatchScheduler._run_batched) can then retry the same jobs
+        serially without any risk of a client seeing output twice. A failure
+        that happens AFTER some job already got a real delta still fans out
+        to every job exactly as before -- a client waits forever on a queue
+        nobody will write to again.
         """
         import time
 
@@ -894,6 +902,12 @@ class EngineHandle:
             self._live_cancels = []
             self._live_thread = None
             raise
+        # Whether ANY job's real .out queue has received a client-visible
+        # item yet. Distinguishes "refused before producing anything" (a
+        # gate-2 admission refusal inside batched_generate, raised before it
+        # ever yields a token) from "failed after real output was already
+        # delivered" -- see the re-raise below.
+        delivered_any = False
         try:
             while True:
                 kind, payload = await loop.run_in_executor(None, bridge.get)
@@ -909,12 +923,22 @@ class EngineHandle:
                         ttft[i] = time.time() - started
                         self._log(jobs[i].req, "TTFT", at=f"{ttft[i]:.1f}s")
                     await jobs[i].out.put(("delta", delta))
+                    delivered_any = True
         finally:
             try:
                 thread.join()
             finally:
                 self._live_cancels = []
                 self._live_thread = None
+            if error is not None and not delivered_any:
+                # Nothing reached a real client queue before the failure, so
+                # there is nothing here for a caller to double-deliver: raise
+                # instead of fanning the error out to every job. This is what
+                # lets BatchScheduler._run tell "safe to retry serially" from
+                # "some client already has real output, retrying would risk
+                # sending it twice" without a caller-side peek/buffer of its
+                # own -- see vaayu/server/scheduler.py's _run_batched.
+                raise error
             # A BaseException that is NOT an Exception (CancelledError,
             # KeyboardInterrupt) raised while finalising one job must still
             # propagate -- swallowing it as a client-visible error would
