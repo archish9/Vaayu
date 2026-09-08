@@ -809,8 +809,7 @@ class EngineHandle:
         that happens AFTER some job already got a real delta still fans out
         to every job exactly as before -- a client waits forever on a queue
         nobody will write to again. (A real cancellation racing with that
-        raise is not swallowed by it either -- see the `sys.exc_info()`
-        guard below.)
+        raise is not swallowed by it either -- see `loop_raised` below.)
 
         On the raise path, NO requests.jsonl row is written for any of
         `jobs` here -- `_write_request_row` lives inside the per-job
@@ -917,6 +916,7 @@ class EngineHandle:
         # ever yields a token) from "failed after real output was already
         # delivered" -- see the re-raise below.
         delivered_any = False
+        loop_raised = False
         try:
             while True:
                 kind, payload = await loop.run_in_executor(None, bridge.get)
@@ -933,13 +933,26 @@ class EngineHandle:
                         self._log(jobs[i].req, "TTFT", at=f"{ttft[i]:.1f}s")
                     await jobs[i].out.put(("delta", delta))
                     delivered_any = True
+        except BaseException:
+            # Recorded HERE, in this frame's own handler, rather than read
+            # back later via sys.exc_info() in the finally below: exc_info()
+            # reflects the whole THREAD's currently-handled exception, not
+            # this method's own try -- if run_batch is ever awaited from
+            # inside a CALLER's own except/finally, an ambient check would
+            # see the CALLER's exception (verified: it does, across an
+            # await, in CPython) and wrongly suppress the raise below even
+            # though nothing in this loop actually failed. A local flag,
+            # set only when THIS try's own body raised, cannot be fooled by
+            # an outer context this method never sees.
+            loop_raised = True
+            raise
         finally:
             try:
                 thread.join()
             finally:
                 self._live_cancels = []
                 self._live_thread = None
-            if error is not None and not delivered_any and sys.exc_info()[0] is None:
+            if error is not None and not delivered_any and not loop_raised:
                 # Nothing reached a real client queue before the failure, so
                 # there is nothing here for a caller to double-deliver: raise
                 # instead of fanning the error out to every job. This is what
@@ -948,10 +961,10 @@ class EngineHandle:
                 # sending it twice" without a caller-side peek/buffer of its
                 # own -- see vaayu/server/scheduler.py's `_run`.
                 #
-                # `sys.exc_info()[0] is None` guards against a DIFFERENT
-                # exception already unwinding through this finally -- a
-                # CancelledError delivered while awaiting the next bridge
-                # item, realistically, once `error` was already set from an
+                # `not loop_raised` guards against a DIFFERENT exception
+                # already unwinding through this finally -- a CancelledError
+                # delivered while awaiting the next bridge item,
+                # realistically, once `error` was already set from an
                 # earlier one. Without the guard, `raise error` here would
                 # REPLACE that CancelledError with `error` (a plain
                 # Exception), and BatchScheduler._run's `except Exception`

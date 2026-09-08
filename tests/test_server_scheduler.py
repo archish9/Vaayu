@@ -450,3 +450,70 @@ def test_a_job_cancelled_while_queued_still_gets_a_sentinel():
     assert members == []
     assert sched._waiting == []
     assert out == []
+
+
+def test_a_job_still_queued_when_the_dispatcher_stops_still_gets_a_sentinel(monkeypatch):
+    """Regression test for review finding 1 (2026-09-08).
+
+    Finding C's failure mode (a queued job dropped with nothing written to
+    its queue) by a different route: a job still sitting in `_waiting` when
+    the dispatch loop exits -- graceful stop() with requests still queued,
+    or a re-raised CancelledError leaving mid-iteration -- must still get a
+    sentinel. Every job that ever entered submit() must end with one.
+
+    `running_job` is submitted and drained to completion FIRST, which
+    parks the dispatch loop on `_arrived.wait()` (nothing left in
+    `_waiting`, `_stopping` still False). `submit()` and `stop()` are then
+    both synchronous up to their own first real suspension point (neither
+    has an `await` that yields control before it), so `queued_job` is
+    guaranteed to still be sitting in `_waiting`, never picked up, at the
+    instant `_stopping` becomes True.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        yield ("delta", "x")
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=1,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        running_job = _job("s0")
+        await sched.submit(running_job)
+        await _drain(running_job)
+        queued_job = _job("s1")
+        await sched.submit(queued_job)
+        await sched.stop()
+        return await asyncio.wait_for(_drain(queued_job), timeout=5)
+
+    out = asyncio.run(go())
+    assert any(k == "error" for k, _p in out), (
+        "a job dropped this way gets an error item, not silence")
+
+
+def test_stop_after_the_dispatch_task_was_cancelled_returns_cleanly():
+    """Regression test for review finding 2 (2026-09-08).
+
+    Once the dispatch task has been cancelled directly (Task 8's
+    app-lifespan path, not stop()'s own cooperative one), `stop()`'s bare
+    `await self._task` re-raises that CancelledError and never clears
+    `self._task` -- surfacing in the lifespan's shutdown code as an
+    exception. `stop()` must return cleanly and leave `_task` cleared
+    regardless of which path cancelled the dispatcher.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        sched._task.cancel()
+        await asyncio.wait_for(sched.stop(), timeout=5)
+        return sched._task
+
+    task_after = asyncio.run(go())
+    assert task_after is None

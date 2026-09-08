@@ -419,3 +419,38 @@ def test_a_real_cancellation_racing_the_error_raise_stays_a_cancellation(monkeyp
             await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(go())
+
+
+def test_run_batch_raise_is_not_suppressed_by_an_ambient_caller_exception():
+    """Hardening test for review finding 3 (2026-09-08).
+
+    The original guard read sys.exc_info(), which reflects the whole
+    THREAD's currently-handled exception, not run_batch's own frame:
+    verified directly (see the task-7 report) that it is visible across an
+    `await`, so if run_batch is ever awaited from inside a CALLER's own
+    except/finally, an ambient check would see the caller's exception and
+    wrongly suppress run_batch's "nothing was delivered -- raise instead of
+    fanning out" rule, even though nothing inside run_batch itself failed.
+    run_batch now tracks this with a local flag (`loop_raised`) set only by
+    its own try/except, so an unrelated exception already active in the
+    caller must not change its behaviour at all.
+    """
+    class Boom(BatchModel):
+        def batched_generate(self, requests, reclaim=False, should_stop=None):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover -- makes this a generator function
+
+    e = EngineHandle(Boom([]))
+    jobs = [_Job("s0", [1] * 10, 8)]
+
+    async def go():
+        try:
+            raise ValueError("unrelated exception, already active in the caller")
+        except ValueError:
+            # run_batch is awaited HERE, inside an active except block, for
+            # the whole duration of the call -- an ambient sys.exc_info()
+            # check would see this ValueError, not run_batch's own state.
+            with pytest.raises(RuntimeError, match="boom"):
+                await e.run_batch(jobs)
+
+    asyncio.run(go())

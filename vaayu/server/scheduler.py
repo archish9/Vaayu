@@ -108,8 +108,21 @@ class BatchScheduler:
         self._stopping = True
         self._arrived.set()
         if self._task is not None:
-            await self._task
-            self._task = None
+            task, self._task = self._task, None
+            try:
+                await task
+            except asyncio.CancelledError:
+                # The dispatch task may already have been cancelled
+                # DIRECTLY (Task 8's app-lifespan path, not this
+                # cooperative one) -- awaiting it here then re-raises that
+                # same CancelledError. `stop()` must still return cleanly:
+                # `self._task` is cleared unconditionally, above, before
+                # this await, so a caller sees the dispatcher as stopped
+                # either way; letting the CancelledError escape from here
+                # would surface in the lifespan's own shutdown code as an
+                # exception, easily misread as the lifespan task's OWN
+                # cancellation rather than the dispatcher's.
+                pass
 
     async def submit(self, job: Job) -> None:
         """Enqueue `job`. Raises QueueFull past `queue_depth`.
@@ -142,51 +155,73 @@ class BatchScheduler:
     # ── the loop ─────────────────────────────────────────────────────────────
 
     async def _dispatch_loop(self) -> None:
-        while not self._stopping:
-            if not self._waiting:
-                await self._arrived.wait()
-                self._arrived.clear()
-                continue
-            members = await self._form()
-            for j in members:
-                self._waiting.remove(j)
-            if not members:
-                # Everything waiting was a client that vanished before its
-                # turn (see `_form`) -- nothing to run this iteration.
-                continue
-            self._running = members
-            try:
-                await self._run(members)
-            except BaseException as ex:      # noqa: BLE001 -- see below
-                # run_batch's own `pending_base_exc` (a CancelledError /
-                # KeyboardInterrupt surfacing while finalising one job) is a
-                # BaseException `_run`'s `except Exception` does not catch.
-                # Left unguarded this unwinds straight out of the loop and
-                # kills the dispatcher task -- every later request then waits
-                # forever on a queue nobody will ever write to again. Deliver
-                # what this batch's own clients can still be told, on every
-                # such BaseException. (Harmless if some of `members` already
-                # got a real sentinel from `_run` before this fired -- their
-                # client already returned at the first one and never reads a
-                # second.)
+        try:
+            while not self._stopping:
+                if not self._waiting:
+                    await self._arrived.wait()
+                    self._arrived.clear()
+                    continue
+                members = await self._form()
                 for j in members:
-                    await j.out.put(("error", ex))
-                    await j.out.put(None)
-                if isinstance(ex, asyncio.CancelledError):
-                    # A dead dispatcher must not be a possible end state for
-                    # a CRASH -- but cancellation is not a crash, it is a
-                    # request to stop (Task 8 wires this into the app
-                    # lifespan), and swallowing it here would mean a
-                    # cancelled dispatch task never actually ends: shutdown
-                    # would hang waiting for a task that keeps looping.
-                    # Notified above; now let the cancellation through.
-                    raise
-                print(f"[Vaayu-Server] WARNING: the dispatcher caught "
-                      f"{type(ex).__name__}: {ex} running a batch of "
-                      f"{len(members)}; its members were notified and the "
-                      f"dispatcher keeps running.")
-            finally:
-                self._running = []
+                    self._waiting.remove(j)
+                if not members:
+                    # Everything waiting was a client that vanished before
+                    # its turn (see `_form`) -- nothing to run this
+                    # iteration.
+                    continue
+                self._running = members
+                try:
+                    await self._run(members)
+                except BaseException as ex:      # noqa: BLE001 -- see below
+                    # run_batch's own `pending_base_exc` (a CancelledError /
+                    # KeyboardInterrupt surfacing while finalising one job) is
+                    # a BaseException `_run`'s `except Exception` does not
+                    # catch. Left unguarded this unwinds straight out of the
+                    # loop and kills the dispatcher task -- every later
+                    # request then waits forever on a queue nobody will ever
+                    # write to again. Deliver what this batch's own clients
+                    # can still be told, on every such BaseException.
+                    # (Harmless if some of `members` already got a real
+                    # sentinel from `_run` before this fired -- their client
+                    # already returned at the first one and never reads a
+                    # second. A job's contract is therefore "at least one
+                    # sentinel, stop at the first" -- never exactly one.)
+                    for j in members:
+                        await j.out.put(("error", ex))
+                        await j.out.put(None)
+                    if isinstance(ex, asyncio.CancelledError):
+                        # A dead dispatcher must not be a possible end state
+                        # for a CRASH -- but cancellation is not a crash, it
+                        # is a request to stop (Task 8 wires this into the
+                        # app lifespan), and swallowing it here would mean a
+                        # cancelled dispatch task never actually ends:
+                        # shutdown would hang waiting for a task that keeps
+                        # looping. Notified above; now let the cancellation
+                        # through.
+                        raise
+                    print(f"[Vaayu-Server] WARNING: the dispatcher caught "
+                          f"{type(ex).__name__}: {ex} running a batch of "
+                          f"{len(members)}; its members were notified and "
+                          f"the dispatcher keeps running.")
+                finally:
+                    self._running = []
+        finally:
+            # Every job that ever entered submit() must end with a sentinel,
+            # on every path the dispatcher can exit -- and this is the one
+            # the two guards above don't cover: jobs still sitting in
+            # `_waiting`, never picked up. That happens on a graceful
+            # stop() with requests still queued (pre-existing), and now
+            # ALSO on the CancelledError re-raise just above, which can
+            # leave `_waiting` non-empty the moment it unwinds out of the
+            # loop. Without this, `job.out.get()` hangs forever -- finding
+            # C's exact failure mode (a queued job dropped with nothing
+            # written to its queue), arriving via loop exit instead of via
+            # `_form`.
+            stranded, self._waiting = self._waiting, []
+            for j in stranded:
+                await j.out.put(("error", RuntimeError(
+                    "the dispatcher stopped before this request could run")))
+                await j.out.put(None)
 
     async def _form(self) -> list:
         """Which waiting jobs run together. The head is always a member, so
