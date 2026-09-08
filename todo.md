@@ -2090,10 +2090,48 @@ bottom-right causal mask whenever `q_len > 1` at `past > 0`, verified on all thr
 the speculative verify pass. The kernel switch is SAFE. It is not FREE: the economics below are
 untouched.
 
-**Row 17 also carries the other half of this row's economics:** flash -> sdpa costs the expert VRAM
-cache **-15.5 %** (8.929 -> 7.542 GB on MiniMax) before batching pays anything, so this row's real
-comparison is **flash@N=1 vs sdpa@N=2**, not P10a's sdpa-vs-sdpa +18.0 %. Take that A/B before
-building the scheduler; **it can still refute the row.**
+**[x] THAT A/B RAN 2026-09-08. THE ROW SURVIVES ON MiniMax, FAILS ON QWEN, AND ITS ECONOMICS WERE
+WRONG.** `docs/2026-09-08-P10-kernel-ab-RESULTS.md`; probe `plans/probes/p10d_kernel_ab.py`.
+2 requests x 64 tok at ~4.15k, `BALLAST_GB=27`, greedy, interleaved BOTH ways, one scope per arm:
+
+| model | flash serial (today) | sdpa serial | sdpa batched | admission granted |
+|---|---|---|---|---|
+| MiniMax-M2.7 | 454.80 s | 465.20 s | **283.13 s = +1.606x** | **N=2** (giveback 2.88 GB) |
+| Qwen3-235B | **170.23 s** | 177.14 s | 573.88 s = **-3.371x** | **N=1** (giveback 0.00, gate 2 RAISE) |
+
+Replicate spread 0.01-1.17 %; every effect is 60 %+. MiniMax mean TTFT 317.2 -> 223.3 s (1.42x) and
+peak VRAM LOWER batched (12.355 vs 13.259 GB).
+
+**THE -15.5 % CACHE CHARGE IS NOT A THROUGHPUT COST — this supersedes the paragraph this row used to
+carry here.** The isolating `sdpa_serial` arm (sdpa kernel on the CHUNKED serial path) puts the
+kernel at **-2.3 % MiniMax / -4.1 % Qwen end-to-end**, not -15.5 %. That figure is an expert-cache
+BUDGET percentage and does not convert to time at this context, because prefill dominates and
+prefill is not cache-bound the way decode is. **Never quote it as a throughput cost again.**
+
+**THE REAL BLOCKER IS THAT `batched_generate` NEVER CHUNKS ITS PREFILL.** Measured, not argued:
+`Chunked prefill` appears **2** times in Qwen's sdpa_serial log and **0** times in its sdpa_batch
+log. It forfeits `_chunked_prefill`'s layer-major batching -- whose own comment prices it: chunks as
+batch elements read "every expert once per prefill instead of once per chunk (a chunk-major 4k
+prompt otherwise re-reads the full expert set 8x)". **Qwen TTFT 30.75 -> 212.94 s, 6.9x against 9
+chunks at 4177 tokens.** MiniMax does not collapse (212.40 chunked vs 223.30 single-forward for TWO
+streams) because the **prefill stager is EXL3-fused-only** (`_moe_stager_capable`; the module-list
+forward passes `staged_layer=None`) -- Qwen is the only model that HAS it to lose.
+
+**So the build order changed. The FIRST item is no longer the scheduler:**
+1. **Give `batched_generate` a chunked prefill.** Qwen's 6.9x lives there and it is worth more than
+   the scheduler on the model that currently loses.
+2. **A global `ATTN_IMPLEMENTATION` flip is REFUTED** (-3.371x on Qwen). The kernel must not switch
+   for a model that cannot batch.
+3. Qwen's admission refusal is the second blocker; P10a already explains it (giveback 0.00 GB), and
+   this A/B is the first time its SERVER-LEVEL cost was priced.
+4. **MiniMax alone justifies the row** at +1.606x end-to-end through shipped admission, nothing forced.
+
+**NEW FACT, PREVIOUSLY NOWHERE ON RECORD: Qwen3-235B prefills 4177 tokens in 28.23 s on flash.**
+Every Qwen prefill figure in this file and in `docs/` is sdpa (214.25 s in the table below; 212.94 s
+in this A/B -- they agree). The flash number is **7.5x faster** and had never been measured because
+no probe ran Qwen prefill on flash. Same chunked+stager path; only the kernel differs, and the
+kernel is worth 4 % -- so the 7.5x is the stager and chunking, visible only because the batched arm
+removed them.
 
 **Design note already established (2026-09-07): NO arrival window is needed in v1.** `QUEUE_DEPTH`
 is 8 and `slot()` already queues waiters, so a batch can be formed from requests ALREADY waiting —
