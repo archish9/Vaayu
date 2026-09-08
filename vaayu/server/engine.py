@@ -79,6 +79,84 @@ class GenerationResult:
     tool_calls: list = field(default_factory=list)
 
 
+class _Detok:
+    """Incremental per-stream detokenization for the batched path.
+
+    Decoding one id at a time does NOT reproduce the text -- merges differ
+    across a decode boundary -- so the whole id list is decoded each time and
+    only the delta is emitted, which is what TextIteratorStreamer does. A
+    trailing replacement char means the last id was half of a multi-byte
+    character: hold it back rather than sending U+FFFD to the client and then
+    contradicting it on the next token.
+    """
+
+    def __init__(self, tokenizer):
+        self.tok = tokenizer
+        self.ids = []
+        self.text = ""
+
+    def feed(self, token_id: int) -> str:
+        self.ids.append(token_id)
+        full = self.tok.decode(self.ids, skip_special_tokens=True)
+        if full.endswith("�"):
+            return ""
+        delta, self.text = full[len(self.text):], full
+        return delta
+
+
+class _BatchStream:
+    """One stream inside a batch: its ids, its text, its stop policy.
+
+    Stop STRINGS, not ids. `BatchRequest.stop_ids` is token ids while the
+    client's `stop` and stopping.py are strings, and tokenizing a stop string
+    to bridge them is wrong at merge boundaries -- the same string tokenizes
+    differently depending on what precedes it. Matching therefore happens here,
+    on decoded text, and trims AT the match exactly as HF does on the serial
+    path: the same request must not return different text because it happened
+    to be batched.
+
+    `retired` is what the engine's should_stop hook reads. It carries the
+    stop-string match and the per-stream cap; the caller ORs in its own
+    cancellation.
+    """
+
+    def __init__(self, job, tokenizer, stops, cap: int):
+        self.job = job
+        self.stops = list(stops or [])
+        self.cap = cap
+        self._detok = _Detok(tokenizer)
+        self.text = ""
+        self.retired = False
+
+    @property
+    def ids(self):
+        return self._detok.ids
+
+    def feed(self, token_id: int) -> str:
+        """Consume one token. Returns the delta to SEND -- "" for nothing."""
+        if self.retired:
+            return ""
+        delta = self._detok.feed(token_id)
+        full = self._detok.text
+        cut = self._earliest_stop(full)
+        if cut is not None:
+            # Trim at the stop and retract anything already sent past it: the
+            # final text is what HF would have returned, not what the deltas
+            # happened to add up to.
+            self.text = full[:cut]
+            self.retired = True
+            keep = len(self.text) - (len(full) - len(delta))
+            return delta[:keep] if keep > 0 else ""
+        self.text = full
+        if len(self.ids) >= self.cap:
+            self.retired = True
+        return delta
+
+    def _earliest_stop(self, full: str):
+        cuts = [full.index(s) for s in self.stops if s in full]
+        return min(cuts) if cuts else None
+
+
 class EngineHandle:
     def __init__(self, model, queue_depth: int = 8, enable_thinking: bool = True,
                  log_dir=None):
