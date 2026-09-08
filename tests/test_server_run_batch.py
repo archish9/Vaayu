@@ -299,6 +299,38 @@ def test_a_finalisation_failure_for_one_job_does_not_starve_the_rest():
     assert _final(b).completion_tokens == 2, "job 1 must still finalise normally"
 
 
+def test_a_keyboardinterrupt_finalising_one_job_still_serves_the_rest_and_propagates():
+    """The BaseException sibling of the test above: a raise while finalising
+    job i that is NOT an Exception (CancelledError, KeyboardInterrupt) must
+    not be swallowed as an ordinary client error -- that would silently drop
+    a real cancellation -- but it also must not starve jobs i+1..N. Every
+    job must still get its item and sentinel, the engine must be left idle
+    afterward, and the KeyboardInterrupt must propagate out of run_batch
+    once every job is served."""
+    class FlakyFinishEngine(EngineHandle):
+        def _finish(self, new_ids, cap, tool_calls, cancel=None):
+            if cap == 3:
+                raise KeyboardInterrupt()
+            return super()._finish(new_ids, cap, tool_calls, cancel=cancel)
+
+    script = [(0, ord("a")), (1, ord("x")), (1, ord("y"))]
+    e = FlakyFinishEngine(BatchModel(script))
+    jobs = [_Job("s0", [1] * 10, 3), _Job("s1", [1] * 10, 8)]
+
+    async def go():
+        with pytest.raises(KeyboardInterrupt):
+            await e.run_batch(jobs)
+        # Reached only if run_batch's finally already ran to completion --
+        # a hang here (no sentinel) would fail the test via timeout instead.
+        return [await _drain(j) for j in jobs]
+
+    a, b = asyncio.run(go())
+    assert any(kind == "error" for kind, _p in a), "job 0's own finalisation failure"
+    assert _final(b).completion_tokens == 2, "job 1 must still finalise normally"
+    assert e.live_cancels == [], "must report idle after propagating"
+    assert e._live_thread is None
+
+
 def test_stop_strings_are_honoured_per_stream():
     script = [(0, ord("a")), (0, ord("E")), (0, ord("N")), (0, ord("D")),
               (0, ord("z")), (1, ord("q"))]

@@ -870,25 +870,30 @@ class EngineHandle:
         thread = threading.Thread(target=_pump, daemon=True)
         ttft = [None] * n
         error = None
-        # Started before the try, not inside it: `start()` raising (e.g.
-        # "can't start a new thread") would otherwise be caught by the
-        # `finally` below, whose `thread.join()` raises ITS OWN "cannot join
-        # thread before it is started" -- masking the real error and, worse,
-        # propagating out of that finally before the fan-out loop below is
-        # ever reached, so no job would get a sentinel at all.
+        # Published BEFORE `start()`, matching `stream()`/`_running`: a
+        # SIGINT/SIGTERM handler runs synchronously on the main thread
+        # between bytecodes (app.py installs it via `signal.signal`), so a
+        # signal landing between `start()` and a later publish would find
+        # `_live_cancels` still empty and `cancel_all()` would silently lose
+        # the cancel -- `cancel_all`'s own docstring says lifespan teardown
+        # does not fire early enough to compensate, so the cost is the
+        # "still alive 20s after SIGTERM" failure it exists to prevent.
         #
-        # `_live_cancels`/`_live_thread` are published only AFTER `start()`
-        # returns, for the same reason: publishing them first and relying on
-        # the `finally` to clear them left both populated when `start()`
-        # raised here (that `finally` is unreachable on this path) --
-        # `live_cancel` would then report a generation in flight forever, and
-        # `quiesce()` (the teardown / client-disconnect path) would call
-        # `.join()` on a Thread that was never started, hitting the exact
-        # "cannot join before started" error this fix exists to avoid, just
-        # relocated to a harder-to-trace caller.
-        thread.start()
+        # `start()` is wrapped rather than left inside a bare try above the
+        # loop below: if it raises (e.g. "can't start a new thread"), this
+        # publish must not be left standing -- `live_cancel` would then
+        # report a generation in flight forever, and `quiesce()` (the
+        # teardown / client-disconnect path) would `.join()` a Thread that
+        # was never started, hitting "cannot join before started". So the
+        # except resets both to idle before re-raising.
         self._live_cancels = [j.cancel for j in jobs]
         self._live_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            self._live_cancels = []
+            self._live_thread = None
+            raise
         try:
             while True:
                 kind, payload = await loop.run_in_executor(None, bridge.get)
