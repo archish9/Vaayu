@@ -50,18 +50,28 @@ def test_max_batch_size_of_one_never_forms_a_batch():
     assert select_width(cands, max_batch_size=1, chunk=CHUNK) == 1
 
 
-def test_the_first_failing_candidate_ends_formation():
-    """Arrival order is preserved: a candidate that fails is not skipped over
-    in favour of a later one, it stops formation and keeps its queue place."""
+def test_first_candidate_with_warm_prefix_still_batches_on_cost():
+    """Pure cost comparison: even a candidate with warm prefix (own_match=4155)
+    batches if the cost metric favors it. Candidates 0,1,2: serial 9+9+1=19,
+    batched 8 (common prefix 200). Batching wins, so width=3 not 1."""
     cands = [Candidate(_prompt(4165, 0)),
              Candidate(_prompt(4165, 10 ** 6)),
              Candidate(_prompt(4165, 2 * 10 ** 6), own_match=4165 - 10)]
-    assert select_width(cands, max_batch_size=3, chunk=CHUNK) == 2
+    assert select_width(cands, max_batch_size=3, chunk=CHUNK) == 3
 
 
 def test_a_single_candidate_is_always_width_one():
     assert select_width([Candidate(_prompt(4165))], max_batch_size=3,
                         chunk=CHUNK) == 1
+
+
+def test_small_nonzero_own_match_batches_when_cost_favors():
+    """Small own_match does not veto batching if the cost comparison says batch.
+    5000-token prompts, common prefix 200: serial costs 20 (10+10), batched costs
+    10. Must batch (width=2) not serialize on the strength of one token match."""
+    cands = [Candidate(_prompt(5000, 0), own_match=0),
+             Candidate(_prompt(5000, 10 ** 6), own_match=1)]
+    assert select_width(cands, max_batch_size=2, chunk=CHUNK) == 2
 
 
 def test_chunk_passes_rounds_up_and_floors_at_zero():

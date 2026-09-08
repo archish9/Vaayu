@@ -88,8 +88,6 @@ def select_width(cands, *, max_batch_size: int, chunk: int) -> int:
     limit = min(len(cands), max(1, max_batch_size))
     width = 1
     for k in range(2, limit + 1):
-        if cands[k - 1].own_match > 0:
-            break
         if batched_passes(cands[:k], chunk) < serial_passes(cands[:k], chunk):
             width = k
         else:
