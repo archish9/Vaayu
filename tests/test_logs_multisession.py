@@ -7,7 +7,28 @@ member -- and must still reach every member's own log, or reading one
 session's file during a batch shows tokens with none of the engine work that
 produced them.
 """
+import pytest
+
 from vaayu.server import logs
+
+
+@pytest.fixture(autouse=True)
+def _restore_marker_state():
+    """Reset the module-global marker state before AND after every test here.
+
+    `_overlap_warned` is a deliberate once-per-process latch in production
+    (logs.py: the warning must fire ONCE, not per line, or a read-only mount
+    floods the log with the same warning). This file is the one that
+    exercises the overlap path, so it is the one that trips that latch --
+    left tripped, it silently disarms the warning assertion in whatever test
+    (in this file or another) runs next, in either file order. There is no
+    public reset, so reach into the private global directly.
+    """
+    logs.clear_current_session()
+    logs._overlap_warned = False
+    yield
+    logs.clear_current_session()
+    logs._overlap_warned = False
 
 
 def _reset():
