@@ -2121,6 +2121,17 @@ already built and must NOT be rebuilt, the three measurements that set the desig
 order, the CORRECTED identity criterion, and the environment traps. **Start there, not at the
 2026-09-07 brief** — that brief's §4 measurement is discharged and its economics are superseded.
 
+**Build tasks (`docs/superpowers/plans/2026-09-08-p10-server-batching.md`):**
+- [ ] T1 `PrefixCacheStore.peek_match` — non-destructive prefix peek
+- [ ] T2 `vaayu/server/batch_policy.py` — the chunk-pass formation rule
+- [ ] T3 `batched_generate(..., should_stop=None)` — per-stream retirement hook
+- [ ] T4 `logs.py` session marker becomes a tuple (issue L1 T4)
+- [ ] T5 `_Detok` + `_BatchStream` — per-stream text, stop strings, finish, row
+- [ ] T6 `EngineHandle.run_batch` — fan-out over one worker thread
+- [ ] T7 `vaayu/server/scheduler.py` — the dispatch loop
+- [ ] T8 Routes + `MAX_BATCH_SIZE` knob + README + the false sdpa doc lines
+- [ ] T9 Inert notices (startup kernel warning, latched never-admitted line)
+- [ ] T10 Server-level on-device A/B + RESULTS + close the row
 
 **[ ] UNBLOCKED 2026-09-08 — row 17 is FIXED** (`sdpa` now gets an explicit causal mask at
 `q_len > 1, past > 0`; `docs/2026-09-08-row17-sdpa-causal-mask-RESULTS.md`). The kernel switch is
