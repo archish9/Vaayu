@@ -758,6 +758,21 @@ class EngineHandle:
                       prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
                       decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
             row["tokens"], row["finish"] = produced, finish
+            if cancel.cancelled:
+                # Mirrors generate()'s own override just above in this file.
+                # `finish_reason` maps cancelled -> "length" on purpose (the
+                # OpenAI wire vocabulary has no other word for it), but
+                # requests.jsonl is NOT the wire and documentation/server.md's
+                # table promises `cancelled` there. This success tail is
+                # reachable even for a cancelled run: `cancel` can be set
+                # (SIGTERM, a batch-mate's failure racing this stream) while
+                # this consumer loop is still actively draining real deltas,
+                # in which case it ends via the pump's own DONE marker rather
+                # than a GeneratorExit -- the ONLY other place this row set
+                # "cancelled" until now. Without this, that disconnect read as
+                # an ordinary "stop"/"length", indistinguishable from a
+                # truncated-but-uncancelled answer.
+                row["finish"] = "cancelled"
             yield ("final", GenerationResult(
                 text=cleaned, tool_calls=calls,
                 prompt_tokens=len(prompt_ids), completion_tokens=produced,

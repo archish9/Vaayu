@@ -427,6 +427,23 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             yield
         finally:
             restore_signals()
+            # NOTE on ordering: `_teardown` below calls `engine.cancel_all()`
+            # as its own first action, and its docstring says stopping first
+            # is why it is safe to run at all. On a REAL SIGINT/SIGTERM
+            # shutdown that is still what happens first -- the signal handler
+            # (`_install_signal_cancel`) calls `cancel_all()` immediately,
+            # independent of this coroutine, so by the time this `finally`
+            # runs any in-flight generation is already unwinding and `stop()`
+            # below returns quickly. But on a PROGRAMMATIC shutdown with no
+            # signal -- an embedded caller closing the app directly, or a
+            # `with TestClient(...)` block exiting mid-generation -- nothing
+            # has cancelled anything yet: `stop()` now waits for the current
+            # run to finish NATURALLY (up to its full token cap) before
+            # `_teardown`'s `cancel_all()` ever runs, where the old code
+            # (pre-P10, no scheduler) reached `cancel_all()` immediately with
+            # no wait in between. Not fixed here -- flagged, since fixing it
+            # would mean deciding whether `stop()` itself should cancel first,
+            # which is Task 7's contract to change, not this one's.
             await app.state.scheduler.stop()
             _teardown(app)
             if restore_stdio is not None:
@@ -443,6 +460,19 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         # idempotent) so a TestClient used without `with` still gets a live
         # dispatcher on its first request. When lifespan DOES run, its own
         # construction+start above supersedes this one.
+        #
+        # ONE REQUEST PER NON-LIFESPAN CLIENT. `start()` is called from
+        # inside the first request that reaches it, binding the dispatch
+        # task to WHATEVER event loop is driving that call. A bare TestClient
+        # used without `with` (this file's own dominant pattern) does not
+        # guarantee that loop survives between separate `.post()`/`.get()`
+        # calls the way the `with` block's portal does -- a second request on
+        # the SAME such client can find `self._task` non-`None` but tied to a
+        # now-dead loop, and `submit()` reads that as `self._task.done()` ->
+        # `QueueFull("the dispatcher is not running")`. That is a 503, not a
+        # hang, so it fails honestly -- but it is real, and no test here
+        # happens to exercise two requests on one bare client. A real server
+        # never hits this: its ONE `app` always runs lifespan.
         app.state.scheduler = BatchScheduler(
             engine,
             queue_depth=(config.queue_depth if config is not None
@@ -645,7 +675,10 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # can only happen when `cancel` is already set (that is why it
             # was dropped), so this is the same "nobody is listening" case
             # the disconnect branch below handles, just with nothing to log a
-            # token count for.
+            # token count for. Nothing else ever ran for this job -- no
+            # generate() call, no row -- so it is this frame's to write, same
+            # as the streaming route's `_sse` does for the identical drop.
+            _refusal_row(e, req, None, None, stream=False, finish="cancelled")
             print("[Vaayu-Server] client disconnected before this request ran")
             return _error(499, "client closed the connection; generation was "
                                "stopped", "client_closed_request")
@@ -719,9 +752,13 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     sent = ""
     final = None
     # `engine.stream` writes this request's row from its own `finally`, but
-    # only once the dispatcher actually runs it -- i.e. from the moment the
-    # job is admitted below. Everything before that point is unowned: the
-    # three yields, the wait to be admitted, `scheduler.submit` itself. Only
+    # only once the dispatcher actually RUNS the job -- a submitted job can
+    # still be dropped by `_form` before that (its client already cancelled
+    # while queued: only a sentinel then, no ("error"|"final", ...) item --
+    # contract fact 2). So ownership transfers on the first REAL item out of
+    # `job.out`, not at `submit()`. Everything before that point is unowned:
+    # the three yields, the wait to be admitted, `scheduler.submit` itself,
+    # AND the wait for the dispatcher to actually start running it. Only
     # QueueFull was ever plugged, by a typed `except`, so every OTHER way of
     # leaving that span ended the request with no row at all -- breaking the
     # "a request never ends without a row" contract README.md and
@@ -751,13 +788,26 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         job.prepared = prepared
         job.stream = True
         await scheduler.submit(job)
-        # No await between here and the loop's first `job.out.get()`, so no
-        # cancellation can land in between: the handover is exact.
-        engine_owns_the_row = True
         while True:
             item = await job.out.get()
             if item is None:
+                if not engine_owns_the_row:
+                    # `_form` dropped this job before the dispatcher ever ran
+                    # it (contract fact 2) -- ownership never transferred, so
+                    # nothing else will ever write this request's row. The
+                    # client is why: only a cancelled `job.cancel` gets a job
+                    # dropped this way.
+                    owed = (None, None, "cancelled")
                 break
+            # Ownership transfers on the FIRST real item, not at submit():
+            # a successfully submitted job can still be dropped by `_form`
+            # before the dispatcher runs it (see above). Once a real item
+            # arrives here the dispatcher has actually started the
+            # generation, and its own row-writing `finally` (engine.stream(),
+            # or run_batch's per-job fan-out) is guaranteed to run even if
+            # this generator bails out right after -- so from here on, a row
+            # written in THIS frame's `finally` would double-count.
+            engine_owns_the_row = True
             kind, payload = item
             if kind == "error":
                 raise payload

@@ -2352,6 +2352,26 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
   skipped beyond the pre-existing 12). See
   `.superpowers/sdd/2026-09-08-p10-server-batching/task-8-report.md` for the full
   per-file diff and the four-contract-fact verification.
+  **Review round 2 (2 Critical, 2 Important, 3 Minor — all fixed):** the "noted, not fixed"
+  line above was WRONG on one count — Critical 2 showed the `finish="cancelled"`
+  unreachability is a REACHABILITY regression this task caused (pre-P10, `_sse.aclose()`
+  cascaded into `engine.stream()`'s GeneratorExit branch, the only place that wrote it; P10's
+  dispatcher owns that generator now, so a mid-stream disconnect fell through to the ordinary
+  success tail instead) — fixed by mirroring `generate()`'s existing `if cancel.cancelled:
+  row["finish"] = "cancelled"` onto `stream()`'s success tail (engine.py), not by touching the
+  docs. Critical 1: a job `_form` drops (only a sentinel, contract fact 2) produced ZERO rows
+  on both routes — `_sse` was claiming row ownership at `submit()` instead of on the first real
+  item; fixed by moving the transfer and writing `_refusal_row(finish="cancelled")` explicitly
+  on an unowned sentinel (streaming) / on `result is None` (non-streaming). Two new dedicated
+  regression tests added (`test_a_dropped_non_streaming_job_still_writes_a_row`,
+  `test_a_mid_stream_disconnect_still_writes_finish_cancelled`), both verified failing against
+  the pre-fix code via `git stash` before the fix landed. Important 3:
+  `test_a_disconnect_while_queued_still_writes_a_row` restored to the TRUE `_waiting` case
+  (two-job shape: A blocks the run, B sits behind it deterministically, B's client vanishes) —
+  the prior version had drifted onto Critical 2's "already running, blocked on lock" case
+  instead. Important 4 + the three Minors: comments only (see task-8-report.md's review-round-2
+  section for exact locations and reasoning) — no behavior change needed for those.
+  1832 passed, 12 skipped after this round.
 - [ ] T9 Inert notices — **IN SCOPE, do it before T10.** Two things, both in
   `scheduler.py`, both small and additive (no concurrency, no shared state):
   (a) a startup WARNING when `MAX_BATCH_SIZE > 1` on a non-sdpa load, then serialize —

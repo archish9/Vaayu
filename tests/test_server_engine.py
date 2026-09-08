@@ -392,6 +392,13 @@ def test_sse_holds_the_slot_until_the_abandoned_worker_thread_has_stopped(monkey
 
     alive_after_close, depth_after_close = asyncio.run(main())
     record["thread"].join(timeout=5)
+    # NOTE: `alive_after_close` is read AFTER `sched.stop()`, which itself
+    # already waits for the dispatcher's current run (worker join included)
+    # to finish -- so this assertion can no longer, by itself, distinguish
+    # "held correctly" from "`_sse` returned early and `stop()` masked it".
+    # `record["lock_at_exit"]` (below) is what still pins the real property:
+    # it is read on the WORKER THREAD, at the moment it observes the
+    # cancellation and exits, independent of anything `stop()` does.
     assert not alive_after_close, (
         "the dispatcher stopped while the generation worker was still "
         "running -- the lock is free and a queued request will be admitted")

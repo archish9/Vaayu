@@ -111,7 +111,14 @@ def _queue_full_on_submit(monkeypatch, message="8 requests are already queued"):
 
     Admission now happens in the scheduler, not in engine.slot()/generate()/
     stream() -- FakeEngine has no queue of its own to be full, so this is how
-    a test puts the SCHEDULER'S queue-full path (contract fact 3) under load."""
+    a test puts the SCHEDULER'S queue-full path (contract fact 3) under load.
+
+    This does not exercise a REAL depth limit being tripped by real traffic
+    (`self.depth >= self.queue_depth` inside `submit()` itself) -- that
+    coverage lives in `test_server_scheduler.py`, against a real
+    `BatchScheduler`. What this file's two callers below pin is what the
+    ROUTES do with a `QueueFull` once raised, which is the thing that
+    actually changed here."""
     from vaayu.server.scheduler import BatchScheduler
 
     async def raising(self, job):
