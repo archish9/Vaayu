@@ -837,28 +837,37 @@ class EngineHandle:
             return streams[i].retired or jobs[i].cancel.cancelled
 
         def _pump():
-            gen = self.model.batched_generate(reqs, should_stop=_should_stop)
+            # `batched_generate(...)` itself is INSIDE the try: real
+            # implementations are plain generator functions (nothing runs
+            # until the first `next()`), so this is theoretical today, but a
+            # model whose `batched_generate` is a wrapper that does work on
+            # call would otherwise raise before `gen` exists at all, killing
+            # this thread with no error/DONE ever reaching the bridge and the
+            # awaiting coroutine stuck on `bridge.get()` forever.
+            gen = None
             try:
+                gen = self.model.batched_generate(reqs, should_stop=_should_stop)
                 for stream_id, tok in gen:
                     bridge.put(("tok", (stream_id, tok)))
             except BaseException as e:           # noqa: BLE001 -- re-raised below
                 bridge.put(("error", e))
             finally:
                 # Explicit, never GC: this is the contract in the docstring
-                # above. A no-op when the loop finished normally. The DONE put
-                # is its own nested finally -- gen.close() runs the model's
-                # substantial teardown (expert-cache budget restore, VRAM
-                # prefix restore, flag clearing), and if THAT raises, the
-                # sentinel must still reach the bridge or the awaiting
-                # coroutine blocks on bridge.get() forever, holding the lock.
+                # above. A no-op when the loop finished normally. `gen` is
+                # None only if the call above itself raised, in which case
+                # there is nothing to close. The DONE put is its own nested
+                # finally -- gen.close() runs the model's substantial
+                # teardown (expert-cache budget restore, VRAM prefix
+                # restore, flag clearing), and if THAT raises, the sentinel
+                # must still reach the bridge or the awaiting coroutine
+                # blocks on bridge.get() forever, holding the lock.
                 try:
-                    gen.close()
+                    if gen is not None:
+                        gen.close()
                 finally:
                     bridge.put((DONE, None))
 
         thread = threading.Thread(target=_pump, daemon=True)
-        self._live_cancels = [j.cancel for j in jobs]
-        self._live_thread = thread
         ttft = [None] * n
         error = None
         # Started before the try, not inside it: `start()` raising (e.g.
@@ -867,7 +876,19 @@ class EngineHandle:
         # thread before it is started" -- masking the real error and, worse,
         # propagating out of that finally before the fan-out loop below is
         # ever reached, so no job would get a sentinel at all.
+        #
+        # `_live_cancels`/`_live_thread` are published only AFTER `start()`
+        # returns, for the same reason: publishing them first and relying on
+        # the `finally` to clear them left both populated when `start()`
+        # raised here (that `finally` is unreachable on this path) --
+        # `live_cancel` would then report a generation in flight forever, and
+        # `quiesce()` (the teardown / client-disconnect path) would call
+        # `.join()` on a Thread that was never started, hitting the exact
+        # "cannot join before started" error this fix exists to avoid, just
+        # relocated to a harder-to-trace caller.
         thread.start()
+        self._live_cancels = [j.cancel for j in jobs]
+        self._live_thread = thread
         try:
             while True:
                 kind, payload = await loop.run_in_executor(None, bridge.get)
@@ -889,6 +910,13 @@ class EngineHandle:
             finally:
                 self._live_cancels = []
                 self._live_thread = None
+            # A BaseException that is NOT an Exception (CancelledError,
+            # KeyboardInterrupt) raised while finalising one job must still
+            # propagate -- swallowing it as a client-visible error would
+            # silently drop a cancellation. But it must not starve i+1..N
+            # either, so it is recorded here and re-raised only once every
+            # job has its result/error item and its sentinel.
+            pending_base_exc = None
             for i, j in enumerate(jobs):
                 row = {"tokens": len(streams[i].ids), "finish": "error",
                        "error": error}
@@ -916,14 +944,20 @@ class EngineHandle:
                                 prompt_tokens=len(j.prompt_ids),
                                 completion_tokens=len(streams[i].ids),
                                 finish_reason=finish)))
-                    except BaseException as e:  # noqa: BLE001 -- a failure
-                        # finalising job i (parse_tool_calls, _finish, _log,
-                        # or building GenerationResult) must not propagate out
-                        # of this loop: that would skip jobs i+1..N entirely,
-                        # leaving their clients blocked on out.get() forever
-                        # with no ("final")/("error") item and no sentinel.
+                    except Exception as e:
+                        # A failure finalising job i (parse_tool_calls,
+                        # _finish, _log, or building GenerationResult) must
+                        # not propagate out of this loop: that would skip
+                        # jobs i+1..N entirely, leaving their clients blocked
+                        # on out.get() forever with no ("final")/("error")
+                        # item and no sentinel.
                         row["error"] = e
                         await j.out.put(("error", e))
+                    except BaseException as e:  # noqa: BLE001 -- re-raised below
+                        row["error"] = e
+                        await j.out.put(("error", e))
+                        if pending_base_exc is None:
+                            pending_base_exc = e
                 finally:
                     # The sentinel on EVERY path, or a client waits forever on
                     # a queue nobody will write to again.
@@ -935,3 +969,8 @@ class EngineHandle:
                         finish=row["finish"], ttft_s=ttft[i],
                         hits_before=hits_before, error=row["error"],
                         batch=batch_note)
+            if pending_base_exc is not None:
+                # Every job has its item and its sentinel by now (the loop
+                # above ran to completion regardless of this exception) --
+                # only now does cancellation propagate, as asyncio requires.
+                raise pending_base_exc

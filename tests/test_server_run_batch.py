@@ -7,6 +7,8 @@ generator so no client can abandon it, and closes it explicitly on every path.
 """
 import asyncio
 
+import pytest
+
 from vaayu.server.engine import CancelToken, EngineHandle
 from vaayu.server.schemas import ChatCompletionRequest
 
@@ -138,7 +140,7 @@ def test_a_cancelled_job_is_retired_and_the_others_finish():
     assert _deltas(b) == "xy", "the rest of the batch is unaffected"
 
 
-def test_the_generator_is_always_closed():
+def test_the_generator_is_always_closed(monkeypatch):
     """No client holds it, and run_batch closes it explicitly rather than
     leaving _batch_decode_active set until GC.
 
@@ -204,18 +206,52 @@ def test_the_generator_is_always_closed():
     jobs = [_Job("s0", [1] * 10, 100_000)]
 
     _FlakyQueue._tok_puts = 0
-    engine_mod._queue.Queue = _FlakyQueue
-    try:
-        async def go():
-            await e.run_batch(jobs)
-            return [await _drain(j) for j in jobs]
+    # pytest's monkeypatch, not a manual assign/restore: same reach (this IS
+    # the stdlib queue module's Queue, patched process-wide for the duration),
+    # but teardown is owned by pytest, so it survives a KeyboardInterrupt or
+    # an internal error between the assignment and a manual try/finally.
+    monkeypatch.setattr(engine_mod._queue, "Queue", _FlakyQueue)
 
-        asyncio.run(go())
-    finally:
-        engine_mod._queue.Queue = real_queue_cls
+    async def go():
+        await e.run_batch(jobs)
+        return [await _drain(j) for j in jobs]
+
+    asyncio.run(go())
 
     assert model.closed is True
     assert model._batch_decode_active is False
+
+
+def test_a_failed_thread_start_leaves_the_engine_idle(monkeypatch):
+    """`_live_cancels`/`_live_thread` used to be published BEFORE
+    `thread.start()`, with cleanup only in the `finally` `start()` raising
+    never reaches -- so a failed start left `live_cancels` populated forever
+    (the engine reporting a generation in flight when none exists) and
+    `_live_thread` pointing at a Thread that was never started, which
+    `quiesce()` -- the teardown / client-disconnect path -- would then try to
+    `.join()`, raising "cannot join thread before it is started". Publishing
+    only happens after `start()` succeeds now; this proves both halves: the
+    engine reports idle, and `quiesce()` does not raise."""
+    import vaayu.server.engine as engine_mod
+
+    class _NeverStarts(engine_mod.threading.Thread):
+        def start(self):
+            raise RuntimeError("no threads available")
+
+    monkeypatch.setattr(engine_mod.threading, "Thread", _NeverStarts)
+
+    e = EngineHandle(BatchModel([(0, ord("a"))]))
+    jobs = [_Job("s0", [1] * 10, 8)]
+
+    async def go():
+        with pytest.raises(RuntimeError, match="no threads available"):
+            await e.run_batch(jobs)
+
+    asyncio.run(go())
+
+    assert e.live_cancels == [], "must report idle, not a phantom generation"
+    assert e._live_thread is None
+    e.quiesce()  # must not raise "cannot join thread before it is started"
 
 
 def test_an_engine_error_reaches_every_job():
