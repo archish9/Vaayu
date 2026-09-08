@@ -328,10 +328,15 @@ class EngineHandle:
         try:
             wall = time.time() - started
             snap_after = reqlog.snapshot(self.model)
-            # Process-wide counters, so under N>1 this is the BATCH's bytes
-            # and stalls, not this stream's -- flagged so nothing sums N
-            # rows into a number that never happened. tokens/ttft_s/wall_s
-            # above stay per-stream and are honest as they are.
+            # Under N>1: `tokens` and `ttft_s` are genuinely per-stream. But
+            # `wall_s` and `decode_tok_s` are NOT -- `started` is the whole
+            # batch's start, so a stream that retires early is still charged
+            # the batch's full wall time and its decode_tok_s understates.
+            # `prefix_hit` is batch-wide too (it compares process counters),
+            # so it reads True on every row if any one stream hit. `decode`
+            # (below) is the batch's bytes and stalls, not this stream's --
+            # flagged `shared=True` so nothing sums N rows into a number that
+            # never happened.
             if batch:
                 decode = dict(reqlog.decode_block(snap_before, snap_after, tokens),
                               shared=True)
@@ -840,17 +845,30 @@ class EngineHandle:
                 bridge.put(("error", e))
             finally:
                 # Explicit, never GC: this is the contract in the docstring
-                # above. A no-op when the loop finished normally.
-                gen.close()
-                bridge.put((DONE, None))
+                # above. A no-op when the loop finished normally. The DONE put
+                # is its own nested finally -- gen.close() runs the model's
+                # substantial teardown (expert-cache budget restore, VRAM
+                # prefix restore, flag clearing), and if THAT raises, the
+                # sentinel must still reach the bridge or the awaiting
+                # coroutine blocks on bridge.get() forever, holding the lock.
+                try:
+                    gen.close()
+                finally:
+                    bridge.put((DONE, None))
 
         thread = threading.Thread(target=_pump, daemon=True)
         self._live_cancels = [j.cancel for j in jobs]
         self._live_thread = thread
         ttft = [None] * n
         error = None
+        # Started before the try, not inside it: `start()` raising (e.g.
+        # "can't start a new thread") would otherwise be caught by the
+        # `finally` below, whose `thread.join()` raises ITS OWN "cannot join
+        # thread before it is started" -- masking the real error and, worse,
+        # propagating out of that finally before the fan-out loop below is
+        # ever reached, so no job would get a sentinel at all.
+        thread.start()
         try:
-            thread.start()
             while True:
                 kind, payload = await loop.run_in_executor(None, bridge.get)
                 if kind is DONE:
@@ -871,33 +889,41 @@ class EngineHandle:
             finally:
                 self._live_cancels = []
                 self._live_thread = None
-            snap = snap_before
             for i, j in enumerate(jobs):
                 row = {"tokens": len(streams[i].ids), "finish": "error",
                        "error": error}
                 try:
-                    if error is not None:
-                        await j.out.put(("error", error))
-                    else:
-                        cleaned, calls = parse_tool_calls(
-                            streams[i].text,
-                            self.tool_format if j.req.tools else None,
-                            declared_tool_names(j.req.tools))
-                        finish = self._finish(streams[i].ids, j.cap, calls,
-                                              cancel=j.cancel)
-                        row["finish"] = finish
-                        if j.cancel.cancelled:
-                            # Same rule generate() applies: requests.jsonl is
-                            # not the wire, and documentation/server.md promises
-                            # `cancelled` there.
-                            row["finish"] = "cancelled"
-                        self._log(j.req, "DONE", tokens=len(streams[i].ids),
-                                  finish=finish, batch=n)
-                        await j.out.put(("final", GenerationResult(
-                            text=cleaned, tool_calls=calls,
-                            prompt_tokens=len(j.prompt_ids),
-                            completion_tokens=len(streams[i].ids),
-                            finish_reason=finish)))
+                    try:
+                        if error is not None:
+                            await j.out.put(("error", error))
+                        else:
+                            cleaned, calls = parse_tool_calls(
+                                streams[i].text,
+                                self.tool_format if j.req.tools else None,
+                                declared_tool_names(j.req.tools))
+                            finish = self._finish(streams[i].ids, j.cap, calls,
+                                                  cancel=j.cancel)
+                            row["finish"] = finish
+                            if j.cancel.cancelled:
+                                # Same rule generate() applies: requests.jsonl is
+                                # not the wire, and documentation/server.md promises
+                                # `cancelled` there.
+                                row["finish"] = "cancelled"
+                            self._log(j.req, "DONE", tokens=len(streams[i].ids),
+                                      finish=finish, batch=n)
+                            await j.out.put(("final", GenerationResult(
+                                text=cleaned, tool_calls=calls,
+                                prompt_tokens=len(j.prompt_ids),
+                                completion_tokens=len(streams[i].ids),
+                                finish_reason=finish)))
+                    except BaseException as e:  # noqa: BLE001 -- a failure
+                        # finalising job i (parse_tool_calls, _finish, _log,
+                        # or building GenerationResult) must not propagate out
+                        # of this loop: that would skip jobs i+1..N entirely,
+                        # leaving their clients blocked on out.get() forever
+                        # with no ("final")/("error") item and no sentinel.
+                        row["error"] = e
+                        await j.out.put(("error", e))
                 finally:
                     # The sentinel on EVERY path, or a client waits forever on
                     # a queue nobody will write to again.
@@ -905,7 +931,7 @@ class EngineHandle:
                     self._write_request_row(
                         j.req, stream=True, started=started,
                         prompt_tokens=len(j.prompt_ids), cap=j.cap,
-                        snap_before=snap, tokens=row["tokens"],
+                        snap_before=snap_before, tokens=row["tokens"],
                         finish=row["finish"], ttft_s=ttft[i],
                         hits_before=hits_before, error=row["error"],
                         batch=batch_note)

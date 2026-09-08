@@ -7,8 +7,6 @@ generator so no client can abandon it, and closes it explicitly on every path.
 """
 import asyncio
 
-import pytest
-
 from vaayu.server.engine import CancelToken, EngineHandle
 from vaayu.server.schemas import ChatCompletionRequest
 
@@ -142,11 +140,80 @@ def test_a_cancelled_job_is_retired_and_the_others_finish():
 
 def test_the_generator_is_always_closed():
     """No client holds it, and run_batch closes it explicitly rather than
-    leaving _batch_decode_active set until GC."""
-    model = BatchModel([(0, ord("a")), (1, ord("x"))])
+    leaving _batch_decode_active set until GC.
+
+    A naive version of this test -- a short script, drained to exhaustion --
+    cannot tell explicit closure from CPython's own refcounting: once _pump's
+    frame returns, its only reference to the generator drops to zero and
+    Python collects it immediately either way, so `model.closed` reads True
+    whether or not `run_batch` ever calls `.close()`. Two things make this
+    version actually discriminate:
+
+    1. The model stashes its OWN reference to the generator (`_last_gen`),
+       kept alive by `model` for the rest of this test -- so nothing but an
+       explicit `.close()` call can run its `finally` early.
+    2. The bridge queue is made to fail relaying the 3rd token, so `_pump`'s
+       consuming loop exits with the generator still suspended mid-yield
+       (real abandonment), not naturally exhausted -- the script never runs
+       out on its own (1000 entries, cap far higher).
+
+    Verified empirically per review: with `gen.close()` temporarily deleted
+    from `run_batch`, this test fails (`closed` reads False); restored, it
+    passes. See task-6-report.md for the transcript.
+    """
+    import vaayu.server.engine as engine_mod
+
+    class SelfKeepingModel(BatchModel):
+        def __init__(self):
+            super().__init__(script=None)
+
+        def batched_generate(self, requests, reclaim=False, should_stop=None):
+            def _inner():
+                self._batch_decode_active = True
+                try:
+                    for k in range(1000):
+                        i = 0
+                        tok = ord("a") + (k % 5)
+                        if should_stop is not None and should_stop(i):
+                            continue
+                        yield (i, tok)
+                finally:
+                    self._batch_decode_active = False
+                    self.closed = True
+            gen = _inner()
+            self._last_gen = gen          # outlives _pump's stack frame
+            return gen
+
+    real_queue_cls = engine_mod._queue.Queue
+
+    class _FlakyQueue(real_queue_cls):
+        """Fails relaying the 3rd token, simulating the bridge breaking while
+        `_pump` is mid-iteration -- forcing its for loop to exit with the
+        generator still suspended, not exhausted."""
+        _tok_puts = 0
+
+        def put(self, item, *a, **kw):
+            if isinstance(item, tuple) and item[0] == "tok":
+                type(self)._tok_puts += 1
+                if type(self)._tok_puts == 3:
+                    raise RuntimeError("bridge broke")
+            return super().put(item, *a, **kw)
+
+    model = SelfKeepingModel()
     e = EngineHandle(model)
-    jobs = [_Job("s0", [1] * 10, 8), _Job("s1", [1] * 10, 8)]
-    asyncio.run(e.run_batch(jobs))
+    jobs = [_Job("s0", [1] * 10, 100_000)]
+
+    _FlakyQueue._tok_puts = 0
+    engine_mod._queue.Queue = _FlakyQueue
+    try:
+        async def go():
+            await e.run_batch(jobs)
+            return [await _drain(j) for j in jobs]
+
+        asyncio.run(go())
+    finally:
+        engine_mod._queue.Queue = real_queue_cls
+
     assert model.closed is True
     assert model._batch_decode_active is False
 
@@ -167,6 +234,33 @@ def test_an_engine_error_reaches_every_job():
     a, b = asyncio.run(go())
     assert any(kind == "error" for kind, _p in a)
     assert any(kind == "error" for kind, _p in b), "no job may hang on a failure"
+
+
+def test_a_finalisation_failure_for_one_job_does_not_starve_the_rest():
+    """A raise while finalising job i (parse_tool_calls, _finish, _log, or
+    building GenerationResult) used to propagate straight out of the fan-out
+    for loop, so jobs i+1..N never got a ("final")/("error") item OR their
+    None sentinel -- their clients would block on out.get() forever while
+    run_batch re-raised through the caller's lock. job 0 is rigged to fail
+    finalising (via cap=3, a marker _finish below raises on); job 1 must
+    still get its normal final result and sentinel."""
+    class FlakyFinishEngine(EngineHandle):
+        def _finish(self, new_ids, cap, tool_calls, cancel=None):
+            if cap == 3:
+                raise RuntimeError("boom finalising job 0")
+            return super()._finish(new_ids, cap, tool_calls, cancel=cancel)
+
+    script = [(0, ord("a")), (1, ord("x")), (1, ord("y"))]
+    e = FlakyFinishEngine(BatchModel(script))
+    jobs = [_Job("s0", [1] * 10, 3), _Job("s1", [1] * 10, 8)]
+
+    async def go():
+        await e.run_batch(jobs)
+        return [await _drain(j) for j in jobs]
+
+    a, b = asyncio.run(go())
+    assert any(kind == "error" for kind, _p in a), "job 0's own finalisation failure"
+    assert _final(b).completion_tokens == 2, "job 1 must still finalise normally"
 
 
 def test_stop_strings_are_honoured_per_stream():
