@@ -170,9 +170,11 @@ class EngineHandle:
         self.enable_thinking = enable_thinking
         self._lock = asyncio.Lock()
         self._inflight = 0
-        # The token of the request currently generating, so shutdown can stop
-        # it. Concurrency is 1 by construction, so one slot is the whole set.
-        self._live_cancel = None
+        # The tokens of the requests currently generating, so shutdown can stop
+        # them. A LIST since P10: the dispatcher runs a batch of one OR N, and
+        # cancel_all() -- which SIGTERM and _teardown reach the GPU through --
+        # must reach every member, not whichever one was published last.
+        self._live_cancels = []
         # The worker thread that token belongs to. The token alone cannot say
         # whether generation has actually STOPPED -- cancellation is cooperative
         # and is only checked once per token -- so `quiesce` needs the thread.
@@ -204,14 +206,22 @@ class EngineHandle:
         return self._inflight
 
     @property
+    def live_cancels(self):
+        """Every running request's CancelToken. Empty when idle."""
+        return list(self._live_cancels)
+
+    @property
     def live_cancel(self):
-        """The running request's CancelToken, or None when idle."""
-        return self._live_cancel
+        """The first running request's CancelToken, or None when idle.
+
+        Kept for callers that only ask "is anything generating?". Under a batch
+        it is one member of several -- use `live_cancels` to act on them all.
+        """
+        return self._live_cancels[0] if self._live_cancels else None
 
     def cancel_all(self) -> None:
         """Stop whatever is generating. Idempotent, and a no-op when idle."""
-        token = self._live_cancel
-        if token is not None:
+        for token in list(self._live_cancels):
             token.cancel()
 
     def quiesce(self) -> None:
@@ -295,7 +305,8 @@ class EngineHandle:
     def _write_request_row(self, req, *, stream: bool, started: float,
                            prompt_tokens: int, cap: int, snap_before: dict,
                            tokens: int = 0, finish: str = "error",
-                           ttft_s=None, hits_before: int = 0, error=None) -> None:
+                           ttft_s=None, hits_before: int = 0, error=None,
+                           batch=None) -> None:
         """One `requests.jsonl` row. Called from a `finally`, so it runs on the
         success path, the raise path, and the client-disconnect path alike --
         which is the point: audit item 9 was that a failed request left a REQ
@@ -317,9 +328,19 @@ class EngineHandle:
         try:
             wall = time.time() - started
             snap_after = reqlog.snapshot(self.model)
+            # Process-wide counters, so under N>1 this is the BATCH's bytes
+            # and stalls, not this stream's -- flagged so nothing sums N
+            # rows into a number that never happened. tokens/ttft_s/wall_s
+            # above stay per-stream and are honest as they are.
+            if batch:
+                decode = dict(reqlog.decode_block(snap_before, snap_after, tokens),
+                              shared=True)
+            else:
+                decode = reqlog.decode_block(snap_before, snap_after, tokens)
             reqlog.write_row(self.log_dir, {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "session": getattr(req, "session_key", None),
+                "batch": batch,
                 "prompt_tokens": prompt_tokens,
                 "cap": cap,
                 "stream": stream,
@@ -334,7 +355,7 @@ class EngineHandle:
                 "finish": finish,
                 "decode_tok_s": ((tokens - 1) / wall
                                  if wall > 0 and tokens > 1 else None),
-                "decode": reqlog.decode_block(snap_before, snap_after, tokens),
+                "decode": decode,
                 "error": reqlog.error_block(error),
             })
         except Exception:                            # noqa: BLE001 -- never displaces
@@ -435,7 +456,7 @@ class EngineHandle:
         uncancelled join on the abandoned path would block for the whole
         remaining cap.
         """
-        self._live_cancel = cancel
+        self._live_cancels = [cancel]
         self._live_thread = thread
         try:
             yield
@@ -450,7 +471,7 @@ class EngineHandle:
                 if thread is not None:
                     thread.join()
             finally:
-                self._live_cancel = None
+                self._live_cancels = []
                 self._live_thread = None
 
     # ── generation ───────────────────────────────────────────────────────────
@@ -652,7 +673,7 @@ class EngineHandle:
                     bridge.put((DONE, None))
 
             thread = threading.Thread(target=_pump, daemon=True)
-            self._live_cancel = cancel
+            self._live_cancels = [cancel]
             self._live_thread = thread
             thread.start()
 
@@ -700,7 +721,7 @@ class EngineHandle:
                 try:
                     thread.join()
                 finally:
-                    self._live_cancel = None
+                    self._live_cancels = []
                     self._live_thread = None
             if error is not None:
                 row["error"] = error
@@ -758,3 +779,133 @@ class EngineHandle:
                 prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
                 tokens=row["tokens"], finish=row["finish"], ttft_s=row["ttft_s"],
                 hits_before=hits_before, error=row["error"])
+
+    async def run_batch(self, jobs):
+        """Drive ONE batched_generate over `jobs`, fanning tokens to each queue.
+
+        THE GENERATOR CONTRACT IS THIS METHOD'S WHOLE REASON FOR EXISTING.
+        `batched_generate`'s docstring: abandoning it mid-iteration leaves the
+        model in batched-decode mode (`_batch_decode_active`/`_batch_n`) until
+        Python garbage-collects the generator -- and a client disconnect is
+        exactly that abandonment. Here the generator is owned by ONE worker
+        thread that always closes it, and clients hold queues rather than
+        generators, so no client CAN abandon it. A disconnect retires that row
+        through should_stop and the other streams keep running.
+
+        Each job receives ("delta", text)*, then one ("final", result) or
+        ("error", exc), then None as its end sentinel. Every job gets a
+        sentinel on every path, or a client waits forever on a queue nobody
+        will write to again.
+        """
+        import time
+
+        from ..batch import BatchRequest
+
+        loop = asyncio.get_running_loop()
+        started = time.time()
+        hits_before = self._prefix_hits()
+        snap_before = reqlog.snapshot(self.model)
+        n = len(jobs)
+        members = [getattr(j, "session_key", None) for j in jobs]
+        batch_note = {"n": n, "members": members}
+
+        streams, reqs = [], []
+        for j in jobs:
+            kwargs = self.build_generate_kwargs(j.req, j.prompt_ids, j.cap,
+                                                cancel=j.cancel)
+            stops = list(kwargs.get("stop_strings") or [])
+            streams.append(_BatchStream(j, self.model.tokenizer, stops, j.cap))
+            reqs.append(BatchRequest(
+                prompt_ids=list(j.prompt_ids), max_new_tokens=j.cap,
+                temperature=kwargs.get("temperature", 0.0),
+                top_p=kwargs.get("top_p", 1.0),
+                # Empty on purpose: EOS is unioned inside batched_generate, and
+                # the client's stops are STRINGS, matched by _BatchStream.
+                stop_ids=()))
+            self._log(j.req, "REQ", prompt=len(j.prompt_ids), cap=j.cap,
+                      stream=True, batch=n)
+
+        bridge: _queue.Queue = _queue.Queue()
+        DONE = object()
+
+        def _should_stop(i):
+            return streams[i].retired or jobs[i].cancel.cancelled
+
+        def _pump():
+            gen = self.model.batched_generate(reqs, should_stop=_should_stop)
+            try:
+                for stream_id, tok in gen:
+                    bridge.put(("tok", (stream_id, tok)))
+            except BaseException as e:           # noqa: BLE001 -- re-raised below
+                bridge.put(("error", e))
+            finally:
+                # Explicit, never GC: this is the contract in the docstring
+                # above. A no-op when the loop finished normally.
+                gen.close()
+                bridge.put((DONE, None))
+
+        thread = threading.Thread(target=_pump, daemon=True)
+        self._live_cancels = [j.cancel for j in jobs]
+        self._live_thread = thread
+        ttft = [None] * n
+        error = None
+        try:
+            thread.start()
+            while True:
+                kind, payload = await loop.run_in_executor(None, bridge.get)
+                if kind is DONE:
+                    break
+                if kind == "error":
+                    error = payload
+                    continue
+                i, tok = payload
+                delta = streams[i].feed(tok)
+                if delta:
+                    if ttft[i] is None:
+                        ttft[i] = time.time() - started
+                        self._log(jobs[i].req, "TTFT", at=f"{ttft[i]:.1f}s")
+                    await jobs[i].out.put(("delta", delta))
+        finally:
+            try:
+                thread.join()
+            finally:
+                self._live_cancels = []
+                self._live_thread = None
+            snap = snap_before
+            for i, j in enumerate(jobs):
+                row = {"tokens": len(streams[i].ids), "finish": "error",
+                       "error": error}
+                try:
+                    if error is not None:
+                        await j.out.put(("error", error))
+                    else:
+                        cleaned, calls = parse_tool_calls(
+                            streams[i].text,
+                            self.tool_format if j.req.tools else None,
+                            declared_tool_names(j.req.tools))
+                        finish = self._finish(streams[i].ids, j.cap, calls,
+                                              cancel=j.cancel)
+                        row["finish"] = finish
+                        if j.cancel.cancelled:
+                            # Same rule generate() applies: requests.jsonl is
+                            # not the wire, and documentation/server.md promises
+                            # `cancelled` there.
+                            row["finish"] = "cancelled"
+                        self._log(j.req, "DONE", tokens=len(streams[i].ids),
+                                  finish=finish, batch=n)
+                        await j.out.put(("final", GenerationResult(
+                            text=cleaned, tool_calls=calls,
+                            prompt_tokens=len(j.prompt_ids),
+                            completion_tokens=len(streams[i].ids),
+                            finish_reason=finish)))
+                finally:
+                    # The sentinel on EVERY path, or a client waits forever on
+                    # a queue nobody will write to again.
+                    await j.out.put(None)
+                    self._write_request_row(
+                        j.req, stream=True, started=started,
+                        prompt_tokens=len(j.prompt_ids), cap=j.cap,
+                        snap_before=snap, tokens=row["tokens"],
+                        finish=row["finish"], ttft_s=ttft[i],
+                        hits_before=hits_before, error=row["error"],
+                        batch=batch_note)

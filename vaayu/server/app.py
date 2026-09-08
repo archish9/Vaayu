@@ -291,6 +291,7 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
         reqlog.write_row(getattr(engine, "log_dir", None), {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "session": getattr(req, "session_key", None),
+            "batch": None,
             "prompt_tokens": None, "cap": None, "stream": stream,
             "thinking": thinking,
             "max_tokens": getattr(req, "max_tokens", None),
