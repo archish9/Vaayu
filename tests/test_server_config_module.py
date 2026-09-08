@@ -69,6 +69,28 @@ def test_the_fast_shipped_defaults_survive():
     assert tracked["PREFILL_CHUNK_SIZE"] == 512
 
 
+def test_max_batch_size_defaults_to_one():
+    """Today's behaviour is the safe default. Any value above 1 is a ceiling,
+    never a target, and is inert unless ATTN_IMPLEMENTATION is "sdpa"."""
+    assert config.MAX_BATCH_SIZE == 1
+
+
+def test_max_batch_size_reaches_the_server_config(monkeypatch, launched):
+    """There is no `config_from_module` in this repo -- `__main__.py` maps
+    config.py's constants onto ServerConfig with an explicit keyword list
+    (~25 entries). This is that real path, exercised end to end via `main()`,
+    not a helper function that does not exist."""
+    monkeypatch.setattr(config, "MODEL_PATH", "/ckpt")
+    monkeypatch.setattr(config, "MAX_BATCH_SIZE", 3)
+
+    from vaayu.server.__main__ import main
+    assert main() == 0
+
+    cfg = launched["cfg"]
+    assert cfg.max_batch_size == 3
+    assert "max_batch_size" in {f.name for f in dataclasses.fields(ServerConfig)}
+
+
 def test_config_declares_no_constant_that_is_not_a_serverconfig_field():
     # The other half of the wiring gate: an orphan constant (a typo, or a knob
     # that was removed from ServerConfig) reads as configurable and does nothing.

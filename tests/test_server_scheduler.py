@@ -268,7 +268,7 @@ def test_stream_false_routes_to_generate(monkeypatch):
     engine = EngineHandle(model)
     calls = []
 
-    async def fake_generate(req, cancel=None):
+    async def fake_generate(req, cancel=None, prepared=None):
         calls.append(req.session_key)
         return GenerationResult(text="hi", prompt_tokens=1, completion_tokens=1,
                                 finish_reason="stop")

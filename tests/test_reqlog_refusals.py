@@ -80,6 +80,11 @@ def _client(run_dir, require_session_id):
         # built one against its own new_run_dir(); rebinding here keeps the
         # assertions reading a directory the test owns.
         app.state.engine = EngineHandle(M(), log_dir=run_dir)
+        # The dispatcher (P10) was built against the lifespan's OWN engine;
+        # every attribute it reads is looked up on `self.engine` fresh on
+        # each dispatch, so repointing that one reference is enough to make
+        # it dispatch through the engine just swapped in above.
+        app.state.scheduler.engine = app.state.engine
         yield c
 
 
@@ -94,19 +99,24 @@ def client_requiring_session(run_dir, no_real_load):
 
 
 def _full_queue_client(run_dir):
-    """Same as `_client`, but the engine is built with `queue_depth=0` so the
-    ordinary admission check trips on the very first request -- an honest
-    QueueFull trigger rather than a monkeypatched exception, since one is
-    available (`EngineHandle.slot` / the route's own eager depth check both
-    key off `queue_depth`, see engine.py:172-183 and app.py's streaming
-    branch).
+    """Same as `_client`, but the queue is built at depth 0 so the ordinary
+    admission check trips on the very first request -- an honest QueueFull
+    trigger rather than a monkeypatched exception, since one is available.
+
+    Admission is the DISPATCHER's now (P10): `BatchScheduler.submit` and the
+    route's own eager depth check both key off `queue_depth`, and the
+    scheduler's own copy is captured once at construction from
+    `ServerConfig.queue_depth` -- not read off whatever engine happens to be
+    bound later, so this has to be `0` on the CONFIG, not just on a swapped-in
+    `EngineHandle`.
     """
     cfg = ServerConfig(model_path="/ckpt", log_dir=str(run_dir.parent),
                        capture_stdio=False, require_session_id=False,
-                       default_stream=False)
+                       default_stream=False, queue_depth=0)
     app = create_app(cfg)
     with TestClient(app) as c:
         app.state.engine = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
+        app.state.scheduler.engine = app.state.engine
         yield c
 
 
@@ -207,18 +217,28 @@ def _sse_req(**over):
 
 
 def test_the_sse_admission_race_writes_a_refusal_row(run_dir):
-    """`EngineHandle.slot` raises QueueFull BEFORE it yields, so engine.stream
-    is never entered and its row-writing `finally` never runs. The route's
-    eager depth check cannot see this race -- it is the reason _sse has a
-    QueueFull handler at all -- so the row is that handler's to write."""
+    """`BatchScheduler.submit` raises QueueFull BEFORE the job ever reaches
+    the dispatcher, so engine.stream is never entered and its row-writing
+    `finally` never runs. The route's eager depth check cannot see this race
+    -- it is the reason _sse has a QueueFull handler at all -- so the row is
+    that handler's to write."""
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     e = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
 
     async def main():
-        return [c async for c in app_mod._sse(e, _sse_req(), "m", None)]
+        req = _sse_req()
+        sched = BatchScheduler(e, queue_depth=0, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        chunks = [c async for c in app_mod._sse(e, req, "m", None,
+                                                prepared=e.prepare(req),
+                                                scheduler=sched)]
+        await sched.stop()
+        return chunks
 
     chunks = asyncio.run(main())
     assert any("server_busy" in c for c in chunks)
@@ -378,16 +398,23 @@ def test_a_disconnect_before_generation_starts_still_writes_a_row(
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     from .test_reqlog_engine import M as StreamingM
 
     e = EngineHandle(StreamingM(), log_dir=run_dir)
 
     async def main():
-        gen = app_mod._sse(e, _sse_req(), "m", warning)
+        req = _sse_req()
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        gen = app_mod._sse(e, req, "m", warning, prepared=e.prepare(req),
+                           scheduler=sched)
         for _ in range(consumed):
             await gen.__anext__()
         await gen.aclose()          # exactly what Starlette does on disconnect
+        await sched.stop()
 
     asyncio.run(main())
     rs = rows(run_dir)
@@ -399,24 +426,40 @@ def test_a_disconnect_before_generation_starts_still_writes_a_row(
 
 
 def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
-    """The same hole, one step further in and INSIDE the try: a request waiting
-    on `engine.slot`'s lock is abandoned by cancelling the ASGI task, which
-    raises CancelledError -- a BaseException that `except Exception` misses --
-    before engine.stream is ever entered. Widening the try does not reach this
-    one; only handing row ownership over at the statement where engine.stream
-    takes it does.
+    """The same hole, one step further in: a request whose JOB the dispatcher
+    has already picked up, but which is blocked behind the engine lock, is
+    abandoned by cancelling the ASGI task. Since P10 that cancellation no
+    longer raises inside `_sse` itself -- clients hold a queue, not the
+    generation generator (scheduler.py's own module docstring) -- so the row
+    is not `_refusal_row`'s to write here. It is the dispatcher's, once
+    unblocked: `_run_serial` calls `engine.stream` regardless of
+    `job.cancel.cancelled` (only `_form` drops a job pre-run, and this one has
+    already left `_waiting`), so it starts with `cancel` already set and runs
+    to its ordinary success tail -- `row["error"]` stays `None`, and
+    `finish_reason` maps a cancelled run to the WIRE value `"length"` there
+    (stopping.py's `finish_reason` docstring), not the row-only `"cancelled"`
+    enrichment `stream()`'s GeneratorExit branch adds. That enrichment is a
+    per-branch thing, not a blanket `cancel.cancelled` check, so a run that
+    reaches the success tail already cancelled does not get it -- pre-existing
+    and unrelated to P10, noted here rather than changed.
     """
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     from .test_reqlog_engine import M as StreamingM
 
     e = EngineHandle(StreamingM(), log_dir=run_dir)
 
     async def main():
-        await e._lock.acquire()             # hold the slot so the request queues
-        gen = app_mod._sse(e, _sse_req(), "m", None)
+        req = _sse_req()
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        await e._lock.acquire()             # hold the lock so the dispatcher blocks
+        gen = app_mod._sse(e, req, "m", None, prepared=e.prepare(req),
+                           scheduler=sched)
         await gen.__anext__()               # queue position
         await gen.__anext__()               # role chunk
 
@@ -425,14 +468,19 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
                 pass
 
         t = asyncio.create_task(drain())
-        await asyncio.sleep(0.05)           # let it block on the lock
+        # Long enough for the job to be submitted, picked up by the dispatch
+        # loop, and blocked on `engine._lock` -- not just enqueued.
+        await asyncio.sleep(0.05)
         t.cancel()
         with pytest.raises(asyncio.CancelledError):
             await t
         e._lock.release()
+        # Let the dispatcher actually finish the now-cancelled run -- it,
+        # not this generator, owns writing the row.
+        await sched.stop()
 
     asyncio.run(main())
     rs = rows(run_dir)
     assert len(rs) == 1, "a client that vanished while queued left no row"
-    assert rs[0]["finish"] == "cancelled"
+    assert rs[0]["finish"] == "length"
     assert rs[0]["error"] is None

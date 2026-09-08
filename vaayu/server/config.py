@@ -103,6 +103,24 @@ ENABLE_PREFIX_CACHE = True
 # (+24.7% MoE, +213% dense at 128) and buys nothing.
 PREFILL_CHUNK_SIZE = 512
 
+# Requests served together as ONE batch. 1 is today's behaviour and the safe
+# default. A CEILING, never a target: max width is model- and
+# context-dependent and is NOT 3.
+#
+# What getting it wrong costs, measured 2026-09-08 at ~4.15k-token agentic
+# prompts, 2 requests x 64 tokens, engine-level:
+#   2  MiniMax-M2.7 454.80s -> 283.13s = +1.606x, TTFT 317.2 -> 223.3s, and
+#      peak VRAM LOWER batched (12.355 vs 13.259 GB).
+#   3  OOMs MiniMax at model.layers.22; on Qwen3-235B it is SLOWER than 2
+#      (1.278 against 1.582 aggregate tok/s -- a bigger KV starves the expert
+#      cache).
+#   Qwen3-235B admits N=1 only today, so any value here buys it nothing.
+#
+# INERT unless ATTN_IMPLEMENTATION is "sdpa" below -- batched decode requires
+# that kernel, and a non-sdpa load serializes with a warning at startup rather
+# than failing a request.
+MAX_BATCH_SIZE = 1
+
 # Pack pooled KV at N bits (9 is the tested floor) so the same RAM budget holds
 # ~2x the sessions. Reuse collapses to ZERO, not proportionally, once the pool
 # is over capacity -- so this matters when serving several agent sessions.
@@ -116,8 +134,12 @@ PREFIX_SESSIONS = 3
 # dequantized mirror.
 KV_CACHE_MODE = "auto"
 
-# None uses sdpa, which every shipped max_seq_len figure was verified on.
-# "flash_attention_2" derives a larger context at the same reserve.
+# None PREFERS flash_attention_2 when flash_attn imports, then sdpa, then eager
+# (vaayu_base.init_model). It does NOT mean sdpa -- this line said so until
+# 2026-09-08 and it is load-bearing: MAX_BATCH_SIZE above is inert on flash.
+# Every shipped max_seq_len figure was verified on sdpa; "flash_attention_2"
+# derives a larger context at the same reserve, and costs -2.3 % MiniMax /
+# -4.1 % Qwen end-to-end against sdpa.
 ATTN_IMPLEMENTATION = None
 
 # GB of PAGEABLE RAM for the dense layer cache. None derives it from TOTAL RAM

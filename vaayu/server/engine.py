@@ -1,9 +1,20 @@
-"""EngineHandle -- the one loaded model, the admission gate, and generation.
+"""EngineHandle -- the one loaded model, request mapping, and generation.
 
-Concurrency is 1 by construction. The engine is not thread-safe, and N>=2 at
-long context is a settled hardware refusal on this box (peak 14.17-15.57 GiB of
-15.47), so this is a depth-bounded FIFO gate, not a scheduler. `batched_generate`
-is deliberately not wired in: it is static-batch v1 and would admit nothing here.
+The engine is not thread-safe across the KV cache, the expert VRAM cache and
+the slab arena, so exactly one generation runs at a time -- but since P10 that
+generation may be a BATCH of one or N. `vaayu/server/scheduler.py` owns the
+dispatch loop and holds `self._lock` for a whole run; this file provides the
+two things it can run: `stream()` (one request, unchanged) and `run_batch()`
+(N requests through `batched_generate`).
+
+This docstring used to say N>=2 at long context was "a settled hardware
+refusal on this box" and that `batched_generate` "would admit nothing here".
+Both were measured false on 2026-09-07/08: at ~4.15k-token agentic prompts
+admission grants N=2 on MiniMax-M2.7 (+1.606x end-to-end) after the P10a
+expert-cache giveback. Qwen3-235B still admits N=1 only -- its cache budget is
+already below one decode step's working set, so it has nothing to surrender --
+and N=1 is served serially, never through `batched_generate`, which is worth
+3.24x to it.
 """
 import asyncio
 import queue as _queue
@@ -507,7 +518,7 @@ class EngineHandle:
             produced=len(new_ids), cap=cap,
             cancelled=cancel is not None and cancel.cancelled)
 
-    async def generate(self, req, cancel=None) -> GenerationResult:
+    async def generate(self, req, cancel=None, prepared=None) -> GenerationResult:
         import time
         if cancel is None:
             # Always publish a REAL token, for the same reason stream() does
@@ -525,9 +536,14 @@ class EngineHandle:
         # sequence (a `tool` message with no matching call, an unexpected role
         # order) raises whatever the template raises. That used to skip the row
         # entirely on both paths, against this file's one contract.
+        #
+        # `prepared` is `prepare(req)`'s result, already computed by the
+        # caller -- same contract as stream()'s: accepting it here is what
+        # keeps a scheduler-dispatched non-streaming job from re-rendering the
+        # chat template and re-tokenizing a prompt it already tokenized.
         prompt_ids, cap = [], 0
         try:
-            prompt_ids, cap = self.prepare(req)
+            prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
             self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
                       thinking=("on" if self.resolve_thinking(req) else "off"))
             if req.max_tokens is None:

@@ -381,7 +381,8 @@ class BatchScheduler:
         if not job.stream:
             base_exc = None
             try:
-                result = await self.engine.generate(job.req, cancel=job.cancel)
+                result = await self.engine.generate(job.req, cancel=job.cancel,
+                                                     prepared=job.prepared)
             except Exception as ex:              # noqa: BLE001 -- reported, not re-raised
                 await job.out.put(("error", ex))
             except BaseException as ex:          # noqa: BLE001 -- reported, then re-raised

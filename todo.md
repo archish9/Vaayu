@@ -2079,6 +2079,128 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 ---
 # 15 · [~] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08, DESIGN DONE 2026-09-08
 
+## ▶ FRESH SESSION STARTS HERE (written 2026-09-08)
+
+**`docs/` and `.superpowers/` are BOTH gitignored, so everything load-bearing is in this
+row.** The plan and spec live at `docs/superpowers/plans/2026-09-08-p10-server-batching.md`
+and `docs/superpowers/specs/2026-09-08-p10-server-batching-design.md` on THIS disk only;
+the per-task reports and the execution ledger are under
+`.superpowers/sdd/2026-09-08-p10-server-batching/` (`progress.md` is the ledger). If any
+of those are missing, this row is still enough to finish the work.
+
+**Branch: `p10-server-batching`, off `main` at `04a6ccd`. NOT merged, NOT pushed.**
+
+**Step 0, before anything else — establish the real state, do not trust this row's
+checkboxes:**
+```
+git log --oneline main..p10-server-batching
+PYTHONPATH=/home/a/code/ai-ml/Vaayu ./venv/bin/python -m pytest tests/ -q | tail -3
+```
+Last measured: **1827 passed, 12 skipped** (2026-09-08, at `b147bfa`, T1–T7 complete).
+**Re-measure against a stashed HEAD before quoting any suite figure** — this number has
+gone stale nine times.
+
+**What is DONE: T1–T7 (see the task list below), and T8 was in flight when this was
+written.** **T9 IS IN SCOPE — the earlier note that it was skipped was wrong and has been
+corrected.** Remaining order: **T8 → T9 → T10.** T10 is the one that decides whether this
+row ships or is refuted.
+
+**Is anything delivered to users yet? NO.** Every piece so far is banked. Until T8 is
+confirmed landed, `app.py` does not construct the scheduler and nothing reaches it. Even
+after T8 the default is `MAX_BATCH_SIZE = 1`, which is today's behaviour exactly, and the
+feature is additionally INERT unless `ATTN_IMPLEMENTATION = "sdpa"`.
+
+### T10, stated in full so it needs nothing else
+
+**An engine probe number does NOT discharge this row** — every figure on record is
+engine-level. Run one `systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0`
+per arm (**22G OOM-kills these; the gate table's 22G is stale**), interleave arms BOTH
+ways (whichever runs second is 0.4–0.9 % slower — a one-way interleave manufactures a
+false ~0.5 % effect), state `BALLAST_GB` and hold it fixed (**it is an ARM VARIABLE**;
+25→27 GB moved N=3 aggregate +9.4 % on its own). Never attach py-spy (corrupts
+`vaayu_rust`'s io_uring). `grep -a` the logs, never `cat` (300 MB–1.3 GB).
+
+Harness to write: `plans/probes/p10e_server_ab.py` — N concurrent HTTP clients against a
+running server, each posting a ~4.15k-token agentic prompt (shared system prompt +
+distinct synthetic file context; **reuse `plans/probes/p10d_kernel_ab.py`'s prompt
+construction** so the numbers stay comparable), `stream=true`, `max_tokens=64`, its own
+`session_id`. Record per client: TTFT, wall, tokens. Overall: aggregate wall, peak VRAM,
+**and the formation decisions — batches formed vs refusals** (T9's notices were skipped,
+so the probe must report this itself). Config per arm via `vaayu/server/config_local.py`
+(gitignored).
+
+| model | clients | arms | must show |
+|---|---|---|---|
+| MiniMax-M2.7 | 2 | `MAX_BATCH_SIZE` 1 vs 2, **× prefix cache ON and OFF** | aggregate gain at the same offered load |
+| Qwen3-235B | 2 | `MAX_BATCH_SIZE = 2` | admission refuses N≥2; serial numbers match the `=1` arm within noise — **a Qwen regression is a stop-the-row result** |
+| Llama-3.2-1B (dense) | 2 | smoke | runs; dense MAY assert token-identity (true since row 16) |
+
+**The prefix-ON arm is the whole point and no measurement on this row has ever taken it.**
+Every existing number was measured with `enable_prefix_cache=False`
+(`plans/probes/p10d_kernel_ab.py:88`) while the server DEFAULTS it True. For that arm each
+client must send **two turns on the same `session_id`** and only the second is timed — a
+one-turn arm cannot measure a warm prefix. Set `ATTN_IMPLEMENTATION = "sdpa"` in every arm.
+
+**REFUTED IF** the server-level A/B shows no aggregate gain despite admission succeeding —
+**including the case where the prefix-ON arm serializes everything**, because the
+formation rule correctly prefers warm prefix reuse (136–377x TTFT) over batching (1.606x).
+That is a real possible outcome on this engine's actual agentic workload, not a bug. **A
+plan ending in refutation CLOSES its row** — record the verdict and move on; do not
+re-scope it to find a win.
+
+**Then:** write `docs/2026-09-08-P10-server-batching-RESULTS.md`, restate every number
+in this row (docs/ does not survive a clone), answer §8's four questions, and set this
+row to `[x]` or `[bug]`/`[!]` with the verdict.
+
+### Load-bearing facts a fresh session must not re-derive
+
+* **`ATTN_IMPLEMENTATION = None` resolves to FLASH, not sdpa** (`init_model`,
+  `vaayu_base.py:2916`, prefers `flash_attention_2` whenever `flash_attn` imports).
+  `config.py` and `server/README.md` both claimed sdpa and were WRONG; corrected by this
+  work. Batching is inert on flash, so this line is load-bearing for the knob.
+* **The +1.606x was measured with the prefix cache OFF.** MiniMax-M2.7, 2×64 tok at
+  ~4.15k, `BALLAST_GB=27`: 454.80s → 283.13s, TTFT 317.2 → 223.3s, peak VRAM LOWER
+  batched (12.355 vs 13.259 GB). Engine-level, one probe, cold expert cache.
+* **Qwen3-235B admits N=1 only** — its cache budget (3.644 GiB) is already below one
+  decode step's working set (8.285), so it has nothing to surrender. **Do NOT "fix" this
+  by lowering the giveback floor**, and do NOT delete gate 2 or replace it with
+  `plan_batch`: gate 2 was RIGHT once (MiniMax N=3 genuinely OOM'd) and `plan_batch`
+  admitted exactly that arm. What unblocks Qwen is need-side over-prediction.
+* **N=1 must never reach `batched_generate`** — 573.88s against 177.14s serial, a 3.24x
+  regression. Structural in `scheduler.py` and pinned by tests that were verified to FAIL
+  when the rule is broken (an earlier version of those tests passed either way).
+* **−15.5 % is an expert-cache BUDGET percentage, NOT a throughput cost.** The kernel
+  costs −2.3 % MiniMax / −4.1 % Qwen end-to-end. Never quote it as time.
+* **Identity criterion, CORRECTED:** never assert greedy-id equality between N=1 and N≥2
+  on MoE — batch width changes GEMM tiling, tiling perturbs router logits ~1 ULP, top-k is
+  DISCONTINUOUS, so that assertion asserts a bug that cannot be fixed. Assert instead:
+  deterministic per configuration; coherent as TEXT; bitwise identity only within a route
+  pair that does not change tiling. Dense MAY assert token-identity.
+* **Contract for anything consuming a `Job` queue:** "at least one sentinel, stop at the
+  first" — rare paths deliver a duplicate `("error", …)` + `None`, benign only because
+  consumers stop at the first `None`. A job dropped by `_form` (client cancelled while
+  queued) gets ONLY a sentinel, no error item. `submit()` raises `QueueFull` when no
+  dispatcher is live. Restart is unsupported: `_stopping` never resets, and `start()`
+  deliberately does not resurrect a dead dispatcher.
+
+### Known-open minors (none blocking; recorded so they are not lost)
+
+* `_stopping` is never reset, so `start()` after `stop()` yields a scheduler that refuses
+  everything — consistent with the no-resurrection rule, but undocumented.
+* `test_the_queue_refuses_past_its_depth` no longer pins WHICH refusal it got; a `match=`
+  on the message would make that explicit.
+* `_BatchStream` feed-after-retired is exercised only incidentally, never asserted.
+* `build_generate_kwargs` materialises and discards an N-token prompt tensor per job.
+* `plan_batch` SUCCEEDING and deferring a member is covered by zero tests (the test stub
+  has no `.config`, so every test takes the exception path).
+* Row 15's own history: **four defects in the plan's text** were found by implementers and
+  reviewers — the `select_width` expectation, a test fake missing `config.eos_token_id`,
+  an `except Exception` around `run_batch` that could never fire (`run_batch` answers a
+  refusal by writing errors into the queues and returning normally), and a
+  `config_from_module` that does not exist (`__main__.py` maps config by explicit
+  keywords). Treat the plan as an argument, not an authority.
+
+
 **[~] IN PROGRESS 2026-09-08 — design spec written and approved:
 `docs/superpowers/specs/2026-09-08-p10-server-batching-design.md`** (gitignored; its
 load-bearing decisions are restated in this row). Approach: **the dispatcher owns
@@ -2122,12 +2244,47 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
 2026-09-07 brief** — that brief's §4 measurement is discharged and its economics are superseded.
 
 **Build tasks (`docs/superpowers/plans/2026-09-08-p10-server-batching.md`):**
-- [ ] T1 `PrefixCacheStore.peek_match` — non-destructive prefix peek
-- [ ] T2 `vaayu/server/batch_policy.py` — the chunk-pass formation rule
-- [ ] T3 `batched_generate(..., should_stop=None)` — per-stream retirement hook
-- [ ] T4 `logs.py` session marker becomes a tuple (issue L1 T4)
-- [ ] T5 `_Detok` + `_BatchStream` — per-stream text, stop strings, finish, row
-- [ ] T6 `EngineHandle.run_batch` — fan-out over one worker thread
+- [x] T1 `PrefixCacheStore.peek_match(session_id, ids) -> int` — non-destructive peek
+  (`lookup()` POPS on a hit, so it cannot price a formation decision). Same key
+  selection as `lookup()`; touches no counters. `3a98f9e`.
+- [x] T2 `vaayu/server/batch_policy.py` — pure formation rule, priced in PREFILL CHUNK
+  PASSES: `serial = Σ ceil((len_i − own_i)/chunk)` against
+  `batched = ceil((max len_i − common)/chunk)`, batch iff batched < serial. Greedy in
+  arrival order; first failure ENDS formation (a skipped candidate could starve).
+  **Two review rounds:** the first implementation added an `own_match > 0` early break
+  that gated on the EXISTENCE of a warm hit rather than its magnitude — once the pool is
+  warm nearly every request has some match, so it would have shipped the feature inert.
+  Removed, and pinned by a test. **Note a plan error found here: the plan's own expected
+  width of 2 was wrong; the rule yields 3** (k=2 serial 18 vs batched 8; k=3 serial 19 vs
+  batched 8). The rule is the authority. `57fd6e0`, `d7f4c1a`, `1c64cc9`.
+- [x] T3 `batched_generate(..., should_stop=None)` — per-stream retirement hook,
+  consulted once per step per row; `None` is byte-identical to today. Without it a client
+  disconnecting at `cap=8000` holds the WHOLE batch for 8000 steps (`while any(active)`
+  is the only exit and nothing outside can reach `active`). Retired rows still get
+  `pad_id` in the rectangular tensors. `b70e6d0`.
+- [x] T4 `logs.py` marker becomes a tuple — **issue L1 T4 DISCHARGED.** A line SHARED by
+  a batch is tagged `session=*` and copied into EVERY member's `sessions/<id>.log`; a
+  line that is UNATTRIBUTABLE (two generations overlapped) is also `*` but has NO members
+  and reaches `server.log` only. Both render `*`; conflating them corrupts per-session
+  logs. `set_current_session(id)` unchanged for one member. `bb7f9ad`, `5f0dfeb`.
+- [x] T5 `_Detok` + `_BatchStream` — per-stream incremental detokenization and
+  STOP STRINGS. `BatchRequest.stop_ids` is token ids while clients and `stopping.py` work
+  in strings, and tokenizing a stop string to bridge them is wrong at merge boundaries,
+  so matching is on decoded text, trimmed where HF trims. **Known and intentional:** a
+  stop string straddling a delta boundary retracts text already streamed — no
+  implementation can un-send flushed SSE bytes, and HF's serial streamer has the same
+  limitation. Therefore the final result MUST read `_BatchStream.text`, never a
+  concatenation of deltas. `c7bb63c`.
+- [x] T6 `EngineHandle.run_batch` — one worker thread owns the generator and always
+  closes it; clients hold queues, so no client CAN abandon it (`batched_generate`'s
+  docstring: abandonment leaves `_batch_decode_active`/`_batch_n` set until GC, and a
+  disconnect is exactly that). **Three review rounds, all hang paths:** an exception
+  finalising job *i* stranded jobs *i+1..N* without sentinels; `thread.start()` raising
+  skipped every sentinel; `gen.close()` before the `DONE` put could block the coroutine
+  forever holding the engine lock. Final ordering publishes `_live_cancels` BEFORE
+  `start()` inside its own `except BaseException` that resets and re-raises without
+  joining an unstarted thread — closing both the stale-state and lost-cancel windows at
+  once. `88010b7`, `910ca96`, `d5e45be`, `ac4d37f`.
 - [x] T7 `vaayu/server/scheduler.py` — the dispatch loop (2026-09-08, 17/17 tests
   green + 12/12 in `test_server_run_batch.py`; brief needed 2 more corrections beyond
   the handoff's 4, then five review rounds of sentinel/cancellation fixes. **The
@@ -2140,9 +2297,82 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
   (cancelling a task suspended on `await other_task` propagates inward, so it reads
   `True` either way, measured), `current_task().cancelling()` can. See
   `docs/2026-09-08-p10-server-batching/task-7-report.md`)
-- [ ] T8 Routes + `MAX_BATCH_SIZE` knob + README + the false sdpa doc lines
-- [ ] T9 Inert notices (startup kernel warning, latched never-admitted line)
-- [ ] T10 Server-level on-device A/B + RESULTS + close the row
+- [x] T8 Routes + `MAX_BATCH_SIZE` knob + README + `documentation/server.md` + the false
+  sdpa doc lines (2026-09-08). **THE TASK THAT MAKES THE FEATURE REACHABLE** (§8) — done:
+  both routes now `submit()` a `Job` to `app.state.scheduler` instead of taking
+  `engine.slot()` directly; `MAX_BATCH_SIZE` (config.py, default 1) is plumbed through
+  `ServerConfig.max_batch_size` → `__main__.py`'s keyword mapping →
+  `BatchScheduler(...)` in both the lifespan and the sync (injected-engine) bind path.
+  The brief's `config_from_module` does not exist in this repo (confirmed) — used the
+  real `__main__.py` keyword-list mapping instead, and the config test was rewritten
+  against that path.
+  **Three fixes beyond the brief, all load-bearing:**
+  (1) `engine.generate()` had no `prepared` param — added it (mirrors `stream()`),
+  `_run_serial`'s non-streaming branch now passes `prepared=job.prepared` so a
+  scheduler-dispatched non-streaming job never re-renders/re-tokenizes.
+  (2) The scheduler must be **started somewhere** even when lifespan never runs
+  (`create_app(engine=...)` used without `with TestClient(...)`, the majority pattern in
+  `tests/test_server_app.py`) — added an idempotent `await app.state.scheduler.start()`
+  at the top of `chat_completions`, and a synchronous (unstarted) `BatchScheduler` bind
+  in `create_app()` alongside the existing eager `app.state.engine = engine` bind, so a
+  TestClient used without `with` still gets a live dispatcher on its first request.
+  (3) `documentation/server.md`'s `requests.jsonl` schema section (correction 3) plus two
+  more stale claims found in the same doc while there — §7.6's "batching is a hardware
+  wall" row and §8's "one request in flight, no continuous batching" bullets — both now
+  false the moment this lands; corrected alongside the named section since §8's whole
+  point is that reachability must be reflected where users read it.
+  **Test fallout fixed, not brief-scoped but required for `pytest tests/` to stay
+  green:** `tests/test_server_scheduler.py::test_stream_false_routes_to_generate`'s fake
+  needed `prepared=None` added to its signature (fix 1 above); `FakeEngine` in
+  `test_server_app.py` needed `_lock = asyncio.Lock()` (the scheduler holds
+  `engine._lock` for a whole run) and its `generate()` needed `prepared=None`; two tests
+  there (`test_a_full_queue_...`, `test_a_queue_full_losing_the_admission_race_...`)
+  relied on `engine.slot()` intercepting `raises=QueueFull`, which nothing calls
+  anymore — rewritten to monkeypatch `BatchScheduler.submit`; `/health`'s `"queued"`
+  field switched from `e.depth` (now permanently 0 — nothing calls `engine.slot()`) to
+  `app.state.scheduler.depth`; `tests/test_server_config_passthrough.py` needed
+  `max_batch_size` added to `NOT_MODEL_KWARGS` (it is a scheduler knob, not a model-load
+  kwarg); `tests/test_server_engine.py` had two B4 regression tests calling `_sse`
+  directly with no `scheduler`/`prepared` — rebuilt against a real `BatchScheduler`, and
+  their core assertion changed from "`_sse.aclose()` synchronously waits for the
+  abandoned worker" (no longer true — P10 clients hold a QUEUE, not the generation
+  generator, by design; scheduler.py's own module docstring) to "the dispatcher does,
+  once unblocked, and the engine lock stays held throughout"; `tests/test_reqlog_refusals.py`
+  had FIVE tests built on the same now-removed assumptions (2 more `_sse(...)`
+  direct-call sites with no scheduler, `queue_depth` moved from the engine onto the
+  scheduler so a test that swapped `EngineHandle(..., queue_depth=0)` after lifespan no
+  longer trips admission, and 2 spots that swap `app.state.engine` post-lifespan without
+  also repointing `app.state.scheduler.engine` at the new one) — all fixed; one of them
+  (`test_a_disconnect_while_queued_...`) now legitimately asserts `finish="length"` not
+  `"cancelled"`, because the job it abandons has already left `_form`'s drop window by
+  the time it cancels and runs to `engine.stream()`'s ordinary success tail, which
+  (pre-existing, independent of this task) does not carry the GeneratorExit branch's
+  `row["finish"] = "cancelled"` enrichment — noted, not fixed, out of scope.
+  All 1830 tests pass (`pytest tests/ -q`, up from 1827 baseline: 3 new tests added, 0
+  skipped beyond the pre-existing 12). See
+  `.superpowers/sdd/2026-09-08-p10-server-batching/task-8-report.md` for the full
+  per-file diff and the four-contract-fact verification.
+- [ ] T9 Inert notices — **IN SCOPE, do it before T10.** Two things, both in
+  `scheduler.py`, both small and additive (no concurrency, no shared state):
+  (a) a startup WARNING when `MAX_BATCH_SIZE > 1` on a non-sdpa load, then serialize —
+  that configuration IS completely inert, and `config.py` itself wrongly documented
+  `None` as sdpa until 2026-09-08, so this is the trap operators will actually hit;
+  (b) a LATCHED line (once per process, after ~20 formation attempts with 2+ waiting)
+  when batching has never admitted, naming the two legitimate causes: this model's
+  admission refuses N>1 at this context, or warm prefix reuse is worth more than
+  batching for this workload — in both cases `MAX_BATCH_SIZE = 1` plus flash is the
+  faster configuration.
+  **Why it is NOT optional.** These are the two guards against shipping silently inert,
+  the exact CLAUDE.md §8 failure this row exists to end (P8 shipped green at +3.21 % and
+  delivered 0 % to users). Qwen3-235B makes it concrete: it admits N=1 only, so an
+  operator who sets the knob pays the kernel cost forever for zero batching with no
+  signal. **And (b) is T10's own instrument** — the likeliest outcome of T10 is "never
+  formed a batch", and telling that apart from "formed and did not help" is what decides
+  whether the row is refuted or merely unreachable. Building it here puts it in the
+  server permanently instead of in a throwaway probe.
+- [ ] T10 Server-level on-device A/B + RESULTS + close the row. **The only thing that
+  can discharge this row** — an engine probe number does NOT. Full spec in the handoff
+  block at the top of this row.
 
 **[ ] UNBLOCKED 2026-09-08 — row 17 is FIXED** (`sdpa` now gets an explicit causal mask at
 `q_len > 1, past > 0`; `docs/2026-09-08-row17-sdpa-causal-mask-RESULTS.md`). The kernel switch is
