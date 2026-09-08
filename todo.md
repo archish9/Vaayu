@@ -2128,8 +2128,17 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
 - [ ] T4 `logs.py` session marker becomes a tuple (issue L1 T4)
 - [ ] T5 `_Detok` + `_BatchStream` — per-stream text, stop strings, finish, row
 - [ ] T6 `EngineHandle.run_batch` — fan-out over one worker thread
-- [x] T7 `vaayu/server/scheduler.py` — the dispatch loop (2026-09-08, 6/6 tests
-  green; brief needed 2 more corrections beyond the handoff's 4 — see
+- [x] T7 `vaayu/server/scheduler.py` — the dispatch loop (2026-09-08, 17/17 tests
+  green + 12/12 in `test_server_run_batch.py`; brief needed 2 more corrections beyond
+  the handoff's 4, then five review rounds of sentinel/cancellation fixes. **The
+  invariant: every job that entered `submit()` ends with exactly one `None` sentinel on
+  `job.out`, on every path.** Round 5 closed the root cause — `submit()` now raises
+  `QueueFull` when there is no live dispatcher (`_stopping`, `_task is None`, or
+  `_task.done()`), so a job is only ever in `_waiting` while something exists to drain
+  it; `start()` deliberately does NOT restart a dead dispatcher. Also: `stop()` now
+  re-raises its CALLER's own cancellation — `task.cancelled()` alone cannot detect it
+  (cancelling a task suspended on `await other_task` propagates inward, so it reads
+  `True` either way, measured), `current_task().cancelling()` can. See
   `docs/2026-09-08-p10-server-batching/task-7-report.md`)
 - [ ] T8 Routes + `MAX_BATCH_SIZE` knob + README + the false sdpa doc lines
 - [ ] T9 Inert notices (startup kernel warning, latched never-admitted line)

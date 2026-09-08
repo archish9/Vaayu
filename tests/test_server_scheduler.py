@@ -180,9 +180,15 @@ def test_the_queue_refuses_past_its_depth():
                            prefill_chunk_size=512)
 
     async def go():
+        # A dispatcher must exist for a submit to be accepted at all (see
+        # `submit`'s liveness guard), and neither submit() nor stop() yields
+        # before its own first real suspension point, so the loop cannot
+        # have picked s0 up before the depth is tested.
+        await sched.start()
         await sched.submit(_job("s0"))          # occupies the depth
         with pytest.raises(QueueFull):
             await sched.submit(_job("s1"))
+        await sched.stop()
 
     asyncio.run(go())
 
@@ -517,3 +523,104 @@ def test_stop_after_the_dispatch_task_was_cancelled_returns_cleanly():
 
     task_after = asyncio.run(go())
     assert task_after is None
+
+
+def test_submit_after_stop_refuses_rather_than_enqueueing():
+    """Regression test for review finding 1 (2026-09-08).
+
+    `submit()` had no liveness guard: it appended to `_waiting` and set
+    `_arrived` whether or not a dispatcher was alive to drain it. A request
+    racing the app lifespan's shutdown lands here -- and its
+    `await job.out.get()` would then wait forever on a queue nobody owns.
+    The honest answer is a refusal (QueueFull -> 503), not a hang.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        await sched.stop()
+        with pytest.raises(QueueFull):
+            await sched.submit(_job("s0"))
+        assert sched._waiting == [], "and nothing was left behind in the queue"
+
+    asyncio.run(go())
+
+
+def test_submit_refuses_once_the_dispatch_task_has_died(monkeypatch):
+    """Regression test for review finding 1 (2026-09-08), second route.
+
+    An exception escaping `_form`/`_admit` kills the dispatch task, and
+    `start()` deliberately does not resurrect it (`start()` only checks
+    `self._task is None`). Every LATER request would then hang forever.
+    A dead dispatcher must be a loud refusal.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    def exploding_form():
+        raise RuntimeError("boom in formation")
+
+    monkeypatch.setattr(sched, "_form", exploding_form)
+
+    async def go():
+        await sched.start()
+        first = _job("s0")
+        await sched.submit(first)
+        # The loop's own finally still strands `first` with a sentinel...
+        await asyncio.wait_for(_drain(first), timeout=5)
+        assert sched._task.done(), "the dispatch task died, as this test needs"
+        with pytest.raises(RuntimeError):
+            await sched._task          # retrieve it; don't warn at GC
+        # ...but the NEXT request must be refused, not silently queued.
+        with pytest.raises(QueueFull):
+            await sched.submit(_job("s1"))
+        assert sched._waiting == []
+
+    asyncio.run(go())
+
+
+def test_stop_propagates_the_callers_own_cancellation(monkeypatch):
+    """Regression test for review finding 2 (2026-09-08).
+
+    `except asyncio.CancelledError: pass` cannot tell "the dispatch task was
+    cancelled" (finding 2 of the previous round -- still swallowed) from
+    "the coroutine calling stop() was ITSELF cancelled". Swallowing the
+    latter breaks cancellation for the app lifespan: the shutdown coroutine
+    would sail on as though it had never been cancelled.
+    """
+    model = RecordingModel()
+    engine = EngineHandle(model)
+    blocked = asyncio.Event()
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        yield ("delta", "x")
+        await blocked.wait()             # never set: the batch never finishes
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        dispatch_task = sched._task
+        job = _job("s0")
+        await sched.submit(job)
+        await job.out.get()              # proves _run is under way and stuck
+        stopper = asyncio.ensure_future(sched.stop())
+        await asyncio.sleep(0.05)        # let stop() reach `await task`
+        assert not stopper.done()
+        stopper.cancel()                 # cancel the CALLER of stop()
+        with pytest.raises(asyncio.CancelledError):
+            await stopper
+        dispatch_task.cancel()           # test cleanup only
+        try:
+            await dispatch_task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(go())

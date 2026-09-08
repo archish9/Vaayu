@@ -112,24 +112,63 @@ class BatchScheduler:
             try:
                 await task
             except asyncio.CancelledError:
-                # The dispatch task may already have been cancelled
-                # DIRECTLY (Task 8's app-lifespan path, not this
-                # cooperative one) -- awaiting it here then re-raises that
-                # same CancelledError. `stop()` must still return cleanly:
-                # `self._task` is cleared unconditionally, above, before
-                # this await, so a caller sees the dispatcher as stopped
-                # either way; letting the CancelledError escape from here
-                # would surface in the lifespan's own shutdown code as an
-                # exception, easily misread as the lifespan task's OWN
-                # cancellation rather than the dispatcher's.
-                pass
+                # Two different cancellations arrive at this one `await`,
+                # and they must NOT be treated alike:
+                #   * the DISPATCH TASK was cancelled (Task 8's app-lifespan
+                #     path, not this cooperative one) -- awaiting it here
+                #     re-raises that same CancelledError. `stop()` must
+                #     still return cleanly: `self._task` is cleared
+                #     unconditionally, above, so a caller sees the
+                #     dispatcher as stopped either way, and letting this
+                #     escape would surface in the lifespan's own shutdown
+                #     code as an exception, easily misread as the lifespan
+                #     task's OWN cancellation.
+                #   * the CALLER of stop() was itself cancelled while
+                #     suspended here. Swallowing THAT breaks cancellation
+                #     for whoever asked -- the shutdown coroutine would
+                #     sail on as though it had never been cancelled.
+                # `task.cancelled()` ALONE DOES NOT SEPARATE THEM, and this
+                # is the whole subtlety: cancelling a task that is suspended
+                # on `await other_task` propagates the cancel INTO
+                # `other_task`, so in the second case the dispatch task ends
+                # up cancelled too and `task.cancelled()` is True either way
+                # (verified directly against this asyncio, both cases). What
+                # does separate them is the CALLER's own cancellation count:
+                # `Task.cancel()` bumps `_num_cancels_requested` on the task
+                # it was called on before propagating inward, so
+                # `current_task().cancelling()` is non-zero exactly when it
+                # was US who were cancelled. `not task.cancelled()` is kept
+                # alongside it for the remaining shape -- the dispatch task
+                # absorbing a cancellation and ending some other way.
+                caller = asyncio.current_task()
+                if (caller is not None and caller.cancelling()) or not task.cancelled():
+                    raise
 
     async def submit(self, job: Job) -> None:
-        """Enqueue `job`. Raises QueueFull past `queue_depth`.
+        """Enqueue `job`. Raises QueueFull past `queue_depth`, and also when
+        there is no live dispatcher to drain it.
 
         The count includes the running batch's members, so a client's queue
         position is `depth` at entry -- the same promise slot() made.
+
+        THE INVARIANT THIS GUARD ENFORCES: a job is only ever in `_waiting`
+        while a dispatcher exists to drain it. Every job that enters here
+        must end with a sentinel on `job.out`, and the only thing that ever
+        writes one is the dispatch loop -- so enqueuing when that loop is
+        gone (stopped, or dead from an exception out of `_form`/`_admit`,
+        which `start()` deliberately does not resurrect) hands the caller a
+        queue nobody owns and an `await job.out.get()` that never returns.
+        A refusal is the honest answer: the routes already turn QueueFull
+        into a 503, which is exactly "this server cannot currently accept
+        work". The message says WHICH refusal it is, so an operator reading
+        the log can tell a dead dispatcher from a genuinely full queue.
         """
+        if self._stopping or self._task is None or self._task.done():
+            raise QueueFull(
+                "the dispatcher is not running (stopped, or its task died); "
+                "this server cannot currently accept work. This is NOT a "
+                "full queue -- the request was refused before it was "
+                f"queued (depth {self.depth} of {self.queue_depth}).")
         if self.depth >= self.queue_depth:
             raise QueueFull(
                 f"{self.depth} requests are already queued (depth "
