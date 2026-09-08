@@ -2077,7 +2077,42 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 `docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
 
 ---
-# 15 · [ ] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08
+# 15 · [~] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08, DESIGN DONE 2026-09-08
+
+**[~] IN PROGRESS 2026-09-08 — design spec written and approved:
+`docs/superpowers/specs/2026-09-08-p10-server-batching-design.md`** (gitignored; its
+load-bearing decisions are restated in this row). Approach: **the dispatcher owns
+generation** — routes submit jobs and read queues, one dispatch task holds `engine._lock`
+for a batch of one *or* N, and no client ever holds a generator (that is §4.4's #1 risk made
+structural). **N=1 delegates to today's `engine.stream()` body untouched**, so
+`batched_generate` is never entered at N=1 (worth 3.24x on Qwen). Kernel gated ONCE at
+startup, never a request-time assert. One engine change: `batched_generate(...,
+should_stop=None)`, a per-stream hook consulted per decode step, carrying disconnect,
+stop-string and per-stream cap alike — without it a client that disconnects at cap=8000
+holds the whole batch for 8000 steps.
+
+**TWO FACTS FOUND WHILE DESIGNING, both load-bearing and neither previously on record:**
+
+1. **`ATTN_IMPLEMENTATION = None` resolves to FLASH, not sdpa.** `init_model`
+   (`vaayu_base.py:2916`) tries `flash_attention_2` first whenever `flash_attn` imports.
+   `vaayu/server/config.py:120` and `vaayu/server/README.md:71` both say "None uses sdpa"
+   and are WRONG. Batching is inert unless the operator sets `ATTN_IMPLEMENTATION="sdpa"`,
+   so this doc line is load-bearing for the knob; both are fixed by this row.
+2. **The +1.606x was measured with the PREFIX CACHE OFF** (`plans/probes/p10d_kernel_ab.py:88`,
+   `enable_prefix_cache=False`), while the server defaults `ENABLE_PREFIX_CACHE=True` and
+   cross-turn reuse is the largest lever on record (136-377x TTFT). `batched_generate` does
+   ONE `pc.lookup(None, common_ids)` on the batch's COMMON prefix and never looks up each
+   stream's own session entry, so batching two agent sessions can DISCARD each one's warm
+   prefix to buy the batch win. Per-row prefixes of differing lengths are an engine change
+   (`broadcast_cache_rows` gives every row the same `m`) and are out of v1. **This is
+   CLAUDE.md §8's trap again — an effect measured in a mode the server does not default
+   to.** The scheduler therefore decides, with a **prefix-affinity rule priced in CHUNK
+   PASSES** (derived from `prefill_chunk_size` and the prompts, no invented constant):
+   serial `= Σ ceil((len_i − own_i)/chunk)` against batched `= ceil((max len_i − common)/chunk)`,
+   batch iff batched < serial. Warm per-session prefixes serialize and keep the 136-377x
+   lever; cold or divergent prompts batch. Needs one new non-destructive
+   `PrefixCacheStore.peek_match()` (`lookup()` POPS). **The acceptance A/B runs prefix-ON as
+   well as prefix-OFF, and the prefix-ON arm can still refute the row.**
 
 **▶ BUILD HANDOFF, written 2026-09-08 to be picked up COLD in a fresh session:
 [`docs/2026-09-08-P10-server-batching-HANDOFF.md`](docs/2026-09-08-P10-server-batching-HANDOFF.md)**
