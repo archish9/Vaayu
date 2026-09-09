@@ -45,8 +45,12 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**TWO rows are open — P10 and P5**, each with a SELF-CONTAINED brief in `docs/` linked in
-the table. **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
+**P10 CLOSED 2026-09-09** (measured, banked, not recommended — see its row). **P5 is the
+only P-row still open.** Two NEW rows came out of P10's measurement and are the live work
+now: **row 20 `[bug]`** — batched decode corrupts output whenever the batch is padded,
+which must be fixed before `MAX_BATCH_SIZE > 1` is recommended to anyone — and **row 21**,
+the gate-2 ceiling that admits batching about once per process. **Row 20 comes first: row
+21 would make row 20's corruption more reachable, not less.** **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
 measurement ran 2026-09-07 and the row PASSED at **1.48-1.78x end-to-end** at realistic agentic
 context — the largest effect on this board by an order of magnitude, and mostly a PREFILL win, not
 the decode win P6/P8 banked. It also found its own prerequisite: `_assert_context_fits` refuses
@@ -68,7 +72,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[ ]` | Wire batched decode into the SERVER — **UNBLOCKED 2026-09-08** | **§4's refuting measurement RAN 2026-09-07 and the row PASSED, far bigger than the brief claimed.** At a realistic ~4.15k-token agentic context, batching is worth **1.48-1.78x END-TO-END** (Qwen N=2 1.98x at 16 tokens, 1.78x projected at 512; MiniMax N=2 1.77x / 1.48x) — not the +3-12 % P6/P8 measured at 690-token prompts, because a long prompt makes PREFILL dominant and prefill is what batching amortizes: **Qwen prefilled TWO 4.18k streams in 214.22 s against 214.25 s for ONE.** **But it also found a prerequisite the brief did not name: `_assert_context_fits` refused EVERY N>1 at that context, so wiring the server alone would have shipped the feature INERT. That prerequisite is DONE (P10a, 2026-09-07): the expert-cache giveback, +18.0 % at MiniMax N=2 through the real gate, banked.** What remains is the server wiring itself — **UNBLOCKED 2026-09-08: row 17 is FIXED** — sdpa now builds an explicit bottom-right causal mask at `q_len > 1, past > 0` (verified on all three forwards), so switching the server's kernel no longer corrupts single-stream requests. **Row 17 still prices the switch, and that price is unchanged: flash → sdpa costs the expert VRAM cache −15.5 %, so this row's real comparison is flash@N=1 vs sdpa@N=2, not P10a's +18.0 %, and it can still be refuted.** The greedy-ids `[bug]` is SETTLED (benign: one word, MoE routing discontinuity — row 15's identity criterion is unachievable on MoE and is replaced there). A DIFFERENT `[bug]` was found on the way and FIXED: the tied lm_head was never materialized on the prefetch path, so any model whose `pinning_budget` hit 0 emitted noise — row **16**, now `[x]`, and dense batched decode is token-identical N=1 vs N=2 after it. | none | **BUILD HANDOFF [`docs/2026-09-08-P10-server-batching-HANDOFF.md`](docs/2026-09-08-P10-server-batching-HANDOFF.md) — start here** · OPTIONAL row **15** · [`docs/2026-09-08-P10-kernel-ab-RESULTS.md`](docs/2026-09-08-P10-kernel-ab-RESULTS.md) · [`docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md`](docs/2026-09-07-P10-admission-at-agentic-context-RESULTS.md) · brief [`docs/2026-09-07-B-server-batched-decode-BRIEF.md`](docs/2026-09-07-B-server-batched-decode-BRIEF.md) |
+| **P10** `[x]` | Wire batched decode into the SERVER — **CLOSED 2026-09-09: MEASURED, BANKED, NOT RECOMMENDED** | **T10 ran and the row is ANSWERED.** 12 arms (MiniMax + Qwen, both interleave directions) plus a dense smoke, through the real server. Batching is worth **1.442×** on a two-turn MiniMax session with the prefix cache ON (the server's default), **1.250×** with it off, and **nothing** on the warm steady-state turn (+0.9 % / +1.3 %, inside noise) — because the formation policy correctly prefers prefix reuse, declining with BOTH gates at 0. **Qwen gets nothing and regresses nothing** (202.50 → 201.12 s, 0 batches). Three structural facts bound it: batching is admitted about **once per process** (row 21), the whole win is the **cold turn**, and **the prefix cache is worth 4.44× where batching's best is 1.44×**. **It is also UNSAFE today — row 20: padded batches corrupt output. Leave `MAX_BATCH_SIZE = 1`.** Four bugs found and FIXED on the way, THREE of which bite users who never enable batching: formation starvation (`94c8e1a`), the prefix-hit chunked-prefill OOM (`266ec80`), cross-session prefix cannibalisation (`efeb343`, **2.77×** on its own arm), the batched store-back (`845608e`). Suite 1838 → **1865**. | none | row **15** · [`docs/2026-09-09-P10-server-batching-RESULTS.md`](docs/2026-09-09-P10-server-batching-RESULTS.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -1897,6 +1901,83 @@ this only bites a diagnostic. It is filed because a debugging session that reach
 loses a tool exactly when it needs one — which is how it was found.
 
 ---
+# 20 · [bug] Batched decode diverges from serial whenever the batch is PADDED
+
+**Opened 2026-09-09 by row 15's T10 dense smoke. PRE-EXISTING — reproduced byte-identically
+at `538e740` (the P10 merge), so no fix from that session caused it. NOT FIXED.**
+
+**`MAX_BATCH_SIZE >= 2` corrupts output when the batch's prompts differ in length**, and
+severity tracks PREFILL CHUNK COUNT:
+
+| probe | prompt lengths | pad_len | chunks | result |
+|---|---|---|---|---|
+| `plans/probes/p10b_ids.py` | equal (by design) | 0 | 1 | identical, 32/32 ids |
+| `plans/probes/p10f_pad_ids.py` (**the reproducer**, ~2 min on Llama-3.2-1B) | 68 vs 75 | 7 | 1 | **DIFFERENT**, both coherent |
+| server arm `dense-mbs2` | 1236 vs 1239 | 3 | 3 | **GARBAGE** — `'**min** \nwith \nassistant:\n\n?...'` against clean serial output |
+
+**ENGINE, not server wiring:** `p10f_pad_ids.py` calls `batched_generate` directly, no
+HTTP. **Dense has no top-k to flip, so ANY divergence is a real defect** — that is exactly
+the discriminator `p10b_ids.py` was built to provide, and it misses this because it uses
+identical prompts (its own docstring names zero padding as an untested control). **Real
+fan-out never has equal-length prompts.**
+
+**The MoE blast radius is UNMEASURED and is the worrying part.** The same padded path
+serves Qwen3-235B and MiniMax-M2.7, where identity is *unassertable* — batch width changes
+GEMM tiling, tiling perturbs router logits ~1 ULP, top-k is DISCONTINUOUS (row 15's own
+settled finding). So this may be silently degrading batched MoE output, and row 15's
+"coherent as TEXT" criterion cannot catch it. T10's MoE arms produced plausible code;
+plausible is not a check.
+
+**Suspects, already narrowed by the chunk-count correlation:** `build_batch_attention_mask`,
+`batch_position_ids`, and the per-chunk `pad_mask[:, :m + _end]` /
+`position_ids[:, :m + _end]` slices in `batched_generate`'s chunk loop — the interaction of
+left-padding with chunk boundaries.
+
+**Consequence while open: `MAX_BATCH_SIZE > 1` must not be recommended to anyone.** It
+defaults to 1, so no user is exposed today.
+
+---
+
+# 21 · [ ] Batching is admitted about once per process — gate 2 cannot see reclaimable VRAM
+
+**Opened 2026-09-09 by row 15's T10 measurement. This is what caps batching's value, and it
+is a PERF row, not a bug.**
+
+In every MiniMax arm `batches_run=1` against `formation_attempts=2`; in every Qwen arm 0.
+The two models are stopped by **different terms of the same expression**, so a fix aimed at
+one would miss the other:
+
+```
+gate 2 = min(free_vram + reusable_pool,  reserve_bytes + expert_giveback_bytes)
+
+MiniMax: "does not fit in 3.01 GiB of free VRAM"          <- the USABLE term binds
+Qwen:    "does not fit in the 5.60 GiB this request may use.
+          9.08 GiB is free, but the expert VRAM cache is
+          entitled to everything above the reserve..."     <- the CLAMP term binds
+```
+
+* **MiniMax:** `_assert_context_fits` is evaluated BEFORE the eviction that follows it in
+  `batched_generate`. After turn 1 the expert VRAM cache has ALLOCATED its bytes, so
+  `free + reusable_pool` has fallen to 3.01 GiB — under its `reserve + giveback` of
+  ~6.2 GiB. **P10a's giveback lifts only the CLAMP term, so it cannot help once the cache
+  holds the memory**; its +18.0 % was measured with more VRAM genuinely free.
+* **Qwen:** 9.08 GiB IS free and the clamp binds at `reserve + giveback` = 5.60 + **0** —
+  its expert cache (3.644 GiB) is already below one decode step's working set (8.285 GiB),
+  so it has nothing to surrender. What unblocks Qwen is need-side over-prediction, **not**
+  lowering the giveback floor (row 15's standing warning).
+
+**Gate 1 does not have MiniMax's problem:** `reclaimable_vram_budget(model, reclaim=True)`
+counts `reclaimable_expert_vram` in its budget, which gate 2's `usable` term never sees.
+This is the gate-1/gate-2 asymmetry already recorded as a known-open minor — now MEASURED
+as the ceiling on batching.
+
+**Do not open this before row 20 is fixed** — lifting the ceiling on a path that corrupts
+padded batches makes the corruption more reachable, not less. And weigh it against row 15's
+finding that the warm steady state gets **nothing** from batching however wide it is
+admitted: more formations only help COLD fan-out.
+
+---
+
 # 19 · [ ] Re-measure any drafter number taken under `sdpa` (fallout of row 16)
 
 Row 16 left this consequence OPEN and it must not be lost inside a closed row.
@@ -2077,7 +2158,47 @@ should be re-measured** — including the 5.57x dense speculative figure CLAUDE.
 `docs/2026-09-07-P10b-ids-divergence-SETTLED.md` §4.
 
 ---
-# 15 · [~] Wire batched decode into the SERVER  (§0 **P10**) — UNBLOCKED 2026-09-08, DESIGN DONE 2026-09-08
+# 15 · [x] Wire batched decode into the SERVER  (§0 **P10**) — **CLOSED 2026-09-09: MEASURED, BANKED, NOT RECOMMENDED**
+
+**VERDICT (2026-09-09).** T10 ran: 12 matrix arms on MiniMax-M2.7 and Qwen3-235B plus a
+dense smoke, one server process per arm, interleaved both ways, `BALLAST_GB=27`, sdpa,
+2 clients × 2 turns × 64 tok at ~4.17k tokens. Full detail:
+`docs/2026-09-09-P10-server-batching-RESULTS.md` (gitignored — the numbers below are the
+durable copy).
+
+| configuration | batching's worth |
+|---|---|
+| two-turn session, prefix ON (server default) | **1.442×** (559.28 → 387.96 s) |
+| two-turn session, prefix OFF | **1.250×** (897.58 → 717.98 s) |
+| warm steady-state turn, prefix ON | 99.20 → 98.29 s = **+0.9 %, nothing** |
+| warm steady-state turn, prefix OFF | 440.37 → 434.59 s = **+1.3 %, nothing** |
+| Qwen3-235B, any mode | **nothing** — 202.50 → 201.12 s, 0 batches, no regression |
+| dense smoke Llama-3.2-1B | 14.84 → 8.56 s = 1.73×, **but the output is WRONG** |
+
+Replication within every pair is 0.07–0.3 %.
+
+**Three structural facts bound the feature, and they are the row's real output:**
+1. **Batching is admitted about ONCE PER PROCESS** at agentic context — `batches_run=1`
+   against `formation_attempts=2` in every MiniMax arm, 0 in every Qwen arm.
+2. **The whole win is the COLD turn.** A warm agentic loop gets nothing: the formation
+   policy correctly prefers prefix reuse, declining with BOTH gates reading 0.
+3. **The prefix cache is worth 4.44× where batching's best is 1.44×** (440.37 → 99.20 s
+   at `MAX_BATCH_SIZE=1`). Perf attention belongs on prefix reuse, not on width.
+
+**IT IS ALSO UNSAFE TODAY — see the padded-batch `[bug]` row below. Leave
+`MAX_BATCH_SIZE = 1`** (the default, so nobody is exposed).
+
+**Measurement caveat, not buried:** every arm ran sdpa on both sides. A user's real
+choice is flash@`MBS=1` against sdpa@`MBS=2`, and row 17's −2.3 % MiniMax / −4.1 % Qwen
+kernel tax applies to the whole sdpa side. That puts cold fan-out near 1.41× and the warm
+case at about −2.3 % — **arithmetic, not measurement.** The flash-baseline arms were not
+run.
+
+**Four bugs were found and FIXED on the way, three of which bite users who never enable
+batching** — each is its own section below with its own commit: formation starvation
+(`94c8e1a`), the prefix-hit chunked-prefill OOM (`266ec80`), cross-session prefix
+cannibalisation (`efeb343`, **2.77× on its own arm**), and the batched store-back
+(`845608e`). Suite **1838 → 1865 passed, 12 skipped.**
 
 ## ▶ FRESH SESSION STARTS HERE (written 2026-09-08)
 
@@ -2396,6 +2517,50 @@ pins its real point (nothing is lost on `GeneratorExit`).
 **On-device re-measurement of the prefix-ON block is PENDING** — the arm table above is
 the pre-fix number.
 
+### [bug] BATCHED DECODE DIVERGES FROM SERIAL WHENEVER THE BATCH IS PADDED — found
+2026-09-09, NOT FIXED, and it is a **blocker on this row's verdict**
+
+**`MAX_BATCH_SIZE >= 2` corrupts output when the batch's prompts differ in length.**
+Pre-existing: reproduced byte-identically at `538e740` (the P10 merge, before any of
+today's fixes), so nothing in this session caused it.
+
+| probe | prompt lengths | pad_len | prefill chunks | result |
+|---|---|---|---|---|
+| `plans/probes/p10b_ids.py` | equal (by design) | 0 | 1 | **identical**, 32/32 ids |
+| `plans/probes/p10f_pad_ids.py` (new) | 68 vs 75 | 7 | 1 | **DIFFERENT**, both outputs coherent |
+| server arm `dense-mbs2` | 1236 vs 1239 | 3 | 3 | **GARBAGE** (`'**min** \nwith \nassistant:\n\n?...'`) against clean serial output |
+
+**Severity grows with chunk count**, which is what makes the two probe results look
+inconsistent until you line them up: one chunk gives a coherent but different answer,
+three chunks give noise.
+
+**It is the ENGINE, not the server wiring.** `p10f_pad_ids.py` calls
+`model.batched_generate` directly, no HTTP, and still diverges. **Dense has no top-k to
+flip**, so ANY divergence is a real defect — that is exactly the discriminator
+`p10b_ids.py`'s own docstring was built to provide, and `p10b` misses it because it uses
+identical prompts and says so in its comments (`max_R` padding zero).
+
+**Why it was never caught:** row 15's identity criterion is "dense MAY assert token
+identity", and the only dense identity probe on record uses equal-length prompts. Real
+fan-out never has equal-length prompts.
+
+**The MoE implication is worse and is UNMEASURED.** The same padded path serves Qwen and
+MiniMax, where identity is *unassertable* (batch width changes GEMM tiling, tiling
+perturbs router logits ~1 ULP, top-k is DISCONTINUOUS — row 15's own settled finding).
+So this defect could be silently degrading batched MoE output, and the "coherent as
+TEXT" criterion cannot catch it. The MoE arms in T10 produced plausible code; plausible
+is not a check.
+
+**Next step when this is picked up:** the suspects are the padded mask
+(`build_batch_attention_mask`), `batch_position_ids`, and the per-chunk
+`pad_mask[:, :m + _end]` / `position_ids[:, :m + _end]` slices in `batched_generate`'s
+chunk loop — the interaction of left-padding with chunk boundaries, since severity
+tracks chunk count. `p10f_pad_ids.py` is the reproducer and runs in ~2 minutes on
+Llama-3.2-1B.
+
+**Until it is fixed, `MAX_BATCH_SIZE > 1` should not be recommended to anyone**, and
+this row cannot close as SHIPPED on its performance numbers alone.
+
 ### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
 
 * **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO
@@ -2655,7 +2820,7 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
   formed a batch", and telling that apart from "formed and did not help" is what decides
   whether the row is refuted or merely unreachable. Building it here puts it in the
   server permanently instead of in a throwaway probe.
-- [~] T10 Server-level on-device A/B + RESULTS + close the row. **STARTED 2026-09-09.** **The only thing that
+- [x] T10 Server-level on-device A/B + RESULTS + close the row. **DONE 2026-09-09.** **The only thing that
   can discharge this row** — an engine probe number does NOT. Full spec in the handoff
   block at the top of this row.
 
