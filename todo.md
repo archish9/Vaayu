@@ -269,8 +269,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1882 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-09 after row 21's batched-prefill form (1875 + 7). The 1875 was verified the same day
+**Suite baseline: 1886 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-09 after the dispatcher-error row-ownership fix (1882 + 4). The 1882 was verified the
+same day after row 21's batched-prefill form (1875 + 7). The 1875 was verified the same day
 after P5's max-over-chunks form (1870 + 5), the 1870 re-measured against a stashed HEAD
 the same day rather than taken from this line. The 1870 was itself verified
 2026-09-09 after row 20's rope_scaling fix (1865 + 5). The 1758 written here before that was
@@ -2929,25 +2930,42 @@ Llama-3.2-1B.
 **Until it is fixed, `MAX_BATCH_SIZE > 1` should not be recommended to anyone**, and
 this row cannot close as SHIPPED on its performance numbers alone.
 
-### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
+### Pending bugs (found by review — CLAUDE.md §6; one FIXED 2026-09-09, one still open)
 
-* **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO
-  `requests.jsonl` rows.** Found 2026-09-08 by T8's re-review, and **PRE-EXISTING at
-  `3ecaaec`** — it is not a regression from the T8 fix, which closed the adjacent hole.
-  Where: `_dispatch_loop`'s stranded-jobs drain in its `finally`, and `_run`'s
-  `except BaseException` fan-out (`vaayu/server/scheduler.py`). Both hand `_sse` (or the
-  non-streaming route) a REAL item while `engine.stream()`/`generate()` was never entered,
-  so `app.py`'s ownership transfer fires on that item and the engine's row-writing
-  `finally` never runs. **Symptom: shutdown with jobs still queued writes no row for
-  them**, against the "a request never ends without a row" contract that
-  `documentation/server.md` states. **A THIRD path, found by the final whole-branch
-  review (2026-09-09):** in `_run`'s gate-2 fallback loop, if
-  `_run_serial(members[0])` re-raises a `BaseException` (a real cancellation, per its own
-  docstring), `members[1..N-1]` never run at all and get ONLY the loop's synthetic
-  `("error", …)` from `_dispatch_loop`'s own exception handler — same root cause (a
-  synthetic item flips the ownership flag with no engine row behind it), same fix. Fix
-  sketch: mark synthetic items so the transfer does not fire on them, or have the drain
-  write the row itself.
+* **[x] FIXED 2026-09-09 — a queued job drained by the scheduler's own synthetic `("error", …)`
+  got ZERO `requests.jsonl` rows.** Found 2026-09-08 by T8's re-review, **PRE-EXISTING at
+  `3ecaaec`** (not a T8 regression). **Cause, proved by execution before any fix:** both routes
+  infer "the engine already wrote this request's row" from a PROXY — `_sse`'s
+  `engine_owns_the_row` flipped on the first real item off `job.out`, and the non-streaming
+  route's `submitted` flipped on `submit()` succeeding. The dispatch loop can END a job the
+  engine never entered, and its item looked identical to an engine one. **Three paths, one root
+  cause, one fix:** `_dispatch_loop`'s stranded-jobs drain in its `finally` (graceful `stop()`
+  with requests still queued), its `except BaseException` fan-out, and `_run`'s gate-2 fallback
+  loop where `_run_serial(members[0])` re-raising a `BaseException` leaves `members[1..N-1]`
+  never run — the third arrives through the second, so fixing the fan-out covers it.
+  **Fix: a FOURTH item kind, `("dispatch_error", exc)`**, written by those two dispatcher sites
+  only; the routes raise it exactly as before but do NOT transfer ownership, so their own
+  `except Exception` writes the row. `run_batch`'s per-job fan-out and `_run_serial`'s own error
+  puts stay `("error", …)` — the engine DID run there and `_write_request_row` already fired, so
+  marking them would double-count. Ownership can now only be withheld, never revoked: a member
+  that got real deltas before the fan-out keeps its engine-written row.
+  **A SECOND HOLE ON THE SAME PATH, found by probing the fix rather than reasoning about it, and
+  fixed with it:** the fan-out re-raises whatever BaseException it caught — usually a
+  `CancelledError`, since the app lifespan stops the dispatcher by cancelling its task — and the
+  non-streaming route had NO `except BaseException` at all (`_sse` has had one all along), so
+  `raise error` walked past `except Exception` and out of the handler with **0 rows**, before and
+  after the kind fix. It now writes the row (`finish="cancelled"`, same mapping `_sse` uses) and
+  re-raises. That clause also covers this route's own ASGI-task cancellation while waiting on
+  `job.out`, which was silently row-less too.
+  **Verified:** both routes measured writing **0 rows** for a dispatcher-drained job before the
+  fix (a temporary copy of the new tests using today's `("error", …)` kind — both failed at
+  `assert 0 == 1`), and 0 rows for the cancelled variant; 1 row each after. 4 new tests (3
+  route-level in `tests/test_reqlog_refusals.py`, 1 scheduler-level pinning the never-ran
+  fallback member in `tests/test_server_scheduler.py`), and the stranded-drain test now pins the
+  kind in both directions. Suite **1882 → 1886 passed, 12 skipped**.
+  **§8:** (1) no knob — a contract repair, nothing to configure. (2) N/A. (3) **REACHABLE
+  TODAY**: both server routes, at `MAX_BATCH_SIZE = 1`, on every graceful shutdown with a
+  request still queued. (4) N/A.
 * **[bug] No test for the sentinel-only cancel path.** `_sse`'s sentinel-with-no-owner
   branch (`owed=(None, None, "cancelled")`) has code but no coverage: it is reached when a
   job's `CancelToken` is set while queued WITHOUT its ASGI task being cancelled — e.g.

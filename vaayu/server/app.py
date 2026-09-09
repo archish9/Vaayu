@@ -627,14 +627,20 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         cancel = CancelToken()
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
         result, error = None, None
-        # Set only once submit() succeeds. prepare() now runs directly here
-        # rather than inside generate()'s own try (B8's reason: an oversized
-        # prompt must be a 400, not a 200 with an SSE-shaped error), so a
-        # prepare() failure never reaches generate()'s row-writing `finally`
-        # at all -- this flag is what tells the except clauses below whether
-        # THEY owe the row or generate() (inside the dispatcher) already
-        # wrote it.
-        submitted = False
+        # Set once a real ENGINE item arrives. prepare() now runs directly
+        # here rather than inside generate()'s own try (B8's reason: an
+        # oversized prompt must be a 400, not a 200 with an SSE-shaped
+        # error), so a prepare() failure never reaches generate()'s
+        # row-writing `finally` at all -- this flag is what tells the except
+        # clauses below whether THEY owe the row or generate() (inside the
+        # dispatcher) already wrote it.
+        #
+        # Submitting is NOT enough to hand ownership over, which is what this
+        # flag used to key off: the dispatch loop can end a submitted job the
+        # engine never entered, with a ("dispatch_error", exc) item and no row
+        # behind it (scheduler.py's Job docstring). That read as "generate()
+        # already logged it" and the request ended with no row at all.
+        engine_owns_the_row = False
         try:
             prepared = e.prepare(req)
             job = Job(req=req, session_key=req.session_key,
@@ -642,7 +648,6 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             job.prepared = prepared
             job.stream = False
             await app.state.scheduler.submit(job)
-            submitted = True
             # Consume to completion: a second admission path could run a
             # generation concurrently with the dispatcher's, on an engine that
             # is not thread-safe across the KV cache, the expert VRAM cache and
@@ -658,6 +663,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 if item is None:
                     break
                 kind, payload = item
+                if kind == "dispatch_error":
+                    # The engine never ran this job, so nothing wrote its
+                    # row -- ownership stays here (see above).
+                    error = payload
+                    continue
+                engine_owns_the_row = True
                 if kind == "error":
                     error = payload
                 elif kind == "final":
@@ -678,18 +689,35 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
-            # `submitted` tells the two remaining sources apart: prepare()
-            # raising something other than the three typed errors above (a
-            # malformed chat template) never reached generate() either, so
-            # nothing else will log it -- write the row here. Once submitted,
-            # generate() ran inside the dispatcher with `prepared` passed
-            # through, and its own `finally` already wrote a row before
-            # `error` ever reached this frame; a second one here would
-            # double-count.
-            if not submitted:
+            # `engine_owns_the_row` tells the three remaining sources apart:
+            # prepare() raising something other than the three typed errors
+            # above (a malformed chat template) never reached generate()
+            # either, and neither did a job the dispatch loop drained -- so
+            # nothing else will log those, and the row is written here. Once
+            # a real engine item arrived, generate() ran inside the
+            # dispatcher with `prepared` passed through and its own `finally`
+            # already wrote a row before `error` ever reached this frame; a
+            # second one here would double-count.
+            if not engine_owns_the_row:
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
                              finish="error")
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
+        except BaseException as ex:                   # noqa: BLE001 -- re-raised
+            # `_sse` has had this clause all along; this route did not, so a
+            # BaseException walked out with no row. Two ways in, both real:
+            # this ASGI task cancelled while waiting on `job.out`, and the
+            # dispatcher fanning out its own caught BaseException as a
+            # ("dispatch_error", CancelledError) -- which is the USUAL shape
+            # of that fan-out, since the app lifespan stops the dispatcher by
+            # cancelling its task. Same finish mapping `_sse` uses; the
+            # exception still propagates.
+            if not engine_owns_the_row:
+                cancelled = isinstance(ex, (GeneratorExit,
+                                            asyncio.CancelledError))
+                _refusal_row(e, req, None if cancelled else type(ex).__name__,
+                             None if cancelled else str(ex), stream=False,
+                             finish="cancelled" if cancelled else "error")
+            raise
         finally:
             watchdog.cancel()
 
@@ -823,7 +851,8 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     # dropped this way.
                     owed = (None, None, "cancelled")
                 break
-            # Ownership transfers on the FIRST real item, not at submit():
+            # Ownership transfers on the FIRST real item -- an ENGINE item,
+            # never a "dispatch_error" (below) -- and not at submit():
             # a successfully submitted job can still be dropped by `_form`
             # before the dispatcher runs it (see above). Once a real item
             # arrives here the dispatcher has actually started the
@@ -831,8 +860,15 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
             # or run_batch's per-job fan-out) is guaranteed to run even if
             # this generator bails out right after -- so from here on, a row
             # written in THIS frame's `finally` would double-count.
-            engine_owns_the_row = True
             kind, payload = item
+            if kind == "dispatch_error":
+                # The dispatcher ended this job WITHOUT the engine ever
+                # running it (scheduler.py's Job docstring) -- stranded at
+                # loop exit, or fanned out from its `except BaseException`.
+                # No engine `finally` wrote a row, so ownership must NOT
+                # transfer: the `except Exception` below is what writes it.
+                raise payload
+            engine_owns_the_row = True
             if kind == "error":
                 raise payload
             if kind == "final":

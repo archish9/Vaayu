@@ -31,6 +31,18 @@ class Job:
     slow client must not stall the other N-1 streams of its batch, and each
     stream's output is bounded by its own cap.
 
+    ("dispatch_error", exc) IS THE FOURTH KIND, AND IT MEANS THE ENGINE
+    NEVER RAN. `engine.stream()`, `engine.generate()` and `run_batch` each
+    write this request's requests.jsonl row from their own `finally`, so a
+    route that sees a real item hands row-writing to them ("the engine owns
+    the row"). The dispatch loop can also terminate a job the engine never
+    entered -- stranded in `_waiting` at loop exit, or fanned out from its
+    `except BaseException` -- and nothing wrote a row for those. The routes
+    read the kind and keep ownership, which is what keeps the "a request
+    never ends without a row" contract (documentation/server.md) true on
+    those paths. Otherwise the row would be lost: it looked like an ordinary
+    error, so both routes assumed a row already existed.
+
     `prepared` and `stream` are set by the route, not passed to `__init__`
     (both default so existing call sites -- and the brief's own test file,
     which never touches either -- keep working):
@@ -264,8 +276,15 @@ class BatchScheduler:
                     # already returned at the first one and never reads a
                     # second. A job's contract is therefore "at least one
                     # sentinel, stop at the first" -- never exactly one.)
+                    #
+                    # "dispatch_error", not "error": for a member the engine
+                    # never ran, nothing wrote a requests.jsonl row, and the
+                    # route only knows that from the KIND (see Job's
+                    # docstring). The gate-2 fallback's `members[1..N-1]`
+                    # arrive here that way -- `_run_serial(members[0])`
+                    # re-raising a BaseException skips them entirely.
                     for j in members:
-                        await j.out.put(("error", ex))
+                        await j.out.put(("dispatch_error", ex))
                         await j.out.put(None)
                     if isinstance(ex, asyncio.CancelledError):
                         # A dead dispatcher must not be a possible end state
@@ -297,7 +316,7 @@ class BatchScheduler:
             # `_form`.
             stranded, self._waiting = self._waiting, []
             for j in stranded:
-                await j.out.put(("error", RuntimeError(
+                await j.out.put(("dispatch_error", RuntimeError(
                     "the dispatcher stopped before this request could run")))
                 await j.out.put(None)
 

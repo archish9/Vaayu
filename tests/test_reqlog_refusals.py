@@ -595,3 +595,91 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
     assert rs["b"]["finish"] == "cancelled", (
         "a client that vanished while queued left no row, or the wrong finish")
     assert rs["b"]["error"] is None
+
+
+def _dispatcher_drain(exc_text="the dispatcher stopped before this request "
+                               "could run"):
+    """Exactly what `_dispatch_loop` writes for a job the ENGINE never ran:
+    a terminal error item followed by the sentinel, from the loop's own
+    `finally` drain (or its `except BaseException` fan-out). No
+    `engine.stream()`/`generate()`/`run_batch` call happened, so no
+    `_write_request_row` did either -- the row is the route's to write.
+
+    Stubbed rather than raced against the real dispatcher's timing, the same
+    way `test_a_dropped_non_streaming_job_still_writes_a_row` stubs a drop:
+    this pins what the ROUTE does with a dispatcher-produced error.
+    `tests/test_server_scheduler.py` owns the drain mechanics.
+    """
+    async def submit(self, job):
+        await job.out.put(("dispatch_error", RuntimeError(exc_text)))
+        await job.out.put(None)
+    return submit
+
+
+def test_a_dispatcher_error_still_writes_a_row_streaming(client, run_dir,
+                                                         monkeypatch):
+    """A job stranded in `_waiting` when the dispatch loop exits gets a
+    synthetic error item, not an engine run -- so the row is `_sse`'s to
+    write. Before the fix `engine_owns_the_row` flipped on that item like
+    any other, and the request ended with NO row at all.
+    """
+    from vaayu.server.scheduler import BatchScheduler
+
+    monkeypatch.setattr(BatchScheduler, "submit", _dispatcher_drain())
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200          # headers are long gone by then
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a job the dispatcher drained left no row"
+    assert rs[0]["finish"] == "error"
+    assert rs[0]["error"]["type"] == "RuntimeError"
+
+
+def test_a_dispatcher_error_still_writes_a_row_non_streaming(client, run_dir,
+                                                             monkeypatch):
+    """Non-streaming half of the same hole: `submitted` was True, so the
+    route's `except Exception` branch assumed `generate()` had already
+    written the row from inside the dispatcher. It never ran.
+    """
+    from vaayu.server.scheduler import BatchScheduler
+
+    monkeypatch.setattr(BatchScheduler, "submit", _dispatcher_drain())
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 500
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a job the dispatcher drained left no row"
+    assert rs[0]["finish"] == "error"
+    assert rs[0]["error"]["type"] == "RuntimeError"
+
+
+def test_a_cancelled_dispatch_error_still_writes_a_row_non_streaming(
+        client, run_dir, monkeypatch):
+    """The fan-out half of the same hole, and the COMMON one: the dispatch
+    loop's `except BaseException` fans out whatever BaseException it caught,
+    which is usually a `CancelledError` (the app lifespan cancels the
+    dispatch task). `raise error` then walks straight past the route's
+    `except Exception` and out of the handler, so the request ended with no
+    row -- exactly as it did before `dispatch_error` existed. `_sse` already
+    had its own `except BaseException` for this; the non-streaming route did
+    not.
+    """
+    import asyncio
+
+    from vaayu.server.scheduler import BatchScheduler
+
+    async def submit(self, job):
+        await job.out.put(("dispatch_error", asyncio.CancelledError()))
+        await job.out.put(None)
+
+    monkeypatch.setattr(BatchScheduler, "submit", submit)
+    with pytest.raises(BaseException):        # noqa: B017 -- re-raised, by design
+        client.post("/v1/chat/completions", json={
+            "model": "m", "session_id": "s", "stream": False,
+            "messages": [{"role": "user", "content": "hi"}]})
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a cancelled dispatcher left no row"
+    assert rs[0]["finish"] == "cancelled"
+    assert rs[0]["error"] is None

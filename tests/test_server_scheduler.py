@@ -510,8 +510,13 @@ def test_a_job_still_queued_when_the_dispatcher_stops_still_gets_a_sentinel(monk
         return await asyncio.wait_for(_drain(queued_job), timeout=5)
 
     out = asyncio.run(go())
-    assert any(k == "error" for k, _p in out), (
-        "a job dropped this way gets an error item, not silence")
+    assert any(k == "dispatch_error" for k, _p in out), (
+        "a job dropped this way gets an error item, not silence -- and it "
+        "must be a DISPATCH error: the engine never ran, so no "
+        "requests.jsonl row exists and the route still owes one")
+    assert not any(k == "error" for k, _p in out), (
+        "an ordinary ('error', ...) tells the route the engine already "
+        "wrote this request's row, and nothing did")
 
 
 def test_stop_after_the_dispatch_task_was_cancelled_returns_cleanly():
@@ -835,3 +840,55 @@ def test_a_re_submitting_client_rejoins_instead_of_anti_phase_locking(monkeypatc
 
     asyncio.run(go())
     assert 2 in model.widths, f"never re-formed a batch: widths={model.widths}"
+
+
+def test_a_fallback_member_the_engine_never_ran_gets_a_dispatch_error(monkeypatch):
+    """The third path onto the "no requests.jsonl row" hole (CLAUDE.md
+    section 6 pending bug, 2026-09-09): gate 2 refuses, `_run` falls back to
+    serial, and `_run_serial(members[0])` re-raises a BaseException (a real
+    cancellation, per its own docstring). `members[1..N-1]` then never run
+    at all -- their only item is `_dispatch_loop`'s own fan-out. That item
+    must say so, or the route reads it as an ordinary engine error and
+    assumes a row it never got.
+
+    Job 0 is the contrast: its engine call DID start, so its ("error", ...)
+    is an engine item and `engine.stream`'s `finally` wrote its row.
+    """
+    model = RecordingModel()
+
+    def refusing(requests, reclaim=False, should_stop=None):
+        raise RuntimeError("insufficient VRAM for N=2")
+        yield  # pragma: no cover -- makes this a generator function
+
+    model.batched_generate = refusing
+    engine = EngineHandle(model)
+    served = []
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        served.append(req.session_key)
+        raise asyncio.CancelledError()
+        yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=4)
+    jobs = [_job("s0", prompt_ids=[1, 2, 3] + [10] * 20),
+            _job("s1", prompt_ids=[1, 2, 3] + [99] * 20)]
+
+    async def go():
+        await sched.start()
+        for j in jobs:
+            await sched.submit(j)
+        out = [await asyncio.wait_for(_drain(j), timeout=5) for j in jobs]
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(sched._task, timeout=5)
+        return out
+
+    out = asyncio.run(go())
+    assert served == ["s0"], "member 1 must never have reached the engine"
+    assert any(k == "error" for k, _p in out[0]), (
+        "member 0's engine call started and raised -- an ENGINE error, whose "
+        "row engine.stream() wrote from its own finally")
+    assert [k for k, _p in out[1]] == ["dispatch_error"], (
+        "member 1 got only the dispatcher's fan-out; it must be marked as "
+        f"one so its route still writes the row -- got {out[1]!r}")
