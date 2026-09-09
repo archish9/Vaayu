@@ -2135,7 +2135,26 @@ class VaayuBaseModel(GenerationMixin):
                 head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
-                kv_capacity_buckets=self._kv_cache_is_bucketed())
+                kv_capacity_buckets=self._kv_cache_is_bucketed(),
+                # Which prefill forward this load will run -- mirrors
+                # _chunked_prefill's own branch (is_moe AND a kernel that takes
+                # an implicit/self-built mask), read off the module tree rather
+                # than an architecture string (§5). It decides which chunk sets
+                # the peak, and getting it WRONG in this direction is the safe
+                # one: the per-chunk loop (False) always predicts >= the
+                # layer-major branch. The one direction that is NOT safe:
+                # a MoE load that falls back into the loop (output_attentions /
+                # output_hidden_states) after being charged here for
+                # layer-major would under-reserve the logits term by
+                # (chunk - trailing) * vocab * 4. That fallback is unreachable
+                # today: `output_hidden_states=True` crashes the forward before
+                # it can allocate anything (todo row 18), and nothing in the
+                # engine or the server passes `output_attentions`. Charged here
+                # rather than pessimised back to the loop because doing so would
+                # hand back the whole saving on both MoE geometries.
+                layer_major_prefill=bool(
+                    getattr(self, 'is_moe', False)
+                    and self._active_attn_impl in ("flash_attention_2", "sdpa")))
             _min_resident = (self._moe_geometry["expert_bytes"]
                              if self._moe_geometry else 0)
             # Kernel-conditional floor (todo row 8, decided 2026-08-15). Rows

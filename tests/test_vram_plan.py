@@ -902,10 +902,19 @@ def test_flash_loads_keep_the_base_reserve_floor(name):
 
 @pytest.mark.parametrize("name", sorted(GEOMETRIES))
 def test_sdpa_floor_buys_back_the_context_flash_would_have_derived(name):
-    """The parity rule, stated as an equality on the OUTCOME (max_seq_len),
-    not on the floor's byte value -- a floor asserted in bytes would be the
-    per-model literal §5 forbids, and would not notice if the two shapes
-    stopped agreeing about S."""
+    """The parity rule, stated on the OUTCOME (max_seq_len), not on the floor's
+    byte value -- a floor asserted in bytes would be the per-model literal §5
+    forbids, and would not notice if the two shapes stopped agreeing about S.
+
+    AT LEAST parity, not exactly it (relaxed 2026-09-09, todo row 6a). The floor
+    IS `predict_peak_vram(sdpa, flash_parity)` and `plan_vram` then takes the
+    largest context whose peak fits that floor. Those were the same S only while
+    the peak form was monotone in S; the max-over-chunks form is not, so a
+    context just past a chunk boundary -- whose trailing chunk has restarted at
+    one token -- can fit the same floor too. It costs nothing: the reserve is
+    `max(predict(chosen), floor)`, which is the floor either way, so this is
+    strictly more context at the same bytes, and every S' <= chosen is still
+    checked against that floor by _largest_s_within_budget."""
     base = int(3.5 * GB)
     flash = shape_for(name, score_elem_bytes=score_elem_bytes("flash_attention_2"))
     sdpa = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
@@ -919,7 +928,9 @@ def test_sdpa_floor_buys_back_the_context_flash_would_have_derived(name):
         # floor from swallowing the pinning budget whole.
         assert floor == ceiling, name
         return
-    assert _plan(name, shape=sdpa, reserve_floor=floor).max_seq_len == parity, name
+    plan = _plan(name, shape=sdpa, reserve_floor=floor)
+    assert plan.max_seq_len >= parity, name
+    assert plan.reserve_bytes == floor, name
 
 
 @pytest.mark.parametrize("impl", ["eager", None, "unknown"])
@@ -1163,3 +1174,93 @@ def test_qwen_gains_nothing_because_its_cache_is_already_under_its_working_set()
     assert admission_headroom(free_vram=m["free"], plan=p,
                               expert_cache_active=True,
                               expert_giveback_bytes=give) == p.reserve_bytes
+
+
+# --- which chunk sets the peak (todo row 6a / §0 P5) -------------------
+#
+# `predict_peak_vram` used to charge ONE chunk's terms against the FINAL KV
+# capacity: `KV(cap(S)) + head + a FULL chunk of logits`. That is the max over
+# chunks only when the logits term outgrows the KV growth between chunks, which
+# is true on Llama-3.2-1B (0.2627 GB of logits against 16.8 MB of KV per chunk)
+# and false on every other geometry measured. The honest whole-prefill data says
+# so directly -- `transient - KV(capacity)` on llama-3.3-70b flash is 0.9278 GB
+# at S=2048/4096/8192 (full trailing chunk) and 0.7140/0.7182 GB at S=2049/4097
+# (1-token trailing chunk), reproducible to four decimals -- and the old form
+# charged the full-chunk figure at both, over-reserving by 30-42% at every
+# partial trailing chunk.
+#
+# Which chunk sets the peak is a property of the FORWARD, not of the model, and
+# vaayu_base.py has exactly two:
+#   * per-chunk loop (dense, or any MoE forward with output_attentions /
+#     output_hidden_states): one `forward` per chunk, so every layer's KV sits at
+#     THAT chunk's capacity and lm_head runs on every chunk.
+#   * layer-major (`_chunked_prefill`'s MoE branch): ONE forward whose chunks are
+#     batch elements, so layer L processes every chunk before layer L+1 starts --
+#     by the time the widest chunk runs, every earlier layer's KV is already at
+#     the FINAL capacity -- and lm_head is skipped for every chunk but the last
+#     (vaayu_base.py:4581, "only the LAST chunk's logits are consumed").
+
+def _sawtooth_shape(**kw):
+    """A shape whose KV growth per chunk dwarfs a chunk of logits -- the
+    llama-3.3-70b/minimax regime, where the peak sits on the LAST chunk."""
+    return shape_for("llama-70b", **kw)
+
+
+def test_layer_major_prefill_charges_logits_on_the_trailing_chunk_only():
+    """The MoE layer-major forward runs lm_head once, on the last chunk."""
+    sh = _sawtooth_shape()
+    lm = dataclasses.replace(sh, layer_major_prefill=True)
+    boundary = 5 * sh.chunk
+    assert kv_capacity_tokens(boundary, chunk=sh.chunk, growth=sh.kv_growth_factor,
+                              buckets=True) == kv_capacity_tokens(
+        boundary + 1, chunk=sh.chunk, growth=sh.kv_growth_factor, buckets=True), \
+        "premise: no KV jump across this boundary, so only the logits term moves"
+    drop = predict_peak_vram(lm, boundary) - predict_peak_vram(lm, boundary + 1)
+    assert drop == lm.N * (lm.chunk - 1) * lm.vocab * 4
+
+
+def test_per_chunk_prefill_keeps_a_full_chunk_of_logits_past_a_boundary():
+    """The dense loop runs lm_head on EVERY chunk, so an earlier full chunk is
+    still a peak candidate once the trailing chunk goes short."""
+    sh = _sawtooth_shape()
+    boundary = 5 * sh.chunk
+    assert predict_peak_vram(sh, boundary + 1) >= predict_peak_vram(sh, boundary)
+
+
+def test_the_peak_sits_on_the_chunk_whose_KV_dominates_not_on_a_full_chunk():
+    """When the KV capacity doubles at the last chunk, that chunk sets the peak
+    -- with ITS logits (one token), not a full chunk's."""
+    sh = _sawtooth_shape()
+    S = 4 * sh.chunk + 1                       # 5 chunks; capacity doubles at the 5th
+    cap = kv_capacity_tokens(S, chunk=sh.chunk, growth=sh.kv_growth_factor, buckets=True)
+    assert cap > kv_capacity_tokens(4 * sh.chunk, chunk=sh.chunk,
+                                    growth=sh.kv_growth_factor, buckets=True)
+    last_chunk = sh.kv_per_token * cap * sh.N + _peak_intercept_bytes(sh, 1)
+    assert predict_peak_vram(sh, S) == last_chunk
+
+
+def test_no_chunk_is_ever_charged_more_than_the_old_flat_envelope():
+    """Safety invariant, the reason this form can ship without a new on-device
+    round: the new max-over-chunks value is never ABOVE the old
+    `KV(cap(S)) + head + full chunk of logits + slope*S` envelope, for either
+    forward. Over-reserving was the safe direction and this only ever reserves
+    less."""
+    for name in GEOMETRIES:
+        for layer_major in (False, True):
+            for score in (0.0, 10.9):
+                sh = dataclasses.replace(shape_for(name, score_elem_bytes=score),
+                                         layer_major_prefill=layer_major)
+                for S in (1, 511, 512, 513, 1024, 2048, 2049, 4097, 8192, 8193):
+                    envelope = (sh.N * sh.n_heads * sh.chunk * sh.score_elem_bytes * S
+                                + max(_peak_intercept_bytes(sh, S),
+                                      float(sh.resident_expert_bytes))
+                                + _kv_term_bytes(sh, S))
+                    assert predict_peak_vram(sh, S) <= int(round(envelope * sh.alloc_factor)) + 1, \
+                        (name, layer_major, score, S)
+
+
+def test_layer_major_prefill_defaults_to_the_per_chunk_loop():
+    """The conservative forward is the default: a shape that does not say which
+    forward it runs is charged the one that peaks higher."""
+    sh = shape_for("qwen3-235b")
+    assert sh.layer_major_prefill is False

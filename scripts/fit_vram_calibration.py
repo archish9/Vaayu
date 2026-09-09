@@ -298,13 +298,20 @@ def shape_for(key: str, attn_impl: str) -> VramShape:
         kv_capacity_buckets=is_exl3,
         resident_expert_bytes=RESIDENT_EXPERT_BYTES[key],
         head_bytes=head_bytes_for(key, cfg, raw),
+        # Which prefill forward this arm ran, mirroring _chunked_prefill's own
+        # branch exactly as vaayu_base does: a MoE model on a kernel that takes
+        # an implicit/self-built mask goes layer-major, everything else runs the
+        # per-chunk loop. Read off FORWARD above rather than typed per model.
+        layer_major_prefill=(FORWARD[key].startswith("MoE")
+                             and attn_impl in ("flash_attention_2", "sdpa")),
     )
 
 
 def main() -> int:
     print("=" * 78)
-    print("FORM CHECK -- peak = KV(capacity) + max(last-chunk logits, resident")
-    print("experts) + N*n_heads*chunk*S*score_elem_bytes[kernel]")
+    print("FORM CHECK -- peak = MAX OVER PREFILL CHUNKS of KV(capacity at that")
+    print("chunk) + max(that chunk's logits, resident experts) + per-chunk scores;")
+    print("which chunk sets it depends on the forward (VramShape.layer_major_prefill)")
     print("alloc_factor = 1.0; the only fitted number is the per-kernel score")
     print("coefficient, one value for all four geometries")
     print("=" * 78)

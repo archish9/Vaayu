@@ -45,8 +45,11 @@ this section whenever a row opens or closes; do not let it drift.
 accepted-and-documented, **P6 SHIPPED at +11.6–12.1 % on MiniMax-M2.7**). The vacancy bullets below
 say what happened to each, and they are anti-regression notes, not history for its own sake.
 
-**P10 CLOSED 2026-09-09** (measured, banked, not recommended — see its row). **P5 is the
-only P-row still open.** Two NEW rows came out of P10's measurement and are the live work
+**P10 CLOSED 2026-09-09** (measured, banked, not recommended — see its row). **P5 CLOSED
+2026-09-09 too — root cause found and fixed, its perf premise refuted, 0 % on tok/s; its one
+survivor (`head_bytes` is probably not a transient) is carried as a `[ ]` inside row 6a and needs
+a GPU round.** **No P-row is open.** The live work is row **21** (the gate-2 batching ceiling,
+which P5's admission saving feeds) and row **19**. Two NEW rows came out of P10's measurement and are the live work
 now: ~~**row 20 `[bug]`**~~ — **FIXED 2026-09-09: the padding was a red herring, the batched
 path computed RoPE without `rope_scaling`; both MoE checkpoints were never affected, and
 `MAX_BATCH_SIZE` stays 1 on row 15's performance grounds, not on corruption** — and **row 21**,
@@ -74,7 +77,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
 | **P10** `[x]` | Wire batched decode into the SERVER — **CLOSED 2026-09-09: MEASURED, BANKED, NOT RECOMMENDED** | **T10 ran and the row is ANSWERED.** 12 arms (MiniMax + Qwen, both interleave directions) plus a dense smoke, through the real server. Batching is worth **1.442×** on a two-turn MiniMax session with the prefix cache ON (the server's default), **1.250×** with it off, and **nothing** on the warm steady-state turn (+0.9 % / +1.3 %, inside noise) — because the formation policy correctly prefers prefix reuse, declining with BOTH gates at 0. **Qwen gets nothing and regresses nothing** (202.50 → 201.12 s, 0 batches). Three structural facts bound it: batching is admitted about **once per process** (row 21), the whole win is the **cold turn**, and **the prefix cache is worth 4.44× where batching's best is 1.44×**. **It was also UNSAFE when this row closed — row 20: padded batches corrupted output. Row 20 is FIXED 2026-09-09 (the batched path computed RoPE without `rope_scaling`; neither MoE checkpoint was ever affected), so `MAX_BATCH_SIZE = 1` now stands on THIS row's performance findings alone.** Four bugs found and FIXED on the way, THREE of which bite users who never enable batching: formation starvation (`94c8e1a`), the prefix-hit chunked-prefill OOM (`266ec80`), cross-session prefix cannibalisation (`efeb343`, **2.77×** on its own arm), the batched store-back (`845608e`). Suite 1838 → **1865**. | none | row **15** · [`docs/2026-09-09-P10-server-batching-RESULTS.md`](docs/2026-09-09-P10-server-batching-RESULTS.md) |
-| **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
+| **P5** `[x]` | The intercept residual — **CLOSED 2026-09-09: it was WHICH CHUNK SETS THE PEAK, and the row's own perf premise is REFUTED** | `predict_peak_vram` charged ONE chunk's terms against the FINAL KV capacity; a prefill's peak is the **max over chunks**, and which chunk that is differs between the per-chunk loop and the layer-major MoE branch (which skips `lm_head` for all but the last chunk, `vaayu_base.py:4581`). Fixed; gate **44/77 → 39/77** outside ±10 %, worst **273.1 % → 152.7 %**, never above the old envelope, no new under-prediction, suite 1870 → 1875. **But the RESERVE DOES NOT MOVE on any geometry or kernel** — flash reserves are floor-bound at 3.5 GiB and `chosen` lands on a KV doubling, where a trailing chunk is full. **The expert cache does not grow and there is no decode win.** The saving lands on ADMISSION instead: MiniMax at 7700 tokens is charged **2.7488 → 2.3821 GiB (−13.3 %)**, Qwen zero (residency dominates). Feeds **row 21**. | none | OPTIONAL row **6a** · [`docs/2026-09-09-P5-which-chunk-sets-the-peak-RESULTS.md`](docs/2026-09-09-P5-which-chunk-sets-the-peak-RESULTS.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
 - **The P1, P2 and P3 slots are VACANT.** P1 was measured 2026-09-06 and **REFUTED** (zero disk reads
@@ -210,13 +213,14 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
   paid before the refusal latches — and P4 closed on the finding that the cost is fixed and
   one-time (see two bullets above).
 
-## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of P5/P8.
+## OPTIONAL — cannot make Vaayu faster on a target run here. Never ahead of the HIGH-PRIORITY rows.
 
 Correctness, capability, tooling and hardware. Real work, and some of it matters — none of it moves
 tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
+| **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a** |
 | **A** | The server reaches 14 of the engine's 28 load parameters | Capability and correctness, not speed. `ENABLE_KV_PERSIST` is exposed while `kv_persist_dir`/`kv_persist_sync` are not, so the feature can be turned on but not aimed. | OPTIONAL row **14** · [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md) |
 | **C1** `[bug]` | A MoE model on `device="cpu"` builds a speculator with **no gate at all** | Real correctness hole. CUDA is what runs here, so it costs nothing today. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
@@ -248,7 +252,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1870 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1875 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-09 after P5's max-over-chunks form (1870 + 5), the 1870 re-measured against a stashed HEAD
+the same day rather than taken from this line. The 1870 was itself verified
 2026-09-09 after row 20's rope_scaling fix (1865 + 5). The 1758 written here before that was
 stale by 112 — it predates T10's four fixes and row 20's. It was itself verified
 2026-09-08 after row 17's sdpa causal-mask fix (+10). **The 1715 written here before that was stale
@@ -1282,6 +1288,25 @@ refuted 2026-09-06 and P9 SHIPPED 2026-09-07 — see SETTLED and §0's vacancy n
 **Read this before proposing any perf work.** Each line is something that was BUILT or MEASURED and
 then refuted. A refutation closes its row; it is not re-scoped. Full text in
 `docs/2026-09-03-todo-archive-preprune.md` and `git log -p -- todo.md`.
+
+**Tightening the VRAM transient reserve cannot pay on this box — measured 2026-09-09 (§0 P5).**
+- **"The intercept over-charges, so the expert cache is smaller than it needs to be" is REFUTED as
+  a PERF premise.** The over-charge was real (up to +42 % at a partial trailing chunk) and it was
+  FIXED — but the reserve did not move on any of the four geometries, on either kernel. Two
+  structural facts, and they outlive the fix: **(1) on flash the reserve is
+  `max(predict(chosen), reserve_floor)` and `reserve_floor` is the 3.5 GiB base floor, which every
+  EXL3 geometry's predicted peak sits BELOW** (MiniMax 2.75 GiB at 8192), so the peak form is
+  invisible there; **(2) `chosen` lands on a KV capacity doubling, always a multiple of
+  `prefill_chunk_size`**, i.e. exactly where the trailing chunk is FULL. **Any future idea whose
+  payoff is "predict a smaller peak → bigger expert cache" is worth ZERO until one of those two
+  changes — price it against the FLOOR, not against the prediction.** What a smaller predicted peak
+  does buy is ADMISSION headroom (`_assert_context_fits` evaluates at the requested length, whose
+  trailing chunk is usually partial): MiniMax −13.3 % at 7700 tokens, Qwen zero.
+  `docs/2026-09-09-P5-which-chunk-sets-the-peak-RESULTS.md`.
+- **Do not conclude "no sawtooth" from Llama-3.2-1B again.** It is the ONE geometry whose logits
+  term outgrows its per-chunk KV, so its peak sits on an early full chunk and looks flat; and its
+  `head_bytes` is EXACTLY 2 × its full-chunk fp32 logits, so it cannot arbitrate the intercept's
+  composition either. Two 2026-08-15 conclusions rest on that geometry and both were wrong-shaped.
 
 **The VRAM expert cache's prefix sizing — the observed-union idea, killed 2026-09-06.**
 - **Sizing the batch VRAM prefix on the OBSERVED routing union instead of P6's zero-overlap bound —
@@ -3077,35 +3102,75 @@ touching `__init__`").
 
 ---
 
-# 6a · [ ] The intercept residual the VRAM calibration could not explain  (§0 **P5**)
+# 6a · [x] The intercept residual — **ANSWERED 2026-09-09: it was WHICH CHUNK SETS THE PEAK.
+Root cause found and FIXED; the row's own premise REFUTED. Expect 0 % on tok/s.**  (§0 **P5**)
 
-**Self-contained brief: `docs/2026-09-06-P5-intercept-residual-BRIEF.md`** (gitignored, this disk
-only). Opened 2026-08-15 out of the kernel-aware-calibration row (archived; `plans/settled_and_method_notes.md`), with the data already in hand
-(`plans/2026-08-15-row6-kernel-aware-calibration-RESULTS.md` §7).
+**`docs/2026-09-09-P5-which-chunk-sets-the-peak-RESULTS.md`** (gitignored, this disk only).
+Answered from the 77-point table already in `scripts/fit_vram_calibration.py` plus two
+`vaayu_base.py` branches — **the GPU round the brief called decisive was never needed.**
 
-**One intercept rule cannot be right for both forwards.** `transient − KV(capacity)`, flash arm:
+**The cause.** `predict_peak_vram` charged ONE chunk's terms against the FINAL KV capacity. A
+prefill is a sequence of chunks and the peak is the **max over them**; the two coincide only where
+a chunk of logits outgrows the KV added between chunks. That is true on Llama-3.2-1B (0.2627 GB of
+logits against 16.8 MB of KV per chunk — which is why its S=4096 and S=4097 transients are
+byte-identical and why 2026-08-15 concluded "no sawtooth") and **false on every other geometry**.
+**The one geometry that fit was the one that cannot tell the two forms apart.** Which chunk it is
+is a property of the FORWARD: the **per-chunk loop** runs one `forward` per chunk (every layer's KV
+at THAT chunk's capacity, `lm_head` on every chunk), while the **layer-major** MoE branch is ONE
+forward whose chunks are batch elements — every earlier layer is already at the FINAL capacity when
+a late layer runs its widest chunk, and `lm_head` is skipped for all but the last chunk
+(`vaayu_base.py:4581`). Reads straight off the data: 70B flash `transient − KV` is **0.9278 G at a
+full trailing chunk and 0.714 G at a 1-token one, three independent pairs, four decimals**.
 
-| geometry | full trailing chunk | 1-token trailing chunk | charged now |
-|---|---|---|---|
-| llama-3.2-1b | 0.792 G | **0.792 G** (identical) | 0.788 ✅ |
-| llama-3.3-70b | 0.928 G | 0.714 G | 1.051 (over) |
-| minimax-m2.7 | 0.62–0.67 G | 0.082–0.089 G | 0.871 (over) |
-| qwen3-235b | ≈ residency | ≈ residency | residency ✅ |
+**Shipped:** `VramShape.layer_major_prefill` (derived at load by mirroring `_chunked_prefill`'s own
+branch, never an architecture string), `_prefill_chunks`, `_score_term_bytes` (per chunk, replacing
+`_peak_linear_slope_bytes`; coefficients unchanged), and `predict_peak_vram` as a max over chunks.
+`_peak_intercept_bytes` is byte-identical. **Gate 44/77 → 39/77 outside ±10 %, worst 273.1 % →
+152.7 %**; worst points 70B sdpa S=8193 **+41.9 % → +1.1 %**, S=4097 +39.5 % → +3.5 %.
+**Never above the old envelope at any S, either forward** (pinned by a test over 4 geometries × 2
+forwards × 2 kernels × 10 S) and **no new under-prediction** on the 77 points. Suite **1870 →
+1875**, the 1870 re-measured against a stashed HEAD the same day. On device, flash:
+`llama-3.2-1b layer_major_prefill=False, max_seq_len 90639 → 91106, reserve 3.50 GiB`;
+`minimax-m2.7 layer_major_prefill=True, max_seq_len 8192, reserve 3.50 GiB, pinning 9.11 GiB` —
+both exactly as the pure form predicted (MiniMax needs `MemoryMax=26G`; 22G OOM-killed it after
+the plan printed).
 
-Llama-3.2-1B does **not** sawtooth in whole-prefill data; MiniMax-M2.7 does (0.3415 G at S=513
-against 0.8690 G at S=512 — real, and consistent across all three of its `+1` points). Everything
-is over-predicted (safe): 15–63 % at small S, up to +231 % on MiniMax at a short trailing chunk,
-and on sdpa the score term and the intercept are summed although they do not fully coexist
-(charging `max()` instead was tested and is worse in the DANGEROUS direction: −38 % on Qwen at
-S=4096).
+**§8 — what it is worth, and the premise it kills. THE RESERVE DOES NOT MOVE**, on any of the four
+geometries, on either kernel (only `max_seq_len` moves: 1B flash 90639 → 91106, 70B sdpa 8192 →
+8272, 1B sdpa 64147 → 64508). Two structural reasons: on **flash the reserve is floor-bound** —
+`max(predict(chosen), reserve_floor)` with `reserve_floor` = the 3.5 GiB base floor, which every
+EXL3 geometry's predicted peak sits below (MiniMax 2.75 GiB at 8192) — and **`chosen` lands on a
+KV capacity doubling**, which is a multiple of `prefill_chunk_size`, i.e. exactly where a trailing
+chunk is FULL and the two forms agree. **So "over-charging the transient reserve shrinks the expert
+cache" is REFUTED at every on-device operating point: the expert cache does not grow by one byte
+and there is no decode win. Do not re-open this row expecting one.**
+**Where it DOES land: ADMISSION.** `_assert_context_fits` evaluates the peak at the REQUESTED
+context, whose trailing chunk is usually partial. Flash (the server's default kernel):
+**MiniMax-M2.7 at 7700 tokens 2.7488 → 2.3821 GiB, −0.3667 GiB (−13.3 %)**; at 7731 −12.5 %; at
+2049 −21.4 %. 70B −7.0 % at 4097 (−25.8 % on sdpa). **Qwen3-235B: zero** — its 1.514 GB chunk-major
+residency dominates the intercept through `_peak_transient_bytes`'s `max()`. It changes an OUTCOME
+only where a request would otherwise be refused, or where batch admission is deciding — **row 21**,
+whose MiniMax arm is stopped by 3.01 GiB of `free + reusable_pool` against a need this row just cut
+by 0.37 GiB. **No knob** (derived; nothing added to `server/config.py`). **It makes no accepted
+single request faster.**
 
-**The decisive experiment**, already named in that row's old brief: hold S fixed at one KV-capacity
-plateau and vary only trailing-chunk length, plus per-chunk allocation instrumentation to find
-which chunk sets the peak in the module-list forward. GPU round, own row.
-
-**Stop rule:** if the per-forward difference turns out not to be derivable from geometry
-(CLAUDE.md §5 forbids a per-model literal), say so and close the row — the current form is already
-safe, just loose.
+**[ ] STILL OPEN, split out on its own evidence: `head_bytes` is probably not a transient at all.**
+Found on the way, NOT fixed, and **do not "just remove it"**: MiniMax's whole measured transient at
+S=513 is **0.3415 G against a `head_bytes` of 0.4614 G**, and the 70B's at S=512 is 0.7493 against
+0.7883 — **a term cannot exceed the total it is part of**, so the pinned `lm_head` is largely
+already inside `alloc_before`. Dropping it fits MiniMax (full-chunk residual **1.52–1.63 ×**
+`512·vocab·4` against the **1.5 ×** a coexisting fp16+fp32 logits pair predicts, `run_lm_head` is
+`layer(seq).float()`) and the 1B (**3.02 ×** = the 12 B/elem of a per-chunk loop where the previous
+chunk's `output` is still bound and `torch.cat(batch, 0)` allocates a third copy). **But the 70B
+has a 0.714 G floor at a 1-token trailing chunk that `head_bytes` = 0.788 G is currently covering
+BY LUCK** — removing it under-predicts the 70B by ~0.7 GB, the dangerous direction. **And
+Llama-3.2-1B cannot arbitrate: its `head_bytes` is EXACTLY 2 × its full-chunk fp32 logits, so
+"head + 1 logits" and "3 logits" are the same number** — the 2026-08-15 round's 0.5 %-accurate
+decomposition on that geometry proves nothing about the split. Needs the GPU round this row did
+not: per-allocation instrumentation inside ONE chunk on the 70B, to identify that 0.714 G floor
+(streamed layer weights in flight is the standing candidate, `_layer_slack` ≈ 0.49 GB/layer there).
+Same §8 caveat applies in advance: it would move the reserve only where the reserve is not
+floor-bound.
 
 ---
 

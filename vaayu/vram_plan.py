@@ -247,21 +247,62 @@ class VramShape:
     # fp32 logits accounts for the whole-prefill transient to within 0.5% at
     # every S from 4096 to 106987.
     head_bytes: int = 0
+    # Which of vaayu_base's TWO prefill forwards this plan is sized for -- a
+    # property of the FORWARD, not of the model, so the caller mirrors
+    # _chunked_prefill's own branch rather than matching an architecture
+    # string (§5). False (the default, and the conservative one) is the
+    # per-chunk loop: one `forward` per chunk, every layer's KV at THAT
+    # chunk's capacity, lm_head on every chunk. True is the MoE layer-major
+    # branch: ONE forward whose chunks are batch elements, so every earlier
+    # layer's KV is already at the FINAL capacity while a late layer runs its
+    # widest chunk, and lm_head is skipped for all but the last chunk
+    # (vaayu_base.py:4581). Which one is charged decides which chunk sets the
+    # peak -- see _prefill_chunks and predict_peak_vram (todo row 6a).
+    layer_major_prefill: bool = False
 
 
-def _peak_linear_slope_bytes(shape: VramShape) -> float:
-    """Bytes of peak VRAM per additional token of context from terms linear in S.
+def _prefill_chunks(shape: VramShape, S: int) -> list[tuple[int, int, int]]:
+    """(tokens, context-after, KV capacity) for each chunk of a prefill of S.
 
-    Only the attention-scores term remains, and whether it is zero is a
-    property of the ATTENTION KERNEL, not of the box: 0 under
-    flash_attention_2, real and large under sdpa (SCORE_ELEM_BYTES). Vaayu's
-    prefill only ever presents `chunk` query positions against up to S key
-    positions per step, so the buffer is `N * n_heads * chunk * S` elements.
-    The activation term that used to live here was removed 2026-08-15 as
-    unobservable -- see DEFAULT_ALLOC_FACTOR's comment. The KV term is charged
-    separately (kv_capacity_tokens): it is a step function of S, not linear, so
-    it cannot live in a per-token slope."""
-    return shape.N * shape.n_heads * shape.chunk * shape.score_elem_bytes
+    Replays the loop `_chunked_prefill` actually runs and the growth rule
+    `FP8DynamicCache._ensure_capacity` actually applies (`new_cap =
+    max(needed, max(1, cap) * growth)`, only when `needed > cap`), rather than
+    kv_capacity_tokens' closed form -- that form answers "capacity after the
+    WHOLE prefill", and the peak needs the capacity at each intermediate chunk.
+    The two agree at the last chunk except that this one charges the real
+    trailing chunk where the closed form rounds up to `ceil(S/chunk)*chunk`.
+
+    `buckets=False` (every non-EXL3 checkpoint, a plain DynamicCache) holds
+    exactly what it has been given, so capacity IS the context length.
+    """
+    chunk = max(1, int(shape.chunk))
+    out: list[tuple[int, int, int]] = []
+    cap, done = 0, 0
+    while done < int(S):
+        tokens = min(chunk, int(S) - done)
+        needed = done + tokens
+        if shape.kv_capacity_buckets:
+            if needed > cap:
+                cap = max(needed, max(1, cap) * int(shape.kv_growth_factor))
+        else:
+            cap = needed
+        out.append((tokens, needed, cap))
+        done = needed
+    return out
+
+
+def _score_term_bytes(shape: VramShape, q_positions: int, keys: int) -> float:
+    """Bytes of transient attention-score buffer for ONE forward pass of
+    `q_positions` queries against `keys` key positions.
+
+    Whether it is zero is a property of the ATTENTION KERNEL, not of the box:
+    0 under flash_attention_2, real and large under sdpa (SCORE_ELEM_BYTES).
+    This used to be a slope, `N * n_heads * chunk * S` charged once against the
+    whole context; it is charged per chunk now because the peak is a max over
+    chunks and a chunk's own query count is what it presents (todo row 6a). The
+    activation term that used to live beside it was removed 2026-08-15 as
+    unobservable -- see DEFAULT_ALLOC_FACTOR's comment."""
+    return shape.N * shape.n_heads * int(q_positions) * int(keys) * shape.score_elem_bytes
 
 
 def _kv_term_bytes(shape: VramShape, S: int) -> int:
@@ -330,22 +371,57 @@ def _peak_transient_bytes(shape: VramShape, S: int) -> float:
 def predict_peak_vram(shape: VramShape, S: int) -> int:
     """Predicted PEAK VRAM in bytes for a prefill of S tokens at this shape.
 
-    PIECEWISE-linear in S and not linear everywhere: the KV term
-    (_kv_term_bytes) is a step function of S on any bucketed shape (every
-    EXL3 checkpoint's ring-buffer KV cache), flat within a capacity bucket
-    and jumping by a whole bucket's worth of KV at each boundary.
+    A prefill is a sequence of chunks, and the peak is the MAX OVER THEM --
+    not one chunk's terms charged against the final KV capacity, which is what
+    this returned until todo row 6a. The two coincide only where a chunk of
+    logits outgrows the KV added between chunks (Llama-3.2-1B: 0.2627 GB of
+    logits against 16.8 MB of KV per chunk, and its measured transient at
+    S=4096 and S=4097 is byte-identical). Everywhere else the LAST chunk sets
+    the peak, with its own trailing-chunk logits -- llama-3.3-70b's measured
+    `transient - KV(capacity)` is 0.9278 GB at a full trailing chunk and
+    0.714 GB at a 1-token one, three independent pairs each, and charging the
+    full-chunk figure at both over-reserved by 30-42 %.
 
-    It IS monotone non-decreasing in S as of 2026-08-15 (todo row 6): the
-    intercept used to saw back DOWN at every chunk boundary, but that was
-    fitted to last-chunk-only peaks, and the honest whole-prefill data has
-    no such sawtooth (see _peak_intercept_bytes). solve_max_seq_len below
-    still verifies every S' <= S rather than binary-searching on the
-    single-S question -- now redundant rather than load-bearing, and what
-    keeps a future trailing-chunk-keyed term from silently returning an
-    S_max that some smaller S' exceeds.
+    The two forwards differ in which chunk that is (see
+    VramShape.layer_major_prefill), so both are modelled:
+
+    * per-chunk loop -- one `forward` per chunk, so during chunk i EVERY
+      layer's KV is at cap_i and lm_head has run on chunk i's own tokens.
+      Peak = max_i [transient(logits_i) + scores(chunk_i) + KV(cap_i)].
+    * layer-major -- ONE forward, layer L over every chunk before layer L+1
+      starts, so the earlier layers are already at the FINAL capacity when a
+      late layer runs its widest chunk, and only the last chunk reaches
+      lm_head. Peak = transient(logits of the LAST chunk) + max_i scores_i +
+      KV(cap_final).
+
+    PIECEWISE in S and not monotone: on a layer-major shape, crossing a chunk
+    boundary drops the logits term from a full chunk to one token, which the
+    KV step does not always outweigh (measured on minimax-m2.7: 1.4054 G at
+    S=1024 against 1.2566 G at S=1025 under sdpa). This is the sawtooth
+    `solve_max_seq_len`'s exhaustive "every S' <= S" check was deliberately
+    KEPT for after row 6 removed the fitted one -- it is load-bearing again,
+    and its own two monotonicity premises still hold (boundary values are
+    non-decreasing in k; within one boundary-to-boundary period the trailing
+    chunk, the capacity and the scores all only grow).
+
+    Never larger than the pre-row-6a envelope at any S, for either forward
+    (test_no_chunk_is_ever_charged_more_than_the_old_flat_envelope): this only
+    ever reserves LESS, so it cannot turn a load that fit into one that does
+    not.
     """
-    raw = (_peak_linear_slope_bytes(shape) * int(S) + _peak_transient_bytes(shape, int(S))
-           + _kv_term_bytes(shape, S))
+    chunks = _prefill_chunks(shape, int(S))
+    if not chunks:
+        return 0
+    if shape.layer_major_prefill:
+        tokens_last, _, cap_final = chunks[-1]
+        raw = (_peak_transient_bytes(shape, tokens_last)
+               + max(_score_term_bytes(shape, q, k) for q, k, _ in chunks)
+               + shape.kv_per_token * cap_final * shape.N)
+    else:
+        raw = max(_peak_transient_bytes(shape, tokens)
+                  + _score_term_bytes(shape, tokens, needed)
+                  + shape.kv_per_token * cap * shape.N
+                  for tokens, needed, cap in chunks)
     return int(round(raw * shape.alloc_factor))
 
 
