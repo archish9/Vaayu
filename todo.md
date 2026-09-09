@@ -54,11 +54,19 @@ per-chunk loop: over-charging 21-26 % at T10's ~4.2k contexts, UNDER-charging up
 elsewhere). **Do not re-open it to "let gate 2 see reclaimable VRAM"** — that half is dead, and
 the server passes `reclaim=False` anyway. **Its A/B produced the finding that matters and it is
 now row 22: batching is worth 1.58x on the module-list forward and 2.04-2.36x SLOWER on the
-fused-EXL3 one, at the same context, both interleave directions.** **Row 19 CLOSED 2026-09-09 —
+fused-EXL3 one, at the same context, both interleave directions.** **Row 22 CLOSED 2026-09-09
+by an 8-arm sweep: the variable is CHUNK COUNT, not length (boundary `chunks = N`, crossed both
+ways at FIXED length), the agent is the PREFILL STAGER re-arming once per `forward()`
+(fused-EXL3 only — MiniMax stages ZERO times), and the fused forward WINS on decode at every
+length while losing only on prefill — so the `expert_style` formation rule row 22 sketched must
+NOT be built. It also refuted raising `prefill_chunk_size` as a mitigation: that costs serial
+decode 2.46x on the N=1 path the server runs today. Its unfixed half is now row **23**.** **Row 19 CLOSED 2026-09-09 —
 audited, and NO recorded drafter/speculative number was taken under `sdpa`; every one ran flash,
 so nothing was owed a re-measurement and CLAUDE.md §0's 5.57× stands as to kernel. It also
 established that row 16 can never reach a DRAFTER: `StandardDrafterDecoder` loads via stock
-transformers, with no `pinning_budget` at all.** The live work is row **22**. Two NEW rows came out of P10's measurement and are the live work
+transformers, with no `pinning_budget` at all.** **Row 22 CLOSED 2026-09-09; the live work is row **23**, its unfixed half — and row 23
+is `MAX_BATCH_SIZE = 1`-gated, so it is worth 0 % to users today. Weigh it against the reachable
+single-stream rows (OPTIONAL **13**) before spending a GPU round on it.** Two NEW rows came out of P10's measurement and are the live work
 now: ~~**row 20 `[bug]`**~~ — **FIXED 2026-09-09: the padding was a red herring, the batched
 path computed RoPE without `rope_scaling`; both MoE checkpoints were never affected, and
 `MAX_BATCH_SIZE` stays 1 on row 15's performance grounds, not on corruption** — and **row 21**,
@@ -2151,26 +2159,109 @@ Full detail: [`docs/2026-09-09-row21-batched-prefill-form-RESULTS.md`](docs/2026
 
 ---
 
-# 22 · [ ] Batching is a per-FORWARD decision and nothing in the engine knows that
+# 22 · [x] CLOSED 2026-09-09 — the variable is CHUNK COUNT, not length, and the agent is the PREFILL STAGER
 
-**Opened 2026-09-09 by row 21's A/B. Carries its own numbers because `docs/` does not survive a
-clone.** At one agentic context (4150 + 64 tokens, sdpa, N=2, `BALLAST_GB=27`), batching measured
-**1.58x FASTER on the module-list forward (MiniMax-M2.7) and 2.04-2.36x SLOWER on the fused-EXL3
-one (Qwen3-235B)** — same box, same day, both interleave directions, no OOM. The scheduler forms a
-batch on queue depth and prices it on VRAM; **neither gate can express "this forward loses 2x when
-batched"**, and gate 2's old over-charge was refusing Qwen's losing batch only by accident.
+**Opened 2026-09-09 by row 21's A/B; ANSWERED the same day by an 8-arm sweep. Carries its own
+numbers because `docs/` does not survive a clone.** Row 22 asked for "the length below which the
+fused forward batches profitably". **There is no such length.** The controlling variable is the
+number of prefill CHUNKS and the boundary is `chunks = N`.
 
-A formation rule keyed on `block_info.expert_style` (CLAUDE.md §0's dispatch table) is the obvious
-shape. **NOT built** — new scope, and one context is not a sweep: the 2x is driven by losing
-chunk-major expert retention across 9 prefill chunks, so it should shrink as the context shortens
-and there is some length below which the fused forward batches profitably. **Find that length
-before writing a rule.**
+Qwen3-235B (fused-EXL3), N=2, `prefill_chunk_size=512`, sdpa, `BALLAST_GB=27`, `ORDER=sb`,
+`enable_prefix_cache=False`, DECODE_TOK=32, one `systemd-run` scope per arm:
 
-**Do NOT "fix" Qwen's regression by restoring the over-charge.** Refusing a losing batch because the
-predictor is wrong is correct by accident — the exact failure mode this ledger exists to end.
+| chunks | prompt | serial P+D | batched P+D | batched vs serial |
+|---|---|---|---|---|
+| 2 | 549 | 52.88 + 59.42 = 112.31 s | 51.91 + 35.24 = **87.14 s** | **1.289x FASTER** |
+| 3 | 1030 | 54.50 + 55.99 = 110.49 s | 60.82 + 52.19 = 113.01 s | 0.978x |
+| 4 | 2010 | 54.03 + 55.63 = 109.65 s | 108.83 + 51.84 = 160.67 s | 0.683x (1.47x slower) |
+| 9 | 4180 | 66.75 + 56.59 = 123.34 s | 241.84 + 48.64 = 290.48 s | 0.425x (2.36x slower) |
 
-**Worth zero to users today** (`MAX_BATCH_SIZE = 1`), like everything else on the batching path.
-Weigh it accordingly (§8): this is a formation-POLICY correctness item, not a tok/s row.
+**Reproduction gate PASSED** — the 9-chunk row is row 21's arm to the byte (0.425x vs 0.42x,
+peak 12.167/13.223 vs 12.167/13.200, `reserve=5.604`, layer-major RAISE -> batched-form PASS at
+`need=5.208`, `giveback=0.000`). Nothing else would have counted without it.
+
+**Chunk count was CROSSED against length in both directions**, holding length fixed and moving
+only `prefill_chunk_size` — a length rule cannot produce this: **549 tokens @512 = 2 chunks WINS
+1.289x, @256 = 3 chunks LOSES (prefill ratio 0.98 -> 1.54); 2010 tokens @512 = 4 chunks LOSES
+1.47x, @1024 = 2 chunks WINS 1.041x (2.01 -> 1.04).** Serial prefill is flat in length
+(52.88 -> 66.75 s over a 7.6x longer prompt) because it is expert-bytes-bound at `N x E`;
+batched is the only term that moves. Per-arm solve gives **E = 26.0-28.8 s** for one full
+expert-set read, which is a hardware check not a fit: ~147 GB at 6.0-6.4 GB/s is ~23-25 s.
+
+**MECHANISM, proved by a counter, not reasoned. Row 21's "loses chunk-major expert retention"
+names the wrong agent.** The agent is the prefill stager, armed inside `forward()`
+(`vaayu_base.py:4430-4457`) **once per forward call**, reading the FULL expert set of layers
+ahead. `batched_generate` sets `prefill_chunk_size=0` and runs its own chunk loop
+(`vaayu_base.py:5593-5599`), so one prefill becomes `c` forwards and the stager runs `c` times.
+Counting `[Vaayu-MoE] prefill stager: depth=` per arm (serial contributes N=2): c=2 -> 4,
+c=3 @1030 -> **4**, c=4 -> 6, c=9 -> **11**, c=3 @549 -> 5, c=2 @2010 -> 4, **MiniMax -> 0.**
+The 1030 arm's deficit is `compute_stage_gate` (`vaayu_base.py:918`,
+`seq_len*top_k >= 2*num_experts`, i.e. seq>=32 at Qwen's 8/128): its trailing chunk is 6 tokens
+and stages nothing, which is why c=3 measured 1.12 there and 1.54 at 549 tokens where all three
+chunks stage. **MiniMax stages ZERO times** — `moe_supports_prefill_stager`
+(`vaayu_base.py:702`) is true only for the EXL3 fused forward. That is the entire forward split:
+the module-list forward has no stager to re-run, which is why it won at c=2 here (**1.72x**:
+97.72+32.83 -> 49.42+26.54, prefill alone 1.98x) and still won at c=9 in row 21.
+
+**TWO FINDINGS THAT CONTRADICT THIS ROW'S OWN FRAMING:**
+
+* **Decode batches PROFITABLY on the fused forward at EVERY length measured** — 1.69x / 1.07x /
+  1.07x / 1.16x (serial 59.42/55.99/55.63/56.59 -> batched 35.24/52.19/51.84/48.64).
+  **"This forward loses 2x when batched" is WRONG as stated.** It loses on PREFILL and wins on
+  DECODE, so the `expert_style` formation rule this row sketched would decline batches whose
+  decode half is profitable. **Do not build that rule.**
+* **You CANNOT buy `chunks < N` by raising `prefill_chunk_size` — measured and REFUTED.** At
+  4150 tokens with `CHUNK=2048` (c: 9->3) the reserve went **5.604 -> 13.280 GiB**, gate 2
+  refused N=2 in BOTH forms so the batched arm never ran, and the expert VRAM cache was crushed
+  **3.7 -> 1.5 GB** (316 -> 128 experts) taking **serial decode 56.59 -> 139.42 s (2.46x
+  WORSE)**. `CHUNK=1024` shows it at half strength (reserve 8.329, cache 1.6 GB, serial decode
+  67.26 s) — **so the 1.041x win in the cross above is an UNDERSTATEMENT**, measured against a
+  depressed cache. **This one IS reachable at N=1: anyone who raises `prefill_chunk_size` pays
+  it on the path the server runs today.**
+
+**The rule that matches the measurement**, derived, no literals:
+`ceil(max_prompt_len / prefill_chunk_size) <= N`, applied only where
+`moe_supports_prefill_stager()` is True; where it is False (module-list, non-EXL3 fused, dense)
+chunk count does not apply at all.
+
+**§8:** (1) **No knob** — `prefill_chunk_size` already exists and this row recommends AGAINST
+tuning it for chunk count. (2) N/A, nothing built. (3) **NOT reachable: `MAX_BATCH_SIZE = 1`,
+so every batching number here is worth 0 % today** — except the serial-decode regression above.
+(4) Unblocked by `MAX_BATCH_SIZE > 1`. **This sweep is evidence row 15's decline was too broad:**
+it measured batching at ~4.2k contexts, where the fused forward sits at c=9 and loses 2.36x;
+at `c <= N` it wins 1.289x.
+
+Full detail: [`docs/2026-09-09-row22-batching-crossover-RESULTS.md`](docs/2026-09-09-row22-batching-crossover-RESULTS.md).
+Harness `plans/probes/p22_crossover.py` (adds a `CHUNK` knob and a prefill/decode split to
+`p21_admit.py`).
+
+---
+
+# 23 · [ ] The prefill stager re-runs once per BATCHED CHUNK — stop it, and the fused forward's 2.36x may go
+
+**Opened 2026-09-09 by row 22, which measured the cost but did NOT fix it. UNMEASURED — two
+hypotheses, in cost order.** Row 22 established that `batched_generate`'s own chunk loop turns
+one prefill into `c` forwards, and the stager (fused-EXL3 only) re-reads the full expert set on
+each, costing `c x E` against serial's `N x E` with **E ~ 27 s on Qwen3-235B**.
+
+* **Cheaper: suppress staging entirely for the batched chunk loop.** The fused forward would
+  then behave like the module-list one and pay routed misses only. **MiniMax is the existence
+  proof that this configuration wins** — it stages zero times and batches profitably at both
+  c=2 (1.72x) and c=9 (1.58x, row 21). Risk: the stager exists to buy TTFT on long prompts, and
+  the RAM expert cache (19.3 GB, ~13 of Qwen's 94 layers) cannot retain a full expert set across
+  chunks, so per-chunk routed misses may not be much cheaper than staging. **Measure, don't
+  assume.**
+* **Better, and NOT a one-liner: make the stager span the batched chunk loop.** The machinery
+  exists for the layer-major path — `_chunk_major_n`, `_staged_consume_count`, and the
+  peek-vs-pop at `moe_patch.py:1778-1799` that keeps a staged layer alive across its chunk
+  calls — and `batched_generate` simply never sets `_chunk_major_n`, so `_n_calls` is 1 and
+  every chunk pops. **But the stager is armed AND torn down inside `forward()`
+  (`vaayu_base.py:4430-4457`), so spanning it means hoisting that out of `forward()`.** That is
+  real scope, not a flag.
+
+**Worth zero to users today** (`MAX_BATCH_SIZE = 1`) — same §8 bucket as everything on the
+batching path. Weigh it accordingly. `plans/probes/p22_crossover.py` measures either variant
+directly; the c=9 Qwen arm (0.425x) is the number to move.
 
 ---
 
