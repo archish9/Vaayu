@@ -2210,6 +2210,15 @@ row to `[x]` or `[bug]`/`[!]` with the verdict.
 
 ### Known-open minors (none blocking; recorded so they are not lost)
 
+* **Gate 1 and gate 2 are not byte-identical arithmetic, deliberately.** After the B1 fix,
+  gate 1 (`_admit` → `plan_batch(..., giveback=True)`) prices `free − safety + giveback`
+  uncapped, while gate 2 (`admission_headroom`) imposes a reserve-based ceiling
+  (`min(free + reusable_pool, reserve + giveback)`) that gate 1 does not. The fix only
+  ever makes gate 1 MORE generous, never stricter, so gate 2 stays the real backstop and
+  the B1 collapse cannot recur — but the two are not the same expression. **T10 must
+  therefore report `gate1_refused` and `gate2_refused` separately** (both counters exist
+  for this reason); a run where gate 1 refuses and gate 2 would not is the shape to watch.
+
 * `_stopping` is never reset, so `start()` after `stop()` yields a scheduler that refuses
   everything — consistent with the no-resurrection rule, but undocumented.
 * `test_the_queue_refuses_past_its_depth` no longer pins WHICH refusal it got; a `match=`
