@@ -5247,7 +5247,7 @@ class VaayuBaseModel(GenerationMixin):
                 self._vram_cacheable_layers = _saved_vram_layers
 
     @torch.no_grad()
-    def batched_generate(self, requests, reclaim: bool = False):
+    def batched_generate(self, requests, reclaim: bool = False, should_stop=None):
         """Static multi-query batched decode. Yields (stream_id, token_id) live.
         requests: list[vaayu.batch.BatchRequest] (already admitted, or pass raw and
         call plan_batch first). MoE forward is unchanged; batching is this loop
@@ -5259,7 +5259,15 @@ class VaayuBaseModel(GenerationMixin):
         garbage-collects the generator and runs the finally block below.
         generate()/speculative_generate() defensively reset both flags at
         entry so a leaked flag can't corrupt those call paths, but relying on
-        GC timing here is still not clean design."""
+        GC timing here is still not clean design.
+
+        `should_stop(i) -> bool` retires row `i` when it returns True: no
+        further tokens are sampled or yielded for it, and it stops holding the
+        batch open. Consulted once per step per row, cooperatively -- the same
+        shape as the server's CancelToken, not a second mechanism. `None` is
+        the unhooked behaviour. Without it there is no way to tell a running
+        batch that one client has gone, and a disconnect at cap=8000 holds
+        every other stream for 8000 steps."""
         from .batch import (sample_step, batch_position_ids, batch_common_prefix,
                             broadcast_cache_rows, slice_cache_row,
                             prefix_store_row, resolve_matched_len,
@@ -5489,6 +5497,13 @@ class VaayuBaseModel(GenerationMixin):
 
             next_tokens = torch.empty((N, 1), dtype=torch.long, device=device)
             for i in range(N):
+                if should_stop is not None and should_stop(i):
+                    # Retired before it ever produced: the row must still be
+                    # filled, because the batch tensors are rectangular. pad_id
+                    # is the same dead-slot value the decode loop uses.
+                    next_tokens[i, 0] = pad_id
+                    active[i] = False
+                    continue
                 tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
                 next_tokens[i, 0] = tok
                 yield (i, tok)
@@ -5509,6 +5524,10 @@ class VaayuBaseModel(GenerationMixin):
                 for i in range(N):
                     if not active[i]:
                         next_tokens[i, 0] = pad_id      # dead slot, masked; static HoL
+                        continue
+                    if should_stop is not None and should_stop(i):
+                        next_tokens[i, 0] = pad_id
+                        active[i] = False
                         continue
                     tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
                     next_tokens[i, 0] = tok

@@ -99,6 +99,33 @@ class PrefixCacheStore:
                 return decompress_cache(entry.cache, device), m
             return entry.cache, m
 
+    def peek_match(self, session_id, input_ids: list) -> int:
+        """Longest prefix this pool COULD serve for `input_ids`. Non-destructive.
+
+        `lookup()` POPS on a hit -- the entry is checked out to the in-flight
+        request and only `store()` puts it back -- so it cannot be used to ask
+        "how much would this request save?" before deciding anything. This
+        answers exactly that and changes nothing: no pop, no counters, so a
+        peek can never show up in the hit rate as reuse that did not happen.
+
+        Same key selection `lookup()` uses -- named session first, then the
+        best auto-match -- so the two cannot disagree about which entry would
+        serve. Used by the server's batch formation (spec 4.3) to compare what
+        batching would throw away against what it would buy.
+        """
+        with self._lock:
+            if session_id is not None and session_id in self._pool:
+                return longest_common_prefix(
+                    self._pool[session_id].token_ids, input_ids)
+            if not self.auto_prefix_match:
+                return 0
+            best_m = 0
+            for e in self._pool.values():
+                m = longest_common_prefix(e.token_ids, input_ids)
+                if m > best_m:
+                    best_m = m
+            return best_m
+
     def store(self, session_id: str, token_ids: list, cache) -> None:
         if self.compress_bits is None:
             cache.to_cpu()

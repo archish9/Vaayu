@@ -352,14 +352,20 @@ def _blocking_fake(engine, cancel, record, *, tick=0.02):
 
 def test_sse_holds_the_slot_until_the_abandoned_worker_thread_has_stopped(monkeypatch):
     # B4. Starlette closes the SSE generator when the client goes away.
-    # GeneratorExit is a BaseException, so `except Exception` misses it,
-    # `engine.slot().__aexit__` runs FIRST -- lock released, _inflight
-    # decremented -- and only then the outer `finally: cancel.cancel()`.
-    # Meanwhile stream_generate's worker is still inside model.generate, so the
-    # next queued request calls generate() on an engine whose own docstring says
-    # concurrency is 1 by construction.
+    #
+    # Since P10, admission runs through BatchScheduler, not engine.slot()
+    # directly -- clients hold a QUEUE, not the generation generator itself
+    # (scheduler.py's own module docstring: this is why an abandoned client
+    # cannot corrupt a batch). So `_sse`'s own aclose() no longer
+    # synchronously waits for the worker to stop; the dispatcher does, in its
+    # own task, still holding `engine._lock` for the whole run. That is the
+    # property this test now checks: the lock stays held until the worker
+    # thread the dispatcher abandoned actually exits, and the scheduler's
+    # queue is empty once the dispatcher (not the client) is done with it --
+    # only then may the next queued request be admitted.
     from vaayu.server.app import _sse
     from vaayu.server.engine import CancelToken
+    from vaayu.server.scheduler import BatchScheduler
 
     e, mod, _ = _streaming_engine([10, 11])
     cancel = CancelToken()
@@ -367,20 +373,35 @@ def test_sse_holds_the_slot_until_the_abandoned_worker_thread_has_stopped(monkey
     monkeypatch.setattr(mod, "stream_generate", _blocking_fake(e, cancel, record))
 
     async def main():
-        agen = _sse(e, _req(max_tokens=50), "vaayu", None, cancel=cancel)
+        req = _req(max_tokens=50)
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        agen = _sse(e, req, "vaayu", None, cancel=cancel,
+                    prepared=e.prepare(req), scheduler=sched)
         seen = 0
         async for _ in agen:
             seen += 1
             if seen >= 4:
                 break
         await agen.aclose()             # exactly what Starlette does on disconnect
-        return record["thread"].is_alive(), e.depth
+        # The dispatcher, not this generator, owns finishing the abandoned
+        # run -- wait for it the same way the app lifespan's shutdown does.
+        await sched.stop()
+        return record["thread"].is_alive(), sched.depth
 
     alive_after_close, depth_after_close = asyncio.run(main())
     record["thread"].join(timeout=5)
+    # NOTE: `alive_after_close` is read AFTER `sched.stop()`, which itself
+    # already waits for the dispatcher's current run (worker join included)
+    # to finish -- so this assertion can no longer, by itself, distinguish
+    # "held correctly" from "`_sse` returned early and `stop()` masked it".
+    # `record["lock_at_exit"]` (below) is what still pins the real property:
+    # it is read on the WORKER THREAD, at the moment it observes the
+    # cancellation and exits, independent of anything `stop()` does.
     assert not alive_after_close, (
-        "the SSE generator returned while the generation worker was still "
-        "running -- the slot is free and a queued request will be admitted")
+        "the dispatcher stopped while the generation worker was still "
+        "running -- the lock is free and a queued request will be admitted")
     assert record["lock_at_exit"] is True, (
         f"the engine lock was {record['lock_at_exit']} when the worker stopped; "
         f"it must still be held, or two generations can overlap")
@@ -389,23 +410,33 @@ def test_sse_holds_the_slot_until_the_abandoned_worker_thread_has_stopped(monkey
 
 def test_a_stream_that_finishes_normally_still_releases_the_slot(monkeypatch):
     # Guards the fix above: quiescing at slot exit must not wait on a worker
-    # that has already gone, and must leave the gate reusable.
+    # that has already gone, and must leave the gate reusable. Exercised
+    # through the dispatcher (P10) rather than _sse holding engine.slot()
+    # directly -- same property: the engine's lock is free and the
+    # scheduler's queue is empty once the run is done.
     from vaayu.server.app import _sse
     from vaayu.server.engine import CancelToken
+    from vaayu.server.scheduler import BatchScheduler
 
     e, mod, fake = _streaming_engine([10, 11, 2], eos_token_id=2)
     monkeypatch.setattr(mod, "stream_generate", fake)
 
     async def main():
-        events = [ev async for ev in _sse(e, _req(max_tokens=5), "vaayu", None,
-                                          cancel=CancelToken())]
-        async with e.slot():            # the gate is usable again
+        req = _req(max_tokens=5)
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        events = [ev async for ev in _sse(e, req, "vaayu", None,
+                                          cancel=CancelToken(),
+                                          prepared=e.prepare(req), scheduler=sched)]
+        await sched.stop()
+        async with e._lock:              # the gate is usable again
             pass
-        return events
+        return events, sched.depth
 
-    events = asyncio.run(main())
+    events, depth_after = asyncio.run(main())
     assert events[-1] == "data: [DONE]\n\n"
-    assert e.depth == 0
+    assert depth_after == 0
 
 
 # ── the cancel token stays published until the worker exits (B9) ─────────────

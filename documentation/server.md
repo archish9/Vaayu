@@ -204,11 +204,24 @@ fields that are unknowable before generation starts (`prompt_tokens`, `cap`,
 so a script can index any field on any row without checking which kind of row it
 is.
 
+Every row also carries `batch`: `null` for a request run on its own, or
+`{"n": <int>, "members": [<session_key>, ...]}` when the dispatcher (P10)
+ran it together with `n - 1` other requests as one batch.
+
 Inside `decode`: `bytes_read_gb` and `gb_per_token` are this request's own NVMe
-traffic — the difference between the persister's read-byte counter at the end
-of the request and at its start (see the `bytes=`/`gb_tok=` fields below for
-what that counter does and does not count). `mean_expert_stall_s` is the same
-kind of diff over the engine's expert-disk-stall total.
+traffic **when `batch` is `null`** — the difference between the persister's
+read-byte counter at the end of the request and at its start (see the
+`bytes=`/`gb_tok=` fields below for what that counter does and does not
+count). `mean_expert_stall_s` is the same kind of diff over the engine's
+expert-disk-stall total.
+
+**Under a batch (`batch.n` > 1), `decode` is the WHOLE BATCH's counters, not
+this row's own**, and is flagged `"shared": true` so nothing sums N rows into
+a traffic figure that never happened on the wire. `tokens` and `ttft_s` stay
+genuinely per-stream, but `wall_s` and `decode_tok_s` are also batch-wide: a
+stream that retires early is still charged the batch's full wall time and its
+own `decode_tok_s` understates. `prefix_hit` is batch-wide too — it reads
+`true` on every row in the batch if any one member hit the prefix cache.
 
 `expert_misses`, `expert_ram_hit_rate` and `expert_vram_hit_rate` are **not**
 diffs — they are the engine's counters read once, at the end of the request.
@@ -262,7 +275,8 @@ holds one model for its whole life and should fill the box.
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
 | `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing |
 | `KV_CACHE_MODE` | `"auto"` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
-| `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives a larger context at the same reserve. Every shipped `max_seq_len` figure was verified on **sdpa** |
+| `ATTN_IMPLEMENTATION` | `None` | **prefers `flash_attention_2`** when `flash_attn` imports, then `sdpa`, then `eager` — it does **not** mean sdpa. Every shipped `max_seq_len` figure was verified on **sdpa**; `"flash_attention_2"` derives a larger context at the same reserve, and costs **−2.3 % MiniMax / −4.1 % Qwen** end-to-end against sdpa. `MAX_BATCH_SIZE` below is **inert** unless this resolves to `sdpa` |
+| `MAX_BATCH_SIZE` | `1` | requests served together as one batch. A **ceiling, never a target** — max width is model- and context-dependent and is **not 3**. Measured 2026-09-08 at ~4.15k-token prompts, **engine-level (`batched_generate` called directly, not through the server) and with the prefix cache OFF** — no server-level A/B has been run, and the server defaults `ENABLE_PREFIX_CACHE = True`: `2` is **+1.606×** on MiniMax-M2.7 (TTFT 317.2 → 223.3 s, peak VRAM *lower* batched); `3` OOMs MiniMax and is **slower** than 2 on Qwen3-235B. Qwen admits N=1 only today, so this buys it nothing. **Inert unless `ATTN_IMPLEMENTATION` resolves to `sdpa`** |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5 |
 | `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart |
 
@@ -293,7 +307,7 @@ holds one model for its whole life and should fill the box.
 | `tools` | array | `null` | OpenAI function-tool definitions |
 | `tool_choice` | any | `null` | accepted and passed through the template |
 | `seed` | int | `null` | |
-| `n` | int | `1` | **must be 1.** `n>1` is a 422 with a named reason — concurrency is 1 on this hardware |
+| `n` | int | `1` | **must be 1.** `n>1` is a 422 with a named reason — the server does not implement multiple completions per request (unrelated to `MAX_BATCH_SIZE`, which batches separate *requests*, not multiple completions of one) |
 | `session_id` | string | — | **Vaayu extra, and REQUIRED** (`REQUIRE_SESSION_ID`, default on). Pins this turn to a prefix-cache session. A request naming no session is a `400`; OpenAI's `user` satisfies it |
 | `enable_thinking` | bool | *server default* (`ENABLE_THINKING`, **`false`**) | **Vaayu extra.** Let the model reason before answering. Suppressed by default; set `true` per request to get it back |
 | `user` | string | — | OpenAI's end-user tag. Used as `session_id` when that is absent, so an OpenAI-native client satisfies the requirement with no Vaayu-specific field. `session_id` wins when both are sent |
@@ -504,14 +518,25 @@ instead — Vaayu keys on it when `session_id` is absent. It is a coarser key by
 share a pool entry and evict each other. For fan-out, give each stream its own
 `session_id`.
 
-### 6.3 One request at a time — design your fan-out around it
+### 6.3 Concurrency is a knob, not a constant — design your fan-out around what's configured
 
-The engine is not thread-safe and N≥2 at long context is a hardware refusal on 16 GB,
-not a missing feature. Requests queue (FIFO, `QUEUE_DEPTH`, default 8) and get `503`
-+ `Retry-After` beyond that.
+The server serves **N concurrent requests together as one batch** when
+`MAX_BATCH_SIZE >= 2` *and* the loaded checkpoint runs on `sdpa`
+(`ATTN_IMPLEMENTATION` resolves to it — see §3). Otherwise it serialises exactly
+as before: one generation at a time, FIFO, `QUEUE_DEPTH` deep (default 8), `503`
++ `Retry-After` past that.
 
-If your agent issues parallel sub-agent calls, they will **serialise**. Either accept
-that, or cap your own concurrency to 1 and save the round trips. Handle `503` with a
+Batching is a **ceiling, never a target** — the real width a batch reaches also
+depends on VRAM admission at the actual context length, and can still fall back
+to serial per-request if that admission refuses at the real width. See
+`MAX_BATCH_SIZE` in §3's config table for the measured numbers and their
+caveats before you plan capacity around it — the one number on record so far is
+engine-level, one model, one width, with the prefix cache off (below).
+
+If your agent issues parallel sub-agent calls and `MAX_BATCH_SIZE` is left at its
+default (`1`), they will still **serialise** — accept that, or cap your own
+concurrency to 1 and save the round trips. With `MAX_BATCH_SIZE >= 2` on an
+`sdpa` load, up to that many will run together instead. Handle `503` with a
 retry — do not fail the tool call.
 
 ### 6.4 Context is the binding constraint, not speed
@@ -562,11 +587,13 @@ delta. Do not expect incremental `function.arguments` fragments.
 on the streaming *and* non-streaming paths, within about a second. The slot frees for the
 next request and the server logs how many tokens it got through.
 
-That matters more here than on a normal server: concurrency is 1, so a generation that
-outlives its client holds the GPU for the rest of its cap while everything behind it
-queues. Aborting is also safe for the cache: the prefix entry is restored on the abort
-path rather than lost, and the partial KV a cancelled turn leaves in the pool is real KV
-the next turn can reuse.
+That matters more here than on a normal server: at `MAX_BATCH_SIZE = 1` (the default),
+concurrency is 1, so a generation that outlives its client holds the GPU for the rest of
+its cap while everything behind it queues. With `MAX_BATCH_SIZE >= 2` a batch slot is
+held instead of the whole GPU, but the principle is the same — an abandoned client still
+occupies capacity it is not using. Aborting is also safe for the cache: the prefix entry
+is restored on the abort path rather than lost, and the partial KV a cancelled turn
+leaves in the pool is real KV the next turn can reuse.
 
 ---
 
@@ -735,7 +762,7 @@ Do not spend time here; each is measured and settled.
 
 | idea | verdict |
 |---|---|
-| batching / higher concurrency | N≥2 at long context is a hardware wall (peak 14.17–15.57 GiB of 15.47) |
+| batching beyond `MAX_BATCH_SIZE`'s measured ceiling | not a blanket "won't help": N=2 is **+1.606×** on MiniMax-M2.7 at ~4.15k-token prompts (2026-09-08, gated behind `MAX_BATCH_SIZE` and `sdpa`, **engine-level with the prefix cache OFF** — no server-level A/B run yet) — but N=3 OOMs MiniMax and is slower than N=2 on Qwen3-235B, which still admits N=1 only. See `MAX_BATCH_SIZE` in §3's config table |
 | smaller `PREFILL_CHUNK_SIZE` | costs TTFT (+24.7 % MoE, +213 % dense at 128), buys nothing measurable |
 | expert pinning | refuted: eviction share is linear in N and always 2–4× below the pin's cost |
 | TurboQuant KV in the live cache | failed its quality gate 2–7× on both models at 4 bits |
@@ -747,10 +774,12 @@ Do not spend time here; each is measured and settled.
 ## 8. Limits, and what is deliberately not here
 
 - **One model per process**, no hot-swap.
-- **One request in flight**, FIFO queue, `n=1` only.
-- **No continuous batching / paged attention.** `batched_generate` exists and is
-  deliberately unwired: it is static-batch v1 and would admit nothing at these context
-  lengths.
+- **One GENERATION runs at a time**, FIFO queue, `n=1` only — but since P10 that
+  generation may be a batch of `MAX_BATCH_SIZE` requests (default `1`, today's
+  behaviour) dispatched together through `batched_generate` rather than one
+  request. See `MAX_BATCH_SIZE` in §3.
+- **No continuous batching / paged attention** — batching here is static per
+  round, not token-level continuous batching or paged KV.
 - **No `/v1/completions`, no FIM**, no Anthropic Messages wire format.
 - **No MCP client** — that is the agent's job.
 - **No auth, no TLS, no rate limiting.** Bind to `127.0.0.1` (the default) or put a

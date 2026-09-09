@@ -121,6 +121,32 @@ def test_plan_batch_reclaim_admits_more_at_agentic_context(free_vram):
         f"reclaim admitted {len(recl_admitted)}, baseline {len(base_admitted)}")
 
 
+def test_plan_batch_giveback_admits_on_a_cold_cache_where_reclaim_cannot(free_vram):
+    """B1 (final whole-branch review): `reclaim` prices CURRENT USAGE
+    (`reclaimable_expert_vram`), which is 0 on a cold cache -- but gate 2
+    (`VaayuBaseModel.batched_generate`, vaayu_base.py:5302) always adds
+    `expert_giveback_bytes`, the cache's ENTITLEMENT (`budget_bytes`), at N>1
+    regardless of whether anything is resident yet -- 2.88 GiB was the MiniMax
+    figure the review named for its own on-device geometry; this fixture uses
+    a comfortably larger entitlement so the arithmetic is not sensitive to
+    this file's synthetic Qwen-shaped geometry. `giveback=True` must buy the
+    same headroom gate 2 will actually admit against; `reclaim=True` buys
+    nothing here because the cache has never been touched."""
+    free_vram(3.44 * GB)
+    m = _FakeModel(vram_cache_usage=0, working_set=int(1.0 * GB))
+    m._expert_vram_cache.budget_bytes = int(8.0 * GB)  # 7 GiB above the floor
+    m.config = type("C", (), {"num_hidden_layers": 94, "num_key_value_heads": 8,
+                              "num_attention_heads": 64, "hidden_size": 8192})()
+    m.kv_cache_mode = "bf16"
+    reqs = [B.BatchRequest([0] * 7751, 16) for _ in range(5)]
+    recl_admitted, _ = B.plan_batch(m, reqs, reclaim=True)
+    give_admitted, _ = B.plan_batch(m, reqs, giveback=True)
+    assert len(recl_admitted) == 1, "cold cache: reclaim=True buys nothing"
+    assert len(give_admitted) > 1, (
+        f"giveback admitted {len(give_admitted)}, reclaim baseline "
+        f"{len(recl_admitted)}")
+
+
 # ---------------------------------------------------------------------------
 # Task 2: batched_generate must perform the reclaim it was admitted under,
 # ONCE at the batch boundary and never on the decode path.

@@ -15,6 +15,7 @@ from .chat import NoChatTemplate, TemplateLacksToolSupport
 from . import envinfo, reqlog
 from .engine import CancelToken, EngineHandle, QueueFull
 from .logs import capture_stdio, collected_warnings, new_run_dir
+from .scheduler import BatchScheduler, Job
 from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
@@ -27,6 +28,7 @@ class ServerConfig:
     model_path: str
     device: str = "cuda:0"
     queue_depth: int = 8
+    max_batch_size: int = 1
     host: str = "127.0.0.1"
     port: int = 9999
     kv_cache_mode: str = "auto"
@@ -291,6 +293,7 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
         reqlog.write_row(getattr(engine, "log_dir", None), {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "session": getattr(req, "session_key", None),
+            "batch": None,
             "prompt_tokens": None, "cap": None, "stream": stream,
             "thinking": thinking,
             "max_tokens": getattr(req, "max_tokens", None),
@@ -385,6 +388,17 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 freeze_after_load()
             else:
                 app.state.engine = engine
+            # An injected engine (tests, embedded use) may carry no ServerConfig
+            # at all -- fall back to the engine's own queue_depth and today's
+            # defaults (batching off) rather than crashing on `config.x`.
+            app.state.scheduler = BatchScheduler(
+                app.state.engine,
+                queue_depth=(config.queue_depth if config is not None
+                            else app.state.engine.queue_depth),
+                max_batch_size=(config.max_batch_size if config is not None else 1),
+                prefill_chunk_size=(config.prefill_chunk_size if config is not None
+                                    else 512))
+            await app.state.scheduler.start()
             if run_dir is not None:
                 # AFTER the load: env.json's whole value is that its numbers are
                 # DERIVED ones -- the geometry the loader found, the budgets the
@@ -413,6 +427,24 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             yield
         finally:
             restore_signals()
+            # NOTE on ordering: `_teardown` below calls `engine.cancel_all()`
+            # as its own first action, and its docstring says stopping first
+            # is why it is safe to run at all. On a REAL SIGINT/SIGTERM
+            # shutdown that is still what happens first -- the signal handler
+            # (`_install_signal_cancel`) calls `cancel_all()` immediately,
+            # independent of this coroutine, so by the time this `finally`
+            # runs any in-flight generation is already unwinding and `stop()`
+            # below returns quickly. But on a PROGRAMMATIC shutdown with no
+            # signal -- an embedded caller closing the app directly, or a
+            # `with TestClient(...)` block exiting mid-generation -- nothing
+            # has cancelled anything yet: `stop()` now waits for the current
+            # run to finish NATURALLY (up to its full token cap) before
+            # `_teardown`'s `cancel_all()` ever runs, where the old code
+            # (pre-P10, no scheduler) reached `cancel_all()` immediately with
+            # no wait in between. Not fixed here -- flagged, since fixing it
+            # would mean deciding whether `stop()` itself should cancel first,
+            # which is Task 7's contract to change, not this one's.
+            await app.state.scheduler.stop()
             _teardown(app)
             if restore_stdio is not None:
                 restore_stdio()
@@ -423,6 +455,31 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         # Bind straight away as well as in lifespan: an injected engine needs no
         # loading, and TestClient only runs lifespan inside a `with` block.
         app.state.engine = engine
+        # Constructed here (no `await` available in this sync function) but not
+        # started -- the routes start it lazily (BatchScheduler.start() is
+        # idempotent) so a TestClient used without `with` still gets a live
+        # dispatcher on its first request. When lifespan DOES run, its own
+        # construction+start above supersedes this one.
+        #
+        # ONE REQUEST PER NON-LIFESPAN CLIENT. `start()` is called from
+        # inside the first request that reaches it, binding the dispatch
+        # task to WHATEVER event loop is driving that call. A bare TestClient
+        # used without `with` (this file's own dominant pattern) does not
+        # guarantee that loop survives between separate `.post()`/`.get()`
+        # calls the way the `with` block's portal does -- a second request on
+        # the SAME such client can find `self._task` non-`None` but tied to a
+        # now-dead loop, and `submit()` reads that as `self._task.done()` ->
+        # `QueueFull("the dispatcher is not running")`. That is a 503, not a
+        # hang, so it fails honestly -- but it is real, and no test here
+        # happens to exercise two requests on one bare client. A real server
+        # never hits this: its ONE `app` always runs lifespan.
+        app.state.scheduler = BatchScheduler(
+            engine,
+            queue_depth=(config.queue_depth if config is not None
+                        else engine.queue_depth),
+            max_batch_size=(config.max_batch_size if config is not None else 1),
+            prefill_chunk_size=(config.prefill_chunk_size if config is not None
+                                else 512))
 
     @app.get("/health")
     async def health():
@@ -432,7 +489,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             "model": _served_name(app),
             "max_seq_len": e.max_seq_len,
             "queue_depth": e.queue_depth,
-            "queued": e.depth,
+            # scheduler.depth, not e.depth: routes admit through the
+            # dispatcher now (P10), so e.depth/_inflight never moves.
+            "queued": app.state.scheduler.depth,
             "prefix_cache": e.prefix_stats(),
         }
         try:
@@ -462,6 +521,13 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
         e = app.state.engine
+        # Idempotent (BatchScheduler.start() no-ops once a dispatch task
+        # exists): the lifespan already started it in real use. An engine
+        # injected without ever running lifespan (TestClient used without
+        # `with`) never gets that call, so this is what gives it a live
+        # dispatcher on its first request instead of every submit() raising
+        # QueueFull with "the dispatcher is not running".
+        await app.state.scheduler.start()
         cfg = getattr(app.state, "config", None)
         if cfg is not None and cfg.require_session_id and not req.session_key:
             _refusal_row(e, req, "MissingSessionId",
@@ -490,13 +556,13 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # and leave the model unprotected for the whole stream. The eager
             # depth check keeps a full queue an honest 503 rather than an SSE
             # error event.
-            if e.depth >= e.queue_depth:
+            if app.state.scheduler.depth >= e.queue_depth:
                 _refusal_row(e, req, "QueueFull",
-                             f"{e.depth} queued, depth {e.queue_depth}",
-                             stream=True)
-                return _error(503, f"{e.depth} requests are already queued "
-                                   f"(depth {e.queue_depth}). This engine runs "
-                                   f"one request at a time.",
+                             f"{app.state.scheduler.depth} queued, depth "
+                             f"{e.queue_depth}", stream=True)
+                return _error(503, f"{app.state.scheduler.depth} requests are "
+                                   f"already queued (depth {e.queue_depth}). "
+                                   f"This engine runs one request at a time.",
                               "server_busy", headers={"Retry-After": "5"})
             try:
                 # Build the prompt HERE rather than inside the generator. A
@@ -528,37 +594,94 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 raise
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
-                     session_id=req.session_key, prepared=prepared),
+                     session_id=req.session_key, prepared=prepared,
+                     scheduler=app.state.scheduler),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)})
 
         cancel = CancelToken()
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
+        result, error = None, None
+        # Set only once submit() succeeds. prepare() now runs directly here
+        # rather than inside generate()'s own try (B8's reason: an oversized
+        # prompt must be a 400, not a 200 with an SSE-shaped error), so a
+        # prepare() failure never reaches generate()'s row-writing `finally`
+        # at all -- this flag is what tells the except clauses below whether
+        # THEY owe the row or generate() (inside the dispatcher) already
+        # wrote it.
+        submitted = False
         try:
-            async with e.slot(req.session_key):
-                result = await e.generate(req, cancel=cancel)
+            prepared = e.prepare(req)
+            job = Job(req=req, session_key=req.session_key,
+                      prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
+            job.prepared = prepared
+            job.stream = False
+            await app.state.scheduler.submit(job)
+            submitted = True
+            # Consume to completion: a second admission path could run a
+            # generation concurrently with the dispatcher's, on an engine that
+            # is not thread-safe across the KV cache, the expert VRAM cache and
+            # the slab arena.
+            #
+            # A dropped job (its client already cancelled while queued --
+            # scheduler.py's `_form`) writes ONLY the sentinel, no ("error",
+            # ...) and no ("final", ...) -- `result` and `error` both stay
+            # None below rather than assuming a terminal item always precedes
+            # it.
+            while True:
+                item = await job.out.get()
+                if item is None:
+                    break
+                kind, payload = item
+                if kind == "error":
+                    error = payload
+                elif kind == "final":
+                    result = payload
+            if error is not None:
+                raise error
         except QueueFull as ex:
+            # submit() raises this both for a genuinely full queue and when
+            # no dispatcher is live to drain it (stopped, or its task died) --
+            # either way the honest answer is the same 503 e.slot() used to
+            # give for a full queue.
             _refusal_row(e, req, "QueueFull", str(ex), stream=False)
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
-            # No row: prepare() now runs inside generate()'s try, so generate()
-            # already wrote one -- with finish="refused", the same value this
-            # handler used to write. Writing a second here would double-count
-            # every oversized prompt on the non-streaming path.
+            # Only prepare() raises these, and prepare() runs before submit() --
+            # so `submitted` is always False here. This row is the only one
+            # this request will ever get.
+            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
-            # No row here: everything that can raise inside the `async with`
-            # above -- prepare() included, since it now runs inside generate()'s
-            # own try -- reaches generate()'s row-writing `finally` first. A
-            # second row would double-count the only case anyone would actually
-            # be counting. What this does NOT cover is a failure of `e.slot`
-            # itself other than QueueFull (handled above); there is no such
-            # failure mode today, and inventing a row for it would be the
+            # `submitted` tells the two remaining sources apart: prepare()
+            # raising something other than the three typed errors above (a
+            # malformed chat template) never reached generate() either, so
+            # nothing else will log it -- write the row here. Once submitted,
+            # generate() ran inside the dispatcher with `prepared` passed
+            # through, and its own `finally` already wrote a row before
+            # `error` ever reached this frame; a second one here would
             # double-count.
+            if not submitted:
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
+                             finish="error")
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
         finally:
             watchdog.cancel()
+
+        if result is None:
+            # Contract: a job dropped by `_form` (client already cancelled
+            # while queued) gets only a sentinel -- no error, no final. That
+            # can only happen when `cancel` is already set (that is why it
+            # was dropped), so this is the same "nobody is listening" case
+            # the disconnect branch below handles, just with nothing to log a
+            # token count for. Nothing else ever ran for this job -- no
+            # generate() call, no row -- so it is this frame's to write, same
+            # as the streaming route's `_sse` does for the identical drop.
+            _refusal_row(e, req, None, None, stream=False, finish="cancelled")
+            print("[Vaayu-Server] client disconnected before this request ran")
+            return _error(499, "client closed the connection; generation was "
+                               "stopped", "client_closed_request")
 
         if cancel.cancelled:
             # Nobody is listening -- this response is discarded by the server.
@@ -606,7 +729,7 @@ def _error_event(ex, kind: str = "internal_error") -> str:
 
 
 async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
-               prepared=None):
+               prepared=None, scheduler=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
@@ -629,14 +752,19 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     sent = ""
     final = None
     # `engine.stream` writes this request's row from its own `finally`, but
-    # only once that generator's BODY has started -- i.e. from the first
-    # `__anext__` below. Everything before that point is unowned: the three
-    # yields, the wait for a slot, `engine.slot` itself. Only QueueFull was
-    # ever plugged, by a typed `except`, so every OTHER way of leaving that
-    # span ended the request with no row at all -- breaking the "a request
-    # never ends without a row" contract README.md and documentation/server.md
-    # both state. `owed` carries what this frame must write; the flag below
-    # hands ownership to the engine at the exact statement where it takes it.
+    # only once the dispatcher actually RUNS the job -- a submitted job can
+    # still be dropped by `_form` before that (its client already cancelled
+    # while queued: only a sentinel then, no ("error"|"final", ...) item --
+    # contract fact 2). So ownership transfers on the first REAL item out of
+    # `job.out`, not at `submit()`. Everything before that point is unowned:
+    # the three yields, the wait to be admitted, `scheduler.submit` itself,
+    # AND the wait for the dispatcher to actually start running it. Only
+    # QueueFull was ever plugged, by a typed `except`, so every OTHER way of
+    # leaving that span ended the request with no row at all -- breaking the
+    # "a request never ends without a row" contract README.md and
+    # documentation/server.md both state. `owed` carries what this frame must
+    # write; the flag below hands ownership to the dispatcher at the exact
+    # statement where it takes it.
     owed = None
     engine_owns_the_row = False
     try:
@@ -644,60 +772,70 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # queued caller tell "waiting behind N requests" from "hung". These
         # three yields are INSIDE the try because a disconnect suspended on
         # any of them is exactly the unowned window described above.
-        yield f": vaayu queue position {engine.depth}\n\n"
+        yield f": vaayu queue position {scheduler.depth}\n\n"
         if warning:
             yield f": warning {warning}\n\n"
 
         yield _chunk(cid, created, model_name, session_id=session_id,
                      delta={"role": "assistant"})
 
-        # Acquired HERE, not in the route: this generator body runs after the
-        # handler returned, so a slot held around that return would already be
-        # released before the first token.
-        async with engine.slot(req.session_key):
-            gen = engine.stream(req, cancel=cancel, prepared=prepared)
-            # No await between here and the loop's first `__anext__`, so no
-            # cancellation can land in between: the handover is exact.
+        # Submitted HERE, not in the route: this generator body runs after the
+        # handler returned, so a job submitted around that return would sit
+        # queued with nobody draining it until the first token anyway --
+        # submitting here is simply the earliest this generator can do it.
+        job = Job(req=req, session_key=req.session_key,
+                  prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
+        job.prepared = prepared
+        job.stream = True
+        await scheduler.submit(job)
+        while True:
+            item = await job.out.get()
+            if item is None:
+                if not engine_owns_the_row:
+                    # `_form` dropped this job before the dispatcher ever ran
+                    # it (contract fact 2) -- ownership never transferred, so
+                    # nothing else will ever write this request's row. The
+                    # client is why: only a cancelled `job.cancel` gets a job
+                    # dropped this way.
+                    owed = (None, None, "cancelled")
+                break
+            # Ownership transfers on the FIRST real item, not at submit():
+            # a successfully submitted job can still be dropped by `_form`
+            # before the dispatcher runs it (see above). Once a real item
+            # arrives here the dispatcher has actually started the
+            # generation, and its own row-writing `finally` (engine.stream(),
+            # or run_batch's per-job fan-out) is guaranteed to run even if
+            # this generator bails out right after -- so from here on, a row
+            # written in THIS frame's `finally` would double-count.
             engine_owns_the_row = True
-            try:
-                async for kind, payload in gen:
-                    if kind == "final":
-                        final = payload
-                        break
-                    if suppressing:
-                        buffered += payload
-                        continue
-                    held += payload
-                    if open_marker and open_marker in held:
-                        # Everything from here MIGHT belong to a tool call. Emit
-                        # the prose that preceded it and buffer the rest until
-                        # the final event says which it was.
-                        cut = held.index(open_marker)
-                        if held[:cut]:
-                            sent += held[:cut]
-                            yield _chunk(cid, created, model_name, session_id=session_id,
-                                         delta={"content": held[:cut]})
-                        held, buffered, suppressing = "", held[cut:], True
-                        continue
-                    # Hold back a marker-length tail so an open marker split
-                    # across two chunks is still recognised.
-                    keep = (len(open_marker) - 1) if open_marker else 0
-                    if len(held) > keep:
-                        emit, held = held[:len(held) - keep], held[len(held) - keep:]
-                        sent += emit
-                        yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
-            finally:
-                # EVERY real streaming request leaves this loop by `break` on
-                # the "final" event, and Python does not close a generator on
-                # `break`: engine.stream stays suspended at its last yield until
-                # GC drops it and asyncio schedules the finalizer. Its
-                # row-writing `finally` therefore ran AFTER this `async with`
-                # released the slot -- so `wall_s`/`decode_tok_s` disagreed with
-                # server.log's DONE line, and the row's `after` counter snapshot
-                # picked up the NEXT admitted request's NVMe reads as this
-                # request's bytes_read_gb. Closing here puts the row inside the
-                # lock, where its `before` edge already was.
-                await gen.aclose()
+            kind, payload = item
+            if kind == "error":
+                raise payload
+            if kind == "final":
+                final = payload
+                break
+            if suppressing:
+                buffered += payload
+                continue
+            held += payload
+            if open_marker and open_marker in held:
+                # Everything from here MIGHT belong to a tool call. Emit
+                # the prose that preceded it and buffer the rest until
+                # the final event says which it was.
+                cut = held.index(open_marker)
+                if held[:cut]:
+                    sent += held[:cut]
+                    yield _chunk(cid, created, model_name, session_id=session_id,
+                                 delta={"content": held[:cut]})
+                held, buffered, suppressing = "", held[cut:], True
+                continue
+            # Hold back a marker-length tail so an open marker split
+            # across two chunks is still recognised.
+            keep = (len(open_marker) - 1) if open_marker else 0
+            if len(held) > keep:
+                emit, held = held[:len(held) - keep], held[len(held) - keep:]
+                sent += emit
+                yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
         # real 503; this is the admission race it cannot see. The headers are
@@ -705,10 +843,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # can be honest, and "internal_error" tells a client to stop retrying
         # when retrying is exactly the right response.
         #
-        # `slot` raises BEFORE it yields, so engine.stream() is never entered
-        # and its row-writing `finally` never runs. Without this row the
-        # request that lost the admission race is the one kind of request that
-        # ends with no row at all.
+        # `submit` raises BEFORE the job ever reaches the dispatcher, so
+        # engine.stream() is never entered and its row-writing `finally` never
+        # runs. Without this row the request that lost the admission race is
+        # the one kind of request that ends with no row at all.
         owed = ("QueueFull", str(ex), "refused")
         yield _error_event(ex, "server_busy")
         yield "data: [DONE]\n\n"

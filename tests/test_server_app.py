@@ -1,4 +1,5 @@
 """HTTP surface, exercised against a fake engine -- no model, no GPU."""
+import asyncio
 import json
 
 from fastapi.testclient import TestClient
@@ -35,6 +36,10 @@ class FakeEngine:
         self.tool_format = None
         self.cancel = None          # the CancelToken the route handed us
         self.cancelled_all = False  # set by shutdown
+        # BatchScheduler._run holds this for a whole batch/serial run -- the
+        # real EngineHandle's own lock, which app.py's routes no longer touch
+        # directly now that admission goes through the scheduler (P10).
+        self._lock = asyncio.Lock()
 
     def notice_if_speculation_skipped(self, req):
         return self.warned
@@ -60,7 +65,7 @@ class FakeEngine:
 
         return _Slot()
 
-    async def generate(self, req, cancel=None):
+    async def generate(self, req, cancel=None, prepared=None):
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
@@ -83,6 +88,43 @@ class FakeEngine:
 
 def _client(engine):
     return TestClient(create_app(engine=engine))
+
+
+def _make_app(**overrides):
+    """A TestClient-backed app over the fake engine, with config overrides.
+
+    Runs lifespan (the `with` block), so the scheduler it builds is
+    constructed AND started/stopped for real -- the `with` exits, and its
+    shutdown, before this returns; that is fine for a test that only checks
+    what BatchScheduler.__init__ was called with.
+    """
+    from vaayu.server.app import ServerConfig, create_app
+
+    cfg = ServerConfig(model_path="unused", **overrides)
+    app = create_app(config=cfg, engine=FakeEngine())
+    with TestClient(app):
+        return app
+
+
+def _queue_full_on_submit(monkeypatch, message="8 requests are already queued"):
+    """Monkeypatch BatchScheduler.submit to raise QueueFull unconditionally.
+
+    Admission now happens in the scheduler, not in engine.slot()/generate()/
+    stream() -- FakeEngine has no queue of its own to be full, so this is how
+    a test puts the SCHEDULER'S queue-full path (contract fact 3) under load.
+
+    This does not exercise a REAL depth limit being tripped by real traffic
+    (`self.depth >= self.queue_depth` inside `submit()` itself) -- that
+    coverage lives in `test_server_scheduler.py`, against a real
+    `BatchScheduler`. What this file's two callers below pin is what the
+    ROUTES do with a `QueueFull` once raised, which is the thing that
+    actually changed here."""
+    from vaayu.server.scheduler import BatchScheduler
+
+    async def raising(self, job):
+        raise QueueFull(message)
+
+    monkeypatch.setattr(BatchScheduler, "submit", raising)
 
 
 BODY = {"model": "vaayu", "messages": [{"role": "user", "content": "hi"}]}
@@ -182,9 +224,9 @@ def test_tools_against_a_template_without_tool_support_is_a_400():
     assert r.status_code == 400
 
 
-def test_a_full_queue_is_a_503_with_retry_after():
-    engine = FakeEngine(raises=QueueFull("8 requests are already queued"))
-    r = _client(engine).post("/v1/chat/completions", json=BODY)
+def test_a_full_queue_is_a_503_with_retry_after(monkeypatch):
+    _queue_full_on_submit(monkeypatch)
+    r = _client(FakeEngine()).post("/v1/chat/completions", json=BODY)
     assert r.status_code == 503
     assert "Retry-After" in r.headers
 
@@ -396,14 +438,13 @@ def test_a_streamed_request_with_no_chat_template_is_a_400():
     assert r.status_code == 400
 
 
-def test_a_queue_full_losing_the_admission_race_is_an_honest_sse_error_type():
+def test_a_queue_full_losing_the_admission_race_is_an_honest_sse_error_type(monkeypatch):
     # The route's eager depth check catches the ordinary full queue with a real
-    # 503. This is the race it cannot catch: depth was under the limit at the
-    # check and slot() raised anyway. Headers are long gone by then, so the
-    # status cannot be fixed -- but the event type can be honest.
-    engine = FakeEngine(raises=QueueFull("8 requests are already queued"))
-    engine.depth = 0
-    r = _client(engine).post("/v1/chat/completions", json={**BODY, "stream": True})
+    # 503. This is the race it cannot catch: scheduler.depth was under the
+    # limit at the check and submit() raised anyway. Headers are long gone by
+    # then, so the status cannot be fixed -- but the event type can be honest.
+    _queue_full_on_submit(monkeypatch)
+    r = _client(FakeEngine()).post("/v1/chat/completions", json={**BODY, "stream": True})
     assert r.status_code == 200, "headers were already sent; only the event type is left"
     errors = [e for e in _sse_events(r.text) if "error" in e]
     assert errors, "the stream must say something went wrong"
@@ -600,3 +641,21 @@ def test_a_started_server_writes_env_json_into_its_run_directory(tmp_path):
     data = json.loads((runs[0] / "env.json").read_text())
     assert "model" in data and "budgets" in data and "collect_errors" in data
     assert data["config"]["model_path"]["name"] == "x"
+
+
+def test_the_app_builds_a_scheduler_with_the_configured_width(monkeypatch):
+    """CLAUDE.md section 8: a knob app.py never passes is decoration."""
+    from vaayu.server.scheduler import BatchScheduler
+
+    seen = {}
+    real_init = BatchScheduler.__init__
+
+    def spy(self, engine, queue_depth=8, max_batch_size=1,
+            prefill_chunk_size=512):
+        seen["max_batch_size"] = max_batch_size
+        seen["queue_depth"] = queue_depth
+        real_init(self, engine, queue_depth, max_batch_size, prefill_chunk_size)
+
+    monkeypatch.setattr(BatchScheduler, "__init__", spy)
+    _app = _make_app(max_batch_size=3, queue_depth=5)
+    assert seen == {"max_batch_size": 3, "queue_depth": 5}

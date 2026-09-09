@@ -80,6 +80,11 @@ def _client(run_dir, require_session_id):
         # built one against its own new_run_dir(); rebinding here keeps the
         # assertions reading a directory the test owns.
         app.state.engine = EngineHandle(M(), log_dir=run_dir)
+        # The dispatcher (P10) was built against the lifespan's OWN engine;
+        # every attribute it reads is looked up on `self.engine` fresh on
+        # each dispatch, so repointing that one reference is enough to make
+        # it dispatch through the engine just swapped in above.
+        app.state.scheduler.engine = app.state.engine
         yield c
 
 
@@ -94,19 +99,24 @@ def client_requiring_session(run_dir, no_real_load):
 
 
 def _full_queue_client(run_dir):
-    """Same as `_client`, but the engine is built with `queue_depth=0` so the
-    ordinary admission check trips on the very first request -- an honest
-    QueueFull trigger rather than a monkeypatched exception, since one is
-    available (`EngineHandle.slot` / the route's own eager depth check both
-    key off `queue_depth`, see engine.py:172-183 and app.py's streaming
-    branch).
+    """Same as `_client`, but the queue is built at depth 0 so the ordinary
+    admission check trips on the very first request -- an honest QueueFull
+    trigger rather than a monkeypatched exception, since one is available.
+
+    Admission is the DISPATCHER's now (P10): `BatchScheduler.submit` and the
+    route's own eager depth check both key off `queue_depth`, and the
+    scheduler's own copy is captured once at construction from
+    `ServerConfig.queue_depth` -- not read off whatever engine happens to be
+    bound later, so this has to be `0` on the CONFIG, not just on a swapped-in
+    `EngineHandle`.
     """
     cfg = ServerConfig(model_path="/ckpt", log_dir=str(run_dir.parent),
                        capture_stdio=False, require_session_id=False,
-                       default_stream=False)
+                       default_stream=False, queue_depth=0)
     app = create_app(cfg)
     with TestClient(app) as c:
         app.state.engine = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
+        app.state.scheduler.engine = app.state.engine
         yield c
 
 
@@ -207,18 +217,28 @@ def _sse_req(**over):
 
 
 def test_the_sse_admission_race_writes_a_refusal_row(run_dir):
-    """`EngineHandle.slot` raises QueueFull BEFORE it yields, so engine.stream
-    is never entered and its row-writing `finally` never runs. The route's
-    eager depth check cannot see this race -- it is the reason _sse has a
-    QueueFull handler at all -- so the row is that handler's to write."""
+    """`BatchScheduler.submit` raises QueueFull BEFORE the job ever reaches
+    the dispatcher, so engine.stream is never entered and its row-writing
+    `finally` never runs. The route's eager depth check cannot see this race
+    -- it is the reason _sse has a QueueFull handler at all -- so the row is
+    that handler's to write."""
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     e = EngineHandle(M(), log_dir=run_dir, queue_depth=0)
 
     async def main():
-        return [c async for c in app_mod._sse(e, _sse_req(), "m", None)]
+        req = _sse_req()
+        sched = BatchScheduler(e, queue_depth=0, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        chunks = [c async for c in app_mod._sse(e, req, "m", None,
+                                                prepared=e.prepare(req),
+                                                scheduler=sched)]
+        await sched.stop()
+        return chunks
 
     chunks = asyncio.run(main())
     assert any("server_busy" in c for c in chunks)
@@ -378,16 +398,23 @@ def test_a_disconnect_before_generation_starts_still_writes_a_row(
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     from .test_reqlog_engine import M as StreamingM
 
     e = EngineHandle(StreamingM(), log_dir=run_dir)
 
     async def main():
-        gen = app_mod._sse(e, _sse_req(), "m", warning)
+        req = _sse_req()
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        gen = app_mod._sse(e, req, "m", warning, prepared=e.prepare(req),
+                           scheduler=sched)
         for _ in range(consumed):
             await gen.__anext__()
         await gen.aclose()          # exactly what Starlette does on disconnect
+        await sched.stop()
 
     asyncio.run(main())
     rs = rows(run_dir)
@@ -398,41 +425,173 @@ def test_a_disconnect_before_generation_starts_still_writes_a_row(
     assert rs[0]["error"] is None
 
 
+def test_a_dropped_non_streaming_job_still_writes_a_row(client, run_dir, monkeypatch):
+    """Critical 1, non-streaming half: `_form` can drop a submitted job with
+    ONLY a sentinel on `job.out` (contract fact 2) -- no ("error"|"final",
+    ...) item, so `engine.generate()` never runs and writes no row of its
+    own. Before this fix, `chat_completions`'s `if result is None:` branch
+    answered the 499 but wrote nothing -- the exact "a request never ends
+    without a row" hole contract fact 2 warns about.
+
+    Reproduced by stubbing `submit()` to do exactly what a drop does, rather
+    than racing the scheduler's real timing: this pins what the ROUTE does
+    with a dropped job, not the drop mechanics themselves (`_form`'s own
+    behaviour is `test_server_scheduler.py`'s job).
+    """
+    from vaayu.server.scheduler import BatchScheduler
+
+    async def drop_immediately(self, job):
+        await job.out.put(None)
+
+    monkeypatch.setattr(BatchScheduler, "submit", drop_immediately)
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 499
+    rs = rows(run_dir)
+    assert len(rs) == 1, "a non-streaming job dropped by _form left no row"
+    assert rs[0]["finish"] == "cancelled"
+    assert rs[0]["error"] is None
+
+
+def test_a_mid_stream_disconnect_still_writes_finish_cancelled(run_dir):
+    """Critical 2: a client that disconnects DURING an active stream -- not
+    before generation starts, not while queued, but with real deltas already
+    flowing -- must still get `finish="cancelled"` in its row.
+
+    Before this fix: `_sse.aclose()` used to cascade directly into
+    `engine.stream()`'s own generator close, landing in its GeneratorExit
+    branch -- the only place that wrote `"cancelled"`. Since P10 the
+    dispatcher owns that generator in its own task (`_run_serial`), so
+    `_sse.aclose()` no longer reaches it at all; `_run_serial` keeps
+    iterating `engine.stream()` to its ORDINARY success tail once `cancel`
+    is set, which used to map `finish` to the WIRE value `"length"`
+    (`stopping.py`'s documented mapping) with no row-level override --
+    silently breaking the promise documentation/server.md:180 makes.
+    `engine.stream()`'s success tail now mirrors `generate()`'s own
+    `if cancel.cancelled: row["finish"] = "cancelled"` (engine.py, both
+    right after the shared `_finish()` call), so this is reachable on
+    either path again.
+    """
+    import asyncio
+    import time
+    import unittest.mock
+
+    import vaayu.server.app as app_mod
+    import vaayu.streaming as streaming_mod
+    from vaayu.server.engine import CancelToken
+    from vaayu.server.scheduler import BatchScheduler
+
+    from .test_reqlog_engine import M as StreamingM
+
+    e = EngineHandle(StreamingM(), log_dir=run_dir)
+
+    def _slow_fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        # Real time between chunks -- unlike test_reqlog_engine.M's
+        # generate(), which fires and finishes before this generator's
+        # caller can possibly disconnect mid-flight. Ignores `cancel`
+        # deliberately: the point is that the run keeps going regardless
+        # (exactly like a real HF generate() loop mid-step), and still ends
+        # up at the success tail once `cancel` is set.
+        for _ in range(10):
+            yield "tok "
+            time.sleep(0.01)
+        if token_ids_out is not None:
+            token_ids_out.extend([10] * 10)
+
+    async def main():
+        cancel = CancelToken()
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        req = _sse_req()
+        gen = app_mod._sse(e, req, "m", None, cancel=cancel,
+                           prepared=e.prepare(req), scheduler=sched)
+        seen = 0
+        async for _ in gen:
+            seen += 1
+            if seen >= 4:      # real deltas already flowing -- genuinely mid-stream
+                break
+        await gen.aclose()    # exactly what Starlette does on disconnect
+        # Let the dispatcher finish the now-cancelled run -- its own
+        # row-writing `finally` (engine.stream()) is what this test checks.
+        await sched.stop()
+
+    with unittest.mock.patch.object(streaming_mod, "stream_generate", _slow_fake):
+        asyncio.run(main())
+
+    rs = rows(run_dir)
+    assert len(rs) == 1
+    assert rs[0]["finish"] == "cancelled", (
+        "a mid-stream disconnect must not read as an ordinary stop/length")
+    assert rs[0]["error"] is None
+
+
 def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
-    """The same hole, one step further in and INSIDE the try: a request waiting
-    on `engine.slot`'s lock is abandoned by cancelling the ASGI task, which
-    raises CancelledError -- a BaseException that `except Exception` misses --
-    before engine.stream is ever entered. Widening the try does not reach this
-    one; only handing row ownership over at the statement where engine.stream
-    takes it does.
+    """A request whose job is genuinely still WAITING -- `_form` has not yet
+    looked at it -- is abandoned by cancelling its ASGI task before its turn.
+
+    This is the review's own repro for the Critical-1 hole: job A holds the
+    run (picked up first, blocked on the engine lock), job B sits behind it
+    in `_waiting` the whole time -- the dispatch loop cannot get back to
+    `_form` until A's `_run()` returns, so B is GUARANTEED untouched, no
+    sleep-timing race needed for that part -- then B's client vanishes.
+    `_form` drops B with only a sentinel (contract fact 2): `engine.stream` is
+    NEVER entered for B, so nothing else will ever write its row. That row is
+    `_sse`'s own to write, on the first `job.out.get()` returning `None`
+    while ownership never transferred (see `_sse`'s `engine_owns_the_row`).
+
+    Two rows are expected: A's own (it runs to completion once unblocked) and
+    B's (cancelled, written by `_sse`).
     """
     import asyncio
 
     import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
 
     from .test_reqlog_engine import M as StreamingM
 
     e = EngineHandle(StreamingM(), log_dir=run_dir)
 
     async def main():
-        await e._lock.acquire()             # hold the slot so the request queues
-        gen = app_mod._sse(e, _sse_req(), "m", None)
-        await gen.__anext__()               # queue position
-        await gen.__anext__()               # role chunk
+        req_a, req_b = _sse_req(session_id="a"), _sse_req(session_id="b")
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
 
-        async def drain():
+        async def drain(gen):
             async for _ in gen:
                 pass
 
-        t = asyncio.create_task(drain())
-        await asyncio.sleep(0.05)           # let it block on the lock
-        t.cancel()
+        await e._lock.acquire()             # A will block here once picked up
+        gen_a = app_mod._sse(e, req_a, "m", None, prepared=e.prepare(req_a),
+                             scheduler=sched)
+        task_a = asyncio.create_task(drain(gen_a))
+        # Long enough for A's job to be submitted, picked up by `_form`, and
+        # blocked inside `_run` on `engine._lock`. From this point on the
+        # dispatch loop cannot reach `_form` again -- so however long the
+        # rest of this test takes, B below cannot be picked up before we
+        # cancel it.
+        await asyncio.sleep(0.05)
+
+        gen_b = app_mod._sse(e, req_b, "m", None, prepared=e.prepare(req_b),
+                             scheduler=sched)
+        task_b = asyncio.create_task(drain(gen_b))
+        await asyncio.sleep(0.05)           # let B reach submit() and sit in _waiting
+        task_b.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await t
+            await task_b
+
         e._lock.release()
+        # Let the dispatcher finish A's run and drop B -- both, not this
+        # generator, own writing their rows.
+        await sched.stop()
+        await task_a
 
     asyncio.run(main())
-    rs = rows(run_dir)
-    assert len(rs) == 1, "a client that vanished while queued left no row"
-    assert rs[0]["finish"] == "cancelled"
-    assert rs[0]["error"] is None
+    rs = {r["session"]: r for r in rows(run_dir)}
+    assert set(rs) == {"a", "b"}, (
+        f"expected A's own row and B's dropped-while-queued row, got {sorted(rs)}")
+    assert rs["b"]["finish"] == "cancelled", (
+        "a client that vanished while queued left no row, or the wrong finish")
+    assert rs["b"]["error"] is None

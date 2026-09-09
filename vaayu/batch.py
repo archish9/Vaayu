@@ -366,10 +366,22 @@ def reclaimable_vram_budget(model, reclaim: bool = False) -> int:
     return max(0, free + reclaimable_expert_vram(model) - _VRAM_SAFETY_BYTES)
 
 
-def plan_batch(model, requests, reclaim: bool = False):
+def plan_batch(model, requests, reclaim: bool = False, giveback: bool = False):
+    """`giveback` mirrors gate 2's own admission (`VaayuBaseModel.batched_generate`
+    at :5302), which unconditionally adds `expert_giveback_bytes` at N>1
+    regardless of `reclaim` -- a separate, ENTITLEMENT-based allowance, not the
+    USAGE-based one `reclaim` adds via `reclaimable_vram_budget`. A caller that
+    prices a batch here and then hands it to `batched_generate` (the
+    scheduler's `_admit`, P10 B1) must set this, or gate 1 prices a stricter
+    budget than gate 2 ever will and can collapse every batch to width 1 even
+    when gate 2 would have admitted it. Defaults off so every other caller
+    keeps today's decision byte for byte.
+    """
     n_layers, n_kv_heads, head_dim, elem = geo_from_model(model)
-    return size_batch(requests, reclaimable_vram_budget(model, reclaim),
-                      n_layers, n_kv_heads, head_dim, elem)
+    budget = reclaimable_vram_budget(model, reclaim)
+    if giveback and len(requests) > 1:
+        budget += expert_giveback_bytes(model)
+    return size_batch(requests, budget, n_layers, n_kv_heads, head_dim, elem)
 
 
 # Methods PrefixCacheStore drives on a cache it stores or hands back:

@@ -129,7 +129,7 @@ def test_teardown_drops_the_engine_so_the_model_can_be_collected():
 def test_teardown_cancels_whatever_is_still_generating():
     app = create_app(engine=EngineHandle(_RecordingModel()))
     token = CancelToken()
-    app.state.engine._live_cancel = token
+    app.state.engine._live_cancels = [token]
     _teardown(app)
     assert token.cancelled is True
 
