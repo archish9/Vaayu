@@ -1593,18 +1593,21 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 
 # OPTIONAL — real work, no slot. Never ahead of OPEN or STILL OPEN.
 
-**This heading predates §0 and is now a LOCATION, not a priority: two rows here (6a = P5, 10 = P8)
-are §0's top perf work.** §0 is the order. Read the `§0` column below before picking anything from this table.
+**This heading predates §0 and is now a LOCATION, not a priority.** It used to say two rows here
+(6a = P5, 10 = P8) were §0's top perf work; **both closed — P8 SHIPPED 2026-09-07, P5 CLOSED
+2026-09-09 — and as of 2026-09-09 NO §0 P-row is open at all**, so every `[ ]` in this table is
+OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
+from this table.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
-| **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` | ~10 min | Two such bugs shipped GREEN and broke both MoE loads. Worth knowing if a linter catches the class. |
+| **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` **PROBED 2026-09-09 — the linter question is ANSWERED, the wiring is not** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
 | **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
-| **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[ ]` | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
+| **6a** | The intercept residual the VRAM calibration could not explain | **P5** | `[x]` **CLOSED 2026-09-09; only its `[ ]` sub-item `head_bytes` survives** | GPU round | One intercept rule cannot fit both forwards: Llama-3.2-1B does NOT sawtooth in whole-prefill data, MiniMax-M2.7 does. Everything is over-predicted (safe), 15–63 % at small S and up to +231 % on MiniMax at a short trailing chunk. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
 | **5** | Deferred write-ups (Plan B/H follow-ups) — **TRIAGED + 2 probes run 2026-09-06** | **P2** (the outlier split) | `[ ]` **2 of 4 closed; 1 docs fix + 1 promoted remain** | CPU sweep | Two closed on new measurement (Plan B Phase 2 refuted directly; fold-`Pi` target removed by Plan I). Real-query gate RUN: **9 bits FAILS on Qwen (0.0649 vs 0.05 bar)** and 9 is the quantizer's ceiling. Outlier split promoted with a measured operating point. See below. |
-| **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | **P8** | `[ ]` | GPU round | Opened 2026-09-06 by P6. Qwen has a 56.9 %-hit VRAM cache buying it nothing. Brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`. See below. |
+| **10** | Does the FUSED forward leave MiniMax's P6 win on the table? | **P8** | `[x]` **SHIPPED 2026-09-07 at +3.21 % on Qwen3-235B; see the row and §0's P8 vacancy note** | GPU round | Opened 2026-09-06 by P6. Qwen has a 56.9 %-hit VRAM cache buying it nothing. Brief: `docs/2026-09-06-P8-fused-predispatch-filter-BRIEF.md`. See below. |
 | **11** | The VRAM prefix is sized on the zero-overlap BOUND, not the observed union | **P7** | `[x]` | GPU round | Opened 2026-09-06 by P6. Cheapest open perf row; stacks on P6's +11.9 %. Brief: `docs/2026-09-06-P7-observed-union-prefix-BRIEF.md`. See below. |
 | **8** | `tensor_align=True` is production-dead code | OPTIONAL | `[~]` **docstrings FIXED 2026-09-03; branch deliberately kept** | done / rest not scheduled | Opened 2026-09-03 by P6, docs half closed the same day. Nothing calls it since `c5014cd` (2026-07-13), and the stale docstring is what produced row R4/P6 and cost that row its premise. **FOUR false claims corrected** in `safetensor_model_persister.py` — `load_expert_into_slab` (mode advertised as "the prefill stager, via stage_read_expert"), the `tensor_align=False` bullet (claimed prefill never routes through `views_from_packed_copy`; it always does now), `_group_layout`, and **`views_from_packed_copy`, the dangerous one — it promised its output was `_TENSOR_ALIGN`-aligned "by construction", which stopped being true at B1; production sources are raw, so its views are copy-SOURCE-safe only and `gpu_repack_aligned` is what makes them kernel-safe.** The BRANCH stays: `_group_layout`/`expert_span_bytes` size every slab `max(raw_aligned_length, packed_span)` for it, and 5 test sites exercise it — deleting it is a sizing change, not a cleanup, and nothing needs it. Docstrings only, no behaviour touched; suite 1322/3. |
 
@@ -3427,6 +3430,34 @@ by reading, the second only by running a real load.
 If it does, wire it in — it would have caught both, immediately, for free. If it does not, say so
 here and close the row; the fallback is already recorded in the gates table ("run a real load after
 touching `__init__`").
+
+**PROBED 2026-09-09 — the question above is ANSWERED, and the answer is SPLIT, so the row narrows
+instead of closing.** Neither linter is installed in `./venv` (`No module named ruff` /
+`No module named pyflakes`); both probes ran via `uvx`, which is why this cost minutes and not the
+`~10 min` the table promised for the whole row.
+
+* **`ruff` does NOT catch the class — do not wire it for this and think the row is discharged.**
+  Checked against a synthetic reproduction of the exact shape (`def f(flag): if flag: x = 1` then
+  `return x`, plus the empty-loop variant): `ruff check --select ALL` reports 9 findings on that
+  file and **none of them is the unbound local** — it flags `ANN001`/`T201` and walks past the bug.
+  `--select F821,F811,F841,E402` over `vaayu/` is likewise **"All checks passed!"**, which is clean
+  for the wrong reason. F821 is *undefined* name, not *used-before-assign* in a branch.
+* **`pylint` DOES catch it, rule `E0606` (`possibly-used-before-assignment`).** On the same
+  synthetic file it reports case 1 exactly (`Possibly using variable 'x' before assignment`). It
+  misses the empty-`for`-loop variant, which is the rarer shape; the branch shape is the one that
+  shipped twice.
+* **`vaayu/` is CLEAN under it today, with two FALSE POSITIVES to suppress when wiring it:**
+  `pylint --disable=all --enable=E0601,E0606,E0602,E0611 vaayu/` → 9.99/10, only
+  `vaayu_base.py:3878` (`get_module_from_name`) and `:3879` (`FP8Linear`). Both are guarded by
+  `_fp8_available`, set in the same `try` that imports them (`vaayu_base.py:3865-3871`) — pylint
+  cannot see the correlation. **Not bugs; do not "fix" them by hoisting the imports.**
+
+**What is left of this row:** wire `pylint --disable=all --enable=E0601,E0606,E0602` (a dev
+dependency, NOT a runtime one) as a check, with those two sites suppressed, and say where it runs.
+It would have caught both original bugs. **It finds zero real defects today**, so this is
+prevention, not a fix — price it accordingly against the other OPTIONAL rows. The gates-table
+fallback ("run a real load after touching `__init__`") stays either way: E0606 would not have
+caught the import-ORDER half on its own if the name had been module-level.
 
 ---
 
