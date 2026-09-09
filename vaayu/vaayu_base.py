@@ -3196,7 +3196,8 @@ class VaayuBaseModel(GenerationMixin):
         return self._vram_plan.pinning_budget if self._vram_plan else 0
 
     def _assert_context_fits(self, n_tokens: int, N: int = 1,
-                             expert_giveback_bytes: int = 0) -> int | None:
+                             expert_giveback_bytes: int = 0,
+                             batched_prefill: bool = False) -> int | None:
         """Refuse an oversized request HERE, where the prompt length is known.
 
         Without this, the wall surfaces as an OOM inside the layer loop ~30
@@ -3216,6 +3217,23 @@ class VaayuBaseModel(GenerationMixin):
 
         `expert_giveback_bytes` is passed straight to `admission_headroom`; see
         `batch.expert_giveback_bytes` for what the caller owes in exchange.
+
+        `batched_prefill` says the caller runs `batched_generate`'s own chunk
+        loop rather than `_chunked_prefill` (todo row 21). The load-time shape
+        describes the forward a SINGLE stream runs, and a batch runs neither
+        half of it: it sets `prefill_chunk_size = 0` and calls `forward` once
+        per chunk (:5573), so lm_head runs on every chunk -- the per-chunk loop,
+        not the layer-major branch -- and chunk-major expert retention never
+        allocates, because `_chunk_major_gpu` is only created when
+        `_chunk_major_n > 1` (moe_patch.py:1787) and only `_chunked_prefill`
+        sets that. Charging the load-time form instead is wrong in BOTH
+        directions: it over-charges 21-26 % just past a KV doubling, where it
+        pairs the largest score buffer with the doubled final capacity (a pair
+        the loop never holds at once), and under-charges by up to 1.02 GiB
+        mid-bucket, where the loop's full-chunk logits beat the layer-major
+        trailing chunk. The second is the dangerous one -- it admits a batch
+        whose real peak was never priced. Default False, so every single-stream
+        caller keeps today's decision byte for byte.
         """
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)
@@ -3228,6 +3246,9 @@ class VaayuBaseModel(GenerationMixin):
         from .vram_plan import (VramPlanError, _too_big_message,
                                  admission_headroom, predict_peak_vram)
         shape = dataclasses.replace(shape, N=int(N))
+        if batched_prefill:
+            shape = dataclasses.replace(shape, layer_major_prefill=False,
+                                        resident_expert_bytes=0)
         try:
             free_vram, _ = torch.cuda.mem_get_info()
         except Exception:
@@ -5398,9 +5419,12 @@ class VaayuBaseModel(GenerationMixin):
         # N=1 claims nothing: that is the path the server runs today and it
         # stays byte-identical.
         _giveback = expert_giveback_bytes(self) if N > 1 else 0
+        # `batched_prefill=True`: the loop below is NOT _chunked_prefill, so the
+        # load-time shape's layer-major form and chunk-major retention are both
+        # wrong for it -- see _assert_context_fits (todo row 21).
         _need = self._assert_context_fits(
             max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N,
-            expert_giveback_bytes=_giveback)
+            expert_giveback_bytes=_giveback, batched_prefill=True)
 
         # Keep the promise. Admission counted these bytes as no longer belonging
         # to the cache, so the cache must really stop taking them -- for the

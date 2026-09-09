@@ -36,7 +36,8 @@ class _Recorder:
             "dump_json": lambda s, *a, **k: None})()
         self.forwards = 0
 
-    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0,
+                             batched_prefill=False):
         return None
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,

@@ -43,7 +43,8 @@ class _Recorder:
         self._prefix_cache = pc
         self.calls = []
 
-    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0,
+                             batched_prefill=False):
         # Duck-typed stub: no _vram_plan on this fake, real method no-ops too.
         pass
 

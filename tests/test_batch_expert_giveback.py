@@ -78,7 +78,8 @@ class _FakeMoEModel:
         self.assert_calls = []
         self.budget_during_decode = []
 
-    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0):
+    def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0,
+                             batched_prefill=False):
         self.assert_calls.append(dict(n_tokens=n_tokens, N=N,
                                       expert_giveback_bytes=expert_giveback_bytes))
         return self._need

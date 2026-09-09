@@ -48,8 +48,14 @@ say what happened to each, and they are anti-regression notes, not history for i
 **P10 CLOSED 2026-09-09** (measured, banked, not recommended — see its row). **P5 CLOSED
 2026-09-09 too — root cause found and fixed, its perf premise refuted, 0 % on tok/s; its one
 survivor (`head_bytes` is probably not a transient) is carried as a `[ ]` inside row 6a and needs
-a GPU round.** **No P-row is open.** The live work is row **21** (the gate-2 batching ceiling,
-which P5's admission saving feeds) and row **19**. Two NEW rows came out of P10's measurement and are the live work
+a GPU round.** **No P-row is open. Row 21 CLOSED 2026-09-09** — both its STATED halves refuted,
+its real cause found and FIXED (gate 2 priced the layer-major forward for a batch that runs the
+per-chunk loop: over-charging 21-26 % at T10's ~4.2k contexts, UNDER-charging up to 1.02 GiB
+elsewhere). **Do not re-open it to "let gate 2 see reclaimable VRAM"** — that half is dead, and
+the server passes `reclaim=False` anyway. **Its A/B produced the finding that matters and it is
+now row 22: batching is worth 1.58x on the module-list forward and 2.04-2.36x SLOWER on the
+fused-EXL3 one, at the same context, both interleave directions.** The live work is row **22**
+and row **19**. Two NEW rows came out of P10's measurement and are the live work
 now: ~~**row 20 `[bug]`**~~ — **FIXED 2026-09-09: the padding was a red herring, the batched
 path computed RoPE without `rope_scaling`; both MoE checkpoints were never affected, and
 `MAX_BATCH_SIZE` stays 1 on row 15's performance grounds, not on corruption** — and **row 21**,
@@ -252,8 +258,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1875 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-09 after P5's max-over-chunks form (1870 + 5), the 1870 re-measured against a stashed HEAD
+**Suite baseline: 1882 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-09 after row 21's batched-prefill form (1875 + 7). The 1875 was verified the same day
+after P5's max-over-chunks form (1870 + 5), the 1870 re-measured against a stashed HEAD
 the same day rather than taken from this line. The 1870 was itself verified
 2026-09-09 after row 20's rope_scaling fix (1865 + 5). The 1758 written here before that was
 stale by 112 — it predates T10's four fixes and row 20's. It was itself verified
@@ -1989,7 +1996,7 @@ closed.
 
 ---
 
-# 21 · [ ] Batching is admitted about once per process — gate 2 cannot see reclaimable VRAM
+# 21 · [x] CLOSED 2026-09-09 — gate 2 priced the WRONG PREFILL FORM; fixed, and the A/B it unlocked split batching BY FORWARD
 
 **Opened 2026-09-09 by row 15's T10 measurement. This is what caps batching's value, and it
 is a PERF row, not a bug.**
@@ -2027,6 +2034,140 @@ lifting the ceiling on a path that corrupted padded batches would have made the 
 reachable). Weigh it against row 15's
 finding that the warm steady state gets **nothing** from batching however wide it is
 admitted: more formations only help COLD fan-out.
+
+## BOTH STATED HALVES ARE REFUTED, and the real cause is a DIFFERENT one (2026-09-09)
+
+Established offline, no model load, against the SHIPPED predictor. **Anchors first, because
+nothing below is worth reading without them:** the offline reconstruction returns MiniMax
+flash N=1 @7700 = **2.3821 GiB**, byte-for-byte the post-P5 figure recorded further down this
+file, and Qwen sdpa N=3 @4662 = **10.415 GiB** against P10a's on-device **10.488** (-0.70 %,
+the gap being P5 landing after that measurement). Harness: throwaway, scratchpad only; it
+re-uses `scripts/fit_vram_calibration.shape_for`, which reads every geometry number off each
+checkpoint's own `config.json` (CLAUDE.md §5).
+
+* **The MiniMax half is dead.** Warm `usable` is 3.01 GiB and the batch's REAL need at N=2 is
+  **5.17 GiB**, so counting `reclaimable_expert_vram` in `usable` cannot close it — and the
+  clamp binds too. Independently: the server calls `batched_generate(reqs, should_stop=...)`
+  (`engine.py:908`) with **`reclaim=False`**, so Plan K's eviction never runs there and
+  counting resident bytes would be an UNKEPT promise. Row 15 already measured warm batching at
+  +0.9 / +1.3 %, inside noise. **Do not re-open this to "let gate 2 see reclaimable VRAM".**
+* **The Qwen half is dead by its own route.** It needs `need` to fall ~21 % from a need-side
+  prediction fix; **P5 was exactly that fix and gave Qwen 0 %**. Giveback is structurally 0
+  (budget 3.644 GiB < working set 8.285 GiB), and row 15 forbids lowering the floor.
+
+**What IS wrong: gate 2 prices a forward the batch does not run.** `_assert_context_fits`
+re-uses `self._vram_shape`, built at LOAD, which for a MoE on sdpa/flash carries
+`layer_major_prefill=True` and (Qwen, fused EXL3) `resident_expert_bytes = 1.514 GB`.
+`batched_generate` runs NEITHER: it sets `prefill_chunk_size = 0` and drives its own loop, one
+`forward` per chunk (`vaayu_base.py:5573-5590`), so lm_head runs on EVERY chunk — the per-chunk
+loop — and chunk-major retention never allocates, because `_chunk_major_gpu` is only created
+when `_chunk_major_n > 1` (`moe_patch.py:1787`) and only `_chunked_prefill` sets that.
+`batched_generate`'s own comment at `:5569` says the layer-major trick "cannot compose with a
+batch".
+
+**The mispricing runs BOTH ways** (sdpa, N=2, GiB; clamp = Qwen 5.60 quoted from its refusal
+message, MiniMax 6.17 RECONSTRUCTED as reserve 3.5 + giveback 2.674 — near-boundary verdicts
+move if the real sdpa reserve differs):
+
+| model | ctx | charged | correct | delta | clamp | today -> corrected |
+|---|---|---|---|---|---|---|
+| Qwen3-235B | 4214 | 7.073 | **5.208** | -26.4 % | 5.60 | refuse -> **ADMIT** |
+| MiniMax-M2.7 | 4214 | 6.524 | **5.174** | -20.7 % | 6.17 | refuse -> **ADMIT** |
+| MiniMax-M2.7 | 4662 | 6.684 | **7.367** | **+10.2 %** | 6.17 | refuse -> refuse |
+| MiniMax-M2.7 | 7764 | 8.262 | **8.900** | **+7.7 %** | 6.17 | refuse -> refuse |
+
+Just past a KV doubling the layer-major form pairs the LARGEST score buffer with the DOUBLED
+final capacity — a pair the loop never holds at once — and over-charges 21-26 %. That is T10's
+~4.15k band, and it is a large part of why batching is admitted about once per process.
+Mid-bucket the loop's own full-chunk logits beat the layer-major trailing chunk and gate 2
+**under**-charges by up to **1.02 GiB**: it can admit a batch whose real peak it never priced.
+**That half is a safety fix, live for anyone who sets `MAX_BATCH_SIZE > 1`.**
+
+**FIXED 2026-09-09.** `_assert_context_fits` takes `batched_prefill: bool = False`; when set it
+replaces the shape's `layer_major_prefill` with `False` and `resident_expert_bytes` with `0`.
+`batched_generate` passes it. Default keeps every single-stream caller byte-identical (pinned by
+test). Suite **1875 -> 1882**; `tests/test_batch_admission_prefill_form.py` (+7, both geometries,
+both directions of the mispricing). Eight test doubles that stub the method's signature were
+updated to match.
+
+**Gate 1 does NOT become the stricter filter:** `plan_batch` prices KV only (`batch_kv_cost`),
+1.51 GiB for Qwen N=2 @4214 against 9.08 GiB free.
+
+## ON-DEVICE A/B — RAN 2026-09-09, and it outgrew this row
+
+`plans/probes/p21_admit.py`, one arm per `systemd-run --user --scope -p MemoryMax=29G
+-p MemorySwapMax=0`, **`BALLAST_GB=27` held fixed**, sdpa, `prefill_chunk_size=512`,
+`enable_prefix_cache=False`, PROMPT_TOK=4150 + NTOK=64 charged in rectangular KV, DECODE_TOK=32
+consumed, greedy, prompt construction copied verbatim from `p10_admit.py`. Serial = `generate()`
+once per request, which is what the server does today. **Both interleave directions.**
+
+| model | forward | order | serial | batched N=2 | batched vs serial |
+|---|---|---|---|---|---|
+| Qwen3-235B | fused EXL3 | sb | 124.64 s | 293.73 s | **0.42x — 2.36x SLOWER** |
+| Qwen3-235B | fused EXL3 | bs | 130.21 s | 266.15 s | **0.49x — 2.04x SLOWER** |
+| MiniMax-M2.7 | module-list | bs | 420.11 s | **265.56 s** | **1.58x FASTER** |
+| MiniMax-M2.7 | module-list | sb | 454.18 s | refused (warm) | — |
+
+64 tokens aggregate every arm. Peak allocated: Qwen 12.167 / 13.200 GB, MiniMax 11.818 /
+14.572 GB. **No arm OOM'd — the over-charge was real slack in VRAM terms.** **Both Qwen orders
+agree and both are CONSERVATIVE FOR BATCHING** (in `sb` the batched arm ran second on a warmed
+cache and still lost 2.36x); MiniMax's 1.58x is conservative the same way, cold-vs-cold is 1.71x.
+
+**The gate flip was confirmed to the byte:** Qwen's predicted N=2 need of **5.208 GiB** is exactly
+what the shipped gate returned on device, against a reserve of **5.604 GiB** (the row's quoted
+5.60), giveback **0.000**. Layer-major RAISE -> batched-form PASS.
+
+**Row 21's stated MiniMax half reproduced exactly and stayed dead:** serial-first, the batch was
+refused with *"Context of 4233 tokens does not fit in 2.44 GiB of free VRAM"* — the `usable` term,
+warm, after the expert cache had allocated.
+
+**Mechanism, from the run's own telemetry, not reasoned.** Two costs land on the FUSED forward and
+not on the module-list one: (1) the batched prefill loses chunk-major expert retention, so the
+expert set is re-read per chunk (9 chunks here) instead of once per layer per prefill — the very
+property that makes its VRAM peak lower is what costs the TIME; (2) P6's union sizing cuts Qwen's
+cacheable prefix **39 -> 19 of 94** against MiniMax's **62 -> 47 of 62**. A third effect is the fix
+paying for itself: the corrected need lowers what admission SPENDS, so MiniMax surrendered
+**0.41 GB instead of ~1.89 GB** of expert-cache budget — ~1.5 GB more cache for the batch.
+**NOT isolated by an A/B: the 1.58x is batched-vs-serial, not fixed-vs-unfixed. Never quote it as
+the fix's own win.**
+
+**A prediction this row got WRONG, recorded because it changed a verdict.** MiniMax was predicted
+to flip refuse -> ADMIT at 4214 using a **reconstructed** clamp of 6.17 GiB (reserve 3.5 +
+giveback 2.674). The real load reports **reserve 4.793 + giveback 2.520 = 7.313 GiB**, so MiniMax
+**already admitted N=2 cold under BOTH forms**. **Never reconstruct a reserve from a floor — read
+it off the load.** Qwen's 5.60, which WAS quoted from its own refusal message, came back at 5.604
+and every Qwen prediction held.
+
+**§8, all four:** (1) **No knob** — `batched_prefill` is a property of the forward the caller runs,
+not a tunable. (2) Plumbed — `batched_generate` is the only caller of that forward and passes it.
+(3) **NOT reachable: `MAX_BATCH_SIZE = 1`, so the change is BANKED.** (4) Unblocked by
+`MAX_BATCH_SIZE > 1`, which row 15 declined on performance grounds — and this A/B is new evidence
+**for** that decision on the fused forward, not against it.
+
+Full detail: [`docs/2026-09-09-row21-batched-prefill-form-RESULTS.md`](docs/2026-09-09-row21-batched-prefill-form-RESULTS.md).
+
+---
+
+# 22 · [ ] Batching is a per-FORWARD decision and nothing in the engine knows that
+
+**Opened 2026-09-09 by row 21's A/B. Carries its own numbers because `docs/` does not survive a
+clone.** At one agentic context (4150 + 64 tokens, sdpa, N=2, `BALLAST_GB=27`), batching measured
+**1.58x FASTER on the module-list forward (MiniMax-M2.7) and 2.04-2.36x SLOWER on the fused-EXL3
+one (Qwen3-235B)** — same box, same day, both interleave directions, no OOM. The scheduler forms a
+batch on queue depth and prices it on VRAM; **neither gate can express "this forward loses 2x when
+batched"**, and gate 2's old over-charge was refusing Qwen's losing batch only by accident.
+
+A formation rule keyed on `block_info.expert_style` (CLAUDE.md §0's dispatch table) is the obvious
+shape. **NOT built** — new scope, and one context is not a sweep: the 2x is driven by losing
+chunk-major expert retention across 9 prefill chunks, so it should shrink as the context shortens
+and there is some length below which the fused forward batches profitably. **Find that length
+before writing a rule.**
+
+**Do NOT "fix" Qwen's regression by restoring the over-charge.** Refusing a losing batch because the
+predictor is wrong is correct by accident — the exact failure mode this ledger exists to end.
+
+**Worth zero to users today** (`MAX_BATCH_SIZE = 1`), like everything else on the batching path.
+Weigh it accordingly (§8): this is a formation-POLICY correctness item, not a tok/s row.
 
 ---
 
