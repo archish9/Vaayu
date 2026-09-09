@@ -651,11 +651,36 @@ def test_the_app_builds_a_scheduler_with_the_configured_width(monkeypatch):
     real_init = BatchScheduler.__init__
 
     def spy(self, engine, queue_depth=8, max_batch_size=1,
-            prefill_chunk_size=512):
+            prefill_chunk_size=512, batch_wait_s=0.05):
         seen["max_batch_size"] = max_batch_size
         seen["queue_depth"] = queue_depth
-        real_init(self, engine, queue_depth, max_batch_size, prefill_chunk_size)
+        # The window is what makes the width reachable at all -- a scheduler
+        # built with the right max_batch_size and no window never batches two
+        # concurrent clients (see test_an_arrival_during_the_window_joins_the
+        # _batch), so it is decoration in exactly the sense section 8 means.
+        seen["batch_wait_s"] = batch_wait_s
+        real_init(self, engine, queue_depth, max_batch_size,
+                  prefill_chunk_size, batch_wait_s)
 
     monkeypatch.setattr(BatchScheduler, "__init__", spy)
-    _app = _make_app(max_batch_size=3, queue_depth=5)
-    assert seen == {"max_batch_size": 3, "queue_depth": 5}
+    _app = _make_app(max_batch_size=3, queue_depth=5, batch_wait_ms=120)
+    assert seen == {"max_batch_size": 3, "queue_depth": 5, "batch_wait_s": 0.12}
+
+
+def test_health_reports_the_batch_formation_counters():
+    """P10 T10's instrument. `batches_run` alone conflates "gate 1 narrowed the
+    batch before batched_generate saw it" with "gate 2 refused at the real
+    width and fell back to serial" -- and gate 1's refusal prints NOTHING, so
+    without this the on-device A/B can see that no batch formed and not say
+    which gate said no."""
+    app = _client(FakeEngine())
+    sched = app.app.state.scheduler
+    sched.max_batch_size = 2
+    sched.batches_run = 3
+    sched.gate1_refused = 5
+    sched.gate2_refused = 1
+
+    batch = app.get("/health").json()["batch"]
+    assert batch == {"max_batch_size": 2, "batching_enabled": sched.batching_enabled,
+                     "batches_run": 3, "gate1_refused": 5, "gate2_refused": 1,
+                     "formation_attempts": 0}

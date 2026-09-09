@@ -64,7 +64,7 @@ server per model and route in front of them if you need several.
 |---|---|---|
 | `POST` | `/v1/chat/completions` | generation, streaming and non-streaming |
 | `GET` | `/v1/models` | the one loaded model and its **derived** `max_seq_len` |
-| `GET` | `/health` | readiness, VRAM, queue depth, **prefix-cache stats** |
+| `GET` | `/health` | readiness, VRAM, queue depth, **prefix-cache stats**, **batch formation** |
 
 `/health` is not decoration. It is the only way to see whether prefix reuse is
 working from outside the process, and prefix reuse is the difference between ~1 s
@@ -78,10 +78,29 @@ and ~98 s time-to-first-token:
   "queue_depth": 8,
   "queued": 0,
   "prefix_cache": "1hit/1miss/0evict hit_rate=50% saved=52/104 tok (50%)",
+  "batch": {
+    "max_batch_size": 1,
+    "batching_enabled": false,
+    "batches_run": 0,
+    "gate1_refused": 0,
+    "gate2_refused": 0,
+    "formation_attempts": 0
+  },
   "vram_free_gib": 14.07,
   "vram_total_gib": 15.47
 }
 ```
+
+The `batch` block answers "is `MAX_BATCH_SIZE` doing anything?" — the one
+question a batching knob cannot answer from throughput alone. `batching_enabled`
+is false whenever the model did not load on `sdpa`, whatever `MAX_BATCH_SIZE`
+says. `formation_attempts` counts the times two or more requests were in flight
+together at all; if it stays 0, the server never had the offered load to batch,
+which is a different problem from being refused. When it does climb and
+`batches_run` does not, the two refusal counters say which gate said no: gate 1
+is the scheduler's own VRAM pre-check narrowing the batch before the engine sees
+it (it prints nothing, so this counter is the only way to see it), gate 2 is
+`batched_generate` refusing at the real width and falling back to serial.
 
 ---
 
@@ -277,6 +296,7 @@ holds one model for its whole life and should fill the box.
 | `KV_CACHE_MODE` | `"auto"` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
 | `ATTN_IMPLEMENTATION` | `None` | **prefers `flash_attention_2`** when `flash_attn` imports, then `sdpa`, then `eager` — it does **not** mean sdpa. Every shipped `max_seq_len` figure was verified on **sdpa**; `"flash_attention_2"` derives a larger context at the same reserve, and costs **−2.3 % MiniMax / −4.1 % Qwen** end-to-end against sdpa. `MAX_BATCH_SIZE` below is **inert** unless this resolves to `sdpa` |
 | `MAX_BATCH_SIZE` | `1` | requests served together as one batch. A **ceiling, never a target** — max width is model- and context-dependent and is **not 3**. Measured 2026-09-08 at ~4.15k-token prompts, **engine-level (`batched_generate` called directly, not through the server) and with the prefix cache OFF** — no server-level A/B has been run, and the server defaults `ENABLE_PREFIX_CACHE = True`: `2` is **+1.606×** on MiniMax-M2.7 (TTFT 317.2 → 223.3 s, peak VRAM *lower* batched); `3` OOMs MiniMax and is **slower** than 2 on Qwen3-235B. Qwen admits N=1 only today, so this buys it nothing. **Inert unless `ATTN_IMPLEMENTATION` resolves to `sdpa`** |
+| `BATCH_WAIT_MS` | `50` | milliseconds a forming batch waits for company before running what it has. **Without it `MAX_BATCH_SIZE` never batches two concurrent clients at all** — a request wakes the dispatcher the instant it is queued, so the first of two simultaneous clients runs alone while the second is still being tokenized (measured on Llama-3.2-1B through the real server: 2 clients, warm, `batch=None` on both requests, 3 runs of 3). It also un-sticks two **steady** clients, which otherwise alternate one-at-a-time forever and never meet in the queue. Cost of getting it wrong is one-sided and bounded: a lone request at an idle server is delayed by this much, once — 0.02 % of MiniMax-M2.7's ~220 s TTFT at 4.15k tokens, ~4 % of a Llama-3.2-1B request. A batch that fills stops waiting immediately. `0` restores the pre-2026-09-09 behaviour. **Inert at `MAX_BATCH_SIZE = 1`.** Does **not** help a client whose turnaround exceeds the window — joining a *running* batch is continuous batching, which Vaayu does not do |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5 |
 | `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart |
 
@@ -538,6 +558,17 @@ default (`1`), they will still **serialise** — accept that, or cap your own
 concurrency to 1 and save the round trips. With `MAX_BATCH_SIZE >= 2` on an
 `sdpa` load, up to that many will run together instead. Handle `503` with a
 retry — do not fail the tool call.
+
+**Requests batch only if they are waiting at the same moment**, and that window
+is `BATCH_WAIT_MS` wide (default 50 ms). Two consequences for a client:
+
+* Fan out in a **burst**. Requests issued together land together. Issuing them
+  one-per-completed-tool-call spreads them past the window and each one runs
+  alone, even at `MAX_BATCH_SIZE = 4`.
+* A request already **running** cannot be joined. There is no continuous
+  batching here: a batch is fixed at formation and runs to the end. So a
+  long-running request does not "absorb" a later arrival — that arrival waits
+  for the next formation.
 
 ### 6.4 Context is the binding constraint, not speed
 

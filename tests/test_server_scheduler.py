@@ -693,3 +693,145 @@ def test_gate_one_never_narrows_a_batch_gate_two_would_admit(monkeypatch):
     assert len(admitted) == 2, (
         "gate 1 narrowed a batch gate 2 would admit")
     assert sched.gate1_refused == 0
+
+
+# ── formation timing: the coalescing window ─────────────────────────────────
+#
+# Found 2026-09-09 by T10's dense smoke, and it is why every test above passes
+# while the SERVER never batched: those tests submit both jobs before the
+# dispatcher's first loop iteration, so the interleaving a real HTTP server
+# produces is exactly what they do not exercise. `submit()` sets `_arrived` on
+# the FIRST job, and without a window `_form` then runs it alone -- so two
+# clients posting simultaneously serialize, and two steady clients anti-phase
+# lock (A waits while B runs, B finishes, A runs alone, B re-posts during A's
+# run, forever). Measured on Llama-3.2-1B through the real server: 2 clients,
+# turn 2, batch=None on 3 of 3 runs.
+
+def _interleaved_scheduler(monkeypatch, **kw):
+    model = RecordingModel()
+    engine = EngineHandle(model)
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        yield ("delta", "x")
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    return model, BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                                 prefill_chunk_size=4, **kw)
+
+
+def test_an_arrival_during_the_window_joins_the_batch(monkeypatch):
+    """The wake-up race. The dispatcher is already parked on `_arrived` when
+    the first job lands, so without a window it forms a batch of one before
+    the second client's request is even parsed."""
+    model, sched = _interleaved_scheduler(monkeypatch, batch_wait_s=0.5)
+
+    async def go():
+        await sched.start()
+        a = _job("s0", prompt_ids=[1, 2, 3] + [10] * 20)
+        await sched.submit(a)
+        await asyncio.sleep(0.02)        # let the dispatcher actually wake
+        b = _job("s1", prompt_ids=[1, 2, 3] + [99] * 20)
+        await sched.submit(b)
+        out = [await _drain(a), await _drain(b)]
+        await sched.stop()
+        return out
+
+    out = asyncio.run(go())
+    assert model.widths == [2], "the second arrival must join, not serialize"
+    assert all(any(k == "delta" for k, _p in o) for o in out)
+
+
+def test_a_lone_request_is_released_when_the_window_expires(monkeypatch):
+    """The window is a CEILING on added latency, not a wait for a partner that
+    never comes: one client at an idle server still runs."""
+    model, sched = _interleaved_scheduler(monkeypatch, batch_wait_s=0.05)
+
+    async def go():
+        await sched.start()
+        a = _job("s0")
+        t0 = asyncio.get_running_loop().time()
+        await sched.submit(a)
+        await _drain(a)
+        elapsed = asyncio.get_running_loop().time() - t0
+        await sched.stop()
+        return elapsed
+
+    elapsed = asyncio.run(go())
+    assert model.widths == []
+    assert 0.05 <= elapsed < 1.0, f"released after the window, not before: {elapsed}"
+
+
+def test_a_full_batch_does_not_wait_out_the_window(monkeypatch):
+    """Reaching max_batch_size ends the wait immediately -- the window costs
+    nothing when the load is already there."""
+    model, sched = _interleaved_scheduler(monkeypatch, batch_wait_s=5.0)
+
+    async def go():
+        await sched.start()
+        jobs = [_job("s0", prompt_ids=[1, 2, 3] + [10] * 20),
+                _job("s1", prompt_ids=[1, 2, 3] + [99] * 20)]
+        t0 = asyncio.get_running_loop().time()
+        for j in jobs:
+            await sched.submit(j)
+        for j in jobs:
+            await _drain(j)
+        elapsed = asyncio.get_running_loop().time() - t0
+        await sched.stop()
+        return elapsed
+
+    elapsed = asyncio.run(go())
+    assert model.widths == [2]
+    assert elapsed < 4.0, f"a full batch waited out the window: {elapsed}"
+
+
+def test_the_window_is_off_when_batching_is(monkeypatch):
+    """MAX_BATCH_SIZE=1 is today's behaviour EXACTLY -- including its latency.
+    A server that cannot batch must not pay a coalescing delay."""
+    model = RecordingModel()
+    engine = EngineHandle(model)
+
+    async def fake_stream(req, cancel=None, prepared=None):
+        yield ("delta", "x")
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=1,
+                           prefill_chunk_size=512, batch_wait_s=5.0)
+
+    async def go():
+        await sched.start()
+        a = _job("s0")
+        t0 = asyncio.get_running_loop().time()
+        await sched.submit(a)
+        await _drain(a)
+        elapsed = asyncio.get_running_loop().time() - t0
+        await sched.stop()
+        return elapsed
+
+    elapsed = asyncio.run(go())
+    assert elapsed < 1.0, f"MAX_BATCH_SIZE=1 waited: {elapsed}"
+
+
+def test_a_re_submitting_client_rejoins_instead_of_anti_phase_locking(monkeypatch):
+    """The anti-phase lock, which is separate from the wake-up race: two steady
+    clients alternate one-waiting-at-a-time forever, so neither ever meets the
+    other in `_waiting`. The window closes it whenever the partner's turnaround
+    is shorter than the window -- and does not pretend to close it when the
+    partner takes seconds to come back (that needs continuous batching)."""
+    model, sched = _interleaved_scheduler(monkeypatch, batch_wait_s=0.5)
+
+    async def client(session, start_delay):
+        await asyncio.sleep(start_delay)
+        for _turn in range(2):
+            j = _job(session, prompt_ids=[1, 2, 3] + [ord(session[-1])] * 20)
+            await sched.submit(j)
+            await _drain(j)
+
+    async def go():
+        await sched.start()
+        # Staggered starts put the two clients out of phase on purpose: this
+        # is the shape that produced batch=None forever on the real server.
+        await asyncio.gather(client("s0", 0.0), client("s1", 0.03))
+        await sched.stop()
+
+    asyncio.run(go())
+    assert 2 in model.widths, f"never re-formed a batch: widths={model.widths}"

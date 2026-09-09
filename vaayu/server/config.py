@@ -121,6 +121,29 @@ PREFILL_CHUNK_SIZE = 512
 # than failing a request.
 MAX_BATCH_SIZE = 1
 
+# Milliseconds a forming batch waits for company before running what it has.
+# INERT at MAX_BATCH_SIZE = 1 (nothing to form) and on a non-sdpa load.
+#
+# Without it the server never batches two concurrent clients AT ALL, whatever
+# MAX_BATCH_SIZE says: a request wakes the dispatcher the instant it is queued,
+# so the first of two simultaneous clients runs alone while the second is still
+# being tokenized in its own route -- measured on Llama-3.2-1B, 2 clients, warm
+# server, batch=None on both requests in 3 runs of 3. It also un-sticks two
+# STEADY clients, which otherwise alternate one-at-a-time forever and never
+# meet in the queue.
+#
+# The cost of getting it wrong is bounded and one-sided: a lone request at an
+# idle server is delayed by this much, once (0.02 % of MiniMax-M2.7's ~220 s
+# time-to-first-token at a 4.15k-token prompt, ~4 % of a Llama-3.2-1B request).
+# A batch that fills stops waiting immediately, so a genuinely concurrent load
+# pays nothing. 0 restores the pre-2026-09-09 behaviour.
+#
+# It does NOT help a client whose turnaround is longer than the window -- an
+# agent that runs a tool between turns comes back seconds later, and admitting
+# a latecomer into a RUNNING batch is continuous batching, which Vaayu does not
+# do.
+BATCH_WAIT_MS = 50
+
 # Pack pooled KV at N bits (9 is the tested floor) so the same RAM budget holds
 # ~2x the sessions. Reuse collapses to ZERO, not proportionally, once the pool
 # is over capacity -- so this matters when serving several agent sessions.

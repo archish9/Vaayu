@@ -20,6 +20,7 @@ def main() -> int:
     cfg = ServerConfig(
         model_path=config.MODEL_PATH, device=config.DEVICE,
         queue_depth=config.QUEUE_DEPTH, max_batch_size=config.MAX_BATCH_SIZE,
+        batch_wait_ms=config.BATCH_WAIT_MS,
         host=config.HOST, port=config.PORT,
         kv_cache_mode=config.KV_CACHE_MODE,
         drafter_model_path=config.DRAFTER_MODEL_PATH,

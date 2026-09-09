@@ -153,3 +153,17 @@ def test_a_gitignored_local_override_can_shadow_any_value():
     assert "config_local" in src, (
         "config.py must import config_local last so machine-specific values "
         "(MODEL_PATH) stay out of git")
+
+
+def test_batch_wait_ms_reaches_the_server_config(monkeypatch, launched):
+    """The window is what makes MAX_BATCH_SIZE reachable: at 0 the dispatcher
+    forms the instant the first request is queued, so two simultaneous clients
+    never batch (measured through the real server, 3 runs of 3). A knob
+    __main__.py does not forward is decoration -- CLAUDE.md section 8."""
+    monkeypatch.setattr(config, "MODEL_PATH", "/ckpt")
+    monkeypatch.setattr(config, "BATCH_WAIT_MS", 120)
+
+    from vaayu.server.__main__ import main
+    assert main() == 0
+
+    assert launched["cfg"].batch_wait_ms == 120

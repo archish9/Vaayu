@@ -67,11 +67,15 @@ class BatchScheduler:
     NEVER_ADMITTED_AFTER = 20
 
     def __init__(self, engine, queue_depth: int = 8, max_batch_size: int = 1,
-                 prefill_chunk_size: int = 512):
+                 prefill_chunk_size: int = 512, batch_wait_s: float = 0.05):
         self.engine = engine
         self.queue_depth = queue_depth
         self.max_batch_size = max_batch_size
         self.prefill_chunk_size = prefill_chunk_size
+        # How long a formation waits for company before running what it has.
+        # Zero restores the pre-2026-09-09 behaviour, which never batched two
+        # concurrent clients at all -- see `_coalesce`.
+        self.batch_wait_s = batch_wait_s
         self._waiting: list = []
         # The batch currently running, if any -- tracked separately from
         # `_waiting` because `_dispatch_loop` removes members from `_waiting`
@@ -234,6 +238,7 @@ class BatchScheduler:
                     await self._arrived.wait()
                     self._arrived.clear()
                     continue
+                await self._coalesce()
                 members = await self._form()
                 for j in members:
                     self._waiting.remove(j)
@@ -295,6 +300,54 @@ class BatchScheduler:
                 await j.out.put(("error", RuntimeError(
                     "the dispatcher stopped before this request could run")))
                 await j.out.put(None)
+
+    async def _coalesce(self) -> None:
+        """Wait, briefly and boundedly, for company before forming a batch.
+
+        WITHOUT this the server never batches two concurrent clients, which is
+        the whole feature. `submit()` sets `_arrived` on the FIRST job, so the
+        dispatcher -- parked on that event -- wakes and forms while the second
+        client's request is still being rendered and tokenized in its own route.
+        Measured through the real server on Llama-3.2-1B, 2 clients, warm:
+        `batch=None` on both requests, 3 runs of 3. It is not a race that
+        sometimes goes the other way; the wake-up ordering is deterministic.
+        The unit tests above missed it because they submit every job before the
+        dispatcher's first iteration, which is not a shape HTTP can produce.
+
+        It also closes the ANTI-PHASE LOCK, which is a different failure with
+        the same cure: two steady clients alternate one-waiting-at-a-time (A
+        waits while B runs, B finishes, A runs alone, B re-posts during A's
+        run) so neither ever meets the other in `_waiting`. Whenever the
+        partner's turnaround is shorter than this window they meet again. When
+        it is longer -- a real agent that thinks or runs a tool for seconds --
+        nothing here helps and nothing here pretends to: admitting a latecomer
+        into a RUNNING batch is continuous batching, which this engine does not
+        do.
+
+        The wait is a CEILING, not a fixed delay. It ends the moment the batch
+        is full, so an already-concurrent load pays nothing; a genuinely lone
+        request at an idle server pays the whole window once, which is why the
+        knob exists and why it is inert at MAX_BATCH_SIZE = 1.
+        """
+        if (self.batch_wait_s <= 0 or self.max_batch_size < 2
+                or not self.batching_enabled):
+            return
+        if len(self._waiting) >= self.max_batch_size:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.batch_wait_s
+        while not self._stopping and len(self._waiting) < self.max_batch_size:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            # Cleared before the wait, not after: an arrival that lands between
+            # the check and the wait must still wake it. The dispatch loop
+            # clears the same event for the same reason.
+            self._arrived.clear()
+            try:
+                await asyncio.wait_for(self._arrived.wait(), remaining)
+            except asyncio.TimeoutError:
+                return
 
     async def _form(self) -> list:
         """Which waiting jobs run together. The head is always a member, so

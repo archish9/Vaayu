@@ -2183,6 +2183,56 @@ row to `[x]` or `[bug]`/`[!]` with the verdict.
   dispatcher is live. Restart is unsupported: `_stopping` never resets, and `start()`
   deliberately does not resurrect a dead dispatcher.
 
+### FORMATION TIMING — found by T10's dense smoke 2026-09-09, FIXED the same day
+
+**The server never batched two concurrent clients, whatever `MAX_BATCH_SIZE` said,
+and no gate was involved.** This is the second prerequisite T10's measurement found
+before it could measure anything (the first was `_assert_context_fits`, P10a). Found
+on Llama-3.2-1B through the real HTTP server, `MAX_BATCH_SIZE=2`, 2 clients, 2 turns
+each: turn 1 batched `n=2`, turn 2 was `batch=None` on both requests, **3 runs of 3 —
+deterministic, not a race.** `batches_run` 1, `formation_attempts` 1, both refusal
+counters 0: `_form` was never even offered a second job.
+
+**Mechanism, two separate failures with one cure:**
+* **The wake-up race.** `submit()` sets `_arrived` on the FIRST job and `_form` takes
+  whatever is in `_waiting` at that instant. The dispatcher, parked on that event,
+  wakes and forms a batch of one while the second client's request is still being
+  rendered and tokenized in its own route. Turn 1 batched ONLY because
+  `scheduler.start()` is lazy (`app.py`'s route calls it on the first request), so the
+  dispatcher task did not exist yet and both jobs were waiting by its first loop.
+  On a warm server the steady rule was: **one request is always consumed alone.** At
+  N=2 that leaves exactly one job for the next formation, so nothing ever batched
+  again; at N=3 and N=4 the first job ran alone and the REST batched (measured:
+  widths 3→1,2 and 4→1,3).
+* **The anti-phase lock.** Two steady clients alternate one-waiting-at-a-time — A
+  waits while B runs, B finishes, A runs alone, B re-posts during A's run — so neither
+  ever meets the other in `_waiting`.
+
+**Why the unit tests missed it, and this is the reusable lesson:** every scheduler
+test submits both jobs before the dispatcher's first iteration, which is not a shape
+HTTP can produce. `test_two_divergent_cold_requests_form_a_batch` passed throughout.
+
+**FIX (2026-09-09): one bounded coalescing window, `BatchScheduler._coalesce`,
+awaited before every `_form`.** It waits up to `batch_wait_s` for company and returns
+the moment the batch is full, so a concurrent load pays nothing and a lone request at
+an idle server pays the window once. Knob `BATCH_WAIT_MS` (default **50**), plumbed
+`config.py` → `__main__.py` → `ServerConfig` → `BatchScheduler`, documented in
+`vaayu/server/README.md` and `documentation/server.md` §3 and §6.3. **Inert at
+`MAX_BATCH_SIZE = 1`** (the default), so no existing deployment changes.
+**Verified on the real server: 3 runs of 3, BOTH turns batch `n=2`** (was 0 of 3).
+Suite **1845 passed, 12 skipped** (1838 + 7 new: 5 scheduler window, 1 `/health`
+counters, 1 knob-forwarding).
+**Cost stated, one-sided:** +`BATCH_WAIT_MS` on a lone request at an idle server —
+0.02 % of MiniMax-M2.7's ~220 s TTFT at 4.15k tokens, ~4 % of a Llama-3.2-1B request.
+**What it does NOT fix:** a client whose turnaround exceeds the window (a real agent
+running a tool for seconds). Joining a RUNNING batch is continuous batching, which
+this engine does not do — recorded, not attempted.
+
+**Also added for T10, and useful beyond it: `/health` now carries a `batch` block**
+(`max_batch_size`, `batching_enabled`, `batches_run`, `gate1_refused`,
+`gate2_refused`, `formation_attempts`). Gate 1 refuses SILENTLY, so without this an
+operator — or the A/B — can see that nothing batched and be unable to say why.
+
 ### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
 
 * **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO
@@ -2442,7 +2492,7 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
   formed a batch", and telling that apart from "formed and did not help" is what decides
   whether the row is refuted or merely unreachable. Building it here puts it in the
   server permanently instead of in a throwaway probe.
-- [ ] T10 Server-level on-device A/B + RESULTS + close the row. **The only thing that
+- [~] T10 Server-level on-device A/B + RESULTS + close the row. **STARTED 2026-09-09.** **The only thing that
   can discharge this row** — an engine probe number does NOT. Full spec in the handoff
   block at the top of this row.
 

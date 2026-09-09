@@ -46,6 +46,11 @@ class ServerConfig:
     # is pure waste.
     max_pinned_layers: int = -1
     prefill_chunk_size: int = 512
+    # Milliseconds a forming batch waits for company. Without it the dispatcher
+    # forms the instant the first job is queued, so two simultaneous clients
+    # never batch -- the second is still being tokenized. Inert at
+    # max_batch_size 1. See config.py's BATCH_WAIT_MS for the measured cost.
+    batch_wait_ms: int = 50
     # "auto" (the shipped default): ON for dense, OFF for MoE, resolved at load
     # by `resolve_use_prompt_lookup` where `is_moe` is known. True/False opt a
     # specific model in or out and always win.
@@ -397,7 +402,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                             else app.state.engine.queue_depth),
                 max_batch_size=(config.max_batch_size if config is not None else 1),
                 prefill_chunk_size=(config.prefill_chunk_size if config is not None
-                                    else 512))
+                                    else 512),
+                batch_wait_s=(config.batch_wait_ms if config is not None
+                              else 50) / 1000.0)
             await app.state.scheduler.start()
             if run_dir is not None:
                 # AFTER the load: env.json's whole value is that its numbers are
@@ -479,11 +486,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                         else engine.queue_depth),
             max_batch_size=(config.max_batch_size if config is not None else 1),
             prefill_chunk_size=(config.prefill_chunk_size if config is not None
-                                else 512))
+                                else 512),
+            batch_wait_s=(config.batch_wait_ms if config is not None
+                          else 50) / 1000.0)
 
     @app.get("/health")
     async def health():
         e = app.state.engine
+        s = app.state.scheduler
         body = {
             "status": "ready",
             "model": _served_name(app),
@@ -493,6 +503,20 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # dispatcher now (P10), so e.depth/_inflight never moves.
             "queued": app.state.scheduler.depth,
             "prefix_cache": e.prefix_stats(),
+            # Batch formation, split by WHICH gate refused. Gate 1 (the
+            # scheduler's own plan_batch pre-check) narrows a would-be batch to
+            # one silently -- it prints nothing -- so without these an operator,
+            # or P10's on-device A/B, can see that no batch ever formed and not
+            # say why. `formation_attempts` separates "never had two requests
+            # in flight to try" from "tried and was refused".
+            "batch": {
+                "max_batch_size": s.max_batch_size,
+                "batching_enabled": s.batching_enabled,
+                "batches_run": s.batches_run,
+                "gate1_refused": s.gate1_refused,
+                "gate2_refused": s.gate2_refused,
+                "formation_attempts": s._formation_attempts,
+            },
         }
         try:
             import torch
