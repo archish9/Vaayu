@@ -880,7 +880,12 @@ class EngineHandle:
                 top_p=kwargs.get("top_p", 1.0),
                 # Empty on purpose: EOS is unioned inside batched_generate, and
                 # the client's stops are STRINGS, matched by _BatchStream.
-                stop_ids=()))
+                stop_ids=(),
+                # So the batch's store-back writes this session's own context
+                # back to the prefix pool. Without it a batched turn left every
+                # member to re-prefill its whole context next turn -- measured
+                # 4.46x end-to-end against MAX_BATCH_SIZE=1 on MiniMax-M2.7.
+                session_id=j.session_key))
             self._log(j.req, "REQ", prompt=len(j.prompt_ids), cap=j.cap,
                       stream=True, batch=n)
 

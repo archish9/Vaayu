@@ -5305,8 +5305,8 @@ class VaayuBaseModel(GenerationMixin):
         batch that one client has gone, and a disconnect at cap=8000 holds
         every other stream for 8000 steps."""
         from .batch import (sample_step, batch_position_ids, batch_common_prefix,
-                            broadcast_cache_rows, slice_cache_row,
-                            prefix_store_row, resolve_matched_len,
+                            broadcast_cache_rows, slice_cache_row_unpadded,
+                            resolve_matched_len,
                             batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES,
                             expert_giveback_bytes)
         assert self._active_attn_impl == "sdpa", (
@@ -5432,6 +5432,10 @@ class VaayuBaseModel(GenerationMixin):
         stop_sets = [set(r.stop_ids) | eos_set for r in requests]
         active = [True] * N
         produced = [0] * N
+        # The ids too, not just the count: the store-back writes one pool entry
+        # PER SESSION now, and an entry's token_ids must be what that session
+        # will resend next turn -- its prompt plus the answer it got.
+        produced_ids: list[list[int]] = [[] for _ in range(N)]
 
         # P6: re-size the VRAM cacheable prefix for THIS batch width. The
         # load-time call (:2578) runs before any batch exists and charges one
@@ -5543,6 +5547,7 @@ class VaayuBaseModel(GenerationMixin):
                 tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
                 next_tokens[i, 0] = tok
                 yield (i, tok)
+                produced_ids[i].append(int(tok))
                 produced[i] = 1
                 if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                     active[i] = False
@@ -5568,6 +5573,7 @@ class VaayuBaseModel(GenerationMixin):
                     tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
                     next_tokens[i, 0] = tok
                     yield (i, tok)
+                    produced_ids[i].append(int(tok))
                     produced[i] += 1
                     if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                         active[i] = False
@@ -5580,13 +5586,30 @@ class VaayuBaseModel(GenerationMixin):
             # post-loop store-back and permanently deletes the pool's best
             # entry. `past is not None` guards the case where teardown hits
             # before the prefill forward() call returns (nothing to store yet).
-            if past is not None and pc is not None and common_ids:
-                # Exactly ONE entry per batch regardless of N: writing N would
-                # be the K=7-against-a-5-slot-pool configuration that measured
-                # ZERO hits (capacity is a cliff, not a slope).
-                # Row choice must be the LONGEST prompt, never row 0 -- see
-                # prefix_store_row's docstring for why row 0 would silently
-                # store padding as if it were the shared prefix.
+            if past is not None and pc is not None:
+                # ONE ENTRY PER SESSION, not one per batch. Until 2026-09-09
+                # this wrote a single entry keyed by a hash of the batch's
+                # COMMON prefix, so every member re-prefilled its whole context
+                # on its next turn. Measured through the server on MiniMax-M2.7,
+                # 2 sessions x 2 turns at ~4.17k tokens with the prefix cache on
+                # (the server's default): aggregate 99.52 s at MAX_BATCH_SIZE=1
+                # against 443.78 s at 2 -- 4.46x SLOWER -- even though batching
+                # WON the cold turn 1.60x (288.8 s against 461.2 s). Turn 2's
+                # hits were 51/4223 and 51/4226 where serial got 4164 and 4167.
+                #
+                # The old comment justified one-entry-per-batch with a
+                # K=7-sessions-against-a-5-slot-pool measurement that showed
+                # ZERO hits when writing N. That is a pool SIZING cliff
+                # (PREFIX_SESSIONS) and belongs to the pool, not to the writer:
+                # seven serial sessions hit it identically. Writing per row is
+                # what makes a batched turn and a serial turn leave the SAME
+                # pool state -- the only behaviour a caller can reason about
+                # when MAX_BATCH_SIZE is a ceiling a batch may or may not reach.
+                #
+                # Each row is spliced, not cropped: tails are left-padded, so
+                # the pad block sits BETWEEN the shared prefix and the row's own
+                # tokens (prefix_store_row's docstring has the layout, and why
+                # storing padding as prefix corrupts the next turn's RoPE).
                 #
                 # try/except Exception (never bare/BaseException -- GeneratorExit
                 # must keep propagating): the cleanup below must run unconditionally
@@ -5604,9 +5627,24 @@ class VaayuBaseModel(GenerationMixin):
                 # a full re-prefill. The warning below is the only signal, and it
                 # is worth reading whenever a prefix hit looks too small.
                 try:
-                    one = slice_cache_row(past, prefix_store_row(requests))
-                    one.crop(len(common_ids))
-                    pc.store(_auto_session_id(common_ids), list(common_ids), one)
+                    _have = past.get_seq_length()
+                    for _i, _r in enumerate(requests):
+                        _ids = list(_r.prompt_ids) + produced_ids[_i]
+                        _pad = max_R - len(tails[_i])
+                        # The LAST token yielded has no KV yet -- it is written
+                        # by the next forward, which a finished or abandoned
+                        # generator never makes. Clamp the ids to what the cache
+                        # actually backs, rather than storing an entry that
+                        # claims a position it cannot serve.
+                        _keep = min(len(_ids) - m, _have - m - _pad)
+                        if _keep <= 0:
+                            continue
+                        _ids = _ids[:m + _keep]
+                        _one = slice_cache_row_unpadded(
+                            past, _i, prefix_len=m, pad_len=_pad,
+                            valid_len=m + _keep)
+                        pc.store(_r.session_id or _auto_session_id(_ids),
+                                 _ids, _one)
                 except Exception as e:
                     print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
                           f"({e!r}) -- lookup() already popped this entry, so "

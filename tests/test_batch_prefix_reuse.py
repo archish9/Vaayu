@@ -276,9 +276,18 @@ def test_abandoning_the_generator_still_stores_the_prefix_back():
     gen.close()   # GeneratorExit at the suspended yield
 
     assert model._batch_decode_active is False
-    assert len(pc._pool) == 1              # entry restored, not lost
-    restored = next(iter(pc._pool.values()))
-    assert restored.token_ids == common_ids
+    # Nothing is lost on GeneratorExit -- that is what this test is for. What
+    # comes back changed on 2026-09-09: the store-back writes ONE ENTRY PER ROW
+    # (each session's own context) instead of a single entry keyed by the
+    # batch's common prefix, because the old shape made every member re-prefill
+    # its whole context next turn -- 4.46x end-to-end on MiniMax-M2.7. These
+    # requests name no session, so each lands under its hashed id.
+    assert len(pc._pool) == len(requests)
+    stored = sorted(e.token_ids for e in pc._pool.values())
+    for ids, r in zip(stored, sorted(requests, key=lambda r: r.prompt_ids)):
+        assert ids[:len(common_ids)] == common_ids
+        assert ids == r.prompt_ids[:len(ids)], (
+            "each entry is that ROW's own prompt, not the shared prefix")
 
 
 def test_abandoning_before_the_first_yield_does_not_crash():

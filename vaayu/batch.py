@@ -18,6 +18,12 @@ class BatchRequest:
     temperature: float = 0.0
     top_p: float = 1.0
     stop_ids: tuple[int, ...] = ()
+    # Whose context this is, for the cross-turn prefix pool. None (a library
+    # caller that names no session) falls back to the hashed id the serial path
+    # uses for an unnamed turn. Without it a batched turn cannot store what it
+    # produced under the right key, and every member re-prefills its whole
+    # context next turn -- measured 4.46x end-to-end on MiniMax-M2.7.
+    session_id: str | None = None
 
 
 def kv_bytes_for(seq_len: int, n_layers: int, n_kv_heads: int,
@@ -218,6 +224,40 @@ def slice_cache_row(cache, row: int):
         setattr(out, name,
                 [t[row:row + 1].to("cpu", copy=True) for t in getattr(cache, name)])
     out._seq_len = list(cache._seq_len)
+    return out
+
+
+def slice_cache_row_unpadded(cache, row: int, prefix_len: int, pad_len: int,
+                             valid_len: int):
+    """Batch-1 CPU cache for `row`, with its INTERIOR pad block spliced out.
+
+    `slice_cache_row` above can only be used on a row that carries no padding,
+    which is why the store-back it serves could only ever keep ONE row. Tails
+    are left-padded, so row i's cache is
+
+        [0 : prefix_len)          the shared prefix, identical on every row
+        [prefix_len : +pad_len)   pad KVs -- garbage, and NOT at either end
+        [.. : valid_len)          this row's own tokens, then what it generated
+
+    A crop keeps the pads; only a splice removes them. Storing a row without
+    this makes the next turn decode against shifted keys with silently wrong
+    RoPE positions, which is the trap `prefix_store_row`'s docstring describes.
+
+    `valid_len` is the row's real length (prefix + its own tail + the tokens it
+    produced), so a stream that retired early stops before the dead slots the
+    rectangle kept filling with pad_id.
+    """
+    out = copy.copy(cache)
+    keep_tail = valid_len - prefix_len
+    for name in cache._BUFFER_LISTS:
+        bufs = []
+        for t in getattr(cache, name):
+            one = t[row:row + 1]
+            head = one.narrow(-2, 0, prefix_len)
+            tail = one.narrow(-2, prefix_len + pad_len, keep_tail)
+            bufs.append(torch.cat([head, tail], dim=-2).to("cpu", copy=True))
+        setattr(out, name, bufs)
+    out._seq_len = [min(valid_len, n) for n in cache._seq_len]
     return out
 
 

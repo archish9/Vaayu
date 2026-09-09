@@ -2343,9 +2343,58 @@ counter. **The pool now requires a 4-method protocol from any cache it holds**
 and a cache type that forgets `copy_prefix` fails loudly rather than resurrecting the
 bug.
 
+**MEASURED END-TO-END ON MiniMax-M2.7, same arm config, only this commit between
+them** (`MAX_BATCH_SIZE=1`, prefix ON, sdpa, 2 clients x 2 turns x 64 tok at ~4.17k,
+`BALLAST_GB=27`): c0's turn-2 match **51/4223 -> 4164/4223**, its TTFT **190.0 s ->
+14.65 s (13.0x)**, and the arm's **aggregate wall 275.94 s -> 99.52 s = 2.77x**. Both
+sessions warm on turn 2 (14.70 s and 14.65 s) where before only the most recent one
+was. **This is a SINGLE-STREAM number** — no batching involved at `MAX_BATCH_SIZE=1` —
+and it is larger than any batching effect ever measured on this board.
+
 **NOT measured:** what a borrow's copy costs at MiniMax scale (a 51-token copy is
 free; a 2000-token shared system prompt would copy ~0.5 GB of KV instead of
 prefilling it, which should still win by orders of magnitude — unmeasured, say so).
+
+### [bug] A BATCHED TURN LEFT EVERY MEMBER TO RE-PREFILL — found and FIXED 2026-09-09
+
+**Measured through the server by T10's own arms, MiniMax-M2.7, 2 sessions × 2 turns at
+~4.17k tokens, `ENABLE_PREFIX_CACHE=True` (the server's DEFAULT):**
+
+| arm | aggregate | turn-1 (cold) | turn-2 prefix match |
+|---|---|---|---|
+| `MAX_BATCH_SIZE=1` | **99.52 s** | serial 242.5 + 218.7 = 461.2 s | 4164/4223, 4167/4226 |
+| `MAX_BATCH_SIZE=2` | **443.78 s** | **batched 288.8 s = 1.60×** | **51/4223, 51/4226** |
+
+**4.46× SLOWER end-to-end — while batching itself WON its turn at 1.60×**, reproducing
+the banked 1.606×. The entire loss is turn 2: TTFT 185.4/187.8 s against 14.7/14.7 s.
+
+**Root cause:** `batched_generate`'s store-back wrote **exactly ONE pool entry per
+batch**, keyed by `_auto_session_id(common_ids)` — a hash of the batch's COMMON prefix,
+the 51-token shared system prompt — and nothing per session. So a batched turn left the
+pool holding a 51-token entry instead of each session's ~4.2k-token context. The old
+comment justified this with a **K=7-sessions-against-a-5-slot-pool** measurement where
+writing N gave ZERO hits; that is a pool SIZING cliff (`PREFIX_SESSIONS`) and belongs to
+the pool, not to the writer — seven SERIAL sessions hit it identically.
+
+**FIX: one entry per session, so a batched turn and a serial turn leave the SAME pool
+state.** `BatchRequest` gains `session_id` (None → the hashed id the serial path uses
+for an unnamed turn), and `vaayu/server/engine.py`'s `run_batch` passes `j.session_key`.
+The row slice is **not a crop**: tails are left-padded, so row i's cache is
+`[0:m]` shared prefix, then `max_R − len(tail_i)` **pads in the MIDDLE**, then its own
+tokens — new `slice_cache_row_unpadded` splices that block out. Storing a padded row
+as a prefix is exactly the silent-RoPE-corruption trap `prefix_store_row`'s docstring
+describes. Entries are clamped to what the KV actually backs: **a yielded token's KV is
+written by the NEXT forward**, which a finished generator never makes, so each entry
+stops one token short of the answer rather than claiming a position it cannot serve.
+
+**Verification:** suite **1865 passed, 12 skipped** (+7 new: the splice's interior-pad
+removal, batch-1 shrink, no-aliasing, the zero-pad row, per-session keys, own-prompt
+contents, the generated-tokens-minus-one clamp, hashed-id fallback). One existing test
+changed contract deliberately — `test_abandoning_the_generator_still_stores_the_prefix_back`
+asserted the single common-prefix entry; it now asserts one entry per row, and still
+pins its real point (nothing is lost on `GeneratorExit`).
+**On-device re-measurement of the prefix-ON block is PENDING** — the arm table above is
+the pre-fix number.
 
 ### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
 
