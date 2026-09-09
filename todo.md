@@ -2194,8 +2194,14 @@ row to `[x]` or `[bug]`/`[!]` with the verdict.
   so `app.py`'s ownership transfer fires on that item and the engine's row-writing
   `finally` never runs. **Symptom: shutdown with jobs still queued writes no row for
   them**, against the "a request never ends without a row" contract that
-  `documentation/server.md` states. Fix sketch: mark synthetic items so the transfer does
-  not fire on them, or have the drain write the row itself.
+  `documentation/server.md` states. **A THIRD path, found by the final whole-branch
+  review (2026-09-09):** in `_run`'s gate-2 fallback loop, if
+  `_run_serial(members[0])` re-raises a `BaseException` (a real cancellation, per its own
+  docstring), `members[1..N-1]` never run at all and get ONLY the loop's synthetic
+  `("error", …)` from `_dispatch_loop`'s own exception handler — same root cause (a
+  synthetic item flips the ownership flag with no engine row behind it), same fix. Fix
+  sketch: mark synthetic items so the transfer does not fire on them, or have the drain
+  write the row itself.
 * **[bug] No test for the sentinel-only cancel path.** `_sse`'s sentinel-with-no-owner
   branch (`owed=(None, None, "cancelled")`) has code but no coverage: it is reached when a
   job's `CancelToken` is set while queued WITHOUT its ASGI task being cancelled — e.g.
@@ -2218,6 +2224,24 @@ row to `[x]` or `[bug]`/`[!]` with the verdict.
   refusal by writing errors into the queues and returning normally), and a
   `config_from_module` that does not exist (`__main__.py` maps config by explicit
   keywords). Treat the plan as an argument, not an authority.
+* **Found by the final whole-branch review (2026-09-09), B4:** `app.py`'s lifespan now
+  awaits `app.state.scheduler.stop()` BEFORE `_teardown`'s `cancel_all()`, so a
+  PROGRAMMATIC shutdown — an embedded caller, or a `with TestClient(...)` block exiting
+  mid-generation — waits for the current run to finish NATURALLY (up to its full token
+  cap) where the old pre-P10 code reached `cancel_all()` immediately with no wait in
+  between. Signal-driven shutdown (real SIGINT/SIGTERM) is unaffected: the signal handler
+  calls `cancel_all()` first, independent of this coroutine. Already flagged in a code
+  comment at `vaayu/server/app.py`'s lifespan `finally` block (the "NOTE on ordering"
+  above `await app.state.scheduler.stop()`); recorded here per CLAUDE.md §6 so it is not
+  lost. Not fixed — deciding whether `stop()` itself should cancel first is Task 7's
+  contract to change, not a whole-branch-review fix.
+* `engine.slot()` is now dead production code — nothing but tests calls it since T8 moved
+  admission onto `BatchScheduler.submit()`. Left in place per CLAUDE.md §3 (don't remove
+  pre-existing code not asked about).
+* `engine.py`'s `generate()` has a stale comment on its `ContextTooLong` branch claiming
+  "the route no longer writes one for them" — false since T8 moved `prepare()` back out
+  of `generate()`'s try into the route, which now DOES write a `_refusal_row(...)` for
+  that exception. Found and fixed by the final whole-branch review (2026-09-09).
 
 
 **[~] IN PROGRESS 2026-09-08 — design spec written and approved:
@@ -2391,7 +2415,7 @@ order, the CORRECTED identity criterion, and the environment traps. **Start ther
   instead. Important 4 + the three Minors: comments only (see task-8-report.md's review-round-2
   section for exact locations and reasoning) — no behavior change needed for those.
   1832 passed, 12 skipped after this round.
-- [ ] T9 Inert notices — **IN SCOPE, do it before T10.** Two things, both in
+- [x] T9 Inert notices — **IN SCOPE, do it before T10.** Two things, both in
   `scheduler.py`, both small and additive (no concurrency, no shared state):
   (a) a startup WARNING when `MAX_BATCH_SIZE > 1` on a non-sdpa load, then serialize —
   that configuration IS completely inert, and `config.py` itself wrongly documented

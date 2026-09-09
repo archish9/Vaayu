@@ -610,10 +610,17 @@ class EngineHandle:
             if isinstance(ex, (ContextTooLong, TemplateLacksToolSupport,
                                NoChatTemplate)):
                 # Rejected before generation started, so the row says `refused`
-                # -- the vocabulary documentation/server.md promises, and what
-                # the route's own `_refusal_row` wrote for these three before
-                # prepare() moved inside this try. The route no longer writes
-                # one for them; that would now be two rows for one request.
+                # -- the vocabulary documentation/server.md promises. Stale
+                # comment fixed (final whole-branch review, 2026-09-09): P10/T8
+                # moved `prepare()` back OUT of this try for the
+                # scheduler-dispatched non-streaming route -- it now calls
+                # `prepare()` itself in app.py and DOES write its own
+                # `_refusal_row` for these three types. No double row results,
+                # because a `prepare()` failure there never reaches this
+                # method at all (no Job is ever built). This branch is only
+                # reachable when `prepared` is None -- a bare `generate(req)`
+                # call with no route in front of it -- and is the sole writer
+                # of the row in that case.
                 row["finish"] = "refused"
             raise
         finally:

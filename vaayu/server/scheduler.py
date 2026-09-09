@@ -86,8 +86,17 @@ class BatchScheduler:
         self._stopping = False
         # Counted so the server can say it out loud when batching never
         # admits -- the CLAUDE.md section 8 failure this row exists to end is
-        # a feature that ships and quietly does nothing.
-        self.formations_refused = 0
+        # a feature that ships and quietly does nothing. Split by WHICH gate
+        # refused (B1, final whole-branch review): gate 1 is this scheduler's
+        # own pre-check (`_admit`'s plan_batch pricing) narrowing a would-be
+        # batch to one before `batched_generate` is ever called; gate 2 is
+        # `batched_generate` itself refusing at the real width and falling
+        # back to serial in `_run`. The on-device measurement needs to tell
+        # a gate 1 that is still too conservative apart from a gate 2 that
+        # hit a real OOM ceiling (MiniMax N=3, P10a) -- one counter conflated
+        # them.
+        self.gate1_refused = 0
+        self.gate2_refused = 0
         self.batches_run = 0
         # CLAUDE.md section 8's guard: attempts counted (2+ waiting jobs,
         # batching enabled) so the on-device probe -- and the latched notice
@@ -316,6 +325,7 @@ class BatchScheduler:
             return self._waiting[:1]
         admitted = self._admit(self._waiting[:width])
         if len(admitted) < 2:
+            self.gate1_refused += 1
             self._note_if_never_admitting()
         return admitted
 
@@ -345,6 +355,17 @@ class BatchScheduler:
     def _admit(self, members: list) -> list:
         """KV pricing (plan_batch). Whatever it defers keeps its queue place.
 
+        `giveback=True`: gate 1 must not be a STRICTER filter than gate 2.
+        `batched_generate` (gate 2, vaayu_base.py:5302) always counts
+        `expert_giveback_bytes` -- the expert VRAM cache's ENTITLEMENT above
+        one decode step's working set, 2.88 GB on the MiniMax arm that
+        measured P10's +1.606x -- at N>1, regardless of `reclaim`. Pricing
+        gate 1 against free VRAM alone (B1, final whole-branch review) could
+        collapse every batch to width 1 and make an operator conclude the
+        model cannot batch, even though gate 2 would have admitted it. See
+        `plan_batch`'s own docstring for why this is a distinct knob from
+        `reclaim` (entitlement vs. currently-resident usage).
+
         On a pricing FAILURE (no CUDA -- a dense CPU-compute load, per CLAUDE.md
         section 5's model-agnostic mandate, has no VRAM to price at all -- or any
         other exception out of geo_from_model/free_vram_budget) this admits
@@ -361,7 +382,7 @@ class BatchScheduler:
         reqs = [BatchRequest(prompt_ids=j.prompt_ids, max_new_tokens=j.cap)
                 for j in members]
         try:
-            admitted, _deferred = plan_batch(self.engine.model, reqs)
+            admitted, _deferred = plan_batch(self.engine.model, reqs, giveback=True)
         except Exception:                        # noqa: BLE001 -- never blocks
             return members
         # plan_batch sorts by length, so map back by the IDENTITY OF THE
@@ -399,11 +420,23 @@ class BatchScheduler:
                         await self.engine.run_batch(members)
                         self.batches_run += 1
                     except Exception as ex:      # noqa: BLE001 -- fallback
-                        self.formations_refused += 1
+                        self.gate2_refused += 1
                         print(f"[Vaayu-Server] batch of {len(members)} refused "
                               f"({type(ex).__name__}: {ex}) -- running them "
                               f"serially.")
                         for j in members:
+                            # B2 (final whole-branch review): `_current_sessions`
+                            # still holds the WHOLE batch from the call above --
+                            # narrowing straight to one member's session here
+                            # reads as a second, overlapping generation to
+                            # `logs.set_current_sessions`, which latches
+                            # `_attribution_lost` and prints a false "real
+                            # invariant violation" warning, and every marker
+                            # read for the rest of this designed fallback comes
+                            # back `('*', ())`. Clear first so each per-job
+                            # call is seen as a fresh single-session marker,
+                            # not an overlap.
+                            clear_current_session()
                             set_current_sessions([j.session_key])
                             await self._run_serial(j)
             finally:

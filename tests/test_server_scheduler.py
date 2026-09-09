@@ -97,7 +97,7 @@ def test_a_single_waiting_request_runs_serially(monkeypatch):
     # this, an N=1 job routed into run_batch (which raises AssertionError,
     # caught, and falls back to serial) would still satisfy `served` and
     # `widths` above -- this is what actually pins the rule.
-    assert sched.formations_refused == 0 and sched.batches_run == 0
+    assert sched.gate1_refused == 0 and sched.gate2_refused == 0 and sched.batches_run == 0
 
 
 def test_max_batch_size_one_never_batches(monkeypatch):
@@ -122,7 +122,7 @@ def test_max_batch_size_one_never_batches(monkeypatch):
 
     asyncio.run(go())
     assert model.widths == [], "MAX_BATCH_SIZE=1 is today's behaviour exactly"
-    assert sched.formations_refused == 0 and sched.batches_run == 0
+    assert sched.gate1_refused == 0 and sched.gate2_refused == 0 and sched.batches_run == 0
 
 
 def test_a_non_sdpa_load_disables_batching(monkeypatch):
@@ -196,6 +196,8 @@ def test_the_queue_refuses_past_its_depth():
 def test_a_gate_two_refusal_falls_back_to_serial(monkeypatch):
     """batched_generate re-checks admission at the real width and may still
     refuse. That is a fallback, never a 500."""
+    from vaayu.server.logs import current_marker
+
     model = RecordingModel()
 
     def refusing(requests, reclaim=False, should_stop=None):
@@ -205,9 +207,18 @@ def test_a_gate_two_refusal_falls_back_to_serial(monkeypatch):
     model.batched_generate = refusing
     engine = EngineHandle(model)
     served = []
+    markers = []
 
     async def fake_stream(req, cancel=None, prepared=None):
         served.append(req.session_key)
+        # B2 (final whole-branch review): the fallback loop narrows
+        # `_current_sessions` from the whole batch to one member at a time.
+        # Without clearing first, `logs.set_current_sessions` reads that as
+        # an overlapping second generation, latches `_attribution_lost`, and
+        # every marker for the rest of this designed serial retry comes back
+        # `('*', ())` -- an unattributable "invariant violation" the
+        # dispatcher itself caused.
+        markers.append(current_marker())
         yield ("delta", "s")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -226,7 +237,10 @@ def test_a_gate_two_refusal_falls_back_to_serial(monkeypatch):
 
     out = asyncio.run(go())
     assert served == ["s0", "s1"], "both ran, serially, after the refusal"
-    assert sched.formations_refused >= 1
+    assert markers == [("s0", ("s0",)), ("s1", ("s1",))], (
+        "each fallback job must be attributed to its OWN session, not the "
+        f"unattributable '*' marker -- got {markers!r}")
+    assert sched.gate2_refused >= 1 and sched.gate1_refused == 0
     assert all(any(k == "delta" for k, _p in o) for o in out)
     assert all(not any(k == "error" for k, _p in o) for o in out), (
         "the refusal must never reach a client -- only the serial retry's "
@@ -624,3 +638,58 @@ def test_stop_propagates_the_callers_own_cancellation(monkeypatch):
             pass
 
     asyncio.run(go())
+
+
+def test_gate_one_never_narrows_a_batch_gate_two_would_admit(monkeypatch):
+    """B1 (final whole-branch review): `_admit`'s own pricing (gate 1) must
+    not be a STRICTER filter than `batched_generate`'s admission (gate 2,
+    vaayu_base.py:5302), which always adds `expert_giveback_bytes` at N>1.
+    Sized so free VRAM alone admits only one of these two streams -- the
+    pre-fix behaviour, confirmed below via a direct `plan_batch` call with
+    `giveback=False` -- while free VRAM plus the expert cache's giveback
+    entitlement admits both. This is the exact MiniMax collapse-to-one B1
+    named: a giveback-blind gate 1 sitting in front of a giveback-aware
+    gate 2.
+    """
+    import types
+
+    from vaayu import batch as B
+
+    n_layers, n_kv_heads, head_dim = 4, 2, 8
+    per_stream = B.kv_bytes_for(1100, n_layers, n_kv_heads, head_dim, "bf16")
+    floor = 1000
+    giveback = per_stream
+    free = B._VRAM_SAFETY_BYTES + int(1.5 * per_stream)
+
+    monkeypatch.setattr(B.torch.cuda, "mem_get_info",
+                        lambda *a, **k: (int(free), int(64 * 1024 ** 3)),
+                        raising=False)
+
+    model = RecordingModel()
+    model.device = "cuda:0"
+    model.config = types.SimpleNamespace(
+        num_hidden_layers=n_layers, num_key_value_heads=n_kv_heads,
+        num_attention_heads=n_kv_heads, hidden_size=head_dim * n_kv_heads)
+    model.kv_cache_mode = "bf16"
+    model._expert_vram_cache = types.SimpleNamespace(budget_bytes=giveback + floor)
+    model._moe_geometry = {"working_set_bytes": floor}
+
+    engine = EngineHandle(model)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    jobs = [_job("s0", prompt_ids=[1] * 1000, cap=100),
+            _job("s1", prompt_ids=[2] * 1000, cap=100)]
+
+    # Prove the fixture actually reproduces the collapse: giveback-blind
+    # pricing (today's plan_batch default) admits only one of the two.
+    reqs = [B.BatchRequest(prompt_ids=j.prompt_ids, max_new_tokens=j.cap)
+            for j in jobs]
+    blind_admitted, _ = B.plan_batch(model, reqs)
+    assert len(blind_admitted) == 1, (
+        "fixture must reproduce the giveback-blind collapse to width 1")
+
+    admitted = sched._admit(jobs)
+    assert len(admitted) == 2, (
+        "gate 1 narrowed a batch gate 2 would admit")
+    assert sched.gate1_refused == 0
