@@ -34,6 +34,14 @@ class _FakeCache:
         return self._nbytes
     def to_cpu(self):
         self.on_cpu = True
+    def copy_prefix(self, length):
+        """Lending a prefix to another session copies it (2026-09-09). Any
+        cache the pool holds owes this method."""
+        out = _FakeCache(self._nbytes)
+        out.on_cpu = self.on_cpu
+        out.copied_from = self
+        out.copied_len = length
+        return out
 
 
 def test_store_lookup_session_hit():
@@ -291,3 +299,129 @@ def test_persist_runs_before_store_compresses():
         telemetry=types.SimpleNamespace(dump_json=lambda p: None))
     VaayuBaseModel._persist_and_store(fake, _PC(), "sess", c, [1, 2, 3, 4, 5])
     assert [o[0] for o in order] == ["persist", "store"]
+
+
+# ── cross-session cannibalisation ───────────────────────────────────────────
+#
+# Found 2026-09-09 by P10 T10's arms. Two agent sessions that share a system
+# prompt and nothing else destroy each other's cached context: a `lookup` for
+# session B auto-matches A's entry on the shared prefix, and because a hit
+# CHECKS THE ENTRY OUT of the pool, `store` then re-inserts it under B's id.
+# A's ~4000-token entry is gone, so A's next turn matches only the system
+# prompt again. Measured on MiniMax-M2.7 at ~4.17k tokens: the session that
+# kept its entry prefilled 59 new positions (TTFT 15.0 s); the one that lost it
+# prefilled 4172 (TTFT 190.0 s). Reported as 3 hits, 0 evictions, so no counter
+# says anything is wrong.
+#
+# `config.py`'s REQUIRE_SESSION_ID says naming a session is what PREVENTS
+# exactly this ("two agents sharing a system prompt land on ONE entry and evict
+# each other, and reuse collapses to zero") -- these sessions were named.
+
+def test_a_named_session_keeps_its_own_entry_when_another_borrows_the_prefix():
+    s = PrefixCacheStore(budget_bytes=10_000, auto_prefix_match=True)
+    a_long = [1, 2, 3] + list(range(100, 140))       # A's own long context
+    s.store("A", a_long, _FakeCache(500))
+
+    # B shares only [1,2,3] and has no entry of its own -- it may borrow, but
+    # borrowing must not take A's entry away.
+    kv, m = s.lookup("B", [1, 2, 3] + list(range(900, 930)))
+    assert m == 3
+    s.store("B", [1, 2, 3] + list(range(900, 930)), _FakeCache(500))
+
+    _kv, m_a = s.lookup("A", a_long + [7])
+    assert m_a == len(a_long), (
+        f"A's own {len(a_long)}-token entry must survive B's borrow; got {m_a}")
+
+
+def test_two_sessions_alternating_keep_reusing_their_own_context():
+    """The agentic fan-out shape: N sessions, one shared system prompt, each
+    coming back for a second turn. Every session must reuse ITS OWN context,
+    not re-prefill because a sibling ran in between."""
+    s = PrefixCacheStore(budget_bytes=100_000, auto_prefix_match=True)
+    shared = [1, 2, 3, 4, 5]
+    ctx = {sid: shared + list(range(base, base + 50))
+           for sid, base in (("X", 100), ("Y", 500))}
+
+    for sid in ("X", "Y"):                            # turn 1: cold
+        s.lookup(sid, ctx[sid])
+        s.store(sid, ctx[sid], _FakeCache(1000))
+
+    for sid in ("X", "Y"):                            # turn 2: must be warm
+        _kv, m = s.lookup(sid, ctx[sid] + [999])
+        assert m == len(ctx[sid]), (
+            f"session {sid} re-prefilled {len(ctx[sid]) - m} of its own "
+            f"{len(ctx[sid])} tokens")
+        s.store(sid, ctx[sid] + [999], _FakeCache(1000))
+
+
+# ── the copy primitive the borrow path needs ────────────────────────────────
+
+def test_copy_prefix_is_independent_of_its_source():
+    """A borrowed prefix must not alias the owner's buffers: the borrower crops
+    and then WRITES its own decode tokens into what it got back."""
+    import torch
+    from vaayu.vaayu_base import FP8DynamicCache
+
+    src = FP8DynamicCache(quantize=False)
+    for layer in range(2):
+        k = (torch.arange(10, dtype=torch.bfloat16)
+             .reshape(1, 1, 10, 1).repeat(1, 2, 1, 4))
+        src.update(k, k + 100, layer, {})
+
+    cp = src.copy_prefix(4)
+    assert cp.get_seq_length() == 4
+    assert src.get_seq_length() == 10, "the source keeps its full length"
+    assert cp.quantize is src.quantize
+    assert len(cp.key_cache) == len(src.key_cache) == 2
+    assert cp.key_cache[0].shape[-2] == 4, "copies only the matched tokens"
+    assert torch.equal(cp.key_cache[0][..., :4, :], src.key_cache[0][..., :4, :])
+    assert torch.equal(cp.value_cache[1][..., :4, :], src.value_cache[1][..., :4, :])
+
+    cp.key_cache[0][..., 0, :] = -1
+    assert not torch.equal(cp.key_cache[0][..., :1, :], src.key_cache[0][..., :1, :]), \
+        "writing the copy must not touch the source"
+
+
+def test_copy_prefix_carries_the_quantized_buffers_too():
+    """fp8 mode has four more buffer lists (scales + the dequantized mirror);
+    a copy that dropped them would return a cache attention cannot read."""
+    import torch
+    from vaayu.vaayu_base import FP8DynamicCache
+
+    src = FP8DynamicCache(quantize=True)
+    k = (torch.arange(8, dtype=torch.float32)
+         .reshape(1, 1, 8, 1).repeat(1, 2, 1, 4))
+    src.update(k, k + 5, 0, {})
+
+    cp = src.copy_prefix(3)
+    assert cp.get_seq_length() == 3
+    for name in src._BUFFER_LISTS:
+        assert getattr(cp, name)[0].shape[-2] == 3, name
+
+
+def test_a_continuation_still_checks_the_entry_out():
+    """The unnamed single-user path: `store` resolves an auto id by HASHING the
+    prompt, so every turn lands under a different key and matches its own
+    previous turn through auto-match. That prompt CONTAINS the whole entry, so
+    it will store a superset back -- checking out loses nobody anything, and
+    copying it every turn would be pure overhead plus a pool entry per turn."""
+    s = PrefixCacheStore(budget_bytes=10_000, auto_prefix_match=True)
+    turn1 = [1, 2, 3, 4]
+    s.store("hash-of-turn1", turn1, _FakeCache(500))
+
+    kv, m = s.lookup(None, turn1 + [5, 6])
+    assert m == 4
+    assert not hasattr(kv, "copied_from"), "a continuation is not a copy"
+    assert len(s._pool) == 0, "checked out, as before"
+    assert s.borrows == 0
+
+
+def test_a_partial_cross_session_match_is_counted_as_a_borrow():
+    s = PrefixCacheStore(budget_bytes=10_000, auto_prefix_match=True)
+    s.store("A", [1, 2, 3] + list(range(50, 90)), _FakeCache(500))
+
+    kv, m = s.lookup("B", [1, 2, 3, 77, 78])
+    assert m == 3
+    assert kv.copied_len == 3, "copies only what was matched"
+    assert s.borrows == 1
+    assert list(s._pool) == ["A"], "the owner keeps its entry"

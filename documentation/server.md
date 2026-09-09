@@ -91,6 +91,13 @@ and ~98 s time-to-first-token:
 }
 ```
 
+`prefix_cache` gains ` borrow=N` once any request has been served by COPYING
+another session's prefix instead of reusing its own. Read it against `saved`: a
+high `hit_rate` with a low `saved` and a climbing `borrow` means your sessions
+share a system prompt and little else, so each one is still re-prefilling its own
+context every turn — give each agent a stable `session_id` and keep it across
+turns.
+
 The `batch` block answers "is `MAX_BATCH_SIZE` doing anything?" — the one
 question a batching knob cannot answer from throughput alone. `batching_enabled`
 is false whenever the model did not load on `sdpa`, whatever `MAX_BATCH_SIZE`

@@ -1340,6 +1340,30 @@ class FP8DynamicCache(DynamicCache):
                     "_value_scales", "_k_out_cache", "_v_out_cache")
         return ("key_cache", "value_cache")
 
+    def copy_prefix(self, length: int) -> "FP8DynamicCache":
+        """An INDEPENDENT cache holding this one's first `length` tokens.
+
+        For lending a prefix to a session that does not own this entry. A hit
+        normally CHECKS THE ENTRY OUT of the prefix pool and the borrower then
+        crops and writes into it -- fine when it is your own context, fatal
+        across sessions: it destroyed the owner's entry to save the borrower the
+        shared system prompt (measured on MiniMax-M2.7 at ~4.17k tokens: the
+        session that kept its entry prefilled 59 new positions, the one that
+        lost it prefilled 4172 -- TTFT 15.0 s against 190.0 s).
+
+        Copies only `length` tokens, not the whole entry: the borrower matched
+        that much and cropping is its next move anyway. Buffers come back
+        contiguous and unpinned; `to_device` is what the caller does with them.
+        """
+        out = type(self)(quantize=self.quantize)
+        for name in self._BUFFER_LISTS:
+            src = getattr(self, name)
+            setattr(out, name, [t[..., :min(length, self._seq_len[i]), :]
+                                .contiguous().clone()
+                                for i, t in enumerate(src)])
+        out._seq_len = [min(length, n) for n in self._seq_len]
+        return out
+
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU
         (pinned when CUDA is available), for RAM-resident prefix-cache storage

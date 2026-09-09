@@ -52,6 +52,12 @@ class PrefixCacheStore:
         self.evictions = 0
         self.matched_tokens = 0
         self.lookup_tokens = 0
+        # Hits served from ANOTHER session's entry, which are copied rather
+        # than checked out. Counted separately because they are the expensive
+        # kind (a copy of the matched prefix) and because a workload that is
+        # mostly borrows is one where every session is re-prefilling most of
+        # its own context -- visible here, invisible in hits/misses.
+        self.borrows = 0
         # Latch for the capacity warning below: once per store lifetime, not
         # once per eviction. The agentic workload re-stores every session every
         # turn, so per-eviction warning would emit hundreds of lines per run and
@@ -82,11 +88,29 @@ class PrefixCacheStore:
             if key is None:
                 self.misses += 1
                 return None, 0
-            entry = self._pool.pop(key)
-            self._current_bytes -= entry.nbytes
+            entry = self._pool[key]
             m = longest_common_prefix(entry.token_ids, input_ids)
             self.hits += 1
             self.matched_tokens += m
+            # BORROWED, not checked out. A hit removes the entry because the
+            # caller crops it and writes its own decode tokens in -- correct for
+            # your OWN context, destructive across sessions: `store` then
+            # re-inserts it under the BORROWER's id and the owner's context is
+            # gone. Two agents sharing a system prompt therefore destroyed each
+            # other's cache every turn, reported as hits with zero evictions.
+            # Measured on MiniMax-M2.7 at ~4.17k tokens: the session that kept
+            # its entry prefilled 59 new positions (TTFT 15.0 s), the one that
+            # lost it prefilled 4172 (190.0 s). So a borrower gets a COPY of the
+            # matched prefix -- which is all it matched, and cropping is its next
+            # move anyway -- and the owner keeps its entry.
+            # Not "someone else's entry" but "an entry this prompt does not
+            # fully contain". A prompt that consumes the WHOLE entry is a
+            # continuation: it will store a superset back, which still serves
+            # the original owner as a complete prefix, so checking it out loses
+            # nobody anything -- and that is the unnamed single-user path, where
+            # each turn hashes to a fresh id and would otherwise copy forever.
+            borrowed = (key != session_id
+                        and m < len(entry.token_ids))
             from .kv_compress import CompressedKV
             if isinstance(entry.cache, CompressedKV):
                 if device is None:
@@ -96,7 +120,21 @@ class PrefixCacheStore:
                         f"would hand the caller indices in place of values.")
                 from .kv_compress import decompress_cache
                 self.decompressions += 1
-                return decompress_cache(entry.cache, device), m
+                # Already a fresh object, so a borrow costs nothing extra here.
+                rebuilt = decompress_cache(entry.cache, device)
+                if borrowed:
+                    self.borrows += 1
+                    self._pool.move_to_end(key)
+                    return rebuilt, m
+                self._pool.pop(key)
+                self._current_bytes -= entry.nbytes
+                return rebuilt, m
+            if borrowed:
+                self.borrows += 1
+                self._pool.move_to_end(key)     # actively useful: keep it MRU
+                return entry.cache.copy_prefix(m), m
+            self._pool.pop(key)
+            self._current_bytes -= entry.nbytes
             return entry.cache, m
 
     def peek_match(self, session_id, input_ids: list) -> int:
@@ -220,6 +258,12 @@ class PrefixCacheStore:
             out = (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
                    f"hit_rate={rate} "
                    f"saved={self.matched_tokens}/{self.lookup_tokens} tok ({saved})")
+            if self.borrows:
+                # Hits served by COPYING another session's prefix. Worth its own
+                # number: a workload that is mostly borrows is one where every
+                # session keeps re-prefilling its own context, which hit_rate
+                # alone renders as a healthy 75%.
+                out += f" borrow={self.borrows}"
             if self.compress_bits is not None:
                 out += (f" compress={self.compress_bits}b "
                         f"{self.compressions}pack/{self.decompressions}unpack")
@@ -242,6 +286,7 @@ class PrefixCacheStore:
             self.evictions = 0
             self.matched_tokens = 0
             self.lookup_tokens = 0
+            self.borrows = 0
             self.compressions = 0
             self.decompressions = 0
 

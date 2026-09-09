@@ -27,6 +27,11 @@ class _FakeSpecCache:
     def crop(self, max_length: int) -> None:
         self.seq_len = min(self.seq_len, max_length)
 
+    def copy_prefix(self, length: int):
+        """Lending a prefix across sessions copies it (2026-09-09), so every
+        cache the prefix pool holds owes this."""
+        return type(self)(seq_len=min(self.seq_len, length))
+
     def to_device(self, device) -> None:
         pass
 

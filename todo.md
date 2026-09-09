@@ -2289,6 +2289,64 @@ materializes that score matrix — so the OOM needs `sdpa`, and **`sdpa` is exac
 batching requires.** The wasted-work half (one unchunked 4k forward instead of eight
 512-token chunks) was there on flash too, unmeasured.
 
+### [bug] CROSS-SESSION PREFIX CANNIBALISATION — found and FIXED 2026-09-09
+
+**Two agent sessions sharing a system prompt destroyed each other's cached context
+every turn — the exact workload CLAUDE.md §0 names (parallel fan-out + heavy context
+reuse), and a bigger TTFT lever than anything on this row.** Found while checking
+whether T10's prefix-ON arms were measuring a warm cache.
+
+**Evidence, MiniMax-M2.7 at ~4.17k tokens, 2 sessions × 2 turns:**
+
+| request | match | new positions prefilled | TTFT |
+|---|---|---|---|
+| c0 turn 1 | MISS | 4168 | 212.9 s |
+| c1 turn 1 | 51/4171 (c0's entry, on the shared system prompt) | 4120 | 185.8 s |
+| c1 turn 2 | **4167**/4226 (its OWN entry) | **59** | **15.1 s** |
+| c0 turn 2 | 51/4223 — its own 4168-token entry was GONE | 4172 | 190.0 s |
+
+Reported as **3 hits, 0 evictions**: no counter said anything was wrong.
+Reproduced on Llama-3.2-1B in seconds — 4 requests, 3 hits, **`saved=216/8496 tok
+(3%)`**, i.e. every hit matched only the ~72-token shared system prompt and NEITHER
+session reused its own ~2100-token context.
+
+**Root cause:** `PrefixCacheStore.lookup` (`vaayu/prefix_cache.py`) — *"A hit REMOVES
+the entry from the pool (checked out to the in-flight request); store() re-inserts
+it."* Correct for your own context, which the caller crops and writes into.
+Destructive across sessions: auto-prefix-match runs even for a NAMED session (a
+deliberate 2026-08 fix — naming a session and missing used to mean zero reuse), so
+session B matched A's entry on the shared prefix, **took** it, and `store` re-inserted
+it under B's id. A's 4168-token context was destroyed to save B **51** tokens.
+`config.py`'s `REQUIRE_SESSION_ID` comment says naming a session is what PREVENTS
+this; these sessions were named.
+
+**FIX: a borrower gets a COPY of the matched prefix; the owner keeps its entry.**
+New `FP8DynamicCache.copy_prefix(length)` (covers `TurboQuantKVCache` by
+inheritance; `CompressedKV` already rebuilt a fresh object, it just must not be
+popped). The predicate is **not** "someone else's entry" but **"an entry this prompt
+does not fully contain"**: a prompt that consumes the WHOLE entry is a continuation
+and will store a superset back, which still serves the original owner as a complete
+prefix — that is the unnamed single-user path, where every turn hashes to a fresh id
+and would otherwise copy forever. It keeps today's zero-copy checkout.
+A borrowed entry is moved to MRU (it is demonstrably in use).
+New `borrows` counter, surfaced in `stats()` as ` borrow=N` and documented in
+`documentation/server.md` — a high hit_rate with low `saved` and a climbing `borrow`
+is the signature of this shape.
+
+**Verification.** Llama-3.2-1B, same two-session run: **`saved=216/8496 (3%)` →
+`saved=4312/8496 (51%) borrow=1`** — each session now reuses its own ~2100-token
+context. Suite **1858 passed, 12 skipped**. Six new tests: the two cannibalisation
+cases (both verified failing first), `copy_prefix` independence, `copy_prefix` over
+the fp8 buffer lists, the continuation-still-checks-out branch, and the borrow
+counter. **The pool now requires a 4-method protocol from any cache it holds**
+(`to_cpu`/`to_device`/`resident_bytes`/`copy_prefix`) — three test fakes were updated,
+and a cache type that forgets `copy_prefix` fails loudly rather than resurrecting the
+bug.
+
+**NOT measured:** what a borrow's copy costs at MiniMax scale (a 51-token copy is
+free; a 2000-token shared system prompt would copy ~0.5 GB of KV instead of
+prefilling it, which should still win by orders of magnitude — unmeasured, say so).
+
 ### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
 
 * **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO
