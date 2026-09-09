@@ -54,8 +54,11 @@ per-chunk loop: over-charging 21-26 % at T10's ~4.2k contexts, UNDER-charging up
 elsewhere). **Do not re-open it to "let gate 2 see reclaimable VRAM"** — that half is dead, and
 the server passes `reclaim=False` anyway. **Its A/B produced the finding that matters and it is
 now row 22: batching is worth 1.58x on the module-list forward and 2.04-2.36x SLOWER on the
-fused-EXL3 one, at the same context, both interleave directions.** The live work is row **22**
-and row **19**. Two NEW rows came out of P10's measurement and are the live work
+fused-EXL3 one, at the same context, both interleave directions.** **Row 19 CLOSED 2026-09-09 —
+audited, and NO recorded drafter/speculative number was taken under `sdpa`; every one ran flash,
+so nothing was owed a re-measurement and CLAUDE.md §0's 5.57× stands as to kernel. It also
+established that row 16 can never reach a DRAFTER: `StandardDrafterDecoder` loads via stock
+transformers, with no `pinning_budget` at all.** The live work is row **22**. Two NEW rows came out of P10's measurement and are the live work
 now: ~~**row 20 `[bug]`**~~ — **FIXED 2026-09-09: the padding was a red herring, the batched
 path computed RoPE without `rope_scaling`; both MoE checkpoints were never affected, and
 `MAX_BATCH_SIZE` stays 1 on row 15's performance grounds, not on corruption** — and **row 21**,
@@ -2171,7 +2174,82 @@ Weigh it accordingly (§8): this is a formation-POLICY correctness item, not a t
 
 ---
 
-# 19 · [ ] Re-measure any drafter number taken under `sdpa` (fallout of row 16)
+# 19 · [x] CLOSED 2026-09-09 — NO recorded drafter/speculative number was taken under `sdpa`
+
+**Verdict: every one of them ran `flash_attention_2`. The numbers stand, CLAUDE.md §0's 5.57×
+included. No re-measurement was owed.** This row's own stop rule asked for exactly this statement,
+made explicitly rather than as "probably fine" — and it is now MEASURED, not only inferred.
+
+**Why the default settles it.** `init_model` (`vaayu_base.py:2989`) tries `flash_attention_2`
+first whenever `flash_attn` imports (2.8.3 is in `./venv`), falling back to sdpa → eager. **No
+speculative harness on disk passes `attn_implementation=`**, so all of them took that default.
+Flash is confirmed for all four checkpoints: Llama-3.3-70B by the `"attn"` field machine-recorded
+in `plans/probes/p7-{base,spec}.json`; Llama-3.2-1B by this row's arm; Qwen3-235B and MiniMax-M2.7
+by `p10d_kernel_ab.py`'s `flash_serial` arm, which asserts `_active_attn_impl == ATTN`.
+
+**Per-arm:** 5.57× and 1.94× (2026-08-16) — `plans/2026-08-16-row12-...-RESULTS.md:14` states
+*"Kernel was `flash_attention_2` (Vaayu's own default) on every arm"*. 5.54/5.47/5.47× (the
+2026-09-02 P7 re-measure) — **machine-recorded flash in both JSONs**. 1.307× / 0.932× (S1d),
+1.285×/1.293× (S1f), +4.16 % (P9), −12.9 % (row 13) — no `attn_implementation=` in
+`s1f_pld_ab.py`, `p9_spec.py`, `p9_e2e.py`, and **no probe under `docs/probes/` contains the
+string `sdpa` at all**.
+
+**The inverse search is the load-bearing one.** Of 17 probe files mentioning `sdpa`, exactly one
+also mentions speculation — `p10d_kernel_ab.py` — and only to say *"Neither model speculates
+here"*. **No probe on disk both forces sdpa and speculates.** The one place the two DID meet is
+T10's dense server smoke (`logs/run-2026-09-09T03-54-34Z/`, `…T03-55-29Z`: sdpa load +
+`[Vaayu-Spec] drafted=` lines), and it is dated **after** row 17's 2026-09-08 fix. Every other
+sdpa load in `logs/` is from that same 2026-09-09 batching session; the only earlier entry is
+flash.
+
+**ROW 16 CANNOT REACH A DRAFTER AT ALL — this is stronger than "it ran flash", and it corrects the
+natural reading of row 16's closing paragraph.** (1) `StandardDrafterDecoder.__init__`
+(`vaayu/speculative/standard.py:36`) loads the drafter with **stock
+`transformers.AutoModelForCausalLM.from_pretrained(..., device_map=device)`** — it never touches
+`_load_from_strategy`, has **no `pinning_budget`**, and materializes every weight eagerly; it is
+the only drafter construction path (`vaayu/speculative/__init__.py:47`). (2) The 5.57× verifier
+target `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` has **`tie_word_embeddings=False`**, so no
+empty `lm_head` shard is ever written. Llama-3.2-1B's `True` bit only ever mattered when it was the
+**target**, never as a drafter.
+
+**Neither fix could have moved a flash number, by construction** — so the 2026-09-02 re-measure
+predating both fixes does not need re-taking. `build_sdpa_causal_mask` (`vaayu_base.py:942`)
+returns `None` on its first line when `attn_impl != "sdpa"`, byte-identical to the pre-fix
+behaviour; `should_use_tied_lm_head` (`:722`) returns `False` unless the layer IS the head AND its
+state dict is empty or its load failed.
+
+**On-device confirmation, run 2026-09-09** — `plans/probes/row19_spec_kernel.py`, one arm per
+`systemd-run --user --scope -p MemoryMax=12G/14G -p MemorySwapMax=0`, Llama-3.2-1B, greedy, 48
+tokens, same prompt, **no `attn_implementation=` in either arm**. The 1B drafts for ITSELF, so
+`StandardDrafterDecoder` is on the path without a 70B round, and this checkpoint carries BOTH
+hazards at once (row 16's tied head, and it is the README's suggested drafter):
+
+| arm | attn (recorded, not requested) | speculator | tok/s | ids |
+|---|---|---|---|---|
+| base | `flash_attention_2` | — | 5.924 | coherent quicksort body |
+| spec | `flash_attention_2` | `StandardDrafterDecoder` | 22.418 | **byte-identical, all 48** |
+
+**3.784× — do NOT quote this as a headline.** Single checkpoint, self-drafted, 48 tokens. It exists
+to measure three things the audit would otherwise have only argued: the default kernel here IS
+flash, the tied-head checkpoint loads a real head under it, and the speculative path is
+byte-identical to plain greedy today.
+
+**One bookkeeping point, pre-existing and NOT a row-19 finding:** the 5.57× has a flash-recorded
+re-measurement — 2026-09-02 returned **5.54× / 5.47× / 5.47×**. Anyone quoting one figure should
+quote that band (HANDOFF-2026-08-30 already says so). CLAUDE.md §0 and `README.md` still say
+5.57×; left alone deliberately, since correcting them is not this row's scope.
+
+**Row 13's −12.9 % is a flash number, so this audit does not weaken that `[bug]`.**
+
+**§8, all four:** (1) **no knob**, none added — an audit, no product code changed. (2) N/A.
+(3) N/A; for the record the server ships `ATTN_IMPLEMENTATION = None` → flash, so **no user was
+ever exposed to the sdpa verify-pass defect on the speculative path**. (4) N/A.
+
+Full detail: [`docs/2026-09-09-row19-sdpa-drafter-audit-RESULTS.md`](docs/2026-09-09-row19-sdpa-drafter-audit-RESULTS.md).
+
+## Original row text (its question is answered above)
+
+# 19 · [x] Re-measure any drafter number taken under `sdpa` (fallout of row 16)
 
 Row 16 left this consequence OPEN and it must not be lost inside a closed row.
 `models/Llama-3.2-1B-Instruct` is the README's suggested speculative drafter and the dense row's
