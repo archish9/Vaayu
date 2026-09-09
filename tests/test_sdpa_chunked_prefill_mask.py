@@ -238,3 +238,41 @@ def test_sdpa_speculative_verify_matches_plain_greedy():
                if l.startswith(("PLAIN", "SPEC")))
     plain, spec = eval(got["PLAIN"]), eval(got["SPEC"])
     assert spec == plain, f"speculation changed the answer:\n{spec}\n{plain}"
+
+
+def test_slice_is_bottom_right_causal_when_the_prefill_starts_behind_a_prefix():
+    """past0 > 0 -- a prefix-cache HIT leaving a long remainder to chunk.
+
+    Dead code until 2026-09-09: `forward()` gated chunked prefill on an empty
+    past, so `compute_chunk_past_lens`'s `past0` argument and this mask's
+    behaviour behind a non-zero past were never exercised in production. The
+    guard came off because that single unchunked forward was OOMing MiniMax-M2.7
+    (3.07 GiB against 2.08 free at ~4.17k tokens), which makes this geometry
+    live -- so it gets the same row-by-row proof chunk 0 already had.
+    """
+    past0 = 7                                   # the reused prefix
+    chunk_lens = [4, 4, 2]                      # the remainder, chunked
+    kv_total = past0 + sum(chunk_lens)
+    past_lens = compute_chunk_past_lens(chunk_lens, past0)
+    assert past_lens == [7, 11, 15]
+
+    mask = build_sdpa_causal_mask("sdpa", max(chunk_lens), kv_total, "cpu")
+
+    for len_s, len_p in zip(chunk_lens, past_lens):
+        blk = _slice_like_forward(mask, len_p, len_s)
+        assert blk.shape == (1, 1, len_s, len_p + len_s)
+        for a in range(len_s):                  # query at absolute len_p + a
+            for b in range(len_p + len_s):      # key at absolute b
+                assert bool(blk[0, 0, a, b]) is (b <= len_p + a), (
+                    f"past0={past0} len_p={len_p} len_s={len_s} q={a} k={b}")
+
+
+def test_the_reused_prefix_is_visible_to_every_chunk():
+    """The point of reusing it: chunk 0 of the remainder must attend the whole
+    cached prefix, not just itself. A mask sized off the remainder alone would
+    hide it and silently answer from a truncated context."""
+    past0, chunk_lens = 7, [4, 4, 2]
+    mask = build_sdpa_causal_mask("sdpa", max(chunk_lens),
+                                  past0 + sum(chunk_lens), "cpu")
+    blk = _slice_like_forward(mask, past0, chunk_lens[0])
+    assert blk[0, 0, 0, :past0].all(), "chunk 0 must see every prefix token"

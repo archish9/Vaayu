@@ -2233,6 +2233,62 @@ this engine does not do — recorded, not attempted.
 `gate2_refused`, `formation_attempts`). Gate 1 refuses SILENTLY, so without this an
 operator — or the A/B — can see that nothing batched and be unable to say why.
 
+### [bug] A PREFIX-CACHE HIT SKIPPED CHUNKED PREFILL — found and FIXED 2026-09-09
+
+**This is a LIVE bug in shipped behaviour, not a P10 artifact, and it was found by
+T10's very first on-device arm.** MiniMax-M2.7, `ENABLE_PREFIX_CACHE=True`, `sdpa`,
+**`MAX_BATCH_SIZE=1`** — no batching anywhere near it. The first (cold) request
+chunked and succeeded at a 12.84 GB peak; **every request after it hit the pool and
+died**: `CUDA out of memory. Tried to allocate 3.07 GiB ... 2.08 GiB free`, on 3 of 4
+requests, the allocation scaling with each prompt (4171→3.07, 4191→3.09,
+4223→3.11 GiB).
+
+**Root cause, traced not guessed.** `forward()` gated chunked prefill on
+`_past_kv_len == 0` (`vaayu/vaayu_base.py`). That guard is from `6cfd252`
+(2026-05-31) and its own test was named *"Decode step (past_kv_len > 0) → no
+chunking"* — but **decode is `q_len == 1`, which the outer
+`input_ids.shape[1] > prefill_chunk_size` test already excludes**, whatever the past
+is. Cross-turn prefix caching landed later (A1, 2026-07-19) and created the case the
+guard actually caught: **a SHORT hit leaving a LONG remainder** — the ordinary shape
+when two agent sessions share a system prompt and nothing else (the arm's own hit
+saved **153 of 16753 tokens**). That remainder then ran as ONE `q_len≈4000` forward,
+and sdpa with an explicit mask falls off its fused backends onto the math one, which
+materializes `num_heads × q × kv` scores: **48 × 4171 × 4171 × 4 B = 3.1 GiB**,
+matching the OOM to within rounding.
+
+**Reproduced on Llama-3.2-1B before any fix** (cheap, seconds): two ~2.1k-token
+prompts sharing only the system prompt — the cold one logged its `Chunk [...]` lines,
+the prefix-hit one logged **none**, at a 2038-token remainder.
+
+**FIX: drop the `_past_kv_len == 0` condition.** `_chunked_prefill` already accepts
+`past_key_values` and threads it through both of its paths, and
+`compute_chunk_past_lens(chunk_lens, past0)` exists precisely to offset each chunk
+element by a non-zero starting past — **`past0 > 0` was simply dead code until now**.
+`prefill_chunk_size = 0` remains the off switch, and is what keeps
+`batched_generate`'s own prefill out of this path (`vaayu_base.py`'s `_saved_chunk`).
+
+**Verification.**
+* Suite **1850 passed, 12 skipped** (1845 + 5 routing tests: prefix-hit chunks, cold
+  chunks, decode does not, a 4-wide speculative verify does not, `chunk_size=0` does
+  not).
+* Mask arithmetic at `past0 > 0` — previously untested — proved row by row for every
+  chunk element, plus "chunk 0 sees the whole reused prefix" (+2 tests).
+* **Llama-3.2-1B, prefix ON vs OFF, same prompts: output BYTE-IDENTICAL** on both the
+  cold and the partial-hit request. That is the end-to-end proof of the position and
+  mask wiring through the legacy per-chunk loop.
+* **MiniMax-M2.7 diverges from its prefix-OFF run, and that is EXPECTED, not a
+  regression**: chunk boundaries change GEMM tiling, tiling perturbs router logits
+  ~1 ULP, top-k is DISCONTINUOUS. Row 15's own corrected identity criterion applies —
+  coherent as TEXT, deterministic per configuration; never assert greedy-id equality
+  on MoE. The prefix-ON answer was on-task. **The prefix-OFF path is unchanged by
+  this fix**, so no MoE behaviour that existed before moved.
+
+**Why nobody hit it before:** the server's default kernel is
+`flash_attention_2` (`ATTN_IMPLEMENTATION = None` resolves to it), which never
+materializes that score matrix — so the OOM needs `sdpa`, and **`sdpa` is exactly what
+batching requires.** The wasted-work half (one unchunked 4k forward instead of eight
+512-token chunks) was there on flash too, unmeasured.
+
 ### Pending bugs (found by review, NOT fixed — CLAUDE.md §6)
 
 * **[bug] A queued job drained by the scheduler's own synthetic `("error", …)` gets ZERO

@@ -4104,18 +4104,30 @@ class VaayuBaseModel(GenerationMixin):
         if (self.prefill_chunk_size > 0
                 and isinstance(input_ids, torch.Tensor)
                 and input_ids.shape[1] > self.prefill_chunk_size):
-            _past_kv_len = (self.get_past_key_values_cache_seq_len(past_key_values)
-                            if past_key_values is not None else 0)
-            if _past_kv_len == 0:
-                return self._chunked_prefill(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
-                )
+            # Deliberately NOT gated on an empty past. It was until 2026-09-09,
+            # from a 2026-05-31 guard whose own test called the case it excluded
+            # a "decode step" -- but decode is q_len == 1 and the length test
+            # above already excludes it, whatever the past. What the guard
+            # actually caught, once cross-turn prefix caching landed in July,
+            # was a SHORT hit leaving a LONG remainder (two agent sessions
+            # sharing a system prompt and nothing else), which then ran as one
+            # q_len ~= 4000 forward. On sdpa that falls off the fused backends
+            # onto the math one and materializes num_heads x q x kv scores:
+            # measured 3.07-3.11 GiB against 1.9-2.1 GiB free on MiniMax-M2.7 at
+            # ~4.17k tokens, so every request after the first died of OOM.
+            # `_chunked_prefill` takes the past and threads it through both of
+            # its paths; `compute_chunk_past_lens(chunk_lens, past0)` exists for
+            # exactly this. `prefill_chunk_size = 0` remains the off switch, and
+            # is what keeps `batched_generate`'s own prefill out of here.
+            return self._chunked_prefill(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
         # Chunk-major prefill (Task 11): input_ids is a LIST of 1-D chunk tensors;
         # each becomes a batch element. KV appends per element within each layer,
