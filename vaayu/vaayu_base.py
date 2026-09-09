@@ -790,6 +790,41 @@ def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
     ))
 
 
+def compute_rope_params(config, device=None):
+    """(inv_freq, attention_scaling) for `config`, honouring ROPE SCALING.
+
+    `compute_rope_inv_freq` above implements the DEFAULT formula only. A
+    checkpoint that declares `rope_scaling` was trained on different
+    frequencies, and for some types on a cos/sin factor as well -- both live in
+    transformers' ROPE_INIT_FUNCTIONS, which is where the model's own rotary
+    module reads them from.
+
+    Computing the default formula for a scaled model is not a small error.
+    Llama-3.2-1B and Llama-3.3-70B both declare `rope_type: llama3`, which
+    divides the long-wavelength inverse frequencies by `factor` (32 and 8):
+    measured max relative error against the correct frequencies, 1414x on the
+    1B. The models run here that declare no scaling -- Qwen3-235B
+    (`rope_type: default`) and MiniMax-M2.7 (no rope params at all) -- take the
+    fall-through and are byte-identical to before.
+
+    'default' is resolved here rather than through ROPE_INIT_FUNCTIONS because
+    transformers >= 5.6 removed that entry (see the shim in
+    _apply_transformers_compat_patches) and
+    because compute_rope_inv_freq is the partial-rotary-aware source of truth.
+    """
+    params = (getattr(config, "rope_parameters", None)
+              or getattr(config, "rope_scaling", None) or {})
+    rope_type = params.get("rope_type") or params.get("type") or "default"
+    fn = None
+    if rope_type != "default":
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+    if fn is None:
+        return compute_rope_inv_freq(config, device), 1.0
+    inv_freq, attention_scaling = fn(config, device=device)
+    return inv_freq, float(attention_scaling)
+
+
 def act_stats(t) -> str:
     """Compact activation summary for VAAYU_TRACE_ACT=1 diagnostics.
 
@@ -3907,7 +3942,15 @@ class VaayuBaseModel(GenerationMixin):
             # Honours partial rotary (rotary_dim < head_dim) — see
             # compute_rope_inv_freq. Emitting a full-head_dim cos/sin here makes
             # apply_rotary_pos_emb rotate dims meant to pass through untouched.
-            inv_freq = compute_rope_inv_freq(self.config, position_ids.device)
+            # And honours rope_scaling: this function is what forward's BATCHED
+            # branch computes RoPE with, while every single-stream call goes
+            # through _precompute_rope to the model's own rotary module, which
+            # applies the scaling. Computing the unscaled formula here made a
+            # batched run of a scaled checkpoint decode against frequencies the
+            # model never saw — measured 5.89 max|dlogit| against serial on
+            # Llama-3.2-1B at N=1 with no padding at all (row 20).
+            inv_freq, attention_scaling = compute_rope_params(
+                self.config, position_ids.device)
         except AttributeError:
             return None
 
@@ -3917,8 +3960,8 @@ class VaayuBaseModel(GenerationMixin):
         with torch.no_grad():
             freqs = (inv_freq_expanded.float() @ position_ids_expanded).transpose(1, 2)
             emb = torch.cat([freqs, freqs], dim=-1)
-            cos = emb.cos().to(dtype=self.running_dtype)
-            sin = emb.sin().to(dtype=self.running_dtype)
+            cos = (emb.cos() * attention_scaling).to(dtype=self.running_dtype)
+            sin = (emb.sin() * attention_scaling).to(dtype=self.running_dtype)
         return cos, sin
 
     def _precompute_rope(self, position_ids):

@@ -47,10 +47,11 @@ say what happened to each, and they are anti-regression notes, not history for i
 
 **P10 CLOSED 2026-09-09** (measured, banked, not recommended — see its row). **P5 is the
 only P-row still open.** Two NEW rows came out of P10's measurement and are the live work
-now: **row 20 `[bug]`** — batched decode corrupts output whenever the batch is padded,
-which must be fixed before `MAX_BATCH_SIZE > 1` is recommended to anyone — and **row 21**,
-the gate-2 ceiling that admits batching about once per process. **Row 20 comes first: row
-21 would make row 20's corruption more reachable, not less.** **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
+now: ~~**row 20 `[bug]`**~~ — **FIXED 2026-09-09: the padding was a red herring, the batched
+path computed RoPE without `rope_scaling`; both MoE checkpoints were never affected, and
+`MAX_BATCH_SIZE` stays 1 on row 15's performance grounds, not on corruption** — and **row 21**,
+the gate-2 ceiling that admits batching about once per process, **which row 20 no longer
+blocks.** **Order: P10 first, and it is now MEASURED rather than argued.** Its refuting
 measurement ran 2026-09-07 and the row PASSED at **1.48-1.78x end-to-end** at realistic agentic
 context — the largest effect on this board by an order of magnitude, and mostly a PREFILL win, not
 the decode win P6/P8 banked. It also found its own prerequisite: `_assert_context_fits` refuses
@@ -72,7 +73,7 @@ decoding (that row was pruned 2026-09-03; its content lives in git history).
 
 | # | item | why it is perf | dependency | where the detail lives |
 |---|---|---|---|---|
-| **P10** `[x]` | Wire batched decode into the SERVER — **CLOSED 2026-09-09: MEASURED, BANKED, NOT RECOMMENDED** | **T10 ran and the row is ANSWERED.** 12 arms (MiniMax + Qwen, both interleave directions) plus a dense smoke, through the real server. Batching is worth **1.442×** on a two-turn MiniMax session with the prefix cache ON (the server's default), **1.250×** with it off, and **nothing** on the warm steady-state turn (+0.9 % / +1.3 %, inside noise) — because the formation policy correctly prefers prefix reuse, declining with BOTH gates at 0. **Qwen gets nothing and regresses nothing** (202.50 → 201.12 s, 0 batches). Three structural facts bound it: batching is admitted about **once per process** (row 21), the whole win is the **cold turn**, and **the prefix cache is worth 4.44× where batching's best is 1.44×**. **It is also UNSAFE today — row 20: padded batches corrupt output. Leave `MAX_BATCH_SIZE = 1`.** Four bugs found and FIXED on the way, THREE of which bite users who never enable batching: formation starvation (`94c8e1a`), the prefix-hit chunked-prefill OOM (`266ec80`), cross-session prefix cannibalisation (`efeb343`, **2.77×** on its own arm), the batched store-back (`845608e`). Suite 1838 → **1865**. | none | row **15** · [`docs/2026-09-09-P10-server-batching-RESULTS.md`](docs/2026-09-09-P10-server-batching-RESULTS.md) |
+| **P10** `[x]` | Wire batched decode into the SERVER — **CLOSED 2026-09-09: MEASURED, BANKED, NOT RECOMMENDED** | **T10 ran and the row is ANSWERED.** 12 arms (MiniMax + Qwen, both interleave directions) plus a dense smoke, through the real server. Batching is worth **1.442×** on a two-turn MiniMax session with the prefix cache ON (the server's default), **1.250×** with it off, and **nothing** on the warm steady-state turn (+0.9 % / +1.3 %, inside noise) — because the formation policy correctly prefers prefix reuse, declining with BOTH gates at 0. **Qwen gets nothing and regresses nothing** (202.50 → 201.12 s, 0 batches). Three structural facts bound it: batching is admitted about **once per process** (row 21), the whole win is the **cold turn**, and **the prefix cache is worth 4.44× where batching's best is 1.44×**. **It was also UNSAFE when this row closed — row 20: padded batches corrupted output. Row 20 is FIXED 2026-09-09 (the batched path computed RoPE without `rope_scaling`; neither MoE checkpoint was ever affected), so `MAX_BATCH_SIZE = 1` now stands on THIS row's performance findings alone.** Four bugs found and FIXED on the way, THREE of which bite users who never enable batching: formation starvation (`94c8e1a`), the prefix-hit chunked-prefill OOM (`266ec80`), cross-session prefix cannibalisation (`efeb343`, **2.77×** on its own arm), the batched store-back (`845608e`). Suite 1838 → **1865**. | none | row **15** · [`docs/2026-09-09-P10-server-batching-RESULTS.md`](docs/2026-09-09-P10-server-batching-RESULTS.md) |
 | **P5** | The intercept residual the VRAM calibration cannot explain | One intercept rule over-charges 2 of 3 geometries (70B charged 1.051 against a measured 0.928; MiniMax 0.871 against 0.62–0.67). Over-charging the transient reserve shrinks the expert cache, and cache size sets throughput. | none | OPTIONAL row **6a** · [`docs/2026-09-06-P5-intercept-residual-BRIEF.md`](docs/2026-09-06-P5-intercept-residual-BRIEF.md) |
 
 **Warnings that belong to this order, not to a later surprise:**
@@ -247,7 +248,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored, see the bug row below. `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1758 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1870 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-09 after row 20's rope_scaling fix (1865 + 5). The 1758 written here before that was
+stale by 112 — it predates T10's four fixes and row 20's. It was itself verified
 2026-09-08 after row 17's sdpa causal-mask fix (+10). **The 1715 written here before that was stale
 by 33** — a stashed-HEAD re-measure the same day returned 1748, exactly as the warning at the end of
 this paragraph says to expect. The 1715 was verified
@@ -1901,40 +1904,63 @@ this only bites a diagnostic. It is filed because a debugging session that reach
 loses a tool exactly when it needs one — which is how it was found.
 
 ---
-# 20 · [bug] Batched decode diverges from serial whenever the batch is PADDED
+# 20 · [x] Batched decode diverges from serial whenever the batch is PADDED — **FIXED 2026-09-09**
 
-**Opened 2026-09-09 by row 15's T10 dense smoke. PRE-EXISTING — reproduced byte-identically
-at `538e740` (the P10 merge), so no fix from that session caused it. NOT FIXED.**
+**The PADDING WAS A RED HERRING. Root cause: the batched path computed RoPE WITHOUT
+`rope_scaling`.** `forward`'s batched branch uses `_compute_full_position_embeddings`, which
+implemented the DEFAULT formula only; every single-stream call goes through `_precompute_rope`
+to the model's own rotary module, which applies the scaling. Two implementations, one
+incomplete. Both Llama checkpoints declare `rope_type: llama3` (factor 32 on the 1B, 8 on the
+70B), which divides the long-wavelength inverse frequencies by that factor — **measured max
+relative error 1414x on the 1B**. Fixed by `compute_rope_params()` (new, `vaayu_base.py`),
+which resolves `(inv_freq, attention_scaling)` through transformers' `ROPE_INIT_FUNCTIONS` and
+falls through to the existing partial-rotary-aware `compute_rope_inv_freq` when a config
+declares no scaling. `tests/test_rope_scaling.py` (+5). Suite **1870 passed, 12 skipped**.
 
-**`MAX_BATCH_SIZE >= 2` corrupts output when the batch's prompts differ in length**, and
-severity tracks PREFILL CHUNK COUNT:
+**What killed the row's own framing, in one probe** (`plans/probes/p10g_pad_localize.py`,
+prefill logits only, Llama-3.2-1B): **N=1 through the batched path with ZERO padding was
+already 5.89 max|dlogit| off serial** (0.33 after the fix). And swapping what sits in the pad
+slots moves **0.000000** — **the pads were always masked out exactly**. `build_batch_attention_mask`,
+`batch_position_ids` and the chunk-loop slices — the row's three suspects — were never wrong.
 
-| probe | prompt lengths | pad_len | chunks | result |
-|---|---|---|---|---|
-| `plans/probes/p10b_ids.py` | equal (by design) | 0 | 1 | identical, 32/32 ids |
-| `plans/probes/p10f_pad_ids.py` (**the reproducer**, ~2 min on Llama-3.2-1B) | 68 vs 75 | 7 | 1 | **DIFFERENT**, both coherent |
-| server arm `dense-mbs2` | 1236 vs 1239 | 3 | 3 | **GARBAGE** — `'**min** \nwith \nassistant:\n\n?...'` against clean serial output |
+**Severity tracked prompt LENGTH, not chunk count** (chunks were a proxy): llama3 scaling only
+alters the long-wavelength dims, so a wrong `inv_freq` costs more at larger absolute position.
+Reproduced without the server at 1511/1515 tokens (`plans/probes/p10h_pad_ids_long.py`),
+**pre-fix batched output `'Thea\n \n is the is<|eot_id|>'` against clean serial text** — the same
+garbage shape as the `dense-mbs2` server arm. Post-fix both rows are coherent.
 
-**ENGINE, not server wiring:** `p10f_pad_ids.py` calls `batched_generate` directly, no
-HTTP. **Dense has no top-k to flip, so ANY divergence is a real defect** — that is exactly
-the discriminator `p10b_ids.py` was built to provide, and it misses this because it uses
-identical prompts (its own docstring names zero padding as an untested control). **Real
-fan-out never has equal-length prompts.**
+**BOTH MoE CHECKPOINTS WERE NEVER AFFECTED, and the row's "unmeasured MoE blast radius" is
+answered:** Qwen3-235B declares `rope_type: default` and MiniMax-M2.7 declares no rope params at
+all, so `compute_rope_params` returns byte-identical frequencies for them (checked against the
+real configs; MiniMax's partial rotary still yields 32 dims). Only scaled checkpoints — the two
+Llamas — were ever wrong.
 
-**The MoE blast radius is UNMEASURED and is the worrying part.** The same padded path
-serves Qwen3-235B and MiniMax-M2.7, where identity is *unassertable* — batch width changes
-GEMM tiling, tiling perturbs router logits ~1 ULP, top-k is DISCONTINUOUS (row 15's own
-settled finding). So this may be silently degrading batched MoE output, and row 15's
-"coherent as TEXT" criterion cannot catch it. T10's MoE arms produced plausible code;
-plausible is not a check.
+**Residual, MEASURED, and NOT a defect:** `p10f_pad_ids.py` is now **IDENTICAL 32/32 on both
+streams**, but at 1515 tokens one row still splits at decode step 4. `p10i_chunk_localize.py`:
+serial-chunked vs serial-unchunked is **0.39**, the batched path is **0.95 — the same 0.9531
+for N=1-unpadded, N=2-padded-one-forward and N=2-padded-chunked alike**, i.e. a fixed offset,
+not something padding or chunking adds. `p10j_decode_margin.py` prints the flip's cause
+directly: serial's own top1-top2 margin is **0.25** at the flip step against a **0.75** delta,
+while steps 0-3 had margins 2.88-7.00 and matched, and the delta is FLAT (no accumulation).
+Cause: the batched path passes an explicit 4D float mask, the single-stream path passes none
+and lets sdpa apply its own causal mask — different backend, different rounding. **Exact
+serial-identity is not attainable for a padded batch** without changing the single-stream
+path's kernel choice, which is not worth doing. **So restate the criterion: "dense may assert
+token identity" holds at short prompts (what `p10f`/`p10b` check); at long context the honest
+check is argmax agreement wherever the model's own margin exceeds ~1 logit, which `p10j`
+measures.**
 
-**Suspects, already narrowed by the chunk-count correlation:** `build_batch_attention_mask`,
-`batch_position_ids`, and the per-chunk `pad_mask[:, :m + _end]` /
-`position_ids[:, :m + _end]` slices in `batched_generate`'s chunk loop — the interaction of
-left-padding with chunk boundaries.
+**Definition of done (§8): no knob needed** (a correctness fix; no configuration wants unscaled
+frequencies). **Reachability: banked** — the server runs `MAX_BATCH_SIZE = 1`, so the batched
+path is not reached. One piece IS user-reachable: the same function is `_precompute_rope`'s
+fallback when instantiating the real rotary module fails, and that fallback was serving unscaled
+frequencies to SINGLE-STREAM generation on a scaled checkpoint. Rare, never observed here, now
+closed.
 
-**Consequence while open: `MAX_BATCH_SIZE > 1` must not be recommended to anyone.** It
-defaults to 1, so no user is exposed today.
+**`MAX_BATCH_SIZE` stays 1** — the corruption blocker is gone, but row 15's performance reasons
+(nothing in the warm steady state, admitted about once per process) are untouched.
+
+`docs/2026-09-09-row20-batched-rope-scaling-RESULTS.md`.
 
 ---
 
@@ -1971,8 +1997,9 @@ counts `reclaimable_expert_vram` in its budget, which gate 2's `usable` term nev
 This is the gate-1/gate-2 asymmetry already recorded as a known-open minor — now MEASURED
 as the ceiling on batching.
 
-**Do not open this before row 20 is fixed** — lifting the ceiling on a path that corrupts
-padded batches makes the corruption more reachable, not less. And weigh it against row 15's
+**UNBLOCKED 2026-09-09 — row 20 is FIXED** (it was "do not open this before row 20 is fixed":
+lifting the ceiling on a path that corrupted padded batches would have made the corruption more
+reachable). Weigh it against row 15's
 finding that the warm steady state gets **nothing** from batching however wide it is
 admitted: more formations only help COLD fan-out.
 
@@ -2518,7 +2545,13 @@ pins its real point (nothing is lost on `GeneratorExit`).
 the pre-fix number.
 
 ### [bug] BATCHED DECODE DIVERGES FROM SERIAL WHENEVER THE BATCH IS PADDED — found
-2026-09-09, NOT FIXED, and it is a **blocker on this row's verdict**
+2026-09-09, **FIXED 2026-09-09 (row 20)**, and it was a blocker on this row's verdict
+
+**The account below is the FINDING as recorded on the day, and its causal reading is WRONG:
+the padding was a red herring and the chunk-count correlation was really prompt LENGTH. Root
+cause: the batched path computed RoPE without `rope_scaling`, so only the two Llama checkpoints
+were ever affected and neither MoE checkpoint was. Read row 20 for the verdict and
+`docs/2026-09-09-row20-batched-rope-scaling-RESULTS.md` for the evidence.**
 
 **`MAX_BATCH_SIZE >= 2` corrupts output when the batch's prompts differ in length.**
 Pre-existing: reproduced byte-identically at `538e740` (the P10 merge, before any of
