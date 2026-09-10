@@ -277,6 +277,8 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
+| **13** `[bug]` | The spec gate's break-even is in EXPERT BYTES, so `run` can lose wall-clock | **SPIKE DONE + DESIGNED 2026-09-10, not built. Build it AFTER row 14, before row 24.** Worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE and the gate is MoE-only, so it only reaches an explicit opt-in, whereas row 14's half-wired `ENABLE_KV_PERSIST` is exposed today. | row **13** · [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) |
+| **24** `[ ]` | Every speculation decision latches for the process; acceptance moved 0.048 → 0.875 inside ONE call | Same §8 bucket as 13 — 0 % on the default config. Opened 2026-09-10 by 13's spike, not yet measured on its own evidence. | row **24** |
 | **A** | The server reaches 14 of the engine's 28 load parameters | Capability and correctness, not speed. `ENABLE_KV_PERSIST` is exposed while `kv_persist_dir`/`kv_persist_sync` are not, so the feature can be turned on but not aimed. | OPTIONAL row **14** · [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md) |
 | ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
@@ -804,10 +806,14 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
+**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** **14 → 13 → 24**, then 6a-b / 3 / 5. Row **14** first because it is CPU-only, cannot be refuted (closing it with 2 knobs and 12 written-down declines is a success), and it fixes a feature that is EXPOSED today —
+`ENABLE_KV_PERSIST` can be turned on but not aimed and never fsyncs. Row **13** second: designed and ready to execute cold, but §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup, and it costs 4 on-device arms. Row **24** third, because it is the same subsystem and a timed bar (13) should exist before anyone argues about re-evaluating one.
+
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[x]` **CLOSED 2026-09-10 — wired, and PROVEN to fail on the real shape** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
-| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
+| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` **SPIKE DONE 2026-09-10 — feasible. DESIGNED, not built. Take it AFTER row 14.** | ~1 day + 4 on-device arms | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. Bounded, self-contained design ready to execute cold: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md). Evidence: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
+| **24** | `[ ]` Every speculation decision LATCHES for the process, but acceptance moves **0.048 → 0.875 inside ONE call** | OPTIONAL | `[ ]` **AFTER row 13** — a timed bar is a better bar, still evaluated once | GPU round | Opened 2026-09-10 by row 13's spike. MiniMax-M2.7 leaving its reasoning preamble for code reproduction: blocks 0-9 lost, blocks 10-14 ran **1.21-1.28x**. A TRIAL sampled in the preamble latches `off` and forfeits the win; one sampled in the code stretch latches `run` and keeps it through the next preamble. **NOT the SETTLED regime-latch item** (that was refuted on Qwen, which never emitted code at all). See below. |
 | **6a-b** | `head_bytes` is probably not a transient at all | OPTIONAL | `[ ]` | GPU round | Split out of row 6a on its own evidence when that row closed 2026-09-09. §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it buys admission headroom, not tok/s. See below. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
 | **4** | 2× KV overshoot (~0.83 GB at Qwen's 8192) | OPTIONAL (parked) | `[ ]` | — | **Deliberately parked.** Re-open only on new evidence. |
@@ -866,6 +872,91 @@ archived — constructing one is part of the work.
 **Stop rule:** if a wall-clock TRIAL cannot be made cheap enough to run per process, say so and
 close the row by documenting that `run` is a bytes claim only — the docs already say this as of
 `5aa9aab`.
+
+## SPIKE DONE 2026-09-10 — feasible, and the fix is CHEAPER than this row assumed
+
+**The fix is now DESIGNED and ready to execute cold in a fresh session — BOUNDED, one class plus two existing call sites: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md)** (gitignored; §4 below restates every load-bearing number it depends on). **Take it AFTER row 14** — see the build order under the OPTIONAL heading.
+
+**Full write-up: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md)**
+(**gitignored — this disk only**; everything load-bearing is restated here). Probe
+`plans/probes/p13_timed_trial.py` + `p13_report.py` + `p13_ab.sh`, **throwaway, also gitignored**.
+6 arms, MiniMax-M2.7, `draft_tokens=3`, NTOK=200, WARM=96 discarded, prefix cache OFF,
+BALLAST_GB=25, one `systemd-run` scope each. **No engine code was changed.**
+
+**Method, and why it cost nothing to build:** a gate subclass that never latches, flips
+`should_draft()` every 8 rounds, and timestamps each round from inside `record_round`. The loop
+already asks `should_draft()` per round (`vaayu_base.py:5301`), a False answer is an ordinary
+1-wide decode that still yields a token, and `record_round` already fires on EVERY round including
+the suppressed ones (k=0). Block 0 excluded from aggregates.
+
+**1. The signal is decisive; noise is not the obstacle.** Suppressed rounds are a very stable
+reference — **0.4386–0.5838 s/tok across 90 blocks** — while drafting swings 0.357–1.074.
+* **loser** (p9_e2e's code prompt, THINK=1): drafting faster in **0/15** and **2/16** paired
+  blocks, pooled ratio **0.734 / 0.753** → a timed gate REFUSES it. Correct.
+* **winner** (constructed, THINK=0 = the server's regime): **8/9** and **8/10** pairs, pooled
+  **+22.8 % / +17.4 %**, acceptance to 1.000 → a timed gate ADMITS it. Correct.
+* **This row's missing reference winner now EXISTS** (trap 3 discharged): reproduce a module given
+  in the prompt three times verbatim with only the class name changed. Archived in the spike doc
+  and the probe.
+
+**2. The measured cost model, and the defect in arithmetic.** PLD drafts 0 or 3, never partial. A
+k=3 round costs **3.124× / 2.900×** a plain decode round; a k=0 round costs 1.02–1.06×. **So a
+4-position verify is ~3× a 1-position decode — ~0.73–0.78× PER POSITION, near-linear in positions
+and nothing like the expert-byte ratio the gate models.** With that per-position factor `alpha`,
+the honest bar is `a* = ((1+d)*alpha − 1)/d`. **Measured `a*` = 0.633–0.710 in EVERY arm against
+the gate's byte break-even of 0.6259** — the byte bar is systematically too permissive, and P9's
+admitted-then-lost arm measured **0.6875, inside exactly that gap.**
+
+**3. The confound this row did not know about is DEAD.** `should_draft()` is False throughout
+CALIBRATE, so P9's verify-width prefix sizing (`vaayu_base.py:5199`) NEVER fires on a process's
+first call — TRIAL always measures under the load-time prefix while the RUN phase it predicts runs
+under the verify-width one. Measured both ways: **`alpha` moves <1 %** (0.7801/0.7821,
+0.7255/0.7250, 0.7372/0.7438) although absolute speed moved several percent. **TRIAL's measurement
+is valid for RUN.**
+
+**4. RECOMMENDED FIX — no new phase, zero extra tokens.** The gate already runs both arms:
+CALIBRATE is `max(8, d+1)` 1-wide rounds (`base`), TRIAL is k-wide rounds. Feed both call sites a
+wall-clock delta, take medians, `alpha = median_k / (base * (1 + draft_tokens))`, and have
+`_decide_acceptance` compare against `max(byte_breakeven, ((1+d)*alpha − 1)/d)` — **keeping the
+byte test as the necessary condition**, since it is free, sound, and what refuses Qwen at zero
+cost. Fall back to bytes alone when the timing sample is too small or too dispersed, and SAY so in
+`status()`. **This costs two timestamps per round**, where this row's original candidate
+(block-alternating TRIAL) roughly doubles TRIAL's length. Validation set is the 6-arm table above.
+**§8: worth 0 % on the server's default configuration** — `USE_PROMPT_LOOKUP = "auto"` is OFF for
+MoE (`config.py:211`) and the gate is MoE-only, so this only ever reaches a user who explicitly
+opts a MoE checkpoint in. **No knob needed** (a bar is not a feature).
+
+**5. Two things NOT folded in.** (a) The latch — filed as row **24**. (b) **Cross-arm greedy id
+identity is not assertable when the arms differ in WHICH rounds are 4-wide** (loser diverged at
+index 169, winner at 84); a 4-wide verify is not bitwise a 1-wide decode. Compare ids only between
+arms with matching per-round widths. Also observed: `alpha` drifts up within a call (0.749 → 0.832
+over 130 rounds) as context grows — small across the adjacent CALIBRATE→TRIAL, but a
+re-calibrating gate would have to re-measure rather than latch it.
+
+# 24 · [ ] Speculation decisions latch for the process; acceptance moves inside ONE call
+
+**Opened 2026-09-10 by row 13's spike** (`docs/2026-09-10-row13-timed-trial-SPIKE.md`,
+gitignored — this row is the durable copy). Not measured on its own evidence yet; the number below
+is a side observation of a run aimed at something else, and that is exactly its status.
+
+`AdaptiveSpecGate`'s decision latches for the PROCESS — `run` as permanently as `off`. Measured on
+MiniMax-M2.7, THINK=1, one 200-token call, alternating 8-round blocks: acceptance went
+**0.048 (blocks 4–8, reasoning preamble) → 0.875 (blocks 12–14, reproducing code)**, and the
+per-block paired ratio with it, **0.43–0.51 → 1.21–1.28**. So a TRIAL sampled during the preamble
+latches `off` and forfeits the win; one sampled in the code stretch latches `run` and keeps it
+through the next preamble. **This is row 13's brief question 5, and it is orthogonal to row 13's
+fix** — a timed bar is a better bar, still evaluated once.
+
+**NOT the SETTLED "regime latch" item.** That one was refuted on **Qwen3-235B**, whose four arms
+(192/192/160/900 tokens) emitted **zero** fenced code blocks, so its transition never happened at
+all. This is MiniMax, the transition is measured, and the bar a re-entry must clear
+(`TRIAL_DRAFTED_TOKENS × breakeven` ≈ 29.3 token-equivalents on MiniMax) is unchanged and still
+applies — **any proposal here must price against it before proposing re-calibration.**
+
+**§8: worth 0 % on the server's default configuration**, same as row 13 — `USE_PROMPT_LOOKUP` is
+OFF for MoE by default and this gate is MoE-only. Weigh it accordingly.
+
+---
 
 # 14 · [ ] The server reaches 14 of the engine's 28 load parameters  (**A**)
 
