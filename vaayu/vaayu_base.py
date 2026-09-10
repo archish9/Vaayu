@@ -5287,6 +5287,14 @@ class VaayuBaseModel(GenerationMixin):
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
                 return generated
 
+            # Row 13: the gate's break-even was in EXPERT BYTES and nothing
+            # timed a clock, so it admitted -- and latched -- a configuration
+            # measured at -16% decode (2026-09-07). The gate is pure and reads
+            # no clock itself, so the loop measures for it. A per-CALL local:
+            # the gate is shared across requests but the delta must not span a
+            # request boundary or a prefill.
+            _round_mark = None
+
             while tokens_generated < max_new_tokens:
                 # This loop is hand-written, so transformers' criteria machinery
                 # never runs here: check it ourselves or a cancelled request keeps
@@ -5298,6 +5306,14 @@ class VaayuBaseModel(GenerationMixin):
                 # has latched off, in which case this round is an ordinary 1-wide
                 # decode that still produces a token and still shows the gate real
                 # routing.
+                # The proposer's own time is separated from the round's:
+                # a round that drafted NOTHING is the gate's 1-wide baseline,
+                # and the counterfactual it stands for -- speculation off --
+                # runs no proposer at all. Row 13, measured 2026-09-10:
+                # leaving the failed search in that baseline understates the
+                # verify pass's per-position cost by about the search's own
+                # share, which was the entire decision margin on MiniMax-M2.7.
+                _draft_t0 = time.perf_counter()
                 if gate is not None and not gate.should_draft():
                     draft_ids = torch.empty((1, 0), dtype=generated.dtype,
                                             device=generated.device)
@@ -5306,6 +5322,7 @@ class VaayuBaseModel(GenerationMixin):
                     draft_ids, draft_state = speculator.draft(
                         generated, past_key_values, num_tokens=self.draft_tokens
                     )
+                _draft_s = time.perf_counter() - _draft_t0
                 k = draft_ids.shape[1]
 
                 # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
@@ -5327,15 +5344,26 @@ class VaayuBaseModel(GenerationMixin):
                 )
 
                 if gate is not None:
+                    # Both call sites fire exactly once per round, at this same
+                    # point, so the delta between consecutive marks IS one
+                    # round -- the draft, the verify and the accept. The first
+                    # mark of a call has no predecessor (the work before it is
+                    # the prefill), so that round is dropped.
+                    _now = time.perf_counter()
+                    _round_s = None if _round_mark is None else _now - _round_mark
+                    _round_mark = _now
                     if gate.phase == "calibrate":
-                        gate.observe(getattr(self, "_expert_history", {}) or {})
+                        gate.observe(getattr(self, "_expert_history", {}) or {},
+                                     elapsed_s=_round_s)
                     else:
                         # `num_accepted` (Step 4) is 1..k+1 -- it always includes
                         # the bonus/correction token verify_and_accept guarantees
                         # every round. The gate's break-even treats that token as
                         # the "+1" in "1 + accepted" (design doc §2) and wants only
                         # the count of DRAFTED tokens that matched, 0..k.
-                        gate.record_round(k, max(0, num_accepted - 1))
+                        gate.record_round(k, max(0, num_accepted - 1),
+                                          elapsed_s=_round_s,
+                                          draft_overhead_s=_draft_s)
                     if gate.decided_off() and self.speculator is not None:
                         s = gate.status()
                         if gate.decision == "off_no_routing":

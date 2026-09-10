@@ -277,8 +277,8 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
-| **13** `[bug]` | The spec gate's break-even is in EXPERT BYTES, so `run` can lose wall-clock | **SPIKE DONE + DESIGNED 2026-09-10, not built. Build it AFTER row 14, before row 24.** Worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE and the gate is MoE-only, so it only reaches an explicit opt-in, whereas row 14's half-wired `ENABLE_KV_PERSIST` is exposed today. | row **13** · [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) |
-| **24** `[ ]` | Every speculation decision latches for the process; acceptance moved 0.048 → 0.875 inside ONE call | Same §8 bucket as 13 — 0 % on the default config. Opened 2026-09-10 by 13's spike, not yet measured on its own evidence. | row **24** |
+| **13** `[bug]` | The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once | **BUILT + MEASURED 2026-09-10. The timed bar exists, is a strict tightening, and changed NO decision on any of 4 on-device arms — banked, not shipped-with-effect. The design's Done condition REFUTED: the losing arm is still admitted (−19.7 % on its own A/B), because CALIBRATE+TRIAL sit in the cheapest stretch of a call.** Still worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE. The path is row **24**, not a better one-shot bar. | row **13** · [`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md) · [`…-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`…-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) |
+| **24** `[ ]` | Every speculation decision latches for the process, and it is decided in the cheapest stretch of a call | Same §8 bucket as 13 — 0 % on the default config. **Now the head of this queue and no longer a side observation: row 13's four on-device arms measured the decision window at 0.510-0.532 s/token against 0.637-0.793 for the whole call, and that gap is exactly why a correct, timed, tightened bar still admits a −19.7 % configuration.** | row **24** |
 | ~~**A**~~ | **CLOSED 2026-09-10 — 19 of 28 reachable, 9 declined in code, drift test wired. Suite 1893 → 1906** | Was: capability and correctness, not speed. `ENABLE_KV_PERSIST` could be turned on but not aimed. **All 5 new knobs are worth 0 % until an operator sets one — no default moved.** | OPTIONAL row **14** |
 | ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
@@ -310,8 +310,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1906 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-10 after row 14's config reachability work (1893 + 13). **The 1893 was re-measured against
+**Suite baseline: 1950 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-10 after row 13's timed spec bar (1906 + 44). The 1906 was verified the same day after
+row 14's config reachability work (1893 + 13). **The 1893 was re-measured against
 a stashed HEAD the same day and MATCHED the figure written here** — the second time in ten that it
 was not stale. The 1893 was verified
 2026-09-10 after C1's no-geometry refusal (1887 + 6). The 1887 was verified the same day after
@@ -809,12 +810,12 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
-**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10** (5 knobs, 9 written-down declines, a drift test; suite 1893 → 1906), so the head of the queue is now **13 → 24**. Row **13** is designed and ready to execute cold, but §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup, and it costs 4 on-device arms. Row **24** after it, because it is the same subsystem and a timed bar (13) should exist before anyone argues about re-evaluating one.
+**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10**; **row 13's timed bar was then BUILT and MEASURED the same day, its Done condition REFUTED, and the row stays open narrowed** — so the head of the queue is now **24**, then 13's remainder, then 6a-b / 3 / 5. The reason 24 moved ahead is measured, not preference: row 13 proved that a one-shot bar cannot be right for a whole call whatever it is denominated in, and 24 is the re-evaluation that premise demands. Both are §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[x]` **CLOSED 2026-09-10 — wired, and PROVEN to fail on the real shape** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
-| **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` **SPIKE DONE 2026-09-10 — feasible. DESIGNED, not built. Take it AFTER row 14.** | ~1 day + 4 on-device arms | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. Bounded, self-contained design ready to execute cold: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md). Evidence: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
+| **13** | `[bug]` The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once (was: it is in expert bytes) | OPTIONAL | `[ ]` **TIMED BAR BUILT + MEASURED 2026-09-10; the design's Done condition is REFUTED and the row stays open, narrowed.** | ~1 day + 4 on-device arms | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. Bounded, self-contained design ready to execute cold: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md). Evidence: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **24** | `[ ]` Every speculation decision LATCHES for the process, but acceptance moves **0.048 → 0.875 inside ONE call** | OPTIONAL | `[ ]` **AFTER row 13** — a timed bar is a better bar, still evaluated once | GPU round | Opened 2026-09-10 by row 13's spike. MiniMax-M2.7 leaving its reasoning preamble for code reproduction: blocks 0-9 lost, blocks 10-14 ran **1.21-1.28x**. A TRIAL sampled in the preamble latches `off` and forfeits the win; one sampled in the code stretch latches `run` and keeps it through the next preamble. **NOT the SETTLED regime-latch item** (that was refuted on Qwen, which never emitted code at all). See below. |
 | **6a-b** | `head_bytes` is probably not a transient at all | OPTIONAL | `[ ]` | GPU round | Split out of row 6a on its own evidence when that row closed 2026-09-09. §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it buys admission headroom, not tok/s. See below. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
@@ -824,7 +825,71 @@ from this table.
 
 ---
 
-# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock
+# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock — TIMED BAR BUILT AND MEASURED 2026-09-10; ROW STAYS OPEN, NARROWED
+
+**STATUS 2026-09-10: the timed bar is BUILT, TESTED and MEASURED on device — and the DESIGN's own
+Done condition is REFUTED. The row does NOT close.** The defect is no longer *"the bar is in
+expert bytes"* (it is not, any more): it is **"the bar is measured in an unrepresentative window
+and evaluated once"**. Full write-up
+[`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md)
+(gitignored — everything load-bearing is restated here).
+
+**What shipped.** `wall_breakeven_acceptance(alpha, d) = ((1+d)*alpha - 1)/d` in
+`vaayu/speculative/adaptive_gate.py`; `observe()`/`record_round()` take an optional `elapsed_s`
+(and `record_round` a `draft_overhead_s`); `alpha = median(wide)/(median(base)*(1+d))`, medians
+never means; the bar is `max(byte_breakeven, wall_breakeven)` so **bytes stays NECESSARY**;
+`status()` gains `alpha`, `wall_breakeven`, `bar_used`, `base_from`, which reach `/v1/models` and
+`env.json` unchanged. The loop marks one `perf_counter()` per round at the point both gate call
+sites already fire from, and times `speculator.draft()` separately. **The gate still reads no
+clock itself.** Tests 24 -> 74 in `tests/test_adaptive_spec_gate.py`, +4 wiring.
+
+**THE FOUR ARMS (real gate, no probe subclass, one `systemd-run` scope each, BALLAST_GB=25,
+WARM=96 + TIMED 200):**
+
+| arm | required | **got** | bar_used | alpha | wall bar | byte bar | acceptance | A/B |
+|---|---|---|---|---|---|---|---|---|
+| MiniMax loser THINK=1 | `off_acceptance` | **`run`** ✗ | wall | 0.7349 | 0.6466 | 0.6305 | 0.6875 | **1.2604 spec-on vs 1.5690 off = −19.7 %** |
+| MiniMax winner THINK=0 | `run` | **`run`** ✓ | wall | 0.7787 | 0.7050 | 0.6125 | 0.8125 | **1.7681 vs 1.5450 = +14.4 %** |
+| MiniMax winner THINK=1 | either, stated | `off_acceptance` | wall | 0.7750 | 0.7000 | 0.6462 | 0.5417 | bytes would refuse it too |
+| Qwen3-235B THINK=0 | `off_union` | **`off_union`** ✓ | — | None | — | 0.4036 | None | 0 drafting rounds |
+
+**The timed bar changed NO decision on any arm.** Bytes alone gives run / run / off_acceptance /
+off_union — the same four. It raises the bar (0.6305 -> 0.6466, 0.6125 -> 0.7050) and becomes the
+binding test wherever it runs, but it moves no outcome. **§8: BANKED, not shipped-with-effect**,
+on top of already being worth 0 % on the default config (`USE_PROMPT_LOOKUP` is OFF for MoE).
+**No knob** — a bar is not a feature.
+
+**WHY ARM 1 STILL FAILS — the finding that supersedes this row's premise, and it is row 24's
+evidence.** To refuse arm 1 the bar needs `alpha >= (1 + d*a)/(1+d)` = **0.7656**; measured
+in-window **0.7349–0.7599**. The gate is not mis-measuring — **it measures a window that does not
+represent the call it decides for**: TRIAL's drafting rounds run at **0.510 s/token** and its k=0
+rounds at **0.532**, while the whole timed call runs at **0.793 s/token speculating and 0.637
+not**. Both slow as context grows and **the speculating arm slows more** (the spike's trap 3,
+`alpha` 0.749 -> 0.832 over 130 rounds, whose consequence was never drawn). CALIBRATE and TRIAL
+sit in the cheapest, most speculation-favourable stretch of the call, where speculation on the
+loser prompt genuinely IS marginally profitable; the loss accrues afterwards. **A bar evaluated
+ONCE, early, cannot be right for the whole call however well it is measured.**
+
+**TWO DESIGN CORRECTIONS MADE ON DEVICE — do not re-derive them:**
+1. **CALIBRATE is a COLD baseline.** The design divided TRIAL's wide median by CALIBRATE's. Run as
+   written that gave **alpha 0.6976 -> wall bar 0.5969, UNDER the byte bar**, so `bar_used` stayed
+   `"bytes"` and the fix was inert on the very arm it was built for. CALIBRATE's rounds are the
+   FIRST rounds of a call, right after the prefill; TRIAL's run warm. **Prefer TRIAL's own k=0
+   rounds** (1-wide decodes in TRIAL's regime), CALIBRATE as fallback, reported in `base_from`.
+   alpha 0.6976 -> 0.7599. **This REVERSES the design's trap 4 for the BASE list**; k=0 rounds
+   still never enter the WIDE median.
+2. **The proposer's own search does not belong in the baseline** — speculation OFF runs no search
+   at all. The loop times `draft()` and the gate subtracts it from k=0 rounds only. **Numerically
+   negligible on MiniMax** (two otherwise-identical arms differ more from run-to-run variance in
+   the ~8-sample k=0 median), kept because it is correct and free.
+
+**WHAT IS LEFT ON THIS ROW.** Either make the measurement representative (which means
+re-evaluating, i.e. row **24**, and must be priced against `TRIAL_DRAFTED_TOKENS * breakeven` ≈
+29.3 token-equivalents on MiniMax), or close the row by documenting that `run` is a
+window-local timed claim. **Do NOT re-open it as "measure alpha better" — a perfectly measured
+in-window alpha is the wrong quantity, exactly as P7's perfectly-measured union was.**
+Harness kept: `plans/probes/p13_validate.py` + `p13v_ab.sh` (gitignored), which carries both
+reference prompts and the winner that arm 2 proves is a genuine +14.4 %.
 
 **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md)**
 — written to be picked up COLD in a fresh session: the defect, the exact call sites, all 8 arms,
@@ -940,6 +1005,17 @@ re-calibrating gate would have to re-measure rather than latch it.
 **Opened 2026-09-10 by row 13's spike** (`docs/2026-09-10-row13-timed-trial-SPIKE.md`,
 gitignored — this row is the durable copy). Not measured on its own evidence yet; the number below
 is a side observation of a run aimed at something else, and that is exactly its status.
+
+**STRENGTHENED 2026-09-10 by row 13's four on-device arms — this row is no longer only about
+acceptance drifting.** The DECISION WINDOW itself is unrepresentative: CALIBRATE and TRIAL are the
+first ~40 rounds of a call, and on MiniMax-M2.7 they run at **0.510 s/token (drafting) / 0.532
+(k=0)** while the whole 200-token call runs at **0.793 speculating and 0.637 not** — both arms slow
+as context grows and the speculating one slows more. That is why a correctly measured, strictly
+tightened, TIMED bar still admitted a configuration its own A/B measured at **−19.7 %**: in the
+window it looked at, speculation really was marginally profitable. **So the case for re-evaluation
+no longer rests on acceptance alone; the cost side moves too, and in the same direction.** Any
+proposal still has to clear `TRIAL_DRAFTED_TOKENS × breakeven` ≈ 29.3 token-equivalents on MiniMax.
+See row **13** and `docs/2026-09-10-row13-timed-bar-RESULTS.md` §4.3.
 
 `AdaptiveSpecGate`'s decision latches for the PROCESS — `run` as permanently as `off`. Measured on
 MiniMax-M2.7, THINK=1, one 200-token call, alternating 8-round blocks: acceptance went

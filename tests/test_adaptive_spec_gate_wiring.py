@@ -4,6 +4,8 @@ The harness is the one tests/test_speculative_reset.py already uses -- it
 drives the REAL VaayuBaseModel.speculative_generate with a fake model, so
 these tests exercise the shipped loop rather than a copy of it.
 """
+import time
+
 import torch
 
 from vaayu.prefix_cache import PrefixCacheStore
@@ -373,3 +375,117 @@ def test_empty_routing_history_latches_distinctly_and_warns(monkeypatch, capsys)
     warnings = capsys.readouterr().out
     assert "[Vaayu-Spec] WARNING" in warnings
     assert "_expert_history" in warnings
+
+
+# ---------------------------------------------------------------------------
+# Row 13: the loop must feed the gate a wall clock. The gate never reads one
+# itself -- it stays pure -- so if these two call sites do not pass a delta,
+# the timed bar silently never engages and the gate decides on bytes alone.
+# ---------------------------------------------------------------------------
+
+class _RecordingGate(ag.AdaptiveSpecGate):
+    """The real gate, plus a record of what the loop handed it."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.observe_times = []
+        self.round_times = []
+
+    def observe(self, history, elapsed_s=None):
+        self.observe_times.append(elapsed_s)
+        super().observe(history, elapsed_s)
+
+    def record_round(self, drafted, accepted, elapsed_s=None,
+                     draft_overhead_s=None):
+        self.round_times.append((drafted, elapsed_s))
+        super().record_round(drafted, accepted, elapsed_s, draft_overhead_s)
+
+
+def _recording_moe_fake(monkeypatch, budget_bytes=14_700_000_000):
+    model = _MoEFake(PrefixCacheStore(budget_bytes=10 ** 9),
+                     budget_bytes=budget_bytes)
+    # _build_spec_gate reuses a cached gate whose draft_tokens and budget
+    # still match, so pre-seeding it is how a test gets its own instance in.
+    model._spec_gate = _RecordingGate(MINIMAX, model.draft_tokens, budget_bytes)
+    return model
+
+
+def test_the_loop_times_every_round_and_drops_the_first(monkeypatch):
+    """The delta between consecutive marks IS one round -- but the first mark
+    of a call has no predecessor, and the round before it is the prefill."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    model = _recording_moe_fake(monkeypatch)
+    model.speculator = _CountingSpeculator()
+    _run(model, max_new_tokens=8)
+
+    gate = model._spec_gate
+    assert gate.observe_times[0] is None, \
+        "the first round of a call sits directly after prefill -- timing it " \
+        "would charge the prefill to the decode baseline"
+    assert len(gate.observe_times) >= 2
+    assert all(t is not None and t > 0 for t in gate.observe_times[1:]), \
+        f"a calibrate round was not timed: {gate.observe_times}"
+    assert gate.round_times, "the trial call site was never reached"
+    assert all(t is not None and t > 0 for _, t in gate.round_times), \
+        f"a trial round was not timed: {gate.round_times}"
+
+
+def test_the_first_round_of_a_LATER_call_is_dropped_too(monkeypatch):
+    """The mark is a per-call local: request 2's first round follows request
+    2's prefill, so its delta would span a prefill plus the gap between
+    requests. The gate itself is shared across the boundary; the clock is not."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    model = _recording_moe_fake(monkeypatch)
+    model.speculator = _CountingSpeculator()
+    _run(model, max_new_tokens=3)
+    first_call_rounds = len(model._spec_gate.observe_times)
+    assert first_call_rounds == 2, "premise: call 1 runs exactly 2 rounds"
+    _run(model, max_new_tokens=3)
+
+    gate = model._spec_gate
+    assert gate.observe_times[first_call_rounds] is None, \
+        "call 2's first round must be dropped, not timed across the boundary"
+
+
+def test_a_drafting_round_reaches_the_wide_median(monkeypatch):
+    """The end of the wire: a k>0 round's delta must land in _wide_times, or
+    alpha never has a numerator and the bar silently stays byte-only."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+    model = _recording_moe_fake(monkeypatch)
+    model.speculator = _DraftingSpeculator([[0, 0, 0], [0, 0, 0]])
+    _run(model, max_new_tokens=10)
+
+    gate = model._spec_gate
+    assert len(gate._base_times) == 3, \
+        f"4 calibrate rounds minus the dropped first: {gate._base_times}"
+    assert len(gate._wide_times) == 2, \
+        f"both trial rounds drafted k=3: {gate._wide_times}"
+    assert all(t > 0 for t in gate._base_times + gate._wide_times)
+
+
+def test_the_loop_reports_the_proposers_own_time_separately(monkeypatch):
+    """A k=0 round's baseline is its DECODE. The loop must hand the gate the
+    proposer's own time so the gate can take the search back out -- and it
+    must be a real measurement, not a zero placeholder."""
+    monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
+
+    class _SlowSearchSpeculator(_FakeSpeculator):
+        """Drafts nothing, slowly -- exactly a failed n-gram search."""
+
+        def reset(self):
+            pass
+
+        def draft(self, generated, past_key_values, num_tokens=5):
+            time.sleep(0.01)
+            return super().draft(generated, past_key_values, num_tokens)
+
+    model = _recording_moe_fake(monkeypatch)
+    model.speculator = _SlowSearchSpeculator()
+    _run(model, max_new_tokens=10)
+
+    gate = model._spec_gate
+    suppressed = [t for d, t in gate.round_times if d == 0 and t is not None]
+    assert suppressed, "no k=0 round reached the gate"
+    assert gate._null_times, "no baseline sample was kept"
+    assert all(n < s for n, s in zip(gate._null_times, suppressed)), \
+        "the proposer's own time was not taken out of the baseline"

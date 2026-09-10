@@ -16,6 +16,8 @@ the state machine is a pure object the generation loop feeds.
 """
 from __future__ import annotations
 
+from statistics import median
+
 
 def observed_union_per_layer(snapshots: list[dict[int, list[int]]], k: int) -> float:
     """Mean unique-expert union over every window of `k` consecutive snapshots.
@@ -74,6 +76,25 @@ def spec_breakeven_acceptance(union_bytes_1: int, union_bytes_k: int,
     return max(0.0, (union_bytes_k / union_bytes_1 - 1.0) / draft_tokens)
 
 
+def wall_breakeven_acceptance(alpha: float, draft_tokens: int) -> float:
+    """Accepted-per-drafted-token above which a verify pass beats plain decode
+    ON THE CLOCK, given a measured per-position cost factor `alpha`.
+
+    Row 13, measured 2026-09-10: a (d+1)-position verify costs about
+    (d+1)*alpha plain-decode rounds -- near-LINEAR in POSITIONS, and nothing
+    like the expert-byte ratio spec_breakeven_acceptance models. A round then
+    costs (1+d)*alpha base-units and yields 1 + a*d tokens, so it breaks even
+    at ((1+d)*alpha - 1)/d.
+
+    Same contract as spec_breakeven_acceptance: inf when unsatisfiable, and
+    never negative -- a verify pass cheaper than one decode round needs no
+    acceptance at all, it does not earn a discount.
+    """
+    if draft_tokens < 1:
+        return float("inf")
+    return max(0.0, ((1.0 + draft_tokens) * alpha - 1.0) / draft_tokens)
+
+
 # Phase-length policy. These are properties of the STATISTICS, not of any
 # model (CLAUDE.md 5 -- no model numbers in code), and are module constants
 # rather than config knobs because nobody asked for the knobs (CLAUDE.md 2).
@@ -130,6 +151,19 @@ class AdaptiveSpecGate:
         self._accepted = 0
         self._drafting_rounds = 0
         self._rounds = 0
+        # Row 13: the wall-clock arm. CALIBRATE's rounds do not draft and
+        # TRIAL's do, so the gate already runs both arms of the A/B -- these
+        # two lists are the only thing it was missing, and they cost the loop
+        # two timestamps per round. The gate never reads a clock itself: it
+        # stays pure and deterministic, which is what makes the whole state
+        # machine testable without a model.
+        self._base_times: list[float] = []
+        self._null_times: list[float] = []
+        self._wide_times: list[float] = []
+        self._alpha: float | None = None
+        self._wall_breakeven: float | None = None
+        self._bar_used: str | None = None
+        self._base_from: str | None = None
 
     # -- phase questions the loop asks ------------------------------------
     def should_draft(self) -> bool:
@@ -139,18 +173,42 @@ class AdaptiveSpecGate:
         return self.phase == "off"
 
     # -- evidence the loop feeds ------------------------------------------
-    def observe(self, history: dict[int, list[int]]) -> None:
-        """One decode step's per-layer routing (a copy of _expert_history)."""
+    def observe(self, history: dict[int, list[int]],
+                elapsed_s: float | None = None) -> None:
+        """One decode step's per-layer routing (a copy of _expert_history).
+
+        `elapsed_s` is that round's wall clock. A calibrate round does not
+        draft, so it is the 1-wide reference the timed bar divides by. It is
+        optional: omit it and the gate decides on bytes alone, exactly as it
+        did before row 13.
+        """
         if self.phase != "calibrate":
             return
+        if elapsed_s is not None:
+            self._base_times.append(float(elapsed_s))
         self._snapshots.append({int(k): list(v) for k, v in history.items()})
         if len(self._snapshots) >= self._calibrate_steps:
             self._decide_union()
 
-    def record_round(self, drafted: int, accepted: int) -> None:
+    def record_round(self, drafted: int, accepted: int,
+                     elapsed_s: float | None = None,
+                     draft_overhead_s: float | None = None) -> None:
         """One speculative round's outcome. A round that drafted nothing is a
         1-wide decode producing one token -- economically identical to plain
         decode -- so it counts toward the round cap but NOT toward acceptance.
+
+        `elapsed_s` is that round's wall clock. A drafting round is the
+        (d+1)-wide pass the bar is about; a k=0 round is an ordinary 1-wide
+        decode, so it is kept SEPARATELY as the contemporaneous baseline --
+        never in the wide median, which would understate alpha and bias toward
+        ADMIT.
+
+        `draft_overhead_s` is the proposer's OWN time in that round. It is
+        subtracted from a k=0 round's baseline and from nothing else: the
+        counterfactual a timed bar compares against is speculation OFF, where
+        the proposer never runs, so the baseline is that round's DECODE, not
+        its decode plus a search that found nothing. On a drafting round the
+        search is a real cost of speculating and stays in the numerator.
         """
         if self.phase != "trial":
             return
@@ -159,6 +217,12 @@ class AdaptiveSpecGate:
             self._drafting_rounds += 1
             self._drafted += drafted
             self._accepted += accepted
+            if elapsed_s is not None:
+                self._wide_times.append(float(elapsed_s))
+        elif elapsed_s is not None:
+            _decode_s = float(elapsed_s) - float(draft_overhead_s or 0.0)
+            if _decode_s > 0:
+                self._null_times.append(_decode_s)
         if self._drafted >= TRIAL_DRAFTED_TOKENS or self._rounds >= TRIAL_ROUND_CAP:
             self._decide_acceptance()
 
@@ -188,11 +252,77 @@ class AdaptiveSpecGate:
             self.phase = "trial"
 
     def _decide_acceptance(self) -> None:
+        bar = self._acceptance_bar()
         measured = self.measured_acceptance
-        if measured is None or measured <= self._breakeven:
+        if measured is None or measured <= bar:
             self.phase, self.decision = "off", "off_acceptance"
         else:
             self.phase, self.decision = "run", "run"
+
+    def _acceptance_bar(self) -> float:
+        """The bar acceptance must clear: bytes AND clock, whichever binds.
+
+        The byte break-even stays a NECESSARY condition -- it is free, it is
+        sound (a verify pass that does not fit thrashes), and it is what
+        refuses Qwen3-235B at zero cost. The timed bar is the sufficient one:
+        measured 2026-09-07, acceptance 0.6875 cleared a byte bar of 0.6259
+        and still cost -16% of decode, because the byte model prices a verify
+        pass in expert bytes and time is near-linear in POSITIONS.
+
+        Falls back to bytes alone when the timing sample is too small or
+        unusable, and says which rule decided in status() -- a gate that
+        silently changes that is worse than either rule.
+        """
+        self._alpha = self._measured_alpha()
+        if self._alpha is None:
+            self._wall_breakeven = None
+            self._bar_used = "bytes"
+            return self._breakeven
+
+        self._wall_breakeven = wall_breakeven_acceptance(
+            self._alpha, self.draft_tokens)
+        self._bar_used = ("wall" if self._wall_breakeven > self._breakeven
+                          else "bytes")
+        return max(self._breakeven, self._wall_breakeven)
+
+    def _measured_alpha(self) -> float | None:
+        """Per-position cost of a verify pass, in plain-decode round units.
+
+        MEDIANS, never means: the spike saw single-round outliers at 1.35x the
+        median, and one NVMe stall must not move a latched verdict. Every list
+        needs at least `draft_tokens + 1` samples -- the same window width
+        observed_union_per_layer is built around, and the floor
+        _calibrate_steps already guarantees -- or this is not a measurement.
+
+        WHICH BASELINE, and why it is not CALIBRATE's by default: CALIBRATE's
+        rounds are the FIRST rounds of a call, immediately after the prefill,
+        so they run against a cold expert cache while TRIAL's run warm.
+        Measured on device 2026-09-10, MiniMax-M2.7's losing arm: that
+        mismatch alone moved alpha 0.7801 -> 0.6976 and put the wall bar
+        (0.5969) UNDER the byte bar (0.6305), so the timed test never bound
+        and the configuration was admitted exactly as before. TRIAL's own k=0
+        rounds are 1-wide decodes sampled in TRIAL's regime -- the
+        contemporaneous baseline the ratio wants. They carry the n-gram
+        search's own small cost, which biases toward ADMIT, but measurably
+        less than the cold-start mismatch does. CALIBRATE remains the fallback
+        for a workload that matches every round and so suppresses none.
+        """
+        floor = self.draft_tokens + 1
+        if len(self._wide_times) < floor:
+            self._base_from = None
+            return None
+        if len(self._null_times) >= floor:
+            samples, self._base_from = self._null_times, "trial_suppressed"
+        elif len(self._base_times) >= floor:
+            samples, self._base_from = self._base_times, "calibrate"
+        else:
+            self._base_from = None
+            return None
+        base = median(samples)
+        if base <= 0:
+            self._base_from = None
+            return None
+        return median(self._wide_times) / (base * (1 + self.draft_tokens))
 
     @property
     def measured_acceptance(self) -> float | None:
@@ -208,5 +338,10 @@ class AdaptiveSpecGate:
             "measured_acceptance": (None if self.measured_acceptance is None
                                     else round(self.measured_acceptance, 4)),
             "drafting_rounds": self._drafting_rounds,
+            "alpha": (None if self._alpha is None else round(self._alpha, 4)),
+            "wall_breakeven": (None if self._wall_breakeven is None
+                               else round(self._wall_breakeven, 4)),
+            "bar_used": self._bar_used,
+            "base_from": self._base_from,
             "decision": self.decision,
         }

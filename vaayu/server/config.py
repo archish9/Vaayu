@@ -265,13 +265,25 @@ DRAFTER_MODEL_PATH = None
 #                   after ~1 call, which costs ~10% on THAT call and nothing
 #                   after (self.speculator is dropped, later calls take the
 #                   ordinary path).
-#                 * thinking ON: acceptance 0.6875, gate says run -- and it
-#                   still LOSES 12.9% total / 16.0% decode wall-clock.
+#                 * thinking ON: acceptance 0.6875, gate said run -- and it
+#                   still LOST 12.9% total / 16.0% decode wall-clock. That
+#                   second case is the defect row 13 fixed (2026-09-10).
 #                 An earlier arm on a different prompt measured 1.307x, so this
 #                 is workload-dependent, not a property of the model.
-# NOTE the second case: the gate's break-even is denominated in EXPERT BYTES,
-# so it can admit a configuration that loses wall-clock. A `run` decision is
-# not a promise of a speedup -- time your own workload both ways.
+# The gate now also TIMES itself: it requires acceptance to clear BOTH the
+# expert-byte break-even and a wall-clock one measured from its own rounds,
+# and reports which bound in `bar_used` ("wall" / "bytes", the latter also
+# being the fallback when the timing sample is too small) plus `alpha`,
+# `wall_breakeven` and `base_from` in /v1/models and env.json.
+# READ THIS BEFORE TRUSTING A `run`: the timed bar is a strict tightening,
+# but it is measured over the FIRST ~40 rounds of a call and then latched,
+# and those rounds are the cheapest part of the call. Measured 2026-09-10 on
+# MiniMax-M2.7: the decision window runs at 0.510-0.532 s/token while the
+# whole call runs at 0.637 (no speculation) / 0.793 (speculating), so the
+# gate still said `run` on an arm its own A/B measured at -19.7%. On the
+# arm where speculation genuinely wins it said `run` and that was worth
+# +14.4%. So: `run` is a claim about the window the gate looked at, not a
+# promise about your whole generation -- TIME YOUR OWN WORKLOAD BOTH WAYS.
 # The default stays "auto" because CLAUDE.md section 5 forbids defaulting into
 # a one-model-wins asymmetry. Set True to opt one in; an explicit value wins.
 USE_PROMPT_LOOKUP = "auto"

@@ -214,10 +214,11 @@ class _FakeGate:
     def should_draft(self):
         return self._drafts
 
-    def observe(self, history):
+    def observe(self, history, elapsed_s=None):
         pass
 
-    def record_round(self, drafted, accepted):
+    def record_round(self, drafted, accepted, elapsed_s=None,
+                     draft_overhead_s=None):
         pass
 
     def decided_off(self):
