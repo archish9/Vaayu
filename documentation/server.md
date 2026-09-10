@@ -897,8 +897,16 @@ directory carries the same one.
 `requested` says what was asked for. On an MoE target the two normally
 disagree, and `refused_because` says why with the numbers the decision used.
 
-There are two gates behind that field, and either may write it:
+There are three gates behind that field, and any of them may write it:
 
+- **before anything is built**, on whether the model can be checked at all: a
+  MoE checkpoint loaded on a non-CUDA compute device has no expert geometry, no
+  expert cache and no routing history, so the two byte gates below and the
+  runtime gate all skip themselves. Speculation there would run checked by
+  nothing, for the life of the process, and report nothing — so it is refused
+  instead. Load the model on CUDA to speculate on it, or set
+  `VAAYU_SPEC_FORCE=1` to run it unchecked deliberately. Dense models and MoE
+  on CUDA are unaffected;
 - **before the drafter loads**, against an *upper bound* of the expert cache
   budget — this is the one that avoids loading a 3 GB drafter only to discard
   it (measured on Qwen3-235B: **3.85 s** of load, every start);

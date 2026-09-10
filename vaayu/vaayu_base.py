@@ -198,6 +198,41 @@ def max_draft_tokens_that_fit(geometry: dict, budget_bytes: int) -> int:
     return best
 
 
+def spec_no_geometry_refusal(is_moe: bool, geometry: dict | None,
+                             device: str) -> str | None:
+    """Why speculation cannot be CHECKED on this model, or None if it can (C1).
+
+    Every gate that governs MoE speculation reads `_moe_geometry`, and on a MoE
+    checkpoint whose compute device is not CUDA that attribute is None -- the
+    expert offset index it is derived from is built under a CUDA guard, as is
+    the expert cache the post-load gate prices against and the forward patching
+    that writes `_expert_history`. So the S1a bound, the Fix #9 bound and the
+    S1d runtime gate all skip themselves, and the generation loop reads a
+    missing gate as "no restriction": the one configuration nothing can check
+    is also the only one that runs unchecked.
+
+    Refusing CONSTRUCTION is the fix rather than building the runtime gate on
+    that path, because it calibrates from routing snapshots that are never
+    written there: it would latch `off_no_routing` every time, which is a
+    refusal disguised as a measurement.
+
+    Dense is unaffected on every device (it never has an expert geometry and
+    never needed one), and so is CUDA MoE (the geometry exists there, so the
+    real gates decide). `VAAYU_SPEC_FORCE=1` still overrides at the call site,
+    which is how a CPU-compute MoE workload can be measured if one appears.
+    """
+    if not is_moe or geometry is not None:
+        return None
+    return (f"this MoE model has no expert geometry on device={device!r} "
+            f"(the expert offset index, the expert cache and the routing "
+            f"history are all built only for CUDA compute), so NOTHING can "
+            f"size or measure speculation on it -- the pre-load bound, the "
+            f"post-load bound and the runtime gate all skip themselves and it "
+            f"would run unchecked for the life of the process. Load this model "
+            f"with a CUDA device to speculate on it, or set VAAYU_SPEC_FORCE=1 "
+            f"to run it unchecked deliberately")
+
+
 def spec_preload_refusal(geometry: dict, draft_tokens: int,
                          available_bytes: int) -> str | None:
     """Why speculation cannot fit on this MoE model, or None if it can.
@@ -2267,7 +2302,16 @@ class VaayuBaseModel(GenerationMixin):
             # something whose refusal is already certain (it gates on an upper
             # bound of that budget, so it can never refuse what the real gate
             # would accept). Both write the same status field.
-            _pre = None
+            # C1, and it runs FIRST because it is not a byte bound: on a MoE
+            # model with no expert geometry (any non-CUDA compute device) the
+            # two bounds below and the runtime gate all skip themselves, so a
+            # speculator built here would be checked by nothing at all. This
+            # covers prompt lookup as well as a weighted drafter -- the PLD
+            # exemption below is an argument about which gate decides, and on
+            # this path there is no gate to hand it to. Dense and CUDA MoE are
+            # untouched (both have `spec_no_geometry_refusal` return None).
+            _pre = spec_no_geometry_refusal(self.is_moe, self._moe_geometry,
+                                            str(self.running_device))
             # S1d: a prompt-lookup proposer has no load to avoid paying for
             # (zero VRAM, CPU n-gram search) -- so the "avoid a load that is
             # certain to fail" argument this bound exists for does not apply
@@ -2304,8 +2348,12 @@ class VaayuBaseModel(GenerationMixin):
                 self.speculative_status["forced"] = True
                 _pre = None
             if _pre is not None:
+                # C1 made this reachable for prompt lookup too, which has no
+                # drafter to leave unloaded -- say what was actually declined.
+                _what = ("the drafter is NOT loaded" if drafter_model_path
+                         else "no prompt-lookup proposer is built")
                 print(f"[Vaayu-Spec] WARNING: {_pre} DISABLING speculative "
-                      f"decoding for this MoE model; the drafter is NOT loaded.")
+                      f"decoding for this MoE model; {_what}.")
                 self.speculative_status["refused_because"] = _pre
             else:
                 from .speculative import build_speculator

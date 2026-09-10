@@ -28,7 +28,7 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 **§0 first: it is the build ORDER and the perf / not-perf split; the sections after it hold the
 detail each entry points to.**
 
-1. **OPEN** — one deferred `[bug]` row (C1), with its brief in `docs/`.
+1. **OPEN** — EMPTY as of 2026-09-10 (C1, its last row, was FIXED that day).
 2. **STILL OPEN, carried forward** — live items left behind by rows that closed.
 3. **SETTLED — DO NOT RE-OPEN** — read this BEFORE proposing any perf work. It is the list of
    things already built and refuted, with the number that killed each one.
@@ -278,7 +278,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 |---|---|---|---|
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
 | **A** | The server reaches 14 of the engine's 28 load parameters | Capability and correctness, not speed. `ENABLE_KV_PERSIST` is exposed while `kv_persist_dir`/`kv_persist_sync` are not, so the feature can be turned on but not aimed. | OPTIONAL row **14** · [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md) |
-| **C1** `[bug]` | A MoE model on `device="cpu"` builds a speculator with **no gate at all** | Real correctness hole. CUDA is what runs here, so it costs nothing today. | OPEN section |
+| ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
 | `expert_sim.py` anchor gap | 31.9 % simulated vs 43.9 % live | A diagnostic tool's accuracy, not the engine. The obvious hypothesis was built and REJECTED. | STILL OPEN |
 | No resident-size checkpoint | Needs a ~14B coder at 4–4.5 bpw EXL3 | A download, not code. The row says it is **not a blocker**. | STILL OPEN |
@@ -308,9 +308,10 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1887 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
-2026-09-10 after row 2's lint gate (1886 + 1), the 1886 re-measured against a stashed HEAD the
-same day and MATCHING the figure written here — the first time in nine that it was not stale.
+**Suite baseline: 1893 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-10 after C1's no-geometry refusal (1887 + 6). The 1887 was verified the same day after
+row 2's lint gate (1886 + 1), the 1886 re-measured against a stashed HEAD the same day and
+MATCHING the figure written here — the first time in nine that it was not stale.
 **The suite now costs 124 s -> 164 s (+40 s, +32 %)**: `tests/test_no_unbound_locals.py` shells
 out to pylint, and in-venv astroid infers the real `torch`/`transformers` (the same run is 3.3 s
 under `uvx`, where they are absent). Findings are IDENTICAL either way. The 1886 was verified
@@ -334,9 +335,10 @@ number written here.
 
 ---
 
-# ▶▶ OPEN — one deferred bug, opened 2026-09-03
+# ▶▶ OPEN — EMPTY as of 2026-09-10
 
-**ONE `[bug]` row is live in this section: C1.** Everything else this section carried closed
+**NO `[bug]` row is live in this section. C1 was FIXED 2026-09-10** — see its row below, which
+keeps the verdict and is pruned at the next prune. Everything else this section carried closed
 between 2026-09-04 and 2026-09-06 (L1 T1–T10 and its fix waves, the `env.json`/`logs/`/
 `requests.jsonl` rows, S1/S1d/S1e-bis/S1f, G1, V1) and was pruned 2026-09-10 — verdicts in SETTLED
 and §0's vacancy notes, full text in `git log -p -- todo.md`. The next work comes from **STILL
@@ -351,43 +353,58 @@ run vs the bench's 64). Verdict, evidence and the two reading traps:
 not survive a fresh clone; this file is the tracked one, and the durable copy of anything moved out
 of it is `git log -p -- todo.md`. That is the standing convention — see `CLAUDE.md` §7.
 
-- **[bug] C1 · a MoE model loaded with `device="cpu"` runs a PLD or drafter speculator with NO
-  gate at all — pre-existing, not introduced by S1d, deferred.** Full brief, self-contained and
-  meant to be picked up cold in a fresh session:
+- **[x] C1 · a MoE model loaded on a non-CUDA compute device ran a PLD or drafter speculator
+  with NO gate at all — FIXED 2026-09-10, Option A (refuse construction), CPU-only, no GPU round.**
+  Pre-existing, not introduced by S1d. Full brief (the defect, the trap in the obvious fix, the
+  four things not to break):
   **[`docs/issue-C1-cpu-moe-ungated-speculation.md`](docs/issue-C1-cpu-moe-ungated-speculation.md)**
-  (**gitignored — this disk only**; the summary here is the durable copy).
-  **Severity is LOWER than this row's original wording ("runs unbounded") implied — corrected
-  2026-09-06 after checking the code.** `patch_moe_blocks` is called at `vaayu_base.py:2400`,
-  INSIDE the same CUDA block as the expert cache, so on CPU-MoE there is no expert streaming, no
-  expert cache, and `_expert_history` is never written. The Fix #9 premise — a verify pass blows
-  the expert cache budget and thrashes NVMe — **does not apply on this path at all.** What is
-  true is narrower: speculation runs UNMEASURED and SILENTLY (no warning, `calibration` stays
-  null), and a `d+1`-wide verify costs more CPU compute than a 1-wide one, so a low acceptance
-  rate plausibly hurts more here than on CUDA. The silence is the §5 violation, not thrash.
-  **Trap for whoever fixes it:** "just build the gate on CPU too" does not work — the gate
-  calibrates on `_expert_history`, which is never written here, so every snapshot is `{}` and the
-  gate would always latch `off_no_routing`. That is a refusal disguised as a measurement.
-  **Recommended fix (Option A in the brief):** refuse speculator CONSTRUCTION when
-  `self.is_moe and _moe_geometry is None` regardless of device, with a `[Vaayu-Spec]` warning and
-  a `refused_because` entry. Testable with no checkpoint (the existing fakes already have this
-  shape). `_moe_geometry` is only computed when
-  `_expert_offset_index` was built, which only happens `if device.startswith("cuda") and
-  self.is_moe` (`vaayu_base.py:1797`); `_expert_cache` is only constructed inside the matching
-  `if self.running_device.startswith("cuda") and self.is_moe:` block (`vaayu_base.py:2078`). On
-  CPU-compute MoE both stay `None`. Consequence, found while reviewing S1d's Task 6: the S1a
-  pre-load bound (needs `_moe_geometry`) and the Fix #9 post-load bound (needs both) silently
-  skip themselves — they always did, this predates S1d — and now `_build_spec_gate()` (S1d) ALSO
-  returns `None` when `geo is None or cache is None`. So `use_prompt_lookup=True` or a
-  `drafter_model_path` on a CPU-compute MoE model builds a speculator that is checked by NEITHER
-  the old static gates NOR the new runtime one — it just runs, unbounded, for the life of the
-  process. **Deferred, not fixed:** CPU-compute MoE is architecturally supported
-  (`CLAUDE.md` §0/§5) but not on-device tested today (both actively-tested MoE targets are
-  CUDA-only EXL3), and no CPU-compute MoE checkpoint exists on this box to verify a fix against —
-  building one unreviewed at the tail of an unrelated branch is exactly the scope creep CLAUDE.md
-  §3 warns against. Fix sketch for whoever picks this up: either gate PLD/drafter construction
-  itself on `_moe_geometry is not None` for MoE regardless of device (refuse rather than run
-  ungated), or compute a CPU-safe `_moe_geometry`/`_expert_cache` pair off the same checkpoint
-  metadata without the CUDA-only `ExpertOffsetIndex` path.
+  (**gitignored — this disk only**; everything load-bearing is restated here).
+  **The defect, re-verified in the code before fixing (line numbers had drifted ~+230 from the
+  brief):** `_expert_offset_index` is built only under `if device.startswith("cuda") and
+  self.is_moe:` (`vaayu_base.py:2027`), `_moe_geometry` only when that index exists (`:2036`), and
+  `_expert_cache` only under the matching `running_device` guard (`:2335`) — while `self.is_moe`
+  is read off the module tree and is device-independent. So on CPU-compute MoE all three gates
+  skipped themselves (S1a `:2325`, Fix #9 `:2585`, `_build_spec_gate()`), the generation loop reads
+  a missing gate as "no restriction", and speculation ran silently and unmeasured for the life of
+  the process — the `CLAUDE.md` §5 violation, independent of the perf question.
+  **Fix:** new pure helper `spec_no_geometry_refusal(is_moe, geometry, device)`
+  (`vaayu_base.py:201`, beside `spec_preload_refusal`) returns a reason whenever `is_moe` and
+  `_moe_geometry is None`; wired as the FIRST `_pre` in the speculator-construction block
+  (`:2305`), so it reuses the existing refusal machinery — one `[Vaayu-Spec] WARNING`, one
+  `speculative_status["refused_because"]`, and the existing `VAAYU_SPEC_FORCE=1` hatch still
+  overrides it (deliberate: that is how a CPU-compute MoE workload gets measured if one appears).
+  It covers **prompt lookup as well as a weighted drafter** — the two static gates' PLD exemption
+  is an argument about WHICH gate decides, and on this path there is no gate to hand it to; the
+  exemption itself is untouched. The S1a bound below it needed no new guard: it already requires
+  `_moe_geometry is not None`, which is exactly when this refusal returns None (a `_pre is None`
+  guard was written, found to be dead by that implication, and removed). One adjacent message
+  fixed because the fix made it reachable for PLD, which has no
+  drafter: the refusal line now says "no prompt-lookup proposer is built" in that case.
+  **`compute_moe_geometry` never returns None**, so `is_moe and geometry is None` is exactly
+  "MoE not on CUDA" — dense (any device) and CUDA MoE are provably untouched, which is the
+  regression that mattered (dense drafter 5.57×, MiniMax PLD 1.307×).
+  **Evidence:** `tests/test_spec_no_geometry_gate.py` (+6, written first and verified to fail on
+  ImportError against the old code): CPU-MoE refused, message names cause and lever, both on-device
+  MoE geometries NOT refused, dense not refused on either device. Full suite **1887 → 1893 passed,
+  12 skipped**; `tests/test_no_unbound_locals.py` green.
+  **§8, all four:** (1) **no knob needed, stated deliberately** — this is a refusal, not a feature,
+  and a knob to disable a safety gate is what `VAAYU_SPEC_FORCE=1` already is; (2) plumbed — it is
+  in `__init__`, the path every server load takes, not behind a config flag; (3) **reachable, and
+  worth 0 %** — the server's `DEVICE` defaults to `"cuda:0"` (`server/config.py:27`), so the
+  refusal never fires on the default configuration and moves no tok/s on any target run here; it
+  changes behaviour only for someone who sets a non-CUDA `DEVICE` with a MoE checkpoint, who
+  previously got a silent unchecked run and now gets a stated refusal; (4) documented in
+  `documentation/server.md` ("Is speculative decoding actually running?" — "two gates" → "three
+  gates", with the new one first and the CUDA/`VAAYU_SPEC_FORCE` levers named).
+  **NOT done, deliberately (Option B in the brief):** making the gate WORK on CPU — a CPU-safe
+  geometry, a budget premise that means something with no expert cache, and forward patching so
+  `_expert_history` is written. That is a change to the CPU MoE path, nothing tests it, no
+  CPU-compute MoE checkpoint exists on this box, and no workload asks for it. **Re-open only with
+  such a workload.** **Also NOT done:** a load-path wiring test. The refusal lives inside
+  `__init__`, which needs a real checkpoint, and no CPU-compute MoE one exists here — so the
+  predicate is unit-tested and the wiring is inspection-verified, the same standard the two
+  adjacent gates (S1a, Fix #9) have always had. A CPU-MoE checkpoint would be the thing that
+  changes that.
 
 **Applied on the spot 2026-09-03, no row needed:** `DEFAULT_STREAM = True` in
 `vaayu/server/config_local.py`. It was `False`, and with a client sending no `max_tokens` that meant
