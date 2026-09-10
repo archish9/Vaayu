@@ -49,15 +49,26 @@ detail each entry points to.**
 board can make Vaayu faster on a target run here, and every row below is OPTIONAL by §0's own test.
 Pick from this list in order; the sections after it are the detail each entry points at.**
 
-| # | pick this if | one line | state | cost |
-|---|---|---|---|---|
-| **13** | you want the decided, designed piece of work | **GO/NO-GO on `even-4`** — widen the spec gate's decision window to 4 alternating pairs (4 drafting + 4 suppressed rounds), decide on `acceptance > byte bar AND mean(per-pair s/token ratio) < 1`. 6/6 correct vs today's 5/6, +1.3–2.5 %. **Closing the row is an equally legitimate outcome** — it is worth 0 % until an operator opts a MoE checkpoint into prompt lookup. | `[~]` designed + priced, not started | ~half a day CPU + 1 on-device A/B |
-| **6a-b** | you have a GPU round and want correctness | `head_bytes` is probably not a transient at all — but the 70B has a 0.714 G floor it currently covers, so it cannot just be removed. Buys admission headroom, not tok/s. | `[ ]` | GPU round |
-| **3** | you want capability, not speed | The cross-turn prefix cache is EXL3-only; `DynamicCache` lacks the three methods the pool needs. Prefix reuse is the server's largest lever (136–377× TTFT) and it is OFF for every fp16 model. No fp16 model runs here today. | `[ ]` | adapter or cache swap |
-| **23** | you are already on the batching path | The prefill stager re-runs once per BATCHED CHUNK (fused-EXL3 only). Two hypotheses, unmeasured. **`MAX_BATCH_SIZE = 1`, so worth 0 % to users.** | `[ ]` | measurement first |
-| **18** | a debugging session just lost a tool | `[bug]` `output_hidden_states=True` crashes the forward (`torch.cat(): expected a non-empty list`). Pre-existing, low severity — nothing in the engine, server or gates asks for hidden states. | `[bug]` | small |
-| **5** | you want quality certification | Does failing the compression bar degrade generated TEXT? Deliberately unscheduled; costs speed if anything. | `[ ]` | CPU sweep |
-| **4** | — | 2× KV overshoot, ~0.83 GB at Qwen's 8192. **Deliberately PARKED.** Re-open only on new evidence. | `[ ]` parked | — |
+| # | pick this if | one line | state | cost | cold-pickup brief (gitignored) |
+|---|---|---|---|---|---|
+| **13** | you want the decided, designed piece of work | **GO/NO-GO on `even-4`** — widen the spec gate's decision window to 4 alternating pairs (4 drafting + 4 suppressed rounds), decide on `acceptance > byte bar AND mean(per-pair s/token ratio) < 1`. 6/6 correct vs today's 5/6, +1.3–2.5 %. **Closing the row is an equally legitimate outcome** — worth 0 % until an operator opts a MoE checkpoint into prompt lookup. | `[~]` designed + priced, not started | ~half a day CPU + 1 on-device A/B | [`…-row13-even4-window-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md) |
+| **6a-b** | you have a GPU round and want correctness | `head_bytes` is probably not a transient at all — but the 70B has a 0.714 G floor it currently covers BY LUCK, so it cannot just be removed. The deliverable is an ATTRIBUTION of that floor. Buys admission headroom, not tok/s. | `[ ]` | GPU round | [`…-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) |
+| **3** | you want capability, not speed | The cross-turn prefix cache is EXL3-only; `DynamicCache` lacks the three methods the pool needs. Prefix reuse is the server's largest lever (136–377× TTFT) and it is OFF for every fp16 model. No fp16 model runs here today. | `[ ]` | adapter or cache swap | [`…-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) |
+| **23** | you are already on the batching path | The prefill stager re-runs once per BATCHED CHUNK (fused-EXL3 only). Two hypotheses, unmeasured; measure the cheap one first. **`MAX_BATCH_SIZE = 1`, so worth 0 % to users.** | `[ ]` | measurement first | [`…-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) |
+| **18** | a debugging session just lost a tool | `[bug]` `output_hidden_states=True` crashes the forward. **Root cause now diagnosed in the brief: two accumulation schemes collide** (`vaayu_base.py:4397` per-layer sublists vs `:4766`'s flat `+=`). Low severity — nothing in the engine, server or gates asks for hidden states. | `[bug]` | small | [`…-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) |
+| **5** | you want quality certification | Does failing the 0.05 rel-L2 compression bar degrade generated TEXT? The bar is an uncertified PROXY. Deliberately unscheduled; costs speed if anything. | `[ ]` | CPU sweep | [`…-row5-quality-certification-BRIEF.md`](docs/2026-09-10-row5-quality-certification-BRIEF.md) |
+| **4** | — | 2× KV overshoot, ~0.83 GB at Qwen's 8192. **Deliberately PARKED** — a LARGER 1.22 GB giveback was measured at decode +0.4 %. **One condition re-opens it** (see brief). | `[ ]` parked | — | [`…-row4-kv-overshoot-PARKED-BRIEF.md`](docs/2026-09-10-row4-kv-overshoot-PARKED-BRIEF.md) |
+
+**Every open item now has a self-contained cold-pickup brief** (written 2026-09-10). They live in
+`docs/`, which is **GITIGNORED** — so the brief is the detail, and the row in this file is the
+durable copy of the conclusion (CLAUDE.md §7). If a brief is missing after a fresh clone, the row
+still carries the numbers, the traps and the stop rule.
+
+Carried-forward items have briefs too:
+[`…-carried-finish-stop-string-BRIEF.md`](docs/2026-09-10-carried-finish-stop-string-BRIEF.md) ·
+[`…-carried-expert-sim-anchor-gap-BRIEF.md`](docs/2026-09-10-carried-expert-sim-anchor-gap-BRIEF.md) ·
+[`…-carried-resident-checkpoint-BRIEF.md`](docs/2026-09-10-carried-resident-checkpoint-BRIEF.md) ·
+[`…-carried-p10-batching-minors-BRIEF.md`](docs/2026-09-10-carried-p10-batching-minors-BRIEF.md)
 
 **Also live, carried out of closed rows (see STILL OPEN):** no resident-size checkpoint on disk
 (a download, not code, and NOT a blocker); `_finish` cannot report WHICH stop string fired (needs a
@@ -477,6 +488,12 @@ test — none can make Vaayu faster.** No §0 P-row is open.
   pinning — was implemented and **REJECTED** (byte-identical result). The gap is confined to the
   small-budget regime (at 16 GB it predicted 20.3 % for MiniMax against a measured 21.3 %).
   **Do not quote its small-budget absolutes.**
+
+**Each carried item now has its own cold-pickup brief** (gitignored, written 2026-09-10):
+[`…-carried-resident-checkpoint-BRIEF.md`](docs/2026-09-10-carried-resident-checkpoint-BRIEF.md) ·
+[`…-carried-finish-stop-string-BRIEF.md`](docs/2026-09-10-carried-finish-stop-string-BRIEF.md) ·
+[`…-carried-expert-sim-anchor-gap-BRIEF.md`](docs/2026-09-10-carried-expert-sim-anchor-gap-BRIEF.md) ·
+[`…-carried-p10-batching-minors-BRIEF.md`](docs/2026-09-10-carried-p10-batching-minors-BRIEF.md)
 
 ## Carried out of row 15 (P10 server batching, closed 2026-09-09, pruned 2026-09-10)
 
@@ -1309,6 +1326,8 @@ sets one**: no default moved; (4) documented in `vaayu/server/README.md` AND
 
 # 18 · [bug] `output_hidden_states=True` crashes the forward
 
+**Cold-pickup brief, with a ROOT-CAUSE diagnosis this row did not have:** [`docs/2026-09-10-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) (gitignored). Two accumulation schemes collide — `vaayu_base.py:4397` allocates one empty sublist per layer, `:4667`/`:4680` fill sublists, but `:4766` does `all_hidden_states += (torch.cat(batch, 0),)`, which EXTENDS the outer list with a bare Tensor. `:4836` then cats a still-empty sublist. The `[0:-2]` at `:4834` is the hand-tuned compensation. **Line numbers below drifted: the crash is now `:4836`, not `:4594`.**
+
 Found 2026-09-07 (incidentally, by a diagnostic probe that asked for hidden states). **Pre-existing
 and untouched by the `fix/gate2-postreclaim-headroom` branch** — `git diff 879f63d..HEAD --
 vaayu/vaayu_base.py` does not mention `all_hidden_states`.
@@ -1331,6 +1350,8 @@ loses a tool exactly when it needs one — which is how it was found.
 ---
 
 # 23 · [ ] The prefill stager re-runs once per BATCHED CHUNK — stop it, and the fused forward's 2.36x may go
+
+**Cold-pickup brief:** [`docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) (gitignored).
 
 **Opened 2026-09-09 by row 22, which measured the cost but did NOT fix it. UNMEASURED — two
 hypotheses, in cost order.** Row 22 established that `batched_generate`'s own chunk loop turns
@@ -1440,6 +1461,8 @@ instruction NOT to silence a false positive by hoisting the import.
 
 # 6a-b · [ ] `head_bytes` is probably not a transient at all
 
+**Cold-pickup brief:** [`docs/2026-09-10-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) (gitignored; the numbers and traps below are the durable copy).
+
 **Split out of row 6a (§0 P5) when that row closed 2026-09-09** — the root cause there was WHICH
 CHUNK SETS THE PEAK, and it is fixed; this is the separate finding it turned up.
 `docs/2026-09-09-P5-which-chunk-sets-the-peak-RESULTS.md` (gitignored, this disk only).
@@ -1466,6 +1489,8 @@ headroom and correctness of the peak form, never as tok/s.
 
 # 3 · [ ] The cross-turn prefix cache only works for EXL3 models
 
+**Cold-pickup brief:** [`docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) (gitignored).
+
 Carried out of the hygiene backlog (H7's third item) when the rest of that row closed
 2026-08-15. Not hygiene — a real capability gap, and the only one left from that group.
 
@@ -1488,6 +1513,8 @@ model nobody currently runs here. (found 2026-08-09)
 
 # 4 · [ ] 2× KV overshoot, ~0.83 GB at Qwen's derived operating context — PARKED
 
+**Cold-pickup brief — read it BEFORE re-opening this row:** [`docs/2026-09-10-row4-kv-overshoot-PARKED-BRIEF.md`](docs/2026-09-10-row4-kv-overshoot-PARKED-BRIEF.md) (gitignored). It carries the single condition that reverses the park.
+
 Real, quantified, recoverable, and **deliberately not scheduled.** The EXL3 ring-buffer KV cache's
 geometric-doubling capacity means that at Qwen's derived `max_seq_len=8192` the cache allocates
 capacity for **16384** tokens, wasting ~0.83 GB on a box already grazing 15.47 GiB. Pre-sizing the
@@ -1506,6 +1533,8 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 ---
 
 # 5 · [ ] DEFERRED write-ups — TRIAGED 2026-09-06, two probes run, one item left
+
+**Cold-pickup brief for the one open item:** [`docs/2026-09-10-row5-quality-certification-BRIEF.md`](docs/2026-09-10-row5-quality-certification-BRIEF.md) (gitignored).
 
 Row 5 was never one row. Full evidence:
 **[`docs/2026-09-06-row5-real-query-gate-and-oracle-repin-RESULTS.md`](docs/2026-09-06-row5-real-query-gate-and-oracle-repin-RESULTS.md)**
