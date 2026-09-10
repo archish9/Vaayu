@@ -277,7 +277,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
-| **13** `[bug]` | The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once | **BUILT + MEASURED 2026-09-10. The timed bar exists, is a strict tightening, and changed NO decision on any of 4 on-device arms — banked, not shipped-with-effect. The design's Done condition REFUTED: the losing arm is still admitted (−19.7 % on its own A/B), because CALIBRATE+TRIAL sit in the cheapest stretch of a call.** Still worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE. **RE-AIMED 2026-09-10 when row 24 closed REFUTED: the path is a WIDER, POOLED one-shot window (m ≥ 3 paired blocks decided 6/6), not re-evaluation and not a later sample.** | row **13** · [`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md) · [`…-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`…-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) |
+| **13** `[bug]` | The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once | **BUILT + MEASURED 2026-09-10. The timed bar exists, is a strict tightening, and changed NO decision on any of 4 on-device arms — banked, not shipped-with-effect. The design's Done condition REFUTED: the losing arm is still admitted (−19.7 % on its own A/B), because CALIBRATE+TRIAL sit in the cheapest stretch of a call.** Still worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE. **RE-AIMED 2026-09-10 when row 24 closed REFUTED: the path is a WIDER, POOLED one-shot window, not re-evaluation and not a later sample. PRICED the same day and it PAYS: `even-4` (4 pairs of 4 suppressed + 4 drafting rounds, verdict by MEAN of the per-pair s/tok ratios) decides **6/6** against today's 5/6 for **+8 suppressed rounds** and the SAME 48 drafted tokens — worth **+1.6–2.5 %** mean over six arms, against a **+1.9 %** ceiling for perfect verdicts at today's window price. Row 24's “m ≥ 3 decides 6/6” was half the story: it scored a MEDIAN, which at m=3 falls to **3/6** on leg geometries two rounds either side — the MEAN is 6/6 across all 24 (m, leg) combinations at m ≥ 3. Re-running whole TRIALs (`full-m`) NEVER pays at any call length.** | row **13** · [`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md) · [`…-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`…-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) · [`…-window-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md) |
 | ~~**24**~~ | **CLOSED 2026-09-10 — REFUTED ON PRICE** (≤ +6.28 % with perfect foresight at zero cost; break-even 0.5–5.9 token-equivalents against a real ~29.3). Its live residue is row 13's remainder, restated as WINDOW WIDTH | Same §8 bucket as 13 — 0 % on the default config. **Now the head of this queue and no longer a side observation: row 13's four on-device arms measured the decision window at 0.510-0.532 s/token against 0.637-0.793 for the whole call, and that gap is exactly why a correct, timed, tightened bar still admits a −19.7 % configuration.** | row **24** |
 | ~~**A**~~ | **CLOSED 2026-09-10 — 19 of 28 reachable, 9 declined in code, drift test wired. Suite 1893 → 1906** | Was: capability and correctness, not speed. `ENABLE_KV_PERSIST` could be turned on but not aimed. **All 5 new knobs are worth 0 % until an operator sets one — no default moved.** | OPTIONAL row **14** |
 | ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
@@ -827,12 +827,12 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
-**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10**; **row 13's timed bar was then BUILT and MEASURED the same day, its Done condition REFUTED, and the row stays open narrowed**; **row 24 CLOSED the same day, REFUTED ON PRICE by an offline replay spike** (≤ +6.28 % with perfect foresight at ZERO cost; break-even 0.5–5.9 token-equivalents against a real re-entry price of ~29.3). So the head of the queue is now **13's remainder**, then 6a-b / 3 / 5. **Row 24's closure re-aimed 13:** the live defect is the decision window's WIDTH, not its repetition and not its placement — pooling ≥3 paired blocks decided correctly on 6/6 arms, while deciding LATER would have been wrong on two arms instead of one. Still §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup.
+**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10**; **row 13's timed bar was then BUILT and MEASURED the same day, its Done condition REFUTED, and the row stays open narrowed**; **row 24 CLOSED the same day, REFUTED ON PRICE by an offline replay spike** (≤ +6.28 % with perfect foresight at ZERO cost; break-even 0.5–5.9 token-equivalents against a real re-entry price of ~29.3). So the head of the queue is now **13's remainder**, then 6a-b / 3 / 5. **Row 24's closure re-aimed 13:** the live defect is the decision window's WIDTH, not its repetition and not its placement — pooling ≥3 paired blocks decided correctly on 6/6 arms, while deciding LATER would have been wrong on two arms instead of one. **That width was then PRICED the same day and it PAYS: `even-4` — four pairs of (4 suppressed, 4 drafting) rounds, verdict by the MEAN of the per-pair s/tok ratios — decides 6/6 against today's 5/6 for +8 suppressed rounds and the same 48 drafted tokens, worth +1.6–2.5 % mean over six arms. So 13's remainder is now a go/no-go on a costed build, not an investigation.** Still §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[x]` **CLOSED 2026-09-10 — wired, and PROVEN to fail on the real shape** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
-| **13** | `[bug]` The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once (was: it is in expert bytes) | OPTIONAL | `[ ]` **TIMED BAR BUILT + MEASURED 2026-09-10; the design's Done condition is REFUTED and the row stays open, narrowed.** | ~1 day + 4 on-device arms | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. Bounded, self-contained design ready to execute cold: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md). Evidence: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
+| **13** | `[bug]` The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once (was: it is in expert bytes) | OPTIONAL | `[~]` **WINDOW WIDTH PRICED 2026-09-10 — the remainder is now a DECIDED, COSTED build (`even-4`), awaiting a go/no-go.** | window fix: ~half a day + 1 on-device A/B | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. Bounded, self-contained design ready to execute cold: [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md). Evidence: [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **24** | `[x]` **CLOSED 2026-09-10 — REFUTED ON PRICE.** Re-evaluation is worth ≤ **+6.28 %** with perfect foresight at ZERO cost, and breaks even at **0.5–5.9** token-equivalents against a real re-entry price of **~29.3** | OPTIONAL | `[x]` **closed by an offline replay spike — CPU only, no GPU round, nothing shipped** | none spent | Opened 2026-09-10 by row 13's spike. MiniMax-M2.7 leaving its reasoning preamble for code reproduction: blocks 0-9 lost, blocks 10-14 ran **1.21-1.28x**. A TRIAL sampled in the preamble latches `off` and forfeits the win; one sampled in the code stretch latches `run` and keeps it through the next preamble. **NOT the SETTLED regime-latch item** (that was refuted on Qwen, which never emitted code at all). See below. |
 | **6a-b** | `head_bytes` is probably not a transient at all | OPTIONAL | `[ ]` | GPU round | Split out of row 6a on its own evidence when that row closed 2026-09-09. §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it buys admission headroom, not tok/s. See below. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
@@ -842,7 +842,7 @@ from this table.
 
 ---
 
-# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock — TIMED BAR BUILT AND MEASURED 2026-09-10; ROW STAYS OPEN, NARROWED
+# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock — TIMED BAR BUILT AND MEASURED 2026-09-10; REMAINDER PRICED THE SAME DAY AND IT PAYS (`even-4`), AWAITING A GO/NO-GO
 
 **STATUS 2026-09-10: the timed bar is BUILT, TESTED and MEASURED on device — and the DESIGN's own
 Done condition is REFUTED. The row does NOT close.** The defect is no longer *"the bar is in
@@ -900,28 +900,69 @@ ONCE, early, cannot be right for the whole call however well it is measured.**
    negligible on MiniMax** (two otherwise-identical arms differ more from run-to-run variance in
    the ~8-sample k=0 median), kept because it is correct and free.
 
-**WHAT IS LEFT ON THIS ROW — RE-AIMED 2026-09-10 when row 24 closed.** Making the measurement
+**WHAT IS LEFT ON THIS ROW — RE-AIMED, THEN PRICED, 2026-09-10.** Making the measurement
 representative does NOT mean re-evaluating: **row 24 is REFUTED ON PRICE** (perfect-foresight
 re-evaluation is worth ≤ +6.28 % at ZERO cost and breaks even at 0.5–5.9 token-equivalents against
 a real ~29.3 — 5×–60× too expensive; see its row). What row 24's replay found instead is that the
-defect is the decision window's **WIDTH**: one-shot verdicts are correct at only **62–100 %** of
-the possible decision points, deciding at the wrong one costs **−10.9 % to −27.0 %**, and pooling
-the median cost ratio over the first **m ≥ 3** paired blocks decides correctly on **6/6** arms
-(m=1 and m=2 are each wrong, on DIFFERENT arms). **Deciding LATER is NOT the fix** — wrong verdicts
-cluster at BOTH ends of a call. So this row's two live options are: **widen and pool the TRIAL
-window** (unmeasured cost, roughly linear in m, and it must still be priced against
-`TRIAL_DRAFTED_TOKENS * breakeven` ≈ 29.3 token-equivalents on MiniMax), or close the row by
-documenting that `run` is a window-local timed claim. **Do NOT re-open it as "measure alpha better" — a perfectly measured
-in-window alpha is the wrong quantity, exactly as P7's perfectly-measured union was.**
+defect is the decision window's **WIDTH**. **That width is now PRICED and it PAYS — the remainder is
+a decided, costed build, not an open question.** Write-up
+[`docs/2026-09-10-row13-window-width-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md)
+(gitignored; everything load-bearing restated here). CPU only, no GPU round, no engine edit — probe
+`plans/probes/p13_window_price.py` (throwaway, gitignored) replays the SAME six alternating traces
+at ROUND granularity, because the shipped window's two legs are different lengths: **CALIBRATE 8
+suppressed rounds + TRIAL 16 drafting rounds = a 24-round window**, and that is what every candidate
+is charged against.
+
+**BUILD THIS — `even-4`: four pairs of (4 suppressed, 4 drafting) rounds, verdict by the MEAN of the
+per-pair s/tok ratios.** 6/6 correct against today's 5/6, for **+8 suppressed rounds** over today's
+window and the **same 48 drafted tokens** (`m × r_draft × d = 4 × 4 × 3`, so `TRIAL_DRAFTED_TOKENS`
+is unchanged and the acceptance estimate the BYTE bar consumes is NOT loosened). Worth **+1.58 % /
++2.09 % / +2.51 %** mean over the six arms at T = 200 / 400 / 2000 tokens, beating shipped from
+**T ≥ 78 tokens**.
+
+**Three findings that must not be re-derived:**
+1. **The prize is bounded at +1.9 % and lives on ONE arm of six.** `oracle-shipped` — today's window
+   cost with the verdict forced to the best arm — is +1.60 % / +1.78 % / +1.91 % at T=200/400/2000.
+   The whole gap is `winner-p0-a` (THINK=1), where the shipped gate says `on` and the call wants
+   `off` (−9.8 % against its own best arm); the pooled window fixes exactly that arm (**+13.66 %** at
+   T=400) and moves the other five by −0.72 % to +1.11 %. **Do not quote "+2.5 % everywhere".**
+2. **Row 24's "m ≥ 3 decides 6/6" is HALF the story — the ESTIMATOR is the other half.** It scored a
+   MEDIAN. A median over three samples flips when one pair moves: at m=3 it scores **3/6** at
+   (r_supp 6, r_draft 6) and **6/6** at (8, 8) — geometries two rounds apart. The **MEAN of the
+   per-pair ratios is 6/6 at every m ≥ 3 and every one of the 24 (m, leg) combinations tried.**
+   Width is still necessary — at m=1 the estimators coincide and nothing beats 4/6 (the shipped 8+16
+   reaches 5/6 only because its drafting leg is long). **m ≥ 3 AND mean, never either alone.**
+3. **"m paired blocks" read LITERALLY is refuted.** The `full-m` family (m whole shipped-length
+   TRIALs) **never** beats shipped at any call length — −15.07 % at T=200, still −1.74 % at T=2000.
+   Widening pays only when the drafting budget is held fixed and REDISTRIBUTED.
+
+**Two things the build must still decide (design, not measurement):** the pooled ratio has to reach
+the decision through the shipped `_measured_alpha()` / `_acceptance_bar()` form — `alpha` against
+`max(byte_breakeven, wall_breakeven)`, not `ratio < 1` directly — and the byte bar stays the
+NECESSARY condition (it is what refuses Qwen at zero cost). **Validation set: the 6-arm table in the
+RESULTS doc, plus an on-device A/B on `winner-p0-a` (THINK=1), the one arm the shipped gate gets
+wrong.**
+
+**Do NOT re-open this row as "measure alpha better"** — a perfectly measured in-window alpha is the
+wrong quantity, exactly as P7's perfectly-measured union was. And **do NOT re-open it as "decide
+later"**: wrong verdicts cluster at BOTH ends of a call, so a gate that simply sampled later would
+have been wrong on two arms instead of one (row 24 §3).
+
+**§8, decided in advance:** **no knob** (a bar and its window are not features); it lands inside
+`AdaptiveSpecGate` plus the two call sites that already pass `elapsed_s`; and it is **REACHABLE but
+worth 0 %** on the default configuration — the gate is MoE-only and `USE_PROMPT_LOOKUP = "auto"` is
+OFF for MoE (`vaayu/server/config.py:211`). **What unblocks it: an operator opting a MoE checkpoint
+into prompt lookup, or a measured case for flipping that default. Neither exists.** That bound has
+not moved since the row opened, and it is the whole case for closing the row instead of building
+`even-4`: **the alternative to building is to close row 13 by documenting that `run` is a
+window-local timed claim**, per the row's own stop rule.
 Where the pooled finding comes from, for a cold pickup:
 [`docs/2026-09-10-row24-relatch-replay-RESULTS.md`](docs/2026-09-10-row24-relatch-replay-RESULTS.md)
-§3 and its probe `plans/probes/p24_replay.py` (gitignored, throwaway) — whose `pooled_accuracy()`
-already scores verdict accuracy against window width `m` and is the thing to extend when pricing
-the wider window, rather than re-deriving it. It replays row 13's OWN six alternating traces
-(`plans/probes/p13-minimax-*.json`), so nothing new has to be measured to re-check the accuracy
-claim; what is unmeasured is the COST of a longer TRIAL.
-Harness kept: `plans/probes/p13_validate.py` + `p13v_ab.sh` (gitignored), which carries both
-reference prompts and the winner that arm 2 proves is a genuine +14.4 %.
+§3 and its probe `plans/probes/p24_replay.py` (gitignored, throwaway), whose loaders
+`p13_window_price.py` imports rather than re-deriving. Both replay row 13's OWN six alternating
+traces (`plans/probes/p13-minimax-*.json`), so the accuracy claim can be re-checked with nothing new
+measured. Harness kept: `plans/probes/p13_validate.py` + `p13v_ab.sh` (gitignored), which carries
+both reference prompts and the winner that arm 2 proves is a genuine +14.4 %.
 
 **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md)**
 — written to be picked up COLD in a fresh session: the defect, the exact call sites, all 8 arms,
