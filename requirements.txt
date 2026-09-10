@@ -48,3 +48,8 @@ Pillow
 # HTTP server (vaayu/server) — OpenAI-compatible inference API
 fastapi>=0.115
 uvicorn[standard]>=0.30
+
+# Dev-only static check (todo.md row 2) — never imported by vaayu/ at runtime.
+# `pylint E0606` catches used-before-assign in a branch; ruff/pyflakes do not.
+# Enforced by tests/test_no_unbound_locals.py.
+pylint>=3.0

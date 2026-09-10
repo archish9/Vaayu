@@ -3874,9 +3874,12 @@ class VaayuBaseModel(GenerationMixin):
         for param_name in layers:
             tensor = remapped_state_dict[param_name]
             if self.hf_quantizer is not None and _fp8_available:
+                # _fp8_available is set in the same try that imports both names, so
+                # neither can be unbound here -- pylint cannot see that correlation.
+                # Suppressed, NOT fixed by hoisting: the imports are optional.
                 try:
-                    module, _ = get_module_from_name(self.model, param_name)
-                    is_fp8_module = isinstance(module, FP8Linear)
+                    module, _ = get_module_from_name(self.model, param_name)  # pylint: disable=possibly-used-before-assignment
+                    is_fp8_module = isinstance(module, FP8Linear)  # pylint: disable=possibly-used-before-assignment
                 except Exception:
                     is_fp8_module = False
                 target = tensor.to(self.running_device, non_blocking=True) if is_fp8_module \

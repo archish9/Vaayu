@@ -282,7 +282,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
 | `expert_sim.py` anchor gap | 31.9 % simulated vs 43.9 % live | A diagnostic tool's accuracy, not the engine. The obvious hypothesis was built and REJECTED. | STILL OPEN |
 | No resident-size checkpoint | Needs a ~14B coder at 4–4.5 bpw EXL3 | A download, not code. The row says it is **not a blocker**. | STILL OPEN |
-| Static unbound-local check | `ruff`/`pyflakes` for used-before-assign | Reliability: two such bugs shipped GREEN and broke both MoE loads. Prevents crashes, not slowness. | OPTIONAL row **2** |
+| ~~Static unbound-local check~~ | **CLOSED 2026-09-10 — `pylint E0606` wired as `tests/test_no_unbound_locals.py`** | Was: reliability, two such bugs shipped GREEN and broke both MoE loads. Prevents crashes, not slowness. | OPTIONAL row **2** |
 | fp16 prefix cache | `DynamicCache` lacks the three methods the pool needs | **Would** be a large win (prefix reuse is 136–377× TTFT) — but only for a **non-EXL3** model, and none is run here. Same class of gap as the `_trim_kv_cache` bug fixed 2026-09-06. | OPTIONAL row **3** |
 | 2× KV overshoot | ~0.83 GB recoverable at Qwen's 8192 | **Would** free real VRAM — **parked by decision**, not by lack of value. Re-open only on new evidence. | OPTIONAL row **4** |
 | Does failing the compression bar degrade TEXT? | Certify the proxy against a real quality measure | Quality certification, deliberately unscheduled. Costs speed if anything. | OPTIONAL row **5** |
@@ -308,7 +308,12 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1886 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1887 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-10 after row 2's lint gate (1886 + 1), the 1886 re-measured against a stashed HEAD the
+same day and MATCHING the figure written here — the first time in nine that it was not stale.
+**The suite now costs 124 s -> 164 s (+40 s, +32 %)**: `tests/test_no_unbound_locals.py` shells
+out to pylint, and in-venv astroid infers the real `torch`/`transformers` (the same run is 3.3 s
+under `uvx`, where they are absent). Findings are IDENTICAL either way. The 1886 was verified
 2026-09-09 after the dispatcher-error row-ownership fix (1882 + 4). The 1882 was verified the
 same day after row 21's batched-prefill form (1875 + 7). The 1875 was verified the same day
 after P5's max-over-chunks form (1870 + 5), the 1870 re-measured against a stashed HEAD
@@ -784,7 +789,7 @@ from this table.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
-| **2** | Static check for unbound locals / import order | OPTIONAL | `[ ]` **PROBED 2026-09-09 — the linter question is ANSWERED, the wiring is not** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
+| **2** | Static check for unbound locals / import order | OPTIONAL | `[x]` **CLOSED 2026-09-10 — wired, and PROVEN to fail on the real shape** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
 | **13** | `[bug]` The adaptive spec gate's break-even is in EXPERT BYTES, so it admits configurations that LOSE wall-clock | OPTIONAL | `[ ]` | GPU round | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **6a-b** | `head_bytes` is probably not a transient at all | OPTIONAL | `[ ]` | GPU round | Split out of row 6a on its own evidence when that row closed 2026-09-09. §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it buys admission headroom, not tok/s. See below. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
@@ -972,6 +977,43 @@ It would have caught both original bugs. **It finds zero real defects today**, s
 prevention, not a fix — price it accordingly against the other OPTIONAL rows. The gates-table
 fallback ("run a real load after touching `__init__`") stays either way: E0606 would not have
 caught the import-ORDER half on its own if the name had been module-level.
+
+**WIRED AND CLOSED 2026-09-10.** It runs **inside `pytest tests/`**, as
+`tests/test_no_unbound_locals.py` — a lint gate riding the suite, not a test of those two bugs.
+That location was chosen because it is the ONLY harness this repo runs: there is no CI, no
+`pyproject.toml` and no pre-commit hook, and the precedent for a meta-check as a test already
+exists (`tests/test_docs_ports.py` greps markdown for stale ports). The test shells out to
+`[sys.executable, "-m", "pylint", "--disable=all", "--enable=E0601,E0606,E0602", "--score=n",
+"vaayu"]` from the repo root and asserts zero findings, printing any it gets verbatim plus the
+instruction NOT to silence a false positive by hoisting the import.
+
+* **`pylint>=3.0` is in `requirements.txt`** under a comment marking it dev-only and naming the
+  test that enforces it; installed into `./venv` (4.0.8). Nothing in `vaayu/` imports it at runtime.
+* **The two false positives are suppressed INLINE at the site**, `vaayu/vaayu_base.py:3876-3880`:
+  a trailing `# pylint: disable=possibly-used-before-assignment` on each of the two lines and one
+  comment above stating that `_fp8_available` is set in the same `try` that imports both names.
+  Behaviour untouched. Suppressing inline (rather than allow-listing in the test) means a bare
+  `pylint vaayu/` is clean too.
+* **PROVEN TO FAIL — "a gate that cannot fail is not a gate" (this file's own rule).** A synthetic
+  `if flag: strategy = "exl3"` / `return strategy` appended to `vaayu/profiler.py` — the exact
+  branch shape that shipped twice — turned the test RED at
+  `vaayu/profiler.py:45:11: E0606`, and the probe was reverted (`git status` clean on that file).
+  The test is not merely green-by-construction.
+* **Cost, and it is not free: the suite goes 124 s -> 164 s (+40 s, +32 %).** In-venv astroid
+  infers the real `torch`/`transformers`; the identical command under `uvx` (no such packages)
+  takes 3.3 s. **Findings are identical either way** — E0606 is intra-function control flow and
+  needs no cross-module inference. `--jobs=4` recovers only 10 s for 4x the CPU, so the gate runs
+  serial. `--init-hook` trimming `site-packages` was tried and does NOT work: it breaks pylint's
+  own config initialisation (`AttributeError: 'Namespace' object has no attribute
+  'overgeneral_exceptions'`).
+* **It skips LOUDLY if pylint is absent**, with a reason naming the install command and saying the
+  gate is not running. Skips stayed at **12** in the closing run, which is how it was verified to
+  have actually executed rather than skipped.
+* **§8 answer: NO server knob, and that is stated rather than assumed.** A dev-time static check
+  reaches no user and nothing in `vaayu/server/` changes. Not plumbed, not reachable, by design.
+* **The gates-table fallback stays**, exactly as this row said: E0606 would not have caught the
+  import-ORDER half if the name had been module-level, so "run a real load after touching
+  `__init__`" is still the rule.
 
 ---
 
