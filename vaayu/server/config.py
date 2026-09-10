@@ -99,6 +99,28 @@ MAX_PINNED_LAYERS = -1
 # and exactly the workload an agent resending its history every turn creates.
 ENABLE_PREFIX_CACHE = True
 
+# Let a request with NO session id still find a prefix entry, by matching the
+# longest shared prompt prefix instead of an exact key. This is the behaviour
+# REQUIRE_SESSION_ID's note above describes; until 2026-09-10 the server could
+# not turn it off. Leave it True unless you have measured a reason: with it
+# False an unnamed request gets NO reuse at all rather than approximate reuse,
+# which on this workload is the larger loss. It changes nothing for a request
+# that names its session -- that path keys exactly, matched or not.
+AUTO_PREFIX_MATCH = True
+
+# Context to plan VRAM for. None DERIVES the largest context whose predicted
+# peak fits the reserve floor -- the shipped path, and the one every measured
+# figure here was taken at.
+#
+# The only reason to set it: asking for a SHORTER context hands the difference
+# back to the expert cache, which is the decode bottleneck on both MoE targets.
+# The cost of getting it wrong is two-sided and both sides are loud, not silent:
+# above the box's S_max the load REFUSES (VramPlanError, naming S_max), and
+# above the derived operating point but under S_max the load succeeds while the
+# larger KV reserve eats the pinning budget -- at 0 the engine warns that every
+# layer now streams from disk on every token. Neither degrades quietly.
+MAX_SEQ_LEN = None
+
 # Tokens per prefill chunk. 512 is measured best; smaller costs TTFT
 # (+24.7% MoE, +213% dense at 128) and buys nothing.
 PREFILL_CHUNK_SIZE = 512
@@ -173,6 +195,50 @@ RAM_CACHE_BUDGET_GB = None
 
 # Persist prefix KV to disk so reuse survives a restart.
 ENABLE_KV_PERSIST = False
+
+# Where those entries are written. None is ~/.cache/vaayu/kv -- the system
+# drive, which is the reason this is a knob: until 2026-09-10 the feature above
+# could be turned ON but not AIMED.
+#
+# The cost of getting it wrong is a disk, not a token: the write budget is
+# DERIVED as half the free space of whatever filesystem this lands on, so a
+# small or shared partition silently caps how much reuse survives a restart,
+# and a large one lets the cache grow to hundreds of GB. Point it at the drive
+# you want to spend.
+KV_PERSIST_DIR = None
+
+# fsync each persisted entry before returning. False (the default) leaves the
+# write in the page cache, so a clean shutdown keeps it and a power loss or
+# kernel panic can leave a TORN entry that is read back at the next boot. True
+# costs a disk flush on the prefix-store path. Inert while ENABLE_KV_PERSIST is
+# False.
+KV_PERSIST_SYNC = False
+
+# Record which experts are routed and which are evicted, for a triage bundle.
+# MoE-only BY CONSTRUCTION -- on a dense checkpoint the engine warns that no
+# tracker will be built and does nothing; that is not dense being second-class,
+# there are no experts to count.
+#
+# OFF by default because its cost is UNMEASURED: it puts track_evicted_keys on
+# the expert-cache path, which decode hits on every layer visit. Measure your
+# own decode both ways before leaving it on in front of users.
+ENABLE_EXPERT_USAGE = False
+
+# --------------------------------------------------------------------------
+# Engine parameters deliberately NOT exposed here (CLAUDE.md section 8 asks
+# that "no knob" be a STATED decision, not a silence). The suite enforces this
+# list: a new engine parameter fails tests/test_engine_param_reachability.py
+# until it is either given a knob above or added to the decline list there.
+#
+#   dtype, prefetching             loader plumbing; no measured operator reason
+#   layer_names_dict,              dev overrides for a checkpoint the loader
+#   tokenizer_class                misreads -- detection is the supported path
+#   layer_shards_saving_path       library-facing: where a one-off split goes
+#   profiling_mode                 dev instrumentation
+#   compression, use_torch_compile `__init__` overrides these in places; they
+#                                  are not live paths
+#   hf_token                       HF auth belongs in the environment
+# --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
 # Speculative decoding (opt-in)

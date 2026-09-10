@@ -73,6 +73,23 @@ library defaults: a server holds one model for its whole life and should fill th
 | `BATCH_WAIT_MS` | `50` | milliseconds a forming batch waits for company before running what it has. **Without it `MAX_BATCH_SIZE` never batches two concurrent clients at all** — a request wakes the dispatcher the instant it is queued, so the first of two simultaneous clients runs alone while the second is still being tokenized (measured on Llama-3.2-1B through the real server: 2 clients, warm, `batch=None` on both requests, 3 runs of 3). It also un-sticks two **steady** clients, which otherwise alternate one-at-a-time forever and never meet in the queue. Cost of getting it wrong is one-sided and bounded: a lone request at an idle server is delayed by this much, once — 0.02 % of MiniMax-M2.7's ~220 s TTFT at 4.15k tokens, ~4 % of a Llama-3.2-1B request. A batch that fills stops waiting immediately. `0` restores the pre-2026-09-09 behaviour. **Inert at `MAX_BATCH_SIZE = 1`.** Does **not** help a client whose turnaround exceeds the window — joining a *running* batch is continuous batching, which Vaayu does not do |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `None` derives it from TOTAL RAM so throughput is reproducible across restarts — keying off momentary free RAM swung Llama-3.3-70B decode **38 %** run to run. `0` disables it. **No effect on MoE**, whose experts live in the pinned expert RAM cache |
 | `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart |
+| `KV_PERSIST_DIR` | `None` *(`~/.cache/vaayu/kv`)* | where those entries are written. Until 2026-09-10 the feature above could be turned **on but not aimed**. The write budget is **derived as half the free space of whatever filesystem this names**, so this choice sets the cache's *size* as well as its location — a small or shared partition silently caps how much reuse survives a restart |
+| `KV_PERSIST_SYNC` | `False` | `fsync` each persisted entry before returning. `False` leaves the write in the page cache: a clean shutdown keeps it, a power loss or panic can leave a **torn entry** read back at the next boot. `True` costs a disk flush on the prefix-store path. Inert while `ENABLE_KV_PERSIST` is `False` |
+| `AUTO_PREFIX_MATCH` | `True` | let a request naming **no session** still find a prefix entry, by matching the longest shared prompt prefix instead of an exact key. This is the behaviour `REQUIRE_SESSION_ID` above describes; the server could not turn it off before 2026-09-10. `False` gives an unnamed request **no reuse at all** rather than approximate reuse — on this workload the larger loss. Changes nothing for a request that names its session |
+| `MAX_SEQ_LEN` | `None` *(derived)* | context to plan VRAM for. `None` derives the largest context whose predicted peak fits the reserve floor — the shipped path, and the one every measured figure here was taken at. The one reason to set it: a **shorter** context hands the difference back to the expert cache, the decode bottleneck on both MoE targets. Both failure directions are loud, not silent — above the box's `S_max` the load **refuses** (`VramPlanError`, naming `S_max`); between the derived point and `S_max` it loads while the larger KV reserve eats the pinning budget, and at `0` the engine warns that every layer now streams from disk on every token |
+| `ENABLE_EXPERT_USAGE` | `False` | record which experts are routed and which are evicted, for a triage bundle. **MoE-only by construction** — on a dense checkpoint the engine warns that no tracker will be built and does nothing (there are no experts to count, not a dense second-class default). Off because its cost is **unmeasured**: it puts `track_evicted_keys` on the expert-cache path, which decode hits on every layer visit. Measure your own decode both ways before leaving it on |
+
+> **Not every engine parameter is a server knob, and that is a decision, not an
+> oversight.** Nine of `VaayuBaseModel.__init__`'s parameters are deliberately not
+> exposed — `dtype`, `prefetching`, `layer_names_dict`, `tokenizer_class`,
+> `layer_shards_saving_path`, `profiling_mode`, `compression`, `use_torch_compile`,
+> `hf_token`. They are loader plumbing, dev overrides for a checkpoint the loader
+> misreads (detection is the supported path), dev instrumentation, two paths
+> `__init__` already overrides in places, and HF auth, which belongs in the
+> environment. The list is enforced: `tests/test_engine_param_reachability.py` fails
+> the suite when a new engine parameter appears with **neither** a knob **nor** a
+> written-down decline.
+
 
 ## Speculative decoding
 

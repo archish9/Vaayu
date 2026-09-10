@@ -58,6 +58,24 @@ class ServerConfig:
     draft_tokens: int = 5
     prefix_compress: int | None = None
     enable_kv_persist: bool = False
+    # Where persisted KV lands. None is ~/.cache/vaayu/kv. The write budget is
+    # DERIVED as half the free space of whatever filesystem this names, so the
+    # choice of directory sets the cache's size as well as its location.
+    kv_persist_dir: str | None = None
+    # fsync each persisted entry. False leaves it in the page cache, so a power
+    # loss can leave a torn entry to be read back at the next boot.
+    kv_persist_sync: bool = False
+    # Match an unnamed request against the longest shared prompt prefix rather
+    # than an exact key. False gives such a request NO reuse at all, which on
+    # this workload is the larger loss; it changes nothing for a named session.
+    auto_prefix_match: bool = True
+    # None DERIVES the largest context whose predicted peak fits the reserve
+    # floor -- the shipped path. A SHORTER value hands VRAM back to the expert
+    # cache; above S_max the load refuses outright rather than degrading.
+    max_seq_len: int | None = None
+    # Expert routing/eviction telemetry for a triage bundle. MoE-only by
+    # construction. Off because its decode cost is unmeasured.
+    enable_expert_usage: bool = False
     attn_implementation: str | None = None
     # Bytes for the dense RAM layer cache. None derives it from TOTAL RAM (see
     # ram_cache.RAM_CACHE_RESERVE) so a server's throughput is reproducible
@@ -378,6 +396,11 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                     draft_tokens=config.draft_tokens,
                     prefix_compress=config.prefix_compress,
                     enable_kv_persist=config.enable_kv_persist,
+                    kv_persist_dir=config.kv_persist_dir,
+                    kv_persist_sync=config.kv_persist_sync,
+                    auto_prefix_match=config.auto_prefix_match,
+                    max_seq_len=config.max_seq_len,
+                    enable_expert_usage=config.enable_expert_usage,
                     attn_implementation=config.attn_implementation,
                     ram_cache_budget=config.ram_cache_budget,
                     prefix_sessions=config.prefix_sessions,

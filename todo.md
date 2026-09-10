@@ -279,7 +279,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
 | **13** `[bug]` | The spec gate's break-even is in EXPERT BYTES, so `run` can lose wall-clock | **SPIKE DONE + DESIGNED 2026-09-10, not built. Build it AFTER row 14, before row 24.** Worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE and the gate is MoE-only, so it only reaches an explicit opt-in, whereas row 14's half-wired `ENABLE_KV_PERSIST` is exposed today. | row **13** · [`docs/2026-09-10-row13-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`docs/2026-09-10-row13-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) |
 | **24** `[ ]` | Every speculation decision latches for the process; acceptance moved 0.048 → 0.875 inside ONE call | Same §8 bucket as 13 — 0 % on the default config. Opened 2026-09-10 by 13's spike, not yet measured on its own evidence. | row **24** |
-| **A** | The server reaches 14 of the engine's 28 load parameters | Capability and correctness, not speed. `ENABLE_KV_PERSIST` is exposed while `kv_persist_dir`/`kv_persist_sync` are not, so the feature can be turned on but not aimed. | OPTIONAL row **14** · [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md) |
+| ~~**A**~~ | **CLOSED 2026-09-10 — 19 of 28 reachable, 9 declined in code, drift test wired. Suite 1893 → 1906** | Was: capability and correctness, not speed. `ENABLE_KV_PERSIST` could be turned on but not aimed. **All 5 new knobs are worth 0 % until an operator sets one — no default moved.** | OPTIONAL row **14** |
 | ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
 | `_finish` stop-string identity | Cannot report WHICH stop string fired | Reporting only, and no client reads it. Needs a new premise (matching stop strings ourselves). | STILL OPEN |
 | `expert_sim.py` anchor gap | 31.9 % simulated vs 43.9 % live | A diagnostic tool's accuracy, not the engine. The obvious hypothesis was built and REJECTED. | STILL OPEN |
@@ -310,7 +310,10 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1893 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1906 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-10 after row 14's config reachability work (1893 + 13). **The 1893 was re-measured against
+a stashed HEAD the same day and MATCHED the figure written here** — the second time in ten that it
+was not stale. The 1893 was verified
 2026-09-10 after C1's no-geometry refusal (1887 + 6). The 1887 was verified the same day after
 row 2's lint gate (1886 + 1), the 1886 re-measured against a stashed HEAD the same day and
 MATCHING the figure written here — the first time in nine that it was not stale.
@@ -806,8 +809,7 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
-**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** **14 → 13 → 24**, then 6a-b / 3 / 5. Row **14** first because it is CPU-only, cannot be refuted (closing it with 2 knobs and 12 written-down declines is a success), and it fixes a feature that is EXPOSED today —
-`ENABLE_KV_PERSIST` can be turned on but not aimed and never fsyncs. Row **13** second: designed and ready to execute cold, but §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup, and it costs 4 on-device arms. Row **24** third, because it is the same subsystem and a timed bar (13) should exist before anyone argues about re-evaluating one.
+**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10** (5 knobs, 9 written-down declines, a drift test; suite 1893 → 1906), so the head of the queue is now **13 → 24**. Row **13** is designed and ready to execute cold, but §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup, and it costs 4 on-device arms. Row **24** after it, because it is the same subsystem and a timed bar (13) should exist before anyone argues about re-evaluating one.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
@@ -958,7 +960,7 @@ OFF for MoE by default and this gate is MoE-only. Weigh it accordingly.
 
 ---
 
-# 14 · [ ] The server reaches 14 of the engine's 28 load parameters  (**A**)
+# 14 · [x] The server reached 14 of the engine's 28 load parameters — CLOSED 2026-09-10, now 19 + 9 declined
 
 **Self-contained brief: [`docs/2026-09-07-A-server-config-reachability-BRIEF.md`](docs/2026-09-07-A-server-config-reachability-BRIEF.md)**
 (gitignored, this disk only — the numbers and the stop rule are restated here so the row survives
@@ -991,6 +993,63 @@ Tier 2 parameter (declining is a valid deliverable), Tier 3 written down, the dr
 fail on an unclassified parameter, suite green. **No on-device arm needed** unless you propose
 changing `enable_expert_usage`'s default. **This row cannot be refuted, only reduced: closing with
 2 knobs and 12 written-down declines is a success.**
+
+## CLOSED 2026-09-10 — 5 knobs, 9 written-down declines, 1 drift test. CPU only, no default moved.
+
+**19 of 28 now reachable; the other 9 are declined IN CODE with a reason each.** Every new knob
+defaults to exactly what the engine already defaulted to, so **no behaviour changed and no
+on-device arm was owed** (brief §5). Suite **1893 → 1906 passed, 12 skipped** — and the 1893 was
+**re-measured against a stashed HEAD**, not quoted (it matched; second time in ten).
+
+**Tier 1 (the half-wired feature), both exposed:** `KV_PERSIST_DIR = None`, `KV_PERSIST_SYNC =
+False`. `ENABLE_KV_PERSIST` could be turned on but **not aimed and never fsynced**. The doc for
+`KV_PERSIST_DIR` carries the trap the brief flagged: the write budget is DERIVED as
+`shutil.disk_usage(dir).free // 2` (`vaayu_base.py:2857-2861`), so the directory choice sets the
+cache's SIZE as well as its location. That budget stays derived — **making it a knob is a NEW row
+with its own evidence**, per the brief.
+
+**Tier 2 — all three EXPOSED (the user's call, 2026-09-10), all at their existing defaults:**
+* `MAX_SEQ_LEN = None`. **Zero new logic, and the brief's "must clamp, never above" was already
+  the engine's contract** — `plan_vram` raises `VramPlanError` above `s_max`
+  (`vram_plan.py:697`) and warns at `pinning_budget=0`. The real trap is documented instead:
+  between the derived operating point and `s_max` the load SUCCEEDS while the larger KV reserve
+  eats the pinning budget. Both failure directions are loud; neither degrades quietly (§5).
+* `AUTO_PREFIX_MATCH = True`. Closes the gap where `REQUIRE_SESSION_ID`'s own comment described
+  behaviour the server could not turn off. Documented as: `False` gives an unnamed request NO
+  reuse rather than approximate reuse, which on this workload is the larger loss.
+* `ENABLE_EXPERT_USAGE = False`. **Default deliberately NOT moved**, which is why no cost
+  measurement was owed. Documented MoE-only *by construction* (`vaayu_base.py:2785` warns and
+  no-ops on dense — no experts to count, not a dense-second-class default, §5), and that flipping
+  it puts `track_evicted_keys` on the decode path at an **unmeasured** cost.
+
+**Tier 3 — 9 declines written down twice**, in `config.py` (a commented block) and in both docs:
+`dtype`, `prefetching`, `layer_names_dict`, `tokenizer_class`, `layer_shards_saving_path`,
+`profiling_mode`, `compression`, `use_torch_compile`, `hf_token`.
+
+**The durable part — `tests/test_engine_param_reachability.py` (+13).** Reads
+`inspect.signature(VaayuBaseModel.__init__)` and asserts it equals
+`SERVER_EXPOSED | SERVER_DELIBERATELY_NOT_EXPOSED` (minus the positional checkpoint path), each
+decline carrying a non-empty reason. **PROVEN both ways, not asserted:** written first and RED on
+the right 5 names; then a dummy `dummy_drift_probe=None` parameter was added to
+`VaayuBaseModel.__init__` and the test failed naming it, and `vaayu_base.py` was restored
+byte-clean (`git diff --stat` empty). It also asserts the plumbing — `from_pretrained` really
+receives every exposed name — so a knob that is decoration fails too.
+**What did NOT need building:** the `config.py → ServerConfig → from_pretrained` chain was
+ALREADY gated in both directions by `test_server_config_module.py:56/94` and
+`test_server_config_passthrough.py:49`; only the engine-signature end was unguarded. The 5 new
+knobs fall into those existing gates automatically.
+
+**§8, all four:** (1) **it IS the knobs** — 5 of them, in `config.py`, each with the cost of
+getting it wrong; (2) plumbed — `__main__.py` maps all 5, `app.py`'s `from_pretrained` passes all
+5, and the drift test fails if either stops; (3) **reachable — every one is live on the default
+server path**, which is the whole point of the row, though **all 5 are worth 0 % until an operator
+sets one**: no default moved; (4) documented in `vaayu/server/README.md` AND
+`documentation/server.md` (5 table rows + the Tier-3 note).
+
+**Files:** `vaayu/server/config.py`, `app.py`, `__main__.py`, `vaayu/server/README.md`,
+`documentation/server.md`, `tests/test_engine_param_reachability.py` (new).
+[`docs/2026-09-10-A-server-config-reachability-RESULTS.md`](docs/2026-09-10-A-server-config-reachability-RESULTS.md)
+(**gitignored — this disk only**; everything load-bearing is restated above).
 
 ---
 
