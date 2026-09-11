@@ -49,8 +49,9 @@ detail each entry points to.**
 or the 70B today — every row is OPTIONAL by §0's test.** The order below was set by the user on 2026-09-11
 after a triage of every open row: **three are worth working, in this order; the rest are not, for the
 reason given.** Pick from the PRIORITY table first. The sections after this one are the detail.
-**All three PRIORITY rows are CLOSED as of 2026-09-11 (3, 25, then 18).** What remains is the NOT-worth-working
-table — pick from it only on its stated re-open condition.
+**All three PRIORITY rows are CLOSED as of 2026-09-11 (3, 25, then 18).** Row **26** was added the same day at the
+user's request (a measurement, no engine code) and is the one open PRIORITY row. Beyond it, what remains is the
+NOT-worth-working table — pick from it only on its stated re-open condition.
 
 ## PRIORITY — worth working, in this order
 
@@ -59,6 +60,7 @@ table — pick from it only on its stated re-open condition.
 | ~~**3**~~ | **CLOSED 2026-09-11 — prefix cache now ON for every non-EXL3 model.** `auto` resolves to `bf16` (the ring buffer, model's own dtype) on every loader. | Done: 1B prefix gate + server gate pass, turn-2 TTFT ~4.5× at 2.8k tokens, decode flat on flash. **Cost: derived `max_seq_len` drops up to ~2× (1B flash 91106 → 65536)** — row 4's doubling overshoot, now paid by non-EXL3 too; `KV_CACHE_MODE="fp16"` is the escape hatch. | `[x]` | done | [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md) · row **3** below |
 | ~~**25**~~ | **CLOSED 2026-09-11 — APST is NULL on both MoE targets.** MiniMax idle-sampler arm: decode 0 gaps ≥ 100 ms; cold prefill 3 mid-generation gaps ≥ 100 ms + a 80–100 ms band (same band Qwen has). | Done: bound ≤ 0.15 % of cold TTFT (≤ 20 wakes × ≤ 15 ms, the kernel's primary-state latency cap), 0 on decode; no full A/B — even a 1 % worst case is inside the A/B's replicate spread. The 70B dense stays unmeasured (not a blocker). | `[x]` | done | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) (MiniMax addendum) · row **25** below |
 | ~~**18**~~ | **CLOSED 2026-09-11 — `output_hidden_states=True` fixed; `output_attentions=True` now raises `NotImplementedError`.** Root cause confirmed by instrumentation: 19 sublists + 19 bare Tensors (outer len 38 = 2 × `len(self.layers)`), from `6253fd1` switching the init to sublists without removing the flat `+=`. | Done: returns transformers 5.x's `num_hidden_layers + 1` entries (post-norm last); matches stock HF to ≤ 0.0184 per-token rel-L2 vs ≥ 0.459 to a neighbour layer; new on-device gate `tests/test_output_hidden_states.py` fails a shifted-layer mutant. 0 % on throughput (diagnostic only). | `[x]` | done | [`…-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md) · row **18** below |
+| **26** | **Measure the ceiling of a CPU-hybrid (AVX2) expert path before anyone builds one.** User asked 2026-09-11: switch to a non-EXL3 8-bit 200B+ MoE and compute on the idle CPU. Verdict so far is ARITHMETIC ONLY: NO as proposed — decode is disk-bound (~47 % stall on Qwen), 8-bit = ~1.6× more bytes per expert read, and a CPU path can only remove H2D + EXL3 construct, never disk. | Cheap and decisive: the instrumentation already exists (`profiling_mode=True` → `[VAAYU-MOE] layer_totals` with `disk_load`/`h2d`/`construct`/`gemm`). A small `H + C` share kills a months-long build for free. A win here WOULD reach users (N=1 decode, §8). | `[ ]` **priority 1** | ~1 h GPU (2 models) | [`…-row26-cpu-hybrid-ceiling-BRIEF.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md) · row **26** below |
 
 ## NOT worth working now — and why (re-open only on the stated condition)
 
@@ -1516,6 +1518,47 @@ index is empty when the concat runs, so the entry is never appended for some lay
 **Severity: low, and say so.** Nothing in the engine, the server or any gate asks for hidden states;
 this only bites a diagnostic. It is filed because a debugging session that reaches for hidden states
 loses a tool exactly when it needs one — which is how it was found.
+
+---
+
+# 26 · [ ] CPU-hybrid (AVX2) expert compute — measure the ceiling first — PRIORITY 1 (added 2026-09-11)
+
+**Cold-pickup brief:** [`docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md)
+(gitignored — this row is the durable copy). **MEASUREMENT ONLY: no engine code in this row.**
+
+**Question (user, 2026-09-11):** use a non-EXL3 8-bit 200B+ MoE and add CPU AVX2 compute so the mostly-idle CPU also
+works on tokens? **Arithmetic verdict, UNMEASURED: NO as proposed.** (1) Decode is disk-bound — 3.70–3.83 GB/s off a
+~7.1 GB/s drive, Qwen ~47 % disk-stall; idle CPU = I/O-bound box, the GPU waits too. (2) 8-bit is ~1.6× the bytes of
+Qwen's EXL3 5.0 bpw (139 GB → ~220–240 GB) on the binding resource; estimated 0.56–0.86 → ~0.3–0.5 tok/s. (3) CPU
+compute cannot remove a disk read. (4) The one real mechanism (KTransformers-style): compute RAM-resident experts on the
+CPU so they skip PCIe (RTX 5060 Ti on **Gen5 x8**, ~32 GB/s peak vs host RAM ~50–90 GB/s, type unknown). It can remove
+only **H2D + EXL3 construct**, and EXL3 has no CPU kernel, so it forces a CPU-friendly format on disk.
+
+**Box:** i5-14600K, 6P+8E / 20 threads, **avx2 + avx_vnni, no avx512**; 32 GB RAM; 344 GB disk free.
+
+- [ ] **Step 1 — physics micro-benches** (no model): host RAM read GB/s and pinned H2D GB/s; CPU expert GEMV per model
+  (shapes DERIVED from config / `_moe_geometry`) in bf16, fp32 and int8 weight-only, at 6 / 14 / 20 threads.
+- [ ] **Step 2 — Qwen3-235B decode**: one process, `MemoryMax=29G`, `BALLAST_GB=25` held in-process and freed after load,
+  speculation OFF, greedy, warm-up discarded → unprofiled arm → `model.profiling_mode = True` → identical profiled arm
+  (verify the toggle works; else a second process). Greedy ids must match across arms.
+- [ ] **Step 3 — MiniMax-M2.7**, identical (module-list forward — a Qwen result does not transfer).
+- [ ] **Step 4 — compute per model:** shares `D` (disk_load) / `H` (h2d) / `C` (construct) / `G` (gemm), tiers V/R/M.
+  Optimistic ceiling `1 / (1 − (H + C) / T_prof)`; realistic estimate with Step 1's CPU rate added back; 8-bit penalty
+  `D × (8 / current_bpw − 1)`, `current_bpw` derived.
+- [ ] **Verdict + RESULTS doc**, box bandwidths added to Environment.
+
+**Traps:** profiling adds `torch.cuda.synchronize()` and serialises overlap → profiled phases are UPPER bounds on what
+removing them saves, true tok/s is the unprofiled arm · MiniMax load dies at `MemoryMax=22G`, use 29G · exclude the
+prefill forward · no py-spy · no literal model numbers.
+
+**Decision rule (proposed; user may override):** KILL if the optimistic ceiling is **< +15 %** decode tok/s on both
+models (a real hybrid is kernels + a new format + loader + dispatch; shipped wins here were +3–12 %). KILL the 8-bit
+variant if `H + C ≤ D × (8 / current_bpw − 1)` on both — **expected**. Only a REALISTIC ≥ +15 % on one model with no
+loss on the other earns a design brief (still not code). Report the decode win as a share of a whole agent turn: a CPU
+path cannot help prefill, and a cold MiniMax turn spent ~205 s in prefill (row 25). **A refutation CLOSES the row.**
+
+**§8:** no knob; nothing to plumb (`profiling_mode` stays out of the server, the probe is in-process); the hypothetical
+feature WOULD be reachable — a per-token N=1 decode effect, the server's mode; not built, unblocked only by this verdict.
 
 ---
 
