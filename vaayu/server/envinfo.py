@@ -333,16 +333,19 @@ def _storage_section(c):
 
     APST is the live hardware tax: MoE decode is 72-74% disk-bound, so a drive
     dropping into a low-power state between reads lands on the dominant cost.
-    The two sysfs paths are the ones scripts/vaayu_optimize_os.sh writes; the
-    first is the kernel-6.x location, which is this box.
+    APST is read per controller from the live knob scripts/vaayu_optimize_os.sh
+    writes (see nvme_apst_tolerance); it is reported active if ANY NVMe
+    controller allows it, and None when none exposes APST control.
     """
     def apst_us():
-        for p in ("/sys/module/nvme_core/parameters/default_ps_max_latency_us",
-                  "/sys/class/nvme/nvme0/power/ps_max_latency_us"):
-            f = Path(p)
-            if f.is_file():
-                return int(f.read_text().strip())
-        return None
+        from ..auto_model import nvme_apst_tolerance
+        vals = [nvme_apst_tolerance(d.name)
+                for d in sorted(Path("/sys/block").glob("nvme*"))]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        v = next((v for v in vals if v != "0"), "0")
+        return int(v) if v.isdigit() else v
 
     def devices():
         out = []

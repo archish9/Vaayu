@@ -110,9 +110,9 @@ sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
 It writes a permanent udev rule to `/etc/udev/rules.d/60-vaayu-nvme.rules` so that all NVMe drives are automatically bound to the `none` scheduler on system boot.
 
 ### 2. Disable Autonomous Power State Transition (APST)
-During Vaayu's layer-streaming generation loop, the NVMe SSD experiences short idle phases while the GPU is executing computations. The operating system's power manager (APST) will aggressively put the SSD into a micro-sleep state. Waking the drive up on the next layer read introduces **50 to 500 microseconds of wakeup latency**. Over 80+ layers, these wakeups cause significant latency jitter.
+**Optional.** APST lets the SSD drop into a low-power state after it has been idle for a while (100 ms for the shallow states on a typical 6.x kernel, see `/sys/module/nvme_core/parameters/apst_primary_timeout_ms`). During generation Vaayu keeps the drive busy in gaps far shorter than that, so the drive almost never sleeps mid-generation: an on/off A/B through the server on Qwen3-235B measured no decode or TTFT difference. Disabling it costs nothing either, if you prefer the drive never sleep.
 
-To disable APST permanently:
+`scripts/vaayu_optimize_os.sh` disables it until the next reboot. To disable APST permanently:
 1. Open `/etc/default/grub` in your preferred text editor (with sudo).
 2. Append the default latency limit parameters to `GRUB_CMDLINE_LINUX_DEFAULT`:
    ```text
@@ -130,7 +130,9 @@ After rebooting, verify that both optimizations are active:
 # Scheduler check: should output '[none]'
 cat /sys/block/nvme0n1/queue/scheduler
 
-# APST check: should output '0'
-cat /sys/module/nvme_core/parameters/default_ps_max_latency_us
+# APST check: should output '0'. This is the controller's LIVE setting; the
+# module parameter nvme_core.default_ps_max_latency_us is only read when the
+# controller initialises, so it can read 0 while the drive still has APST on.
+cat /sys/block/nvme0n1/device/power/pm_qos_latency_tolerance_us
 ```
 *(Replace `nvme0n1` with your actual system boot drive identifier if different).*

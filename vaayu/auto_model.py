@@ -3,6 +3,25 @@ import subprocess
 from transformers import AutoConfig
 
 
+def nvme_apst_tolerance(block_dev: str, sys_root: str = "/sys"):
+    """Live APST latency tolerance of the controller behind `block_dev` ("nvme0n1").
+
+    This is the knob the kernel honours at runtime: the controller's PM-QoS
+    latency tolerance (nvme_set_latency_tolerance -> nvme_configure_apst).
+    The module parameter nvme_core.default_ps_max_latency_us is read only when
+    a controller initialises, so after boot it says nothing about the drive --
+    writing it changes nothing, and reading it can report "disabled" while the
+    drive still has APST on. The file is exposed only for controllers that
+    support APST.
+
+    Returns the raw value ("0" = APST off; an integer, "auto" or "any" = APST
+    allowed), or None when the controller exposes no APST control.
+    """
+    f = (pathlib.Path(sys_root) / "block" / block_dev / "device" / "power"
+         / "pm_qos_latency_tolerance_us")
+    return f.read_text().strip() if f.is_file() else None
+
+
 def _check_nvme_scheduler(model_path: str) -> None:
     if not pathlib.Path(model_path).exists():
         return
@@ -15,7 +34,6 @@ def _check_nvme_scheduler(model_path: str) -> None:
         ).strip() or dev.replace("/dev/", "")
         if not nvme.startswith("nvme"):
             return
-        nvme_char = nvme.split("n")[0]  # nvme0n1 → nvme0
 
         scheduler = pathlib.Path(f"/sys/block/{nvme}/queue/scheduler").read_text()
         fix_cmd = f"sudo bash scripts/vaayu_optimize_os.sh {model_path}  # one-time per machine"
@@ -28,20 +46,17 @@ def _check_nvme_scheduler(model_path: str) -> None:
         else:
             print(f"[Vaayu] {nvme} I/O scheduler: optimized (none)")
 
-        apst_candidates = [
-            pathlib.Path("/sys/module/nvme_core/parameters/default_ps_max_latency_us"),
-            pathlib.Path(f"/sys/class/nvme/{nvme_char}/power/ps_max_latency_us"),
-        ]
-        apst_path = next((p for p in apst_candidates if p.exists()), None)
-        if apst_path:
-            apst_val = apst_path.read_text().strip()
+        apst_val = nvme_apst_tolerance(nvme)
+        if apst_val is not None:
             if apst_val != "0":
-                print(f"[Vaayu Warning] {nvme_char} APST (power management) is active "
-                      f"(ps_max_latency_us={apst_val}).")
-                print(f"  Drive enters micro-sleep during GPU compute phases — latency spikes over 80+ layers.")
-                print(f"  Fix (once): {fix_cmd}")
+                # Info, not a warning: measured with no decode/TTFT cost -- the
+                # drive's idle gaps during generation are shorter than APST's
+                # sleep timeout (todo.md row 25, 2026-09-11).
+                print(f"[Vaayu] {nvme} APST: active (ps_max_latency_us={apst_val}) — "
+                      f"no measured decode/TTFT cost; optional to disable (until "
+                      f"reboot): sudo bash scripts/vaayu_optimize_os.sh {model_path}")
             else:
-                print(f"[Vaayu] {nvme_char} APST: optimized (disabled)")
+                print(f"[Vaayu] {nvme} APST: optimized (disabled)")
     except Exception:
         pass
 

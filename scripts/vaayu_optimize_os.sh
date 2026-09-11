@@ -40,21 +40,21 @@ else
 fi
 
 # ── 2. APST (power management) ──────────────────────────────────────────────
-APST_PATH=""
-if [[ -f "/sys/module/nvme_core/parameters/default_ps_max_latency_us" ]]; then
-    APST_PATH="/sys/module/nvme_core/parameters/default_ps_max_latency_us"  # kernel 6.x
-elif [[ -f "/sys/class/nvme/$NVME_CHAR/power/ps_max_latency_us" ]]; then
-    APST_PATH="/sys/class/nvme/$NVME_CHAR/power/ps_max_latency_us"          # kernel 4.x/5.x
-fi
-
-if [[ -n "$APST_PATH" ]]; then
+# The live knob is the controller's PM-QoS latency tolerance: writing it runs
+# nvme_set_latency_tolerance -> nvme_configure_apst immediately (0 = APST off).
+# NOT the module parameter nvme_core.default_ps_max_latency_us -- the kernel
+# reads that only when a controller initialises, so writing it after boot
+# changes nothing on this drive. The file exists only if the controller
+# supports APST.
+APST_PATH="/sys/block/$NVME_DEV/device/power/pm_qos_latency_tolerance_us"
+if [[ -f "$APST_PATH" ]]; then
     echo "Disabling APST..."
     echo 0 | tee "$APST_PATH" > /dev/null
-    echo "  Immediate: done (path: $APST_PATH)"
+    echo "  Immediate: done ($APST_PATH now reads $(cat "$APST_PATH"))"
     echo "  Note: resets on reboot. For permanent fix, add nvme_core.default_ps_max_latency_us=0"
     echo "  to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then run: sudo update-grub"
 else
-    echo "  APST sysfs path not found on this kernel — skipping"
+    echo "  $NVME_CHAR exposes no APST control (controller does not support APST) — skipping"
 fi
 
 echo ""
@@ -62,3 +62,4 @@ echo "Vaayu OS optimization complete!"
 echo ""
 echo "Verify with:"
 echo "  cat /sys/block/$NVME_DEV/queue/scheduler   # should output [none]"
+echo "  cat $APST_PATH   # should output 0"

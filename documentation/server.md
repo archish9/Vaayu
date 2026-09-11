@@ -874,8 +874,9 @@ When the server will not start at all, there is no `logs/run-*/env.json` to
 read — this prints the same environment snapshot in seconds, without loading
 any weights, then flags the settings worth checking on this box:
 
-- **NVMe APST is active.** The drive drops into a low-power state between
-  reads, which fights decode's disk-stall-dominated cost.
+- **NVMe APST is active.** Minor, reported for completeness: measured with no
+  decode or TTFT cost, because decode keeps the drive's idle gaps shorter than
+  APST's sleep timeout.
 - **Another process holds GPU memory.** Budgets are sized once at load, so
   this is subtracted from the expert cache for the whole run even if the
   process exits later.
