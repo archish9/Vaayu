@@ -110,7 +110,7 @@ sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
 It writes a permanent udev rule to `/etc/udev/rules.d/60-vaayu-nvme.rules` so that all NVMe drives are automatically bound to the `none` scheduler on system boot.
 
 ### 2. Disable Autonomous Power State Transition (APST)
-**Optional.** APST lets the SSD drop into a low-power state after it has been idle for a while (100 ms for the shallow states on a typical 6.x kernel, see `/sys/module/nvme_core/parameters/apst_primary_timeout_ms`). During generation Vaayu keeps the drive busy in gaps far shorter than that, so the drive almost never sleeps mid-generation: an on/off A/B through the server on Qwen3-235B measured no decode or TTFT difference. Disabling it costs nothing either, if you prefer the drive never sleep.
+**Optional.** APST lets the SSD drop into a low-power state after it has been idle for a while (100 ms for the shallow states on a typical 6.x kernel, see `/sys/module/nvme_core/parameters/apst_primary_timeout_ms`). During generation Vaayu keeps the drive busy in gaps far shorter than that, so the drive almost never sleeps mid-generation: an on/off A/B through the server on Qwen3-235B measured no decode or TTFT difference, and an idle-gap measurement on MiniMax-M2.7 bounds APST's cost there at under 0.2 % of a cold prompt's TTFT and zero on decode. Disabling it costs nothing either, if you prefer the drive never sleep.
 
 `scripts/vaayu_optimize_os.sh` disables it until the next reboot. To disable APST permanently:
 1. Open `/etc/default/grub` in your preferred text editor (with sudo).
