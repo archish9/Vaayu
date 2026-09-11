@@ -318,20 +318,35 @@ def _calibrate_timed(gate, base_s, layers=range(62)):
                      elapsed_s=base[step % len(base)])
 
 
-def _trial_timed(gate, wide_s, acceptance, drafted_per_round=3):
+def _trial_timed(gate, wide_s, acceptance, drafted_per_round=3,
+                 draft_overhead_s=None):
     """TRIAL at a given acceptance, timing every drafting round.
 
     Acceptance is realised exactly: the total accepted count is spread over
     the drafting rounds, never exceeding what each round drafted.
+
+    Follows the gate's own leg schedule (row 13, `even-4`) until it decides.
+    Suppressed rounds are left UNTIMED, so no pair forms and these tests
+    exercise the single-window rule -- alpha against the wall and byte bars
+    -- which is what decides when fewer than TRIAL_PAIRS pairs are timed.
+    Drafting-leg rounds past the helper's own `rounds` are untimed no-match
+    rounds, so they move neither acceptance nor any median.
     """
     from vaayu.speculative import adaptive_gate as ag
     rounds = ag.TRIAL_DRAFTED_TOKENS // drafted_per_round
     wide = list(wide_s) if isinstance(wide_s, (list, tuple)) else [wide_s] * rounds
     remaining = round(acceptance * drafted_per_round * rounds)
-    for i in range(rounds):
-        take = min(drafted_per_round, remaining)
-        remaining -= take
-        gate.record_round(drafted_per_round, take, elapsed_s=wide[i % len(wide)])
+    i = 0
+    while gate.phase == "trial":
+        if gate.should_draft() and i < rounds:
+            take = min(drafted_per_round, remaining)
+            remaining -= take
+            gate.record_round(drafted_per_round, take,
+                              elapsed_s=wide[i % len(wide)],
+                              draft_overhead_s=draft_overhead_s)
+            i += 1
+        else:
+            gate.record_round(0, 0)
 
 
 def _wide_s_for(alpha, base_s, draft_tokens):
@@ -431,11 +446,9 @@ def test_acceptance_exactly_on_the_timed_bar_refuses():
 def test_a_short_timing_sample_falls_back_to_the_byte_bar():
     """Fewer than draft_tokens+1 deltas in either list is not a measurement.
     Here CALIBRATE was never timed at all."""
-    from vaayu.speculative import adaptive_gate as ag
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
     _calibrate_with_overlap(gate, layers=range(62))      # no elapsed_s at all
-    for _ in range(ag.TRIAL_DRAFTED_TOKENS // 3):
-        gate.record_round(3, 3, elapsed_s=1.5)
+    _trial_timed(gate, wide_s=1.5, acceptance=1.0)
     s = gate.status()
     assert s["bar_used"] == "bytes"
     assert s["alpha"] is None and s["wall_breakeven"] is None
@@ -527,8 +540,7 @@ def test_a_drafting_rounds_search_stays_in_the_numerator():
     round that got nothing for it is corrected."""
     gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
     _calibrate_timed(gate, base_s=0.5)
-    for i in range(16):
-        gate.record_round(3, 3, elapsed_s=1.5, draft_overhead_s=0.4)
+    _trial_timed(gate, wide_s=1.5, acceptance=1.0, draft_overhead_s=0.4)
     assert gate.status()["alpha"] == pytest.approx(0.75, abs=1e-9)
 
 
@@ -604,3 +616,223 @@ def test_the_six_measured_arms_replay_to_the_right_decision(name, alpha,
     assert gate.decision == expected, (
         f"{name}: alpha={alpha} acceptance={acceptance} "
         f"wall_bar={gate.status()['wall_breakeven']}")
+
+
+# ---------------------------------------------------------------------------
+# Row 13, `even-4` (2026-09-11). The timed bar changed no decision on device,
+# because it was measured in ONE narrow, early window: CALIBRATE's 8 rounds and
+# TRIAL's 16 sit in the cheapest stretch of a call, so a correctly-measured bar
+# still admitted an arm that lost -19.7% on its own A/B. The fix is a WIDER
+# window, not a better bar in the same one: TRIAL alternates legs of
+# TRIAL_LEG_ROUNDS drafting and TRIAL_LEG_ROUNDS suppressed rounds, and the
+# verdict is `run` iff acceptance clears the BYTE bar (necessary, unchanged)
+# AND the MEAN of the per-pair s/token ratios is below 1.
+#
+# Replayed on the six archived traces: 6/6 correct against the shipped 5/6.
+# Routing the pooled ratio through alpha -> wall bar instead scored 4/6 --
+# worse than doing nothing -- so the ratio decides directly.
+# ---------------------------------------------------------------------------
+
+def _pooled_trial(gate, pairs, supp_s=0.5):
+    """Drive TRIAL the way the loop does: ask should_draft() every round,
+    draft when told to, run an ordinary 1-wide decode when not.
+
+    `pairs[j] = (wide_s, accepted_per_round)` sets pair j's drafting leg; the
+    last entry repeats if the trial runs past len(pairs). Every suppressed
+    round takes `supp_s` and yields one token. A pair starts at each
+    suppressed -> drafting transition, so this helper needs no knowledge of
+    the leg length. Returns the number of trial rounds run.
+    """
+    d = gate.draft_tokens
+    j, prev, rounds = -1, None, 0
+    while gate.phase == "trial" and rounds < 10_000:
+        drafting = gate.should_draft()
+        if drafting and prev is not True:
+            j += 1
+        prev = drafting
+        wide_s, acc = pairs[min(max(j, 0), len(pairs) - 1)]
+        if drafting:
+            gate.record_round(d, acc, elapsed_s=wide_s)
+        else:
+            gate.record_round(0, 0, elapsed_s=supp_s)
+        rounds += 1
+    return rounds
+
+
+# Per-round drafting-leg times that give a pair ratio r at full acceptance
+# (d=3 -> 4 tokens per round) against 0.5 s/token suppressed legs.
+def _wide_for_ratio(r, tokens_per_round=4, supp_s=0.5):
+    return r * supp_s * tokens_per_round
+
+
+def test_trial_alternates_drafting_and_suppressed_legs():
+    """[D4 S4] x 4 after CALIBRATE: the gate itself schedules the A/B, and the
+    loop already honours should_draft() per round (vaayu_base.py)."""
+    from vaayu.speculative import adaptive_gate as ag
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_with_overlap(gate, layers=range(62))
+    pattern = []
+    while gate.phase == "trial":
+        drafting = gate.should_draft()
+        pattern.append(drafting)
+        gate.record_round(3 if drafting else 0, 3 if drafting else 0)
+    leg = ag.TRIAL_LEG_ROUNDS
+    assert pattern == ([True] * leg + [False] * leg) * ag.TRIAL_PAIRS
+    assert gate.decision == "run"
+
+
+@pytest.mark.parametrize("geo", [QWEN, MINIMAX], ids=["qwen", "minimax"])
+def test_the_trial_drafts_48_tokens_over_four_pairs(geo):
+    """The widened window keeps TRIAL_DRAFTED_TOKENS: 4 pairs x 4 drafting
+    rounds x 3 drafted = 48, so the acceptance estimate the byte bar consumes
+    is not loosened -- and suppressed rounds never enter it."""
+    gate = AdaptiveSpecGate(geo, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5, layers=range(geo["num_moe_layers"]))
+    rounds = _pooled_trial(gate, [(_wide_for_ratio(0.75), 3)])
+    assert rounds == 32
+    assert gate.status()["drafting_rounds"] == 16
+    assert gate.measured_acceptance == 1.0
+
+
+@pytest.mark.parametrize("geo", [QWEN, MINIMAX], ids=["qwen", "minimax"])
+def test_three_pairs_that_favour_drafting_outvote_one_that_does_not(geo):
+    """The odd pair comes FIRST -- where the shipped single window would have
+    sampled it and nothing else."""
+    gate = AdaptiveSpecGate(geo, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5, layers=range(geo["num_moe_layers"]))
+    gate._breakeven = MINIMAX_BYTE_BAR
+    _pooled_trial(gate, [(_wide_for_ratio(1.5), 3)] + [(_wide_for_ratio(0.75), 3)] * 3)
+    s = gate.status()
+    assert gate.decision == "run"
+    assert s["bar_used"] == "pooled"
+    assert s["pooled_ratio"] == pytest.approx(0.9375)     # (1.5 + 3*0.75) / 4
+    assert s["pairs_used"] == 4
+
+
+@pytest.mark.parametrize("geo", [QWEN, MINIMAX], ids=["qwen", "minimax"])
+def test_three_pairs_against_drafting_refuse_it(geo):
+    gate = AdaptiveSpecGate(geo, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5, layers=range(geo["num_moe_layers"]))
+    gate._breakeven = MINIMAX_BYTE_BAR
+    _pooled_trial(gate, [(_wide_for_ratio(0.75), 3)] + [(_wide_for_ratio(1.5), 3)] * 3)
+    s = gate.status()
+    assert gate.decision == "off_acceptance"
+    assert s["bar_used"] == "pooled"
+    assert s["pooled_ratio"] == pytest.approx(1.3125)     # (0.75 + 3*1.5) / 4
+
+
+def test_the_pooled_estimator_is_a_mean_not_a_median():
+    """Row 13's price replay: a median over 3-4 pairs flips when one pair
+    moves. Ratios [0.9, 0.9, 0.9, 1.5]: median 0.9 would admit, mean 1.05
+    refuses -- and the one expensive pair is a real cost of the call."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5)
+    gate._breakeven = MINIMAX_BYTE_BAR
+    _pooled_trial(gate, [(_wide_for_ratio(0.9), 3)] * 3 + [(_wide_for_ratio(1.5), 3)])
+    assert gate.status()["pooled_ratio"] == pytest.approx(1.05)
+    assert gate.decision == "off_acceptance"
+
+
+def test_a_pair_ratio_is_seconds_per_token_so_it_carries_realised_acceptance():
+    """A drafting round yields accepted + 1 tokens, a suppressed one yields 1
+    -- derivable inside the gate from what record_round already receives.
+    wide 1.5 s at 1 accepted = 2 tokens = 0.75 s/tok, against 0.5: ratio 1.5."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5)
+    gate._breakeven = 0.0
+    _pooled_trial(gate, [(1.5, 1)])
+    assert gate.status()["pooled_ratio"] == pytest.approx(1.5)
+    assert gate.decision == "off_acceptance"
+
+
+@pytest.mark.parametrize("geo", [QWEN, MINIMAX], ids=["qwen", "minimax"])
+def test_the_byte_bar_stays_necessary_under_the_pooled_rule(geo):
+    """Every pair favours drafting (ratio 0.667), but acceptance 2/3 is under
+    a 0.9 byte bar: refuse. The byte test is free, sound, and what refuses
+    Qwen3-235B before a single draft is paid for."""
+    gate = AdaptiveSpecGate(geo, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5, layers=range(geo["num_moe_layers"]))
+    gate._breakeven = 0.9
+    _pooled_trial(gate, [(1.0, 2)])       # 1.0 s / 3 tokens vs 0.5 s / token
+    s = gate.status()
+    assert s["pooled_ratio"] == pytest.approx(2 / 3, abs=1e-4)
+    assert gate.measured_acceptance == pytest.approx(2 / 3)
+    assert gate.decision == "off_acceptance"
+
+
+@pytest.mark.parametrize("geo", [QWEN, MINIMAX], ids=["qwen", "minimax"])
+def test_a_slow_proposer_extends_the_trial_by_whole_pairs(geo):
+    """PLD drafts 0 or d. A proposer that matches on every other drafting
+    round has drafted only 24 tokens after four pairs, so the trial keeps
+    going -- whole pairs at a time, so every leg keeps its partner -- until
+    it has TRIAL_DRAFTED_TOKENS: 8 pairs, 64 rounds."""
+    gate = AdaptiveSpecGate(geo, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5, layers=range(geo["num_moe_layers"]))
+    rounds = drafting_seen = 0
+    while gate.phase == "trial":
+        if gate.should_draft():
+            drafting_seen += 1
+            k = 3 if drafting_seen % 2 else 0
+            gate.record_round(k, k, elapsed_s=1.5 if k else 0.5)
+        else:
+            gate.record_round(0, 0, elapsed_s=0.5)
+        rounds += 1
+    assert rounds == 64
+    assert gate._drafted == 48
+    assert gate.status()["pairs_used"] == 8
+
+
+def test_the_cap_gives_a_proposer_that_never_matches_as_many_chances_as_before():
+    """Only half a trial's rounds may draft now, so the cap doubled: a
+    proposer that never matches still gets the shipped 64 drafting-eligible
+    rounds before the gate decides on what it has."""
+    from vaayu.speculative import adaptive_gate as ag
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5)
+    eligible = rounds = 0
+    while gate.phase == "trial":
+        eligible += gate.should_draft()
+        gate.record_round(0, 0, elapsed_s=0.5)
+        rounds += 1
+    assert rounds == ag.TRIAL_ROUND_CAP
+    assert eligible == 64
+    assert gate.decision == "off_acceptance"
+
+
+def test_too_few_timed_pairs_fall_back_to_the_single_window_rule_and_say_so():
+    """A pair needs BOTH legs timed. Untimed suppressed legs leave no pair to
+    pool, so the gate decides on the shipped rule -- and status() says so.
+    A gate that silently changes rule is worse than either rule."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    _calibrate_timed(gate, base_s=0.5)
+    gate._breakeven = MINIMAX_BYTE_BAR
+    while gate.phase == "trial":
+        if gate.should_draft():
+            gate.record_round(3, 3, elapsed_s=_wide_s_for(0.7438, 0.5, 3))
+        else:
+            gate.record_round(0, 0)
+    s = gate.status()
+    assert s["pairs_used"] == 0 and s["pooled_ratio"] is None
+    assert s["bar_used"] == "wall"          # alpha 0.7438 -> 0.6584 > 0.6259
+    assert gate.decision == "run"
+
+
+LEGACY_STATUS_KEYS = {
+    "observed_union_gb", "budget_gb", "breakeven_acceptance",
+    "measured_acceptance", "drafting_rounds", "alpha", "wall_breakeven",
+    "bar_used", "base_from", "decision",
+}
+
+
+def test_status_keeps_every_existing_key_and_adds_the_pooled_ones():
+    """These keys reach /v1/models and env.json unchanged."""
+    gate = AdaptiveSpecGate(MINIMAX, draft_tokens=3, budget_bytes=15_000_000_000)
+    before = gate.status()
+    assert LEGACY_STATUS_KEYS <= set(before)
+    assert before["pooled_ratio"] is None and before["pairs_used"] == 0
+    _calibrate_timed(gate, base_s=0.5)
+    _pooled_trial(gate, [(_wide_for_ratio(0.75), 3)])
+    after = gate.status()
+    assert LEGACY_STATUS_KEYS <= set(after)
+    assert isinstance(after["pooled_ratio"], float)
+    assert isinstance(after["pairs_used"], int)

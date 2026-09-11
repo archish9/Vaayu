@@ -5183,12 +5183,15 @@ class VaayuBaseModel(GenerationMixin):
             # suppressed-draft path, 1-wide to the end. Measured on Qwen3-235B
             # 2026-09-07, whose gate latches off_union after calibration and never
             # drafts: 65/94 layers -> 16/94 and 0.9740 -> 0.9423 tok/s, -3.25%.
-            # `should_draft()` latches for the PROCESS, so it is read once here
+            # The gate's PHASE latches for the process, so it is read once here
             # rather than re-read per round: only the FIRST call of a process can
             # change phase mid-flight, and there this errs to the load-time sizing,
             # which is the status quo. Over-charging a pass that IS wide can only
             # shorten the prefix, the safe direction (a too-long prefix is the
-            # failure being fixed).
+            # failure being fixed). The phase, not `should_draft()`: TRIAL
+            # alternates drafting and suppressed legs (row 13, `even-4`), so a
+            # call that opens on a suppressed leg still drafts rounds later and
+            # its suppressed rounds are over-charged -- the safe direction again.
             #
             # Restored in the finally below: this loop has several returns and had
             # no finally at all, and a leaked verify-sized prefix would shrink
@@ -5197,7 +5200,7 @@ class VaayuBaseModel(GenerationMixin):
             # if that ever changes, the combined width is N * (draft_tokens + 1)
             # positions, not the max of the two.
             _vram_c = getattr(self, "_expert_vram_cache", None)
-            _will_draft = gate is None or gate.should_draft()
+            _will_draft = gate is None or gate.phase in ("trial", "run")
             _geo = getattr(self, "_moe_geometry", None)
             _blocks = getattr(self, "_moe_blocks", None)
             if _will_draft and _vram_c is not None and _geo and _blocks:

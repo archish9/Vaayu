@@ -242,6 +242,40 @@ def test_a_gate_that_will_not_draft_leaves_the_load_time_prefix_alone(
     assert model._vram_cacheable_layers == load_time
 
 
+def _gate_at_a_suppressed_trial_leg(geo):
+    """A REAL gate, mid-TRIAL, whose next round falls in a suppressed leg --
+    the state any call after the first can now start in (row 13, `even-4`)."""
+    from vaayu.speculative import adaptive_gate as ag
+    gate = ag.AdaptiveSpecGate(geo, DRAFT_TOKENS, budget_bytes=10 ** 12)
+    for _ in range(max(ag.CALIBRATE_STEPS, DRAFT_TOKENS + 1)):
+        gate.observe({l: list(range(8)) for l in range(geo["num_moe_layers"])})
+    for _ in range(ag.TRIAL_LEG_ROUNDS):
+        gate.record_round(DRAFT_TOKENS, DRAFT_TOKENS)
+    assert gate.phase == "trial" and gate.should_draft() is False
+    return gate
+
+
+@pytest.mark.parametrize("name,geo,budget,layer_ids", GEOMETRIES)
+def test_a_call_starting_in_a_suppressed_trial_leg_still_gets_the_verify_width_prefix(
+        name, geo, budget, layer_ids):
+    """The per-call read asks whether this CALL will speculate, not whether
+    its first round drafts. TRIAL alternates legs, so a call that opens on a
+    suppressed leg still drafts a few rounds later -- and those verify passes
+    need the verify-width prefix. Charging the suppressed rounds for it
+    over-charges, the safe direction."""
+    model, _ = _model(geo, budget, layer_ids)
+    gate = _gate_at_a_suppressed_trial_leg(geo)
+    model._build_spec_gate = lambda: gate
+    expected = compute_vram_layer_range(
+        budget, geo, layer_ids,
+        experts_per_layer=batch_union_per_layer(geo, DRAFT_TOKENS + 1))
+
+    _run(model)
+
+    assert model.seen_during_forward, "forward never ran"
+    assert all(s == expected for s in model.seen_during_forward)
+
+
 @pytest.mark.parametrize("name,geo,budget,layer_ids", GEOMETRIES)
 def test_a_gate_that_drafts_still_gets_the_verify_width_prefix(
         name, geo, budget, layer_ids):

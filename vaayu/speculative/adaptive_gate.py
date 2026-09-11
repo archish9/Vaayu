@@ -16,7 +16,7 @@ the state machine is a pure object the generation loop feeds.
 """
 from __future__ import annotations
 
-from statistics import median
+from statistics import fmean, median
 
 
 def observed_union_per_layer(snapshots: list[dict[int, list[int]]], k: int) -> float:
@@ -115,9 +115,24 @@ CALIBRATE_STEPS = 8
 # Qwen's measured 0.286 sits ~3 SE below its 0.520 bar -- decisive without
 # over-sampling.
 TRIAL_DRAFTED_TOKENS = 48
+# TRIAL_LEG_ROUNDS / TRIAL_PAIRS (row 13, `even-4`): TRIAL alternates legs of
+# TRIAL_LEG_ROUNDS drafting rounds and TRIAL_LEG_ROUNDS suppressed ones, and
+# the verdict pools at least TRIAL_PAIRS such pairs. One narrow window, however
+# well measured, sampled the cheapest stretch of a call and admitted an arm
+# that lost -19.7% on its own A/B (2026-09-10). Replayed on the six archived
+# MiniMax-M2.7 traces with CALIBRATE charged: 4 pairs of 4+4 decide 6/6 at
+# every leg geometry tried; 3 pairs drop to 5/6, 1 pair never beats 4/6.
+# 4 x 4 drafting rounds x 3 drafted = 48 = TRIAL_DRAFTED_TOKENS at the
+# measured draft_tokens=3, so the acceptance estimate is not loosened; at other
+# widths the trial ends at whichever of the two floors is reached LAST.
+TRIAL_LEG_ROUNDS = 4
+TRIAL_PAIRS = 4
 # TRIAL_ROUND_CAP: bounds the case where the proposer rarely matches at all,
-# so a trial cannot run forever waiting for drafts that never come.
-TRIAL_ROUND_CAP = 64
+# so a trial cannot run forever waiting for drafts that never come. Doubled
+# from 64 when TRIAL began alternating, so a proposer still gets the same 64
+# drafting-eligible rounds; a multiple of 2 * TRIAL_LEG_ROUNDS, so the cap
+# always lands on a pair boundary.
+TRIAL_ROUND_CAP = 128
 
 
 class AdaptiveSpecGate:
@@ -126,8 +141,10 @@ class AdaptiveSpecGate:
     Three phases. CALIBRATE runs the loop without drafting and watches real
     routing; if the observed union of a verify pass does not fit the expert
     cache budget, speculation is refused before a single draft is paid for.
-    TRIAL speculates and measures acceptance against a break-even derived from
-    those same observed unions. RUN speculates.
+    TRIAL alternates drafting and suppressed legs -- an A/B inside the call --
+    and admits only if acceptance clears a break-even derived from those same
+    observed unions AND the drafting legs were cheaper per token than their
+    suppressed partners, on average over the pairs. RUN speculates.
 
     The decision latches: once off, it stays off for the process. Pure -- no
     torch, no model -- so the whole machine is testable without a load.
@@ -164,10 +181,23 @@ class AdaptiveSpecGate:
         self._wall_breakeven: float | None = None
         self._bar_used: str | None = None
         self._base_from: str | None = None
+        # Row 13, `even-4`: per-pair [draft_s, draft_tokens, supp_s,
+        # supp_tokens], timed rounds only.
+        self._pairs: list[list[float]] = []
+        self._pooled_ratio: float | None = None
+        self._pairs_used = 0
 
     # -- phase questions the loop asks ------------------------------------
     def should_draft(self) -> bool:
-        return self.phase in ("trial", "run")
+        if self.phase == "trial":
+            return self._in_drafting_leg()
+        return self.phase == "run"
+
+    def _in_drafting_leg(self) -> bool:
+        """Whether the NEXT trial round falls in a drafting leg. Each pair
+        drafts first, so CALIBRATE's suppressed rounds are never followed by
+        a further suppressed leg before the first draft."""
+        return self._rounds % (2 * TRIAL_LEG_ROUNDS) < TRIAL_LEG_ROUNDS
 
     def decided_off(self) -> bool:
         return self.phase == "off"
@@ -209,10 +239,24 @@ class AdaptiveSpecGate:
         the proposer never runs, so the baseline is that round's DECODE, not
         its decode plus a search that found nothing. On a drafting round the
         search is a real cost of speculating and stays in the numerator.
+
+        Row 13, `even-4`: the round is also booked to its leg of the current
+        pair -- seconds and tokens, a drafting round yielding `accepted + 1`
+        and a suppressed one 1. No draft-overhead correction there: a leg's
+        s/token is what the call actually paid in that arm.
         """
         if self.phase != "trial":
             return
+        cycle = 2 * TRIAL_LEG_ROUNDS
+        drafting_leg = self._in_drafting_leg()
+        pair = self._rounds // cycle
         self._rounds += 1
+        if elapsed_s is not None:
+            while len(self._pairs) <= pair:
+                self._pairs.append([0.0, 0, 0.0, 0])
+            leg = 0 if drafting_leg else 2
+            self._pairs[pair][leg] += float(elapsed_s)
+            self._pairs[pair][leg + 1] += (accepted + 1) if drafted > 0 else 1
         if drafted > 0:
             self._drafting_rounds += 1
             self._drafted += drafted
@@ -223,7 +267,11 @@ class AdaptiveSpecGate:
             _decode_s = float(elapsed_s) - float(draft_overhead_s or 0.0)
             if _decode_s > 0:
                 self._null_times.append(_decode_s)
-        if self._drafted >= TRIAL_DRAFTED_TOKENS or self._rounds >= TRIAL_ROUND_CAP:
+        # Decide only on a pair boundary, so every leg keeps its partner.
+        if (self._rounds >= TRIAL_ROUND_CAP
+                or (self._rounds % cycle == 0
+                    and self._rounds // cycle >= TRIAL_PAIRS
+                    and self._drafted >= TRIAL_DRAFTED_TOKENS)):
             self._decide_acceptance()
 
     # -- the two decisions -------------------------------------------------
@@ -252,12 +300,42 @@ class AdaptiveSpecGate:
             self.phase = "trial"
 
     def _decide_acceptance(self) -> None:
+        """`run` iff acceptance clears the byte bar AND the mean per-pair
+        s/token ratio is below 1 (row 13, `even-4`).
+
+        The ratio decides DIRECTLY, not through alpha and the wall bar:
+        replayed on the same six traces, pooled-alpha -> wall bar scored 4/6,
+        worse than the shipped 5/6, while bytes AND the pooled ratio scored
+        6/6 at every leg geometry. alpha is a per-position cost from 4-sample
+        medians with acceptance re-applied afterwards; the s/token ratio
+        already contains realised acceptance, which is the quantity at issue.
+        MEAN, not median: a median over 4 pairs flips when one pair moves.
+
+        With fewer than TRIAL_PAIRS timed pairs there is nothing to pool, and
+        the shipped single-window rule decides; `bar_used` says which.
+        alpha and the wall bar are still computed either way, as telemetry.
+        """
         bar = self._acceptance_bar()
         measured = self.measured_acceptance
-        if measured is None or measured <= bar:
-            self.phase, self.decision = "off", "off_acceptance"
+        ratios = self._pair_ratios()
+        self._pairs_used = len(ratios)
+        if len(ratios) >= TRIAL_PAIRS:
+            self._pooled_ratio = fmean(ratios)
+            self._bar_used = "pooled"
+            admit = (measured is not None and measured > self._breakeven
+                     and self._pooled_ratio < 1.0)
         else:
+            admit = measured is not None and measured > bar
+        if admit:
             self.phase, self.decision = "run", "run"
+        else:
+            self.phase, self.decision = "off", "off_acceptance"
+
+    def _pair_ratios(self) -> list[float]:
+        """(drafting-leg s/token) / (suppressed-leg s/token) for every pair
+        with both legs timed. A pair missing either leg is not an A/B."""
+        return [(ds / dt) / (ss / st) for ds, dt, ss, st in self._pairs
+                if dt > 0 and st > 0 and ss > 0]
 
     def _acceptance_bar(self) -> float:
         """The bar acceptance must clear: bytes AND clock, whichever binds.
@@ -343,5 +421,8 @@ class AdaptiveSpecGate:
                                else round(self._wall_breakeven, 4)),
             "bar_used": self._bar_used,
             "base_from": self._base_from,
+            "pooled_ratio": (None if self._pooled_ratio is None
+                             else round(self._pooled_ratio, 4)),
+            "pairs_used": self._pairs_used,
             "decision": self.decision,
         }

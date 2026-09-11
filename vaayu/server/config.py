@@ -270,20 +270,21 @@ DRAFTER_MODEL_PATH = None
 #                   second case is the defect row 13 fixed (2026-09-10).
 #                 An earlier arm on a different prompt measured 1.307x, so this
 #                 is workload-dependent, not a property of the model.
-# The gate now also TIMES itself: it requires acceptance to clear BOTH the
-# expert-byte break-even and a wall-clock one measured from its own rounds,
-# and reports which bound in `bar_used` ("wall" / "bytes", the latter also
-# being the fallback when the timing sample is too small) plus `alpha`,
-# `wall_breakeven` and `base_from` in /v1/models and env.json.
-# READ THIS BEFORE TRUSTING A `run`: the timed bar is a strict tightening,
-# but it is measured over the FIRST ~40 rounds of a call and then latched,
-# and those rounds are the cheapest part of the call. Measured 2026-09-10 on
-# MiniMax-M2.7: the decision window runs at 0.510-0.532 s/token while the
-# whole call runs at 0.637 (no speculation) / 0.793 (speculating), so the
-# gate still said `run` on an arm its own A/B measured at -19.7%. On the
-# arm where speculation genuinely wins it said `run` and that was worth
-# +14.4%. So: `run` is a claim about the window the gate looked at, not a
-# promise about your whole generation -- TIME YOUR OWN WORKLOAD BOTH WAYS.
+# The gate runs its own A/B (row 13, 2026-09-11): its trial alternates 4
+# drafting and 4 suppressed rounds for >= 4 pairs and >= 48 drafted tokens,
+# and admits only if acceptance clears the expert-byte break-even AND the
+# drafting rounds were cheaper per token than their suppressed partners, on
+# average over the pairs. It reports `bar_used` ("pooled"; "wall" / "bytes"
+# only when too few pairs were timed and the older single-window rule
+# decided), `pooled_ratio`, `pairs_used`, `alpha`, `wall_breakeven` and
+# `base_from` in /v1/models and env.json. Measured on MiniMax-M2.7: the arm
+# the single-window gate admitted and lost -19.7% on is now refused, 3/3
+# replicates (forcing it on: -18.6%); the winning arm is still admitted,
+# +15.4%. READ THIS BEFORE TRUSTING A `run`: the whole trial still sits in
+# the first ~40-60 rounds, the cheapest part of a call, and the refusal
+# above rests on the wider window (its first four pairs alone averaged
+# 0.99). `run` is a claim about the start of the call, not a promise about
+# your whole generation -- TIME YOUR OWN WORKLOAD BOTH WAYS.
 # The default stays "auto" because CLAUDE.md section 5 forbids defaulting into
 # a one-model-wins asymmetry. Set True to opt one in; an explicit value wins.
 USE_PROMPT_LOOKUP = "auto"
