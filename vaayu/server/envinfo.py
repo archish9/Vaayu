@@ -331,8 +331,8 @@ def _gpu_section(c, device):
 def _storage_section(c):
     """The NVMe facts that actually move tokens on this box.
 
-    APST is the live hardware tax: MoE decode is 72-74% disk-bound, so a drive
-    dropping into a low-power state between reads lands on the dominant cost.
+    APST is reported, but measured ~free on both MoE targets (todo.md row 25):
+    the drive's idle gaps during generation stay under APST's 100 ms timeout.
     APST is read per controller from the live knob scripts/vaayu_optimize_os.sh
     writes (see nvme_apst_tolerance); it is reported active if ANY NVMe
     controller allows it, and None when none exposes APST control.

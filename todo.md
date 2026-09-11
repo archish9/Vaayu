@@ -55,7 +55,7 @@ reason given.** Pick from the PRIORITY table first. The sections after this one 
 | # | one line | why it is worth it | state | cost | brief (gitignored) |
 |---|---|---|---|---|---|
 | ~~**3**~~ | **CLOSED 2026-09-11 — prefix cache now ON for every non-EXL3 model.** `auto` resolves to `bf16` (the ring buffer, model's own dtype) on every loader. | Done: 1B prefix gate + server gate pass, turn-2 TTFT ~4.5× at 2.8k tokens, decode flat on flash. **Cost: derived `max_seq_len` drops up to ~2× (1B flash 91106 → 65536)** — row 4's doubling overshoot, now paid by non-EXL3 too; `KV_CACHE_MODE="fp16"` is the escape hatch. | `[x]` | done | [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md) · row **3** below |
-| **25** | **APST: one MiniMax idle-sampler arm** to close the row. Qwen measured NULL 2026-09-11; MiniMax (module-list forward, no stager — a different read pattern) is unmeasured. | Cheap (~7 min GPU, harness exists), closes a row, and makes the "APST costs nothing" wording in the boot line and docs true for both MoE targets rather than one. Full A/B only if the arm shows material ≥ 100 ms idle. | `[~]` **priority 2** | 1 arm | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) · row **25** below |
+| ~~**25**~~ | **CLOSED 2026-09-11 — APST is NULL on both MoE targets.** MiniMax idle-sampler arm: decode 0 gaps ≥ 100 ms; cold prefill 3 mid-generation gaps ≥ 100 ms + a 80–100 ms band (same band Qwen has). | Done: bound ≤ 0.15 % of cold TTFT (≤ 20 wakes × ≤ 15 ms, the kernel's primary-state latency cap), 0 on decode; no full A/B — even a 1 % worst case is inside the A/B's replicate spread. The 70B dense stays unmeasured (not a blocker). | `[x]` | done | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) (MiniMax addendum) · row **25** below |
 | **18** | `[bug]` **`output_hidden_states=True` crashes the forward.** Diagnosis re-verified 2026-09-11 against HEAD: `vaayu_base.py:4397` builds one sublist per layer, `:4667`/`:4680` fill them, `:4766` does a flat `+=` of a bare Tensor, `:4836` cats an empty sublist; `:4834`'s `[0:-2]` is the hand-tuned compensation. | Small, testable on the 1B in seconds, and it is a real crash on a public forward argument. Low severity (nothing in the engine, server or gates asks for hidden states) — which is why it is third. | `[bug]` **priority 3** | small | [`…-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) · row **18** below |
 
 ## NOT worth working now — and why (re-open only on the stated condition)
@@ -73,7 +73,8 @@ reason given.** Pick from the PRIORITY table first. The sections after this one 
 **Closed 2026-09-11 (kept here until the next prune):** row **3** (`auto` → `bf16` for non-EXL3, prefix cache ON —
 [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md)), row **13** (`even-4` built, done condition met,
 0 % on the default config — [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md)) and
-row **25**'s Qwen A/B + remedy fix (`c256e18`).
+row **25** (APST NULL on Qwen by A/B and on MiniMax by idle-gap bound, remedy fix `c256e18` —
+[`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md)).
 
 **Every open item now has a self-contained cold-pickup brief** (written 2026-09-10). They live in
 `docs/`, which is **GITIGNORED** — so the brief is the detail, and the row in this file is the
@@ -92,8 +93,8 @@ new premise); `expert_sim.py`'s anchor gap is unexplained (do not quote its smal
 and a batch of `MAX_BATCH_SIZE = 1`-gated minors from P10.
 
 **Standing hardware tax, warned at every boot, not a code row:** `rustdesk` permanently holds 0.14 GiB
-of GPU. ~~NVMe APST~~ — **measured 2026-09-11 (row 25): NULL on Qwen at N=1**, not a tax on the dominant cost
-(the drive's idle gaps are < 100 ms, APST's timeout). The boot still warns about it; see row 25.
+of GPU. ~~NVMe APST~~ — **measured 2026-09-11 (row 25): NULL on Qwen and MiniMax at N=1**, not a tax on the dominant cost
+(the drive's idle gaps are < 100 ms, APST's timeout). The boot prints it as info, not a warning; see row 25.
 
 **Before proposing ANY perf work, read SETTLED.** It is the list of things already built and
 refuted, with the number that killed each one.
@@ -482,7 +483,7 @@ The server already warns about the combination; nobody was reading the warning.
 
 **Still unfixed on this box, warned at every boot, not a code row:** `rustdesk` holds 0.14 GiB of GPU,
 below the 256 MiB refusal threshold but permanent, because budgets are sized once at load. **NVMe APST
-is no longer on this list — row 25 measured it NULL on Qwen at N=1 (2026-09-11)**, and found the
+is no longer on this list — row 25 measured it NULL on Qwen and MiniMax at N=1 (2026-09-11)**, and found the
 script that was meant to disable it could not do so without a reboot (fixed).
 
 ---
@@ -896,7 +897,7 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
-**Build ORDER, set by the user 2026-09-11 — supersedes the 2026-09-10 order (14 → 13 → 24, then 6a-b / 3 / 5; rows 14, 13 and 24 are all closed): row 3 → row 25's MiniMax arm → row 18.** **Row 3 CLOSED 2026-09-11 — next is row 25's MiniMax arm.** Everything else is not worth working now; the reasons and re-open conditions are in START HERE. The 2026-09-10 paragraph is in `git log -p -- todo.md`.
+**Build ORDER, set by the user 2026-09-11 — supersedes the 2026-09-10 order (14 → 13 → 24, then 6a-b / 3 / 5; rows 14, 13 and 24 are all closed): row 3 → row 25's MiniMax arm → row 18.** **Row 3 CLOSED 2026-09-11; row 25 CLOSED 2026-09-11 (MiniMax arm NULL) — next is row 18.** Everything else is not worth working now; the reasons and re-open conditions are in START HERE. The 2026-09-10 paragraph is in `git log -p -- todo.md`.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
@@ -1398,7 +1399,7 @@ sets one**: no default moved; (4) documented in `vaayu/server/README.md` AND
 
 ---
 
-# 25 · [~] NVMe APST A/B — MEASURED NULL on Qwen; the documented fix was inert (FIXED) — MiniMax arm is PRIORITY 2
+# 25 · [x] NVMe APST A/B — CLOSED 2026-09-11: NULL on Qwen (A/B) and MiniMax (idle-gap bound); the documented fix was inert (FIXED)
 
 Opened 2026-09-11. **Question:** does disabling APST move Qwen3-235B's cold TTFT or decode tok/s through
 the real server (N=1, server-default config, flash)? Qwen is 47 % disk-stall; 47 % is NOT APST's cost —
@@ -1425,9 +1426,18 @@ run it.
   100 ms primary timeout almost never fires mid-generation. Bound ≤ ~0.1 %. **So APST is NOT a tax on the
   dominant cost; "Qwen is 47 % disk-stall" was never evidence that it was.**
   [`docs/2026-09-11-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md).
-- [ ] MiniMax-M2.7 (module-list forward, no stager — a different read pattern) and the 70B dense are
-  UNMEASURED. Cheapest check: ONE arm with the idle sampler (`plans/probes/apst_idle_sampler.py` +
-  `apst_idle_report.py`); a full A/B only if it shows material ≥ 100 ms idle.
+- [x] **MiniMax-M2.7 — NULL, 2026-09-11, no full A/B.** Warm-up + `mm-on-1`, APST on, `BALLAST_GB=25`, same
+  harness (`plans/probes/apst_mm_chain.sh`, windows by `apst_windows.py`). Decode (2 × 70 s): **0 gaps ≥ 100 ms**.
+  Cold prefill (205 s): **3 mid-generation gaps ≥ 100 ms** (0.10–0.11 s) and 19 candidates ≥ 80 ms (the sampler
+  quantises to ~10 ms); prefix-hit prefill (14.6 s): 1 candidate. Longer gaps (0.6–1.2 s) are request
+  boundaries. The 50–100 ms prefill band is NOT MiniMax-specific — Qwen's cold prefill has it denser.
+  **Bound:** the 100 ms primary timeout only enters states with ≤ 15 ms total latency
+  (`apst_primary_latency_tol_us=15000`; deeper states need 2 s idle, never reached mid-generation) → 20 × 15 ms
+  = **0.30 s per 205 s cold turn, ≤ 0.15 %**, 0 on decode. Charging the full 100 ms tolerance instead gives
+  1.0 %, already inside the Qwen A/B's ~1 % replicate spread — an A/B could not resolve it, so none was run.
+  Arms agree (t1 TTFT 204.6/205.2 s, t2 decode 1.494/1.500 tok/s, text identical). `setup_and_speed_guide.md`
+  now cites both targets; `envinfo.py`'s "APST is the live hardware tax" docstring corrected.
+  **70B dense: unmeasured, not a blocker** (continuous ~37 GB/token reads — fewer gaps expected, not measured).
 - [x] Toned down 2026-09-11 (user's call): the boot line is now `[Vaayu] … APST: active … no measured
   decode/TTFT cost; optional to disable` — info, NOT `[Vaayu Warning]`, so it no longer lands in env.json's
   `warnings` (`storage.apst_active` still records it structurally). `diagnose` still lists it (its tests pin
@@ -1441,8 +1451,8 @@ run it.
   command reads it. **Also fixed on the way:** the boot check's `nvme.split("n")[0]` returned `''` for `nvme0n1`,
   so its second candidate path was `/sys/class/nvme//power/…` and its warning named no drive. envinfo hardcoded
   `nvme0`; it now reports APST active if ANY NVMe controller allows it. Test: `tests/test_nvme_apst.py`.
-- §8: no server knob (OS setting). The server's boot warning is the user-facing path, and it currently
-  points at a fix that does not take effect.
+- §8: no server knob needed (OS setting, measured ~free). Plumbed/reachable: the boot info line and `diagnose`
+  both read the live knob since `c256e18`, and the script they point at now takes effect without a reboot.
 
 ---
 
