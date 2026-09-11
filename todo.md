@@ -50,8 +50,10 @@ or the 70B today — every row is OPTIONAL by §0's test.** The order below was 
 after a triage of every open row: **three are worth working, in this order; the rest are not, for the
 reason given.** Pick from the PRIORITY table first. The sections after this one are the detail.
 **All three PRIORITY rows are CLOSED as of 2026-09-11 (3, 25, then 18).** Row **26** was added the same day at the
-user's request (a measurement, no engine code) and is the one open PRIORITY row. Beyond it, what remains is the
-NOT-worth-working table — pick from it only on its stated re-open condition.
+user's request (a measurement, no engine code) and **CLOSED the same day** — and it opened row **27**, which is
+**the first open row since 2026-09-10 that measurably makes Vaayu faster: +27 % decode tok/s on Qwen3-235B** (keep one
+CPU core awake during decode). Row 27 is the one open PRIORITY row. Beyond it, what remains is the NOT-worth-working
+table — pick from it only on its stated re-open condition.
 
 ## PRIORITY — worth working, in this order
 
@@ -60,7 +62,8 @@ NOT-worth-working table — pick from it only on its stated re-open condition.
 | ~~**3**~~ | **CLOSED 2026-09-11 — prefix cache now ON for every non-EXL3 model.** `auto` resolves to `bf16` (the ring buffer, model's own dtype) on every loader. | Done: 1B prefix gate + server gate pass, turn-2 TTFT ~4.5× at 2.8k tokens, decode flat on flash. **Cost: derived `max_seq_len` drops up to ~2× (1B flash 91106 → 65536)** — row 4's doubling overshoot, now paid by non-EXL3 too; `KV_CACHE_MODE="fp16"` is the escape hatch. | `[x]` | done | [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md) · row **3** below |
 | ~~**25**~~ | **CLOSED 2026-09-11 — APST is NULL on both MoE targets.** MiniMax idle-sampler arm: decode 0 gaps ≥ 100 ms; cold prefill 3 mid-generation gaps ≥ 100 ms + a 80–100 ms band (same band Qwen has). | Done: bound ≤ 0.15 % of cold TTFT (≤ 20 wakes × ≤ 15 ms, the kernel's primary-state latency cap), 0 on decode; no full A/B — even a 1 % worst case is inside the A/B's replicate spread. The 70B dense stays unmeasured (not a blocker). | `[x]` | done | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) (MiniMax addendum) · row **25** below |
 | ~~**18**~~ | **CLOSED 2026-09-11 — `output_hidden_states=True` fixed; `output_attentions=True` now raises `NotImplementedError`.** Root cause confirmed by instrumentation: 19 sublists + 19 bare Tensors (outer len 38 = 2 × `len(self.layers)`), from `6253fd1` switching the init to sublists without removing the flat `+=`. | Done: returns transformers 5.x's `num_hidden_layers + 1` entries (post-norm last); matches stock HF to ≤ 0.0184 per-token rel-L2 vs ≥ 0.459 to a neighbour layer; new on-device gate `tests/test_output_hidden_states.py` fails a shifted-layer mutant. 0 % on throughput (diagnostic only). | `[x]` | done | [`…-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md) · row **18** below |
-| **26** | **Measure the ceiling of a CPU-hybrid (AVX2) expert path before anyone builds one.** User asked 2026-09-11: switch to a non-EXL3 8-bit 200B+ MoE and compute on the idle CPU. Verdict so far is ARITHMETIC ONLY: NO as proposed — decode is disk-bound (~47 % stall on Qwen), 8-bit = ~1.6× more bytes per expert read, and a CPU path can only remove H2D + EXL3 construct, never disk. | Cheap and decisive: the instrumentation already exists (`profiling_mode=True` → `[VAAYU-MOE] layer_totals` with `disk_load`/`h2d`/`construct`/`gemm`). A small `H + C` share kills a months-long build for free. A win here WOULD reach users (N=1 decode, §8). | `[ ]` **priority 1** | ~1 h GPU (2 models) | [`…-row26-cpu-hybrid-ceiling-BRIEF.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md) · row **26** below |
+| ~~**26**~~ | **CLOSED 2026-09-11 — 8-bit + AVX2 proposal KILLED; bytes-neutral CPU hybrid has a real mechanism but a modest ceiling (+6.8 % Qwen / +22.0 % MiniMax over row 27's baseline) → design brief only, after row 27.** 8-bit's disk floor alone is slower than today on both (−9.6 % / −15.5 % tok/s). | Done: measured floor = serial (stubbed-expert arm, 0.074 / 0.052 s) + device-busy (0.772 / 0.396 s). The brief's formulas implied times 21 % / 9 % BELOW that floor. Found row 27 on the way. | `[x]` | done | [`…-row26-cpu-hybrid-ceiling-RESULTS.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md) · row **26** below |
+| **27** | **Keep one CPU core awake during decode — the idle package's wake latency costs Qwen ~21 % of decode.** One `SCHED_IDLE` spinner on an E-core: Qwen 1.147 → 0.970 s/token (−15.5 %); 8 E-core spinners 0.901 (−21.5 %, +27 % tok/s); threads pinned to P-cores alone 1.060 (−7.6 %). Greedy ids identical; raw read latency unchanged. MiniMax −2.6 %. | Bigger than any recently shipped decode win (+3–12 %), ~zero engineering, reaches users at N=1 (§8). Needs a knob + server A/B + MiniMax/70B/prefill checks. | `[ ]` **priority 1** | ~1 day | [`…-row26-cpu-hybrid-ceiling-RESULTS.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md) §7 · row **27** below |
 
 ## NOT worth working now — and why (re-open only on the stated condition)
 
@@ -816,6 +819,13 @@ it must not be "restored", both locked by test.**
 - GPU arms: one arm per subprocess under `systemd-run --user --scope -p MemoryMax=<charge+2GB>
   -p MemorySwapMax=0`; never attach py-spy (corrupts `vaayu_rust`'s io_uring state); discard each
   checkpoint's first touch; redirect stdout to a file; `grep -a` logs, never `cat` (300 MB–1.3 GB).
+- **CPU / RAM / PCIe, measured 2026-09-11 (row 26, `plans/probes/row26_physics.py`) — hardware constants:** i5-14600K,
+  CPUs 0–11 = 6 P-cores × 2 HT (5.3 GHz), CPUs 12–19 = 8 E-cores (4.0 GHz); avx2 + avx_vnni, no avx512. **Host RAM read
+  65.6 GB/s** (6 P-threads; 63.3 @14, 60.5 @20). **Pinned H2D 19.7 GB/s** (256 MB; one 11.8 MB expert 634 µs) — NOT
+  Gen5 x8's ~32 GB/s theory; D2H 16.9, pageable H2D 15.3. Hidden-state GPU→CPU→GPU round trip ~18 µs. CPU batch-1
+  expert GEMV is memory-bound; 6 P-core threads beat 14/20. Idle states POLL / C1_ACPI (1 µs) / **C2_ACPI (127 µs)**,
+  governor `powersave`, EPP `balance_performance`; `/dev/cpu_dma_latency` is root-only. **An idle package costs Qwen
+  decode ~21 % (row 27)** — a probe that spins (e.g. `profiling_mode`'s `synchronize()`) runs FASTER than the real thing.
 - **Same-box, same-day A/B or it does not count.** `main` itself has fallen below two historical
   gate bars on unchanged code.
 - **`BALLAST_GB` is an ARM VARIABLE — state it, hold it fixed across a comparison, never compare
@@ -1521,7 +1531,7 @@ loses a tool exactly when it needs one — which is how it was found.
 
 ---
 
-# 26 · [ ] CPU-hybrid (AVX2) expert compute — measure the ceiling first — PRIORITY 1 (added 2026-09-11)
+# 26 · [x] CPU-hybrid (AVX2) expert compute — CLOSED 2026-09-11: 8-bit KILLED; bytes-neutral hybrid +6.8 % Qwen / +22.0 % MiniMax over row 27 → design brief only, after row 27
 
 **Cold-pickup brief:** [`docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md)
 (gitignored — this row is the durable copy). **MEASUREMENT ONLY: no engine code in this row.**
@@ -1536,16 +1546,48 @@ only **H2D + EXL3 construct**, and EXL3 has no CPU kernel, so it forces a CPU-fr
 
 **Box:** i5-14600K, 6P+8E / 20 threads, **avx2 + avx_vnni, no avx512**; 32 GB RAM; 344 GB disk free.
 
-- [ ] **Step 1 — physics micro-benches** (no model): host RAM read GB/s and pinned H2D GB/s; CPU expert GEMV per model
+- [x] **Step 1 — physics micro-benches** (no model): host RAM read GB/s and pinned H2D GB/s; CPU expert GEMV per model
   (shapes DERIVED from config / `_moe_geometry`) in bf16, fp32 and int8 weight-only, at 6 / 14 / 20 threads.
-- [ ] **Step 2 — Qwen3-235B decode**: one process, `MemoryMax=29G`, `BALLAST_GB=25` held in-process and freed after load,
+  **Done 2026-09-11 (`plans/probes/row26_physics.py`):** RAM read 65.6 GB/s (6 P-threads; 63.3 @14, 60.5 @20);
+  pinned H2D **19.7 GB/s** (not Gen5 x8's ~32 theory), D2H 16.9, one Qwen expert H2D 634 µs; hidden GPU→CPU→GPU
+  round trip ~18 µs. CPU expert at batch 1, 6 P-threads best: Qwen int8 348 µs / int4-g128 214 µs / bf16 697 µs /
+  fp32 1132 µs; MiniMax int8 282 / int4 163 µs. int8 with fp32 activations is 3.7× slower than bf16 activations.
+- [x] **Step 2 — Qwen3-235B decode**: one process, `MemoryMax=29G`, `BALLAST_GB=25` held in-process and freed after load,
   speculation OFF, greedy, warm-up discarded → unprofiled arm → `model.profiling_mode = True` → identical profiled arm
   (verify the toggle works; else a second process). Greedy ids must match across arms.
-- [ ] **Step 3 — MiniMax-M2.7**, identical (module-list forward — a Qwen result does not transfer).
-- [ ] **Step 4 — compute per model:** shares `D` (disk_load) / `H` (h2d) / `C` (construct) / `G` (gemm), tiers V/R/M.
+  **Done 2026-09-11:** U1 1.167 / P 1.018 / U2 1.173 s/token, greedy ids identical in all arms. **ANOMALY: the profiled
+  arm is 13 % FASTER** — the brief's trap 1 (profiling only slows) is false on the fused-EXL3 forward. Same bytes
+  (4.84 GB/token) and tiers (V 208.5 / R 135 / M 409 of 752); only the stall differs (0.548 vs 0.355 s). Diagnostic
+  re-runs (`-run2`, `-run3`) DONE: mechanism = CPU idle-state wake latency + thread placement → row **27**.
+- [x] **Step 3 — MiniMax-M2.7**, identical (module-list forward — a Qwen result does not transfer).
+  **Done 2026-09-11:** U1 0.578 / P 0.595 / U2 0.580 s/token (profiling +3 %, as expected — no anomaly on
+  module-list, whose H2D is synchronous). Ids identical U1/P/U2. Tiers V 186 / R 42 / M 268 of 496; 2.38 GB/token.
+  Diagnostic `Usi` null; `Uspin` (spinners on every CPU) −27 % — confounded by SMT sharing, not a valid C-state test.
+- [x] **Step 4 — compute per model:** shares `D` (disk_load) / `H` (h2d) / `C` (construct) / `G` (gemm), tiers V/R/M.
   Optimistic ceiling `1 / (1 − (H + C) / T_prof)`; realistic estimate with Step 1's CPU rate added back; 8-bit penalty
   `D × (8 / current_bpw − 1)`, `current_bpw` derived.
-- [ ] **Verdict + RESULTS doc**, box bandwidths added to Environment.
+  **Done 2026-09-11 — the brief's formulas are UNPHYSICAL here.** Profiled split (run 2): Qwen D 0.371 / **H 0.329** /
+  C 0.013 / G 0.062 of T_prof 1.007; MiniMax D 0.091 / **H 0.180** / C 0.008 / G 0.153 of 0.596. Formula (a) gives
+  +51 % / +46 % but implies 0.666 / 0.408 s, **21 % / 9 % below the measured floor** (the copies were hiding disk time).
+  Replaced by a measured floor: `NOEXP` arm (experts stubbed, router + routing sync kept) = serial non-expert time
+  **0.074 s (Qwen) / 0.052 s (MiniMax)**; **device-busy** (union of in-flight raw read intervals) 0.772 / 0.396 s under
+  keep-awake. Floor 0.845 / 0.448 s. Realistic hybrid (bytes-neutral ~5 bpw at int4's 47 GB/s, CPU work hides inside
+  device-busy, per-layer tail = last expert's CPU compute + 18 µs hidden round trip): **0.871 / 0.461 s = +6.8 % /
+  +22.0 % over keep-awake** (+35 % / +25 % over today). 8-bit: bytes ×1.595 (bpw 5.014 / 5.016 derived); brief's test
+  `H + C ≤ D × 0.595` does NOT fire (D is exposed stall), corrected test (device-busy × 0.595 = 0.460 / 0.235 s > H + C)
+  does; 8-bit floor 1.305 / 0.683 s vs today 1.180 / 0.577 → **−9.6 % / −15.5 % tok/s** before cache-hit loss.
+- [x] **Verdict + RESULTS doc**, box bandwidths added to Environment.
+  [`docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md).
+  **VERDICT:** (1) the proposal as asked (8-bit non-EXL3 + AVX2) is **killed**. (2) The bytes-neutral hybrid
+  (KTransformers-style) is **not killed** — CPU int4 expert 214 µs vs 634 µs to copy it over PCIe (measured 19.7 GB/s,
+  not Gen5 x8's 32) — and by the brief's rule (realistic ≥ 15 % on one model, no loss on the other) it **earns a design
+  brief, not code** — but only AFTER row 27, measured against row 27's baseline (a hybrid keeps the CPU busy, so an A/B vs
+  today would credit it with row 27's win). Its value is then mostly MiniMax, and a cheaper GPU-side attack on the same
+  slice (MiniMax module-list GEMV ~0.31 ms/expert vs ~0.08 ms on the fused path) must be priced first. Turn-level
+  hybrid gain over keep-awake: ×1.05–1.06 Qwen, ×1.05–1.21 MiniMax (prefill cannot be helped). **The 8-bit half is
+  closed by refutation; the hybrid half is closed with its number and handed to a design-brief decision.**
+  **Probe trap, new:** on the fused-EXL3 forward `profiling_mode=True` is 13–15 % FASTER than unprofiled (its
+  `synchronize()` spin-waits keep a core awake) — never read a profiled Qwen arm as an upper bound on true time.
 
 **Traps:** profiling adds `torch.cuda.synchronize()` and serialises overlap → profiled phases are UPPER bounds on what
 removing them saves, true tok/s is the unprofiled arm · MiniMax load dies at `MemoryMax=22G`, use 29G · exclude the
@@ -1559,6 +1601,48 @@ path cannot help prefill, and a cold MiniMax turn spent ~205 s in prefill (row 2
 
 **§8:** no knob; nothing to plumb (`profiling_mode` stays out of the server, the probe is in-process); the hypothetical
 feature WOULD be reachable — a per-token N=1 decode effect, the server's mode; not built, unblocked only by this verdict.
+
+---
+
+# 27 · [ ] Keep one CPU core awake during decode — the idle package's wake latency costs Qwen3-235B ~21 % — PRIORITY 1 (added 2026-09-11)
+
+**Source:** found by row 26 (see its RESULTS §7). **Durable copy of the evidence is this row** (docs/ is gitignored).
+
+**Observation:** on Qwen's fused-EXL3 forward, `profiling_mode=True` (which only ADDS `synchronize()` calls) decoded
+13–15 % faster than unprofiled arms on both sides of it, in two processes, same tokens / bytes / tiers. Token-by-token the
+gap tracked disk reads (r = 0.81, ~0.37 ms per read).
+
+**Tests (Qwen, same process, greedy ids identical in every arm; s/token, 63 decode forwards):**
+
+| arm | run 2 | run 3 | reading |
+|---|---|---|---|
+| unprofiled U1 / U2 | 1.171 / 1.190 | 1.156 / 1.138 | baseline |
+| GIL switch interval 5 → 0.5 ms (`Usi`) | 1.185 | — | GIL starvation REJECTED |
+| ONE `SCHED_IDLE` spinner on an E-core (`UspinE1`) | — | **0.970 (−15.5 %)** | package-level idle: C2 residency barely moved (0.74 → 0.70) |
+| all threads pinned to P-cores, no spinner (`UP`) | — | **1.060 (−7.6 %)** | thread placement |
+| spinners on all 8 E-cores (`UspinE`) | **0.930** | **0.901 (−21.5 %)** | both: 1 − 0.845 × 0.924 = 21.9 % predicted |
+
+Raw Rust read latency 2.9–3.1 ms/call in EVERY arm (the drive is not slower); what shrinks is the host side of each read:
+loader time minus raw reads 1.22 → 0.34 ms/read, slab-acquire wait 69 → 20 ms/token, device-busy gaps 0.80 → 0.74 s.
+Box idles in `C2_ACPI` (declared exit latency 127 µs), governor `powersave` / EPP `balance_performance`, CPU 7.5 % busy
+during decode. **Why only Qwen (most likely — inferred, not instrumented):** its forward issues async copies then SLEEPS waiting on
+reads; MiniMax's synchronous copies block inside `cudaMemcpy`, which under CUDA's default scheduling spin-waits, so
+MiniMax gains only −2.6 % (0.577 → 0.562). Spinners on ALL 20 CPUs
+(`Uspin`) slowed MiniMax 27 % — SMT siblings shared with engine threads; never put a spinner on a P-core sibling.
+
+- [ ] Design the keep-awake: a GIL-free busy thread (or subprocess) at `SCHED_IDLE` on ONE detected E-core (lowest
+  `cpuinfo_max_freq`; never a typed CPU id — CLAUDE.md §5; on a non-hybrid CPU pick the least-loaded core), started at
+  generation begin, stopped at end; optional P-core affinity for the engine's own threads on hybrid CPUs. Measure 1 vs
+  2 spinners and the power cost.
+- [ ] §8: knob in `vaayu/server/config.py` + `README.md` with the measured cost of getting it wrong (−21 % tok/s on Qwen
+  off; one E-core's power on). Plumbed through `app.py`/`engine.py`. Reachable at N=1 — the server's mode.
+- [ ] Same-day A/B THROUGH THE SERVER on Qwen and MiniMax (ballast fixed, ids identical); check prefill TTFT (unmeasured
+  — prefill is read-heavy too and may gain) and the 70B dense.
+- [ ] Root-only alternatives for users go in `documentation/TUNING.md` as documentation: PM QoS via
+  `/dev/cpu_dma_latency` (mode 0600 on this box) or disabling `C2_ACPI` (`cpupower idle-set`).
+
+**Stop rule:** if the server A/B does not reproduce ≥ +10 % decode tok/s on Qwen, close as refuted-through-the-server
+and record why the in-process effect did not transfer.
 
 ---
 
