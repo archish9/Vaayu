@@ -1549,7 +1549,7 @@ directly; the c=9 Qwen arm (0.425x) is the number to move.
 
 ---
 
-# 2 · [ ] Static check for unbound locals / import order
+# 2 · [x] Static check for unbound locals / import order — CLOSED 2026-09-10: `pylint E0606` wired as `tests/test_no_unbound_locals.py`
 
 Two bugs of exactly this shape shipped GREEN today, inside the same edit: `detect_moe_blocks` and
 then `EXL3LoaderStrategy` were referenced in `vaayu_base.__init__` ABOVE their in-function
