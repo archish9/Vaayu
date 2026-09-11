@@ -242,8 +242,8 @@ def test_budgets_come_off_the_vram_plan_and_the_caches():
 
 
 def test_a_model_with_no_prefix_cache_reports_clean_not_as_an_error():
-    # Prefix reuse auto-disables on a non-EXL3 / dense checkpoint (the bare
-    # DynamicCache has no to_cpu/to_device/resident_bytes), leaving
+    # Prefix reuse auto-disables under an explicit kv_cache_mode="fp16" (the
+    # bare DynamicCache has no to_cpu/to_device/resident_bytes), leaving
     # _prefix_cache legitimately None -- the same "unset, not broken"
     # condition Item 7 already covers for the expert caches. Before this fix,
     # prefix_cache_gb was the one budgets.* field that skipped the null-check
@@ -673,13 +673,14 @@ def _real_exl3():
 
 @pytest.mark.parametrize("requested,strategy,resolved", [
     ("auto", _real_exl3, "bf16"),
-    ("auto", _Strategy, "fp16"),
+    ("auto", _Strategy, "bf16"),     # fp16 until row 3 (2026-09-11)
     ("bf16", _Strategy, "bf16"),
+    ("fp16", _Strategy, "fp16"),
 ])
 def test_kv_cache_mode_is_the_resolved_mode_not_the_requested_one(
         requested, strategy, resolved):
     """`auto` is a REQUEST, not a KV dtype: _create_kv_cache resolves it to
-    bf16 on an EXL3 checkpoint and fp16 otherwise. env.json recording "auto"
+    bf16 on every loader (row 3; fp16 off EXL3 before 2026-09-11). env.json recording "auto"
     verbatim breaks this module's own premise (every field is DERIVED, read
     off the loaded model) and leaves a maintainer reading a mailed bundle
     unable to say which dtype actually ran. The REQUESTED value is not lost:

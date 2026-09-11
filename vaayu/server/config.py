@@ -175,7 +175,11 @@ PREFIX_COMPRESS = None
 # cache claims the rest. Lower = faster decode, fewer cached sessions.
 PREFIX_SESSIONS = 3
 
-# "auto" picks bf16 for EXL3. "fp8" is 1.5x LARGER, not smaller -- it keeps a
+# "auto" picks bf16 on every checkpoint (row 3, 2026-09-11: it was fp16 off EXL3,
+# which switched the prefix cache off). "fp16" is the bare transformers cache and
+# DISABLES the prefix cache, but it does not over-allocate: the ring buffer's
+# doubling can cost up to ~2x derived context (Llama-3.2-1B on flash: 91106
+# tokens under fp16, 65536 under auto). "fp8" is 1.5x LARGER, not smaller -- it keeps a
 # dequantized mirror.
 KV_CACHE_MODE = "auto"
 

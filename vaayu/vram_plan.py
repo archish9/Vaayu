@@ -37,7 +37,8 @@ class VramPlanError(RuntimeError):
 # Measured bytes per KV ELEMENT, by cache mode. NOT simply the dtype width:
 # fp8 mode stores the fp8 copy AND the dequantized mirror that attention reads,
 # measured at 3.016 against bf16's 2.000 (Plan E RESULTS, 2026-08-01).
-# `auto` resolves to bf16 on EXL3 and fp16 otherwise -- both 2.0 either way.
+# `auto` resolves to bf16 on every loader (fp16 off EXL3 before 2026-09-11,
+# row 3) -- 2.0 either way.
 _KV_ELEM_BYTES = {"auto": 2.0, "fp16": 2.0, "bf16": 2.0, "fp8": 3.016}
 
 
@@ -152,8 +153,9 @@ def kv_capacity_tokens(S: int, *, chunk: int, growth: int, buckets: bool) -> int
 
     Chunked prefill calls this once per `chunk`-sized slice of the context
     (the last slice may be shorter, `S % chunk`). `buckets=False` models a
-    plain transformers.DynamicCache instead (every non-EXL3 checkpoint,
-    confirmed by the Task 5 GPU probe's llama-1b control): it holds exactly S
+    plain transformers.DynamicCache instead (an explicit kv_cache_mode="fp16";
+    every non-EXL3 checkpoint before row 3, 2026-09-11, confirmed by the Task 5
+    GPU probe's llama-1b control): it holds exactly S
     tokens with no over-allocation, so it returns S unchanged.
 
     Sub-chunk boundary (S <= chunk): there is exactly ONE `_ensure_capacity`
@@ -272,7 +274,7 @@ def _prefill_chunks(shape: VramShape, S: int) -> list[tuple[int, int, int]]:
     The two agree at the last chunk except that this one charges the real
     trailing chunk where the closed form rounds up to `ceil(S/chunk)*chunk`.
 
-    `buckets=False` (every non-EXL3 checkpoint, a plain DynamicCache) holds
+    `buckets=False` (kv_cache_mode="fp16", a plain DynamicCache) holds
     exactly what it has been given, so capacity IS the context length.
     """
     chunk = max(1, int(shape.chunk))

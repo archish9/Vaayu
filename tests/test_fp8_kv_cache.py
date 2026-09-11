@@ -201,8 +201,9 @@ def test_create_kv_cache_fp8_and_fp16_modes_unchanged():
     assert isinstance(fp8, FP8DynamicCache) and fp8.quantize is True
     fp16 = _cache_for_mode("fp16")
     assert type(fp16) is DynamicCache
-    # non-EXL3 loader_strategy -> auto still resolves to fp16
-    assert type(_cache_for_mode("auto")) is DynamicCache
+    # non-EXL3 loader_strategy -> auto resolves to bf16 too (row 3, 2026-09-11)
+    auto = _cache_for_mode("auto")
+    assert type(auto) is FP8DynamicCache and auto.quantize is False
 
 
 def test_auto_selects_bf16_for_exl3():

@@ -1216,9 +1216,9 @@ def format_byte_fields(read_bytes_delta: int) -> str:
 def resolve_kv_cache_mode(mode: str, loader_strategy) -> str:
     """The mode `_create_kv_cache` will actually honour, given a REQUESTED one.
 
-    `"auto"` is a request, not a KV dtype -- it resolves to bf16 on an EXL3
-    checkpoint and fp16 otherwise -- and `"fp8"` silently becomes fp16 on a
-    PyTorch build without float8. Both resolutions used to live only inside
+    `"auto"` is a request, not a KV dtype -- it resolves to bf16 on every
+    loader -- and `"fp8"` silently becomes fp16 on a PyTorch build without
+    float8. Both resolutions used to live only inside
     the constructor, copied a second time into `_kv_cache_is_bucketed`, so
     nothing outside could say which dtype ran: `env.json` reported `"auto"`
     verbatim, against its own premise that every field is DERIVED. This is
@@ -1228,9 +1228,15 @@ def resolve_kv_cache_mode(mode: str, loader_strategy) -> str:
     An unrecognised mode is passed through unchanged -- `_create_kv_cache`
     refuses it there, with the message that names the known values.
     """
+    # "auto" -> bf16 on every loader. It was fp16 off EXL3 until 2026-09-11
+    # (row 3), and fp16 builds a bare transformers DynamicCache, which lacks the
+    # to_cpu/to_device/resident_bytes surface PrefixCacheStore drives -- so the
+    # prefix cache switched itself off at load for every non-EXL3 model. bf16
+    # mode is FP8DynamicCache(quantize=False): the ring buffer holding K/V in
+    # the model's own dtype, not a cast, so this changes no model's KV dtype.
+    # loader_strategy stays in the signature for the readers that pass it.
     if mode == "auto":
-        from .persist.loader_strategy import EXL3LoaderStrategy
-        return "bf16" if isinstance(loader_strategy, EXL3LoaderStrategy) else "fp16"
+        return "bf16"
     if mode == "fp8" and not hasattr(torch, "float8_e4m3fn"):
         return "fp16"
     return mode
@@ -2806,8 +2812,9 @@ class VaayuBaseModel(GenerationMixin):
         if getattr(self, "enable_prefix_cache", False):
             # PrefixCacheStore drives to_cpu()/to_device()/resident_bytes() on
             # every cache it stores. Vaayu's own cache classes have them; the
-            # bare transformers DynamicCache that kv_cache_mode "fp16" yields
-            # (what "auto" resolves to for every non-EXL3 model) does not, and
+            # bare transformers DynamicCache that an explicit kv_cache_mode
+            # "fp16" yields does not ("auto" is bf16 on every loader since
+            # row 3, 2026-09-11; it was fp16 off EXL3 before), and
             # store() would AttributeError. Since lookup() POPS an entry before
             # store() can put one back, failing per-turn would silently drain
             # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
@@ -3359,7 +3366,7 @@ class VaayuBaseModel(GenerationMixin):
 
     def _create_kv_cache(self):
         """Return a KV cache instance sized and typed for the configured kv_cache_mode."""
-        # auto -> bf16 on EXL3, fp16 otherwise. bf16, not fp8: fp8 mode stores
+        # auto -> bf16 on every loader (resolve_kv_cache_mode). bf16, not fp8: fp8 mode stores
         # an fp8 copy AND the dequantized mirror attention actually reads,
         # measured 3.016 bytes/element against bf16's 2.000. bf16 is lossless,
         # 33.7% smaller, and decodes slightly faster on both on-device models
