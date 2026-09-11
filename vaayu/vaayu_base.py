@@ -2187,10 +2187,12 @@ class VaayuBaseModel(GenerationMixin):
                 # a MoE load that falls back into the loop (output_attentions /
                 # output_hidden_states) after being charged here for
                 # layer-major would under-reserve the logits term by
-                # (chunk - trailing) * vocab * 4. That fallback is unreachable
-                # today: `output_hidden_states=True` crashes the forward before
-                # it can allocate anything (todo row 18), and nothing in the
-                # engine or the server passes `output_attentions`. Charged here
+                # (chunk - trailing) * vocab * 4. That fallback is reached only
+                # by `output_hidden_states=True`, a diagnostic nothing in the
+                # engine or the server passes (`output_attentions` raises at
+                # the top of forward; todo row 18), and a long diagnostic
+                # prompt on a MoE load may OOM there -- it also holds one
+                # chunk's num_hidden_layers + 1 hidden states, uncharged. Charged here
                 # rather than pessimised back to the loop because doing so would
                 # hand back the whole saving on both MoE geometries.
                 layer_major_prefill=bool(
@@ -4251,6 +4253,14 @@ class VaayuBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        if output_attentions:
+            # Under transformers 5.x a decoder layer returns only its hidden
+            # states -- the weights never leave the attention module -- and the
+            # sdpa / flash kernels this engine runs never compute them at all.
+            raise NotImplementedError(
+                "output_attentions=True is not supported: the decoder layers "
+                "this forward calls do not return attention weights")
+
         _exec_start = time.time()
         self.telemetry.begin_token(self._token_count)
 
@@ -4402,7 +4412,6 @@ class VaayuBaseModel(GenerationMixin):
         if use_cache and past_key_values is None:
             past_key_values = self._create_kv_cache()
         all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
-        all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         # Capture KV length once before the layer loop. len_p stays constant for the
         # full forward pass — all layers process the same positions. Re-querying
@@ -4755,9 +4764,6 @@ class VaayuBaseModel(GenerationMixin):
                                     # levers rather than fabricate a recovery.
                             new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-                            if output_attentions and isinstance(layer_out, tuple) and len(layer_out) > 1:
-                                all_self_attns[i].append(layer_out[1])
-
                             batch[j] = new_seq
 
                     # VAAYU_TRACE_ACT: hidden-state health after this layer.
@@ -4768,9 +4774,6 @@ class VaayuBaseModel(GenerationMixin):
                         print(f"[VAAYU-ACT] tok={self._token_count} "
                               f"i={i:>3} {layer_name} {act_stats(batch[0])}",
                               flush=True)
-
-                    if output_hidden_states:
-                        all_hidden_states += (torch.cat(batch, 0),)
 
                     # Reclaim VRAM — skip for pinned layers (they stay resident)
                     if layer_name not in self.pinned_layer_names and layer_name not in self.non_expert_pinned_layer_names:
@@ -4832,15 +4835,15 @@ class VaayuBaseModel(GenerationMixin):
         # logits exist/matter (see lm_head skip above).
         logits = batch[-1] if _chunk_lens is not None else torch.cat(batch, 0)
 
-        if output_attentions:
-            all_self_attns = all_self_attns[0:-2]
-            for i in range(len(all_self_attns)):
-                all_self_attns[i] = torch.cat(all_self_attns[i], 0)
-
         if output_hidden_states:
-            all_hidden_states = all_hidden_states[0:-2]
-            for i in range(len(all_hidden_states)):
-                all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
+            # transformers' convention: the embedding output, every decoder
+            # layer's output but the last, then the final-norm output. Each
+            # decoder layer recorded its INPUT and the norm its OUTPUT; the
+            # embedding and lm_head record nothing, so they are dropped BY
+            # NAME -- an empty sublist anywhere else must still raise here.
+            _unrecorded = (self.layer_names_dict['embed'], self.layer_names_dict['lm_head'])
+            all_hidden_states = [torch.cat(h, 0) for name, h in zip(self.layer_names, all_hidden_states)
+                                 if name not in _unrecorded]
 
         _exec_end = time.time()
         _total = _exec_end - _exec_start
@@ -4880,8 +4883,7 @@ class VaayuBaseModel(GenerationMixin):
         if not return_dict:
             return tuple(v for v in [logits,
                                      past_key_values if use_cache else None,
-                                     tuple(all_hidden_states) if all_hidden_states is not None else None,
-                                     tuple(all_self_attns) if all_self_attns is not None else None] if v is not None)
+                                     tuple(all_hidden_states) if all_hidden_states is not None else None] if v is not None)
         if self.profiling_mode:
             forward_elapsed_time = time.process_time() - forward_start
             forward_elapsed_time_wall = time.time() - forward_start_wall
@@ -4899,7 +4901,6 @@ class VaayuBaseModel(GenerationMixin):
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
-            attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )
 
     def _trim_kv_cache(self, cache, target_seq_len: int) -> None:

@@ -49,6 +49,8 @@ detail each entry points to.**
 or the 70B today — every row is OPTIONAL by §0's test.** The order below was set by the user on 2026-09-11
 after a triage of every open row: **three are worth working, in this order; the rest are not, for the
 reason given.** Pick from the PRIORITY table first. The sections after this one are the detail.
+**All three PRIORITY rows are CLOSED as of 2026-09-11 (3, 25, then 18).** What remains is the NOT-worth-working
+table — pick from it only on its stated re-open condition.
 
 ## PRIORITY — worth working, in this order
 
@@ -56,7 +58,7 @@ reason given.** Pick from the PRIORITY table first. The sections after this one 
 |---|---|---|---|---|---|
 | ~~**3**~~ | **CLOSED 2026-09-11 — prefix cache now ON for every non-EXL3 model.** `auto` resolves to `bf16` (the ring buffer, model's own dtype) on every loader. | Done: 1B prefix gate + server gate pass, turn-2 TTFT ~4.5× at 2.8k tokens, decode flat on flash. **Cost: derived `max_seq_len` drops up to ~2× (1B flash 91106 → 65536)** — row 4's doubling overshoot, now paid by non-EXL3 too; `KV_CACHE_MODE="fp16"` is the escape hatch. | `[x]` | done | [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md) · row **3** below |
 | ~~**25**~~ | **CLOSED 2026-09-11 — APST is NULL on both MoE targets.** MiniMax idle-sampler arm: decode 0 gaps ≥ 100 ms; cold prefill 3 mid-generation gaps ≥ 100 ms + a 80–100 ms band (same band Qwen has). | Done: bound ≤ 0.15 % of cold TTFT (≤ 20 wakes × ≤ 15 ms, the kernel's primary-state latency cap), 0 on decode; no full A/B — even a 1 % worst case is inside the A/B's replicate spread. The 70B dense stays unmeasured (not a blocker). | `[x]` | done | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) (MiniMax addendum) · row **25** below |
-| **18** | `[bug]` **`output_hidden_states=True` crashes the forward.** Diagnosis re-verified 2026-09-11 against HEAD: `vaayu_base.py:4397` builds one sublist per layer, `:4667`/`:4680` fill them, `:4766` does a flat `+=` of a bare Tensor, `:4836` cats an empty sublist; `:4834`'s `[0:-2]` is the hand-tuned compensation. | Small, testable on the 1B in seconds, and it is a real crash on a public forward argument. Low severity (nothing in the engine, server or gates asks for hidden states) — which is why it is third. | `[bug]` **priority 3** | small | [`…-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) · row **18** below |
+| ~~**18**~~ | **CLOSED 2026-09-11 — `output_hidden_states=True` fixed; `output_attentions=True` now raises `NotImplementedError`.** Root cause confirmed by instrumentation: 19 sublists + 19 bare Tensors (outer len 38 = 2 × `len(self.layers)`), from `6253fd1` switching the init to sublists without removing the flat `+=`. | Done: returns transformers 5.x's `num_hidden_layers + 1` entries (post-norm last); matches stock HF to ≤ 0.0184 per-token rel-L2 vs ≥ 0.459 to a neighbour layer; new on-device gate `tests/test_output_hidden_states.py` fails a shifted-layer mutant. 0 % on throughput (diagnostic only). | `[x]` | done | [`…-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md) · row **18** below |
 
 ## NOT worth working now — and why (re-open only on the stated condition)
 
@@ -70,7 +72,8 @@ reason given.** Pick from the PRIORITY table first. The sections after this one 
 | carried | `_finish` stop-string identity · `expert_sim.py` anchor gap · row **8** `tensor_align` | Reporting / a diagnostic tool / dead code — none changes the engine. | a client needs the stop string / someone quotes `expert_sim` small-budget absolutes | `[ ]` | see STILL OPEN |
 | carried | No resident-size checkpoint on disk. | A download, not code — but still the single largest usability change for the agent (streamed MoE runs ~0.56–0.86 tok/s). | — (do it whenever) | `[ ]` | [`…-carried-resident-checkpoint-BRIEF.md`](docs/2026-09-10-carried-resident-checkpoint-BRIEF.md) |
 
-**Closed 2026-09-11 (kept here until the next prune):** row **3** (`auto` → `bf16` for non-EXL3, prefix cache ON —
+**Closed 2026-09-11 (kept here until the next prune):** row **18** (`output_hidden_states` fixed, `output_attentions`
+refused — [`…-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md)), row **3** (`auto` → `bf16` for non-EXL3, prefix cache ON —
 [`…-row3-auto-bf16-prefix-cache-RESULTS.md`](docs/2026-09-11-row3-auto-bf16-prefix-cache-RESULTS.md)), row **13** (`even-4` built, done condition met,
 0 % on the default config — [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md)) and
 row **25** (APST NULL on Qwen by A/B and on MiniMax by idle-gap bound, remedy fix `c256e18` —
@@ -370,7 +373,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1979 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1979 passed, 15 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-11 after row 18 (+3 skipped: its new on-device gate, skipped without `HIDDEN_CKPT`; the
+1979 / 12 was re-measured against a stashed HEAD the same day and MATCHED). The 1979 / 12 was verified
 2026-09-11 after row 3's `auto` → `bf16` (1972 + 7). The 1972 was verified
 2026-09-11 after row 25's APST live-knob fix (1968 + 4). The 1968 was verified
 2026-09-11 after row 13's `even-4` window (1950 + 18; the 1950 was re-measured against a stashed
@@ -852,8 +857,11 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity (8 tokens — a long generation CAN flip at an exact bf16 tie, row 3). MoE: first token + warm reproducibility. Runs on any checkpoint under `auto` since row 3 (2026-09-11); **Llama-3.2-1B passes in ~7 s**. Before row 3 a non-EXL3 checkpoint failed its premise assert |
 | HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` (**`-s` is enforced** — without it the module fails every test with a message naming the flag, before loading anything; G1) | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
+| hidden states (row 18) | `HIDDEN_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_output_hidden_states.py -q -s` | 6 s (1B) / 30 s (MiniMax) | `output_hidden_states` broken: count `num_hidden_layers + 1`, shapes, a shifted or pre-norm entry (values vs stock HF — non-quantized checkpoints only; skips on EXL3), `output_attentions` refused by name. Seen to fail: RED on the unfixed forward, and on a shifted-layer mutant |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
+**MiniMax-M2.7, which needs 29G: at 22G its LOAD is OOM-killed (exit 137) at the pinning stage, measured twice
+2026-09-11 (row 18); every recent MiniMax arm already runs at 29–30G** — and except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
 blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 2026-08-16.
 
@@ -1456,7 +1464,37 @@ run it.
 
 ---
 
-# 18 · [bug] `output_hidden_states=True` crashes the forward — PRIORITY 3 (2026-09-11)
+# 18 · [x] `output_hidden_states=True` crashes the forward — CLOSED 2026-09-11: FIXED; `output_attentions` refused
+
+**Verdict (2026-09-11):** [`docs/2026-09-11-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md) (gitignored).
+
+- [x] **Root cause CONFIRMED by instrumentation** (the brief's hypothesis). On Llama-3.2-1B the list before
+  `[0:-2]` held **38 = 2 × `len(self.layers)`** elements: 19 per-layer sublists (embedding and lm_head
+  EMPTY) then 19 bare Tensors from the flat `+=`. Origin: the AirLLM init `[] * n` is `[]` (flat scheme
+  only); `6253fd1` (2026-05-25) made it real sublists without removing the `+=`. **Never worked in either form.**
+- [x] **Fix:** flat `+=` deleted; the sublist scheme kept (decoder records its INPUT, norm its OUTPUT =
+  transformers 5.x's convention, checked in `utils/output_capturing.py`); embedding and lm_head sublists
+  dropped **by name**, never by emptiness. Returns `num_hidden_layers + 1` entries, post-norm last.
+- [x] **`output_attentions=True` DECLARED OUT OF SCOPE — raises `NotImplementedError` at the top of `forward()`.**
+  It had the same double structure, and could never work anyway: transformers 5.5.4's decoder layer returns
+  a bare Tensor (weights never leave the attention module) and sdpa/flash never compute weights. Its dead
+  accumulation code is removed.
+- [x] **Gate:** new on-device `tests/test_output_hidden_states.py` (`HIDDEN_CKPT=`). RED on HEAD (3 errors, the
+  exact `ValueError`); fixed 1B **3 passed** — count, shapes, finite, no duplicates, refusal, and values vs
+  stock HF fp32: per-token rel-L2 **≤ 0.0184** against **≥ 0.459** to a neighbour layer (TOL 0.05, the test
+  asserts TOL < every gap as its premise). **A shifted-layer mutant FAILS it (1.697).** MiniMax-M2.7 **2 passed,
+  1 skipped** (value arm skips on EXL3). Qwen not run — shared loop, one dense + one MoE geometry covers it.
+- [x] **Trap found:** whole-tensor rel-L2 CANNOT tell adjacent layers apart — the BOS token's massive activation
+  (norm ~790 vs ~5) put neighbours 0.009 apart, under bf16 rounding (0.019). Leave position 0 out.
+- [x] **Comment fixed:** `predict_peak_vram`'s note (~`vaayu_base.py:2187`) called the MoE layer-major → per-chunk
+  fallback "unreachable" *because* of this crash. Now reachable via `output_hidden_states=True` only — a long
+  diagnostic prompt on a MoE load may OOM (logits under-reserve + one chunk's hidden states, uncharged).
+- **Known, not changed:** a chunked prefill returns only the LAST chunk's hidden states, as it does its logits
+  (keeping all would retain `(L+1) × S × hidden` on GPU — 4.5 GB for the 1B at 65k).
+- **§8:** no knob; nothing to plumb; not reachable through the server, by design — 0 % on throughput.
+- Suite: stashed HEAD 1979 passed / 12 skipped → **1979 passed / 15 skipped**.
+
+*Original row text follows.*
 
 **Cold-pickup brief, with a ROOT-CAUSE diagnosis this row did not have:** [`docs/2026-09-10-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) (gitignored). Two accumulation schemes collide — `vaayu_base.py:4397` allocates one empty sublist per layer, `:4667`/`:4680` fill sublists, but `:4766` does `all_hidden_states += (torch.cat(batch, 0),)`, which EXTENDS the outer list with a bare Tensor. `:4836` then cats a still-empty sublist. The `[0:-2]` at `:4834` is the hand-tuned compensation. **Line numbers below drifted: the crash is now `:4836`, not `:4594`.**
 
