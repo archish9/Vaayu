@@ -44,11 +44,49 @@ def test_every_valid_mode_still_returns_its_own_cache(mode, expected):
     assert type(VaayuBaseModel._create_kv_cache(_model(mode))) is expected
 
 
-def test_auto_still_resolves_by_loader_not_by_string():
-    """auto is bf16 on EXL3 and fp16 otherwise -- the branch the raise must not
-    disturb."""
-    assert type(VaayuBaseModel._create_kv_cache(_model("auto", exl3=True))) is FP8DynamicCache
-    assert type(VaayuBaseModel._create_kv_cache(_model("auto"))) is DynamicCache
+def test_auto_builds_the_ring_buffer_on_every_loader():
+    """auto is bf16 on EXL3 AND on everything else (row 3, 2026-09-11). It used
+    to be fp16 off EXL3, which built a bare DynamicCache and so switched the
+    prefix cache off at load for every non-EXL3 model."""
+    for exl3 in (True, False):
+        c = VaayuBaseModel._create_kv_cache(_model("auto", exl3=exl3))
+        assert type(c) is FP8DynamicCache and c.quantize is False
+
+
+@pytest.mark.parametrize("exl3", [True, False])
+def test_auto_yields_a_cache_the_prefix_pool_can_store(exl3):
+    """The point of row 3: with the server's defaults (KV_CACHE_MODE="auto",
+    ENABLE_PREFIX_CACHE=True) the load-time probe must pass on any loader."""
+    from vaayu.batch import cache_supports_prefix_store
+    assert cache_supports_prefix_store(
+        VaayuBaseModel._create_kv_cache(_model("auto", exl3=exl3))) is True
+
+
+def test_an_explicit_fp16_request_still_reaches_the_refusal():
+    """fp16 still means the stock DynamicCache, so the load-time refusal (the
+    guard against lookup()-pops-then-store()-fails draining the pool) stays
+    reachable for anyone who asks for it."""
+    from vaayu.batch import cache_supports_prefix_store
+    assert cache_supports_prefix_store(
+        VaayuBaseModel._create_kv_cache(_model("fp16"))) is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_bf16_mode_stores_the_source_dtype_and_round_trips(dtype):
+    """"bf16" mode is the ring buffer, not a cast: K/V keep whatever dtype the
+    model runs in (fp16 on a pre-Ampere GPU, fp32 on CPU). What auto now builds
+    for non-EXL3 models must not change their KV dtype, and the pool's
+    to_cpu/to_device round trip must hand back the same values."""
+    c = VaayuBaseModel._create_kv_cache(_model("bf16"))
+    k, v = torch.randn(1, 2, 5, 4, dtype=dtype), torch.randn(1, 2, 5, 4, dtype=dtype)
+    c.update(k, v, 0)
+    assert c.key_cache[0].dtype is dtype
+    c.to_cpu()
+    c.to_device("cpu")
+    assert c.resident_bytes() == 2 * k.nbytes    # compacted to used length
+    k2, v2 = c.update(k[..., :1, :], v[..., :1, :], 0)
+    assert k2.dtype is dtype
+    assert torch.equal(k2[..., :5, :], k) and torch.equal(v2[..., :5, :], v)
 
 
 def test_fp8_is_reachable_explicitly():
@@ -68,7 +106,7 @@ def test_fp8_is_reachable_explicitly():
 
 @pytest.mark.parametrize("mode,exl3,expected", [
     ("auto", True, "bf16"),
-    ("auto", False, "fp16"),
+    ("auto", False, "bf16"),
     ("bf16", False, "bf16"),
     ("fp16", False, "fp16"),
     ("fp8", False, "fp8"),

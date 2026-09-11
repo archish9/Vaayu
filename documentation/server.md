@@ -840,10 +840,11 @@ Do not spend time here; each is measured and settled.
 - **No auth, no TLS, no rate limiting.** Bind to `127.0.0.1` (the default) or put a
   reverse proxy in front of it. Do not expose this directly to a network you do not
   control.
-- **Prefix caching is disabled for non-EXL3 checkpoints.** The bare `DynamicCache`
-  returned for `kv_cache_mode="fp16"` has no `to_cpu`/`to_device`/`resident_bytes`, so
-  the pool is disabled at load with a warning. `/health` will report
-  `"prefix_cache": "disabled"`. Every EXL3 checkpoint is unaffected.
+- **Prefix caching is disabled under `KV_CACHE_MODE = "fp16"`.** The bare `DynamicCache`
+  that mode returns has no `to_cpu`/`to_device`/`resident_bytes`, so the pool is disabled
+  at load with a warning and `/health` reports `"prefix_cache": "disabled"`. The default
+  `"auto"` resolves to `"bf16"` on every checkpoint, EXL3 or not, and keeps it on —
+  `"bf16"` is the ring buffer holding K/V in the model's own dtype, not a cast.
 
 ---
 
@@ -851,7 +852,7 @@ Do not spend time here; each is measured and settled.
 
 | symptom | cause | fix |
 |---|---|---|
-| `"prefix_cache": "disabled"` in `/health` | non-EXL3 checkpoint | use an EXL3 build; the fp16 adapter is unbuilt |
+| `"prefix_cache": "disabled"` in `/health` | `KV_CACHE_MODE = "fp16"` | set it back to `"auto"` (or `"bf16"`) |
 | generation is ~10× slower than expected | `MAX_PINNED_LAYERS = 0` | set it back to `-1`, the default |
 | `400` naming a token count | prompt exceeds the derived window | shorten by the number the message gives |
 | `400` mentioning tool support | the checkpoint's template cannot render `tools` | use a tool-capable checkpoint |

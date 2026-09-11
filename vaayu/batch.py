@@ -276,8 +276,7 @@ def build_batch_attention_mask(pad_mask, q_len, dtype, device):
 def _resolve_kv_elem_bytes(model):
     """1 (fp8), 2 (bf16/fp16), mirroring VaayuBaseModel._create_kv_cache, or
     the real kv_cache_mode STRING for TurboQuant (e.g. 'turboquant:9').
-    Conservative for the unknown/auto-non-EXL3 case: 2 (never under-reserves
-    KV).
+    Conservative for the unknown case: 2 (never under-reserves KV).
 
     TurboQuant used to collapse into the same `1` as fp8, but fp8 and
     TurboQuant are NOT the same rate: fp8 measures 3.016 B/elem while
@@ -288,12 +287,7 @@ def _resolve_kv_elem_bytes(model):
     correct turboquant branch (vram_plan.kv_elem_bytes)."""
     mode = getattr(model, "kv_cache_mode", "fp16")
     if mode == "auto":
-        try:
-            from .persist.loader_strategy import EXL3LoaderStrategy
-            mode = "bf16" if isinstance(getattr(model, "loader_strategy", None),
-                                        EXL3LoaderStrategy) else "fp16"
-        except Exception:
-            mode = "fp16"
+        mode = "bf16"   # every loader, as resolve_kv_cache_mode (row 3)
     if mode == "fp8":
         return 1
     if mode == "turboquant" or mode.startswith("turboquant:"):
@@ -434,8 +428,8 @@ def cache_supports_prefix_store(cache) -> bool:
 
     Vaayu's FP8DynamicCache / TurboQuantKVCache do. A bare
     transformers.cache_utils.DynamicCache -- what `_create_kv_cache` returns
-    whenever kv_cache_mode resolves to "fp16", which is what "auto" gives every
-    non-EXL3 model -- does NOT: it has no to_cpu, no to_device and no
+    for an explicit kv_cache_mode "fp16" (and, before row 3 on 2026-09-11, for
+    "auto" on every non-EXL3 model) -- does NOT: it has no to_cpu, no to_device and no
     resident_bytes. store() would raise AttributeError on it, and because
     lookup() POPS an entry before store() puts one back, each such failure
     permanently drops the pool's entry.

@@ -741,7 +741,7 @@ Full list, request-body reference, tool-calling examples and the troubleshooting
 One model per process, no hot-swap. One request in flight, `n=1` only. No continuous
 batching (N≥2 at long context is a hardware wall on 16 GB, not a missing feature). No
 `/v1/completions`, no MCP client, **no auth or TLS** — bind to `127.0.0.1` or put a proxy in
-front. Prefix caching is disabled for non-EXL3 checkpoints; `/health` reports it.
+front. Prefix caching is disabled under `KV_CACHE_MODE = "fp16"`; `/health` reports it.
 
 ---
 

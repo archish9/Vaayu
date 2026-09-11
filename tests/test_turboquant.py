@@ -339,7 +339,8 @@ def test_create_kv_cache_turboquant_with_explicit_bits():
 def test_create_kv_cache_existing_modes_unchanged():
     from transformers import DynamicCache
     assert type(_cache_for_mode("fp16")) is DynamicCache
-    assert type(_cache_for_mode("auto")) is DynamicCache        # non-EXL3
+    auto = _cache_for_mode("auto")                  # non-EXL3: bf16 since row 3
+    assert type(auto) is FP8DynamicCache and auto.quantize is False
     bf16 = _cache_for_mode("bf16")
     assert type(bf16) is FP8DynamicCache and bf16.quantize is False
     fp8 = _cache_for_mode("fp8")

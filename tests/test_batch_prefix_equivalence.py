@@ -5,12 +5,12 @@ Run: PREFIX_CKPT=/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3
 
 Skipped without PREFIX_CKPT -- it needs a real model load.
 
-The checkpoint must be one the prefix cache actually supports, i.e. an EXL3
-model, so kv_cache_mode "auto" resolves to "bf16" and `_create_kv_cache`
-returns Vaayu's FP8DynamicCache. A non-EXL3 model resolves to "fp16" -> a bare
-transformers DynamicCache, which has no to_cpu/to_device/resident_bytes, so the
-prefix cache disables itself at load with a warning and round 2 could never
-hit. That limit is pre-existing and belongs to the prefix subsystem as a whole
+The checkpoint must be one the prefix cache actually supports: kv_cache_mode
+"auto" resolves to "bf16" and `_create_kv_cache` returns Vaayu's
+FP8DynamicCache. Since row 3 (2026-09-11) that holds on every loader; before
+it, a non-EXL3 model resolved to "fp16" -> a bare transformers DynamicCache,
+which has no to_cpu/to_device/resident_bytes, so the prefix cache disabled
+itself at load with a warning and round 2 could never hit. That limit is pre-existing and belongs to the prefix subsystem as a whole
 (generate() drives the same store()), not to batched decode.
 
 WHAT IS ASSERTED DEPENDS ON THE MODEL, and that is a measured conclusion, not a

@@ -198,9 +198,10 @@ def test_prefix_reuse(client):
     # even when the pool is disabled, which is how the first run of this
     # gate reported green while prefix reuse was off entirely.
     if stats == "disabled":
-        # Expected only for non-EXL3 checkpoints -- todo OPTIONAL row 3, the
-        # bare DynamicCache has no to_cpu/to_device/resident_bytes.
-        print("  (pool disabled -- expected on a non-EXL3 checkpoint, todo row 3)")
+        # Expected only with an explicit KV_CACHE_MODE="fp16": the bare
+        # DynamicCache has no to_cpu/to_device/resident_bytes. Since row 3
+        # (2026-09-11) "auto" enables the pool on every loader.
+        print("  (pool disabled -- expected only with KV_CACHE_MODE='fp16', todo row 3)")
     else:
         assert "hits=0" not in stats, stats
 
