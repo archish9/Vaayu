@@ -51,7 +51,7 @@ Pick from this list in order; the sections after it are the detail each entry po
 
 | # | pick this if | one line | state | cost | cold-pickup brief (gitignored) |
 |---|---|---|---|---|---|
-| **13** | you want the decided, designed piece of work | **GO/NO-GO on `even-4`** — widen the spec gate's decision window to 4 alternating pairs (4 drafting + 4 suppressed rounds), decide on `acceptance > byte bar AND mean(per-pair s/token ratio) < 1`. 6/6 correct vs today's 5/6, +1.3–2.5 %. **Closing the row is an equally legitimate outcome** — worth 0 % until an operator opts a MoE checkpoint into prompt lookup. | `[~]` designed + priced, not started | ~half a day CPU + 1 on-device A/B | [`…-row13-even4-window-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md) |
+| **13** | — | **CLOSED 2026-09-11 — `even-4` BUILT, on-device done condition MET.** TRIAL alternates 4 drafting + 4 suppressed rounds (≥4 pairs, ≥48 drafted); `run` iff acceptance > byte bar AND mean pair s/token ratio < 1. MiniMax loser THINK=1 (HEAD said `run`, −19.7 %) now `off` 3/3, forced = −18.6 %; winner THINK=0 still `run`, +15.4 %. **The brief's 5/6→6/6 and +1.3–2.5 % did NOT reproduce** — priced against a ratio-only model of the gate; the real HEAD gate is 6/6 on the traces. Worth 0 % on the default config. | `[x]` closed | done | [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md) |
 | **6a-b** | you have a GPU round and want correctness | `head_bytes` is probably not a transient at all — but the 70B has a 0.714 G floor it currently covers BY LUCK, so it cannot just be removed. The deliverable is an ATTRIBUTION of that floor. Buys admission headroom, not tok/s. | `[ ]` | GPU round | [`…-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) |
 | **3** | you want capability, not speed | The cross-turn prefix cache is EXL3-only; `DynamicCache` lacks the three methods the pool needs. Prefix reuse is the server's largest lever (136–377× TTFT) and it is OFF for every fp16 model. No fp16 model runs here today. | `[ ]` | adapter or cache swap | [`…-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) |
 | **23** | you are already on the batching path | The prefill stager re-runs once per BATCHED CHUNK (fused-EXL3 only). Two hypotheses, unmeasured; measure the cheap one first. **`MAX_BATCH_SIZE = 1`, so worth 0 % to users.** | `[ ]` | measurement first | [`…-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) |
@@ -320,7 +320,7 @@ tok/s or TTFT on Qwen3-235B, MiniMax-M2.7 or the 70B dense today.
 | item | what it is | why it is not perf | where |
 |---|---|---|---|
 | **6a-b** `[ ]` | `head_bytes` is probably not a transient at all | Correctness of the peak form, and §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it further buys admission headroom, not tok/s. Needs a GPU round (the 70B's 0.714 G floor). | row **6a-b** |
-| **13** `[bug]` | The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once | **BUILT + MEASURED 2026-09-10. The timed bar exists, is a strict tightening, and changed NO decision on any of 4 on-device arms — banked, not shipped-with-effect. The design's Done condition REFUTED: the losing arm is still admitted (−19.7 % on its own A/B), because CALIBRATE+TRIAL sit in the cheapest stretch of a call.** Still worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE. **RE-AIMED 2026-09-10 when row 24 closed REFUTED: the path is a WIDER, POOLED one-shot window, not re-evaluation and not a later sample. PRICED the same day and it PAYS: `even-4` — TRIAL becomes 4 alternating pairs of 4 drafting + 4 suppressed rounds, verdict `run` iff acceptance > byte bar AND MEAN of the per-pair s/token ratios < 1 — decides **6/6** against today's 5/6 for **+16 suppressed rounds** (40 rounds vs 24) and the SAME 48 drafted tokens, worth **+1.3–2.5 %** mean over six arms against a **+1.9 %** ceiling for perfect verdicts at today's price. **DO NOT route the pooled ratio through the shipped `alpha`/wall-bar form — measured 4/6, worse than today.** Row 24's “m ≥ 3, median” is wrong twice: the estimator must be a MEAN, and charged faithfully for CALIBRATE the safe width is **m ≥ 4** (m=3 is 5/6). Re-running whole TRIALs (`full-m`) NEVER pays at any call length.** | row **13** · [`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md) · [`…-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`…-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) · [`…-window-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md) · [`…-even4-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md) |
+| **13** `[x]` | The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once | **CLOSED 2026-09-11 — `even-4` built and validated on device; see row 13's CLOSED block.** **BUILT + MEASURED 2026-09-10. The timed bar exists, is a strict tightening, and changed NO decision on any of 4 on-device arms — banked, not shipped-with-effect. The design's Done condition REFUTED: the losing arm is still admitted (−19.7 % on its own A/B), because CALIBRATE+TRIAL sit in the cheapest stretch of a call.** Still worth **0 %** on the default config — `USE_PROMPT_LOOKUP` is OFF for MoE. **RE-AIMED 2026-09-10 when row 24 closed REFUTED: the path is a WIDER, POOLED one-shot window, not re-evaluation and not a later sample. PRICED the same day and it PAYS: `even-4` — TRIAL becomes 4 alternating pairs of 4 drafting + 4 suppressed rounds, verdict `run` iff acceptance > byte bar AND MEAN of the per-pair s/token ratios < 1 — decides **6/6** against today's 5/6 for **+16 suppressed rounds** (40 rounds vs 24) and the SAME 48 drafted tokens, worth **+1.3–2.5 %** mean over six arms against a **+1.9 %** ceiling for perfect verdicts at today's price. **DO NOT route the pooled ratio through the shipped `alpha`/wall-bar form — measured 4/6, worse than today.** Row 24's “m ≥ 3, median” is wrong twice: the estimator must be a MEAN, and charged faithfully for CALIBRATE the safe width is **m ≥ 4** (m=3 is 5/6). Re-running whole TRIALs (`full-m`) NEVER pays at any call length.** | row **13** · [`docs/2026-09-10-row13-timed-bar-RESULTS.md`](docs/2026-09-10-row13-timed-bar-RESULTS.md) · [`…-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) · [`…-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md) · [`…-window-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md) · [`…-even4-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md) |
 | ~~**24**~~ | **CLOSED 2026-09-10 — REFUTED ON PRICE** (≤ +6.28 % with perfect foresight at zero cost; break-even 0.5–5.9 token-equivalents against a real ~29.3). Its live residue is row 13's remainder, restated as WINDOW WIDTH | Same §8 bucket as 13 — 0 % on the default config. **Now the head of this queue and no longer a side observation: row 13's four on-device arms measured the decision window at 0.510-0.532 s/token against 0.637-0.793 for the whole call, and that gap is exactly why a correct, timed, tightened bar still admits a −19.7 % configuration.** | row **24** |
 | ~~**A**~~ | **CLOSED 2026-09-10 — 19 of 28 reachable, 9 declined in code, drift test wired. Suite 1893 → 1906** | Was: capability and correctness, not speed. `ENABLE_KV_PERSIST` could be turned on but not aimed. **All 5 new knobs are worth 0 % until an operator sets one — no default moved.** | OPTIONAL row **14** |
 | ~~**C1**~~ | **CLOSED 2026-09-10 — construction refused, Option A, suite 1887 → 1893** | Was: real correctness hole. CUDA is what runs here, so the fix is worth **0 %** on every target run here. | OPEN section |
@@ -353,7 +353,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1950 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1968 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-11 after row 13's `even-4` window (1950 + 18; the 1950 was re-measured against a stashed
+HEAD the same day and MATCHED). The 1950 was verified
 2026-09-10 after row 13's timed spec bar (1906 + 44). The 1906 was verified the same day after
 row 14's config reachability work (1893 + 13). **The 1893 was re-measured against
 a stashed HEAD the same day and MATCHED the figure written here** — the second time in ten that it
@@ -891,7 +893,61 @@ from this table.
 
 ---
 
-# 13 · [bug] The spec gate can say `run` on a configuration that loses wall-clock — TIMED BAR BUILT AND MEASURED 2026-09-10; REMAINDER PRICED THE SAME DAY AND IT PAYS (`even-4`), AWAITING A GO/NO-GO
+# 13 · [x] The spec gate can say `run` on a configuration that loses wall-clock — CLOSED 2026-09-11: `even-4` BUILT, DONE CONDITION MET ON DEVICE
+
+**CLOSED 2026-09-11 (GO given that day).** Full write-up
+[`docs/2026-09-11-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md) (gitignored —
+everything load-bearing is restated here).
+
+**Built.** `adaptive_gate.py`: `TRIAL_LEG_ROUNDS = 4`, `TRIAL_PAIRS = 4`, `TRIAL_ROUND_CAP` 64 → 128
+(same 64 drafting-eligible rounds). TRIAL alternates [D4 S4] pairs; ends on a pair boundary at
+≥ 4 pairs AND ≥ 48 drafted (a slow proposer runs more pairs), or the cap. With ≥ 4 fully-timed pairs:
+`run` iff acceptance > byte bar AND **mean** pair s/token ratio < 1 (`bar_used="pooled"`); fewer →
+the old single-window rule, `bar_used` says which. `status()` + `pooled_ratio`, `pairs_used`; every
+old key unchanged. **Plus a fix the brief said was unnecessary:** `vaayu_base.py`'s per-CALL VRAM
+prefix read (P9) used `should_draft()`, which now alternates inside TRIAL — a call opening on a
+suppressed leg would have run its drafting legs under the load-time prefix. Now reads
+`gate.phase in ("trial", "run")`; test RED before, both geometries. Tests +18. **Suite: stashed
+HEAD 1950 / 12 skipped (matched), with the change 1968 / 12.**
+
+**The brief's price did NOT reproduce.** Its "today 5/6 → 6/6, +1.3–2.5 %" scored a RATIO-ONLY model
+of the shipped gate. Replayed through the REAL `AdaptiveSpecGate` (HEAD and new) on the same six
+traces at byte bars 0.6125 / 0.6259 / 0.6462: **HEAD is 6/6** (it refuses `winner-p0-a` on
+acceptance, as on-device arm 3 did on 2026-09-10), even-4 changes no verdict, and costs **−1.03 /
+−0.73 / −0.47 %** at T = 200 / 400 / 2000 on the probe's own pricing. **Lesson: a probe that models
+the shipped rule must replay the shipped CLASS.** The traces cannot contain the real failure (their
+in-window loser acceptance is 0.42–0.50, under the byte bar), so the validation was re-aimed at the
+arm the real gate actually got wrong.
+
+**On device, same day, BALLAST_GB=25, d=3, WARM 96 + TIMED 200:**
+
+| arm | gate | acceptance / byte bar | pooled ratio (pairs) | timed tok/s |
+|---|---|---|---|---|
+| MiniMax loser THINK=1 ×3 | **off_acceptance** ×3 | 0.6078 / 0.6305 | 1.359 / 1.352 / 1.333 (5) | 1.5615 / 1.5049 / 1.5092 |
+| — forced (no gate) | — | — | — | **1.2710 → speculation −18.6 %** |
+| MiniMax winner THINK=0 | **run** | 0.8542 / 0.6125 | 0.836 (4) | **1.7724** |
+| — off | — | — | — | **1.5363 → +15.4 %** |
+| MiniMax winner THINK=1 | off_acceptance | 0.3750 / 0.6462 | 1.550 (7) | 1.5047 |
+| Qwen3-235B winner THINK=0 | off_union, 0 drafts | — | — | 0.9786 |
+
+**How it flips, and how thin:** in the wider window EVERY rule refuses the loser — acceptance 0.6078 is
+under the byte bar alone (HEAD's 16-consecutive-round window measured 0.6875 and admitted). The
+improvement is the window's WIDTH, the brief's thesis, not the decision rule. The pooled ratio agrees
+but is **not independently decisive: its first 4 pairs average 0.99 on all 3 replicates**; it refuses
+through pair 5 (every draft rejected), which exists only because 48 drafted tokens were not reached in
+4 pairs. Greedy text is deterministic, so 3/3 is three timings of ONE trajectory.
+
+**§8:** no knob (a window is not a feature); nothing to plumb (inside `AdaptiveSpecGate`); REACHABLE
+but **worth 0 % on the default config** — MoE-only gate, `USE_PROMPT_LOOKUP = "auto"` OFF for MoE.
+Unblocked by an operator opting a MoE checkpoint in. Docs updated in the same change:
+`documentation/server.md` (config row + runtime-gate paragraph), `vaayu/server/config.py` comment.
+**Do NOT re-open as "make the ratio decisive"** — on the one losing workload measured, four pairs sit
+at 0.99; tuning to that arm is tuning to noise.
+
+---
+
+*Pre-close history of this row follows (kept until the next prune).*
+
 
 **STATUS 2026-09-10: the timed bar is BUILT, TESTED and MEASURED on device — and the DESIGN's own
 Done condition is REFUTED. The row does NOT close.** The defect is no longer *"the bar is in

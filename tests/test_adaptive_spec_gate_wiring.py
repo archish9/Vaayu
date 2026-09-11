@@ -345,16 +345,23 @@ def test_off_acceptance_latches_through_the_real_loop(monkeypatch):
     monkeypatch.setattr(ag, "CALIBRATE_STEPS", 4)
     monkeypatch.setattr(ag, "TRIAL_DRAFTED_TOKENS", 6)
     monkeypatch.setattr(ag, "TRIAL_ROUND_CAP", 10)
+    # Row 13, `even-4`: TRIAL alternates drafting and suppressed legs and
+    # decides on a pair boundary. One pair of 2+2 keeps this test's trial to
+    # the same 2 drafting rounds, plus the 2 suppressed rounds that complete
+    # the pair.
+    monkeypatch.setattr(ag, "TRIAL_LEG_ROUNDS", 2)
+    monkeypatch.setattr(ag, "TRIAL_PAIRS", 1)
     model = _CyclingRoutingFake(PrefixCacheStore(budget_bytes=10 ** 9),
                                 budget_bytes=20_000_000_000)
     model.speculator = _DraftingSpeculator([[0, 0, 7], [0, 0, 7]])
-    # 1 prefill + 4 calibrate rounds (1 tok each) + 2 trial rounds (3 tok
-    # each, drafted=3/accepted=2 -> num_accepted=3 per round) = 11.
-    out = _run(model, max_new_tokens=11)
+    # 1 prefill + 4 calibrate rounds (1 tok each) + 2 drafting trial rounds
+    # (3 tok each, drafted=3/accepted=2 -> num_accepted=3 per round) + 2
+    # suppressed trial rounds (1 tok each) = 13.
+    out = _run(model, max_new_tokens=13)
     assert model.speculator is None, \
         "off on measured evidence must disable speculation the same way off_union does"
     assert model.speculative_status["calibration"]["decision"] == "off_acceptance"
-    assert out.shape[1] == 5 + 11, \
+    assert out.shape[1] == 5 + 13, \
         "latching mid-call must not truncate the answer"
 
 
