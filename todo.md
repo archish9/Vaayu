@@ -43,22 +43,36 @@ detail each entry points to.**
 
 ---
 
-# ▶ START HERE — the whole open queue, 2026-09-10
+# ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-**Nothing is in flight. No `[bug]` is live in OPEN, and NO §0 P-row is open — so nothing on this
-board can make Vaayu faster on a target run here, and every row below is OPTIONAL by §0's own test.
-Pick from this list in order; the sections after it are the detail each entry points at.**
+**Nothing is in flight. No §0 P-row is open, so nothing here makes Vaayu faster on Qwen3-235B, MiniMax-M2.7
+or the 70B today — every row is OPTIONAL by §0's test.** The order below was set by the user on 2026-09-11
+after a triage of every open row: **three are worth working, in this order; the rest are not, for the
+reason given.** Pick from the PRIORITY table first. The sections after this one are the detail.
 
-| # | pick this if | one line | state | cost | cold-pickup brief (gitignored) |
+## PRIORITY — worth working, in this order
+
+| # | one line | why it is worth it | state | cost | brief (gitignored) |
 |---|---|---|---|---|---|
-| **13** | — | **CLOSED 2026-09-11 — `even-4` BUILT, on-device done condition MET.** TRIAL alternates 4 drafting + 4 suppressed rounds (≥4 pairs, ≥48 drafted); `run` iff acceptance > byte bar AND mean pair s/token ratio < 1. MiniMax loser THINK=1 (HEAD said `run`, −19.7 %) now `off` 3/3, forced = −18.6 %; winner THINK=0 still `run`, +15.4 %. **The brief's 5/6→6/6 and +1.3–2.5 % did NOT reproduce** — priced against a ratio-only model of the gate; the real HEAD gate is 6/6 on the traces. Worth 0 % on the default config. | `[x]` closed | done | [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md) |
-| **25** | — | **APST A/B on Qwen3-235B — MEASURED 2026-09-11: NULL.** 4 arms ABBA through the real server (N=1, default config): off vs on = t1 decode +0.8 %, t2 decode −0.6 %, TTFT −0.5 % / +1.5 % — inside replicate spread, signs disagree. Mechanism: only 2–5 idle gaps ≥ 100 ms (APST's primary timeout) per 361 s arm, ≤ 1 s total. **Found + FIXED: the documented remedy was inert** — `vaayu_optimize_os.sh` wrote a module param read only at controller init, and the boot check read the same value. Warning toned down to info. Left: MiniMax/dense unmeasured (one idle-sampler arm). | `[~]` | 1 arm left | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) |
-| **6a-b** | you have a GPU round and want correctness | `head_bytes` is probably not a transient at all — but the 70B has a 0.714 G floor it currently covers BY LUCK, so it cannot just be removed. The deliverable is an ATTRIBUTION of that floor. Buys admission headroom, not tok/s. | `[ ]` | GPU round | [`…-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) |
-| **3** | you want capability, not speed | The cross-turn prefix cache is EXL3-only; `DynamicCache` lacks the three methods the pool needs. Prefix reuse is the server's largest lever (136–377× TTFT) and it is OFF for every fp16 model. No fp16 model runs here today. | `[ ]` | adapter or cache swap | [`…-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) |
-| **23** | you are already on the batching path | The prefill stager re-runs once per BATCHED CHUNK (fused-EXL3 only). Two hypotheses, unmeasured; measure the cheap one first. **`MAX_BATCH_SIZE = 1`, so worth 0 % to users.** | `[ ]` | measurement first | [`…-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) |
-| **18** | a debugging session just lost a tool | `[bug]` `output_hidden_states=True` crashes the forward. **Root cause now diagnosed in the brief: two accumulation schemes collide** (`vaayu_base.py:4397` per-layer sublists vs `:4766`'s flat `+=`). Low severity — nothing in the engine, server or gates asks for hidden states. | `[bug]` | small | [`…-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) |
-| **5** | you want quality certification | Does failing the 0.05 rel-L2 compression bar degrade generated TEXT? The bar is an uncertified PROXY. Deliberately unscheduled; costs speed if anything. | `[ ]` | CPU sweep | [`…-row5-quality-certification-BRIEF.md`](docs/2026-09-10-row5-quality-certification-BRIEF.md) |
-| **4** | — | 2× KV overshoot, ~0.83 GB at Qwen's 8192. **Deliberately PARKED** — a LARGER 1.22 GB giveback was measured at decode +0.4 %. **One condition re-opens it** (see brief). | `[ ]` parked | — | [`…-row4-kv-overshoot-PARKED-BRIEF.md`](docs/2026-09-10-row4-kv-overshoot-PARKED-BRIEF.md) |
+| **3** | **Prefix cache is OFF for every non-EXL3 model.** `auto` resolves to `fp16` → bare `DynamicCache`, which lacks `to_cpu`/`to_device`/`resident_bytes`, so the pool disables itself at load. | **RE-PRICED 2026-09-11: likely a one-line fix, and testable TODAY.** `FP8DynamicCache(quantize=False)` (what `bf16` mode builds) stores K/V in the model's SOURCE dtype (`vaayu_base.py:1280`), so it is safe for fp16 models; resolving `auto` to it for non-EXL3 turns the prefix cache on. `Llama-3.2-1B-Instruct` is unquantized and on disk — the "no fp16 model runs here" line was wrong. Reachable through the server's defaults (`ENABLE_PREFIX_CACHE=True`, `KV_CACHE_MODE="auto"`). The model-agnostic mandate's biggest open gap. | `[ ]` **priority 1** | small + 1B runs | [`…-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) · row **3** below |
+| **25** | **APST: one MiniMax idle-sampler arm** to close the row. Qwen measured NULL 2026-09-11; MiniMax (module-list forward, no stager — a different read pattern) is unmeasured. | Cheap (~7 min GPU, harness exists), closes a row, and makes the "APST costs nothing" wording in the boot line and docs true for both MoE targets rather than one. Full A/B only if the arm shows material ≥ 100 ms idle. | `[~]` **priority 2** | 1 arm | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) · row **25** below |
+| **18** | `[bug]` **`output_hidden_states=True` crashes the forward.** Diagnosis re-verified 2026-09-11 against HEAD: `vaayu_base.py:4397` builds one sublist per layer, `:4667`/`:4680` fill them, `:4766` does a flat `+=` of a bare Tensor, `:4836` cats an empty sublist; `:4834`'s `[0:-2]` is the hand-tuned compensation. | Small, testable on the 1B in seconds, and it is a real crash on a public forward argument. Low severity (nothing in the engine, server or gates asks for hidden states) — which is why it is third. | `[bug]` **priority 3** | small | [`…-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) · row **18** below |
+
+## NOT worth working now — and why (re-open only on the stated condition)
+
+| # | one line | why not | re-open if | state | brief (gitignored) |
+|---|---|---|---|---|---|
+| **6a-b** | `head_bytes` is probably not a transient; the 70B's 0.714 G floor is covered BY LUCK. | A GPU round that buys admission headroom, never tok/s — the reserve is floor-bound on flash. The current form errs SAFE. | someone edits `predict_peak_vram` (then this is a trap to read first) | `[ ]` | [`…-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) |
+| **5** | Does failing the 0.05 rel-L2 compression bar degrade TEXT? | `PREFIX_COMPRESS = None` is the server default, so it only affects users who opt in. | compression becomes a default, or a user reports degraded prefix-reused turns | `[ ]` | [`…-row5-quality-certification-BRIEF.md`](docs/2026-09-10-row5-quality-certification-BRIEF.md) |
+| **23** | Prefill stager re-runs once per batched chunk (fused-EXL3). | `MAX_BATCH_SIZE = 1` → 0 % to users (§8). P10 banked batching as not recommended. | batching is enabled in the server | `[ ]` | [`…-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) |
+| **4** | 2× KV overshoot, ~0.83 GB at Qwen's 8192. | PARKED — a larger 1.22 GB giveback measured decode +0.4 %. | the condition in its brief (per-cell VRAM drops enough for N=2) | `[ ]` parked | [`…-row4-kv-overshoot-PARKED-BRIEF.md`](docs/2026-09-10-row4-kv-overshoot-PARKED-BRIEF.md) |
+| carried | P10 batching minors (STILL OPEN). **One is NOT batching-gated:** the sentinel-only cancel path is reachable at N=1 — a job QUEUED behind the running one, cancelled by `cancel_all()` at SIGTERM. | Coverage only; no defect known on any of them. | a shutdown/cancel bug is reported | `[ ]` / `[bug]` | [`…-carried-p10-batching-minors-BRIEF.md`](docs/2026-09-10-carried-p10-batching-minors-BRIEF.md) |
+| carried | `_finish` stop-string identity · `expert_sim.py` anchor gap · row **8** `tensor_align` | Reporting / a diagnostic tool / dead code — none changes the engine. | a client needs the stop string / someone quotes `expert_sim` small-budget absolutes | `[ ]` | see STILL OPEN |
+| carried | No resident-size checkpoint on disk. | A download, not code — but still the single largest usability change for the agent (streamed MoE runs ~0.56–0.86 tok/s). | — (do it whenever) | `[ ]` | [`…-carried-resident-checkpoint-BRIEF.md`](docs/2026-09-10-carried-resident-checkpoint-BRIEF.md) |
+
+**Closed 2026-09-11 (kept here until the next prune):** row **13** (`even-4` built, done condition met,
+0 % on the default config — [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md)) and
+row **25**'s Qwen A/B + remedy fix (`c256e18`).
 
 **Every open item now has a self-contained cold-pickup brief** (written 2026-09-10). They live in
 `docs/`, which is **GITIGNORED** — so the brief is the detail, and the row in this file is the
@@ -880,12 +894,12 @@ seen fail is not known to work.** Run it after any change to config defaults, no
 OPTIONAL by §0's own test. §0 is still the order. Read the `§0` column below before picking anything
 from this table.
 
-**Build ORDER among the open rows, decided 2026-09-10 (no §0 P-row is open, so this is the whole queue):** was **14 → 13 → 24**, then 6a-b / 3 / 5. **Row 14 CLOSED 2026-09-10**; **row 13's timed bar was then BUILT and MEASURED the same day, its Done condition REFUTED, and the row stays open narrowed**; **row 24 CLOSED the same day, REFUTED ON PRICE by an offline replay spike** (≤ +6.28 % with perfect foresight at ZERO cost; break-even 0.5–5.9 token-equivalents against a real re-entry price of ~29.3). So the head of the queue is now **13's remainder**, then 6a-b / 3 / 5. **Row 24's closure re-aimed 13:** the live defect is the decision window's WIDTH, not its repetition and not its placement — pooling ≥3 paired blocks decided correctly on 6/6 arms, while deciding LATER would have been wrong on two arms instead of one. **That width was then PRICED the same day and it PAYS: `even-4` — TRIAL becomes four alternating pairs of 4 drafting + 4 suppressed rounds, decided on the MEAN of the per-pair s/token ratios with the byte bar kept as the necessary condition — decides 6/6 against today's 5/6 for +16 suppressed rounds and the same 48 drafted tokens, worth +1.3–2.5 % mean over six arms. So 13's remainder is now a go/no-go on a designed, costed build, not an investigation: [`docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md).** Still §8-worth **0 %** until a user explicitly opts a MoE checkpoint into prompt lookup.
+**Build ORDER, set by the user 2026-09-11 — supersedes the 2026-09-10 order (14 → 13 → 24, then 6a-b / 3 / 5; rows 14, 13 and 24 are all closed): row 3 → row 25's MiniMax arm → row 18.** Everything else is not worth working now; the reasons and re-open conditions are in START HERE. The 2026-09-10 paragraph is in `git log -p -- todo.md`.
 
 | # | Item | §0 | Status | Cost | Why it sits here |
 |---|---|---|---|---|---|
 | **2** | Static check for unbound locals / import order | OPTIONAL | `[x]` **CLOSED 2026-09-10 — wired, and PROVEN to fail on the real shape** | ~30 min, CPU only | Two such bugs shipped GREEN and broke both MoE loads. **`ruff` does NOT catch the class — `pylint E0606` does.** `vaayu/` is clean today under it (2 false positives). The row narrows to wiring pylint + suppressing those two. See below. |
-| **13** | `[bug]` The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once (was: it is in expert bytes) | OPTIONAL | `[~]` **WINDOW WIDTH PRICED 2026-09-10 — the remainder is now a DECIDED, COSTED build (`even-4`), awaiting a go/no-go.** | window fix: ~half a day + 1 on-device A/B | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. **Cold-executable build brief for the remainder: [`docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md)** — read it before touching code; it carries the trap that makes the obvious implementation WORSE than today. Evidence: [`…-window-width-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md), [`…-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md), [`…-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) (the SHIPPED half). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
+| **13** | `[bug]` The spec gate's bar is measured in an UNREPRESENTATIVE window and evaluated once (was: it is in expert bytes) | OPTIONAL | `[x]` **CLOSED 2026-09-11 — `even-4` built, done condition met on device (see row 13).** Was: `[~]` **WINDOW WIDTH PRICED 2026-09-10 — the remainder is now a DECIDED, COSTED build (`even-4`), awaiting a go/no-go.** | window fix: ~half a day + 1 on-device A/B | **Build order: row 14 FIRST, then this, then row 24.** Row 14 is CPU-only and fixes a feature that IS exposed today (`ENABLE_KV_PERSIST` can be turned on but not aimed); this row is worth **0 %** unless a user explicitly opts a MoE checkpoint into prompt lookup. **Cold-executable build brief for the remainder: [`docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md`](docs/2026-09-10-row13-even4-window-BUILD-BRIEF.md)** — read it before touching code; it carries the trap that makes the obvious implementation WORSE than today. Evidence: [`…-window-width-price-RESULTS.md`](docs/2026-09-10-row13-window-width-price-RESULTS.md), [`…-timed-trial-SPIKE.md`](docs/2026-09-10-row13-timed-trial-SPIKE.md), [`…-timed-bar-DESIGN.md`](docs/2026-09-10-row13-timed-bar-DESIGN.md) (the SHIPPED half). | Opened 2026-09-07 by the P9 end-to-end arm. MiniMax-M2.7, thinking ON: gate measured acceptance 0.6875 against a 0.6259 break-even and decided `run` — and speculation still cost **−12.9 % total / −16.0 % decode**. **Self-contained brief: [`docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md`](docs/2026-09-07-row13-spec-gate-wallclock-BRIEF.md).** See below. |
 | **24** | `[x]` **CLOSED 2026-09-10 — REFUTED ON PRICE.** Re-evaluation is worth ≤ **+6.28 %** with perfect foresight at ZERO cost, and breaks even at **0.5–5.9** token-equivalents against a real re-entry price of **~29.3** | OPTIONAL | `[x]` **closed by an offline replay spike — CPU only, no GPU round, nothing shipped** | none spent | Opened 2026-09-10 by row 13's spike. MiniMax-M2.7 leaving its reasoning preamble for code reproduction: blocks 0-9 lost, blocks 10-14 ran **1.21-1.28x**. A TRIAL sampled in the preamble latches `off` and forfeits the win; one sampled in the code stretch latches `run` and keeps it through the next preamble. **NOT the SETTLED regime-latch item** (that was refuted on Qwen, which never emitted code at all). See below. |
 | **6a-b** | `head_bytes` is probably not a transient at all | OPTIONAL | `[ ]` | GPU round | Split out of row 6a on its own evidence when that row closed 2026-09-09. §8-bounded the same way P5 was: the reserve is floor-bound on flash, so tightening it buys admission headroom, not tok/s. See below. |
 | **3** | Non-EXL3 (fp16) prefix cache is disabled | OPTIONAL | `[ ]` | adapter or cache swap | Capability gap, not urgent: every on-device target is EXL3. Now has a real consumer — the server's largest lever is off for every fp16 model. |
@@ -1382,7 +1396,7 @@ sets one**: no default moved; (4) documented in `vaayu/server/README.md` AND
 
 ---
 
-# 25 · [~] NVMe APST A/B — MEASURED NULL on Qwen; the documented fix was inert (FIXED)
+# 25 · [~] NVMe APST A/B — MEASURED NULL on Qwen; the documented fix was inert (FIXED) — MiniMax arm is PRIORITY 2
 
 Opened 2026-09-11. **Question:** does disabling APST move Qwen3-235B's cold TTFT or decode tok/s through
 the real server (N=1, server-default config, flash)? Qwen is 47 % disk-stall; 47 % is NOT APST's cost —
@@ -1430,7 +1444,7 @@ run it.
 
 ---
 
-# 18 · [bug] `output_hidden_states=True` crashes the forward
+# 18 · [bug] `output_hidden_states=True` crashes the forward — PRIORITY 3 (2026-09-11)
 
 **Cold-pickup brief, with a ROOT-CAUSE diagnosis this row did not have:** [`docs/2026-09-10-row18-output-hidden-states-BRIEF.md`](docs/2026-09-10-row18-output-hidden-states-BRIEF.md) (gitignored). Two accumulation schemes collide — `vaayu_base.py:4397` allocates one empty sublist per layer, `:4667`/`:4680` fill sublists, but `:4766` does `all_hidden_states += (torch.cat(batch, 0),)`, which EXTENDS the outer list with a bare Tensor. `:4836` then cats a still-empty sublist. The `[0:-2]` at `:4834` is the hand-tuned compensation. **Line numbers below drifted: the crash is now `:4836`, not `:4594`.**
 
@@ -1593,7 +1607,7 @@ headroom and correctness of the peak form, never as tok/s.
 
 ---
 
-# 3 · [ ] The cross-turn prefix cache only works for EXL3 models
+# 3 · [ ] The cross-turn prefix cache only works for EXL3 models — PRIORITY 1 (2026-09-11)
 
 **Cold-pickup brief:** [`docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) (gitignored).
 
@@ -1614,6 +1628,24 @@ per-turn — the per-turn failure was the dangerous one, because `lookup()` POPS
 through `FP8DynamicCache(quantize=False)`. **Not urgent** — every on-device target is EXL3, and
 prefix reuse is this engine's biggest measured lever (136–377× TTFT), so the gap only bites a
 model nobody currently runs here. (found 2026-08-09)
+
+**RE-PRICED 2026-09-11 — PRIORITY 1. Cheaper than above, and testable today.**
+- **Likely fix: resolve `auto` → `bf16` for non-EXL3 too** (`resolve_kv_cache_mode`, `vaayu_base.py:1231-1233`).
+  `bf16` builds `FP8DynamicCache(quantize=False)`, which stores K/V in the model's SOURCE dtype (docstring
+  `vaayu_base.py:1280`) — so it is the ring buffer, not a dtype change, and has all three methods the pool
+  needs. The load-time warning already tells users `kv_cache_mode='bf16'` enables it. **Verify the source-dtype
+  claim on an fp16 load before relying on it.**
+- **"No fp16 model runs here" was wrong:** `Llama-3.2-1B-Instruct` is unquantized and on disk.
+- **Costs to measure BEFORE deciding:** (1) the ring buffer over-allocates by geometric doubling and the VRAM
+  planner charges it (`_kv_cache_is_bucketed`) — the 1B's derived `max_seq_len` (71981 sdpa) may drop; record
+  before/after. (2) CPU-compute and non-CUDA paths have never run this cache class. (3) Plan E's "bf16 decodes
+  slightly faster" was measured on EXL3 MoE only — re-check decode on the 1B.
+- **Done condition:** `PREFIX_CKPT=<1B> pytest tests/test_batch_prefix_equivalence.py` — which today FAILS at its
+  own premise assert on a non-EXL3 checkpoint — passes; a two-turn server run on the 1B shows `prefix_hit=true`
+  on turn 2; `max_seq_len` and decode tok/s before/after recorded; EXL3 resolution unchanged (both MoE targets
+  already resolve to `bf16`, so they must be byte-identical); suite green.
+- **§8:** no new knob (`KV_CACHE_MODE` exists); plumbed (`app.py` passes it); reachable at N=1 through the
+  server's defaults — this is a fix a user gets on the next start, for any non-EXL3 model.
 
 ---
 
