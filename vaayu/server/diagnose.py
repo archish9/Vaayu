@@ -68,10 +68,10 @@ def taxes(data: dict, cfg) -> list:
     if storage.get("apst_active"):
         us = storage.get("apst_ps_max_latency_us")
         out.append(
-            f"NVMe APST is active (ps_max_latency_us={us}). The drive drops into "
-            f"a low-power state between reads, and this engine's decode is "
-            f"disk-stall dominated. Fix: run scripts/vaayu_optimize_os.sh once "
-            f"(needs sudo).")
+            f"NVMe APST is active (ps_max_latency_us={us}). Minor: measured with "
+            f"no decode or TTFT cost here, because decode keeps the drive's idle "
+            f"gaps shorter than APST's sleep timeout. To disable it anyway: "
+            f"scripts/vaayu_optimize_os.sh (needs sudo).")
 
     for p in gpu.get("foreign_processes") or []:
         out.append(

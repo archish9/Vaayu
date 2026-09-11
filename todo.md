@@ -52,6 +52,7 @@ Pick from this list in order; the sections after it are the detail each entry po
 | # | pick this if | one line | state | cost | cold-pickup brief (gitignored) |
 |---|---|---|---|---|---|
 | **13** | — | **CLOSED 2026-09-11 — `even-4` BUILT, on-device done condition MET.** TRIAL alternates 4 drafting + 4 suppressed rounds (≥4 pairs, ≥48 drafted); `run` iff acceptance > byte bar AND mean pair s/token ratio < 1. MiniMax loser THINK=1 (HEAD said `run`, −19.7 %) now `off` 3/3, forced = −18.6 %; winner THINK=0 still `run`, +15.4 %. **The brief's 5/6→6/6 and +1.3–2.5 % did NOT reproduce** — priced against a ratio-only model of the gate; the real HEAD gate is 6/6 on the traces. Worth 0 % on the default config. | `[x]` closed | done | [`…-row13-even4-RESULTS.md`](docs/2026-09-11-row13-even4-RESULTS.md) |
+| **25** | — | **APST A/B on Qwen3-235B — MEASURED 2026-09-11: NULL.** 4 arms ABBA through the real server (N=1, default config): off vs on = t1 decode +0.8 %, t2 decode −0.6 %, TTFT −0.5 % / +1.5 % — inside replicate spread, signs disagree. Mechanism: only 2–5 idle gaps ≥ 100 ms (APST's primary timeout) per 361 s arm, ≤ 1 s total. **Found + FIXED: the documented remedy was inert** — `vaayu_optimize_os.sh` wrote a module param read only at controller init, and the boot check read the same value. Warning toned down to info. Left: MiniMax/dense unmeasured (one idle-sampler arm). | `[~]` | 1 arm left | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) |
 | **6a-b** | you have a GPU round and want correctness | `head_bytes` is probably not a transient at all — but the 70B has a 0.714 G floor it currently covers BY LUCK, so it cannot just be removed. The deliverable is an ATTRIBUTION of that floor. Buys admission headroom, not tok/s. | `[ ]` | GPU round | [`…-row6a-b-head-bytes-BRIEF.md`](docs/2026-09-10-row6a-b-head-bytes-BRIEF.md) |
 | **3** | you want capability, not speed | The cross-turn prefix cache is EXL3-only; `DynamicCache` lacks the three methods the pool needs. Prefix reuse is the server's largest lever (136–377× TTFT) and it is OFF for every fp16 model. No fp16 model runs here today. | `[ ]` | adapter or cache swap | [`…-row3-fp16-prefix-cache-BRIEF.md`](docs/2026-09-10-row3-fp16-prefix-cache-BRIEF.md) |
 | **23** | you are already on the batching path | The prefill stager re-runs once per BATCHED CHUNK (fused-EXL3 only). Two hypotheses, unmeasured; measure the cheap one first. **`MAX_BATCH_SIZE = 1`, so worth 0 % to users.** | `[ ]` | measurement first | [`…-row23-batched-chunk-stager-BRIEF.md`](docs/2026-09-10-row23-batched-chunk-stager-BRIEF.md) |
@@ -75,9 +76,9 @@ Carried-forward items have briefs too:
 new premise); `expert_sim.py`'s anchor gap is unexplained (do not quote its small-budget absolutes);
 and a batch of `MAX_BATCH_SIZE = 1`-gated minors from P10.
 
-**Two standing hardware taxes, warned at every boot, neither a code row:** NVMe **APST** is active
-(`scripts/vaayu_optimize_os.sh`, one-time, needs sudo) — Qwen is 47 % disk-stall, so this is the one
-hardware tax landing on the dominant cost — and `rustdesk` permanently holds 0.14 GiB of GPU.
+**Standing hardware tax, warned at every boot, not a code row:** `rustdesk` permanently holds 0.14 GiB
+of GPU. ~~NVMe APST~~ — **measured 2026-09-11 (row 25): NULL on Qwen at N=1**, not a tax on the dominant cost
+(the drive's idle gaps are < 100 ms, APST's timeout). The boot still warns about it; see row 25.
 
 **Before proposing ANY perf work, read SETTLED.** It is the list of things already built and
 refuted, with the number that killed each one.
@@ -353,7 +354,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1968 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 1972 passed, 12 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-11 after row 25's APST live-knob fix (1968 + 4). The 1968 was verified
 2026-09-11 after row 13's `even-4` window (1950 + 18; the 1950 was re-measured against a stashed
 HEAD the same day and MATCHED). The 1950 was verified
 2026-09-10 after row 13's timed spec bar (1906 + 44). The 1906 was verified the same day after
@@ -462,10 +464,10 @@ of it is `git log -p -- todo.md`. That is the standing convention — see `CLAUD
 **864 s of silence** for an 809-token answer — most of the reported "slowness" was this, not tok/s.
 The server already warns about the combination; nobody was reading the warning.
 
-**Still unfixed on this box, both warned at every boot, neither a code row:** NVMe **APST** is
-active (`scripts/vaayu_optimize_os.sh`, one-time, needs sudo) — Qwen is 47 % disk-stall, so this
-is the one hardware tax landing on the dominant cost; and `rustdesk` holds 0.14 GiB of GPU, below
-the 256 MiB refusal threshold but permanent, because budgets are sized once at load.
+**Still unfixed on this box, warned at every boot, not a code row:** `rustdesk` holds 0.14 GiB of GPU,
+below the 256 MiB refusal threshold but permanent, because budgets are sized once at load. **NVMe APST
+is no longer on this list — row 25 measured it NULL on Qwen at N=1 (2026-09-11)**, and found the
+script that was meant to disable it could not do so without a reboot (fixed).
 
 ---
 
@@ -1377,6 +1379,54 @@ sets one**: no default moved; (4) documented in `vaayu/server/README.md` AND
 `documentation/server.md`, `tests/test_engine_param_reachability.py` (new).
 [`docs/2026-09-10-A-server-config-reachability-RESULTS.md`](docs/2026-09-10-A-server-config-reachability-RESULTS.md)
 (**gitignored — this disk only**; everything load-bearing is restated above).
+
+---
+
+# 25 · [~] NVMe APST A/B — MEASURED NULL on Qwen; the documented fix was inert (FIXED)
+
+Opened 2026-09-11. **Question:** does disabling APST move Qwen3-235B's cold TTFT or decode tok/s through
+the real server (N=1, server-default config, flash)? Qwen is 47 % disk-stall; 47 % is NOT APST's cost —
+APST only bites when the drive idles past the kernel's timeouts (`apst_primary_timeout_ms=100` for states
+with total latency ≤ 15000 µs, `apst_secondary_timeout_ms=2000` for ≤ 100000 µs, this box).
+
+**Found before any arm ran — `scripts/vaayu_optimize_os.sh` cannot disable APST without a reboot.** It
+writes `/sys/module/nvme_core/parameters/default_ps_max_latency_us`, a plain `module_param` read only in
+controller init (verified in `drivers/nvme/host/core.c`: no `param_ops` set hook). The live path is
+`/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us` → `nvme_set_latency_tolerance` →
+`nvme_configure_apst` (0 = APST off). `vaayu/auto_model.py:31-40`'s detector checks the module param
+FIRST, so after the script it prints "APST: optimized (disabled)" against a drive that still has APST on.
+Its second candidate `/sys/class/nvme/<ctrl>/power/ps_max_latency_us` does not exist on this kernel
+(6.17). **Fix is owed whatever the A/B says** (script + detector), because the boot warning tells users to
+run it.
+
+- [x] Arms: warm-up (discarded, first touch) → on-1 → off-1 → off-2 → on-2 (ABBA), `BALLAST_GB=25` fixed,
+  prompt ~4179 tok, 2 turns, 128 tokens, temperature 0; each arm asserted the live tolerance at start and end.
+- [x] **Verdict: NULL on Qwen3-235B at N=1.** Means off vs on: turn-1 decode 0.7620 vs 0.7557 tok/s (+0.8 %),
+  turn-2 decode 0.6362 vs 0.6398 (−0.6 %), turn-1 TTFT 28.30 vs 28.44 s, turn-2 TTFT 25.95 vs 25.58 s. Replicate
+  spread ~1 %; signs disagree between turns. Same work in every arm (text identical, device reads 1604.1–1605.1 GB,
+  misses within 0.1 %). **Mechanism (100 Hz `/sys/block/nvme0n1/stat` sampler):** the drive is idle ~35 % of the
+  time, but in gaps < 20 ms; only 2–5 gaps ≥ 100 ms per ~361 s arm (≤ 1 s total), identical on and off — APST's
+  100 ms primary timeout almost never fires mid-generation. Bound ≤ ~0.1 %. **So APST is NOT a tax on the
+  dominant cost; "Qwen is 47 % disk-stall" was never evidence that it was.**
+  [`docs/2026-09-11-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md).
+- [ ] MiniMax-M2.7 (module-list forward, no stager — a different read pattern) and the 70B dense are
+  UNMEASURED. Cheapest check: ONE arm with the idle sampler (`plans/probes/apst_idle_sampler.py` +
+  `apst_idle_report.py`); a full A/B only if it shows material ≥ 100 ms idle.
+- [x] Toned down 2026-09-11 (user's call): the boot line is now `[Vaayu] … APST: active … no measured
+  decode/TTFT cost; optional to disable` — info, NOT `[Vaayu Warning]`, so it no longer lands in env.json's
+  `warnings` (`storage.apst_active` still records it structurally). `diagnose` still lists it (its tests pin
+  that) but says "Minor". `documentation/server.md`, `setup_and_speed_guide.md` and `README.md` lost the
+  "50–500 µs jitter over 80+ layers" claim; the guide now scopes the measurement to Qwen3-235B.
+- [x] Fix `vaayu_optimize_os.sh` and the detectors to use the live knob — **done 2026-09-11.** Live-verified by
+  toggling the knob (module param left at 100000 → check says disabled; back → warns); test fails 4/4 on the old read. One helper,
+  `vaayu.auto_model.nvme_apst_tolerance(block_dev)`, reads `/sys/block/<dev>/device/power/pm_qos_latency_tolerance_us`
+  (`device` resolves to the controller); both the boot check and `server/envinfo.py`'s `storage.apst_*` (→
+  `diagnose`) call it, so they cannot drift apart again. The script writes that file; the setup guide's verify
+  command reads it. **Also fixed on the way:** the boot check's `nvme.split("n")[0]` returned `''` for `nvme0n1`,
+  so its second candidate path was `/sys/class/nvme//power/…` and its warning named no drive. envinfo hardcoded
+  `nvme0`; it now reports APST active if ANY NVMe controller allows it. Test: `tests/test_nvme_apst.py`.
+- §8: no server knob (OS setting). The server's boot warning is the user-facing path, and it currently
+  points at a fix that does not take effect.
 
 ---
 

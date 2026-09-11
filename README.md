@@ -141,7 +141,7 @@ Run our system optimization script to tell the Linux kernel to stop throttling y
 sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
 ```
 * **I/O Scheduler**: Changes your NVMe block scheduler from `mq-deadline` (which wastes CPU reordering requests) to `none` (FIFO pass-through).
-* **APST Power Management**: Prevents the SSD from entering micro-sleep states between layer queries, eliminating 50-500μs of wakeup latency jitter.
+* **APST Power Management**: Stops the SSD from entering low-power states when idle. Optional: measured with no decode or TTFT cost, because generation keeps the drive's idle gaps shorter than APST's sleep timeout.
 
 ---
 
