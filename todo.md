@@ -1943,6 +1943,23 @@ only mode. (4) not built; step 1 unblocks step 2, step 4 unblocks the measuremen
 
 # 30 · [ ] Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode (added 2026-09-12) — sequence steps S1–S3
 
+**AVX2, stated plainly (asked 2026-09-12): phase 4 does NOT write AVX2 intrinsics.** It calls
+`torch.ops.aten._weight_int4pack_mm_for_cpu`, which is what emits AVX2/AVX-VNNI on this box (row 26 measured that
+kernel at **214 µs/expert at g128**). "CPU-AVX2 hybrid" in rows 26/28 is the NAME of the idea, not a kernel-writing
+commitment. A hand-written AVX2 kernel is only needed for formats torch has no CPU path for — MXFP4 (e2m1) and fp8,
+per this row's format table — and **the selected int4-g32 checkpoint avoids that**; what it does owe is a REPACK, since
+compressed-tensors' `pack-quantized` layout is not torch's `int4pack` layout.
+
+**NEW INTERACTION, 2026-09-12 — row 27 shipped, so the CPU is no longer idle, and phase 4's bar moved:**
+the default now runs **8 `SCHED_IDLE` spinners on the E-cores** plus **engine threads pinned to the P-cores**
+(`KEEP_AWAKE="auto"`, `PIN_ENGINE_THREADS=True`). Phase 4 wants **6 P-core threads** for expert GEMV — i.e. the same
+cores the engine is now pinned to. This is the CPU/io_uring core contention this row already names as phase 4's most
+likely miss, now with a concrete source. Two consequences: (1) the keep-awake baseline this row demands is **measured**
+as of today (Qwen3-235B +23.1 % decode through the server), so the hybrid must beat a materially faster baseline than
+the one row 29 projected against; (2) a hybrid arm must state what it did with `KEEP_AWAKE`/`PIN_ENGINE_THREADS` —
+leaving them at default while the CPU does expert work is a different experiment from turning them off, and the two
+must not be compared to each other.
+
 **CHECKPOINT SELECTED BY THE USER, 2026-09-12: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`.** This is the
 model S2/S3 are built against; the sweep below stays as the comparison it was chosen from.
 
