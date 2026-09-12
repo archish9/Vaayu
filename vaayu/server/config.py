@@ -114,6 +114,12 @@ AUTO_PREFIX_MATCH = True
 #
 # The only reason to set it: asking for a SHORTER context hands the difference
 # back to the expert cache, which is the decode bottleneck on both MoE targets.
+# It does NOT buy VRAM (row 31, 2026-09-12): the reserve is max(predicted peak,
+# 3.5 GiB floor) and already sits ON the floor at the derived 8192 on both MoE
+# models, so 4096 returns zero VRAM and does not lift the "Restricting VRAM cache
+# to the first 65/94 MoE layers" warning. On the RAM side it is the SAME knob as
+# PREFIX_SESSIONS -- only the product `sessions x max_seq_len` is visible
+# downstream, so 1 x 8192 and 2 x 4096 are literally one configuration.
 # The cost of getting it wrong is two-sided and both sides are loud, not silent:
 # above the box's S_max the load REFUSES (VramPlanError, naming S_max), and
 # above the derived operating point but under S_max the load succeeds while the
@@ -173,6 +179,17 @@ PREFIX_COMPRESS = None
 
 # Concurrent agent sessions the prefix pool must hold before the MoE expert
 # cache claims the rest. Lower = faster decode, fewer cached sessions.
+#
+# MEASURED COST OF GETTING IT WRONG (row 31, 2026-09-12, Qwen3-235B through this
+# server, prefix cache on). `prefix_sessions=1` against this default:
+#   one session, 2.7k context, two turns .... +5.7 % wall
+#   four sessions, 2.7k context ............. +1.9 %
+#   two sessions, 7.4k context .............. -8.9 %   <- the agentic case
+# The last one is why 3 stays. Reuse does not degrade: one session past the pool's
+# capacity it goes to ZERO (each re-store cascade-evicts the rest), and at 7.4k the
+# turn-2 match fell 7422/7517 -> 44/7517, TTFT 25.0 s -> 51.3 s. The engine warns
+# ("prefix pool over capacity") when that happens -- `prefix_hit` in requests.jsonl
+# does NOT: it is True on a 1-token match. See documentation/TUNING.md section 3b.
 PREFIX_SESSIONS = 3
 
 # "auto" picks bf16 on every checkpoint (row 3, 2026-09-11: it was fp16 off EXL3,

@@ -62,6 +62,12 @@ This is the single largest lever in the engine. It reuses the previous turn's KV
 and prefills only the diverged tail. Measured **TTFT 91 s → 9.6 s** at 2k-token
 sessions, and **332 s → 9.8 s** at 8k.
 
+Those two figures are the *over-budget* case — sessions that would otherwise be
+recomputed from scratch. An ordinary single-session second turn on a **streamed**
+MoE gains less, because the reused prefill still routes ~every expert per layer:
+measured on Qwen3-235B, a full hit is worth **−6.6 % of TTFT at 2.7k tokens** and
+**−53 % at 7.4k**. The benefit grows with context; it is never negative. Keep it on.
+
 It does nothing if your requests are unrelated to each other; the cache cannot hit
 what it has never seen.
 
@@ -135,6 +141,61 @@ process restart. Measured **TTFT 27.6 s → 3.0 s** on a restored session. Costs
 
 Not compatible with `kv_cache_mode="turboquant"` — the writer refuses that layout
 and says so. It works fine with `prefix_compress`.
+
+## 3b. `prefix_sessions` — leave it at 3 unless you run ONE agent at short context
+
+**Default:** `3`. It is not a limit on how many sessions you may open — it is how many
+full-length sessions the engine reserves RAM for **before** the MoE expert cache claims
+what is left:
+
+    expert cache ceiling = available RAM − 3.5 GiB − (prefix_sessions × max_seq_len × KV bytes/token)
+
+So lowering it hands RAM to the expert cache, which is the decode bottleneck on a streamed
+MoE. On Qwen3-235B the default reservation is **4.74 GB** of a ~20.7 GB budget; at
+`prefix_sessions=1` that falls to 1.58 GB and the expert cache grows 12.26 → 15.42 GB.
+
+**Measured on Qwen3-235B, through the server, prefix cache on** (`prefix_sessions=1` vs the
+default 3):
+
+| workload | effect of `prefix_sessions=1` |
+|---|---|
+| one session, 2.7k-token context, two turns | **+5.7 %** wall (decode +6.1 %, TTFT −9.2 %) |
+| four sessions, 2.7k-token context | +1.9 % |
+| two sessions, **7.4k-token context** | **−8.9 %** |
+
+The last row is the one to take seriously, and it is why the default stays at 3. Cross-turn
+reuse does **not** degrade gracefully: one session past the pool's capacity it goes to
+**zero**, because each recomputed session's re-store cascade-evicts the ones before it. At
+7.4k tokens the second turn's prefix match fell from **7422 of 7517 tokens to 44**, and TTFT
+went from 25.0 s back to 51.3 s — which costs far more than the extra expert cache pays.
+
+**Set `prefix_sessions=1` only if all of these hold:** one agent session at a time, contexts
+of a few thousand tokens, and no need for a second session's turn-2 to be fast. Then it is
+worth about +6 %.
+
+**How to tell you got it wrong** — the engine says so itself, at load and at run time:
+
+    [Vaayu] cross-turn prefix cache ENABLED: 2.03 GB budget (free RAM 5.79 GB - 3.76 GB reserve)
+    [Vaayu] WARNING: prefix pool over capacity — evicting under budget pressure. Budget 2.04 GB holds 3 sessions
+
+If that WARNING appears, your reuse is gone, not reduced. **Do not trust `prefix_hit` in
+`requests.jsonl` for this** — it is `True` even for a 1-token match, so it reads as a HIT in
+exactly the runs where reuse has collapsed. Read the `[Vaayu-Prefix] HIT … match_len=X/Y`
+line instead: what matters is X, not that it says HIT.
+
+## 3c. `max_seq_len` — lowering it does NOT buy VRAM
+
+**Default:** `None` (derive). It is tempting to ask for a shorter context to free VRAM. It
+does not work: the VRAM reserve is `max(predicted peak, 3.5 GiB floor)` and on both on-device
+MoE models it already sits **on the floor** at the derived 8192, so requesting 4096 returns
+**zero** VRAM and does not lift the `Restricting VRAM cache to the first 65/94 MoE layers`
+warning.
+
+What a shorter context *does* do is shrink the same RAM reservation `prefix_sessions` scales —
+and only as the product. `prefix_sessions=1 × 8192` and `prefix_sessions=2 × 4096` are
+**literally the same configuration**. So if you want more expert cache, use §3b's table and
+decide how many sessions you are giving up; halving the context is just another way of paying
+the same price, and it also refuses prompts you may actually want to send.
 
 ## 4. `kv_cache_mode` — leave on `"auto"`
 

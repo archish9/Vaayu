@@ -87,7 +87,7 @@ download" cost estimate on row 30 is stale.
 | ~~**28**~~ | **CLOSED 2026-09-12 — the new non-EXL3 model does NOT rescue the CPU-AVX2 hybrid; it undercuts it. `deepseek-ai--DeepSeek-V4-Flash-0731` (155.42 GiB) is fp4 **4.2500 bpw**, not 8-bit, and Vaayu CANNOT LOAD IT** (transformers 5.5.4 has no `deepseek_v4`; repo ships no HF remote code; TileLang fp4/sparse-attn/Sinkhorn kernels absent). Hybrid projected **+4.5–5.0 %** over row 27's baseline vs row 26's +6.8 % Qwen / +22.0 % MiniMax → **close the CPU-hybrid idea.** | Real prize found instead: **258 slots/token × 12.750 MiB = 3.212 GiB/token vs Qwen's 8.285** → projected **2.1–2.3 tok/s (~2.5–2.7× Qwen's measured 0.85)**, from architecture (top-6 of 256 over 43 layers), not from the CPU. Unblocked only by an architecture PORT (weeks). Its fp8 sibling build would cost ~43 % of that — row 26's bytes rule, reproduced non-EXL3. | `[x]` | done | [`…-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md`](docs/2026-09-12-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md) · row **28** below |
 | ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
 | ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
-| **31** | **Stop spending the expert RAM cache on context nobody is using.** `derive_expert_ceiling` = `available − 3.5 GiB − (PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes/token)`, so the KV reservation is subtracted from the expert cache. Both terms are ALREADY server knobs. Sweep them. | **Zero code, zero download, today.** The reservation costs Qwen **4.74 GB** and MiniMax **6.24 GB** of a 15.2 GB budget at the defaults (3 × 8192). An on-device sweep already on record (`vaayu_base.py:286-291`) measured **−25 % warm wall** from 8.5 → 18 GiB of ceiling. Two-sided: prefix reuse is worth 4.44× and collapses to ZERO one session past capacity (Plan I), so this is a single-agent-vs-fan-out trade, not a free win. Price it offline first with `vaayu/expert_sim.py`. | `[ ]` **priority 1** | half a day | [`…-speedup-options-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.1 · row **31** below |
+| **31** | **Stop spending the expert RAM cache on context nobody is using.** `derive_expert_ceiling` = `available − 3.5 GiB − (PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes/token)`, so the KV reservation is subtracted from the expert cache. Both terms are ALREADY server knobs. Sweep them. | **Zero code, zero download, today.** The reservation costs Qwen **4.74 GB** and MiniMax **6.24 GB** of a 15.2 GB budget at the defaults (3 × 8192). An on-device sweep already on record (`vaayu_base.py:286-291`) measured **−25 % warm wall** from 8.5 → 18 GiB of ceiling. Two-sided: prefix reuse is worth 4.44× and collapses to ZERO one session past capacity (Plan I), so this is a single-agent-vs-fan-out trade, not a free win. Price it offline first with `vaayu/expert_sim.py`. | `[x]` **CLOSED 2026-09-12 — defaults STAY** | done | [`…-speedup-options-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.1 · row **31** below |
 | **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). **S1 DONE 2026-09-12; checkpoint chosen: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`** (compressed-tensors int4 **g32**, 45.82 GiB, 0.85 GB/token = 5.22× lighter than today). **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. Blocker refined 2026-09-12: transformers **does** merge per-expert keys into the fused 3D params (`conversion_mapping.py`, `qwen3_next` → `qwen2_moe`) — but only for `.weight`, and this checkpoint stores `weight_packed`/`weight_scale`, which no quantizer converter binds. **That binding is S2's first task.** | `[ ]` **priority 2** | 2–4 days — **NO download, the checkpoint is on disk** | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[ ]` **priority 3** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
@@ -155,7 +155,7 @@ lets each step start.** Every step names a stop rule. Do not start a step whose 
 |---|---|---|---|---|---|
 | ~~**S0**~~ **DONE** | **Keep one CPU core awake during decode.** `SCHED_IDLE` spinner on a detected E-core + P-core affinity for engine threads. Knob + server A/B + MiniMax/70B/prefill checks. | **27** | ~1 day | ~~none — start here~~ **CLOSED 2026-09-12, +23.1 % through the server, shipped ON.** Applied to every model. | A/B through the server shows < 5 % → close it |
 | ~~**S1**~~ **DONE** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
-| **T1** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — the KV reservation is subtracted from the expert RAM cache by `derive_expert_ceiling`. Price it offline with `expert_sim.py` first, then confirm the chosen point on device. Ends with a measured default + a `documentation/TUNING.md` paragraph. | **31** | **half a day, zero code** | **none — start here.** Applies to whatever model S2 lands on too. | best point under +5 % on a realistic two-turn agentic session (prefix cache ON) → document the default and close |
+| ~~**T1**~~ **DONE** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — **CLOSED 2026-09-12: both defaults STAY.** The +5.7 % a single session at 2.7k context wins is an **−8.9 %** loss at 7.4k with 2 sessions, where reuse collapses 7422/7517 → 44/7517 tokens. `MAX_SEQ_LEN` pays ONCE, not twice (the VRAM reserve is floor-bound). | **31** | done | — | fired in substance: the point that wins the two-turn session loses the workload the server exists for |
 | **S2** | **Make a non-EXL3 int4 MoE load, stream and measure.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) | garbage output → fix numerics before ANY perf work |
 | **T2** | **Truncate `top_k` at decode.** One clamp at `vaayu_base.py:3233` PLUS the same clamp written into each MoE module's own `top_k` by detection (contract-routed models ignore the engine's `k`; renormalisation already exists everywhere), `DECODE_TOP_K` knob, ppl sweep at k ∈ {8,6,5,4} on both MoE models. **Regime-independent** — do it whether or not S2 lands. | **33** | ~1 day + a ppl sweep | none, but it is worth more on a model you are keeping → after S2's verdict | k=6 costs more quality than row 32's 3.0 bpw build at the same speed-up → prefer 32 and close |
 | **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
@@ -591,6 +591,24 @@ script that was meant to disable it could not do so without a reboot (fixed).
 Live items left behind by rows that closed and were pruned. **All of them are OPTIONAL by §0's
 test — none can make Vaayu faster.** No §0 P-row is open.
 
+- **[bug] `prefix_hit` in `requests.jsonl` cannot detect a reuse COLLAPSE** (found by row 31,
+  2026-09-12). It is `True` for a 1-token match, so an arm whose turn-2 match had fallen from
+  **7422/7517 tokens to 44** still logged `prefix_hit: true` on every request — row 31's fan-out
+  arms read as "4/4 HITs" in the exact configurations where reuse was provably gone, and only the
+  engine's `[Vaayu-Prefix] HIT … match_len=X/Y` stdout line told the truth. **Anyone tuning the
+  prefix pool from `requests.jsonl` today is reading a metric that cannot fail.** The fix is small
+  and known: the engine already computes `match_len` at the point it logs it — carry it (and the
+  prompt length) into the request row so the ratio is visible. Not fixed on the spot: it is a
+  reporting change, and row 31 did not need it once the stdout line was read. **Reachable at N=1,
+  affects every user who looks at the logs.**
+- **[ ] `documentation/TUNING.md` §1's prefix-cache headline describes a different case than it
+  reads as** (row 31, 2026-09-12). `TTFT 91 s → 9.6 s at 2k-token sessions` and `332 s → 9.8 s at
+  8k` are the OVER-BUDGET recompute-cascade case (Plan I, K=3 × 7.7k). Ordinary single-session
+  reuse on a streamed MoE is worth far less, because the reused prefill still routes ~every expert
+  per layer: measured on Qwen3-235B, **−6.6 % of TTFT at 2.7k tokens and −53 % at 7.4k**. A
+  qualifying paragraph with those two numbers was added beneath it; the original figures were left
+  standing because they are correct for the case they describe. Anyone re-measuring prefix reuse
+  should state which of the two regimes they are in.
 - **[ ] No resident-size checkpoint on disk.** The server's "usable now" target needs a ~14B-class
   coder at 4–4.5 bpw EXL3 (~8 GB weights, against a derived ~10.5 GiB budget). Nothing of that size
   is on this box — only the two huge MoEs, the 70B dense, and the 1B/1.5B tinies. Until then the
@@ -2183,7 +2201,83 @@ can pay more cuts bytes per token or raises delivered GB/s.**
 
 ---
 
-# 31 · [ ] Stop spending the expert RAM cache on context nobody is using — PRIORITY 1, zero code (added 2026-09-12)
+# 31 · [x] Stop spending the expert RAM cache on context nobody is using — CLOSED 2026-09-12: defaults STAY, the trade is now measured and documented
+
+**VERDICT: `PREFIX_SESSIONS = 3` and `MAX_SEQ_LEN = None` both STAY. No default moved.** The lever is real
+and it is NOT free, and the arm that made it look free was the unrepresentative one. Measured on
+Qwen3-235B THROUGH THE SERVER, prefix cache on, `MemoryMax=29G`, `BALLAST_GB=25`, 4 two-turn arms + 5
+fan-out arms, all `exit=0`, identical text across arms (trap 6):
+
+| workload | `PREFIX_SESSIONS=1` vs default |
+|---|---|
+| one session, 2.7k context, two turns | **+5.7 %** wall (decode +6.1 %, TTFT −9.2 %) |
+| four sessions, 2.7k context | +1.9 % |
+| **two sessions, 7.4k context** | **−8.9 %** |
+
+The third row is the workload `CLAUDE.md` §0 describes, and it decides the row: at 7.4k the turn-2 prefix
+match collapsed **7422/7517 → 44/7517** and TTFT went **25.0 s → 51.3 s**, which costs far more than the
+3.2 GB of extra expert cache pays. Plan I's *collapses to ZERO, not proportionally* reproduced exactly,
+with the engine's own `WARNING: prefix pool over capacity … Budget 1.49 GB holds 1 session`.
+
+**Full two-turn table (2.7k context, medians of 2 reps, baseline spread 0.7 % decode / 1.4 % TTFT):**
+
+| arm | expert budget | cap/layer | VRAM layers | t1 tok/s | t2 tok/s | RAM hit | wall |
+|---|---|---|---|---|---|---|---|
+| `3×None` **default** | 12.26 G | 11 | 65/94 | 0.7558 | 0.6364 | 49.9 % | 143.0 s |
+| `3×4096` | 14.49 G | 13 | 65/94 | +2.5 % | +2.8 % | 53.7 % | +2.6 % |
+| `1×None` | 15.42 G | 13 | 65/94 | **+6.1 %** | +5.2 % | 53.7 % | **+5.7 %** |
+| `1×4096` | 16.16 G | 14 | 65/94 | **+6.7 %** | +5.9 % | 55.5 % | **+6.4 %** |
+
+**Why a prefix hit is worth so little at 2.7k and so much at 7.4k (−6.6 % vs −53 % of TTFT):** the expert
+sweep SATURATES at either size (95 new positions × top-8 already exceeds 128 experts/layer), so reuse
+only saves the attention/GEMM work, which grows with context while the expert bytes do not. **On a
+streamed MoE, a second turn's TTFT is waiting on the expert cache, not the prefix cache.**
+
+**§8:** (1) no new knob — both existed; the measured cost of getting each wrong is now IN
+`vaayu/server/config.py` beside the default. (2) plumbed already. (3) reachable at N=1, measured there.
+(4) shipped: `documentation/TUNING.md` §3b (`prefix_sessions`) and §3c (`max_seq_len`), plus the
+`PREFIX_SESSIONS` row in `vaayu/server/README.md`.
+
+**MiniMax was NOT re-measured on device** — deliberately, because no default moved and the Phase-0
+projection puts its gains strictly BELOW Qwen's (+8.2 % vs +13.2 % at `1×None`) against the same
+collapse risk, so the conservative verdict covers it. Anyone who wants `PREFIX_SESSIONS=1` shipped for
+MiniMax owes the 7.4k fan-out arm on that checkpoint first.
+
+**PHASE 0 DONE 2026-09-12 (offline pricing, no GPU, no load — `plans/probes/row31_price.py`; detail
+[`…-row31-prefix-reservation-RESULTS.md`](docs/2026-09-12-row31-prefix-reservation-RESULTS.md)).** Five findings, and
+two of them change what this row is:
+
+1. **`MAX_SEQ_LEN=None` IS 8192 on both MoE models** (the boot log derives it: *largest context whose predicted peak
+   fits the 3.50 GiB reserve floor, capped at s_max=65536*), so 3 of the 9 grid points are duplicates of `8192`.
+2. **The two knobs are ONE knob — the PRODUCT `sessions × max_seq_len × kv_bytes/token`.** Nothing downstream sees the
+   factors, so `1 session × 8192` and `2 × 4096` are literally the same arm. The 9-point grid holds **5 distinct cache
+   configurations** (Qwen budgets 12.21 / 13.79 / 14.58 / 15.36 / 16.15 GB).
+3. **`MAX_SEQ_LEN` does NOT pay twice — this row's VRAM half is REFUTED offline.** The VRAM reserve is
+   `max(predict_peak_vram(S), 3.5 GiB floor)` and the log shows it sitting exactly ON the floor at 8192
+   (`reserve=3.50 GiB of which KV 1.47 GiB`). Under flash (`score_elem_bytes = 0`, the kernel the server picks) the
+   only S-dependent term left is KV capacity, so `reserve(4096) = reserve(8192) = 3.50 GiB` — **halving the context
+   returns ZERO VRAM, and Qwen's `Restricting VRAM cache to the first 65/94 MoE layers` does not move.** Same shape as
+   P5's SETTLED verdict, on a knob P5 never touched.
+4. **Projected decode (simulator's miss-rate RATIO applied to the MEASURED device-busy):** Qwen `2×None` +7.8 %,
+   `3×4096` +13.2 %, `1×None` **+13.2 %**, `1×4096` **+18.5 %**; MiniMax +4.0 / +6.0 / **+8.2** / **+10.6 %**. The gain
+   is QUANTISED by the derived per-layer cap, not smooth in bytes (Qwen's 14.58 GB and 15.36 GB both derive cap 13).
+5. **The `expert_sim` anchor gap (STILL OPEN) now has a candidate cause:** the simulator's absolute bytes/token match
+   Qwen to **+2.5 %** but over-state MiniMax by **+57 %**, and the simulator models the **RAM tier only** while the VRAM
+   expert tier — *unrestricted* on MiniMax (working set 4.40 GB fits), *restricted to 65/94 layers* on Qwen — serves
+   part of the same demand stream. Right direction, right order of magnitude. Not proven; recorded.
+
+**Validated before being trusted:** the pricing script reproduces the boot log's own ceiling (12.21 vs 12.20 GB Qwen,
+10.92 vs 10.92 MiniMax), its KV term (1.47 / 1.94 GiB at 8192) and `expert_sim`'s own recorded 44 % Qwen hit rate.
+
+**TRAP found on device, costs an arm if missed:** raising the ceiling raises RSS, so **every arm needs a BIGGER
+cgroup, and the same one**. The first attempt ran `MemoryMax=22G` (row 27's figure) and BOTH arms were **OOM-killed
+(exit 137)** — the `PREFIX_SESSIONS=1` arm during its LOAD, because its arena is ~3.2 GB larger by construction. The
+engine sizes from host `available`, which the cgroup does not constrain. Re-run at a uniform **29G**.
+
+**Also measured on device, and it reframes TTFT for this row:** a turn-2 prefix HIT reused **2732 of 2827 tokens** yet
+TTFT stayed **24.4 s** — the 95 remaining positions still route ~every expert per layer (95 × top-8 = 760 slots vs 128
+experts → saturation), ≈142 GB at 6.3 GB/s. **Prefix reuse saves attention work, not expert streaming.** So on a
+streamed MoE the expert cache, not the prefix cache, is what a second turn's TTFT is waiting on.
 
 `derive_expert_ceiling` (`vaayu/vaayu_base.py:302`) is literally
 `available_RAM − 3.5 GiB − (prefix_sessions × max_seq_len × kv_bytes_per_token)`. **The expert RAM cache is paid for
@@ -2228,9 +2322,9 @@ C-state residency, **not** frequency, so `performance` + EPP `performance` is a 
 compose with it. `/sys/block/nvme0n1/queue/scheduler` is already `none`, so that part of
 `scripts/vaayu_optimize_os.sh` is done.
 
-- [ ] Sweep `PREFIX_SESSIONS ∈ {1,2,3}` × `MAX_SEQ_LEN ∈ {4096, 8192, None}`, one model, same day, `BALLAST_GB` fixed
-- [ ] Confirm the chosen point on a realistic **two-turn** agentic session with the prefix cache ON (the server default)
-- [ ] Land the measured default + a `documentation/TUNING.md` paragraph naming the trade
+- [x] Sweep `PREFIX_SESSIONS ∈ {1,2,3}` × `MAX_SEQ_LEN ∈ {4096, 8192, None}` — priced offline (9 points → **5 distinct**), 4 run on device
+- [x] Confirmed on a two-turn session at BOTH 2.7k and 7.4k tokens, prefix cache ON — and the 7.4k arm is the one that reversed the verdict
+- [x] Landed: default UNCHANGED (measured), `documentation/TUNING.md` §3b + §3c, `config.py` comments, `server/README.md`
 
 **Stop rule: best point under +5 % on that two-turn session → document the default and close the row.**
 
