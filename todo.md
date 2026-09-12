@@ -72,7 +72,7 @@ port-gated prize (~2.5–2.7× Qwen's decode from 2.58×-lighter tokens). **Row 
 | ~~**28**~~ | **CLOSED 2026-09-12 — the new non-EXL3 model does NOT rescue the CPU-AVX2 hybrid; it undercuts it. `deepseek-ai--DeepSeek-V4-Flash-0731` (155.42 GiB) is fp4 **4.2500 bpw**, not 8-bit, and Vaayu CANNOT LOAD IT** (transformers 5.5.4 has no `deepseek_v4`; repo ships no HF remote code; TileLang fp4/sparse-attn/Sinkhorn kernels absent). Hybrid projected **+4.5–5.0 %** over row 27's baseline vs row 26's +6.8 % Qwen / +22.0 % MiniMax → **close the CPU-hybrid idea.** | Real prize found instead: **258 slots/token × 12.750 MiB = 3.212 GiB/token vs Qwen's 8.285** → projected **2.1–2.3 tok/s (~2.5–2.7× Qwen's measured 0.85)**, from architecture (top-6 of 256 over 43 layers), not from the CPU. Unblocked only by an architecture PORT (weeks). Its fp8 sibling build would cost ~43 % of that — row 26's bytes rule, reproduced non-EXL3. | `[x]` | done | [`…-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md`](docs/2026-09-12-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md) · row **28** below |
 | ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
 | ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
-| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). Phase 0 is a **< 1 h** load probe, no download. **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. New blocker found 2026-09-12: **disk keys (`\.experts\.(\d+)\.`) and module layout (fused 3D in transformers 5.5.4) are different questions and they disagree.** | `[ ]` **priority 2** | < 1 h, then 2–4 days + download | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
+| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). **S1 DONE 2026-09-12; checkpoint chosen: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`** (compressed-tensors int4 **g32**, 45.82 GiB, 0.85 GB/token = 5.22× lighter than today). **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. Blocker refined 2026-09-12: transformers **does** merge per-expert keys into the fused 3D params (`conversion_mapping.py`, `qwen3_next` → `qwen2_moe`) — but only for `.weight`, and this checkpoint stores `weight_packed`/`weight_scale`, which no quantizer converter binds. **That binding is S2's first task.** | `[ ]` **priority 2** | < 1 h, then 2–4 days + download | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` priority 3 | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
 selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
 
@@ -1942,6 +1942,93 @@ only mode. (4) not built; step 1 unblocks step 2, step 4 unblocks the measuremen
 ---
 
 # 30 · [ ] Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode (added 2026-09-12) — sequence steps S1–S3
+
+**CHECKPOINT SELECTED BY THE USER, 2026-09-12: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`.** This is the
+model S2/S3 are built against; the sweep below stays as the comparison it was chosen from.
+
+**What it is, measured (not from its model card):** despite the "AWQ" in the name its `quant_method` is
+**`compressed-tensors`**, format `pack-quantized`, `group_0: bits=4 strategy=group group_size=32 sym=True
+targets=['Linear']`. 512 experts × 48 MoE layers, top_k **10**, **1.769 MB/expert** (1.688 MiB), **45.82 GiB** in 10
+shards / 226,472 tensors, **0.85 GB/token** — **5.22× lighter per token than Qwen3-235B-EXL3's measured 4.43**.
+C1 PASS (`qwen3_next` → `Qwen3NextConfig`), C4 PASS (225,792 keys match `\.experts\.(\d+)\.`, 512 ids, 48 layers).
+
+**Four consequences of this choice, to carry into S2/S3 — none is a blocker, all are re-pricings:**
+1. **`pip install compressed-tensors` is required** (C2 dispatch fails without it: `ImportError: compressed_tensors is
+   not installed`). It lands in `requirements.txt` in the commit that makes the model load.
+2. **The binder gap is S2's first real problem.** transformers 5.5.4 merges per-expert disk keys into
+   `Qwen3NextExperts`'s fused 3D params via `conversion_mapping.py` (`qwen3_next` → `qwen2_moe`), but that converter
+   matches **`.weight`**, and this checkpoint stores `weight_packed` / `weight_scale` / `weight_shape`. The
+   compressed-tensors quantizer inherits `get_weight_conversions() → []`, so nothing maps the packed expert tensors
+   onto the fused parameter. Expect to write that binding; it is the "load-path bugs, not tuning" this row warns about.
+3. **S3's CPU kernel is NOT blocked by g32 — verified on device 2026-09-12:**
+   `torch.ops.aten._weight_int4pack_mm_for_cpu` accepts `group_size` 32/64/128/256 on torch 2.11.0+cu130 (checked with
+   the correct `[K/gs, N, 2]` scale layout; an earlier probe failed only because the scales were shaped wrong). BUT
+   row 26's **214 µs/expert was measured at g128**, g32 carries 4× the scales, and compressed-tensors' pack layout is
+   not torch's int4pack layout — a repack is needed either way. **Re-measure that number, do not inherit it.**
+4. **It is the heaviest of the four candidates**, chosen with that known: 0.85 GB/token vs 0.78 for
+   `RedHatAI/…w4a16` and `Intel/…AutoRound` (+9 %), 45.82 GiB vs 40.87 / 39.48 (+12 %) — and vs row 29's assumed
+   0.80 GB/token / 41.1 GB, which produced the **18.1 tok/s** projection. More bytes AND a bigger footprint against a
+   fixed ~8.5 GB expert-cache ceiling both push the same way, so **expect below 18.1 tok/s and re-derive it from the
+   first measured run rather than quoting the projection.**
+
+**Smoke rung unchanged and still recommended first:** `RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16`
+(15.52 GiB, 0.93 GB/token, int4 g128, same compressed-tensors family) — it hits the same binder problem for a quarter
+of the download. If you would rather smoke on the same group size as the target, any 30B compressed-tensors g32 build
+does the job equally well.
+
+**S1 CANDIDATE SWEEP, 2026-09-12 — Qwen3-Next-80B-A3B-Instruct int4 located and probed (metadata only, no
+download). Probe: `plans/probes/row30_s1_probe.py <repo_id>` (gitignored — it re-derives all of this in ~1 min/repo).**
+
+| repo | format | C2 dispatch | footprint | GB/token |
+|---|---|---|---|---|
+| `unsloth/Qwen3-Next-80B-A3B-Instruct-bnb-4bit` | bitsandbytes NF4 (blk 64) | **PASS, `validate_environment() → OK`** (bitsandbytes already installed) | 39.23 GiB | **0.78** |
+| `RedHatAI/Qwen3-Next-80B-A3B-Instruct-quantized.w4a16` | compressed-tensors int4 **g128** sym | needs `pip install compressed-tensors` | 40.87 GiB | **0.78** |
+| `Intel/Qwen3-Next-80B-A3B-Instruct-int4-AutoRound` | auto-round 4-bit **g128** | needs `pip install auto-round>=0.5` | 39.48 GiB | 0.78 |
+| `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` (34k dl) | compressed-tensors **g32** | needs `pip install compressed-tensors` | 45.82 GiB | 0.85 |
+| smoke rung: `RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16` | compressed-tensors int4 g128 | same pip | **15.52 GiB** | 0.93 |
+
+All pass **C1** (`qwen3_next` → `Qwen3NextConfig`; 30B: `qwen3_moe`) and **C4** (221k–442k keys matching
+`\.experts\.(\d+)\.`, 512 expert ids over 48 layers; 30B: 55k / 128 / 48). **Row 29's projection is confirmed by the
+real checkpoints** — it assumed 41.1 GB / 0.80 GB per token, they measure 39–41 GiB / 0.78, i.e. **5.7× lighter per
+token than Qwen3-235B-EXL3's measured 4.43 GB/token.**
+
+**CORRECTION to this row's "disk keys and module layout disagree".** Half of that is wrong and it changes S2:
+transformers 5.5.4 DOES ship the merge — `transformers/conversion_mapping.py`'s `_MODEL_TO_CONVERSION_PATTERN` maps
+`qwen3_next` AND `glm4_moe` → `qwen2_moe`, whose `WeightConverter` folds `mlp.experts.*.gate_proj.weight` +
+`up_proj.weight` into the fused 3D `mlp.experts.gate_up_proj` (`MergeModulelist`/`Concatenate`). **But it matches
+`.weight`.** compressed-tensors / GPTQ / AutoRound store `weight_packed`+`weight_scale` (or `qweight/scales/qzeros/
+g_idx`), and **all three quantizers inherit `get_weight_conversions() → []`** (enumerated: only bitnet, bnb_4bit,
+bnb_8bit, finegrained_fp8, fouroversix, fp_quant, metal, mxfp4, quark, sinq, torchao override it). So their packed
+expert tensors have **no target to bind to** — that, not the fused layout itself, is S2's real blocker.
+**bnb-4bit is the one family where both halves exist** (`Bnb4bitDeserialize` + `.weight`-shaped expert keys).
+
+**Recommendation, two tracks:** (a) to get a non-EXL3 MoE LOADING, take `unsloth/…bnb-4bit` — no new package, complete
+native path; caveat: NF4 block-64 is **not** the int4-g128 row 29's CPU kernel was priced on (214 µs/expert), and it
+carries 442k tensors (6 per projection) for the streaming index to chew. (b) for the S3 hybrid itself, take
+`RedHatAI/…w4a16` (int4-g128, exactly row 29's assumption) and pay one pip install plus the expert-binder work.
+**Run S2 on the 30B RedHat rung first (15.5 GiB) to hit the binder problem cheaply before a 40 GiB download.**
+
+**S1 data point, 2026-09-12 — `QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix` REJECTED (metadata only, no download).**
+Asked for by the user; probed against the playbook's five contracts.
+- **C1 PASS** — `glm4_moe` → `Glm4MoeConfig` in transformers 5.5.4.
+- **C2 FAIL, measured** — `quant_method: "gptq_marlin"` → `ValueError: Unknown quantization type`; rewritten to
+  `"gptq"` → `NameError: name 'QuantizeConfig' is not defined` (needs **gptqmodel**, which is NOT installed and NOT in
+  `requirements.txt`; `auto_gptq` absent too). Its mixed-precision `dynamic` block
+  (`+:model[.]layers[.]([0-4]|4[4-6])[.].*: bits 8`) is a GPTQModel extension transformers' `GPTQConfig` does not model.
+- **C3 MISMATCH** — repo ships **no remote code, no `auto_map`**, so it rides built-in `glm4_moe`, and 5.5.4 builds
+  `Glm4MoeNaiveMoe`: fused 3D `nn.Parameter`s (`gate_up_proj [128, 2816, 4096]`, `down_proj`), **no `nn.Linear` for
+  GPTQ's QuantLinear to replace**, and a FUSED `gate_up` where the disk has separate `gate_proj`/`up_proj`.
+- **C4 PASS** — 70,656 keys match `\.experts\.(\d+)\.`, 128 expert ids, layers 1–46 (46 = the `num_nextn_predict_layers`
+  MTP layer, unused by `Glm4MoeForCausalLM`). Streaming index would be satisfied.
+- **Geometry, exact, read from the shard safetensors headers:** 4-bit expert **9.027 MB** (8.609 MiB, vs row 29's
+  assumed 8.77 MiB ✓); 8-bit expert (layers 1–4, 44–45) **17.745 MB**; **routed 3.67 GB/token** (top-8 over 45 MoE
+  layers) vs row 29's assumed 3.31 (+11 %); footprint **66.02 GiB** vs 52.9 (+25 %); plus an **unquantized fp16 shared
+  expert, 34.60 MB/layer × 45 = 1.56 GB**, touched every token. Qwen3-235B measures 4.43 GB/token today, so this build
+  is only ~1.2× lighter than what already runs here — **row 29's 7.3 tok/s was priced on a pure-int4 52.9 GB build at
+  85 % hit and must be re-derived for this one, not inherited.**
+- **Verdict:** stay with Qwen3-Next-80B-A3B int4 (smoke rung Qwen3-30B-A3B int4). The C3 fused-3D problem applies to
+  those too — it is this row's known blocker — but they do not also carry GLM's C2 failure. A **pure int4** GLM-4.5-Air
+  build (`quant_method` plain `gptq`/`awq`, no `Int8Mix`) would drop the +11 % bytes and one of the two blockers.
 
 **Source:** the user, 2026-09-12, choosing `Qwen3-Next-80B-A3B-Instruct` int4 to test CPU+GPU token generation.
 **Durable copy of the plan summary is this row.** Detail:
