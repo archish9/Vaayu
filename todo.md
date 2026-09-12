@@ -52,8 +52,14 @@ reason given.** Pick from the PRIORITY table first. The sections after this one 
 **All three PRIORITY rows are CLOSED as of 2026-09-11 (3, 25, then 18).** Row **26** was added the same day at the
 user's request (a measurement, no engine code) and **CLOSED the same day** — and it opened row **27**, which is
 **the first open row since 2026-09-10 that measurably makes Vaayu faster: +27 % decode tok/s on Qwen3-235B** (keep one
-CPU core awake during decode). Row 27 is the one open PRIORITY row. Beyond it, what remains is the NOT-worth-working
+CPU core awake during decode). Row 27 **CLOSED 2026-09-12: +23.1 % decode tok/s on Qwen3-235B through the server, shipped ON** — the first measured user-facing speed-up since 2026-09-10. The open PRIORITY rows are now 30 then 28b. Beyond it, what remains is the NOT-worth-working
 table — pick from it only on its stated re-open condition.
+
+**Added 2026-09-12: row 28**, the user's follow-up to 26 (*re-run it on the non-EXL3 model that arrived*). **CLOSED the same
+day: the checkpoint (`deepseek-ai--DeepSeek-V4-Flash-0731`) DOES NOT LOAD** — `deepseek_v4` is unknown to transformers 5.5.4
+and the repo ships no HF remote code — and the arithmetic says a non-EXL3 model makes the CPU-AVX2 hybrid **worse**
+(+4.5–5.0 % vs row 26's +6.8 / +22.0 %), so **the CPU-hybrid idea is recommended closed**. It did find a large
+port-gated prize (~2.5–2.7× Qwen's decode from 2.58×-lighter tokens). **Row 27 still outranks everything.**
 
 ## PRIORITY — worth working, in this order
 
@@ -63,7 +69,12 @@ table — pick from it only on its stated re-open condition.
 | ~~**25**~~ | **CLOSED 2026-09-11 — APST is NULL on both MoE targets.** MiniMax idle-sampler arm: decode 0 gaps ≥ 100 ms; cold prefill 3 mid-generation gaps ≥ 100 ms + a 80–100 ms band (same band Qwen has). | Done: bound ≤ 0.15 % of cold TTFT (≤ 20 wakes × ≤ 15 ms, the kernel's primary-state latency cap), 0 on decode; no full A/B — even a 1 % worst case is inside the A/B's replicate spread. The 70B dense stays unmeasured (not a blocker). | `[x]` | done | [`…-row25-apst-ab-RESULTS.md`](docs/2026-09-11-row25-apst-ab-RESULTS.md) (MiniMax addendum) · row **25** below |
 | ~~**18**~~ | **CLOSED 2026-09-11 — `output_hidden_states=True` fixed; `output_attentions=True` now raises `NotImplementedError`.** Root cause confirmed by instrumentation: 19 sublists + 19 bare Tensors (outer len 38 = 2 × `len(self.layers)`), from `6253fd1` switching the init to sublists without removing the flat `+=`. | Done: returns transformers 5.x's `num_hidden_layers + 1` entries (post-norm last); matches stock HF to ≤ 0.0184 per-token rel-L2 vs ≥ 0.459 to a neighbour layer; new on-device gate `tests/test_output_hidden_states.py` fails a shifted-layer mutant. 0 % on throughput (diagnostic only). | `[x]` | done | [`…-row18-output-hidden-states-RESULTS.md`](docs/2026-09-11-row18-output-hidden-states-RESULTS.md) · row **18** below |
 | ~~**26**~~ | **CLOSED 2026-09-11 — 8-bit + AVX2 proposal KILLED; bytes-neutral CPU hybrid has a real mechanism but a modest ceiling (+6.8 % Qwen / +22.0 % MiniMax over row 27's baseline) → design brief only, after row 27.** 8-bit's disk floor alone is slower than today on both (−9.6 % / −15.5 % tok/s). | Done: measured floor = serial (stubbed-expert arm, 0.074 / 0.052 s) + device-busy (0.772 / 0.396 s). The brief's formulas implied times 21 % / 9 % BELOW that floor. Found row 27 on the way. | `[x]` | done | [`…-row26-cpu-hybrid-ceiling-RESULTS.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md) · row **26** below |
-| **27** | **Keep one CPU core awake during decode — the idle package's wake latency costs Qwen ~21 % of decode.** One `SCHED_IDLE` spinner on an E-core: Qwen 1.147 → 0.970 s/token (−15.5 %); 8 E-core spinners 0.901 (−21.5 %, +27 % tok/s); threads pinned to P-cores alone 1.060 (−7.6 %). Greedy ids identical; raw read latency unchanged. MiniMax −2.6 %. | Bigger than any recently shipped decode win (+3–12 %), ~zero engineering, reaches users at N=1 (§8). Needs a knob + server A/B + MiniMax/70B/prefill checks. | `[ ]` **priority 1** | ~1 day | [`…-row26-cpu-hybrid-ceiling-RESULTS.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-RESULTS.md) §7 · row **27** below |
+| ~~**28**~~ | **CLOSED 2026-09-12 — the new non-EXL3 model does NOT rescue the CPU-AVX2 hybrid; it undercuts it. `deepseek-ai--DeepSeek-V4-Flash-0731` (155.42 GiB) is fp4 **4.2500 bpw**, not 8-bit, and Vaayu CANNOT LOAD IT** (transformers 5.5.4 has no `deepseek_v4`; repo ships no HF remote code; TileLang fp4/sparse-attn/Sinkhorn kernels absent). Hybrid projected **+4.5–5.0 %** over row 27's baseline vs row 26's +6.8 % Qwen / +22.0 % MiniMax → **close the CPU-hybrid idea.** | Real prize found instead: **258 slots/token × 12.750 MiB = 3.212 GiB/token vs Qwen's 8.285** → projected **2.1–2.3 tok/s (~2.5–2.7× Qwen's measured 0.85)**, from architecture (top-6 of 256 over 43 layers), not from the CPU. Unblocked only by an architecture PORT (weeks). Its fp8 sibling build would cost ~43 % of that — row 26's bytes rule, reproduced non-EXL3. | `[x]` | done | [`…-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md`](docs/2026-09-12-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md) · row **28** below |
+| ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
+| ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
+| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). Phase 0 is a **< 1 h** load probe, no download. **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. New blocker found 2026-09-12: **disk keys (`\.experts\.(\d+)\.`) and module layout (fused 3D in transformers 5.5.4) are different questions and they disagree.** | `[ ]` **priority 2** | < 1 h, then 2–4 days + download | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
+| **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` priority 3 | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
+selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
 
 ## NOT worth working now — and why (re-open only on the stated condition)
 
@@ -106,6 +117,44 @@ of GPU. ~~NVMe APST~~ — **measured 2026-09-11 (row 25): NULL on Qwen and MiniM
 
 **Before proposing ANY perf work, read SETTLED.** It is the list of things already built and
 refuted, with the number that killed each one.
+
+---
+
+# ▶▶ IMPLEMENTATION SEQUENCE — added 2026-09-12, the ORDER to build in
+
+**This section is the build order. The PRIORITY table above is the priority; this is the sequence, with the gate that
+lets each step start.** Every step names a stop rule. Do not start a step whose gate has not reported.
+
+| # | step | row | cost | gate that lets it start | stop rule |
+|---|---|---|---|---|---|
+| **S0** | **Keep one CPU core awake during decode.** `SCHED_IDLE` spinner on a detected E-core + P-core affinity for engine threads. Knob + server A/B + MiniMax/70B/prefill checks. | **27** | ~1 day | **none — start here.** Independent of everything below, applies to every model. | A/B through the server shows < 5 % → close it |
+| **S1** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
+| **S2** | **Make a non-EXL3 int4 MoE load, stream and measure.** Smoke rung `Qwen3-30B-A3B-Instruct-2507` int4 (~17 GB) first, then `Qwen3-Next-80B-A3B-Instruct` int4 (~45 GB). Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days + download | S1's verdict | garbage output → fix numerics before ANY perf work |
+| **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
+| **S4** | **Port DeepSeek-V4-Flash.** TileLang/Triton kernels → HF modeling code + `auto_map` → key remap → persist → measure. | **28b** | **weeks** | S2 done (it proves the non-EXL3 MoE path end to end, cheaply) | kernels will not build/validate on sm_120 → abandon at step 1, ~2 days lost |
+| **S5** | *optional, after S4:* the 10.12 GiB **MTP draft module** already in that checkpoint — speculative decoding with no second model. | **28b** §3 step 6 | ? | S4 measured | — |
+
+**Reference for S2 and S4:** [`docs/2026-09-12-IMPL-adding-new-architectures-PLAYBOOK.md`](docs/2026-09-12-IMPL-adding-new-architectures-PLAYBOOK.md)
+— the five contracts (C1 transformers builds it · C2 quantizer dispatches · C3 module tree exposes experts+router ·
+C4 **disk keys carry per-expert tensors** · C5 HF forward contract), the tier decision tree, the format cheat-sheet,
+and Vaayu's seven known generality gaps.
+
+**Two facts that decide more than anything else in this sequence:**
+
+1. **C3 and C4 are different questions and they disagree for modern MoE checkpoints.** `ExpertOffsetIndex` streams
+   only what matches **`\.experts\.(\d+)\.`** on disk; transformers 5.5.4 builds `Qwen3MoeExperts` /
+   `Qwen3NextExperts` / `GptOssExperts` as **fused 3D `nn.Parameter`s** in memory. GPTQ/AWQ int4 checkpoints are
+   per-expert on disk (good for C4, risky for C2); gpt-oss MXFP4 is one 3D tensor per layer (**C4 finds ZERO experts
+   → no streaming at all**). A C4 failure is silent — it looks like a model with no experts.
+2. **Bytes per token decides speed, not the quant lineage.** `moe_layers × top_k × 3 × hidden × moe_intermediate ×
+   bpw/8`. Never take an 8-bit build over a 4-bit one (row 28: the fp8 build of the *same* model costs ~43 % of its
+   decode). Never assume more NVMe concurrency helps (row P8: the drive plateaus at ~7.1 GB/s at 2 readers and
+   **slows past ~4**).
+
+**What is NOT in this sequence, and why:** the CPU-AVX2 hybrid is capped at **+21 %** on this box in the best case
+(row 29), because the GPU link (18.7 GB/s measured) is only 2.5× slower than 6 P-cores (46.6 GB/s). **S2's model swap
+is worth ~21× on its own** (0.85 → ~18 tok/s projected). S2 is the value; S3 is the user's stated goal and rides on
+S2's measurement. If S2 lands and S3's gate fails, **S2 was still the biggest win on this board.**
 
 ---
 
@@ -848,6 +897,7 @@ it must not be "restored", both locked by test.**
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
 | Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 8192 (sdpa) |
 | Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
+| **DeepSeek-V4-Flash-0731** ⛔ **DOES NOT LOAD** | `deepseek-ai--DeepSeek-V4-Flash-0731` | 43 / 1 / 512 / 4096 / 64 / 129280 · 256 experts, top-6, **fp4 4.2500 bpw**, 12.750 MiB/expert, 155.42 GiB (137.06 experts + 8.24 dense + 10.12 MTP draft) | n/a | none — `deepseek_v4` unknown to transformers 5.5.4, no HF remote code in repo, TileLang kernels absent (row 28) | n/a |
 
 (`max_seq_len` is KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15 (rows 6/7), and
 the sdpa reserve floor is raised to flash parity from 2026-08-16 (archived row 8). Every figure above is
@@ -1583,7 +1633,7 @@ only **H2D + EXL3 construct**, and EXL3 has no CPU kernel, so it forces a CPU-fr
   not Gen5 x8's 32) — and by the brief's rule (realistic ≥ 15 % on one model, no loss on the other) it **earns a design
   brief, not code** — but only AFTER row 27, measured against row 27's baseline (a hybrid keeps the CPU busy, so an A/B vs
   today would credit it with row 27's win). Its value is then mostly MiniMax, and a cheaper GPU-side attack on the same
-  slice (MiniMax module-list GEMV ~0.31 ms/expert vs ~0.08 ms on the fused path) must be priced first. Turn-level
+  slice (MiniMax module-list GEMV ~0.31 ms/expert vs ~0.08 ms on the fused path) must be priced first. **Second GPU-side lead on the same slice (added 2026-09-12):** that forward's H2D is **synchronous** — `moe_patch.py:694` passes `non_blocking=False` **deliberately** (the comment says async there leaks host RAM), so it cannot hide behind disk the way the fused forward's does. Not a flag flip: a fix needs an explicit buffer-lifetime mechanism. Price it before building any CPU path to win the same 0.114 s. Turn-level
   hybrid gain over keep-awake: ×1.05–1.06 Qwen, ×1.05–1.21 MiniMax (prefill cannot be helped). **The 8-bit half is
   closed by refutation; the hybrid half is closed with its number and handed to a design-brief decision.**
   **Probe trap, new:** on the fused-EXL3 forward `profiling_mode=True` is 13–15 % FASTER than unprofiled (its
@@ -1604,7 +1654,82 @@ feature WOULD be reachable — a per-token N=1 decode effect, the server's mode;
 
 ---
 
-# 27 · [ ] Keep one CPU core awake during decode — the idle package's wake latency costs Qwen3-235B ~21 % — PRIORITY 1 (added 2026-09-11)
+# 28 · [x] Does a non-EXL3 model change the CPU-AVX2 verdict? — CLOSED 2026-09-12: NO, it makes the hybrid WORSE; and the checkpoint does not load
+
+**Source:** the user's follow-up to row 26 (2026-09-11): *"whole question was if i can run non-EXL3 model on this box and
+also use idle CPU to generate token… now i have one in `/home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731`,
+so re-run the measurement on non-EXL3."* **Durable copy of the verdict is this row** (docs/ is gitignored).
+Detail: [`docs/2026-09-12-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md`](docs/2026-09-12-row28-nonexl3-dsv4-cpu-hybrid-VERDICT.md).
+
+**MEASUREMENT ONLY — no engine code written, none proposed.**
+
+## The three answers
+
+**1. The measurement cannot be run — the checkpoint does not load.** Three independent blockers, each verified 2026-09-12:
+- `AutoConfig.from_pretrained(..., trust_remote_code=True)` raises `ValueError: ... model type deepseek_v4 but Transformers
+  does not recognize this architecture`. transformers 5.5.4 carries `deepseek_v2/v3/vl/vl_hybrid`, no `v4`. Vaayu hits this
+  at `vaayu/vaayu_base.py:1913`, essentially the first thing `from_pretrained` does.
+- `trust_remote_code` has nothing to load: **no `auto_map` in `config.json`, no `modeling_*.py` at repo root.** (Contrast
+  MiniMax-M2.7, which is also unknown to transformers but runs here *because* its repo ships `modeling_minimax_m2.py`.)
+  What the repo ships instead is `inference/` — DeepSeek's standalone torchrun/model-parallel reference impl, not HF.
+- Tensor names are private (`layers.3.ffn.experts.7.w1.weight`, `layers.3.attn.wq_b.weight`, `layers.3.hc_ffn_fn`) with no
+  `model.` prefix, and the math needs `tilelang==0.1.8` + `fast_hadamard_transform` (`fp4_gemm`, `fp8_gemm`, `sparse_attn`,
+  `hc_split_sinkhorn`) — **both absent from the venv**, no transformers equivalent. torch 2.11 does have `float4_e2m1fn_x2`
+  / `float8_e4m3fn` / `float8_e8m0fnu` and the GPU is sm_120, so a port is possible — it is just a **new architecture port,
+  weeks**, not a quant-format switch. (Plus ~155 GiB for the `splitted_model/` persist copy; 190 GB free.)
+
+**2. Non-EXL3 makes the CPU-AVX2 hybrid WORSE, not better — close the idea.** Projected on this model with row 26's
+measured box constants: **+4.5 … +5.0 %** decode tok/s over row 27's keep-awake baseline, against row 26's **+6.8 % (Qwen)
+/ +22.0 % (MiniMax)**. The mechanism is still real and still the same size (CPU computes one expert in **287 µs** vs
+**715 µs** to copy it over PCIe) — but a hybrid can only remove *exposed* host-side time, and this model's 2.58×-lighter
+token shrinks that term while its own CPU tail (43 layers × ~305 µs) does not shrink at all. Cost remains months
+(CPU kernels, a new dual-kernel on-disk format + its quality validation, loader, dispatch). **Row 28 removes the last open
+justification for the hybrid, which was "maybe a non-EXL3 model changes the picture".**
+
+**3. The premise "non-EXL3 ⇒ 8-bit ⇒ more bytes" does not describe this checkpoint — and the real prize is elsewhere.**
+Derived from its own safetensors headers (nothing typed): 43 layers × 256 experts, top-6, **13,369,344 B/expert = 12.750 MiB
+= exactly 4.2500 bpw fp4** (group-32, e8m0 scales) — *fewer* bytes per weight than EXL3 5.014. Per token it moves
+**258 slots × 12.750 MiB = 3.212 GiB**, vs **Qwen 8.285** and **MiniMax 4.100**.
+
+| | Qwen3-235B (measured) | DSV4 (projected, serial band 1×–2×) |
+|---|---|---|
+| floor = serial + device-busy | 0.845 s | **0.340 – 0.375 s** |
+| today-equivalent | **1.180 s = 0.85 tok/s** | **0.439 – 0.474 s = 2.11 – 2.28 tok/s** |
+| + row 27 keep-awake | 0.930 s = 1.08 tok/s | 0.370 – 0.405 s = 2.47 – 2.70 tok/s |
+| + CPU hybrid on top | 0.871 s = 1.15 tok/s | 0.353 – 0.388 s = 2.58 – 2.83 tok/s |
+
+**≈ 2.5–2.7× Qwen's decode, from architecture (top-6 of 256 over 43 layers, ~6.5 B routed active params vs ~22 B), with the
+CPU doing nothing.** Miss fraction assumed 54 % because both measured models hit 54.4 / 54.1 % at the same per-layer cache
+coverage (Qwen 12.8 %, MiniMax 14.0 %, DSV4 11.7–12.3 %); sensitivity 50 → 70 % gives 2.16 – 3.17 tok/s, so the conclusion
+does not depend on it. Unblocked only by the port.
+
+**Bonus, flagged not priced:** the checkpoint carries a **10.12 GiB MTP/DSpark draft module** (`num_nextn_predict_layers=1`)
+— built-in speculative decoding, no second checkpoint to download. Dense spec decoding measured 5.57× (row P7) but the MoE
+mechanism differs; **do not assume it carries over** — measure after a port, if there ever is one.
+
+**Row 26's bytes rule, reproduced on a non-EXL3 checkpoint:** DeepSeek publishes an fp8 expert build of this same model
+(`inference/README.md`: drop `"expert_dtype": "fp4"`, `--expert-dtype fp8`). Ratio 8/4.250 = **1.882×** → device-busy
+0.305 → 0.574 s, floor **0.61 s = 1.64 tok/s** vs 2.67–2.95 at fp4. **Picking the fp8 build of the very same model costs
+~43 % of its decode speed.** The rule is about bytes per token, never about quant lineage.
+
+## Ranking after this row
+
+1. **Row 27 (keep-awake)** — measured +27 % on Qwen, ~1 day, model-independent, reaches users at N=1. Still priority 1;
+   nothing here outranks it.
+2. **Port DeepSeek-V4-Flash** (weeks: HF modeling + config with `auto_map` the MiniMax way, key remap → module-list forward,
+   fp4/fp8/sparse-attn/Sinkhorn kernels via TileLang or Triton 3.6.0, ~155 GiB persist copy). Largest number on the board.
+3. **CPU-AVX2 hybrid — recommend CLOSED.** +4.5–5.0 % here, +6.8 / +22.0 % on the EXL3 pair, months of work.
+
+**§8:** (1) no knob — no engine behaviour changed, none proposed. (2) nothing to plumb; the projection is a gitignored
+probe, `plans/probes/row28_dsv4_projection.py` (no GPU, no model load, ~20 s). (3) reachable? N/A today — the checkpoint
+does not load; a ported model's decode effect WOULD be a per-token N=1 effect, the server's only mode. (4) not reachable
+today: the hybrid is unblocked by nothing (close it); the 2.5× is unblocked by the port; row 27 by its own server A/B.
+
+**Stop rule honoured:** the question is answered with numbers and the row is closed. It is NOT re-scoped into a port plan.
+
+---
+
+# 27 · [x] Keep one CPU core awake during decode — the idle package's wake latency costs Qwen3-235B ~21 % — PRIORITY 1 (added 2026-09-11)
 
 **Source:** found by row 26 (see its RESULTS §7). **Durable copy of the evidence is this row** (docs/ is gitignored).
 
@@ -1630,19 +1755,257 @@ reads; MiniMax's synchronous copies block inside `cudaMemcpy`, which under CUDA'
 MiniMax gains only −2.6 % (0.577 → 0.562). Spinners on ALL 20 CPUs
 (`Uspin`) slowed MiniMax 27 % — SMT siblings shared with engine threads; never put a spinner on a P-core sibling.
 
-- [ ] Design the keep-awake: a GIL-free busy thread (or subprocess) at `SCHED_IDLE` on ONE detected E-core (lowest
+- [x] Design the keep-awake: a GIL-free busy thread (or subprocess) at `SCHED_IDLE` on ONE detected E-core (lowest
   `cpuinfo_max_freq`; never a typed CPU id — CLAUDE.md §5; on a non-hybrid CPU pick the least-loaded core), started at
   generation begin, stopped at end; optional P-core affinity for the engine's own threads on hybrid CPUs. Measure 1 vs
   2 spinners and the power cost.
-- [ ] §8: knob in `vaayu/server/config.py` + `README.md` with the measured cost of getting it wrong (−21 % tok/s on Qwen
+- [x] §8: knob in `vaayu/server/config.py` + `README.md` with the measured cost of getting it wrong (−21 % tok/s on Qwen
   off; one E-core's power on). Plumbed through `app.py`/`engine.py`. Reachable at N=1 — the server's mode.
-- [ ] Same-day A/B THROUGH THE SERVER on Qwen and MiniMax (ballast fixed, ids identical); check prefill TTFT (unmeasured
+- [x] Same-day A/B THROUGH THE SERVER on Qwen and MiniMax (ballast fixed, ids identical); check prefill TTFT (unmeasured
   — prefill is read-heavy too and may gain) and the 70B dense.
-- [ ] Root-only alternatives for users go in `documentation/TUNING.md` as documentation: PM QoS via
+- [x] Root-only alternatives for users go in `documentation/TUNING.md` as documentation: PM QoS via
   `/dev/cpu_dma_latency` (mode 0600 on this box) or disabling `C2_ACPI` (`cpupower idle-set`).
+
+**CLOSED 2026-09-12 — built, measured through the server, shipped ON. Stop rule PASSED.**
+[`docs/2026-09-12-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) (gitignored; the numbers
+below are the durable copy).
+
+**Result — through the server, N=1, its real default config (prefix cache ON), greedy, ids identical in every arm:**
+
+| model | forward | off | keep-awake + pin | delta | TTFT |
+|---|---|---|---|---|---|
+| **Qwen3-235B** | fused-EXL3 MoE | 0.9229 tok/s | **1.1363** | **+23.1 %** (n=3, spread 0.5 %) | 1.680 → 1.306 s (−22.3 %) |
+| MiniMax-M2.7 | module-list MoE | 1.7405 | 1.7625 | +1.3 % | 0.839 → 0.798 s |
+| Llama-3.3-70B | streamed dense | 0.2745 | 0.2824 | +2.9 % | 3.454 → 3.321 s |
+| Llama-3.2-1B | dense, VRAM-pinned | 111.7 | 111.2 | **null** — the control: it reads no disk | — |
+
+**Qwen sweep, prefix cache OFF (every arm pays a full prefill), served / decode-excluding-prefill:**
+off 0.7952 / 1.1484 · spin1 +2.7 / +3.6 % · **spinAll +8.8 / +12.4 %** · pin alone +0.6 / +0.9 % ·
+**both +10.1 / +14.1 %**. The win is the PACKAGE leaving deep idle, not the core: one spinner buys a quarter of what
+eight do. **P-core pinning is worth far less through the server (+0.9 %) than in-process (row 26: −7.6 % wall)** — it
+still composes (+12.4 → +14.1 %), so it ships on, but the spinners are the lever.
+**Mechanism, measured directly** (per-CPU `cpuidle` sums over one Qwen request): C2_ACPI residency **1.142 → 0.492 s**,
+wakes **1.74 M → 1.22 M**.
+
+**Built:** `vaayu/keepawake.py` + `tests/test_keepawake.py` (23) + `tests/test_keepawake_wiring.py` (6), TDD.
+E-cores DETECTED off `cpuinfo_max_freq` (CLAUDE.md §5), and a spin CPU can never be an SMT sibling of an engine CPU
+**by construction** — row 26's `Uspin` −27 % MiniMax confound is now unreachable. Spinner = `/bin/sh` arithmetic loop
+at `SCHED_IDLE` (99.5 % of one E-core measured), ~1 MB RSS, no `chrt`/`taskset` dependency. Wired into `generate`,
+`batched_generate` AND `speculative_generate`. Knobs `KEEP_AWAKE="auto"` / `PIN_ENGINE_THREADS=True` in
+`vaayu/server/config.py` → `__main__.py` → `ServerConfig` → `from_pretrained`, documented in `vaayu/server/README.md`
+and `documentation/TUNING.md` §5b (with the root-only alternatives: `/dev/cpu_dma_latency`, `cpupower idle-set`).
+
+**Four findings worth keeping (each has a test that fails without its fix):**
+1. **`speculative_generate` is a SEPARATE entry point** — `choose_speculative_target` hands it to `stream_generate`
+   whenever a speculator is loaded, so wiring only `generate` misses every speculating request (and
+   `USE_PROMPT_LOOKUP="auto"` turns speculation ON for dense by default).
+2. **Orphaned spinners.** SIGKILL runs no `atexit`, and this box OOM-kills loads (exit 137 on three gates), so a
+   spinner would burn an E-core until reboot. It now watches its owner's pid with `kill -0` and exits by itself.
+3. **Sticky P-core placement.** Restoring only the SAVED threads left every thread born inside a generation pinned for
+   the life of the process — half the effect applied silently forever, and in an A/B every arm after the first pinned
+   one contaminated. Exit now returns new threads to the entering thread's mask too.
+4. **Keep the loops under their PUBLIC names.** A wrapper + `_private` rename broke **46 tests**: stub engines across
+   the suite borrow these loops as unbound methods. `keepawake_for(model)` no-ops for a partial object.
+
+**Measurement traps this run hit** (all in `plans/probes/row27_server_ab.py`): `fastapi.testclient` delivers a whole
+SSE response at once, so client-side timing read **536,072 tok/s** — take the numbers from the server's own
+`requests.jsonl`; the server's `capture_stdio=True` swallows a probe's own prints into `logs/<run>/server.log`; and
+without a discarded warm-up plus alternating arm order, warm-up alone reads as **+78 %** for whichever arm ran later.
+
+**Not measured:** package POWER. `/sys/class/powercap/intel-rapl:0/energy_uj` is root-only on this box, so the cost of
+leaving it on is stated qualitatively (one E-core per spinner at `SCHED_IDLE` for the duration of a generation) rather
+than in watts. Non-hybrid CPUs decline with a WARNING (unmeasured hardware; `allow_non_hybrid` reserves a whole
+physical core for an opt-in).
 
 **Stop rule:** if the server A/B does not reproduce ≥ +10 % decode tok/s on Qwen, close as refuted-through-the-server
 and record why the in-process effect did not transfer.
+
+---
+
+# 29 · [ ] Pick a non-EXL3 MoE Vaayu can actually LOAD, then measure the CPU+GPU hybrid on it (added 2026-09-12)
+
+**Source:** the user, pushing back on row 28: *"EXL3 use custom CUDA driver that only run with GPU, and because of this
+limitation i want to use non-EXL3 model and use CPU and GPU both… i am not letting this idea go."* **Correct — and rows
+26/28 agree**: EXL3 has no CPU kernel, so a non-EXL3 checkpoint is a **prerequisite** for the hybrid, not an optimisation.
+Row 28's "+4.2 %" was a number for **DeepSeek-V4-Flash specifically** (a 147 GB disk-streamed model — the regime where the
+hybrid is structurally weakest), not a statement about non-EXL3 formats. This row prices the regimes and names the download.
+**Durable copy of the numbers is this row.** Detail: [`docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md).
+
+**DECISION + 1-DAY MEASUREMENT. No engine code until step 3 below reports.**
+
+## The constraint that decides everything: which expert formats have a CPU kernel (checked 2026-09-12)
+
+| format | CPU kernel | GPU | verdict |
+|---|---|---|---|
+| **EXL3** | **none** | yes | impossible for a hybrid — the user's point, confirmed |
+| **int4 group-128** | **`torch._weight_int4pack_mm_for_cpu`, measured row 26 at 214 µs/expert (46.9 GB/s)** | yes | **the path.** Needs a one-time repack GPTQ/AWQ → torch CPU layout |
+| int8 weight-only | `torch._weight_int8pack_mm`, 348 µs | yes | 8 bpw doubles footprint → out of the good regime (rows 26/28) |
+| bf16 / fp32 | yes, 697 / 1132 µs | yes | zero kernel work, but 16/32 bpw — small models only |
+| **MXFP4** (gpt-oss) | **none in torch** | yes — transformers `mxfp4`; `kernels` 0.13.0 + triton 3.6.0 ARE installed | **loads today**, CPU path needs an AVX2 e2m1 kernel |
+| fp8 e4m3 block-128 | none in torch | yes (Vaayu already patches FineGrainedFP8, `vaayu_base.py:2964`) | GPU-only today |
+
+**Installed backends: bitsandbytes only.** `gptqmodel`/`auto_gptq`/`autoawq`/`compressed_tensors` are ABSENT — a GPTQ or
+AWQ checkpoint needs one `pip install` first.
+
+## Projected decode, all candidates (model calibrated on both measured models; tiers within 0.01–0.03, timing +7 % Qwen / −16 % MiniMax — treat ±20 %)
+
+| candidate | footprint | GB/tok | vram% | disk% | **T_gpu → tok/s** | **hybrid** |
+|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B int4 | 15.4 GB | 0.96 | 97 | 0 | 0.049 → **20.5** | +14.8 % |
+| **Qwen3-Next-80B-A3B int4** | 41.1 GB | 0.80 | 91 | 3 | 0.055 → **18.1** | **+21.1 % (best in set)** |
+| gpt-oss-120b MXFP4 | 60.9 GB | 1.90 | 71 | 18 | 0.090 → **11.2** | **−4.6 % (LOSES)** |
+| GLM-4.5-Air int4 | 52.9 GB | 3.31 | 67 | 15 | 0.136 → **7.3** | +7.7 % |
+| Qwen3-235B-A22B int4 | 120.6 GB | 7.54 | 32 | 52 | 0.800 → 1.25 | +7.8 % |
+| DeepSeek-V4-Flash fp4 *(won't load, row 28)* | 147.2 GB | 3.45 | 27 | 59 | 0.398 → 2.5 | +4.2 % |
+| **Qwen3-235B EXL3 — today** | 135.8 GB | 8.90 | 28 | 54 | **0.85 MEASURED** | n/a |
+
+## Two conclusions
+
+**1. The hybrid has a regime, and nobody has tested it in that regime.** Footprint ≈ 2× the ~20 GB cache is its best case
+(**+21 %**); ≫ cache is its worst (+4–8 %, rows 26/28); and at 3–5× it can go **negative** (gpt-oss-120b −4.6 %, because its
+per-layer CPU tail 36 × 301 µs = 10.8 ms exceeds the GPU arm's 6 ms host tail). **But the honest ceiling on THIS box is
++21 %**, because the GPU link (18.7 GB/s measured) is only 2.5× slower than 6 P-cores (46.6 GB/s) — replacing a copy with a
+compute saves a 2.5× factor on a term that is rarely the bottleneck. KTransformers-class wins need many more cores and far
+more RAM bandwidth per core.
+
+**2. The far bigger number is the model choice itself — and it is a DOWNLOAD, not code.** Same engine, model whose experts
+fit the box: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×).
+This is exactly the carried row already on this board ("no resident-size checkpoint on disk… the single largest usability
+change for the agent"). The hybrid adds ~20 % **on top of** that, at best.
+
+**3. What breaks next in that regime:** for every resident candidate the **serial per-layer term (0.8 ms × layers) becomes
+the largest phase** — 38 ms of Qwen3-30B's 49 ms. That is Vaayu's own per-layer Python/launch overhead, not bytes. **In the
+resident regime the next perf lever is CUDA graphs / fused per-layer dispatch, not AVX2.**
+
+## Order of work
+
+1. `pip install gptqmodel` (or `autoawq`) — nothing GPTQ/AWQ loads without it.
+2. **Download `Qwen3-30B-A3B-Instruct-2507` int4 (~17 GB)** — `JunHowie/…-GPTQ-Int4`, `cyankiwi/…-AWQ-4bit`, or
+   `stelterlab/…-AWQ`. `model_type: qwen3_moe`, the same family Vaayu already runs at 235B. Persist, generate.
+   **This would be the first non-EXL3 MoE ever run on this box** (§0 dispatch table: fused non-EXL3 = "gated in, not
+   perf-tuned", on-device today: none) — expect to find load-path bugs, which is why it is 17 GB and not 63.
+3. **Run `plans/probes/row26_decode.py` on it unchanged** → real `serial` / `device_busy` / `h2d` / `gemm` / tier split.
+   One afternoon; replaces every projection above with a measurement and confirms or kills the regime story.
+4. Only then: write the int4 repack (GPTQ/AWQ packing → torch CPU layout), flag it on one forward's RAM tier, A/B.
+   **Stop rule: if measured H2D + gemm + tail is under ~15 % of the token, the ceiling is not there — close it.**
+5. **Row 27 (keep-awake, +27 % MEASURED, ~1 day) comes before all of it** and applies to every model here.
+
+**Do NOT** download an 8-bit build (rows 26/28: bytes per token is the whole game) or another EXL3 model (no CPU kernel).
+**Disk:** 190 GB free, Vaayu needs its own `splitted_model/` copy → budget 2× the download. Deleting the unusable
+DeepSeek-V4-Flash checkpoint returns 156 GB.
+
+**§8:** (1) knob — a hybrid would need `expert_compute_device` in `vaayu/server/config.py`; a model choice needs none.
+(2) nothing plumbed, nothing built; the picker is a gitignored probe, `plans/probes/row29_hybrid_model_picker.py`.
+(3) reachable — every effect here is a per-token N=1 decode effect, the server's only mode. (4) not reachable today: the
+hybrid is unblocked by step 3's measurement, the 9–21× by steps 1–2 (a load path never exercised on device).
+
+---
+
+# 28b · [ ] Port DeepSeek-V4-Flash-0731 so Vaayu can run it (added 2026-09-12) — sequence step S4
+
+**Source:** row 28's verdict. **Durable copy of the plan summary is this row.** Detail:
+[`docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md).
+
+**Prize (projection, row 28, ±20 %):** 258 routed slots/token × 12.750 MiB = **3.212 GiB/token vs Qwen3-235B's 8.285**
+→ **2.1–2.3 tok/s vs Qwen's measured 0.85 (~2.5–2.7×)**, with the CPU doing nothing. Already on disk, 155.42 GiB.
+**NOT a CPU-hybrid enabler** — row 28 priced the hybrid on it at **+4.2 %**, the weakest of every candidate.
+
+**Four blockers, each verified 2026-09-12, each independently fatal:** (1) transformers 5.5.4 has no `deepseek_v4`
+(`AutoConfig` raises; Vaayu dies at `vaayu_base.py:1913`); (2) no `auto_map`, no `modeling_*.py` in the repo — what
+ships is DeepSeek's standalone torchrun reference impl in `inference/`; (3) `tilelang==0.1.8` +
+`fast_hadamard_transform` absent, needed for `fp4_gemm` / `fp8_gemm` / `sparse_attn` / `hc_split_sinkhorn`, none of
+which exists in transformers; (4) ~155 GiB more disk for the `splitted_model/` copy (190 GB free → ~34 GB spare).
+
+**The template is MiniMax-M2.7** — also unknown to transformers, runs here anyway because its repo ships
+`modeling_minimax_m2.py`. **Write HF modeling code, drop it in the checkpoint dir with `auto_map`. Do not upstream.**
+
+**Steps (each with its own verify):** 1 **kernels first, standalone, on sm_120** (2–5 days; **stop rule: if TileLang
+will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
+machinery stripped, **experts as `nn.ModuleList`** so it lands on the module-list forward MiniMax already exercises
+(1–2 weeks; verify logits against `inference/generate.py` BEFORE measuring) → 3 key remap + persist (verify
+`ExpertOffsetIndex` finds **43 × 256 = 11,008** derived entries) → 4 first on-device generation → 5 run
+`row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)
+→ 6 *optional* the **10.12 GiB MTP draft module** already in the checkpoint (free speculative drafter; dense spec
+measured 5.57× in row P7 but **the MoE mechanism differs — do not assume it transfers**).
+
+**Good news that is not obvious:** its disk keys are `layers.3.ffn.experts.7.w1.weight` — they already match
+`ExpertOffsetIndex`'s only rule (`\.experts\.(\d+)\.`), so streaming works once the model loads. **The hard part is
+the model, not the streaming.** Watch: dense footprint **8.24 GiB** (vs Qwen's ~5.8) must be VRAM-resident or the
+per-token H2D (~0.31 s) swamps everything.
+
+**Check before starting:** a newer transformers may have added `deepseek_v4`; that deletes steps 1–2.
+
+**§8:** (1) no new knob — the model path is already a parameter; state it in the commit. (2) server must be able to
+load it — grep `app.py` / `engine.py` for the `trust_remote_code` path. (3) reachable — per-token N=1, the server's
+only mode. (4) not built; step 1 unblocks step 2, step 4 unblocks the measurement.
+
+---
+
+# 30 · [ ] Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode (added 2026-09-12) — sequence steps S1–S3
+
+**Source:** the user, 2026-09-12, choosing `Qwen3-Next-80B-A3B-Instruct` int4 to test CPU+GPU token generation.
+**Durable copy of the plan summary is this row.** Detail:
+[`docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md).
+
+**FOUR THINGS THAT ARE NOT TRUE and are easy to assume:**
+1. **"Vaayu supports int4 group-128."** It does not. `torch._weight_int4pack_mm_for_cpu` is a **torch** kernel that
+   row 26's throwaway probe benchmarked (214 µs/expert, 46.9 GB/s on 6 P-cores). **Vaayu has NO CPU expert compute
+   of any kind** — `compute_device` is forced to `"cuda"` for EXL3 (`moe_patch.py:819`).
+2. **"Non-EXL3 MoE runs, just untuned."** It has **never run on device** (CLAUDE.md §0: "on-device today: none").
+   Expect load-path bugs, not tuning.
+3. **"A 4-bit HF checkpoint will just stream."** Two independent layout questions — see below.
+4. **"The hybrid is the win."** Best case **+21 %** on this box (row 29). The **model swap is ~21×**. Phases 0–3 are
+   the value; do them even if phase 4 never happens.
+
+**The blocker nobody has hit yet — C3 ≠ C4.** `detect_moe_blocks` (`moe_patch.py:552`) reads the **module tree**;
+`ExpertOffsetIndex` (`persist/expert_offset_index.py`) reads the **disk keys**, with exactly one rule:
+**`\.experts\.(\d+)\.`**. transformers 5.5.4 builds `Qwen3MoeExperts` / `Qwen3NextExperts` / `GptOssExperts` as
+**fused 3D `nn.Parameter`s** (`modeling_qwen3_moe.py:215–226`) → `expert_style == "fused"`, `is_exl3 == False` →
+**`_make_fused_sparse_forward` (`:1289`), the branch nothing has ever run.** Meanwhile GPTQ/AWQ int4 checkpoints are
+**per-expert on disk** (good for streaming, risky for loading: only `finegrained_fp8` implements transformers'
+fused-MoE experts abstraction — **there is no GPTQ/AWQ fused-MoE experts class**), and gpt-oss MXFP4 is **one 3D
+tensor per layer → the index finds ZERO experts → no streaming at all.**
+
+**Phases.** **0** — `row30_load_probe.py`: config + index only, no download, **< 1 hour**; counts per-expert keys,
+derives bytes/expert + bpw, checks the quantizer resolves. **Decides the path: A it loads · B dequant+repack to
+torch int4-g128 at persist time (likely, and the best shape — it is also the hybrid's dispatch point, a new
+`Int4PackLoaderStrategy` beside `EXL3LoaderStrategy` at `loader_strategy.py:431`) · C split fused 3D at persist time
+(pick another repo first).** **1** make it load (`pip install gptqmodel`/`autoawq` — only bitsandbytes is installed;
+verify 64 coherent greedy tokens). **2** make it stream (index count == `moe_layers × num_experts`, derived).
+**3** run `row26_decode.py` unchanged. **4** hybrid, **only if the gate passes**.
+
+**THE GATE for phase 4:** `(h2d + gemm + tail) / T`. Row 29 projects **~31 % (80B) / ~22 % (30B)**.
+**< 15 % → STOP and close the idea.** ≥ 15 % → realistic gain ≈ share × 0.6 (= 1 − 18.7/46.6, the measured
+PCIe-vs-CPU ratio). **Baseline must be row 27's keep-awake arm, not today's** — a hybrid keeps the CPU busy and would
+otherwise be credited with up to 21 % that one `SCHED_IDLE` spinner delivers alone.
+
+**Smoke rung first: `Qwen3-30B-A3B-Instruct-2507` int4 (~17 GB, `qwen3_moe` — the family Vaayu already runs at
+235B).** Repos: `JunHowie/…-GPTQ-Int4`, `cyankiwi/…-AWQ-4bit`, `stelterlab/…-AWQ`. Target repos for the 80B:
+`cyankiwi/…-AWQ-4bit`, `dazipe/…-GPTQ-Int4A16`, `RedHatAI/…-quantized.w4a16`, `Intel/…-int4-AutoRound`.
+
+**Row 29's projections this row must beat or refute (±20 %):** 80B — expert 1.59 MiB, footprint 41.1 GB,
+0.80 GB/token, vram 91 % / disk 3 %, **T ≈ 0.055 s → 18.1 tok/s**, phases serial 0.038 / devbusy 0.005 / h2d 0.004 /
+gemm 0.006 / tail 0.007. 30B — 2.39 MiB, 15.4 GB, 0.96 GB/token, **T ≈ 0.049 s → 20.5 tok/s**.
+**Expect the surprise to be that `serial` dominates** (0.038 of 0.055 s = 69 %) — Vaayu's own per-layer Python/launch
+overhead. If measurement confirms it, **the next lever on this model is CUDA graphs / fused per-layer dispatch, not
+AVX2** — open it as its own row rather than absorbing it here.
+
+**Risks, ranked:** (1) the 4-bit checkpoint may not load in 5.5.4 → phase 0 catches it in under an hour;
+(2) `_make_fused_sparse_forward` has never executed; (3) **24,576 slabs** on the 80B (512 experts × 48 layers, ~1.6 MiB
+each) vs Qwen's 1,034 of ~11 MiB — untested scale for `SlabArena`, the offset index and io_uring, and
+`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB reads (**re-measure with `p8_samepath.py`, do not assume**);
+(4) **`qwen3_next` is hybrid linear/full attention** (full attention every 4 layers) and Vaayu's KV cache, prefix
+cache and derived `max_seq_len` all assume uniform attention — **unverified**; this risk does not exist on the 30B
+rung, which is another reason to do it first; (5) int4 4.25 bpw quality vs EXL3 5.0 unassessed; (6) CPU/io_uring core
+contention, the most likely reason phase 4 misses its projection.
+
+**§8:** (1) phases 0–3 no knob; phase 4 needs `EXPERT_COMPUTE_DEVICE` in `vaayu/server/config.py` **in the same
+commit**, with its measured cost, plus `vaayu/server/README.md`. (2) phase 4's knob must be passed by `app.py`'s
+`from_pretrained(...)` — grep it and `engine.py`. (3) reachable — per-token **N=1**, the server's only mode
+(`MAX_BATCH_SIZE = 1`, `config.py:144`). (4) not built; phase 1 unblocks 2–3, phase 3's gate unblocks 4.
+
+**Disk:** 190 GB free, Vaayu needs its own `splitted_model/` copy → **budget 2× the download**. Deleting the
+unusable `deepseek-ai--DeepSeek-V4-Flash-0731` returns 156 GB.
 
 ---
 

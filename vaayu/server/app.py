@@ -73,6 +73,14 @@ class ServerConfig:
     # floor -- the shipped path. A SHORTER value hands VRAM back to the expert
     # cache; above S_max the load refuses outright rather than degrading.
     max_seq_len: int | None = None
+    # SCHED_IDLE spinners that hold the CPU package out of deep idle while a
+    # generation runs: "auto" (every detected E-core), an int, or False. Off
+    # costs ~21 % of Qwen3-235B's decode (row 27); on costs one E-core's power
+    # per spinner. Declines with a warning on a non-hybrid CPU.
+    keep_awake: str | int | bool = "auto"
+    # Pin the engine's threads to the P-cores for the generation. Composes with
+    # keep_awake (-7.6 % on its own, -21.5 % together).
+    pin_engine_threads: bool = True
     # Expert routing/eviction telemetry for a triage bundle. MoE-only by
     # construction. Off because its decode cost is unmeasured.
     enable_expert_usage: bool = False
@@ -404,6 +412,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                     attn_implementation=config.attn_implementation,
                     ram_cache_budget=config.ram_cache_budget,
                     prefix_sessions=config.prefix_sessions,
+                    keep_awake=config.keep_awake,
+                    pin_engine_threads=config.pin_engine_threads,
                 )
                 print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                       f"derived max_seq_len={model.max_seq_len}")

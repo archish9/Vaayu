@@ -39,6 +39,8 @@ def main() -> int:
         enable_expert_usage=config.ENABLE_EXPERT_USAGE,
         attn_implementation=config.ATTN_IMPLEMENTATION,
         prefix_sessions=config.PREFIX_SESSIONS,
+        keep_awake=config.KEEP_AWAKE,
+        pin_engine_threads=config.PIN_ENGINE_THREADS,
         delete_original=config.DELETE_ORIGINAL,
         log_dir=config.LOG_DIR, capture_stdio=config.CAPTURE_STDIO,
         log_rotate_mb=config.LOG_ROTATE_MB,

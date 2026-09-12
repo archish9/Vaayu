@@ -229,6 +229,45 @@ KV_PERSIST_SYNC = False
 ENABLE_EXPERT_USAGE = False
 
 # --------------------------------------------------------------------------
+# Keep-awake (row 27)
+# --------------------------------------------------------------------------
+
+# Hold the CPU package out of deep idle while a generation runs.
+#
+# This box idles in C2_ACPI, whose declared exit latency is 127 us, and decode
+# leaves the CPU ~7.5 % busy. Qwen's fused-EXL3 forward issues async copies and
+# then SLEEPS on ~800 read completions per token, so it pays that wake latency
+# on nearly every one of them. A SCHED_IDLE busy loop on an E-core keeps the
+# package shallow; SCHED_IDLE means it runs only when the CPU would otherwise
+# be idle, so it takes no time from the engine.
+#
+# MEASURED COST OF GETTING IT WRONG (row 26 arms, in-process, Qwen3-235B,
+# 63 decode forwards, greedy ids identical in every arm):
+#     off                     1.147-1.190 s/token   (baseline)
+#     one E-core spinner      0.970          -15.5 %
+#     all 8 E-core spinners   0.901          -21.5 %  (= +27 % tok/s)
+# MiniMax-M2.7 gains less (-2.6 %): its synchronous copies block inside
+# cudaMemcpy, which spin-waits and keeps a core awake already.
+#
+# COST OF LEAVING IT ON: one E-core per spinner runs a busy loop (~1 MB RSS
+# each) for the duration of each generation -- package power, not throughput.
+# "auto" = every detected E-core, an int = that many, False = off.
+#
+# A non-hybrid CPU gets NO spinner and prints a warning instead: row 27 was
+# measured on a hybrid CPU, and on a uniform one every core a spinner could
+# take is an SMT sibling of a core the engine wants -- row 26's `Uspin` arm
+# SLOWED MiniMax 27 % that way.
+KEEP_AWAKE = "auto"
+
+# Pin every engine thread to the P-cores for the duration of a generation.
+# Composes with the spinners (row 26: -7.6 % on its own, -21.5 % together).
+# Threads created inside a generation inherit the mask, which is what carries
+# it to the Rust io_uring readers. Threads the kernel refuses to move are
+# reported by name, never counted silently -- 0 of 66 were refused here.
+# Skipped automatically on a CPU with no P/E split.
+PIN_ENGINE_THREADS = True
+
+# --------------------------------------------------------------------------
 # Engine parameters deliberately NOT exposed here (CLAUDE.md section 8 asks
 # that "no knob" be a STATED decision, not a silence). The suite enforces this
 # list: a new engine parameter fails tests/test_engine_param_reachability.py

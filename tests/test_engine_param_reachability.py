@@ -45,6 +45,8 @@ SERVER_EXPOSED = {
     "draft_tokens",
     "use_prompt_lookup",
     "enable_expert_usage",
+    "keep_awake",
+    "pin_engine_threads",
 }
 
 # Declined on purpose. The reason is the deliverable -- §8 requires the decision

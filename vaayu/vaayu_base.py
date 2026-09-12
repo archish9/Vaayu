@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import gc
 import os
 import subprocess
@@ -23,6 +24,7 @@ from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
 from .prefix_cache import PrefixCacheStore
+from .keepawake import KeepAwake
 from . import turboquant
 
 # BetterTransformer is deprecated in newer optimum versions
@@ -919,6 +921,18 @@ def speculative_ignored_sampling(temperature, kwargs) -> list:
     return ignored
 
 
+def keepawake_for(model):
+    """The model's keep-awake context, or a no-op for a partial object.
+
+    The generation loops are borrowed as unbound methods by stub engines all
+    over the suite (the same reason `_build_prefix_store` reads its flags with
+    getattr). A real VaayuBaseModel always has `_keepawake_ctx`; a stub that
+    borrowed one loop must not be forced to grow the rest of the model.
+    """
+    ctx = getattr(model, "_keepawake_ctx", None)
+    return ctx() if ctx is not None else contextlib.nullcontext()
+
+
 def choose_speculative_target(model, temperature, kwargs):
     """The generate callable this ONE request should run on.
 
@@ -1762,7 +1776,7 @@ class VaayuBaseModel(GenerationMixin):
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
                  enable_expert_usage=False, ram_cache_budget=None,
-                 prefix_sessions=3):
+                 prefix_sessions=3, keep_awake="auto", pin_engine_threads=True):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -1846,6 +1860,10 @@ class VaayuBaseModel(GenerationMixin):
         self.kv_persist_dir = kv_persist_dir
         self.kv_persist_sync = kv_persist_sync
         self.enable_expert_usage = enable_expert_usage
+        # Row 27: an idle CPU package costs Qwen3-235B ~21 % of decode. Both
+        # default ON because that is the measured configuration.
+        self.keep_awake = keep_awake
+        self.pin_engine_threads = pin_engine_threads
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -4963,63 +4981,80 @@ class VaayuBaseModel(GenerationMixin):
     # .lookup()'s checkout (Task 4) makes a second concurrent same-id call a
     # miss (full prefill) rather than a corruption, so the failure mode is a
     # perf loss, not wrong output.
+    def _keepawake_ctx(self):
+        """The keep-awake for one generation (row 27), built once per model.
+
+        Once, not per call: `detect_topology` reads sysfs, and the instance
+        carries the re-entrancy depth that lets a nested generate keep the
+        spinners the outer one started instead of doubling them.
+        """
+        ka = getattr(self, "_keepawake_obj", None)
+        if ka is None:
+            ka = KeepAwake(spinners=getattr(self, "keep_awake", "auto"),
+                           pin_threads=getattr(self, "pin_engine_threads", True))
+            self._keepawake_obj = ka
+        return ka
+
     def generate(self, *args, session_id=None, **kwargs):
-        self._batch_decode_active = False
-        self._batch_n = 1
+        # Row 27: hold the CPU package out of deep idle for the whole
+        # generation, prefill included -- prefill is read-heavy too.
+        with keepawake_for(self):
+            self._batch_decode_active = False
+            self._batch_n = 1
 
-        # Fail fast here, where the prompt length is known (Task 8) -- before
-        # this can surface ~30 frames deep as an OOM in the layer loop.
-        input_ids = kwargs.get("input_ids")
-        if input_ids is None and args:
-            input_ids = args[0]
-        if input_ids is not None:
-            # kwargs.get(..., 0): every in-repo caller passes max_new_tokens
-            # explicitly. A caller relying on self.generation_config's default
-            # instead would under-count here -- HF's own merge of kwargs with
-            # generation_config happens deeper inside super().generate(),
-            # replicating it here was judged not worth the duplication for a
-            # gap no current call site hits.
-            self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0))
+            # Fail fast here, where the prompt length is known (Task 8) -- before
+            # this can surface ~30 frames deep as an OOM in the layer loop.
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None and args:
+                input_ids = args[0]
+            if input_ids is not None:
+                # kwargs.get(..., 0): every in-repo caller passes max_new_tokens
+                # explicitly. A caller relying on self.generation_config's default
+                # instead would under-count here -- HF's own merge of kwargs with
+                # generation_config happens deeper inside super().generate(),
+                # replicating it here was judged not worth the duplication for a
+                # gap no current call site hits.
+                self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0))
 
-        pc = getattr(self, "_prefix_cache", None)
-        if pc is None:
-            result = super().generate(*args, **kwargs)
-            self.telemetry.dump_json("vaayu_telemetry.json")
+            pc = getattr(self, "_prefix_cache", None)
+            if pc is None:
+                result = super().generate(*args, **kwargs)
+                self.telemetry.dump_json("vaayu_telemetry.json")
+                return result
+
+            # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
+            # calls with distinct session ids).
+            ids_list = input_ids[0].tolist()
+
+            # device= so a compressed entry is rebuilt straight onto the GPU; the
+            # store raises rather than handing back a packed container.
+            kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
+            if kv is None:
+                kv = self._create_kv_cache()
+                print(f"[Vaayu-Prefix] MISS session={session_id} "
+                      f"prompt_len={input_ids.shape[1]} — full prefill")
+            else:
+                match_len = self._adopt_prefix_hit(
+                    kv, match_len, input_ids.shape[1], session_id)
+                print(f"[Vaayu-Prefix] HIT session={session_id} "
+                      f"match_len={match_len}/{input_ids.shape[1]} — "
+                      f"prefill only {input_ids.shape[1] - match_len} new positions")
+            kwargs["past_key_values"] = kv
+
+            resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
+            try:
+                result = super().generate(*args, **kwargs)
+            except BaseException:
+                # lookup() above POPPED this entry. Without putting it back, an
+                # aborted turn -- an SSE client disconnecting mid-stream, a
+                # cancellation, an OOM -- drains the pool permanently.
+                from .prefix_cache import restore_on_abort
+                restore_on_abort(pc, resolved_sid, ids_list, kv, match_len)
+                raise
+            # `kv` was mutated in place through the forward passes -> holds the full
+            # final KV.
+            self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())
             return result
-
-        # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
-        # calls with distinct session ids).
-        ids_list = input_ids[0].tolist()
-
-        # device= so a compressed entry is rebuilt straight onto the GPU; the
-        # store raises rather than handing back a packed container.
-        kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
-        if kv is None:
-            kv = self._create_kv_cache()
-            print(f"[Vaayu-Prefix] MISS session={session_id} "
-                  f"prompt_len={input_ids.shape[1]} — full prefill")
-        else:
-            match_len = self._adopt_prefix_hit(
-                kv, match_len, input_ids.shape[1], session_id)
-            print(f"[Vaayu-Prefix] HIT session={session_id} "
-                  f"match_len={match_len}/{input_ids.shape[1]} — "
-                  f"prefill only {input_ids.shape[1] - match_len} new positions")
-        kwargs["past_key_values"] = kv
-
-        resolved_sid = session_id if session_id is not None else _auto_session_id(ids_list)
-        try:
-            result = super().generate(*args, **kwargs)
-        except BaseException:
-            # lookup() above POPPED this entry. Without putting it back, an
-            # aborted turn -- an SSE client disconnecting mid-stream, a
-            # cancellation, an OOM -- drains the pool permanently.
-            from .prefix_cache import restore_on_abort
-            restore_on_abort(pc, resolved_sid, ids_list, kv, match_len)
-            raise
-        # `kv` was mutated in place through the forward passes -> holds the full
-        # final KV.
-        self._persist_and_store(pc, resolved_sid, kv, result[0].tolist())
-        return result
 
     def _build_prefix_store(self, budget_bytes):
         """Construct the RAM prefix pool, honouring prefix_compress."""
@@ -5141,319 +5176,322 @@ class VaayuBaseModel(GenerationMixin):
         Returns:
             generated: (1, prompt_len + new_tokens) tensor of all token IDs
         """
-        assert self.speculator is not None, "speculative_generate called with no speculator"
+        # Row 27. choose_speculative_target hands stream_generate THIS method
+        # whenever a speculator is loaded, so cover it too.
+        with keepawake_for(self):
+            assert self.speculator is not None, "speculative_generate called with no speculator"
 
-        # Bound before the try: the finally below reads both, so a raise
-        # anywhere inside must not find them unassigned.
-        _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
-        _resized_vram_prefix = False
+            # Bound before the try: the finally below reads both, so a raise
+            # anywhere inside must not find them unassigned.
+            _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
+            _resized_vram_prefix = False
 
-        try:
-            # This loop honours NOTHING about sampling -- say so rather than hand
-            # back greedy text under a sampled request's name (CLAUDE.md: warn, do
-            # not silently degrade).
-            _ignored = speculative_ignored_sampling(temperature, kwargs)
-            if _ignored:
-                print(f"[Vaayu-Spec] WARNING: speculative decoding is greedy; "
-                      f"{', '.join(_ignored)} IGNORED for this generation. "
-                      f"Load without drafter_model_path to use them.")
+            try:
+                # This loop honours NOTHING about sampling -- say so rather than hand
+                # back greedy text under a sampled request's name (CLAUDE.md: warn, do
+                # not silently degrade).
+                _ignored = speculative_ignored_sampling(temperature, kwargs)
+                if _ignored:
+                    print(f"[Vaayu-Spec] WARNING: speculative decoding is greedy; "
+                          f"{', '.join(_ignored)} IGNORED for this generation. "
+                          f"Load without drafter_model_path to use them.")
 
-            # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
-            # only correct within one generation: `_drafter_seen` is a length into
-            # THIS input_ids. Carried into the next call it slices a different
-            # sequence, and the drafter drafts from another prompt's context.
-            # Measured: three identical greedy calls in one process returned three
-            # different sequences; resetting made them byte-identical.
-            self.speculator.reset()
+                # The drafter keeps its KV cache ACROSS draft rounds (Fix #9), which is
+                # only correct within one generation: `_drafter_seen` is a length into
+                # THIS input_ids. Carried into the next call it slices a different
+                # sequence, and the drafter drafts from another prompt's context.
+                # Measured: three identical greedy calls in one process returned three
+                # different sequences; resetting made them byte-identical.
+                self.speculator.reset()
 
-            # S1d: the runtime gate. `speculator` is held locally because an OFF
-            # decision sets self.speculator = None -- the same mechanism the load
-            # gate uses, so every LATER call takes the ordinary path -- while this
-            # call finishes on the suppressed-draft path below.
-            speculator = self.speculator
-            gate = self._build_spec_gate()
-            self._spec_gate = gate
+                # S1d: the runtime gate. `speculator` is held locally because an OFF
+                # decision sets self.speculator = None -- the same mechanism the load
+                # gate uses, so every LATER call takes the ordinary path -- while this
+                # call finishes on the suppressed-draft path below.
+                speculator = self.speculator
+                gate = self._build_spec_gate()
+                self._spec_gate = gate
 
-            # P9: size the VRAM cacheable prefix for THIS call's verify width.
-            # A verify pass is (draft_tokens + 1) positions through every MoE layer
-            # in ONE forward, so its per-layer insert load is the routing union over
-            # those positions -- the same quantity P6 sizes for a batch's N streams,
-            # and the same bound Fix #9 already applies to admission. The load-time
-            # call (:2610) charges one stream's top_k, which under-charges a
-            # draft_tokens=3 verify by 4x: MiniMax caches ALL 62 layers while
-            # inserting 4x what it is charged for -- exactly the configuration P6
-            # measured at a 2.35% hit rate against 48.4% when sized right.
-            #
-            # Sized ONCE for the whole call, and ONLY when the gate will actually
-            # draft. A round the gate refuses is an ordinary 1-wide decode, so the
-            # verify-width charge is simply wrong for it -- and a refusal is not a
-            # brief phase: `off` latches and this call then finishes on the
-            # suppressed-draft path, 1-wide to the end. Measured on Qwen3-235B
-            # 2026-09-07, whose gate latches off_union after calibration and never
-            # drafts: 65/94 layers -> 16/94 and 0.9740 -> 0.9423 tok/s, -3.25%.
-            # The gate's PHASE latches for the process, so it is read once here
-            # rather than re-read per round: only the FIRST call of a process can
-            # change phase mid-flight, and there this errs to the load-time sizing,
-            # which is the status quo. Over-charging a pass that IS wide can only
-            # shorten the prefix, the safe direction (a too-long prefix is the
-            # failure being fixed). The phase, not `should_draft()`: TRIAL
-            # alternates drafting and suppressed legs (row 13, `even-4`), so a
-            # call that opens on a suppressed leg still drafts rounds later and
-            # its suppressed rounds are over-charged -- the safe direction again.
-            #
-            # Restored in the finally below: this loop has several returns and had
-            # no finally at all, and a leaked verify-sized prefix would shrink
-            # caching for every later single-stream call. batched_generate and this
-            # path never run together (this one resets _batch_decode_active below);
-            # if that ever changes, the combined width is N * (draft_tokens + 1)
-            # positions, not the max of the two.
-            _vram_c = getattr(self, "_expert_vram_cache", None)
-            _will_draft = gate is None or gate.phase in ("trial", "run")
-            _geo = getattr(self, "_moe_geometry", None)
-            _blocks = getattr(self, "_moe_blocks", None)
-            if _will_draft and _vram_c is not None and _geo and _blocks:
-                _positions = (getattr(self, "draft_tokens", 0) or 0) + 1
-                _union = batch_union_per_layer(_geo, _positions)
-                _verify_layers = compute_vram_layer_range(
-                    _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
-                    experts_per_layer=_union)
-                if _verify_layers != _saved_vram_layers:
-                    self._vram_cacheable_layers = _verify_layers
-                    _resized_vram_prefix = True
-                    # Once per process: this path runs per REQUEST, and the same
-                    # line on every one of them is log spam, not information.
-                    if not getattr(self, "_spec_vram_prefix_announced", False):
-                        self._spec_vram_prefix_announced = True
-                        _n = (len(_blocks) if _verify_layers is None
-                              else len(_verify_layers))
-                        print(f"[Vaayu-Spec] a {_positions}-position verify pass "
-                              f"inserts the routing union ({_union}) per MoE layer, "
-                              f"not top_k ({_geo['top_k']}) — VRAM cache restricted "
-                              f"to {_n}/{len(_blocks)} MoE layers while speculating "
-                              f"(was {len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
+                # P9: size the VRAM cacheable prefix for THIS call's verify width.
+                # A verify pass is (draft_tokens + 1) positions through every MoE layer
+                # in ONE forward, so its per-layer insert load is the routing union over
+                # those positions -- the same quantity P6 sizes for a batch's N streams,
+                # and the same bound Fix #9 already applies to admission. The load-time
+                # call (:2610) charges one stream's top_k, which under-charges a
+                # draft_tokens=3 verify by 4x: MiniMax caches ALL 62 layers while
+                # inserting 4x what it is charged for -- exactly the configuration P6
+                # measured at a 2.35% hit rate against 48.4% when sized right.
+                #
+                # Sized ONCE for the whole call, and ONLY when the gate will actually
+                # draft. A round the gate refuses is an ordinary 1-wide decode, so the
+                # verify-width charge is simply wrong for it -- and a refusal is not a
+                # brief phase: `off` latches and this call then finishes on the
+                # suppressed-draft path, 1-wide to the end. Measured on Qwen3-235B
+                # 2026-09-07, whose gate latches off_union after calibration and never
+                # drafts: 65/94 layers -> 16/94 and 0.9740 -> 0.9423 tok/s, -3.25%.
+                # The gate's PHASE latches for the process, so it is read once here
+                # rather than re-read per round: only the FIRST call of a process can
+                # change phase mid-flight, and there this errs to the load-time sizing,
+                # which is the status quo. Over-charging a pass that IS wide can only
+                # shorten the prefix, the safe direction (a too-long prefix is the
+                # failure being fixed). The phase, not `should_draft()`: TRIAL
+                # alternates drafting and suppressed legs (row 13, `even-4`), so a
+                # call that opens on a suppressed leg still drafts rounds later and
+                # its suppressed rounds are over-charged -- the safe direction again.
+                #
+                # Restored in the finally below: this loop has several returns and had
+                # no finally at all, and a leaked verify-sized prefix would shrink
+                # caching for every later single-stream call. batched_generate and this
+                # path never run together (this one resets _batch_decode_active below);
+                # if that ever changes, the combined width is N * (draft_tokens + 1)
+                # positions, not the max of the two.
+                _vram_c = getattr(self, "_expert_vram_cache", None)
+                _will_draft = gate is None or gate.phase in ("trial", "run")
+                _geo = getattr(self, "_moe_geometry", None)
+                _blocks = getattr(self, "_moe_blocks", None)
+                if _will_draft and _vram_c is not None and _geo and _blocks:
+                    _positions = (getattr(self, "draft_tokens", 0) or 0) + 1
+                    _union = batch_union_per_layer(_geo, _positions)
+                    _verify_layers = compute_vram_layer_range(
+                        _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
+                        experts_per_layer=_union)
+                    if _verify_layers != _saved_vram_layers:
+                        self._vram_cacheable_layers = _verify_layers
+                        _resized_vram_prefix = True
+                        # Once per process: this path runs per REQUEST, and the same
+                        # line on every one of them is log spam, not information.
+                        if not getattr(self, "_spec_vram_prefix_announced", False):
+                            self._spec_vram_prefix_announced = True
+                            _n = (len(_blocks) if _verify_layers is None
+                                  else len(_verify_layers))
+                            print(f"[Vaayu-Spec] a {_positions}-position verify pass "
+                                  f"inserts the routing union ({_union}) per MoE layer, "
+                                  f"not top_k ({_geo['top_k']}) — VRAM cache restricted "
+                                  f"to {_n}/{len(_blocks)} MoE layers while speculating "
+                                  f"(was {len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
 
-            self._batch_decode_active = False
-            self._batch_n = 1
+                self._batch_decode_active = False
+                self._batch_n = 1
 
-            # Fail fast here too (Task 8), same entry-point policy as generate().
-            # This loop is single-stream (N=1, the default); the per-step verify
-            # forward routes draft_tokens+1 positions at once, but that transient
-            # is far below a full prefill chunk and the final KV length is capped
-            # by prompt_len + max_new_tokens regardless of how many draft/verify
-            # rounds it takes to get there -- the same total this predicate checks
-            # for generate().
-            self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)
+                # Fail fast here too (Task 8), same entry-point policy as generate().
+                # This loop is single-stream (N=1, the default); the per-step verify
+                # forward routes draft_tokens+1 positions at once, but that transient
+                # is far below a full prefill chunk and the final KV length is capped
+                # by prompt_len + max_new_tokens regardless of how many draft/verify
+                # rounds it takes to get there -- the same total this predicate checks
+                # for generate().
+                self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)
 
-            pc = getattr(self, "_prefix_cache", None)
-            kv, ids_list = None, input_ids[0].tolist()
-            if pc is not None:
-                kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
-                if kv is None:
-                    kv = self._create_kv_cache()
-                else:
-                    self._adopt_prefix_hit(
-                        kv, match_len, input_ids.shape[1], session_id)
+                pc = getattr(self, "_prefix_cache", None)
+                kv, ids_list = None, input_ids[0].tolist()
+                if pc is not None:
+                    kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
+                    if kv is None:
+                        kv = self._create_kv_cache()
+                    else:
+                        self._adopt_prefix_hit(
+                            kv, match_len, input_ids.shape[1], session_id)
 
-            # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
-            # gets away with passing the untouched prompt because HF's own
-            # generate() loop calls prepare_inputs_for_generation (above), which
-            # slices input_ids down to what the cache doesn't already hold. This
-            # loop calls forward() directly with no such step, so do it here: feed
-            # only the tail beyond kv's current length, or forward() would
-            # re-append the already-cached prefix on top of itself.
-            prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
+                # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
+                # gets away with passing the untouched prompt because HF's own
+                # generate() loop calls prepare_inputs_for_generation (above), which
+                # slices input_ids down to what the cache doesn't already hold. This
+                # loop calls forward() directly with no such step, so do it here: feed
+                # only the tail beyond kv's current length, or forward() would
+                # re-append the already-cached prefix on top of itself.
+                prefill_ids = input_ids[:, kv.get_seq_length():] if kv is not None else input_ids
 
-            # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
-            prefill_out = self.forward(
-                input_ids=prefill_ids,
-                past_key_values=kv,
-                use_cache=True,
-                return_dict=True,
-            )
-            past_key_values = prefill_out.past_key_values
-            # Seed the first new token from prefill logits
-            first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
-            generated = torch.cat([input_ids, first_token], dim=1)
-            tokens_generated = 1
+                # Step 1: Prefill — forward() auto-chunks if prefill_chunk_size > 0
+                prefill_out = self.forward(
+                    input_ids=prefill_ids,
+                    past_key_values=kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = prefill_out.past_key_values
+                # Seed the first new token from prefill logits
+                first_token = prefill_out.logits[:, -1].argmax(dim=-1, keepdim=True)
+                generated = torch.cat([input_ids, first_token], dim=1)
+                tokens_generated = 1
 
-            if streamer is not None:
-                # Put the PROMPT first, exactly as generate() does. A streamer built
-                # with skip_prompt=True (what stream_generate always builds) swallows
-                # its first put() and clears the flag; without this line the call it
-                # eats is `first_token` -- the first GENERATED token -- so streamed
-                # text and the id sink are both short by exactly one token.
-                streamer.put(input_ids.cpu())
-                streamer.put(first_token.cpu())
+                if streamer is not None:
+                    # Put the PROMPT first, exactly as generate() does. A streamer built
+                    # with skip_prompt=True (what stream_generate always builds) swallows
+                    # its first put() and clears the flag; without this line the call it
+                    # eats is `first_token` -- the first GENERATED token -- so streamed
+                    # text and the id sink are both short by exactly one token.
+                    streamer.put(input_ids.cpu())
+                    streamer.put(first_token.cpu())
 
-            eos_ids = self.config.eos_token_id
-            if isinstance(eos_ids, int):
-                eos_ids = [eos_ids]
-            eos_set = set(eos_ids) if eos_ids else set()
+                eos_ids = self.config.eos_token_id
+                if isinstance(eos_ids, int):
+                    eos_ids = [eos_ids]
+                eos_set = set(eos_ids) if eos_ids else set()
 
-            if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+                if first_token.item() in eos_set or tokens_generated >= max_new_tokens:
+                    if streamer is not None:
+                        streamer.end()
+                    if pc is not None:
+                        resolved = session_id if session_id is not None else _auto_session_id(ids_list)
+                        self._persist_and_store(pc, resolved, kv, generated[0].tolist())
+                    return generated
+
+                # Row 13: the gate's break-even was in EXPERT BYTES and nothing
+                # timed a clock, so it admitted -- and latched -- a configuration
+                # measured at -16% decode (2026-09-07). The gate is pure and reads
+                # no clock itself, so the loop measures for it. A per-CALL local:
+                # the gate is shared across requests but the delta must not span a
+                # request boundary or a prefill.
+                _round_mark = None
+
+                while tokens_generated < max_new_tokens:
+                    # This loop is hand-written, so transformers' criteria machinery
+                    # never runs here: check it ourselves or a cancelled request keeps
+                    # drafting and verifying with nobody left to read the tokens.
+                    if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
+                        break
+
+                    # Step 2: Draft K tokens -- unless the gate is still calibrating or
+                    # has latched off, in which case this round is an ordinary 1-wide
+                    # decode that still produces a token and still shows the gate real
+                    # routing.
+                    # The proposer's own time is separated from the round's:
+                    # a round that drafted NOTHING is the gate's 1-wide baseline,
+                    # and the counterfactual it stands for -- speculation off --
+                    # runs no proposer at all. Row 13, measured 2026-09-10:
+                    # leaving the failed search in that baseline understates the
+                    # verify pass's per-position cost by about the search's own
+                    # share, which was the entire decision margin on MiniMax-M2.7.
+                    _draft_t0 = time.perf_counter()
+                    if gate is not None and not gate.should_draft():
+                        draft_ids = torch.empty((1, 0), dtype=generated.dtype,
+                                                device=generated.device)
+                        draft_state = None
+                    else:
+                        draft_ids, draft_state = speculator.draft(
+                            generated, past_key_values, num_tokens=self.draft_tokens
+                        )
+                    _draft_s = time.perf_counter() - _draft_t0
+                    k = draft_ids.shape[1]
+
+                    # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
+                    # past_key_values has prompt+accepted tokens; verify adds k+1 more
+                    past_len_before = past_key_values.get_seq_length()
+                    verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
+                    verify_out = self.forward(
+                        input_ids=verify_input,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
+                    past_key_values = verify_out.past_key_values
+
+                    # Step 4: Accept/reject longest correct prefix
+                    accepted_ids, num_accepted = speculator.verify_and_accept(
+                        generated, draft_ids, verifier_logits, draft_state
+                    )
+
+                    if gate is not None:
+                        # Both call sites fire exactly once per round, at this same
+                        # point, so the delta between consecutive marks IS one
+                        # round -- the draft, the verify and the accept. The first
+                        # mark of a call has no predecessor (the work before it is
+                        # the prefill), so that round is dropped.
+                        _now = time.perf_counter()
+                        _round_s = None if _round_mark is None else _now - _round_mark
+                        _round_mark = _now
+                        if gate.phase == "calibrate":
+                            gate.observe(getattr(self, "_expert_history", {}) or {},
+                                         elapsed_s=_round_s)
+                        else:
+                            # `num_accepted` (Step 4) is 1..k+1 -- it always includes
+                            # the bonus/correction token verify_and_accept guarantees
+                            # every round. The gate's break-even treats that token as
+                            # the "+1" in "1 + accepted" (design doc §2) and wants only
+                            # the count of DRAFTED tokens that matched, 0..k.
+                            gate.record_round(k, max(0, num_accepted - 1),
+                                              elapsed_s=_round_s,
+                                              draft_overhead_s=_draft_s)
+                        if gate.decided_off() and self.speculator is not None:
+                            s = gate.status()
+                            if gate.decision == "off_no_routing":
+                                # 800467d fixed the same ambiguity for a starved
+                                # k-window; this is the other way observed_union_gb
+                                # reads 0.0 -- every calibration snapshot's routing
+                                # dict was empty, i.e. this forward stopped writing
+                                # _expert_history (design doc S8's named risk), not a
+                                # real over-budget refusal. Name the cause, don't let
+                                # it read as a measured union that happened to be 0.
+                                print(f"[Vaayu-Spec] WARNING: no expert routing was "
+                                      f"observed during calibration (_expert_history "
+                                      f"stayed empty every step) -- this forward is "
+                                      f"not writing it, so the gate has no evidence "
+                                      f"to size a verify pass against. DISABLING "
+                                      f"speculative decoding for this MoE model "
+                                      f"rather than guessing: {s}")
+                            else:
+                                print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
+                                      f"for this MoE model on measured evidence: {s}")
+                            self.speculator = None
+                            status = getattr(self, "speculative_status", None)
+                            if status is not None:
+                                status["active"] = False
+                                status["calibration"] = s
+                        elif gate.decision == "run":
+                            # Refreshed every round, not written once: with the gate
+                            # now cached across calls (Critical 1), a `run` decision
+                            # keeps accumulating drafted/accepted after it latches, so
+                            # freezing the first generation's numbers here would make
+                            # every later report stale.
+                            status = getattr(self, "speculative_status", None)
+                            if status is not None:
+                                status["calibration"] = gate.status()
+
+                    # Step 5: Trim verifier KV back to past_len + num_accepted
+                    # (verify pass grew cache by k+1; we only keep num_accepted new positions)
+                    self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
+
+                    # Step 6: Sync drafter cache to match accepted length. Skipped
+                    # when draft_state is None -- the suppressed-draft path (gate
+                    # calibrating, or latched off) never called speculator.draft(),
+                    # so there is no drafter-side state to roll back, and a weighted
+                    # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
+                    # draft_state unconditionally once its own cache is warm and
+                    # crashes on None (PLD's is a no-op `pass`, which is why this was
+                    # never reachable through it).
+                    if draft_state is not None:
+                        speculator.rollback_cache(draft_state, num_accepted)
+
+                    # Step 7: Extend generated sequence (cap at max_new_tokens)
+                    remaining = max_new_tokens - tokens_generated
+                    if num_accepted > remaining:
+                        accepted_ids = accepted_ids[:, :remaining]
+                        num_accepted = remaining
+                    generated = torch.cat([generated, accepted_ids], dim=1)
+                    tokens_generated += num_accepted
+
+                    if streamer is not None:
+                        streamer.put(accepted_ids.cpu())
+
+                    accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
+                    print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
+                          f"total_new={tokens_generated}/{max_new_tokens} "
+                          f"accept_rate={accept_rate_str}")
+
+                    if accepted_ids[0, -1].item() in eos_set:
+                        break
+
                 if streamer is not None:
                     streamer.end()
                 if pc is not None:
                     resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
+                self.telemetry.dump_json("vaayu_telemetry.json")
                 return generated
-
-            # Row 13: the gate's break-even was in EXPERT BYTES and nothing
-            # timed a clock, so it admitted -- and latched -- a configuration
-            # measured at -16% decode (2026-09-07). The gate is pure and reads
-            # no clock itself, so the loop measures for it. A per-CALL local:
-            # the gate is shared across requests but the delta must not span a
-            # request boundary or a prefill.
-            _round_mark = None
-
-            while tokens_generated < max_new_tokens:
-                # This loop is hand-written, so transformers' criteria machinery
-                # never runs here: check it ourselves or a cancelled request keeps
-                # drafting and verifying with nobody left to read the tokens.
-                if stopping_criteria is not None and bool(stopping_criteria(generated, None).any()):
-                    break
-
-                # Step 2: Draft K tokens -- unless the gate is still calibrating or
-                # has latched off, in which case this round is an ordinary 1-wide
-                # decode that still produces a token and still shows the gate real
-                # routing.
-                # The proposer's own time is separated from the round's:
-                # a round that drafted NOTHING is the gate's 1-wide baseline,
-                # and the counterfactual it stands for -- speculation off --
-                # runs no proposer at all. Row 13, measured 2026-09-10:
-                # leaving the failed search in that baseline understates the
-                # verify pass's per-position cost by about the search's own
-                # share, which was the entire decision margin on MiniMax-M2.7.
-                _draft_t0 = time.perf_counter()
-                if gate is not None and not gate.should_draft():
-                    draft_ids = torch.empty((1, 0), dtype=generated.dtype,
-                                            device=generated.device)
-                    draft_state = None
-                else:
-                    draft_ids, draft_state = speculator.draft(
-                        generated, past_key_values, num_tokens=self.draft_tokens
-                    )
-                _draft_s = time.perf_counter() - _draft_t0
-                k = draft_ids.shape[1]
-
-                # Step 3: Verify — one Vaayu pass over [last_token, d_0, ..., d_{k-1}]
-                # past_key_values has prompt+accepted tokens; verify adds k+1 more
-                past_len_before = past_key_values.get_seq_length()
-                verify_input = torch.cat([generated[:, -1:], draft_ids], dim=1)
-                verify_out = self.forward(
-                    input_ids=verify_input,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                verifier_logits = verify_out.logits   # shape: (1, k+1, vocab_size)
-                past_key_values = verify_out.past_key_values
-
-                # Step 4: Accept/reject longest correct prefix
-                accepted_ids, num_accepted = speculator.verify_and_accept(
-                    generated, draft_ids, verifier_logits, draft_state
-                )
-
-                if gate is not None:
-                    # Both call sites fire exactly once per round, at this same
-                    # point, so the delta between consecutive marks IS one
-                    # round -- the draft, the verify and the accept. The first
-                    # mark of a call has no predecessor (the work before it is
-                    # the prefill), so that round is dropped.
-                    _now = time.perf_counter()
-                    _round_s = None if _round_mark is None else _now - _round_mark
-                    _round_mark = _now
-                    if gate.phase == "calibrate":
-                        gate.observe(getattr(self, "_expert_history", {}) or {},
-                                     elapsed_s=_round_s)
-                    else:
-                        # `num_accepted` (Step 4) is 1..k+1 -- it always includes
-                        # the bonus/correction token verify_and_accept guarantees
-                        # every round. The gate's break-even treats that token as
-                        # the "+1" in "1 + accepted" (design doc §2) and wants only
-                        # the count of DRAFTED tokens that matched, 0..k.
-                        gate.record_round(k, max(0, num_accepted - 1),
-                                          elapsed_s=_round_s,
-                                          draft_overhead_s=_draft_s)
-                    if gate.decided_off() and self.speculator is not None:
-                        s = gate.status()
-                        if gate.decision == "off_no_routing":
-                            # 800467d fixed the same ambiguity for a starved
-                            # k-window; this is the other way observed_union_gb
-                            # reads 0.0 -- every calibration snapshot's routing
-                            # dict was empty, i.e. this forward stopped writing
-                            # _expert_history (design doc S8's named risk), not a
-                            # real over-budget refusal. Name the cause, don't let
-                            # it read as a measured union that happened to be 0.
-                            print(f"[Vaayu-Spec] WARNING: no expert routing was "
-                                  f"observed during calibration (_expert_history "
-                                  f"stayed empty every step) -- this forward is "
-                                  f"not writing it, so the gate has no evidence "
-                                  f"to size a verify pass against. DISABLING "
-                                  f"speculative decoding for this MoE model "
-                                  f"rather than guessing: {s}")
-                        else:
-                            print(f"[Vaayu-Spec] WARNING: DISABLING speculative decoding "
-                                  f"for this MoE model on measured evidence: {s}")
-                        self.speculator = None
-                        status = getattr(self, "speculative_status", None)
-                        if status is not None:
-                            status["active"] = False
-                            status["calibration"] = s
-                    elif gate.decision == "run":
-                        # Refreshed every round, not written once: with the gate
-                        # now cached across calls (Critical 1), a `run` decision
-                        # keeps accumulating drafted/accepted after it latches, so
-                        # freezing the first generation's numbers here would make
-                        # every later report stale.
-                        status = getattr(self, "speculative_status", None)
-                        if status is not None:
-                            status["calibration"] = gate.status()
-
-                # Step 5: Trim verifier KV back to past_len + num_accepted
-                # (verify pass grew cache by k+1; we only keep num_accepted new positions)
-                self._trim_kv_cache(past_key_values, past_len_before + num_accepted)
-
-                # Step 6: Sync drafter cache to match accepted length. Skipped
-                # when draft_state is None -- the suppressed-draft path (gate
-                # calibrating, or latched off) never called speculator.draft(),
-                # so there is no drafter-side state to roll back, and a weighted
-                # drafter's rollback_cache (e.g. StandardDrafterDecoder) reads
-                # draft_state unconditionally once its own cache is warm and
-                # crashes on None (PLD's is a no-op `pass`, which is why this was
-                # never reachable through it).
-                if draft_state is not None:
-                    speculator.rollback_cache(draft_state, num_accepted)
-
-                # Step 7: Extend generated sequence (cap at max_new_tokens)
-                remaining = max_new_tokens - tokens_generated
-                if num_accepted > remaining:
-                    accepted_ids = accepted_ids[:, :remaining]
-                    num_accepted = remaining
-                generated = torch.cat([generated, accepted_ids], dim=1)
-                tokens_generated += num_accepted
-
-                if streamer is not None:
-                    streamer.put(accepted_ids.cpu())
-
-                accept_rate_str = f"{num_accepted / k:.0%}" if k > 0 else "n/a (no match)"
-                print(f"[Vaayu-Spec] drafted={k} accepted={num_accepted} "
-                      f"total_new={tokens_generated}/{max_new_tokens} "
-                      f"accept_rate={accept_rate_str}")
-
-                if accepted_ids[0, -1].item() in eos_set:
-                    break
-
-            if streamer is not None:
-                streamer.end()
-            if pc is not None:
-                resolved = session_id if session_id is not None else _auto_session_id(ids_list)
-                self._persist_and_store(pc, resolved, kv, generated[0].tolist())
-            self.telemetry.dump_json("vaayu_telemetry.json")
-            return generated
-        finally:
-            if _resized_vram_prefix:
-                self._vram_cacheable_layers = _saved_vram_layers
+            finally:
+                if _resized_vram_prefix:
+                    self._vram_cacheable_layers = _saved_vram_layers
 
     @torch.no_grad()
     def batched_generate(self, requests, reclaim: bool = False, should_stop=None):
@@ -5477,272 +5515,251 @@ class VaayuBaseModel(GenerationMixin):
         the unhooked behaviour. Without it there is no way to tell a running
         batch that one client has gone, and a disconnect at cap=8000 holds
         every other stream for 8000 steps."""
-        from .batch import (sample_step, batch_position_ids, batch_common_prefix,
-                            broadcast_cache_rows, slice_cache_row_unpadded,
-                            resolve_matched_len,
-                            batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES,
-                            expert_giveback_bytes)
-        assert self._active_attn_impl == "sdpa", (
-            f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
-        N = len(requests)
-        device = self.running_device
-        pad_id = self.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = self.tokenizer.eos_token_id
+        # Row 27. A generator, so the context spans the whole iteration and
+        # still closes when the body raises (its admission asserts do,
+        # routinely). Not reachable through the server today:
+        # MAX_BATCH_SIZE = 1 (CLAUDE.md section 8 #3).
+        with keepawake_for(self):
+            from .batch import (sample_step, batch_position_ids, batch_common_prefix,
+                                broadcast_cache_rows, slice_cache_row_unpadded,
+                                resolve_matched_len,
+                                batch_kv_cost, geo_from_model, _VRAM_SAFETY_BYTES,
+                                expert_giveback_bytes)
+            assert self._active_attn_impl == "sdpa", (
+                f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
+            N = len(requests)
+            device = self.running_device
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id
 
-        # Fail fast here, at the real batch width (Task 8): the load-time
-        # plan is sized for N=1, and a fan-out of N streams multiplies KV,
-        # activations and logits, so admission must re-evaluate rather than
-        # assume the load-time answer still holds.
-        #
-        # P10: and admission must be told what the expert VRAM cache will
-        # SURRENDER for this batch, or it charges the batch against a
-        # single-stream reserve that no N>1 request at a real agentic context
-        # can fit under. Measured 2026-09-07 at ~4.15k tokens: the guard
-        # refused N=2 and N=3 on both MoE checkpoints, while 3 of those 4 arms
-        # ran fine when forced past it -- and the 4th (MiniMax N=3) OOM'd, so
-        # the guard is right to exist and only its budget was wrong.
-        # `expert_giveback_bytes` is the ENTITLEMENT above one decode step's
-        # working set, which is what blocks admission even on a cold cache;
-        # Plan K's eviction below prices resident USAGE and cannot substitute.
-        #
-        # N=1 claims nothing: that is the path the server runs today and it
-        # stays byte-identical.
-        _giveback = expert_giveback_bytes(self) if N > 1 else 0
-        # `batched_prefill=True`: the loop below is NOT _chunked_prefill, so the
-        # load-time shape's layer-major form and chunk-major retention are both
-        # wrong for it -- see _assert_context_fits (todo row 21).
-        _need = self._assert_context_fits(
-            max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N,
-            expert_giveback_bytes=_giveback, batched_prefill=True)
-
-        # Keep the promise. Admission counted these bytes as no longer belonging
-        # to the cache, so the cache must really stop taking them -- for the
-        # batch's lifetime, restored in the finally below. Without this the
-        # cache regrows into the KV admission just allocated and the OOM moves
-        # from prefill to decode, which is strictly worse: later, and after the
-        # prefill has already been paid for.
-        #
-        # `evict_until_free` (Plan K, just below) does NOT do this. It frees
-        # bytes once and leaves budget_bytes untouched, so put() keeps admitting
-        # experts up to the old entitlement on the very next decode step.
-        #
-        # Charged at what admission SPENT, not the whole giveback: the surplus
-        # is cache the batch can still use, and cache size sets decode
-        # throughput (P6). `_need` is None when the guard could not check at all
-        # (CPU, no CUDA, no plan) -- nothing was admitted against a giveback
-        # then, so nothing may be taken.
-        _vram_cache = getattr(self, "_expert_vram_cache", None)
-        _saved_budget = None
-        if _giveback > 0 and _need is not None and _vram_cache is not None:
-            _spend = min(_giveback, max(0, int(_need) - self._vram_plan.reserve_bytes))
-            if _spend > 0:
-                _saved_budget = _vram_cache.budget_bytes
-                _vram_cache.budget_bytes = _saved_budget - _spend
-                print(f"[Vaayu-Batch] N={N}: expert VRAM cache budget "
-                      f"{_saved_budget / 1e9:.2f} -> "
-                      f"{_vram_cache.budget_bytes / 1e9:.2f} GB for this batch "
-                      f"(admission spent {_spend / 1e9:.2f} GB of a "
-                      f"{_giveback / 1e9:.2f} GB giveback).")
-
-        # Plan K: perform the reclaim this batch was ADMITTED under. Admitting
-        # against reclaimable VRAM without reclaiming it just moves the OOM.
-        #
-        # ONCE, here at the batch boundary, never on the decode path below --
-        # a per-step reclaim would re-evict the cache every token, which is
-        # Plan H's mistake in a different costume (right mechanism, hot path).
-        # Pinned by test.
-        #
-        # Runs before the prefix lookup's to_device() so the freed VRAM is
-        # still free when the reused KV lands on the GPU; reclaiming after it
-        # would evict experts to make room for bytes already allocated.
-        # batch_kv_cost is the SAME expression plan_batch admitted against --
-        # if these two diverge, admission is lying and the gap surfaces as an
-        # OOM instead of a deferral.
-        if reclaim:
-            _vram = getattr(self, "_expert_vram_cache", None)
-            if _vram is not None:
-                _target = (batch_kv_cost(requests, *geo_from_model(self))
-                           + _VRAM_SAFETY_BYTES)
-                _freed = _vram.evict_until_free(_target)
-                print(f"[Vaayu-Batch] reclaim: freed {_freed / 1e9:.2f} GB of expert "
-                      f"VRAM cache for N={N} (free target {_target / 1e9:.2f} GB)")
-
-        pc = getattr(self, "_prefix_cache", None)
-        common_ids = batch_common_prefix(requests) if pc is not None else []
-        kv, m = (pc.lookup(None, common_ids, device=device)
-                 if common_ids else (None, 0))
-        if kv is not None:
-            # Every stream must keep >=1 token to run, same clamp generate()
-            # applies at :3714 and for the same reason.
-            m = min(m, min(len(r.prompt_ids) for r in requests) - 1)
-        if kv is None or m <= 0:
-            kv, m = None, 0
-        else:
-            kv.to_device(device)
-            m = resolve_matched_len(kv, m)
-            broadcast_cache_rows(kv, N)
-            print(f"[Vaayu-Prefix] BATCH HIT n={N} match_len={m}/"
-                  f"{len(common_ids)} — prefilling only the divergent tails")
-
-        tails = [r.prompt_ids[m:] for r in requests]
-        max_R = max(len(t) for t in tails)
-        input_ids = torch.full((N, max_R), pad_id, dtype=torch.long, device=device)
-        tail_mask = torch.zeros((N, max_R), dtype=torch.long, device=device)
-        for i, t in enumerate(tails):
-            input_ids[i, max_R - len(t):] = torch.tensor(t, device=device)
-            tail_mask[i, max_R - len(t):] = 1
-        pad_mask = torch.cat(
-            [torch.ones((N, m), dtype=torch.long, device=device), tail_mask], dim=1)
-        position_ids = batch_position_ids(pad_mask)
-
-        _total_prompt = sum(len(r.prompt_ids) for r in requests)
-        self._batch_prefix_stats = {
-            "matched": m, "common": len(common_ids),
-            "prefill_tokens": _total_prompt,
-            "coverage": (N * m / _total_prompt) if _total_prompt else 0.0,
-        }
-
-        eos = self.config.eos_token_id
-        eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
-        stop_sets = [set(r.stop_ids) | eos_set for r in requests]
-        active = [True] * N
-        produced = [0] * N
-        # The ids too, not just the count: the store-back writes one pool entry
-        # PER SESSION now, and an entry's token_ids must be what that session
-        # will resend next turn -- its prompt plus the answer it got.
-        produced_ids: list[list[int]] = [[] for _ in range(N)]
-
-        # P6: re-size the VRAM cacheable prefix for THIS batch width. The
-        # load-time call (:2578) runs before any batch exists and charges one
-        # stream's top_k, but the N streams share one forward per layer and
-        # insert their routing UNION -- measured 1.80x top_k on Qwen at N=3 and
-        # 2.06x on MiniMax, which collapsed the cache to 0.1% / 2.4% hit rates
-        # against 44.0% / 29.0% at N=1 (docs/2026-09-06-P1-...-RESULTS.md §4).
-        # MiniMax is the case with NO load-time restriction at all, because its
-        # SINGLE-stream working set fits.
-        #
-        # Restored in the finally below: a leaked batch-sized prefix would
-        # shrink caching for every later single-stream call.
-        _vram_c = getattr(self, "_expert_vram_cache", None)
-        _geo = getattr(self, "_moe_geometry", None)
-        _blocks = getattr(self, "_moe_blocks", None)
-        _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
-        _resized_vram_prefix = False
-        if N > 1 and _vram_c is not None and _geo and _blocks:
-            _union = batch_union_per_layer(_geo, N)
-            _batch_layers = compute_vram_layer_range(
-                _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
-                experts_per_layer=_union)
-            if _batch_layers != _saved_vram_layers:
-                self._vram_cacheable_layers = _batch_layers
-                _resized_vram_prefix = True
-                _n_layers = (len(_blocks) if _batch_layers is None
-                             else len(_batch_layers))
-                print(f"[Vaayu-Batch] N={N}: per-layer expert insert load is the "
-                      f"routing union ({_union}), not top_k ({_geo['top_k']}) — "
-                      f"VRAM cache restricted to {_n_layers}/{len(_blocks)} MoE "
-                      f"layers for this batch (was "
-                      f"{len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
-
-        # Feature B: only batched_generate ever sets this. It gates the padding
-        # mask / per-stream positions / batched-RoPE branches in forward() (Task
-        # 5) — without it, forward() silently falls through to the single-stream
-        # path on a padded batch, producing wrong results. Must stay True for
-        # every forward() call below (prefill AND decode loop) and must always
-        # be cleared on exit, so it never leaks into a later single-stream call.
-        self._batch_decode_active = True
-        self._batch_n = N
-        self.telemetry.reset_batch_overlap()
-        past = None   # bound in finally's store-back guard; stays None if the
-                       # generator is torn down before the prefill forward returns
-        try:
-            # Prefill, CHUNKED. Running the whole batch prompt as one forward
-            # made long contexts unreachable at any N: measured on MiniMax,
-            # N=1 fits at 4k tokens and OOMs at 7 768 (tried 5.79 GiB with
-            # 5.13 free), N=3 fits at 2k and OOMs at 4k. The constraint is
-            # prefill ACTIVATIONS, scaling with N x context — which is why no
-            # admission policy could help there (Plan K Task 3).
+            # Fail fast here, at the real batch width (Task 8): the load-time
+            # plan is sized for N=1, and a fan-out of N streams multiplies KV,
+            # activations and logits, so admission must re-evaluate rather than
+            # assume the load-time answer still holds.
             #
-            # forward()'s own chunked path is NOT reusable here: its MoE fast
-            # path turns chunks INTO batch elements, so it needs the batch
-            # dimension this caller is already using. Hence chunking here,
-            # where pad_mask and the per-stream positions already exist, with
-            # forward's own chunking disabled for each call.
+            # P10: and admission must be told what the expert VRAM cache will
+            # SURRENDER for this batch, or it charges the batch against a
+            # single-stream reserve that no N>1 request at a real agentic context
+            # can fit under. Measured 2026-09-07 at ~4.15k tokens: the guard
+            # refused N=2 and N=3 on both MoE checkpoints, while 3 of those 4 arms
+            # ran fine when forced past it -- and the 4th (MiniMax N=3) OOM'd, so
+            # the guard is right to exist and only its budget was wrong.
+            # `expert_giveback_bytes` is the ENTITLEMENT above one decode step's
+            # working set, which is what blocks admission even on a cold cache;
+            # Plan K's eviction below prices resident USAGE and cannot substitute.
             #
-            # Per chunk, with past = m + start and q = end - start:
-            #   mask       pad_mask[:, :m + end]      width == past + q
-            #   positions  position_ids[:, :m + end]  get_pos_emb_args slices
-            #                                         [len_p : len_p + len_s],
-            #                                         so positions are absolute
-            #                                         from 0, never chunk-local.
-            # check_batch_kv_invariant re-checks the mask/KV agreement on every
-            # one of these calls.
+            # N=1 claims nothing: that is the path the server runs today and it
+            # stays byte-identical.
+            _giveback = expert_giveback_bytes(self) if N > 1 else 0
+            # `batched_prefill=True`: the loop below is NOT _chunked_prefill, so the
+            # load-time shape's layer-major form and chunk-major retention are both
+            # wrong for it -- see _assert_context_fits (todo row 21).
+            _need = self._assert_context_fits(
+                max(len(r.prompt_ids) + r.max_new_tokens for r in requests), N=N,
+                expert_giveback_bytes=_giveback, batched_prefill=True)
+
+            # Keep the promise. Admission counted these bytes as no longer belonging
+            # to the cache, so the cache must really stop taking them -- for the
+            # batch's lifetime, restored in the finally below. Without this the
+            # cache regrows into the KV admission just allocated and the OOM moves
+            # from prefill to decode, which is strictly worse: later, and after the
+            # prefill has already been paid for.
             #
-            # Cost, stated because it is real: the layer-major optimisation that
-            # reads each expert once per PREFILL rather than once per chunk is
-            # the very trick that cannot compose with a batch, so a batched
-            # chunked prefill re-reads the expert set per chunk. That buys the
-            # ability to run at all.
-            _saved_chunk = self.prefill_chunk_size
-            self.prefill_chunk_size = 0
-            _step = _saved_chunk if _saved_chunk and _saved_chunk > 0 else max_R
+            # `evict_until_free` (Plan K, just below) does NOT do this. It frees
+            # bytes once and leaves budget_bytes untouched, so put() keeps admitting
+            # experts up to the old entitlement on the very next decode step.
+            #
+            # Charged at what admission SPENT, not the whole giveback: the surplus
+            # is cache the batch can still use, and cache size sets decode
+            # throughput (P6). `_need` is None when the guard could not check at all
+            # (CPU, no CUDA, no plan) -- nothing was admitted against a giveback
+            # then, so nothing may be taken.
+            _vram_cache = getattr(self, "_expert_vram_cache", None)
+            _saved_budget = None
+            if _giveback > 0 and _need is not None and _vram_cache is not None:
+                _spend = min(_giveback, max(0, int(_need) - self._vram_plan.reserve_bytes))
+                if _spend > 0:
+                    _saved_budget = _vram_cache.budget_bytes
+                    _vram_cache.budget_bytes = _saved_budget - _spend
+                    print(f"[Vaayu-Batch] N={N}: expert VRAM cache budget "
+                          f"{_saved_budget / 1e9:.2f} -> "
+                          f"{_vram_cache.budget_bytes / 1e9:.2f} GB for this batch "
+                          f"(admission spent {_spend / 1e9:.2f} GB of a "
+                          f"{_giveback / 1e9:.2f} GB giveback).")
+
+            # Plan K: perform the reclaim this batch was ADMITTED under. Admitting
+            # against reclaimable VRAM without reclaiming it just moves the OOM.
+            #
+            # ONCE, here at the batch boundary, never on the decode path below --
+            # a per-step reclaim would re-evict the cache every token, which is
+            # Plan H's mistake in a different costume (right mechanism, hot path).
+            # Pinned by test.
+            #
+            # Runs before the prefix lookup's to_device() so the freed VRAM is
+            # still free when the reused KV lands on the GPU; reclaiming after it
+            # would evict experts to make room for bytes already allocated.
+            # batch_kv_cost is the SAME expression plan_batch admitted against --
+            # if these two diverge, admission is lying and the gap surfaces as an
+            # OOM instead of a deferral.
+            if reclaim:
+                _vram = getattr(self, "_expert_vram_cache", None)
+                if _vram is not None:
+                    _target = (batch_kv_cost(requests, *geo_from_model(self))
+                               + _VRAM_SAFETY_BYTES)
+                    _freed = _vram.evict_until_free(_target)
+                    print(f"[Vaayu-Batch] reclaim: freed {_freed / 1e9:.2f} GB of expert "
+                          f"VRAM cache for N={N} (free target {_target / 1e9:.2f} GB)")
+
+            pc = getattr(self, "_prefix_cache", None)
+            common_ids = batch_common_prefix(requests) if pc is not None else []
+            kv, m = (pc.lookup(None, common_ids, device=device)
+                     if common_ids else (None, 0))
+            if kv is not None:
+                # Every stream must keep >=1 token to run, same clamp generate()
+                # applies at :3714 and for the same reason.
+                m = min(m, min(len(r.prompt_ids) for r in requests) - 1)
+            if kv is None or m <= 0:
+                kv, m = None, 0
+            else:
+                kv.to_device(device)
+                m = resolve_matched_len(kv, m)
+                broadcast_cache_rows(kv, N)
+                print(f"[Vaayu-Prefix] BATCH HIT n={N} match_len={m}/"
+                      f"{len(common_ids)} — prefilling only the divergent tails")
+
+            tails = [r.prompt_ids[m:] for r in requests]
+            max_R = max(len(t) for t in tails)
+            input_ids = torch.full((N, max_R), pad_id, dtype=torch.long, device=device)
+            tail_mask = torch.zeros((N, max_R), dtype=torch.long, device=device)
+            for i, t in enumerate(tails):
+                input_ids[i, max_R - len(t):] = torch.tensor(t, device=device)
+                tail_mask[i, max_R - len(t):] = 1
+            pad_mask = torch.cat(
+                [torch.ones((N, m), dtype=torch.long, device=device), tail_mask], dim=1)
+            position_ids = batch_position_ids(pad_mask)
+
+            _total_prompt = sum(len(r.prompt_ids) for r in requests)
+            self._batch_prefix_stats = {
+                "matched": m, "common": len(common_ids),
+                "prefill_tokens": _total_prompt,
+                "coverage": (N * m / _total_prompt) if _total_prompt else 0.0,
+            }
+
+            eos = self.config.eos_token_id
+            eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
+            stop_sets = [set(r.stop_ids) | eos_set for r in requests]
+            active = [True] * N
+            produced = [0] * N
+            # The ids too, not just the count: the store-back writes one pool entry
+            # PER SESSION now, and an entry's token_ids must be what that session
+            # will resend next turn -- its prompt plus the answer it got.
+            produced_ids: list[list[int]] = [[] for _ in range(N)]
+
+            # P6: re-size the VRAM cacheable prefix for THIS batch width. The
+            # load-time call (:2578) runs before any batch exists and charges one
+            # stream's top_k, but the N streams share one forward per layer and
+            # insert their routing UNION -- measured 1.80x top_k on Qwen at N=3 and
+            # 2.06x on MiniMax, which collapsed the cache to 0.1% / 2.4% hit rates
+            # against 44.0% / 29.0% at N=1 (docs/2026-09-06-P1-...-RESULTS.md §4).
+            # MiniMax is the case with NO load-time restriction at all, because its
+            # SINGLE-stream working set fits.
+            #
+            # Restored in the finally below: a leaked batch-sized prefix would
+            # shrink caching for every later single-stream call.
+            _vram_c = getattr(self, "_expert_vram_cache", None)
+            _geo = getattr(self, "_moe_geometry", None)
+            _blocks = getattr(self, "_moe_blocks", None)
+            _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
+            _resized_vram_prefix = False
+            if N > 1 and _vram_c is not None and _geo and _blocks:
+                _union = batch_union_per_layer(_geo, N)
+                _batch_layers = compute_vram_layer_range(
+                    _vram_c.budget_bytes, _geo, [b.layer_idx for b in _blocks],
+                    experts_per_layer=_union)
+                if _batch_layers != _saved_vram_layers:
+                    self._vram_cacheable_layers = _batch_layers
+                    _resized_vram_prefix = True
+                    _n_layers = (len(_blocks) if _batch_layers is None
+                                 else len(_batch_layers))
+                    print(f"[Vaayu-Batch] N={N}: per-layer expert insert load is the "
+                          f"routing union ({_union}), not top_k ({_geo['top_k']}) — "
+                          f"VRAM cache restricted to {_n_layers}/{len(_blocks)} MoE "
+                          f"layers for this batch (was "
+                          f"{len(_blocks) if _saved_vram_layers is None else len(_saved_vram_layers)}).")
+
+            # Feature B: only batched_generate ever sets this. It gates the padding
+            # mask / per-stream positions / batched-RoPE branches in forward() (Task
+            # 5) — without it, forward() silently falls through to the single-stream
+            # path on a padded batch, producing wrong results. Must stay True for
+            # every forward() call below (prefill AND decode loop) and must always
+            # be cleared on exit, so it never leaks into a later single-stream call.
+            self._batch_decode_active = True
+            self._batch_n = N
+            self.telemetry.reset_batch_overlap()
+            past = None   # bound in finally's store-back guard; stays None if the
+                           # generator is torn down before the prefill forward returns
             try:
-                _acc = kv
-                for _start in range(0, max_R, _step):
-                    _end = min(_start + _step, max_R)
-                    out = self.forward(
-                        input_ids=input_ids[:, _start:_end],
-                        attention_mask=pad_mask[:, :m + _end],
-                        position_ids=position_ids[:, :m + _end],
-                        past_key_values=_acc,
-                        use_cache=True, return_dict=True)
-                    _acc = out.past_key_values
-                    # Bind after each SUCCESSFUL chunk, not before the loop: a
-                    # chunk that raises must not leave `past` pointing at a
-                    # cache the finally-block would then store back as if the
-                    # prefill had completed. Binding it as we go still lets the
-                    # store-back return the popped pool entry rather than lose
-                    # it — store()'s crop plus lookup()'s resolve_matched_len
-                    # make a short entry safe, an over-claimed one is what they
-                    # exist to handle.
-                    past = _acc
-            finally:
-                self.prefill_chunk_size = _saved_chunk
-            logits = out.logits[:, -1, :]           # right edge aligned by left-pad
+                # Prefill, CHUNKED. Running the whole batch prompt as one forward
+                # made long contexts unreachable at any N: measured on MiniMax,
+                # N=1 fits at 4k tokens and OOMs at 7 768 (tried 5.79 GiB with
+                # 5.13 free), N=3 fits at 2k and OOMs at 4k. The constraint is
+                # prefill ACTIVATIONS, scaling with N x context — which is why no
+                # admission policy could help there (Plan K Task 3).
+                #
+                # forward()'s own chunked path is NOT reusable here: its MoE fast
+                # path turns chunks INTO batch elements, so it needs the batch
+                # dimension this caller is already using. Hence chunking here,
+                # where pad_mask and the per-stream positions already exist, with
+                # forward's own chunking disabled for each call.
+                #
+                # Per chunk, with past = m + start and q = end - start:
+                #   mask       pad_mask[:, :m + end]      width == past + q
+                #   positions  position_ids[:, :m + end]  get_pos_emb_args slices
+                #                                         [len_p : len_p + len_s],
+                #                                         so positions are absolute
+                #                                         from 0, never chunk-local.
+                # check_batch_kv_invariant re-checks the mask/KV agreement on every
+                # one of these calls.
+                #
+                # Cost, stated because it is real: the layer-major optimisation that
+                # reads each expert once per PREFILL rather than once per chunk is
+                # the very trick that cannot compose with a batch, so a batched
+                # chunked prefill re-reads the expert set per chunk. That buys the
+                # ability to run at all.
+                _saved_chunk = self.prefill_chunk_size
+                self.prefill_chunk_size = 0
+                _step = _saved_chunk if _saved_chunk and _saved_chunk > 0 else max_R
+                try:
+                    _acc = kv
+                    for _start in range(0, max_R, _step):
+                        _end = min(_start + _step, max_R)
+                        out = self.forward(
+                            input_ids=input_ids[:, _start:_end],
+                            attention_mask=pad_mask[:, :m + _end],
+                            position_ids=position_ids[:, :m + _end],
+                            past_key_values=_acc,
+                            use_cache=True, return_dict=True)
+                        _acc = out.past_key_values
+                        # Bind after each SUCCESSFUL chunk, not before the loop: a
+                        # chunk that raises must not leave `past` pointing at a
+                        # cache the finally-block would then store back as if the
+                        # prefill had completed. Binding it as we go still lets the
+                        # store-back return the popped pool entry rather than lose
+                        # it — store()'s crop plus lookup()'s resolve_matched_len
+                        # make a short entry safe, an over-claimed one is what they
+                        # exist to handle.
+                        past = _acc
+                finally:
+                    self.prefill_chunk_size = _saved_chunk
+                logits = out.logits[:, -1, :]           # right edge aligned by left-pad
 
-            next_tokens = torch.empty((N, 1), dtype=torch.long, device=device)
-            for i in range(N):
-                if should_stop is not None and should_stop(i):
-                    # Retired before it ever produced: the row must still be
-                    # filled, because the batch tensors are rectangular. pad_id
-                    # is the same dead-slot value the decode loop uses.
-                    next_tokens[i, 0] = pad_id
-                    active[i] = False
-                    continue
-                tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
-                next_tokens[i, 0] = tok
-                yield (i, tok)
-                produced_ids[i].append(int(tok))
-                produced[i] = 1
-                if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
-                    active[i] = False
-
-            while any(active):
-                pad_mask = torch.cat(
-                    [pad_mask, torch.ones((N, 1), dtype=torch.long, device=device)], dim=1)
-                position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=1)
-                out = self.forward(
-                    input_ids=next_tokens, past_key_values=past,
-                    attention_mask=pad_mask, position_ids=position_ids,
-                    use_cache=True, return_dict=True)
-                past = out.past_key_values
-                logits = out.logits[:, -1, :]
+                next_tokens = torch.empty((N, 1), dtype=torch.long, device=device)
                 for i in range(N):
-                    if not active[i]:
-                        next_tokens[i, 0] = pad_id      # dead slot, masked; static HoL
-                        continue
                     if should_stop is not None and should_stop(i):
+                        # Retired before it ever produced: the row must still be
+                        # filled, because the batch tensors are rectangular. pad_id
+                        # is the same dead-slot value the decode loop uses.
                         next_tokens[i, 0] = pad_id
                         active[i] = False
                         continue
@@ -5750,89 +5767,115 @@ class VaayuBaseModel(GenerationMixin):
                     next_tokens[i, 0] = tok
                     yield (i, tok)
                     produced_ids[i].append(int(tok))
-                    produced[i] += 1
+                    produced[i] = 1
                     if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
                         active[i] = False
-        finally:
-            # Store-back lives in finally, not after the while loop: lookup()
-            # already POPPED the pooled entry, and only store() puts one back.
-            # batched_generate is a generator (its own docstring treats early
-            # abandonment as real) -- a consumer `break` raises GeneratorExit
-            # at the currently-suspended yield, which unwinds straight past a
-            # post-loop store-back and permanently deletes the pool's best
-            # entry. `past is not None` guards the case where teardown hits
-            # before the prefill forward() call returns (nothing to store yet).
-            if past is not None and pc is not None:
-                # ONE ENTRY PER SESSION, not one per batch. Until 2026-09-09
-                # this wrote a single entry keyed by a hash of the batch's
-                # COMMON prefix, so every member re-prefilled its whole context
-                # on its next turn. Measured through the server on MiniMax-M2.7,
-                # 2 sessions x 2 turns at ~4.17k tokens with the prefix cache on
-                # (the server's default): aggregate 99.52 s at MAX_BATCH_SIZE=1
-                # against 443.78 s at 2 -- 4.46x SLOWER -- even though batching
-                # WON the cold turn 1.60x (288.8 s against 461.2 s). Turn 2's
-                # hits were 51/4223 and 51/4226 where serial got 4164 and 4167.
-                #
-                # The old comment justified one-entry-per-batch with a
-                # K=7-sessions-against-a-5-slot-pool measurement that showed
-                # ZERO hits when writing N. That is a pool SIZING cliff
-                # (PREFIX_SESSIONS) and belongs to the pool, not to the writer:
-                # seven serial sessions hit it identically. Writing per row is
-                # what makes a batched turn and a serial turn leave the SAME
-                # pool state -- the only behaviour a caller can reason about
-                # when MAX_BATCH_SIZE is a ceiling a batch may or may not reach.
-                #
-                # Each row is spliced, not cropped: tails are left-padded, so
-                # the pad block sits BETWEEN the shared prefix and the row's own
-                # tokens (prefix_store_row's docstring has the layout, and why
-                # storing padding as prefix corrupts the next turn's RoPE).
-                #
-                # try/except Exception (never bare/BaseException -- GeneratorExit
-                # must keep propagating): the cleanup below must run unconditionally
-                # on exit, and a failure here must never replace whatever exception
-                # is already unwinding through this finally (e.g. a CUDA OOM in
-                # decode, where store()'s to_cpu pinned alloc can plausibly fail
-                # again) -- that would be the exact diagnostic-laundering failure
-                # this repo already fixed elsewhere (bug D3). Not re-raising means
-                # the entry is simply lost, which lookup()'s pop already made true
-                # the moment this batch started.
-                #
-                # That swallowing is why this failed SILENTLY for a whole sweep:
-                # slice_cache_row used to clone on-device and OOM'd here at 7.7k
-                # context, so every pool-on cell reported a 1.08x "hit" that was
-                # a full re-prefill. The warning below is the only signal, and it
-                # is worth reading whenever a prefix hit looks too small.
-                try:
-                    _have = past.get_seq_length()
-                    for _i, _r in enumerate(requests):
-                        _ids = list(_r.prompt_ids) + produced_ids[_i]
-                        _pad = max_R - len(tails[_i])
-                        # The LAST token yielded has no KV yet -- it is written
-                        # by the next forward, which a finished or abandoned
-                        # generator never makes. Clamp the ids to what the cache
-                        # actually backs, rather than storing an entry that
-                        # claims a position it cannot serve.
-                        _keep = min(len(_ids) - m, _have - m - _pad)
-                        if _keep <= 0:
+
+                while any(active):
+                    pad_mask = torch.cat(
+                        [pad_mask, torch.ones((N, 1), dtype=torch.long, device=device)], dim=1)
+                    position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=1)
+                    out = self.forward(
+                        input_ids=next_tokens, past_key_values=past,
+                        attention_mask=pad_mask, position_ids=position_ids,
+                        use_cache=True, return_dict=True)
+                    past = out.past_key_values
+                    logits = out.logits[:, -1, :]
+                    for i in range(N):
+                        if not active[i]:
+                            next_tokens[i, 0] = pad_id      # dead slot, masked; static HoL
                             continue
-                        _ids = _ids[:m + _keep]
-                        _one = slice_cache_row_unpadded(
-                            past, _i, prefix_len=m, pad_len=_pad,
-                            valid_len=m + _keep)
-                        pc.store(_r.session_id or _auto_session_id(_ids),
-                                 _ids, _one)
-                except Exception as e:
-                    print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
-                          f"({e!r}) -- lookup() already popped this entry, so "
-                          f"it is now LOST from the pool.")
-            if _resized_vram_prefix:
-                self._vram_cacheable_layers = _saved_vram_layers
-            if _saved_budget is not None:
-                # P10: a leaked reduction would shrink the expert cache for
-                # every later request in this process -- a permanent throughput
-                # loss from one dropped connection, since a client disconnect
-                # unwinds through here as GeneratorExit.
-                _vram_cache.budget_bytes = _saved_budget
-            self._batch_decode_active = False
-            self._batch_n = 1
-            self.telemetry.dump_json("vaayu_telemetry.json")
+                        if should_stop is not None and should_stop(i):
+                            next_tokens[i, 0] = pad_id
+                            active[i] = False
+                            continue
+                        tok = sample_step(logits[i], requests[i].temperature, requests[i].top_p)
+                        next_tokens[i, 0] = tok
+                        yield (i, tok)
+                        produced_ids[i].append(int(tok))
+                        produced[i] += 1
+                        if tok in stop_sets[i] or produced[i] >= requests[i].max_new_tokens:
+                            active[i] = False
+            finally:
+                # Store-back lives in finally, not after the while loop: lookup()
+                # already POPPED the pooled entry, and only store() puts one back.
+                # batched_generate is a generator (its own docstring treats early
+                # abandonment as real) -- a consumer `break` raises GeneratorExit
+                # at the currently-suspended yield, which unwinds straight past a
+                # post-loop store-back and permanently deletes the pool's best
+                # entry. `past is not None` guards the case where teardown hits
+                # before the prefill forward() call returns (nothing to store yet).
+                if past is not None and pc is not None:
+                    # ONE ENTRY PER SESSION, not one per batch. Until 2026-09-09
+                    # this wrote a single entry keyed by a hash of the batch's
+                    # COMMON prefix, so every member re-prefilled its whole context
+                    # on its next turn. Measured through the server on MiniMax-M2.7,
+                    # 2 sessions x 2 turns at ~4.17k tokens with the prefix cache on
+                    # (the server's default): aggregate 99.52 s at MAX_BATCH_SIZE=1
+                    # against 443.78 s at 2 -- 4.46x SLOWER -- even though batching
+                    # WON the cold turn 1.60x (288.8 s against 461.2 s). Turn 2's
+                    # hits were 51/4223 and 51/4226 where serial got 4164 and 4167.
+                    #
+                    # The old comment justified one-entry-per-batch with a
+                    # K=7-sessions-against-a-5-slot-pool measurement that showed
+                    # ZERO hits when writing N. That is a pool SIZING cliff
+                    # (PREFIX_SESSIONS) and belongs to the pool, not to the writer:
+                    # seven serial sessions hit it identically. Writing per row is
+                    # what makes a batched turn and a serial turn leave the SAME
+                    # pool state -- the only behaviour a caller can reason about
+                    # when MAX_BATCH_SIZE is a ceiling a batch may or may not reach.
+                    #
+                    # Each row is spliced, not cropped: tails are left-padded, so
+                    # the pad block sits BETWEEN the shared prefix and the row's own
+                    # tokens (prefix_store_row's docstring has the layout, and why
+                    # storing padding as prefix corrupts the next turn's RoPE).
+                    #
+                    # try/except Exception (never bare/BaseException -- GeneratorExit
+                    # must keep propagating): the cleanup below must run unconditionally
+                    # on exit, and a failure here must never replace whatever exception
+                    # is already unwinding through this finally (e.g. a CUDA OOM in
+                    # decode, where store()'s to_cpu pinned alloc can plausibly fail
+                    # again) -- that would be the exact diagnostic-laundering failure
+                    # this repo already fixed elsewhere (bug D3). Not re-raising means
+                    # the entry is simply lost, which lookup()'s pop already made true
+                    # the moment this batch started.
+                    #
+                    # That swallowing is why this failed SILENTLY for a whole sweep:
+                    # slice_cache_row used to clone on-device and OOM'd here at 7.7k
+                    # context, so every pool-on cell reported a 1.08x "hit" that was
+                    # a full re-prefill. The warning below is the only signal, and it
+                    # is worth reading whenever a prefix hit looks too small.
+                    try:
+                        _have = past.get_seq_length()
+                        for _i, _r in enumerate(requests):
+                            _ids = list(_r.prompt_ids) + produced_ids[_i]
+                            _pad = max_R - len(tails[_i])
+                            # The LAST token yielded has no KV yet -- it is written
+                            # by the next forward, which a finished or abandoned
+                            # generator never makes. Clamp the ids to what the cache
+                            # actually backs, rather than storing an entry that
+                            # claims a position it cannot serve.
+                            _keep = min(len(_ids) - m, _have - m - _pad)
+                            if _keep <= 0:
+                                continue
+                            _ids = _ids[:m + _keep]
+                            _one = slice_cache_row_unpadded(
+                                past, _i, prefix_len=m, pad_len=_pad,
+                                valid_len=m + _keep)
+                            pc.store(_r.session_id or _auto_session_id(_ids),
+                                     _ids, _one)
+                    except Exception as e:
+                        print(f"[Vaayu-Prefix] WARNING: batch store-back failed "
+                              f"({e!r}) -- lookup() already popped this entry, so "
+                              f"it is now LOST from the pool.")
+                if _resized_vram_prefix:
+                    self._vram_cacheable_layers = _saved_vram_layers
+                if _saved_budget is not None:
+                    # P10: a leaked reduction would shrink the expert cache for
+                    # every later request in this process -- a permanent throughput
+                    # loss from one dropped connection, since a client disconnect
+                    # unwinds through here as GeneratorExit.
+                    _vram_cache.budget_bytes = _saved_budget
+                self._batch_decode_active = False
+                self._batch_n = 1
+                self.telemetry.dump_json("vaayu_telemetry.json")

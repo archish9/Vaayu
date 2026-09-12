@@ -163,6 +163,55 @@ Recorded so nobody spends an afternoon on them:
   MoE path. Experiment at your own risk; not a recommendation.
 - **`VAAYU_LOOKAHEAD`** — deliberately disabled; raises on use.
 
+## 5b. `keep_awake` / `pin_engine_threads` — leave both on
+
+Streamed decode sleeps on disk reads — roughly 800 read completions per token on
+Qwen3-235B — and every one of them wakes a CPU out of a deep idle state. On this
+box that state is `C2_ACPI`, whose declared exit latency is **127 µs**, and decode
+leaves the CPU only ~7.5 % busy, so the package keeps falling back into it.
+
+Vaayu holds the package shallow for the duration of a generation: a `SCHED_IDLE`
+busy loop on each detected E-core (`keep_awake`), plus P-core placement for the
+engine's own threads (`pin_engine_threads`). `SCHED_IDLE` runs only when a CPU
+would otherwise be idle, so the loop never takes time from the engine — it costs
+power, not throughput.
+
+Measured through the server at its default configuration, one request at a time,
+greedy, identical outputs in every arm:
+
+| model | off | on | decode |
+|---|---|---|---|
+| Qwen3-235B (fused-EXL3 MoE) | 0.9229 tok/s | **1.1363** | **+23.1 %** |
+| MiniMax-M2.7 (module-list MoE) | 1.7405 | 1.7625 | +1.3 % |
+| Llama-3.3-70B (streamed dense) | 0.2745 | 0.2824 | +2.9 % |
+| Llama-3.2-1B (fully VRAM-pinned) | 111.7 | 111.2 | none — it reads no disk |
+
+Directly visible in the kernel's own counters over one Qwen request: C2 residency
+1.142 s → 0.492 s, wakes 1.74 M → 1.22 M.
+
+**Turn `keep_awake` off only to save power**, and expect to pay up to ~23 % of
+decode for it on a heavily streamed MoE. Set it to an integer to run fewer
+spinners: one E-core buys +3.6 % where all eight buy +12.4 % (prefix cache off),
+so the win is the package leaving deep idle, not the individual core.
+
+**On a CPU with no P/E split Vaayu declines and prints a warning** rather than
+guessing: every core a spinner could take there is an SMT sibling of one the
+engine wants, and that arrangement measured **27 % slower** on MiniMax.
+
+### Root-only alternatives (they cover the whole machine, not just Vaayu)
+
+Neither is needed when `keep_awake` is on, and both require privileges Vaayu does
+not have or want:
+
+- **PM QoS** — `sudo sh -c 'exec 3<>/dev/cpu_dma_latency; echo -n -e "\x00\x00\x00\x00" >&3'`
+  holds the whole system at a 0 µs wake-latency target for as long as that file
+  descriptor stays open. `/dev/cpu_dma_latency` is mode 0600 on this box.
+- **Disable the deep state** — `sudo cpupower idle-set -d 2` disables `C2_ACPI`
+  (check the numbering with `cpupower idle-info` first). Persists until re-enabled.
+
+Both raise idle power across the machine. The spinner is the scoped version of the
+same idea: it is active only while a generation is running.
+
 ## 6. Knobs to leave alone unless you have a reason
 
 - **`max_pinned_layers=10`** — how many transformer layers stay resident in VRAM.
