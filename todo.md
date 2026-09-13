@@ -91,7 +91,10 @@ the durable copy is row **30**.
 (`gb_tok=0.030`, 96.5 % RAM-cache hit) against **70–83 %** on Qwen3-235B / MiniMax-M2.7. **So T3's streaming ladder
 (rows 32 · 34 · 35) is dead on this model and T4 is the live branch** — but take **S2b** first: phase 3 measured
 three levers worth more than anything in T4, and the phase-4 gate passes for a reason that is NOT the one S3 was
-priced on (`h2d` is launch-bound on 4320 tiny copies per token, not PCIe-bound).
+priced on — **CORRECTED 2026-09-13: `h2d` is BANDWIDTH-bound (14.52 GB/s as shipped, 95 % of this box's
+pageable line rate), S3's PCIe premise is restored, and lever (i) is REFUTED at ≤ 5.7 % of a token.** What
+remains of S2b is (ii), landed, and (iii), the VRAM expert cache — the only lever that removes the
+0.849 GB/token transfer rather than making it faster.
 
 ## PRIORITY — worth working, in this order
 
@@ -174,7 +177,7 @@ lets each step start.** Every step names a stop rule. Do not start a step whose 
 | ~~**S1**~~ **DONE** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
 | ~~**T1**~~ **DONE** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — **CLOSED 2026-09-12: both defaults STAY.** The +5.7 % a single session at 2.7k context wins is an **−8.9 %** loss at 7.4k with 2 sessions, where reuse collapses 7422/7517 → 44/7517 tokens. `MAX_SEQ_LEN` pays ONCE, not twice (the VRAM reserve is floor-bound). | **31** | done | — | fired in substance: the point that wins the two-turn session loses the workload the server exists for |
 | ~~**S2**~~ **DONE** | **CLOSED 2026-09-13 — the non-EXL3 int4 MoE LOADS, STREAMS AND IS MEASURED: `4.0648 tok/s` warm at N=1 on server knobs (spread 1.30 %, greedy ids identical across arms), and the server gate passes on it (9 passed) — 4.8× Qwen3-235B-EXL3's raw 0.85, 3.6× row 27's served 1.1363.** Seven root causes, all fixed: RC1 packed-int4 dequant · RC3 shared expert · RC4(a)(b) hybrid-attention KV cache · **RC5 the splitter silently dropped tensors on a non-layer-major shard index** (24356 of 24576 experts) · **RC6 `get_seq_length()` returned 0 on hybrid so every decode step re-ran the whole sequence** (9.5×) · **RC7 the prefix cache cannot lend recurrent state — refused.** RC4(c) is the one open item. | **30** §4–6 | done | — | fired and PASSED: output coherent, ids stable |
-| **S2b** `[ ]` | **The three levers phase 3 put on the table, in cost order — ahead of S3.** (i) coalesce the per-expert H2D (4320 tiny `.to()` per token, ~34 % of `T_prof`) · (ii) land RC1's banked `torch.compile` dequant (17.9 vs 117.5 µs/expert, **6.5× measured**, on ~25 %) · (iii) wire the VRAM expert cache into the non-EXL3 fused forward (`V=0.0`, **7.79 GB reserved and idle**). | **30** | ~2–4 days | S2's measurement (**reported**) | all three bounded by `FLOOR ×6.30` over U1 (~25.6 tok/s); a lever that measures under a third of its share → drop it |
+| **S2b** `[~]` | **(ii) DONE 2026-09-13: `4.0648 → 4.3459 tok/s`, +6.92 %, bit-identical.** (i) **REFUTED** — the H2D is bandwidth-bound at 95 % of line rate, worth ≤ 5.7 % (see §5g). (iii) VRAM expert cache is now the live lever; **(iv)** one contiguous blob per expert at cache-fill time unlocks the ~12 % left in (i)+(ii). *Original text: (i) coalesce the per-expert H2D (4320 tiny `.to()` per token, ~34 % of `T_prof`) · (ii) land RC1's banked `torch.compile` dequant (17.9 vs 117.5 µs/expert, **6.5× measured**, on ~25 %) · (iii) wire the VRAM expert cache into the non-EXL3 fused forward (`V=0.0`, **7.79 GB reserved and idle**).* | **30** | ~2–4 days | S2's measurement (**reported**) | all three bounded by `FLOOR ×6.30` over U1 (~25.6 tok/s); a lever that measures under a third of its share → drop it |
 | **T2** | **Truncate `top_k` at decode.** One clamp at `vaayu_base.py:3233` PLUS the same clamp written into each MoE module's own `top_k` by detection (contract-routed models ignore the engine's `k`; renormalisation already exists everywhere), `DECODE_TOP_K` knob, ppl sweep at k ∈ {8,6,5,4} on both MoE models. **Regime-independent** — do it whether or not S2 lands. | **33** | ~1 day + a ppl sweep | none, but it is worth more on a model you are keeping → after S2's verdict | k=6 costs more quality than row 32's 3.0 bpw build at the same speed-up → prefer 32 and close |
 | **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
 | ~~**T3**~~ **DEAD on this model** | **The streaming-regime ladder — ONLY if S2 stalls or is abandoned.** In order: **32** download a ≤ 3.25 bpw EXL3 build of Qwen3-235B (×1.50, zero code, and it lifts the 62/94-layer VRAM-cache restriction) → **34** probe in-flight read depth, build only if ≥ 60 % of busy time sits at depth 1 (×1.10) → **35** per-model measured gate for `VAAYU_LOOKAHEAD` (+11.7 % Qwen). | **32 · 34 · 35** | a download · ½ day · ~2 days | **S2 stalled.** If S2 lands, these three mostly die — they only pay while experts stream from disk | 34: depth already ≥ 2 → R2's verdict extends, close it · 35: cannot reproduce +11.7 % through the server with the trial cost included → close it |
@@ -2204,15 +2207,50 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   **Two honesty notes.** (1) Profiling costs ×1.382 and `h2d` carries the most `synchronize()` points, so
   its share is an UPPER BOUND; scaled to `T_unprof`: h2d ≈ 0.0875 (35.8 %), construct ≈ 0.0647 (26.5 %),
   gemm ≈ 0.0173 (7.1 %). (2) **`h2d` is NOT bandwidth** — the token moves 0.030 GB, which is 2 ms at
-  pageable 15.3 GB/s, not 115. It is **4320 tiny `.to(device)` calls per token** (480 experts × 3 projections
-  × 3 components): launch-bound, the same shape RC1 found for the dequant. **S3 was priced on H2D being a
-  PCIe cost a CPU-resident expert avoids. It is not.** The gate is satisfied and S3 is NOT closed — but
-  price the three levers below first.
+  pageable 15.3 GB/s, not 115 — **THIS WAS WRONG, see the correction below.** The gate is satisfied and S3
+  is NOT closed.
+- `[x]` **CORRECTED 2026-09-13 by direct measurement (`plans/probes/row30_s2b_h2d.py`), and the correction
+  reverses the conclusion.** The earlier text here read *"`h2d` is NOT bandwidth — the token moves 0.030 GB,
+  which is 2 ms at pageable 15.3 GB/s, not 115. It is 4320 tiny `.to(device)` calls per token:
+  launch-bound … S3 was priced on H2D being a PCIe cost a CPU-resident expert avoids. It is not."*
+  **Both halves are wrong.** `gb_tok=0.030` is what is read from DISK; what crosses PCIe is the ROUTED
+  WORKING SET, **0.849 GB/token** (`working_set_bytes`, 480 × 1.6875 MiB) — a cache hit still has to copy.
+  And the count is **2880**, not 4320: `weight_shape` never crosses (6 of 9 tensors per expert).
+  Measured at the real geometry, 200 reps: **as shipped (pageable, 6 copies) 121.9 µs/expert = 58.5 ms/token
+  at 14.52 GB/s — already 95 % of this box's pageable H2D line rate (15.3 GB/s, row 26).**
+  Coalescing to one prebuilt byte blob: 108.9 µs (52.3 ms/token, 16.25 GB/s). Pinned, as shipped: 95.7
+  (45.9 ms, 18.50). Pinned + blob: 92.7 (44.5 ms, 19.09). Building the blob per call is a NET LOSS (123.9
+  pageable / 115.9 pinned). **So `h2d` is BANDWIDTH-bound, S3's PCIe premise is RESTORED, and lever (i) is
+  REFUTED: coalescing is worth 2.5 % of the token, pinning 5.2 %, both together 5.7 % — not the ~34 % the
+  profile share implied.** The only lever that removes these bytes rather than moving them faster is the
+  VRAM expert cache, (iii).
 - `[x]` **Phase profile added to the non-EXL3 fused forward** — it was the only one of the three recording
   nothing into `_moe_profile`, so the gate would have read ZERO and closed the hybrid idea on an artefact.
   Same keys and bracketing as the other two; `h2d`/`construct` split inside `_expert_dense_weights(timing=)`
   because the copy and the dequant run back to back there. Fully gated on `profiling_mode`.
-- `[ ]` **THREE LEVERS THIS MEASUREMENT PUT ON THE TABLE, in cost order — do these BEFORE phase 4:**
+- `[x]` **S2b (ii) LANDED AND MEASURED — one fused dequant per expert instead of three: `4.0648 →
+  4.3459 tok/s`, +6.92 %, greedy ids IDENTICAL, output bit-identical.** Replicate spread 0.55 % (baseline
+  1.30 %), so the delta is ~12× the spread. `construct` **0.0854 → 0.0444 s/token** (25.1 % → 16.3 % of
+  `T_prof`), a 48 % cut. Server gate green on the checkpoint afterwards (9 passed). Mechanism: the cost is
+  kernel LAUNCHES, not arithmetic — one real expert, 300 reps: three per-linear calls **114.3 µs**, one
+  fused call **75.7**, the fused call under `torch.compile` **17.6** (a trivial kernel is 2.7). `torch.compile`
+  is applied only on CUDA (that is where launch overhead exists) and falls back to eager on a dynamo failure.
+  **Bit-exactness is the whole point and is asserted, not assumed:** these weights feed `F.linear` directly,
+  so `tests/test_packed_expert_dequant.py` holds the fused path to `torch.equal` against the per-role path on
+  int4-g32 / int4-g128 / int8-g128, plus a fallback when roles disagree on bit width or group size, the
+  `NotImplementedError` for asymmetric/act-order restated on the fused path, a guard that the fused path
+  ACTUALLY fuses (0 per-role calls — the silent-no-op failure mode), and the compile-fallback branch (which
+  shipped with a `NameError` in it until that test was written). Suite **2064 passed, 15 skipped**.
+  **Why +6.9 % and not the microbench's 6.5×:** production does two on-device `torch.cat`s per expert that
+  the probe's prebuilt flat tensors skipped. Note also that `h2d` fell 0.1155 → 0.0850 in the PROFILED arm —
+  that is a MEASUREMENT artefact (one `synchronize()` bracket per expert instead of three; overhead ×1.382 →
+  ×1.181), not a gain.
+- `[ ]` **S2b (iv) — the leftover of (i) AND (ii), behind ONE prerequisite: store each expert as a single
+  contiguous blob at cache-fill time.** Both remainders need exactly that. With it: h2d's coalesced 2.5 %
+  (§5g) becomes collectable without the per-call `cat` that made it a loss, AND the dequant drops its two
+  `cat`s to reach the microbench's ~17.6 µs (0.0444 → ~0.018 s ≈ another **10 %** of the token). Together
+  **~12 %**. Touches `ExpertRAMCache`'s storage layout, so it is a real change, not a tweak.
+- `[~]` **THREE LEVERS THIS MEASUREMENT PUT ON THE TABLE, in cost order — do these BEFORE phase 4:**
   **(i) coalesce the per-expert H2D** — 9 separate copies per expert, one per expert or per layer instead;
   attacks the largest phase (~34 %), no new kernel. **(ii) land RC1's banked `torch.compile` dequant** —
   measured **17.9 µs/expert vs the 117.5 shipped, 6.5×**, banked behind "do not optimise before phase 3 says

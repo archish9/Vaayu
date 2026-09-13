@@ -525,23 +525,28 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
 
     packed = _group_packed_tensors_by_weight(raw)
     if packed["gate"]:
-        out = []
-        for role in ("gate", "down", "up"):
-            comps = packed[role]
-            if "weight_packed" not in comps or "weight_scale" not in comps:
-                return None, None, None
-            _t0 = _mark()
-            on_device = {
-                k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
-                for k, v in comps.items()
-            }
-            if timing is not None:
-                _t1 = _mark()
-                timing["h2d"] += _t1 - _t0
-            out.append(dequantize_packed_weight(on_device, dtype))
-            if timing is not None:
-                timing["construct"] += _mark() - _t1
-        return out[0], out[1], out[2]
+        roles = ("gate", "down", "up")
+        if any("weight_packed" not in packed[r] or "weight_scale" not in packed[r]
+               for r in roles):
+            return None, None, None
+        _t0 = _mark()
+        on_device = {
+            r: {k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
+                for k, v in packed[r].items()}
+            for r in roles
+        }
+        if timing is not None:
+            _t1 = _mark()
+            timing["h2d"] += _t1 - _t0
+        # ONE dequant pass for the whole expert, not three. The cost is kernel
+        # launches, not arithmetic -- 114.3 us/expert for three per-linear calls
+        # against 17.6 for one compiled pass, on work a trivial kernel does in
+        # 2.7 (measured on a real expert, 300 reps). At 480 routed experts per
+        # token that is ~46 ms of a ~244 ms token.
+        dense = dequantize_expert_weights(on_device, dtype)
+        if timing is not None:
+            timing["construct"] += _mark() - _t1
+        return dense["gate"], dense["down"], dense["up"]
 
     w_gate, w_down, w_up = _classify_expert_tensors(raw)
     if w_gate is None or w_down is None or w_up is None:
@@ -632,6 +637,101 @@ def dequantize_packed_weight(components: dict, dtype: "torch.dtype") -> "torch.T
         codes.view(rows, groups, cols // groups).to(dtype)
         * scale.view(rows, groups, 1).to(dtype)
     ).view(rows, cols)
+
+
+_FUSED_DEQUANT_CACHE: dict = {}
+
+
+def _fused_dequant_kernel(flat_packed, flat_scale, num_bits, group_size, dtype):
+    """Every code in one expert, unpacked and scaled in a single pass.
+
+    Correct only under the preconditions `dequantize_expert_weights` checks:
+    `32 % num_bits == 0`, every role packed at the same bit width and the same
+    group size, and each role's `cols` a whole number of codes per int32 word.
+    Given those, the three projections concatenate into one flat code stream
+    whose consecutive runs of `group_size` line up with the flat scales.
+
+    The offset is folded into the float subtract instead of taking the int8 hop
+    the per-linear path uses -- measured 114.3 -> 75.7 us/expert, and asserted
+    BIT-IDENTICAL by tests/test_packed_expert_dequant.py rather than assumed
+    (bf16 represents every code in 0..255 exactly, so the two orders agree).
+    """
+    per_word = 32 // num_bits
+    shifts = torch.arange(per_word, device=flat_packed.device,
+                          dtype=torch.int32) * num_bits
+    codes = (flat_packed.unsqueeze(-1) >> shifts) & ((1 << num_bits) - 1)
+    codes = codes.view(-1, group_size).to(dtype) - (1 << (num_bits - 1))
+    return (codes * flat_scale.reshape(-1, 1).to(dtype)).view(-1)
+
+
+def _fused_dequant_fn(num_bits, group_size, dtype, device_type):
+    """`_fused_dequant_kernel`, compiled once per shape on CUDA.
+
+    The remaining cost is kernel LAUNCHES, not arithmetic: 75.7 us/expert for
+    work a trivial kernel does in 2.7, falling to 17.6 compiled (measured on one
+    real expert, 300 reps). Compiling is therefore worth it exactly where launch
+    overhead exists, so CPU keeps the eager function -- and a dynamo failure
+    falls back to it rather than taking the model down.
+    """
+    if device_type != "cuda":
+        return _fused_dequant_kernel
+    key = (num_bits, group_size, dtype)
+    if key not in _FUSED_DEQUANT_CACHE:
+        try:
+            _FUSED_DEQUANT_CACHE[key] = torch.compile(_fused_dequant_kernel, dynamic=False)
+        except Exception as exc:                      # pragma: no cover - env-dependent
+            _log.warning("torch.compile unavailable for the expert dequant (%s); "
+                         "running it eagerly", exc)
+            _FUSED_DEQUANT_CACHE[key] = _fused_dequant_kernel
+    return _FUSED_DEQUANT_CACHE[key]
+
+
+def dequantize_expert_weights(by_role: dict, dtype: "torch.dtype") -> dict:
+    """{role: dense weight} for one expert, in ONE dequant pass where possible.
+
+    `dequantize_packed_weight` per role costs three launches of everything; this
+    concatenates the roles and pays them once. Falls back to the per-role path,
+    role by role, for any checkpoint whose roles are not packed alike -- decoding
+    such a checkpoint with one flat group-size view would decode it WRONGLY, so
+    the compatibility test is a precondition, not an optimisation hint.
+    """
+    geom = {}
+    for role, comps in by_role.items():
+        if "weight_zero_point" in comps or "weight_g_idx" in comps:
+            # RC1's refusal, restated here so the fused path cannot lose it.
+            raise NotImplementedError(
+                "asymmetric / act-order pack-quantized experts carry a zero point or "
+                "g_idx that Vaayu does not apply; this checkpoint would decode to "
+                "shifted weights. Supported today: symmetric group quantization.")
+        rows, cols = (int(x) for x in comps["weight_shape"].tolist())
+        num_bits, remainder = divmod(comps["weight_packed"].numel() * 32, rows * cols)
+        gs = cols // comps["weight_scale"].shape[-1]
+        geom[role] = (rows, cols, num_bits, gs, remainder)
+
+    first = next(iter(geom.values()))
+    num_bits, group_size = first[2], first[3]
+    fusable = (
+        num_bits and 32 % num_bits == 0
+        and all(r == 0 and nb == num_bits and g == group_size
+                and c % (32 // num_bits) == 0
+                for _, c, nb, g, r in geom.values())
+    )
+    if not fusable:
+        return {role: dequantize_packed_weight(comps, dtype)
+                for role, comps in by_role.items()}
+
+    roles = list(by_role)
+    flat_packed = torch.cat([by_role[r]["weight_packed"].reshape(-1) for r in roles])
+    flat_scale = torch.cat([by_role[r]["weight_scale"].reshape(-1) for r in roles])
+    fn = _fused_dequant_fn(num_bits, group_size, dtype, flat_packed.device.type)
+    flat = fn(flat_packed, flat_scale, num_bits, group_size, dtype)
+
+    out, at = {}, 0
+    for role in roles:
+        rows, cols = geom[role][0], geom[role][1]
+        out[role] = flat[at:at + rows * cols].view(rows, cols)
+        at += rows * cols
+    return out
 
 
 def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:

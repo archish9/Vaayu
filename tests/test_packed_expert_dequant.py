@@ -327,3 +327,134 @@ def test_fused_forward_dense_checkpoint_still_profiles_h2d(tmp_path):
     assert w_gate is not None and w_down is not None and w_up is not None
     assert timing["h2d"] > 0.0
     assert timing["construct"] == 0.0
+
+
+# ── S2b (ii): one fused dequant per expert instead of three ──────────────────
+#
+# Phase 3 measured `construct` -- this dequant -- at 25.1 % of a decode token,
+# which is the condition RC1 banked the faster variants behind. Re-measured on
+# one real expert, 300 reps: three per-linear calls 114.3 us, one fused call
+# 75.7 us, the fused call under torch.compile 17.6 us (a trivial kernel is 2.7),
+# so it is kernel-launch overhead, not arithmetic. At 480 routed experts per
+# token that is ~46 ms of a 244 ms token.
+#
+# The whole win is only collectable if the output stays BIT-IDENTICAL: these
+# weights feed F.linear directly, and the suite above holds the unpack to
+# compressed_tensors' own reference bit-for-bit. `allclose` would not do.
+
+def _components(rows, cols, num_bits, group_size, seed):
+    torch.manual_seed(seed)
+    w = torch.randn(rows, cols, dtype=torch.bfloat16) * 0.1
+    packed, scale, shape, _ = _reference_pack(w, num_bits, group_size)
+    return {"weight_packed": packed, "weight_scale": scale, "weight_shape": shape}
+
+
+def _expert_components(num_bits=4, group_size=32, hidden=256, intermediate=128):
+    """gate/up [intermediate, hidden] and down [hidden, intermediate], the real shape."""
+    return {
+        "gate": _components(intermediate, hidden, num_bits, group_size, 1),
+        "up": _components(intermediate, hidden, num_bits, group_size, 2),
+        "down": _components(hidden, intermediate, num_bits, group_size, 3),
+    }
+
+
+@pytest.mark.parametrize("num_bits,group_size", [(4, 32), (4, 128), (8, 128)])
+def test_fused_expert_dequant_is_bit_identical_to_three_calls(num_bits, group_size):
+    from vaayu.moe_patch import dequantize_expert_weights
+
+    by_role = _expert_components(num_bits, group_size)
+    expected = {r: dequantize_packed_weight(c, torch.bfloat16) for r, c in by_role.items()}
+
+    got = dequantize_expert_weights(by_role, torch.bfloat16)
+
+    assert set(got) == set(expected)
+    for role in expected:
+        assert got[role].shape == expected[role].shape
+        assert got[role].dtype == expected[role].dtype
+        assert torch.equal(got[role], expected[role]), f"{role} is not bit-identical"
+
+
+def test_fused_dequant_falls_back_when_the_roles_disagree():
+    """The fused pass flattens all three roles into one group-size-32 view. A
+    checkpoint whose roles were packed differently must still decode, one role
+    at a time, rather than decode wrongly."""
+    from vaayu.moe_patch import dequantize_expert_weights
+
+    by_role = {
+        "gate": _components(128, 256, 4, 32, 1),
+        "up": _components(128, 256, 4, 32, 2),
+        "down": _components(256, 128, 4, 64, 3),      # different group size
+    }
+    expected = {r: dequantize_packed_weight(c, torch.bfloat16) for r, c in by_role.items()}
+
+    got = dequantize_expert_weights(by_role, torch.bfloat16)
+
+    for role in expected:
+        assert torch.equal(got[role], expected[role]), f"{role} decoded wrongly"
+
+
+def test_fused_dequant_refuses_asymmetric_by_name():
+    """The NotImplementedError RC1 added must not be lost to the fused path."""
+    from vaayu.moe_patch import dequantize_expert_weights
+
+    by_role = _expert_components()
+    by_role["gate"]["weight_zero_point"] = torch.zeros(1)
+    with pytest.raises(NotImplementedError, match="zero point"):
+        dequantize_expert_weights(by_role, torch.bfloat16)
+
+
+def test_fused_dequant_actually_fuses():
+    """Guard against the optimization silently becoming a no-op.
+
+    A feature that quietly stops firing is this repo's recurring failure mode
+    (CLAUDE.md §0). One fused pass must not call the per-role dequantiser at all
+    on the geometry the target checkpoint actually has.
+    """
+    import vaayu.moe_patch as mp
+
+    calls = []
+    real = mp.dequantize_packed_weight
+    mp.dequantize_packed_weight = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        mp.dequantize_expert_weights(_expert_components(), torch.bfloat16)
+    finally:
+        mp.dequantize_packed_weight = real
+    assert calls == [], f"fused path fell back: {len(calls)} per-role calls"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled path is CUDA-only")
+def test_compiled_fused_dequant_matches_eager_bit_for_bit():
+    """torch.compile is where the 6.5x is. It may not change a single bit."""
+    from vaayu.moe_patch import dequantize_expert_weights
+
+    by_role = {r: {k: (v if k == "weight_shape" else v.cuda()) for k, v in c.items()}
+               for r, c in _expert_components().items()}
+    expected = {r: dequantize_packed_weight(c, torch.bfloat16) for r, c in by_role.items()}
+
+    got = dequantize_expert_weights(by_role, torch.bfloat16)
+
+    for role in expected:
+        assert torch.equal(got[role], expected[role]), f"{role} differs under compile"
+
+
+def test_dequant_falls_back_to_eager_when_compile_is_unavailable(monkeypatch):
+    """The compile fallback is a branch that never runs in a healthy env, which
+    is exactly how a NameError ships in one. Force it and check the output is
+    still right -- and that the warning it logs can actually be emitted."""
+    import vaayu.moe_patch as mp
+
+    mp._FUSED_DEQUANT_CACHE.clear()
+    monkeypatch.setattr(mp.torch, "compile",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no dynamo")))
+    monkeypatch.setattr(mp.torch.cuda, "is_available", lambda: True)
+
+    by_role = _expert_components()
+    expected = {r: dequantize_packed_weight(c, torch.bfloat16) for r, c in by_role.items()}
+
+    fn = mp._fused_dequant_fn(4, 32, torch.bfloat16, "cuda")
+    assert fn is mp._fused_dequant_kernel
+
+    got = mp.dequantize_expert_weights(by_role, torch.bfloat16)
+    for role in expected:
+        assert torch.equal(got[role], expected[role])
+    mp._FUSED_DEQUANT_CACHE.clear()
