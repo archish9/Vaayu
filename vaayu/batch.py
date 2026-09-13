@@ -463,3 +463,23 @@ def cache_holds_recurrent_state(cache) -> bool:
         if hasattr(layer, "update_conv_state") or hasattr(layer, "conv_states"):
             return True
     return False
+
+
+def prefix_cache_refusal_reason(cache, kv_cache_mode) -> str | None:
+    """Why the cross-turn prefix cache cannot run on `cache`, or None.
+
+    Two independent reasons, and they must be reported in THIS order: a hybrid
+    cache also fails the method-surface test (cache_supports_prefix_store is
+    False for it), so checking the surface first prints a true statement about
+    the wrong cause -- "does not implement to_cpu/to_device/resident_bytes" on a
+    class that implements all three. That is exactly what shipped for one run.
+    """
+    if cache_holds_recurrent_state(cache):
+        return ("this model has recurrent (linear-attention) layers, whose state "
+                "is a fixed-size summary with no per-token prefix to lend. "
+                "Prefill runs in full on every turn.")
+    if not cache_supports_prefix_store(cache):
+        return (f"kv_cache_mode={kv_cache_mode!r} yields {type(cache).__name__}, "
+                f"which does not implement to_cpu/to_device/resident_bytes. Load "
+                f"with kv_cache_mode='bf16' to enable it on this model.")
+    return None

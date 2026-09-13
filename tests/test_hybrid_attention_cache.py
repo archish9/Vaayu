@@ -271,6 +271,24 @@ def test_prefix_store_refuses_a_cache_with_recurrent_layers():
         FP8DynamicCache(quantize=False, config=cfg)) is False
 
 
+def test_the_refusal_names_the_recurrent_state_not_the_method_surface():
+    """A hybrid cache fails BOTH checks, so the order of the two decides which
+    cause gets printed. Checking the surface first said FP8DynamicCache "does
+    not implement to_cpu/to_device/resident_bytes" -- true of nothing, since it
+    implements all three. That version shipped for one run."""
+    from vaayu.batch import prefix_cache_refusal_reason
+    hybrid = FP8DynamicCache(quantize=False, config=_hybrid_config())
+    reason = prefix_cache_refusal_reason(hybrid, "auto")
+    assert reason is not None and "recurrent" in reason
+    assert "to_cpu" not in reason
+
+    assert prefix_cache_refusal_reason(FP8DynamicCache(quantize=False), "auto") is None
+
+    plain = DynamicCache()
+    surface = prefix_cache_refusal_reason(plain, "fp16")
+    assert surface is not None and "to_cpu" in surface
+
+
 def test_copy_prefix_refuses_on_a_hybrid_cache():
     """Backstop: no other caller may reach the IndexError either."""
     cache = FP8DynamicCache(quantize=False, config=_hybrid_config())

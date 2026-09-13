@@ -76,6 +76,23 @@ DISK AND COMPLETE** (46 GB, 10/10 shards + index + config), and the unusable Dee
 **deleted** → **299 GB free**. Row 30's S2 therefore needs **no download** and is unblocked right now; every "+ a
 download" cost estimate on row 30 is stale.
 
+**2026-09-13 — S2 IS DONE, AND IT IS THE LARGEST MEASURED WIN ON THIS BOARD.** `Qwen3-Next-80B-A3B-Instruct` int4
+runs: **4.0648 tok/s** warm at N=1 on the server's own knobs (replicate spread 1.30 %, greedy ids identical across
+arms), and **the server gate passes on it (9 passed)** — so it is **shipped, not banked**. That is **4.8×**
+Qwen3-235B-EXL3's raw 0.85 tok/s and **3.6×** row 27's served 1.1363. It is the **first non-EXL3 MoE ever executed
+on this box**, and it took **seven** root causes, three of which are bugs in code every model uses:
+**RC5** the splitter silently dropped tensors whenever a layer spanned non-adjacent shards (24356 of 24576 experts,
+`.done` marker stamped anyway), **RC6** `get_seq_length()` returned 0 on a hybrid model so every decode step re-ran
+the whole sequence (**9.5×** when fixed), **RC7** the prefix cache tried to lend recurrent state and crashed inside
+transformers (now refused, loudly). Detail: [`…-row30-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md);
+the durable copy is row **30**.
+
+**And it settles the T3/T4 branch with a number.** The drive is now **1.7 %** of a decode token on this model
+(`gb_tok=0.030`, 96.5 % RAM-cache hit) against **70–83 %** on Qwen3-235B / MiniMax-M2.7. **So T3's streaming ladder
+(rows 32 · 34 · 35) is dead on this model and T4 is the live branch** — but take **S2b** first: phase 3 measured
+three levers worth more than anything in T4, and the phase-4 gate passes for a reason that is NOT the one S3 was
+priced on (`h2d` is launch-bound on 4320 tiny copies per token, not PCIe-bound).
+
 ## PRIORITY — worth working, in this order
 
 | # | one line | why it is worth it | state | cost | brief (gitignored) |
@@ -88,7 +105,7 @@ download" cost estimate on row 30 is stale.
 | ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
 | ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
 | **31** | **Stop spending the expert RAM cache on context nobody is using.** `derive_expert_ceiling` = `available − 3.5 GiB − (PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes/token)`, so the KV reservation is subtracted from the expert cache. Both terms are ALREADY server knobs. Sweep them. | **Zero code, zero download, today.** The reservation costs Qwen **4.74 GB** and MiniMax **6.24 GB** of a 15.2 GB budget at the defaults (3 × 8192). An on-device sweep already on record (`vaayu_base.py:286-291`) measured **−25 % warm wall** from 8.5 → 18 GiB of ceiling. Two-sided: prefix reuse is worth 4.44× and collapses to ZERO one session past capacity (Plan I), so this is a single-agent-vs-fan-out trade, not a free win. Price it offline first with `vaayu/expert_sim.py`. | `[x]` **CLOSED 2026-09-12 — defaults STAY** | done | [`…-speedup-options-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.1 · row **31** below |
-| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). **S1 DONE 2026-09-12; checkpoint chosen: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`** (compressed-tensors int4 **g32**, 45.82 GiB, 0.85 GB/token = 5.22× lighter than today). **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. Blocker refined 2026-09-12: transformers **does** merge per-expert keys into the fused 3D params (`conversion_mapping.py`, `qwen3_next` → `qwen2_moe`) — but only for `.weight`, and this checkpoint stores `weight_packed`/`weight_scale`, which no quantizer converter binds. **That binding is S2's first task — ANSWERED 2026-09-13, see row 30's S2 block: the binding is not needed, it must be BYPASSED.** | `[~]` **priority 2, IN PROGRESS 2026-09-13** | 2–4 days — **NO download, the checkpoint is on disk** | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
+| **30** | **S2 CLOSED 2026-09-13 — `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` RUNS: `4.0648 tok/s` warm at N=1 on server knobs, server gate green (9 passed), the FIRST non-EXL3 MoE ever executed on this box.** Seven root causes fixed (RC1 dequant · RC3 shared expert · RC4(a)(b) hybrid KV · **RC5 the splitter dropped tensors** · **RC6 `get_seq_length()`=0 on hybrid, 9.5×** · **RC7 prefix cache refused on recurrent state**). Remaining: **S2b's three levers**, then RC4(c), then S3. | **4.8× Qwen3-235B-EXL3's raw 0.85 / 3.6× row 27's served 1.1363** — the largest measured win on this board. NOT row 29's projected 18.1; re-derive from the measurement. **Phase-4 gate PASSES** (`h2d+gemm` 40.7 % of `T_prof` vs a 15 % rule) but **`h2d` is launch-bound — 4320 tiny `.to()` per token for 0.030 GB — not the PCIe cost S3 was priced on.** Disk fell to **1.7 %** of a token, so **T3 is dead here and T4 is live**. | `[~]` **priority 2 — S2 DONE, S2b next** | S2b 2–4 days — **NO download** | [`…-row30-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[ ]` **priority 3** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
@@ -156,11 +173,12 @@ lets each step start.** Every step names a stop rule. Do not start a step whose 
 | ~~**S0**~~ **DONE** | **Keep one CPU core awake during decode.** `SCHED_IDLE` spinner on a detected E-core + P-core affinity for engine threads. Knob + server A/B + MiniMax/70B/prefill checks. | **27** | ~1 day | ~~none — start here~~ **CLOSED 2026-09-12, +23.1 % through the server, shipped ON.** Applied to every model. | A/B through the server shows < 5 % → close it |
 | ~~**S1**~~ **DONE** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
 | ~~**T1**~~ **DONE** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — **CLOSED 2026-09-12: both defaults STAY.** The +5.7 % a single session at 2.7k context wins is an **−8.9 %** loss at 7.4k with 2 sessions, where reuse collapses 7422/7517 → 44/7517 tokens. `MAX_SEQ_LEN` pays ONCE, not twice (the VRAM reserve is floor-bound). | **31** | done | — | fired in substance: the point that wins the two-turn session loses the workload the server exists for |
-| **S2** `[~]` | **Make a non-EXL3 int4 MoE load, stream and measure.** **2026-09-13: three of four load-path root causes FIXED and green — RC1 packed-int4 dequant, RC3 shared expert, RC4(a)(b) hybrid-attention KV cache. Next is the 46 GB persist, then `row26_decode.py`. See row 30.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) — **STARTED 2026-09-13; 4 root causes measured before any code, see row 30** | garbage output → fix numerics before ANY perf work |
+| ~~**S2**~~ **DONE** | **CLOSED 2026-09-13 — the non-EXL3 int4 MoE LOADS, STREAMS AND IS MEASURED: `4.0648 tok/s` warm at N=1 on server knobs (spread 1.30 %, greedy ids identical across arms), and the server gate passes on it (9 passed) — 4.8× Qwen3-235B-EXL3's raw 0.85, 3.6× row 27's served 1.1363.** Seven root causes, all fixed: RC1 packed-int4 dequant · RC3 shared expert · RC4(a)(b) hybrid-attention KV cache · **RC5 the splitter silently dropped tensors on a non-layer-major shard index** (24356 of 24576 experts) · **RC6 `get_seq_length()` returned 0 on hybrid so every decode step re-ran the whole sequence** (9.5×) · **RC7 the prefix cache cannot lend recurrent state — refused.** RC4(c) is the one open item. | **30** §4–6 | done | — | fired and PASSED: output coherent, ids stable |
+| **S2b** `[ ]` | **The three levers phase 3 put on the table, in cost order — ahead of S3.** (i) coalesce the per-expert H2D (4320 tiny `.to()` per token, ~34 % of `T_prof`) · (ii) land RC1's banked `torch.compile` dequant (17.9 vs 117.5 µs/expert, **6.5× measured**, on ~25 %) · (iii) wire the VRAM expert cache into the non-EXL3 fused forward (`V=0.0`, **7.79 GB reserved and idle**). | **30** | ~2–4 days | S2's measurement (**reported**) | all three bounded by `FLOOR ×6.30` over U1 (~25.6 tok/s); a lever that measures under a third of its share → drop it |
 | **T2** | **Truncate `top_k` at decode.** One clamp at `vaayu_base.py:3233` PLUS the same clamp written into each MoE module's own `top_k` by detection (contract-routed models ignore the engine's `k`; renormalisation already exists everywhere), `DECODE_TOP_K` knob, ppl sweep at k ∈ {8,6,5,4} on both MoE models. **Regime-independent** — do it whether or not S2 lands. | **33** | ~1 day + a ppl sweep | none, but it is worth more on a model you are keeping → after S2's verdict | k=6 costs more quality than row 32's 3.0 bpw build at the same speed-up → prefer 32 and close |
 | **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
-| **T3** | **The streaming-regime ladder — ONLY if S2 stalls or is abandoned.** In order: **32** download a ≤ 3.25 bpw EXL3 build of Qwen3-235B (×1.50, zero code, and it lifts the 62/94-layer VRAM-cache restriction) → **34** probe in-flight read depth, build only if ≥ 60 % of busy time sits at depth 1 (×1.10) → **35** per-model measured gate for `VAAYU_LOOKAHEAD` (+11.7 % Qwen). | **32 · 34 · 35** | a download · ½ day · ~2 days | **S2 stalled.** If S2 lands, these three mostly die — they only pay while experts stream from disk | 34: depth already ≥ 2 → R2's verdict extends, close it · 35: cannot reproduce +11.7 % through the server with the trial cost included → close it |
-| **T4** | **The residency-regime levers — ONLY if S2 lands.** **36** CUDA graphs / fused per-layer dispatch; **37** re-gate speculative decoding, whose refusal (`off_union`, 19.31 GB vs ~17 GB) is a BYTE bound that S2 dissolves. | **36 · 37** | 36: ~1 week · 37: ~2 days | **36:** a resident model measures `serial / T` ≥ 30 %. **37:** S2 or row 32 landed | 36: `serial / T` under 30 % → it is still invisible, close it · 37: gate still refuses on the resident model → close it |
+| ~~**T3**~~ **DEAD on this model** | **The streaming-regime ladder — ONLY if S2 stalls or is abandoned.** In order: **32** download a ≤ 3.25 bpw EXL3 build of Qwen3-235B (×1.50, zero code, and it lifts the 62/94-layer VRAM-cache restriction) → **34** probe in-flight read depth, build only if ≥ 60 % of busy time sits at depth 1 (×1.10) → **35** per-model measured gate for `VAAYU_LOOKAHEAD` (+11.7 % Qwen). | **32 · 34 · 35** | a download · ½ day · ~2 days | **S2 stalled.** If S2 lands, these three mostly die — they only pay while experts stream from disk | 34: depth already ≥ 2 → R2's verdict extends, close it · 35: cannot reproduce +11.7 % through the server with the trial cost included → close it |
+| **T4** ← **LIVE BRANCH** | **The residency-regime levers — ONLY if S2 lands.** **S2 LANDED 2026-09-13 and the disk is now 1.7 % of a decode token here (`gb_tok=0.030`, 96.5 % RAM-cache hit) against 70–83 % on the EXL3 models — the branch condition is MET.** Take S2b's three levers first; 36's own gate below is still unmeasured on a resident model. **36** CUDA graphs / fused per-layer dispatch; **37** re-gate speculative decoding, whose refusal (`off_union`, 19.31 GB vs ~17 GB) is a BYTE bound that S2 dissolves. | **36 · 37** | 36: ~1 week · 37: ~2 days | **36:** a resident model measures `serial / T` ≥ 30 %. **37:** S2 or row 32 landed | 36: `serial / T` under 30 % → it is still invisible, close it · 37: gate still refuses on the resident model → close it |
 | **S4** | **Port DeepSeek-V4-Flash.** TileLang/Triton kernels → HF modeling code + `auto_map` → key remap → persist → measure. | **28b** | **weeks** | S2 done (it proves the non-EXL3 MoE path end to end, cheaply) | kernels will not build/validate on sm_120 → abandon at step 1, ~2 days lost |
 | **S5** | *optional, after S4:* the 10.12 GiB **MTP draft module** already in that checkpoint — speculative decoding with no second model. **Qwen3-Next ships one too** — if S2 lands, this arrives with it and pairs with T4's row 37. | **28b** §3 step 6 | ? | S4 measured (or S2, for Qwen3-Next's own MTP) | — |
 | **T5** | **Research tier. Never ahead of anything above.** **38** mixed-bpw by expert hotness — *do the trace arithmetic, not the repack*; **39** expert slimming. | **38 · 39** | weeks | 38: trace arithmetic clears a 20 % byte cut. 39: rows 31–35 measured | 38: under 20 % → row 32 beats it at a fraction of the effort, close it |
@@ -2152,14 +2170,75 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   slab arena** (`arena_slabs: null`) and the non-EXL3 fused forward clones into PAGEABLE RAM — pageable H2D
   is 15.3 GB/s vs 19.7 pinned (row 26). The gate is CORRECT for the code as written: that forward reaches
   `expert_cache.put()`, not `_dispatch_expert_misses`. Worth ~? — price it in phase 3, do not assume.
-- `[ ]` **Next, in order:** watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB
-  reads, these are 1.6875 MiB — re-measure with `p8_samepath.py`) → first real load / stream →
-  `row26_decode.py` → the phase-4 gate; then RC4 (c).
-- **§8 for what landed:** (1) **no knob needed**, stated not assumed — both fixes are format/architecture
-  detection with nothing for a user to set. (2) N/A, no knob. (3) **NOT reachable today**: RC1 needs the
-  checkpoint to load (RC4 blocks it), and RC3 is reachable for any shared-expert MoE but none is on disk,
-  so **0 % through the server right now**. Both are correctness, not throughput. (4) RC4's two cache
-  fixes plus the persist unblock it. **Banked, not shipped.**
+- `[x]` **RC7 FIXED (refused) — the prefix cache cannot lend a hybrid model its state.** The SECOND
+  generation in one process died: `[Vaayu-Prefix] HIT match_len=134/135` → `copy_prefix` rebuilds the cache
+  as `type(self)(quantize=...)` **with no config** → `layers == []` →
+  `IndexError: list index out of range` at `cache_utils.py:959` (`update_conv_state`). Passing the config
+  through only moves it: `copy_prefix` copies the K/V ring buffers and NOTHING else, and conv/recurrent
+  state is not sliceable by token position — a fixed-size summary has no "first N tokens" — so the hit
+  would be silently WRONG instead of loudly broken. **This is the decision RC4 (c) said was owed; it is
+  taken: refuse.** `cache_holds_recurrent_state` (detected off the layer objects' `update_conv_state` /
+  `conv_states`, not a config field, not a name) makes `cache_supports_prefix_store` False → the existing
+  refuse-at-load path prints one WARNING and turns the prefix cache off for that model; `copy_prefix`
+  raises the same explanation so no other caller reaches the IndexError. **A bug inside the fix, caught by
+  reading the run:** a hybrid cache fails BOTH checks and the surface check ran first, printing
+  *"FP8DynamicCache … does not implement to_cpu/to_device/resident_bytes"* — true of nothing. Both reasons
+  now live in one pure `prefix_cache_refusal_reason(cache, kv_cache_mode)`, recurrent first, with a test
+  asserting the hybrid reason says "recurrent" and never mentions `to_cpu`.
+- `[x]` **PHASE 3 MEASURED — `row26_decode.py`, `MODEL=qwen3next`, server knobs, 29G scope.
+  `T_unprof = 0.2444 / 0.2476 s → 4.0648 tok/s`, replicate spread 1.30 %, greedy ids identical across
+  W/U1/P/U2.** Cold W 2.897, profiled P 2.942 (overhead ×1.382), NOEXP serial floor **0.0348 s/token**
+  (28.71 tok/s). Derived bpw 4.500, 480 routed slots/token, 0 pinned MoE layers.
+  **Qwen3-235B-EXL3 measures 0.85 raw / 1.1363 through the server (row 27) → this is 4.8× / 3.6×.**
+  NOT row 29's projected 18.1 — re-derive from this, never quote the projection.
+- `[x]` **THE REGIME CHANGED — this is what S2 existed to do, and it settles the T3/T4 branch.**
+  `tiers U1: V=0.0 R=463.1 M=16.9 gb_tok=0.030 stall=0.0000s`; disk floor at the 7.1 GB/s plateau =
+  **0.0042 s = 1.7 % of the token**, against **70–83 %** on Qwen3-235B / MiniMax-M2.7. **96.5 % of routed
+  slots come from the RAM cache.** → **T3 (rows 32 · 34 · 35) buys a factor on a cost that no longer exists
+  on this model; T4 (rows 36 · 37) is the live branch.** Also demotes the 24,576-slab / `_NVME_READ_CONCURRENCY`
+  watch **with a number**: it can move at most 1.7 % here.
+- `[x]` **THE PHASE-4 GATE PASSES — `h2d + gemm = 40.7 %` of `T_prof`, 65.8 % with `construct`, against a
+  15 % stop rule.** Phases s/token (share of T_p 0.3400): **h2d 0.1155 (34.0 %)** · **construct — the int4
+  dequant — 0.0854 (25.1 %)** · other 0.0631 (18.6 %) · disk_load 0.0239 (7.0 %) · scatter 0.0232 (6.8 %) ·
+  **gemm 0.0228 (6.7 %)** · route 0.0047 · mask_sync 0.0013 · attach/detach 0.
+  **Two honesty notes.** (1) Profiling costs ×1.382 and `h2d` carries the most `synchronize()` points, so
+  its share is an UPPER BOUND; scaled to `T_unprof`: h2d ≈ 0.0875 (35.8 %), construct ≈ 0.0647 (26.5 %),
+  gemm ≈ 0.0173 (7.1 %). (2) **`h2d` is NOT bandwidth** — the token moves 0.030 GB, which is 2 ms at
+  pageable 15.3 GB/s, not 115. It is **4320 tiny `.to(device)` calls per token** (480 experts × 3 projections
+  × 3 components): launch-bound, the same shape RC1 found for the dequant. **S3 was priced on H2D being a
+  PCIe cost a CPU-resident expert avoids. It is not.** The gate is satisfied and S3 is NOT closed — but
+  price the three levers below first.
+- `[x]` **Phase profile added to the non-EXL3 fused forward** — it was the only one of the three recording
+  nothing into `_moe_profile`, so the gate would have read ZERO and closed the hybrid idea on an artefact.
+  Same keys and bracketing as the other two; `h2d`/`construct` split inside `_expert_dense_weights(timing=)`
+  because the copy and the dequant run back to back there. Fully gated on `profiling_mode`.
+- `[ ]` **THREE LEVERS THIS MEASUREMENT PUT ON THE TABLE, in cost order — do these BEFORE phase 4:**
+  **(i) coalesce the per-expert H2D** — 9 separate copies per expert, one per expert or per layer instead;
+  attacks the largest phase (~34 %), no new kernel. **(ii) land RC1's banked `torch.compile` dequant** —
+  measured **17.9 µs/expert vs the 117.5 shipped, 6.5×**, banked behind "do not optimise before phase 3 says
+  dequant is visible". **Phase 3 says 25.1 %. That condition has fired.** **(iii) wire the VRAM expert cache
+  into this forward** — `V=0.0`, `vram=0hit/0miss`, while **7.79 GB of VRAM budget sits reserved and idle**;
+  verified in source, not inferred: the non-EXL3 fused forward has ZERO references to `_expert_vram_cache`,
+  `_dispatch_expert_misses`, the slab arena or the prefill stager. A VRAM-resident hot set deletes h2d AND
+  construct for what it holds. **This is the `VAAYU_CACHE_BIAS` pattern (CLAUDE.md §0) in a fourth place.**
+  All three are bounded together by `FLOOR[plateau] = T_noexp 0.0348 + disk 0.0042 = 0.0390 s → ×6.30 over
+  U1`, i.e. **~25.6 tok/s** if every host-side expert cost vanished.
+- `[ ]` **RC4 (c), now unblocked with the measured peak it was waiting for: 4.48 GiB of 15.47 GiB, and
+  `max_seq_len` derives to 16384** while only 12 of 48 layers hold KV — the ~4× over-reservation is real
+  and there is headroom to spend.
+- **§8 for what landed — UPDATED 2026-09-13, and it is now SHIPPED, not banked.** (1) **No knob needed**,
+  stated not assumed, for every fix: RC1/RC3 are format and architecture detection, RC5 reads the
+  checkpoint's own index, RC6 reads which buffers hold KV, RC7 refuses on a detected capability; the
+  profile instrumentation rides `profiling_mode`, already on record as NOT an operator control
+  (`tests/test_engine_param_reachability.py`). (2) N/A, no knob. (3) **REACHABLE, and PROVEN:**
+  `SERVER_CKPT=<the int4 checkpoint> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` →
+  **9 passed in 24.9 s**, load 4.2 s, derived `max_seq_len` 16384, prefix refusal printing its correct
+  reason. A user can point `vaayu/server` at this model today and get **4.06 tok/s at N=1** — the server's
+  only mode. RC5 and RC6 also reach every other model (any non-layer-major index; any hybrid model).
+  Regression gates for the models that already ship are green on the same tree:
+  `test_moe_accumulator_determinism.py` on Qwen3-235B (8 passed, **29G — it is OOM-killed at 22G directly
+  after another checkpoint's run**) and `test_batch_prefix_equivalence.py` on Llama-3.2-1B (1 passed).
+  (4) Nothing is blocked; the three levers above are the next work.
 
 
 **AVX2, stated plainly (asked 2026-09-12): phase 4 does NOT write AVX2 intrinsics.** It calls

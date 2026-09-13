@@ -2930,20 +2930,12 @@ class VaayuBaseModel(GenerationMixin):
             # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
             # silently degrade). Pre-existing limit of the prefix subsystem,
             # not of batched decode -- generate() calls the same store().
-            from .batch import cache_holds_recurrent_state, cache_supports_prefix_store
+            from .batch import prefix_cache_refusal_reason
             _probe = self._create_kv_cache()
-            if not cache_supports_prefix_store(_probe):
+            _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
+            if _refusal is not None:
                 print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
-                      f"kv_cache_mode={self.kv_cache_mode!r} yields "
-                      f"{type(_probe).__name__}, which does not implement "
-                      f"to_cpu/to_device/resident_bytes. Load with "
-                      f"kv_cache_mode='bf16' to enable it on this model.")
-                self.enable_prefix_cache = False
-            elif cache_holds_recurrent_state(_probe):
-                print("[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
-                      "this model has recurrent (linear-attention) layers, whose "
-                      "state is a fixed-size summary with no per-token prefix to "
-                      "lend. Prefill runs in full on every turn.")
+                      f"{_refusal}")
                 self.enable_prefix_cache = False
             del _probe
         if getattr(self, "enable_prefix_cache", False):
