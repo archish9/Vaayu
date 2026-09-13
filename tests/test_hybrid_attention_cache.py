@@ -305,3 +305,127 @@ def test_copy_prefix_still_works_on_a_uniform_cache():
     out = cache.copy_prefix(4)
     assert out.get_seq_length() == 4
     assert out._seq_len == [4, 4, 4]
+
+
+# ── RC4 (c): the PLANNER must charge only the layers that hold KV ────────────
+#
+# RC4 (b) made the ALLOCATOR right (non-KV layers get zero-capacity
+# placeholders, so nothing is allocated for them). The planner stayed wrong:
+# `kv_bytes_per_token` multiplies by `config.num_hidden_layers`, and on the S2
+# checkpoint the index says 12 of 48 layers carry `self_attn` while 36 carry
+# `linear_attn` -- an exactly 4x over-charge, which shrinks the derived
+# `max_seq_len` by the same factor.
+
+
+def _attn_layer():
+    """A decoder layer that stores KV: it owns k/v projections."""
+    attn = torch.nn.Module()
+    attn.q_proj = torch.nn.Linear(H * D, H * D, bias=False)
+    attn.k_proj = torch.nn.Linear(H * D, H * D, bias=False)
+    attn.v_proj = torch.nn.Linear(H * D, H * D, bias=False)
+    layer = torch.nn.Module()
+    layer.self_attn = attn
+    return layer
+
+
+def _linear_attn_layer():
+    """A gated-delta-net layer: no k/v projections, so no KV."""
+    lin = torch.nn.Module()
+    lin.in_proj_qkvz = torch.nn.Linear(H * D, H * D, bias=False)
+    lin.conv1d = torch.nn.Conv1d(H * D, H * D, 4, groups=H * D, bias=False)
+    layer = torch.nn.Module()
+    layer.linear_attn = lin
+    return layer
+
+
+def _fused_qkv_layer():
+    """A layer whose attention fuses q/k/v into one projection."""
+    attn = torch.nn.Module()
+    attn.qkv_proj = torch.nn.Linear(H * D, 3 * H * D, bias=False)
+    layer = torch.nn.Module()
+    layer.self_attn = attn
+    return layer
+
+
+def _tree(layers):
+    """A stand-in model exposing `model.layers.<i>.…`, as every checkpoint does."""
+    inner = torch.nn.Module()
+    inner.layers = torch.nn.ModuleList(layers)
+    root = torch.nn.Module()
+    root.model = inner
+    return root
+
+
+def _model_with(layers, config=None):
+    m = _tree(layers)
+    m.config = config if config is not None else _uniform_config(len(layers))
+    m.kv_cache_mode = "bf16"
+    return m
+
+
+def test_kv_bearing_layer_count_counts_only_the_attention_layers():
+    """The S2 geometry in miniature: full attention every 4th layer."""
+    from vaayu.batch import kv_bearing_layer_count
+    layers = [_attn_layer() if (i % 4) == 3 else _linear_attn_layer()
+              for i in range(8)]
+    m = _model_with(layers, _hybrid_config(num_layers=8, interval=4))
+    assert kv_bearing_layer_count(m) == 2
+
+
+def test_kv_bearing_layer_count_is_every_layer_on_a_uniform_model():
+    """Regression guard: all four checkpoints that ship today take this path
+    and must keep quoting exactly `num_hidden_layers`."""
+    from vaayu.batch import kv_bearing_layer_count
+    m = _model_with([_attn_layer() for _ in range(4)])
+    assert kv_bearing_layer_count(m) == 4 == m.config.num_hidden_layers
+
+
+def test_kv_bearing_layer_count_falls_back_to_the_config_when_it_finds_none():
+    """A fused-qkv attention has no `k_proj` to count. Over-charging is the
+    safe error here; under-charging is an OOM, so the fallback charges every
+    layer rather than returning 0."""
+    from vaayu.batch import kv_bearing_layer_count
+    m = _model_with([_fused_qkv_layer() for _ in range(6)])
+    assert kv_bearing_layer_count(m) == 6
+
+
+def test_kv_bearing_layer_count_needs_both_projections():
+    """A `k_proj` with no `v_proj` is not an attention layer -- and counting it
+    would over-charge, which is exactly what this fix exists to stop."""
+    from vaayu.batch import kv_bearing_layer_count
+    half = torch.nn.Module()
+    half.self_attn = torch.nn.Module()
+    half.self_attn.k_proj = torch.nn.Linear(H * D, H * D, bias=False)
+    m = _model_with([half, _attn_layer()])
+    assert kv_bearing_layer_count(m) == 1
+
+
+def test_geo_from_model_charges_only_kv_bearing_layers():
+    """Batch admission quotes the same count as the reserve."""
+    from vaayu.batch import geo_from_model
+    layers = [_attn_layer() if (i % 4) == 3 else _linear_attn_layer()
+              for i in range(8)]
+    m = _model_with(layers, _hybrid_config(num_layers=8, interval=4))
+    n_layers, _, _, _ = geo_from_model(m)
+    assert n_layers == 2
+
+
+def test_no_site_charges_kv_for_every_layer_of_the_config():
+    """Source guard for the invariant kv_bytes_for's docstring already names:
+    if the reserve and admission quote different expressions, admission is
+    lying and the difference surfaces as an OOM rather than a deferral. A new
+    call site that reaches for `config.num_hidden_layers` is the way that
+    happens, so no call site may name it."""
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "vaayu"
+    calls = []
+    for name in ("vaayu_base.py", "batch.py", "vram_plan.py"):
+        src = (root / name).read_text()
+        for m in re.finditer(r"num_hidden_layers\s*=\s*([^,\n]+)", src):
+            arg = m.group(1).strip()
+            if "num_hidden_layers" in arg:
+                calls.append(f"{name}: num_hidden_layers={arg}")
+    assert calls == [], (
+        "these sites charge KV for every layer of the config; they must quote "
+        "kv_bearing_layer_count instead: " + "; ".join(calls))

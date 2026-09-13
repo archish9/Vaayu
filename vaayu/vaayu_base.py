@@ -2262,9 +2262,13 @@ class VaayuBaseModel(GenerationMixin):
                     _resident_expert_bytes = int(
                         self._moe_geometry["num_experts"]
                         * self._moe_geometry["expert_bytes"])
+            from .batch import kv_bearing_layer_count
+            # Only the layers that actually store KV (RC4 (c)). Uniform models
+            # get their full depth back, so nothing on device today moves.
+            _kv_layers = kv_bearing_layer_count(self)
             _shape = VramShape(
                 kv_per_token=kv_bytes_per_token(
-                    num_hidden_layers=self.config.num_hidden_layers,
+                    num_hidden_layers=_kv_layers,
                     num_key_value_heads=getattr(self.config, "num_key_value_heads",
                                                 _n_heads),
                     head_dim=_head_dim,
@@ -2555,8 +2559,9 @@ class VaayuBaseModel(GenerationMixin):
             # the warm wall 36.6 -> 27.3 s with prefix reuse unchanged at 83 %.
             from .vram_plan import kv_bytes_per_token as _kv_per_tok
             try:
+                from .batch import kv_bearing_layer_count
                 _kv_tok = _kv_per_tok(
-                    num_hidden_layers=self.config.num_hidden_layers,
+                    num_hidden_layers=kv_bearing_layer_count(self),
                     num_key_value_heads=getattr(self.config, "num_key_value_heads",
                                                 self.config.num_attention_heads),
                     head_dim=getattr(self.config, "head_dim",

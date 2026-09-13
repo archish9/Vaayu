@@ -604,10 +604,16 @@ Check `/v1/models` at startup and budget against the real number:
 | MiniMax-M2.7 | 8192 |
 | Llama-3.3-70B | 8192 |
 | Llama-3.2-1B | 90639 |
+| Qwen3-Next-80B int4 | 65536 (flash) |
 
 8192 is **tight** for a tool-using agent: system prompt plus a few MCP tool schemas can
 be 1.5–3k before any code is read. Keep tool schemas terse, and read files in slices.
 `ATTN_IMPLEMENTATION = "flash_attention_2"` derives more context at the same reserve.
+
+A **hybrid-attention** checkpoint derives far more than its size suggests, because only some
+of its layers store KV at all: Qwen3-Next-80B has 12 attention layers among 48, so a token
+costs a quarter of what the layer count implies. The engine counts those layers off the model
+itself — there is no knob, and nothing to set.
 
 ### 6.5 MCP belongs in your agent, not here
 

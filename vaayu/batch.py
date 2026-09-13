@@ -295,9 +295,62 @@ def _resolve_kv_elem_bytes(model):
     return 2
 
 
+# Attribute names of the two projections that MAKE a layer store KV. A layer
+# without both writes nothing into the cache, so charging it is pure waste.
+_KV_PROJ_NAMES = ("k_proj", "v_proj")
+
+
+def kv_bearing_layer_count(model) -> int:
+    """How many decoder layers actually store KV.
+
+    Read off the MODULE TREE, never off `config.layer_types` (CLAUDE.md §5):
+    `layer_types` is optional and its `"full_attention"` spelling is a
+    transformers convention, while the k/v projections are the thing that
+    actually puts bytes in the cache. RC4 (b) already made the ALLOCATOR agree
+    -- `_ensure_capacity` pads a non-KV layer with a zero-capacity placeholder
+    -- so this is the planner catching up with it.
+
+    A hybrid model charges its whole depth without this: the S2 checkpoint has
+    12 `self_attn` layers and 36 `linear_attn` layers at `num_hidden_layers=48`,
+    so `kv_bytes_per_token` quoted exactly 4x what the cache allocates and the
+    derived `max_seq_len` came out 4x short.
+
+    Errs SAFE in both directions it can be wrong. Finding nothing (a fused
+    `qkv_proj` attention, a module tree this probe does not understand) falls
+    back to the full depth, i.e. today's behaviour -- over-charging costs
+    context, under-charging is an OOM. And the answer is clamped to the config
+    depth, so a second layer stack in the tree (an MTP draft module) cannot
+    inflate it.
+    """
+    cfg = getattr(model, "config", None)
+    depth = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+    tree = model if hasattr(model, "named_modules") else getattr(model, "model", None)
+    if tree is None or not hasattr(tree, "named_modules"):
+        return depth
+
+    found: dict = {}
+    for name, _mod in tree.named_modules():
+        head, _, leaf = name.rpartition(".")
+        if leaf not in _KV_PROJ_NAMES or not head:
+            continue
+        parts = head.split(".")
+        digits = [i for i, part in enumerate(parts) if part.isdigit()]
+        if not digits:
+            continue
+        # Everything up to and including the layer index, so two stacks with
+        # the same indices stay distinct without naming either of them.
+        key = ".".join(parts[:digits[-1] + 1])
+        found.setdefault(key, set()).add(leaf)
+
+    n = sum(1 for names in found.values() if len(names) == len(_KV_PROJ_NAMES))
+    if n <= 0:
+        return depth
+    return min(n, depth) if depth > 0 else n
+
+
 def geo_from_model(model) -> tuple:
     cfg = model.config
-    n_layers = cfg.num_hidden_layers
+    n_layers = kv_bearing_layer_count(model)
     n_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
     head_dim = getattr(cfg, "head_dim", None)
     if not isinstance(head_dim, int):
