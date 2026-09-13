@@ -88,7 +88,7 @@ download" cost estimate on row 30 is stale.
 | ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
 | ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
 | **31** | **Stop spending the expert RAM cache on context nobody is using.** `derive_expert_ceiling` = `available − 3.5 GiB − (PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes/token)`, so the KV reservation is subtracted from the expert cache. Both terms are ALREADY server knobs. Sweep them. | **Zero code, zero download, today.** The reservation costs Qwen **4.74 GB** and MiniMax **6.24 GB** of a 15.2 GB budget at the defaults (3 × 8192). An on-device sweep already on record (`vaayu_base.py:286-291`) measured **−25 % warm wall** from 8.5 → 18 GiB of ceiling. Two-sided: prefix reuse is worth 4.44× and collapses to ZERO one session past capacity (Plan I), so this is a single-agent-vs-fan-out trade, not a free win. Price it offline first with `vaayu/expert_sim.py`. | `[x]` **CLOSED 2026-09-12 — defaults STAY** | done | [`…-speedup-options-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.1 · row **31** below |
-| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). **S1 DONE 2026-09-12; checkpoint chosen: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`** (compressed-tensors int4 **g32**, 45.82 GiB, 0.85 GB/token = 5.22× lighter than today). **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. Blocker refined 2026-09-12: transformers **does** merge per-expert keys into the fused 3D params (`conversion_mapping.py`, `qwen3_next` → `qwen2_moe`) — but only for `.weight`, and this checkpoint stores `weight_packed`/`weight_scale`, which no quantizer converter binds. **That binding is S2's first task.** | `[ ]` **priority 2** | 2–4 days — **NO download, the checkpoint is on disk** | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
+| **30** | **Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode** (steps S1–S3). **S1 DONE 2026-09-12; checkpoint chosen: `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit`** (compressed-tensors int4 **g32**, 45.82 GiB, 0.85 GB/token = 5.22× lighter than today). **Vaayu has NO CPU expert compute and has never loaded a non-EXL3 MoE** — expect load-path bugs, not tuning. | Model swap alone ≈ **21×** (0.85 → ~18 tok/s projected); hybrid **+21 % at best** and only past a measured **15 % gate**. Blocker refined 2026-09-12: transformers **does** merge per-expert keys into the fused 3D params (`conversion_mapping.py`, `qwen3_next` → `qwen2_moe`) — but only for `.weight`, and this checkpoint stores `weight_packed`/`weight_scale`, which no quantizer converter binds. **That binding is S2's first task — ANSWERED 2026-09-13, see row 30's S2 block: the binding is not needed, it must be BYPASSED.** | `[~]` **priority 2, IN PROGRESS 2026-09-13** | 2–4 days — **NO download, the checkpoint is on disk** | [`…-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md`](docs/2026-09-12-row30-IMPL-nonexl3-int4-cpu-gpu-hybrid.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[ ]` **priority 3** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
@@ -156,7 +156,7 @@ lets each step start.** Every step names a stop rule. Do not start a step whose 
 | ~~**S0**~~ **DONE** | **Keep one CPU core awake during decode.** `SCHED_IDLE` spinner on a detected E-core + P-core affinity for engine threads. Knob + server A/B + MiniMax/70B/prefill checks. | **27** | ~1 day | ~~none — start here~~ **CLOSED 2026-09-12, +23.1 % through the server, shipped ON.** Applied to every model. | A/B through the server shows < 5 % → close it |
 | ~~**S1**~~ **DONE** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
 | ~~**T1**~~ **DONE** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — **CLOSED 2026-09-12: both defaults STAY.** The +5.7 % a single session at 2.7k context wins is an **−8.9 %** loss at 7.4k with 2 sessions, where reuse collapses 7422/7517 → 44/7517 tokens. `MAX_SEQ_LEN` pays ONCE, not twice (the VRAM reserve is floor-bound). | **31** | done | — | fired in substance: the point that wins the two-turn session loses the workload the server exists for |
-| **S2** | **Make a non-EXL3 int4 MoE load, stream and measure.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) | garbage output → fix numerics before ANY perf work |
+| **S2** `[~]` | **Make a non-EXL3 int4 MoE load, stream and measure.** **2026-09-13: RC1 (packed-int4 dequant) and RC3 (shared expert) FIXED and green; RC4 (hybrid-attention KV cache, 2 reproduced failures) is now the blocker — see row 30.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) — **STARTED 2026-09-13; 4 root causes measured before any code, see row 30** | garbage output → fix numerics before ANY perf work |
 | **T2** | **Truncate `top_k` at decode.** One clamp at `vaayu_base.py:3233` PLUS the same clamp written into each MoE module's own `top_k` by detection (contract-routed models ignore the engine's `k`; renormalisation already exists everywhere), `DECODE_TOP_K` knob, ppl sweep at k ∈ {8,6,5,4} on both MoE models. **Regime-independent** — do it whether or not S2 lands. | **33** | ~1 day + a ppl sweep | none, but it is worth more on a model you are keeping → after S2's verdict | k=6 costs more quality than row 32's 3.0 bpw build at the same speed-up → prefer 32 and close |
 | **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
 | **T3** | **The streaming-regime ladder — ONLY if S2 stalls or is abandoned.** In order: **32** download a ≤ 3.25 bpw EXL3 build of Qwen3-235B (×1.50, zero code, and it lifts the 62/94-layer VRAM-cache restriction) → **34** probe in-flight read depth, build only if ≥ 60 % of busy time sits at depth 1 (×1.10) → **35** per-model measured gate for `VAAYU_LOOKAHEAD` (+11.7 % Qwen). | **32 · 34 · 35** | a download · ½ day · ~2 days | **S2 stalled.** If S2 lands, these three mostly die — they only pay while experts stream from disk | 34: depth already ≥ 2 → R2's verdict extends, close it · 35: cannot reproduce +11.7 % through the server with the trial cost included → close it |
@@ -1998,7 +1998,109 @@ only mode. (4) not built; step 1 unblocks step 2, step 4 unblocks the measuremen
 
 ---
 
-# 30 · [ ] Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode (added 2026-09-12) — sequence steps S1–S3
+# 30 · [~] Run a non-EXL3 int4 MoE, then build CPU+GPU hybrid decode (added 2026-09-12) — sequence steps S1–S3
+
+## S2 STARTED 2026-09-13 — FOUR ROOT CAUSES MEASURED BEFORE ANY CODE (probes, no full load)
+
+Probes (gitignored, re-derive in ~1 min each): `plans/probes/row30_s2_skeleton.py` (meta-device skeleton +
+quantizer + key diff), `row30_s2_unpack.py` (one real expert's tensors), `row30_s2_sizes.py` (byte geometry
+off the shard headers). `pip install compressed-tensors` **done** (0.18.0) — must land in `requirements.txt`
+in the commit that makes the model load.
+
+**Geometry, measured off the real shards (all derived, no literals in code):** expert **1,769,520 B =
+1.6875 MiB** exactly (uniform across all 25,088 expert/layer pairs), routed **0.849 GB/token** (48 × 10 ×
+1.6875 MiB) — 5.2× lighter than Qwen3-235B-EXL3's 4.43. Per-layer NON-expert weights **62.9 MB** (12 full-attn
+layers) / **75.8 MB** (36 linear-attn layers), **3.485 GB over 48 layers**, plus embed 0.622 + lm_head 0.622 =
+**4.73 GB that must sit in VRAM as non-expert pins** (fits 15.47 GiB usable with room for the expert VRAM
+cache). Total 48.2 GB excluding the **0.986 GB unused `mtp.*` draft module** (49 expert-carrying "layers" on
+disk = 48 + mtp; `Qwen3NextForCausalLM` never builds it). One expert = 3 projs × {`weight_packed` I32,
+`weight_scale` **BF16** (not F16), `weight_shape` I64}; gate/up `[512, 2048]`, down `[2048, 512]`, g32 sym.
+
+**RC1 — the packed int4 experts have no dequantiser anywhere in Vaayu.** `_classify_expert_tensors`
+(`moe_patch.py:424`) returns the FIRST tensor whose key contains the role segment, so for this checkpoint it
+hands `_make_fused_sparse_forward` whichever of `weight_packed`/`weight_scale`/`weight_shape` iterates first,
+and `F.linear` gets an int32 pack. **This, not the HF binder, is S2's real first task.**
+
+**RC2 — the binder gap is real but must be BYPASSED, not fixed** (this CORRECTS the row's earlier
+"that binding is S2's first task"). Measured: `CompressedTensorsHfQuantizer` resolves and
+`preprocess_model` runs clean — and does **nothing**: `Applying quantization config: 0it`,
+`Compressing model: 0it`, 2 params added (both rotary buffers). Reason: every non-expert Linear is in the
+checkpoint's own `ignore` list and the routed experts are **not `nn.Linear`** — 5.5.4 builds
+`Qwen3NextExperts` with fused 3D `nn.Parameter`s (`gate_up_proj [512, 1024, 2048]`,
+`down_proj [512, 2048, 512]`, bf16 = **3 GiB/layer if ever materialised**). Key diff: **225,809 disk keys with
+no model target, 98 model keys with no disk tensor** (the 49 × 2 fused params). Vaayu streams experts from its
+own per-layer shards and never reads those params, so the fix is to keep them on meta forever — binding them
+would cost 144 GiB of bf16. **C1 PASS** (skeleton builds, sdpa), **C3 fused / non-EXL3** →
+`_make_fused_sparse_forward`, the branch nothing has ever run, as predicted.
+
+**RC3 — the shared expert is silently DROPPED.** `Qwen3NextSparseMoeBlock.forward` returns
+`routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)`; `patch_moe_blocks` (`moe_patch.py:842`) replaces
+the whole **block** forward and every one of the three Vaayu forwards returns the routed part only. Neither
+on-device model has a shared expert (Qwen3-235B and MiniMax-M2.7 both lack one), so no gate covers this. It is
+**~63 MB/layer of weights that would just not be applied** — output would be plausible-looking and wrong.
+Affects every shared-expert MoE family (Qwen2/Qwen3-Next, DeepSeek, GLM).
+
+**RC4 — the KV cache is built without `config=`, and this model is HYBRID attention.** `layer_types` is
+36 × `linear_attention` + 12 × `full_attention` (`full_attention_interval: 4`). `DynamicCache()` /
+`FP8DynamicCache(quantize=False)` (`vaayu_base.py:3400,3407`) pass no config, so 5.5.4 lazily replicates
+`DynamicLayer` for all 48; the linear-attention layers need `LinearAttentionLayer`
+(`conv_states`/`recurrent_states`, read at `modeling_qwen3_next.py:609`). Second half of the same problem:
+Vaayu's VRAM/KV planner charges `num_hidden_layers` KV layers, but only **12 of 48** hold KV here, so
+`max_seq_len` is derived ~4× too small. Risk #4 of this row, now confirmed rather than suspected.
+
+**Order this implies (unchanged stop rule: garbage output → fix numerics before ANY perf work):**
+RC1 (dequant, unit-testable against `compressed_tensors`' own reference, no GPU) → RC3 (shared expert,
+detected not hardcoded) → RC4 (cache + planner) → persist 46 GB → stream → `row26_decode.py`.
+
+### S2 progress 2026-09-13 — RC1 and RC3 FIXED and green; RC4 diagnosed, NOT fixed
+
+Full results: [`docs/2026-09-13-row30-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md).
+Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing has run end to end yet.**
+
+- `[x]` **RC1 fixed.** `vaayu/moe_patch.py`: `_group_packed_tensors_by_weight`, `unpack_int32_to_int8`,
+  `dequantize_packed_weight`, `_expert_dense_weights` (one call site in `_make_fused_sparse_forward`).
+  Bit width derived from packed-vs-original element count, group size from the scale's last dim — no
+  config read, no literal; asymmetric/act-order raises `NotImplementedError` by name. **Dequant runs on
+  the COMPUTE DEVICE at use time, deliberately:** dequantizing at persist time (what this row's IMPL doc
+  floated as path B) would store bf16 and multiply the disk read AND the H2D by 4×, deleting the reason
+  to run a 4-bit model. New gate `tests/test_packed_expert_dequant.py` (13) holds the unpack to
+  `compressed_tensors`' own reference **bit-for-bit** across int4-g32 / int4-g128 / int8-g128, so the
+  decode path never imports that package; verified additionally on a REAL expert (exact match on all
+  three projections, CPU == CUDA). `compressed-tensors>=0.18.0` added to `requirements.txt`.
+  **Measured dequant cost, and it is LAUNCH-bound, not bandwidth-bound** (trivial kernel = 2.7 µs on this
+  GPU): as landed **117.5 µs/expert = 56 ms/token**; no-int8-hop 93.1; one call per expert 78.5;
+  **`torch.compile` of that 17.9 µs = 8.6 ms/token**. Shipped the simplest. **Do not optimise before
+  phase 3 says dequant is visible** against the 0.849 GB/token read — the three alternatives are measured
+  and banked here.
+- `[x]` **RC3 fixed.** `_shared_expert_output` in `vaayu/moe_patch.py`, wired into **all three** forwards
+  (a feature wired into one silently no-ops in the others — CLAUDE.md §0). Found by name beside the
+  router: `_gate`-suffixed sibling ⇒ sigmoid-gated (Qwen2/Qwen3-Next), absent ⇒ added ungated (DeepSeek).
+  New gate `tests/test_shared_expert.py` (4), **including the no-shared-expert case as the regression
+  guard for Qwen3-235B / MiniMax-M2.7**.
+- `[bug]` **RC4 OPEN — the KV cache is wrong for hybrid attention. Two distinct failures, both
+  reproduced** (`plans/probes/row30_s2_cache_hybrid.py`), and this is what BLOCKS the first load:
+  **(a)** `_create_kv_cache` (`vaayu_base.py:3400,3407`) passes no `config=`, so 5.5.4 replicates
+  `DynamicLayer` for all 48 layers and the gated-delta-net layers hit
+  `AttributeError: 'DynamicLayer' object has no attribute 'conv_states'`. With `config=` the split is
+  correct (36 `LinearAttentionLayer` + 12 `DynamicLayer`).
+  **(b)** the DEFAULT ring buffer cannot address non-contiguous layer indices — `FP8DynamicCache`'s
+  per-layer buffers are positional appends and the first layer to `update()` on this model is layer 3:
+  `IndexError: list index out of range` at `vaayu_base.py:1365`. Config alone does not fix this; the
+  storage must become index-safe.
+  **(c)** only **12 of 48** layers hold KV, so `vram_plan`'s `num_hidden_layers` charge and the derived
+  `max_seq_len` are ~4× off (conservative — under-derives context, does not OOM), and the prefix cache
+  needs a DECISION not a port: conv/recurrent state is not sliceable by token position.
+- `[ ]` **Next, in order:** RC4 (a)+(b) with a hybrid `layer_types` case added to
+  `tests/test_fp8_kv_ring.py` → RC4 (c) → persist to `splitted_model/` (~46 GB, 299 GB free) and assert
+  the index finds `48 × 512` experts — **the `mtp.*` group is a 49th on disk and must not be counted** →
+  watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB reads, these are
+  1.6875 MiB — re-measure with `p8_samepath.py`) → `row26_decode.py` → the phase-4 gate.
+- **§8 for what landed:** (1) **no knob needed**, stated not assumed — both fixes are format/architecture
+  detection with nothing for a user to set. (2) N/A, no knob. (3) **NOT reachable today**: RC1 needs the
+  checkpoint to load (RC4 blocks it), and RC3 is reachable for any shared-expert MoE but none is on disk,
+  so **0 % through the server right now**. Both are correctness, not throughput. (4) RC4's two cache
+  fixes plus the persist unblock it. **Banked, not shipped.**
+
 
 **AVX2, stated plainly (asked 2026-09-12): phase 4 does NOT write AVX2 intrinsics.** It calls
 `torch.ops.aten._weight_int4pack_mm_for_cpu`, which is what emits AVX2/AVX-VNNI on this box (row 26 measured that

@@ -14,6 +14,13 @@ huggingface-hub>=0.20.0
 # Quantization support (BnB 4-bit/8-bit)
 bitsandbytes>=0.43.0
 
+# compressed-tensors (GPTQ/AWQ int4 "pack-quantized" checkpoints, e.g. Qwen3-Next
+# int4). Needed for transformers to RESOLVE the quantizer at load time; Vaayu's
+# decode path does its own dequant and does not import it (see moe_patch.py's
+# dequantize_packed_weight, held to this package's reference implementation by
+# tests/test_packed_expert_dequant.py).
+compressed-tensors>=0.18.0
+
 # EXL3 strategy: ExLlamaV3 4-bit quantized inference
 # Requires CUDA Toolkit 12.x and gcc/g++ build tools.
 # If compile fails due to memory: MAX_JOBS=4 pip install exllamav3

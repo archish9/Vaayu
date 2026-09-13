@@ -440,6 +440,178 @@ def _classify_expert_tensors(
 
 _EXL3_COMPONENT_KEYS = {"trellis", "mcg", "suh", "svh", "su", "sv", "mul1"}
 
+# compressed-tensors `pack-quantized` (GPTQ/AWQ int4 checkpoints): one expert
+# linear is stored as bit-packed int32 codes + per-group scales, not as a dense
+# weight. Row 30 / S2 — the HF quantizer binds none of these for a fused-experts
+# MoE, so Vaayu dequantizes them itself on the compute device, which is also
+# what keeps the DISK read at 4 bits per weight (the whole point of the model).
+_PACKED_COMPONENT_KEYS = {
+    "weight_packed", "weight_scale", "weight_shape", "weight_zero_point", "weight_g_idx",
+}
+
+
+def _group_packed_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:
+    """Groups compressed-tensors pack-quantized tensors by weight role.
+
+    Returns {"gate": {"weight_packed": t, "weight_scale": t, ...}, "down": ..., "up": ...}.
+    Empty per-role dicts mean the expert is NOT packed (dense or EXL3) — that is
+    how the forward picks its path.
+    """
+    result: dict[str, dict[str, "torch.Tensor"]] = {"gate": {}, "down": {}, "up": {}}
+    for key, tensor in raw.items():
+        role = None
+        for pattern, r in _EXPERT_WEIGHT_ROLES:
+            if pattern in key:
+                role = r
+                break
+        if role is None:
+            continue
+        component = key.rsplit(".", 1)[-1]
+        if component in _PACKED_COMPONENT_KEYS:
+            result[role][component] = tensor
+    return result
+
+
+def _shared_expert_output(moe_mod: nn.Module, flat_hidden: "torch.Tensor"):
+    """The block's always-on shared-expert contribution, flat (tokens, hidden).
+
+    None when the block has no shared expert — which is every model Vaayu has
+    run on device so far (Qwen3-235B and MiniMax-M2.7 route only), and why this
+    was missed: `patch_moe_blocks` replaces the whole MoE BLOCK forward, so a
+    shared expert sitting beside the router is silently dropped.
+
+    Two shapes exist in the wild and both are handled by name, the same way the
+    router is found (`_ROUTER_NAMES`): Qwen2 / Qwen3-Next gate it with a sibling
+    `shared_expert_gate` (sigmoid over one logit), DeepSeek adds `shared_experts`
+    ungated. The gate is identified by its `_gate` suffix, not by its shape.
+    """
+    shared = gate = None
+    for name, child in moe_mod.named_children():
+        if "shared_expert" not in name:
+            continue
+        if name.endswith("_gate"):
+            gate = child
+        elif shared is None:
+            shared = child
+    if shared is None:
+        return None
+    out = shared(flat_hidden)
+    if gate is not None:
+        out = torch.sigmoid(gate(flat_hidden)) * out
+    return out
+
+
+def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype"):
+    """(w_gate, w_down, w_up) for one expert, on `device`, ready for `F.linear`.
+
+    Pack-quantized experts (compressed-tensors int4/int8 GPTQ-AWQ checkpoints)
+    are dequantized HERE, on the compute device, so the disk read and the H2D
+    copy stay at the checkpoint's bit width — dequantizing at persist time would
+    multiply both by 4x and delete the reason for running a 4-bit model.
+    Dense/EXL3-adjacent checkpoints keep the plain cast path unchanged.
+
+    Returns (None, None, None) if any of the three roles is missing.
+    """
+    packed = _group_packed_tensors_by_weight(raw)
+    if packed["gate"]:
+        out = []
+        for role in ("gate", "down", "up"):
+            comps = packed[role]
+            if "weight_packed" not in comps or "weight_scale" not in comps:
+                return None, None, None
+            on_device = {
+                k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
+                for k, v in comps.items()
+            }
+            out.append(dequantize_packed_weight(on_device, dtype))
+        return out[0], out[1], out[2]
+
+    w_gate, w_down, w_up = _classify_expert_tensors(raw)
+    if w_gate is None or w_down is None or w_up is None:
+        return None, None, None
+    return (w_gate.to(device, dtype=dtype, non_blocking=True),
+            w_down.to(device, dtype=dtype, non_blocking=True),
+            w_up.to(device, dtype=dtype, non_blocking=True))
+
+
+def unpack_int32_to_int8(packed: "torch.Tensor", num_bits: int, cols: int) -> "torch.Tensor":
+    """Inverse of compressed-tensors' `pack_to_int32` along the last dim.
+
+    32 consecutive elements occupy exactly `num_bits` int32 words, packed
+    densely from bit 0 with an offset of 2**(num_bits-1) so the stored codes are
+    unsigned; this returns the signed int8 codes. Held to the reference
+    implementation bit-for-bit by tests/test_packed_expert_dequant.py, which is
+    why nothing on the decode path has to import compressed_tensors.
+    """
+    rows, num_words = packed.shape
+    if 32 % num_bits == 0:
+        # No element straddles a word (num_bits in 1/2/4/8 — every int4 and int8
+        # checkpoint), so the unpack is a broadcast shift with no gather. The
+        # general path below costs ~3x more on GPU, which at 480 expert-linears
+        # per token is the difference between 50 ms and 150 ms.
+        per_word = 32 // num_bits
+        shifts = torch.arange(per_word, device=packed.device, dtype=torch.int32) * num_bits
+        out = (packed.unsqueeze(-1) >> shifts) & ((1 << num_bits) - 1)
+        out = out.view(rows, num_words * per_word)[:, :cols]
+        return (out - (1 << (num_bits - 1))).to(torch.int8)
+
+    if num_words % num_bits:
+        packed = torch.nn.functional.pad(packed, (0, num_bits - num_words % num_bits))
+        num_words = packed.shape[1]
+    num_groups = num_words // num_bits
+    value_g = packed.reshape(rows * num_groups, num_bits)
+
+    elem = torch.arange(32, device=packed.device, dtype=torch.int32)
+    bit_start = elem * num_bits
+    word_idx = (bit_start // 32).long()
+    bit_off = bit_start % 32
+    lo_bits = torch.clamp(32 - bit_off, max=num_bits)
+
+    out = (value_g[:, word_idx] >> bit_off.unsqueeze(0)) & ((1 << lo_bits) - 1).unsqueeze(0)
+    straddles = lo_bits < num_bits
+    if bool(straddles.any()):
+        hi_bits = num_bits - lo_bits[straddles]
+        out[:, straddles] |= (
+            value_g[:, word_idx[straddles] + 1] & ((1 << hi_bits) - 1).unsqueeze(0)
+        ) << lo_bits[straddles].unsqueeze(0)
+
+    out = out.view(rows, num_groups * 32)[:, :cols]
+    return (out - (1 << (num_bits - 1))).to(torch.int8)
+
+
+def dequantize_packed_weight(components: dict, dtype: "torch.dtype") -> "torch.Tensor":
+    """One expert linear's dense weight from its pack-quantized components.
+
+    Bit width and group size are DERIVED from the tensors (packed vs original
+    element count; scale's last dim) — never read from a config and never a
+    literal, so int4-g32, int4-g128 and int8 checkpoints all take the same path
+    (CLAUDE.md §5). Runs wherever `components` already live, so calling it with
+    GPU tensors keeps the dequant off the CPU.
+    """
+    packed = components["weight_packed"]
+    scale = components["weight_scale"]
+    if "weight_zero_point" in components or "weight_g_idx" in components:
+        raise NotImplementedError(
+            "asymmetric / act-order pack-quantized experts carry a zero point or "
+            "g_idx that Vaayu does not apply; this checkpoint would decode to "
+            "shifted weights. Supported today: symmetric group quantization."
+        )
+    rows, cols = (int(x) for x in components["weight_shape"].tolist())
+
+    num_bits, remainder = divmod(packed.numel() * 32, rows * cols)
+    if remainder or not 1 <= num_bits <= 8:
+        raise ValueError(
+            f"cannot derive bit width: {packed.numel()} int32 words for a "
+            f"{rows}x{cols} weight"
+        )
+
+    codes = unpack_int32_to_int8(packed, num_bits, cols)
+    groups = scale.shape[-1]
+    return (
+        codes.view(rows, groups, cols // groups).to(dtype)
+        * scale.view(rows, groups, 1).to(dtype)
+    ).view(rows, cols)
+
 
 def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:
     """Groups EXL3 checkpoint tensors by weight role and component.
@@ -1278,6 +1450,10 @@ def _make_modulelist_sparse_forward(
         accumulate_expert_outputs(_flat_final, _contribs)
 
         # 4. Write routing result to vaayu_ref for speculative prefetch scheduling
+        _shared = _shared_expert_output(block_info.moe_module, hidden_states.view(-1, H))
+        if _shared is not None:
+            _flat_final += _shared.to(_flat_final.dtype)
+
         vaayu_ref._expert_history[layer_idx] = unique_experts
         _trace_moe_block(vaayu_ref, layer_idx, "module_list", hidden_states,
                          final_hidden, routing_weights, unique_experts)
@@ -1391,10 +1567,6 @@ def _make_fused_sparse_forward(
             if raw is None:
                 continue
 
-            w_gate, w_down, w_up = _classify_expert_tensors(raw)
-            if w_gate is None or w_down is None or w_up is None:
-                continue
-
             top_k_pos, token_idx = torch.where(expert_mask[eidx])
             if token_idx.numel() == 0:
                 continue
@@ -1402,9 +1574,9 @@ def _make_fused_sparse_forward(
             token_idx_gpu = token_idx.to(device)
             current_state = flat_hidden[token_idx_gpu]
 
-            w_gate_gpu = w_gate.to(device, dtype=dtype, non_blocking=True)
-            w_down_gpu = w_down.to(device, dtype=dtype, non_blocking=True)
-            w_up_gpu   = w_up.to(device, dtype=dtype, non_blocking=True)
+            w_gate_gpu, w_down_gpu, w_up_gpu = _expert_dense_weights(raw, device, dtype)
+            if w_gate_gpu is None:
+                continue
 
             gate_out = act_fn(F.linear(current_state, w_gate_gpu))
             up_out = F.linear(current_state, w_up_gpu)
@@ -1415,6 +1587,9 @@ def _make_fused_sparse_forward(
             del w_gate_gpu, w_down_gpu, w_up_gpu
 
         result = final_hidden.to(flat_hidden.dtype)
+        _shared = _shared_expert_output(moe_mod, flat_hidden)
+        if _shared is not None:
+            result = result + _shared.to(result.dtype)
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return result.view(B, S, H)
@@ -2073,6 +2248,10 @@ def _make_fused_sparse_forward_exl3(
             vaayu_ref._chunk_major_gpu_bytes = 0
 
         accumulate_expert_outputs(final_hidden, _contribs)
+
+        _shared = _shared_expert_output(moe_mod, flat_hidden)
+        if _shared is not None:
+            final_hidden += _shared.to(final_hidden.dtype)
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         final_hidden = final_hidden.to(flat_hidden.dtype)
