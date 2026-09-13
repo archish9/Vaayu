@@ -2106,10 +2106,27 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   a measured VRAM peak, not before.** Separately, the prefix cache needs a DECISION not a port: conv /
   recurrent state is not sliceable by token position, so `copy_prefix` on a hybrid model must be refused
   loudly or redesigned.
-- `[ ]` **Next, in order:** persist to `splitted_model/` (~46 GB, 299 GB free) and assert
-  the index finds `48 × 512` experts — **the `mtp.*` group is a 49th on disk and must not be counted** →
-  watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB reads, these are
-  1.6875 MiB — re-measure with `p8_samepath.py`) → `row26_decode.py` → the phase-4 gate; then RC4 (c).
+- `[x]` **RC5 FIXED — the splitter silently DROPPED tensors, and the completeness check called it good.**
+  Found by running the persist, not by reading code. `split_and_save_layers` (`vaayu/utils.py`) loaded, per
+  layer, only `max(shard number)` and only when it differed from the shard already held — which assumes the
+  index is **layer-major and monotonic**. This checkpoint is neither: one layer spans up to 4 NON-ADJACENT
+  shards and the numbers do not rise with the layer index (observed load order `1,4,7,3,9,6,2,8,5`). The
+  layer was written anyway, minus the tensors from shards never loaded, **with its `.done` marker stamped**,
+  so `found_layers` reported the split complete. **Measured: 24,356 of 24,576 experts, layers 14 and 24
+  short, 11 distinct expert byte sizes (partial experts), 41.57 GB instead of 48.24.** Fix: group the index
+  by layer once, then read each layer's keys out of whichever files hold them — safetensors **one tensor at
+  a time via `safe_open`**, so the resident set is ONE LAYER instead of a growing pile of whole shards (the
+  `single_file_loaded` preload is gone, orphaned by the change). `.bin` keeps whole-file loads, same
+  memory profile as before, same bug fixed. Cost **+8 % wall** (64.1 → 69.2 s) for correctness. New gate
+  `tests/test_split_shard_spanning.py` (3) — 2 RED on the old code, and the third asserts `mtp.layers.*` is
+  NOT swept into `model.layers.*`. **Affects every model Vaayu splits**, not just this one.
+- `[x]` **Persist DONE and asserted** (`plans/probes/row30_s2_persist.py`, gitignored): 51 shards,
+  **48.24 GB**, index finds **24,576 = 48 × 512** experts over 48 layers, **0 `mtp` groups** (shard 10 is
+  100 % `mtp` and is never opened), and **one single distinct expert size, 1,769,520 B = 1.6875 MiB**,
+  matching the header geometry above exactly. Suite **2041 passed, 15 skipped** (baseline 2038 + the 3 new).
+- `[ ]` **Next, in order:** watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB
+  reads, these are 1.6875 MiB — re-measure with `p8_samepath.py`) → first real load / stream →
+  `row26_decode.py` → the phase-4 gate; then RC4 (c).
 - **§8 for what landed:** (1) **no knob needed**, stated not assumed — both fixes are format/architecture
   detection with nothing for a user to set. (2) N/A, no knob. (3) **NOT reachable today**: RC1 needs the
   checkpoint to load (RC4 blocks it), and RC3 is reachable for any shared-expert MoE but none is on disk,

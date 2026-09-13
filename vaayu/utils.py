@@ -1,4 +1,5 @@
 ﻿import gc
+import contextlib
 import json
 import os
 import ctypes
@@ -13,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from .persist import ModelPersister
@@ -395,22 +397,46 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
 
-    shard = -1
-    n_shards = len(set(index.values()))
-    state_dict = {}
-    single_file_loaded = False
+    # A layer's tensors may live in ANY set of shards, in ANY order. This used to
+    # load, per layer, only `max(shard number)`, and only when that number differed
+    # from the shard already held -- which assumes the index is layer-major and
+    # monotonic, so that every lower-numbered shard was pulled in by an earlier
+    # layer. Modern quantized MoE checkpoints break that: one layer spreads over
+    # several NON-ADJACENT shards and the numbers do not rise with the layer index.
+    # The layer was then written anyway, minus the tensors from the shards that were
+    # never loaded, with its .done marker stamped beside it -- so the completeness
+    # check above called the split good. Measured on a 48-layer / 512-expert int4
+    # checkpoint: 24356 of 24576 experts, two layers short, and no error anywhere.
+    # See tests/test_split_shard_spanning.py.
+    #
+    # Group the index by layer once, then read each layer's keys out of whichever
+    # files hold them. safetensors is read ONE TENSOR AT A TIME, so the resident set
+    # is a single layer rather than a growing pile of whole shards.
+    keys_by_layer = {layer: [] for layer in layers}
+    for k, fname in index.items():
+        for layer in layers:
+            if layer in k:
+                keys_by_layer[layer].append((k, fname))
 
-    # For single file models, check if we already loaded the state_dict
-    if n_shards == 1 and list(set(index.values()))[0] in ['model.safetensors', 'pytorch_model.bin']:
-        single_file_name = list(set(index.values()))[0]
-        if os.path.exists(checkpoint_path / single_file_name):
-            print(f"Loading single model file: {single_file_name}")
-            if single_file_name.endswith('.safetensors'):
-                state_dict = load_file(checkpoint_path / single_file_name, device='cpu')
-            else:
-                state_dict = torch.load(checkpoint_path / single_file_name, map_location='cpu')
-            single_file_loaded = True
+    shard_readers = contextlib.ExitStack()
+    open_shards = {}          # safetensors: fname -> safe_open handle
+    bin_state_dicts = {}      # .bin: fname -> the whole loaded state dict
 
+    def _fetch(key, fname):
+        path = checkpoint_path / fname
+        if not os.path.exists(path):
+            assert repo_id is not None
+            huggingface_hub.snapshot_download(repo_id, allow_patterns=fname, token=hf_token)
+        if safetensors_format:
+            if fname not in open_shards:
+                print(f'Opening shard {fname}')
+                open_shards[fname] = shard_readers.enter_context(
+                    safe_open(path, framework='pt', device='cpu'))
+            return open_shards[fname].get_tensor(key)
+        if fname not in bin_state_dicts:
+            print(f'Loading shard {fname}')
+            bin_state_dicts[fname] = torch.load(path, map_location='cpu')
+        return bin_state_dicts[fname][key]
 
     if not os.path.exists(saving_path):
         #os.makedirs(saving_path)
@@ -419,70 +445,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     for layer in tqdm(layers):
 
-        # Skip loading if we already have the full state_dict from a single file
-        if not single_file_loaded:
-            # Optionnally load next shard
-            # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-            shards = [int(v.split('-')[1]) for k, v in index.items() if layer in k and '-' in v and len(v.split('-')) > 1]
-            if len(shards) > 0:
-                target_shard = max(shards)
-                if target_shard != shard:
-                    # No deletion here. Deleting shard N-1 on the way to shard N
-                    # destroyed sources while the split was still unfinished: a
-                    # crash at shard 5 of 9 left 1-4 gone AND the split unusable,
-                    # and it never reclaimed the last shard, which nothing
-                    # advances past. Deletion now happens once, at the end, gated
-                    # on the same completeness check the already-split path uses.
-                    shard = target_shard
-                    print(f'Loading shard {shard}/{n_shards}')
-
-                    # Dynamically find the real filename from the index map instead of rigidly string formatting
-                    matching_files = [val for val in set(index.values()) if '-' in val and len(val.split('-')) > 1 and int(val.split('-')[1]) == shard]
-                    
-                    if len(matching_files) > 0:
-                        to_load = checkpoint_path / matching_files[0]
-                    else:
-                        # Defensive fallback
-                        if not safetensors_format:
-                            to_load = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                        else:
-                            to_load = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
-
-                    # check if to_load exist, if not downloaad it...
-                    if not os.path.exists(to_load):
-                        assert repo_id is not None
-                        huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                        token=hf_token)
-
-                    if not safetensors_format:
-                        state_dict.update(torch.load(to_load, map_location='cpu'))
-                    else:
-                        state_dict.update(load_file(to_load, device='cpu'))
-
-            else:
-                shards = [v for k, v in index.items() if layer in k]
-                if len(shards) == 0:
-                    # No weights for this layer in index, skip it
-                    continue
-                to_load = checkpoint_path / shards[0]
-                # check if to_load exist, if not downloaad it...
-                if not os.path.exists(to_load):
-                    assert repo_id is not None
-                    huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                    token=hf_token)
-                if not safetensors_format:
-                    state_dict.update(torch.load(to_load, map_location='cpu'))
-                else:
-                    state_dict.update(load_file(to_load, device='cpu'))
-
         # Get layer state dict and strip unknown architectural prefixes to standardize map for Vaayu Base
         layer_state_dict = {}
-        for k, v in state_dict.items():
-            if layer in k:
-                # Strip everything preceding the canonical layer ID string map
-                idx = k.find(layer)
-                normalized_k = k[idx:]
-                layer_state_dict[normalized_k] = v
+        for k, fname in keys_by_layer[layer]:
+            # Strip everything preceding the canonical layer ID string map
+            idx = k.find(layer)
+            layer_state_dict[k[idx:]] = _fetch(k, fname)
 
         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
 
@@ -493,11 +461,13 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer.rstrip('.'), saving_path)
 
         # Free memory
-        for k in layer_state_dict.keys():
-            if k in state_dict:
-                del state_dict[k]
+        for k, fname in keys_by_layer[layer]:
+            if fname in bin_state_dicts:
+                bin_state_dicts[fname].pop(k, None)
         del layer_state_dict
         clean_memory()
+
+    shard_readers.close()
 
     # The ONE place a fresh split deletes anything, and it runs after every layer
     # is written. Gated on the same completeness check the already-split path at
