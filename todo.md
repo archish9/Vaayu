@@ -94,12 +94,16 @@ three levers worth more than anything in T4, and the phase-4 gate passes for a r
 priced on — **CORRECTED 2026-09-13: `h2d` is BANDWIDTH-bound (14.52 GB/s as shipped, 95 % of this box's
 pageable line rate), S3's PCIe premise is restored, and lever (i) is REFUTED at ≤ 5.7 % of a token.** What
 remains of S2b is (ii), landed, and (iii), the VRAM expert cache — the only lever that removes the
-0.849 GB/token transfer rather than making it faster. **(iii)'s layout question was ANSWERED BY REPLAY
-2026-09-13 and the answer is neither option the row posed: store the PACKED BLOB** (`flat_packed`/`flat_scale`
-pre-concatenated) — packed's bytes and hit rate (80.9 / 89.3 % warm on two unlike prompts) plus a hit that
-also skips the two `torch.cat`s at `moe_patch.py:724-725`. **+47.4 / +56.1 %, i.e. 4.3459 → 6.41 / 6.78
-tok/s**, against packed's +28.1 / +32.7 % and dequant-bf16's +33.2 / +37.6 %. **The build is planned,
-unstarted, and its cold-pickup plan is in row 30 — start at its step 1, which is a stop-rule measurement.**
+0.849 GB/token transfer rather than making it faster. **(iii) IS BUILT, MEASURED AND SHIPPED (2026-09-13):
+`4.1584 → 6.4702 tok/s, +55.6 %`** at N=1 on the server's own knobs, against a **same-day baseline arm on the
+stashed tree**, greedy ids identical across every arm, VRAM cache 83 % hit, suite 2081 passed and every
+on-device gate green (server gate on this checkpoint 9 passed; Qwen3-235B, MiniMax-M2.7 and Llama-3.2-1B
+regression gates all pass). The entry layout is the **PACKED BLOB** (`flat_packed`/`flat_scale`
+pre-concatenated), chosen by replay and confirmed by the build's own stop-rule measurement —
+`construct_flat` **31.8 µs/expert** measured in place against a 58 µs abandon rule (and against the spike's
+assumed 17.6, which is exactly the correction that step existed to make). **Peak VRAM 11.66 GiB, i.e.
+3.17 GiB free against the 3.50 GiB reserve floor — tight, recorded, no OOM.** Detail:
+[`…-row30-S2b-iii-vram-cache-RESULTS.md`](docs/2026-09-13-row30-S2b-iii-vram-cache-RESULTS.md).
 
 ## PRIORITY — worth working, in this order
 
@@ -113,7 +117,7 @@ unstarted, and its cold-pickup plan is in row 30 — start at its step 1, which 
 | ~~**27**~~ | **CLOSED 2026-09-12 — BUILT, MEASURED THROUGH THE SERVER, SHIPPED ON. +23.1 % decode tok/s on Qwen3-235B at the server's real default** (0.9229 → 1.1363 tok/s, n=3, ids identical, 0.5 % replicate spread); TTFT 1.680 → 1.306 s (−22.3 %). Cache-off sweep: spinAll +12.4 %, pin alone +0.9 %, both +14.1 % decode / +10.1 % served. No regression: MiniMax-M2.7 +1.3 %, Llama-3.3-70B dense +2.9 %, Llama-3.2-1B null (VRAM-pinned, reads no disk — the control). Mechanism confirmed in the kernel's counters: C2_ACPI residency 1.142 → 0.492 s, wakes 1.74 M → 1.22 M. | Knobs `KEEP_AWAKE="auto"` + `PIN_ENGINE_THREADS=True`, plumbed and documented; reachable at N=1. Stop rule (≥ +10 % on Qwen) PASSED. | `[x]` | done | [`…-row27-keepawake-RESULTS.md`](docs/2026-09-12-row27-keepawake-RESULTS.md) · row **27** below |
 | ~~**29**~~ | **Pick a non-EXL3 MoE Vaayu can LOAD, then measure the hybrid on it.** EXL3 has no CPU kernel, so non-EXL3 is a PREREQUISITE for CPU+GPU decode — row 28's +4.2 % was DeepSeek-V4-Flash's disk-streamed regime, not a verdict on non-EXL3. Best hybrid case on this box is **+21 %** (Qwen3-Next-80B int4); gpt-oss-120b actually **LOSES −4.6 %**. | The far bigger number is the download itself: **gpt-oss-120b ≈ 11 tok/s (13× today, zero new kernels)**, GLM-4.5-Air ≈ 7.3 (9×), Qwen3-Next-80B ≈ 18 (21×) vs Qwen3-235B EXL3's measured 0.85. Step 2 would be the FIRST non-EXL3 MoE ever run on device. Only int4-g128 has a torch CPU kernel (row 26: 214 µs/expert); MXFP4 and fp8 have none. | `[x]` decision taken 2026-09-12: **Qwen3-Next-80B-A3B-Instruct int4**, smoke rung Qwen3-30B-A3B int4 → row **30** | 1 day + a download | [`…-row29-hybrid-model-selection-BRIEF.md`](docs/2026-09-12-row29-hybrid-model-selection-BRIEF.md) · row **29** below |
 | **31** | **Stop spending the expert RAM cache on context nobody is using.** `derive_expert_ceiling` = `available − 3.5 GiB − (PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes/token)`, so the KV reservation is subtracted from the expert cache. Both terms are ALREADY server knobs. Sweep them. | **Zero code, zero download, today.** The reservation costs Qwen **4.74 GB** and MiniMax **6.24 GB** of a 15.2 GB budget at the defaults (3 × 8192). An on-device sweep already on record (`vaayu_base.py:286-291`) measured **−25 % warm wall** from 8.5 → 18 GiB of ceiling. Two-sided: prefix reuse is worth 4.44× and collapses to ZERO one session past capacity (Plan I), so this is a single-agent-vs-fan-out trade, not a free win. Price it offline first with `vaayu/expert_sim.py`. | `[x]` **CLOSED 2026-09-12 — defaults STAY** | done | [`…-speedup-options-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.1 · row **31** below |
-| **30** | **S2b (iii) layout SETTLED 2026-09-13 by replay — PACKED BLOB, projected 4.3459 → 6.41 / 6.78 tok/s (+47.4 / +56.1 %). Build PLANNED and UNSTARTED; the cold-pickup plan is in row 30 below, step 1 is a stop-rule measurement (`construct_flat` ≥ 58 µs → switch to dequant-bf16). — S2 CLOSED 2026-09-13 — `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` RUNS: `4.0648 tok/s` warm at N=1 on server knobs, server gate green (9 passed), the FIRST non-EXL3 MoE ever executed on this box.** Seven root causes fixed (RC1 dequant · RC3 shared expert · RC4(a)(b) hybrid KV · **RC5 the splitter dropped tensors** · **RC6 `get_seq_length()`=0 on hybrid, 9.5×** · **RC7 prefix cache refused on recurrent state**). Remaining: **S2b's three levers**, then RC4(c), then S3. | **4.8× Qwen3-235B-EXL3's raw 0.85 / 3.6× row 27's served 1.1363** — the largest measured win on this board. NOT row 29's projected 18.1; re-derive from the measurement. **Phase-4 gate PASSES** (`h2d+gemm` 40.7 % of `T_prof` vs a 15 % rule) but **`h2d` is launch-bound — 4320 tiny `.to()` per token for 0.030 GB — not the PCIe cost S3 was priced on.** Disk fell to **1.7 %** of a token, so **T3 is dead here and T4 is live**. | `[~]` **priority 2 — S2 DONE, S2b next** | S2b 2–4 days — **NO download** | [`…-row30-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md) · row **30** below |
+| **30** | **S2b (iii) BUILT AND SHIPPED 2026-09-13 — the VRAM expert cache now reaches the non-EXL3 fused forward: `4.1584 → 6.4702 tok/s, +55.6 %` at N=1 on server knobs (same-day baseline arm, greedy ids identical, 83 % VRAM hit). Stop rule was ≥ +20 %. Peak VRAM 11.66 GiB — 3.17 GiB free against a 3.50 GiB reserve floor, tight, recorded. Next on this row: RC4(c), then S3; S2b (iv) is mostly absorbed. — S2 CLOSED 2026-09-13 — `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` RUNS: `4.0648 tok/s` warm at N=1 on server knobs, server gate green (9 passed), the FIRST non-EXL3 MoE ever executed on this box.** Seven root causes fixed (RC1 dequant · RC3 shared expert · RC4(a)(b) hybrid KV · **RC5 the splitter dropped tensors** · **RC6 `get_seq_length()`=0 on hybrid, 9.5×** · **RC7 prefix cache refused on recurrent state**). Remaining: **S2b's three levers**, then RC4(c), then S3. | **7.6× Qwen3-235B-EXL3's raw 0.85 / 5.7× row 27's served 1.1363** (was 4.8× / 3.6× at S2's close) — the largest measured win on this board. NOT row 29's projected 18.1; re-derive from the measurement. **Phase-4 gate PASSES** (`h2d+gemm` 40.7 % of `T_prof` vs a 15 % rule) but **`h2d` is launch-bound — 4320 tiny `.to()` per token for 0.030 GB — not the PCIe cost S3 was priced on.** Disk fell to **1.7 %** of a token, so **T3 is dead here and T4 is live**. | `[~]` **priority 2 — S2 + S2b (i)(ii)(iii) DONE; RC4(c) then S3 next** | **NO download** | [`…-row30-S2b-iii-vram-cache-RESULTS.md`](docs/2026-09-13-row30-S2b-iii-vram-cache-RESULTS.md) · [`…-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[ ]` **priority 3** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
@@ -2250,8 +2254,10 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   the probe's prebuilt flat tensors skipped. Note also that `h2d` fell 0.1155 → 0.0850 in the PROFILED arm —
   that is a MEASUREMENT artefact (one `synchronize()` bracket per expert instead of three; overhead ×1.382 →
   ×1.181), not a gain.
-- `[~]` **S2b (iii) — WIRE THE VRAM EXPERT CACHE INTO THE NON-EXL3 FUSED FORWARD. The largest lever left,
-  and the budget for it is already reserved and idle.** Measured today: `V=0.0`, `vram=0hit/0miss/0evict`,
+- `[x]` **S2b (iii) — DONE 2026-09-13: THE VRAM EXPERT CACHE IS WIRED INTO THE NON-EXL3 FUSED FORWARD.
+  `4.1584 → 6.4702 tok/s, +55.6 %` (same-day baseline arm, ids identical, VRAM cache 83 % hit, peak
+  11.66 GiB). Everything below is the reasoning that produced it; the build's own record is the numbered
+  plan further down.** Measured before the build: `V=0.0`, `vram=0hit/0miss/0evict`,
   **7.79 GB of VRAM expert-cache budget unused**, while peak VRAM is only **4.48 GiB of 15.47**. Verified in
   source, not inferred: `_make_fused_sparse_forward` contains ZERO references to `_expert_vram_cache`,
   `_dispatch_expert_misses`, the slab arena or the prefill stager — the other two forwards reach the VRAM
@@ -2288,55 +2294,101 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
     (S2b (ii)'s microbench on prebuilt flat tensors, a different measurement context); it beats dequant for
     any value **< 58 µs** and never loses to plain packed. **The build must measure it directly.**
     [`…-row30-S2b-iii-vram-layout-SPIKE.md`](docs/2026-09-13-row30-S2b-iii-vram-layout-SPIKE.md)
-  - `[ ]` **THE BUILD — cold-pickup plan, written 2026-09-13. Everything needed is in this row; the SPIKE
+  - `[x]` **THE BUILD — DONE 2026-09-13, +55.6 % (4.1584 → 6.4702 tok/s), shipped. Plan as written 2026-09-13. Everything needed is in this row; the SPIKE
     doc is detail, not the only copy.** Scope: `_make_fused_sparse_forward` (`moe_patch.py:1586`) is the ONLY
     forward without VRAM-cache wiring; the other two reach it and are the pattern to copy
     (fused-EXL3 `:2133-2161` for the gate/hold, `:2295-2303` for the `put()` ownership contract).
-    1. `[ ]` **MEASURE `construct_flat` FIRST — this is the stop rule, not a formality.** Time the compiled
-       fused dequant on an ALREADY-CONCATENATED blob on the real hit path. **≥ 58 µs/expert → abandon
-       packed-blob and build the dequant-bf16 layout instead** (+33.2 / +37.6 %), and then fix the guard bug
-       below, which dequant NEEDS. < 58 µs → packed-blob. The spike's 17.6 µs is S2b (ii)'s microbench from a
-       different context; the margin is real but it is derived, not measured in place.
-    2. `[ ]` Make `dequantize_expert_weights` (`moe_patch.py:689-734`) able to return / accept the flat blob
-       (`flat_packed`, `flat_scale`, built at `:724-725`) so the forward can cache it and a hit calls
-       `_fused_dequant_fn` directly. Keep the non-fusable fallback and RC1's `NotImplementedError` intact.
-    3. `[ ]` Wire the cache into the fused forward: `_vram` lookup for every routed expert BEFORE the load
-       dispatch, entries HELD for the whole compute loop (eviction only drops the dict's reference), `_vram`
-       gated OFF during prefill (`_moe_prefill_pass`), `_vram_cacheable_layers` honoured, `put()` after
-       construct with the ownership contract (`put()` False → caller still owns and must free).
-    4. `[ ]` Tests, TDD, before the on-device arm: bit-exactness of the blob path vs today's
-       (`torch.equal`, the way `tests/test_packed_expert_dequant.py` does it); **a test that a VRAM hit
-       actually skips the H2D — the silent-no-op failure mode that is how `VAAYU_CACHE_BIAS` came to do
-       nothing**; and the entry-bytes fix below, parametrized over both geometries (§5).
-    5. `[ ]` On-device: A/B `row26_decode.py MODEL=qwen3next` W/U1/P/U2, 29G scope, `BALLAST_GB=25`, ids
-       identical across arms. **Stop rule: ≥ +20 % on `T_unprof` or the layout choice was wrong.**
-       Projected 4.3459 → 6.41–6.78 tok/s.
-    6. `[ ]` **Peak VRAM is the build's own gate** — today 4.48 GiB of 15.47 and NOTHING has ever been
-       allocated from this budget on this model; the cache will now fill it (budget = `free_vram − reserve`,
-       `vram_plan.py:794-801`). Check against the 3.50 GiB reserve floor and the KV plan, then re-run the
-       server gate on this checkpoint (`SERVER_CKPT=… test_server_smoke.py -q -s`, was 9 passed) plus the
-       Qwen3-235B (`test_moe_accumulator_determinism.py`, 29G) and Llama-3.2-1B
-       (`test_batch_prefix_equivalence.py`) regression gates.
-    7. `[ ]` **§8, all four answers, in this row and the RESULTS doc.** Provisional: no knob (the cache and
-       its budget are already derived and already exist — the forward simply never used them); reachable at
-       N=1, which is the server's only mode; nothing blocked.
+    1. `[x]` **MEASURED 2026-09-13 — `construct_flat` = 31.8 µs/expert interleaved (26.9 isolated), the stop
+       rule PASSES, the layout is PACKED-BLOB.** `plans/probes/row30_s2b_construct_flat.py` (gitignored),
+       64 distinct REAL experts cycled with the three `F.linear` calls the forward runs between dequants, so
+       the launch queue and L2 pressure are production's: gemms-only 25.5 µs, +today's construct 81.0
+       (construct **55.5**), +blob 57.2 (**construct_flat 31.8**). Blob output asserted `torch.equal` to
+       today's fused path, which is itself equal to the per-role path. **Two corrections the build must carry
+       forward, both of which shrink the spike's projection:** (a) `construct_flat` is **31.8**, not the
+       spike's assumed 17.6 (S2b (ii)'s microbench on prebuilt flats, a different context — exactly the risk
+       this step existed to retire); (b) today's construct measured **55.5 µs**, not the 78.3 the spike
+       de-scaled from the profiled arm. Per-hit saving is therefore **h2d 121.9 + (55.5 − 31.8) = 145.6 µs**,
+       and the honest projection is **+32.5 % (trace A) / +37.2 % (B), i.e. 4.3459 → 5.76 / 5.96 tok/s**, not
+       +47.4 / +56.1 %. **Packed-blob still wins and by a real margin**: re-derived at the measured costs the
+       crossover to dequant-bf16 sits at `construct_flat` **51.5 (A) / 53.8 (B) µs** against the measured
+       31.8, and dequant-bf16 projects +27.0 / +30.0 %. Step 5's ≥ +20 % stop rule is unchanged and still the
+       gate.
+    2. `[x]` **DONE — `build_expert_blob` / `dequantize_expert_blob` / `expert_weights_from_entry`
+       (`vaayu/moe_patch.py`).** `dequantize_expert_weights` is now the first two called in sequence, so the
+       cached and uncached paths are THE SAME CODE, not two that must be kept in step. The non-fusable
+       fallback and RC1's `NotImplementedError` both live in `build_expert_blob` and are tested there.
+    3. `[x]` **DONE — the fused forward reaches the VRAM cache.** `_vram` lookup for every routed expert
+       BEFORE the load dispatch, entries HELD for the whole compute loop, gated off during prefill and
+       outside `_vram_cacheable_layers`, `put()` after construct. A GPU-resident expert that missed the RAM
+       cache now issues NO disk read (P8's lesson, in this forward for the first time). `_expert_dense_weights`
+       returns `(w_gate, w_down, w_up, entry)`. **Dense (non-packed) fused checkpoints are cached too** —
+       entry = the weights; a packed-only wiring would silently no-op on every other checkpoint, which is the
+       failure mode this row exists to stop. Ownership: `put()` False is ignored because these are plain
+       torch tensors — unlike the EXL3 forward's BC objects there is no C++ heap, so dropping the reference
+       IS the free (stated, not assumed).
+    4. `[x]` **DONE — 17 tests, written first, watched fail.** `tests/test_fused_vram_expert_cache.py` (new,
+       10) incl. **a hit actually skips the H2D** (the silent-no-op guard), hits change not one bit, no
+       re-read off NVMe for a resident expert, the prefill and layer-restriction gates (**both
+       mutation-checked — they fail when the gate is deleted**), a refused `put()` still answers correctly,
+       and the entry-bytes invariant over BOTH layouts; `tests/test_packed_expert_dequant.py` (+7) holds the
+       blob roundtrip `torch.equal` to the fused path on int4-g32 / int4-g128 / int8-g128;
+       `tests/test_expert_vram_cache.py` (+1) for `_group_bytes`. **Suite 2081 passed, 15 skipped.**
+       `ExpertVRAMCache._group_bytes` now skips any value that is not a dict of tensors (the blob entry's
+       derived `geom`) **while keeping the `bc` name check** — generalising it away broke the EXL3 forward's
+       accounting and the module-list `bc` lifecycle test caught it.
+    5. `[x]` **DONE — +55.6 %, stop rule (≥ +20 %) PASSED. `4.1584 → 6.4702 tok/s`** on `T_unprof`, N=1,
+       server knobs, 29G, `BALLAST_GB=25`, greedy ids identical across every arm. Two treated runs
+       (U1 6.4702 / 6.4138, U2 6.4473 / 6.3829, spread 0.9 %) against a **same-day baseline arm on the
+       stashed tree** (U1 4.1584, U2 4.1714, `vram=0hit/0miss` — the wiring's own control). VRAM cache
+       83 % hit over the run (73–95 % per token), `usage=7.57GB/7.57GB`. **The same-day baseline is the
+       point:** this row's pre-build figure of 4.3459 was measured earlier the same day and had drifted 4 %;
+       quoting it would have inflated the win to +49 %. Spike projected 6.41–6.78 tok/s; measured 6.41–6.47.
+       **Against the board: 7.6× Qwen3-235B-EXL3's raw 0.85, 5.7× row 27's served 1.1363.**
+    6. `[x]` **DONE, and peak VRAM is TIGHT — recorded, not waved off.** Treated peak `max_allocated`
+       **11.66 GiB** (baseline 4.61), device used **12.30 of 15.47 GiB**, i.e. **3.17 GiB free against the
+       3.50 GiB reserve floor** — the cache overshoots its intended floor by ~0.33 GiB (allocator reservation
+       + context overhead above the budget arithmetic). No OOM, `prefill_evict=0`, and the reactive guard for
+       exactly this (`_ensure_prefill_headroom` → `evict_until_free`) is untouched, so a long prefill leans on
+       reactive eviction rather than spare headroom. **Re-check if `max_seq_len` or the reserve floor moves.**
+       Gates all green on the same tree: server gate on this checkpoint **9 passed**, Qwen3-235B
+       `test_moe_accumulator_determinism.py` 8 passed, **MiniMax-M2.7 the same 8 passed** (run because
+       `_group_bytes` is shared by all three forwards), Llama-3.2-1B `test_batch_prefix_equivalence.py`
+       1 passed.
+    7. `[x]` **§8 — (1) NO knob, stated not assumed:** the cache, its `free_vram − reserve` budget and the
+       layer-restriction guard already exist and are already derived; the entry layout is derived from the
+       tensors (bit width from packed-vs-original element count, group size from the scale's last dim), not
+       chosen. **(2)** N/A, no knob. **(3) REACHABLE and PROVEN at N=1**, the server's only mode — server gate
+       green on this checkpoint; a user pointing `vaayu/server` at it gets **6.47 tok/s** where they got 4.16.
+       **(4)** nothing blocked. Full detail:
+       [`…-row30-S2b-iii-vram-cache-RESULTS.md`](docs/2026-09-13-row30-S2b-iii-vram-cache-RESULTS.md).
     **Probes to re-use, not rebuild** (`plans/probes/`, gitignored): `row30_s2b_trace.py` captures an ordered
     routed-expert trace (monkeypatches `_maybe_record_usage`, no engine edit; `PROMPT=A|B`, `TAG=`),
     `row30_s2b_replay.py` replays it through the real cache (`BUDGETS_GB=`, `FRACS=`, `CONSTRUCT_FLAT_US=`).
     Traces already captured: `plans/probes/row30_out/trace-qwen3next{,-b}.json`.
-  - `[ ]` **BUG the build must fix, found by the spike: `compute_vram_layer_range` (`vaayu_base.py:700`)
-    sizes the working set with `geometry["expert_bytes"]` — the CHECKPOINT's packed expert size, not the
-    cache ENTRY's.** Any non-packed layout makes it under-count (bf16 by 3.56×) and return `None` — no layer
-    restriction — in exactly the case the guard exists for. Harmless under packed/packed-blob (the two sizes
-    are equal, and on this model it correctly returns `None`: 7.5 GB budget ≫ 0.849 GB working set).
-    **Measured floor, not theory:** a tier under one token's working set hits **0 %** — dequant reads 0.0 %
-    at 1 and 2 GB where packed reads 45.2 % / 61.2 %.
-- `[ ]` **S2b (iv) — the leftover of (i) AND (ii), behind ONE prerequisite: store each expert as a single
-  contiguous blob at cache-fill time.** Both remainders need exactly that. With it: h2d's coalesced 2.5 %
+  - `[x]` **VERDICT 2026-09-13 — NOT a bug under the layout that shipped; PINNED BY A TEST instead of
+    changed.** `compute_vram_layer_range` (`vaayu_base.py:700`) sizes the working set with
+    `geometry["expert_bytes"]`, the CHECKPOINT's expert size, not the cache ENTRY's. **Under packed-blob the
+    two are equal** — the entry drops `weight_shape` (72 B/expert, never crosses PCIe) — so the guard is
+    correct here and conservative in the safe direction; the 3.56× under-count the spike named belongs to the
+    bf16 layout this build REFUTED and did not build. Changing it now would be a parameter no caller can fill
+    with anything but today's value (CLAUDE.md §2). **What ships instead is the invariant, tested over BOTH
+    entry layouts** (`test_entry_bytes_never_exceed_the_checkpoints_expert_bytes`): an entry may never exceed
+    the checkpoint's expert bytes. **The one configuration that would still break it is named:** a dense
+    fused MoE whose compute dtype is WIDER than the checkpoint stores (bf16 checkpoint at fp32) — no
+    checkpoint on disk does this and no server knob reaches it. That test failing IS the re-open signal.
+    **Measured floor, kept because it outlasts the layout choice:** a tier under one token's working set hits
+    **0 %** — dequant reads 0.0 % at 1 and 2 GB where packed reads 45.2 % / 61.2 %.
+- `[ ]` **S2b (iv) — MOSTLY ABSORBED by (iii) 2026-09-13: the prerequisite IS the packed-blob cache entry,
+  and it now exists.** What is left is the part that applies on a cache MISS (the h2d of a miss is still 6
+  separate copies) — re-price it against the new baseline before building anything, since 83 % of routed
+  slots no longer take that path at all. Original text: **the leftover of (i) AND (ii), behind ONE
+  prerequisite: store each expert as a single contiguous blob at cache-fill time.** Both remainders need exactly that. With it: h2d's coalesced 2.5 %
   (§5g) becomes collectable without the per-call `cat` that made it a loss, AND the dequant drops its two
   `cat`s to reach the microbench's ~17.6 µs (0.0444 → ~0.018 s ≈ another **10 %** of the token). Together
   **~12 %**. Touches `ExpertRAMCache`'s storage layout, so it is a real change, not a tweak.
-- `[~]` **THREE LEVERS THIS MEASUREMENT PUT ON THE TABLE, in cost order — do these BEFORE phase 4:**
+- `[x]` **THREE LEVERS THIS MEASUREMENT PUT ON THE TABLE — ALL THREE ANSWERED 2026-09-13: (i) REFUTED at
+  ≤ 5.7 % of a token (h2d is bandwidth-bound, not launch-bound), (ii) LANDED at +6.92 %, (iii) BUILT at
+  +55.6 %. Original text kept below for the reasoning:**
   **(i) coalesce the per-expert H2D** — 9 separate copies per expert, one per expert or per layer instead;
   attacks the largest phase (~34 %), no new kernel. **(ii) land RC1's banked `torch.compile` dequant** —
   measured **17.9 µs/expert vs the 117.5 shipped, 6.5×**, banked behind "do not optimise before phase 3 says

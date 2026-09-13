@@ -322,11 +322,15 @@ def test_fused_forward_dense_checkpoint_still_profiles_h2d(tmp_path):
     raw = {f"{PACKED_PREFIX}{seg}.weight": torch.randn(4, 4)
            for seg in PACKED_ROLE_SEG.values()}
     timing = {"h2d": 0.0, "construct": 0.0}
-    w_gate, w_down, w_up = _expert_dense_weights(raw, "cpu", torch.float32, timing=timing)
+    w_gate, w_down, w_up, entry = _expert_dense_weights(
+        raw, "cpu", torch.float32, timing=timing)
 
     assert w_gate is not None and w_down is not None and w_up is not None
     assert timing["h2d"] > 0.0
     assert timing["construct"] == 0.0
+    # Cacheable as-is: a dense expert's entry IS its weights, so a VRAM hit on
+    # one skips the upload and owes no dequant (row 30, S2b (iii)).
+    assert entry == {"dense": {"gate": w_gate, "down": w_down, "up": w_up}}
 
 
 # ── S2b (ii): one fused dequant per expert instead of three ──────────────────
@@ -458,3 +462,78 @@ def test_dequant_falls_back_to_eager_when_compile_is_unavailable(monkeypatch):
     for role in expected:
         assert torch.equal(got[role], expected[role])
     mp._FUSED_DEQUANT_CACHE.clear()
+
+
+# ── S2b (iii): the packed-blob VRAM cache entry ──────────────────────────────
+#
+# The VRAM expert cache stores what the two on-device `torch.cat`s in
+# `dequantize_expert_weights` build -- `flat_packed` / `flat_scale` already
+# concatenated -- so a hit skips the H2D AND the cats and pays only the compiled
+# fused kernel. Measured 2026-09-13 on 64 real experts interleaved with the
+# forward's own gemms: today's construct 55.5 us/expert, the blob's 31.8.
+#
+# The entry feeds `F.linear` exactly as before, so the roundtrip has to be
+# BIT-identical to the path it replaces -- `allclose` would not do.
+
+@pytest.mark.parametrize("num_bits,group_size", [(4, 32), (4, 128), (8, 128)])
+def test_blob_roundtrip_is_bit_identical_to_the_fused_path(num_bits, group_size):
+    from vaayu.moe_patch import (build_expert_blob, dequantize_expert_blob,
+                                 dequantize_expert_weights)
+
+    by_role = _expert_components(num_bits, group_size)
+    expected = dequantize_expert_weights(by_role, torch.bfloat16)
+
+    blob = build_expert_blob(by_role)
+    got = dequantize_expert_blob(blob, torch.bfloat16)
+
+    assert set(got) == set(expected)
+    for role in expected:
+        assert got[role].shape == expected[role].shape
+        assert torch.equal(got[role], expected[role]), f"{role} is not bit-identical"
+
+
+def test_blob_entry_holds_only_the_two_flat_tensors():
+    """The entry is the cache's byte cost. It must carry the packed bytes and
+    the scales and nothing else -- `weight_shape` never crosses PCIe, and a
+    dense copy would be 3.56x the bytes and a different layout decision."""
+    from vaayu.moe_patch import build_expert_blob
+
+    by_role = _expert_components()
+    blob = build_expert_blob(by_role)
+
+    assert set(blob["flat"]) == {"packed", "scale"}
+    expected_bytes = sum(c["weight_packed"].nbytes + c["weight_scale"].nbytes
+                         for c in by_role.values())
+    assert sum(t.nbytes for t in blob["flat"].values()) == expected_bytes
+
+
+def test_blob_is_refused_when_the_roles_disagree():
+    """Not fusable -> no blob, so the caller keeps the per-role path rather than
+    decoding three differently-packed roles through one flat view."""
+    from vaayu.moe_patch import build_expert_blob
+
+    by_role = {
+        "gate": _components(128, 256, 4, 32, 1),
+        "up": _components(128, 256, 4, 32, 2),
+        "down": _components(256, 128, 4, 64, 3),      # different group size
+    }
+    assert build_expert_blob(by_role) is None
+
+
+def test_blob_refuses_asymmetric_by_name():
+    """RC1's refusal may not be lost on the way into the cache."""
+    from vaayu.moe_patch import build_expert_blob
+
+    by_role = _expert_components()
+    by_role["gate"]["weight_zero_point"] = torch.zeros_like(
+        by_role["gate"]["weight_packed"])
+    with pytest.raises(NotImplementedError, match="zero"):
+        build_expert_blob(by_role)
+
+
+def test_blob_is_none_for_a_dense_expert():
+    """A bf16 fused checkpoint has nothing to pack -- the caller caches its
+    dense weights instead, and must not be handed a half-built blob."""
+    from vaayu.moe_patch import build_expert_blob
+
+    assert build_expert_blob({"gate": {"weight": torch.zeros(4, 4)}}) is None

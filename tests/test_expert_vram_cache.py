@@ -183,3 +183,22 @@ def test_prefill_wipe_evictions_are_not_attributed():
     assert c.prefill_evictions >= 1
     assert c.evicted_keys[(2, 5)] == 0         # NOT attributed
     assert sum(c.evicted_keys.values()) == 0
+
+
+def test_group_bytes_counts_tensor_groups_and_ignores_the_rest():
+    """Entries are not all `{role: {name: tensor}}`. The packed-blob entry the
+    non-EXL3 fused forward caches (row 30, S2b (iii)) carries its derived
+    geometry beside the tensors, and the EXL3 forward caches BC_LinearEXL3
+    wrappers under "bc". Budget accounting counts the TENSORS; anything that is
+    not a group of them has no byte footprint of its own."""
+    entry = {
+        "flat": {"packed": torch.zeros(1000, dtype=torch.uint8),
+                 "scale": torch.zeros(24, dtype=torch.uint8)},
+        "geom": (4, 32, (("gate", 8, 16), ("down", 16, 8))),
+    }
+    assert ExpertVRAMCache._group_bytes(entry) == 1024
+
+    c = ExpertVRAMCache(budget_bytes=4096)
+    assert c.put(0, 0, entry) is True
+    assert c.current_usage == 1024
+    assert c.get(0, 0) is entry

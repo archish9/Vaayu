@@ -776,9 +776,12 @@ class ExpertVRAMCache:
     def _group_bytes(groups: dict) -> int:
         total = 0
         for role_name, role in groups.items():
-            if role_name == "bc":
-                # Cached BC_LinearEXL3 objects (Task 7): C++ wrappers around the
-                # tensors already counted below — no separate byte footprint.
+            if role_name == "bc" or not isinstance(role, dict):
+                # "bc": cached BC_LinearEXL3 objects (Task 7) — C++ wrappers
+                # around the tensors already counted below, no separate byte
+                # footprint, and a dict, so it needs its own name check.
+                # Not-a-dict: the packed-blob entry's "geom", the derived shapes
+                # the fused dequant slices its output by (row 30, S2b (iii)).
                 continue
             for t in role.values():
                 total += t.nbytes

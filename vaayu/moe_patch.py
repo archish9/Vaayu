@@ -516,7 +516,12 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
     zero. Passing it also switches on the `synchronize()` calls that make the
     numbers truthful, so it is for the profiled arm only.
 
-    Returns (None, None, None) if any of the three roles is missing.
+    Returns (w_gate, w_down, w_up, entry), where `entry` is what the VRAM expert
+    cache should store for this expert — the PACKED BLOB for a pack-quantized
+    checkpoint (the checkpoint's own bytes, so a hit skips this whole function),
+    the dense weights for anything else, None when there is nothing cacheable.
+
+    Returns (None, None, None, None) if any of the three roles is missing.
     """
     def _mark():
         if timing is not None and torch.cuda.is_available():
@@ -528,7 +533,7 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
         roles = ("gate", "down", "up")
         if any("weight_packed" not in packed[r] or "weight_scale" not in packed[r]
                for r in roles):
-            return None, None, None
+            return None, None, None, None
         _t0 = _mark()
         on_device = {
             r: {k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
@@ -543,21 +548,26 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
         # against 17.6 for one compiled pass, on work a trivial kernel does in
         # 2.7 (measured on a real expert, 300 reps). At 480 routed experts per
         # token that is ~46 ms of a ~244 ms token.
-        dense = dequantize_expert_weights(on_device, dtype)
+        blob = build_expert_blob(on_device)
+        if blob is None:
+            dense = {r: dequantize_packed_weight(on_device[r], dtype) for r in roles}
+        else:
+            dense = dequantize_expert_blob(blob, dtype)
         if timing is not None:
             timing["construct"] += _mark() - _t1
-        return dense["gate"], dense["down"], dense["up"]
+        return dense["gate"], dense["down"], dense["up"], blob
 
     w_gate, w_down, w_up = _classify_expert_tensors(raw)
     if w_gate is None or w_down is None or w_up is None:
-        return None, None, None
+        return None, None, None, None
     _t0 = _mark()
     dense = (w_gate.to(device, dtype=dtype, non_blocking=True),
              w_down.to(device, dtype=dtype, non_blocking=True),
              w_up.to(device, dtype=dtype, non_blocking=True))
     if timing is not None:
         timing["h2d"] += _mark() - _t0
-    return dense
+    # Nothing to dequantize on this path, so the cache entry IS the weights.
+    return dense + ({"dense": dict(zip(("gate", "down", "up"), dense))},)
 
 
 def unpack_int32_to_int8(packed: "torch.Tensor", num_bits: int, cols: int) -> "torch.Tensor":
@@ -686,52 +696,104 @@ def _fused_dequant_fn(num_bits, group_size, dtype, device_type):
     return _FUSED_DEQUANT_CACHE[key]
 
 
-def dequantize_expert_weights(by_role: dict, dtype: "torch.dtype") -> dict:
-    """{role: dense weight} for one expert, in ONE dequant pass where possible.
+def build_expert_blob(by_role: dict) -> "dict | None":
+    """One expert's pack-quantized tensors as a single blob, or None.
 
-    `dequantize_packed_weight` per role costs three launches of everything; this
-    concatenates the roles and pays them once. Falls back to the per-role path,
-    role by role, for any checkpoint whose roles are not packed alike -- decoding
-    such a checkpoint with one flat group-size view would decode it WRONGLY, so
-    the compatibility test is a precondition, not an optimisation hint.
+    `flat_packed` / `flat_scale` concatenated ONCE, plus the geometry needed to
+    slice the decoded stream back into roles. This is what the VRAM expert cache
+    stores (S2b (iii)): the entry is the checkpoint's own bytes, so a hit skips
+    the host-to-device copy AND the two `torch.cat` calls, leaving only the
+    compiled fused kernel -- measured 55.5 -> 31.8 us/expert on 64 real experts
+    interleaved with the forward's own gemms (2026-09-13).
+
+    Returns None when this expert cannot be decoded in one fused pass -- a dense
+    (non-packed) expert, or roles packed at different bit widths / group sizes.
+    Decoding those through one flat group-size view would decode them WRONGLY,
+    so the compatibility test is a precondition, not an optimisation hint, and
+    the caller falls back to the per-role path.
     """
-    geom = {}
+    geom = []
     for role, comps in by_role.items():
         if "weight_zero_point" in comps or "weight_g_idx" in comps:
-            # RC1's refusal, restated here so the fused path cannot lose it.
+            # RC1's refusal, restated here so neither the fused path nor the
+            # cache can lose it.
             raise NotImplementedError(
                 "asymmetric / act-order pack-quantized experts carry a zero point or "
                 "g_idx that Vaayu does not apply; this checkpoint would decode to "
                 "shifted weights. Supported today: symmetric group quantization.")
+        if not {"weight_packed", "weight_scale", "weight_shape"} <= set(comps):
+            return None
         rows, cols = (int(x) for x in comps["weight_shape"].tolist())
         num_bits, remainder = divmod(comps["weight_packed"].numel() * 32, rows * cols)
-        gs = cols // comps["weight_scale"].shape[-1]
-        geom[role] = (rows, cols, num_bits, gs, remainder)
+        geom.append((role, rows, cols, num_bits,
+                     cols // comps["weight_scale"].shape[-1], remainder))
 
-    first = next(iter(geom.values()))
-    num_bits, group_size = first[2], first[3]
+    if not geom:
+        return None
+    num_bits, group_size = geom[0][3], geom[0][4]
     fusable = (
         num_bits and 32 % num_bits == 0
         and all(r == 0 and nb == num_bits and g == group_size
                 and c % (32 // num_bits) == 0
-                for _, c, nb, g, r in geom.values())
+                for _role, _rows, c, nb, g, r in geom)
     )
     if not fusable:
-        return {role: dequantize_packed_weight(comps, dtype)
-                for role, comps in by_role.items()}
+        return None
 
-    roles = list(by_role)
-    flat_packed = torch.cat([by_role[r]["weight_packed"].reshape(-1) for r in roles])
-    flat_scale = torch.cat([by_role[r]["weight_scale"].reshape(-1) for r in roles])
+    roles = [g[0] for g in geom]
+    return {
+        "flat": {
+            "packed": torch.cat([by_role[r]["weight_packed"].reshape(-1) for r in roles]),
+            "scale": torch.cat([by_role[r]["weight_scale"].reshape(-1) for r in roles]),
+        },
+        # Derived from the tensors, never a config read (CLAUDE.md 5).
+        "geom": (num_bits, group_size, tuple((g[0], g[1], g[2]) for g in geom)),
+    }
+
+
+def dequantize_expert_blob(blob: dict, dtype: "torch.dtype") -> dict:
+    """{role: dense weight} from a blob built by `build_expert_blob`.
+
+    All that is left of the dequant once the concatenation is done -- one
+    compiled kernel over the flat code stream, then metadata-only role views.
+    """
+    num_bits, group_size, roles = blob["geom"]
+    flat_packed, flat_scale = blob["flat"]["packed"], blob["flat"]["scale"]
     fn = _fused_dequant_fn(num_bits, group_size, dtype, flat_packed.device.type)
     flat = fn(flat_packed, flat_scale, num_bits, group_size, dtype)
 
     out, at = {}, 0
-    for role in roles:
-        rows, cols = geom[role][0], geom[role][1]
+    for role, rows, cols in roles:
         out[role] = flat[at:at + rows * cols].view(rows, cols)
         at += rows * cols
     return out
+
+
+def expert_weights_from_entry(entry: dict, dtype: "torch.dtype") -> tuple:
+    """(w_gate, w_down, w_up) for one VRAM-cached expert.
+
+    The mirror of the `entry` `_expert_dense_weights` returns: a packed blob
+    still owes the compiled fused kernel (measured 31.8 us/expert on 64 real
+    experts interleaved with the forward's own gemms, against 55.5 for the
+    upload path's cat-and-decode), dense weights are already the weights.
+    Either way the host-to-device copy is skipped, which is the 121.9 us.
+    """
+    dense = entry["dense"] if "dense" in entry else dequantize_expert_blob(entry, dtype)
+    return dense["gate"], dense["down"], dense["up"]
+
+
+def dequantize_expert_weights(by_role: dict, dtype: "torch.dtype") -> dict:
+    """{role: dense weight} for one expert, in ONE dequant pass where possible.
+
+    `dequantize_packed_weight` per role costs three launches of everything; the
+    blob concatenates the roles and pays them once. Falls back to the per-role
+    path, role by role, for any checkpoint `build_expert_blob` refuses.
+    """
+    blob = build_expert_blob(by_role)
+    if blob is None:
+        return {role: dequantize_packed_weight(comps, dtype)
+                for role, comps in by_role.items()}
+    return dequantize_expert_blob(blob, dtype)
 
 
 def _group_exl3_tensors_by_weight(raw: dict) -> dict[str, dict[str, "torch.Tensor"]]:
@@ -1653,6 +1715,29 @@ def _make_fused_sparse_forward(
             vaayu_ref.telemetry.record_batch_overlap(
                 layer_idx, len(unique_experts), vaayu_ref._batch_n * top_k)
 
+        # VRAM expert cache (S2b (iii)). Until 2026-09-13 this forward reached it
+        # through ZERO code paths while its budget sat reserved and idle — the
+        # VAAYU_CACHE_BIAS failure mode (CLAUDE.md §0) in a fourth place. Same
+        # two gates the other two forwards apply.
+        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
+        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
+            # Prefill routes ~every expert once; don't churn the GPU LRU with a
+            # whole-model sweep.
+            _vram = None
+        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
+        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
+            _vram = None
+
+        # Held for the whole compute loop, as the other two forwards hold theirs:
+        # eviction only pops the dict and drops its reference, so a held entry
+        # stays valid even if a later put() in this same visit evicts it.
+        _vram_hold: dict = {}
+        if _vram is not None:
+            for _e in unique_experts:
+                _held = _vram.get(layer_idx, _e)
+                if _held is not None:
+                    _vram_hold[_e] = _held
+
         # Load active expert weights: cache → parallel sparse io_uring for misses
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         expert_tensors: dict[int, dict] = {}
@@ -1661,6 +1746,11 @@ def _make_fused_sparse_forward(
             cached = expert_cache.get(layer_idx, eidx)
             if cached is not None:
                 expert_tensors[eidx] = cached
+            elif eidx in _vram_hold:
+                # On the GPU already — reading it off NVMe would fill a RAM slot
+                # with a copy of something the compute loop will not look at (P8).
+                # The get() above already refreshed the RAM LRU.
+                expert_tensors[eidx] = VRAM_RESIDENT_NO_RAW
             else:
                 misses.append(eidx)
 
@@ -1722,13 +1812,29 @@ def _make_fused_sparse_forward(
             if _prof:
                 _mp['scatter'] += time.perf_counter() - _t_scatter
 
-            # h2d / construct are split inside _expert_dense_weights: the copy
-            # and the dequant run back to back there, and the phase-4 gate is a
-            # ratio of exactly those two.
-            w_gate_gpu, w_down_gpu, w_up_gpu = _expert_dense_weights(
-                raw, device, dtype, timing=_mp)
-            if w_gate_gpu is None:
-                continue
+            _held = _vram_hold.get(eidx)
+            if _held is not None:
+                # A hit skips the host-to-device copy entirely; a packed entry
+                # still owes the fused dequant, which is 'construct' either way.
+                _t_con = _mark() if _prof else 0.0
+                w_gate_gpu, w_down_gpu, w_up_gpu = expert_weights_from_entry(
+                    _held, dtype)
+                if _prof:
+                    _mp['construct'] += _mark() - _t_con
+            else:
+                # h2d / construct are split inside _expert_dense_weights: the copy
+                # and the dequant run back to back there, and the phase-4 gate is a
+                # ratio of exactly those two.
+                w_gate_gpu, w_down_gpu, w_up_gpu, _entry = _expert_dense_weights(
+                    raw, device, dtype, timing=_mp)
+                if w_gate_gpu is None:
+                    continue
+                if _vram is not None and _entry is not None:
+                    # put() False means the cache refused ownership (duplicate key,
+                    # or one expert larger than the whole budget). These are plain
+                    # torch tensors — unlike the EXL3 forward's BC objects there is
+                    # no C++ heap to free, so dropping the reference is the free.
+                    _vram.put(layer_idx, eidx, _entry)
 
             _t_gemm = _mark() if _prof else 0.0
             gate_out = act_fn(F.linear(current_state, w_gate_gpu))
