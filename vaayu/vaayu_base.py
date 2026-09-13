@@ -1525,6 +1525,15 @@ class FP8DynamicCache(DynamicCache):
         that much and cropping is its next move anyway. Buffers come back
         contiguous and unpinned; `to_device` is what the caller does with them.
         """
+        from .batch import cache_holds_recurrent_state
+        if cache_holds_recurrent_state(self):
+            raise RuntimeError(
+                "copy_prefix cannot lend a cache that holds recurrent state. "
+                "A hybrid-attention model's conv/recurrent layers keep a "
+                "fixed-size summary of everything seen, not a per-token "
+                "history, so there is no prefix of it to copy -- and the copy "
+                "would have no linear-attention layers at all, which fails "
+                "inside transformers at update_conv_state.")
         out = type(self)(quantize=self.quantize)
         for name in self._BUFFER_LISTS:
             src = getattr(self, name)
@@ -2921,7 +2930,7 @@ class VaayuBaseModel(GenerationMixin):
             # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
             # silently degrade). Pre-existing limit of the prefix subsystem,
             # not of batched decode -- generate() calls the same store().
-            from .batch import cache_supports_prefix_store
+            from .batch import cache_holds_recurrent_state, cache_supports_prefix_store
             _probe = self._create_kv_cache()
             if not cache_supports_prefix_store(_probe):
                 print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
@@ -2929,6 +2938,12 @@ class VaayuBaseModel(GenerationMixin):
                       f"{type(_probe).__name__}, which does not implement "
                       f"to_cpu/to_device/resident_bytes. Load with "
                       f"kv_cache_mode='bf16' to enable it on this model.")
+                self.enable_prefix_cache = False
+            elif cache_holds_recurrent_state(_probe):
+                print("[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
+                      "this model has recurrent (linear-attention) layers, whose "
+                      "state is a fixed-size summary with no per-token prefix to "
+                      "lend. Prefill runs in full on every turn.")
                 self.enable_prefix_cache = False
             del _probe
         if getattr(self, "enable_prefix_cache", False):

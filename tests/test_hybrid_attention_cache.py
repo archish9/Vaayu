@@ -242,3 +242,48 @@ def test_batch_kv_invariant_still_catches_a_real_disagreement():
     pad_mask = torch.ones(B, 5, dtype=torch.long)
     with pytest.raises(RuntimeError, match="per-layer lengths that disagree"):
         check_batch_kv_invariant(pad_mask, q_len=1, past_key_values=cache)
+
+
+# ── RC7: the prefix cache cannot lend a hybrid model its state ───────────────
+#
+# Found by the second generation in one process. `copy_prefix` rebuilds the
+# cache as `type(self)(quantize=...)` with NO config, so the copy has no
+# LinearAttentionLayer at all and the next forward dies in transformers:
+#
+#   File ".../qwen3_next/modeling_qwen3_next.py", line 633, in forward
+#     conv_state = cache_params.update_conv_state(conv_state, self.layer_idx)
+#   File ".../cache_utils.py", line 959, in update_conv_state
+#     if not isinstance(self.layers[layer_idx], LinearAttentionCacheLayerMixin):
+#   IndexError: list index out of range
+#
+# Passing the config through would only move the failure: `copy_prefix` copies
+# the K/V ring buffers and nothing else, and a gated-delta-net layer's
+# conv/recurrent state is NOT sliceable by token position -- there is no
+# "first N tokens" of a recurrent state to lend. So the answer is to refuse,
+# loudly, until someone designs a real one (CLAUDE.md §5: warn, never silently
+# degrade).
+
+def test_prefix_store_refuses_a_cache_with_recurrent_layers():
+    from vaayu.batch import cache_supports_prefix_store
+    cfg = _hybrid_config()
+    assert cache_supports_prefix_store(FP8DynamicCache(quantize=False)) is True
+    assert cache_supports_prefix_store(
+        FP8DynamicCache(quantize=False, config=cfg)) is False
+
+
+def test_copy_prefix_refuses_on_a_hybrid_cache():
+    """Backstop: no other caller may reach the IndexError either."""
+    cache = FP8DynamicCache(quantize=False, config=_hybrid_config())
+    cache.update(*_kv(4), layer_idx=3)
+    with pytest.raises(RuntimeError, match="recurrent"):
+        cache.copy_prefix(2)
+
+
+def test_copy_prefix_still_works_on_a_uniform_cache():
+    """Regression guard: this is the path all four on-disk checkpoints take."""
+    cache = FP8DynamicCache(quantize=False)
+    for idx in range(3):
+        cache.update(*_kv(6), layer_idx=idx)
+    out = cache.copy_prefix(4)
+    assert out.get_seq_length() == 4
+    assert out._seq_len == [4, 4, 4]

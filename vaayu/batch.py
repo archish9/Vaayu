@@ -436,5 +436,30 @@ def cache_supports_prefix_store(cache) -> bool:
 
     This is a pre-existing limit of the prefix-cache subsystem, not of batched
     decode: generate()'s own cross-turn path calls the same store().
+
+    A cache holding RECURRENT state is refused for a different reason: see
+    cache_holds_recurrent_state.
     """
+    if cache_holds_recurrent_state(cache):
+        return False
     return all(callable(getattr(cache, m, None)) for m in _PREFIX_STORE_METHODS)
+
+
+def cache_holds_recurrent_state(cache) -> bool:
+    """True iff any of `cache`'s layers keeps conv / recurrent state.
+
+    A hybrid-attention model (qwen3_next: gated delta net on 3 of every 4
+    layers) does. Nothing in the prefix subsystem can lend that state: an entry
+    is served by cropping to the matched length, and a recurrent state has no
+    "first N tokens" to crop to -- it is a fixed-size summary of everything the
+    layer has seen. copy_prefix does not even copy it today, so a hit hands the
+    borrower a cache with no linear-attention layers and transformers dies at
+    `update_conv_state` with an IndexError.
+
+    Detected off the layer objects, by the capability they expose -- not from a
+    config field and not from an architecture name (CLAUDE.md §5).
+    """
+    for layer in getattr(cache, "layers", None) or ():
+        if hasattr(layer, "update_conv_state") or hasattr(layer, "conv_states"):
+            return True
+    return False
