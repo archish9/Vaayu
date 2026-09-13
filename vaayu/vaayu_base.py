@@ -1284,6 +1284,31 @@ def resolve_use_prompt_lookup(requested, is_moe: bool) -> bool:
         f'or "auto" (on for dense, off for MoE).')
 
 
+def cache_config_if_non_uniform(config):
+    """The config to hand a Cache constructor, or None for uniform attention.
+
+    transformers needs the config for ONE thing: picking a per-layer CacheLayer
+    class. A hybrid model (qwen3_next: gated delta net on 3 of every 4 layers)
+    must get `LinearAttentionLayer` for its conv/recurrent state or the forward
+    raises `AttributeError: 'DynamicLayer' object has no attribute
+    'conv_states'`. But passing it also MATERIALIZES `cache.layers` up front,
+    which flips `len(cache)` from 0 to num_hidden_layers and `is_initialized`
+    from False to True before a single token is stored -- an observable change
+    for the uniform-attention models that work today (Qwen3-235B, MiniMax-M2.7,
+    both Llamas: none declares `layer_types`, none has a sliding window).
+
+    So: hand it over only when the layer classes actually differ.
+    """
+    if config is None:
+        return None
+    types = set(getattr(config, "layer_types", None) or ())
+    window = (getattr(config, "sliding_window", None)
+              or getattr(config, "attention_chunk_size", None))
+    if window is not None or (types and types != {"full_attention"}):
+        return config
+    return None
+
+
 class FP8DynamicCache(DynamicCache):
     """
     DynamicCache variant that stores K/V tensors in torch.float8_e4m3fn.
@@ -1306,8 +1331,13 @@ class FP8DynamicCache(DynamicCache):
     mode-independent.
     """
 
-    def __init__(self, quantize: bool = True):
-        super().__init__()
+    def __init__(self, quantize: bool = True, config=None):
+        # config is what tells transformers which CacheLayer each model layer
+        # needs -- a hybrid model needs LinearAttentionLayer to hold its
+        # conv/recurrent state. Callers pass it only for non-uniform attention
+        # (see cache_config_if_non_uniform): handing it over eagerly also
+        # materializes self.layers, which is observable.
+        super().__init__(config=config)
         self.quantize = bool(quantize)
         # Capacity buffers (allocated lazily on first update per layer). Each holds
         # >= _seq_len[layer] valid tokens on the dim=-2 (sequence) axis; the tail is
@@ -1327,6 +1357,14 @@ class FP8DynamicCache(DynamicCache):
     def _ensure_capacity(self, layer_idx, needed, template_kv, template_scale):
         """Grow layer_idx's buffers so capacity >= needed. Copies existing valid
         tokens once on growth. template_* provide dtype/device/leading dims."""
+        # Layers do NOT necessarily update in order from 0: a hybrid-attention
+        # model stores KV only on its full-attention layers (qwen3_next: 3, 7,
+        # 11, ...), so these lists are addressed by layer_idx and padded with
+        # zero-capacity placeholders rather than appended to positionally.
+        # Placeholders keep every list indexable and every slice-based consumer
+        # (crop, crop_front, copy_prefix, resident_bytes) working unchanged.
+        while len(self._seq_len) <= layer_idx:
+            self._seq_len.append(0)
         cap = self.key_cache[layer_idx].shape[-2] if layer_idx < len(self.key_cache) else 0
         if layer_idx < len(self.key_cache) and cap >= needed:
             return
@@ -1339,12 +1377,11 @@ class FP8DynamicCache(DynamicCache):
 
         def _grow(old_list, last_dim, dtype):
             buf = torch.zeros((B, H, new_cap, last_dim), dtype=dtype, device=dev)
-            if layer_idx < len(old_list):
-                used = self._seq_len[layer_idx]
-                buf[..., :used, :] = old_list[layer_idx][..., :used, :]
-                old_list[layer_idx] = buf
-            else:
-                old_list.append(buf)
+            while len(old_list) <= layer_idx:
+                old_list.append(torch.zeros((B, H, 0, last_dim), dtype=dtype, device=dev))
+            used = self._seq_len[layer_idx]
+            buf[..., :used, :] = old_list[layer_idx][..., :used, :]
+            old_list[layer_idx] = buf
 
         _grow(self.key_cache,     D, kv_dtype)
         _grow(self.value_cache,   D, kv_dtype)
@@ -1353,8 +1390,6 @@ class FP8DynamicCache(DynamicCache):
             _grow(self._value_scales, 1, template_scale.dtype)
             _grow(self._k_out_cache,  D, out_dtype)
             _grow(self._v_out_cache,  D, out_dtype)
-        if layer_idx >= len(self._seq_len):
-            self._seq_len.append(0)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if not self.quantize:
@@ -1500,11 +1535,11 @@ class TurboQuantKVCache(FP8DynamicCache):
     """
 
     def __init__(self, bits_total: int = 4, rot_seed: int = 0x5EED,
-                 qjl_seed: int = 0x9317):
+                 qjl_seed: int = 0x9317, config=None):
         # quantize=False: there are no fp8 scales. The flag alone does NOT make
         # the persistence path safe (both of its values mis-describe this
         # layout); explicit type checks do.
-        super().__init__(quantize=False)
+        super().__init__(quantize=False, config=config)
         if bits_total < 2:
             raise ValueError(f"bits_total must be >= 2 (1 bit goes to QJL), got {bits_total}")
         self.bits_total = int(bits_total)
@@ -1548,6 +1583,10 @@ class TurboQuantKVCache(FP8DynamicCache):
         """Grow layer_idx's six buffers so capacity >= needed, reusing the
         parent's geometric-doubling policy. Each list has its own last dim and
         dtype, so the templates come from the freshly packed tensors."""
+        # Same layer_idx-addressed padding as the parent's _ensure_capacity: a
+        # hybrid-attention model updates only some layer indices.
+        while len(self._seq_len) <= layer_idx:
+            self._seq_len.append(0)
         cap = self.key_cache[layer_idx].shape[-2] if layer_idx < len(self.key_cache) else 0
         if layer_idx < len(self.key_cache) and cap >= needed:
             return
@@ -1556,14 +1595,11 @@ class TurboQuantKVCache(FP8DynamicCache):
             lst = getattr(self, name)
             B, H, _, D = t.shape
             buf = torch.zeros((B, H, new_cap, D), dtype=t.dtype, device=t.device)
-            if layer_idx < len(lst):
-                used = self._seq_len[layer_idx]
-                buf[..., :used, :] = lst[layer_idx][..., :used, :]
-                lst[layer_idx] = buf
-            else:
-                lst.append(buf)
-        if layer_idx >= len(self._seq_len):
-            self._seq_len.append(0)
+            while len(lst) <= layer_idx:
+                lst.append(torch.zeros((B, H, 0, D), dtype=t.dtype, device=t.device))
+            used = self._seq_len[layer_idx]
+            buf[..., :used, :] = lst[layer_idx][..., :used, :]
+            lst[layer_idx] = buf
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         k_idx, k_sign, k_norm = self._quantize(key_states)
@@ -3394,17 +3430,23 @@ class VaayuBaseModel(GenerationMixin):
         # (QUANT_SIG_BF16, no scales).
         mode = resolve_kv_cache_mode(self.kv_cache_mode, self.loader_strategy)
 
+        # None for uniform attention, so those models keep the lazy cache they
+        # have today; the real config only for hybrid / sliding-window layouts,
+        # which need per-layer cache classes. getattr, because partial stand-ins
+        # construct caches too.
+        cfg = cache_config_if_non_uniform(getattr(self, "config", None))
+
         if mode == "fp16":
             if self.kv_cache_mode == "fp8":
                 print("[Vaayu] FP8 KV cache unavailable (PyTorch < 2.1). Falling back to FP16.")
-            return DynamicCache()
+            return DynamicCache(config=cfg)
 
         if mode == "bf16":
             # Ring buffer without the fp8 store or the dequantized mirror:
             # 2.0 bytes/element vs 3.016 for fp8 mode, and lossless.
             print("[Vaayu] KV Cache: bf16 ring buffer (no quantization, ~33% "
                   "less VRAM than fp8 mode)")
-            return FP8DynamicCache(quantize=False)
+            return FP8DynamicCache(quantize=False, config=cfg)
 
         if mode == "turboquant" or mode.startswith("turboquant:"):
             bits_total = int(mode.split(":", 1)[1]) if ":" in mode else 4
@@ -3414,13 +3456,13 @@ class VaayuBaseModel(GenerationMixin):
                   f"({bits_total / 8:.3f} bytes/element of indices + 4 bytes per "
                   f"token-head of norms, vs bf16's 2.0). LOSSY — see the Plan H "
                   f"RESULTS quality gate.")
-            return TurboQuantKVCache(bits_total=bits_total)
+            return TurboQuantKVCache(bits_total=bits_total, config=cfg)
 
         if mode == "fp8":
             # The float8-unavailable fallback is resolved above, not here, so
             # env.json reports the fp16 that actually ran (resolve_kv_cache_mode).
             print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
-            return FP8DynamicCache()
+            return FP8DynamicCache(config=cfg)
 
         # H1: fp8 used to be the FALL-THROUGH, so any unrecognised mode string
         # -- a typo included -- silently got a different cache format than the

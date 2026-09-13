@@ -156,7 +156,7 @@ lets each step start.** Every step names a stop rule. Do not start a step whose 
 | ~~**S0**~~ **DONE** | **Keep one CPU core awake during decode.** `SCHED_IDLE` spinner on a detected E-core + P-core affinity for engine threads. Knob + server A/B + MiniMax/70B/prefill checks. | **27** | ~1 day | ~~none — start here~~ **CLOSED 2026-09-12, +23.1 % through the server, shipped ON.** Applied to every model. | A/B through the server shows < 5 % → close it |
 | ~~**S1**~~ **DONE** | **Load probe, no download.** For each candidate 4-bit repo pull only `config.json` + `model.safetensors.index.json`; count keys matching `\.experts\.(\d+)\.`; derive bytes/expert and bpw; check `quant_method` resolves in transformers 5.5.4. | **30** §3 | **< 1 hour** | none | all candidates are fused-3D-on-disk → change model, do **not** start writing a splitter |
 | ~~**T1**~~ **DONE** | **Sweep `PREFIX_SESSIONS` × `MAX_SEQ_LEN`** — **CLOSED 2026-09-12: both defaults STAY.** The +5.7 % a single session at 2.7k context wins is an **−8.9 %** loss at 7.4k with 2 sessions, where reuse collapses 7422/7517 → 44/7517 tokens. `MAX_SEQ_LEN` pays ONCE, not twice (the VRAM reserve is floor-bound). | **31** | done | — | fired in substance: the point that wins the two-turn session loses the workload the server exists for |
-| **S2** `[~]` | **Make a non-EXL3 int4 MoE load, stream and measure.** **2026-09-13: RC1 (packed-int4 dequant) and RC3 (shared expert) FIXED and green; RC4 (hybrid-attention KV cache, 2 reproduced failures) is now the blocker — see row 30.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) — **STARTED 2026-09-13; 4 root causes measured before any code, see row 30** | garbage output → fix numerics before ANY perf work |
+| **S2** `[~]` | **Make a non-EXL3 int4 MoE load, stream and measure.** **2026-09-13: three of four load-path root causes FIXED and green — RC1 packed-int4 dequant, RC3 shared expert, RC4(a)(b) hybrid-attention KV cache. Next is the 46 GB persist, then `row26_decode.py`. See row 30.** `cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` is **already on disk, complete** (46 GB, 10/10 shards). The 30B smoke rung is optional now that nothing has to be downloaded — take it only if S2 stalls on numerics. Ends with `row26_decode.py` output. | **30** §4–6 | 2–4 days, **no download** | S1's verdict (**reported**) — **STARTED 2026-09-13; 4 root causes measured before any code, see row 30** | garbage output → fix numerics before ANY perf work |
 | **T2** | **Truncate `top_k` at decode.** One clamp at `vaayu_base.py:3233` PLUS the same clamp written into each MoE module's own `top_k` by detection (contract-routed models ignore the engine's `k`; renormalisation already exists everywhere), `DECODE_TOP_K` knob, ppl sweep at k ∈ {8,6,5,4} on both MoE models. **Regime-independent** — do it whether or not S2 lands. | **33** | ~1 day + a ppl sweep | none, but it is worth more on a model you are keeping → after S2's verdict | k=6 costs more quality than row 32's 3.0 bpw build at the same speed-up → prefer 32 and close |
 | **S3** | **CPU+GPU hybrid.** `EXPERT_COMPUTE_DEVICE` knob, int4 CPU kernel on the RAM/disk tier, 6 P-core threads, A/B vs the **row-27 keep-awake** baseline. | **30** §7 | ~1 week | **S2 measured `(h2d+gemm+tail)/T` ≥ 15 %.** Row 29 projects ~31 % (80B) / ~22 % (30B) | measured gain < half the projection, or negative under CPU/IO contention → **close the hybrid idea** |
 | **T3** | **The streaming-regime ladder — ONLY if S2 stalls or is abandoned.** In order: **32** download a ≤ 3.25 bpw EXL3 build of Qwen3-235B (×1.50, zero code, and it lifts the 62/94-layer VRAM-cache restriction) → **34** probe in-flight read depth, build only if ≥ 60 % of busy time sits at depth 1 (×1.10) → **35** per-model measured gate for `VAAYU_LOOKAHEAD` (+11.7 % Qwen). | **32 · 34 · 35** | a download · ½ day · ~2 days | **S2 stalled.** If S2 lands, these three mostly die — they only pay while experts stream from disk | 34: depth already ≥ 2 → R2's verdict extends, close it · 35: cannot reproduce +11.7 % through the server with the trial cost included → close it |
@@ -2052,7 +2052,7 @@ Vaayu's VRAM/KV planner charges `num_hidden_layers` KV layers, but only **12 of 
 RC1 (dequant, unit-testable against `compressed_tensors`' own reference, no GPU) → RC3 (shared expert,
 detected not hardcoded) → RC4 (cache + planner) → persist 46 GB → stream → `row26_decode.py`.
 
-### S2 progress 2026-09-13 — RC1 and RC3 FIXED and green; RC4 diagnosed, NOT fixed
+### S2 progress 2026-09-13 — RC1, RC3 and RC4(a)(b) FIXED and green; RC4(c) left on purpose
 
 Full results: [`docs/2026-09-13-row30-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md).
 Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing has run end to end yet.**
@@ -2077,8 +2077,8 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   router: `_gate`-suffixed sibling ⇒ sigmoid-gated (Qwen2/Qwen3-Next), absent ⇒ added ungated (DeepSeek).
   New gate `tests/test_shared_expert.py` (4), **including the no-shared-expert case as the regression
   guard for Qwen3-235B / MiniMax-M2.7**.
-- `[bug]` **RC4 OPEN — the KV cache is wrong for hybrid attention. Two distinct failures, both
-  reproduced** (`plans/probes/row30_s2_cache_hybrid.py`), and this is what BLOCKS the first load:
+- `[x]` **RC4 (a)+(b) FIXED — the KV cache was wrong for hybrid attention. Two distinct failures, both
+  reproduced first** (`plans/probes/row30_s2_cache_hybrid.py`); this was what blocked the first load:
   **(a)** `_create_kv_cache` (`vaayu_base.py:3400,3407`) passes no `config=`, so 5.5.4 replicates
   `DynamicLayer` for all 48 layers and the gated-delta-net layers hit
   `AttributeError: 'DynamicLayer' object has no attribute 'conv_states'`. With `config=` the split is
@@ -2087,14 +2087,29 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   per-layer buffers are positional appends and the first layer to `update()` on this model is layer 3:
   `IndexError: list index out of range` at `vaayu_base.py:1365`. Config alone does not fix this; the
   storage must become index-safe.
-  **(c)** only **12 of 48** layers hold KV, so `vram_plan`'s `num_hidden_layers` charge and the derived
-  `max_seq_len` are ~4× off (conservative — under-derives context, does not OOM), and the prefix cache
-  needs a DECISION not a port: conv/recurrent state is not sliceable by token position.
-- `[ ]` **Next, in order:** RC4 (a)+(b) with a hybrid `layer_types` case added to
-  `tests/test_fp8_kv_ring.py` → RC4 (c) → persist to `splitted_model/` (~46 GB, 299 GB free) and assert
+  **Fix (a):** `FP8DynamicCache` / `TurboQuantKVCache` take and forward `config=`, and `_create_kv_cache`
+  passes it through the new `cache_config_if_non_uniform()`. **That gate matters and cost a second pass to
+  find:** passing the config unconditionally MATERIALIZES `cache.layers`, flipping `len(cache)` from 0 to
+  `num_hidden_layers` and `is_initialized` False→True before any token is stored — observable state
+  changing for the four working models in exchange for nothing, and **2037 tests passed with that version**.
+  Config now goes over only when the layer classes actually differ (hybrid, or a sliding window). **Fix (b):** both
+  `_ensure_capacity*` address their per-layer lists BY `layer_idx`, padding with **zero-capacity
+  placeholder tensors** — zero-capacity, not `None`, so every existing slice-based consumer (`crop`,
+  `crop_front`, `copy_prefix`, `resident_bytes`) keeps working with no per-site guard. New gate
+  `tests/test_hybrid_attention_cache.py` (12), **including the uniform-model case for all three cache
+  modes** — checked, not assumed: none of the four checkpoints on disk has `layer_types` or a sliding
+  window, so all four are byte-identical to before.
+- `[ ]` **RC4 (c) OPEN, deliberately.** Only **12 of 48** layers hold KV, so `kv_bytes_per_token`'s
+  `config.num_hidden_layers` charge (`vaayu_base.py:2189`, `batch.py:45`) over-reserves ~4× here and the
+  derived `max_seq_len` comes out that much smaller. It errs SAFE, it does not block the load, and it sits
+  in the middle of the most load-bearing tested code here — **fix it after the first successful load, with
+  a measured VRAM peak, not before.** Separately, the prefix cache needs a DECISION not a port: conv /
+  recurrent state is not sliceable by token position, so `copy_prefix` on a hybrid model must be refused
+  loudly or redesigned.
+- `[ ]` **Next, in order:** persist to `splitted_model/` (~46 GB, 299 GB free) and assert
   the index finds `48 × 512` experts — **the `mtp.*` group is a 49th on disk and must not be counted** →
   watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB reads, these are
-  1.6875 MiB — re-measure with `p8_samepath.py`) → `row26_decode.py` → the phase-4 gate.
+  1.6875 MiB — re-measure with `p8_samepath.py`) → `row26_decode.py` → the phase-4 gate; then RC4 (c).
 - **§8 for what landed:** (1) **no knob needed**, stated not assumed — both fixes are format/architecture
   detection with nothing for a user to set. (2) N/A, no knob. (3) **NOT reachable today**: RC1 needs the
   checkpoint to load (RC4 blocks it), and RC3 is reachable for any shared-expert MoE but none is on disk,
