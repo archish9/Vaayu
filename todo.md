@@ -2245,6 +2245,29 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   the probe's prebuilt flat tensors skipped. Note also that `h2d` fell 0.1155 → 0.0850 in the PROFILED arm —
   that is a MEASUREMENT artefact (one `synchronize()` bracket per expert instead of three; overhead ×1.382 →
   ×1.181), not a gain.
+- `[ ]` **S2b (iii) — WIRE THE VRAM EXPERT CACHE INTO THE NON-EXL3 FUSED FORWARD. The largest lever left,
+  and the budget for it is already reserved and idle.** Measured today: `V=0.0`, `vram=0hit/0miss/0evict`,
+  **7.79 GB of VRAM expert-cache budget unused**, while peak VRAM is only **4.48 GiB of 15.47**. Verified in
+  source, not inferred: `_make_fused_sparse_forward` contains ZERO references to `_expert_vram_cache`,
+  `_dispatch_expert_misses`, the slab arena or the prefill stager — the other two forwards reach the VRAM
+  cache through that shared helper, this one never did. **Prize: a VRAM-resident expert skips BOTH `h2d`
+  (0.0850 s/token) AND `construct` (0.0444) — together ~0.103 s of a ~0.230 s token, ~45 %.** Nothing else
+  left touches more than ~12 %.
+  **THE DESIGN QUESTION, and it must be MEASURED, not assumed: store PACKED or DEQUANTIZED?**
+  packed 1.6875 MiB/expert → ~4600 experts in 7.79 GB = **19 %** of the 24,576 population, skips `h2d` only;
+  dequantized bf16 ~6.29 MB/expert → ~1240 = **5 %**, skips `h2d` AND `construct`. Packed holds **3.7×**
+  more; dequantized saves ~1.75× more per hit. The answer turns entirely on routing skew — and the steepness
+  is real (the RAM cache reaches **96.5 % hit at ~32 % coverage**).
+  **DO NOT price this with `vaayu/expert_sim.py`.** Its anchor gap is a STILL-OPEN item in this file —
+  31.9 % simulated against 43.9 % live at a **9.12 GB** budget — and it is confined to the SMALL-BUDGET
+  regime, which is exactly where 7.79 GB sits. Its curve SHAPE is usable; this decision needs ABSOLUTES at
+  two very different capacities, which is the half it gets wrong. **Instead: record the routed-expert
+  sequence from one real decode run and replay it through the ACTUAL `ExpertVRAMCache` class at both element
+  sizes** — row 13's lesson (2026-09-11), that a brief priced against a ratio-only MODEL of a gate got 5/6
+  where the real class got 6/6. Replay evidence through HEAD code before building.
+  **Watch:** the 7.79 GB is *reserved* but nothing is allocated today, so actually using it will move peak
+  VRAM for the first time — check it against the 3.50 GiB reserve floor and the KV plan, and re-run the
+  server gate.
 - `[ ]` **S2b (iv) — the leftover of (i) AND (ii), behind ONE prerequisite: store each expert as a single
   contiguous blob at cache-fill time.** Both remainders need exactly that. With it: h2d's coalesced 2.5 %
   (§5g) becomes collectable without the per-call `cat` that made it a loss, AND the dequant drops its two
