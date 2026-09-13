@@ -23,7 +23,8 @@ from vaayu.persist.expert_cache import ExpertRAMCache, ExpertVRAMCache
 from vaayu.persist.expert_offset_index import ExpertOffsetIndex
 from vaayu.moe_patch import patch_moe_blocks
 from tests.test_moe_patch import MockFusedModel, MockVaayuRef, _make_fused_checkpoint
-from tests.test_packed_expert_dequant import _write_packed_fused_checkpoint
+from tests.test_packed_expert_dequant import (
+    _BLANK_PROFILE, _write_packed_fused_checkpoint)
 
 HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K = 32, 64, 8, 2
 BIG_BUDGET = 64 * 1024 * 1024
@@ -215,3 +216,47 @@ def test_entry_bytes_never_exceed_the_checkpoints_expert_bytes(tmp_path, packed)
         assert vram._group_bytes(entry) <= checkpoint_bytes, (
             f"{key}: entry {vram._group_bytes(entry)} B > checkpoint expert "
             f"{checkpoint_bytes} B")
+
+
+# ── S3-pre: the phase profile must separate a VRAM hit from a miss ───────────
+#
+# `construct` and `gemm` are recorded on BOTH branches — a packed-blob hit still
+# owes the fused dequant, and the GEMM runs on the GPU either way. S3's gate is
+# `(h2d + gemm + tail) / T`, but S3 can only move the slots that are NOT already
+# VRAM-resident: a resident expert crosses no PCIe, so a CPU kernel would have to
+# copy it BACK. Read undivided, the gate counts work the hybrid cannot take and
+# over-reads by the hit rate (83 % on Qwen3-Next-80B). These keys make the split
+# a measurement instead of a proportionality assumption.
+
+def test_the_profile_splits_vram_hits_from_misses(tmp_path):
+    model, vaayu_ref, _ram = _patch(tmp_path)
+    vaayu_ref.profiling_mode = True
+    vaayu_ref._moe_profile = dict(_BLANK_PROFILE)
+    x = torch.randn(1, 4, HIDDEN)
+
+    model.layers[0].mlp.forward(x)          # fill  -> every routed slot misses
+    prof = dict(vaayu_ref._moe_profile)
+    assert prof["slots_miss"] > 0 and prof["slots_hit"] == 0, (
+        f"fill pass: {prof['slots_miss']} miss / {prof['slots_hit']} hit")
+    assert prof["construct_hit"] == 0.0 and prof["gemm_hit"] == 0.0
+
+    model.layers[0].mlp.forward(x)          # same routing -> every slot hits
+    prof = dict(vaayu_ref._moe_profile)
+    assert prof["slots_hit"] > 0, "second pass recorded no VRAM-hit slots"
+    assert prof["construct_hit"] > 0.0, "a hit still dequants — it must be timed"
+    assert prof["gemm_hit"] > 0.0, "a hit still runs the GEMM — it must be timed"
+    assert prof["construct_hit"] <= prof["construct"], "hit share exceeds the total"
+    assert prof["gemm_hit"] <= prof["gemm"], "hit share exceeds the total"
+
+
+def test_the_hit_miss_split_is_gated_too(tmp_path):
+    """Off means untouched, same rule as every other phase key."""
+    model, vaayu_ref, _ram = _patch(tmp_path)
+    vaayu_ref.profiling_mode = False
+    blank = dict(_BLANK_PROFILE)
+    vaayu_ref._moe_profile = dict(blank)
+
+    model.layers[0].mlp.forward(torch.randn(1, 4, HIDDEN))
+    model.layers[0].mlp.forward(torch.randn(1, 4, HIDDEN))
+
+    assert vaayu_ref._moe_profile == blank

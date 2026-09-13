@@ -4560,8 +4560,13 @@ class VaayuBaseModel(GenerationMixin):
         # MoE dispatch sub-timing (mask sync / disk load / H2D / object construct / GEMM),
         # gated behind profiling_mode so it's zero-cost when disabled.
         self._moe_profile = (
+            # construct_hit/gemm_hit/slots_* split the two phases that run on BOTH
+            # sides of a VRAM-cache hit (S3-pre): S3 can only move slots that are
+            # not already GPU-resident, so the undivided totals over-read its gate.
             {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0, "gemm": 0.0,
-             "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0}
+             "route": 0.0, "attach": 0.0, "detach": 0.0, "scatter": 0.0,
+             "construct_hit": 0.0, "gemm_hit": 0.0,
+             "slots_hit": 0.0, "slots_miss": 0.0}
             if self.profiling_mode and self.is_moe else None
         )
 
@@ -4996,6 +5001,7 @@ class VaayuBaseModel(GenerationMixin):
         if self._moe_profile is not None:
             _mp = self._moe_profile
             print(f"[VAAYU-MOE] layer_totals: mask_sync={_mp['mask_sync']:.3f}s  disk_load={_mp['disk_load']:.3f}s  h2d={_mp['h2d']:.3f}s  construct={_mp['construct']:.3f}s  gemm={_mp['gemm']:.3f}s  route={_mp['route']:.3f}s  attach={_mp['attach']:.3f}s  detach={_mp['detach']:.3f}s  scatter={_mp['scatter']:.3f}s")
+            print(f"[VAAYU-MOE] vram_split: slots={_mp['slots_hit']:.0f}hit/{_mp['slots_miss']:.0f}miss  construct_hit={_mp['construct_hit']:.3f}s  gemm_hit={_mp['gemm_hit']:.3f}s")
 
         if not return_dict:
             return tuple(v for v in [logits,

@@ -256,9 +256,12 @@ def test_fused_forward_runs_packed_experts(tmp_path):
 # `(h2d + gemm + tail) / T`, which reads that dict — unmeasured, the gate reads
 # zero and would close the hybrid idea on an artefact.
 
+# Must carry every key `VaayuBase.forward` puts in `_moe_profile` — a missing
+# one is a KeyError inside the forward, not a soft miss.
 _BLANK_PROFILE = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0,
                   "gemm": 0.0, "route": 0.0, "attach": 0.0, "detach": 0.0,
-                  "scatter": 0.0}
+                  "scatter": 0.0, "construct_hit": 0.0, "gemm_hit": 0.0,
+                  "slots_hit": 0.0, "slots_miss": 0.0}
 
 
 def _patch_packed_fused(tmp_path, *, hidden=32, intermediate=64, num_experts=8, top_k=2):

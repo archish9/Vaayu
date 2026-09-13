@@ -1816,11 +1816,16 @@ def _make_fused_sparse_forward(
             if _held is not None:
                 # A hit skips the host-to-device copy entirely; a packed entry
                 # still owes the fused dequant, which is 'construct' either way.
+                # It is booked to 'construct_hit' as well, because S3 cannot move
+                # a GPU-resident expert to the CPU without copying it back.
                 _t_con = _mark() if _prof else 0.0
                 w_gate_gpu, w_down_gpu, w_up_gpu = expert_weights_from_entry(
                     _held, dtype)
                 if _prof:
-                    _mp['construct'] += _mark() - _t_con
+                    _d_con = _mark() - _t_con
+                    _mp['construct'] += _d_con
+                    _mp['construct_hit'] += _d_con
+                    _mp['slots_hit'] += 1
             else:
                 # h2d / construct are split inside _expert_dense_weights: the copy
                 # and the dequant run back to back there, and the phase-4 gate is a
@@ -1835,13 +1840,18 @@ def _make_fused_sparse_forward(
                     # torch tensors — unlike the EXL3 forward's BC objects there is
                     # no C++ heap to free, so dropping the reference is the free.
                     _vram.put(layer_idx, eidx, _entry)
+                if _prof:
+                    _mp['slots_miss'] += 1
 
             _t_gemm = _mark() if _prof else 0.0
             gate_out = act_fn(F.linear(current_state, w_gate_gpu))
             up_out = F.linear(current_state, w_up_gpu)
             out = F.linear(gate_out * up_out, w_down_gpu)
             if _prof:
-                _mp['gemm'] += _mark() - _t_gemm
+                _d_gemm = _mark() - _t_gemm
+                _mp['gemm'] += _d_gemm
+                if _held is not None:
+                    _mp['gemm_hit'] += _d_gemm
 
             _t_scatter = _mark() if _prof else 0.0
             out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
