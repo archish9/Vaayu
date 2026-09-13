@@ -2124,6 +2124,34 @@ Suite **2025 passed, 15 skipped** after both fixes. **No perf claim — nothing 
   **48.24 GB**, index finds **24,576 = 48 × 512** experts over 48 layers, **0 `mtp` groups** (shard 10 is
   100 % `mtp` and is never opened), and **one single distinct expert size, 1,769,520 B = 1.6875 MiB**,
   matching the header geometry above exactly. Suite **2041 passed, 15 skipped** (baseline 2038 + the 3 new).
+- `[x]` **FIRST SUCCESSFUL RUN — the first non-EXL3 MoE ever executed on this box.** Loads in **4.1 s**,
+  greedy output coherent (`Here's a Python function that reverses a string:\n\n```python\ndef
+  reverse_string(s):` …), geometry all DERIVED and exact: expert 1,769,520 B, 48 MoE blocks, top_k 10,
+  512 experts, working set 0.849 GB, `expert_style="fused"` / `is_exl3=None` → **`_make_fused_sparse_forward`,
+  the branch nothing had ever run** (CLAUDE.md §0's "on-device today: none" row), flash_attention_2,
+  derived `max_seq_len` 16384, peak VRAM 4.48 GiB. RC1's dequant and RC3's shared expert are exercised for
+  real. **No perf claim yet — this is a probe, not `row26_decode.py`.**
+- `[x]` **RC6 FIXED — `get_seq_length()` reported 0 on a hybrid model, so EVERY decode step re-ran the whole
+  sequence.** Found by running it. `FP8DynamicCache` (what `auto` resolves to) overrides
+  `Cache.get_seq_length` and returned `_seq_len[0]`; layer 0 here is linear-attention and never calls
+  `update()`, so it stays 0 for the whole run. transformers' generation loop then never trimmed `input_ids`.
+  **A/B that settled it: stock `DynamicCache(config=cfg)` → 1, Vaayu's ring buffer → 0** on the same
+  update. Second-order damage: `seq_len > 1` every step ⇒ `compute_prefill_pass` ⇒ `_moe_prefill_pass` ⇒
+  the fused forward SUPPRESSES `expert_cache.put()`, so the RAM cache sat at **0.00 GB / 0 % hit / 0 evict
+  forever**. Measured before: **7.49 GB read per token** against a 0.849 GB working set (**8.8×**),
+  **4205 expert misses/token** against 480 routed, **0.201 tok/s**. After: **480 exactly** (48 × 10),
+  gb_tok 0.05–0.32, hit rate to 95 %, **1.906 tok/s** — **9.5×**, with the first 16 greedy ids IDENTICAL
+  to the broken run. Fix: `_kv_layer_indices()` / `kv_layer_lengths()` derived from which buffers have
+  capacity (no config read, no layer-type names), and `get_seq_length()` falls through to the first
+  KV-bearing layer for the default index — the same rule `Cache.get_seq_length` already uses.
+  `check_batch_kv_invariant`'s `min(lens) != max(lens)` had the same flaw (a permanent 0 on every
+  linear-attn layer is an absence, not a disagreement) and is fixed with it. 8 new tests in
+  `tests/test_hybrid_attention_cache.py` incl. the stock-vs-Vaayu A/B, the uniform-model regression guard,
+  and the invariant still catching a REAL disagreement. Suite **2049 passed, 15 skipped**.
+- **Perf note, not a bug:** `moe_supports_slab_arena` requires `is_exl3`, so this model gets **NO pinned
+  slab arena** (`arena_slabs: null`) and the non-EXL3 fused forward clones into PAGEABLE RAM — pageable H2D
+  is 15.3 GB/s vs 19.7 pinned (row 26). The gate is CORRECT for the code as written: that forward reaches
+  `expert_cache.put()`, not `_dispatch_expert_misses`. Worth ~? — price it in phase 3, do not assume.
 - `[ ]` **Next, in order:** watch the 24,576-slab scale (`_NVME_READ_CONCURRENCY = 3` was tuned at ~11 MiB
   reads, these are 1.6875 MiB — re-measure with `p8_samepath.py`) → first real load / stream →
   `row26_decode.py` → the phase-4 gate; then RC4 (c).

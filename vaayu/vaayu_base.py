@@ -1049,14 +1049,20 @@ def check_batch_kv_invariant(pad_mask, q_len: int, past_key_values) -> None:
 
     Both halves matter:
       - total length: pad_mask width must equal past + this call's queries.
-      - per-layer agreement: get_seq_length() reads layer 0 ONLY, so a cache
+      - per-layer agreement: get_seq_length() reads ONE layer, so a cache
         whose layers hold different lengths satisfies every length check in
         forward() and still mismatches at whichever layer differs. Checked
-        only for caches that expose _seq_len (Vaayu's own classes); a plain
-        transformers DynamicCache has no per-layer view to check.
+        only for caches that expose the per-layer view (Vaayu's own classes);
+        a plain transformers DynamicCache has none to check. Layers that hold
+        no KV at all are excluded -- see kv_layer_lengths.
     """
     past = past_key_values.get_seq_length() if past_key_values is not None else 0
-    lens = getattr(past_key_values, "_seq_len", None)
+    # Only the layers that STORE KV can disagree. A hybrid-attention model keeps
+    # a permanent 0 in `_seq_len` for every linear-attention layer, which is an
+    # absence, not a mismatch -- comparing it raised on a consistent cache.
+    lens = (past_key_values.kv_layer_lengths()
+            if hasattr(past_key_values, "kv_layer_lengths")
+            else getattr(past_key_values, "_seq_len", None))
     if lens and min(lens) != max(lens):
         raise RuntimeError(
             f"batched KV cache has per-layer lengths that disagree: "
@@ -1428,7 +1434,46 @@ class FP8DynamicCache(DynamicCache):
         return (self._k_out_cache[layer_idx][..., :used, :],
                 self._v_out_cache[layer_idx][..., :used, :])
 
+    def _kv_layer_indices(self) -> list:
+        """Layer indices that actually store KV, in order.
+
+        `_seq_len` carries an entry per layer index and `_ensure_capacity` pads
+        the gaps with zero-capacity placeholders, so a hybrid-attention model's
+        linear-attention layers sit there with a permanent 0. Only a layer that
+        has been through `update()` has real capacity, which is what separates
+        the two -- derived from the buffers themselves, never from a config
+        field or a layer-type name (CLAUDE.md §5).
+        """
+        return [i for i, t in enumerate(self.key_cache) if t.shape[-2] > 0]
+
+    def kv_layer_lengths(self) -> list:
+        """Used lengths of only the layers that store KV.
+
+        For callers that compare lengths ACROSS layers: the permanent 0 on a
+        linear-attention layer is not a disagreement, it is an absence.
+        """
+        return [self._seq_len[i] for i in self._kv_layer_indices()]
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Length of layer `layer_idx`, or of the first KV-bearing layer.
+
+        The default arg is what transformers' generation loop calls, and on a
+        hybrid-attention model layer 0 is linear attention: it never calls
+        `update()`, so its length is 0 for the whole run. Reporting that made
+        the cache look empty after prefill, `prepare_inputs_for_generation`
+        never trimmed `input_ids`, and every decode step re-ran the entire
+        sequence -- measured on a 48-layer hybrid at 7.49 GB read per token
+        against a 0.849 GB working set, with the RAM cache permanently empty
+        because a `seq_len > 1` forward is classified as prefill.
+
+        `Cache.get_seq_length` in transformers falls through to the first real
+        attention layer for exactly this reason. This class overrides that
+        method, so it has to do the same.
+        """
+        if layer_idx == 0:
+            kv_layers = self._kv_layer_indices()
+            if kv_layers:
+                layer_idx = kv_layers[0]
         if layer_idx >= len(self._seq_len):
             return 0
         return self._seq_len[layer_idx]

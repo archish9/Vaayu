@@ -68,8 +68,11 @@ def test_ring_buffer_addresses_non_contiguous_layers(quantize):
         cache.update(*_kv(), layer_idx=idx)
         assert cache.get_seq_length(idx) == 2
 
-    # Layers that never stored anything report zero, not garbage.
-    for idx in (0, 1, 2, 4):
+    # Layers that never stored anything report zero, not garbage. Index 0 is
+    # excluded on purpose: transformers treats it as "the model's length" and
+    # falls through to the first KV-bearing layer there (see RC6 below), so it
+    # is not a per-layer query on a hybrid cache.
+    for idx in (1, 2, 4):
         assert cache.get_seq_length(idx) == 0
 
 
@@ -157,3 +160,85 @@ def test_missing_config_still_builds_a_cache():
     back rather than raising on a model object with no `config`."""
     stub = types.SimpleNamespace(kv_cache_mode="bf16", loader_strategy=object())
     assert isinstance(VaayuBaseModel._create_kv_cache(stub), FP8DynamicCache)
+
+
+# ── RC6: get_seq_length() must skip layers that store no KV ──────────────────
+#
+# Found by running the model, not by reading code. `FP8DynamicCache` overrides
+# `Cache.get_seq_length`, and its override returns `_seq_len[0]`. On a hybrid
+# model layer 0 is linear-attention and never calls `update()`, so that stays 0
+# forever -- after prefill the cache reports a length of ZERO. transformers'
+# generation loop then never trims `input_ids`, so EVERY decode step re-runs the
+# whole sequence. Measured on the 80B int4 target: 7.49 GB read per token
+# against a routed working set of 0.849 GB (8.8x), 4205 expert misses per token
+# against 480 routed, RAM-cache usage stuck at 0.00 GB (a `seq_len > 1` forward
+# is classified as prefill, and prefill suppresses cache puts), 0.201 tok/s.
+#
+# transformers' own `Cache.get_seq_length` handles this by falling through to
+# the first real attention layer. Stock `DynamicCache(config=cfg)` returns 1
+# where Vaayu's returned 0 -- that A/B is the test below.
+
+@pytest.mark.parametrize("cls,kwargs", [
+    (FP8DynamicCache, {"quantize": False}),
+    (FP8DynamicCache, {"quantize": True}),
+    (TurboQuantKVCache, {}),
+])
+def test_get_seq_length_reports_the_first_layer_that_holds_kv(cls, kwargs):
+    if kwargs.get("quantize") and not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("needs FP8 support")
+    cache = cls(**kwargs)
+    for idx in (3, 7, 11):                       # full_attention_interval=4
+        cache.update(*_kv(5), layer_idx=idx)
+
+    # The default arg is what transformers' generation loop calls.
+    assert cache.get_seq_length() == 5
+    assert cache.get_seq_length(3) == 5
+    assert cache.get_seq_length(1) == 0          # explicit non-KV layer: still 0
+
+
+def test_vaayu_ring_buffer_agrees_with_stock_transformers_on_a_hybrid_cache():
+    """The A/B that found it: stock said 1, Vaayu's ring buffer said 0."""
+    cfg = _hybrid_config()
+    stock = DynamicCache(config=cfg)
+    ours = FP8DynamicCache(quantize=False, config=cfg)
+    for cache in (stock, ours):
+        cache.update(*_kv(), layer_idx=3)
+    assert ours.get_seq_length() == stock.get_seq_length() == 1
+
+
+@pytest.mark.parametrize("quantize", [False, True])
+def test_uniform_model_get_seq_length_unchanged(quantize):
+    """Regression guard for the four checkpoints on disk, all uniform."""
+    if quantize and not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("needs FP8 support")
+    cache = FP8DynamicCache(quantize=quantize)
+    assert cache.get_seq_length() == 0           # nothing stored yet
+    for idx in range(4):
+        cache.update(*_kv(3), layer_idx=idx)
+    assert cache.get_seq_length() == 3
+    assert [cache.get_seq_length(i) for i in range(4)] == [3, 3, 3, 3]
+
+
+def test_batch_kv_invariant_ignores_layers_that_store_no_kv():
+    """`min(lens) != max(lens)` sees a permanent 0 on every linear-attn layer.
+
+    Those layers hold no KV, so they cannot disagree with anything; comparing
+    them raised on a cache that was perfectly consistent.
+    """
+    from vaayu.vaayu_base import check_batch_kv_invariant
+    cache = FP8DynamicCache(quantize=False)
+    for idx in (3, 7, 11):
+        cache.update(*_kv(4), layer_idx=idx)
+    pad_mask = torch.ones(B, 5, dtype=torch.long)     # past 4 + q_len 1
+    check_batch_kv_invariant(pad_mask, q_len=1, past_key_values=cache)
+
+
+def test_batch_kv_invariant_still_catches_a_real_disagreement():
+    """The guard must keep firing when KV-bearing layers really differ."""
+    from vaayu.vaayu_base import check_batch_kv_invariant
+    cache = FP8DynamicCache(quantize=False)
+    cache.update(*_kv(4), layer_idx=3)
+    cache.update(*_kv(2), layer_idx=7)
+    pad_mask = torch.ones(B, 5, dtype=torch.long)
+    with pytest.raises(RuntimeError, match="per-layer lengths that disagree"):
+        check_batch_kv_invariant(pad_mask, q_len=1, past_key_values=cache)
