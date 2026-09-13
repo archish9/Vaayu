@@ -247,3 +247,83 @@ def test_fused_forward_runs_packed_experts(tmp_path):
                               * weights[tok, pos]).squeeze(0)
     assert torch.allclose(got.view(-1, hidden), expected, atol=1e-4), (
         f"max|d| = {(got.view(-1, hidden) - expected).abs().max().item():.3e}")
+
+
+# ── the fused forward's phase profile (row 30, phase 3) ──────────────────────
+#
+# The non-EXL3 fused forward is the only one of the three that recorded NOTHING
+# into `_moe_profile`. Phase 3's whole deliverable is the gate
+# `(h2d + gemm + tail) / T`, which reads that dict — unmeasured, the gate reads
+# zero and would close the hybrid idea on an artefact.
+
+_BLANK_PROFILE = {"mask_sync": 0.0, "disk_load": 0.0, "h2d": 0.0, "construct": 0.0,
+                  "gemm": 0.0, "route": 0.0, "attach": 0.0, "detach": 0.0,
+                  "scatter": 0.0}
+
+
+def _patch_packed_fused(tmp_path, *, hidden=32, intermediate=64, num_experts=8, top_k=2):
+    from vaayu.moe_patch import patch_moe_blocks
+    from vaayu.persist.expert_cache import ExpertRAMCache
+    from vaayu.persist.expert_offset_index import ExpertOffsetIndex
+    from tests.test_moe_patch import MockFusedModel, MockVaayuRef
+
+    _write_packed_fused_checkpoint(
+        tmp_path, hidden=hidden, intermediate=intermediate, num_experts=num_experts)
+    model = MockFusedModel(num_layers=1, hidden=hidden)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    vaayu_ref = MockVaayuRef()
+    patch_moe_blocks(
+        model=model,
+        expert_cache=ExpertRAMCache(budget_bytes=8 * 1024 * 1024),
+        offset_index=idx,
+        checkpoint_path=str(tmp_path),
+        top_k=top_k,
+        device="cpu",
+        dtype=torch.float32,
+        vaayu_ref=vaayu_ref,
+        loader_strategy=None,
+    )
+    return model, vaayu_ref, hidden
+
+
+def test_fused_forward_records_its_phase_profile(tmp_path):
+    """Every phase the decode split is built from must be populated."""
+    model, vaayu_ref, hidden = _patch_packed_fused(tmp_path)
+    vaayu_ref.profiling_mode = True
+    vaayu_ref._moe_profile = dict(_BLANK_PROFILE)
+
+    model.layers[0].mlp.forward(torch.randn(1, 4, hidden))
+
+    prof = vaayu_ref._moe_profile
+    for key in ("route", "disk_load", "mask_sync", "h2d", "construct", "gemm", "scatter"):
+        assert prof[key] > 0.0, f"fused forward recorded zero {key}"
+    # This forward has no VRAM cache and no per-expert module to detach.
+    assert prof["attach"] == 0.0 and prof["detach"] == 0.0
+
+
+def test_fused_forward_profile_is_fully_gated(tmp_path):
+    """Off means untouched — the instrumentation may not cost a decode anything."""
+    model, vaayu_ref, hidden = _patch_packed_fused(tmp_path)
+    vaayu_ref.profiling_mode = False
+    vaayu_ref._moe_profile = dict(_BLANK_PROFILE)
+
+    model.layers[0].mlp.forward(torch.randn(1, 4, hidden))
+
+    assert vaayu_ref._moe_profile == _BLANK_PROFILE
+
+
+def test_fused_forward_dense_checkpoint_still_profiles_h2d(tmp_path):
+    """A non-packed (dense) fused checkpoint has no dequant, so `construct`
+    stays 0 — but the H2D cast must still be timed, or the gate under-reads on
+    every model that is not pack-quantized."""
+    from vaayu.moe_patch import _expert_dense_weights
+
+    raw = {f"{PACKED_PREFIX}{seg}.weight": torch.randn(4, 4)
+           for seg in PACKED_ROLE_SEG.values()}
+    timing = {"h2d": 0.0, "construct": 0.0}
+    w_gate, w_down, w_up = _expert_dense_weights(raw, "cpu", torch.float32, timing=timing)
+
+    assert w_gate is not None and w_down is not None and w_up is not None
+    assert timing["h2d"] > 0.0
+    assert timing["construct"] == 0.0

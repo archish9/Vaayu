@@ -501,7 +501,7 @@ def _shared_expert_output(moe_mod: nn.Module, flat_hidden: "torch.Tensor"):
     return out
 
 
-def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype"):
+def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: dict = None):
     """(w_gate, w_down, w_up) for one expert, on `device`, ready for `F.linear`.
 
     Pack-quantized experts (compressed-tensors int4/int8 GPTQ-AWQ checkpoints)
@@ -510,8 +510,19 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype"):
     multiply both by 4x and delete the reason for running a 4-bit model.
     Dense/EXL3-adjacent checkpoints keep the plain cast path unchanged.
 
+    `timing`, when given, receives the split between the host-to-device copy
+    ('h2d') and the dequant ('construct'). Those two happen back to back here,
+    and the phase-4 gate is a ratio of exactly them — with no split it reads
+    zero. Passing it also switches on the `synchronize()` calls that make the
+    numbers truthful, so it is for the profiled arm only.
+
     Returns (None, None, None) if any of the three roles is missing.
     """
+    def _mark():
+        if timing is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
     packed = _group_packed_tensors_by_weight(raw)
     if packed["gate"]:
         out = []
@@ -519,19 +530,29 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype"):
             comps = packed[role]
             if "weight_packed" not in comps or "weight_scale" not in comps:
                 return None, None, None
+            _t0 = _mark()
             on_device = {
                 k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
                 for k, v in comps.items()
             }
+            if timing is not None:
+                _t1 = _mark()
+                timing["h2d"] += _t1 - _t0
             out.append(dequantize_packed_weight(on_device, dtype))
+            if timing is not None:
+                timing["construct"] += _mark() - _t1
         return out[0], out[1], out[2]
 
     w_gate, w_down, w_up = _classify_expert_tensors(raw)
     if w_gate is None or w_down is None or w_up is None:
         return None, None, None
-    return (w_gate.to(device, dtype=dtype, non_blocking=True),
-            w_down.to(device, dtype=dtype, non_blocking=True),
-            w_up.to(device, dtype=dtype, non_blocking=True))
+    _t0 = _mark()
+    dense = (w_gate.to(device, dtype=dtype, non_blocking=True),
+             w_down.to(device, dtype=dtype, non_blocking=True),
+             w_up.to(device, dtype=dtype, non_blocking=True))
+    if timing is not None:
+        timing["h2d"] += _mark() - _t0
+    return dense
 
 
 def unpack_int32_to_int8(packed: "torch.Tensor", num_bits: int, cols: int) -> "torch.Tensor":
@@ -1485,6 +1506,18 @@ def _make_fused_sparse_forward(
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
 
+        # Phase profile, same key set and same bracketing rules as the other two
+        # forwards. This one recorded nothing until row 30 phase 3, whose whole
+        # deliverable is the (h2d + gemm + tail) / T ratio these keys carry.
+        _prof = (getattr(vaayu_ref, 'profiling_mode', False)
+                 and getattr(vaayu_ref, '_moe_profile', None) is not None)
+        _mp = vaayu_ref._moe_profile if _prof else None
+
+        def _mark():
+            if _prof and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
         moe_mod = block_info.moe_module
         router = getattr(moe_mod, block_info.router_attr)
         experts_mod = getattr(moe_mod, block_info.experts_attr)
@@ -1493,6 +1526,10 @@ def _make_fused_sparse_forward(
         B, S, H = hidden_states.shape
         flat_hidden = hidden_states.view(-1, H)
 
+        # 'route' brackets the router forward, the top-k and the
+        # unique().tolist() sync below -- the same window the other two forwards
+        # call route.
+        _t_route = _mark()
         # Router runs on GPU (pinned in VRAM)
         router_res = router(flat_hidden)
         if isinstance(router_res, tuple) and len(router_res) >= 3:
@@ -1509,6 +1546,8 @@ def _make_fused_sparse_forward(
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        if _prof:
+            _mp['route'] += time.perf_counter() - _t_route
 
         if getattr(vaayu_ref, "_batch_n", 1) > 1:
             vaayu_ref.telemetry.record_batch_overlap(
@@ -1525,6 +1564,7 @@ def _make_fused_sparse_forward(
             else:
                 misses.append(eidx)
 
+        _t_disk = _mark() if _prof else 0.0
         if misses:
             def _load_one(eidx: int):
                 metas = offset_index.get_expert_offsets(layer_name, eidx)
@@ -1549,15 +1589,20 @@ def _make_fused_sparse_forward(
             for eidx, raw in _results:
                 if raw is not None:
                     expert_tensors[eidx] = raw
+        if _prof:
+            _mp['disk_load'] += time.perf_counter() - _t_disk
 
         # fp32 accumulator, cast back at the return -- see the identical note in
         # _make_fused_sparse_forward_exl3. Experts reach index_add_ in disk
         # completion order, and a bf16 accumulator makes that order observable.
         # Expert mask on CPU (avoids PCIe for index tensors)
+        _t_mask = _mark() if _prof else 0.0
         expert_indices_cpu = expert_indices.cpu()
         expert_mask = F.one_hot(
             expert_indices_cpu, num_classes=experts_mod.num_experts
         ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+        if _prof:
+            _mp['mask_sync'] += time.perf_counter() - _t_mask
 
         # ── Compute FFN on the target device ──────────────────────────────────
         final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
@@ -1571,18 +1616,32 @@ def _make_fused_sparse_forward(
             if token_idx.numel() == 0:
                 continue
 
+            _t_scatter = _mark() if _prof else 0.0
             token_idx_gpu = token_idx.to(device)
             current_state = flat_hidden[token_idx_gpu]
+            if _prof:
+                _mp['scatter'] += time.perf_counter() - _t_scatter
 
-            w_gate_gpu, w_down_gpu, w_up_gpu = _expert_dense_weights(raw, device, dtype)
+            # h2d / construct are split inside _expert_dense_weights: the copy
+            # and the dequant run back to back there, and the phase-4 gate is a
+            # ratio of exactly those two.
+            w_gate_gpu, w_down_gpu, w_up_gpu = _expert_dense_weights(
+                raw, device, dtype, timing=_mp)
             if w_gate_gpu is None:
                 continue
 
+            _t_gemm = _mark() if _prof else 0.0
             gate_out = act_fn(F.linear(current_state, w_gate_gpu))
             up_out = F.linear(current_state, w_up_gpu)
             out = F.linear(gate_out * up_out, w_down_gpu)
+            if _prof:
+                _mp['gemm'] += _mark() - _t_gemm
+
+            _t_scatter = _mark() if _prof else 0.0
             out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
             final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
+            if _prof:
+                _mp['scatter'] += _mark() - _t_scatter
 
             del w_gate_gpu, w_down_gpu, w_up_gpu
 
