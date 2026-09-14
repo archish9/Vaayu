@@ -282,15 +282,15 @@ cost Qwen3-Next 1.47 % perplexity; a 12.5 % cut cost MiniMax-M2.7 6.34 %). So do
 
 **Set `DECODE_TOP_K = "auto"`.** On the first load of a checkpoint Vaayu measures it on a built-in code text and a prose passage: it tries fewer experts one step at a time and keeps the fastest setting whose perplexity cost stays within `DECODE_TOP_K_BUDGET` (default `0.035` = 3.5 %) on **both** texts. If no fixed expert count fits, it tries a per-token cutoff instead, which drops an expert only on tokens where it carries little weight. The result is cached next to the checkpoint's split files, so every later load applies it instantly.
 
-| model | pick at 3.5 % | decode tok/s | perplexity cost | one-time first load |
+| model | pick at 3.5 % | decode tok/s | perplexity cost (worse of code and prose) | one-time first load |
 |---|---|---|---|---|
-| Qwen3-Next-80B int4 | fixed k = 8 of 10 | **+22.2 %** | +3.43 % | ≈ 3.5 min |
-| MiniMax-M2.7 | cutoff p = 0.90 | **+10.75 %** | +1.76 % | ≈ 12 min |
-| Qwen3-235B | fixed k = 7 of 8 | not measured | +3.40 % | ≈ 12 min |
+| Qwen3-Next-80B int4 | fixed k = 8 of 10 | **+23.1 %** | +3.43 % | ≈ 6.5 min |
+| MiniMax-M2.7 | cutoff p = 0.90 | **+8.4 %** | +2.25 % | ≈ 26 min |
+| Qwen3-235B | fixed k = 7 of 8 | **+11.2 %** (one sample) | +3.40 % | ≈ 26 min |
 
-These were measured on the prose passage alone; `"auto"` scores its code text too and keeps the worse cost, so the pick it prints is the one that applies. **While the first load measures, the server is not reachable** — like a long load.
+These picks were measured by `"auto"` itself on 2026-09-14; your checkpoint's pick is the one its load log prints. **While the first load measures, the server is not reachable** — like a long load.
 Watch `server.log` for one `DECODE_TOP_K=auto:` line per trial and a final WARNING naming the pick and its
-cost; afterwards `/health` → `decode_top_k` reports it.
+cost (or a line saying no setting fits the budget, when none does); afterwards `/health` → `decode_top_k` reports it.
 
 - **Tighter quality needs:** lower `DECODE_TOP_K_BUDGET` (at 0.02 Qwen3-Next picks k = 9, +17.0 % for
   +1.47 %). A changed budget re-measures on the next load.

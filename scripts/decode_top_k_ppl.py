@@ -7,7 +7,7 @@ is how much the loss costs, and the cheapest honest proxy is teacher-forced
 perplexity taken in DECODE MODE.
 
 Decode mode, not one full-sequence forward: the clamp is gated off during
-prefill (`_decode_k_for` returns None when `_moe_prefill_pass` is set, because
+prefill (`_decode_limits` returns None when `_moe_prefill_pass` is set, because
 prefill routes ~every expert anyway). A single `model(ids)` over the passage IS
 a prefill forward, so it can never see the feature. The prompt is prefilled
 once, then scored one token at a time — each of those is a real decode step.

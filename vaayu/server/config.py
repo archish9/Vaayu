@@ -294,8 +294,8 @@ PIN_ENGINE_THREADS = True
 #           setting whose perplexity cost stays within DECODE_TOP_K_BUDGET:
 #           a fixed k if one fits, otherwise a per-token routing-mass cutoff.
 #           Cached per checkpoint; later loads apply it instantly. The first
-#           load of each checkpoint is slower (~3.5 min Qwen3-Next-80B,
-#           ~12 min Qwen3-235B / MiniMax-M2.7) and no endpoint answers while it
+#           load of each checkpoint is slower (~6.5 min Qwen3-Next-80B,
+#           ~26 min Qwen3-235B / MiniMax-M2.7) and no endpoint answers while it
 #           measures.
 #
 # This is the one knob here that is LOSSY: every other default preserves the
@@ -308,8 +308,8 @@ PIN_ENGINE_THREADS = True
 DECODE_TOP_K = None
 
 # The perplexity cost DECODE_TOP_K="auto" may spend, as a fraction.
-# Measured picks at 0.035: Qwen3-Next-80B int4 -> fixed k=8, +22.2 % tok/s for
-# +3.43 %; MiniMax-M2.7 -> cutoff p=0.90, +10.75 % for +1.76 % (no fixed k fits).
+# Measured picks at 0.035: Qwen3-Next-80B int4 -> fixed k=8, +23.1 % tok/s for
+# +3.43 %; MiniMax-M2.7 -> cutoff p=0.90, +8.4 % for +2.25 % (no fixed k fits).
 # At 0.02: Qwen3-Next -> k=9, +17.0 % for +1.47 %. Changing it re-measures on
 # the next load. Ignored, with a note, for an explicit int.
 DECODE_TOP_K_BUDGET = 0.035
