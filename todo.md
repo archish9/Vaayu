@@ -85,6 +85,10 @@ geometry** (a 10 % slot cut costs Qwen3-Next 1.47 %; a 12.5 % cut costs MiniMax 
 derived. **S3-pre's projection was low by exactly 2× on both Qwen3-Next arms** — it held the VRAM cache hit rate
 constant, and the hit rate actually RISES with the clamp (83 → 90 %). Row **33**.
 
+**2026-09-14 — `DECODE_TOP_K="auto"` merged; six row-33 follow-ups open (K1, D4, D3, D1, D2, D5)**, each with a
+self-contained brief linked from its row. Their suggested order among themselves is in the table headed
+"Row-33 follow-ups — suggested order" (search that phrase); it does not rank them against the rows here.
+
 **2026-09-13 — S2 IS DONE, AND IT IS THE LARGEST MEASURED WIN ON THIS BOARD.** `Qwen3-Next-80B-A3B-Instruct` int4
 runs: **4.0648 tok/s** warm at N=1 on the server's own knobs (replicate spread 1.30 %, greedy ids identical across
 arms), and **the server gate passes on it (9 passed)** — so it is **shipped, not banked**. That is **4.8×**
@@ -2956,6 +2960,8 @@ reproduced across a reboot.
   (k=7 ≤ ~4.9 %) → contract owners switch to the attribute clamp, softmax/router owners keep tensor truncation;
   otherwise MiniMax is intolerant and the design stands, close this. ~½ day + ~15 min device. Reachable at N=1 (§8), no
   new knob. NOT worth doing unless someone wants DECODE_TOP_K on MiniMax — the default is `None` either way.
+  **Relevance changed 2026-09-14:** `auto` now picks the cutoff p=0.90 on MiniMax (+8.4 % tok/s, worst +2.25 %); a true clamp that
+  lets k=7 fit the budget could beat it. **Brief (D5, self-contained):** [`docs/issue-D5-minimax-true-clamp-experiment.md`](docs/issue-D5-minimax-true-clamp-experiment.md) (gitignored — this row is the durable summary).
 - [x] **`DECODE_TOP_K="auto"` — opt-in automatic k. DESIGN IN PROGRESS 2026-09-14.** The user's concern: on `None`, a
   user running a tolerant model silently loses speed (Qwen3-Next: +17 % for 1.47 %) and has no way to know. **User
   decisions:** (1) **opt-in** — default stays `None` (lossless), keeping `documentation/TUNING.md`'s "off or conservative
@@ -3132,24 +3138,48 @@ reproduced across a reboot.
     q235-cold2,servergate2}.log`; full RESULTS: `docs/2026-09-14-row33-decode-top-k-auto-RESULTS.md` ("Method 2"
     section).
     - done 2026-09-14: commits `0c78fe7` + `1a225a1`, task review clean; picks Qwen3-Next k=8, MiniMax p=0.90, Qwen3-235B k=7 (all ≤ 3.5 % worst of code/prose); ABBA no-op PASS
-- [bug] **DECODE_TOP_K p-cutoff renormalises even when it drops nothing** (final review M3, 2026-09-14). `truncate_top_k`'s
+**Row-33 follow-ups — suggested order (added 2026-09-14).** Six items below, each with a self-contained brief in
+`docs/issue-*.md` (gitignored; the row is the durable summary). This orders them **against each other only** — not against
+other open rows, whose priority is the user's call. Rule: cheap and no-GPU first, correctness before performance,
+research last.
+
+| # | item | why here | effort | GPU |
+|---|---|---|---|---|
+| 1 | **K1** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
+| 2 | **D4** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
+| 3 | **D3** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
+| 4 | **D1** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
+| 5 | **D2** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
+| 6 | **D5** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
+
+- [bug] **DECODE_TOP_K truncation renormalises routing weights to sum 1 — wrong for scaling routers** (final review M3,
+  2026-09-14; **scope widened while writing the brief:** the fixed-k int path has it too, since row 33 — on the 12
+  transformers families that multiply by `routed_scaling_factor` (DeepSeek-V2/V3, GLM-4-MoE, dots1, Mistral4, …) an
+  explicit `DECODE_TOP_K=<int>` silently shrinks every MoE block's output). `truncate_top_k`'s
   cutoff path (`vaayu/moe_patch.py`) rescales kept weights to sum 1 always. For contract-routed models whose top-k weights do
   NOT sum to 1 (`norm_topk_prob=False`, or a scaling factor inside `route_tokens_to_experts`), the very first cutoff trial
   already includes a scale change, so `auto` measures it as damage and lands on `none` — lossless, but `auto` silently cannot
   help that family. Spec §7 says "renormalise", and the fixed-k path did the same before this branch, so the fix is a spec
   change: scale kept weights to preserve the ORIGINAL row sum, on both paths. On-device numbers are unaffected (MiniMax
   p=0.95 cost +0.13 %). Needs a ppl re-check of the fixed-k path if it changes.
+  **Brief (D1, self-contained):** [`docs/issue-D1-cutoff-renormalises-non-unit-sum-routers.md`](docs/issue-D1-cutoff-renormalises-non-unit-sum-routers.md) (gitignored — this row is the durable summary). **Latent on this box:** all three on-device models return unit-sum top-k weights (both Qwen3 configs
+  `norm_topk_prob: true`; MiniMax divides by the sum, `modeling_minimax_m2.py:117`), so it needs a synthetic test to reproduce.
 - [bug] **DECODE_TOP_K=auto calibration runs without KEEP_AWAKE / thread pinning** (final review M4). `decode_mode_ppl` calls
   `model(...)` directly; `keepawake_for` wraps only `generate` (`vaayu/vaayu_base.py` ~5204). Row 27 measured −21.5 % time per
   token on Qwen3-235B from those two knobs, so the ~26-min first load is probably longer than necessary. Candidate: wrap
   `run_ladders` in `with keepawake_for(model):`. **Unmeasured — needs a first-load A/B before claiming a saving.**
-- [bug] **DECODE_TOP_K=auto calibration consumes one-shot decode telemetry** (final review M5). `_decode_stats_reset`
-  (`vaayu/vaayu_base.py` ~4708) fires once per model lifetime, so it now fires during calibration and later decode hit rates
-  include ~10 calibration prefills; with `ENABLE_EXPERT_USAGE` on, the histogram also records calibration routing (truncated
-  trials included). Telemetry only — no effect on output or speed.
+  **Brief (D2, self-contained):** [`docs/issue-D2-calibration-without-keepawake.md`](docs/issue-D2-calibration-without-keepawake.md) (gitignored — this row is the durable summary).
+- [bug] **DECODE_TOP_K=auto calibration is counted in the expert-usage histogram** (final review M5, **scope corrected
+  2026-09-14 while writing the brief**). The review's main claim — that `_decode_stats_reset` fires once per model lifetime,
+  so calibration pollutes later decode hit rates — is **wrong**: `decode_stats_reset` (`vaayu/vaayu_base.py:426`) re-arms on
+  every prefill (the F13 fix), so the first real turn's first decode pass wipes calibration's cache counts. What remains:
+  with `ENABLE_EXPERT_USAGE` on (default off), `ExpertUsageTracker` (`vaayu/expert_usage.py`, no reset method) permanently
+  counts calibration's decode routes, truncated trials included. Telemetry only — no effect on output or speed.
+  **Brief (D3, self-contained):** [`docs/issue-D3-calibration-consumes-decode-telemetry.md`](docs/issue-D3-calibration-consumes-decode-telemetry.md) (gitignored — this row is the durable summary).
 - [bug] **Invalid DECODE_TOP_K fails after the layer split, not before** (final review M6). `check_decode_top_k_value` runs in
   `_detect_moe` (~2206), after `find_or_create_local_splitted_path` (~2022); the budget is validated at ~2013. Calling it next
   to the budget check would fail fast. The late timing predates this branch for the int path.
+  **Brief (D4, self-contained):** [`docs/issue-D4-decode-top-k-validated-after-split.md`](docs/issue-D4-decode-top-k-validated-after-split.md) (gitignored — this row is the durable summary).
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),
@@ -3164,6 +3194,7 @@ reproduced across a reboot.
   1.1363, n=3, ids identical). The auto plan's server.md row uses the measured server figure instead of copying the
   stale sentence. **README not fixed** (not in the agreed scope) — replace that sentence with the row-27 server numbers.
   Docs-only, ~5 min.
+  Docs-only, ~5 min. **Brief (K1, self-contained):** [`docs/issue-K1-readme-keepawake-stale-claim.md`](docs/issue-K1-readme-keepawake-stale-claim.md) (gitignored — this row is the durable summary).
 
 
 ## BUILT 2026-09-13 (T2). Code landed, suite green, quality measured. Default `DECODE_TOP_K = None`.
