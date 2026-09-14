@@ -164,30 +164,52 @@ def route_experts(moe_module, router_logits, top_k: int):
     return w.reshape(*lead_shape, -1), idx.reshape(*lead_shape, -1)
 
 
-def truncate_top_k(weights, indices, k: int):
-    """Keep only the `k` largest-weight slots of an already-routed (weights,
-    indices) pair. Row 33 / T2.
+def truncate_top_k(weights, indices, k, p=None):
+    """Decode-time expert budget on an already-routed (weights, indices) pair.
+    Row 33 / T2, and DECODE_TOP_K="auto".
 
-    `k is None` (feature off) and `k >= K` return the SAME tensors, not equal
-    copies: MiniMax routes with `sorted=False`, and expert accumulation is
-    order-dependent, so re-running topk on a path the user did not turn on
-    would be a bit-level change."""
-    if k is None or k >= weights.shape[-1]:
+    `k`: keep the `k` largest-weight slots. `p`: the routing-mass cutoff --
+    keep, per row, the smallest set of slots whose normalised weight sums to
+    >= p (always >= 1), and RE-POINT each dropped slot at that row's top-1
+    expert with weight 0. Shapes are unchanged, so no forward's dispatch
+    changes, and a dropped slot loads nothing (it duplicates an expert already
+    routed). The top-1 is found by WEIGHT, not position: MiniMax routes with
+    `sorted=False`. If both are given, `k` applies first.
+
+    `k is None or k >= K` with `p is None` returns the SAME tensors, not equal
+    copies: expert accumulation is order-dependent, so re-running topk on a
+    path the user did not turn on would be a bit-level change."""
+    num_slots = weights.shape[-1]
+    if (k is None or k >= num_slots) and p is None:
         return weights, indices
-    w, pos = torch.topk(weights.float(), k, dim=-1)
+    if k is not None and k < num_slots:
+        w, pos = torch.topk(weights.float(), k, dim=-1)
+        w = w / w.sum(dim=-1, keepdim=True)
+        weights, indices = w.to(weights.dtype), indices.gather(-1, pos)
+    if p is None:
+        return weights, indices
+    w = weights.float()
     w = w / w.sum(dim=-1, keepdim=True)
-    return w.to(weights.dtype), indices.gather(-1, pos)
+    sorted_w, order = torch.sort(w, dim=-1, descending=True)
+    keep_sorted = (sorted_w.cumsum(dim=-1) - sorted_w) < p
+    keep = torch.zeros_like(keep_sorted).scatter(-1, order, keep_sorted)
+    top1 = indices.gather(-1, order[..., :1]).expand_as(indices)
+    w = torch.where(keep, w, torch.zeros_like(w))
+    w = w / w.sum(dim=-1, keepdim=True)
+    return w.to(weights.dtype), torch.where(keep, indices, top1)
 
 
-def _decode_k_for(vaayu_ref):
-    """The decode-time `top_k` clamp, or None when it must not apply.
+def _decode_limits(vaayu_ref):
+    """The decode-time `(k, p)` budget, or `(None, None)` when it must not
+    apply.
 
     Decode-only by design (row 33 / T2): prefill routes ~every expert anyway
     (224.23 per layer per chunk, measured), so truncating it buys nearly
     nothing and costs prompt quality."""
     if getattr(vaayu_ref, "_moe_prefill_pass", False):
-        return None
-    return getattr(vaayu_ref, "_decode_top_k", None)
+        return None, None
+    return (getattr(vaayu_ref, "_decode_top_k", None),
+            getattr(vaayu_ref, "_decode_top_p", None))
 
 
 def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
@@ -1397,7 +1419,7 @@ def _make_modulelist_sparse_forward(
             vaayu_ref, "this model uses the module-list expert layout, whose forward "
                        "has no cache-aware routing")
         routing_weights, expert_indices = truncate_top_k(
-            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
+            routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -1736,7 +1758,7 @@ def _make_fused_sparse_forward(
                        "cache-aware routing")
 
         routing_weights, expert_indices = truncate_top_k(
-            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
+            routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -2215,7 +2237,7 @@ def _make_fused_sparse_forward_exl3(
                     getattr(vaayu_ref, "_cache_bias", 0.0))
 
         routing_weights, expert_indices = truncate_top_k(
-            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
+            routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()

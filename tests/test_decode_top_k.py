@@ -378,3 +378,123 @@ def test_no_warning_when_the_clamp_is_inert(capsys, requested):
     resolve_decode_top_k(10, requested)
 
     assert "WARNING" not in capsys.readouterr().out
+
+
+# ── routing-mass cutoff: DECODE_TOP_K="auto" (spec §7) ─────────────────────
+#
+# The cutoff keeps, per token, the smallest set of routed slots whose weight
+# sums to >= p (always >= 1) and RE-POINTS each dropped slot at that token's
+# top-1 expert with weight 0. Shapes never change, so no forward's dispatch
+# code changes, and a dropped slot loads nothing: it duplicates an expert the
+# token already routes to. That is the exact mechanism whose speed was measured
+# (+12.9 % Qwen3-Next, +10.75 % MiniMax at p=0.90).
+
+
+def test_cutoff_repoints_dropped_slots_at_the_top1_expert():
+    w = torch.tensor([[0.5, 0.3, 0.15, 0.05]])
+    i = torch.tensor([[7, 3, 9, 1]])
+
+    w2, i2 = truncate_top_k(w, i, None, p=0.9)
+
+    assert i2.tolist() == [[7, 3, 9, 7]]
+    assert w2[0, 3].item() == 0.0
+    assert abs(w2.sum().item() - 1.0) < 1e-6
+
+
+def test_cutoff_finds_the_top1_by_weight_on_unsorted_routing():
+    """MiniMax routes with sorted=False: slot 0 is not the top expert."""
+    w = torch.tensor([[0.05, 0.5, 0.15, 0.3]])
+    i = torch.tensor([[1, 7, 9, 3]])
+
+    w2, i2 = truncate_top_k(w, i, None, p=0.9)
+
+    assert i2.tolist() == [[7, 7, 9, 3]]
+    assert w2[0, 0].item() == 0.0
+
+
+def test_cutoff_always_keeps_the_top1():
+    w = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+    i = torch.tensor([[5, 6, 7, 8]])
+
+    w2, i2 = truncate_top_k(w, i, None, p=0.01)
+
+    assert set(i2.flatten().tolist()) == {5}
+    assert abs(w2[0, 0].item() - 1.0) < 1e-6
+
+
+def test_no_cutoff_and_no_clamp_returns_the_very_same_tensors():
+    w = torch.rand(3, 8)
+    w = w / w.sum(dim=-1, keepdim=True)
+    i = torch.randint(0, 64, (3, 8))
+
+    a, b = truncate_top_k(w, i, 8, p=None)
+
+    assert a is w and b is i
+
+
+def test_fused_forward_cutoff_computes_only_the_kept_experts(tmp_path):
+    """p=0.01 keeps exactly the top-1 per token, whatever the weights."""
+    model, ref = _fused(tmp_path, decode_k=K)
+    ref._decode_top_p = 0.01
+
+    model.layers[0].mlp.forward(torch.randn(1, 1, HIDDEN))
+
+    assert len(ref._expert_history[0]) == 1
+
+
+def test_fused_forward_cutoff_is_off_during_prefill(tmp_path):
+    model, ref = _fused(tmp_path, decode_k=K, prefill=True)
+    ref._decode_top_p = 0.01
+
+    model.layers[0].mlp.forward(torch.randn(1, 1, HIDDEN))
+
+    assert len(ref._expert_history[0]) == K
+
+
+def test_modulelist_forward_cutoff_reaches_the_softmax_owner(tmp_path):
+    model, ref = _modulelist(tmp_path, decode_k=K)
+    ref._decode_top_p = 0.01
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, HIDDEN))
+
+    assert len(ref._expert_history[0]) == 1
+
+
+def test_modulelist_forward_cutoff_reaches_the_contract_owner(tmp_path):
+    model, ref = _modulelist(tmp_path, decode_k=K, contract=True)
+    ref._decode_top_p = 0.01
+
+    model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, HIDDEN))
+
+    assert len(ref._expert_history[0]) == 1
+
+
+def test_exl3_forward_cutoff_computes_only_the_kept_experts(tmp_path):
+    model = MockFusedModel(num_layers=1, hidden=HIDDEN)
+    model.layers[0].mlp.gate = _LogitsRouter(HIDDEN, NUM_EXPERTS)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=HIDDEN,
+                           intermediate=HIDDEN * 2, num_experts=NUM_EXPERTS)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    cache = ExpertRAMCache(budget_bytes=BUDGET)
+    for eidx in range(NUM_EXPERTS):
+        cache.put(0, eidx, _make_mock_exl3_raw("layers.0", eidx,
+                                               in_dim=HIDDEN, out_dim=HIDDEN * 2))
+    ref = MockVaayuRef()
+    ref._moe_prefill_pass = False
+    ref._decode_top_k = K
+    ref._decode_top_p = 0.01
+
+    block_info = detect_moe_blocks(model)[0]
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.side_effect = (
+        lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16))
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3", return_value=mock_bc):
+        block_info.moe_module.forward = _make_fused_sparse_forward_exl3(
+            block_info=block_info, expert_cache=cache, offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)), top_k=K, device="cpu",
+            dtype=torch.float32, vaayu_ref=ref,
+        )
+        model.layers[0].mlp.forward(torch.randn(1, 1, HIDDEN))
+
+    assert len(ref._expert_history[0]) == 1
