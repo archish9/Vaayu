@@ -197,6 +197,10 @@ def read_cache(checkpoint_path, key):
         return None
     if not isinstance(record, dict) or not isinstance(record.get("pick"), dict):
         return None
+    pick = record["pick"]
+    if (pick.get("kind") not in ("k", "p", "none") or "value" not in pick
+            or "cost" not in pick or not isinstance(record.get("measured_at"), str)):
+        return None
     if any(record.get(field) != value for field, value in key.items()):
         return None
     return record
@@ -218,3 +222,114 @@ def write_cache(checkpoint_path, record):
         except OSError:
             pass
         return False
+
+
+def decode_mode_ppl(model, ids, prefix_tokens=PREFIX_TOKENS, score_tokens=SCORE_TOKENS):
+    """Teacher-forced perplexity in DECODE mode: one prefill of `prefix_tokens`,
+    then `score_tokens` single-token forwards. A single full-sequence forward
+    would be a PREFILL pass, where the decode budget is inactive by design, so
+    it could never see what is being measured."""
+    import math
+
+    import torch
+    import torch.nn.functional as F
+
+    with torch.no_grad():
+        out = model(ids[:, :prefix_tokens], use_cache=True, return_dict=True)
+    past = out.past_key_values
+    losses = []
+    for t in range(prefix_tokens, prefix_tokens + score_tokens):
+        with torch.no_grad():
+            out = model(ids[:, t:t + 1], past_key_values=past,
+                        use_cache=True, return_dict=True)
+        losses.append(F.cross_entropy(out.logits[:, -1, :].float(), ids[:, t + 1]).item())
+        past = out.past_key_values
+    return math.exp(sum(losses) / len(losses))
+
+
+_NONE = {"kind": "none", "value": None, "cost": None}
+_FAILED = {"mode": "none", "value": None, "cost": None, "source": "failed"}
+
+
+def _apply(model, pick):
+    model._decode_top_k = model.moe_top_k
+    model._decode_top_p = None
+    if pick["kind"] == "k":
+        model._decode_top_k = pick["value"]
+    elif pick["kind"] == "p":
+        model._decode_top_p = pick["value"]
+
+
+def _status(pick, source):
+    return {"mode": pick["kind"], "value": pick["value"], "cost": pick["cost"], "source": source}
+
+
+def _announce(pick, config_k):
+    if pick["kind"] == "none":
+        _log(f"no setting fits the budget on this checkpoint; running at its own "
+             f"top-{config_k} (lossless)")
+        return
+    what = (f"top-{pick['value']} of {config_k}" if pick["kind"] == "k"
+            else f"routing-mass cutoff p={pick['value']:.2f}")
+    _log(f"WARNING: applying {what}. Output is DEGRADED by design (greedy ids will "
+         f"differ); measured cost {pick['cost'] * 100:+.2f} % perplexity on the "
+         f"calibration text")
+
+
+def _scorer(model, ids):
+    def score(k, p):
+        saved = (model._decode_top_k, model._decode_top_p)
+        model._decode_top_k, model._decode_top_p = k, p
+        try:
+            return decode_mode_ppl(model, ids)
+        finally:
+            model._decode_top_k, model._decode_top_p = saved
+    return score
+
+
+def resolve(model, budget):
+    """Apply the checkpoint's cached pick, or measure it now and cache it.
+
+    Every failure is loud and lossless (CLAUDE.md §5): a WARNING, the
+    checkpoint's own top_k, and no cache written, so the next load retries."""
+    config_k = model.moe_top_k
+    _apply(model, _NONE)
+    if config_k <= 1:
+        _log(f"the checkpoint routes top-{config_k}; there is nothing to truncate, "
+             f"so auto does nothing (lossless)")
+        return {"mode": "none", "value": None, "cost": None, "source": "config"}
+    ids = model.tokenizer(CALIB_TEXT, return_tensors="pt").input_ids
+    if ids.shape[1] < MIN_CALIB_TOKENS:
+        _log(f"WARNING: the calibration text is {ids.shape[1]} tokens for this "
+             f"tokenizer, {MIN_CALIB_TOKENS} are needed; auto skipped, running at "
+             f"the checkpoint's own top-{config_k}")
+        return dict(_FAILED)
+    ids = ids.to(model.running_device)
+
+    key = cache_key(budget, fingerprint(model.config.to_json_string(), model.checkpoint_path))
+    cached = read_cache(model.checkpoint_path, key)
+    if cached is not None:
+        _log(f"cached pick for this checkpoint and budget (measured {cached['measured_at']})")
+        _apply(model, cached["pick"])
+        _announce(cached["pick"], config_k)
+        return _status(cached["pick"], "cache")
+
+    _log(f"no cached pick for this checkpoint at budget {budget * 100:.1f} %; "
+         f"measuring now -- one-time, the server is not reachable until it finishes")
+    try:
+        out = run_ladders(config_k, budget, _scorer(model, ids))
+    except Exception as e:  # noqa: BLE001 -- any failure must degrade loudly, never crash the load
+        _apply(model, _NONE)
+        _log(f"WARNING: measurement failed ({type(e).__name__}: {e}); running at the "
+             f"checkpoint's own top-{config_k}; nothing cached, the next load retries")
+        return dict(_FAILED)
+
+    record = {**key, "config_k": config_k, "baseline_ppl": out["baseline_ppl"],
+              "trials": out["trials"], "pick": out["pick"],
+              "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not write_cache(model.checkpoint_path, record):
+        _log(f"WARNING: could not write {Path(model.checkpoint_path) / CACHE_FILENAME}; "
+             f"the pick applies now but will be re-measured on every load")
+    _apply(model, out["pick"])
+    _announce(out["pick"], config_k)
+    return _status(out["pick"], "measured")
