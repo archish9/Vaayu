@@ -2941,7 +2941,21 @@ because this is the only server knob whose wrong value fails silently; inert val
 tests. (2) **Shared-expert hypothesis under test:** the tolerant model (Qwen3-Next) is the only one with a shared expert
 (`shared_expert_intermediate_size: 512`), which runs on every token and is never truncated; MiniMax and Qwen3-235B have
 none. Detectable via `_shared_expert_output` (`moe_patch.py:475`), so if it holds it is the only candidate basis for a
-`DECODE_TOP_K="auto"`. n=2 so far; Qwen3-235B (no shared expert → predicted intolerant, >5 % at k=7) is the third point.
+`DECODE_TOP_K="auto"`. **REFUTED 2026-09-14 by the third point:** Qwen3-235B (no shared expert) costs **+3.40 % at k=7, +5.33 % at k=6** —
+prediction was > 5 % at k=7. Matched against MiniMax (same top-8, same cut fractions, also no shared expert: +6.34 % /
++19.30 %) it differs 1.9× / 3.6×, so the shared expert does not explain the gap; the two softmax Qwen models sit on
+roughly one curve and **MiniMax is the outlier.** What MiniMax alone has: **tensor truncation is NOT a true clamp there**
+(biased `sorted=False` selection vs unbiased weights) — a choice this row made. So part of MiniMax's result may be an
+artifact of the design, not the model. **No `auto` signal survives three models; `None` stays.** Qwen3-235B throughput
+not measured (projected ~+21 % at k=6 by the byte model, which was accurate on disk-bound MiniMax). k=8 baseline 7.7818
+reproduced across a reboot.
+
+- [ ] **Separate MiniMax's intolerance from the truncation design.** Build a TRUE clamp for contract-routed owners only
+  (set `moe_module.top_k` on decode passes so `route_tokens_to_experts` selects k by its own biased scores), re-measure
+  MiniMax ppl at k=7 and k=6 with `scripts/decode_top_k_ppl.py`. **Stop rule:** closes ≥ half the gap to Qwen3-235B
+  (k=7 ≤ ~4.9 %) → contract owners switch to the attribute clamp, softmax/router owners keep tensor truncation;
+  otherwise MiniMax is intolerant and the design stands, close this. ~½ day + ~15 min device. Reachable at N=1 (§8), no
+  new knob. NOT worth doing unless someone wants DECODE_TOP_K on MiniMax — the default is `None` either way.
 
 
 ## BUILT 2026-09-13 (T2). Code landed, suite green, quality measured. Default `DECODE_TOP_K = None`.
