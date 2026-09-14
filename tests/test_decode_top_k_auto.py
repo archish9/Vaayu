@@ -64,6 +64,15 @@ def test_the_fixed_k_ladder_stops_at_one():
     assert [t["value"] for t in out["trials"]] == [2, 1]
 
 
+# ── non-finite perplexities (final review I2) ────────────────────────────────
+
+def test_a_non_finite_trial_counts_as_over_budget():
+    costs = {(9, None): float("nan"), (10, 0.95): 0.5}
+    out = dtka.run_ladders(10, 0.035, _scorer(10, 8.0, costs))
+    assert out["pick"] == {"kind": "none", "value": None, "cost": None}
+    assert out["trials"][0]["cost"] == float("inf")
+
+
 # ── cache ───────────────────────────────────────────────────────────────────
 
 def _record(key):
@@ -281,6 +290,34 @@ def test_a_too_short_calibration_text_warns_and_skips(tmp_path, monkeypatch, cap
     assert "WARNING" in capsys.readouterr().out
 
 
+def test_a_nan_baseline_warns_caches_nothing_and_stays_lossless(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(dtka, "decode_mode_ppl", lambda *a, **k: float("nan"))
+    m = _FakeMoE(tmp_path)
+
+    status = dtka.resolve(m, 0.035)
+
+    assert status == {"mode": "none", "value": None, "cost": None, "source": "failed"}
+    assert (m._decode_top_k, m._decode_top_p) == (10, None)
+    assert not (tmp_path / dtka.CACHE_FILENAME).exists()
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_a_tokenizer_error_warns_and_stays_lossless(tmp_path, capsys):
+    m = _FakeMoE(tmp_path)
+
+    def broken(text, return_tensors=None):
+        raise RuntimeError("tokenizer exploded")
+
+    m.tokenizer = broken
+
+    status = dtka.resolve(m, 0.035)
+
+    assert status == {"mode": "none", "value": None, "cost": None, "source": "failed"}
+    assert (m._decode_top_k, m._decode_top_p) == (10, None)
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "tokenizer exploded" in out
+
+
 def test_an_unwritable_cache_still_applies_the_pick_and_warns(tmp_path, monkeypatch, capsys):
     _fake_ppl(monkeypatch, 10, 8.58, QWEN3_NEXT_LIKE, [])
     monkeypatch.setattr(dtka, "write_cache", lambda *a, **k: False)
@@ -306,6 +343,36 @@ def test_a_structurally_damaged_cache_is_a_miss(tmp_path, damage):
     damage(record)
     dtka.write_cache(tmp_path, record)
     assert dtka.read_cache(tmp_path, key) is None
+
+
+# ── cache pick type/range validation (final review M1) ───────────────────────
+
+@pytest.mark.parametrize("pick", [
+    {"kind": "k", "value": 8, "cost": None},
+    {"kind": "k", "value": "8", "cost": 0.03},
+    {"kind": "k", "value": 0, "cost": 0.03},
+    {"kind": "k", "value": 8, "cost": float("nan")},
+    {"kind": "p", "value": 0, "cost": 0.02},
+    {"kind": "p", "value": 1.5, "cost": 0.02},
+    {"kind": "none", "value": 3, "cost": None},
+])
+def test_a_cache_with_a_badly_typed_pick_is_a_miss(tmp_path, pick):
+    key = dtka.cache_key(0.035, "abc")
+    dtka.write_cache(tmp_path, {**_record(key), "pick": pick})
+    assert dtka.read_cache(tmp_path, key) is None
+
+
+def test_a_cached_k_not_below_the_checkpoints_own_re_measures(tmp_path, monkeypatch):
+    m = _FakeMoE(tmp_path)
+    key = dtka.cache_key(0.035, dtka.fingerprint(m.config.to_json_string(), tmp_path))
+    dtka.write_cache(tmp_path, {**_record(key), "pick": {"kind": "k", "value": 10, "cost": 0.0}})
+    calls = []
+    _fake_ppl(monkeypatch, 10, 8.58, QWEN3_NEXT_LIKE, calls)
+
+    status = dtka.resolve(m, 0.035)
+
+    assert calls, "a cached k >= config_k must be re-measured, not applied"
+    assert status["source"] == "measured"
 
 
 def test_a_top1_checkpoint_measures_nothing(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -194,6 +195,8 @@ def run_ladders(config_k, budget, score):
     it, the ladder stops early, erring toward LESS clamping."""
     t0 = time.perf_counter()
     baseline = _as_tuple(score(config_k, None))
+    if any(not math.isfinite(b) or b <= 0 for b in baseline):
+        raise ValueError(f"non-finite baseline perplexity {_fmt(baseline)}")
     _log(f"baseline top-{config_k} ppl={_fmt(baseline)} ({time.perf_counter() - t0:.1f}s)")
     trials = []
 
@@ -201,7 +204,7 @@ def run_ladders(config_k, budget, score):
         t = time.perf_counter()
         ppl = _as_tuple(score(k, p))
         costs = [q / b - 1.0 for q, b in zip(ppl, baseline)]
-        cost = max(costs)
+        cost = max(costs) if all(math.isfinite(c) for c in costs) else math.inf
         rec = {"kind": kind, "value": value, "ppl": list(ppl), "costs": costs,
                "cost": cost, "seconds": time.perf_counter() - t}
         trials.append(rec)
@@ -256,6 +259,19 @@ def read_cache(checkpoint_path, key):
     if (pick.get("kind") not in ("k", "p", "none") or "value" not in pick
             or "cost" not in pick or not isinstance(record.get("measured_at"), str)):
         return None
+    kind, value, cost = pick["kind"], pick["value"], pick["cost"]
+    if kind == "none":
+        if value is not None or cost is not None:
+            return None
+    else:
+        if (not isinstance(cost, (int, float)) or isinstance(cost, bool)
+                or not math.isfinite(cost)):
+            return None
+        if kind == "k" and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            return None
+        if kind == "p" and (not isinstance(value, (int, float)) or isinstance(value, bool)
+                            or not 0 < value < 1):
+            return None
     if any(record.get(field) != value for field, value in key.items()):
         return None
     return record
@@ -354,17 +370,25 @@ def resolve(model, budget):
              f"so auto does nothing (lossless)")
         return {"mode": "none", "value": None, "cost": None, "source": "config"}
     ids_list = []
-    for name, text in CALIB_TEXTS:
-        ids = model.tokenizer(text, return_tensors="pt").input_ids
-        if ids.shape[1] < MIN_CALIB_TOKENS:
-            _log(f"WARNING: the {name} calibration text is {ids.shape[1]} tokens for "
-                 f"this tokenizer, {MIN_CALIB_TOKENS} are needed; auto skipped, running "
-                 f"at the checkpoint's own top-{config_k}")
-            return dict(_FAILED)
-        ids_list.append(ids.to(model.running_device))
+    try:
+        for name, text in CALIB_TEXTS:
+            ids = model.tokenizer(text, return_tensors="pt").input_ids
+            if ids.shape[1] < MIN_CALIB_TOKENS:
+                _log(f"WARNING: the {name} calibration text is {ids.shape[1]} tokens for "
+                     f"this tokenizer, {MIN_CALIB_TOKENS} are needed; auto skipped, running "
+                     f"at the checkpoint's own top-{config_k}")
+                return dict(_FAILED)
+            ids_list.append(ids.to(model.running_device))
 
-    key = cache_key(budget, fingerprint(model.config.to_json_string(), model.checkpoint_path))
+        key = cache_key(budget, fingerprint(model.config.to_json_string(), model.checkpoint_path))
+    except Exception as e:  # noqa: BLE001 -- any failure must degrade loudly, never crash the load
+        _log(f"WARNING: calibration setup failed ({type(e).__name__}: {e}); running at the "
+             f"checkpoint's own top-{config_k}; nothing cached, the next load retries")
+        return dict(_FAILED)
+
     cached = read_cache(model.checkpoint_path, key)
+    if cached is not None and cached["pick"]["kind"] == "k" and cached["pick"]["value"] >= config_k:
+        cached = None
     if cached is not None:
         _log(f"cached pick for this checkpoint and budget (measured {cached['measured_at']})")
         _apply(model, cached["pick"])
