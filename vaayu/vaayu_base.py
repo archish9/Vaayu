@@ -90,16 +90,30 @@ def _auto_session_id(token_ids: list) -> str:
     return "auto:" + hashlib.sha1(head).hexdigest()[:16]
 
 
-def resolve_decode_top_k(config_top_k: int, requested) -> int:
-    """Effective DECODE-time top_k (row 33 / T2).
+DEFAULT_DECODE_TOP_K_BUDGET = 0.035
 
-    `requested is None` means the feature is off -> the checkpoint's own value.
-    A request is never honoured ABOVE it: the router only ever selected
-    `config_top_k` experts, so a larger k has nothing to route. Clamping is a
-    real limit, so it WARNS rather than degrading silently (CLAUDE.md §5)."""
-    if requested is None:
+
+def validate_decode_top_k_budget(budget) -> float:
+    """DECODE_TOP_K_BUDGET: the perplexity cost DECODE_TOP_K="auto" may spend."""
+    budget = float(budget)
+    if not 0.0 < budget < 1.0:
+        raise ValueError(f"DECODE_TOP_K_BUDGET must be between 0 and 1 (a fraction: "
+                         f"0.035 = 3.5 % perplexity); got {budget}")
+    return budget
+
+
+def resolve_decode_top_k(config_top_k: int, requested) -> int:
+    """Effective DECODE-time top_k at load (row 33 / T2).
+
+    `None` is the feature off and `"auto"` defers the choice to
+    `decode_top_k_auto.resolve()` at the end of load -- both return the
+    checkpoint's own value here. A request is never honoured ABOVE it: the
+    router only ever selected `config_top_k` experts. Clamping is a real limit,
+    so it WARNS rather than degrading silently (CLAUDE.md §5)."""
+    if requested is None or requested == "auto":
         return config_top_k
-    requested = int(requested)
+    if not isinstance(requested, int) or isinstance(requested, bool):
+        raise ValueError(f'DECODE_TOP_K must be None, an int, or "auto"; got {requested!r}')
     if requested > config_top_k:
         print(f"[Vaayu-MoE] WARNING: DECODE_TOP_K={requested} exceeds the "
               f"checkpoint's num_experts_per_tok={config_top_k}; using "
@@ -1988,6 +2002,8 @@ class VaayuBaseModel(GenerationMixin):
         # Read by _detect_moe() below, which resolves it against the
         # checkpoint's own num_experts_per_tok (row 33 / T2).
         self._requested_decode_top_k = decode_top_k
+        self._decode_top_k_budget = DEFAULT_DECODE_TOP_K_BUDGET
+        self._decode_top_p = None
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -3020,6 +3036,7 @@ class VaayuBaseModel(GenerationMixin):
         print(f"[Vaayu-RAM] ledger @ post-load: avail={_snap['available'] / 1e9:.2f}GB "
               f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
               f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
+        self._resolve_decode_top_k_auto()
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -3333,6 +3350,19 @@ class VaayuBaseModel(GenerationMixin):
         state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
         self.move_layer_to_device(state_dict)
 
+    def _resolve_decode_top_k_auto(self) -> None:
+        """DECODE_TOP_K="auto": apply this checkpoint's cached pick, or measure it
+        now. Runs as the LAST statement of __init__, once the model is complete."""
+        if not getattr(self, "_decode_top_k_auto", False):
+            return
+        from . import decode_top_k_auto
+        self._decode_top_k_status = decode_top_k_auto.resolve(self, self._decode_top_k_budget)
+
+    def decode_top_k_status(self) -> dict:
+        """The active decode expert budget, for /health."""
+        return dict(getattr(self, "_decode_top_k_status",
+                            {"mode": "off", "value": None, "cost": None, "source": "config"}))
+
     def _build_moe_geometry(self) -> None:
         """Derive the MoE geometry at the DECODE top_k (row 33 / T2).
 
@@ -3369,8 +3399,18 @@ class VaayuBaseModel(GenerationMixin):
                 self.config, "num_experts_per_tok",
                 getattr(self.config, "top_k", 2)
             )
-            self._decode_top_k = resolve_decode_top_k(
-                self.moe_top_k, getattr(self, "_requested_decode_top_k", None))
+            _requested = getattr(self, "_requested_decode_top_k", None)
+            self._decode_top_k = resolve_decode_top_k(self.moe_top_k, _requested)
+            self._decode_top_k_auto = _requested == "auto"
+            self._decode_top_k_status = (
+                {"mode": "k", "value": self._decode_top_k, "cost": None, "source": "config"}
+                if self._decode_top_k < self.moe_top_k else
+                {"mode": "off", "value": None, "cost": None, "source": "config"})
+            if (isinstance(_requested, int) and not isinstance(_requested, bool)
+                    and getattr(self, "_decode_top_k_budget", DEFAULT_DECODE_TOP_K_BUDGET)
+                    != DEFAULT_DECODE_TOP_K_BUDGET):
+                print('[Vaayu-MoE] note: DECODE_TOP_K_BUDGET only applies to '
+                      'DECODE_TOP_K="auto"; ignored for an explicit int')
             print(
                 f"[Vaayu] MoE detected: {self.moe_num_experts} experts, "
                 f"top-{self.moe_top_k} active per token"
@@ -3385,6 +3425,11 @@ class VaayuBaseModel(GenerationMixin):
             self.moe_num_experts = 0
             self.moe_top_k = 0
             self._decode_top_k = None
+            self._decode_top_k_auto = False
+            self._decode_top_k_status = {"mode": "off", "value": None, "cost": None,
+                                         "source": "config"}
+            if getattr(self, "_requested_decode_top_k", None) == "auto":
+                print('[Vaayu] note: DECODE_TOP_K="auto" ignored -- not an MoE checkpoint')
 
     # ── VRAM pinning ─────────────────────────────────────────────────────────
 

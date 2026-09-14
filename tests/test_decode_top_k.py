@@ -498,3 +498,104 @@ def test_exl3_forward_cutoff_computes_only_the_kept_experts(tmp_path):
         model.layers[0].mlp.forward(torch.randn(1, 1, HIDDEN))
 
     assert len(ref._expert_history[0]) == 1
+
+
+# ── engine wiring for DECODE_TOP_K="auto" (spec §7) ─────────────────────
+from vaayu.vaayu_base import DEFAULT_DECODE_TOP_K_BUDGET, validate_decode_top_k_budget
+
+
+def test_auto_resolves_to_the_checkpoints_own_k_at_load(capsys):
+    assert resolve_decode_top_k(10, "auto") == 10
+    assert "WARNING" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["fast", "8", True, 7.5])
+def test_an_unknown_decode_top_k_value_raises(bad):
+    with pytest.raises(ValueError, match="auto"):
+        resolve_decode_top_k(10, bad)
+
+
+@pytest.mark.parametrize("budget", [0, 1, -0.1, 1.5])
+def test_a_budget_outside_zero_one_raises(budget):
+    with pytest.raises(ValueError):
+        validate_decode_top_k_budget(budget)
+
+
+def test_a_valid_budget_is_returned():
+    assert validate_decode_top_k_budget(0.035) == 0.035
+
+
+def _bare_moe(requested, budget=DEFAULT_DECODE_TOP_K_BUDGET):
+    m = VaayuBaseModel.__new__(VaayuBaseModel)
+    m.config = SimpleNamespace(num_experts=512, num_experts_per_tok=10,
+                               architectures=["Qwen3NextForCausalLM"])
+    m._requested_decode_top_k = requested
+    m._decode_top_k_budget = budget
+    return m
+
+
+def test_detect_moe_marks_auto_pending_without_clamping():
+    m = _bare_moe("auto")
+
+    m._detect_moe()
+
+    assert (m._decode_top_k, m._decode_top_k_auto) == (10, True)
+    assert m.decode_top_k_status()["mode"] == "off"
+
+
+def test_detect_moe_reports_an_explicit_clamp_as_config():
+    m = _bare_moe(8)
+
+    m._detect_moe()
+
+    assert m.decode_top_k_status() == {"mode": "k", "value": 8, "cost": None, "source": "config"}
+
+
+def test_a_budget_with_an_explicit_int_is_noted(capsys):
+    m = _bare_moe(8, budget=0.02)
+
+    m._detect_moe()
+
+    assert "only applies" in capsys.readouterr().out
+
+
+def test_auto_on_a_dense_checkpoint_is_a_noted_no_op(capsys):
+    m = VaayuBaseModel.__new__(VaayuBaseModel)
+    m.config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    m._requested_decode_top_k = "auto"
+    m._decode_top_k_budget = DEFAULT_DECODE_TOP_K_BUDGET
+
+    m._detect_moe()
+
+    assert m._decode_top_k_auto is False
+    assert "not an MoE checkpoint" in capsys.readouterr().out
+
+
+def test_the_hook_runs_resolve_only_when_auto(monkeypatch):
+    import vaayu.decode_top_k_auto as dtka
+    seen = []
+
+    def fake_resolve(model, budget):
+        seen.append(budget)
+        return {"mode": "k", "value": 8, "cost": 0.03, "source": "measured"}
+
+    monkeypatch.setattr(dtka, "resolve", fake_resolve)
+    m = _bare_moe("auto", budget=0.02)
+    m._detect_moe()
+    m._resolve_decode_top_k_auto()
+    assert seen == [0.02]
+    assert m.decode_top_k_status()["source"] == "measured"
+
+    off = _bare_moe(None)
+    off._detect_moe()
+    off._resolve_decode_top_k_auto()
+    assert seen == [0.02]
+
+
+def test_the_hook_is_the_last_statement_of_init():
+    """Measurement needs a fully constructed model -- prefix cache, KV persist
+    and the post-load RAM ledger included. AutoModel.from_pretrained does no
+    setup after construction, so the end of __init__ IS load complete."""
+    import inspect
+    lines = inspect.getsource(VaayuBaseModel.__init__).rstrip().splitlines()
+    assert lines[-1].strip() == "self._resolve_decode_top_k_auto()"
