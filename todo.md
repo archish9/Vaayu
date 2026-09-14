@@ -3132,6 +3132,24 @@ reproduced across a reboot.
     q235-cold2,servergate2}.log`; full RESULTS: `docs/2026-09-14-row33-decode-top-k-auto-RESULTS.md` ("Method 2"
     section).
     - done 2026-09-14: commits `0c78fe7` + `1a225a1`, task review clean; picks Qwen3-Next k=8, MiniMax p=0.90, Qwen3-235B k=7 (all ≤ 3.5 % worst of code/prose); ABBA no-op PASS
+- [bug] **DECODE_TOP_K p-cutoff renormalises even when it drops nothing** (final review M3, 2026-09-14). `truncate_top_k`'s
+  cutoff path (`vaayu/moe_patch.py`) rescales kept weights to sum 1 always. For contract-routed models whose top-k weights do
+  NOT sum to 1 (`norm_topk_prob=False`, or a scaling factor inside `route_tokens_to_experts`), the very first cutoff trial
+  already includes a scale change, so `auto` measures it as damage and lands on `none` — lossless, but `auto` silently cannot
+  help that family. Spec §7 says "renormalise", and the fixed-k path did the same before this branch, so the fix is a spec
+  change: scale kept weights to preserve the ORIGINAL row sum, on both paths. On-device numbers are unaffected (MiniMax
+  p=0.95 cost +0.13 %). Needs a ppl re-check of the fixed-k path if it changes.
+- [bug] **DECODE_TOP_K=auto calibration runs without KEEP_AWAKE / thread pinning** (final review M4). `decode_mode_ppl` calls
+  `model(...)` directly; `keepawake_for` wraps only `generate` (`vaayu/vaayu_base.py` ~5204). Row 27 measured −21.5 % time per
+  token on Qwen3-235B from those two knobs, so the ~26-min first load is probably longer than necessary. Candidate: wrap
+  `run_ladders` in `with keepawake_for(model):`. **Unmeasured — needs a first-load A/B before claiming a saving.**
+- [bug] **DECODE_TOP_K=auto calibration consumes one-shot decode telemetry** (final review M5). `_decode_stats_reset`
+  (`vaayu/vaayu_base.py` ~4708) fires once per model lifetime, so it now fires during calibration and later decode hit rates
+  include ~10 calibration prefills; with `ENABLE_EXPERT_USAGE` on, the histogram also records calibration routing (truncated
+  trials included). Telemetry only — no effect on output or speed.
+- [bug] **Invalid DECODE_TOP_K fails after the layer split, not before** (final review M6). `check_decode_top_k_value` runs in
+  `_detect_moe` (~2206), after `find_or_create_local_splitted_path` (~2022); the budget is validated at ~2013. Calling it next
+  to the budget check would fail fast. The late timing predates this branch for the int path.
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),
