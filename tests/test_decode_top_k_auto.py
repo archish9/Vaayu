@@ -127,8 +127,10 @@ def test_calibration_text_tokenizes_to_the_minimum(path):
     if not Path(path).is_dir():
         pytest.skip(f"tokenizer not on this box: {path}")
     from transformers import AutoTokenizer
-    n = len(AutoTokenizer.from_pretrained(path)(dtka.CALIB_TEXT).input_ids)
-    assert n >= dtka.MIN_CALIB_TOKENS, n
+    tok = AutoTokenizer.from_pretrained(path)
+    for name, text in dtka.CALIB_TEXTS:
+        n = len(tok(text).input_ids)
+        assert n >= dtka.MIN_CALIB_TOKENS, (name, n)
 
 
 # ── decode_mode_ppl ─────────────────────────────────────────────────────────
@@ -318,3 +320,105 @@ def test_a_top1_checkpoint_measures_nothing(tmp_path, monkeypatch):
     assert calls == []
     assert status == {"mode": "none", "value": None, "cost": None, "source": "config"}
     assert (m._decode_top_k, m._decode_top_p) == (1, None)
+
+
+# ── two calibration texts: a trial's cost is the WORSE of code and prose ─────
+#
+# Task 7's first on-device arm priced truncation on the code text alone:
+# Qwen3-Next picked top-6 at +2.26 % on code, which costs +8.97 % on row 33's
+# prose passage -- 2.6x the budget. User decision 2026-09-14: score both texts
+# and keep the safer pick. One ladder whose cost is the worse text's is that
+# rule, with no k-versus-p comparison to make.
+
+def _two_text_scorer(config_k, bases, costs):
+    """`costs` maps (k, p) -> (code_cost, prose_cost); returns one ppl per text."""
+    def score(k, p):
+        if (k, p) == (config_k, None):
+            return bases
+        return tuple(b * (1.0 + c) for b, c in zip(bases, costs[(k, p)]))
+    return score
+
+
+# Qwen3-Next: code costs from Task 7's cold arm (2026-09-14), prose costs from
+# row 33 (256 scored tokens). Prose k=7 was never measured; 0.06 stands in for
+# "over budget", which row 33's prose k=6 (+8.97 %) already implies.
+QWEN3_NEXT_TWO_TEXTS = {
+    (9, None): (-0.0081, 0.0147),
+    (8, None): (0.0055, 0.0343),
+    (7, None): (0.0153, 0.06),
+}
+TWO_TEXT_BASES = (1.9005, 8.5824)
+
+
+def test_the_worse_text_decides_the_pick():
+    out = dtka.run_ladders(10, 0.035, _two_text_scorer(10, TWO_TEXT_BASES, QWEN3_NEXT_TWO_TEXTS))
+    assert out["pick"] == {"kind": "k", "value": 8, "cost": pytest.approx(0.0343)}
+
+
+def test_each_trial_records_every_texts_cost():
+    out = dtka.run_ladders(10, 0.035, _two_text_scorer(10, TWO_TEXT_BASES, QWEN3_NEXT_TWO_TEXTS))
+    first = out["trials"][0]
+    assert first["costs"] == pytest.approx([-0.0081, 0.0147])
+    assert first["cost"] == pytest.approx(0.0147)
+    assert out["baseline_ppl"] == pytest.approx(list(TWO_TEXT_BASES))
+
+
+class _TwoTextMoE(_FakeMoE):
+    """Tokenizes the code and prose texts to different lengths, so a fake
+    perplexity can tell which text it is scoring."""
+    CODE_TOKENS = 400
+
+    def __init__(self, ckpt, prose_tokens=450, **kwargs):
+        super().__init__(ckpt, **kwargs)
+
+        def tokenize(text, return_tensors=None):
+            n = self.CODE_TOKENS if text == dtka.CALIB_TEXT else prose_tokens
+            return SimpleNamespace(input_ids=torch.zeros(1, n, dtype=torch.long))
+
+        self.tokenizer = tokenize
+
+
+def _fake_two_text_ppl(monkeypatch, config_k, bases, costs, calls):
+    def fake(model, ids, prefix_tokens=dtka.PREFIX_TOKENS, score_tokens=dtka.SCORE_TOKENS):
+        text = 0 if ids.shape[1] == _TwoTextMoE.CODE_TOKENS else 1
+        key = (model._decode_top_k, model._decode_top_p)
+        calls.append((text, key))
+        if key == (config_k, None):
+            return bases[text]
+        return bases[text] * (1.0 + costs[key][text])
+    monkeypatch.setattr(dtka, "decode_mode_ppl", fake)
+
+
+def test_resolve_scores_both_texts_and_applies_the_safer_pick(tmp_path, monkeypatch):
+    calls = []
+    _fake_two_text_ppl(monkeypatch, 10, TWO_TEXT_BASES, QWEN3_NEXT_TWO_TEXTS, calls)
+    m = _TwoTextMoE(tmp_path)
+
+    status = dtka.resolve(m, 0.035)
+
+    assert (m._decode_top_k, status["value"], status["source"]) == (8, 8, "measured")
+    assert {text for text, _ in calls} == {0, 1}
+    assert len(calls) == 2 * (1 + 3)   # baseline + k=9, 8, 7 -- each on both texts
+
+
+def test_a_too_short_prose_text_warns_naming_it(tmp_path, monkeypatch, capsys):
+    calls = []
+    _fake_two_text_ppl(monkeypatch, 10, TWO_TEXT_BASES, QWEN3_NEXT_TWO_TEXTS, calls)
+    m = _TwoTextMoE(tmp_path, prose_tokens=dtka.MIN_CALIB_TOKENS - 1)
+
+    status = dtka.resolve(m, 0.035)
+
+    assert calls == []
+    assert status["source"] == "failed"
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "prose" in out
+
+
+def test_calib_prose_is_row33s_passage():
+    """Row 33's measured prose costs are only comparable if this is that text."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / "cache_bias_ppl.py"
+    spec = importlib.util.spec_from_file_location("_cb_ppl", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert dtka.CALIB_PROSE == module.FIXED_TEXT

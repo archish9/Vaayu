@@ -280,11 +280,7 @@ lever — and the only **lossy** knob Vaayu has: output changes, greedy ids dive
 costs is a property of the model, and it is **not predictable** from expert count or top-k (a 10 % cut
 cost Qwen3-Next 1.47 % perplexity; a 12.5 % cut cost MiniMax-M2.7 6.34 %). So do not guess a number.
 
-**Set `DECODE_TOP_K = "auto"`.** On the first load of a checkpoint Vaayu measures it on a built-in code
-text: it tries fewer experts one step at a time and keeps the fastest setting whose perplexity cost
-stays within `DECODE_TOP_K_BUDGET` (default `0.035` = 3.5 %). If no fixed expert count fits, it tries a
-per-token cutoff instead, which drops an expert only on tokens where it carries little weight. The
-result is cached next to the checkpoint's split files, so every later load applies it instantly.
+**Set `DECODE_TOP_K = "auto"`.** On the first load of a checkpoint Vaayu measures it on a built-in code text and a prose passage: it tries fewer experts one step at a time and keeps the fastest setting whose perplexity cost stays within `DECODE_TOP_K_BUDGET` (default `0.035` = 3.5 %) on **both** texts. If no fixed expert count fits, it tries a per-token cutoff instead, which drops an expert only on tokens where it carries little weight. The result is cached next to the checkpoint's split files, so every later load applies it instantly.
 
 | model | pick at 3.5 % | decode tok/s | perplexity cost | one-time first load |
 |---|---|---|---|---|
@@ -292,8 +288,7 @@ result is cached next to the checkpoint's split files, so every later load appli
 | MiniMax-M2.7 | cutoff p = 0.90 | **+10.75 %** | +1.76 % | ≈ 12 min |
 | Qwen3-235B | fixed k = 7 of 8 | not measured | +3.40 % | ≈ 12 min |
 
-These were measured on a prose passage; `"auto"` measures on its code text, so the pick it prints is
-the one that applies. **While the first load measures, the server is not reachable** — like a long load.
+These were measured on the prose passage alone; `"auto"` scores its code text too and keeps the worse cost, so the pick it prints is the one that applies. **While the first load measures, the server is not reachable** — like a long load.
 Watch `server.log` for one `DECODE_TOP_K=auto:` line per trial and a final WARNING naming the pick and its
 cost; afterwards `/health` → `decode_top_k` reports it.
 

@@ -14,8 +14,8 @@ import os
 import time
 from pathlib import Path
 
-METHOD_VERSION = 1
-CALIB_TEXT_VERSION = 1
+METHOD_VERSION = 2  # 2: a trial's cost is the worse of code and prose
+CALIB_TEXT_VERSION = 2  # 2: CALIB_TEXTS gained CALIB_PROSE
 # Measurement-method constants, not model numbers (CLAUDE.md §5). 256 scored
 # steps, not 64: the 64-token window disagreed with 256 by up to 19 pp.
 PREFIX_TOKENS = 48
@@ -127,31 +127,86 @@ def run_in_priority_order(jobs: dict[str, int], limiter: TokenBucket) -> list[st
     return started
 '''
 
+# Row 33's prose passage, copied verbatim from scripts/cache_bias_ppl.py
+# (FIXED_TEXT) so row 33's measured prose costs stay comparable; engine code
+# never imports scripts/. Measured on CALIB_TEXT alone, truncation looked ~4x
+# too cheap (Qwen3-Next top-6: +2.26 % on code, +8.97 % on this passage).
+CALIB_PROSE = (
+    "The history of computing is a story of abstraction. Early machines were "
+    "programmed by rewiring physical panels, one instruction encoded as a "
+    "literal electrical path between components. The invention of stored-program "
+    "architecture collapsed that distinction: instructions became data, and data "
+    "could describe instructions. From there, each subsequent layer buried the "
+    "previous one's complexity a little further from view. Assembly language gave "
+    "names to opcodes. Compilers translated readable syntax into those opcodes "
+    "automatically. Operating systems arbitrated access to shared hardware so "
+    "programs no longer needed to know which physical device answered a request. "
+    "Virtual memory made a program believe it owned the whole address space, even "
+    "as it shared a single machine with a hundred others. Networking protocols "
+    "made distant machines look like local resources, and later, distributed "
+    "systems made whole fleets of machines look like a single coherent service. "
+    "Each abstraction traded some efficiency for a large gain in what a single "
+    "engineer could build without first mastering the layer beneath. The engineers "
+    "who built compilers understood processors. The engineers who use compilers "
+    "today mostly do not, and that ignorance is not a failure — it is the entire "
+    "point of the abstraction working correctly. Modern software engineering "
+    "extends this lineage into higher-level constructs: garbage collection frees "
+    "programmers from manual memory bookkeeping, package managers absorb the "
+    "labor of dependency resolution, and container orchestration systems abstract "
+    "away the physical topology of a data center entirely. Machine learning "
+    "systems are the newest entry in that lineage: instead of hand-writing rules "
+    "for a task, engineers now describe a loss function and a training procedure, "
+    "and the parameters that solve the task emerge from optimization rather than "
+    "explicit authorship. Large language models push this one step further — the "
+    "specification itself becomes natural language, and the system infers both "
+    "the rules and their application from context. Whether this counts as a new "
+    "layer of abstraction or a fundamentally different mode of computation is "
+    "still being argued, but the historical pattern is familiar: what once "
+    "required deep specialist knowledge is being made accessible through an "
+    "interface that hides the machinery beneath it, at some cost in predictability "
+    "and some gain in reach."
+)
+
+# Every text a trial is scored on. A trial's cost is the WORST of them.
+CALIB_TEXTS = (("code", CALIB_TEXT), ("prose", CALIB_PROSE))
+
 
 def _log(msg: str) -> None:
     print(f"[Vaayu-MoE] DECODE_TOP_K=auto: {msg}", flush=True)
 
 
+def _as_tuple(ppl):
+    return tuple(ppl) if isinstance(ppl, (tuple, list)) else (ppl,)
+
+
+def _fmt(values):
+    return "/".join(f"{v:.4f}" for v in values)
+
+
 def run_ladders(config_k, budget, score):
     """Fixed k first; the cutoff ladder runs only if no fixed k fits.
 
-    `score(k, p)` returns perplexity. Each ladder stops at its first trial over
-    budget -- cost is assumed to rise as k or p falls, which held on all three
-    models measured; if a model violates it, the ladder stops early, erring
-    toward LESS clamping."""
+    `score(k, p)` returns perplexity on each calibration text -- a float for one
+    text, a tuple for several. A trial's cost is the WORST text's relative
+    perplexity increase, so a pick must fit the budget on every text. Each
+    ladder stops at its first trial over budget -- cost is assumed to rise as k
+    or p falls, which held on all three models measured; if a model violates
+    it, the ladder stops early, erring toward LESS clamping."""
     t0 = time.perf_counter()
-    baseline = score(config_k, None)
-    _log(f"baseline top-{config_k} ppl={baseline:.4f} ({time.perf_counter() - t0:.1f}s)")
+    baseline = _as_tuple(score(config_k, None))
+    _log(f"baseline top-{config_k} ppl={_fmt(baseline)} ({time.perf_counter() - t0:.1f}s)")
     trials = []
 
     def trial(kind, value, k, p):
         t = time.perf_counter()
-        ppl = score(k, p)
-        cost = ppl / baseline - 1.0
-        rec = {"kind": kind, "value": value, "ppl": ppl, "cost": cost,
-               "seconds": time.perf_counter() - t}
+        ppl = _as_tuple(score(k, p))
+        costs = [q / b - 1.0 for q, b in zip(ppl, baseline)]
+        cost = max(costs)
+        rec = {"kind": kind, "value": value, "ppl": list(ppl), "costs": costs,
+               "cost": cost, "seconds": time.perf_counter() - t}
         trials.append(rec)
-        _log(f"{kind}={value} ppl={ppl:.4f} cost={cost * 100:+.2f} % "
+        per_text = "/".join(f"{c * 100:+.2f}" for c in costs)
+        _log(f"{kind}={value} ppl={_fmt(ppl)} cost={per_text} % worst {cost * 100:+.2f} % "
              f"({'in' if cost <= budget else 'OVER'} budget {budget * 100:.1f} %, "
              f"{rec['seconds']:.1f}s)")
         return cost
@@ -171,7 +226,7 @@ def run_ladders(config_k, budget, score):
             pick = {"kind": "p", "value": p, "cost": cost}
     if pick is None:
         pick = {"kind": "none", "value": None, "cost": None}
-    return {"baseline_ppl": baseline, "trials": trials, "pick": pick}
+    return {"baseline_ppl": list(baseline), "trials": trials, "pick": pick}
 
 
 def fingerprint(config_json, checkpoint_path):
@@ -273,15 +328,15 @@ def _announce(pick, config_k):
             else f"routing-mass cutoff p={pick['value']:.2f}")
     _log(f"WARNING: applying {what}. Output is DEGRADED by design (greedy ids will "
          f"differ); measured cost {pick['cost'] * 100:+.2f} % perplexity on the "
-         f"calibration text")
+         f"worse of the code and prose calibration texts")
 
 
-def _scorer(model, ids):
+def _scorer(model, ids_list):
     def score(k, p):
         saved = (model._decode_top_k, model._decode_top_p)
         model._decode_top_k, model._decode_top_p = k, p
         try:
-            return decode_mode_ppl(model, ids)
+            return tuple(decode_mode_ppl(model, ids) for ids in ids_list)
         finally:
             model._decode_top_k, model._decode_top_p = saved
     return score
@@ -298,13 +353,15 @@ def resolve(model, budget):
         _log(f"the checkpoint routes top-{config_k}; there is nothing to truncate, "
              f"so auto does nothing (lossless)")
         return {"mode": "none", "value": None, "cost": None, "source": "config"}
-    ids = model.tokenizer(CALIB_TEXT, return_tensors="pt").input_ids
-    if ids.shape[1] < MIN_CALIB_TOKENS:
-        _log(f"WARNING: the calibration text is {ids.shape[1]} tokens for this "
-             f"tokenizer, {MIN_CALIB_TOKENS} are needed; auto skipped, running at "
-             f"the checkpoint's own top-{config_k}")
-        return dict(_FAILED)
-    ids = ids.to(model.running_device)
+    ids_list = []
+    for name, text in CALIB_TEXTS:
+        ids = model.tokenizer(text, return_tensors="pt").input_ids
+        if ids.shape[1] < MIN_CALIB_TOKENS:
+            _log(f"WARNING: the {name} calibration text is {ids.shape[1]} tokens for "
+                 f"this tokenizer, {MIN_CALIB_TOKENS} are needed; auto skipped, running "
+                 f"at the checkpoint's own top-{config_k}")
+            return dict(_FAILED)
+        ids_list.append(ids.to(model.running_device))
 
     key = cache_key(budget, fingerprint(model.config.to_json_string(), model.checkpoint_path))
     cached = read_cache(model.checkpoint_path, key)
@@ -317,7 +374,7 @@ def resolve(model, budget):
     _log(f"no cached pick for this checkpoint at budget {budget * 100:.1f} %; "
          f"measuring now -- one-time, the server is not reachable until it finishes")
     try:
-        out = run_ladders(config_k, budget, _scorer(model, ids))
+        out = run_ladders(config_k, budget, _scorer(model, ids_list))
     except Exception as e:  # noqa: BLE001 -- any failure must degrade loudly, never crash the load
         _apply(model, _NONE)
         _log(f"WARNING: measurement failed ({type(e).__name__}: {e}); running at the "
