@@ -2997,42 +2997,48 @@ reproduced across a reboot.
   ledger commit until the plan lands).
   **PLAN WRITTEN 2026-09-14:** [`docs/superpowers/plans/2026-09-14-decode-top-k-auto.md`](docs/superpowers/plans/2026-09-14-decode-top-k-auto.md)
   (gitignored — the checklist below is the durable copy; the plan holds the exact code).
-  - [ ] **Task 1 — cutoff mode in `truncate_top_k`** (`vaayu/moe_patch.py`): `truncate_top_k(w, i, k, p=None)` keeps the
+  - [x] **Task 1 — cutoff mode in `truncate_top_k`** (`vaayu/moe_patch.py`): `truncate_top_k(w, i, k, p=None)` keeps the
     smallest set of slots carrying ≥ p of the weight and re-points dropped slots at the row's top-1 expert (found by
     weight) with weight 0; `_decode_limits(ref) -> (k, p)` replaces `_decode_k_for` at the 3 forward call sites.
-    - [ ] failing tests: cutoff on sorted and `sorted=False` routing, top-1 always kept, identity when off; all three
+    - [x] failing tests: cutoff on sorted and `sorted=False` routing, top-1 always kept, identity when off; all three
       routing owners through real forwards with `p=0.01` compute exactly 1 expert, prefill untouched
-    - [ ] implement; `grep _decode_k_for` returns nothing
-    - [ ] `tests/test_decode_top_k.py` + `tests/test_moe_patch.py` green; commit
-  - [ ] **Task 2 — `vaayu/decode_top_k_auto.py` core:** constants (prefill 48, score 256, min 305 tokens, cutoff steps
+    - [x] implement; `grep _decode_k_for` returns nothing
+    - [x] `tests/test_decode_top_k.py` + `tests/test_moe_patch.py` green; commit
+    - done 2026-09-14: commit `edbe4dd`, task review clean (2 minors deferred)
+  - [x] **Task 2 — `vaayu/decode_top_k_auto.py` core:** constants (prefill 48, score 256, min 305 tokens, cutoff steps
     95→50), original code `CALIB_TEXT`, `run_ladders` (fixed k first), `fingerprint`, `cache_key`, `read_cache`,
     `write_cache` (atomic temp + `os.replace`).
-    - [ ] failing tests: picks for Qwen3-Next-, MiniMax- and Qwen3-235B-shaped costs, nothing-in-budget, cost == budget,
+    - [x] failing tests: picks for Qwen3-Next-, MiniMax- and Qwen3-235B-shaped costs, nothing-in-budget, cost == budget,
       k floor at 1; cache round trip / key-field miss / corrupt / failed write leaves nothing / fingerprint; text length
       in chars and in tokens on local tokenizers
-    - [ ] implement; green; commit
-  - [ ] **Task 3 — `decode_mode_ppl` + `resolve(model, budget)`:** cache hit → apply; miss → measure, write, apply;
+    - [x] implement; green; commit
+    - done 2026-09-14: commit `5d93f11`, task review clean (2 minors promoted to Task 3: damaged-cache guard, top-1 guard)
+  - [x] **Task 3 — `decode_mode_ppl` + `resolve(model, budget)`:** cache hit → apply; miss → measure, write, apply;
     every failure loud and lossless (`source: "failed"`, no cache written).
-    - [ ] failing tests (uniform-logits LM; fake MoE model): cold, warm, budget change, cutoff pick, none,
+    - [x] failing tests (uniform-logits LM; fake MoE model): cold, warm, budget change, cutoff pick, none,
       measurement raises, too-short text, unwritable cache
-    - [ ] implement; green; commit
-  - [ ] **Task 4 — engine wiring** (`vaayu/vaayu_base.py`): `resolve_decode_top_k` accepts `"auto"` and rejects
+    - [x] implement; green; commit
+    - done 2026-09-14: commit `ce9c770`, task review clean (+ damaged-cache and top-1 guards)
+  - [x] **Task 4 — engine wiring** (`vaayu/vaayu_base.py`): `resolve_decode_top_k` accepts `"auto"` and rejects
     anything not None/int; `validate_decode_top_k_budget`; `_detect_moe` records status and notes;
     `_resolve_decode_top_k_auto()` is the LAST statement of `__init__`; `decode_top_k_status()`.
-    - [ ] failing tests: resolution, invalid values, budget bounds, status, explicit-int budget note, dense no-op,
+    - [x] failing tests: resolution, invalid values, budget bounds, status, explicit-int budget note, dense no-op,
       hook runs only for auto, hook is the last statement of `__init__`
-    - [ ] implement; green (no new `__init__` parameter yet, so §8 reachability unaffected); commit
-  - [ ] **Task 5 — server, §8 in one commit:** `decode_top_k_budget` engine parameter (validated); `DECODE_TOP_K`
+    - [x] implement; green (no new `__init__` parameter yet, so §8 reachability unaffected); commit
+    - done 2026-09-14: commits `fdd6199` + review fix `6ace30c` (review found the dense branch never validated DECODE_TOP_K — now `check_decode_top_k_value` runs on every checkpoint)
+  - [x] **Task 5 — server, §8 in one commit:** `decode_top_k_budget` engine parameter (validated); `DECODE_TOP_K`
     comment + `DECODE_TOP_K_BUDGET = 0.035` in `config.py`; `ServerConfig` fields + plumbing in `app.py` and
     `__main__.py`; `/health` `decode_top_k` (hasattr fallback); `EngineHandle.decode_top_k_status()`; README rows.
-    - [ ] failing tests: reachability `SERVER_EXPOSED`, `/health` field and fallback, forwarder, parameter default,
+    - [x] failing tests: reachability `SERVER_EXPOSED`, `/health` field and fallback, forwarder, parameter default,
       knob equals engine default
-    - [ ] implement; green; commit
-  - [ ] **Task 6 — user docs:** `documentation/server.md` §3 rows for `DECODE_TOP_K`, `DECODE_TOP_K_BUDGET`,
+    - [x] implement; green; commit
+    - done 2026-09-14: commit `51a7388`, task review clean; full suite 2181 passed, 15 skipped (2116 before the branch)
+  - [x] **Task 6 — user docs:** `documentation/server.md` §3 rows for `DECODE_TOP_K`, `DECODE_TOP_K_BUDGET`,
     `KEEP_AWAKE` (with the server-measured +23.1 %, not the README's stale "pending"), `PIN_ENGINE_THREADS`;
     `documentation/TUNING.md` §5c.
-    - [ ] failing test `tests/test_docs_speed_knobs.py`; implement; green; commit
-  - [ ] **Task 7 — on-device acceptance.** The probe `plans/probes/row26_decode.py` is gitignored and hard-codes the
+    - [x] failing test `tests/test_docs_speed_knobs.py`; implement; green; commit
+    - done 2026-09-14: commit `ea0cdc2`, task review clean
+  - [~] **Task 7 — on-device acceptance.** The probe `plans/probes/row26_decode.py` is gitignored and hard-codes the
     project root on `sys.path`, so it gains a `VAAYU_ROOT` override, env-gated `DECODE_TOP_K` kwargs and a
     `vaayu imported from` proof line; the smoke gate gains `SERVER_DECODE_TOP_K`.
     - [ ] full CPU suite green
@@ -3042,13 +3048,58 @@ reproduced across a reboot.
     - [ ] Qwen3-235B cold auto pick ≤ 3.5 %; knob-None no-op vs base on all three forwards (tok/s within spread, ids identical)
     - [ ] server gate on Qwen3-Next with `SERVER_DECODE_TOP_K=auto`; `/health` shows the cached pick
     - [ ] remove worktree; RESULTS doc; close this bullet with numbers and the §8 answers; close the server.md `[bug]`; commit
-- [bug] **`documentation/server.md` §3 "Speed" table is missing three shipped knobs** (found 2026-09-14 during the
+  - **Method-1 acceptance run 2026-09-14 (code calibration text only) — SUPERSEDED:** full CPU suite
+    2186 passed, 15 skipped. Baseline worktree `/tmp/vaayu-base` at `1955fbe` (parent of `edbe4dd`),
+    every base log names `/tmp/vaayu-base/vaayu/__init__.py` — valid. **Picks (code text only,
+    3.5 % budget): Qwen3-Next k=6 (cost +2.26 %, ladder k=9 −0.81 %/k=8 +0.55 %/k=7 +1.53 %/k=6
+    +2.26 %/k=5 +3.76 % OVER); MiniMax k=6 (cost +1.19 %, ladder k=7 +1.87 %/k=6 +1.19 %/k=5 +5.11 %
+    OVER — fixed k stayed in budget, no cutoff ladder ran); Qwen3-235B k=6 (cost +2.37 %, ladder k=7
+    +0.93 %/k=6 +2.37 %/k=5 +5.27 % OVER).** None match the design-doc prose-passage guesses
+    (Qwen3-Next k=8, MiniMax p=0.90, Qwen3-235B k=7) — recorded as measured. First-load measurement
+    times: Qwen3-Next 261.9s, MiniMax 578.1s, Qwen3-235B 975.4s (all = trial-second sum + baseline
+    load, confirmed against the probe's own `loaded in` line). Qwen3-Next warm load: cache hit, same
+    pick k=6, `source: cache`, no trial lines. **Throughput (U1/U2 tok/s, mean/spread): Qwen3-Next
+    base 6.65345/0.0049 → auto(k=6) 10.2006/0.0324, gain 3.54715 > 2×0.0324=0.0648 PASS, ids
+    identical; MiniMax base 1.80265/0.0021 → auto(k=6) 2.2914/0.0018, gain 0.48875 > 2×0.0021=0.0042
+    PASS, ids identical.** Knob-`None` no-op: Qwen3-Next off vs base 6.57815 vs 6.65345, diff
+    0.0753 ≤ 2×0.2867=0.5734 PASS, ids identical; MiniMax off vs base 1.79485 vs 1.80265, diff
+    0.0078 ≤ 2×0.0131=0.0262 PASS, ids identical; **Qwen3-235B off vs base (single-U1 samples, no
+    spread) 1.1137 vs 1.1537 tok/s, diff 3.47-3.59 % — FAILS the brief's ≤2 % bound (ids ARE
+    identical); a stop-rule trigger, not re-run** — likely single-sample GPU noise on the largest
+    model (no U2 replicate to gauge spread, unlike the two models above). Server gate:
+    `SERVER_DECODE_TOP_K=auto` on Qwen3-Next, 9 passed, `/health.decode_top_k` =
+    `{mode: k, value: 6, cost: 0.0226, source: cache}` (warm from Step 4's cache) — PASS. §8: (1)
+    knob — two, `decode_top_k` + `decode_top_k_budget`; (2) plumbed — `vaayu/server/app.py` +
+    `vaayu/server/__main__.py`; (3) reachable at N=1 — yes; (4) reachable now — yes, first load of
+    each checkpoint is slower (up to 975.4s measured) and the server is unreachable while that
+    one-time measurement runs; every later load of the same checkpoint+budget is a cache hit.
+    **User decision 2026-09-14: the code text priced truncation ~4x too cheaply (Qwen3-Next top-6 =
+    +2.26 % on code but +8.97 % on the row-33 prose passage), so auto will score code AND prose and
+    keep the worse cost (plan Tasks 8-9); these picks are not the shipped behaviour.** Full logs:
+    `docs/probes/row33-auto-*.log`; full RESULTS (gitignored, labeled "method 1 (code text only),
+    superseded"): `docs/2026-09-14-row33-decode-top-k-auto-RESULTS.md`.
+  - [ ] **Task 8 — measure BOTH calibration texts, keep the safer pick (user decision 2026-09-14).** Task 7's first
+    on-device arm showed the code text prices truncation ~4× too cheaply: Qwen3-Next baseline ppl **1.90** on it vs 8.58
+    on the row-33 prose passage; k=9 measured **−0.81 %** (noise ~±1 % against a 3.5 % budget); the pick **k=6** (+2.26 %
+    on code) costs **+8.97 % on prose** — 2.6× the budget. Fix: one ladder whose trial cost is the WORSE of code and
+    prose (row-33 passage copied verbatim as `CALIB_PROSE`); `METHOD_VERSION` and `CALIB_TEXT_VERSION` → 2 so method-1
+    caches re-measure. On today's numbers Qwen3-Next picks **k=8** (+0.55 % code, +3.43 % prose). First load ~2×
+    (one-time, cached). Task 7's `auto` picks are recorded as superseded method-1 evidence.
+    - [ ] failing tests: worst-text ladder picks k=8 on Qwen3-Next's measured code+prose costs; per-text costs recorded;
+      resolve measures both texts; a too-short prose text warns naming it; `CALIB_PROSE` equals the row-33 passage and
+      tokenizes to ≥ 305 tokens
+    - [ ] implement (+ TUNING.md wording); green; review; commit
+  - [ ] **Task 9 — re-run on-device acceptance with method 2:** delete caches; Qwen3-Next cold + warm, MiniMax cold,
+    Qwen3-235B cold; throughput vs same-day base arms (re-run the base arms if not the same day as Task 7); server gate
+    with `"auto"`; RESULTS doc; close row 33's `auto` bullet
+- [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),
   **`KEEP_AWAKE`** or **`PIN_ENGINE_THREADS`** (row 27). `DECODE_TOP_K` is closed by the auto work's docs step (spec §8).
   **User decision 2026-09-14: all three are FOLDED INTO the auto work's docs task** (spec §8/§14 updated) —
   one `server.md` edit adds `DECODE_TOP_K`, `DECODE_TOP_K_BUDGET`, `KEEP_AWAKE`, `PIN_ENGINE_THREADS`, the last two
-  in `vaayu/server/README.md`'s wording. Closes when that task lands.
+  in `vaayu/server/README.md`'s wording. Task 6 (commit `ea0cdc2`, "docs: DECODE_TOP_K auto in TUNING.md;
+  server.md rows for four speed knobs") added all four rows to `documentation/server.md` §3.
 - [bug] **`vaayu/server/README.md`'s `KEEP_AWAKE` row carries a STALE claim** (found 2026-09-14 while planning the
   server.md rows): it ends "**The server-level A/B is pending (todo.md row 27); the figures above are in-process**", but
   row 27 CLOSED 2026-09-12 with the server A/B done — **+23.1 % decode tok/s on Qwen3-235B through the server** (0.9229 →

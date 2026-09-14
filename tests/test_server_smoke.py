@@ -87,8 +87,13 @@ def client(uncaptured_stdout):
     recognising the directory as a local checkpoint and fell through to a
     HuggingFace download. A gate may not consume the thing it is testing.
     """
+    # SERVER_DECODE_TOP_K=auto (or an int) runs this gate with the decode
+    # expert budget on; unset keeps the server default (None).
+    _dtk = os.environ.get("SERVER_DECODE_TOP_K")
     cfg = ServerConfig(model_path=CKPT, served_model_name="vaayu-smoke",
-                       delete_original=False)
+                       delete_original=False,
+                       decode_top_k=(None if not _dtk
+                                     else "auto" if _dtk == "auto" else int(_dtk)))
     with TestClient(create_app(cfg)) as c:
         yield c
 
@@ -97,6 +102,7 @@ def test_health(client):
     h = client.get("/health").json()
     print(json.dumps(h, indent=2))
     assert h["status"] == "ready"
+    assert "decode_top_k" in h, "the /health decode_top_k field is missing"
     # The derived window, NOT a literal: only that it is a real number and
     # bigger than the CPU fallback this server warns about.
     assert h["max_seq_len"] > 512, f"max_seq_len={h['max_seq_len']}"
