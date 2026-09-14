@@ -350,3 +350,31 @@ def test_geometry_is_sized_from_the_decode_k(tmp_path):
     m._build_moe_geometry()
 
     assert m._moe_geometry["top_k"] == DECODE_K
+
+
+# ── the lossy knob has to announce itself ───────────────────────────────────
+#
+# DECODE_TOP_K is the only knob in vaayu/server/config.py whose wrong value
+# fails SILENTLY: no error, no crash, just quietly worse output. Every other
+# default there preserves the model's output exactly. CLAUDE.md §5 asks for a
+# warning rather than a silent degradation, and a degradation the operator
+# opted into still needs saying -- they cannot know THIS checkpoint's cost
+# unless they measured it, and the two models measured here differ by 4x.
+
+
+def test_an_active_clamp_warns_that_output_is_degraded(capsys):
+    resolve_decode_top_k(10, 6)
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "DECODE_TOP_K" in out
+
+
+@pytest.mark.parametrize("requested", [None, 10])
+def test_no_warning_when_the_clamp_is_inert(capsys, requested):
+    """None is the feature off, and k == the checkpoint's own value routes
+    exactly what it always routed. Neither degrades anything, so neither may
+    cry wolf."""
+    resolve_decode_top_k(10, requested)
+
+    assert "WARNING" not in capsys.readouterr().out

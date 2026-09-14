@@ -105,7 +105,19 @@ def resolve_decode_top_k(config_top_k: int, requested) -> int:
               f"checkpoint's num_experts_per_tok={config_top_k}; using "
               f"{config_top_k}")
         return config_top_k
-    return max(1, requested)
+    requested = max(1, requested)
+    if requested < config_top_k:
+        # The ONLY knob in vaayu/server/config.py whose wrong value fails
+        # silently -- no error, just quietly worse output. Say so once, at
+        # load. The measured cost differs 4x between the two MoE models tested
+        # (row 33), so nobody can know THIS checkpoint's cost without measuring
+        # it on THIS checkpoint.
+        print(f"[Vaayu-MoE] WARNING: DECODE_TOP_K={requested} routes fewer "
+              f"experts than the checkpoint's {config_top_k}. Output is "
+              f"DEGRADED by design (greedy ids will differ). The cost on this "
+              f"checkpoint is unknown unless you measured it -- "
+              f"scripts/decode_top_k_ppl.py")
+    return requested
 
 
 def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_experts):
