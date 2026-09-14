@@ -93,6 +93,15 @@ def _auto_session_id(token_ids: list) -> str:
 DEFAULT_DECODE_TOP_K_BUDGET = 0.035
 
 
+def check_decode_top_k_value(requested) -> None:
+    """DECODE_TOP_K must be None, an int, or "auto" -- on EVERY checkpoint, dense
+    included, so a bad value fails the same way whatever the architecture."""
+    if requested is None or requested == "auto":
+        return
+    if not isinstance(requested, int) or isinstance(requested, bool):
+        raise ValueError(f'DECODE_TOP_K must be None, an int, or "auto"; got {requested!r}')
+
+
 def validate_decode_top_k_budget(budget) -> float:
     """DECODE_TOP_K_BUDGET: the perplexity cost DECODE_TOP_K="auto" may spend."""
     budget = float(budget)
@@ -110,10 +119,9 @@ def resolve_decode_top_k(config_top_k: int, requested) -> int:
     checkpoint's own value here. A request is never honoured ABOVE it: the
     router only ever selected `config_top_k` experts. Clamping is a real limit,
     so it WARNS rather than degrading silently (CLAUDE.md §5)."""
+    check_decode_top_k_value(requested)
     if requested is None or requested == "auto":
         return config_top_k
-    if not isinstance(requested, int) or isinstance(requested, bool):
-        raise ValueError(f'DECODE_TOP_K must be None, an int, or "auto"; got {requested!r}')
     if requested > config_top_k:
         print(f"[Vaayu-MoE] WARNING: DECODE_TOP_K={requested} exceeds the "
               f"checkpoint's num_experts_per_tok={config_top_k}; using "
@@ -3428,6 +3436,7 @@ class VaayuBaseModel(GenerationMixin):
             self._decode_top_k_auto = False
             self._decode_top_k_status = {"mode": "off", "value": None, "cost": None,
                                          "source": "config"}
+            check_decode_top_k_value(getattr(self, "_requested_decode_top_k", None))
             if getattr(self, "_requested_decode_top_k", None) == "auto":
                 print('[Vaayu] note: DECODE_TOP_K="auto" ignored -- not an MoE checkpoint')
 

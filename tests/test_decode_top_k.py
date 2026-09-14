@@ -599,3 +599,15 @@ def test_the_hook_is_the_last_statement_of_init():
     import inspect
     lines = inspect.getsource(VaayuBaseModel.__init__).rstrip().splitlines()
     assert lines[-1].strip() == "self._resolve_decode_top_k_auto()"
+
+
+@pytest.mark.parametrize("bad", ["fast", "8", True, 7.5])
+def test_an_unknown_decode_top_k_value_raises_on_a_dense_checkpoint_too(bad):
+    """The load-time ValueError must not depend on the architecture: a dense
+    checkpoint never reaches resolve_decode_top_k, so it validates on its own."""
+    m = VaayuBaseModel.__new__(VaayuBaseModel)
+    m.config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    m._requested_decode_top_k = bad
+    m._decode_top_k_budget = DEFAULT_DECODE_TOP_K_BUDGET
+    with pytest.raises(ValueError, match="auto"):
+        m._detect_moe()
