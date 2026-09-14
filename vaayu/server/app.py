@@ -84,7 +84,9 @@ class ServerConfig:
     # Route this many experts per token at DECODE instead of the checkpoint's
     # own num_experts_per_tok. None = the checkpoint's value. The only lossy
     # knob here: it changes the model's output by design.
-    decode_top_k: int | None = None
+    decode_top_k: int | str | None = None
+    # Perplexity cost DECODE_TOP_K="auto" may spend (0.035 = 3.5 %).
+    decode_top_k_budget: float = 0.035
     # Expert routing/eviction telemetry for a triage bundle. MoE-only by
     # construction. Off because its decode cost is unmeasured.
     enable_expert_usage: bool = False
@@ -419,6 +421,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                     keep_awake=config.keep_awake,
                     pin_engine_threads=config.pin_engine_threads,
                     decode_top_k=config.decode_top_k,
+                    decode_top_k_budget=config.decode_top_k_budget,
                 )
                 print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                       f"derived max_seq_len={model.max_seq_len}")
@@ -541,6 +544,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # dispatcher now (P10), so e.depth/_inflight never moves.
             "queued": app.state.scheduler.depth,
             "prefix_cache": e.prefix_stats(),
+            # The active decode expert budget, including DECODE_TOP_K="auto"'s
+            # measured pick and its cost. hasattr: /health must never be the
+            # thing that fails, and an injected engine may lack the accessor.
+            "decode_top_k": (e.decode_top_k_status() if hasattr(e, "decode_top_k_status")
+                             else {"mode": "off", "value": None, "cost": None,
+                                   "source": "config"}),
             # Batch formation, split by WHICH gate refused. Gate 1 (the
             # scheduler's own plan_batch pre-check) narrows a would-be batch to
             # one silently -- it prints nothing -- so without these an operator,

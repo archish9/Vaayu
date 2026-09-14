@@ -1919,7 +1919,7 @@ class VaayuBaseModel(GenerationMixin):
                  kv_persist_dir=None, kv_persist_sync=False,
                  enable_expert_usage=False, ram_cache_budget=None,
                  prefix_sessions=3, keep_awake="auto", pin_engine_threads=True,
-                 decode_top_k=None):
+                 decode_top_k=None, decode_top_k_budget=DEFAULT_DECODE_TOP_K_BUDGET):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -2010,7 +2010,7 @@ class VaayuBaseModel(GenerationMixin):
         # Read by _detect_moe() below, which resolves it against the
         # checkpoint's own num_experts_per_tok (row 33 / T2).
         self._requested_decode_top_k = decode_top_k
-        self._decode_top_k_budget = DEFAULT_DECODE_TOP_K_BUDGET
+        self._decode_top_k_budget = validate_decode_top_k_budget(decode_top_k_budget)
         self._decode_top_p = None
 
         # Save parameters

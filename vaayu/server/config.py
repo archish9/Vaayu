@@ -284,23 +284,35 @@ KEEP_AWAKE = "auto"
 # Skipped automatically on a CPU with no P/E split.
 PIN_ENGINE_THREADS = True
 
-# Decode-time expert budget: route this many experts per token instead of the
-# checkpoint's own `num_experts_per_tok`. None = the checkpoint's value (off).
-# Prefill is never truncated -- it routes ~every expert anyway (224.23 per
-# layer per chunk, measured), so truncating it costs prompt quality and buys
-# nearly nothing.
+# Decode-time expert budget: route fewer experts per token than the checkpoint's
+# own `num_experts_per_tok`. Prefill is never truncated -- it routes ~every
+# expert anyway (224.23 per layer per chunk, measured).
 #
-# This is the one knob here that is LOSSY. Every other default in this file
-# preserves the model's output exactly; this one CHANGES it. Greedy ids diverge
-# by construction -- that is the feature, not a bug.
+#   None    off (the checkpoint's own value). Lossless.
+#   <int>   a fixed clamp, applied as given.
+#   "auto"  measure THIS checkpoint once at first load and apply the fastest
+#           setting whose perplexity cost stays within DECODE_TOP_K_BUDGET:
+#           a fixed k if one fits, otherwise a per-token routing-mass cutoff.
+#           Cached per checkpoint; later loads apply it instantly. The first
+#           load of each checkpoint is slower (~3.5 min Qwen3-Next-80B,
+#           ~12 min Qwen3-235B / MiniMax-M2.7) and no endpoint answers while it
+#           measures.
 #
-# MEASURED COST OF GETTING IT WRONG: see vaayu/server/README.md. Speed rises
-# roughly with the slot count removed; quality falls with it.
+# This is the one knob here that is LOSSY: every other default preserves the
+# model's output exactly. Greedy ids diverge by construction.
 #
-# A value ABOVE the checkpoint's own top_k is clamped down with a warning: the
-# router only ever selected that many experts, so there is nothing more to
-# route.
+# MEASURED COST OF GETTING IT WRONG: the safe value is per MODEL, not derivable
+# from geometry -- a 10 % slot cut cost Qwen3-Next 1.47 % perplexity, a 12.5 %
+# cut cost MiniMax 6.34 %. Guessing an int can badly degrade one model and help
+# another; "auto" measures instead. See vaayu/server/README.md.
 DECODE_TOP_K = None
+
+# The perplexity cost DECODE_TOP_K="auto" may spend, as a fraction.
+# Measured picks at 0.035: Qwen3-Next-80B int4 -> fixed k=8, +22.2 % tok/s for
+# +3.43 %; MiniMax-M2.7 -> cutoff p=0.90, +10.75 % for +1.76 % (no fixed k fits).
+# At 0.02: Qwen3-Next -> k=9, +17.0 % for +1.47 %. Changing it re-measures on
+# the next load. Ignored, with a note, for an explicit int.
+DECODE_TOP_K_BUDGET = 0.035
 
 # --------------------------------------------------------------------------
 # Engine parameters deliberately NOT exposed here (CLAUDE.md section 8 asks

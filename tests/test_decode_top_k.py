@@ -611,3 +611,14 @@ def test_an_unknown_decode_top_k_value_raises_on_a_dense_checkpoint_too(bad):
     m._decode_top_k_budget = DEFAULT_DECODE_TOP_K_BUDGET
     with pytest.raises(ValueError, match="auto"):
         m._detect_moe()
+
+
+def test_the_engine_budget_parameter_defaults_to_the_documented_value():
+    import inspect
+    param = inspect.signature(VaayuBaseModel.__init__).parameters["decode_top_k_budget"]
+    assert param.default == DEFAULT_DECODE_TOP_K_BUDGET
+
+
+def test_the_server_budget_knob_matches_the_engine_default():
+    from vaayu.server import config
+    assert config.DECODE_TOP_K_BUDGET == DEFAULT_DECODE_TOP_K_BUDGET

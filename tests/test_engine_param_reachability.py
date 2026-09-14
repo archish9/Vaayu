@@ -48,6 +48,7 @@ SERVER_EXPOSED = {
     "keep_awake",
     "pin_engine_threads",
     "decode_top_k",
+    "decode_top_k_budget",
 }
 
 # Declined on purpose. The reason is the deliverable -- §8 requires the decision

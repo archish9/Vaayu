@@ -684,3 +684,29 @@ def test_health_reports_the_batch_formation_counters():
     assert batch == {"max_batch_size": 2, "batching_enabled": sched.batching_enabled,
                      "batches_run": 3, "gate1_refused": 5, "gate2_refused": 1,
                      "formation_attempts": 0}
+
+
+from types import SimpleNamespace
+
+
+def test_health_reports_the_decode_top_k_pick():
+    eng = FakeEngine()
+    eng.decode_top_k_status = lambda: {"mode": "k", "value": 8, "cost": 0.0343,
+                                       "source": "cache"}
+    body = _client(eng).get("/health").json()
+    assert body["decode_top_k"] == {"mode": "k", "value": 8, "cost": 0.0343,
+                                    "source": "cache"}
+
+
+def test_health_survives_an_engine_without_the_decode_top_k_accessor():
+    """/health must never be the thing that fails."""
+    body = _client(FakeEngine()).get("/health").json()
+    assert body["decode_top_k"]["mode"] == "off"
+
+
+def test_engine_handle_forwards_decode_top_k_status():
+    from vaayu.server.engine import EngineHandle
+    model = SimpleNamespace(decode_top_k_status=lambda: {
+        "mode": "p", "value": 0.9, "cost": 0.0176, "source": "measured"})
+    assert EngineHandle.decode_top_k_status(SimpleNamespace(model=model))["mode"] == "p"
+    assert EngineHandle.decode_top_k_status(SimpleNamespace(model=object()))["mode"] == "off"

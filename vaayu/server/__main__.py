@@ -42,6 +42,7 @@ def main() -> int:
         keep_awake=config.KEEP_AWAKE,
         pin_engine_threads=config.PIN_ENGINE_THREADS,
         decode_top_k=config.DECODE_TOP_K,
+        decode_top_k_budget=config.DECODE_TOP_K_BUDGET,
         delete_original=config.DELETE_ORIGINAL,
         log_dir=config.LOG_DIR, capture_stdio=config.CAPTURE_STDIO,
         log_rotate_mb=config.LOG_ROTATE_MB,

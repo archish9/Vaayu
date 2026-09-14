@@ -251,6 +251,13 @@ class EngineHandle:
             thread.join()
             self._live_thread = None
 
+    def decode_top_k_status(self) -> dict:
+        """The active decode expert budget (DECODE_TOP_K), for /health."""
+        fn = getattr(self.model, "decode_top_k_status", None)
+        if not callable(fn):
+            return {"mode": "off", "value": None, "cost": None, "source": "config"}
+        return fn()
+
     def prefix_stats(self) -> str:
         """One grep-able line from the prefix pool, or a note that it is off.
 
