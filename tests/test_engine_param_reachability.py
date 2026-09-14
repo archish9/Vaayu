@@ -47,6 +47,7 @@ SERVER_EXPOSED = {
     "enable_expert_usage",
     "keep_awake",
     "pin_engine_threads",
+    "decode_top_k",
 }
 
 # Declined on purpose. The reason is the deliverable -- §8 requires the decision

@@ -284,6 +284,24 @@ KEEP_AWAKE = "auto"
 # Skipped automatically on a CPU with no P/E split.
 PIN_ENGINE_THREADS = True
 
+# Decode-time expert budget: route this many experts per token instead of the
+# checkpoint's own `num_experts_per_tok`. None = the checkpoint's value (off).
+# Prefill is never truncated -- it routes ~every expert anyway (224.23 per
+# layer per chunk, measured), so truncating it costs prompt quality and buys
+# nearly nothing.
+#
+# This is the one knob here that is LOSSY. Every other default in this file
+# preserves the model's output exactly; this one CHANGES it. Greedy ids diverge
+# by construction -- that is the feature, not a bug.
+#
+# MEASURED COST OF GETTING IT WRONG: see vaayu/server/README.md. Speed rises
+# roughly with the slot count removed; quality falls with it.
+#
+# A value ABOVE the checkpoint's own top_k is clamped down with a warning: the
+# router only ever selected that many experts, so there is nothing more to
+# route.
+DECODE_TOP_K = None
+
 # --------------------------------------------------------------------------
 # Engine parameters deliberately NOT exposed here (CLAUDE.md section 8 asks
 # that "no knob" be a STATED decision, not a silence). The suite enforces this

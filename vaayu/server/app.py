@@ -81,6 +81,10 @@ class ServerConfig:
     # Pin the engine's threads to the P-cores for the generation. Composes with
     # keep_awake (-7.6 % on its own, -21.5 % together).
     pin_engine_threads: bool = True
+    # Route this many experts per token at DECODE instead of the checkpoint's
+    # own num_experts_per_tok. None = the checkpoint's value. The only lossy
+    # knob here: it changes the model's output by design.
+    decode_top_k: int | None = None
     # Expert routing/eviction telemetry for a triage bundle. MoE-only by
     # construction. Off because its decode cost is unmeasured.
     enable_expert_usage: bool = False
@@ -414,6 +418,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                     prefix_sessions=config.prefix_sessions,
                     keep_awake=config.keep_awake,
                     pin_engine_threads=config.pin_engine_threads,
+                    decode_top_k=config.decode_top_k,
                 )
                 print(f"[Vaayu-Server] loaded in {time.time() - t0:.1f}s; "
                       f"derived max_seq_len={model.max_seq_len}")

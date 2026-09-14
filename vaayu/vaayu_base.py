@@ -90,6 +90,24 @@ def _auto_session_id(token_ids: list) -> str:
     return "auto:" + hashlib.sha1(head).hexdigest()[:16]
 
 
+def resolve_decode_top_k(config_top_k: int, requested) -> int:
+    """Effective DECODE-time top_k (row 33 / T2).
+
+    `requested is None` means the feature is off -> the checkpoint's own value.
+    A request is never honoured ABOVE it: the router only ever selected
+    `config_top_k` experts, so a larger k has nothing to route. Clamping is a
+    real limit, so it WARNS rather than degrading silently (CLAUDE.md §5)."""
+    if requested is None:
+        return config_top_k
+    requested = int(requested)
+    if requested > config_top_k:
+        print(f"[Vaayu-MoE] WARNING: DECODE_TOP_K={requested} exceeds the "
+              f"checkpoint's num_experts_per_tok={config_top_k}; using "
+              f"{config_top_k}")
+        return config_top_k
+    return max(1, requested)
+
+
 def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_experts):
     """Model-agnostic MoE geometry, derived — never hardcoded (REPORT §1.5).
 
@@ -1866,7 +1884,8 @@ class VaayuBaseModel(GenerationMixin):
                  auto_prefix_match=True, enable_kv_persist=False,
                  kv_persist_dir=None, kv_persist_sync=False,
                  enable_expert_usage=False, ram_cache_budget=None,
-                 prefix_sessions=3, keep_awake="auto", pin_engine_threads=True):
+                 prefix_sessions=3, keep_awake="auto", pin_engine_threads=True,
+                 decode_top_k=None):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -1954,6 +1973,9 @@ class VaayuBaseModel(GenerationMixin):
         # default ON because that is the measured configuration.
         self.keep_awake = keep_awake
         self.pin_engine_threads = pin_engine_threads
+        # Read by _detect_moe() below, which resolves it against the
+        # checkpoint's own num_experts_per_tok (row 33 / T2).
+        self._requested_decode_top_k = decode_top_k
 
         # Save parameters
         self._layer_names_override = layer_names_dict or {}
@@ -2182,14 +2204,7 @@ class VaayuBaseModel(GenerationMixin):
         # it is computed BEFORE pinning rather than at cache-sizing time. Its
         # inputs are all ready: _detect_moe() ran above, set_layers_from_layer_names()
         # ran above that, the offset index just above.
-        self._moe_geometry = None
-        if self.is_moe and self._expert_offset_index is not None:
-            self._moe_geometry = compute_moe_geometry(
-                self._expert_offset_index,
-                num_layers=len(self.layers),
-                moe_top_k=self.moe_top_k,
-                moe_num_experts=self.moe_num_experts,
-            )
+        self._build_moe_geometry()
 
         self._vram_plan = None
         if device.startswith("cuda") and torch.cuda.is_available():
@@ -3306,6 +3321,21 @@ class VaayuBaseModel(GenerationMixin):
         state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
         self.move_layer_to_device(state_dict)
 
+    def _build_moe_geometry(self) -> None:
+        """Derive the MoE geometry at the DECODE top_k (row 33 / T2).
+
+        `working_set_bytes` is one decode step by definition, and every expert
+        cache budget is derived from it, so a clamped decode k must shrink them
+        with it. Prefill is unaffected: it keeps `self.moe_top_k`."""
+        self._moe_geometry = None
+        if self.is_moe and self._expert_offset_index is not None:
+            self._moe_geometry = compute_moe_geometry(
+                self._expert_offset_index,
+                num_layers=len(self.layers),
+                moe_top_k=self._decode_top_k or self.moe_top_k,
+                moe_num_experts=self.moe_num_experts,
+            )
+
     # ── MoE detection ────────────────────────────────────────────────────────
 
     def _detect_moe(self) -> None:
@@ -3327,9 +3357,13 @@ class VaayuBaseModel(GenerationMixin):
                 self.config, "num_experts_per_tok",
                 getattr(self.config, "top_k", 2)
             )
+            self._decode_top_k = resolve_decode_top_k(
+                self.moe_top_k, getattr(self, "_requested_decode_top_k", None))
             print(
                 f"[Vaayu] MoE detected: {self.moe_num_experts} experts, "
                 f"top-{self.moe_top_k} active per token"
+                + (f" (decode clamped to top-{self._decode_top_k})"
+                   if self._decode_top_k < self.moe_top_k else "")
             )
             print(
                 "[Vaayu] Expert-aware streaming (Phase 3): pending — "
@@ -3338,6 +3372,7 @@ class VaayuBaseModel(GenerationMixin):
         else:
             self.moe_num_experts = 0
             self.moe_top_k = 0
+            self._decode_top_k = None
 
     # ── VRAM pinning ─────────────────────────────────────────────────────────
 

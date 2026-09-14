@@ -164,6 +164,32 @@ def route_experts(moe_module, router_logits, top_k: int):
     return w.reshape(*lead_shape, -1), idx.reshape(*lead_shape, -1)
 
 
+def truncate_top_k(weights, indices, k: int):
+    """Keep only the `k` largest-weight slots of an already-routed (weights,
+    indices) pair. Row 33 / T2.
+
+    `k is None` (feature off) and `k >= K` return the SAME tensors, not equal
+    copies: MiniMax routes with `sorted=False`, and expert accumulation is
+    order-dependent, so re-running topk on a path the user did not turn on
+    would be a bit-level change."""
+    if k is None or k >= weights.shape[-1]:
+        return weights, indices
+    w, pos = torch.topk(weights.float(), k, dim=-1)
+    w = w / w.sum(dim=-1, keepdim=True)
+    return w.to(weights.dtype), indices.gather(-1, pos)
+
+
+def _decode_k_for(vaayu_ref):
+    """The decode-time `top_k` clamp, or None when it must not apply.
+
+    Decode-only by design (row 33 / T2): prefill routes ~every expert anyway
+    (224.23 per layer per chunk, measured), so truncating it buys nearly
+    nothing and costs prompt quality."""
+    if getattr(vaayu_ref, "_moe_prefill_pass", False):
+        return None
+    return getattr(vaayu_ref, "_decode_top_k", None)
+
+
 def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
     """Bias top-k SELECTION toward resident experts; take combination WEIGHTS
     from the ORIGINAL logits (selection changes, weighting stays faithful —
@@ -1370,6 +1396,8 @@ def _make_modulelist_sparse_forward(
         _warn_cache_bias_inert(
             vaayu_ref, "this model uses the module-list expert layout, whose forward "
                        "has no cache-aware routing")
+        routing_weights, expert_indices = truncate_top_k(
+            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -1420,7 +1448,8 @@ def _make_modulelist_sparse_forward(
                         layer_idx, hidden_states, top_k, unique_experts)
         B, S, H = hidden_states.shape
         _pair, _starts, _counts_l = compute_expert_dispatch(
-            expert_indices.cpu().reshape(-1, top_k), len(experts_list))
+            expert_indices.cpu().reshape(-1, expert_indices.shape[-1]),
+            len(experts_list))
         _pair_gpu = _pair.to(hidden_states.device, non_blocking=True)
         if _prof:
             _mp['mask_sync'] += time.perf_counter() - _t0
@@ -1438,7 +1467,7 @@ def _make_modulelist_sparse_forward(
         # it. Holds tokens x top_k x H of fp16, which is 64 KB at decode and
         # ~32 MB for a 512-token prefill chunk.
         _contribs: list = []
-        _flat_routing = routing_weights.reshape(-1, top_k)
+        _flat_routing = routing_weights.reshape(-1, routing_weights.shape[-1])
 
         # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
         # prefill routes ~every expert once, so caching there only churns the LRU;
@@ -1705,6 +1734,9 @@ def _make_fused_sparse_forward(
         _warn_cache_bias_inert(
             vaayu_ref, "this model takes the non-EXL3 fused forward, which has no "
                        "cache-aware routing")
+
+        routing_weights, expert_indices = truncate_top_k(
+            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -2181,6 +2213,9 @@ def _make_fused_sparse_forward_exl3(
                 routing_weights, expert_indices = cache_aware_topk(
                     router_logits, _res_mask, top_k,
                     getattr(vaayu_ref, "_cache_bias", 0.0))
+
+        routing_weights, expert_indices = truncate_top_k(
+            routing_weights, expert_indices, _decode_k_for(vaayu_ref))
 
         if _prof:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
