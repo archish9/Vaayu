@@ -3038,16 +3038,16 @@ reproduced across a reboot.
     `documentation/TUNING.md` §5c.
     - [x] failing test `tests/test_docs_speed_knobs.py`; implement; green; commit
     - done 2026-09-14: commit `ea0cdc2`, task review clean
-  - [~] **Task 7 — on-device acceptance.** The probe `plans/probes/row26_decode.py` is gitignored and hard-codes the
+  - [x] **Task 7 — on-device acceptance.** The probe `plans/probes/row26_decode.py` is gitignored and hard-codes the
     project root on `sys.path`, so it gains a `VAAYU_ROOT` override, env-gated `DECODE_TOP_K` kwargs and a
     `vaayu imported from` proof line; the smoke gate gains `SERVER_DECODE_TOP_K`.
-    - [ ] full CPU suite green
-    - [ ] pre-feature worktree at the commit before Task 1; every base log must name `/tmp/vaayu-base`
-    - [ ] Qwen3-Next base / cold auto / warm auto: pick ≤ 3.5 %; warm = cache hit, no trials; gain > 2× replicate spread
-    - [ ] MiniMax base / cold auto: pick ≤ 3.5 %; gain > 2× replicate spread
-    - [ ] Qwen3-235B cold auto pick ≤ 3.5 %; knob-None no-op vs base on all three forwards (tok/s within spread, ids identical)
-    - [ ] server gate on Qwen3-Next with `SERVER_DECODE_TOP_K=auto`; `/health` shows the cached pick
-    - [ ] remove worktree; RESULTS doc; close this bullet with numbers and the §8 answers; close the server.md `[bug]`; commit
+    - [x] full CPU suite green
+    - [x] pre-feature worktree at the commit before Task 1; every base log must name `/tmp/vaayu-base`
+    - [x] Qwen3-Next base / cold auto / warm auto: pick ≤ 3.5 %; warm = cache hit, no trials; gain > 2× replicate spread
+    - [x] MiniMax base / cold auto: pick ≤ 3.5 %; gain > 2× replicate spread
+    - [x] Qwen3-235B cold auto pick ≤ 3.5 %; knob-None no-op vs base on all three forwards (tok/s within spread, ids identical)
+    - [x] server gate on Qwen3-Next with `SERVER_DECODE_TOP_K=auto`; `/health` shows the cached pick
+    - [x] remove worktree; RESULTS doc; close this bullet with numbers and the §8 answers; close the server.md `[bug]`; commit
   - **Method-1 acceptance run 2026-09-14 (code calibration text only) — SUPERSEDED:** full CPU suite
     2186 passed, 15 skipped. Baseline worktree `/tmp/vaayu-base` at `1955fbe` (parent of `edbe4dd`),
     every base log names `/tmp/vaayu-base/vaayu/__init__.py` — valid. **Picks (code text only,
@@ -3078,20 +3078,44 @@ reproduced across a reboot.
     keep the worse cost (plan Tasks 8-9); these picks are not the shipped behaviour.** Full logs:
     `docs/probes/row33-auto-*.log`; full RESULTS (gitignored, labeled "method 1 (code text only),
     superseded"): `docs/2026-09-14-row33-decode-top-k-auto-RESULTS.md`.
-  - [ ] **Task 8 — measure BOTH calibration texts, keep the safer pick (user decision 2026-09-14).** Task 7's first
+    - done 2026-09-14: commit `4471ba1` — method-1 evidence (auto picks superseded by Tasks 8-9); Qwen3-235B knob-off −3.5 % on one sample routed to Task 9's replicated re-check
+  - [x] **Task 8 — measure BOTH calibration texts, keep the safer pick (user decision 2026-09-14).** Task 7's first
     on-device arm showed the code text prices truncation ~4× too cheaply: Qwen3-Next baseline ppl **1.90** on it vs 8.58
     on the row-33 prose passage; k=9 measured **−0.81 %** (noise ~±1 % against a 3.5 % budget); the pick **k=6** (+2.26 %
     on code) costs **+8.97 % on prose** — 2.6× the budget. Fix: one ladder whose trial cost is the WORSE of code and
     prose (row-33 passage copied verbatim as `CALIB_PROSE`); `METHOD_VERSION` and `CALIB_TEXT_VERSION` → 2 so method-1
     caches re-measure. On today's numbers Qwen3-Next picks **k=8** (+0.55 % code, +3.43 % prose). First load ~2×
     (one-time, cached). Task 7's `auto` picks are recorded as superseded method-1 evidence.
-    - [ ] failing tests: worst-text ladder picks k=8 on Qwen3-Next's measured code+prose costs; per-text costs recorded;
+    - [x] failing tests: worst-text ladder picks k=8 on Qwen3-Next's measured code+prose costs; per-text costs recorded;
       resolve measures both texts; a too-short prose text warns naming it; `CALIB_PROSE` equals the row-33 passage and
       tokenizes to ≥ 305 tokens
-    - [ ] implement (+ TUNING.md wording); green; review; commit
-  - [ ] **Task 9 — re-run on-device acceptance with method 2:** delete caches; Qwen3-Next cold + warm, MiniMax cold,
+    - [x] implement (+ TUNING.md wording); green; review; commit
+    - done 2026-09-14: commit `28df444`, task review clean; full suite 2191 passed, 15 skipped
+  - [~] **Task 9 — re-run on-device acceptance with method 2:** delete caches; Qwen3-Next cold + warm, MiniMax cold,
     Qwen3-235B cold; throughput vs same-day base arms (re-run the base arms if not the same day as Task 7); server gate
     with `"auto"`; RESULTS doc; close row 33's `auto` bullet
+  - **Method-2 acceptance run 2026-09-14 — STOPPED:** Step 1 state check passed (HEAD `28df444` = Task 8; no Vaayu
+    process on the GPU; `arm.sh` present, unmodified; Task 7's three `*-base.log` files valid as the same-day Step 4
+    base). Step 2b (Qwen3-235B knob-off no-op, replicated) then FAILED its inequality and the run stopped there —
+    Step 3 (method-2 cold/warm arms), Step 4 (throughput acceptance) and Step 5 (server gate) were **not run**; no
+    `decode_top_k_auto.json` caches were touched (Task 8's method-1 caches are still in place on all three
+    checkpoints). **Step 2b numbers:** worktree `/tmp/vaayu-base` at `1955fbe` (parent of `edbe4dd`, same commit Task 7
+    used), removed after the run. `q235-base3` (`/tmp/vaayu-base/vaayu/__init__.py` confirmed, `ARMS=W,U1,U2
+    NEW_TOK=32`): U1 **1.1575** tok/s, U2 **1.1641** tok/s → mean **1.1608**, spread **0.0066**; ids identical to U1
+    for W/U1/U2. `q235-off3` (same tree, HEAD): U1 **1.1182** tok/s, U2 **1.1260** tok/s → mean **1.1221**, spread
+    **0.0078**; ids identical to U1 for W/U1/U2. Bound: `|mean_off3 − mean_base3| ≤ max(0.02 × mean_base3, 2 ×
+    max(spread_off3, spread_base3))` → `|1.1221 − 1.1608| = 0.0387` vs `max(0.02 × 1.1608 = 0.023216, 2 × max(0.0078,
+    0.0066) = 0.0156) = 0.023216` → **0.0387 > 0.023216, FAIL** (relative gap **−3.33 %** vs a ~2.0 % bar). This
+    sharpens rather than resolves Task 7's single-sample −3.5 % concern: with two replicates on each side the
+    knob-off (`DECODE_TOP_K=None`) decode path is now consistently and measurably slower than base on Qwen3-235B
+    specifically (both models' spreads are small, ~0.006-0.008 tok/s, so the ~0.039 tok/s gap is not replicate noise
+    at this sample size) — Qwen3-Next and MiniMax's no-ops passed clean in Task 7. Per the brief and the task's stop
+    rules: **do not chase this by re-running arms or changing engine code.** What unblocks Task 9: someone should
+    look at why `_decode_limits`'s extra getattr/tuple and `truncate_top_k`'s `p is None` check cost more on
+    Qwen3-235B's decode step specifically than on the other two models (slower per-token wall time so a fixed
+    per-call overhead is a larger fraction? more replicates to rule out a systematic GPU-clock/thermal effect
+    between the two back-to-back 24-minute cold-load arms?) before method-2 acceptance can proceed past Step 2b.
+    Logs: `docs/probes/row33-auto-q235-base3.log`, `docs/probes/row33-auto-q235-off3.log`.
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),
