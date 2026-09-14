@@ -3091,7 +3091,7 @@ reproduced across a reboot.
       tokenizes to ≥ 305 tokens
     - [x] implement (+ TUNING.md wording); green; review; commit
     - done 2026-09-14: commit `28df444`, task review clean; full suite 2191 passed, 15 skipped
-  - [~] **Task 9 — re-run on-device acceptance with method 2:** delete caches; Qwen3-Next cold + warm, MiniMax cold,
+  - [x] **Task 9 — re-run on-device acceptance with method 2:** delete caches; Qwen3-Next cold + warm, MiniMax cold,
     Qwen3-235B cold; throughput vs same-day base arms (re-run the base arms if not the same day as Task 7); server gate
     with `"auto"`; RESULTS doc; close row 33's `auto` bullet
   - **CLOSED 2026-09-14 (method 2):** Step 2b's first (back-to-back) design FAILED: worktree `/tmp/vaayu-base` at
@@ -3131,6 +3131,7 @@ reproduced across a reboot.
     `docs/probes/row33-auto-q235-{base,off}{3,4,5}.log`, `docs/probes/row33-auto-{q3n-cold2,q3n-warm2,mm-cold2,
     q235-cold2,servergate2}.log`; full RESULTS: `docs/2026-09-14-row33-decode-top-k-auto-RESULTS.md` ("Method 2"
     section).
+    - done 2026-09-14: commits `0c78fe7` + `1a225a1`, task review clean; picks Qwen3-Next k=8, MiniMax p=0.90, Qwen3-235B k=7 (all ≤ 3.5 % worst of code/prose); ABBA no-op PASS
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),
