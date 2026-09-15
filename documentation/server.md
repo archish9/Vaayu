@@ -871,6 +871,7 @@ Do not spend time here; each is measured and settled.
 | `422` on `n` | `n>1` requested | this server returns one choice |
 | `warnings` on the response naming a sampling param | that request skipped speculation, because the speculative loop would drop the param | nothing to fix — the param was honoured. To speculate instead, send `temperature: 0` and no `top_p`/`top_k`/`stop` |
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
+| startup WARNING: `N persistent buffer(s) have no tensor in this checkpoint` | the converted checkpoint dropped tensors the model was trained with (MiniMax-M2.7's EXL3 build: its MoE routing bias) | run `scripts/fetch_missing_buffers.py --repo <original repo> --checkpoint <model dir>` and restart — see [missing_buffers.md](missing_buffers.md) |
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 | killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |
 | `refusing to load -- the GPU is not exclusive` | something else holds GPU memory | run the commands the message prints, then start again. A container needs `docker stop`, not `kill` — `restart=unless-stopped` respawns it |

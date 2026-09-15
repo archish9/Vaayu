@@ -2228,6 +2228,10 @@ class VaayuBaseModel(GenerationMixin):
         # Refresh layers list to pick up newly replaced modules (e.g. ExLlamaV3Linear for lm_head)
         self.set_layers_from_layer_names()
 
+        # On the final module tree: fill persistent buffers the checkpoint lacks
+        # from a fetched sidecar, and warn about any still missing.
+        self._apply_missing_buffers()
+
         self.draft_tokens = draft_tokens if draft_tokens is not None else 5
 
         # Build offset index BEFORE _init_pinned_layers so Phase 2 can use
@@ -3295,6 +3299,16 @@ class VaayuBaseModel(GenerationMixin):
         if 'rotary_pos_emb' in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
+
+    def _apply_missing_buffers(self):
+        """Persistent buffers with no checkpoint tensor keep their init values
+        silently -- MiniMax-M2.7's EXL3 build routed with a zero bias. Fill them
+        from the sidecar scripts/fetch_missing_buffers.py writes; warn about the
+        rest. See vaayu/missing_buffers.py."""
+        from .missing_buffers import apply_sidecar, missing_persistent_buffers, warn_missing
+        missing = missing_persistent_buffers(self.model, self.checkpoint_path, self.layer_names)
+        applied = set(apply_sidecar(self.model, self.checkpoint_path, missing))
+        warn_missing([n for n in missing if n not in applied])
 
     def diagnose_attention(self):
         print(f"Configured attention: {self._active_attn_impl}")

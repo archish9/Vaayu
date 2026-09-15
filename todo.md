@@ -3255,7 +3255,20 @@ research last.
   rounding path only — yet measured +8.20 % vs +6.34 % at k=7 (**+1.86 pp**) and +16.46 % vs +19.30 % at k=6
   (**−2.84 pp**). So between equivalent arms at these damage levels the band is ±2-3 pp, not ±0.8. Caveat: MiniMax is
   bf16-routed and more damaged here than Qwen3-Next/Qwen3-235B at their picks; the band may scale with damage.
-- [bug] **MiniMax-M2.7 EXL3 build runs WITHOUT its trained routing bias, silently** (found 2026-09-15 by D5, no brief —
+- [x] **CLOSED 2026-09-15: a checkpoint missing a persistent buffer is no longer silent; the MiniMax bias is
+  fetchable and measured NEUTRAL.** Shipped: `vaayu/missing_buffers.py` + `VaayuBaseModel._apply_missing_buffers()`
+  (WARNING for any persistent buffer the owning layer file lacks — fires on MiniMax only, 0 on Qwen3-235B, Qwen3-Next,
+  Llama-3.3-70B, Llama-3.2-1B), an auto-applied sidecar `splitted_model/vaayu_missing_buffers.safetensors`,
+  `scripts/fetch_missing_buffers.py` (HTTP Range, pinned sha), `documentation/missing_buffers.md`. Tests 14 new;
+  full suite **2243 passed / 15 skipped / 0 failed**. Device, MiniMax, `decode_top_k_ppl.py` KS=8 256 tokens: with the
+  sidecar `Loaded 62 missing buffer(s)`, no WARNING, ppl **7.0212** (= B1's f32 arm 7.021189); without it the WARNING
+  prints and ppl **7.2626** (= reference). B1 verdict NEUTRAL (code mean −2.58 %, one code passage +6.25 %) → bias
+  optional. **Box left as found:** sidecar moved to `models/MiniMaxAI--MiniMax-M2.7-e_score_correction_bias/` —
+  copy it back into `splitted_model/` to enable. §8: (1) no knob — the sidecar's presence is the switch; (2) runs in
+  `VaayuBaseModel.__init__`, the path `app.py`'s `from_pretrained` takes; (3) reachable at N=1 (load time); (4)
+  reachable today — verified through `AutoModel.from_pretrained` with the server's config knobs, not through a live
+  server process. Not done: reporting the exllamav3 key mismatch upstream (outward-facing, user's call).
+  Was: [bug] **MiniMax-M2.7 EXL3 build runs WITHOUT its trained routing bias, silently** (found 2026-09-15 by D5, no brief —
   this row is the summary). `config.json` declares `use_routing_bias: true`, `scoring_func: sigmoid`, and its
   `original_quantization_config.modules_to_not_convert` lists `e_score_correction_bias` (so upstream
   `MiniMaxAI/MiniMax-M2.7` ships it), but `NeuroSenko--MiniMax-M2.7-exl3` has no such tensor; the HF block's
@@ -3288,6 +3301,50 @@ research last.
     regression. Next (user's call): (1) load-time WARNING when a config declares a routing bias with no tensor —
     cheap, CPU, correct either way; (2) broader ppl: several code + prose passages, code at k=7, before any sidecar
     loading. RESULTS: `docs/2026-09-15-D5-minimax-true-clamp-RESULTS.md` §4.
+  - **PLAN APPROVED 2026-09-15 (user: "add the warning then run, instructions how to add bias, document why it's
+    important, do the broader test"):**
+    - [x] **B1 broader ppl test** (GPU, scratchpad probe): 4 code + 4 prose passages from real files, zero vs upstream
+      f32 bias at k=8, code at k=7 both ways; decision rule written in the RESULTS doc BEFORE the run.
+      **DONE 2026-09-15 — verdict NEUTRAL by the pre-registered rule** (`docs/probes/b1-bias-broad.{log,json}`). k=8,
+      zero → f32: code Vaayu `expert_cache.py` 32.970153 → 29.764052 (−9.72 %), Rudra `prefetch.py` 5.865248 →
+      6.231713 (**+6.25 %**), stdlib `textwrap.py` −1.89 %, `json/decoder.py` −4.96 % → **code mean −2.58 %**; prose
+      row-33 −3.32 %, `architecture.md` −0.37 %, `TUNING.md` +2.58 %, Rudra README −3.38 % → mean −1.13 %. Rule: code
+      mean ≤ −0.5 % AND no code passage > +1.0 % → FAILS on `prefetch.py` (and §4's calibration code was +4.73 %);
+      not ≥ +0.5 % either → neutral: optional, not a default, no throughput A/B. k=7 cost vs own k=8 on code: zero
+      +1.96 %, f32 +2.63 % — **the bias does not make `DECODE_TOP_K` cheaper on code** (the one prose passage's
+      halving did not generalise).
+    - [x] **B2 load-time WARNING** (TDD; DONE 2026-09-15 — device run without sidecar prints it): persistent buffer with no checkpoint tensor → WARNING naming it; false-positive
+      check on Qwen3-235B, Qwen3-Next, Llama-3.3-70B, Llama-3.2-1B first. §8 answer in the row.
+      - false-positive check DONE (CPU, `from_config` + `state_dict()` keys vs checkpoint keys): MiniMax 62 missing (all
+        `e_score_correction_bias`); Qwen3-235B, Qwen3-Next, Llama-3.3-70B, Llama-3.2-1B **0** persistent buffers, 0
+        missing. Non-persistent buffers (rotary `inv_freq`) are excluded by the rule.
+    - [x] **B3 a working way to add the bias** (DONE 2026-09-15 — real fetch + device load `Loaded 62`, ppl 7.0212) — none exists today (both layer loaders would cast a file tensor to
+      `running_dtype` and nothing user-facing writes one). **User chose 2026-09-15: fetch script + auto-load** —
+      `scripts/fetch_missing_buffers.py` range-downloads only the missing tensors from the upstream repo the user names
+      into a sidecar file in the split dir; Vaayu applies it at load (file dtype kept), no server knob (file presence is
+      the switch), and the `auto` fingerprint changes with it. TDD; end-to-end check on MiniMax after B1.
+      - progress 2026-09-15: `tests/test_missing_buffers.py` (14) RED (`ModuleNotFoundError: vaayu.missing_buffers`)
+        → GREEN 14 passed. New `vaayu/missing_buffers.py` (detect by owning layer file header on a dot boundary,
+        sidecar `vaayu_missing_buffers.safetensors` in the split dir keeps file dtype, wrong shape raises, WARNING
+        names the fetch command); `VaayuBaseModel._apply_missing_buffers()` runs right after the post-`setup_model`
+        `set_layers_from_layer_names()`; `scripts/fetch_missing_buffers.py` (meta skeleton → missing names → HTTP Range
+        fetch, pinned sha, `HF_TOKEN` honoured, refuses a server that ignores Range). Split-dir scanners checked safe:
+        expert index keeps `.experts.N.` keys only (one rebuild on newer mtime), `moe_key_remap` filters by layer
+        prefix, EXL3 detect peeks `model.layers.0`, io_uring looks files up by path (`file_map`). Pending: full suite
+        (deferred — B1 holds the RAM), device load check (warning gone, ppl = f32 arm).
+      - real fetch DONE 2026-09-15: `scripts/fetch_missing_buffers.py --repo MiniMaxAI/MiniMax-M2.7` found the 62
+        missing buffers from the meta skeleton, pinned `d494266a…`, wrote `splitted_model/vaayu_missing_buffers.safetensors`
+        (70,896 B); all 62 tensors `torch.equal` to the manual download, float32, source repo + sha in metadata.
+        **The sidecar is LIVE on this box:** every MiniMax load from now applies the upstream bias, and the cached
+        `DECODE_TOP_K=auto` pick in that split dir re-measures on its next `auto` load. Delete the file to revert.
+    - [x] B1 first launch stopped before load (probe's prose start rule found no ≥ 200-char line in TUNING.md);
+      rule amended to ≥ 120 before any result, relaunched.
+    - [x] **B4 docs** (`documentation/`; DONE 2026-09-15): why the routing bias matters + how to add it, with B1's numbers.
+      - progress 2026-09-15: new `documentation/missing_buffers.md` (what a missing persistent buffer is, the WARNING,
+        why the MoE routing bias matters, how to fetch, license, undo, `auto` re-measure side effect); linked from the
+        root `README.md` docs list, `vaayu/server/README.md` "Reading the logs" (§8: no knob — file presence is the
+        switch) and a `documentation/server.md` §9 troubleshooting row. Measured section now carries B1's 9 passages
+        and the neutral verdict (bias optional; the one-passage "k=7 costs half" claim removed — it did not hold on code).
 - [x] **CLOSED 2026-09-15 (D2): KEPT — Qwen3-235B first load −15.1 % (1514.0 → 1285.4 s, −228.6 s), picks and
   perplexities identical.** `_resolve_decode_top_k_auto` (`vaayu/vaayu_base.py`) runs `resolve(...)` inside
   `with keepawake_for(self):`, so calibration's bare `model(...)` decode forwards get row 27's spinners and P-core

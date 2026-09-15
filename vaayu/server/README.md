@@ -153,6 +153,13 @@ Streaming requests add a `TTFT at=…` line between the two. `prefix_hit` is the
 watch across turns of the same session: `False` on turn 2 means the prefix cache is not
 being reused and TTFT is paying full prefill.
 
+At boot, `[Vaayu] WARNING: N persistent buffer(s) have no tensor in this checkpoint` means the
+checkpoint dropped part of the model — MiniMax-M2.7's EXL3 build ships no MoE routing bias, so it
+routes with zeros. There is no knob: fetch the missing tensors with
+`scripts/fetch_missing_buffers.py --repo <original repo> --checkpoint <model dir>` and restart; the
+file it writes is applied on load (`Loaded N missing buffer(s)`), and deleting it undoes it. Why it
+matters and what it measured: [documentation/missing_buffers.md](../../documentation/missing_buffers.md).
+
 Filenames are sanitized — `session_id` arrives in an HTTP body, so it is untrusted input
 that becomes a path. A hostile id lands inside `sessions/` with a hash suffix
 (`../../etc/pwned` → `____etc_pwned-bf73a33346.log`), never outside it.
