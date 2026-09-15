@@ -3148,11 +3148,30 @@ research last.
 | ~~1~~ | ~~**K1**~~ **DONE 2026-09-15** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
 | ~~2~~ | ~~**D4**~~ **DONE 2026-09-15** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
 | ~~3~~ | ~~**D3**~~ **DONE 2026-09-15** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
-| 4 | **D1** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
+| ~~4~~ | ~~**D1**~~ **DONE 2026-09-15** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
 | 5 | **D2** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
 | 6 | **D5** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
 
-- [bug] **DECODE_TOP_K truncation renormalises routing weights to sum 1 — wrong for scaling routers** (final review M3,
+- [x] **CLOSED 2026-09-15 (D1):** `truncate_top_k` (`vaayu/moe_patch.py`) rescales kept weights to each row's
+  ORIGINAL sum on both the `k` and `p` paths, and a sum within 1e-2 of 1 (rounding: bf16 ≤ 2.44e-3, measured) snaps
+  to exactly 1.0. So scaled routers (`routed_scaling_factor`: DeepSeek-V2/V3, GLM-4-MoE, …) are no longer shrunk by
+  `1 / original_sum`, and unit-sum routers (every model on this box) stay BIT-IDENTICAL. `METHOD_VERSION` 2 → 3.
+  Tests: 11 scaled-router cases plus 4 bit-identity cases in `tests/test_decode_top_k.py`, each RED before its step and
+  GREEN after; full suite **2228 passed / 15 skipped / 0 failed**. **Device (256-token decode ppl, same day):**
+  - The snap reproduces an unmodified HEAD worktree to 6 decimals on all five arms (Qwen3-Next k=10/9/8 8.582392 /
+    8.708857 / 8.876525; MiniMax k=8/7 7.262630 / 7.723136).
+  - **Round 1, without the snap, FAILED the ±0.0005 stop rule** (Qwen3-Next k=9 +0.66 %, k=8 −0.77 %; MiniMax k=7
+    −0.62 %), although on Qwen3-Next's float32 router it changed weights by ≤ 1.8e-7.
+  - **A null control (HEAD × (1+2^-23) on the kept weights) moved Qwen3-Next k=9 +0.40 % and k=8 −0.16 %.** This
+    perplexity is bit-sensitive, so ±0.0005 is a bit-identity test (→ new row D6).
+
+  §8: no knob; already plumbed; reachable at N=1; correctness-only on this box. **Cost:** the version bump makes the 3
+  cached `auto` picks on disk re-measure once on their next `auto` load (~400 s / 1556 s / 1584 s). With the snap they
+  should land on the same picks, since the arithmetic is bit-identical. Server default `None`. RESULTS:
+  `docs/2026-09-15-D1-truncation-keeps-row-sum-RESULTS.md`. Semantics note: for DeepSeek-V3 / GLM-4-MoE (normalise,
+  then scale) the kept sum is the model's own value at the smaller k; for DeepSeek-V2 / `norm_topk_prob: false` it is
+  a magnitude-preserving choice, and per-family detection was not built.
+  Was: [bug] **DECODE_TOP_K truncation renormalises routing weights to sum 1 — wrong for scaling routers** (final review M3,
   2026-09-14; **scope widened while writing the brief:** the fixed-k int path has it too, since row 33 — on the 12
   transformers families that multiply by `routed_scaling_factor` (DeepSeek-V2/V3, GLM-4-MoE, dots1, Mistral4, …) an
   explicit `DECODE_TOP_K=<int>` silently shrinks every MoE block's output). `truncate_top_k`'s
@@ -3164,6 +3183,50 @@ research last.
   p=0.95 cost +0.13 %). Needs a ppl re-check of the fixed-k path if it changes.
   **Brief (D1, self-contained):** [`docs/issue-D1-cutoff-renormalises-non-unit-sum-routers.md`](docs/issue-D1-cutoff-renormalises-non-unit-sum-routers.md) (gitignored — this row is the durable summary). **Latent on this box:** all three on-device models return unit-sum top-k weights (both Qwen3 configs
   `norm_topk_prob: true`; MiniMax divides by the sum, `modeling_minimax_m2.py:117`), so it needs a synthetic test to reproduce.
+  - history: **2026-09-15, CPU phase (round 1).** `truncate_top_k` now rescales kept weights to each
+    row's ORIGINAL sum on both the `k` and `p` paths (`row_sum` taken once, before either); `METHOD_VERSION` 2 → 3; spec
+    §7 amended. Confirmed in transformers source: DeepSeek-V3 / GLM-4-MoE normalise then `× routed_scaling_factor`, so the
+    kept sum equals what the model computes at the smaller k (DeepSeek-V2 does not renormalise — there sum-preserving is
+    a magnitude choice, not the model's own semantics). New tests in `tests/test_decode_top_k.py`: 11 RED before
+    (scaled row sum, k/p/k+p × 3 geometries; drop-nothing cutoff at scale 2.5; module-list forward with a scaled
+    contract router at p=0.999), GREEN after; 2 unit-sum guards green both sides. Three files 231 passed; full
+    `pytest tests/` **2224 passed / 15 skipped / 0 failed, 172 s** (GPU visible — with `CUDA_VISIBLE_DEVICES=""` three
+    GPU-assuming tests fail, and an 8 G scope OOM-kills the run at ~64 %). **Watch on device:** MiniMax's router returns
+    bf16 weights, whose row sums miss 1 by 4.9e-4 mean / 2.4e-3 max (measured offline); the old code forced 1, the new
+    keeps the rounded sum the untruncated model already uses. **Cost of the bump:** the 3 cached `auto` picks on disk
+    re-measure once on their next `auto` load (~400 s / 1556 s / 1584 s); server default is `None`.
+  - history: **2026-09-15 13:14 — round-1 device stop rule FIRED, not shipped; resolved by the snap (above).** `decode_top_k_ppl.py`, 256 scored:
+    Qwen3-Next k=10 **8.5824** (=), k=9 **8.7662** (ref 8.7089, +0.0573), k=8 **8.8082** (ref 8.8765, −0.0683);
+    MiniMax k=8 **7.2626** (=), k=7 **7.6751** (ref 7.7231, −0.0480). Identity arms reproduce to the digit; every
+    truncated arm misses by ~100× tolerance, both signs. **But on Qwen3-Next the router returns float32, where old vs
+    new `truncate_top_k` differ by ≤ 1.8e-7 with identical indices (measured) — the fix cannot move it; suspect the
+    references/harness.** In bf16 (MiniMax) old vs new differ by one bf16 quantum (≤ 7.8e-3 rel), so MiniMax can
+    move. Unblocks: same-day arms on an unmodified HEAD worktree (`36c1178`), running. Logs `docs/probes/d1-*.log`.
+    **13:18–13:23 — HEAD reproduces ALL FIVE references to the digit (Qwen3-Next 8.5824 / 8.7089 / 8.8765, MiniMax
+    7.2626 / 7.7231), so the fix DID move
+    it: a ≤ 1.8e-7 float32 weight change shifts 256-token decode ppl by ~0.6 % (bf16 activations + recurrent state).**
+    Round 2: `row_sum` within 1e-2 of 1 snaps to exactly 1.0 (bf16 rounding max 2.44e-3, measured) → unit-sum routers
+    bit-identical to plain renormalisation, scaled routers still keep their sum.
+    `test_unit_sum_rows_that_miss_one_by_rounding_stay_bit_identical[k|p × float32|bf16]` RED before (weights not
+    `torch.equal`), GREEN after; three files 235 passed. Running: snap arms (must equal HEAD) + a NULL CONTROL (HEAD
+    with ×(1+ulp) on the k path — how far ANY bit-level perturbation moves this ppl; it bears on row 33's 3.5 %
+    budget, where k=8 was picked at +3.43 %) + full suite.
+- [ ] **D6: `DECODE_TOP_K=auto`'s 3.5 % budget walk decides inside its own measurement noise** (found 2026-09-15 by
+  D1's null control; no brief, so this row is the summary). A single 256-token decode perplexity is bit-sensitive:
+  - a semantically null ×(1+2^-23) on the kept weights moved Qwen3-Next k=9 **+0.40 %** and k=8 **−0.16 %**;
+  - D1's round-1 change (≤ 1.8e-7 on the weights) moved it +0.66 % / −0.77 %, and MiniMax k=7 −0.62 %.
+
+  It is deterministic: the same code reproduces bit-for-bit, and any bit-pattern change draws a different value from
+  that band. **Two on-device picks sit inside it:**
+  - Qwen3-Next k=8 at +3.43 %, 0.07 pp under budget. The next-milder step is k=9, +1.47 %.
+  - Qwen3-235B k=7 at +3.40 %, 0.10 pp under. Its only milder step is `none`, which would lose its measured
+    **+11.15 %** decode.
+
+  MiniMax p=0.90 at +2.25 % is 1.25 pp clear. So an unrelated change that alters bits on the truncated path can flip a
+  pick at its next re-measure (any `METHOD_VERSION` / text / fingerprint change). Not a defect in today's picks. Price
+  first, no GPU yet: how wide the band really is (several null perturbations, not one), whether it narrows with
+  `SCORE_TOKENS`, or a margin / hysteresis on the budget. Stop rule: a band ≤ 0.1 pp at the current 256 tokens → close
+  as noise-free enough.
 - [bug] **DECODE_TOP_K=auto calibration runs without KEEP_AWAKE / thread pinning** (final review M4). `decode_mode_ppl` calls
   `model(...)` directly; `keepawake_for` wraps only `generate` (`vaayu/vaayu_base.py` ~5204). Row 27 measured −21.5 % time per
   token on Qwen3-235B from those two knobs, so the ~26-min first load is probably longer than necessary. Candidate: wrap

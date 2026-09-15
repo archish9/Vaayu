@@ -15,7 +15,8 @@ import os
 import time
 from pathlib import Path
 
-METHOD_VERSION = 2  # 2: a trial's cost is the worse of code and prose
+METHOD_VERSION = 3  # 2: a trial's cost is the worse of code and prose
+#                     3: truncation keeps each row's original weight sum (D1)
 CALIB_TEXT_VERSION = 2  # 2: CALIB_TEXTS gained CALIB_PROSE
 # Measurement-method constants, not model numbers (CLAUDE.md §5). 256 scored
 # steps, not 64: the 64-token window disagreed with 256 by up to 19 pp.

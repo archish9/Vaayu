@@ -191,12 +191,12 @@ class _ContractBlock(nn.Module):
         raise AssertionError("patched forward must replace this")
 
 
-def _modulelist(tmp_path, *, decode_k, contract=False):
+def _modulelist(tmp_path, *, decode_k, contract=False, contract_cls=_ContractBlock):
     model = MockModel(num_layers=1, hidden=HIDDEN)
     _make_checkpoint(tmp_path, model)
     if contract:
         layer = model.layers[0]
-        layer.block_sparse_moe = _ContractBlock(
+        layer.block_sparse_moe = contract_cls(
             layer.block_sparse_moe, NUM_EXPERTS, K)
     idx = ExpertOffsetIndex(str(tmp_path))
     idx.build()
@@ -467,6 +467,109 @@ def test_modulelist_forward_cutoff_reaches_the_contract_owner(tmp_path):
     model.layers[0].block_sparse_moe.forward(torch.randn(1, 1, HIDDEN))
 
     assert len(ref._expert_history[0]) == 1
+
+
+# ── routers that SCALE their weights (D1) ───────────────────────────────────
+#
+# DeepSeek-V2/V3, GLM-4-MoE, dots1, Mistral4, ... multiply their top-k weights
+# by `routed_scaling_factor`, so a row sums to the factor, not 1 (and a
+# `norm_topk_prob: false` router sums to less than 1). Truncation must keep each
+# row's ORIGINAL sum: forcing it to 1 silently rescales every MoE block's output
+# by 1 / original_sum. For DeepSeek-V3 / GLM-4-MoE (normalise, then scale) the
+# kept sum IS what the model itself would produce at the smaller k.
+SCALE = 2.5  # a routed_scaling_factor, not any one model's number
+
+
+@pytest.mark.parametrize("num_experts,top_k", GEOMETRIES)
+@pytest.mark.parametrize("mode", ["k", "p", "k+p"])
+def test_truncation_keeps_a_scaled_routers_row_sum(num_experts, top_k, mode):
+    torch.manual_seed(3)
+    logits = torch.randn(5, num_experts)
+    w, idx = torch.topk(logits.softmax(dim=-1), top_k, dim=-1)
+    w = w / w.sum(dim=-1, keepdim=True) * SCALE
+    k = top_k - 2 if "k" in mode else None
+    p = 0.9 if "p" in mode else None
+
+    w_t, _ = truncate_top_k(w, idx, k, p=p)
+
+    assert torch.allclose(w_t.sum(dim=-1), torch.full((5,), SCALE), atol=1e-5)
+
+
+@pytest.mark.parametrize("scale", [1.0, SCALE])
+def test_a_cutoff_that_drops_nothing_leaves_the_weights_unchanged(scale):
+    w = torch.tensor([[0.4, 0.3, 0.2, 0.1]]) * scale
+    i = torch.tensor([[5, 6, 7, 8]])
+
+    w2, i2 = truncate_top_k(w, i, None, p=0.999)
+
+    assert i2.tolist() == i.tolist()
+    assert torch.allclose(w2, w, atol=1e-6)
+
+
+def test_unit_sum_routing_is_unchanged_by_keeping_the_row_sum():
+    """Every on-device model routes unit-sum rows; their numbers must not move."""
+    w = torch.tensor([[0.5, 0.3, 0.15, 0.05]])
+    i = torch.tensor([[7, 3, 9, 1]])
+
+    wk, ik = truncate_top_k(w, i, 3)
+    wp, ip = truncate_top_k(w, i, None, p=0.9)
+
+    assert ik.tolist() == [[7, 3, 9]]
+    assert torch.allclose(wk, torch.tensor([[0.5, 0.3, 0.15]]) / 0.95, atol=1e-6)
+    assert ip.tolist() == [[7, 3, 9, 7]]
+    assert torch.allclose(wp, torch.tensor([[0.5, 0.3, 0.15, 0.0]]) / 0.95, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["k", "p"])
+def test_unit_sum_rows_that_miss_one_by_rounding_stay_bit_identical(dtype, mode):
+    """A unit-sum router's row sums miss 1 by rounding (bf16: up to ~2.4e-3).
+    Multiplying by that sum flips bits, and bit flips are NOT harmless here:
+    on device a <= 1.8e-7 weight change moved Qwen3-Next's decode ppl by 0.6 %
+    (D1). So rounding-level sums must give exactly plain renormalisation."""
+    torch.manual_seed(5)
+    w, idx = torch.topk(torch.randn(2000, 256).softmax(dim=-1), 8, dim=-1)
+    w = (w / w.sum(dim=-1, keepdim=True)).to(dtype)
+    k, p = (6, None) if mode == "k" else (None, 0.9)
+
+    got, got_i = truncate_top_k(w, idx, k, p=p)
+
+    if mode == "k":
+        ref, pos = torch.topk(w.float(), k, dim=-1)
+        ref, ref_i = (ref / ref.sum(dim=-1, keepdim=True)).to(dtype), idx.gather(-1, pos)
+    else:
+        f = w.float() / w.float().sum(dim=-1, keepdim=True)
+        s, order = torch.sort(f, dim=-1, descending=True)
+        keep = torch.zeros_like(s, dtype=torch.bool).scatter(-1, order, (s.cumsum(-1) - s) < p)
+        ref = torch.where(keep, f, torch.zeros_like(f))
+        ref = (ref / ref.sum(dim=-1, keepdim=True)).to(dtype)
+        ref_i = torch.where(keep, idx, idx.gather(-1, order[..., :1]).expand_as(idx))
+    assert torch.equal(got_i, ref_i)
+    assert torch.equal(got, ref)
+
+
+class _ScaledContractBlock(_ContractBlock):
+    """Owner 2 with a DeepSeek-V3-style router: normalised, then scaled."""
+
+    def route_tokens_to_experts(self, router_logits):
+        idx, w = super().route_tokens_to_experts(router_logits)
+        return idx, w * SCALE
+
+
+def test_modulelist_forward_cutoff_that_drops_nothing_keeps_a_scaled_routers_output(tmp_path):
+    torch.manual_seed(4)
+    model, ref = _modulelist(tmp_path, decode_k=K, contract=True,
+                             contract_cls=_ScaledContractBlock)
+    block = model.layers[0].block_sparse_moe
+    x = torch.randn(1, 1, HIDDEN)
+    untruncated, _ = block.forward(x)
+
+    ref._decode_top_p = 0.999
+    ref._expert_history.clear()
+    cut, _ = block.forward(x)
+
+    assert len(ref._expert_history[0]) == K  # the cutoff really dropped nothing
+    assert torch.allclose(cut, untruncated, atol=1e-5)
 
 
 def test_exl3_forward_cutoff_computes_only_the_kept_experts(tmp_path):

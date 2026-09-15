@@ -176,15 +176,28 @@ def truncate_top_k(weights, indices, k, p=None):
     routed). The top-1 is found by WEIGHT, not position: MiniMax routes with
     `sorted=False`. If both are given, `k` applies first.
 
+    Kept weights are rescaled to each row's ORIGINAL sum, not to 1 (D1).
+    Routers that multiply by `routed_scaling_factor` (DeepSeek-V2/V3,
+    GLM-4-MoE, dots1, ...) or skip renormalisation do not sum to 1, and forcing
+    1 would silently rescale every MoE block's output by 1 / original_sum.
+    A sum that misses 1 only by rounding is snapped to exactly 1.0, so
+    unit-sum routers stay bit-identical to plain renormalisation: on device a
+    <= 1.8e-7 weight change moved Qwen3-Next's decode perplexity by 0.6 %.
+
     `k is None or k >= K` with `p is None` returns the SAME tensors, not equal
     copies: expert accumulation is order-dependent, so re-running topk on a
     path the user did not turn on would be a bit-level change."""
     num_slots = weights.shape[-1]
     if (k is None or k >= num_slots) and p is None:
         return weights, indices
+    row_sum = weights.float().sum(dim=-1, keepdim=True)
+    # Numerical tolerance, not a model number: bf16 rounding leaves a unit-sum
+    # row up to 2.44e-3 off 1 (measured, D1); 1e-2 keeps a 4x margin.
+    row_sum = torch.where((row_sum - 1.0).abs() < 1e-2,
+                          torch.ones_like(row_sum), row_sum)
     if k is not None and k < num_slots:
         w, pos = torch.topk(weights.float(), k, dim=-1)
-        w = w / w.sum(dim=-1, keepdim=True)
+        w = w / w.sum(dim=-1, keepdim=True) * row_sum
         weights, indices = w.to(weights.dtype), indices.gather(-1, pos)
     if p is None:
         return weights, indices
@@ -195,7 +208,7 @@ def truncate_top_k(weights, indices, k, p=None):
     keep = torch.zeros_like(keep_sorted).scatter(-1, order, keep_sorted)
     top1 = indices.gather(-1, order[..., :1]).expand_as(indices)
     w = torch.where(keep, w, torch.zeros_like(w))
-    w = w / w.sum(dim=-1, keepdim=True)
+    w = w / w.sum(dim=-1, keepdim=True) * row_sum
     return w.to(weights.dtype), torch.where(keep, indices, top1)
 
 
