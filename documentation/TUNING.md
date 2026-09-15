@@ -286,7 +286,7 @@ cost Qwen3-Next 1.47 % perplexity; a 12.5 % cut cost MiniMax-M2.7 6.34 %). So do
 |---|---|---|---|---|
 | Qwen3-Next-80B int4 | fixed k = 8 of 10 | **+23.1 %** | +3.43 % | ≈ 6.5 min |
 | MiniMax-M2.7 | cutoff p = 0.90 | **+8.4 %** | +2.25 % | ≈ 26 min |
-| Qwen3-235B | fixed k = 7 of 8 | **+11.2 %** (one sample) | +3.40 % | ≈ 26 min |
+| Qwen3-235B | fixed k = 7 of 8 | **+11.2 %** (one sample) | +3.40 % | ≈ 21 min |
 
 These picks were measured by `"auto"` itself on 2026-09-14; your checkpoint's pick is the one its load log prints. **While the first load measures, the server is not reachable** — like a long load.
 Watch `server.log` for one `DECODE_TOP_K=auto:` line per trial and a final WARNING naming the pick and its

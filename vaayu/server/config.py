@@ -295,8 +295,8 @@ PIN_ENGINE_THREADS = True
 #           a fixed k if one fits, otherwise a per-token routing-mass cutoff.
 #           Cached per checkpoint; later loads apply it instantly. The first
 #           load of each checkpoint is slower (~6.5 min Qwen3-Next-80B,
-#           ~26 min Qwen3-235B / MiniMax-M2.7) and no endpoint answers while it
-#           measures.
+#           ~21 min Qwen3-235B, ~26 min MiniMax-M2.7) and no endpoint answers
+#           while it measures.
 #
 # This is the one knob here that is LOSSY: every other default preserves the
 # model's output exactly. Greedy ids diverge by construction.

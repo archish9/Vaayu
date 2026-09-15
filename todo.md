@@ -3149,7 +3149,7 @@ research last.
 | ~~2~~ | ~~**D4**~~ **DONE 2026-09-15** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
 | ~~3~~ | ~~**D3**~~ **DONE 2026-09-15** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
 | ~~4~~ | ~~**D1**~~ **DONE 2026-09-15** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
-| 5 | **D2** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
+| ~~5~~ | ~~**D2**~~ **DONE 2026-09-15 — kept, Qwen3-235B first load −15.1 %** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
 | 6 | **D5** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
 
 - [x] **CLOSED 2026-09-15 (D1):** `truncate_top_k` (`vaayu/moe_patch.py`) rescales kept weights to each row's
@@ -3227,7 +3227,31 @@ research last.
   first, no GPU yet: how wide the band really is (several null perturbations, not one), whether it narrows with
   `SCORE_TOKENS`, or a margin / hysteresis on the budget. Stop rule: a band ≤ 0.1 pp at the current 256 tokens → close
   as noise-free enough.
-- [bug] **DECODE_TOP_K=auto calibration runs without KEEP_AWAKE / thread pinning** (final review M4). `decode_mode_ppl` calls
+- [x] **CLOSED 2026-09-15 (D2): KEPT — Qwen3-235B first load −15.1 % (1514.0 → 1285.4 s, −228.6 s), picks and
+  perplexities identical.** `_resolve_decode_top_k_auto` (`vaayu/vaayu_base.py`) runs `resolve(...)` inside
+  `with keepawake_for(self):`, so calibration's bare `model(...)` decode forwards get row 27's spinners and P-core
+  pinning, as `generate` does. **Device ABBA** (`plans/probes/row26_decode.py`, `BALLAST_GB=25`, cache deleted before
+  each arm; fix = working tree, base = `145566d` worktree): calibration seconds fix1 **1283.7** · base1 1508.2 ·
+  base2 1506.6 · fix2 **1274.6** → mean −228.2 s (−15.14 %); base replicates within 0.1 %. Every arm picked top-7
+  with identical ppl (1.7659/7.7818 · 1.7824/8.0462 · 1.8078/8.1966) — bit-identical, as predicted (affinity only).
+  Mechanism checked live: fix1 had 8 `SCHED_IDLE` spinners on E-cores 12–19 and 170/170 threads on CPUs 0–11; base1
+  had 0 spinners and 66/66 threads on 0–19; 0 orphan spinners after. Stop rule (≥ 5 % ≈ 78 s) passed ~3×. Docs:
+  Qwen3-235B first load ≈26 → ≈21 min in `vaayu/server/config.py`, `vaayu/server/README.md`,
+  `documentation/server.md`, `documentation/TUNING.md`; MiniMax (≈26) and Qwen3-Next (≈6.5) not re-measured, left as
+  is. §8: no knob (reuses `KEEP_AWAKE` / `PIN_ENGINE_THREADS`, honoured — both set before the hook); plumbed; reachable
+  at N=1 (runs at server load); reachable today for `DECODE_TOP_K = "auto"` users. RESULTS:
+  `docs/2026-09-15-D2-calibration-keepawake-RESULTS.md`.
+  - history: **Phase 1** confirmed in code: `resolve(...)` (`vaayu/vaayu_base.py`
+  `_resolve_decode_top_k_auto`) runs bare; `keep_awake` / `pin_engine_threads` are set before the hook, so a wrap
+  honours a user's `False`. Prior Qwen3-235B cold load: calibration 584.0 + 516.2 + 449.2 = 1549.4 s of 1555.9 s.
+  Plan: RED test → wrap → suites → ABBA first-load A/B (fix = working tree, base = HEAD worktree).
+  - history: **CPU phase done.** `resolve(...)` now runs inside `with keepawake_for(self):`; D3's telemetry clear
+    stays after it, outside the wrap. `tests/test_decode_top_k.py::test_calibration_runs_inside_keepawake` RED before
+    (`assert False is True`), GREEN after. Two files 88 passed; full `pytest tests/ -q` **2229 passed / 15 skipped /
+    0 failed, 172 s**. Device ABBA (fix, base, base, fix; cache deleted before each arm) RUNNING, logs
+    `docs/probes/d2-{fix1,base1,base2,fix2}.log`, summary `docs/probes/d2-abba-summary.txt`. Stop rule: saving < 5 %
+    of first-load time → revert, close as measured null.
+  Was: [bug] **DECODE_TOP_K=auto calibration runs without KEEP_AWAKE / thread pinning** (final review M4). `decode_mode_ppl` calls
   `model(...)` directly; `keepawake_for` wraps only `generate` (`vaayu/vaayu_base.py` ~5204). Row 27 measured −21.5 % time per
   token on Qwen3-235B from those two knobs, so the ~26-min first load is probably longer than necessary. Candidate: wrap
   `run_ladders` in `with keepawake_for(model):`. **Unmeasured — needs a first-load A/B before claiming a saving.**

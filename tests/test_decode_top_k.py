@@ -695,6 +695,34 @@ def test_the_hook_runs_resolve_only_when_auto(monkeypatch):
     assert seen == [0.02]
 
 
+def test_calibration_runs_inside_keepawake(monkeypatch):
+    """D2: calibration is decode-heavy; it must get the same keep-awake /
+    pinning context generate() gets (row 27)."""
+    import contextlib
+    import vaayu.vaayu_base as vb
+    import vaayu.decode_top_k_auto as dtka
+    state = {"inside": False, "seen": None}
+
+    @contextlib.contextmanager
+    def fake_keepawake(model):
+        state["inside"] = True
+        try:
+            yield
+        finally:
+            state["inside"] = False
+
+    def fake_resolve(model, budget):
+        state["seen"] = state["inside"]
+        return {"mode": "k", "value": 8, "cost": 0.03, "source": "measured"}
+
+    monkeypatch.setattr(vb, "keepawake_for", fake_keepawake)
+    monkeypatch.setattr(dtka, "resolve", fake_resolve)
+    m = _bare_moe("auto")
+    m._detect_moe()
+    m._resolve_decode_top_k_auto()
+    assert state["seen"] is True
+
+
 def _auto_with_usage_telemetry():
     from collections import Counter
     from vaayu.expert_usage import ExpertUsageTracker

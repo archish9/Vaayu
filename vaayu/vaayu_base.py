@@ -3366,7 +3366,10 @@ class VaayuBaseModel(GenerationMixin):
         if not getattr(self, "_decode_top_k_auto", False):
             return
         from . import decode_top_k_auto
-        self._decode_top_k_status = decode_top_k_auto.resolve(self, self._decode_top_k_budget)
+        # Calibration is teacher-forced decode through bare forwards, so it never
+        # passes generate()'s keep-awake; give it the same context (row 27, D2).
+        with keepawake_for(self):
+            self._decode_top_k_status = decode_top_k_auto.resolve(self, self._decode_top_k_budget)
         # Calibration's decode passes are not user traffic, yet the usage histogram
         # recorded them and evicted_keys kept their evictions -- neither store is
         # reset per turn (D3). A failed ladder may have recorded part of a run; a
