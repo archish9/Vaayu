@@ -2954,7 +2954,17 @@ artifact of the design, not the model. **No `auto` signal survives three models;
 not measured (projected ~+21 % at k=6 by the byte model, which was accurate on disk-bound MiniMax). k=8 baseline 7.7818
 reproduced across a reboot.
 
-- [ ] **Separate MiniMax's intolerance from the truncation design.** Build a TRUE clamp for contract-routed owners only
+- [x] **CLOSED 2026-09-15 (D5): REFUTED — MiniMax is intolerant; tensor truncation stays.** Device, one process,
+  256 scored steps (`docs/probes/d5-probe.{log,json}`): trunc k=8 **7.262630** / k=7 **7.723136 (+6.34 %)** / k=6
+  **8.664506 (+19.30 %)** — all three reproduce the references; true clamp k=7 **7.858454 (+8.20 %)**, k=6 8.457805
+  (+16.46 %). Adopt rule (clamp k=7 ≤ ~4.9 %) FAILS. Root cause: the checkpoint's routing bias is zero, so the router's
+  own top-k IS the k largest weights — measured kept-set disagreement **0.00 % (k=7) / 0.66 % (k=6)** of 15,872 rows;
+  H2 (bf16 weight ties) refuted too — boundary gap 7.6-8.4 % vs bf16's 0.8 % step. The ±2-3 pp clamp-vs-trunc gap
+  flips sign (k=7 +1.86, k=6 −2.84) → order/rounding noise (→ D6). No toggle written (probe monkeypatch), no
+  `METHOD_VERSION` bump. §8: no knob, nothing plumbed or adopted. **Scope:** zero-bias checkpoint only — the routing-bias
+  `[bug]` row re-opens the question if the upstream bias is wired. RESULTS:
+  `docs/2026-09-15-D5-minimax-true-clamp-RESULTS.md`.
+  Was: **Separate MiniMax's intolerance from the truncation design.** Build a TRUE clamp for contract-routed owners only
   (set `moe_module.top_k` on decode passes so `route_tokens_to_experts` selects k by its own biased scores), re-measure
   MiniMax ppl at k=7 and k=6 with `scripts/decode_top_k_ppl.py`. **Stop rule:** closes ≥ half the gap to Qwen3-235B
   (k=7 ≤ ~4.9 %) → contract owners switch to the attribute clamp, softmax/router owners keep tensor truncation;
@@ -2962,6 +2972,19 @@ reproduced across a reboot.
   new knob. NOT worth doing unless someone wants DECODE_TOP_K on MiniMax — the default is `None` either way.
   **Relevance changed 2026-09-14:** `auto` now picks the cutoff p=0.90 on MiniMax (+8.4 % tok/s, worst +2.25 %); a true clamp that
   lets k=7 fit the budget could beat it. **Brief (D5, self-contained):** [`docs/issue-D5-minimax-true-clamp-experiment.md`](docs/issue-D5-minimax-true-clamp-experiment.md) (gitignored — this row is the durable summary).
+  - history: **2026-09-15, Phase 1 (CPU, no code changed) — the brief's premise is FALSE, but the experiment survives
+    for a different reason.** (a) **MiniMax's `e_score_correction_bias` is ZERO at runtime:** no tensor by that name
+    anywhere (index; `splitted_model/` 65 files, 191,772 keys, 0 hits); a CPU build with Vaayu's own
+    `init_empty_weights` + `from_config` + compat patches, then the `vaayu_base.py:3291` buffer move, gives 62 real
+    buffers, nonzero count 0. So selection is `topk(sigmoid)`, monotone in the weights — the biased-selection gap the
+    brief describes does not exist on this checkpoint. (b) **But bf16 breaks the equivalence:** synthetic 256-expert
+    top-8 routing, zero bias — float32 weights give truncation == true clamp (0/20,000 rows differ; ≤ 0.02 % at logit
+    scale 4); **bf16 weights differ on 7-10 % of rows at logit scale ≤ 1, 33 % at 2, 99.9 % at 4** (bfloat16 has 7
+    mantissa bits, so near-equal top-8 weights tie and truncation drops an arbitrary tied slot). Positive control
+    (bias std 0.05) 73-95 %. MiniMax's router returns bf16 weights (D1); Qwen3-235B's softmax fallback and
+    Qwen3-Next's router return float32. **H2: MiniMax's outlier k=7 cost is partly bf16 rank loss at the drop
+    boundary.** Next: one device probe (scratchpad `d5_probe.py`, monkeypatch only, no engine edit) — trunc k=8/7,
+    clamp k=7/6, trunc k=6 in one process, with real set-disagreement and bf16 boundary-tie rates. Stop rule unchanged.
 - [x] **`DECODE_TOP_K="auto"` — opt-in automatic k. DESIGN IN PROGRESS 2026-09-14.** The user's concern: on `None`, a
   user running a tolerant model silently loses speed (Qwen3-Next: +17 % for 1.47 %) and has no way to know. **User
   decisions:** (1) **opt-in** — default stays `None` (lossless), keeping `documentation/TUNING.md`'s "off or conservative
@@ -3150,7 +3173,7 @@ research last.
 | ~~3~~ | ~~**D3**~~ **DONE 2026-09-15** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
 | ~~4~~ | ~~**D1**~~ **DONE 2026-09-15** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
 | ~~5~~ | ~~**D2**~~ **DONE 2026-09-15 — kept, Qwen3-235B first load −15.1 %** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
-| 6 | **D5** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
+| ~~6~~ | ~~**D5**~~ **DONE 2026-09-15 — REFUTED, truncation design stands** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
 
 - [x] **CLOSED 2026-09-15 (D1):** `truncate_top_k` (`vaayu/moe_patch.py`) rescales kept weights to each row's
   ORIGINAL sum on both the `k` and `p` paths, and a sum within 1e-2 of 1 (rounding: bf16 ≤ 2.44e-3, measured) snaps
@@ -3227,6 +3250,44 @@ research last.
   first, no GPU yet: how wide the band really is (several null perturbations, not one), whether it narrows with
   `SCORE_TOKENS`, or a margin / hysteresis on the budget. Stop rule: a band ≤ 0.1 pp at the current 256 tokens → close
   as noise-free enough.
+  **Data point 2026-09-15 (D5), and it WIDENS the band:** on MiniMax, a true clamp and tensor truncation keep the same
+  experts on 100 % (k=7) / 99.34 % (k=6) of rows with weights equal to one bf16 step — they differ in slot order and
+  rounding path only — yet measured +8.20 % vs +6.34 % at k=7 (**+1.86 pp**) and +16.46 % vs +19.30 % at k=6
+  (**−2.84 pp**). So between equivalent arms at these damage levels the band is ±2-3 pp, not ±0.8. Caveat: MiniMax is
+  bf16-routed and more damaged here than Qwen3-Next/Qwen3-235B at their picks; the band may scale with damage.
+- [bug] **MiniMax-M2.7 EXL3 build runs WITHOUT its trained routing bias, silently** (found 2026-09-15 by D5, no brief —
+  this row is the summary). `config.json` declares `use_routing_bias: true`, `scoring_func: sigmoid`, and its
+  `original_quantization_config.modules_to_not_convert` lists `e_score_correction_bias` (so upstream
+  `MiniMaxAI/MiniMax-M2.7` ships it), but `NeuroSenko--MiniMax-M2.7-exl3` has no such tensor; the HF block's
+  `register_buffer(torch.zeros)` stays zero on all 62 layers (measured, CPU). exllamav3 looks for
+  `block_sparse_moe.gate.e_score_correction_bias` with `optional = True`
+  (`exllamav3/architecture/minimax_m2.py:133`), while the HF code registers it on the block — likely why the
+  conversion dropped it, and why exllamav3 is silent too. **Effect unmeasured:** every token's routed set may differ
+  from the trained model's, at k=8, on every MiniMax number on record. CLAUDE.md §5 says warn, don't silently degrade:
+  Vaayu should at least WARN when the config declares a routing bias the checkpoint has no tensor for. Measuring the
+  cost needs the 62 × 256 bias values from upstream (a small ranged download — user's call) and a ppl A/B.
+  - history: **2026-09-15 — user approved the download; DONE.** Ranged GETs of only the 62 tensors from
+    `MiniMaxAI/MiniMax-M2.7` @ `d494266a4affc0d2995ba1fa35c8481cbd84294b` (upstream key
+    `model.layers.N.block_sparse_moe.e_score_correction_bias` — the HF buffer's name, NOT exllamav3's
+    `...gate.e_score_correction_bias`: key mismatch confirmed). Saved to
+    `/home/a/code/ai-ml/models/MiniMaxAI--MiniMax-M2.7-e_score_correction_bias/e_score_correction_bias.safetensors`
+    (70,896 B, sha256 `48c9bcfe…2de2cc1`), outside the EXL3 dir so the `auto` fingerprint is untouched. float32,
+    15,872/15,872 nonzero, range 1.303-8.860, mean 2.153, **per-layer std median 0.045** — comparable to MiniMax's
+    measured decode boundary gap (top-8 sigmoid spread 0.458, k=7/k=8 relative gap 7.6 %), so selection should change.
+    **Trap if wired:** `vaayu_base.py:3291` casts buffers to `running_dtype`; bf16's step at ~2.15 is ~0.016, a third
+    of the selection-relevant spread. Next: ppl A/B (scratchpad `d5_bias_ab.py`) zero vs float32 vs bf16 bias at k=8,
+    prose + code, plus trunc vs clamp k=7 under the float32 bias.
+  - history: **2026-09-15 — A/B MEASURED: MIXED, verdict open.** One process, 48 + 256 decode ppl, buffer swapped per
+    arm (`docs/probes/d5-bias-ab.{log,json}`). k=8 prose: zero **7.262630** (= reference) → f32 bias **7.021189
+    (−3.32 %)**, bf16 bias 7.053263 (−2.88 %). k=8 code (`CALIB_TEXT`): zero **1.775318** → f32 **1.859224 (+4.73 %)**.
+    k=7 prose with f32 bias: truncation 7.217688 (**+2.80 %** vs its k=8; zero-bias k=7 was +6.34 %), true clamp
+    7.237924 (+3.09 %). So: prose better, code WORSE, both outside the k=8 null band (±0.4 %); bias ≈ halves MiniMax's
+    k=7 prose cost (suggestive — 3.5 pp, edge of D5's ±2-3 pp equivalent-arm band); bf16 cast costs only 0.45 pp.
+    Unverified: the EXL3 build was likely calibrated on zero-bias routing (exllamav3 runs it biasless), which would
+    explain code getting worse. **Do NOT wire the bias yet** — Vaayu's workload is code, the only code number is a
+    regression. Next (user's call): (1) load-time WARNING when a config declares a routing bias with no tensor —
+    cheap, CPU, correct either way; (2) broader ppl: several code + prose passages, code at k=7, before any sidecar
+    loading. RESULTS: `docs/2026-09-15-D5-minimax-true-clamp-RESULTS.md` §4.
 - [x] **CLOSED 2026-09-15 (D2): KEPT — Qwen3-235B first load −15.1 % (1514.0 → 1285.4 s, −228.6 s), picks and
   perplexities identical.** `_resolve_decode_top_k_auto` (`vaayu/vaayu_base.py`) runs `resolve(...)` inside
   `with keepawake_for(self):`, so calibration's bare `model(...)` decode forwards get row 27's spinners and P-core
