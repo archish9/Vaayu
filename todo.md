@@ -3146,7 +3146,7 @@ research last.
 | # | item | why here | effort | GPU |
 |---|---|---|---|---|
 | ~~1~~ | ~~**K1**~~ **DONE 2026-09-15** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
-| 2 | **D4** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
+| ~~2~~ | ~~**D4**~~ **DONE 2026-09-15** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
 | 3 | **D3** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
 | 4 | **D1** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
 | 5 | **D2** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
@@ -3176,10 +3176,29 @@ research last.
   with `ENABLE_EXPERT_USAGE` on (default off), `ExpertUsageTracker` (`vaayu/expert_usage.py`, no reset method) permanently
   counts calibration's decode routes, truncated trials included. Telemetry only — no effect on output or speed.
   **Brief (D3, self-contained):** [`docs/issue-D3-calibration-consumes-decode-telemetry.md`](docs/issue-D3-calibration-consumes-decode-telemetry.md) (gitignored — this row is the durable summary).
-- [bug] **Invalid DECODE_TOP_K fails after the layer split, not before** (final review M6). `check_decode_top_k_value` runs in
+- [x] **CLOSED 2026-09-15 (D4):** `check_decode_top_k_value(decode_top_k)` now runs in `VaayuBaseModel.__init__`
+  beside the budget check (`vaayu/vaayu_base.py:2013`), before `find_or_create_local_splitted_path`; the two later
+  checks (`resolve_decode_top_k`, `_detect_moe`'s dense branch) stay for tests that bypass `__init__`.
+  `tests/test_decode_top_k.py::test_an_invalid_decode_top_k_fails_before_the_layer_split` (`"Auto"`, `"8"`, `True`,
+  `7.5`; split stubbed to raise) RED before — the stub was reached — GREEN after; file 61 passed. Full suite 2206
+  passed / 15 skipped / **1 failed, unrelated** (`test_slab_arena.py::test_load_expert_into_slab_tensor_align_gates_pool_usage`,
+  passes alone and alongside this file — order-dependent, recorded as its own `[bug]` row below). §8: no knob; already
+  plumbed (`app.py:423`, `__main__.py:44`); reachable at N=1 — a server started with a typo now fails before the split
+  instead of after it. CPU only, no behaviour change for a valid value.
+  Was: [bug] **Invalid DECODE_TOP_K fails after the layer split, not before** (final review M6). `check_decode_top_k_value` runs in
   `_detect_moe` (~2206), after `find_or_create_local_splitted_path` (~2022); the budget is validated at ~2013. Calling it next
   to the budget check would fail fast. The late timing predates this branch for the int path.
   **Brief (D4, self-contained):** [`docs/issue-D4-decode-top-k-validated-after-split.md`](docs/issue-D4-decode-top-k-validated-after-split.md) (gitignored — this row is the durable summary).
+- [bug] **`tests/test_slab_arena.py::test_load_expert_into_slab_tensor_align_gates_pool_usage` fails in the full suite
+  only** (found 2026-09-15 during D4's suite run: 1 failed / 2206 passed / 15 skipped, 18 min). It passes alone (58
+  passed), with `test_decode_top_k.py` (119 passed) and with `test_ring_pool_sizing.py` (63 passed). The test asserts on
+  process-global state — `_EXPERT_BUF_POOL` (`vaayu/persist/safetensor_model_persister.py:155`) via a wrapped
+  `get` `call_count` and `qsize() == 1` — so something earlier in suite order leaves that state dirty. **Which assertion
+  fails was not captured** (the run's output was cut to its summary). **Refuted:** `init_model_io`'s pool fill
+  (`:314-341`, only called by `tests/test_ring_pool_sizing.py`). **Unconfirmed candidate:** a background thread left by
+  an earlier test calling `_EXPERT_BUF_POOL.get` (`:748`, `:1004`) would bump `call_count`. Not proven pre-existing on
+  HEAD, but D4's change (one validation line in `__init__`) never reaches the pool. Next: re-run the full suite with
+  `--tb=long` to a log to get the assertion, then bisect by file. Test hygiene only — no engine behaviour.
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),

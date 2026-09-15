@@ -613,6 +613,20 @@ def test_an_unknown_decode_top_k_value_raises_on_a_dense_checkpoint_too(bad):
         m._detect_moe()
 
 
+@pytest.mark.parametrize("bad", ["Auto", "8", True, 7.5])
+def test_an_invalid_decode_top_k_fails_before_the_layer_split(monkeypatch, bad):
+    """A typo must not cost a full layer split (~136 GB for Qwen3-235B) before it
+    is reported -- the same fail-fast the budget already gets (todo.md D4)."""
+    import vaayu.vaayu_base as vb
+
+    def split_reached(*args, **kwargs):
+        raise AssertionError("the layer split ran before DECODE_TOP_K was validated")
+
+    monkeypatch.setattr(vb, "find_or_create_local_splitted_path", split_reached)
+    with pytest.raises(ValueError, match="auto"):
+        vb.VaayuBaseModel("/nonexistent-checkpoint", device="cpu", decode_top_k=bad)
+
+
 def test_the_engine_budget_parameter_defaults_to_the_documented_value():
     import inspect
     param = inspect.signature(VaayuBaseModel.__init__).parameters["decode_top_k_budget"]

@@ -2008,7 +2008,9 @@ class VaayuBaseModel(GenerationMixin):
         self.keep_awake = keep_awake
         self.pin_engine_threads = pin_engine_threads
         # Read by _detect_moe() below, which resolves it against the
-        # checkpoint's own num_experts_per_tok (row 33 / T2).
+        # checkpoint's own num_experts_per_tok (row 33 / T2). Validated here,
+        # before the layer split, so a typo does not cost a full split first.
+        check_decode_top_k_value(decode_top_k)
         self._requested_decode_top_k = decode_top_k
         self._decode_top_k_budget = validate_decode_top_k_budget(decode_top_k_budget)
         self._decode_top_p = None
