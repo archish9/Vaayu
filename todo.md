@@ -3145,7 +3145,7 @@ research last.
 
 | # | item | why here | effort | GPU |
 |---|---|---|---|---|
-| 1 | **K1** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
+| ~~1~~ | ~~**K1**~~ **DONE 2026-09-15** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
 | 2 | **D4** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
 | 3 | **D3** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
 | 4 | **D1** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
@@ -3188,7 +3188,10 @@ research last.
   one `server.md` edit adds `DECODE_TOP_K`, `DECODE_TOP_K_BUDGET`, `KEEP_AWAKE`, `PIN_ENGINE_THREADS`, the last two
   in `vaayu/server/README.md`'s wording. Task 6 (commit `ea0cdc2`, "docs: DECODE_TOP_K auto in TUNING.md;
   server.md rows for four speed knobs") added all four rows to `documentation/server.md` §3.
-- [bug] **`vaayu/server/README.md`'s `KEEP_AWAKE` row carries a STALE claim** (found 2026-09-14 while planning the
+- [x] **CLOSED 2026-09-15 (K1):** README sentence replaced with row 27's server figures (+23.1 % Qwen3-235B, 0.9229 →
+  1.1363, TTFT −22.3 %; MiniMax +1.3 %, 70B +2.9 %, 1B unchanged); `tests/test_docs_speed_knobs.py::test_readme_keepawake_row_is_not_stale`
+  RED before, GREEN after; doc tests 13 passed. §8: docs only — no knob, nothing to plumb, no behaviour change.
+  Was: [bug] **`vaayu/server/README.md`'s `KEEP_AWAKE` row carries a STALE claim** (found 2026-09-14 while planning the
   server.md rows): it ends "**The server-level A/B is pending (todo.md row 27); the figures above are in-process**", but
   row 27 CLOSED 2026-09-12 with the server A/B done — **+23.1 % decode tok/s on Qwen3-235B through the server** (0.9229 →
   1.1363, n=3, ids identical). The auto plan's server.md row uses the measured server figure instead of copying the

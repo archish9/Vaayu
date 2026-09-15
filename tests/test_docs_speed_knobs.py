@@ -22,3 +22,10 @@ def test_tuning_guide_documents_decode_top_k_auto():
     text = (ROOT / "documentation" / "TUNING.md").read_text()
     assert "## 5c. `decode_top_k`" in text
     assert '"auto"' in text
+
+
+def test_readme_keepawake_row_is_not_stale():
+    # Row 27's server A/B closed 2026-09-12; the README said it was pending (K1).
+    text = (ROOT / "vaayu" / "server" / "README.md").read_text()
+    assert "server-level A/B is pending" not in text
+    assert "+23.1 % decode tok/s on Qwen3-235B" in text
