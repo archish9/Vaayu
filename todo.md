@@ -3212,7 +3212,14 @@ research last.
   **2026-09-15 (D3's suite run): did NOT reproduce** — `pytest tests/ -q --tb=long`, 2210 passed / 15 skipped / 0 failed
   in **173 s**. D4's run is recorded at 18 min for ~the same test count; that gap would fit D4's run having collected the
   repo-root on-device scripts too (see the bare-`pytest` row below) — **unverified**, its command was not recorded.
-- [bug] **A bare `pytest` from the repo root loads real models and can OOM the box** (found 2026-09-15 during D3). There is
+- [x] **CLOSED 2026-09-15:** `pytest.ini` at the repo root sets `testpaths = tests`.
+  `tests/test_pytest_config.py::test_bare_pytest_collects_only_the_tests_directory` RED before (`pytest.ini missing`),
+  GREEN after. Bare `pytest --collect-only` from the root under a 4 G / no-swap scope with CUDA hidden:
+  `configfile: pytest.ini`, `testpaths: tests`, 2226 collected, no root module, exit 0. Bare `pytest -q` from the root:
+  **2211 passed / 15 skipped / 0 failed, 172 s**. Rootdir unchanged (already the repo root); no test reads it; the only
+  conftest (`tests/conftest.py`) defines no hooks. Explicit paths (`pytest tests/test_x.py`, the on-device gates) are
+  unaffected — `testpaths` only applies with no args. §8: test tooling, no engine or server change.
+  Was: [bug] **A bare `pytest` from the repo root loads real models and can OOM the box** (found 2026-09-15 during D3). There is
   no pytest config (no `pytest.ini` / `pyproject.toml` / `setup.cfg` / `tox.ini`), so `./venv/bin/python -m pytest -q`
   collects the root scripts `test_generate.py` (Qwen3-235B) and `test_multiturn.py` (MiniMax-M2.7), whose module-level
   code loads and generates at import. Observed: run started 11:54:45, `.vaayu_kv` written 11:58:08, kernel `global_oom`
