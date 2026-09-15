@@ -3147,7 +3147,7 @@ research last.
 |---|---|---|---|---|
 | ~~1~~ | ~~**K1**~~ **DONE 2026-09-15** README `KEEP_AWAKE` row still says the server A/B is "pending" | docs-only, removes a false claim users read | ~5 min | no |
 | ~~2~~ | ~~**D4**~~ **DONE 2026-09-15** invalid `DECODE_TOP_K` rejected only after the layer split | one line + one test; a typo can cost a full split (~136 GB on Qwen3-235B) | ~15 min | no |
-| 3 | **D3** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
+| ~~3~~ | ~~**D3**~~ **DONE 2026-09-15** calibration routes stay in the expert-usage histogram | CPU test only; edits `_resolve_decode_top_k_auto`, which D2 also edits — land D3 first, then D2 on top | ~30 min | no |
 | 4 | **D1** truncation forces router weights to sum 1 | **correctness** for scaling-router families (DeepSeek-V2/V3, GLM-4-MoE, …) even with an explicit int; latent on this box; bumps `METHOD_VERSION` — do it before D2/D5 so their measurements run on the final semantics | ~½ day + ~15 min device | yes |
 | 5 | **D2** calibration runs without keep-awake / thread pinning | performance, unmeasured; needs an ~2 h ABBA first-load A/B on Qwen3-235B; stop rule < 5 % saving → close | ~30 min + ~2 h device | yes |
 | 6 | **D5** MiniMax true-clamp experiment | research; only pays if a true clamp lets k=7 beat `auto`'s cutoff p=0.90 on MiniMax; would bump `METHOD_VERSION` again if adopted | ~½ day + ~20 min device | yes |
@@ -3169,7 +3169,17 @@ research last.
   token on Qwen3-235B from those two knobs, so the ~26-min first load is probably longer than necessary. Candidate: wrap
   `run_ladders` in `with keepawake_for(model):`. **Unmeasured — needs a first-load A/B before claiming a saving.**
   **Brief (D2, self-contained):** [`docs/issue-D2-calibration-without-keepawake.md`](docs/issue-D2-calibration-without-keepawake.md) (gitignored — this row is the durable summary).
-- [bug] **DECODE_TOP_K=auto calibration is counted in the expert-usage histogram** (final review M5, **scope corrected
+- [x] **CLOSED 2026-09-15 (D3):** `_resolve_decode_top_k_auto` (`vaayu/vaayu_base.py`, right after `resolve` returns)
+  now zeroes `_expert_usage.counts` and clears `_expert_vram_cache.evicted_keys` when the status `source` is `measured`
+  or `failed` (a failed ladder may have recorded part of a run); `cache` / `config` ran no forward and clear nothing.
+  `tests/test_decode_top_k.py::test_calibration_routes_do_not_stay_in_the_usage_telemetry[measured|failed]` RED before
+  (`assert 2 == 0`), GREEN after; `test_a_cached_pick_leaves_the_usage_telemetry_alone` guards against over-clearing
+  (green both sides, by design). Three files 103 passed; full `pytest tests/ -q` **2210 passed / 15 skipped / 0 failed,
+  173 s**. **Reachability, checked:** latent in-repo — the histogram's only reader, `test_generate.py:254-274`, sets
+  neither `enable_expert_usage` nor `decode_top_k`, and the server builds the tracker but never prints the report.
+  §8: no knob (behind `ENABLE_EXPERT_USAGE`); already plumbed; reachable at N=1; telemetry only, no output or speed
+  change. CPU only. D2 edits the same method next.
+  Was: [bug] **DECODE_TOP_K=auto calibration is counted in the expert-usage histogram** (final review M5, **scope corrected
   2026-09-14 while writing the brief**). The review's main claim — that `_decode_stats_reset` fires once per model lifetime,
   so calibration pollutes later decode hit rates — is **wrong**: `decode_stats_reset` (`vaayu/vaayu_base.py:426`) re-arms on
   every prefill (the F13 fix), so the first real turn's first decode pass wipes calibration's cache counts. What remains:
@@ -3199,6 +3209,16 @@ research last.
   an earlier test calling `_EXPERT_BUF_POOL.get` (`:748`, `:1004`) would bump `call_count`. Not proven pre-existing on
   HEAD, but D4's change (one validation line in `__init__`) never reaches the pool. Next: re-run the full suite with
   `--tb=long` to a log to get the assertion, then bisect by file. Test hygiene only — no engine behaviour.
+  **2026-09-15 (D3's suite run): did NOT reproduce** — `pytest tests/ -q --tb=long`, 2210 passed / 15 skipped / 0 failed
+  in **173 s**. D4's run is recorded at 18 min for ~the same test count; that gap would fit D4's run having collected the
+  repo-root on-device scripts too (see the bare-`pytest` row below) — **unverified**, its command was not recorded.
+- [bug] **A bare `pytest` from the repo root loads real models and can OOM the box** (found 2026-09-15 during D3). There is
+  no pytest config (no `pytest.ini` / `pyproject.toml` / `setup.cfg` / `tox.ini`), so `./venv/bin/python -m pytest -q`
+  collects the root scripts `test_generate.py` (Qwen3-235B) and `test_multiturn.py` (MiniMax-M2.7), whose module-level
+  code loads and generates at import. Observed: run started 11:54:45, `.vaayu_kv` written 11:58:08, kernel `global_oom`
+  killed pytest (total-vm 103 GB) at 64 % at 12:11:21. Nothing destructive (`VAAYU_DELETE_ORIGINAL` unset, both scripts
+  default it off). The Environment section's `pytest tests/ -q` is correct; the trap is the default. Candidate fix:
+  a minimal config with `testpaths = tests`. Not done — outside D3's scope.
 - [x] **CLOSED 2026-09-14 (Task 6, commit `ea0cdc2`):** `documentation/server.md` §3 "Speed" table was missing three shipped knobs (found 2026-09-14 during the
   auto spec self-review). That table lists speed knobs by constant name (`MAX_PINNED_LAYERS` … `ENABLE_EXPERT_USAGE`),
   but has no row for **`DECODE_TOP_K`** (row 33, commit `7bc5703` — documented only in `vaayu/server/README.md`),

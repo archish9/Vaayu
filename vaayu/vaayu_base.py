@@ -3367,6 +3367,17 @@ class VaayuBaseModel(GenerationMixin):
             return
         from . import decode_top_k_auto
         self._decode_top_k_status = decode_top_k_auto.resolve(self, self._decode_top_k_budget)
+        # Calibration's decode passes are not user traffic, yet the usage histogram
+        # recorded them and evicted_keys kept their evictions -- neither store is
+        # reset per turn (D3). A failed ladder may have recorded part of a run; a
+        # cache hit ran no forward and has nothing to clear.
+        if self._decode_top_k_status.get("source") in ("measured", "failed"):
+            usage = getattr(self, "_expert_usage", None)
+            if usage is not None:
+                usage.counts.zero_()
+            vram = getattr(self, "_expert_vram_cache", None)
+            if vram is not None and vram.evicted_keys is not None:
+                vram.evicted_keys.clear()
 
     def decode_top_k_status(self) -> dict:
         """The active decode expert budget, for /health."""

@@ -592,6 +592,53 @@ def test_the_hook_runs_resolve_only_when_auto(monkeypatch):
     assert seen == [0.02]
 
 
+def _auto_with_usage_telemetry():
+    from collections import Counter
+    from vaayu.expert_usage import ExpertUsageTracker
+
+    m = _bare_moe("auto")
+    m._detect_moe()
+    m._expert_usage = ExpertUsageTracker(n_rows=4, n_experts=8, device="cpu")
+    m._expert_vram_cache = SimpleNamespace(evicted_keys=Counter())
+    return m
+
+
+@pytest.mark.parametrize("source", ["measured", "failed"])
+def test_calibration_routes_do_not_stay_in_the_usage_telemetry(monkeypatch, source):
+    """D3: calibration's teacher-forced decode passes are recorded like user
+    traffic, and neither the usage histogram nor evicted_keys has a reset of its
+    own, so a triage report taken after an auto first load would count them. A
+    failed run may have recorded part of a ladder before raising."""
+    import vaayu.decode_top_k_auto as dtka
+
+    def fake_resolve(model, budget):
+        model._expert_usage.record(1, torch.tensor([[2, 3]]))
+        model._expert_vram_cache.evicted_keys[(1, 2)] += 1
+        return {"mode": "none", "value": None, "cost": None, "source": source}
+
+    monkeypatch.setattr(dtka, "resolve", fake_resolve)
+    m = _auto_with_usage_telemetry()
+    m._resolve_decode_top_k_auto()
+
+    assert int(m._expert_usage.counts.sum()) == 0
+    assert sum(m._expert_vram_cache.evicted_keys.values()) == 0
+
+
+def test_a_cached_pick_leaves_the_usage_telemetry_alone(monkeypatch):
+    """A cache hit runs no forward, so there is nothing of its own to clear."""
+    import vaayu.decode_top_k_auto as dtka
+
+    monkeypatch.setattr(dtka, "resolve", lambda model, budget: {
+        "mode": "k", "value": 8, "cost": 0.03, "source": "cache"})
+    m = _auto_with_usage_telemetry()
+    m._expert_usage.record(1, torch.tensor([[2, 3]]))
+    m._expert_vram_cache.evicted_keys[(1, 2)] += 1
+    m._resolve_decode_top_k_auto()
+
+    assert int(m._expert_usage.counts.sum()) == 2
+    assert sum(m._expert_vram_cache.evicted_keys.values()) == 1
+
+
 def test_the_hook_is_the_last_statement_of_init():
     """Measurement needs a fully constructed model -- prefix cache, KV persist
     and the post-load RAM ledger included. AutoModel.from_pretrained does no
