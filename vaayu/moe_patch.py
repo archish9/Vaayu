@@ -1722,7 +1722,6 @@ def _make_fused_sparse_forward(
     original_forward = None,
 ):
     import torch.nn.functional as F
-    from .persist.safetensor_model_persister import load_expert_sparse
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -1805,128 +1804,135 @@ def _make_fused_sparse_forward(
                 if _held is not None:
                     _vram_hold[_e] = _held
 
-        # Load active expert weights: cache → parallel sparse io_uring for misses
+        # Load active expert weights through the SHARED miss loader (row 30-P).
+        # With a slab arena -- the engine allocates one for this forward on CUDA
+        # since 30-P -- RAM-tier entries are views into PINNED slabs, so the miss
+        # path's .to(device, non_blocking=True) is a real async copy instead of a
+        # pageable one that holds the host (157 us vs 32-40 us per expert,
+        # measured; +10.62 % decode tok/s on Qwen3-Next-80B int4). Without an
+        # arena (CPU compute, unit tests) the helper takes the legacy clone path,
+        # which is what this forward used to do inline.
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
-        expert_tensors: dict[int, dict] = {}
-        misses: list[int] = []
-        for eidx in unique_experts:
-            cached = expert_cache.get(layer_idx, eidx)
-            if cached is not None:
-                expert_tensors[eidx] = cached
-            elif eidx in _vram_hold:
-                # On the GPU already — reading it off NVMe would fill a RAM slot
-                # with a copy of something the compute loop will not look at (P8).
-                # The get() above already refreshed the RAM LRU.
-                expert_tensors[eidx] = VRAM_RESIDENT_NO_RAW
-            else:
-                misses.append(eidx)
-
+        _arena = expert_cache.arena
         _t_disk = _mark() if _prof else 0.0
-        if misses:
-            def _load_one(eidx: int):
-                metas = offset_index.get_expert_offsets(layer_name, eidx)
-                if metas is None:
-                    return eidx, None
-                raw = load_expert_sparse(shard_file, metas)
-                if not getattr(vaayu_ref, "_moe_prefill_pass", False):
-                    expert_cache.put(layer_idx, eidx, raw)
-                return eidx, raw
-
-            # Reuse the persistent MoE executor (created once at model init) —
-            # a fresh ThreadPoolExecutor per layer call paid thread create/join
-            # on every MoE layer. Fallback covers unit tests whose mock
-            # vaayu_ref has no executor.
-            _ex = getattr(vaayu_ref, "_moe_executor", None)
-            if _ex is not None:
-                _results = _ex.map(_load_one, misses)
-            else:
-                from concurrent.futures import ThreadPoolExecutor as _TPE
-                with _TPE(max_workers=min(len(misses), 8)) as _tmp_ex:
-                    _results = list(_tmp_ex.map(_load_one, misses))
-            for eidx, raw in _results:
-                if raw is not None:
-                    expert_tensors[eidx] = raw
-        if _prof:
-            _mp['disk_load'] += time.perf_counter() - _t_disk
-
-        # fp32 accumulator, cast back at the return -- see the identical note in
-        # _make_fused_sparse_forward_exl3. Experts reach index_add_ in disk
-        # completion order, and a bf16 accumulator makes that order observable.
-        # Expert mask on CPU (avoids PCIe for index tensors)
-        _t_mask = _mark() if _prof else 0.0
-        expert_indices_cpu = expert_indices.cpu()
-        expert_mask = F.one_hot(
-            expert_indices_cpu, num_classes=experts_mod.num_experts
-        ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
-        if _prof:
-            _mp['mask_sync'] += time.perf_counter() - _t_mask
-
-        # ── Compute FFN on the target device ──────────────────────────────────
-        final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
-
-        for eidx in unique_experts:
-            raw = expert_tensors.get(eidx)
-            if raw is None:
-                continue
-
-            top_k_pos, token_idx = torch.where(expert_mask[eidx])
-            if token_idx.numel() == 0:
-                continue
-
-            _t_scatter = _mark() if _prof else 0.0
-            token_idx_gpu = token_idx.to(device)
-            current_state = flat_hidden[token_idx_gpu]
+        expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
+            unique_experts,
+            layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
+            offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref,
+            # On the GPU already: a RAM miss on these reads nothing off NVMe (P8).
+            # Their RAM lookup still runs inside the helper (LRU refresh).
+            vram_resident=set(_vram_hold),
+        )
+        try:
+            # Wait for EVERY read before computing, as the inline loader did: the
+            # loop below runs in ascending expert id, which fixes final_hidden's
+            # fp32 index_add_ order. Consuming reads in completion order would
+            # make that order timing-dependent.
+            for _fut in _miss_futures:
+                _e, _raw = _fut.result()
+                if _raw is not None:
+                    expert_tensors[_e] = _raw
             if _prof:
-                _mp['scatter'] += time.perf_counter() - _t_scatter
+                _mp['disk_load'] += time.perf_counter() - _t_disk
 
-            _held = _vram_hold.get(eidx)
-            if _held is not None:
-                # A hit skips the host-to-device copy entirely; a packed entry
-                # still owes the fused dequant, which is 'construct' either way.
-                # It is booked to 'construct_hit' as well, because S3 cannot move
-                # a GPU-resident expert to the CPU without copying it back.
-                _t_con = _mark() if _prof else 0.0
-                w_gate_gpu, w_down_gpu, w_up_gpu = expert_weights_from_entry(
-                    _held, dtype)
-                if _prof:
-                    _d_con = _mark() - _t_con
-                    _mp['construct'] += _d_con
-                    _mp['construct_hit'] += _d_con
-                    _mp['slots_hit'] += 1
-            else:
-                # h2d / construct are split inside _expert_dense_weights: the copy
-                # and the dequant run back to back there, and the phase-4 gate is a
-                # ratio of exactly those two.
-                w_gate_gpu, w_down_gpu, w_up_gpu, _entry = _expert_dense_weights(
-                    raw, device, dtype, timing=_mp)
-                if w_gate_gpu is None:
+            # fp32 accumulator, cast back at the return -- see the identical note in
+            # _make_fused_sparse_forward_exl3. Experts reach index_add_ in disk
+            # completion order, and a bf16 accumulator makes that order observable.
+            # Expert mask on CPU (avoids PCIe for index tensors)
+            _t_mask = _mark() if _prof else 0.0
+            expert_indices_cpu = expert_indices.cpu()
+            expert_mask = F.one_hot(
+                expert_indices_cpu, num_classes=experts_mod.num_experts
+            ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+            if _prof:
+                _mp['mask_sync'] += time.perf_counter() - _t_mask
+
+            # ── Compute FFN on the target device ──────────────────────────────
+            final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
+
+            for eidx in unique_experts:
+                raw = expert_tensors.get(eidx)
+                if raw is None:
                     continue
-                if _vram is not None and _entry is not None:
-                    # put() False means the cache refused ownership (duplicate key,
-                    # or one expert larger than the whole budget). These are plain
-                    # torch tensors — unlike the EXL3 forward's BC objects there is
-                    # no C++ heap to free, so dropping the reference is the free.
-                    _vram.put(layer_idx, eidx, _entry)
+
+                top_k_pos, token_idx = torch.where(expert_mask[eidx])
+                if token_idx.numel() == 0:
+                    continue
+
+                _t_scatter = _mark() if _prof else 0.0
+                token_idx_gpu = token_idx.to(device)
+                current_state = flat_hidden[token_idx_gpu]
                 if _prof:
-                    _mp['slots_miss'] += 1
+                    _mp['scatter'] += time.perf_counter() - _t_scatter
 
-            _t_gemm = _mark() if _prof else 0.0
-            gate_out = act_fn(F.linear(current_state, w_gate_gpu))
-            up_out = F.linear(current_state, w_up_gpu)
-            out = F.linear(gate_out * up_out, w_down_gpu)
-            if _prof:
-                _d_gemm = _mark() - _t_gemm
-                _mp['gemm'] += _d_gemm
+                _held = _vram_hold.get(eidx)
                 if _held is not None:
-                    _mp['gemm_hit'] += _d_gemm
+                    # A hit skips the host-to-device copy entirely; a packed entry
+                    # still owes the fused dequant, which is 'construct' either way.
+                    # It is booked to 'construct_hit' as well, because S3 cannot move
+                    # a GPU-resident expert to the CPU without copying it back.
+                    _t_con = _mark() if _prof else 0.0
+                    w_gate_gpu, w_down_gpu, w_up_gpu = expert_weights_from_entry(
+                        _held, dtype)
+                    if _prof:
+                        _d_con = _mark() - _t_con
+                        _mp['construct'] += _d_con
+                        _mp['construct_hit'] += _d_con
+                        _mp['slots_hit'] += 1
+                else:
+                    # h2d / construct are split inside _expert_dense_weights: the copy
+                    # and the dequant run back to back there, and the phase-4 gate is a
+                    # ratio of exactly those two.
+                    w_gate_gpu, w_down_gpu, w_up_gpu, _entry = _expert_dense_weights(
+                        raw, device, dtype, timing=_mp)
+                    # This expert's copies out of the RAM tier are now issued. If they
+                    # read from a pinned slab, arm the arena's read event so acquire()
+                    # cannot recycle the slab under the in-flight DMA, then release
+                    # this forward's pin on the key -- the same order as
+                    # _make_fused_sparse_forward_exl3. A legacy clone is in no slab
+                    # (slab_index_of -> None) and needs neither.
+                    if _arena is not None:
+                        _rd = _arena.slab_index_of(next(iter(raw.values())))
+                        if _rd is not None:
+                            _arena.record_read(_rd)
+                    if (layer_idx, eidx) in _pinned_keys:
+                        expert_cache.unpin(layer_idx, eidx)
+                        _pinned_keys.discard((layer_idx, eidx))
+                    if w_gate_gpu is None:
+                        continue
+                    if _vram is not None and _entry is not None:
+                        # put() False means the cache refused ownership (duplicate key,
+                        # or one expert larger than the whole budget). These are plain
+                        # torch tensors — unlike the EXL3 forward's BC objects there is
+                        # no C++ heap to free, so dropping the reference is the free.
+                        _vram.put(layer_idx, eidx, _entry)
+                    if _prof:
+                        _mp['slots_miss'] += 1
 
-            _t_scatter = _mark() if _prof else 0.0
-            out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
-            final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
-            if _prof:
-                _mp['scatter'] += _mark() - _t_scatter
+                _t_gemm = _mark() if _prof else 0.0
+                gate_out = act_fn(F.linear(current_state, w_gate_gpu))
+                up_out = F.linear(current_state, w_up_gpu)
+                out = F.linear(gate_out * up_out, w_down_gpu)
+                if _prof:
+                    _d_gemm = _mark() - _t_gemm
+                    _mp['gemm'] += _d_gemm
+                    if _held is not None:
+                        _mp['gemm_hit'] += _d_gemm
 
-            del w_gate_gpu, w_down_gpu, w_up_gpu
+                _t_scatter = _mark() if _prof else 0.0
+                out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+                final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
+                if _prof:
+                    _mp['scatter'] += _mark() - _t_scatter
+
+                del w_gate_gpu, w_down_gpu, w_up_gpu
+        finally:
+            # Every key the helper pinned that the loop did not release (VRAM
+            # hits, skipped experts, an exception mid-loop). A leaked pin blocks
+            # that key's eviction forever.
+            for _pk in _pinned_keys:
+                expert_cache.unpin(*_pk)
 
         result = final_hidden.to(flat_hidden.dtype)
         _shared = _shared_expert_output(moe_mod, flat_hidden)

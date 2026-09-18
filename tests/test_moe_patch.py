@@ -2386,10 +2386,13 @@ def test_iter_expert_loads_yields_the_resident_sentinel(tmp_path):
     assert seen == [(3, VRAM_RESIDENT_NO_RAW)]
 
 
-def test_only_the_fused_forward_passes_vram_resident():
-    """Model-agnostic mandate (CLAUDE.md §5): this lands in ONE forward. The
-    module-list forward already filters resident experts out of _to_load, and
-    the non-EXL3 fused forward is untouched."""
+def test_both_fused_forwards_pass_vram_resident_and_the_module_list_does_not():
+    """Model-agnostic mandate (CLAUDE.md §5): P8's read suppression must reach
+    every forward that can hold a VRAM entry for a RAM-missed expert. The
+    fused-EXL3 forward passes it; the non-EXL3 fused forward passes it since
+    row 30-P moved its inline loader onto _dispatch_expert_misses (it did the
+    same suppression inline before, via VRAM_RESIDENT_NO_RAW). The module-list
+    forward filters resident experts out of _to_load instead."""
     import inspect
     from vaayu import moe_patch
 
@@ -2401,5 +2404,8 @@ def test_only_the_fused_forward_passes_vram_resident():
         "the fused-EXL3 forward must tell dispatch which experts are already "
         "on the GPU, or the read suppression never fires"
     )
+    assert "vram_resident=" in plain, (
+        "the non-EXL3 fused forward must tell dispatch which experts are already "
+        "on the GPU (row 30-P), or a RAM miss on them re-reads NVMe (P8)"
+    )
     assert "vram_resident=" not in modlist
-    assert "vram_resident=" not in plain
