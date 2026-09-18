@@ -2535,13 +2535,18 @@ class VaayuBaseModel(GenerationMixin):
                       f"otherwise: {_pre}")
                 self.speculative_status["forced"] = True
                 _pre = None
+            if _pre is None:
+                # Row 41: correctness, not a byte bound, so it sits after the
+                # measurement hatch above -- VAAYU_SPEC_FORCE does not lift it.
+                from .batch import spec_recurrent_refusal
+                _pre = spec_recurrent_refusal(self._create_kv_cache())
             if _pre is not None:
                 # C1 made this reachable for prompt lookup too, which has no
                 # drafter to leave unloaded -- say what was actually declined.
                 _what = ("the drafter is NOT loaded" if drafter_model_path
                          else "no prompt-lookup proposer is built")
                 print(f"[Vaayu-Spec] WARNING: {_pre} DISABLING speculative "
-                      f"decoding for this MoE model; {_what}.")
+                      f"decoding for this model; {_what}.")
                 self.speculative_status["refused_because"] = _pre
             else:
                 from .speculative import build_speculator
@@ -3310,6 +3315,15 @@ class VaayuBaseModel(GenerationMixin):
         if 'rotary_pos_emb' in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
+
+        # Row 43: a hybrid model's linear-attention mixers must continue from
+        # the state their cache holds across prefill chunks; stock transformers
+        # restarts them at every chunk. Zero on every uniform-attention model.
+        from .recurrent_state import install_state_continuation
+        self._state_continuation_layers = install_state_continuation(self.model)
+        if self._state_continuation_layers:
+            print(f"[Vaayu] {self._state_continuation_layers} linear-attention "
+                  f"mixers continue from cached state across prefill chunks")
 
     def _apply_missing_buffers(self):
         """Persistent buffers with no checkpoint tensor keep their init values
@@ -4412,6 +4426,12 @@ class VaayuBaseModel(GenerationMixin):
         chunk_size = self.prefill_chunk_size
         total_len  = input_ids.shape[1]
         n_chunks   = (total_len + chunk_size - 1) // chunk_size
+        if n_chunks > 1:
+            from .recurrent_state import continuation_refusal
+            _refusal = continuation_refusal(
+                past_key_values, getattr(self, "_state_continuation_layers", 0))
+            if _refusal is not None:
+                raise NotImplementedError(f"Chunked prefill refused: {_refusal}")
         print(f"[Vaayu] Chunked prefill: {total_len} tokens → {n_chunks} chunks of {chunk_size}")
 
         # Layer-major path (MoE): chunks become batch elements of ONE forward, so
@@ -5190,6 +5210,16 @@ class VaayuBaseModel(GenerationMixin):
         """
         if cache is None:
             return
+        from .batch import cache_holds_recurrent_state
+        if cache_holds_recurrent_state(cache):
+            # Row 41: `crop` here shortens only the KV layers; the recurrent
+            # layers keep every verified token. Speculation is refused at load
+            # on such a cache (spec_recurrent_refusal); this is the backstop.
+            raise TypeError(
+                f"{type(cache).__name__} holds recurrent (linear-attention) "
+                f"state, which cannot be trimmed back to {target_seq_len} "
+                f"tokens: it is a fixed-size summary of everything the layer "
+                f"has seen. Speculative decoding must not run on this model.")
         if hasattr(cache, 'crop'):
             cache.crop(target_seq_len)
         elif hasattr(cache, 'key_cache'):

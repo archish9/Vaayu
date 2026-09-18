@@ -90,10 +90,14 @@ def client(uncaptured_stdout):
     # SERVER_DECODE_TOP_K=auto (or an int) runs this gate with the decode
     # expert budget on; unset keeps the server default (None).
     _dtk = os.environ.get("SERVER_DECODE_TOP_K")
+    # SERVER_USE_PROMPT_LOOKUP=1 opts speculation in (row 41: a hybrid model
+    # must load with it REFUSED and still pass); unset keeps "auto".
+    _pld = os.environ.get("SERVER_USE_PROMPT_LOOKUP")
     cfg = ServerConfig(model_path=CKPT, served_model_name="vaayu-smoke",
                        delete_original=False,
                        decode_top_k=(None if not _dtk
-                                     else "auto" if _dtk == "auto" else int(_dtk)))
+                                     else "auto" if _dtk == "auto" else int(_dtk)),
+                       use_prompt_lookup=("auto" if not _pld else _pld == "1"))
     with TestClient(create_app(cfg)) as c:
         yield c
 

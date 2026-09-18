@@ -518,6 +518,24 @@ def cache_holds_recurrent_state(cache) -> bool:
     return False
 
 
+def spec_recurrent_refusal(cache) -> str | None:
+    """Why speculative decoding cannot run on `cache`, or None (row 41).
+
+    A rejected draft has to be rolled back out of the cache, and a recurrent
+    state cannot be: it is a fixed-size summary of every token the verify pass
+    fed it, with no per-token history to crop -- `crop` shortens only the KV
+    layers. Measured 2026-09-18 on Qwen3-Next before this refusal existed:
+    `speculative_generate` emitted garbage from the first drafting round. This
+    is correctness, not a byte bound, so VAAYU_SPEC_FORCE does not override it.
+    """
+    if cache_holds_recurrent_state(cache):
+        return ("this model has recurrent (linear-attention) layers, and a "
+                "rejected draft cannot be rolled back out of a recurrent state "
+                "-- every partially accepted round would decode later tokens "
+                "against drafts that were never emitted.")
+    return None
+
+
 def prefix_cache_refusal_reason(cache, kv_cache_mode) -> str | None:
     """Why the cross-turn prefix cache cannot run on `cache`, or None.
 
