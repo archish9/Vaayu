@@ -150,11 +150,15 @@ self-contained brief covers all three: [`…-hybrid-model-next-steps-BRIEF.md`](
 durable copies).** Why these: Qwen3-Next is the fastest model on this box (7.34 tok/s at N=1, ~6.5× Qwen3-235B as
 served). Its 36 linear-attention layers keep a recurrent state that Vaayu's cache code cannot crop, which already cost
 it the prefix cache (RC7). Order rule: correctness first, cheap and no-GPU next, research last.
-1. **Row 41 `[bug]` SUSPECTED — speculative decoding may corrupt a hybrid model's recurrent state on a rejected draft.**
+0. ~~**Row 43**~~ **DONE 2026-09-18 — chunked prefill restarted Qwen3-Next's 36 linear-attention layers at every
+   512-token chunk (DEFAULT path; logits rel-L2 0.314 vs a 0.051 floor). FIXED by exact state continuation: 0.041.**
+1. ~~**Row 41**~~ **DONE 2026-09-18 — CONFIRMED (speculation on a hybrid emitted garbage from the first drafting round);
+   now REFUSED at load on any recurrent cache.** Original text: speculative decoding may corrupt a hybrid model's recurrent state on a rejected draft.
    Confirm with one short GPU run; if confirmed, refuse speculation on recurrent caches, as RC7 does for the prefix cache.
 2. **Row 30's OPTIONAL RAM-ceiling observation — price it.** ~4.8 GB held back for prefix sessions this model refuses.
    CPU replay, ~1 h. Close if < +2 % (upper bound: `disk_load` is 8.4 % of `T_prof`).
-3. **Row 42 — SCOPING spike: recurrent-state snapshot/restore.** One mechanism unblocks both the prefix cache (the
+3. **Row 42 — SCOPING spike: recurrent-state snapshot/restore.** *(2026-09-18: row 43 already built the multi-token
+   continuation a hybrid prefix hit needs; what is left is the snapshot itself.)* One mechanism unblocks both the prefix cache (the
    agent workload's top TTFT lever, OFF on this model) and speculation (row **37**, whose gate has been MET since S2
    landed 2026-09-13). One snapshot is ~38–75 MB (derived). Measurement only; go/no-go per use.
 
@@ -178,7 +182,7 @@ rows **32 · 34 · 35** and **28b**.
 | **30** | **S3 CLOSED 2026-09-18 by its re-gate on the 30-P build: gate 1 `(construct_miss + gemm_miss)/T_prof` = 6.96 / 6.99 % < 10 %; every S-step of this row is now closed.** — **S2b (iii) BUILT AND SHIPPED 2026-09-13 — the VRAM expert cache now reaches the non-EXL3 fused forward: `4.1584 → 6.4702 tok/s, +55.6 %` at N=1 on server knobs (same-day baseline arm, greedy ids identical, 83 % VRAM hit). Stop rule was ≥ +20 %. Peak VRAM 11.66 GiB — 3.17 GiB free against a 3.50 GiB reserve floor, tight, recorded. RC4(c) DONE 2026-09-13 (max_seq_len 16384 -> 65536, 0 % tok/s). **S3-pre DONE 2026-09-13: NEITHER gate fires cleanly and the gate had been read the wrong way — `construct`/`gemm` run on BOTH sides of a VRAM hit, so the literal reading counts work S3 cannot take. ADDRESSABLE `(h2d+construct_miss+gemm_miss)/T` = 15.1 / 15.2 % (literal 20.8 / 21.1 %); row 36's `serial/T` = 23.0 / 23.4 % strict, 32.5 / 32.8 % wide. S3 RECOMMENDED CLOSED — the VRAM cache's only fill site IS the miss branch S3 removes, so its 15 % is self-defeating (that mechanism objection was later dissolved by S3-fill's fill-behind, 2026-09-18; S3 then closed on its re-gate NUMBER). NEXT WAS T2 / row 33 (`top_k` 10→8 = +14.7 %, →6 = +34.2 %, derived from measurement).** — S2 CLOSED 2026-09-13 — `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` RUNS: `4.0648 tok/s` warm at N=1 on server knobs, server gate green (9 passed), the FIRST non-EXL3 MoE ever executed on this box.** Seven root causes fixed (RC1 dequant · RC3 shared expert · RC4(a)(b) hybrid KV · **RC5 the splitter dropped tensors** · **RC6 `get_seq_length()`=0 on hybrid, 9.5×** · **RC7 prefix cache refused on recurrent state**). ~~Remaining: S3 only~~ — **S3 CLOSED 2026-09-18** (re-gate, above); 30-P DONE 2026-09-18 (+11.69 %). **S2b CLOSED 2026-09-16: (iv) re-priced at 0.33 % of `T_prof` and DROPPED** (`docs/2026-09-16-row30-S2b-iv-reprice-RESULTS.md`); T2 / row 33 closed 2026-09-13. | **7.6× Qwen3-235B-EXL3's raw 0.85 / 5.7× row 27's served 1.1363** (was 4.8× / 3.6× at S2's close) — the largest measured win on this board. NOT row 29's projected 18.1; re-derive from the measurement. **Phase-4 gate, re-read correctly 2026-09-13 (S3-pre): 15.1 / 15.2 % addressable, ON the 15 % rule — and S3 is recommended closed on mechanism, not on the number.** Disk fell to **1.7 %** of a token, so **T3 is dead here**; T4's row 36 straddles its own rule (23.4 % strict / 32.8 % wide), so **T2 / row 33 goes first**. | `[~]` **priority 2 — S1, S2, S2b, RC4(c), S3-pre, 30-P and S3 (re-gate: CLOSED 2026-09-18) all DONE; the row stays open only for the OPTIONAL RAM-ceiling observation found by 30-P (its `[bug]` arena cap is now row 40)** | **NO download** | [`…-row30-S2b-iii-vram-cache-RESULTS.md`](docs/2026-09-13-row30-S2b-iii-vram-cache-RESULTS.md) · [`…-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[x]` **CLOSED 2026-09-13 — shipped OFF; Qwen3-Next k=9 = +17.0 % for +1.47 % ppl, MiniMax has no viable k** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **30-P** | **DONE 2026-09-18 — pinned RAM tier (slab arena) for the non-EXL3 fused forward.** Replaced the forward's inline pageable-clone loader with `_dispatch_expert_misses`; the arena gate now accepts fused non-EXL3 on CUDA. | **+11.69 % decode tok/s measured on branch `row30p-pinned-ram-tier` on Qwen3-Next (6.6329 → 7.4084, ABBA, greedy ids identical × 12 × 64 tokens)** — beats the probe's own +10.62 %. No knob, reachable at N=1 (measured there), bit-identical, VRAM hit/peak unchanged (83 %, Δ ≈ 0.03 GiB). Server-sizing arena: 10380 × 1.8MB, 18.54 GB pinned. It is also the hard prerequisite of any S3 fill-behind — unblocked now. | `[x]` **DONE — merged to `main` 2026-09-18 (`8475123`); the S3 re-gate it unblocked ran the same day and CLOSED S3** | ~1–2 days | [`…/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md`](docs/superpowers/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md) · spec [`…-row30-S3-fill-site-SCOPING.md`](docs/2026-09-18-row30-S3-fill-site-SCOPING.md) · [`…-row30P-pinned-ram-tier-RESULTS.md`](docs/2026-09-18-row30P-pinned-ram-tier-RESULTS.md) · row **30** below |
-| **41** | **`[bug]` SUSPECTED (code reading 2026-09-18, not reproduced): speculative decoding on a hybrid model rolls back only the KV layers.** `_trim_kv_cache` → `crop()` (`vaayu_base.py:5171` / `:1544`) shortens KV lengths; the 36 linear-attention layers' recurrent state keeps the rejected draft tokens → silently wrong text. | Correctness. Reachable only by opt-in: `USE_PROMPT_LOOKUP=True` (server knob) with Qwen3-Next. `"auto"` = off on MoE, so the default is safe. Fix if confirmed is small: refuse at load via `cache_holds_recurrent_state`, as RC7 does. | `[bug]` **sequence step 1 (2026-09-18)** | ~½ day | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1 · row **41** below |
+| **41** | **`[bug]` SUSPECTED (code reading 2026-09-18, not reproduced): speculative decoding on a hybrid model rolls back only the KV layers.** `_trim_kv_cache` → `crop()` (`vaayu_base.py:5171` / `:1544`) shortens KV lengths; the 36 linear-attention layers' recurrent state keeps the rejected draft tokens → silently wrong text. | Correctness. Reachable only by opt-in: `USE_PROMPT_LOOKUP=True` (server knob) with Qwen3-Next. `"auto"` = off on MoE, so the default is safe. Fix if confirmed is small: refuse at load via `cache_holds_recurrent_state`, as RC7 does. | `[x]` **CLOSED 2026-09-18 — confirmed, refused at load; its root cause also broke chunked prefill (row 43, FIXED)** | ~½ day | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1 · row **41** below |
 | **42** | **SCOPING spike: recurrent-state snapshot/restore for hybrid models.** Would unblock the cross-turn prefix cache (RC7 refused it) AND speculative decoding (row 37) on Qwen3-Next. | Qwen3-Next is the fastest model here. Prefix reuse is the agent workload's top TTFT lever (CLAUDE.md §0). Row 37's gate is MET (S2, 2026-09-13), and the checkpoint ships a free MTP drafter. One snapshot ~38–75 MB (derived). | `[ ]` **sequence step 3 (after 41 and the row-30 RAM pricing)** | ~1–2 days | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 3 · row **42** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
@@ -3830,9 +3834,17 @@ derived like the arena. It is reachable at N=1, since the arena is allocated at 
 
 ---
 
-# 41 · [bug] SUSPECTED: speculative decoding may corrupt a hybrid model's recurrent state on a rejected draft (added 2026-09-18)
+# 41 · [x] Speculative decoding corrupted a hybrid model's recurrent state — CLOSED 2026-09-18: CONFIRMED (garbage from the first drafting round), now REFUSED on recurrent caches (added 2026-09-18)
 
-**Status: found by code reading 2026-09-18, NOT reproduced. Sequence step 1.** Brief (self-contained, gitignored):
+**Status: `[x]` CLOSED 2026-09-18 — CONFIRMED on device, WIDER than filed, FIXED (refusal) the same day.
+The same root cause is a separate, DEFAULT-reachable bug in chunked prefill: row **43**.** Results:
+[`…-row41-hybrid-multitoken-state-RESULTS.md`](docs/2026-09-18-row41-hybrid-multitoken-state-RESULTS.md) (gitignored).
+**Widened by the investigation, same day (was the hypothesis; now measured, see the confirm bullet):** transformers 5.5.4's `Qwen3NextGatedDeltaNet.forward`
+(`modeling_qwen3_next.py:603-691`) continues from cached conv/recurrent state ONLY when `seq_len == 1`; any multi-token
+forward on a non-empty cache runs `chunk_gated_delta_rule(initial_state=None)` + a zero-history conv and then
+OVERWRITES the cached state. If that holds, (a) every speculative verify pass (k+1 tokens) is wrong, not just rejected
+rounds, and (b) Vaayu's own chunked prefill (`_chunked_prefill`, layer-major, `PREFILL_CHUNK_SIZE=512` server default)
+restarts the 36 linear layers' state at every chunk for any prompt > 512 tokens -- DEFAULT-reachable. Repro in progress. Brief (self-contained, gitignored):
 [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1.
 
 - **Mechanism (file:line at `9c4f14f`):** the speculative loop's Step 5 calls
@@ -3847,17 +3859,87 @@ derived like the arena. It is reachable at N=1, since the arena is allocated at 
   (`resolve_use_prompt_lookup`, `vaayu_base.py:1328`); `USE_PROMPT_LOOKUP = True` + Qwen3-Next reaches it. Check
   `DRAFTER_MODEL_PATH` too. It bites only on rounds that draft AND are partially accepted (MoE's adaptive gate may
   latch drafting off).
-- [ ] **Confirm:** a CPU check first (`crop()` leaves conv/recurrent tensors unchanged). Then one GPU run: two
+- [x] **CONFIRMED 2026-09-18.** CPU, layer level: a 12-token forward on a cache that already holds 12 tokens of state
+  equals the same forward on a FRESH cache **bit for bit (0.000)** and differs from the full-sequence forward by 6.12
+  (output max 5.68); one-token-at-a-time matches (4.5e-6) — the state is DISCARDED, not merely polluted. GPU, real
+  Qwen3-Next through `VaayuBaseModel.forward` (`plans/probes/row41_hybrid_state.py`, `VAAYU_SPEC_FORCE=1`,
+  `draft_tokens=5`, `BALLAST_GB=25`): one fully-accepted 5-token verify forward moves the next logits **rel-L2 0.743 vs a
+  0.051 numerics floor (14.6×)**, NLL 3.418 → 4.231 over 48 teacher-forced tokens; the real `speculative_generate` on a
+  163-token "repeat this code" prompt emits `'def is a is a 1, is a 10 is a 100 …'` where greedy copies the code
+  verbatim — **diverges at token 1, the first drafting round** (40 drafting rounds, 8 fully accepted, 32 partial).
+  Root cause: transformers 5.5.4 `Qwen3NextGatedDeltaNet.forward` (`modeling_qwen3_next.py:603-691`) uses the cached
+  conv/recurrent state only when `seq_len == 1`; a multi-token forward runs `initial_state=None` + a zero-history conv
+  and OVERWRITES the cache. The rollback gap the row was filed for is real too (`FP8DynamicCache.crop` touches only
+  `_seq_len`; transformers' `LinearAttentionCacheLayerMixin.crop` is `pass`) but is downstream of the reset.
+  Original plan text: a CPU check first (`crop()` leaves conv/recurrent tensors unchanged). Then one GPU run: two
   processes, `use_prompt_lookup` False vs True, same repetitive greedy prompt, compare ids and read
   `model.speculative_status`. Ids differ after the first partial acceptance → confirmed. Zero drafting rounds →
   inconclusive; force drafting.
-- [ ] **If confirmed — fix (small):** refuse speculation at load when the cache holds recurrent state (status
+- [x] **FIXED 2026-09-18.** `spec_recurrent_refusal` (`vaayu/batch.py`) runs at load after the `VAAYU_SPEC_FORCE` hatch (so
+  it cannot be lifted): `refused_because` set, one WARNING ("…DISABLING speculative decoding for this model"), no
+  proposer built. `_trim_kv_cache` raises `TypeError` on a recurrent cache (backstop). Tests in
+  `tests/test_hybrid_recurrent_state.py`. Gates: suite 2288 passed / 0 failed; server gate on Qwen3-Next with
+  `SERVER_USE_PROMPT_LOOKUP=1` (new gate env) 9 passed and logs the refusal; server gate on Llama-3.2-1B 9 passed with 4
+  drafting rounds (dense still drafts); accumulator gates Qwen3-Next / Qwen3-235B / MiniMax 8/8/8. Docs: `server.md`,
+  `server/README.md` (`DRAFTER_MODEL_PATH`, `USE_PROMPT_LOOKUP`). §8: no knob; reachable at N=1 (opt-in); a refusal, 0 %.
+  Original plan text: refuse speculation at load when the cache holds recurrent state (status
   `refused_because` + one WARNING, mirroring RC7), and make `_trim_kv_cache` raise on a recurrent cache. RED test
   first (fake cache exposing `conv_states`). Gates: full suite; server gate on Qwen3-Next with `USE_PROMPT_LOOKUP=True`
   logs the refusal; Llama-3.2-1B still drafts.
 - **§8:** no new knob (existing `USE_PROMPT_LOOKUP` / `DRAFTER_MODEL_PATH`); reachable at N=1; a refusal, 0 % speed.
   The speed-up is row 42's question.
-- **If refuted:** close with where the state IS restored. Row 42 then gets simpler.
+- **If refuted:** close with where the state IS restored. Row 42 then gets simpler. *(Not refuted — confirmed.)*
+- **Consequence for row 42:** the exact continuation fix (row 43, option A, BUILT 2026-09-18) makes the verify LOGITS right but still
+  cannot roll back a rejected draft, so speculation on hybrids stays refused until row 42's snapshot exists. And row
+  42's prefix-cache design (restore a snapshot, prefill the diff) IS a multi-token forward on a non-empty recurrent
+  cache — it needs row 43's option A first.
+
+---
+
+# 43 · [x] Chunked prefill restarted every linear-attention layer at each chunk — CLOSED 2026-09-18: FIXED, exact continuation, at the numerics floor (added 2026-09-18)
+
+**Status: `[x]` CLOSED 2026-09-18 — CONFIRMED on device by row 41's investigation and FIXED the same day (user chose
+option A). Was: correctness, silent, on the server's default path for every Qwen3-Next prompt > 512 tokens.** Results:
+[`…-row41-hybrid-multitoken-state-RESULTS.md`](docs/2026-09-18-row41-hybrid-multitoken-state-RESULTS.md) (gitignored; this row is the durable copy).
+
+- **Mechanism:** same root cause as row 41 (transformers' gated-delta-net continues from cached state only at
+  `seq_len == 1`). `VaayuBaseModel._chunked_prefill`'s layer-major path (MoE) runs `layer(seq)` once per chunk against
+  one cache, so chunk *j ≥ 1* restarts all 36 linear layers from zero. After prefill they have seen ONLY the last
+  chunk; only the 12 full-attention layers carry earlier context — why text stays fluent and S2 / the server gate /
+  row 33 never flagged it.
+- **Measured** (real Qwen3-Next, 1100-token code prompt → chunks 512/512/76, server knobs): logits at the prompt end
+  **rel-L2 0.314 vs REF against a 0.051 numerics floor (6.2×)**; NLL over the next 48 teacher-forced tokens 3.418 →
+  3.579 (+0.16 nats); top-1 agreement with REF 95.8 % (floor) → 77.1 %. One draw at 2 chunk boundaries; longer prompts
+  lose more context (unmeasured).
+- **Reachable:** default. `PREFILL_CHUNK_SIZE = 512` (`server/config.py:132`); every Qwen3-Next request with a prompt
+  > 512 tokens — i.e. most agent-workload requests. Same `seq_len == 1` gate in transformers' qwen3_5, qwen3_5_moe,
+  bamba, falcon_h1, jamba, granitemoehybrid, olmo_hybrid, zamba — any hybrid Vaayu loads next inherits it.
+- **Affected numbers: NONE.** Checked 2026-09-18: no Qwen3-Next log under `docs/probes/` except this row's contains a
+  `Chunked prefill` line — row 33's quality arms, S2, 30-P and the S3 re-gate all ran prompts ≤ 512 tokens.
+- [x] **FIXED 2026-09-18 — option A.** `vaayu/recurrent_state.py`: `install_state_continuation` wraps each gated-delta-net
+  mixer (detected by surface, not name) so a multi-token forward on a cache holding its state runs the STOCK forward
+  with the cached last k-1 conv inputs prepended (via `causal_conv1d_fn`, fast path or not) and the cached recurrent
+  state as `initial_state`, then rewrites the conv state as the last k inputs (the stock update zero-fills it for a
+  < k-token tail). Installed at the end of `init_model` (Qwen3-Next logs `36 linear-attention mixers continue …`).
+  `continuation_refusal` makes a multi-chunk prefill on a hybrid whose mixers are NOT all wrapped raise
+  `NotImplementedError` naming `PREFILL_CHUNK_SIZE=0` — any other hybrid family fails loudly, never silently.
+  27 CPU tests (`tests/test_hybrid_recurrent_state.py`): split == one forward for qwen3_next AND qwen3_5 × both cache
+  classes × 3 split shapes incl. a 2-token tail, final state included; RED watched (18 assertion failures on stubs).
+  **On device, same probe:** CHUNK rel-L2 **0.314 → 0.041** at 1100 tokens (floor 0.051), **0.020** at 3000 tokens / 6
+  chunks (floor 0.041); NLL 3.579 → 3.410 (REF 3.418); top-1 vs REF 77.1 → 95.8 %. VERIFY 0.743 → 0.056. REF/NOISE
+  bit-identical to the pre-fix run. Gates as row 41. Docs: `PREFILL_CHUNK_SIZE` rows in `server.md` / `server/README.md`.
+- **Design options as weighed (kept for the record):** (A) exact continuation for gated-delta-net mixers:
+  pass the cached recurrent state as `initial_state` (the torch kernel supports it; right-padding is state-neutral)
+  and prepend the cached conv inputs; keeps the 512-token memory bound; prerequisite for row 42's hybrid prefix cache;
+  detected by capability, covers qwen3_next / qwen3_5 / qwen3_5_moe. (B) do not chunk when the cache holds recurrent
+  state: trivial and model-agnostic, but drops the prefill memory bound (long prompts may OOM below the derived
+  `max_seq_len` 65536). Either way: a model-agnostic guard that raises on a multi-token forward over a non-empty
+  recurrent cache unless the mixer is known to continue correctly.
+- **Done rule:** re-run `plans/probes/row41_hybrid_state.py`; the CHUNK arm must fall to the NOISE floor (rel-L2 ≈
+  0.05) and a CPU test must pin chunked == single-forward on a tiny hybrid. Gates: full suite; server gate on
+  Qwen3-Next; Qwen3-235B / MiniMax / Llama-3.2-1B regression gates unchanged (no recurrent state → untouched path).
+- **§8 (answered):** no knob (continuation is always right). Plumbed: `init_model`, which every load runs, including
+  `create_app`'s. Reachable at N=1 on the default config — delivered to every Qwen3-Next user; 0 % speed, correctness.
 
 ---
 
