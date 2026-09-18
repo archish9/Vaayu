@@ -145,7 +145,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 **Vaayu must run ANY model — MoE or dense, EXL3-quantized or not, CUDA or CPU
 compute — on low-resource hardware. Never one specific model, quant format, or
 compute device.** See §0's dispatch table for which code paths currently exist.
-Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.5
+Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.7
 (62 layers, 256 experts) — both EXL3-quantized MoE, selected in
 `test_generate.py` — but on **different forwards**: Qwen is fused-layout (EXL3
 fused forward), MiniMax is module-list layout (module-list forward). See §0.
@@ -177,14 +177,7 @@ them without edits — never assume EXL3, never assume CUDA, never assume MoE.
   down to **~5.15 GB/s at 8**. Reproduced on both models, at every io_uring queue
   depth (qd=1…32), and for scattered and file-adjacent reads alike. That knee is why
   `_NVME_READ_CONCURRENCY` exists in `safetensor_model_persister.py`.
-  **C1's `3.3 at 1, 5.3 at 2, 6.5 at 3, 6.9 at 4, still rising` is superseded** — it
-  was inferred from overlapping in-path reads under a uniform-delivery assumption
-  (its own k>=5 buckets exceed spec), and it is wrong in both directions: it
-  understates one reader by ~2x and implies a rise that in fact reverses. C1's
-  headline stands — 5.5 GB/s is not the drive. **The ~5.5 GB/s figure used before
-  2026-08-30 was a measured-path number (roughly what the expert path achieves at
-  2-3 reads in flight) that got promoted to a hardware constant and then used as a
-  denominator.** Never quote a single-stream rate as the drive's limit; say which
+  Never quote a single-stream rate as the drive's limit; say which
   concurrency a bandwidth figure was taken at, and never assume more concurrency
   helps. (`plans/2026-09-03-P8-ring-pool-RESULTS.md`, superseding
   `plans/2026-08-30-R2-structural-probe-RESULTS.md`.)
