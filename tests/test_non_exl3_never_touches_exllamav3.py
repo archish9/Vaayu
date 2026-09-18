@@ -20,7 +20,7 @@ from tests.test_fused_nonexl3_slab_arena import _build, _checkpoint, _x
 def test_the_non_exl3_fused_forward_runs_with_exllamav3_unimportable(tmp_path, monkeypatch, arena):
     """sys.modules[name] = None makes every `import exllamav3...` raise, so any
     exllamav3 use on this path -- import or call -- fails the forward."""
-    for name in [m for m in sys.modules if m == "exllamav3" or m.startswith("exllamav3.")]:
+    for name in [m for m in sys.modules if m.startswith("exllamav3")]:
         monkeypatch.delitem(sys.modules, name)
     monkeypatch.setitem(sys.modules, "exllamav3", None)
     idx = _checkpoint(tmp_path)
@@ -67,6 +67,6 @@ def test_on_device_a_non_exl3_load_and_decode_never_touches_exllamav3():
         sys.setprofile(None)
         threading.setprofile(None)
     assert not isinstance(m.loader_strategy, EXL3LoaderStrategy), "this is an EXL3 checkpoint"
-    assert not any(k == "exllamav3" or k.startswith("exllamav3.") for k in sys.modules), \
+    assert not any(k.startswith("exllamav3") for k in sys.modules), \
         "exllamav3 was imported on a non-EXL3 load"
     assert sum(hits.values()) == 0, f"exllamav3 calls: {dict(hits)}"

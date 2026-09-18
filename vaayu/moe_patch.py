@@ -1836,9 +1836,10 @@ def _make_fused_sparse_forward(
             if _prof:
                 _mp['disk_load'] += time.perf_counter() - _t_disk
 
-            # fp32 accumulator, cast back at the return -- see the identical note in
-            # _make_fused_sparse_forward_exl3. Experts reach index_add_ in disk
-            # completion order, and a bf16 accumulator makes that order observable.
+            # fp32 accumulator, cast back at the return -- mirrors the identical
+            # note in _make_fused_sparse_forward_exl3, where experts DO arrive in
+            # disk completion order. Here the loop below adds experts in a fixed
+            # ascending expert-id order, so that order is never observable.
             # Expert mask on CPU (avoids PCIe for index tensors)
             _t_mask = _mark() if _prof else 0.0
             expert_indices_cpu = expert_indices.cpu()
@@ -1981,8 +1982,9 @@ def _dispatch_expert_misses(
     every key in pinned_keys in a finally block; a leaked pin permanently blocks
     that key's eviction (a slow cache-capacity leak).
 
-    `vram_resident` (fused-EXL3 forward only) is the set of routed experts the
-    caller already holds a VRAM cache entry for. Their RAM lookup still runs —
+    `vram_resident` (both fused forwards pass it -- fused-EXL3, and since row
+    30-P the non-EXL3 fused forward) is the set of routed experts the caller
+    already holds a VRAM cache entry for. Their RAM lookup still runs —
     that LRU refresh is the residency invariant P1 measured, and dropping it is
     the change P1 refuted — but on a MISS no disk read is issued: the caller
     serves those experts from their GPU copies and gets VRAM_RESIDENT_NO_RAW in
@@ -1990,8 +1992,9 @@ def _dispatch_expert_misses(
     before it calls this helper and passes nothing, so its behaviour is
     unchanged.
 
-    Shared by the fused-EXL3 and module-list forwards: the slab/pin/arena
-    discipline below is subtle enough that a second copy would rot.
+    Shared by all three MoE forwards (fused-EXL3, module-list, and since row
+    30-P the non-EXL3 fused forward): the slab/pin/arena discipline below is
+    subtle enough that a second copy would rot.
     """
     from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
 
@@ -2126,8 +2129,7 @@ def _dispatch_expert_misses(
         # _moe_executor only exists for CUDA MoE (see vaayu_base.py's
         # is_moe/running_device gate) — this helper is also the module-list
         # forward's loader, which is the generic CPU-compute fallback, so it
-        # must not hard-depend on that attribute. Mirrors the same fallback
-        # in _make_fused_sparse_forward's own miss loader.
+        # must not hard-depend on that attribute.
         _ex = getattr(vaayu_ref, "_moe_executor", None)
         if _ex is not None:
             miss_futures = [_ex.submit(_load_one, e) for e in misses]

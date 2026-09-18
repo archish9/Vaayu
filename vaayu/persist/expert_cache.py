@@ -379,7 +379,8 @@ class ExpertRAMCache:
         still holds views into it. Rather than make every caller thread its own
         release through the forward, the release is tied to the pin the decode
         miss path already takes: `_dispatch_expert_misses` pins every miss key
-        before dispatching, and both forwards unpin in a finally that runs after
+        before dispatching, and every MoE forward that loads through
+        `_dispatch_expert_misses` unpins in a finally that runs after
         their H2D copy is issued and record_read() has armed the arena's event
         guard. So the slab stays out of the free list for exactly the window the
         caller is reading it, and comes back exactly once.
