@@ -145,11 +145,23 @@ on the pre-30-P runs it was already 7.06 / 7.19 %). Gate 2 (native CPU kernel) w
 [`…-row30-S3-regate-RESULTS.md`](docs/2026-09-18-row30-S3-regate-RESULTS.md) (gitignored; row 30's re-gate bullet
 is the durable copy).
 
-**▶ NEXT: nothing is queued — the user's pick.** Open candidates: row **40** `[bug]` (the slab arena is never capped at
-the model's own expert bytes — latent, 0 measured impact on this box's models; shared sizing → all three
-accumulator gates); row 30's OPTIONAL RAM-ceiling observation (price it with `plans/probes/s3fill_ram_replay.py` at
-+4.8 GB first); row **36** (CONDITIONAL — strict `serial/T` now **26.4 / 26.7 %**, derived to fire once `T_unprof`
-≤ ~0.120 s); PRIORITY rows **32 · 34 · 35** and **28b**.
+**▶ NEXT — the hybrid-model sequence, set by the user 2026-09-18. Work it in this order, in a fresh session; one
+self-contained brief covers all three: [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) (gitignored — the rows are the
+durable copies).** Why these: Qwen3-Next is the fastest model on this box (7.34 tok/s at N=1, ~6.5× Qwen3-235B as
+served). Its 36 linear-attention layers keep a recurrent state that Vaayu's cache code cannot crop, which already cost
+it the prefix cache (RC7). Order rule: correctness first, cheap and no-GPU next, research last.
+1. **Row 41 `[bug]` SUSPECTED — speculative decoding may corrupt a hybrid model's recurrent state on a rejected draft.**
+   Confirm with one short GPU run; if confirmed, refuse speculation on recurrent caches, as RC7 does for the prefix cache.
+2. **Row 30's OPTIONAL RAM-ceiling observation — price it.** ~4.8 GB held back for prefix sessions this model refuses.
+   CPU replay, ~1 h. Close if < +2 % (upper bound: `disk_load` is 8.4 % of `T_prof`).
+3. **Row 42 — SCOPING spike: recurrent-state snapshot/restore.** One mechanism unblocks both the prefix cache (the
+   agent workload's top TTFT lever, OFF on this model) and speculation (row **37**, whose gate has been MET since S2
+   landed 2026-09-13). One snapshot is ~38–75 MB (derived). Measurement only; go/no-go per use.
+
+**After the sequence, or instead of it, on the user's call:** row **40** `[bug]` (arena never capped at the model's
+expert bytes — latent, 0 measured impact on this box's models; shared sizing → all three accumulator gates); row
+**36** (CONDITIONAL — strict `serial/T` now **26.4 / 26.7 %**, derived to fire once `T_unprof` ≤ ~0.120 s); PRIORITY
+rows **32 · 34 · 35** and **28b**.
 
 ## PRIORITY — worth working, in this order
 
@@ -166,6 +178,8 @@ accumulator gates); row 30's OPTIONAL RAM-ceiling observation (price it with `pl
 | **30** | **S3 CLOSED 2026-09-18 by its re-gate on the 30-P build: gate 1 `(construct_miss + gemm_miss)/T_prof` = 6.96 / 6.99 % < 10 %; every S-step of this row is now closed.** — **S2b (iii) BUILT AND SHIPPED 2026-09-13 — the VRAM expert cache now reaches the non-EXL3 fused forward: `4.1584 → 6.4702 tok/s, +55.6 %` at N=1 on server knobs (same-day baseline arm, greedy ids identical, 83 % VRAM hit). Stop rule was ≥ +20 %. Peak VRAM 11.66 GiB — 3.17 GiB free against a 3.50 GiB reserve floor, tight, recorded. RC4(c) DONE 2026-09-13 (max_seq_len 16384 -> 65536, 0 % tok/s). **S3-pre DONE 2026-09-13: NEITHER gate fires cleanly and the gate had been read the wrong way — `construct`/`gemm` run on BOTH sides of a VRAM hit, so the literal reading counts work S3 cannot take. ADDRESSABLE `(h2d+construct_miss+gemm_miss)/T` = 15.1 / 15.2 % (literal 20.8 / 21.1 %); row 36's `serial/T` = 23.0 / 23.4 % strict, 32.5 / 32.8 % wide. S3 RECOMMENDED CLOSED — the VRAM cache's only fill site IS the miss branch S3 removes, so its 15 % is self-defeating (that mechanism objection was later dissolved by S3-fill's fill-behind, 2026-09-18; S3 then closed on its re-gate NUMBER). NEXT WAS T2 / row 33 (`top_k` 10→8 = +14.7 %, →6 = +34.2 %, derived from measurement).** — S2 CLOSED 2026-09-13 — `cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit` RUNS: `4.0648 tok/s` warm at N=1 on server knobs, server gate green (9 passed), the FIRST non-EXL3 MoE ever executed on this box.** Seven root causes fixed (RC1 dequant · RC3 shared expert · RC4(a)(b) hybrid KV · **RC5 the splitter dropped tensors** · **RC6 `get_seq_length()`=0 on hybrid, 9.5×** · **RC7 prefix cache refused on recurrent state**). ~~Remaining: S3 only~~ — **S3 CLOSED 2026-09-18** (re-gate, above); 30-P DONE 2026-09-18 (+11.69 %). **S2b CLOSED 2026-09-16: (iv) re-priced at 0.33 % of `T_prof` and DROPPED** (`docs/2026-09-16-row30-S2b-iv-reprice-RESULTS.md`); T2 / row 33 closed 2026-09-13. | **7.6× Qwen3-235B-EXL3's raw 0.85 / 5.7× row 27's served 1.1363** (was 4.8× / 3.6× at S2's close) — the largest measured win on this board. NOT row 29's projected 18.1; re-derive from the measurement. **Phase-4 gate, re-read correctly 2026-09-13 (S3-pre): 15.1 / 15.2 % addressable, ON the 15 % rule — and S3 is recommended closed on mechanism, not on the number.** Disk fell to **1.7 %** of a token, so **T3 is dead here**; T4's row 36 straddles its own rule (23.4 % strict / 32.8 % wide), so **T2 / row 33 goes first**. | `[~]` **priority 2 — S1, S2, S2b, RC4(c), S3-pre, 30-P and S3 (re-gate: CLOSED 2026-09-18) all DONE; the row stays open only for the OPTIONAL RAM-ceiling observation found by 30-P (its `[bug]` arena cap is now row 40)** | **NO download** | [`…-row30-S2b-iii-vram-cache-RESULTS.md`](docs/2026-09-13-row30-S2b-iii-vram-cache-RESULTS.md) · [`…-S2-load-path-RESULTS.md`](docs/2026-09-13-row30-S2-load-path-RESULTS.md) · row **30** below |
 | **33** | **Truncate `top_k` at decode.** `bytes_read ∝ top_k`, and `top_k` enters the engine at exactly one place (`vaayu_base.py:3233`), so clamping it there shrinks routed slots AND every derived budget coherently, on all three forwards. **Lossy — the user authorised lossy 2026-09-12.** | Projected **×1.26 Qwen / ×1.21 MiniMax at k=8→6**, ×1.71 / ×1.54 at k=4, holding hit rate constant (conservative). **Regime-independent** — it pays streamed and resident. Two traps: contract-routed models (MiniMax's `route_tokens_to_experts`) take NO `k` and read the module's own `top_k`, so the clamp must be written into each MoE module by detection or the model keeps selecting 8 against budgets sized for 6 (renormalisation already exists on every path — corrected 2026-09-12); and prefill routes ~every expert anyway (224.23/layer) so decode-only is the defensible scope. | `[x]` **CLOSED 2026-09-13 — shipped OFF; Qwen3-Next k=9 = +17.0 % for +1.47 % ppl, MiniMax has no viable k** | ~1 day + a ppl sweep | [`…-NEW-LEVERS-HANDOFF.md`](docs/2026-09-12-speedup-options-NEW-LEVERS-HANDOFF.md) §2.3 · row **33** below |
 | **30-P** | **DONE 2026-09-18 — pinned RAM tier (slab arena) for the non-EXL3 fused forward.** Replaced the forward's inline pageable-clone loader with `_dispatch_expert_misses`; the arena gate now accepts fused non-EXL3 on CUDA. | **+11.69 % decode tok/s measured on branch `row30p-pinned-ram-tier` on Qwen3-Next (6.6329 → 7.4084, ABBA, greedy ids identical × 12 × 64 tokens)** — beats the probe's own +10.62 %. No knob, reachable at N=1 (measured there), bit-identical, VRAM hit/peak unchanged (83 %, Δ ≈ 0.03 GiB). Server-sizing arena: 10380 × 1.8MB, 18.54 GB pinned. It is also the hard prerequisite of any S3 fill-behind — unblocked now. | `[x]` **DONE — merged to `main` 2026-09-18 (`8475123`); the S3 re-gate it unblocked ran the same day and CLOSED S3** | ~1–2 days | [`…/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md`](docs/superpowers/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md) · spec [`…-row30-S3-fill-site-SCOPING.md`](docs/2026-09-18-row30-S3-fill-site-SCOPING.md) · [`…-row30P-pinned-ram-tier-RESULTS.md`](docs/2026-09-18-row30P-pinned-ram-tier-RESULTS.md) · row **30** below |
+| **41** | **`[bug]` SUSPECTED (code reading 2026-09-18, not reproduced): speculative decoding on a hybrid model rolls back only the KV layers.** `_trim_kv_cache` → `crop()` (`vaayu_base.py:5171` / `:1544`) shortens KV lengths; the 36 linear-attention layers' recurrent state keeps the rejected draft tokens → silently wrong text. | Correctness. Reachable only by opt-in: `USE_PROMPT_LOOKUP=True` (server knob) with Qwen3-Next. `"auto"` = off on MoE, so the default is safe. Fix if confirmed is small: refuse at load via `cache_holds_recurrent_state`, as RC7 does. | `[bug]` **sequence step 1 (2026-09-18)** | ~½ day | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1 · row **41** below |
+| **42** | **SCOPING spike: recurrent-state snapshot/restore for hybrid models.** Would unblock the cross-turn prefix cache (RC7 refused it) AND speculative decoding (row 37) on Qwen3-Next. | Qwen3-Next is the fastest model here. Prefix reuse is the agent workload's top TTFT lever (CLAUDE.md §0). Row 37's gate is MET (S2, 2026-09-13), and the checkpoint ships a free MTP drafter. One snapshot ~38–75 MB (derived). | `[ ]` **sequence step 3 (after 41 and the row-30 RAM pricing)** | ~1–2 days | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 3 · row **42** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
 
@@ -174,7 +188,7 @@ accumulator gates); row 30's OPTIONAL RAM-ceiling observation (price it with `pl
 | # | one line | gate that opens it | why it is worth it then | state |
 |---|---|---|---|---|
 | **36** | **CUDA graphs / fused per-layer dispatch.** | **a resident model measures `serial / T` ≥ 30 %** — **MEASURED 2026-09-13 (S3-pre): 23.0 / 23.4 % strict (NOEXP), 32.5 / 32.8 % wide (`other`/T). Straddles the rule; does NOT fire strictly.** **Re-read 2026-09-18 on the 30-P build (S3 re-gate runs): 26.4 / 26.7 % strict, 35.9 / 35.9 % wide — `serial` unchanged at ~0.036 s, the share rose only because the token shrank; still does NOT fire strictly (derived: fires once `T_unprof` ≤ ~0.120 s).** | `serial` is 0.074 s of Qwen's 0.930 s today — 8 %, invisible. Row 29 projected it becomes the LARGEST phase once experts are resident (38 ms of Qwen3-30B-int4's projected 49 ms). Nothing owns it today. | `[ ]` |
-| **37** | **Re-gate speculative decoding on MoE.** The gate refuses Qwen with `off_union` — observed verify union **19.31 GB against a ~17 GB budget**. That is a **byte** bound. | row 30's S2, or row 32's lower-bpw build, lands | At 3.0 bpw Qwen's union falls to ~11.6 GB and fits. The break-even acceptance falls too: with experts resident, extra drafted positions cost ~0 extra disk bytes, which is the dominant term today. Machinery is BUILT (`speculative/adaptive_gate.py`, row 13's `even-4` trial, P9's +4.16 %). **Prefer a checkpoint that ships an MTP module** — a free drafter, no vocab mismatch, no second load. | `[ ]` |
+| **37** | **Re-gate speculative decoding on MoE.** The gate refuses Qwen with `off_union` — observed verify union **19.31 GB against a ~17 GB budget**. That is a **byte** bound. | row 30's S2, or row 32's lower-bpw build, lands | At 3.0 bpw Qwen's union falls to ~11.6 GB and fits. The break-even acceptance falls too: with experts resident, extra drafted positions cost ~0 extra disk bytes, which is the dominant term today. Machinery is BUILT (`speculative/adaptive_gate.py`, row 13's `even-4` trial, P9's +4.16 %). **Prefer a checkpoint that ships an MTP module** — a free drafter, no vocab mismatch, no second load. | `[ ]` **Gate MET 2026-09-13 (S2 landed) — noted 2026-09-18. On Qwen3-Next (hybrid) it is blocked by row 41 (rollback) and needs row 42 (state snapshot) first.** |
 | **38** | **Mixed-bpw by expert hotness** — hot experts high bpw, cold tail 2–3 bpw. | **trace arithmetic clears a 20 % byte reduction** | NOT the refuted pinning idea: Plan F/B-ph2 refuted **residency** by hotness; this is **precision**, which pays on every disk read whether or not the expert is ever cached. Plan F's "share is linear in N" is the argument FOR it — the tail holds most of the bytes. Likely loses to row 32 at a fraction of the effort; do the arithmetic first. | `[ ]` |
 | **39** | **Expert slimming** — structured row / N:M prune of the intermediate dim, re-pack, stream fewer bytes per expert. | rows 31–35 measured | Research, not engineering; quality risk real and unbounded. Priced honestly: a 30 % row prune is a 30 % byte cut — roughly what downloading a 3.5 bpw build gets for free in an afternoon. | `[ ]` |
 
@@ -2111,7 +2125,7 @@ only mode. (4) not built; step 1 unblocks step 2, step 4 unblocks the measuremen
   - **Row 36 off the same runs (context only):** strict `serial/T_unprof` (NOEXP 0.036 s, unchanged) 23.0 / 23.4 → **26.4 / 26.7 %**; wide `other/T_prof` 32.5 / 32.8 → 35.9 / 35.9 %. Strict still below 30 %; derived to fire once `T_unprof` ≤ ~0.120 s (~8.3 tok/s).
   - **What closing gives up (spec §7 method, re-gate numbers, derived):** per miss GPU 118.6 µs unprofiled vs CPU 55.6 µs serial / ~18 µs overlapped → **−0.2 % (microbench) … +3.7 % (serial) … +5.9 % (fully overlapped, upper bound)** of the 30-P token — for ~1–2 weeks, a new native AVX2 kernel (`vaayu_rust` has no SIMD), P-core contention with the pinned host loop, and a perplexity-gated A/B.
   - **§8:** no knob (nothing built); nothing plumbed; S3 WOULD be reachable at N=1 (80 VRAM misses per single-stream token) but it is unbuilt and now closed → 0 % to users, nothing banked. **Re-open only if** a future build/model measures gate 1 ≥ 10 % (e.g. a far lower VRAM hit rate), and then gate 2 must pass too.
-- [ ] **Observation (2026-09-18, found by the 30-P dry-run; OPTIONAL, not in 30-P): the expert RAM ceiling reserves prefix-session KV on a model whose prefix cache is REFUSED.** Qwen3-Next log: `Expert cache ceiling 18.20 GB (… reserving 3 prefix session(s) of 1.61 GB each)` next to `cross-turn prefix cache DISABLED — this model has recurrent (linear-attention) layers` (RC7). ~4.8 GB of RAM held back for sessions that cannot exist (`derive_expert_ceiling`, `vaayu_base.py` ~:2630, is called with `prefix_enabled=bool(enable_prefix_cache)` before RC7's refusal is known). Value unmeasured: RAM hit is already ~96 % on this model, so a bigger tier may buy little. Price it with `plans/probes/s3fill_ram_replay.py` at +4.8 GB before touching code.
+- [ ] **→ Sequence step 2 (set 2026-09-18): price this with [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 2 (CPU replay; close if < +2 %).** **Observation (2026-09-18, found by the 30-P dry-run; OPTIONAL, not in 30-P): the expert RAM ceiling reserves prefix-session KV on a model whose prefix cache is REFUSED.** Qwen3-Next log: `Expert cache ceiling 18.20 GB (… reserving 3 prefix session(s) of 1.61 GB each)` next to `cross-turn prefix cache DISABLED — this model has recurrent (linear-attention) layers` (RC7). ~4.8 GB of RAM held back for sessions that cannot exist (`derive_expert_ceiling`, `vaayu_base.py` ~:2630, is called with `prefix_enabled=bool(enable_prefix_cache)` before RC7's refusal is known). Value unmeasured: RAM hit is already ~96 % on this model, so a bigger tier may buy little. Price it with `plans/probes/s3fill_ram_replay.py` at +4.8 GB before touching code.
 - → **Moved 2026-09-18 to its own row: row 40 below.** the `[bug]` found by the 30-P final review (the expert slab arena is never capped at the model's own expert bytes). Text moved verbatim.
 
 ## S2 STARTED 2026-09-13 — FOUR ROOT CAUSES MEASURED BEFORE ANY CODE (probes, no full load)
@@ -3723,6 +3737,8 @@ owns it.
 
 # 37 · [ ] Re-gate speculative decoding on MoE — its refusal is a BYTE bound — CONDITIONAL (added 2026-09-12)
 
+**2026-09-18: the gate below is MET — row 30's S2 landed 2026-09-13.** On Qwen3-Next, the only model it opened, speculation first needs row **41** (a rejected draft may corrupt the recurrent state) and row **42** (a state snapshot/restore to make rejection correct). Start there, not here.
+
 The gate refuses Qwen today with `off_union`: **observed verify union 19.31 GB against a ~17 GB budget, 0 drafting
 rounds.** That is a **byte** bound, and every byte lever in this block shrinks it — at 3.0 bpw Qwen's union falls to
 **~11.6 GB** and lands inside the budget. **The break-even acceptance falls too:** with experts resident, drafting extra
@@ -3811,6 +3827,68 @@ accumulator gates must stay green (Qwen3-Next, Qwen3-235B, MiniMax-M2.7) with **
 because none of them is under-populated. **§8 (to answer at build time):** no knob is expected, since the cap is
 derived like the arena. It is reachable at N=1, since the arena is allocated at load in every mode. But it delivers
 0 % to any user until a model smaller than its arena is served.
+
+---
+
+# 41 · [bug] SUSPECTED: speculative decoding may corrupt a hybrid model's recurrent state on a rejected draft (added 2026-09-18)
+
+**Status: found by code reading 2026-09-18, NOT reproduced. Sequence step 1.** Brief (self-contained, gitignored):
+[`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1.
+
+- **Mechanism (file:line at `9c4f14f`):** the speculative loop's Step 5 calls
+  `_trim_kv_cache(past_key_values, past_len_before + num_accepted)` (`vaayu/vaayu_base.py:5700`). That calls
+  `cache.crop()` (`:5171` → `:1544`), which only lowers the KV ring buffers' `_seq_len`. The linear-attention layers'
+  conv/recurrent state (built at `:1361` / `:1406`) is never touched. So on a partially-accepted draft, Qwen3-Next's 36
+  recurrent states still include the rejected tokens. Wrong text, no exception, which is exactly what
+  `_trim_kv_cache`'s own docstring says must raise instead.
+- **Detector exists, unused here:** `cache_holds_recurrent_state` (`vaayu/batch.py:501`). RC7 uses it for the prefix
+  cache via `prefix_cache_refusal_reason` (`batch.py:521`, WARNING at `vaayu_base.py:~3010`).
+- **Reachable:** only by opt-in. `USE_PROMPT_LOOKUP = "auto"` (`config.py:380`) → off for MoE
+  (`resolve_use_prompt_lookup`, `vaayu_base.py:1328`); `USE_PROMPT_LOOKUP = True` + Qwen3-Next reaches it. Check
+  `DRAFTER_MODEL_PATH` too. It bites only on rounds that draft AND are partially accepted (MoE's adaptive gate may
+  latch drafting off).
+- [ ] **Confirm:** a CPU check first (`crop()` leaves conv/recurrent tensors unchanged). Then one GPU run: two
+  processes, `use_prompt_lookup` False vs True, same repetitive greedy prompt, compare ids and read
+  `model.speculative_status`. Ids differ after the first partial acceptance → confirmed. Zero drafting rounds →
+  inconclusive; force drafting.
+- [ ] **If confirmed — fix (small):** refuse speculation at load when the cache holds recurrent state (status
+  `refused_because` + one WARNING, mirroring RC7), and make `_trim_kv_cache` raise on a recurrent cache. RED test
+  first (fake cache exposing `conv_states`). Gates: full suite; server gate on Qwen3-Next with `USE_PROMPT_LOOKUP=True`
+  logs the refusal; Llama-3.2-1B still drafts.
+- **§8:** no new knob (existing `USE_PROMPT_LOOKUP` / `DRAFTER_MODEL_PATH`); reachable at N=1; a refusal, 0 % speed.
+  The speed-up is row 42's question.
+- **If refuted:** close with where the state IS restored. Row 42 then gets simpler.
+
+---
+
+# 42 · [ ] SCOPING spike: recurrent-state snapshot/restore for hybrid models — unblocks prefix cache + speculation (added 2026-09-18)
+
+**Status: not started. Sequence step 3, after row 41 and row 30's RAM-ceiling pricing. Measurement only, no engine
+code.** Brief: [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 3.
+
+- **Why:** Qwen3-Next (hybrid: 36 linear + 12 full-attention layers) is the fastest model on this box (7.34 tok/s,
+  N=1). Two features are unreachable on it because its recurrent state cannot be cropped:
+  - **(a) the cross-turn prefix cache**, refused by RC7. CLAUDE.md §0: the top TTFT lever for the agent workload.
+    Measured elsewhere: ~10× round-2 TTFT (EXL3), ~4.5× at 2.8k tokens (1B, row 3).
+  - **(b) speculative decoding (row 37)**, whose gate is MET (S2, 2026-09-13). The checkpoint carries a free MTP drafter
+    (4,625 `mtp.*` keys, ~0.986 GB, never built by transformers 5.5.4).
+- **Why it may be cheap (derived from `config.json`, confirm dtype on device):** recurrent state per linear layer =
+  32 value heads × 128 × 128 = 524,288 elements; conv state ≈ 24.6k; × 36 layers → **~38 MB/snapshot bf16, ~75 MB
+  fp32**. Against ~3.2 GiB VRAM headroom.
+- [ ] Snapshot mechanics: where the state lives, real dtype/bytes, clone and restore cost.
+- [ ] (a) Price: Qwen3-Next TTFT today at 2k / 8k / 16k prompts; projected round-2 TTFT with snapshot-at-prefix-end
+  (restore the newest snapshot ≤ match length, crop KV, prefill the diff).
+- [ ] (b) Price: verify-pass cost for k+1 positions vs one decode token; rejection needs the state at
+  `past_len_before + num_accepted` (snapshot + re-run accepted, or per-position capture); acceptance of prompt lookup
+  on a code prompt; MTP as the stronger drafter.
+- [ ] VRAM: snapshots × sessions vs headroom; interaction with the prefix-session RAM reservation (row 30 observation).
+- **Stop rules:** (a) go if the projected round-2 TTFT on a realistic agent turn is ≥ 2× → write a build plan. (b) go
+  only if the projected decode gain is ≥ +10 % after verify cost; else close row 37 for hybrids. Both no-go → close
+  this row with the numbers.
+- **§8 (stated now):** (a) no new knob (`ENABLE_PREFIX_CACHE` exists), reachable at N=1. (b) existing
+  `USE_PROMPT_LOOKUP` / `DRAFTER_MODEL_PATH`, or a new knob for MTP; reachable at N=1. Unbuilt — scoping only.
+- **§5:** detect by capability (`cache_holds_recurrent_state`), derive sizes from config, never special-case
+  `qwen3_next`.
 
 ---
 
