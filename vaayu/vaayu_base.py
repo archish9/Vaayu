@@ -757,7 +757,7 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     return set(sorted(moe_layer_ids)[:n_fit])
 
 
-def moe_supports_slab_arena(expert_styles, is_exl3: bool) -> bool:
+def moe_supports_slab_arena(expert_styles, is_exl3: bool, cuda: bool = False) -> bool:
     """True iff this model's MoE forward reads expert weights through the
     pinned slab arena on its decode miss path.
 
@@ -781,11 +781,22 @@ def moe_supports_slab_arena(expert_styles, is_exl3: bool) -> bool:
     assumed to consume the arena, since allocating one nothing reads is exactly
     the double-spend this gate exists to prevent. Mixed layouts return False: a
     partially-usable arena is not worth the pinned, unswappable RAM.
+
+    Row 30-P (2026-09-18): the NON-EXL3 fused forward reads the arena too -- it
+    loads through `_dispatch_expert_misses` -- but only CUDA pays for it: the
+    arena exists so miss uploads come from PINNED memory and run async
+    (measured 157 us -> 32-40 us of host time per expert, +10.62 % decode
+    tok/s on Qwen3-Next-80B int4). A CPU-compute load has no host-to-device
+    copy, so pinning RAM for it would buy nothing. The non-EXL3 module-list
+    layout stays excluded: never measured with an arena on a non-EXL3
+    checkpoint.
     """
     styles = list(expert_styles)
-    return (bool(is_exl3) and bool(styles)
-            and len(set(styles)) == 1
-            and styles[0] in ("fused", "module_list"))
+    if not styles or len(set(styles)) != 1:
+        return False
+    if is_exl3:
+        return styles[0] in ("fused", "module_list")
+    return bool(cuda) and styles[0] == "fused"
 
 
 def moe_supports_prefill_stager(expert_styles, is_exl3: bool) -> bool:
@@ -2594,7 +2605,7 @@ class VaayuBaseModel(GenerationMixin):
             # Independent capabilities — see the two predicates' docstrings.
             # The module-list layout reads the arena but does not consume staged
             # layers, a combination the previous single gate could not express.
-            self._moe_slab_capable = moe_supports_slab_arena(_styles_detected, _is_exl3)
+            self._moe_slab_capable = moe_supports_slab_arena(_styles_detected, _is_exl3, cuda=str(self.running_device).startswith("cuda"))
             self._moe_stager_capable = moe_supports_prefill_stager(_styles_detected, _is_exl3)
 
             _mem = _psutil.virtual_memory()
