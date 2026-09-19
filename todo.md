@@ -181,10 +181,7 @@ is cheap to answer (one instrumented prefill, no engine code). 42-B is the bigge
 be re-measured first, and its cost — the prefix-session reservation returning ~4.83 GB to the KV side — now bites
 harder relative to a 37 s miss than it did against a 269 s one.
 
-**After those:** row **40** `[bug]` (arena never capped at the model's expert bytes — latent, 0 measured impact),
-row **36** (CONDITIONAL, `serial/T` 26.4 / 26.7 % against a 30 % rule), PRIORITY rows **32 · 34 · 35**, then **28b**.
-
-**After the sequence, or instead of it, on the user's call:** row **40** `[bug]` (arena never capped at the model's
+**After those, on the user's call:** row **40** `[bug]` (arena never capped at the model's
 expert bytes — latent, 0 measured impact on this box's models; shared sizing → all three accumulator gates); row
 **36** (CONDITIONAL — strict `serial/T` now **26.4 / 26.7 %**, derived to fire once `T_unprof` ≤ ~0.120 s); PRIORITY
 rows **32 · 34 · 35** and **28b**.
