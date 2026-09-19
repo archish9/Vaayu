@@ -1722,6 +1722,7 @@ def _make_fused_sparse_forward(
     original_forward = None,
 ):
     import torch.nn.functional as F
+    from .persist.expert_cache import ExpertVRAMCache
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -1801,6 +1802,38 @@ def _make_fused_sparse_forward(
         if _vram is not None:
             for _e in unique_experts:
                 _held = _vram.get(layer_idx, _e)
+                if _held is not None:
+                    _vram_hold[_e] = _held
+
+        # Chunk-major retention (row 44 F2). The layer-major chunked prefill calls
+        # this layer once per chunk, back to back; without this, each call re-read
+        # its experts -- 53,938 loads for a 2k Qwen3-Next prefill against a
+        # per-layer union of 17,445 (10.9x at 8k). An expert uploaded by an
+        # earlier chunk call is kept as the same entry the VRAM cache would store
+        # and served through the hit branch below; the dict is dropped at the
+        # layer's last chunk call. Same mechanism as the fused-EXL3 forward's
+        # _chunk_major_gpu, with its own call counter since that one rides the
+        # EXL3-only prefill stager. Bounded by the VRAM cache budget, idle during
+        # prefill. _chunked_prefill's finally clears the dict on an exception,
+        # which is why a missing dict always starts a fresh count.
+        _cm = None
+        _cm_last_call = False
+        _cm_budget = 0
+        _n_calls = getattr(vaayu_ref, "_chunk_major_n", None) or 1
+        if getattr(vaayu_ref, "_moe_prefill_pass", False) and _n_calls > 1:
+            _cm = getattr(vaayu_ref, "_chunk_major_gpu", None)
+            _owner, _seen = getattr(vaayu_ref, "_chunk_major_owner", (None, 0))
+            if _cm is None or _owner != layer_idx:
+                _cm = vaayu_ref._chunk_major_gpu = {}
+                vaayu_ref._chunk_major_gpu_bytes = 0
+                _seen = 0
+            _seen += 1
+            vaayu_ref._chunk_major_owner = (layer_idx, _seen)
+            _cm_last_call = _seen >= _n_calls
+            _cm_budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
+                                 "budget_bytes", 0)
+            for _e in unique_experts:
+                _held = _cm.get(_e)
                 if _held is not None:
                     _vram_hold[_e] = _held
 
@@ -1908,6 +1941,12 @@ def _make_fused_sparse_forward(
                         # torch tensors — unlike the EXL3 forward's BC objects there is
                         # no C++ heap to free, so dropping the reference is the free.
                         _vram.put(layer_idx, eidx, _entry)
+                    elif _cm is not None and _entry is not None and not _cm_last_call:
+                        # Overflow past the budget simply re-reads on a later chunk.
+                        _sz = ExpertVRAMCache._group_bytes(_entry)
+                        if vaayu_ref._chunk_major_gpu_bytes + _sz <= _cm_budget:
+                            _cm[eidx] = _entry
+                            vaayu_ref._chunk_major_gpu_bytes += _sz
                     if _prof:
                         _mp['slots_miss'] += 1
 
@@ -1934,6 +1973,10 @@ def _make_fused_sparse_forward(
             # that key's eviction forever.
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+
+        if _cm_last_call:
+            vaayu_ref._chunk_major_gpu = None
+            vaayu_ref._chunk_major_gpu_bytes = 0
 
         result = final_hidden.to(flat_hidden.dtype)
         _shared = _shared_expert_output(moe_mod, flat_hidden)
