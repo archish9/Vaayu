@@ -4108,9 +4108,30 @@ Detail: [`…-row42-hybrid-state-snapshot-SCOPING.md`](docs/2026-09-19-row42-hyb
   hits re-running the dequant) · h2d 3.33 · scatter 3.21 · gemm 2.91 · loop ~5.9; 36,493 retained hits + 17,445
   misses.** So F3 reduced (slab-backed transient prefill reads + pinned H2D) is worth **~4 s at 2k (−16 %)**, not
   the row's 5–10 s ceiling. Decide against F4/F5 below before building it.
-- [ ] **F4 (new, from F3's measurement) — coalesce adjacent expert reads in prefill.** Prefill routes ~55 % of a
-  layer's experts and expert ids are contiguous on disk, so runs of adjacent experts can be one io_uring read.
-  P8: 11.8 MB reads deliver 7.1 GB/s against 3.7 here → up to ~1.9× on the 9.41 s disk term (~4–5 s at 2k).
+  **REVISED 2026-09-19 after F4: F3 is now the best remaining lever and its blocker is gone.** The objection was
+  that uploading from pinned means holding one of 8 pooled buffers until the H2D lands, while the forward waits for
+  all ~281 reads of a layer call first. Use the **slab arena** as the transient source instead: ~10,111 pinned
+  1.8 MB slabs, all free during prefill (prefill never fills the RAM tier). Acquire a slab per miss, hand the views
+  to the forward, release after the layer's compute behind a CUDA event — the fused-EXL3 staged path already does
+  exactly this. Then the read path is SLAB not SPARSE (**3.74 vs 2.48 GB/s at k=8**) and the H2D is pinned
+  (**114 vs 147 µs/expert**): projected **disk 9.10 → ~6.0 s, h2d 3.33 → ~2.6 s ≈ −3.8 s of 25 s (−15 %)**.
+- [x] **F4 — coalesce adjacent expert reads in prefill. BUILT, MEASURED, REVERTED 2026-09-19 on its own stop rule.**
+  Buffer sized to a whole number of experts up to a new hardware constant `_NVME_EFFICIENT_READ_BYTES` (12 MiB) →
+  Qwen3-Next 11.9 MiB × 8 (95 MB pinned), EXL3 unchanged (spans 11.29 / 8.48 MiB already exceed it);
+  `load_experts_sparse` + `plan_expert_read_runs`; prefill dispatched one task per run; futures returned lists of
+  `(eidx, raw)`. Tests `tests/test_coalesced_expert_reads.py` (8), suite 2312 passed.
+  **TRAP (cost one GPU arm): the first planner bounded a run by the expert's first-to-last SPAN and was a complete
+  no-op** — this checkpoint is TYPE-MAJOR (all `weight_shape`, then all `weight_scale`, then all `weight_packed`,
+  experts in id order inside each), so one expert's blocks sit ~832 MiB apart while consecutive experts' same-type
+  blocks touch. The bound must be each expert's WIDEST BLOCK. Fixed: on the real index a 281-expert layer miss list
+  plans 41 runs, **843 → 337 reads**, largest read 1.69 → **10.5 MiB**.
+  **Same-day ABBA (F4a → base → F4b), logits identical: 2k 25.16 → 24.10 s (−4.2 %), 8k 58.90 → 59.33 s (+0.7 %,
+  NULL), disk_load 9.10 → 8.55 s (−6.0 %), decode −0.3 % (noise).** Stop rule was disk_load < ~7 s → **NOT MET,
+  reverted**; suite back to 2306 passed / 16 skipped. Refuted test kept at
+  `docs/refuted/test_coalesced_expert_reads.py.refuted`.
+  **Why it under-delivered:** at 2k only ~55 % of a layer's experts are routed, so ADJACENT-id runs average ~2.2
+  experts (reads grow 1.69 → ~3.7 MiB, not the 11.8 MiB where the drive pays 7.1 GB/s), and disk is only ~35 % of
+  the post-F2 prefill. **Do not re-open without a denser routing regime or a bigger read.**
 - [ ] **F5 (new, from F3's measurement) — port the permutation dispatch into the non-EXL3 fused forward.** It still
   builds an int64 one-hot mask and runs `torch.where` per expert; the other two forwards replaced that with one CPU
   argsort (`compute_expert_dispatch`). Targets scatter (3.21 s) + part of the ~5.9 s unbracketed loop.
