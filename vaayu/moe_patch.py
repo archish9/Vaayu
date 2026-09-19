@@ -1396,6 +1396,7 @@ def _make_modulelist_sparse_forward(
     original_forward = None,
 ):
     from .persist.loader_strategy import ExLlamaV3Linear
+    from .persist.expert_cache import ExpertVRAMCache
 
     layer_name = block_info.layer_name
     layer_idx  = block_info.layer_idx
@@ -1515,6 +1516,35 @@ def _make_modulelist_sparse_forward(
         if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
             _vram = None
 
+        # Chunk-major retention (row 45, the module-list half of row 44's F2). The
+        # layer-major chunked prefill calls this layer once per chunk, back to
+        # back, for any MoE model -- but until this, only the two fused forwards
+        # kept anything across those calls. Measured on MiniMax-M2.7: a 2048-token
+        # prefill issued 55,871 expert loads against a per-layer union of 15,268
+        # (3.659x, 495.86 GB read), and the repeated per-load H2D + dequant +
+        # detach was 63 % of a 113.9 s wall. An expert uploaded by an earlier chunk
+        # call is kept as the same entry the VRAM cache would store and served
+        # through the hit branch below; the dict is dropped at the layer's last
+        # chunk call and bounded by the VRAM cache budget, which is idle during
+        # prefill (_vram is None above). _chunked_prefill's finally clears
+        # _chunk_major_gpu, which is why a missing dict always starts a fresh count.
+        _cm = None
+        _cm_last_call = False
+        _cm_budget = 0
+        _n_calls = getattr(vaayu_ref, "_chunk_major_n", None) or 1
+        if getattr(vaayu_ref, "_moe_prefill_pass", False) and _n_calls > 1:
+            _cm = getattr(vaayu_ref, "_chunk_major_gpu", None)
+            _owner, _seen = getattr(vaayu_ref, "_chunk_major_owner", (None, 0))
+            if _cm is None or _owner != layer_idx:
+                _cm = vaayu_ref._chunk_major_gpu = {}
+                vaayu_ref._chunk_major_gpu_bytes = 0
+                _seen = 0
+            _seen += 1
+            vaayu_ref._chunk_major_owner = (layer_idx, _seen)
+            _cm_last_call = _seen >= _n_calls
+            _cm_budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
+                                 "budget_bytes", 0)
+
         # Experts already VRAM-resident need no RAM lookup and no disk read at all.
         # ONE get() per expert, entry held for the compute loop below — not
         # has()-then-get(), which would take the lock twice and leave a window
@@ -1523,6 +1553,14 @@ def _make_modulelist_sparse_forward(
         if _vram is not None:
             for _e in unique_experts:
                 _entry = _vram.get(layer_idx, _e)
+                if _entry is not None:
+                    _vram_resident[_e] = _entry
+        if _cm is not None:
+            # Mutually exclusive with the branch above in practice (_vram is None
+            # during prefill), but the lookup is written as its own pass so
+            # neither gate depends on the other's state.
+            for _e in unique_experts:
+                _entry = _cm.get(_e)
                 if _entry is not None:
                     _vram_resident[_e] = _entry
         _to_load = [e for e in unique_experts if e not in _vram_resident]
@@ -1633,6 +1671,16 @@ def _make_modulelist_sparse_forward(
                     # eviction would reclaim no VRAM. It also keeps peak GPU
                     # residency at one uncached expert regardless of routing width.
                     _vram.put(layer_idx, eidx, entry)
+                elif _cm is not None and not _cm_last_call:
+                    # Retain for this layer's remaining chunk calls. Overflow past
+                    # the budget simply re-reads on a later chunk, as F2 does.
+                    # _detach_expert still runs below: the entry owns the GPU
+                    # tensors and the BC objects, the module only borrows them,
+                    # which is exactly why the VRAM-cache path above can detach too.
+                    _sz = ExpertVRAMCache._group_bytes(entry)
+                    if vaayu_ref._chunk_major_gpu_bytes + _sz <= _cm_budget:
+                        _cm[eidx] = entry
+                        vaayu_ref._chunk_major_gpu_bytes += _sz
                 _run_expert(eidx, expert_mod)
             finally:
                 _detach_expert(eidx, expert_mod)
@@ -1661,7 +1709,15 @@ def _make_modulelist_sparse_forward(
                         # failed attach must not silently drop this expert's
                         # contribution to final_hidden — fall through to a real
                         # disk load below instead of skipping compute.
-                        _vram.drop(layer_idx, eidx)
+                        # The entry came from whichever tier is live: the VRAM
+                        # cache at decode, the chunk-major dict during a
+                        # layer-major prefill (where _vram is None, so the drop
+                        # must not go through it).
+                        if _vram is not None:
+                            _vram.drop(layer_idx, eidx)
+                        if _cm is not None and eidx in _cm:
+                            vaayu_ref._chunk_major_gpu_bytes -= (
+                                ExpertVRAMCache._group_bytes(_cm.pop(eidx)))
                         _attach_failed.append(eidx)
                         continue
                     _run_expert(eidx, expert_mod)
@@ -1693,6 +1749,10 @@ def _make_modulelist_sparse_forward(
             # through — a leaked pin permanently blocks that key's eviction.
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+
+        if _cm_last_call:
+            vaayu_ref._chunk_major_gpu = None
+            vaayu_ref._chunk_major_gpu_bytes = 0
 
         accumulate_expert_outputs(_flat_final, _contribs)
 
