@@ -192,7 +192,8 @@ rows **32 · 34 · 35** and **28b**.
 | **30-P** | **DONE 2026-09-18 — pinned RAM tier (slab arena) for the non-EXL3 fused forward.** Replaced the forward's inline pageable-clone loader with `_dispatch_expert_misses`; the arena gate now accepts fused non-EXL3 on CUDA. | **+11.69 % decode tok/s measured on branch `row30p-pinned-ram-tier` on Qwen3-Next (6.6329 → 7.4084, ABBA, greedy ids identical × 12 × 64 tokens)** — beats the probe's own +10.62 %. No knob, reachable at N=1 (measured there), bit-identical, VRAM hit/peak unchanged (83 %, Δ ≈ 0.03 GiB). Server-sizing arena: 10380 × 1.8MB, 18.54 GB pinned. It is also the hard prerequisite of any S3 fill-behind — unblocked now. | `[x]` **DONE — merged to `main` 2026-09-18 (`8475123`); the S3 re-gate it unblocked ran the same day and CLOSED S3** | ~1–2 days | [`…/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md`](docs/superpowers/plans/2026-09-18-row30P-pinned-ram-tier-nonexl3-fused.md) · spec [`…-row30-S3-fill-site-SCOPING.md`](docs/2026-09-18-row30-S3-fill-site-SCOPING.md) · [`…-row30P-pinned-ram-tier-RESULTS.md`](docs/2026-09-18-row30P-pinned-ram-tier-RESULTS.md) · row **30** below |
 | **41** | **`[bug]` SUSPECTED (code reading 2026-09-18, not reproduced): speculative decoding on a hybrid model rolls back only the KV layers.** `_trim_kv_cache` → `crop()` (`vaayu_base.py:5171` / `:1544`) shortens KV lengths; the 36 linear-attention layers' recurrent state keeps the rejected draft tokens → silently wrong text. | Correctness. Reachable only by opt-in: `USE_PROMPT_LOOKUP=True` (server knob) with Qwen3-Next. `"auto"` = off on MoE, so the default is safe. Fix if confirmed is small: refuse at load via `cache_holds_recurrent_state`, as RC7 does. | `[x]` **CLOSED 2026-09-18 — confirmed, refused at load; its root cause also broke chunked prefill (row 43, FIXED)** | ~½ day | [`…-hybrid-model-next-steps-BRIEF.md`](docs/2026-09-18-hybrid-model-next-steps-BRIEF.md) item 1 · row **41** below |
 | **42** | **SCOPING spike: recurrent-state snapshot/restore for hybrid models.** Would unblock the cross-turn prefix cache (RC7 refused it) AND speculative decoding (row 37) on Qwen3-Next. | Qwen3-Next is the fastest model here. Prefix reuse is the agent workload's top TTFT lever (CLAUDE.md §0). Row 37's gate is MET (S2, 2026-09-13), and the checkpoint ships a free MTP drafter. One snapshot ~38–75 MB (derived). | `[x]` **CLOSED 2026-09-19 — (a) GO (8.6–21× round-2 TTFT at 8k) → row 42-B; (b) NO-GO (verify 2.6–4.8× t_dec, p ≥ 0.87 needed) → row 37 closed for hybrids; found row 44** | done | [`…-row42-hybrid-state-snapshot-SCOPING.md`](docs/2026-09-19-row42-hybrid-state-snapshot-SCOPING.md) · row **42** below |
-| **44** | **Qwen3-Next prefill is 33 ms/token: the non-EXL3 fused forward re-reads its experts on every 512-token prefill chunk, pageable, never cached.** A 2048-token prefill read **96.1 GB (2.19× the model's experts, 53,938 loads) at ~1.13 GB/s**; RAM-tier hits do not change the rate (row 41: 53–66 % hits, same ~31 ms/token) → per-expert loop cost, not NVMe. The `_chunk_major_gpu` retention exists only in the EXL3 fused forward. | TTFT on the fastest model here: **2k → 69 s, 8k → 269 s, 16k ≈ 540 s (derived)** — never measured before row 42. Derived ceiling ~5–10 s for 2k (load each expert once, RAM-tier hits, NVMe at ~7 GB/s). Every Qwen3-Next request, N=1, default config. Also shrinks the hit path of 42-B. | `[ ]` **found 2026-09-19 by row 42; recommended next** | ~1–2 days | [`…-row42-…-SCOPING.md`](docs/2026-09-19-row42-hybrid-state-snapshot-SCOPING.md) §4 · row **44** below |
+| **44** | **Qwen3-Next prefill is 33 ms/token: the non-EXL3 fused forward re-reads its experts on every 512-token prefill chunk, pageable, never cached.** A 2048-token prefill read **96.1 GB (2.19× the model's experts, 53,938 loads) at ~1.13 GB/s**; RAM-tier hits do not change the rate (row 41: 53–66 % hits, same ~31 ms/token) → per-expert loop cost, not NVMe. The `_chunk_major_gpu` retention exists only in the EXL3 fused forward. | TTFT on the fastest model here: **2k → 69 s, 8k → 269 s, 16k ≈ 540 s (derived)** — never measured before row 42. Derived ceiling ~5–10 s for 2k (load each expert once, RAM-tier hits, NVMe at ~7 GB/s). Every Qwen3-Next request, N=1, default config. Also shrinks the hit path of 42-B. | `[~]` **F1 + F2 DONE 2026-09-19 (uncommitted): 2k TTFT 83.51 → 24.84 s (3.36×), 8k 335.26 → 58.11 s (5.77×), logits bit-identical, all gates green. Two root causes: loader pool was 1 worker on every non-EXL3 ckpt (512 MB buffer guess) and the forward retained nothing across chunk calls (3.09× at 2k, 10.9× at 8k). F3 open** | ~1–2 days | [`…-row42-…-SCOPING.md`](docs/2026-09-19-row42-hybrid-state-snapshot-SCOPING.md) §4 · row **44** below |
+| **45** | **Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk too?** Found by row 44 by code reading, UNMEASURED. Row 44's F1 does not apply (MiniMax's pool was always 8) and F2 fixed the other forward. | At 512-token chunks MiniMax routes ~all 256 experts of a layer per chunk, so the factor would be ~the chunk count (4× at 2k, 16× at 8k) on a disk-bound prefill — but its EXL3 prefill STAGER may already amortise the reads. **Measure first** (one instrumented 2k prefill: loads vs per-layer union, `plans/probes/row44_prefill_split.py MODEL=`). | `[ ]` **measure before building** | ~½ day to measure | row **45** below |
 | **42-B** | **Build the hybrid-model prefix cache** (write the build plan first, then build). Snapshot the recurrent state at the prompt end (40.1 MB, 2.5 ms D2H); append-only turns need no snapshot; lift RC7 for hybrids. | Measured 8.6–21× round-2 TTFT at 8k (row 42). **Cost: the prefix-session RAM reservation returns (4.83 GB) → ~−13 % decode** at default `PREFIX_SESSIONS=3` (row 30's +15.09 % reversed); break-even ~13,300 generated tokens/turn at 8k. Question the reservation sizing in the plan. | `[ ]` **after row 44 (re-price then)** | plan ½ day; build ~2–3 days | row **42-B** below |
 | **32 · 34 · 35** | **The streaming-regime ladder — fallback if S2 stalls.** **32** run a lower-bpw EXL3 build of the models already here (5.01 → 3.0 bpw). **34** find out why the drive delivers 6.3 GB/s when it plateaus at 7.1. **35** give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block. | 32 = **×1.50 projected, a download and zero code**, and below ~3.25 bpw Qwen's working set drops under its VRAM cache budget so the 62/94-layer restriction disappears entirely. 34 = ×1.10, probe first. 35 = **+11.7 % Qwen measured**, gate machinery already built. **All three only pay while experts stream from disk — if S2 lands they mostly die.** | `[ ]` **priority 4** | 32: a download · 34: ½ day probe · 35: ~2 days | §2.2 / §2.4 / §2.5 · rows **32**, **34**, **35** below |
 | **28b** | **Port DeepSeek-V4-Flash-0731** (step S4) — kernels first on sm_120, then HF modeling code + `auto_map` the MiniMax way, key remap, persist, measure. | Projected **~2.5–2.7× Qwen's decode** from 2.58×-lighter tokens. **Weeks**, mostly kernels and numerics. Its disk keys already satisfy the streaming index — the hard part is the model. | `[ ]` **priority 6** | weeks | [`…-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md) · row **28b** below |
@@ -4013,9 +4014,10 @@ hybrids; side finding → row 44. No engine code.** Results (gitignored; this ro
 
 ---
 
-# 44 · [ ] Qwen3-Next prefill re-reads its experts on every prefill chunk, pageable, at ~1.1 GB/s — 33 ms/token TTFT (added 2026-09-19, found by row 42)
+# 44 · [~] Qwen3-Next prefill re-reads its experts on every prefill chunk, pageable, at ~1.1 GB/s — 33 ms/token TTFT (added 2026-09-19, found by row 42)
 
-**Status: open, not started. Recommended next (ahead of 42-B).** Found by row 42's TTFT arms, not a planned
+**Status: `[~]` F1 + F2 DONE AND MEASURED 2026-09-19 (uncommitted): 2k TTFT 83.51 → 24.84 s (3.36×), 8k 335.26 →
+58.11 s (5.77×), logits bit-identical, every gate green. F3 (the pageable clone / H2D) is the only lever left open.** Found by row 42's TTFT arms, not a planned
 measurement: Qwen3-Next's TTFT had never been recorded (S2 / 30-P / row 33 / S3 all measured decode).
 Detail: [`…-row42-hybrid-state-snapshot-SCOPING.md`](docs/2026-09-19-row42-hybrid-state-snapshot-SCOPING.md) §4
 (gitignored; this row is the durable copy).
@@ -4041,10 +4043,85 @@ Detail: [`…-row42-hybrid-state-snapshot-SCOPING.md`](docs/2026-09-19-row42-hyb
 - **Interaction:** 42-B's hit prefill runs at the same rate (d=1024: 31–34 ms/token; d=64: 7.5 s). This row shrinks
   MISS and HIT together → re-price 42-B after it.
 - **§8:** no knob expected; every Qwen3-Next request, N=1, default config — reachable the day it lands.
-- [ ] Instrument one 2k prefill: split the 85 s into disk read / H2D / dequant / GEMM loop.
-- [ ] Decide the fix (chunk-major retention for the non-EXL3 fused forward, and/or pinned-path loads) → plan in `docs/`.
+- [x] Instrument one 2k prefill: split the 85 s into disk read / H2D / dequant / GEMM loop. **DONE 2026-09-19**
+  (`plans/probes/row44_prefill_split.py`, logs `docs/probes/row44-prefill-split-{r1,pool8}.log`, server knobs,
+  `BALLAST_GB=25`, 29G scope, HEAD `64d868f`; detail [`…-row44-qwen3next-prefill-RESULTS.md`](docs/2026-09-19-row44-qwen3next-prefill-RESULTS.md)).
+  2k prefill U / U2 = **86.26 / 84.62 s**, top id 526 every arm. MoE blocks = **99.3 %** of wall; all 48 mixers
+  together 0.52 s (the torch gated-delta fallback is NOT the cost). P arm (89.96 s): **disk_load 59.16 s (65.8 %,
+  1.10 ms/expert-call)**, h2d 10.35 (pageable, 192 µs), construct 5.67 (105 µs), scatter 3.43, gemm 3.28,
+  unbracketed loop ~7.3. 53,938 loads vs a per-layer union across the 4 chunks of **17,445 → 3.09× re-reads**.
+  **RC-A (NEW, not the row's hypothesis): the expert loader runs ONE worker on every non-EXL3 checkpoint.**
+  `init_model_io` sizes each pinned loader buffer at `(32 if exl3 else 512) MB` (the 512 "unverified") against a
+  `max(0.5, avail − 27 GB)` budget that is always 0.5 GB on this box → **1 buffer** (log: `n=1 size=512.0MB`) →
+  `_moe_executor` width 1, ring pool 1, stager executor 1: every Qwen3-Next expert read, prefill AND decode, is
+  serial. Qwen3-Next's largest expert is ~1.8 MB. **Override test (probe pre-fills 8 × 8 MB buffers, engine
+  untouched): U 86.26 → 57.07 s (−34 %), W 55.99, P 61.91, top id 526** — disk_load 59.16 → 31.60 s, every other
+  phase unchanged. Disk then runs at only **3.0 GB/s aggregate** (summed in-call 250 s over 8 callers; the Rust read
+  releases the GIL) → suspect the per-tensor pageable `clone()` in `load_expert_sparse` (lever F3, unmeasured).
+  **RC-B (the row's hypothesis, confirmed): no chunk-major retention in the non-EXL3 fused forward** → 3.09× the
+  loads at 2k, and disk + h2d + construct (84 % of P) all scale with it. Row 41's "hits don't change the rate" is
+  explained: a hit still pays pageable h2d + construct + loop per chunk call, and misses were still serial.
+  **Also found:** the module-list forward (MiniMax) has no cross-chunk retention either (code reading; MiniMax is
+  EXL3, pool 8, RC-A does not apply; unmeasured). Dense checkpoints allocate the unused expert loader pool too
+  (1 × 512 MB pinned non-EXL3, 8 × 32 MB EXL3) — pre-existing, unmeasured.
+- [x] **F1 — derive the loader buffer size from the expert offset index (`compute_slab_bytes`), not the 32/512 MB
+  literals (CLAUDE.md §5). DONE 2026-09-19 (uncommitted):** `expert_read_buffer_bytes()` in
+  `init_model_io` (dense → old sizing); tests `tests/test_expert_loader_buffer_sizing.py` (RED on the literal),
+  suite **2299 passed / 16 skipped**. Qwen3-Next now `pool n=8 × 1.7 MB` (13.6 MB pinned, was 1 × 512 MB), rings 3.
+  **Same-day ABBA (F1a → base stashed → F1b): TTFT 2k 83.51 → 55.82 s (−33.2 %), 8k 335.26 → 223.65 s (−33.3 %,
+  cold tiers), decode 8.009 → 8.171 tok/s (+2.0 %); top ids identical, decode greedy ids identical 9 arms × 3
+  processes.** 8k re-read factor: 214,717 loads vs union 19,696 (10.9×) — F2's target. Logs
+  `docs/probes/row44-f1ab-*.log`. Measured −34 % at 2k by override first. **Gates (logs `docs/probes/row44-f1-*.log`):
+  server Qwen3-Next 9 passed; accumulator Qwen3-Next / Qwen3-235B / MiniMax 8 / 8 / 8; Llama-3.2-1B prefix 1 passed;
+  no offset-index file written into any dense dir.** Derived buffers (`splitted_model/`): Qwen3-235B 11.29 MiB,
+  MiniMax 8.48 MiB, Qwen3-Next 1.70 MiB → pool 8 on all three; dense → 0 → old sizing (unchanged). EXL3 pool count
+  and ring count do NOT move (8 / 3); their pinned pool shrinks 256 → ~90 / ~68 MB — no throughput A/B run on EXL3
+  (nothing on their token path changes). **§8: no knob (derived); plumbed by construction (`create_app` →
+  `from_pretrained` → `init_model_io`); reachable at N=1 on the default config, every MoE load. No `documentation/`
+  page describes the loader pool → no doc change.** Shared infra (every MoE checkpoint: EXL3 buffers
+  shrink 32 → ~11.8 / ~8.9 MB, count stays capped at 8) → all three regression gates. Dense unchanged (no experts
+  → old sizing). §8: no knob; `create_app` → `from_pretrained` → `init_model_io`, reachable at N=1 by default.
+- [x] **F2 — chunk-major retention for the non-EXL3 fused forward. DONE 2026-09-19 (uncommitted).** Per-layer
+  `_chunk_major_gpu` dict + `_chunk_major_owner=(layer_idx, calls_seen)`, active only when `_moe_prefill_pass` and
+  `_chunk_major_n > 1`; retained entries are the same object the VRAM cache stores, joined into `_vram_hold` so the
+  hit branch serves them and no read is dispatched; bounded by the prefill-idle VRAM cache budget (7.2 GB on
+  Qwen3-Next); dropped at the layer's last chunk call. Tests `tests/test_fused_nonexl3_chunk_retention.py` (RED at
+  22 loads vs union 8); suite **2306 passed / 16 skipped** (`test_no_unbound_locals` caught `_cm_budget` — initialised,
+  not suppressed). **Same-day ABBA (F2a → F1-only stashed → F2b): TTFT 2k 56.16 → 24.84 s (−55.8 %), 8k 225.48 →
+  58.11 s (−74.2 %); expert loads 53,938 → 17,445 (2k) and 214,717 → 19,696 (8k) = the per-layer union exactly;
+  decode 7.956 → 8.049 tok/s (+1.2 %, F2 idle at decode); prompt-end logits sha256 IDENTICAL across arms at both
+  lengths.** Peak VRAM 5.52 GiB / 8.74 GiB free at 8k (prefill-only process). Gates: server Qwen3-Next 9 passed;
+  accumulator Qwen3-Next / Qwen3-235B / MiniMax 8/8/8; Llama-3.2-1B prefix 1 passed. Plan:
+  [`…/plans/2026-09-19-row44-F2-chunk-retention-nonexl3.md`](docs/superpowers/plans/2026-09-19-row44-F2-chunk-retention-nonexl3.md).
+  **§8: no knob; layer-major chunked prefill is the default for MoE on flash/sdpa → every Qwen3-Next request over
+  512 tokens gets it at N=1. No `documentation/` page states a Qwen3-Next TTFT number → no doc change.** Projected 2k ~57 → ~27 s (per-load
+  phases × 17,445/53,938 = 0.323; gemm/scatter/loop unchanged). Bigger at 8k (16 chunks).
+- [ ] **F3 — transient prefill loads without the pageable clone** (pinned source → pinned H2D). Measure first:
+  h2d 192 µs/expert pageable vs ~40 µs pinned (30-P); the 3.0 GB/s disk cap may be the clone too. **After F1+F2 the
+  2k prefill is 24.84 s for 30.9 GB of unique experts — the disk at ~3.0 GB/s is ~10 s of it, the pageable H2D ~3.3 s
+  and the per-expert loop ~7 s.** Row 44's derived ceiling was ~5–10 s at 2k. Stop rule: if a probe cannot show the
+  clone (not the drive) is the 3.0 GB/s cap, close F3 — the drive's own plateau at 2–4 readers is ~7.1 GB/s (P8).
+- [~] Decide the fix → F1 / F2 / F3 above, in that order (F1 is the smallest and already measured).
 - [ ] Build + measure TTFT at 2k / 8k (same-day A/B), greedy ids identical; gates: suite, server gate on Qwen3-Next,
   regression gates Qwen3-235B / MiniMax / Llama-3.2-1B.
+
+---
+
+# 45 · [ ] The module-list forward (MiniMax-M2.7) re-reads its experts on every prefill chunk too (added 2026-09-19, found by row 44)
+
+**Status: open, not started, UNMEASURED.** Code reading only (`_make_modulelist_sparse_forward`, `moe_patch.py:1387`):
+it dispatches its own loads on every chunk call and keeps nothing across them, exactly the gap row 44's F2 closed for
+the non-EXL3 fused forward. MiniMax is EXL3, so row 44's F1 (loader pool = 1) does NOT apply to it — its pool was
+always 8 — and the fused-EXL3 retention (`_chunk_major_gpu`) is in the other forward.
+
+- **Why it may matter:** at 512-token chunks MiniMax routes close to all 256 experts of a layer per chunk, so the
+  re-read factor is ~the chunk count (2k → 4×, 8k → 16×), on a model whose prefill is disk-bound.
+- **Why it may not:** MiniMax prefill runs the EXL3-only prefill STAGER, which may already amortise the reads; and
+  its RAM tier is large. **Measure before building** — one instrumented 2k prefill (`plans/probes/row44_prefill_split.py`
+  works on any checkpoint via `MODEL=`), comparing loads against the per-layer union, exactly as row 44 step 1 did.
+- **Scope:** ONE forward (module-list). Retention would follow F2's shape; entries there are EXL3 BC objects, so the
+  free discipline is the fused-EXL3 one (`_owned_by_cache`), not F2's plain-tensor drop.
+- **§8:** no knob expected; reachable at N=1 if it fires.
 
 ---
 
