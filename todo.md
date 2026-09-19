@@ -4096,11 +4096,24 @@ Detail: [`…-row42-hybrid-state-snapshot-SCOPING.md`](docs/2026-09-19-row42-hyb
   **§8: no knob; layer-major chunked prefill is the default for MoE on flash/sdpa → every Qwen3-Next request over
   512 tokens gets it at N=1. No `documentation/` page states a Qwen3-Next TTFT number → no doc change.** Projected 2k ~57 → ~27 s (per-load
   phases × 17,445/53,938 = 0.323; gemm/scatter/loop unchanged). Bigger at 8k (16 chunks).
-- [ ] **F3 — transient prefill loads without the pageable clone** (pinned source → pinned H2D). Measure first:
-  h2d 192 µs/expert pageable vs ~40 µs pinned (30-P); the 3.0 GB/s disk cap may be the clone too. **After F1+F2 the
-  2k prefill is 24.84 s for 30.9 GB of unique experts — the disk at ~3.0 GB/s is ~10 s of it, the pageable H2D ~3.3 s
-  and the per-expert loop ~7 s.** Row 44's derived ceiling was ~5–10 s at 2k. Stop rule: if a probe cannot show the
-  clone (not the drive) is the 3.0 GB/s cap, close F3 — the drive's own plateau at 2–4 readers is ~7.1 GB/s (P8).
+- [ ] **F3 — PROBED 2026-09-19, PREMISE REFUTED AS STATED; a reduced version survives.**
+  `plans/probes/row44_f3_clone.py` (real expert ranges, median 1.69 MiB, O_DIRECT, 3 rings; log
+  `docs/probes/row44-f3-clone-r1.log`) measured three read paths at k = 1/2/4/8 callers: RAW (io_uring only)
+  1.79 / 2.81 / 3.55 / **3.69** GB/s · SPARSE (today: pooled buffer + per-tensor clone) 1.83 / 2.82 / 3.39 /
+  **2.48** · SLAB (pinned, zero clone) 1.83 / 2.76 / 3.55 / **3.74**. **The clone is NOT the cap — read SIZE is:**
+  a 1.69 MiB read tops out at ~3.7 GB/s with no tensors at all, against P8's ~7.1 GB/s at 11.8 MB. The clone costs
+  only at k=8 (−34 %), which is the width prefill dispatches at, and is free at k=4. H2D per expert: pageable
+  **147.3 µs** vs pinned **114.3 µs** (−22 %; NOT 30-P's 32–40 µs — different measurement shape).
+  **Post-F2 2k profile (`TAG=-f2prof`, P 28.82 s / U 24.93 s): disk_load 9.41 · construct 3.91 (2.03 = retained
+  hits re-running the dequant) · h2d 3.33 · scatter 3.21 · gemm 2.91 · loop ~5.9; 36,493 retained hits + 17,445
+  misses.** So F3 reduced (slab-backed transient prefill reads + pinned H2D) is worth **~4 s at 2k (−16 %)**, not
+  the row's 5–10 s ceiling. Decide against F4/F5 below before building it.
+- [ ] **F4 (new, from F3's measurement) — coalesce adjacent expert reads in prefill.** Prefill routes ~55 % of a
+  layer's experts and expert ids are contiguous on disk, so runs of adjacent experts can be one io_uring read.
+  P8: 11.8 MB reads deliver 7.1 GB/s against 3.7 here → up to ~1.9× on the 9.41 s disk term (~4–5 s at 2k).
+- [ ] **F5 (new, from F3's measurement) — port the permutation dispatch into the non-EXL3 fused forward.** It still
+  builds an int64 one-hot mask and runs `torch.where` per expert; the other two forwards replaced that with one CPU
+  argsort (`compute_expert_dispatch`). Targets scatter (3.21 s) + part of the ~5.9 s unbracketed loop.
 - [~] Decide the fix → F1 / F2 / F3 above, in that order (F1 is the smallest and already measured).
 - [ ] Build + measure TTFT at 2k / 8k (same-day A/B), greedy ids identical; gates: suite, server gate on Qwen3-Next,
   regression gates Qwen3-235B / MiniMax / Llama-3.2-1B.
