@@ -36,7 +36,7 @@ class ExpertOffsetIndex:
         self.checkpoint_path = Path(checkpoint_path)
         self.index: dict[str, dict[int, dict[str, ExpertTensorMeta]]] = {}
 
-    def build(self) -> None:
+    def build(self, write_cache: bool = True) -> None:
         self.index = {}
         for shard_path in sorted(self.checkpoint_path.glob("*.safetensors")):
             layer_name = shard_path.stem
@@ -62,7 +62,8 @@ class ExpertOffsetIndex:
                     )
                 )
 
-        self._write_cache()
+        if write_cache:
+            self._write_cache()
 
     def _write_cache(self) -> None:
         raw = {}

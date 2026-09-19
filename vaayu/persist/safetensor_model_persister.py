@@ -313,17 +313,22 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     global _EXPERT_PINNED_SIZE, _EXPERT_POOL_ACTUAL_N
     if _USE_PINNED and _EXPERT_BUF_POOL.empty():
         # Buffer must fit the largest single contiguous read group per expert, not
-        # a flat guess. EXL3 checkpoints measured ~11.8 MB max group (trellis quant
-        # keeps expert size near-constant); 512 MB was sized for uncompressed BF16
-        # experts and was ~43x oversized for EXL3, starving the pool down to a
-        # single buffer on RAM-constrained machines. Non-EXL3 keeps the original
-        # 512 MB (unverified but unchanged — no evidence it's wrong).
-        try:
-            from .loader_strategy import _is_exl3_checkpoint
-            _is_exl3 = _is_exl3_checkpoint(model_dir)
-        except Exception:
-            _is_exl3 = False
-        _EXPERT_PINNED_SIZE = (32 if _is_exl3 else 512) * 1024 * 1024
+        # a flat guess: it is the checkpoint's largest aligned expert span, derived
+        # from its offset index (CLAUDE.md §5). The guesses it replaces -- 32 MB
+        # EXL3, 512 MB anything else -- gave every non-EXL3 checkpoint ONE buffer
+        # on this box's 0.5 GB budget, so one loader worker and one ring: every
+        # Qwen3-Next expert read (~1.8 MB) ran serially, 66 % of a 2k prefill
+        # (row 44, 2026-09-19: 86.3 -> 57.1 s with a full-width pool). A
+        # checkpoint with no per-expert tensors never calls the expert loader and
+        # keeps the old sizing, so its ring count does not move.
+        _EXPERT_PINNED_SIZE = expert_read_buffer_bytes(model_dir)
+        if _EXPERT_PINNED_SIZE == 0:
+            try:
+                from .loader_strategy import _is_exl3_checkpoint
+                _is_exl3 = _is_exl3_checkpoint(model_dir)
+            except Exception:
+                _is_exl3 = False
+            _EXPERT_PINNED_SIZE = (32 if _is_exl3 else 512) * 1024 * 1024
 
         # Budget pool size against available RAM. Reserve 27 GB for: layer load
         # double-buffer (~6 GB), expert RAM cache (~16.5 GB), non-expert tensor
@@ -857,6 +862,21 @@ def expert_span_bytes(expert_metas: dict) -> int:
         _, _, _, _, slab_span = _group_layout(group)
         total += slab_span
     return total
+
+
+def expert_read_buffer_bytes(model_dir: str) -> int:
+    """Bytes one expert-loader buffer needs: the checkpoint's largest aligned
+    expert span (`compute_slab_bytes`), read off its expert offset index.
+    0 when the checkpoint has no per-expert tensors.
+
+    The cached index is used when present; otherwise the headers are scanned
+    WITHOUT writing a cache, so a checkpoint with no experts (dense) gains no
+    file. The engine's own build_or_load() writes it for MoE checkpoints."""
+    from .expert_offset_index import ExpertOffsetIndex
+    idx = ExpertOffsetIndex(model_dir)
+    if not idx.load_cached():
+        idx.build(write_cache=False)
+    return compute_slab_bytes(idx) if idx.index else 0
 
 
 def compute_slab_bytes(offset_index) -> int:
