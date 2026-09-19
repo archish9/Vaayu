@@ -1847,7 +1847,6 @@ def _make_fused_sparse_forward(
         # which is what this forward used to do inline.
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
         _arena = expert_cache.arena
-        _t_disk = _mark() if _prof else 0.0
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
             unique_experts,
             layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
@@ -1858,21 +1857,14 @@ def _make_fused_sparse_forward(
             vram_resident=set(_vram_hold),
         )
         try:
-            # Wait for EVERY read before computing, as the inline loader did: the
-            # loop below runs in ascending expert id, which fixes final_hidden's
-            # fp32 index_add_ order. Consuming reads in completion order would
-            # make that order timing-dependent.
-            for _fut in _miss_futures:
-                _e, _raw = _fut.result()
-                if _raw is not None:
-                    expert_tensors[_e] = _raw
-            if _prof:
-                _mp['disk_load'] += time.perf_counter() - _t_disk
-
-            # fp32 accumulator, cast back at the return -- mirrors the identical
-            # note in _make_fused_sparse_forward_exl3, where experts DO arrive in
-            # disk completion order. Here the loop below adds experts in a fixed
-            # ascending expert-id order, so that order is never observable.
+            # fp32 accumulator, cast back at the return. Experts are CONSUMED in
+            # arrival order (that is what overlaps the reads with compute, row 44
+            # F6) and summed in expert-id order afterwards by
+            # accumulate_expert_outputs, exactly as the other two forwards do --
+            # so the sum never depends on which read finished first. Until F6
+            # this forward waited for EVERY read before computing anything,
+            # which put 9.10 s of a 25 s Qwen3-Next 2k prefill in a stall with
+            # ~19 s of compute queued behind it.
             # Expert mask on CPU (avoids PCIe for index tensors)
             _t_mask = _mark() if _prof else 0.0
             expert_indices_cpu = expert_indices.cpu()
@@ -1884,12 +1876,10 @@ def _make_fused_sparse_forward(
 
             # ── Compute FFN on the target device ──────────────────────────────
             final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
+            _contribs: list = []
 
-            for eidx in unique_experts:
-                raw = expert_tensors.get(eidx)
-                if raw is None:
-                    continue
-
+            for eidx, raw in _iter_expert_loads(
+                    expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None):
                 top_k_pos, token_idx = torch.where(expert_mask[eidx])
                 if token_idx.numel() == 0:
                     continue
@@ -1962,11 +1952,16 @@ def _make_fused_sparse_forward(
 
                 _t_scatter = _mark() if _prof else 0.0
                 out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
-                final_hidden.index_add_(0, token_idx_gpu, out.to(final_hidden.dtype))
+                # Buffered, not added here: accumulate_expert_outputs sums in
+                # expert-id order once every expert has run, so arrival order
+                # cannot reach the arithmetic (row 44 F6).
+                _contribs.append((eidx, token_idx_gpu, out))
                 if _prof:
                     _mp['scatter'] += _mark() - _t_scatter
 
                 del w_gate_gpu, w_down_gpu, w_up_gpu
+
+            accumulate_expert_outputs(final_hidden, _contribs)
         finally:
             # Every key the helper pinned that the loop did not release (VRAM
             # hits, skipped experts, an exception mid-loop). A leaked pin blocks
