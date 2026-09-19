@@ -1865,12 +1865,18 @@ def _make_fused_sparse_forward(
             # this forward waited for EVERY read before computing anything,
             # which put 9.10 s of a 25 s Qwen3-Next 2k prefill in a stall with
             # ~19 s of compute queued behind it.
-            # Expert mask on CPU (avoids PCIe for index tensors)
+            # Permutation dispatch (row 44 F5, ported from the other two
+            # forwards): ONE CPU argsort and ONE H2D of the index pairs per
+            # layer, replacing an int64 one-hot mask of num_experts x top_k x
+            # tokens (21 MB per 512-token Qwen3-Next chunk) and a torch.where
+            # plus two tiny per-expert copies. Each expert's positions are a
+            # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
             expert_indices_cpu = expert_indices.cpu()
-            expert_mask = F.one_hot(
-                expert_indices_cpu, num_classes=experts_mod.num_experts
-            ).permute(2, 1, 0)  # (num_experts, top_k, B*S)
+            _pair, _starts, _counts_l = compute_expert_dispatch(
+                expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
+                experts_mod.num_experts)
+            _pair_gpu = _pair.to(device, non_blocking=True)
             if _prof:
                 _mp['mask_sync'] += time.perf_counter() - _t_mask
 
@@ -1880,12 +1886,13 @@ def _make_fused_sparse_forward(
 
             for eidx, raw in _iter_expert_loads(
                     expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None):
-                top_k_pos, token_idx = torch.where(expert_mask[eidx])
-                if token_idx.numel() == 0:
+                _s, _c = _starts[eidx], _counts_l[eidx]
+                if _c == 0:
                     continue
 
                 _t_scatter = _mark() if _prof else 0.0
-                token_idx_gpu = token_idx.to(device)
+                token_idx_gpu = _pair_gpu[0, _s:_s + _c]
+                top_k_pos_gpu = _pair_gpu[1, _s:_s + _c]
                 current_state = flat_hidden[token_idx_gpu]
                 if _prof:
                     _mp['scatter'] += time.perf_counter() - _t_scatter
@@ -1951,7 +1958,7 @@ def _make_fused_sparse_forward(
                         _mp['gemm_hit'] += _d_gemm
 
                 _t_scatter = _mark() if _prof else 0.0
-                out = out * routing_weights[token_idx_gpu, top_k_pos.to(device), None]
+                out = out * routing_weights[token_idx_gpu, top_k_pos_gpu, None]
                 # Buffered, not added here: accumulate_expert_outputs sums in
                 # expert-id order once every expert has run, so arrival order
                 # cannot reach the arithmetic (row 44 F6).
