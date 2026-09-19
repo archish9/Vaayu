@@ -2215,6 +2215,10 @@ class VaayuBaseModel(GenerationMixin):
         else:
             self.stream = None
 
+        # Before any cache is sized: the MoE expert ceiling reserves RAM for
+        # prefix sessions only if the prefix cache will actually run.
+        self._refuse_unsupported_prefix_cache()
+
         # MoE detection — must happen before pinning so setup_model has correct context
         self._detect_moe()
 
@@ -2643,15 +2647,16 @@ class VaayuBaseModel(GenerationMixin):
                     kv_cache_mode=self.kv_cache_mode)
             except Exception:
                 _kv_tok = 0        # D3: a sizing helper must not become the crash
+            _prefix_on = bool(getattr(self, "enable_prefix_cache", False))
             _ceiling = derive_expert_ceiling(
                 available_bytes=_mem.available,
                 prefix_sessions=self.prefix_sessions,
                 kv_bytes_per_token=_kv_tok,
                 max_seq_len=self.max_seq_len or 0,
-                prefix_enabled=bool(getattr(self, "enable_prefix_cache", False)))
+                prefix_enabled=_prefix_on)
             print(f"[Vaayu-MoE] Expert cache ceiling {_ceiling / 1e9:.2f} GB "
                   f"(derived: available {_mem.available / 1e9:.2f} GB, reserving "
-                  f"{self.prefix_sessions} prefix session(s) of "
+                  f"{self.prefix_sessions if _prefix_on else 0} prefix session(s) of "
                   f"{(_kv_tok * (self.max_seq_len or 0)) / 1e9:.2f} GB each)")
             _expert_budget, _ne_budget, _max_per_layer = compute_expert_budget(
                 available_bytes=_mem.available,
@@ -2996,26 +3001,10 @@ class VaayuBaseModel(GenerationMixin):
         # today. RAM-backed pool sized from free system memory (hardware).
         # Model-agnostic: applies to MoE and dense alike, so it lives here,
         # after both branches converge, not inside the is_moe block above.
+        # Whether it CAN run was decided before cache sizing
+        # (_refuse_unsupported_prefix_cache), so the expert ceiling does not
+        # reserve RAM for a pool that is never built.
         self._prefix_cache = None
-        if getattr(self, "enable_prefix_cache", False):
-            # PrefixCacheStore drives to_cpu()/to_device()/resident_bytes() on
-            # every cache it stores. Vaayu's own cache classes have them; the
-            # bare transformers DynamicCache that an explicit kv_cache_mode
-            # "fp16" yields does not ("auto" is bf16 on every loader since
-            # row 3, 2026-09-11; it was fp16 off EXL3 before), and
-            # store() would AttributeError. Since lookup() POPS an entry before
-            # store() can put one back, failing per-turn would silently drain
-            # the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
-            # silently degrade). Pre-existing limit of the prefix subsystem,
-            # not of batched decode -- generate() calls the same store().
-            from .batch import prefix_cache_refusal_reason
-            _probe = self._create_kv_cache()
-            _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
-            if _refusal is not None:
-                print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
-                      f"{_refusal}")
-                self.enable_prefix_cache = False
-            del _probe
         if getattr(self, "enable_prefix_cache", False):
             import psutil as _ps
             _free_ram = _ps.virtual_memory().available
@@ -3632,6 +3621,35 @@ class VaayuBaseModel(GenerationMixin):
         unrecognised passthrough, which _create_kv_cache refuses anyway) is a
         bucketed FP8DynamicCache."""
         return resolve_kv_cache_mode(self.kv_cache_mode, self.loader_strategy) != "fp16"
+
+    def _refuse_unsupported_prefix_cache(self):
+        """Clear `enable_prefix_cache`, with one WARNING, if this model's cache cannot back it.
+
+        PrefixCacheStore drives to_cpu()/to_device()/resident_bytes() on
+        every cache it stores. Vaayu's own cache classes have them; the
+        bare transformers DynamicCache that an explicit kv_cache_mode
+        "fp16" yields does not ("auto" is bf16 on every loader since
+        row 3, 2026-09-11; it was fp16 off EXL3 before), and
+        store() would AttributeError. Since lookup() POPS an entry before
+        store() can put one back, failing per-turn would silently drain
+        the pool. Refuse up front and say why (CLAUDE.md §5: warn, never
+        silently degrade). Pre-existing limit of the prefix subsystem,
+        not of batched decode -- generate() calls the same store().
+
+        Runs before cache sizing (row 30, 2026-09-19): the expert ceiling
+        reserved 3 sessions for a refused cache on Qwen3-Next, 4.83 GB of RAM
+        tier, and un-reserving it measured +17.2 % decode tok/s.
+        """
+        if not getattr(self, "enable_prefix_cache", False):
+            return
+        from .batch import prefix_cache_refusal_reason
+        _probe = self._create_kv_cache()
+        _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
+        if _refusal is not None:
+            print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
+                  f"{_refusal}")
+            self.enable_prefix_cache = False
+        del _probe
 
     def _create_kv_cache(self):
         """Return a KV cache instance sized and typed for the configured kv_cache_mode."""

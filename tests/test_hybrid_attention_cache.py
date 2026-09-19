@@ -289,6 +289,39 @@ def test_the_refusal_names_the_recurrent_state_not_the_method_surface():
     assert surface is not None and "to_cpu" in surface
 
 
+def _refusal_stub(mode, config):
+    stub = _model(mode, config)
+    stub.enable_prefix_cache = True
+    stub._create_kv_cache = lambda: VaayuBaseModel._create_kv_cache(stub)
+    return stub
+
+
+@pytest.mark.parametrize("mode,config,kept", [
+    ("auto", _hybrid_config(), False),      # recurrent state: refused (RC7)
+    ("fp16", _uniform_config(), False),     # bare DynamicCache: refused
+    ("auto", _uniform_config(), True),      # uniform ring buffer: kept
+])
+def test_refuse_unsupported_prefix_cache_clears_the_flag_only_when_refused(mode, config, kept):
+    stub = _refusal_stub(mode, config)
+    VaayuBaseModel._refuse_unsupported_prefix_cache(stub)
+    assert stub.enable_prefix_cache is kept
+
+
+def test_the_refusal_is_decided_before_the_expert_ceiling_reserves_for_it():
+    """Row 30, 2026-09-19: the ceiling reserved 3 prefix sessions (4.83 GB on
+    Qwen3-Next) for a prefix cache RC7 refused ~350 lines later, because it read
+    `enable_prefix_cache` before the refusal had cleared it. Un-reserving it
+    measured +17.2 % decode tok/s on device (reads/token 27.4 -> 9.0). The
+    refusal must run first, or the ceiling pays for sessions that cannot exist."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
+    refusal = src.find("self._refuse_unsupported_prefix_cache()")
+    ceiling = src.find("_ceiling = derive_expert_ceiling(")
+    assert ceiling != -1
+    assert refusal != -1, "the prefix-cache refusal is never called at load"
+    assert refusal < ceiling, "the ceiling is derived before the refusal is known"
+
+
 def test_copy_prefix_refuses_on_a_hybrid_cache():
     """Backstop: no other caller may reach the IndexError either."""
     cache = FP8DynamicCache(quantize=False, config=_hybrid_config())
