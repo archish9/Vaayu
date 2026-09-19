@@ -172,19 +172,25 @@ The next step is row 42-B.**
 18.13 s (4.61×), 8k 335.26 → 37.20 s (9.01×), decode 7.95 → 9.06 tok/s (+14 %), all at N=1 on server defaults,
 logits bit-identical, every gate green.** Commits `85478ef` `c289945` `4d2fa99` `736c4c6`.
 
-**▶ NEXT — the order to work in, set 2026-09-19 after row 44. Each step is startable cold: its brief is
-self-contained and its gate says whether to continue.**
+**▶ NEXT — the order to work in, updated 2026-09-19 after row 45 closed. Each step is startable cold: its
+brief is self-contained and its gate says whether to continue.**
+
+**START HERE IN A FRESH SESSION: row 42-B.** Row 45 is done and shipped. 42-B needs no setup from this
+session — read [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md)
+(or row 42-B's own section below, which carries the same numbers, traps and stop rule and survives a fresh
+clone), then run its ~20 min re-measure FIRST. Do not write code before N* is recomputed from measured
+numbers — the stop rule can close the row.
 
 | # | row | what it is | start gate | stop rule | cost | brief |
 |---|---|---|---|---|---|---|
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | **1 (NEXT)** | **42-B** | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
-| 3 | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
+| **2** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
 
-**Why 45 before 42-B:** 45 is the same defect class row 44 just fixed, on the second actively-tested model, and it
-is cheap to answer (one instrumented prefill, no engine code). 42-B is the bigger feature but its whole case has to
-be re-measured first, and its cost — the prefix-session reservation returning ~4.83 GB to the KV side — now bites
-harder relative to a 37 s miss than it did against a 269 s one.
+**Why 45 went first (settled — it is closed):** 45 was the same defect class row 44 had just fixed, on the second
+actively-tested model, and cheap to answer (one instrumented prefill). It fired at 3.659× and shipped a 2.75× / 5.47×
+TTFT win. 42-B is the bigger feature but its whole case has to be re-measured first, and its cost — the prefix-session
+reservation returning ~4.83 GB to the KV side — now bites harder against a 37 s miss than it did against a 269 s one.
 
 **After those, on the user's call:** row **40** `[bug]` (arena never capped at the model's
 expert bytes — latent, 0 measured impact on this box's models; shared sizing → all three accumulator gates); row
@@ -4240,8 +4246,29 @@ Cold-pickup brief (self-contained, gitignored):
 
 # 42-B · [ ] Build the hybrid-model cross-turn prefix cache (added 2026-09-19, from row 42 (a))
 
-**Status: open. Order: RE-MEASURE → plan (`docs/superpowers/plans/`) → build.** Cold-pickup brief
+**Status: open, and it is the NEXT row to work (row 45 closed 2026-09-19).
+Order: RE-MEASURE → plan (`docs/superpowers/plans/`) → build.** Cold-pickup brief
 (self-contained, gitignored): [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md).
+
+**Startable cold in a fresh session — verified 2026-09-19 after row 45.** Every code reference this
+row depends on was re-checked against HEAD that day: `cache_holds_recurrent_state` (`vaayu/batch.py:501`),
+`prefix_cache_refusal_reason` (`vaayu/batch.py:539`), `copy_prefix` (`vaayu/vaayu_base.py:1576`),
+`enable_prefix_cache`/`prefix_sessions` plumbed at `vaayu/server/app.py:406,420` and declared at
+`vaayu/server/config.py:100,193`, probe `plans/probes/row42_snapshot.py` present.
+**Row 45 does NOT move this row's numbers** — it changed only the module-list forward (MiniMax-M2.7),
+and Qwen3-Next runs the non-EXL3 fused forward. The 9.06 → ~7.87 tok/s decode figures below are HEAD's.
+
+**Environment, three traps that each cost a run on 2026-09-19 (suite baseline is now 2318 passed / 16
+skipped at `58b19b3`):** (1) pass a checkpoint's **repo root**, never its `splitted_model` subdir —
+`config.json` is in the root and `AutoConfig` fails on the split dir; (2) **22G is OOM-killed (exit 137)
+directly after a MiniMax arm** — use a 29G scope throughout; (3) at 29G, run gates in the **FOREGROUND**
+— as background shells they are stopped by Claude Code's background-shell memory reaper, which is not a
+test failure (the Qwen3-Next accumulator gate was killed twice, then passed in 41 s in the foreground).
+
+**One methodological warning row 45 paid for:** it projected its own win from the `_moe_profile` split
+and **under-predicted by 40 %** (predicted 54.6 s, measured 38.91) because the projection held `gemm`
+and `scatter` fixed and they fell ~40 % once the competing traffic went away. A per-phase projection is
+a LOWER BOUND. Compute N* from a measured T_hit, never a projected one.
 
 **RE-PRICED 2026-09-19 — row 44 moved both sides of this trade and row 42's headline is STALE.** Row 42 justified
 the build with 8.6–21× round-2 TTFT against a **269.3 s** 8k miss; that miss is now **37.2 s measured**
