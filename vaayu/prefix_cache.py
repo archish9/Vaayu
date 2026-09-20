@@ -338,12 +338,36 @@ def restore_on_abort(store, session_id: str, token_ids: list, cache,
     Never raises: this runs on an exception path, and a failure here would
     replace the real error the caller is about to re-raise. Returns True only
     when an entry actually went back.
+
+    A recurrent (linear-attention) cache cannot be safely cropped (42-B):
+    `crop` shortens the KV layers' `_seq_len` only, and the conv/recurrent
+    state a gated-delta-net layer keeps is a fixed-size summary that has
+    already consumed every position fed to it -- there is no "first N
+    tokens" of it to roll back to. If some forwards completed before the
+    abort, the state has moved past `prefix_len` while the cropped KV would
+    claim only `prefix_len` positions, and the next turn's lookup() reads
+    `get_seq_length()` (the KV length) to decide what is safely servable --
+    it has no way to see that the state disagrees. Serving that entry would
+    resume generation against a state that already consumed tokens the next
+    turn is about to re-feed it: silently wrong text, no crash. So a
+    recurrent cache that actually needs cropping is dropped instead of
+    stored; the no-crop case (the turn aborted before any forward completed,
+    so KV and state already agree) is unaffected and still restores.
     """
     if store is None or prefix_len <= 0:
         return False
     try:
-        keep = min(int(prefix_len), int(cache.get_seq_length()))
+        seq_len = int(cache.get_seq_length())
+        keep = min(int(prefix_len), seq_len)
         if keep <= 0:
+            return False
+        from .batch import cache_holds_recurrent_state
+        if keep < seq_len and cache_holds_recurrent_state(cache):
+            print(f"[Vaayu-Prefix] WARNING: aborted turn on session "
+                  f"{session_id!r} advanced a recurrent (linear-attention) "
+                  f"state past the restorable length; dropping the entry "
+                  f"rather than storing one whose KV and state disagree. "
+                  f"The next turn prefills in full.")
             return False
         cache.crop(keep)
         store.store(session_id, list(token_ids[:keep]), cache)
