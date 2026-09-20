@@ -237,7 +237,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
-| **1 (NEXT — BUILD)** | **36** | **CUDA graphs / fused per-layer dispatch.** Its gate FIRED 2026-09-20 (32.34 / 32.73 %). `serial` is 0.0371 s of a 0.1141 s token on the fastest model here and **nothing else on this board owns it**. | open now — gate met | **PLAN FIRST**, no code until there is one; baseline on the **U arm**, never `P` (row 27), ABBA ordering (rows 33/44); §8 answered before the days are spent | ~1 week | row **36** below · [`…-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
+| **1 (NEXT)** | **36, RE-SCOPED** | **The gate fired, then the spike refuted the scope (both 2026-09-20).** `serial` is **74.8 % GPU kernel time / 25.2 % host gap** — CUDA graphs are the wrong tool and the ~1-week build is OFF. Matmuls already run at **80–86 % of the RTX 5060 Ti's 448 GB/s**, so 12.59 ms of the 37 ms is a FLOOR. What is left: **4,353 elementwise launches/token at 1.8 µs** and 653 µs/layer of CPU in the 36 `GatedDeltaNet` layers → **fusion**, and `use_torch_compile` (mode=`reduce-overhead`) ALREADY EXISTS, defaults False, and has no server knob (§8). | open now | A/B must beat the U-arm baseline, ABBA; per-model gate, never a default that wins on one model (§5) | **~1 day to measure**, not ~1 week | row **36** below · [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) |
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
@@ -3815,7 +3815,7 @@ per model. **Only pays while experts stream — dies if row 30's S2 lands.**
 
 ---
 
-# 36 · [ ] CUDA graphs / fused per-layer dispatch — **ITS GATE FIRED 2026-09-20 (32.34 / 32.73 % vs ≥ 30 %) — THIS IS THE NEXT BUILD, ~1 WEEK, PLAN FIRST** (added 2026-09-12)
+# 36 · [!] CUDA graphs / fused per-layer dispatch — **GATE FIRED 2026-09-20 (32.34 / 32.73 %), THEN THE SPIKE REFUTED THE SCOPE: `serial` is GPU-BOUND (74.8 % kernel time), host gap only 25.2 % vs a ≥ 40 % rule. DO NOT BUILD CUDA GRAPHS — RE-SCOPE.** (added 2026-09-12)
 
 **GATE RE-CHECK DONE 2026-09-20 on `main` `da118ab` — IT FIRES, for the first time in three readings.**
 **strict `serial / T_unprof` = 32.34 % / 32.73 %** (two replicates, spread 1.2 %, under the 2 % re-run rule)
@@ -3839,7 +3839,34 @@ U-arm tok/s 8.9066 / 8.6726 and 8.7780 / 8.7119; greedy ids identical to U1 on W
 the durable copy); logs `docs/probes/r36-recheck-{1,2}.log`, JSONs
 `plans/probes/row26_out/decode-qwen3next-r36recheck{1,2}.json`.
 
-**NEXT STEP: write a plan (CLAUDE.md §4/§7) before any code. This run says the phase is LARGE, not what
+**SPIKE DONE 2026-09-20 (same day, `0e6736b`) — IT ANSWERED "what removes it" AND THE ANSWER IS "NOT CUDA
+GRAPHS". `serial` = 37.04 ms splits 74.8 % GPU kernel time / 25.2 % host gap** (CUPTI; stop rule was
+host-gap ≥ 40 %). **7,702 kernel launches per decode token**, 160 per MoE layer. Inside the 27.70 ms of
+kernel time: **matmul 12.59 ms** (306 launches) — and that is a **FLOOR**, not a target: the non-expert tier
+is 4.83 GB resident, ~4.5 GB is read per token, and this box is an **RTX 5060 Ti at 448 GB/s**, so the floor
+is 10.04–10.78 ms and the matmuls are already at **80–86 % of peak memory bandwidth**; **elementwise
+7.80 ms across 4,353 launches at 1.8 µs each** (at/below launch latency); topk/reduce/conv 3.11 ms;
+**41.7 PAGEABLE HtoD memcpys/token**. Per-module CPU wall: `Qwen3NextGatedDeltaNet` (36 of 48 layers)
+**653 µs each = 76.6 %** of a 30.67 ms CPU total; `Qwen3NextAttention` (12) 592 µs each. Graphs remove only
+the 9.34 ms host gap = **8.3 % of the full 0.1124 s token**, and capture is broken 48×/token by the MoE
+routing D2H sync, so the realistic take is a fraction of that.
+
+**RE-SCOPE, ~1 day not ~1 week, and it is a §8 BANKED-FEATURE case:** `use_torch_compile`
+(`vaayu/vaayu_base.py:2113`) already compiles the layer forward through `self._compiled_layer_fn` with
+**`mode="reduce-overhead"` — torch.compile PLUS CUDA graphs** (`vaayu_base.py:5064`). It **defaults False**
+and **`vaayu/server/config.py` has NO knob for it** (only a comment, `config.py:328`), so no user can reach
+it. Next step: (1) A/B `use_torch_compile=True` on Qwen3-Next at N=1, ABBA, U-arm baseline; (2) if it pays,
+plumb the knob in the SAME commit with a per-model gate (§5 forbids defaulting into a one-model-wins
+asymmetry; `USE_PROMPT_LOOKUP="auto"` and `AdaptiveSpecGate` are the existing patterns); (3) separately,
+pin the 41.7 pageable HtoD copies. **Caveats: one draw, one model (Qwen3-Next only — MiniMax and the dense
+70B unmeasured), NOEXP arm only, CUPTI inflated the wall 18 % (on the profiled wall the split reads 63/37,
+which does not change the verdict).** Probe `plans/probes/r36_serial_split.py` is THROWAWAY; nothing in
+`vaayu/` was touched. Detail:
+[`…-row36-serial-split-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) (gitignored; this row is the
+durable copy); log `docs/probes/r36-split-1.log`, JSON
+`plans/probes/row26_out/r36split-qwen3next-r36split1.json`.
+
+**Superseded by the spike above — NEXT STEP: write a plan (CLAUDE.md §4/§7) before any code. This run says the phase is LARGE, not what
 removes it.** Baseline any row-36 A/B on the **U arm**, never `P` (row 27), with ABBA ordering (rows 33/44).
 
 **The same run also answered row 46's open question — see that row: `disk_load` collapsed to 0.42 / 0.32 %
