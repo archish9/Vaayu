@@ -181,7 +181,18 @@ session — read [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row
 clone), then run its ~20 min re-measure FIRST. Do not write code before N* is recomputed from measured
 numbers — the stop rule can close the row.
 
-**UPDATE 2026-09-20 (FINAL, after 42-B merged) — START A FRESH SESSION AT THE ROW 36 GATE RE-CHECK, NOT AT 46.**
+**UPDATE 2026-09-20 (LATEST) — THE ROW 36 GATE RE-CHECK IS DONE AND **IT FIRED**: strict `serial / T_unprof` =
+**32.34 % / 32.73 %** against its ≥ 30 % rule, two replicates on `main` `da118ab`, spread 1.2 %. **`serial` did NOT
+move (0.0363 → 0.0360 → 0.0368 s, flat across three builds, row 44's F5 notwithstanding); the share rose because the
+token shrank to 0.1141 s.** **So row 36 — CUDA graphs / fused per-layer dispatch — IS THE NEXT BUILD (~1 week), and
+nothing else on this board owns `serial`. Write a plan before any code (CLAUDE.md §4/§7): this measurement says the
+phase is LARGE, it does not say what removes it.** The same run also settled row 46's open question: `disk_load`
+collapsed to **0.42 / 0.32 %** of `T_prof` (was 8.41 / 8.46 %) with a 96.6 / 96.7 % RAM-cache hit, so **the expert RAM
+cache is no longer the binding constraint on Qwen3-Next and every "give the cache more RAM" lever is near-dead there**
+(MiniMax unmeasured — do not carry it across). S3's gate 1 re-read 8.15 / 8.25 %, still under 10 % — S3 stays closed.
+[`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md).
+
+**Superseded, kept for the trail — UPDATE 2026-09-20 (after 42-B merged) — START A FRESH SESSION AT THE ROW 36 GATE RE-CHECK, NOT AT 46.**
 Cold-pickup brief, self-contained:
 [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) (gitignored; rows 36 and 46 are the
 durable copies). **It is ~30 min and no code**, and it may promote a ~1-week lever nobody owns: row 36 fires at
@@ -225,7 +236,8 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 |---|---|---|---|---|---|---|
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
-| **1 (NEXT)** | **36 gate re-check** | **MEASUREMENT ONLY, ~30 min, no code.** Two replicates of `row26_decode.py MODEL=qwen3next ARMS=W,U1,P,U2,NOEXP`; strict share = NOEXP `serial` / U-arm `T_unprof`. Was 23.0/23.4 % (pre-30-P) then 26.4/26.7 % (30-P) with `serial` FLAT at ~0.036 s; derived to fire at `T_unprof` ≤ ~0.120 s, and HEAD's 9.06 tok/s IS 0.1104 s → ≈ 32.6 % if `serial` held. Never measured post-row-44, which rewrote the dispatch the NOEXP arm brackets. | open now | strict < 26 % → `serial` FELL, say so in row 36 and move on · 26–30 % → record it, do not build on a near-miss · **≥ 30 % → row 36 is the next build (~1 week), nothing owns it** | ~30 min | [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) |
+| ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
+| **1 (NEXT — BUILD)** | **36** | **CUDA graphs / fused per-layer dispatch.** Its gate FIRED 2026-09-20 (32.34 / 32.73 %). `serial` is 0.0371 s of a 0.1141 s token on the fastest model here and **nothing else on this board owns it**. | open now — gate met | **PLAN FIRST**, no code until there is one; baseline on the **U arm**, never `P` (row 27), ABBA ordering (rows 33/44); §8 answered before the days are spent | ~1 week | row **36** below · [`…-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
@@ -3803,10 +3815,38 @@ per model. **Only pays while experts stream — dies if row 30's S2 lands.**
 
 ---
 
-# 36 · [ ] CUDA graphs / fused per-layer dispatch — CONDITIONAL — **ITS GATE RE-CHECK IS THE NEXT TASK ON THE BOARD (2026-09-20)** (added 2026-09-12)
+# 36 · [ ] CUDA graphs / fused per-layer dispatch — **ITS GATE FIRED 2026-09-20 (32.34 / 32.73 % vs ≥ 30 %) — THIS IS THE NEXT BUILD, ~1 WEEK, PLAN FIRST** (added 2026-09-12)
 
-**NEXT UP, ~30 min, no code.** Brief: [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md)
-(gitignored; this row is the durable copy). The gate has been read twice and never fired — 23.0 / 23.4 % (2026-09-13,
+**GATE RE-CHECK DONE 2026-09-20 on `main` `da118ab` — IT FIRES, for the first time in three readings.**
+**strict `serial / T_unprof` = 32.34 % / 32.73 %** (two replicates, spread 1.2 %, under the 2 % re-run rule)
+against the **≥ 30 %** rule. Numbers, all three readings:
+
+| when | build | `serial` (NOEXP s/tok) | `T_unprof` (s/tok) | strict | fires? |
+|---|---|---|---|---|---|
+| 2026-09-13 (S3-pre) | pre-30-P | 0.0363 / 0.0363 | 0.1580 / 0.1550 | 22.97 / 23.41 % | no |
+| 2026-09-18 (S3 re-gate) | 30-P `108d67f` | 0.0360 / 0.0362 | 0.1367 / 0.1357 | 26.38 / 26.68 % | no |
+| **2026-09-20** | **`da118ab`** | **0.0368 / 0.0374** | **0.1138 / 0.1144** | **32.34 / 32.73 %** | **YES** |
+
+**`serial` did NOT move — 0.0363 → 0.0360 → 0.0368, flat across three builds.** That was the open
+question: row 44's F5 replaced the per-expert `torch.where` one-hot dispatch (~960 tiny H2D copies per
+decode token) *inside* what the NOEXP arm brackets, and it could have fallen. It did not. **F5's own terms
+moved and cancelled:** `scatter` 0.0260 → 0.0148 s (−43 %), `mask_sync` 0.0014 → 0.0055 s (+293 %). The
+share rose purely because the token shrank (0.1550 → 0.1362 → 0.1141 s, past the derived ~0.120 s trigger).
+U-arm tok/s 8.9066 / 8.6726 and 8.7780 / 8.7119; greedy ids identical to U1 on W/U1/P/U2 in both replicates
+(NOEXP differs by construction). S3's gate 1 re-read off the same JSONs: **8.15 / 8.25 %**, still under its
+≥ 10 % rule — **S3 stays closed.** Wide `other/T_prof` = 41.1 % (was 35.9 %). Detail:
+[`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) (gitignored; this row is
+the durable copy); logs `docs/probes/r36-recheck-{1,2}.log`, JSONs
+`plans/probes/row26_out/decode-qwen3next-r36recheck{1,2}.json`.
+
+**NEXT STEP: write a plan (CLAUDE.md §4/§7) before any code. This run says the phase is LARGE, not what
+removes it.** Baseline any row-36 A/B on the **U arm**, never `P` (row 27), with ABBA ordering (rows 33/44).
+
+**The same run also answered row 46's open question — see that row: `disk_load` collapsed to 0.42 / 0.32 %
+of `T_prof` (was 8.41 / 8.46 %), RAM hit 96.6 / 96.7 %, so the expert RAM cache is NO LONGER the binding
+constraint on Qwen3-Next.**
+
+**History — the gate had been read twice and never fired — 23.0 / 23.4 % (2026-09-13,
 pre-30-P) then 26.4 / 26.7 % (2026-09-18, 30-P) — with **`serial` FLAT at ~0.036 s both times**; the share rose only
 because the token shrank, and the row was derived to **fire once `T_unprof` ≤ ~0.120 s (~8.3 tok/s)**. **Row 44 and
 row 30's RAM-ceiling fix then took Qwen3-Next decode to 9.06 tok/s — `T_unprof` = 0.1104 s, UNDER the trigger — which
@@ -4612,6 +4652,16 @@ expert count and byte size from the checkpoint, never from a config literal.
 this row prices the reservation on its own, on the two models that pay it TODAY.** Splitting keeps
 42-B's ABBA attributable (one change, one number) and puts this lever where its payoff actually is —
 it needs no hybrid at all.
+
+**AND THE MECHANISM IS NOW MEASURED (2026-09-20, row 36's gate re-check, `da118ab`): on Qwen3-Next the
+expert RAM cache is NO LONGER the binding constraint, so this row's mechanism barely exists here.**
+`disk_load` is **0.0006 / 0.0005 s, i.e. 0.42 / 0.32 % of `T_prof`** (was 0.0142 s, 8.41 / 8.46 % on the
+30-P build), bytes/token 0.0260 / 0.0255 GB, RAM-cache hit **96.64 / 96.71 %**, blocking expert stall
+0.0011 s. That explains 42-B's ~2.6 % rather than merely restating it, and it **generalises: any lever
+whose mechanism is "give the expert RAM cache more RAM" is near-dead on Qwen3-Next.** **Do NOT carry
+this across to MiniMax-M2.7** — it still streams experts and its 6.24 GB reservation is unmeasured
+post-row-44. (Qwen3-235B's 4.74 GB is now moot: retired and deleted 2026-09-20.) Detail:
+[`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md).
 
 **RE-PRICED 2026-09-20 BY ROW 42-B's OWN A/B — READ THIS BEFORE COSTING THE ROW.** 42-B measured
 both sides of this reservation directly on Qwen3-Next: the ON arms reserved 3 × 1.61 = **4.83 GB**
