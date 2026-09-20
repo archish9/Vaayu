@@ -181,7 +181,13 @@ session — read [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row
 clone), then run its ~20 min re-measure FIRST. Do not write code before N* is recomputed from measured
 numbers — the stop rule can close the row.
 
-**UPDATE 2026-09-20 — the re-measure IS DONE and the stop rule did NOT fire, so the next step is the BUILD PLAN,
+**UPDATE 2026-09-20 (LATER) — ROW 42-B IS CLOSED AND SHIPPED. START A FRESH SESSION AT ROW 46**, which 42-B
+re-priced DOWN to ~2.6 % (see its row). 42-B measured: turn-2 TTFT 30.599 → 4.902 s (**6.24×**), decode
+9.7364 → 9.4868 tok/s (−2.56 %), generated ids sha256 identical across all four ABBA arms, suite 2334/16,
+every on-device gate green, **N\* = 9,512 generated tokens/turn against a ~500 stop rule**. Branch
+`row42b-hybrid-prefix-cache`, commits `6cac130..13f804e`.
+
+**UPDATE 2026-09-20 (earlier, kept for the trail) — the re-measure IS DONE and the stop rule did NOT fire, so the next step is the BUILD PLAN,
 not the probe.** Measured on HEAD `5b9d898`: MISS 2k **16.45 s** / 8k **35.05 s** (row 42's 269.3 s 8k miss is
 7.7× gone), HIT flat in P at **3.92 / 3.97 s** for d=64 → **N\* = 1862 / 1635 / 1318 at 8k** and **751 / 576 /
 300 at 2k** for d = 64 / 256 / 1024; only the 2k/d=1024 corner is under the ~500 close threshold. The build
@@ -192,8 +198,8 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | # | row | what it is | start gate | stop rule | cost | brief |
 |---|---|---|---|---|---|---|
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
-| **1 (NEXT)** | **42-B** | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
-| **2** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). Row 30 measured returning 4.83 GB as **+15.09 % decode**. | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
+| ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
+| **1 (NEXT)** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
 | **3** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
 
 **Why 45 went first (settled — it is closed):** 45 was the same defect class row 44 had just fixed, on the second
@@ -4253,7 +4259,7 @@ Cold-pickup brief (self-contained, gitignored):
 
 ---
 
-# 42-B · [~] Build the hybrid-model cross-turn prefix cache (added 2026-09-19, from row 42 (a))
+# 42-B · [x] CLOSED 2026-09-20 — BUILT, MEASURED, SHIPPED: round-2 TTFT 30.60 → 4.90 s (6.24×) on Qwen3-Next, decode −2.56 %, ids bit-identical, N* = 9,512 tok/turn vs a ~500 stop rule, every gate green
 
 **Status: open, and it is the NEXT row to work (row 45 closed 2026-09-19).
 Order: RE-MEASURE → plan (`docs/superpowers/plans/`) → build.** Cold-pickup brief
@@ -4349,17 +4355,41 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
   2318 → **2334**. A/B is `plans/probes/row42b_ab.py`, **one arm per PROCESS** (4 loads in one process hits the
   exit-137 pinned-block trap), ABBA `off,on,on,off`, greedy ids sha256 identical across arms.
   **Reservation sizing is NOT in this plan — it is row 46** (user's call, 2026-09-20).
-- [ ] Build + verify: suite, same-day ABBA (round-1 TTFT, round-2 TTFT, decode), logit sha256 identical on the
-  restore path, server gate Qwen3-Next, accumulator ×3, Llama-3.2-1B prefix gate.
+- [x] **BUILT AND VERIFIED 2026-09-20 — SHIPPED.** Branch `row42b-hybrid-prefix-cache`, 5 commits
+  `6cac130..13f804e`, 4 TDD code tasks + on-device measurement. Detail:
+  [`…-row42B-hybrid-prefix-cache-RESULTS.md`](docs/2026-09-20-row42B-hybrid-prefix-cache-RESULTS.md).
+  **Measured, ABBA `off,on,on,off`, one process per arm, 8192-token prompt + 256 new, GEN=64, server knobs:
+  turn-1 TTFT unchanged (32.634 → 32.560 s, −0.23 %, so the A/B is valid), turn-2 TTFT 30.599 → 4.902 s
+  (6.24×, 25.70 s saved), turn-2 decode 9.7364 → 9.4868 tok/s (−2.56 %), generated ids sha256 IDENTICAL on
+  all four arms** (`9e312308…`, greedy, 64 tokens). **N\* = 25.697 / 0.0027016 = 9,512 generated tokens/turn
+  against a ~500 stop rule — it misses by 19×.** Gates: suite **2334 passed / 16 skipped** (was 2318/16),
+  accumulator Qwen3-Next 8 / Qwen3-235B 8 / MiniMax 8, server gate Qwen3-Next 9, Llama-3.2-1B prefix 1.
+  **§8: no new knob, already plumbed, REACHABLE at N=1 on server defaults, nothing banked.** Still refused and
+  re-verified against live code after the lift: `copy_prefix`, speculative decoding + its independent crop
+  backstop, `enable_kv_persist`, `prefix_compress`, and the bare `DynamicCache` from `kv_cache_mode="fp16"`.
 
 ---
 
-# 46 · [ ] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B)
+# 46 · [ ] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B) — **RE-PRICED DOWN 2026-09-20: the prize is ~2.6 %, not ~15 %**
 
 **Split out of row 42-B on 2026-09-20 at the user's call: 42-B lifts RC7 with the reservation AS-IS,
 this row prices the reservation on its own, on the two models that pay it TODAY.** Splitting keeps
 42-B's ABBA attributable (one change, one number) and puts this lever where its payoff actually is —
 it needs no hybrid at all.
+
+**RE-PRICED 2026-09-20 BY ROW 42-B's OWN A/B — READ THIS BEFORE COSTING THE ROW.** 42-B measured
+both sides of this reservation directly on Qwen3-Next: the ON arms reserved 3 × 1.61 = **4.83 GB**
+(expert ceiling 13.78 / 14.13 GB) and the OFF arms reserved **0** (ceiling 18.77 / 18.86 GB) — and
+the decode difference between them was only **−2.56 %** (9.7364 → 9.4868 tok/s, 2 replicates each,
+ABBA). **So handing the expert cache ~5 GB back is worth ~2.6 % on this model today, NOT the
++15.09 % row 30 measured on 2026-09-19.** Row 30's figure predates row 44 (F1+F2+F6+F5, shipped
+2026-09-19), which changed how the non-EXL3 fused forward retains and dispatches experts.
+**Hypothesis, untested: the expert cache is no longer the binding constraint it was, so extra
+ceiling buys much less.** The 2.56 % is measured; the explanation is a guess worth one probe.
+**Consequence: this row's prize is ~2.6 % on Qwen3-Next against 1-2 days of work with row 31's
+collapse risk attached — price it accordingly, and note that the 4.74 GB (Qwen3-235B) and 6.24 GB
+(MiniMax) reservations have never been measured post-row-44 either.** Detail:
+[`…-row42B-hybrid-prefix-cache-RESULTS.md`](docs/2026-09-20-row42B-hybrid-prefix-cache-RESULTS.md).
 
 **The number.** `derive_expert_ceiling` (`vaayu/vaayu_base.py:354`, called `:2651`) subtracts
 `PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes_per_token` from the expert RAM tier. Measured off real load
