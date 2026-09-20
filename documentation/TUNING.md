@@ -154,12 +154,16 @@ So lowering it hands RAM to the expert cache, which is the decode bottleneck on 
 MoE. On Qwen3-235B the default reservation is **4.74 GB** of a ~20.7 GB budget; at
 `prefix_sessions=1` that falls to 1.58 GB and the expert cache grows 12.26 → 15.42 GB.
 
-**It reserves nothing on a model whose prefix cache cannot run.** A hybrid model with
-recurrent (linear-attention) layers, such as Qwen3-Next, or any model loaded with
-`kv_cache_mode="fp16"`, prints `cross-turn prefix cache DISABLED` at load. The expert
-cache then gets that RAM, and `prefix_sessions` has no effect. Before 2026-09-19 the
-sessions were reserved anyway: on Qwen3-Next that was 4.83 GB of expert cache held for
-nothing, and returning it measured **+17.2 % decode tok/s**.
+**It reserves nothing on a model whose prefix cache cannot run.** A model loaded with
+`kv_cache_mode="fp16"` prints `cross-turn prefix cache DISABLED` at load. The expert cache
+then gets that RAM, and `prefix_sessions` has no effect.
+
+**A hybrid model pays the reservation again since 42-B.** Until then a hybrid with recurrent
+(linear-attention) layers, such as Qwen3-Next, was refused at load and reserved nothing: on
+that model 4.83 GB of expert cache had been held for a pool that could not exist, and
+returning it measured **+17.2 % decode tok/s** (2026-09-19). 42-B made cross-turn reuse work
+on hybrids, so the reservation is live on them once more, at that same 4.83 GB — budget for
+it on a hybrid exactly as you would on any other model.
 
 **Measured on Qwen3-235B, through the server, prefix cache on** (`prefix_sessions=1` vs the
 default 3):
