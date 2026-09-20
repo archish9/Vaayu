@@ -4482,7 +4482,23 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
       `.done` marker over dropped tensors once. Verify shard count against the `-of-NNNNN` suffix AND that every
       `weight_map` ref resolves, before writing anything. Still worth building after this checkpoint completed: the
       next one will not be complete either.
-- [ ] **G1 — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
+- [ ] **G1 — NOW REPRODUCIBLE, AND IT HAS A PLAN PROMPT. `gpt-oss-20b` arrived on disk 2026-09-20 and IS the
+      silent failure.** Measured: **`r'\.experts\.(\d+)\.'` matches 0 of its 459 tensors**, because its experts
+      are one 3D blob per layer (`model.layers.N.mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]` — the
+      leading 32 IS the expert axis). **transformers 5.5.4 supports `gpt_oss` natively** (`AutoConfig` →
+      `GptOssConfig`, `modeling_gpt_oss.GptOssExperts` is a fused-3D forward), so there is **no modeling code and no
+      kernel port in scope** — this is Tier 0, "supported, just never run here", and the whole gap is Vaayu's
+      persist/streaming path. `detect_moe_blocks` reads the MODULE tree, so it classes this `"fused"` non-EXL3 →
+      `_make_fused_sparse_forward`, **the same forward Qwen3-Next runs and rows 30-P/44/42-B tuned** — the compute
+      path is exercised, the persist path has never seen a 3D layout. **13.8 GB · 24 layers · 32 experts top-4 ·
+      13.24 MB/expert · 423.6 MB/layer · 10.17 GB of experts · top-4 working set ≈ 1.27 GB · MXFP4 (U8 blocks + U8
+      scales + BF16 expert BIASES, which neither on-device model has) · alternating sliding/full attention,
+      `sliding_window: 128`.** **ABANDON GATE, settle it FIRST: does MXFP4 run on this box, or does the only path
+      dequantize to bf16 (~40 GB of experts — does not fit)? If bf16-only, STOP and fall back to the raise.**
+      Brief + the fresh-session plan prompt:
+      [`…-row47-G1-gptoss-BRIEF.md`](docs/2026-09-20-row47-G1-gptoss-BRIEF.md).
+      The original gap text follows.
+- [ ] **G1 (original) — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
       `_EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')`). **Every fused-3D checkpoint is unsupported SILENTLY** — it
       finds zero experts rather than raising, and the docstring's claim that it "covers … any future architecture"
       is exactly the trap. Fused-3D (`experts.gate_up_proj` shaped `[E, …]`) is what modern transformers MoE ships.
@@ -4527,8 +4543,10 @@ split is:
 
 **Do NOT start at 28b.** Do 1–3 inside row 47 first: each is small, each is needed by 28b anyway, and G1-minimum is
 the one that converts "finds zero experts and proceeds" into an error. **G1's full fused-3D splitter is NOT needed for
-this model** — its keys already match `.experts.N.` — so build the raise, not the splitter, unless a fused-3D
-checkpoint actually arrives.
+DeepSeek** — its keys already match `.experts.N.`. **But a fused-3D checkpoint HAS now arrived: `gpt-oss-20b`,
+2026-09-20**, so the splitter has a real driving case and its own brief + plan prompt
+([`…-row47-G1-gptoss-BRIEF.md`](docs/2026-09-20-row47-G1-gptoss-BRIEF.md)). Build the raise as the floor and the
+splitter as the goal.
 
 **G5 is NOT a blocker here (re-checked 2026-09-20):** 12.750 MiB/expert sits inside the 8–12 MiB band the slab arena
 was tuned at, and Qwen3-Next already runs 24,576 slabs against this model's ~11,008. Only `_NVME_READ_CONCURRENCY`
