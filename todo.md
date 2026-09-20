@@ -196,9 +196,11 @@ still the binding constraint here, which is what re-priced row 46. Tree clean at
 
 * **SPEED: 36 (if its gate fires) → 35 (+11.7 % measured, machinery built) → 32 (×1.50 projected, a download and zero
   code; also the only thing that re-opens 37) → 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
-* **REACH: row 47** — close the architecture-generality gaps so the next checkpoint loads at all. Start at **G0 + G1's
-  minimum** (both turn a silent wrong answer into a message, both small). Row **28b** (the DeepSeek-V4 port) sits
-  BEHIND 47: 47 makes 28b cheap, and 28b needs G0/G7/G4 anyway.
+* **REACH: row 47, now five plans with a fixed order — `A1 → A2 → A3`, then `A4 → A5`.** A1 (guards) is startable
+  right now with no dependency and no on-device risk; A2 (fused-3D indexing) is unit-tested only; A3 takes
+  **gpt-oss-20b end to end** and opens with an abandon gate; A4 (shared experts) is A5's prerequisite; A5 is the
+  DeepSeek-V4 port, weeks, gated on sm_120 kernels at step 1. Row **28b** IS A5.
+  Program: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architecture-support-PROGRAM.md).
 
 **Model set re-set by the user 2026-09-20: Qwen3-235B is RETIRED AND DELETED — do not test it, do not put it in a gate;
 the accumulator gate is now ×2, not ×3, and the fused-EXL3 forward has NO on-device model. DeepSeek-V4-Flash is on disk
@@ -224,7 +226,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | **1 (NEXT)** | **36 gate re-check** | **MEASUREMENT ONLY, ~30 min, no code.** Two replicates of `row26_decode.py MODEL=qwen3next ARMS=W,U1,P,U2,NOEXP`; strict share = NOEXP `serial` / U-arm `T_unprof`. Was 23.0/23.4 % (pre-30-P) then 26.4/26.7 % (30-P) with `serial` FLAT at ~0.036 s; derived to fire at `T_unprof` ≤ ~0.120 s, and HEAD's 9.06 tok/s IS 0.1104 s → ≈ 32.6 % if `serial` held. Never measured post-row-44, which rewrote the dispatch the NOEXP arm brackets. | open now | strict < 26 % → `serial` FELL, say so in row 36 and move on · 26–30 % → record it, do not build on a near-miss · **≥ 30 % → row 36 is the next build (~1 week), nothing owns it** | ~30 min | [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) |
-| **1b (REACH track, user-requested 2026-09-20)** | **47** | **Close the architecture-generality gaps so the next model is cheap.** Seven gaps from the playbook §6, which recorded them as *"none is currently a row"*. G1 first: `ExpertOffsetIndex` knows ONE key scheme, so every fused-3D checkpoint is unsupported **silently**. | open now — independent of the perf queue | it buys REACH, not tok/s; do not rank it against 36/35/32 on speed | G0+G1-min ~1 day · the rest per gap | row **47** below |
+| **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
 | **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
@@ -4438,7 +4440,45 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
 
 ---
 
-# 47 · [ ] Close the architecture-generality gaps so the NEXT model is cheap — the row that makes Vaayu run many models (added 2026-09-20 at the user's request)
+# 47 · [ ] ARCHITECTURE-SUPPORT PROGRAM — the row that makes Vaayu serve different architectures (added 2026-09-20; decomposed into 5 plans the same day at the user's NON-NEGOTIABLE direction)
+
+**User mandate 2026-09-20: "Vaayu MUST serve different architectures."** The work was decomposed
+into **five plans** because it spans four independent subsystems — checkpoint validation, expert
+indexing, MoE dispatch, model porting — plus two models that share almost nothing. One plan would
+stall entirely whenever any single piece stalled, which is the failure mode §6 exists to prevent.
+Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architecture-support-PROGRAM.md).
+
+**THE ORDER TO IMPLEMENT — this is the answer to "when do I work on which item":**
+
+| # | plan | delivers | depends on | gate | cost | doc |
+|---|---|---|---|---|---|---|
+| **A1** | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
+| **A2** | **Fused-3D expert indexing** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
+| **A3** | **gpt-oss-20b END TO END** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
+| **A4** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | none | ~2 days | brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
+| **A5** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | A4 | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
+| A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
+| A7 | G3 `compute_device` parity · G5 NVMe re-measure | removes two latent generality traps | — | none | ~1 day | plan when picked |
+
+**A4 and A5 are BRIEFS, not plans, deliberately** — a TDD plan for kernel work of unproven
+feasibility would be placeholders. Each carries its scope, gate and abandon rule and becomes a plan
+the day its gate passes.
+
+**Sequence in one line: A1 → A2 → A3, then A4 → A5. A6/A7 are opportunistic.**
+
+**A3 does NOT make DeepSeek cheaper.** gpt-oss is MXFP4 / fused-3D / sliding-window and natively
+supported by transformers; DeepSeek is I8+fp8 / per-expert / MLA+sparse-index and unsupported, needing
+modeling code plus sm_120 kernels. The only shared piece is A1. **Do not price A5 as "cheaper because
+A3 is done."**
+
+**Design spec behind A1–A3:**
+[`…-row47-G1-fused3d-gptoss-design.md`](docs/superpowers/specs/2026-09-20-row47-G1-fused3d-gptoss-design.md).
+Approach decided: **whole-layer streaming through the stock MXFP4 kernel (A)**, because
+`Mxfp4GptOssExperts.forward` calls `matmul_ogs` over the whole 3D parameter and routes INSIDE the
+kernel — per-expert slices do not compose with it. Per-expert streaming is A6, priced against A3.
+
+**The gap list below (G0–G7) is the source material the plans were cut from. G2 is already closed;
+G6 is closed as a perf idea (rows 26/28) and is reach-only.**
 
 **This is the row that broadens REACH, not speed. It does not rank against the perf queue (36/35/32/46/34)
 on the same axis — those buy tok/s, this buys "the next checkpoint loads at all".** Source of the gap list:
