@@ -263,25 +263,23 @@ def test_batch_kv_invariant_still_catches_a_real_disagreement():
 # loudly, until someone designs a real one (CLAUDE.md §5: warn, never silently
 # degrade).
 
-def test_prefix_store_refuses_a_cache_with_recurrent_layers():
+def test_prefix_store_accepts_a_cache_with_recurrent_layers():
+    """42-B: the pool carries the recurrent state with the entry (task 1) and
+    serves it only at the length that state describes (task 2), so the surface
+    test is all that is left -- and a hybrid cache passes it."""
     from vaayu.batch import cache_supports_prefix_store
     cfg = _hybrid_config()
     assert cache_supports_prefix_store(FP8DynamicCache(quantize=False)) is True
     assert cache_supports_prefix_store(
-        FP8DynamicCache(quantize=False, config=cfg)) is False
+        FP8DynamicCache(quantize=False, config=cfg)) is True
 
 
-def test_the_refusal_names_the_recurrent_state_not_the_method_surface():
-    """A hybrid cache fails BOTH checks, so the order of the two decides which
-    cause gets printed. Checking the surface first said FP8DynamicCache "does
-    not implement to_cpu/to_device/resident_bytes" -- true of nothing, since it
-    implements all three. That version shipped for one run."""
+def test_the_refusal_still_names_the_method_surface_for_a_bare_cache():
+    """The remaining refusal: a bare transformers DynamicCache (kv_cache_mode
+    'fp16') implements none of to_cpu/to_device/resident_bytes."""
     from vaayu.batch import prefix_cache_refusal_reason
     hybrid = FP8DynamicCache(quantize=False, config=_hybrid_config())
-    reason = prefix_cache_refusal_reason(hybrid, "auto")
-    assert reason is not None and "recurrent" in reason
-    assert "to_cpu" not in reason
-
+    assert prefix_cache_refusal_reason(hybrid, "auto") is None
     assert prefix_cache_refusal_reason(FP8DynamicCache(quantize=False), "auto") is None
 
     plain = DynamicCache()
@@ -297,7 +295,7 @@ def _refusal_stub(mode, config):
 
 
 @pytest.mark.parametrize("mode,config,kept", [
-    ("auto", _hybrid_config(), False),      # recurrent state: refused (RC7)
+    ("auto", _hybrid_config(), True),       # recurrent state: SERVED since 42-B
     ("fp16", _uniform_config(), False),     # bare DynamicCache: refused
     ("auto", _uniform_config(), True),      # uniform ring buffer: kept
 ])

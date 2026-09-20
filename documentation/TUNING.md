@@ -190,6 +190,17 @@ If that WARNING appears, your reuse is gone, not reduced. **Do not trust `prefix
 exactly the runs where reuse has collapsed. Read the `[Vaayu-Prefix] HIT … match_len=X/Y`
 line instead: what matters is X, not that it says HIT.
 
+**Hybrid-attention models (e.g. Qwen3-Next).** Since 42-B these reuse prefixes
+too, with one restriction that follows from how they work: their
+linear-attention layers keep a fixed-size summary of everything they have seen
+rather than a per-token history, so an entry can only be resumed at exactly the
+point it was stored. A turn that resends the whole previous turn and appends to
+it (the agent loop's shape) is served; a turn that diverges in the middle of the
+stored context takes a full prefill, as it did before. The engine counts those
+as `recurrent_partial` in the prefix stats line. Such a model also cannot lend a
+prefix to another session, and both `enable_kv_persist` and `prefix_compress`
+are ignored on it, with a warning at load.
+
 ## 3c. `max_seq_len` — lowering it does NOT buy VRAM
 
 **Default:** `None` (derive). It is tempting to ask for a shorter context to free VRAM. It

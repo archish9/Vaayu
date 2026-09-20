@@ -490,11 +490,10 @@ def cache_supports_prefix_store(cache) -> bool:
     This is a pre-existing limit of the prefix-cache subsystem, not of batched
     decode: generate()'s own cross-turn path calls the same store().
 
-    A cache holding RECURRENT state is refused for a different reason: see
-    cache_holds_recurrent_state.
+    Recurrent state is no longer disqualifying: `to_cpu`/`to_device` carry it
+    with the entry and the store serves it only at the length it describes
+    (42-B).
     """
-    if cache_holds_recurrent_state(cache):
-        return False
     return all(callable(getattr(cache, m, None)) for m in _PREFIX_STORE_METHODS)
 
 
@@ -502,12 +501,13 @@ def cache_holds_recurrent_state(cache) -> bool:
     """True iff any of `cache`'s layers keeps conv / recurrent state.
 
     A hybrid-attention model (qwen3_next: gated delta net on 3 of every 4
-    layers) does. Nothing in the prefix subsystem can lend that state: an entry
-    is served by cropping to the matched length, and a recurrent state has no
-    "first N tokens" to crop to -- it is a fixed-size summary of everything the
-    layer has seen. copy_prefix does not even copy it today, so a hit hands the
-    borrower a cache with no linear-attention layers and transformers dies at
-    `update_conv_state` with an IndexError.
+    layers) does. Callers use this to decide what a cache needs rather than to
+    refuse it: the prefix store carries the state with the entry and serves it
+    only at the length it describes (42-B), while `copy_prefix`, KV disk
+    persistence and TurboQuant pooling refuse it outright. copy_prefix does not
+    even copy it today, so a hit hands the borrower a cache with no
+    linear-attention layers and transformers dies at `update_conv_state` with
+    an IndexError.
 
     Detected off the layer objects, by the capability they expose -- not from a
     config field and not from an architecture name (CLAUDE.md §5).
@@ -539,16 +539,19 @@ def spec_recurrent_refusal(cache) -> str | None:
 def prefix_cache_refusal_reason(cache, kv_cache_mode) -> str | None:
     """Why the cross-turn prefix cache cannot run on `cache`, or None.
 
-    Two independent reasons, and they must be reported in THIS order: a hybrid
-    cache also fails the method-surface test (cache_supports_prefix_store is
-    False for it), so checking the surface first prints a true statement about
-    the wrong cause -- "does not implement to_cpu/to_device/resident_bytes" on a
-    class that implements all three. That is exactly what shipped for one run.
+    One reason is left: a bare transformers DynamicCache -- what an explicit
+    kv_cache_mode "fp16" yields -- implements none of to_cpu/to_device/
+    resident_bytes, and store() would AttributeError. Since lookup() POPS an
+    entry before store() can put one back, failing per-turn would silently
+    drain the pool, so refuse up front and say why (CLAUDE.md §5).
+
+    Recurrent (linear-attention) state used to be a second, earlier reason
+    (RC7). It was lifted by 42-B: the state travels with the entry through
+    to_cpu/to_device, and PrefixCacheStore.lookup serves such an entry only at
+    the one length its state describes. What a hybrid still cannot do is LEND a
+    prefix (copy_prefix raises) or use the KV-only side channels -- disk
+    persistence and TurboQuant pooling both refuse at load.
     """
-    if cache_holds_recurrent_state(cache):
-        return ("this model has recurrent (linear-attention) layers, whose state "
-                "is a fixed-size summary with no per-token prefix to lend. "
-                "Prefill runs in full on every turn.")
     if not cache_supports_prefix_store(cache):
         return (f"kv_cache_mode={kv_cache_mode!r} yields {type(cache).__name__}, "
                 f"which does not implement to_cpu/to_device/resident_bytes. Load "
