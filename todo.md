@@ -2053,7 +2053,7 @@ and record why the in-process effect did not transfer.
 
 ---
 
-# 29 · [ ] Pick a non-EXL3 MoE Vaayu can actually LOAD, then measure the CPU+GPU hybrid on it (added 2026-09-12)
+# 29 · [x] CLOSED 2026-09-12 (decision taken → row 30) — Pick a non-EXL3 MoE Vaayu can actually LOAD, then measure the CPU+GPU hybrid on it (added 2026-09-12)
 
 **Source:** the user, pushing back on row 28: *"EXL3 use custom CUDA driver that only run with GPU, and because of this
 limitation i want to use non-EXL3 model and use CPU and GPU both… i am not letting this idea go."* **Correct — and rows
@@ -4101,7 +4101,7 @@ hybrids; side finding → row 44. No engine code.** Results (gitignored; this ro
 
 ---
 
-# 44 · [~] Qwen3-Next prefill re-reads its experts on every prefill chunk, pageable, at ~1.1 GB/s — 33 ms/token TTFT (added 2026-09-19, found by row 42)
+# 44 · [x] CLOSED 2026-09-19 — Qwen3-Next prefill re-read its experts on every prefill chunk, pageable, at ~1.1 GB/s — 33 ms/token TTFT (added 2026-09-19, found by row 42)
 
 **Status: `[x]` DONE 2026-09-19 — F1 + F2 + F6 + F5 SHIPPED (`85478ef`, `c289945`, `4d2fa99`, `736c4c6`):
 **2k TTFT 83.51 → 18.13 s (4.61×, 40.8 → 8.9 ms/token), 8k 335.26 → 37.20 s (9.01×, 40.9 → 4.5 ms/token), and
