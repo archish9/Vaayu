@@ -1049,6 +1049,20 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
     return results
 
 
+def _copy_async_ok(pinned_source: bool, tensor, dtype) -> bool:
+    """Whether ONE host-to-device copy of `tensor` may run non_blocking.
+
+    Two conditions, both necessary: the source must be page-locked (the caller
+    knows — see _load_inject_run), and the copy must not carry a dtype change.
+    A `.to(device, dtype=other, non_blocking=True)` casts on the HOST first, so
+    the copy's real source is a fresh PAGEABLE temp, which PyTorch stages
+    through its CachingHostAllocator pool — the host-RAM leak build_exl3_qmatrix's
+    docstring describes, from a call site that looks page-locked. dtype None
+    means "no cast requested" (build_exl3_qmatrix's copies).
+    """
+    return bool(pinned_source) and (dtype is None or tensor.dtype == dtype)
+
+
 def _inject_expert_weights(
     expert_mod: nn.Module,
     raw: dict,
@@ -1057,6 +1071,7 @@ def _inject_expert_weights(
     device: str,
     dtype,
     timing: dict | None = None,
+    pinned_source: bool = False,
 ) -> dict | None:
     """
     Inject expert tensor weights into expert_mod for inference.
@@ -1080,6 +1095,15 @@ def _inject_expert_weights(
     tensor copies alike land in 'h2d'; only the QMatrix construction lands in
     'construct'). None (the default) means "don't time" — callers that don't
     profile pay nothing extra.
+
+    pinned_source: the caller's statement that `raw`'s tensors live in the
+    pinned slab arena, which is what makes an async copy both faster and safe
+    (row 49). It is a claim about the MEMORY, not a request: each copy still
+    goes through _copy_async_ok, which refuses async for a dtype change. False
+    (the default) keeps every copy synchronous, which is what the pageable
+    clone paths — prefill and the arena-exhausted fallback — need. A caller
+    that passes True MUST also arm the arena's read event for the source slab
+    (SlabArena.record_read) before the slab can be recycled.
     """
     from .persist.loader_strategy import ExLlamaV3Linear, build_exl3_qmatrix, _EXL3_QTENSOR_KEYS
 
@@ -1103,11 +1127,16 @@ def _inject_expert_weights(
             if isinstance(submod, ExLlamaV3Linear) and any(
                 b in _EXL3_QTENSOR_KEYS for b in bases
             ):
-                # non_blocking=False: these tensors come from disk loads /
-                # the RAM cache, not guaranteed page-locked — see
-                # build_exl3_qmatrix's docstring for why async here leaks host RAM.
+                # Async only from the pinned slab arena (row 49): a pageable
+                # source would be staged through PyTorch's CachingHostAllocator
+                # pool, which leaks host RAM — see build_exl3_qmatrix's
+                # docstring. No dtype is passed here, so no host-side cast can
+                # turn a page-locked source back into a pageable one.
                 state[submod_path] = build_exl3_qmatrix(
-                    submod, bases, device, non_blocking=False, timing=timing)
+                    submod, bases, device,
+                    non_blocking=_copy_async_ok(
+                        pinned_source, next(iter(bases.values())), None),
+                    timing=timing)
                 bc_objs[submod_path] = submod.bc
                 continue
 
@@ -1116,7 +1145,8 @@ def _inject_expert_weights(
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _t0 = time.perf_counter()
-                t = tensor.to(device, dtype=dtype, non_blocking=False)
+                t = tensor.to(device, dtype=dtype,
+                              non_blocking=_copy_async_ok(pinned_source, tensor, dtype))
                 if timing is not None:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -1655,8 +1685,27 @@ def _make_modulelist_sparse_forward(
                 # phase to its own _mp key (see build_exl3_qmatrix's timing
                 # param). Non-EXL3 submodules only ever populate 'h2d'.
                 _timing = {} if _prof else None
+                # Row 49: upload async when — and only when — these bytes sit in
+                # the pinned slab arena. slab_index_of is pointer arithmetic on
+                # the arena's chunks (no CUDA call), and it answers both
+                # questions at once: whether the source is page-locked, and
+                # which slab the in-flight DMA reads from. A prefill clone or an
+                # arena-exhausted fallback is in no slab -> None -> synchronous,
+                # which is what those pageable buffers need.
+                _arena = expert_cache.arena
+                _rd = (_arena.slab_index_of(next(iter(raw.values())))
+                       if _arena is not None and raw else None)
                 entry = _inject_expert_weights(
-                    expert_mod, raw, eidx, layer_name, device, dtype, timing=_timing)
+                    expert_mod, raw, eidx, layer_name, device, dtype,
+                    timing=_timing, pinned_source=_rd is not None)
+                if _rd is not None:
+                    # The copies are issued but not drained. Arm the arena's read
+                    # event so acquire() cannot hand this slab to a fresh io_uring
+                    # write under the in-flight DMA (silent torn weights) — the
+                    # same guarantee both fused forwards take. This forward's pin
+                    # on the key is held until the layer's finally, so the window
+                    # between the copy and the event is covered by the pin.
+                    _arena.record_read(_rd)
                 if _prof:
                     _mp['h2d'] += _timing.get('h2d', 0.0)
                     _mp['construct'] += _timing.get('construct', 0.0)

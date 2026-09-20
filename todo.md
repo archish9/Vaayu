@@ -4044,7 +4044,7 @@ end of the space on 2026-09-12. **Do not start while rows 31-35 are unmeasured.*
 
 ---
 
-# 49 · [ ] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request)
+# 49 · [~] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request) — **STEPS 0, 1 AND 2A DONE 2026-09-20: H1 TRUE on decode, `h2d` was 31.5 %, async upload SHIPPED at +6.90 % decode. Left: step 3 (the CPU-hybrid decision) and the B re-rank.**
 
 **Brief:** [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) (gitignored;
 this row is the durable copy).
@@ -4080,6 +4080,85 @@ nothing has re-split this model's decode since rows 27/30-P/44/45 · step 2 the 
 depending on H1, **correctness gate = prompt-end logits BIT-IDENTICAL + greedy ids identical + a
 host-RAM watermark** (the original comment's fear was a leak, so the test must be able to see one) ·
 step 3 re-price the CPU hybrid only then.
+
+- [x] **step 0 — code read, H1 ANSWERED 2026-09-20: TRUE on the decode path, FALSE on prefill and on
+  the arena-exhausted fallback.** Durable summary (detail:
+  [`…-row49-step01-RESULTS.md`](docs/2026-09-20-row49-step01-RESULTS.md)):
+  **(a) `:1119` is dead for MiniMax experts** — all 47,616×4 expert tensors are `trellis/suh/svh/mcg`,
+  every one in `_EXL3_QTENSOR_KEYS`, so 100 % of expert bytes take the `:1110` branch. **The whole
+  0.18 s slice is ONE line: `loader_strategy.py:384`'s `t.to(device, non_blocking=non_blocking)`.**
+  **(b) The decode source IS page-locked today.** `moe_supports_slab_arena` is True for
+  EXL3+module_list (`vaayu_base.py:798`) and `_pin = torch.cuda.is_available()` (`:2732`); both runs
+  today logged `Expert slab arena: 1259/1250 x 8.9MB … (pinned)`. RAM-cache hits return the slab
+  views themselves (`get()` = `dict(...)`, no clone) and misses read io_uring straight into a slab.
+  Checked directly: a view into a pinned chunk reports `is_pinned() == True`; a `.clone()` of one
+  reports False. **(c) Measured cross-check: 309.8 experts/token × 8,875,020 B = 2.749 GB in
+  0.1821 s = 15.1 GB/s = 77 % of this box's pinned H2D (19.7 GB/s), 2.1× the pageable rate
+  (~7.1 GB/s)** — a pageable source would have put `h2d` at ~0.39 s. The residual is ~3,700 blocking
+  per-tensor copies/token (588 µs per expert, 12 copies each), not bandwidth. **(d) The pageable
+  sources are prefill (`_moe_prefill_pass` → `load_expert_sparse` → `.clone()`,
+  `safetensor_model_persister.py:790`) and the arena-exhausted/`arena is None` fallback** — the
+  22-27 GB RSS blow-up the comment fears came from exactly there, so step 2 must scope the flag to
+  pinned sources, not flip it globally. **(e) The lifetime machinery already exists:**
+  `SlabArena.record_read` (`expert_cache.py:230`) + `acquire()`'s event sync, which both fused
+  forwards call after their async copies (`moe_patch.py:1989/2561/2582`), and the module-list forward
+  already holds its pins until end-of-layer (`moe_patch.py:1746-1751`) — stricter than the fused
+  unpin-after-issue. **So step 2 is a flag change + `record_read`, NOT a buffer-pool build.**
+- [x] **step 1 — decode split re-measured 2026-09-20 on `4e5a088`, 2 replicates, 29G scope,
+  foreground, `ARMS=W,U1,P,U2,NOEXP`, greedy ids identical U1/P/U2.** **`h2d` = 0.1821 / 0.1833 s =
+  31.48 % / 31.47 % of `T_prof`** (0.5786 / 0.5825 s) — replicates agree to 0.02 pp. **STOP RULE
+  (< ~15 %) NOT TRIGGERED: the slice did not shrink under rows 27/30-P/44/45** (row 26's own JSONs,
+  re-run through the same script: 0.1861/31.26 % and 0.1801/30.20 %). Rest of the token:
+  `gemm` 0.1366-0.1391 (23.6-23.9 %), `disk_load` exposed stall 0.0970-0.0991 (16.7-17.1 %),
+  `other` 0.0961-0.0971 (16.6 %), `scatter` 0.0305-0.0312, `detach` ~0.010, `construct` ~0.008,
+  `route` ~0.009, `mask_sync` ~0.006, `attach` 0.0022. **Decode itself is 3.0-3.2 % FASTER than
+  2026-09-11** (`T_unprof` 0.5787/0.5773 → 0.5604/0.5624 s; U arms 1.778-1.790 tok/s), the gain
+  sitting in `gemm` and `other`, never in H2D. 2.38 GB/token, 267.8 reads/token, RAM hit 13.6 %,
+  VRAM 186.2 hit / 309.8 miss per token — all unmoved. By-product for row 36: `serial` (NOEXP) =
+  0.0526/0.0543 s = **9.4-9.6 % of `T_unprof` on MiniMax**, nowhere near the ≥ 30 % trigger.
+  **Step-2 ceiling as a LOWER bound:** the same 2.749 GB at the measured pinned 19.7 GB/s is
+  0.182 → 0.140 s = **−0.042 s = +7.5 % decode** from killing the per-call sync alone; overlap
+  against the 0.099 s disk stall and 0.137 s gemm is the upside beyond that (~+17 % if H2D vanished
+  entirely). Measure it, do not project it. Logs `docs/probes/r49-split-{1,2}.log`, table
+  `docs/probes/r49-split-table.txt`, script `docs/probes/r49_split_table.py` (module-list key set —
+  `s3regate_table.py` reads only the fused forwards' `slots_hit`/`*_hit` keys and cannot parse these).
+- [x] **step 2A — SHIPPED AND MEASURED 2026-09-20: +6.90 % MiniMax decode, logits BIT-IDENTICAL, no RAM
+  leak.** Detail: [`…-row49-step2-RESULTS.md`](docs/2026-09-20-row49-step2-RESULTS.md). **Scope was A only**
+  (approved 2026-09-20): derive `non_blocking` per expert from arena-backing, arm the read event. **B (a
+  dedicated copy stream) was NOT built** — copies and gemm share the default stream, so A removes the HOST
+  stall, not same-stream serialisation. **The change:** new `_copy_async_ok(pinned_source, tensor, dtype)` in
+  `vaayu/moe_patch.py` (async iff page-locked AND no dtype change — a cast runs host-side and makes the real
+  source a pageable temp); `_inject_expert_weights(..., pinned_source=False)` threaded into the
+  `build_exl3_qmatrix` call and the plain loop; `_load_inject_run` derives it with
+  `arena.slab_index_of(next(iter(raw.values())))` (pointer arithmetic, no CUDA call) and calls
+  `arena.record_read(_rd)` after injection. Prefill clones and the arena-exhausted fallback are in no slab →
+  None → stay synchronous, automatically. Plus the stale `non_blocking` paragraph in `build_exl3_qmatrix`'s
+  docstring, and one pre-existing test stub's signature. **A/B: ABBA `fix,base,base,fix`, U arms only (row 27's
+  trap), base = a git worktree at `4e5a088` proven by each log's import path — fix 0.5224 vs base 0.5584
+  s/token = +6.90 % throughput (1.7907 → 1.9143 tok/s)**, within-arm spread 0.13 % / 0.57 %. **Correctness:
+  prompt-end logits sha256 `3211568a…40dd18` IDENTICAL in all four runs; greedy ids identical in every arm;
+  peak RSS 18.62/19.01 GB (fix) vs 18.94/19.04 GB (base)** at 4 Hz sampling — the leak the original comment
+  feared does not happen from a pinned source. **Gates: suite 2348 passed / 16 skipped (baseline 2336/16),
+  accumulator Qwen3-Next 8, accumulator MiniMax 8, server smoke Qwen3-Next 9, 1B prefix 1.** Dense has NO gate
+  (`test_batched_dense_smoke.py` deleted 2026-09-03) — it does not reach this code by reading, not by
+  measurement. **§8: (1) NO KNOB, deliberately — `config.py` untouched, a correct overlap is strictly better;
+  (2) n/a, forward-internal; (3) REACHABLE — N=1 per decode token on the forward the server runs for every
+  MiniMax request on its own defaults, unlike P8's N=3 win; (4) not blocked.**
+- [ ] **NEW, from step 2A's own numbers — re-rank B before building it.** After A the largest phase of a
+  MiniMax decode token is the **exposed disk wait: 0.233 s of 0.524 s (44 %)**, up from 0.123 s of 0.558 s,
+  while `gemm` is 0.143 s. Nothing got slower — the host used to sit 0.18 s in `cudaMemcpy` while the loader
+  threads read ahead, and now reaches the future-wait sooner (bytes 2.380 GB/token, 267.8 reads, 13.6 % RAM
+  hit — all unchanged, which rules out "it read less"). B's mechanism (overlap expert N+1's H2D with expert
+  N's gemm) therefore attacks the SMALLER of the two; price it against a deeper prefetch / disk-overlap lever
+  using measured numbers on both sides. **Also recorded: the profiled arm now UNDER-reads this forward** —
+  `build_exl3_qmatrix` brackets its copy with `cuda.synchronize()` when timing is on, re-serialising what the
+  fix made async (`overhead` P/U 1.033 → 1.110, `T_prof` flat while `T_unprof` fell). Measure this slice on the
+  U arms, never the P arm.
+- [ ] step 3 — re-price the CPU hybrid, only after step 2. The stop rule did NOT close it; its own
+  verdict below (MiniMax-only, EXL3 has no CPU kernel, weeks) is unchanged by these numbers.
+- [ ] **NOT IN SCOPE, recorded so it is not lost: MiniMax PREFILL's H2D is pageable** (step 0(d);
+  row 45 measured h2d at 59.8 % of prefill wall). H1 does not cover it. Either pin the prefill clone
+  path or leave it synchronous — decide after step 2, it is a separate question.
 
 **STOP RULE (step 1): `h2d_pct` < ~15 % of `T_prof` → the slice shrank under rows 27/30-P/44/45;
 close this row with the number, and close the CPU-hybrid half too — its prize was smaller than this

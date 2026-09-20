@@ -365,7 +365,12 @@ def build_exl3_qmatrix(
     (confirmed: prefill alone drove RSS to ~22-27GB). The per-layer pinned
     path (inject_to_gpu, SlabArena-backed) keeps non_blocking=True since its
     sources are genuinely pinned; the per-token module-list path
-    (moe_patch.py) passes non_blocking=False.
+    (moe_patch.py) DERIVES it per expert (row 49, 2026-09-20): True when that
+    expert's bytes are views into the pinned slab arena, which is every decode
+    hit and miss, and False for the clone paths that are genuinely pageable —
+    prefill and the arena-exhausted fallback. It used to pass False always, on
+    the grounds that the source was "not guaranteed page-locked"; that became
+    stale when the module-list layout turned slab-capable.
 
     timing: optional dict to accumulate {'h2d': seconds, 'construct': seconds}
     into (keys added with += so repeated calls, e.g. one per submodule role,

@@ -1239,7 +1239,8 @@ def test_modulelist_load_arm_continue_still_detaches(tmp_path):
 
     real_inject = mp._inject_expert_weights
 
-    def _partial_bind_then_fail(expert_mod, raw, eidx, layer_name, device, dtype, timing=None):
+    def _partial_bind_then_fail(expert_mod, raw, eidx, layer_name, device, dtype,
+                                timing=None, pinned_source=False):
         # Real-bind only the w1 tensors (mirrors an EXL3 expert whose w1
         # QMatrix builds fine), then report overall failure — mirrors a later
         # group (w2) raising partway through injection.
