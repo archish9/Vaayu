@@ -238,8 +238,9 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
 | ~~1~~ | ~~**36**~~ | **PARKED 2026-09-20 — gate fired, then two spikes killed every lever.** `serial` is **74.8 % GPU-bound**; its matmul half (12.59 ms) is at **80–86 % of the RTX 5060 Ti's 448 GB/s**, a floor; `use_torch_compile` **CRASHES** (cudagraph-trees step boundary, reproduced 2×); without cudagraphs it is **24–35 % SLOWER** (46 dynamo graphs — broken by the engine's own `time.perf_counter` instrumentation and by `aten.bincount`). Elementwise term still real but **not ~1 day**. | — | — | done, ~1 day | [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) · [`…-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md) |
+| **1 (NEXT — SPEED)** | **49** | **MiniMax-M2.7's expert H2D is SYNCHRONOUS on purpose** (`moe_patch.py:1110`/`:1119`, `non_blocking=False`), so it cannot hide behind the disk read the way the fused forward's does. Row 26 measured it at **0.180 s of a 0.596 s token — 30.2 %, the largest removable phase on that model**, and ORDERED this priced before any CPU path. Never done. **Bigger than the CPU hybrid's whole 0.114 s prize, and needs no CPU kernel or new on-disk format.** | open now — row 26's precondition 1 (after row 27) was met 2026-09-12 | **step 1: `h2d_pct` < ~15 % of `T_prof` → close the row AND the CPU-hybrid half with the number** | step 0 ~1 h · step 1 ~1 h · step 2 1–3 days | [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) · row **49** below |
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
-| **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
+| ~~2~~ | **35** | ~~Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block.~~ **BLOCKED 2026-09-20 — DO NOT PICK.** Its +11.7 % was measured on **Qwen3-235B, deleted 2026-09-20**, so its stop rule (*reproduce +11.7 % on Qwen at N=1 through the server*) is **unrunnable**. Its own kill condition (*dies if S2 lands*) **fired 2026-09-13**, and Qwen3-Next's disk is now 0.42 % of a token. The only still-streaming model, MiniMax, is the **−3.7 %** arm. | **blocked** | re-opens only on a measured **≥ +15 % on MiniMax at N=1** on a current build | — | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
 | **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
 | **3** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
@@ -1824,7 +1825,17 @@ loses a tool exactly when it needs one — which is how it was found.
 
 ---
 
-# 26 · [x] CPU-hybrid (AVX2) expert compute — CLOSED 2026-09-11: 8-bit KILLED; bytes-neutral hybrid +6.8 % Qwen / +22.0 % MiniMax over row 27 → design brief only, after row 27
+# 26 · [x] CPU-hybrid (AVX2) expert compute — CLOSED 2026-09-11: 8-bit KILLED; bytes-neutral hybrid +6.8 % Qwen / +22.0 % MiniMax over row 27 → design brief only, after row 27 — **ITS UNMET PRECONDITION IS NOW ROW 49 (2026-09-20)**
+
+**2026-09-20 — READ THIS BEFORE CITING ANY NUMBER IN THIS ROW.** The hybrid half was **deferred, not
+refuted** ("not killed … earns a design brief, not code"), behind two preconditions: *after row 27*
+(met 2026-09-12) and *a cheaper GPU-side attack on the same slice must be priced FIRST* (**never done
+— it is now row 49**). Row 28's later "close the CPU-hybrid idea" answered whether the non-EXL3
+DeepSeek-V4 checkpoint rescued it, not whether MiniMax's +22.0 % stands. **Both measured arms have
+since decayed:** the **+6.8 % Qwen3-235B arm is UNVERIFIABLE FOREVER** (model deleted 2026-09-20), and
+the mechanism is **dead on Qwen3-Next** (disk 0.42 / 0.32 % of a decode token, row 36's spike). The
+**+22.0 % is an arithmetic ceiling, never executed**, on a model whose EXL3 format **has no CPU
+kernel**. See row **49**.
 
 **Cold-pickup brief:** [`docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md`](docs/2026-09-11-row26-cpu-hybrid-ceiling-BRIEF.md)
 (gitignored — this row is the durable copy). **MEASUREMENT ONLY: no engine code in this row.**
@@ -3784,7 +3795,31 @@ built. (4) unblocked by the probe. **Only pays while experts stream — dies if 
 
 ---
 
-# 35 · [ ] Give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block (added 2026-09-12)
+# 35 · [!] Give `VAAYU_LOOKAHEAD` a per-model measured gate instead of a hard block (added 2026-09-12) — **BLOCKED / ALL BUT DEAD 2026-09-20: its prize model was DELETED and its mechanism died when S2 landed**
+
+**CORRECTED 2026-09-20. Do not pick this row off the queue as "+11.7 %, machinery built" — that
+ranking is stale on three counts:**
+
+1. **Its stop rule is UNRUNNABLE.** The rule is verbatim *"cannot reproduce **+11.7 % on Qwen** at
+   N=1 THROUGH THE SERVER … → close it. That number is the entire prize."* In this file "Qwen" is
+   **Qwen3-235B**, which the user RETIRED AND DELETED on 2026-09-20 (confirmed: no `*Qwen3-235B*`
+   directory under `/home/a/code/ai-ml/models/`). **The only model the prize was ever measured on no
+   longer exists**, and its forward (fused-EXL3) has no on-device model at all, so the number cannot
+   be reproduced or refuted.
+2. **Its own kill condition has already fired.** This row says *"Only pays while experts stream —
+   **dies if row 30's S2 lands**."* **S2 landed 2026-09-13.** On Qwen3-Next the split spike measured
+   `disk_load` at **0.42 / 0.32 % of a decode token** (2026-09-20, row 36) with a 96.6 % RAM-cache
+   hit — there is essentially nothing left to prefetch, so lookahead has no mechanism there.
+3. **The only remaining model where experts DO stream is the arm that LOST.** MiniMax-M2.7 measured
+   **−3.7 %**, and that was at N=3, which the server does not run — so even the loss would need
+   re-measuring at N=1 before it meant anything.
+
+**What would re-open it:** a measured ≥ +15 % on MiniMax-M2.7 at **N=1**, on a current build — i.e.
+re-measuring the losing arm on the one model that still streams. That is a new measurement, not the
+banked +11.7 %. Nothing else revives this row; the +11.7 % should be treated as historical.
+
+**Historical detail below, kept for the trail — the numbers are real, the models are not current.**
+
 
 Measured post-P4: **Qwen N=1 +11.7 %**, **MiniMax N=3 −3.7 %**. Hard-blocked at `check_lookahead_flag_safe`
 (`vaayu/vaayu_base.py:794`) because defaulting it ON ships a win to one actively-tested model and a loss to the other —
@@ -4006,6 +4041,64 @@ re-pack, stream fewer bytes per expert at unchanged architecture. Unlike row 32 
 **Genuine research; quality risk real and unbounded. Priced honestly: a 30 % row prune is a 30 % byte cut — roughly what
 downloading a 3.5 bpw build gets for free in an afternoon (row 32).** Recorded because the user asked for the aggressive
 end of the space on 2026-09-12. **Do not start while rows 31-35 are unmeasured.**
+
+---
+
+# 49 · [ ] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request)
+
+**Brief:** [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) (gitignored;
+this row is the durable copy).
+
+**Why this is legitimate to re-open: row 26 did NOT refute the hybrid, it DEFERRED it behind two
+preconditions.** Verbatim: *"the bytes-neutral hybrid … is **not killed** … it **earns a design
+brief, not code** — but only AFTER row 27 … and a cheaper GPU-side attack on the same slice … must be
+priced **first**."* Row 27 closed 2026-09-12 (precondition 1 ✅). **The GPU-side pricing was never
+done (precondition 2 ❌) — this row is it.** Row 28's later *"close the CPU-hybrid idea"* answered a
+different question (whether the non-EXL3 DeepSeek-V4 checkpoint *rescued* it; it did not) and never
+re-refuted MiniMax's +22.0 %.
+
+**THE TARGET — and it is bigger than the hybrid's whole prize.** The module-list forward copies
+expert bytes with **`non_blocking=False`, deliberately** (`vaayu/moe_patch.py:1110` and `:1119` — row
+26 cited `:694`, the code has moved; the comment says async there leaks host RAM). So MiniMax's H2D
+**cannot hide behind the disk read the way the fused forward's does.** Row 26's own profiled split:
+**`h2d` = 0.180 s of a 0.596 s token — 30.2 %, the largest removable phase on this model** (disk 0.091
+/ 15.3 %, gemm 0.153 / 25.7 %, construct 0.008 / 1.3 %). Cross-check: 2.38 GB/token at the measured
+19.7 GB/s pinned H2D = 0.121 s. Row 45 independently measured h2d at **59.8 % of the wall** in
+MiniMax *prefill*, same forward, same cause. **The CPU hybrid's entire prize was 0.114 s
+(0.562 → 0.448 s floor) — smaller than this slice — and this one needs no CPU kernel, no new on-disk
+format, no AVX2.**
+
+**H1, the lead hypothesis, verify in code FIRST:** the `non_blocking=False` comment's reason is that
+the tensors are *"not guaranteed page-locked"* — **that may be stale.** Row **30-P** (2026-09-18)
+shipped a pinned RAM tier and recorded *"EXL3 models (Qwen3-235B, MiniMax) are unchanged — they
+already had it."* If those bytes already arrive pinned, the safety reason is gone and the fix is far
+smaller than "an explicit buffer-lifetime mechanism".
+
+**Plan:** step 0 code read (~1 h, no GPU) answer H1 · step 1 **re-measure the MiniMax decode split on
+the current build** (~1 h GPU, `row26_decode.py MODEL=minimax ARMS=W,U1,P,U2,NOEXP`, 2 replicates) —
+nothing has re-split this model's decode since rows 27/30-P/44/45 · step 2 the overlap fix, 1–3 days
+depending on H1, **correctness gate = prompt-end logits BIT-IDENTICAL + greedy ids identical + a
+host-RAM watermark** (the original comment's fear was a leak, so the test must be able to see one) ·
+step 3 re-price the CPU hybrid only then.
+
+**STOP RULE (step 1): `h2d_pct` < ~15 % of `T_prof` → the slice shrank under rows 27/30-P/44/45;
+close this row with the number, and close the CPU-hybrid half too — its prize was smaller than this
+slice to begin with.**
+
+**WHAT IS LEFT OF THE CPU HYBRID, stated so nobody re-derives it:** its **+6.8 % Qwen3-235B arm is
+UNVERIFIABLE FOREVER** (model deleted 2026-09-20, fused-EXL3 forward has no on-device model); it is
+**dead on Qwen3-Next** (disk is 0.42 / 0.32 % of a decode token, row 36's spike — no device-busy
+shadow to hide CPU work in); so its prize is **MiniMax-only**, a §5 asymmetry question before it is
+an engineering one. **+22.0 % is an arithmetic CEILING, never executed** (0.562 → 0.461 s computed
+from row 26 step-1 physics: CPU int4 expert 214 / 163 µs, RAM read 65.6 GB/s). And **EXL3 has no CPU
+kernel** — row 26 says so — so collecting it on MiniMax means re-quantising the checkpoint to a
+CPU-friendly int4 format **plus** kernels **plus** loader **plus** dispatch. **Weeks.**
+**Recommended default: close the CPU-hybrid half for good once step 2 lands.**
+
+**§8:** (1) step 2 probably needs no knob — a correct overlap is strictly better; any safety escape
+hatch lands in `vaayu/server/config.py` in the SAME commit. (2) n/a, forward-internal. (3) **REACHABLE
+— an N=1 per-decode-token effect on a model the server loads**, unlike P8's N=3 win that delivered
+0 % to users. (4) not blocked.
 
 ---
 
