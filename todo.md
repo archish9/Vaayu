@@ -4328,7 +4328,27 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
   ~8×, moving every N\* the same way. **Caveat: 7.87 tok/s is DERIVED (row 30's +15.09 % reversed), never
   measured with the cache live — row 45 under-predicted itself 40 % on exactly this kind of projection, so the
   build MEASURES the reserved-side decode.**
-- [ ] Build plan in `docs/superpowers/plans/` with those numbers and the reservation decision.
+- [x] **Build plan WRITTEN 2026-09-20:** [`docs/superpowers/plans/2026-09-20-row42B-hybrid-prefix-cache.md`](docs/superpowers/plans/2026-09-20-row42B-hybrid-prefix-cache.md)
+  (gitignored — this bullet is the durable copy). **5 TDD tasks. The design turned out SMALLER than this row
+  assumed, because two facts in the code collapse it:** (1) `prefix_cache.py:113` —
+  `borrowed = (key != session_id and m < len(entry.token_ids))`, so a prompt consuming the WHOLE entry is a
+  check-out, never a copy, and the append shape never reaches `copy_prefix` at all; (2) `vaayu_base.py:5381` —
+  a stored entry's `token_ids` is length `T` while its cache holds `L = T − 1` fed positions, and HF re-derives
+  the prefill split from `get_seq_length()`, so the restore point is `L` automatically. **There is therefore NO
+  snapshot object**: the recurrent state IS part of the entry, and `to_cpu`/`to_device`/`resident_bytes` just
+  learn to carry `conv_states`/`recurrent_states` with the KV.
+  **T1** carry the state (capability-detected, `_recurrent_state_layers` / `_move_recurrent_state`) ·
+  **T2** the serving gate in `lookup()` — refuse unless `m == len(entry.token_ids)` **and**
+  `min(m, prompt_len−1) ≥ L`, counted as `recurrent_partial_misses` in `stats()` (verified against all five hit
+  shapes: continuation and exact resend both restore at `L`; partial divergence, a prompt shorter than the entry,
+  and the borrow shape all MISS) · **T3** keep the KV-only side channels refused — `enable_kv_persist` and
+  `prefix_compress` both carry K/V only and would restore a state that never saw those tokens (lands BEFORE the
+  lift so no commit ordering exposes them) · **T4** lift RC7 (delete the recurrent clause from
+  `cache_supports_prefix_store` and `prefix_cache_refusal_reason`; `copy_prefix` keeps raising) · **T5** on-device
+  A/B + gates. Adds 16 unit tests, all CPU-only (real `Qwen3NextConfig` layer objects, no checkpoint) → suite
+  2318 → **2334**. A/B is `plans/probes/row42b_ab.py`, **one arm per PROCESS** (4 loads in one process hits the
+  exit-137 pinned-block trap), ABBA `off,on,on,off`, greedy ids sha256 identical across arms.
+  **Reservation sizing is NOT in this plan — it is row 46** (user's call, 2026-09-20).
 - [ ] Build + verify: suite, same-day ABBA (round-1 TTFT, round-2 TTFT, decode), logit sha256 identical on the
   restore path, server gate Qwen3-Next, accumulator ×3, Llama-3.2-1B prefix gate.
 
