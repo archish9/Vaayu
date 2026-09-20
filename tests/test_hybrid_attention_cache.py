@@ -244,7 +244,8 @@ def test_batch_kv_invariant_still_catches_a_real_disagreement():
         check_batch_kv_invariant(pad_mask, q_len=1, past_key_values=cache)
 
 
-# ── RC7: the prefix cache cannot lend a hybrid model its state ───────────────
+# ── RC7 / 42-B: the prefix STORE accepts a hybrid model's state; COPYING it
+#    across sessions is still refused ──────────────────────────────────────
 #
 # Found by the second generation in one process. `copy_prefix` rebuilds the
 # cache as `type(self)(quantize=...)` with NO config, so the copy has no
@@ -256,12 +257,14 @@ def test_batch_kv_invariant_still_catches_a_real_disagreement():
 #     if not isinstance(self.layers[layer_idx], LinearAttentionCacheLayerMixin):
 #   IndexError: list index out of range
 #
-# Passing the config through would only move the failure: `copy_prefix` copies
-# the K/V ring buffers and nothing else, and a gated-delta-net layer's
-# conv/recurrent state is NOT sliceable by token position -- there is no
-# "first N tokens" of a recurrent state to lend. So the answer is to refuse,
-# loudly, until someone designs a real one (CLAUDE.md §5: warn, never silently
-# degrade).
+# `copy_prefix` copies the K/V ring buffers and nothing else, and a
+# gated-delta-net layer's conv/recurrent state is NOT sliceable by token
+# position -- there is no "first N tokens" of a recurrent state to lend, so
+# lending a COPY of a partial prefix still refuses, loudly (CLAUDE.md §5: warn,
+# never silently degrade). But storing the cache itself is a different
+# question: 42-B carries the whole recurrent state with the pooled entry
+# (to_cpu/to_device/resident_bytes) and lookup() serves it only at the exact
+# length that state describes, so the store now ACCEPTS a hybrid cache.
 
 def test_prefix_store_accepts_a_cache_with_recurrent_layers():
     """42-B: the pool carries the recurrent state with the entry (task 1) and

@@ -150,6 +150,11 @@ what is left:
 
     expert cache ceiling = available RAM − 3.5 GiB − (prefix_sessions × max_seq_len × KV bytes/token)
 
+(On a hybrid model, `resident_bytes()` also charges the ~40 MB/session recurrent state that
+travels with a pooled entry since 42-B; the formula above omits that term. Immaterial today —
+at 8k tokens it is ~0.24 GB against the 1.61 GB/session the KV term alone reserves — but the
+two no longer agree exactly.)
+
 So lowering it hands RAM to the expert cache, which is the decode bottleneck on a streamed
 MoE. On Qwen3-235B the default reservation is **4.74 GB** of a ~20.7 GB budget; at
 `prefix_sessions=1` that falls to 1.58 GB and the expert cache grows 12.26 → 15.42 GB.
@@ -201,9 +206,14 @@ rather than a per-token history, so an entry can only be resumed at exactly the
 point it was stored. A turn that resends the whole previous turn and appends to
 it (the agent loop's shape) is served; a turn that diverges in the middle of the
 stored context takes a full prefill, as it did before. The engine counts those
-as `recurrent_partial` in the prefix stats line. Such a model also cannot lend a
-prefix to another session, and both `enable_kv_persist` and `prefix_compress`
-are ignored on it, with a warning at load.
+as `recurrent_partial` in the prefix stats line. A different session CAN check
+out such an entry when it consumes the whole thing — `borrowed` only latches
+when part of it is left behind, which cannot happen on a recurrent entry — but
+there is no partial-prefix *copy*, since the recurrent state has no "first N
+tokens" to lend. On a hybrid, the original owner does not get the entry back
+after that hand-off, so under parallel fan-out this behaves as entry hand-off
+between sessions rather than sharing. Both `enable_kv_persist` and
+`prefix_compress` are ignored on it, with a warning at load.
 
 ## 3c. `max_seq_len` — lowering it does NOT buy VRAM
 
