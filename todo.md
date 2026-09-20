@@ -237,7 +237,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
-| **1 (NEXT)** | **36, RE-SCOPED** | **The gate fired, then the spike refuted the scope (both 2026-09-20).** `serial` is **74.8 % GPU kernel time / 25.2 % host gap** — CUDA graphs are the wrong tool and the ~1-week build is OFF. Matmuls already run at **80–86 % of the RTX 5060 Ti's 448 GB/s**, so 12.59 ms of the 37 ms is a FLOOR. What is left: **4,353 elementwise launches/token at 1.8 µs** and 653 µs/layer of CPU in the 36 `GatedDeltaNet` layers → **fusion**, and `use_torch_compile` (mode=`reduce-overhead`) ALREADY EXISTS, defaults False, and has no server knob (§8). | open now | A/B must beat the U-arm baseline, ABBA; per-model gate, never a default that wins on one model (§5) | **~1 day to measure**, not ~1 week | row **36** below · [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) |
+| ~~1~~ | ~~**36**~~ | **PARKED 2026-09-20 — gate fired, then two spikes killed every lever.** `serial` is **74.8 % GPU-bound**; its matmul half (12.59 ms) is at **80–86 % of the RTX 5060 Ti's 448 GB/s**, a floor; `use_torch_compile` **CRASHES** (cudagraph-trees step boundary, reproduced 2×); without cudagraphs it is **24–35 % SLOWER** (46 dynamo graphs — broken by the engine's own `time.perf_counter` instrumentation and by `aten.bincount`). Elementwise term still real but **not ~1 day**. | — | — | done, ~1 day | [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) · [`…-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md) |
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
@@ -3815,7 +3815,7 @@ per model. **Only pays while experts stream — dies if row 30's S2 lands.**
 
 ---
 
-# 36 · [!] CUDA graphs / fused per-layer dispatch — **GATE FIRED 2026-09-20 (32.34 / 32.73 %), THEN THE SPIKE REFUTED THE SCOPE: `serial` is GPU-BOUND (74.8 % kernel time), host gap only 25.2 % vs a ≥ 40 % rule. DO NOT BUILD CUDA GRAPHS — RE-SCOPE.** (added 2026-09-12)
+# 36 · [!] CUDA graphs / fused per-layer dispatch — **PARKED 2026-09-20. Its gate fired (32.34 / 32.73 %), then TWO spikes killed every lever: `serial` is 74.8 % GPU-BOUND, its matmul half is at 80–86 % of this card's bandwidth, `use_torch_compile` CRASHES as shipped, and without cudagraphs it is 24–35 % SLOWER.** (added 2026-09-12)
 
 **GATE RE-CHECK DONE 2026-09-20 on `main` `da118ab` — IT FIRES, for the first time in three readings.**
 **strict `serial / T_unprof` = 32.34 % / 32.73 %** (two replicates, spread 1.2 %, under the 2 % re-run rule)
@@ -3851,7 +3851,39 @@ is 10.04–10.78 ms and the matmuls are already at **80–86 % of peak memory ba
 the 9.34 ms host gap = **8.3 % of the full 0.1124 s token**, and capture is broken 48×/token by the MoE
 routing D2H sync, so the realistic take is a fraction of that.
 
-**RE-SCOPE, ~1 day not ~1 week, and it is a §8 BANKED-FEATURE case:** `use_torch_compile`
+**THE RE-SCOPE WAS MEASURED THE SAME DAY AND IT ALSO FAILED (2026-09-20, `34ceb7b`) — ROW 36 IS PARKED.**
+Two findings, both on Qwen3-Next, probe `plans/probes/r36_compile_ab.py` (THROWAWAY, no `vaayu/` change):
+
+1. **`use_torch_compile=True` CRASHES — `[bug]`, reproduced in two independent processes.**
+   `RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`,
+   raised at `transformers/models/qwen3_next/modeling_qwen3_next.py:866`. Structural, not incidental:
+   `_compiled_layer_fn` uses **`mode="reduce-overhead"` = torch.compile PLUS inductor cudagraph trees**
+   (`vaayu_base.py:5064-5068`), which need `torch.compiler.cudagraph_mark_step_begin()` per model
+   invocation — and Vaayu drives **48+ layers through that one callable per token** with no step
+   boundary. **`effective=True` at load, so the flag IS live on CUDA and `config.py:328`'s stated reason
+   for declining it ("not live paths") is FACTUALLY WRONG** — the real reason is that it crashes.
+   Also seen: 9 distinct shapes from chunked prefill, and a dynamo recompile-limit hit (`[14/8]`).
+2. **Without cudagraphs (`mode="default"`) it is CORRECT but SLOWER.** Within-process ABBA
+   (`W,A1,Bw,B1,B2,A2` — one model load, the engine reads `use_torch_compile` per layer call, so no
+   cross-process drift): compiled **0.1543 / 0.1539 s** (spread 0.3 %) vs eager **0.1146** (A1; A2 read
+   0.1346, a 16 % spread and the ~6 %-dip artefact row 44 documented — every other same-day baseline on
+   this model is 0.1113–0.1146). **+23.7 % slower on the A-mean, +34.6 % against A1.** Greedy ids
+   **identical across every arm**, so it is correct, just slow. Compile cost 104.4 s.
+   **Why it loses: the fusion never happens.** Dynamo 117 frames / 107 ok / **46 unique graphs**, broken
+   by **`time.perf_counter` — the engine's OWN per-layer timing instrumentation inside the traced
+   region** — and by `aten.bincount.default` (MoE routing, data-dependent shape). The 4,353 tiny
+   elementwise launches are re-entered across graph boundaries instead of fused, and guard/dispatch cost
+   is added on top.
+
+**So every lever in this row is now closed or floored:** CUDA graphs refuted (8.3 % of a token, capture
+broken 48×/token by the routing D2H sync) · matmul 12.59 ms is a bandwidth FLOOR · the flag crashes ·
+compile regresses. **The elementwise term is still real but needs the instrumentation and dynamic ops out
+of the traced region, or a hand-written GatedDeltaNet kernel — NOT ~1 day.** Re-open only on a measured
+plan for that term that does not route through `torch.compile` as the code stands. Detail:
+[`…-row36-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md); logs
+`docs/probes/r36-abba-{1A,2B,3B}.log`, `docs/probes/r36-fuse-1.log`.
+
+**Superseded by the A/B above — RE-SCOPE, ~1 day not ~1 week, and it is a §8 BANKED-FEATURE case:** `use_torch_compile`
 (`vaayu/vaayu_base.py:2113`) already compiles the layer forward through `self._compiled_layer_fn` with
 **`mode="reduce-overhead"` — torch.compile PLUS CUDA graphs** (`vaayu_base.py:5064`). It **defaults False**
 and **`vaayu/server/config.py` has NO knob for it** (only a comment, `config.py:328`), so no user can reach
@@ -3974,6 +4006,38 @@ re-pack, stream fewer bytes per expert at unchanged architecture. Unlike row 32 
 **Genuine research; quality risk real and unbounded. Priced honestly: a 30 % row prune is a 30 % byte cut — roughly what
 downloading a 3.5 bpw build gets for free in an afternoon (row 32).** Recorded because the user asked for the aggressive
 end of the space on 2026-09-12. **Do not start while rows 31-35 are unmeasured.**
+
+---
+
+# 48 · [bug] `use_torch_compile=True` CRASHES on CUDA — and `config.py` declines it for the wrong reason (added 2026-09-20, found by row 36's A/B)
+
+**Reproduced in two independent processes on Qwen3-Next**, both during the first generation:
+`RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent
+run`, raised at `transformers/models/qwen3_next/modeling_qwen3_next.py:866`.
+
+**Cause (structural, model-independent):** `_compiled_layer_fn` is built with
+**`mode="reduce-overhead"`, which is torch.compile PLUS inductor's cudagraph trees**
+(`vaayu/vaayu_base.py:5064-5068`). Cudagraph trees assume one model invocation per step and require
+`torch.compiler.cudagraph_mark_step_begin()` at each boundary. Vaayu drives **48+ layers through that
+one compiled callable per token** with no step boundary, so a graph's output is read after a later
+replay overwrote it. The Qwen3-Next line number is incidental; the mismatch is not.
+
+**Second, separate defect — a doc/test claim that is wrong.** `vaayu/server/config.py:328` puts
+`use_torch_compile` on `tests/test_engine_param_reachability.py`'s decline list with the reason
+*"`__init__` overrides these in places; they are not live paths"*. Measured: **`effective=True` after
+load on CUDA** — the only `__init__` guard (`vaayu_base.py:2118`) disables it for non-CUDA devices
+and leaves it ON for CUDA. It IS a live path, reachable by any library caller. The correct reason to
+decline it is that it crashes.
+
+**Not fixed here** — row 36's A/B was a measurement spike, nothing in `vaayu/` was touched. Two
+candidate fixes, unpriced: (a) change the mode off `reduce-overhead` — but measured **24–35 % SLOWER**
+that way, so that is a correctness fix, not a perf one; (b) refuse `use_torch_compile=True` at load
+the way RC7 refuses the prefix cache on recurrent caches, and correct `config.py:328`'s reason.
+**(b) is the cheap honest one.** Detail:
+[`…-row36-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md).
+
+**Not measured:** MiniMax-M2.7 and the dense 70B. The crash site is in Qwen3-Next modeling code, but
+the step-boundary mismatch is not model-specific.
 
 ---
 
