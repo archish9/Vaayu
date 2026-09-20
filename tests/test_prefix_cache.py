@@ -425,3 +425,98 @@ def test_a_partial_cross_session_match_is_counted_as_a_borrow():
     assert kv.copied_len == 3, "copies only what was matched"
     assert s.borrows == 1
     assert list(s._pool) == ["A"], "the owner keeps its entry"
+
+# ── 42-B: a recurrent entry is servable at exactly ONE length ────────────────
+#
+# The conv/recurrent state summarises L fed positions and cannot be cropped to
+# anything else, so a partial match is a MISS -- a full prefill, no regression
+# -- rather than a hit that restores a state the tokens never produced.
+
+import types
+
+
+class _FakeRecurrentCache(_FakeCache):
+    """A _FakeCache that reports recurrent layers and a fed length L."""
+    def __init__(self, nbytes, seq_len):
+        super().__init__(nbytes)
+        self._seq = seq_len
+        self.layers = [types.SimpleNamespace(conv_states=object(),
+                                             recurrent_states=object())]
+
+    def get_seq_length(self, layer_idx=0):
+        return self._seq
+
+
+def _recurrent_store(ids, seq_len):
+    """A pool holding one recurrent entry stored under 'sid'."""
+    store = PrefixCacheStore(budget_bytes=10 ** 9)
+    store.store("sid", list(ids), _FakeRecurrentCache(1000, seq_len))
+    return store
+
+
+def test_recurrent_entry_serves_a_continuation():
+    """The agent loop's shape: turn N+1 resends turn N's ids and appends."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)      # T=4 ids, L=3 fed
+    cache, m = store.lookup("sid", [1, 2, 3, 4, 5, 6])
+    assert cache is not None and m == 4
+    assert store.hits == 1 and store.recurrent_partial_misses == 0
+
+
+def test_recurrent_entry_refuses_a_partial_match():
+    """Divergence before the end: the state describes 3 positions, the match
+    would restore at 2."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    cache, m = store.lookup("sid", [1, 2, 9, 9, 9])
+    assert cache is None and m == 0
+    assert store.misses == 1 and store.recurrent_partial_misses == 1
+
+
+def test_recurrent_entry_serves_an_exact_resend():
+    """The same ids again: served at L, replaying the one token the entry
+    holds in token_ids but never fed through the model."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    cache, m = store.lookup("sid", [1, 2, 3, 4])
+    assert cache is not None and m == 4
+    assert store.recurrent_partial_misses == 0
+
+
+def test_recurrent_entry_refuses_a_prompt_shorter_than_the_entry():
+    """prompt_len == L: the entry is not fully consumed, so there is no point
+    at which its state is valid for this prompt."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    cache, m = store.lookup("sid", [1, 2, 3])
+    assert cache is None and m == 0
+    assert store.recurrent_partial_misses == 1
+
+
+def test_recurrent_entry_serves_a_continuation_from_another_session():
+    """A prompt that consumes the WHOLE entry is a continuation, not a borrow:
+    lookup checks it out rather than copying, so copy_prefix is not reached."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    cache, m = store.lookup("other-session", [1, 2, 3, 4, 5])
+    assert cache is not None and m == 4
+    assert store.borrows == 0
+
+
+def test_recurrent_entry_is_never_borrowed_by_another_session():
+    """A borrow calls copy_prefix, which refuses on recurrent state. The gate
+    makes that unreachable: a borrow implies m < len(token_ids)."""
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    cache, m = store.lookup("other-session", [1, 2, 3, 9, 9])
+    assert cache is None and m == 0
+    assert store.borrows == 0 and store.recurrent_partial_misses == 1
+
+
+def test_recurrent_partial_misses_appear_in_stats():
+    store = _recurrent_store([1, 2, 3, 4], seq_len=3)
+    store.lookup("sid", [1, 2, 9])
+    assert "recurrent_partial=1" in store.stats()
+
+
+def test_non_recurrent_entries_are_unaffected():
+    """Regression guard: a plain entry still serves partial matches."""
+    store = PrefixCacheStore(budget_bytes=10 ** 9)
+    store.store("sid", [1, 2, 3, 4], _FakeCache(1000))
+    cache, m = store.lookup("sid", [1, 2, 9, 9])
+    assert cache is not None and m == 2
+    assert store.recurrent_partial_misses == 0

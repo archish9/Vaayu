@@ -58,6 +58,13 @@ class PrefixCacheStore:
         # mostly borrows is one where every session is re-prefilling most of
         # its own context -- visible here, invisible in hits/misses.
         self.borrows = 0
+        # Lookups refused because the entry holds recurrent state and the match
+        # would restore it at a length it does not describe (42-B). These are
+        # MISSES, not failures: the request takes the full prefill it would have
+        # taken before hybrids could reuse anything at all. Counted separately
+        # because a workload that is mostly these is one where the hybrid prefix
+        # cache is buying nothing, which hit_rate alone renders as healthy.
+        self.recurrent_partial_misses = 0
         # Latch for the capacity warning below: once per store lifetime, not
         # once per eviction. The agentic workload re-stores every session every
         # turn, so per-eviction warning would emit hundreds of lines per run and
@@ -90,6 +97,26 @@ class PrefixCacheStore:
                 return None, 0
             entry = self._pool[key]
             m = longest_common_prefix(entry.token_ids, input_ids)
+            # A recurrent (linear-attention) entry is servable at exactly ONE
+            # length: the L positions its conv/recurrent state summarises. The
+            # KV half crops anywhere; the state half cannot be cropped at all,
+            # because it is a fixed-size summary with no per-token history. The
+            # caller's crop is min(m, prompt_len - 1) (_adopt_prefix_hit) and
+            # crop() itself takes a min, so the cache lands on L whenever that
+            # clamp is >= L. Refuse below it, and refuse any match that does not
+            # consume the WHOLE entry -- the latter is also what keeps `borrowed`
+            # False, so the raising copy_prefix stays unreachable. Stored entries
+            # always satisfy L == len(token_ids) - 1 (the last sampled token was
+            # never fed), so the second clause is an invariant guard: it fires
+            # only if some future store breaks that relationship.
+            from .batch import cache_holds_recurrent_state
+            if cache_holds_recurrent_state(entry.cache):
+                fed = entry.cache.get_seq_length()
+                if (m < len(entry.token_ids)
+                        or min(m, len(input_ids) - 1) < fed):
+                    self.misses += 1
+                    self.recurrent_partial_misses += 1
+                    return None, 0
             self.hits += 1
             self.matched_tokens += m
             # BORROWED, not checked out. A hit removes the entry because the
@@ -264,6 +291,8 @@ class PrefixCacheStore:
                 # session keeps re-prefilling its own context, which hit_rate
                 # alone renders as a healthy 75%.
                 out += f" borrow={self.borrows}"
+            if self.recurrent_partial_misses:
+                out += f" recurrent_partial={self.recurrent_partial_misses}"
             if self.compress_bits is not None:
                 out += (f" compress={self.compress_bits}b "
                         f"{self.compressions}pack/{self.decompressions}unpack")
@@ -287,6 +316,7 @@ class PrefixCacheStore:
             self.matched_tokens = 0
             self.lookup_tokens = 0
             self.borrows = 0
+            self.recurrent_partial_misses = 0
             self.compressions = 0
             self.decompressions = 0
 
