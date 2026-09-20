@@ -462,3 +462,65 @@ def test_no_site_charges_kv_for_every_layer_of_the_config():
     assert calls == [], (
         "these sites charge KV for every layer of the config; they must quote "
         "kv_bearing_layer_count instead: " + "; ".join(calls))
+
+# ── 42-B: the pooled entry carries the recurrent state ───────────────────────
+#
+# A hybrid entry is not "KV plus a snapshot": the conv/recurrent state IS part
+# of the entry. to_cpu()/to_device() move it with the KV, and resident_bytes()
+# counts it, or the pool budget is wrong by 40 MB per session and a restored
+# entry hands the model a state that never saw the pooled tokens.
+
+def _hybrid_cache_with_state(num_layers=8, interval=4):
+    """A hybrid cache whose linear-attention layers hold identifiable state."""
+    cache = FP8DynamicCache(quantize=False, config=_hybrid_config(num_layers, interval))
+    for i, layer in enumerate(cache.layers):
+        if hasattr(layer, "conv_states"):
+            layer.conv_states = torch.full((1, 4, 2), float(i), dtype=torch.bfloat16)
+            layer.recurrent_states = torch.full((1, 2, 3, 3), float(i), dtype=torch.bfloat16)
+    cache.update(*_kv(4), layer_idx=3)
+    return cache
+
+
+def test_recurrent_state_layers_are_found_by_capability():
+    cache = _hybrid_cache_with_state()
+    found = [i for i, _l in cache._recurrent_state_layers()]
+    assert found == [0, 1, 2, 4, 5, 6], found          # full_attention_interval=4
+    # A layer whose state is still None is not carried: nothing has run yet.
+    fresh = FP8DynamicCache(quantize=False, config=_hybrid_config())
+    assert fresh._recurrent_state_layers() == []
+
+
+def test_resident_bytes_counts_the_recurrent_state():
+    cache = _hybrid_cache_with_state()
+    kv_only = sum(t.nbytes for name in cache._BUFFER_LISTS
+                  for t in getattr(cache, name))
+    state = sum(l.conv_states.nbytes + l.recurrent_states.nbytes
+                for _i, l in cache._recurrent_state_layers())
+    assert state > 0
+    assert cache.resident_bytes() == kv_only + state
+
+
+def test_to_cpu_then_to_device_round_trips_the_recurrent_state():
+    cache = _hybrid_cache_with_state()
+    before = {i: (l.conv_states.clone(), l.recurrent_states.clone())
+              for i, l in cache._recurrent_state_layers()}
+    cache.to_cpu()
+    cache.to_device("cpu")
+    after = dict(cache._recurrent_state_layers())
+    assert set(before) == set(after)
+    for i, (c, r) in before.items():
+        assert torch.equal(after[i].conv_states, c)
+        assert torch.equal(after[i].recurrent_states, r)
+
+
+def test_uniform_cache_carries_nothing_extra():
+    """Regression guard for the three non-hybrid checkpoints on disk."""
+    cache = FP8DynamicCache(quantize=False)
+    cache.update(*_kv(4), layer_idx=0)
+    kv_only = sum(t.nbytes for name in cache._BUFFER_LISTS
+                  for t in getattr(cache, name))
+    assert cache._recurrent_state_layers() == []
+    assert cache.resident_bytes() == kv_only
+    cache.to_cpu()
+    cache.to_device("cpu")
+    assert cache.resident_bytes() == kv_only

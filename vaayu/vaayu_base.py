@@ -1606,10 +1606,42 @@ class FP8DynamicCache(DynamicCache):
         out._seq_len = [min(length, n) for n in self._seq_len]
         return out
 
+    def _recurrent_state_layers(self):
+        """(index, layer) for every cache layer holding conv/recurrent state.
+
+        A hybrid-attention model keeps a fixed-size summary on its
+        linear-attention layers instead of a per-token KV history. Found by
+        the capability the layer exposes -- never from a config field or an
+        architecture name (CLAUDE.md §5). Both attributes are None until that
+        layer's first forward, so a cache that has never run carries nothing.
+        """
+        out = []
+        for i, layer in enumerate(getattr(self, "layers", None) or ()):
+            conv = getattr(layer, "conv_states", None)
+            rec = getattr(layer, "recurrent_states", None)
+            if conv is not None and rec is not None:
+                out.append((i, layer))
+        return out
+
+    def _move_recurrent_state(self, device, pin: bool = False) -> None:
+        """Move conv/recurrent state to `device`, in place on the layer objects.
+
+        The state travels with the entry rather than in a side object: the
+        pool stores this cache, and a restore is `to_device` -- there is no
+        separate snapshot to keep in sync. Unlike the KV buffers there is
+        nothing to compact, because the state is a fixed-size summary whose
+        shape does not depend on how many tokens it has seen.
+        """
+        for _i, layer in self._recurrent_state_layers():
+            for name in ("conv_states", "recurrent_states"):
+                moved = getattr(layer, name).to(device, non_blocking=True)
+                setattr(layer, name, moved.pin_memory() if pin else moved)
+
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU
         (pinned when CUDA is available), for RAM-resident prefix-cache storage
-        between turns. Drops the geometric-growth capacity tail."""
+        between turns. Drops the geometric-growth capacity tail. The recurrent
+        state travels with the KV."""
         pin = torch.cuda.is_available()
         for name in self._BUFFER_LISTS:
             lst = getattr(self, name)
@@ -1619,18 +1651,24 @@ class FP8DynamicCache(DynamicCache):
                 if pin:
                     compact = compact.pin_memory()
                 lst[i] = compact
+        self._move_recurrent_state("cpu", pin=pin)
 
     def to_device(self, device) -> None:
-        """Move all buffers to `device` (GPU) for an in-flight request."""
+        """Move all buffers to `device` (GPU) for an in-flight request. The
+        recurrent state travels with the KV."""
         for name in self._BUFFER_LISTS:
             lst = getattr(self, name)
             for i in range(len(lst)):
                 lst[i] = lst[i].to(device, non_blocking=True)
+        self._move_recurrent_state(device)
 
     def resident_bytes(self) -> int:
-        """Total byte footprint of all resident buffers (for budget sizing)."""
-        return sum(t.nbytes for name in self._BUFFER_LISTS
-                   for t in getattr(self, name))
+        """Total byte footprint of all resident buffers (for budget sizing).
+        Includes the recurrent state's bytes."""
+        return (sum(t.nbytes for name in self._BUFFER_LISTS
+                    for t in getattr(self, name))
+                + sum(l.conv_states.nbytes + l.recurrent_states.nbytes
+                      for _i, l in self._recurrent_state_layers()))
 
 
 class TurboQuantKVCache(FP8DynamicCache):
