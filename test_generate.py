@@ -45,8 +45,11 @@ logging.basicConfig(
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # MODEL_PATH         = "/home/a/code/ai-ml/models/NeuroSenko--MiniMax-M2.7-exl3"
-# Known-good reference on this stack, for VAAYU_TRACE_ACT baselines:
-MODEL_PATH       = "/home/a/code/ai-ml/models/Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw"
+# MODEL_PATH         = "/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw"
+# Qwen3-235B was RETIRED and deleted 2026-09-20 at the user's request; the path
+# below used to point at it and would now fail at load. The default is the
+# fastest model on this box and the most perf-tuned path (fused, non-EXL3).
+MODEL_PATH       = "/home/a/code/ai-ml/models/cyankiwi--Qwen3-Next-80B-A3B-Instruct-AWQ-4bit"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = 10
 # max_new_tokens is a SAFETY CEILING, not a target length — you can't know a

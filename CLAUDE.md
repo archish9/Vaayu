@@ -9,9 +9,11 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 **Vaayu is a low-resource LLM inference engine that will power an autonomous coding
 agent doing loop-engineering** (repeated agentic iterations). It is **a true
 model-agnostic engine — MoE or dense, EXL3-quantized or not, CUDA or CPU compute
-— the user selects what to load** (see the dispatch table below). MoE-EXL3 on
-CUDA is the actively-tested / perf-tuned area much of the current work targets —
-but note it spans **two different forwards**, one per expert layout (table below).
+— the user selects what to load** (see the dispatch table below). **As of 2026-09-20 the most-tested and most
+perf-tuned path is non-EXL3 MoE on CUDA** (Qwen3-Next-80B int4, the fused non-EXL3
+forward) — NOT EXL3, where this sentence pointed for most of the project's life.
+EXL3 MoE is still tested through MiniMax-M2.7 on the module-list forward; the
+fused-EXL3 forward lost its only model when Qwen3-235B was retired (table below).
 Dense must keep working, and **large streamed-dense performance is now ON THE
 ROADMAP — the deferral was lifted 2026-09-02.** (It previously read "a planned
 FUTURE target, deferred until the MoE path is solid"; that is no longer the
@@ -42,18 +44,19 @@ layout, not the quant format, picks the forward:**
 
 | Expert layout | Quant | Compute | Code path | On-device today |
 |---|---|---|---|---|
-| fused (experts module with `num_experts`) | EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | **Qwen3-235B** — actively tested |
-| fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | none — gated in, not perf-tuned |
-| module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested |
-| dense | either | as configured | non-MoE forward | **Llama-3.3-70B-exl3** (path below), ppl 8.78; tied-`lm_head` checkpoints (Llama-3.2-1B) fixed 2026-08-09, ppl 11.94; streamed-perf deferred |
+| fused (experts module with `num_experts`) | EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | **NO MODEL ON DISK since 2026-09-20** — Qwen3-235B was retired at the user's request and deleted. This forward is now UNCOVERED on device: its perf history stands, but nothing re-tests it. Treat a change here as unverifiable without a new fused-EXL3 checkpoint. |
+| fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | **Qwen3-Next-80B-A3B int4 (AWQ)** — actively tested, and the most perf-tuned path here (rows 30/30-P/44/42-B). The fastest model on this box. |
+| module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested. Also the intended landing spot for **DeepSeek-V4-Flash** once ported (row 28b / row 47). |
+| dense | either | as configured | non-MoE forward | **Llama-3.3-70B-exl3** (path below), ppl 8.78 — a first-class test target, confirmed on disk 2026-09-20; tied-`lm_head` checkpoints (Llama-3.2-1B) fixed 2026-08-09, ppl 11.94 |
 
 **An EXL3 model does NOT imply the EXL3 fused forward.** `detect_moe_blocks`
 reads the layout off the module tree: an experts module exposing `num_experts`
 is `"fused"`, an `nn.ModuleList` of per-expert submodules is `"module_list"`.
 MiniMax's EXL3 repo ships custom modeling code with per-expert submodules
 (`...block_sparse_moe.experts.10.w1.*`), so it is EXL3-quantized yet runs the
-module-list forward. **Both of the actively-tested models are EXL3, but they are
-on different rows** — and every MiniMax perf number on record is a module-list
+module-list forward. **The actively-tested models sit on three different rows, and
+only one of them is still EXL3** (2026-09-20: MiniMax is EXL3/module-list,
+Qwen3-Next is non-EXL3/fused, Llama-3.3-70B is dense/EXL3) — and every MiniMax perf number on record is a module-list
 number. (Measured 2026-08-02; see
 `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESULTS.md`.)
 
@@ -145,16 +148,26 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 **Vaayu must run ANY model — MoE or dense, EXL3-quantized or not, CUDA or CPU
 compute — on low-resource hardware. Never one specific model, quant format, or
 compute device.** See §0's dispatch table for which code paths currently exist.
-Current on-device targets: Qwen3-235B (94 layers, 128 experts) and MiniMax-M2.7
-(62 layers, 256 experts) — both EXL3-quantized MoE, selected in
-`test_generate.py` — but on **different forwards**: Qwen is fused-layout (EXL3
-fused forward), MiniMax is module-list layout (module-list forward). See §0.
-Dense is also an on-device target — Llama-3.3-70B-Instruct EXL3 4.5 bpw (80
-layers), path in §0 — the gate that covered it (`test_batched_dense_smoke.py`)
-was deleted 2026-09-03, see `todo.md`. Non-EXL3 and
-CPU-compute paths are architecturally supported (gated by `is_exl3` and the
-`compute_device` switch) but not actively tested on-device today. Any code, plan, or fix you produce MUST work for all of
-them without edits — never assume EXL3, never assume CUDA, never assume MoE.
+**Current on-device targets, re-set by the user 2026-09-20 (Qwen3-235B RETIRED and
+deleted — do not test it, do not add it back to a gate):**
+
+| model | layout / quant | forward | role |
+|---|---|---|---|
+| **Qwen3-Next-80B-A3B int4 (AWQ)** | fused, non-EXL3, hybrid attention (36 of 48 layers linear) | `_make_fused_sparse_forward` | fastest here; the perf-tuned path |
+| **MiniMax-M2.7 (EXL3)** | module-list, 62 layers, 256 experts | `_make_modulelist_sparse_forward` | the streamed-MoE case |
+| **Llama-3.3-70B-Instruct EXL3 4.5bpw** | dense, 80 layers | non-MoE forward | the dense case |
+| **Llama-3.2-1B-Instruct** | dense, unquantized | non-MoE forward | seconds-not-minutes smoke |
+| **DeepSeek-V4-Flash-0731** | module-list keys, **fp8 E4M3 / E8M0 scales**, 43 layers, 256 experts, top-6, shared experts, sparse-index attention | — | **ON DISK, CANNOT LOAD** (`deepseek_v4` unknown to transformers 5.5.4, no `auto_map`). Row 47 / 28b. |
+
+Three forwards therefore have a model and **the fused-EXL3 forward no longer does** —
+that is a real coverage loss, not an oversight; say so rather than claiming a change
+there is verified.
+The dense gate that covered Llama-3.3-70B (`test_batched_dense_smoke.py`) was
+deleted 2026-09-03 and has no committed replacement — see `todo.md`. **Non-EXL3 is
+now the most-tested path, not an untested one** (Qwen3-Next); CPU compute remains
+architecturally supported (`compute_device`) but has never run a model here. Any
+code, plan, or fix you produce MUST work for all of them without edits — never
+assume EXL3, never assume CUDA, never assume MoE.
 
 **Rules — apply to every change and every plan:**
 - **Never hardcode a model number.** Expert byte-size, layer count, expert count,
@@ -184,9 +197,13 @@ them without edits — never assume EXL3, never assume CUDA, never assume MoE.
 - **Detection over assumption.** Find MoE blocks, router names, and expert tensor
   roles by probing the module tree / checkpoint keys (as `moe_patch.py` already
   does), not by matching an architecture string.
-- **Test both models.** Any sizing/caching helper gets a test parametrized over at
-  least the Qwen-like and MiniMax-like geometries. A fix that only proves out on
-  Qwen is not done.
+- **Test more than one geometry.** Any sizing/caching helper gets a test parametrized
+  over at least two contrasting geometries — today that means **Qwen3-Next-like**
+  (48 layers, 512 experts, ~1.69 MiB each, hybrid attention) and **MiniMax-like**
+  (62 layers, 256 experts, ~8 MiB each). A fix that only proves out on one is not
+  done. The Qwen3-235B-like geometry (94 layers, 128 experts, 11.28 MiB) stays VALID
+  as a synthetic parametrization even though the checkpoint is gone — existing tests
+  using it must keep passing; just do not claim an ON-DEVICE result from it.
 - **When a model genuinely doesn't fit the hardware, warn — don't silently
   degrade.** (e.g. working set > cache budget → print a WARNING; it's a real limit,
   not a bug to hide.)

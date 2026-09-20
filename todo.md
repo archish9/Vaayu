@@ -192,9 +192,18 @@ It has never been measured post-row-44, and row 44 rewrote exactly the dispatch 
 have gone either way. **Measure it; do not assume it.** The same run also answers whether the expert RAM cache is
 still the binding constraint here, which is what re-priced row 46. Tree clean at `8c5ae12`, suite 2336/16.
 
-**Sequence after that probe (re-ranked 2026-09-20, full reasoning in the brief): 36 (if it fires) → 35 (+11.7 %
-measured, machinery built) → 32 (×1.50 projected, a download and zero code; also the only thing that re-opens 37)
-→ 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
+**TWO TRACKS from 2026-09-20, and they do not compete — one buys speed, the other buys REACH:**
+
+* **SPEED: 36 (if its gate fires) → 35 (+11.7 % measured, machinery built) → 32 (×1.50 projected, a download and zero
+  code; also the only thing that re-opens 37) → 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
+* **REACH: row 47** — close the architecture-generality gaps so the next checkpoint loads at all. Start at **G0 + G1's
+  minimum** (both turn a silent wrong answer into a message, both small). Row **28b** (the DeepSeek-V4 port) sits
+  BEHIND 47: 47 makes 28b cheap, and 28b needs G0/G7/G4 anyway.
+
+**Model set re-set by the user 2026-09-20: Qwen3-235B is RETIRED AND DELETED — do not test it, do not put it in a gate;
+the accumulator gate is now ×2, not ×3, and the fused-EXL3 forward has NO on-device model. DeepSeek-V4-Flash is on disk
+but INCOMPLETE (46 of 48 shards, no `model.safetensors.index.json`) and still cannot load.** `CLAUDE.md` §0/§5 updated
+the same day; `test_generate.py`'s hardcoded default repointed from the deleted checkpoint to Qwen3-Next.
 
 **Superseded, kept for the trail — ROW 42-B IS CLOSED AND SHIPPED**, and it
 re-priced row 46 DOWN to ~2.6 % (see its row). 42-B measured: turn-2 TTFT 30.599 → 4.902 s (**6.24×**), decode
@@ -215,6 +224,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | **1 (NEXT)** | **36 gate re-check** | **MEASUREMENT ONLY, ~30 min, no code.** Two replicates of `row26_decode.py MODEL=qwen3next ARMS=W,U1,P,U2,NOEXP`; strict share = NOEXP `serial` / U-arm `T_unprof`. Was 23.0/23.4 % (pre-30-P) then 26.4/26.7 % (30-P) with `serial` FLAT at ~0.036 s; derived to fire at `T_unprof` ≤ ~0.120 s, and HEAD's 9.06 tok/s IS 0.1104 s → ≈ 32.6 % if `serial` held. Never measured post-row-44, which rewrote the dispatch the NOEXP arm brackets. | open now | strict < 26 % → `serial` FELL, say so in row 36 and move on · 26–30 % → record it, do not build on a near-miss · **≥ 30 % → row 36 is the next build (~1 week), nothing owns it** | ~30 min | [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) |
+| **1b (REACH track, user-requested 2026-09-20)** | **47** | **Close the architecture-generality gaps so the next model is cheap.** Seven gaps from the playbook §6, which recorded them as *"none is currently a row"*. G1 first: `ExpertOffsetIndex` knows ONE key scheme, so every fused-3D checkpoint is unsupported **silently**. | open now — independent of the perf queue | it buys REACH, not tok/s; do not rank it against 36/35/32 on speed | G0+G1-min ~1 day · the rest per gap | row **47** below |
 | **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
 | **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
@@ -1112,7 +1122,7 @@ it must not be "restored", both locked by test.**
 
 | model | dir | L / kv_heads / head_dim / hidden / n_heads / vocab | KV bf16 | forward | shipped `max_seq_len` |
 |---|---|---|---|---|---|
-| Qwen3-235B | `Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw` | 94 / 4 / 128 / 4096 / 64 / 151936 | 0.193 MB/tok | MoE fused-EXL3 | 8192 |
+| ~~Qwen3-235B~~ ⛔ **RETIRED + DELETED 2026-09-20 (user request) — do not test, do not gate** | ~~`Minthy--Qwen3-235B-A22B-Thinking-2507-exl3-5.0bpw`~~ | 94 / 4 / 128 / 4096 / 64 / 151936 | 0.193 MB/tok | MoE fused-EXL3 | 8192 |
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
 | Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 8192 (sdpa) |
 | Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
@@ -1135,7 +1145,7 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | gate | invoke | ~time | catches |
 |---|---|---|---|
 | dense smoke (CLAUDE.md §0's named guard) | **DELETED** 2026-09-03 (`7d806e7`) — `test_batched_dense_smoke.py` no longer exists. No committed replacement | -- | *was:* dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged as of its last real run |
-| MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. Qwen and MiniMax both pass |
+| MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. **×2 since 2026-09-20 (Qwen3-Next + MiniMax); the Qwen3-235B arm is gone with its checkpoint** |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity (8 tokens — a long generation CAN flip at an exact bf16 tie, row 3). MoE: first token + warm reproducibility. Runs on any checkpoint under `auto` since row 3 (2026-09-11); **Llama-3.2-1B passes in ~7 s**. Before row 3 a non-EXL3 checkpoint failed its premise assert |
 | HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` (**`-s` is enforced** — without it the module fails every test with a message naming the flag, before loading anything; G1) | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
 | hidden states (row 18) | `HIDDEN_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_output_hidden_states.py -q -s` | 6 s (1B) / 30 s (MiniMax) | `output_hidden_states` broken: count `num_hidden_layers + 1`, shapes, a shifted or pre-norm entry (values vs stock HF — non-quantized checkpoints only; skips on EXL3), `output_attentions` refused by name. Seen to fail: RED on the unfixed forward, and on a shifted-layer mutant |
@@ -4425,6 +4435,85 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
   `MAX_BATCH_SIZE = 1` (§8 #3), so this path is unreachable.** It has no regression test, deliberately —
   **if batching is ever wired in, this needs one, and `peek_match` still over-reports on hybrids
   (`scheduler.py:237` reads it).**
+
+---
+
+# 47 · [ ] Close the architecture-generality gaps so the NEXT model is cheap — the row that makes Vaayu run many models (added 2026-09-20 at the user's request)
+
+**This is the row that broadens REACH, not speed. It does not rank against the perf queue (36/35/32/46/34)
+on the same axis — those buy tok/s, this buys "the next checkpoint loads at all".** Source of the gap list:
+[`…-IMPL-adding-new-architectures-PLAYBOOK.md`](docs/2026-09-12-IMPL-adding-new-architectures-PLAYBOOK.md) §6,
+which recorded them 2026-09-12 with the note *"None is currently a row; each is a candidate one."* This is that row.
+Row **28b** is the DeepSeek port — ONE architecture. This row is what makes the one after it cheap.
+
+**MODEL SET RE-SET BY THE USER 2026-09-20.** On disk now: **Qwen3-Next-80B int4** (fused non-EXL3, hybrid attn),
+**MiniMax-M2.7 EXL3** (module-list), **Llama-3.3-70B EXL3 4.5bpw** (dense), **Llama-3.2-1B** (small dense),
+**DeepSeek-V4-Flash-0731** (does not load). **Qwen3-235B is RETIRED AND DELETED — do not test it, do not put it in
+a gate.** Consequence to state plainly: **the fused-EXL3 forward now has NO on-device model.** Its perf history
+stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
+
+**DeepSeek-V4-Flash — the board's record of it was STALE; these are measured off the bytes on disk 2026-09-20:**
+- **fp8, not fp4.** `quantization_config` = `{quant_method: fp8, fmt: e4m3, scale_fmt: ue8m0, weight_block_size: [128,128]}`;
+  shard headers show `F8_E4M3` weights with `F8_E8M0` scales. Rows 28/28b's **"fp4 4.2500 bpw"** and **155.42 GiB**
+  describe a DIFFERENT revision — **re-derive every byte number before quoting it.** `du -sh` now says **145 G**.
+- **INCOMPLETE DOWNLOAD: 46 of 48 shards.** `model-00047-of-00048` and `model-00048-of-00048` are ABSENT, and there is
+  **no `model.safetensors.index.json`**. Nothing can load or split until both are fixed. **Row 30's RC5 is the exact
+  failure mode to fear here: the splitter silently dropped tensors when a layer spanned non-adjacent shards and stamped
+  its `.done` marker anyway.** Verify completeness FIRST, and make the splitter refuse an incomplete set (subtask G0).
+- **Its expert keys DO satisfy the offset index** — `layers.4.ffn.experts.0.w1.weight` matches `\.experts\.(\d+)\.`.
+  So gap G1 does NOT block this model. Note the prefix is `layers.N.ffn.…`, not HF's `model.layers.N.mlp.…` → key remap.
+- **It has `shared_experts`** (`layers.N.ffn.shared_experts.w{1,2,3}`) → G7 bites. They are always active, so they
+  belong PINNED, not streamed; nothing does that today.
+- **It has sparse-index attention** (`attn.indexer`, `attn.compressor`, `attn_sink`) → G4 bites.
+- Still `model_type: deepseek_v4` with **no `auto_map`**, so transformers 5.5.4 still cannot build it. **NEW since
+  2026-09-12: the repo now ships `inference/model.py`, `inference/kernel.py`, `inference/convert.py`** — DeepSeek's own
+  reference implementation. Row 28b assumed this had to be written from scratch; it can now be PORTED. Re-cost 28b.
+
+**The seven gaps, in bite-order (G1 first because it is the only one that fails SILENTLY):**
+
+- [ ] **G0 — an incomplete or inconsistent checkpoint must fail LOUDLY at persist time.** 46-of-48 shards with no index
+      is not an exotic case, it is a download that stopped. RC5 shipped a `.done` marker over dropped tensors once.
+      Verify shard-count vs the `-of-NNNNN` suffix and the index's key set before writing anything.
+- [ ] **G1 — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
+      `_EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')`). **Every fused-3D checkpoint is unsupported SILENTLY** — it
+      finds zero experts rather than raising, and the docstring's claim that it "covers … any future architecture"
+      is exactly the trap. Fused-3D (`experts.gate_up_proj` shaped `[E, …]`) is what modern transformers MoE ships.
+      **Minimum: raise a clear error when the config implies experts and the index finds none. Real fix: a persist-time
+      3D splitter.** Do the minimum first — it converts a silent wrong answer into a message.
+- [ ] **G2 — ~~`_make_fused_sparse_forward` (non-EXL3) has never executed on device~~ CLOSED by row 30's S2
+      (2026-09-13).** Qwen3-Next runs it daily and 30-P/44 perf-tuned it. Kept here so the playbook's stale line is
+      not re-copied into a plan.
+- [ ] **G3 — only ONE of the three MoE forwards takes `compute_device`** (`_make_fused_sparse_forward`); the other two
+      read the device off the loaded modules (`moe_patch.py:819`, `:837`). Any device-placement feature wired into one
+      forward silently no-ops in the others — **this is exactly how `VAAYU_CACHE_BIAS` came to do nothing on either
+      model** (SETTLED, do not rebuild that).
+- [ ] **G4 — uniform-attention assumption.** KV sizing, the prefix cache and derived `max_seq_len` assume every layer
+      attends the same way. **Partly paid down already:** row 30 RC4/RC6 and row 42-B handled hybrid linear/full for
+      Qwen3-Next. **Still unhandled: sliding-window and sparse-index attention (DeepSeek-V4).** Check before trusting
+      any TTFT or context number on such a model.
+- [ ] **G5 — slab scale.** `SlabArena` (`vaayu/persist/expert_cache.py:25`) was exercised at ~1,000–1,250 slabs of
+      8–12 MiB. Qwen3-Next is already 24,576 slabs of ~1.6 MiB and works, so this is partly disproven — but
+      `_NVME_READ_CONCURRENCY = 3` (`safetensor_model_persister.py:181`) was tuned at ~11 MiB reads and **has never been
+      re-measured at 1.6 MiB**. Re-measure with `plans/probes/p8_samepath.py`; do not assume it transfers.
+- [ ] **G6 — no CPU expert compute exists at all.** `compute_device` is forced to `"cuda"` for EXL3; the only CPU mode
+      is running a whole non-EXL3 model with `device="cpu"`. A hybrid is new construction, not a flag. **Row 26/28
+      already priced the CPU-AVX2 hybrid and RECOMMENDED IT CLOSED** (+6.8 % Qwen / +22.0 % MiniMax ceiling, and a
+      non-EXL3 model makes it worse) — so treat G6 as REACH-only, never as a perf lever.
+- [ ] **G7 — shared experts have no special handling.** DeepSeek-V4 and GLM-4.5-Air have them; neither previously
+      tested model did. They are always active, so they belong pinned, not streamed. **DeepSeek-V4 on disk now makes
+      this concrete rather than hypothetical.**
+
+**Suggested order:** G0 + G1-minimum first (both turn silent wrongness into a message, both are small), then G7 and G4
+if and only if DeepSeek-V4 is the next target, then G3, then G5's re-measure. G2 is already closed; G6 is closed as a
+perf idea and is reach-only.
+
+**§8:** (1) knob — probably none; a new loader strategy may need a format knob, and if so it lands in
+`vaayu/server/config.py` in the SAME commit with the measured cost of getting it wrong, plus `vaayu/server/README.md`.
+(2)/(3) the model path is already a server parameter, so reach work is reachable at N=1 by construction. (4) nothing
+is banked — a model that loads, loads for users.
+
+**§5:** every fix here is a generality fix; none may hardcode a model number. G1's splitter in particular must derive
+expert count and byte size from the checkpoint, never from a config literal.
 
 ---
 
