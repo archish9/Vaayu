@@ -524,3 +524,50 @@ def test_uniform_cache_carries_nothing_extra():
     cache.to_cpu()
     cache.to_device("cpu")
     assert cache.resident_bytes() == kv_only
+
+
+# ── 42-B: the KV-only side channels stay refused on a hybrid ─────────────────
+#
+# Disk persistence and TurboQuant pooling both carry K/V and nothing else. On a
+# hybrid, a record or a packed entry restored from either would hand the model
+# a recurrent state that never saw those tokens -- silently wrong text, not a
+# crash. Both refuse, loudly (CLAUDE.md section 5).
+
+def test_the_load_probe_records_whether_the_cache_holds_recurrent_state():
+    hybrid = _refusal_stub("auto", _hybrid_config())
+    VaayuBaseModel._refuse_unsupported_prefix_cache(hybrid)
+    assert hybrid._cache_holds_recurrent_state is True
+
+    uniform = _refusal_stub("auto", _uniform_config())
+    VaayuBaseModel._refuse_unsupported_prefix_cache(uniform)
+    assert uniform._cache_holds_recurrent_state is False
+
+    off = _refusal_stub("auto", _hybrid_config())
+    off.enable_prefix_cache = False
+    VaayuBaseModel._refuse_unsupported_prefix_cache(off)
+    assert off._cache_holds_recurrent_state is False
+
+
+def test_prefix_compress_is_refused_on_a_recurrent_cache(capsys):
+    stub = types.SimpleNamespace(prefix_compress=9, auto_prefix_match=True,
+                                 _cache_holds_recurrent_state=True)
+    store = VaayuBaseModel._build_prefix_store(stub, 10 ** 9)
+    assert store.compress_bits is None
+    assert "prefix_compress ignored" in capsys.readouterr().out
+
+
+def test_prefix_compress_is_untouched_on_a_uniform_cache():
+    stub = types.SimpleNamespace(prefix_compress=9, auto_prefix_match=True,
+                                 _cache_holds_recurrent_state=False)
+    assert VaayuBaseModel._build_prefix_store(stub, 10 ** 9).compress_bits == 9
+
+
+def test_kv_persist_refuses_a_recurrent_cache_by_source():
+    """The writer is built inside __init__, which needs a real checkpoint, so
+    this asserts the guard exists and precedes the DiskWriter construction."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
+    guard = src.find("enable_kv_persist=True ignored: this model has recurrent")
+    writer = src.find("self._kv_writer = DiskWriter(")
+    assert guard != -1, "kv_persist has no recurrent-state guard"
+    assert guard < writer, "the guard must run before the writer is built"

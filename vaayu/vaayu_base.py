@@ -3071,6 +3071,12 @@ class VaayuBaseModel(GenerationMixin):
         self._kv_writer = None
         if getattr(self, "enable_kv_persist", False) and self._prefix_cache is None:
             print("[KV] enable_kv_persist=True ignored: enable_prefix_cache is False")
+        elif (getattr(self, "enable_kv_persist", False)
+                and getattr(self, "_cache_holds_recurrent_state", False)):
+            print("[KV] enable_kv_persist=True ignored: this model has recurrent "
+                  "(linear-attention) layers and an on-disk record holds K/V only, "
+                  "so a restored turn would run against a state that never saw the "
+                  "persisted tokens. The in-RAM prefix cache still works (42-B).")
         elif getattr(self, "enable_kv_persist", False):
             import shutil
             from .kv_persist import DiskWriter, KvDiskLoader
@@ -3678,10 +3684,15 @@ class VaayuBaseModel(GenerationMixin):
         reserved 3 sessions for a refused cache on Qwen3-Next, 4.83 GB of RAM
         tier, and un-reserving it measured +17.2 % decode tok/s.
         """
+        # Recorded whether or not the cache is refused: the KV-only side
+        # channels (disk persistence, TurboQuant pooling) read it, and it must
+        # be False -- not absent -- when the prefix cache is off entirely.
+        self._cache_holds_recurrent_state = False
         if not getattr(self, "enable_prefix_cache", False):
             return
-        from .batch import prefix_cache_refusal_reason
+        from .batch import cache_holds_recurrent_state, prefix_cache_refusal_reason
         _probe = self._create_kv_cache()
+        self._cache_holds_recurrent_state = cache_holds_recurrent_state(_probe)
         _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
         if _refusal is not None:
             print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
@@ -5392,6 +5403,12 @@ class VaayuBaseModel(GenerationMixin):
     def _build_prefix_store(self, budget_bytes):
         """Construct the RAM prefix pool, honouring prefix_compress."""
         bits = getattr(self, "prefix_compress", None)
+        if bits is not None and getattr(self, "_cache_holds_recurrent_state", False):
+            print("[Vaayu-Prefix] WARNING: prefix_compress ignored on this model — "
+                  "it has recurrent (linear-attention) layers and the packed "
+                  "container carries K/V only, so a rebuilt entry would restore a "
+                  "state that never saw the pooled tokens. Pooling uncompressed.")
+            bits = None
         if bits is not None and bits < 9:
             print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
                   f"bits/channel that passes the quality gate on both on-device "
