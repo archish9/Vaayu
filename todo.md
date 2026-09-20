@@ -181,8 +181,23 @@ session — read [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row
 clone), then run its ~20 min re-measure FIRST. Do not write code before N* is recomputed from measured
 numbers — the stop rule can close the row.
 
-**UPDATE 2026-09-20 (LATER) — ROW 42-B IS CLOSED AND SHIPPED. START A FRESH SESSION AT ROW 46**, which 42-B
-re-priced DOWN to ~2.6 % (see its row). 42-B measured: turn-2 TTFT 30.599 → 4.902 s (**6.24×**), decode
+**UPDATE 2026-09-20 (FINAL, after 42-B merged) — START A FRESH SESSION AT THE ROW 36 GATE RE-CHECK, NOT AT 46.**
+Cold-pickup brief, self-contained:
+[`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) (gitignored; rows 36 and 46 are the
+durable copies). **It is ~30 min and no code**, and it may promote a ~1-week lever nobody owns: row 36 fires at
+`serial / T_unprof ≥ 30 %`, was 26.4 / 26.7 % on the 30-P build with `serial` FLAT at ~0.036 s across two reads, and
+was derived to fire once `T_unprof` ≤ ~0.120 s. **Row 44 (+ row 30's RAM-ceiling fix) then took Qwen3-Next decode to
+9.06 tok/s = 0.1104 s — under the trigger — which puts the strict share at ≈ 32.6 % if `serial` has not moved.**
+It has never been measured post-row-44, and row 44 rewrote exactly the dispatch the NOEXP arm brackets, so it could
+have gone either way. **Measure it; do not assume it.** The same run also answers whether the expert RAM cache is
+still the binding constraint here, which is what re-priced row 46. Tree clean at `8c5ae12`, suite 2336/16.
+
+**Sequence after that probe (re-ranked 2026-09-20, full reasoning in the brief): 36 (if it fires) → 35 (+11.7 %
+measured, machinery built) → 32 (×1.50 projected, a download and zero code; also the only thing that re-opens 37)
+→ 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
+
+**Superseded, kept for the trail — ROW 42-B IS CLOSED AND SHIPPED**, and it
+re-priced row 46 DOWN to ~2.6 % (see its row). 42-B measured: turn-2 TTFT 30.599 → 4.902 s (**6.24×**), decode
 9.7364 → 9.4868 tok/s (−2.56 %), generated ids sha256 identical across all four ABBA arms, suite 2334/16,
 every on-device gate green, **N\* = 9,512 generated tokens/turn against a ~500 stop rule**. Branch
 `row42b-hybrid-prefix-cache`, commits `6cac130..13f804e`.
@@ -199,7 +214,10 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 |---|---|---|---|---|---|---|
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
-| **1 (NEXT)** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
+| **1 (NEXT)** | **36 gate re-check** | **MEASUREMENT ONLY, ~30 min, no code.** Two replicates of `row26_decode.py MODEL=qwen3next ARMS=W,U1,P,U2,NOEXP`; strict share = NOEXP `serial` / U-arm `T_unprof`. Was 23.0/23.4 % (pre-30-P) then 26.4/26.7 % (30-P) with `serial` FLAT at ~0.036 s; derived to fire at `T_unprof` ≤ ~0.120 s, and HEAD's 9.06 tok/s IS 0.1104 s → ≈ 32.6 % if `serial` held. Never measured post-row-44, which rewrote the dispatch the NOEXP arm brackets. | open now | strict < 26 % → `serial` FELL, say so in row 36 and move on · 26–30 % → record it, do not build on a near-miss · **≥ 30 % → row 36 is the next build (~1 week), nothing owns it** | ~30 min | [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md) |
+| **2** | **35** | Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block. | open | **+11.7 % measured on Qwen3-235B**, gate machinery already built | ~2 days | row **35** below |
+| **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
+| **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
 | **3** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
 
 **Why 45 went first (settled — it is closed):** 45 was the same defect class row 44 had just fixed, on the second
@@ -239,7 +257,7 @@ rows **32 · 34 · 35** and **28b**.
 
 | # | one line | gate that opens it | why it is worth it then | state |
 |---|---|---|---|---|
-| **36** | **CUDA graphs / fused per-layer dispatch.** | **a resident model measures `serial / T` ≥ 30 %** — **MEASURED 2026-09-13 (S3-pre): 23.0 / 23.4 % strict (NOEXP), 32.5 / 32.8 % wide (`other`/T). Straddles the rule; does NOT fire strictly.** **Re-read 2026-09-18 on the 30-P build (S3 re-gate runs): 26.4 / 26.7 % strict, 35.9 / 35.9 % wide — `serial` unchanged at ~0.036 s, the share rose only because the token shrank; still does NOT fire strictly (derived: fires once `T_unprof` ≤ ~0.120 s).** | `serial` is 0.074 s of Qwen's 0.930 s today — 8 %, invisible. Row 29 projected it becomes the LARGEST phase once experts are resident (38 ms of Qwen3-30B-int4's projected 49 ms). Nothing owns it today. | `[ ]` |
+| **36** | **CUDA graphs / fused per-layer dispatch.** | **a resident model measures `serial / T` ≥ 30 %** — **MEASURED 2026-09-13 (S3-pre): 23.0 / 23.4 % strict (NOEXP), 32.5 / 32.8 % wide (`other`/T). Straddles the rule; does NOT fire strictly.** **Re-read 2026-09-18 on the 30-P build (S3 re-gate runs): 26.4 / 26.7 % strict, 35.9 / 35.9 % wide — `serial` unchanged at ~0.036 s, the share rose only because the token shrank; still does NOT fire strictly (derived: fires once `T_unprof` ≤ ~0.120 s).** **RE-CHECK IS NOW THE NEXT TASK ON THE BOARD (2026-09-20): row 44 + row 30's RAM-ceiling fix took Qwen3-Next decode to 9.06 tok/s = `T_unprof` 0.1104 s, UNDER the trigger, so the strict share is ≈ 32.6 % if `serial` still sits at ~0.036 s — but row 44 rewrote the very dispatch the NOEXP arm brackets (F5 replaced a per-expert `torch.where` one-hot mask, ~960 tiny H2D copies/token), so `serial` may have moved either way. MEASURE IT, do not estimate — the row says so. Brief: [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md).** | `serial` is 0.074 s of Qwen's 0.930 s today — 8 %, invisible. Row 29 projected it becomes the LARGEST phase once experts are resident (38 ms of Qwen3-30B-int4's projected 49 ms). Nothing owns it today. | `[ ]` |
 | **37** | **Re-gate speculative decoding on MoE.** The gate refuses Qwen with `off_union` — observed verify union **19.31 GB against a ~17 GB budget**. That is a **byte** bound. | row 30's S2, or row 32's lower-bpw build, lands | At 3.0 bpw Qwen's union falls to ~11.6 GB and fits. The break-even acceptance falls too: with experts resident, extra drafted positions cost ~0 extra disk bytes, which is the dominant term today. Machinery is BUILT (`speculative/adaptive_gate.py`, row 13's `even-4` trial, P9's +4.16 %). **Prefer a checkpoint that ships an MTP module** — a free drafter, no vocab mismatch, no second load. | `[ ]` **Gate MET 2026-09-13 (S2 landed). CLOSED FOR HYBRIDS 2026-09-19 (row 42 (b): verify 2.6–4.8× t_dec, drafter needs p ≥ 0.87). Open only for row 32's route.** |
 | **38** | **Mixed-bpw by expert hotness** — hot experts high bpw, cold tail 2–3 bpw. | **trace arithmetic clears a 20 % byte reduction** | NOT the refuted pinning idea: Plan F/B-ph2 refuted **residency** by hotness; this is **precision**, which pays on every disk read whether or not the expert is ever cached. Plan F's "share is linear in N" is the argument FOR it — the tail holds most of the bytes. Likely loses to row 32 at a fraction of the effort; do the arithmetic first. | `[ ]` |
 | **39** | **Expert slimming** — structured row / N:M prune of the intermediate dim, re-pack, stream fewer bytes per expert. | rows 31–35 measured | Research, not engineering; quality risk real and unbounded. Priced honestly: a 30 % row prune is a 30 % byte cut — roughly what downloading a 3.5 bpw build gets for free in an afternoon. | `[ ]` |
@@ -3773,7 +3791,27 @@ per model. **Only pays while experts stream — dies if row 30's S2 lands.**
 
 ---
 
-# 36 · [ ] CUDA graphs / fused per-layer dispatch — CONDITIONAL (added 2026-09-12)
+# 36 · [ ] CUDA graphs / fused per-layer dispatch — CONDITIONAL — **ITS GATE RE-CHECK IS THE NEXT TASK ON THE BOARD (2026-09-20)** (added 2026-09-12)
+
+**NEXT UP, ~30 min, no code.** Brief: [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md)
+(gitignored; this row is the durable copy). The gate has been read twice and never fired — 23.0 / 23.4 % (2026-09-13,
+pre-30-P) then 26.4 / 26.7 % (2026-09-18, 30-P) — with **`serial` FLAT at ~0.036 s both times**; the share rose only
+because the token shrank, and the row was derived to **fire once `T_unprof` ≤ ~0.120 s (~8.3 tok/s)**. **Row 44 and
+row 30's RAM-ceiling fix then took Qwen3-Next decode to 9.06 tok/s — `T_unprof` = 0.1104 s, UNDER the trigger — which
+puts the strict share at ≈ 32.6 % if `serial` has not moved.** Row 42-B's own A/B corroborates the token size
+(9.4868 tok/s server-default / 9.7364 cache-off → 0.1054 / 0.1027 s → 34–35 %), but **that is `stream_generate`
+end-to-end decode, not the U arm the gate is defined on — corroboration, not the gate.**
+**It could equally have FALLEN:** row 44's F5 replaced the per-expert `torch.where` one-hot dispatch (~960 tiny H2D
+copies per decode token) and that work is inside what the NOEXP arm brackets. Never measured post-row-44.
+**Run:** two replicates of `systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0 env PYTHONPATH=$PWD
+MODEL=qwen3next BALLAST_GB=25 NEW_TOK=64 ARMS=W,U1,P,U2,NOEXP TAG=-r36recheck<N>
+./venv/bin/python plans/probes/row26_decode.py`, one GPU job at a time; arithmetic via
+`docs/probes/s3regate_table.py`. **strict = NOEXP `serial` / mean(U1,U2) `T_unprof`** — never the `P` arm
+(`profiling_mode` runs FASTER than the real thing on fused-EXL3, ×0.85–0.87, row 27).
+**Decision: ≥ 30 % → row 36 becomes the next build (~1 week), and nothing else on this board owns `serial`.
+26–30 % → record the number here, do NOT build on a near-miss. < 26 % → `serial` FELL, which is itself new
+information (it was flat across two builds) — say so here.** Write the number, the date and the build sha into this
+row either way. The same run also decomposes the token, which is what re-priced row **46**.
 
 `serial` is **0.074 s of Qwen's 0.930 s today — 8 %, invisible.** Row 29 projected that for a **resident** candidate the
 per-layer serial term becomes the **largest** phase: **38 ms of Qwen3-30B-int4's projected 49 ms**. Nothing in this file
