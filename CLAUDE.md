@@ -157,7 +157,7 @@ deleted — do not test it, do not add it back to a gate):**
 | **MiniMax-M2.7 (EXL3)** | module-list, 62 layers, 256 experts | `_make_modulelist_sparse_forward` | the streamed-MoE case |
 | **Llama-3.3-70B-Instruct EXL3 4.5bpw** | dense, 80 layers | non-MoE forward | the dense case |
 | **Llama-3.2-1B-Instruct** | dense, unquantized | non-MoE forward | seconds-not-minutes smoke |
-| **DeepSeek-V4-Flash-0731** | module-list keys, **fp8 E4M3 / E8M0 scales**, 43 layers, 256 experts, top-6, shared experts, sparse-index attention | — | **ON DISK, CANNOT LOAD** (`deepseek_v4` unknown to transformers 5.5.4, no `auto_map`). Row 47 / 28b. |
+| **DeepSeek-V4-Flash-0731** | module-list keys; **routed experts I8 + E8M0 scales (147.2 GB), shared experts and attention F8_E4M3** — two formats, and `config.json` names only one; 43 MoE layers, 256 experts top-6, 1 shared expert, 12.750 MiB/expert, MLA + sparse-index attention (`index_topk 512`) | — | **ON DISK AND COMPLETE (48/48 shards, 157 G), STILL CANNOT LOAD** (`deepseek_v4` unknown to transformers 5.5.4, no `auto_map`). Rows 47 → 28b. |
 
 Three forwards therefore have a model and **the fused-EXL3 forward no longer does** —
 that is a real coverage loss, not an oversight; say so rather than claiming a change

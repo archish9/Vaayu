@@ -1126,7 +1126,7 @@ it must not be "restored", both locked by test.**
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
 | Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 8192 (sdpa) |
 | Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
-| **DeepSeek-V4-Flash-0731** ⛔ **DOES NOT LOAD** | `deepseek-ai--DeepSeek-V4-Flash-0731` | 43 / 1 / 512 / 4096 / 64 / 129280 · 256 experts, top-6, **fp4 4.2500 bpw**, 12.750 MiB/expert, 155.42 GiB (137.06 experts + 8.24 dense + 10.12 MTP draft) | n/a | none — `deepseek_v4` unknown to transformers 5.5.4, no HF remote code in repo, TileLang kernels absent (row 28) | n/a |
+| **DeepSeek-V4-Flash-0731** ⛔ **COMPLETE ON DISK 2026-09-20 (48/48, 157 G) — STILL CANNOT LOAD** | `deepseek-ai--DeepSeek-V4-Flash-0731` | 43 / 1 / 512 / 4096 / 64 / 129280 · 256 experts, top-6, **fp4 4.2500 bpw**, 12.750 MiB/expert, 155.42 GiB (137.06 experts + 8.24 dense + 10.12 MTP draft) | n/a | none — `deepseek_v4` unknown to transformers 5.5.4, no HF remote code in repo, TileLang kernels absent (row 28) | n/a |
 
 (`max_seq_len` is KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15 (rows 6/7), and
 the sdpa reserve floor is raised to flash parity from 2026-08-16 (archived row 8). Every figure above is
@@ -4453,13 +4453,19 @@ a gate.** Consequence to state plainly: **the fused-EXL3 forward now has NO on-d
 stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
 
 **DeepSeek-V4-Flash — the board's record of it was STALE; these are measured off the bytes on disk 2026-09-20:**
-- **fp8, not fp4.** `quantization_config` = `{quant_method: fp8, fmt: e4m3, scale_fmt: ue8m0, weight_block_size: [128,128]}`;
-  shard headers show `F8_E4M3` weights with `F8_E8M0` scales. Rows 28/28b's **"fp4 4.2500 bpw"** and **155.42 GiB**
-  describe a DIFFERENT revision — **re-derive every byte number before quoting it.** `du -sh` now says **145 G**.
-- **INCOMPLETE DOWNLOAD: 46 of 48 shards.** `model-00047-of-00048` and `model-00048-of-00048` are ABSENT, and there is
-  **no `model.safetensors.index.json`**. Nothing can load or split until both are fixed. **Row 30's RC5 is the exact
-  failure mode to fear here: the splitter silently dropped tensors when a layer spanned non-adjacent shards and stamped
-  its `.done` marker anyway.** Verify completeness FIRST, and make the splitter refuse an incomplete set (subtask G0).
+- **COMPLETE as of 2026-09-20 (re-checked): 48/48 shards, `model.safetensors.index.json` present, 72,317 tensors,
+  every index ref resolves on disk, 157 G.** (It was 46/48 earlier the same day — verify before trusting.)
+- **TWO QUANT FORMATS IN ONE CHECKPOINT, and `config.json` tells you only one of them.** `quantization_config` says
+  `{quant_method: fp8, fmt: e4m3, scale_fmt: ue8m0, weight_block_size: [128,128]}`, but the tensor dtypes say:
+  **routed experts are `I8` (int8) weights + `F8_E8M0` scales** — that is the 147.2 GB bulk — while **shared experts
+  and attention are `F8_E4M3` + `F8_E8M0`**, norms are BF16, `attn_sink` is F32, and `ffn.gate.tid2eid` is I64.
+  **Dequant must handle both, and rows 28/28b's "fp4 4.2500 bpw" is simply wrong — re-derive every byte number.**
+- **Geometry, measured off the index, not the config:** 43 MoE layers (0–42, **every** layer is MoE — no dense prefix),
+  256 routed experts + **1 shared expert** per layer, 6 tensors per expert (`w{1,2,3}.{weight,scale}`),
+  **one expert = 12.750 MiB** (that figure in row 28 was right), **all routed experts = 147.2 GB**.
+- **Attention is MLA + sparse-index:** `q_lora_rank 1024`, `num_key_value_heads 1`, `num_attention_heads 64`,
+  `index_topk 512`, keys `attn.wq_a/wq_b/wkv/q_norm/kv_norm/attn_sink/indexer.*/compressor.*`. G4 bites hard here —
+  this is not a sliding window, it is low-rank KV plus a learned index.
 - **Its expert keys DO satisfy the offset index** — `layers.4.ffn.experts.0.w1.weight` matches `\.experts\.(\d+)\.`.
   So gap G1 does NOT block this model. Note the prefix is `layers.N.ffn.…`, not HF's `model.layers.N.mlp.…` → key remap.
 - **It has `shared_experts`** (`layers.N.ffn.shared_experts.w{1,2,3}`) → G7 bites. They are always active, so they
@@ -4471,9 +4477,11 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
 
 **The seven gaps, in bite-order (G1 first because it is the only one that fails SILENTLY):**
 
-- [ ] **G0 — an incomplete or inconsistent checkpoint must fail LOUDLY at persist time.** 46-of-48 shards with no index
-      is not an exotic case, it is a download that stopped. RC5 shipped a `.done` marker over dropped tensors once.
-      Verify shard-count vs the `-of-NNNNN` suffix and the index's key set before writing anything.
+- [ ] **G0 — an incomplete or inconsistent checkpoint must fail LOUDLY at persist time.** This checkpoint WAS 46-of-48
+      with no index for part of 2026-09-20 — a download that stopped, not an exotic case — and RC5 already shipped a
+      `.done` marker over dropped tensors once. Verify shard count against the `-of-NNNNN` suffix AND that every
+      `weight_map` ref resolves, before writing anything. Still worth building after this checkpoint completed: the
+      next one will not be complete either.
 - [ ] **G1 — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
       `_EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')`). **Every fused-3D checkpoint is unsupported SILENTLY** — it
       finds zero experts rather than raising, and the docstring's claim that it "covers … any future architecture"
@@ -4502,6 +4510,29 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
 - [ ] **G7 — shared experts have no special handling.** DeepSeek-V4 and GLM-4.5-Air have them; neither previously
       tested model did. They are always active, so they belong pinned, not streamed. **DeepSeek-V4 on disk now makes
       this concrete rather than hypothetical.**
+
+**WHAT ACTUALLY HAS TO BE IMPLEMENTED FOR DeepSeek-V4-Flash — and row 47 ALONE DOES NOT DO IT.**
+Row 47 removes silent failures and makes the NEXT checkpoint cheap. Making THIS one run is row **28b**, and the
+split is:
+
+| # | work | row | why |
+|---|---|---|---|
+| 1 | **G0** incomplete-checkpoint guard · **G1-minimum** raise instead of finding zero experts | **47** | ~1 day, independent of everything, and it is what stops a silent wrong answer later |
+| 2 | **G7** shared experts pinned, not streamed (this model has exactly 1/layer, always active) | **47** | 28b needs it; nothing does it today |
+| 3 | **G4** KV sizing / `max_seq_len` for **MLA + sparse-index** attention (`q_lora_rank 1024`, `kv_heads 1`, `index_topk 512`) | **47** | 28b needs it; hybrid linear/full was paid down by rows 30/42-B, this is NOT that case |
+| 4 | **Dequant for BOTH formats** — I8+E8M0 block-scaled routed experts AND F8_E4M3+E8M0 shared/attention | **28b** | the bulk of the bytes is int8; do not assume the config's fp8 |
+| 5 | **HF modeling code + `auto_map`**, ported from the repo's own `inference/model.py` (MiniMax is the precedent) | **28b** | `deepseek_v4` is unknown to transformers 5.5.4 and there is no remote code |
+| 6 | **Key remap** `layers.N.ffn.experts.M.w{1,2,3}` → the module tree the forward expects | **28b** | keys are DeepSeek's own, not HF's `model.layers.N.mlp.…` |
+| 7 | **Kernels on sm_120** — MLA and the DSA indexer/compressor | **28b** | **the hard part, and the abandon gate: if these will not build or validate, stop at step 1** (~2 days lost, not weeks) |
+
+**Do NOT start at 28b.** Do 1–3 inside row 47 first: each is small, each is needed by 28b anyway, and G1-minimum is
+the one that converts "finds zero experts and proceeds" into an error. **G1's full fused-3D splitter is NOT needed for
+this model** — its keys already match `.experts.N.` — so build the raise, not the splitter, unless a fused-3D
+checkpoint actually arrives.
+
+**G5 is NOT a blocker here (re-checked 2026-09-20):** 12.750 MiB/expert sits inside the 8–12 MiB band the slab arena
+was tuned at, and Qwen3-Next already runs 24,576 slabs against this model's ~11,008. Only `_NVME_READ_CONCURRENCY`
+remains unverified, and at 12.75 MiB reads it is close to its original tuning point.
 
 **Suggested order:** G0 + G1-minimum first (both turn silent wrongness into a message, both are small), then G7 and G4
 if and only if DeepSeek-V4 is the next target, then G3, then G5's re-measure. G2 is already closed; G6 is closed as a
