@@ -193,7 +193,8 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 |---|---|---|---|---|---|---|
 | ~~1~~ | ~~**45**~~ | **DONE 2026-09-19 — it fired (3.659× at 2k, 14.216× at 8k) and the retention shipped: 2k TTFT 107.07 → 38.91 s (2.75×), 8k 430.36 → 78.70 s (5.47×), logits bit-identical, decode null, every gate green.** Original text: **MEASUREMENT FIRST, no code.** Does the module-list forward (MiniMax-M2.7) re-read its experts per prefill chunk, the way the fused one did? It is the ONLY one of row 44's four levers that this forward still lacks — F5's dispatch and F6's overlap are already in it, and F1 never applied (EXL3 pools were always 8). Nothing amortises it either: the prefill stager is EXL3-**and-fused**, so MiniMax never gets one. | none — start here | `routed_sum / routed_union` at 2k **< 1.5×** → close the row with the number | ~½ day to measure, ~1–2 days if it fires | [`…-row45-modulelist-chunk-retention-BRIEF.md`](docs/2026-09-19-row45-modulelist-chunk-retention-BRIEF.md) |
 | **1 (NEXT)** | **42-B** | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
-| **2** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
+| **2** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). Row 30 measured returning 4.83 GB as **+15.09 % decode**. | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
+| **3** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
 
 **Why 45 went first (settled — it is closed):** 45 was the same defect class row 44 had just fixed, on the second
 actively-tested model, and cheap to answer (one instrumented prefill). It fired at 3.659× and shipped a 2.75× / 5.47×
@@ -4330,6 +4331,38 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
 - [ ] Build plan in `docs/superpowers/plans/` with those numbers and the reservation decision.
 - [ ] Build + verify: suite, same-day ABBA (round-1 TTFT, round-2 TTFT, decode), logit sha256 identical on the
   restore path, server gate Qwen3-Next, accumulator ×3, Llama-3.2-1B prefix gate.
+
+---
+
+# 46 · [ ] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B)
+
+**Split out of row 42-B on 2026-09-20 at the user's call: 42-B lifts RC7 with the reservation AS-IS,
+this row prices the reservation on its own, on the two models that pay it TODAY.** Splitting keeps
+42-B's ABBA attributable (one change, one number) and puts this lever where its payoff actually is —
+it needs no hybrid at all.
+
+**The number.** `derive_expert_ceiling` (`vaayu/vaayu_base.py:354`, called `:2651`) subtracts
+`PREFIX_SESSIONS × MAX_SEQ_LEN × kv_bytes_per_token` from the expert RAM tier. Measured off real load
+lines: **Qwen3-235B reserves 3 × 1.58 = 4.74 GB, MiniMax-M2.7 3 × 2.08 = 6.24 GB**, and Qwen3-Next
+would reserve 3 × 1.61 = 4.83 GB the day 42-B lifts RC7 (today it reserves **0** — the row-30 fix,
+ceiling 18.03 GB). **A stored 8k session holds 0.20 GB and a 2k one 0.05 GB**, so the default
+over-reserves **8× at 8k and 32× at 2k**. Row 30 measured returning 4.83 GB of it as **+15.09 %
+decode** on Qwen3-Next, so the prize here is of that order on two more models.
+
+**THE TRAP, and it is why this is a row and not a one-liner (row 31, SETTLED — read it first).** Row 31
+already refuted *cutting sessions*: `PREFIX_SESSIONS=1` measured **−8.9 %** on the two-session / 7.4k
+workload, where the turn-2 match collapsed **7422/7517 → 44/7517** and TTFT went **25.0 → 51.3 s**.
+Reuse does not degrade — it goes to ZERO one session past capacity (Plan I). Reserving less per session
+fails the SAME way and for a subtler reason: **the expert arena is pinned at load and cannot shrink**,
+so an under-reservation that guessed prompt lengths too low buys exactly row 31's collapse the first
+time real prompts grow. Any design here must say what happens when the guess is wrong.
+
+- [ ] Price offline first (`vaayu/expert_sim.py`, `plans/probes/row31_price.py` — row 31's own tooling).
+- [ ] Decide the mechanism: reserve to a measured typical length; grow the reservation dynamically; or
+      shrink the pool instead of the arena. Each must answer the over-capacity case.
+- [ ] Measure on Qwen3-235B AND MiniMax (§5 — a fix proved on one model is not done), including **row
+      31's 7.4k two-session arm**, which is the arm that kills a naive version.
+- [ ] §8: `PREFIX_SESSIONS` and `MAX_SEQ_LEN` are existing knobs; say whether the sizing needs a new one.
 
 ---
 
