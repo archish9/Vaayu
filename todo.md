@@ -4367,6 +4367,26 @@ Row 42 measured the mechanics (40.1 MB bf16 snapshot, exact restore) — design 
   **§8: no new knob, already plumbed, REACHABLE at N=1 on server defaults, nothing banked.** Still refused and
   re-verified against live code after the lift: `copy_prefix`, speculative decoding + its independent crop
   backstop, `enable_kv_persist`, `prefix_compress`, and the bare `DynamicCache` from `kv_cache_mode="fp16"`.
+- [x] **Final whole-branch review found ONE Critical the five per-task reviews structurally could not
+  (each saw one commit, and the breaking store site is PRE-EXISTING) — FIXED 2026-09-20, `8618303`.**
+  `restore_on_abort` (`prefix_cache.py`) crops a checked-out entry back to the matched length and re-pools
+  it when a turn dies mid-flight. `crop()` shortens `_seq_len` ONLY — it never rolls back the recurrent
+  state (that is why `_trim_kv_cache` refuses a recurrent cache) — so an aborted hybrid turn banked an
+  entry whose KV claimed `keep` positions while its state described more, **and the serving gate could not
+  see it, because the gate reads `get_seq_length()`, which IS the KV length.** The next turn would be
+  served against a state that already consumed the tokens it was about to re-run: silently wrong text, no
+  crash. Now refused with a warning whenever the crop would actually shorten a recurrent cache; the
+  no-crop case (abort before any forward completed) still restores. Mutation-tested: with the guard
+  disabled the new test fails. **General lesson worth keeping: a guard that validates an invariant using
+  the same accessor the breaking writer uses cannot detect that writer.**
+- [x] **BANKED LIMITATION (`a3b90dc`): `batched_generate` refuses the prefix cache on a recurrent cache.**
+  Lifting RC7 made `pc` non-`None` on hybrids for the first time, which newly broke two batched sites —
+  `broadcast_cache_rows` walks the KV buffer lists only (KV goes to batch N, the state stays batch 1), and
+  `slice_cache_row_unpadded` raises on a hybrid, so every batched store-back warned "LOST from the pool".
+  Both are now skipped with one warning. **Worth ZERO to users today and costs nothing: the server runs
+  `MAX_BATCH_SIZE = 1` (§8 #3), so this path is unreachable.** It has no regression test, deliberately —
+  **if batching is ever wired in, this needs one, and `peek_match` still over-reports on hybrids
+  (`scheduler.py:237` reads it).**
 
 ---
 
