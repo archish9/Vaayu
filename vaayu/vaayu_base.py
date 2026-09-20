@@ -5962,6 +5962,24 @@ class VaayuBaseModel(GenerationMixin):
                           f"VRAM cache for N={N} (free target {_target / 1e9:.2f} GB)")
 
             pc = getattr(self, "_prefix_cache", None)
+            if pc is not None and getattr(self, "_cache_holds_recurrent_state", False):
+                # Recurrent (linear-attention) state is fixed-size, batch-1, and
+                # keyed to one session's exact token history -- broadcast_cache_rows
+                # below only widens the KV buffers (_BUFFER_LISTS), so a lookup hit
+                # would leave conv_states/recurrent_states at batch 1 while the KV
+                # grew to batch N, raising in the next forward. The store-back side
+                # is just as broken: slice_cache_row_unpadded has no notion of a
+                # per-row recurrent state to splice out, so every batched store-back
+                # would warn "LOST from the pool" (CLAUDE.md §5: warn, don't
+                # silently degrade). Not reachable through the server today
+                # (MAX_BATCH_SIZE=1), so refusing cleanly is enough -- there is no
+                # batched hybrid path to make correct yet.
+                print("[Vaayu-Prefix] WARNING: batched_generate does not support "
+                      "the cross-turn prefix cache on a model with recurrent "
+                      "(linear-attention) state -- skipping both the lookup and "
+                      "the store-back for this batch; every stream prefills in "
+                      "full.")
+                pc = None
             common_ids = batch_common_prefix(requests) if pc is not None else []
             kv, m = (pc.lookup(None, common_ids, device=device)
                      if common_ids else (None, 0))
