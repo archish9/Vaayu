@@ -4164,12 +4164,34 @@ step 3 re-price the CPU hybrid only then.
   <= +12.8 % (deterministic, hours) · B <= +6 % (last) · first two together +53.6 %.** Not claimed:
   per-depth rates — reads are 3.04 per expert and strongly non-uniform (dt p50 0.119 vs p90 5.20 ms),
   so a uniform-bytes depth model returns 8.47 GB/s at depth 2, above the drive's 7.45 spec.
-- [ ] **NEXT OUT OF THE RE-RANK — the cheap deterministic one: row 34 is ALIVE on MiniMax.** todo
-  calls it "dead on Qwen3-Next" (true, and irrelevant to this forward). Worth **<= +12.8 %** and its
-  first arm is an environment variable: **`VAAYU_RING_POOL_N=4`** (`_ring_pool_size()` pins the pool
-  at `_NVME_READ_CONCURRENCY = 3`; P8 says the device tolerates ~4 concurrent reads before
-  throughput falls), then the read-shape question — **3.04 reads per 8.875 MB expert, one large
-  `trellis` range plus small `suh/svh/mcg` ones**. ~1 h for the A/B.
+- [x] **MEASURED 2026-09-21 — the ring-pool arm ran, the hypothesis was BACKWARDS, and it found a
+  win one step the OTHER way.** Detail:
+  [`…-row49-ringpool-AB-RESULTS.md`](docs/2026-09-21-row49-ringpool-AB-RESULTS.md). MiniMax, U arms,
+  29G scope, foreground, ABBA (`4,3,3,4` then `2,3,2`), ids identical in every arm, bytes/token and
+  reads/token identical across all eight runs. **Pooled s/token: n=1 0.5536 (−5.70 %) · n=2 0.5123
+  (+1.89 %) · n=3 0.5220 (SHIPPED) · n=4 0.5328 (−2.07 %).** Both n=4 arms sit above every n=3 arm
+  and both n=2 arms below every one, in both orderings; within-arm spread 0.04–0.40 %. **The
+  mechanism is the delivered RATE, not the duty cycle: duty is flat at 75.5–76.3 % while the rate
+  goes 6.08 → 6.03 → 5.90 GB/s**, and the in-flight histogram shows 3→4 moving span mass out of
+  depth-1 (16.1 → 12.9 %) into depth 4–6 — more reads in flight, less bandwidth. n=1 fails
+  differently (duty RISES to 78.1 %, rate collapses to 5.50). P5's arena trap ruled out (slabs
+  1250–1259, uncorrelated — the slowest run has the largest arena). **This refines P8: its
+  standalone probe measured "FLAT at ~7.09 GB/s for 2–4 rings" and the code took 3 from the middle
+  of that zone (`safetensor_model_persister.py:181`, `ecb5c2f`); IN PATH the 2–4 zone is not flat,
+  it falls monotonically, and never reaches 7.09.** The concurrency axis is now EXHAUSTED — single
+  interior optimum, code one step off it.
+- [ ] **`_NVME_READ_CONCURRENCY = 3` → 2 is a ONE-LINE +1.89 %, NOT YET SHIPPED — it is SHARED INFRA
+  and needs three more paths first.** (1) Qwen3-Next decode (expect null, disk is 0.42 % of its
+  token — measure, do not assume) · (2) MiniMax prefill/TTFT, a different caller-concurrency regime
+  · (3) **Llama-3.3-70B dense, ~37 GB read per token, the most disk-bound path here AND the one with
+  no committed gate** since `test_batched_dense_smoke.py` was deleted 2026-09-03 · (4) the gate set.
+  **§8: no new knob (`VAAYU_RING_POOL_N` is already the override), nothing to plumb, REACHABLE at
+  N=1 on every MiniMax request.**
+- [ ] **What is left of the rate ceiling after n=2: the READ SHAPE.** The lever's ceiling was
+  ≤ +12.8 % (6.03 → 7.1 GB/s at the same duty); n=2 collects 1.89 of it. The rest, if it exists, is
+  **3.04 reads per 8.875 MB expert — one large `trellis` range plus small `suh/svh/mcg` ones**, dt
+  bimodal p50 0.119 / p90 5.20 ms. (Row 44's F4 coalescing was REVERTED on its stop rule, but on the
+  OTHER forward — read that first.)
 - [ ] **The big one, and the only one needing PREDICTION: fill the 1.57 ms/layer drive-idle gap
   (>= +31 %).** Do NOT scope a fresh build first — `VAAYU_LOOKAHEAD` is the one built form of this
   and it measured **-3.7 % on MiniMax** (row 35). Re-gate that machinery against THIS number
