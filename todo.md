@@ -5032,6 +5032,25 @@ for a fused checkpoint are computed and unconsumed** until A3 (whole-layer, uses
 `fused_layer_tensors`) or A6 (per-expert streaming, uses `index`). They cost microseconds and exist
 so the layout is described once, not twice.
 
+**A3 IS IN PROGRESS (started 2026-09-21, branch `row47-a3-gptoss-e2e`). Task 1 — THE ABANDON GATE —
+PASSED: packed MXFP4 RUNS on this box, no dequant fallback.** Stock transformers 5.5.4,
+`device_map="cuda:0"`, no Vaayu: `experts class: Mxfp4GptOssExperts`, `quantization_config.dequantize
+= False`, loaded in 13.6 s, **peak VRAM 13.79 GB** (of 16.31 GB — it fits whole, so streaming is a
+budget win here, not the only way in). `triton_kernels_hub` fetched from the Hub at run time (42
+files) and the sm_120 build ran — that fetch is a live NETWORK dependency of this model, and nothing
+caches it in the repo. **Reference for Task 4's comparison** (`plans/probes/a3_out/reference.json`,
+gitignored — these numbers are the durable copy): prompt `"def fibonacci(n):"` = ids
+`[1314, 165916, 2406, 3127]`, last-position logits
+`sha256 7bfd3bb02c1a28280a1adaf3b3c608eccbd74d4df961f1901ef4f36f8f855fc1`, top-5 ids
+`[59, 538, 793, 622, 220]`, top-5 logits `[16.25, 14.5, 14.4375, 14.3125, 14.0625]`. Probe:
+`plans/probes/a3_mxfp4_gate.py`, log `docs/probes/a3-mxfp4-gate.log`.
+**One correction to the plan's premise, found by the gate and it shapes Tasks 3/4: the experts
+module's MXFP4 weights are NOT `nn.Parameter`s.** `experts.named_parameters()` returns only
+`gate_up_proj_bias (32, 5760) float32` and `down_proj_bias (32, 2880) float32`; the `_blocks` /
+`_scales` tensors are not in it. A3 task 3's `fused_param_experts` still detects the module (the
+biases lead with the expert axis), but task 4 cannot "populate the module's parameters" as written —
+whatever the seam sets, it is not a parameter assignment.
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
