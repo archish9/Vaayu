@@ -17,6 +17,7 @@ from accelerate import init_empty_weights
 
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer, HfQuantizer
+from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 
 from .profiler import LayeredProfiler
 from .persist.loader_strategy import build_loader_strategy, LoaderStrategy
@@ -3259,6 +3260,36 @@ class VaayuBaseModel(GenerationMixin):
         except Exception as e:
             print(f"[Vaayu] FP8 compat: deepgemm fallback patch failed: {e}")
 
+    # Hardware constant, not a model number (CLAUDE.md §5): the flash-attention
+    # build this box ships (vllm-flash-attn3) implements the attention-SINK path
+    # for Hopper only -- "S aux is currently only supported for Hopper GPUs",
+    # raised from the kernel at the first forward, long after the model loaded.
+    # Re-test this when the kernel is upgraded; it is the kernel's limit, not the
+    # architecture's.
+    _FLASH_SINK_CC_MAJOR = 9
+
+    def _flash_refuses_this_model(self, attn_impl: str) -> str | None:
+        """Why flash attention cannot run THIS model here, or None if it can.
+
+        Vaayu prefers flash_attention_2 and transformers accepts the request --
+        the architecture does support flash -- but acceptance is a check of the
+        model class, not of the kernel build in front of it. A model whose
+        attention carries sinks (an extra learned logit per head, gpt-oss-20b's
+        attention) then loads clean and dies at the first token. Detected off the
+        module tree, never from an architecture string.
+        """
+        if not attn_impl.startswith("flash_attention"):
+            return None
+        if not any(n.rsplit(".", 1)[-1] == "sinks" for n, _ in self.model.named_parameters()):
+            return None
+        if not torch.cuda.is_available():
+            return None
+        cc = torch.cuda.get_device_capability()
+        if cc[0] == self._FLASH_SINK_CC_MAJOR:
+            return None
+        return (f"this model's attention carries sinks and the flash kernel "
+                f"supports them on Hopper only (this GPU is sm_{cc[0]}{cc[1]})")
+
     def init_model(self):
         self._apply_transformers_compat_patches()
         self.model = None
@@ -3278,7 +3309,8 @@ class VaayuBaseModel(GenerationMixin):
         if self.get_use_better_transformer() and better_transformer_available:
             try:
                 with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+                    self.model = AutoModelForCausalLM.from_config(
+                        self.config, dtype=self.running_dtype, trust_remote_code=True)
                     self.model = BetterTransformer.transform(self.model)
                 self._active_attn_impl = "BetterTransformer"
             except Exception:
@@ -3291,9 +3323,30 @@ class VaayuBaseModel(GenerationMixin):
             for attn_impl in attn_candidates:
                 try:
                     with init_empty_weights():
+                        # dtype is the one Vaayu will RUN in, not whatever the config
+                        # happens to name. `from_config` falls back to `config.dtype`,
+                        # which is None for a checkpoint that declares neither `dtype`
+                        # nor `torch_dtype` -- gpt-oss-20b is one -- and a None lands on
+                        # torch's float32 default. That is not a cosmetic difference:
+                        # accelerate's set_module_tensor_to_device casts every injected
+                        # tensor to the dtype the skeleton already has, so an fp32
+                        # skeleton silently turns Vaayu's bf16 weights back into fp32 --
+                        # double the VRAM, uncharged against the pin budget (which is
+                        # measured off the file bytes), and flash-attention refuses the
+                        # layer outright ("only supports fp16, bf16, and fp8_e4m3").
+                        # Every other checkpoint on this box declares bfloat16 and gets
+                        # exactly the skeleton it got before.
                         self.model = AutoModelForCausalLM.from_config(
-                            self.config, attn_implementation=attn_impl, trust_remote_code=True
+                            self.config, dtype=self.running_dtype,
+                            attn_implementation=attn_impl, trust_remote_code=True
                         )
+                    _refused = self._flash_refuses_this_model(attn_impl)
+                    if _refused:
+                        print(f"[Vaayu] attn_impl={attn_impl!r} skipped: {_refused}")
+                        del self.model
+                        clean_memory()
+                        self.model = None
+                        continue
                     self._active_attn_impl = attn_impl
                     break
                 except Exception as _e:
@@ -3332,7 +3385,16 @@ class VaayuBaseModel(GenerationMixin):
             else:
                 self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
                 device_map = self.hf_quantizer.update_device_map(None)
-                self._patch_fp8_quantizer_compat(self.hf_quantizer.quantization_config)
+                # FP8 ONLY. The compat below tells the quantizer to leave every
+                # `experts` container alone, which is right for replace_with_fp8_linear
+                # (it would swap a custom expert container for FP8Experts) and WRONG
+                # for any other quantizer that has real work to do inside that
+                # container: MXFP4 then never installs its experts module, the model
+                # keeps the stock grouped-GEMM forward, the packed weights have no
+                # home, and the failure surfaces as a signature mismatch three layers
+                # down. Applied unconditionally until 2026-09-21 (A3 task 4).
+                if isinstance(self.hf_quantizer, FineGrainedFP8HfQuantizer):
+                    self._patch_fp8_quantizer_compat(self.hf_quantizer.quantization_config)
                 self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()
@@ -4715,9 +4777,22 @@ class VaayuBaseModel(GenerationMixin):
             # is monotonically increasing and tops out at the same total on the
             # last chunk -- so no chunk's slice can ever exceed this size.
             _mask_size = max(1, _past_len_for_pos + _seq_total)
-            attention_mask = torch.ones(_mask_size, _mask_size)
-            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-            attention_mask = attention_mask.to(self.running_device)
+            # ADDITIVE, not boolean. This branch feeds EAGER attention, and every
+            # eager_attention_forward in transformers does `attn_weights =
+            # attn_weights + attention_mask`. A bool mask adds True == 1.0 to the
+            # positions it means to ALLOW and 0.0 to the ones it means to BLOCK,
+            # so nothing is masked and every allowed score carries a +1 bias --
+            # the model attends to its own future. Latent until gpt-oss-20b,
+            # which is the first checkpoint here that cannot take flash or sdpa
+            # (it refuses sdpa, and the flash build has no Hopper-free sink path),
+            # so this branch had never run on a real model. Measured 2026-09-21:
+            # layer-0 attention 26 % off stock, and the model's top-5 came back
+            # reordered. dtype is the run dtype, matching the scores it is added
+            # to, and the size is past+new (never max_seq_len) as before.
+            attention_mask = torch.full(
+                (_mask_size, _mask_size), torch.finfo(self.running_dtype).min,
+                dtype=self.running_dtype, device=self.running_device)
+            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...]
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.

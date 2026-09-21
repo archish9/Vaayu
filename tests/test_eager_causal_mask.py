@@ -71,12 +71,22 @@ seq_total = ids.shape[1]
 
 def _spy_forward(input_ids, **kwargs):
     seen = []
-    real_ones = torch.ones
+    real_ones, real_full = torch.ones, torch.full
     def _spy_ones(*args, **kw):
         if len(args) == 2 and isinstance(args[0], int) and args[0] == args[1]:
             seen.append(args[0])
         return real_ones(*args, **kw)
-    with mock.patch("torch.ones", side_effect=_spy_ones):
+    def _spy_full(*args, **kw):
+        # The mask became ADDITIVE (torch.full of dtype min) in A3: a bool mask
+        # is silently unmasking under eager attention, which adds it to the
+        # scores. The SIZE question this test asks is unchanged, so watch both
+        # constructors rather than pinning the mask to one of them.
+        if args and isinstance(args[0], tuple) and len(args[0]) == 2 \
+                and args[0][0] == args[0][1]:
+            seen.append(args[0][0])
+        return real_full(*args, **kw)
+    with mock.patch("torch.ones", side_effect=_spy_ones), \
+            mock.patch("torch.full", side_effect=_spy_full):
         with torch.no_grad():
             out = model.forward(input_ids=input_ids, use_cache=True,
                                 return_dict=True, **kwargs)
@@ -129,7 +139,7 @@ def _assert_sized_from_past_plus_seq_not_max_seq_len(stage):
     assert max_seq_len > seq_total * 50, (
         "need max_seq_len >> call length to tell the bug from the fix "
         f"(max_seq_len={max_seq_len}, seq_total={seq_total})")
-    assert seen, "eager path never built a square mask via torch.ones(N, N)"
+    assert seen, "eager path never built a square NxN mask (torch.ones/torch.full)"
     # The bug's signature: a mask sized off max_seq_len regardless of the
     # actual past+new length.
     assert max_seq_len not in seen, (
