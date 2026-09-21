@@ -4487,13 +4487,25 @@ class VaayuBaseModel(GenerationMixin):
             # Natively bypass init_empty_weights uninitialized buffer by creating a local un-mocked instance.
             # Guarantees perfectly matched dimensionality outputs specific to the framework (e.g. concatenated Llama vs chunked GptOss)
             rotary_emb_cls = type(self.get_rotary_emb())
-            real_rotary = rotary_emb_cls(config=self.config).to(device=self.running_device, dtype=self.running_dtype)
+            # fp32, NOT running_dtype. The module's `inv_freq` is a table of
+            # FREQUENCIES, and the angle it produces is freq * position, so a
+            # relative error in it grows with the position it multiplies. In bf16
+            # (8 mantissa bits) that error is ~1.5e-3, which is invisible at a
+            # handful of tokens and is NOT invisible later: measured on
+            # gpt-oss-20b 2026-09-21, cos/sin were 0.0039 off stock at position 3
+            # (one bf16 ulp) and 0.51 off -- 38 % of full scale -- at position
+            # 255, and the model's top-1 token changed. Stock transformers keeps
+            # this table in fp32 for every model. The cos/sin THEMSELVES are cast
+            # back to the run dtype below, which is what the layers expect.
+            real_rotary = rotary_emb_cls(config=self.config).to(
+                device=self.running_device, dtype=torch.float32)
 
             # Provide a dummy sequence tensor; many modern RoPE forwards require x purely for querying .device and .dtype
             dummy_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
-            dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=self.running_dtype)
+            dummy_x = torch.empty(1, 1, position_ids.shape[1], dummy_dim, device=self.running_device, dtype=torch.float32)
 
-            return real_rotary(dummy_x, position_ids)
+            cos, sin = real_rotary(dummy_x, position_ids)
+            return cos.to(self.running_dtype), sin.to(self.running_dtype)
         except Exception as e:
             print(f"Native RoPE instantiation failed ({e}), falling back to manual fallback.")
             try:
@@ -4527,9 +4539,52 @@ class VaayuBaseModel(GenerationMixin):
     def get_past_key_value_args(self, past_key_values):
         return {'past_key_values': past_key_values}
 
-    def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
+    @staticmethod
+    def layer_attention_window(layer) -> "int | None":
+        """This layer's attention window, or None if it attends everything.
+
+        Read off the attention module, which is where transformers puts it
+        (`self.sliding_window = config.sliding_window if layer_type ==
+        "sliding_attention" else None`), so any architecture that mixes windowed
+        and full layers is covered without naming one.
+        """
+        window = getattr(getattr(layer, "self_attn", None), "sliding_window", None)
+        return int(window) if isinstance(window, int) and window > 0 else None
+
+    def _windowed_mask(self, mask, window: int):
+        """`mask` with everything older than `window` keys also masked out.
+
+        transformers builds a SECOND mask for the windowed layers and hands each
+        layer the one its type asks for; Vaayu's loop calls the layers itself, so
+        it has to do the same or a windowed layer attends its whole history. The
+        overlay is transformers' own rule -- attend iff `kv_idx > q_idx - window`
+        (`masking_utils.sliding_window_overlay`).
+
+        Cached per (window, size, dtype, device): the mask is rebuilt per forward
+        but is the same for every layer of a given type within it.
+        """
+        size = mask.shape[-1]
+        key = (window, size, mask.dtype, str(mask.device))
+        cached = getattr(self, "_windowed_mask_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        idx = torch.arange(size, device=mask.device)
+        too_old = (idx[None, :] <= (idx[:, None] - window))[None, None]
+        blocked = (False if mask.dtype == torch.bool
+                   else torch.finfo(mask.dtype).min)
+        out = mask.masked_fill(too_old, blocked)
+        self._windowed_mask_cache = (key, out)
+        return out
+
+    def get_attention_mask_args(self, full_attention_mask, len_p, len_s, layer=None):
         if full_attention_mask is None:
+            # No explicit mask: flash gets the window through the attention
+            # module's own `sliding_window` argument, and sdpa's implicit causal
+            # mask has none -- see row 47's G4 follow-up.
             return {}
+        window = self.layer_attention_window(layer) if layer is not None else None
+        if window is not None:
+            full_attention_mask = self._windowed_mask(full_attention_mask, window)
         return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
@@ -5129,7 +5184,8 @@ class VaayuBaseModel(GenerationMixin):
                                 'use_cache': use_cache,
                                 **self.get_past_key_value_args(past_key_values),
                                 **self.get_pos_emb_args(_lp, len_s),
-                                **self.get_attention_mask_args(attention_mask, _lp, len_s),
+                                **self.get_attention_mask_args(attention_mask, _lp, len_s,
+                                                               layer=layer),
                                 **self.get_position_ids_args(position_ids, _lp, len_s),
                             }
 
