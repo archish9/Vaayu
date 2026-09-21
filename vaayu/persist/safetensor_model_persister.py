@@ -178,7 +178,19 @@ _EXPERT_POOL_ACTUAL_N = 1  # actual buffer count allocated, set by init_model_io
 # drive past its knee, and was the ~5.12 GB/s aggregate ceiling row P8 was opened
 # to explain. Caller-side concurrency (buffer pool, MoE executor width, in-flight
 # staging slabs) is a RAM budget and stays at get_expert_pool_size().
-_NVME_READ_CONCURRENCY = 3
+#
+# 2 NOT 3, corrected 2026-09-21 (row 49). P8's standalone probe reported that
+# flat 2-4 zone and this constant took 3 from the middle of it; IN PATH the zone
+# is NOT flat and never reaches 7.09 GB/s. Swept through real decode with a live
+# model (MiniMax-M2.7, ABBA, greedy ids identical at every n): delivered-while-
+# busy 6.08 (n=2) / 6.03 (n=3) / 5.90 (n=4) GB/s, and n=1 collapses to 5.50.
+# Throughput vs n=3: n=2 +1.89 % decode and +1.85 % on a 2k prefill, n=4
+# -2.07 %, n=1 -5.70 %. Null on Qwen3-Next (its disk is 0.42 % of a decode
+# token) and on Llama-3.3-70B dense, both inside their own arm spread. The
+# difference from the probe is everything it left out: 8 loader threads, the GPU
+# stream and the expert-phase host work all contending inside a real token.
+# docs/2026-09-21-row49-ringpool-AB-RESULTS.md.
+_NVME_READ_CONCURRENCY = 2
 
 _RING_INITIALIZED = False   # True after vaayu_rust.init_ring_pool() succeeds
 _FILES_REGISTERED = False   # True after register_files() succeeds

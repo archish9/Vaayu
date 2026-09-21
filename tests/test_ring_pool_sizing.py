@@ -30,8 +30,8 @@ def test_ring_pool_never_exceeds_the_caller_pool(monkeypatch):
     monkeypatch.delenv("VAAYU_RING_POOL_N", raising=False)
     monkeypatch.setattr(P, "_EXPERT_POOL_ACTUAL_N", 1)
     assert P._ring_pool_size() == 1
-    monkeypatch.setattr(P, "_EXPERT_POOL_ACTUAL_N", 2)
-    assert P._ring_pool_size() == 2
+    monkeypatch.setattr(P, "_EXPERT_POOL_ACTUAL_N", 4)
+    assert P._ring_pool_size() == P._NVME_READ_CONCURRENCY
 
 
 def test_env_override_selects_the_ring_count(monkeypatch):

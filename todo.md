@@ -4180,13 +4180,22 @@ step 3 re-price the CPU hybrid only then.
   of that zone (`safetensor_model_persister.py:181`, `ecb5c2f`); IN PATH the 2–4 zone is not flat,
   it falls monotonically, and never reaches 7.09.** The concurrency axis is now EXHAUSTED — single
   interior optimum, code one step off it.
-- [ ] **`_NVME_READ_CONCURRENCY = 3` → 2 is a ONE-LINE +1.89 %, NOT YET SHIPPED — it is SHARED INFRA
-  and needs three more paths first.** (1) Qwen3-Next decode (expect null, disk is 0.42 % of its
-  token — measure, do not assume) · (2) MiniMax prefill/TTFT, a different caller-concurrency regime
-  · (3) **Llama-3.3-70B dense, ~37 GB read per token, the most disk-bound path here AND the one with
-  no committed gate** since `test_batched_dense_smoke.py` was deleted 2026-09-03 · (4) the gate set.
-  **§8: no new knob (`VAAYU_RING_POOL_N` is already the override), nothing to plumb, REACHABLE at
-  N=1 on every MiniMax request.**
+- [x] **SHIPPED 2026-09-21 — `_NVME_READ_CONCURRENCY = 3 → 2`, one line, all three verification
+  paths cleared FIRST (measured with `VAAYU_RING_POOL_N` as the arm variable, so no engine code
+  moved until every one reported).** **MiniMax decode +1.89 % · MiniMax 2k prefill +1.85 %
+  (39.515 vs 40.260 s, ABBA `2,3,3,2`, every n=2 arm below every n=3 arm) · Qwen3-Next decode NULL
+  (0.45 %, arms interleave inside a ~3.5 % between-run spread) · Llama-3.3-70B dense NULL (3.2846 vs
+  3.2895 s/token at 13.86 GB/token, inside the n=3 arm's own 1.6 % spread).** **Numerically inert,
+  proven: ONE greedy-id sha256 per model across n=1/2/3/4** — Qwen3-Next `144f0e3f883e`, MiniMax
+  `7a8c6f3021cc`, dense `963f6991fba0` — and the prefill probe's prompt-end `top` hash is identical
+  in all four prefill runs. **Dense has no committed gate, so those dense arms ARE its coverage for
+  this change.** Gates: suite **2348 passed / 16 skipped** (identical to baseline), accumulator
+  Qwen3-Next 8, accumulator MiniMax 8, **server smoke Qwen3-Next 9 — and its log prints
+  `persistent ring pool initialized n=2`, so the change is verified REACHING the server in the
+  gate's own output**, 1B prefix 1. Also corrected the constant's comment block, which asserted P8's
+  flat-2-4 zone as the reason for 3; and one test (`test_ring_pool_never_exceeds_the_caller_pool`)
+  whose `pool=2 → 2` case the new constant made tautological now uses `pool=4`. **§8: no new knob
+  (`VAAYU_RING_POOL_N` is the override), nothing to plumb, REACHABLE at N=1 on every request.**
 - [ ] **What is left of the rate ceiling after n=2: the READ SHAPE.** The lever's ceiling was
   ≤ +12.8 % (6.03 → 7.1 GB/s at the same duty); n=2 collects 1.89 of it. The rest, if it exists, is
   **3.04 reads per 8.875 MB expert — one large `trellis` range plus small `suh/svh/mcg` ones**, dt
