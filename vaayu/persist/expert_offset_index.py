@@ -69,6 +69,9 @@ class ExpertOffsetIndex:
         return None
 
     def build(self, write_cache: bool = True) -> None:
+        from .checkpoint_integrity import assert_checkpoint_complete
+        assert_checkpoint_complete(str(self.checkpoint_path))
+
         self.index = {}
         for shard_path in sorted(self.checkpoint_path.glob("*.safetensors")):
             layer_name = shard_path.stem
