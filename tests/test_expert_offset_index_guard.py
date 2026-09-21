@@ -43,3 +43,55 @@ def test_missing_config_implies_no_experts(tmp_path):
 
 def test_zero_or_negative_count_implies_no_experts(tmp_path):
     assert _ckpt(tmp_path, {"num_experts": 0}).expected_expert_count() is None
+
+
+import struct
+
+
+def _write_shard(path, tensors: dict):
+    """Minimal safetensors file: {key: (dtype, shape, nbytes)}."""
+    header, offset = {}, 0
+    for key, (dtype, shape, nbytes) in tensors.items():
+        header[key] = {"dtype": dtype, "shape": shape,
+                       "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+    blob = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(blob)) + blob + b"\0" * offset)
+
+
+def test_build_raises_when_config_implies_experts_and_none_were_found(tmp_path):
+    """The gpt-oss shape: experts live in one 3D blob per layer, so the
+    `.experts.N.` regex matches nothing and the index comes back empty."""
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    _write_shard(tmp_path / "model-00001-of-00001.safetensors", {
+        "model.layers.0.mlp.experts.gate_up_proj_blocks": ("U8", [32, 64, 9, 16], 294912),
+        "model.layers.0.mlp.experts.gate_up_proj_scales": ("U8", [32, 64, 9], 18432),
+    })
+    index = ExpertOffsetIndex(str(tmp_path))
+    with pytest.raises(RuntimeError) as excinfo:
+        index.build(write_cache=False)
+    message = str(excinfo.value)
+    assert "32" in message                                   # what was expected
+    assert "gate_up_proj_blocks" in message                   # what was actually seen
+    assert str(tmp_path) in message                           # which checkpoint
+
+
+def test_build_does_not_raise_for_a_dense_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 4}))
+    _write_shard(tmp_path / "model-00001-of-00001.safetensors", {
+        "model.layers.0.self_attn.q_proj.weight": ("BF16", [8, 8], 128),
+    })
+    ExpertOffsetIndex(str(tmp_path)).build(write_cache=False)   # must not raise
+
+
+def test_build_still_indexes_a_per_expert_checkpoint(tmp_path):
+    """Regression guard for every model on disk that works today."""
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 2}))
+    _write_shard(tmp_path / "model-00001-of-00001.safetensors", {
+        "model.layers.0.mlp.experts.0.w1.weight": ("BF16", [4, 4], 32),
+        "model.layers.0.mlp.experts.1.w1.weight": ("BF16", [4, 4], 32),
+    })
+    index = ExpertOffsetIndex(str(tmp_path))
+    index.build(write_cache=False)
+    shard = index.index["model-00001-of-00001"]
+    assert sorted(shard) == [0, 1]

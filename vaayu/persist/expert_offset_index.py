@@ -26,8 +26,11 @@ class ExpertOffsetIndex:
         {layer_name: {expert_idx: {tensor_key: ExpertTensorMeta}}}
 
     Detection: any tensor key matching r'\\.experts\\.(\\d+)\\.' is an expert tensor.
-    This covers Mixtral, DeepSeek, Kimi, Qwen MoE, and any future architecture
-    that follows the `.experts.N.` naming convention.
+    This covers Mixtral, DeepSeek, Kimi and Qwen MoE. It does NOT cover
+    checkpoints that store all experts in one fused tensor per layer (leading
+    expert axis, e.g. `...experts.gate_up_proj_blocks` of shape [E, ...]) --
+    those match nothing here. `_assert_experts_found` turns that into an error
+    rather than an empty index; supporting the layout is a separate change.
     """
 
     CACHE_FILENAME = "vaayu_expert_offsets.json"
@@ -91,8 +94,39 @@ class ExpertOffsetIndex:
                     )
                 )
 
+        self._assert_experts_found()
+
         if write_cache:
             self._write_cache()
+
+    def _assert_experts_found(self) -> None:
+        """Refuse an empty index when the config says there should be experts.
+
+        The index matched nothing, so the model would load, stream no experts,
+        and produce wrong output with no error anywhere -- the failure this
+        guard exists to convert into a message. Deliberately layout-agnostic:
+        it asks "config says E, index holds zero", so it stays correct for the
+        next layout nobody has seen yet, not just the ones known today.
+        """
+        expected = self.expected_expert_count()
+        if expected is None or self.index:
+            return
+        seen = []
+        for shard_path in sorted(self.checkpoint_path.glob("*.safetensors")):
+            with open(shard_path, "rb") as f:
+                hdr_len = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(hdr_len))
+            seen = [k for k in hdr if k != "__metadata__" and "expert" in k.lower()]
+            if seen:
+                break
+        raise RuntimeError(
+            f"{self.checkpoint_path}: config implies {expected} routed experts, but the "
+            f"expert offset index found NONE. Vaayu would stream no experts and produce "
+            f"wrong output silently. Expert-ish tensor keys actually present: "
+            f"{seen[:4] if seen else '(none)'}. If this checkpoint stores experts as one "
+            f"fused tensor per layer rather than as '.experts.<N>.' keys, that layout is "
+            f"not indexed here."
+        )
 
     def _write_cache(self) -> None:
         raw = {}
