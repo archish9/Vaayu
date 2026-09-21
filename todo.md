@@ -5034,7 +5034,9 @@ for a fused checkpoint are computed and unconsumed** until A3 (whole-layer, uses
 `fused_layer_tensors`) or A6 (per-expert streaming, uses `index`). They cost microseconds and exist
 so the layout is described once, not twice.
 
-**A3 IS IN PROGRESS (started 2026-09-21, branch `row47-a3-gptoss-e2e`). Task 1 — THE ABANDON GATE —
+**A3 IS CLOSED — done and verified 2026-09-21, MERGED to `main` (fast-forward `e756e09 → d4e2fd0`,
+nine commits `7c17773..d4e2fd0`); the branch `row47-a3-gptoss-e2e` is gone, so `git log` that range
+for the diffs. Suite on merged main: 2416 passed / 16 skipped. Task 1 — THE ABANDON GATE —
 PASSED: packed MXFP4 RUNS on this box, no dequant fallback.** Stock transformers 5.5.4,
 `device_map="cuda:0"`, no Vaayu: `experts class: Mxfp4GptOssExperts`, `quantization_config.dequantize
 = False`, loaded in 13.6 s, **peak VRAM 13.79 GB** (of 16.31 GB — it fits whole, so streaming is a
