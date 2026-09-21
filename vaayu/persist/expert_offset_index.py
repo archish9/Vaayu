@@ -36,6 +36,35 @@ class ExpertOffsetIndex:
         self.checkpoint_path = Path(checkpoint_path)
         self.index: dict[str, dict[int, dict[str, ExpertTensorMeta]]] = {}
 
+    # Total routed-expert count, by config field name. ORDERED and EXPLICIT, not a
+    # substring scan: `num_experts_per_tok` is the top-k (10 on Qwen3-Next, not 512)
+    # and `shared_expert_intermediate_size` is a width -- a scan for "expert" grabs
+    # both and silently believes the wrong number. Verified 2026-09-20 against the
+    # four checkpoints on this box.
+    _EXPERT_COUNT_FIELDS = ("num_experts", "num_local_experts", "n_routed_experts")
+
+    def expected_expert_count(self) -> int | None:
+        """How many routed experts this checkpoint's config implies, or None.
+
+        None means "this config does not describe a routed-MoE model" -- a dense
+        checkpoint, or one with no config at all. Callers must treat None as
+        "no expectation", never as zero: a dense model legitimately indexes no
+        experts and must not be made to raise.
+        """
+        config_path = self.checkpoint_path / "config.json"
+        if not config_path.exists():
+            return None
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            return None
+        for field in self._EXPERT_COUNT_FIELDS:
+            value = config.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
     def build(self, write_cache: bool = True) -> None:
         self.index = {}
         for shard_path in sorted(self.checkpoint_path.glob("*.safetensors")):
