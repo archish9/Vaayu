@@ -5100,6 +5100,44 @@ discriminator is the CHECKPOINT layout, which is what A2 already records: dispat
 pins the trap (`test_a_per_expert_checkpoints_module_also_reports_fused`), so dispatching on the predicate
 alone fails in unit tests rather than on the tuned model.
 
+**A3 Task 4 DONE (2026-09-21) — gpt-oss-20b RUNS under Vaayu, and the streamed MoE path is
+BIT-IDENTICAL to stock transformers.** `_make_whole_layer_sparse_forward` ships in
+`vaayu/moe_patch.py` with the dispatch of Task 2's decision. **Proof (`plans/probes/a3_moe_block_compare.py`):
+the same fixed input through layer 0, 9, 10 and 23's MoE block gives the SAME sha256 in stock and in
+Vaayu — `max|diff| = 0` on all four** (layer 0 pinned-router, the rest streamed, so A2's per-layer byte
+ranges and the swizzle are proven, not just layer 0's). **Whole-model:** top-5 ids match stock exactly and
+in order (`[59, 538, 793, 622, 220]`), logits within **one bf16 ulp** (16.375 vs 16.25 on the top slot);
+the residual is NOT the MoE path, NOT the rotary buffer (an fp32-inv_freq variant returns a byte-identical
+sha) and NOT the attention implementation (both eager, both bf16 KV) — it is accumulation order, measured
+and bounded, not assumed. Prefill 5.76 s for 4 tokens, **peak VRAM 1.66 GB against stock's 13.79 GB** —
+the experts genuinely stream. Gates: suite **2393 → 2406 passed / 16 skipped** (+13), Qwen3-Next
+accumulator **8 passed**, MiniMax-M2.7 accumulator **8 passed**, Llama-3.2-1B prefix **1 passed**.
+**FIVE root causes, and FOUR of them are bugs in code EVERY model uses — the model only exposed them:**
+**RC1 (`_read_grouped_ranges`, shared reader) took a NEW staging slot PER GROUP.** The A/B pair is safe
+only because one caller holds its slot while the other writes the other one, so cycling both inside one
+call overwrites what the other caller holds. gpt-oss's layer files interleave small non-expert tensors
+between six ~70 MB expert blobs → one read is a dozen groups → **it clobbered the 1.16 GB embedding
+between its read and its injection (absmax 118.5 → 1.36e38), and the model emitted garbage from layer 10
+on, deterministically.** Every checkpoint whose non-expert tensors sit contiguously (Qwen3-Next, MiniMax)
+is ONE group and never saw it. Fix: one slot per call. **RC2 the skeleton was built at `config.dtype`,
+which is None for a checkpoint declaring neither `dtype` nor `torch_dtype` → torch's fp32 default →
+accelerate casts every injected bf16 tensor BACK to fp32** (double VRAM, uncharged against the pin budget,
+and flash refuses the layer). Now built at `running_dtype`; the other four checkpoints declare bfloat16 and
+are unchanged. **RC3 the FP8-only experts workaround ran for EVERY quantizer.** It appends `"experts"` to
+`modules_to_not_convert`, so MXFP4 never installed its experts module and the model kept the stock
+grouped-GEMM forward — surfacing three frames away as `grouped_mm_experts_forward() got an unexpected
+keyword argument 'scatter_idx'`. Now gated on `FineGrainedFP8HfQuantizer`. **RC4 the eager causal mask was
+BOOLEAN.** Every `eager_attention_forward` does `attn_weights + attention_mask`, so a bool mask adds
+**1.0 to the positions it means to ALLOW and 0.0 to the ones it means to BLOCK** — nothing is masked and
+the model attends to its own future. **Latent since forever: all three working models take flash or sdpa.**
+Measured 26 % off stock in layer-0 attention; now additive (`torch.finfo(dtype).min`, same past+new
+sizing). **RC5 flash attention accepted a model it cannot run:** transformers approves the request (the
+architecture supports flash) but the kernel build dies at the first token with *"S aux is currently only
+supported for Hopper GPUs"* — attention SINKS are Hopper-only in this build. Vaayu now skips flash when the
+module tree carries sinks and the GPU is not Hopper (sm_120 here), landing on eager, which is what stock
+picks for this model anyway. **§8: no knob** — every one of these is a correctness fix with no user choice
+in it. Probes: `a3_streamed_forward.py`, `a3_moe_block_compare.py`, `a3_layer_trace.py`, `a3_rope_cause.py`.
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A

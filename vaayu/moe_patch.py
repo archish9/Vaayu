@@ -1354,6 +1354,23 @@ def _make_sparse_moe_forward(
     which is triage step one (CLAUDE.md 0).
     """
     if block_info.expert_style == "fused":
+        # Whole-layer delivery, ahead of the quant split: the question is where the
+        # CHECKPOINT keeps this layer's experts, not how they are quantised. Both
+        # conditions are load-bearing. The module predicate alone does NOT
+        # discriminate -- Qwen3NextExperts reports fused parameters too (measured
+        # 2026-09-21) while its checkpoint stores one tensor per expert, which is
+        # what the tuned forward below streams -- so the index's whole-tensor metas
+        # decide, and the predicate only confirms the module can take them.
+        _fused_metas = (offset_index.fused_layer_tensors.get(block_info.layer_name)
+                        if offset_index is not None else None)
+        if _fused_metas and fused_param_experts(
+                getattr(block_info.moe_module, block_info.experts_attr)):
+            fwd = _make_whole_layer_sparse_forward(
+                block_info, offset_index, checkpoint_path, device, vaayu_ref,
+                original_forward=original_forward,
+            )
+            fwd.__vaayu_forward__ = "_make_whole_layer_sparse_forward"
+            return fwd
         if is_exl3:
             fwd = _make_fused_sparse_forward_exl3(
                 block_info, expert_cache, offset_index, checkpoint_path, top_k, device, dtype, vaayu_ref
@@ -1844,6 +1861,146 @@ def _make_modulelist_sparse_forward(
         _trace_moe_block(vaayu_ref, layer_idx, "module_list", hidden_states,
                          final_hidden, routing_weights, unique_experts)
         return final_hidden.to(hidden_states.dtype), router_logits
+
+    return sparse_forward
+
+
+def _weight_converter_target(converter) -> str:
+    """The attribute name a weight converter writes, from its target pattern.
+
+    The patterns are regexes anchored for matching parameter names (`gate_up_proj$`);
+    what the conversion op wants is the plain attribute, because it resolves the
+    module by name. Either a string or a one-element list, both shapes ship in
+    transformers 5.5.4.
+    """
+    targets = converter.target_patterns
+    if isinstance(targets, str):
+        targets = [targets]
+    return re.sub(r"[\^$]", "", targets[0])
+
+
+def _populate_fused_experts(experts_mod, experts_path: str, raw: dict,
+                            device: str, vaayu_ref) -> None:
+    """Put ONE layer's fused expert tensors on the experts module.
+
+    Quantised projections go through the QUANTIZER'S OWN weight conversions
+    (`hf_quantizer.get_weight_conversions()`), never through a format-specific
+    branch here: that hook returns the two MXFP4 deserialisers for gpt-oss and an
+    EMPTY list for Qwen3-Next's compressed-tensors quantizer (measured
+    2026-09-21), so this stays quant-agnostic and inert for a checkpoint whose
+    fused tensors need no conversion. Whatever the converters do not consume --
+    the expert biases here -- is assigned directly, in the dtype the module's own
+    (meta) parameter declares, which is how the stock loader fixes the dtype too.
+    """
+    leaves = {key.rsplit(".", 1)[-1]: tensor for key, tensor in raw.items()}
+    on_device = {name: t.to(device, non_blocking=True) for name, t in leaves.items()}
+
+    hf_quantizer = getattr(vaayu_ref, "hf_quantizer", None)
+    converters = []
+    if hf_quantizer is not None and hasattr(hf_quantizer, "get_weight_conversions"):
+        converters = hf_quantizer.get_weight_conversions() or []
+
+    consumed: set = set()
+    for converter in converters:
+        sources = list(getattr(converter, "source_patterns", []) or [])
+        if not sources or not all(name in on_device for name in sources):
+            continue
+        target = _weight_converter_target(converter)
+        payload = {name: on_device[name] for name in sources}
+        for op in converter.operations:
+            op.convert(payload, model=vaayu_ref.model,
+                       full_layer_name=f"{experts_path}.{target}",
+                       missing_keys=set())
+        consumed.update(sources)
+
+    for name, tensor in on_device.items():
+        if name in consumed:
+            continue
+        declared = experts_mod._parameters.get(name)
+        if declared is not None and declared.dtype != tensor.dtype:
+            tensor = tensor.to(declared.dtype)
+        experts_mod._parameters[name] = nn.Parameter(tensor, requires_grad=False)
+
+
+def _release_fused_experts(experts_mod, meta_params: dict, base_attrs: dict) -> None:
+    """Undo one _populate_fused_experts, exactly.
+
+    The swizzled weight a conversion op leaves behind is neither a parameter nor
+    a buffer -- it is a plain attribute holding a kernel-side tensor object, plus
+    a `{proj}_precision_config` beside it -- so nothing in Vaayu's usual teardown
+    (`set_module_tensor_to_device(..., "meta")`, `_to_meta_preserving_buffers`)
+    frees it. Left alone it would hold this layer's expert bytes on the GPU for
+    the model's lifetime: 423.6 MB per layer on gpt-oss-20b, 10.17 GB per sweep.
+    Restoring the patch-time snapshot puts the module back on meta whatever the
+    converters did, including when populate raised part-way through.
+    """
+    experts_mod._parameters.clear()
+    experts_mod._parameters.update(meta_params)
+    for name in [n for n in experts_mod.__dict__ if n not in base_attrs]:
+        del experts_mod.__dict__[name]
+    experts_mod.__dict__.update(base_attrs)
+
+
+def _make_whole_layer_sparse_forward(
+    block_info: MoEBlockInfo,
+    offset_index: "ExpertOffsetIndex",
+    checkpoint_path: Path,
+    device: str,
+    vaayu_ref,
+    original_forward=None,
+):
+    """Stream a fused-3D layer WHOLE and let the module's own forward route it.
+
+    For a checkpoint that stores every expert of a layer in one tensor per
+    projection, the routing happens inside the module's kernel -- a grouped GEMM
+    is handed the entire fused tensor -- so there is no per-expert delivery to
+    make and no sparsity for the expert cache to exploit. The layer's bytes are
+    read by the whole-tensor metas the offset index records, handed to the module,
+    computed by `original_forward`, and released before the call returns.
+
+    The block's `original_forward` is the module's own forward as it stood when
+    Vaayu patched it -- for a quantised model that is the quantizer's forward,
+    installed by `preprocess_model` -- so its return value is passed back
+    untouched: gpt-oss's MoE block returns `(hidden_states, router_scores)`, not a
+    bare tensor. Per-expert streaming of a fused-3D checkpoint is row 47's A6 and
+    needs a kernel that takes one expert at a time.
+    """
+    from .persist.safetensor_model_persister import load_fused_layer_tensors
+
+    layer_name = block_info.layer_name
+    layer_idx = block_info.layer_idx
+    experts_mod = getattr(block_info.moe_module, block_info.experts_attr)
+    experts_path = f"{block_info.module_path}.{block_info.experts_attr}"
+    shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+    # Snapshot taken at PATCH time, while the module is still meta-initialised:
+    # this is what a visit restores, so a release can never leave the module
+    # holding a live expert tensor.
+    meta_params = dict(experts_mod._parameters)
+    base_attrs = dict(experts_mod.__dict__)
+    # Every expert, because the kernel is handed every expert. The spec-decode
+    # gate sizes a verify pass off this (vaayu_base.py, gate.observe) and an empty
+    # dict reads to it as "this forward does not report routing".
+    all_experts = list(range(int(getattr(experts_mod, "num_experts", 0))))
+
+    def sparse_forward(hidden_states, **kwargs):
+        _ensure_prefill_headroom(vaayu_ref, layer_idx)
+        if layer_name in vaayu_ref.pinned_layer_names:
+            return original_forward(hidden_states, **kwargs)
+
+        metas = offset_index.fused_layer_tensors.get(layer_name)
+        if not metas:
+            raise RuntimeError(
+                f"[Vaayu-MoE] {layer_name}: the whole-layer forward was installed but the "
+                f"expert offset index holds no fused tensors for this layer. Vaayu would "
+                f"run the layer with meta-initialised experts and emit garbage."
+            )
+        raw = load_fused_layer_tensors(shard_file, metas)
+        try:
+            _populate_fused_experts(experts_mod, experts_path, raw, device, vaayu_ref)
+            vaayu_ref._expert_history[layer_idx] = all_experts
+            return original_forward(hidden_states, **kwargs)
+        finally:
+            _release_fused_experts(experts_mod, meta_params, base_attrs)
 
     return sparse_forward
 
