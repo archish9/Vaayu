@@ -45,6 +45,28 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
+## ▶▶ PICK THIS NEXT (set 2026-09-21, after A3 closed) ◀◀
+
+**A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
+document that carries its own start gate, stop rule, numbers and commands.**
+
+| order | item | what to open FIRST | cost | why this order |
+|---|---|---|---|---|
+| **1** | **A4 — shared-expert pinning** (row 47 REACH track) | [`…-A4-shared-experts-SESSION-PROMPT.md`](docs/2026-09-21-A4-shared-experts-SESSION-PROMPT.md) | ~½ day to answer its two questions; ~2 days only if they fire | The user's REACH mandate fixes the order `A1 → A2 → A3 → **A4** → A5`, and A1-A3 are closed. It opens with a MEASUREMENT whose stop rule can close it for free, and A5 (DeepSeek-V4, row 28b) cannot start without it. |
+| **2** | **Row 32 — a lower-bpw EXL3 build** | [`…-row32-lower-bpw-HANDOFF.md`](docs/2026-09-21-row32-lower-bpw-HANDOFF.md) | a download, **zero code** | The only large speed lever left, but **row 32's own table is STALE** — it was written for Qwen3-235B, which was deleted, and its kill clause already fired for Qwen3-Next. The handoff re-anchors it on **MiniMax-M2.7**: **×1.44 projected at 3.0 bpw**, derived from a measured 75.7-76.4 % drive-busy token. |
+| **3** | **Row 46 — size the prefix reservation** | [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md) | ½ day to measure, 1-2 days to build | Re-priced DOWN to **~2.6 %** on Qwen3-Next and its mechanism is measured away there (disk 0.42 % of a token). Its remaining hope is MiniMax's unmeasured 6.24 GB. Measure first; the stop rule closes it under ~3 %. |
+
+**The SPEED slot is empty.** Row 49's two successors were both spent or refuted on 2026-09-21: the
+ring-pool optimum is n=2 (shipped, +1.89 % decode) and the read-shape arm was built and REVERTED
+(−0.40 % decode despite removing 66.7 % of the reads). Nothing in the speed track is pickable
+without a new idea, which is why the REACH track leads this list.
+
+**Also open, smaller, no doc needed — the row carries them:** 47-m5 (18.45 GB pinned expert arena the
+whole-layer path never reads — cheap, and it improves the model that just landed), 47-m4
+(sliding-window KV, 0.813 GB), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`, and **47-m6** (the one
+open question A3's own fixes created).
+
+
 **Nothing is in flight. No §0 P-row is open, so nothing here makes Vaayu faster on Qwen3-235B, MiniMax-M2.7
 or the 70B today — every row is OPTIONAL by §0's test.** The order below was set by the user on 2026-09-11
 after a triage of every open row: **three are worth working, in this order; the rest are not, for the
@@ -3056,7 +3078,27 @@ which moves the reservation itself rather than the prediction of it.
 
 ---
 
-# 32 · [ ] Run a lower-bpw EXL3 build of the models already on disk — a download, zero code (added 2026-09-12)
+# 32 · [ ] Run a lower-bpw EXL3 build of the models already on disk — a download, zero code (added 2026-09-12) — **RE-ANCHORED 2026-09-21: the table below is Qwen3-235B's and that checkpoint is GONE**
+
+**READ THE HANDOFF FIRST: [`…-row32-lower-bpw-HANDOFF.md`](docs/2026-09-21-row32-lower-bpw-HANDOFF.md)
+(gitignored — the corrected numbers are repeated here so this row survives without it).** Two things
+invalidated the arithmetic below. (1) **Qwen3-235B, the model it is computed on, was RETIRED AND DELETED
+2026-09-20.** (2) **The row's own kill clause fired for the other candidate:** it says *"only pays while
+experts stream — if row 30's S2 lands, this row mostly dies"*, and S2 landed 2026-09-13, after which
+Qwen3-Next's drive is **0.42 % of a decode token** (RAM hit 96.6 %, 0.030 GB/token). **The one live target
+is MiniMax-M2.7**, which is EXL3 **5.0 bpw** (head 6), 135 GB, and whose drive is busy **75.7-76.4 % of a
+decode token** at 6.03-6.05 GB/s (row 49, 2026-09-21) against a **~1.82 tok/s** baseline. Re-derived there:
+**3.0 bpw → 0.382 s/token ≈ 2.62 tok/s = ×1.44**; 4.0 bpw → ×1.18. **PROJECTION, not a measurement.**
+**And the trap:** row 49 refuted a **RATE** lever on this same model (−66.7 % reads and +6.9 % delivered
+bandwidth bought **−0.40 %** decode). This is a **BYTE** lever, which is the axis rows 26/28 found
+decisive — different thing — but the token did NOT collapse onto the disk-busy line there, so price this
+from an A/B, not from the table. Disk: 231 GB free, and a 3.0-bpw build needs ~81 GB plus an equal
+`splitted_model/` copy. **Quality gate unchanged and mandatory — and there is still no committed MoE ppl
+baseline, so establish one on the CURRENT MiniMax build first** (and take several draws: one decode-ppl
+draw is ONE draw, D6).
+
+**The original Qwen3-235B text follows, kept because the method is still right.**
+
 
 Qwen3-235B is here at **5.01 bpw** (11.8 MB/expert). `bytes_read ∝ bpw`, so by the primer's formula, holding hit rate
 constant (**conservative** — smaller experts mean more of them fit the same cache):
@@ -4886,7 +4928,7 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 | **A1** `[x]` | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
 | **A2** `[x]` | **Fused-3D expert indexing** — **CLOSED 2026-09-21** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
 | **A3** `[x]` | **gpt-oss-20b END TO END — CLOSED 2026-09-21** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
-| **A4** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | none | ~2 days | brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
+| **A4** **(NEXT)** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | **starts with a measurement whose stop rule can CLOSE it for free** | ~½ day to answer its two questions, ~2 days only if they fire | **fresh-session pickup: [`…-A4-SESSION-PROMPT.md`](docs/2026-09-21-A4-shared-experts-SESSION-PROMPT.md)** · brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
 | **A5** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | A4 | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
 | A7 | G3 `compute_device` parity · G5 NVMe re-measure | removes two latent generality traps | — | none | ~1 day | plan when picked |
@@ -5237,6 +5279,24 @@ the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20
       size the arena to zero for those layers. Derived, no model number. Related to row **40** (the arena is
       never capped at the model's own expert bytes) but distinct: this one is about a model whose forward
       never reads the cache at all. Touches shared sizing → all three accumulator gates.
+- [ ] **47-m6 — A3's fp32 rotary table changed numerics for EVERY model, and only gpt-oss's side of it was
+      measured.** Opened 2026-09-21 by the change that closed A3 task 5. `_precompute_rope` used to build the
+      rotary module in `running_dtype`, so `inv_freq` — a table of FREQUENCIES — was bf16, and the phase error
+      grows with the position it multiplies: **cos/sin 0.0039 off stock at position 3, 0.51 off (38 % of full
+      scale) at position 255.** It is now fp32, which is what stock transformers does for every model, and that
+      is what made gpt-oss-20b bit-identical to stock. **For Qwen3-Next, MiniMax-M2.7, Llama-3.3-70B and
+      Llama-3.2-1B the change is real but UNMEASURED.** The gates that ran (accumulator determinism ×2, 1B
+      batch/prefix equivalence, suite 2416) prove determinism and self-consistency — **none of them measures
+      quality**, so "green" here is not evidence either way. Expected direction: better, and more so the longer
+      the context, since the error being removed grows with position. **The work: teacher-forced perplexity
+      before vs after (`git stash` the one-line dtype change, or check out `cac352e^`), on Qwen3-Next AND
+      MiniMax, at a context long enough for the effect to exist (≥ 4k — at 256 tokens the cos error was already
+      0.51, so 4k is not exotic), SEVERAL draws per arm** (one decode-ppl draw is ONE draw: a null bit change
+      moves it sd 0.5-0.7 pp, D6). Also record decode tok/s: the fp32 table costs a little more compute where
+      cos/sin are built, once per forward, and that should be ~0 but has not been checked. **Stop rule: if ppl
+      is unchanged within noise on both models, close with the number — the fix is still right, it just did not
+      matter below 33k context. If it improved, that is a quality win nothing else on this board delivers. If it
+      REGRESSED, stop and investigate: that would mean something downstream depended on the bf16 table.**
 - [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
       `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
       **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE
@@ -5393,6 +5453,10 @@ expert count and byte size from the checkpoint, never from a config literal.
 ---
 
 # 46 · [ ] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B) — **RE-PRICED DOWN 2026-09-20: the prize is ~2.6 %, not ~15 %**
+
+**FRESH-SESSION HANDOFF: [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md)**
+(gitignored; this row remains the durable copy). **Its step 1 is a MEASUREMENT on MiniMax-M2.7 with a stop
+rule — under ~3 % and the row closes**, the way Qwen3-Next's measured 2.56 % already closed the case there.
 
 **Split out of row 42-B on 2026-09-20 at the user's call: 42-B lifts RC7 with the reservation AS-IS,
 this row prices the reservation on its own, on the two models that pay it TODAY.** Splitting keeps
