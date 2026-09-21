@@ -7,6 +7,10 @@ from pathlib import Path
 
 _EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')
 
+# A tensor that sits under an `experts.` prefix with NO numeric expert component --
+# the fused layout, where one tensor holds every expert on a leading axis.
+_FUSED_EXPERTS_RE = re.compile(r'\.experts\.[A-Za-z_][A-Za-z0-9_]*$')
+
 
 @dataclass
 class ExpertTensorMeta:
@@ -73,6 +77,25 @@ class ExpertOffsetIndex:
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return value
         return None
+
+    @staticmethod
+    def _fused_expert_axis(key: str, shape: list, expected: int | None) -> bool:
+        """True iff `key` holds EVERY expert on a leading axis.
+
+        Two conditions, both required. The key must sit under an `experts.`
+        prefix with no numeric component (`...experts.gate_up_proj_blocks`, not
+        `...experts.0.w1.weight`), and its leading dimension must equal the
+        expert count the config declares. Shape alone is not enough -- an
+        attention tensor can legitimately lead with the same number -- and the
+        prefix alone is not enough either, since a fused checkpoint also stores
+        per-layer scalars under it.
+
+        Needs at least 2 dimensions: a 1-D tensor under an experts prefix has
+        no axis left to slice once the expert axis is consumed.
+        """
+        if expected is None or len(shape) < 2 or shape[0] != expected:
+            return False
+        return _FUSED_EXPERTS_RE.search(key) is not None
 
     def build(self, write_cache: bool = True) -> None:
         from .checkpoint_integrity import assert_checkpoint_complete
