@@ -2,6 +2,7 @@ import json
 import os
 import struct
 import threading
+from contextlib import contextmanager
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -150,6 +151,12 @@ _PINNED_BUFS = [None, None]     # Double buffer (A/B)
 _PINNED_SIZES = [0, 0]          # Allocated size of each buffer
 _BUF_IDX = 0                    # Toggles 0 → 1 → 0 → 1 …
 _BUF_LOCK = __import__("threading").Lock()  # Guards _BUF_IDX toggle under concurrent prefetch
+
+# Staging for WHOLE-LAYER fused expert reads, deliberately separate from the A/B
+# pair above. See _staging_buffer for why sharing them corrupts a layer.
+_FUSED_BUF = [None]
+_FUSED_SIZE = [0]
+_FUSED_LOCK = threading.Lock()
 
 import queue as _queue
 _EXPERT_BUF_POOL: "_queue.Queue[torch.Tensor]" = _queue.Queue()
@@ -577,7 +584,92 @@ def load_non_expert_tensors(
     if not non_expert:
         return {}
 
-    non_expert.sort(key=lambda x: x[2])
+    result = _read_grouped_ranges(file_path, non_expert)
+    size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
+    print(f"[VAAYU-IO] non-expert  {size_mb:.1f}MB  {layer_name}")
+    return result
+
+
+def load_fused_layer_tensors(file_path: str, metas: dict) -> dict:
+    """Load WHOLE fused expert tensors -- one blob per projection, every expert
+    of the layer inside it -- for a kernel that routes internally.
+
+    Deliberately not `load_expert_sparse`: that reader serves one expert per
+    call out of a pinned pool sized to the largest single expert (13.27 MB on
+    gpt-oss-20b), and a whole fused layer is 423 MB. This path takes the same
+    grouped reader the non-expert tensors use, whose buffer grows to the read.
+
+    `metas` is {tensor_key: ExpertTensorMeta}, i.e. ExpertOffsetIndex's
+    `fused_layer_tensors[layer_name]`.
+    """
+    if not metas:
+        return {}
+    items = [(key, {"dtype": m.dtype, "shape": m.shape}, m.file_offset, m.byte_length)
+             for key, m in metas.items()]
+    return _read_grouped_ranges(file_path, items, dedicated=True)
+
+
+@contextmanager
+def _staging_buffer(aligned_length: int, dedicated: bool):
+    """Yield a pinned staging buffer large enough for one grouped read.
+
+    The A/B pair alternates between exactly TWO users -- the layer prefetch
+    thread and the main thread -- and that alternation IS the safety argument:
+    each clones out of its own buffer while the other writes into the other one.
+    A THIRD concurrent user silently breaks it, and a whole-layer fused expert
+    read is exactly that: it runs on the main thread inside a layer's forward,
+    while the prefetcher is already reading the NEXT layer's non-expert tensors.
+    Measured on gpt-oss-20b 2026-09-21: the model's output went NaN from layer 10
+    -- the second STREAMED layer -- deterministically, because layer 9's 423 MB
+    expert read landed in the buffer layer 10's attention weights were being
+    cloned out of. The split file was byte-perfect; the corruption was in RAM.
+
+    So that reader gets its own buffer, and the lock is held across the read AND
+    the clone, not just the index toggle.
+    """
+    global _BUF_IDX
+    if dedicated:
+        with _FUSED_LOCK:
+            if _FUSED_BUF[0] is None or _FUSED_SIZE[0] < aligned_length:
+                alloc_size = next_pow2_at_least(aligned_length)
+                _FUSED_BUF[0] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
+                _FUSED_SIZE[0] = alloc_size
+                print(f"[VAAYU-IO] alloc  fused-layer staging "
+                      f"{alloc_size / (1024**2):.1f}MB")
+            yield _FUSED_BUF[0]
+        return
+
+    with _BUF_LOCK:
+        buf_idx = _BUF_IDX
+        _BUF_IDX = 1 - _BUF_IDX
+    if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < aligned_length:
+        # Same policy as pinned_alloc_size: ask for the power of two the
+        # caching host allocator charges anyway, so the whole block is
+        # usable. No O_DIRECT slack on top -- unlike the expert path's
+        # total_size, aligned_length is already _align_up(read_len +
+        # prefix_pad), i.e. exactly what io_uring writes below.
+        alloc_size = next_pow2_at_least(aligned_length)
+        _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
+        _PINNED_SIZES[buf_idx] = alloc_size
+        print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB (non-expert)")
+    yield _PINNED_BUFS[buf_idx]
+
+
+def _read_grouped_ranges(file_path: str, items: list, dedicated: bool = False) -> dict:
+    """Read a set of byte ranges out of one shard into CPU tensors.
+
+    `items` is [(key, {'dtype','shape'}, absolute_file_offset, byte_length)].
+    Adjacent ranges (gap <= _ALIGN) are coalesced into one io_uring call, and
+    the pinned staging area grows to the largest group. Returns {key: cloned cpu
+    tensor}, safe to hold after the buffer is reused.
+
+    `dedicated=True` stages through a buffer of this reader's own instead of the
+    shared A/B pair -- required for any caller that can run CONCURRENTLY with the
+    layer prefetcher (see _staging_buffer).
+    """
+    if not items:
+        return {}
+    non_expert = sorted(items, key=lambda x: x[2])
 
     # Group contiguous ranges (gap <= _ALIGN) to minimise io_uring calls
     groups: list[list] = []
@@ -592,61 +684,51 @@ def load_non_expert_tensors(
     groups.append(current_group)
 
     result: dict = {}
-    global _PINNED_BUFS, _PINNED_SIZES, _BUF_IDX
 
+    # ONE staging slot for the whole call, sized to the largest group -- not one
+    # per group. The A/B pair's safety argument is that a caller holds its slot
+    # while the OTHER caller writes the other one; taking a fresh slot per group
+    # cycles both within a single call and overwrites what the other caller is
+    # still holding. gpt-oss-20b is where that surfaced: its layer files
+    # interleave the small non-expert tensors between six ~70 MB expert blobs, so
+    # one non-expert read is a dozen groups, and it clobbered the 1.16 GB
+    # embedding the main thread had read but not yet injected (measured
+    # 2026-09-21: absmax 118.5 at read, 1.36e38 at inject, logits garbage).
+    # Every checkpoint whose non-expert tensors sit contiguously -- Qwen3-Next,
+    # MiniMax -- is one group and never saw it.
+    _plan = []
     for group in groups:
         group_start = group[0][2]
         group_end = group[-1][2] + group[-1][3]
-        read_len = group_end - group_start
-
         aligned_offset = _align_down(group_start)
         prefix_pad = group_start - aligned_offset
-        aligned_length = _align_up(read_len + prefix_pad)
-        note_read_bytes(aligned_length)
+        aligned_length = _align_up(group_end - group_start + prefix_pad)
+        _plan.append((group, group_start, aligned_offset, prefix_pad, aligned_length))
 
-        with _BUF_LOCK:
-            buf_idx = _BUF_IDX
-            _BUF_IDX = 1 - _BUF_IDX
-
-        if _PINNED_BUFS[buf_idx] is None or _PINNED_SIZES[buf_idx] < aligned_length:
-            # Same policy as pinned_alloc_size: ask for the power of two the
-            # caching host allocator charges anyway, so the whole block is
-            # usable. No O_DIRECT slack on top — unlike the expert path's
-            # total_size, aligned_length is already _align_up(read_len +
-            # prefix_pad), i.e. exactly what io_uring writes below. The old
-            # `+ 4 MiB` pad bought dead surplus and left these shared
-            # _PINNED_SIZES slots sized by two different policies.
-            alloc_size = next_pow2_at_least(aligned_length)
-            _PINNED_BUFS[buf_idx] = torch.empty(alloc_size, dtype=torch.uint8, pin_memory=True)
-            _PINNED_SIZES[buf_idx] = alloc_size
-            print(f"[VAAYU-IO] alloc  buf={buf_idx}  size={alloc_size / (1024**2):.1f}MB (non-expert)")
-
-        buf = _PINNED_BUFS[buf_idx]
-
-        if _USE_IOURING:
-            vaayu_rust.io_uring_read_into(
-                file_path, aligned_offset, aligned_length,
-                buf.data_ptr(), 8, _USE_DIRECT_IO,
-            )
-            data_buf = buf[prefix_pad:]
-        else:
-            fd = os.open(file_path, os.O_RDONLY)
-            try:
-                view = memoryview(buf.numpy())
-                os.preadv(fd, [view[:aligned_length]], aligned_offset)
-            finally:
-                os.close(fd)
+    with _staging_buffer(max(p[4] for p in _plan), dedicated) as buf:
+        for group, group_start, aligned_offset, prefix_pad, aligned_length in _plan:
+            note_read_bytes(aligned_length)
+            if _USE_IOURING:
+                vaayu_rust.io_uring_read_into(
+                    file_path, aligned_offset, aligned_length,
+                    buf.data_ptr(), 8, _USE_DIRECT_IO,
+                )
+            else:
+                fd = os.open(file_path, os.O_RDONLY)
+                try:
+                    view = memoryview(buf.numpy())
+                    os.preadv(fd, [view[:aligned_length]], aligned_offset)
+                finally:
+                    os.close(fd)
             data_buf = buf[prefix_pad:]
 
-        for key, meta, file_offset, byte_len in group:
-            rel_start = file_offset - group_start
-            rel_end = rel_start + byte_len
-            dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
-            tensor = data_buf[rel_start:rel_end].view(dtype).reshape(meta['shape'])
-            result[key] = tensor.clone()
+            for key, meta, file_offset, byte_len in group:
+                rel_start = file_offset - group_start
+                rel_end = rel_start + byte_len
+                dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
+                tensor = data_buf[rel_start:rel_end].view(dtype).reshape(meta['shape'])
+                result[key] = tensor.clone()
 
-    size_mb = sum(v.nbytes for v in result.values()) / (1024**2)
-    print(f"[VAAYU-IO] non-expert  {size_mb:.1f}MB  {layer_name}")
     return result
 
 
