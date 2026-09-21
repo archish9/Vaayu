@@ -5085,6 +5085,21 @@ here — nothing to clamp when the kernel routes. **Costs accepted, to be MEASUR
 during chunked prefill (the row 44-F2 / row 45 defect class, arriving by construction). Decision doc:
 [`…-A3-seam-DECISION.md`](docs/2026-09-20-A3-seam-DECISION.md) (gitignored — this paragraph is the durable copy).
 
+**A3 Task 3 DONE (2026-09-21) — and it CORRECTED the plan's selector before it could cost the fastest
+model on this box.** `fused_param_experts(experts_module)` ships in `vaayu/moe_patch.py` (shape-derived,
+`recurse=False`), with `tests/test_fused_param_detection.py` — **6 tests, all passing** (the plan wrote 4).
+**The finding: the predicate does NOT discriminate.** Measured on the live module tree
+(`plans/probes/a3_qwen_experts_shape.py`), **`Qwen3NextExperts` reports True too** — it carries DIRECT
+fused parameters `gate_up_proj [512, 1024, 2048]` and `down_proj [512, 2048, 512]` with `num_experts=512`,
+**both before and after `CompressedTensorsHfQuantizer.preprocess_model`** — while its CHECKPOINT stores one
+tensor per expert (24,576 per-expert entries in the index). Had the third branch dispatched on the module
+predicate the plan specifies, **Qwen3-Next would have been routed off `_make_fused_sparse_forward`** — the
+path rows 30/30-P/44/42-B tuned, 4.06 → 7.4 tok/s — onto an unmeasured whole-layer forward. **The
+discriminator is the CHECKPOINT layout, which is what A2 already records: dispatch requires
+`offset_index.fused_layer_tensors[layer_name]` to be non-empty AND the module predicate.** A regression test
+pins the trap (`test_a_per_expert_checkpoints_module_also_reports_fused`), so dispatching on the predicate
+alone fails in unit tests rather than on the tuned model.
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A

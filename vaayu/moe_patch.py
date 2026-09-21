@@ -1049,6 +1049,36 @@ def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
     return results
 
 
+def fused_param_experts(experts_module) -> bool:
+    """True iff this experts module holds FUSED parameters, one per projection
+    with the expert count leading, rather than per-expert weights.
+
+    Detected from the parameters' own shapes (CLAUDE.md §5), never from a
+    parameter name or an architecture string: a direct parameter whose leading
+    dimension equals `num_experts` and which has at least 2 dimensions.
+
+    `recurse=False` is deliberate: a `ModuleList` of per-expert submodules
+    exposes its children's parameters under `recurse=True` and would
+    false-positive.
+
+    NOT SUFFICIENT TO CHOOSE A FORWARD ON ITS OWN, and measured to be so before
+    it was written: `Qwen3NextExperts` reports True here too -- its live module
+    carries `gate_up_proj [512, 1024, 2048]` and `down_proj [512, 2048, 512]`,
+    with and without its quantizer applied -- while its CHECKPOINT stores one
+    tensor per expert, which is what the tuned fused forward streams. What
+    separates the two is the checkpoint layout, so dispatch pairs this with the
+    offset index's `fused_layer_tensors` for the layer; this predicate only
+    answers "could this module take a whole-layer tensor at all".
+    """
+    num_experts = getattr(experts_module, "num_experts", None)
+    if not isinstance(num_experts, int) or num_experts <= 0:
+        return False
+    for _name, param in experts_module.named_parameters(recurse=False):
+        if param.dim() >= 2 and param.shape[0] == num_experts:
+            return True
+    return False
+
+
 def _copy_async_ok(pinned_source: bool, tensor, dtype) -> bool:
     """Whether ONE host-to-device copy of `tensor` may run non_blocking.
 
