@@ -238,7 +238,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**42-B**~~ | **DONE 2026-09-20 — shipped: round-2 TTFT 6.24× (30.60 → 4.90 s), decode −2.56 %, ids bit-identical, N\* = 9,512 vs a ~500 stop rule, all gates green.** Original text: | **RE-MEASURE, THEN PLAN, THEN BUILD** the hybrid cross-turn prefix cache. Row 42 proved the mechanism (40.1 MB snapshot, exact restore) but priced it against a 269 s 8k miss that is now **37.2 s**. | **open now — row 45 is closed** | recompute `N* = (T_miss − T_hit) / (1/7.87 − 1/9.06)`; **N\* below ~500 generated tokens/turn → close 42-B** | re-measure ~20 min · plan ½ day · build ~2–3 days | [`…-row42B-hybrid-prefix-cache-BRIEF.md`](docs/2026-09-19-row42B-hybrid-prefix-cache-BRIEF.md) |
 | ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
 | ~~1~~ | ~~**36**~~ | **PARKED 2026-09-20 — gate fired, then two spikes killed every lever.** `serial` is **74.8 % GPU-bound**; its matmul half (12.59 ms) is at **80–86 % of the RTX 5060 Ti's 448 GB/s**, a floor; `use_torch_compile` **CRASHES** (cudagraph-trees step boundary, reproduced 2×); without cudagraphs it is **24–35 % SLOWER** (46 dynamo graphs — broken by the engine's own `time.perf_counter` instrumentation and by `aten.bincount`). Elementwise term still real but **not ~1 day**. | — | — | done, ~1 day | [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) · [`…-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md) |
-| **1 (NEXT — SPEED)** | **49** | **MiniMax-M2.7's expert H2D is SYNCHRONOUS on purpose** (`moe_patch.py:1110`/`:1119`, `non_blocking=False`), so it cannot hide behind the disk read the way the fused forward's does. Row 26 measured it at **0.180 s of a 0.596 s token — 30.2 %, the largest removable phase on that model**, and ORDERED this priced before any CPU path. Never done. **Bigger than the CPU hybrid's whole 0.114 s prize, and needs no CPU kernel or new on-disk format.** | open now — row 26's precondition 1 (after row 27) was met 2026-09-12 | **step 1: `h2d_pct` < ~15 % of `T_prof` → close the row AND the CPU-hybrid half with the number** | step 0 ~1 h · step 1 ~1 h · step 2 1–3 days | [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) · row **49** below |
+| **1 (NEXT — SPEED)** | **49** | **STEP 2A SHIPPED 2026-09-20 (+6.90 % decode); B RE-RANKED AND REFUTED 2026-09-21 (<= +6 %).** The probe that killed B also priced its successors on the same run: **the drive is busy 75.7-76.4 % of a MiniMax decode token at 6.03-6.05 GB/s, idling 1.57 ms in EVERY layer** — so the live work is (a) the ring-pool / read-shape arm, `VAAYU_RING_POOL_N=4`, **<= +12.8 %, ~1 h, deterministic**, and (b) filling that per-layer gap, **>= +31 %**, which needs prediction and should start by re-gating `VAAYU_LOOKAHEAD` (-3.7 % on MiniMax, row 35). Original text: **MiniMax-M2.7's expert H2D is SYNCHRONOUS on purpose** (`moe_patch.py:1110`/`:1119`, `non_blocking=False`), so it cannot hide behind the disk read the way the fused forward's does. Row 26 measured it at **0.180 s of a 0.596 s token — 30.2 %, the largest removable phase on that model**, and ORDERED this priced before any CPU path. Never done. **Bigger than the CPU hybrid's whole 0.114 s prize, and needs no CPU kernel or new on-disk format.** | open now — row 26's precondition 1 (after row 27) was met 2026-09-12 | **step 1: `h2d_pct` < ~15 % of `T_prof` → close the row AND the CPU-hybrid half with the number** | step 0 ~1 h · step 1 ~1 h · step 2 1–3 days | [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) · row **49** below |
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | ~~2~~ | **35** | ~~Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block.~~ **BLOCKED 2026-09-20 — DO NOT PICK.** Its +11.7 % was measured on **Qwen3-235B, deleted 2026-09-20**, so its stop rule (*reproduce +11.7 % on Qwen at N=1 through the server*) is **unrunnable**. Its own kill condition (*dies if S2 lands*) **fired 2026-09-13**, and Qwen3-Next's disk is now 0.42 % of a token. The only still-streaming model, MiniMax, is the **−3.7 %** arm. | **blocked** | re-opens only on a measured **≥ +15 % on MiniMax at N=1** on a current build | — | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
@@ -4044,7 +4044,7 @@ end of the space on 2026-09-12. **Do not start while rows 31-35 are unmeasured.*
 
 ---
 
-# 49 · [~] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request) — **STEPS 0, 1 AND 2A DONE 2026-09-20: H1 TRUE on decode, `h2d` was 31.5 %, async upload SHIPPED at +6.90 % decode. Left: step 3 (the CPU-hybrid decision) and the B re-rank.**
+# 49 · [~] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request) — **STEPS 0, 1, 2A AND THE B RE-RANK DONE: H1 TRUE on decode, `h2d` was 31.5 %, async upload SHIPPED at +6.90 % decode (2026-09-20); B REFUTED 2026-09-21 (<= +6 % against a 76 %-busy drive) — the live successors are the ring-pool/read-shape arm (<= +12.8 %, ~1 h) and the drive-idle gap (>= +31 %, needs prediction). Left: step 3 (the CPU-hybrid decision).**
 
 **Brief:** [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) (gitignored;
 this row is the durable copy).
@@ -4144,16 +4144,36 @@ step 3 re-price the CPU hybrid only then.
   measurement. **§8: (1) NO KNOB, deliberately — `config.py` untouched, a correct overlap is strictly better;
   (2) n/a, forward-internal; (3) REACHABLE — N=1 per decode token on the forward the server runs for every
   MiniMax request on its own defaults, unlike P8's N=3 win; (4) not blocked.**
-- [ ] **NEW, from step 2A's own numbers — re-rank B before building it.** After A the largest phase of a
-  MiniMax decode token is the **exposed disk wait: 0.233 s of 0.524 s (44 %)**, up from 0.123 s of 0.558 s,
-  while `gemm` is 0.143 s. Nothing got slower — the host used to sit 0.18 s in `cudaMemcpy` while the loader
-  threads read ahead, and now reaches the future-wait sooner (bytes 2.380 GB/token, 267.8 reads, 13.6 % RAM
-  hit — all unchanged, which rules out "it read less"). B's mechanism (overlap expert N+1's H2D with expert
-  N's gemm) therefore attacks the SMALLER of the two; price it against a deeper prefetch / disk-overlap lever
-  using measured numbers on both sides. **Also recorded: the profiled arm now UNDER-reads this forward** —
-  `build_exl3_qmatrix` brackets its copy with `cuda.synchronize()` when timing is on, re-serialising what the
-  fix made async (`overhead` P/U 1.033 → 1.110, `T_prof` flat while `T_unprof` fell). Measure this slice on the
-  U arms, never the P arm.
+- [x] **DONE 2026-09-21 — B RE-RANKED AND REFUTED: do not build it.** Detail:
+  [`…-row49-B-rerank-RESULTS.md`](docs/2026-09-21-row49-B-rerank-RESULTS.md). Measurement only, no
+  engine code. Two replicates of `row26_decode.py MODEL=minimax ARMS=W,U1,U2 BALLAST_GB=25
+  NEW_TOK=64` on `4743325`, 29G scope, foreground, U arms only (the P arm re-serialises A's async
+  copy), greedy ids identical; new analysis = the UNION of every expert read's `(t0, t0+dt)`
+  interval inside a decode span, which the probe already recorded. **The drive is BUSY 75.7-76.4 %
+  of a decode token and delivers 6.03-6.05 GB/s while busy, against a token-average of
+  4.56-4.62 GB/s and P8's 7.1 GB/s plateau.** The union counts ring-wait, so **idle >= 23.6 % is a
+  FLOOR and the rate headroom is a CEILING.** The stop rule did NOT fire either way (75-90 % straddle
+  band); the decomposition resolved it instead. **The idle is ONE GAP PER MoE LAYER: 61.0-61.1 gaps
+  >= 1 ms per token against 62 layers, p50 1.57 ms, p90 1.88 ms, holding 110 of the 123 ms.**
+  Split: `token 0.5217 = disk busy 0.3988 + idle 0.1229`, and `idle = serial 0.0541 (NOEXP, same
+  build) + exposed expert-phase GPU work 0.0688`. **B reaches only the 0.0688, minus `scatter`
+  0.0317 and `construct` 0.0082 which no copy stream removes -> ~0.03 s/token = <= +6 %, for a 1-3
+  day build.** A's own pass-through confirms the regime: step 2A removed 0.18 s of host block and
+  delivered 0.036 s (**20 %**), the rest handed back as exposed stall. **Ranked ceilings from the
+  same run: fill the idle >= +30.8/31.2 % (needs PREDICTION) · raise the busy rate to 7.1 GB/s
+  <= +12.8 % (deterministic, hours) · B <= +6 % (last) · first two together +53.6 %.** Not claimed:
+  per-depth rates — reads are 3.04 per expert and strongly non-uniform (dt p50 0.119 vs p90 5.20 ms),
+  so a uniform-bytes depth model returns 8.47 GB/s at depth 2, above the drive's 7.45 spec.
+- [ ] **NEXT OUT OF THE RE-RANK — the cheap deterministic one: row 34 is ALIVE on MiniMax.** todo
+  calls it "dead on Qwen3-Next" (true, and irrelevant to this forward). Worth **<= +12.8 %** and its
+  first arm is an environment variable: **`VAAYU_RING_POOL_N=4`** (`_ring_pool_size()` pins the pool
+  at `_NVME_READ_CONCURRENCY = 3`; P8 says the device tolerates ~4 concurrent reads before
+  throughput falls), then the read-shape question — **3.04 reads per 8.875 MB expert, one large
+  `trellis` range plus small `suh/svh/mcg` ones**. ~1 h for the A/B.
+- [ ] **The big one, and the only one needing PREDICTION: fill the 1.57 ms/layer drive-idle gap
+  (>= +31 %).** Do NOT scope a fresh build first — `VAAYU_LOOKAHEAD` is the one built form of this
+  and it measured **-3.7 % on MiniMax** (row 35). Re-gate that machinery against THIS number
+  (0.123 s/token of provable idle, one gap per layer) before anything new.
 - [ ] step 3 — re-price the CPU hybrid, only after step 2. The stop rule did NOT close it; its own
   verdict below (MiniMax-only, EXL3 has no CPU kernel, weeks) is unchanged by these numbers.
 - [ ] **NOT IN SCOPE, recorded so it is not lost: MiniMax PREFILL's H2D is pageable** (step 0(d);
