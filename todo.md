@@ -4065,7 +4065,7 @@ end of the space on 2026-09-12. **Do not start while rows 31-35 are unmeasured.*
 
 ---
 
-# 49 · [~] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request) — **STEPS 0, 1, 2A AND THE B RE-RANK DONE: H1 TRUE on decode, `h2d` was 31.5 %, async upload SHIPPED at +6.90 % decode (2026-09-20); B REFUTED 2026-09-21 (<= +6 % against a 76 %-busy drive) — the live successors are the ring-pool/read-shape arm (<= +12.8 %, ~1 h) and the drive-idle gap (>= +31 %, needs prediction). Left: step 3 (the CPU-hybrid decision).**
+# 49 · [~] MiniMax-M2.7's expert H2D is SYNCHRONOUS — price the GPU-side attack row 26 ordered, THEN decide the CPU hybrid (added 2026-09-20, re-opened out of row 26 at the user's request) — **STEPS 0, 1, 2A AND THE B RE-RANK DONE: H1 TRUE on decode, `h2d` was 31.5 %, async upload SHIPPED at +6.90 % decode (2026-09-20); B REFUTED 2026-09-21 (<= +6 % against a 76 %-busy drive) — ring pool 3 -> 2 SHIPPED 2026-09-21 (+1.89 % decode / +1.85 % 2k prefill). READ-SHAPE arm BUILT AND REVERTED 2026-09-21 on its stop rule: reads/token -66.7 % and delivered rate +6.9 % bought -0.40 % decode, which REFUTES the rate lever by direct experiment and puts the idle lever's >= +31 % in doubt. Left: the drive-idle gap and step 3 (the CPU-hybrid decision).**
 
 **Brief:** [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) (gitignored;
 this row is the durable copy).
@@ -4217,15 +4217,61 @@ step 3 re-price the CPU hybrid only then.
   flat-2-4 zone as the reason for 3; and one test (`test_ring_pool_never_exceeds_the_caller_pool`)
   whose `pool=2 → 2` case the new constant made tautological now uses `pool=4`. **§8: no new knob
   (`VAAYU_RING_POOL_N` is the override), nothing to plumb, REACHABLE at N=1 on every request.**
-- [ ] **What is left of the rate ceiling after n=2: the READ SHAPE.** The lever's ceiling was
-  ≤ +12.8 % (6.03 → 7.1 GB/s at the same duty); n=2 collects 1.89 of it. The rest, if it exists, is
-  **3.04 reads per 8.875 MB expert — one large `trellis` range plus small `suh/svh/mcg` ones**, dt
-  bimodal p50 0.119 / p90 5.20 ms. (Row 44's F4 coalescing was REVERTED on its stop rule, but on the
-  OTHER forward — read that first.)
-- [ ] **The big one, and the only one needing PREDICTION: fill the 1.57 ms/layer drive-idle gap
-  (>= +31 %).** Do NOT scope a fresh build first — `VAAYU_LOOKAHEAD` is the one built form of this
-  and it measured **-3.7 % on MiniMax** (row 35). Re-gate that machinery against THIS number
-  (0.123 s/token of provable idle, one gap per layer) before anything new.
+- [x] **READ SHAPE — BUILT, MEASURED, REVERTED 2026-09-21 ON ITS OWN STOP RULE. The mechanism
+  worked perfectly and bought NOTHING, which is why the result is worth more than the feature was.**
+  Detail: [`…-row49-small-group-preload-RESULTS.md`](docs/2026-09-21-row49-small-group-preload-RESULTS.md).
+  **Characterisation first, off the checkpoints' own `vaayu_expert_offsets.json` through
+  `_group_contiguous_ranges`' own rule, no GPU:** both MoE checkpoints store each expert as
+  **EXACTLY 3 contiguous file groups**, one bandwidth-bound and the rest latency-bound —
+  MiniMax 47,616 groups of which 31,744 are < 64 KiB (**66.7 % of reads, 439.0 MB resident,
+  0.31 % of expert bytes**; per expert `trellis` 8.85 MB + `suh/svh` 31.7 KB + `mcg` 4.1 KB,
+  useful 8,875,020 B vs aligned 8,887,299 B = **amplification 1.0014**), Qwen3-Next 73,728 of
+  which 24,576 (33.3 %, 1.2 MB). That confirms the 3.04 figure exactly: 271 loads/token × 3 =
+  the 814 rust reads/token the duty probe counted.
+  **COALESCING REFUTED BEFORE THE BUILD, do not retry:** the `mcg`→`suh` gap grows linearly with
+  expert id — 29.7 KB at expert 0, **4.84 MB at expert 255** — so no fixed gap tolerance merges
+  them without reading megabytes of other experts. (Row 44's F4 died on the OTHER forward for a
+  different reason: adjacent-id runs averaged 2.2 experts at 55 % density.)
+  **BUILT:** `_NVME_SMALL_READ_BYTES = 64 KiB` hardware constant + a resident table `copy_`d into
+  exactly the destination the read would have filled, so slab layout / `prefix_pad` / views /
+  `slab_span` / arena backing / step 2A's async-H2D decision were unchanged **by construction**;
+  17 tests over two geometries, suite 2365 passed / 16 skipped (baseline 2348/16); engine knob
+  `SMALL_READ_PRELOAD` plumbed and documented; engine logged `439.0MB resident (3.9 % of the
+  expert cache budget)` on every fix arm — the index prediction landed exactly.
+  **MEASURED, ABBA `fix,base,base,fix`, U arms only, 29G scope, foreground, one build with the
+  knob as the arm variable:** **reads/token 803 → 268 (−66.7 %)**, **delivered-while-busy
+  6.07 → 6.50 GB/s (+6.9 %)**, **disk BUSY 75.8-76.5 % → 70.6 % (−5.4 pp)**, bytes/token
+  unchanged — **and decode −0.40 %** (pooled 0.51455 base vs 0.51660 fix; arms INTERLEAVE, the
+  fastest pair is a base pair and the slowest a fix pair; within-arm spread 0.10-0.33 %,
+  between-run spread on base alone 1.0 %). **The 26 ms/token of freed disk busy went straight
+  into idle (0.125 → 0.152 s/token); exposed stall did not move.**
+  **The gap census says it twice:** idle gaps ≥ 1 ms are UNCHANGED (3835/3840 base vs 3828/3834
+  fix, the same ~61/token, one per MoE layer). What vanished is ~98 **sub-millisecond** gaps per
+  token (158.8 → 60.9; median gap 0.09 → 2.22 ms). **The small reads were filling the small gaps.
+  The structural per-layer gap never belonged to the drive.**
+  **THIS REFUTES THE RATE LEVER BY DIRECT EXPERIMENT.** The B re-rank priced 6.03 → 7.1 GB/s at
+  ≤ +12.8 %; this moved the rate **39 % of that distance and paid −0.40 %**. That ceiling was
+  computed by holding duty fixed while busy shrank — **duty did not hold.**
+  **Not claimed:** cross-arm greedy-id identity on device — `row26_decode.py` compares ids only
+  WITHIN a run (identical to U1 in every arm of all four) and never emits them. Byte identity is
+  proven structurally by the tests instead. A future build of this idea must add that check.
+  **Archived, not deleted:** `docs/refuted/2026-09-21-row49-small-group-preload.diff.refuted`
+  (the whole implementation) and `docs/refuted/test_small_group_preload.py.refuted` (the 17
+  tests). Rebuild only if something makes the token track disk busy again.
+  **§8, answered before the measurement:** it had a knob, it was plumbed, it was reachable at
+  N=1 on every MiniMax request. **Reachability was never the problem; the effect was.**
+- [ ] **The last lever, and its headline number is NOW IN DOUBT: fill the 1.57 ms/layer drive-idle
+  gap.** The **>= +31 %** came from "token -> 0.399 s at the same 6.03 GB/s", i.e. from assuming the
+  token collapses onto disk-busy time. **The read-shape arm above tested exactly that assumption and
+  it FAILED: busy fell 26 ms/token and the token moved 2 ms the WRONG WAY, while the >= 1 ms
+  per-layer gaps stayed identical in number.** Prefetching *useful* bytes is a different experiment
+  from supplying the same bytes faster, so this is not refuted — but do not quote +31 % as if it
+  were measured. **Also note the N=1 arm is POSITIVE, not the -3.7 % this row used to cite:**
+  `VAAYU_LOOKAHEAD` on MiniMax measured **+2.5 % at N=1** post-P4 and **-3.7 % at N=3**
+  (`check_lookahead_flag_safe`), and the server runs N=1. Cheap way in is still to re-gate that
+  built machinery rather than scope a new build — but price it against its **+18.0 % bytes/token**
+  first: against a 76 %-busy drive that alone puts the token floor near +11 %, under row 35's own
+  >= +15 % re-open bar.
 - [ ] step 3 — re-price the CPU hybrid, only after step 2. The stop rule did NOT close it; its own
   verdict below (MiniMax-only, EXL3 has no CPU kernel, weeks) is unchanged by these numbers.
 - [ ] **NOT IN SCOPE, recorded so it is not lost: MiniMax PREFILL's H2D is pageable** (step 0(d);
