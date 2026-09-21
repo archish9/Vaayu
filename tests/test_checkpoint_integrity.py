@@ -8,7 +8,11 @@ import json
 
 import pytest
 
-from vaayu.persist.checkpoint_integrity import assert_checkpoint_complete
+from vaayu.persist.checkpoint_integrity import (
+    assert_checkpoint_complete,
+    assert_expert_layout_indexable,
+)
+from vaayu.utils import find_or_create_local_splitted_path, split_and_save_layers
 
 
 def _shards(tmp_path, names):
@@ -49,3 +53,52 @@ def test_unsharded_checkpoint_passes(tmp_path):
 def test_directory_with_no_safetensors_passes(tmp_path):
     """Not this check's job to decide whether a directory is a checkpoint."""
     assert_checkpoint_complete(str(tmp_path))
+
+
+# G1: the same layout question, asked BEFORE a split writes or deletes anything.
+
+def test_assert_expert_layout_indexable_raises_for_fused_3d(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    keys = ["model.layers.0.mlp.experts.gate_up_proj_blocks",
+            "model.layers.0.self_attn.q_proj.weight"]
+    with pytest.raises(RuntimeError) as excinfo:
+        assert_expert_layout_indexable(str(tmp_path), keys)
+    assert "32" in str(excinfo.value)
+
+
+def test_assert_expert_layout_indexable_passes_for_per_expert_keys(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    keys = ["model.layers.0.mlp.experts.0.w1.weight",
+            "model.layers.0.mlp.experts.1.w1.weight"]
+    assert_expert_layout_indexable(str(tmp_path), keys)   # must not raise
+
+
+def test_assert_expert_layout_indexable_passes_for_dense_config(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 80}))
+    keys = ["model.layers.0.self_attn.q_proj.weight"]
+    assert_expert_layout_indexable(str(tmp_path), keys)   # must not raise
+
+
+def test_split_and_save_layers_refuses_a_fused_3d_original_before_writing(tmp_path):
+    """The finding's actual guarantee: nothing is written before the raise."""
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": "model.safetensors",
+            "model.layers.0.self_attn.q_proj.weight": "model.safetensors",
+        }
+    }))
+    with pytest.raises(RuntimeError, match="32"):
+        split_and_save_layers(str(tmp_path))
+    assert not (tmp_path / "splitted_model").exists()
+
+
+def test_find_or_create_local_splitted_path_raises_g0_for_shards_with_no_index(tmp_path):
+    """The finding's motivating case: shards present, no index -- an
+    interrupted download -- must raise G0's message, not HFValidationError."""
+    (tmp_path / "model-00001-of-00003.safetensors").write_bytes(b"\0" * 16)
+    (tmp_path / "model-00002-of-00003.safetensors").write_bytes(b"\0" * 16)
+    with pytest.raises(RuntimeError) as excinfo:
+        find_or_create_local_splitted_path(str(tmp_path))
+    message = str(excinfo.value)
+    assert "3" in message and "2" in message

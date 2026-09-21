@@ -333,6 +333,15 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                               f"pytorch_model.bin.index.json, model.safetensors.index.json, "
                               f"model.safetensors, or pytorch_model.bin")
 
+    # G1: ask the same layout question ExpertOffsetIndex asks, but on the
+    # ORIGINAL keys, before anything is written or (under delete_original)
+    # deleted. The equivalent check in ExpertOffsetIndex.build() runs only
+    # after the split -- and after delete_original_shards() under the
+    # server's DELETE_ORIGINAL default -- so a checkpoint Vaayu cannot index
+    # would otherwise cost the user their only copy before anything said so.
+    from .persist.checkpoint_integrity import assert_expert_layout_indexable
+    assert_expert_layout_indexable(str(checkpoint_path), index.keys())
+
     if layer_names is None:
         prefix = 'model.layers'
     else:
@@ -553,6 +562,15 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
                                                                             compression=compression, layer_names=layer_names, delete_original=delete_original)
         else:
+            # G0: a directory holding shards but no index is an interrupted
+            # download (the 46-of-48-with-no-index case G0 was written for),
+            # not a genuine repo id -- raise G0's message here rather than
+            # falling through to snapshot_download(<this local path>), which
+            # raises an opaque HFValidationError instead. A directory with
+            # zero *.safetensors returns silently, so a real repo id is
+            # unaffected.
+            from .persist.checkpoint_integrity import assert_checkpoint_complete
+            assert_checkpoint_complete(str(model_local_path_or_repo_id))
             print(
                 f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
 
