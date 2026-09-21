@@ -3760,7 +3760,28 @@ resurrect the dead path to implement it, and do not let a review conflate them.
 
 ---
 
-# 34 · [ ] The drive delivers 6.3 GB/s while it plateaus at 7.1 — probe why (added 2026-09-12)
+# 34 · [x] The drive delivers 6.3 GB/s while it plateaus at 7.1 — probe why (added 2026-09-12) — **CLOSED 2026-09-21 ON ITS OWN STOP RULE: depth is ALREADY 2-4. Its probe was run under row 49 and its second branch fired.**
+
+**VERDICT: `6.0-6.1 GB/s IS the drive's real rate for this access pattern`** — this row's own words for
+the branch that fired. **Time-weighted in-flight depth over a real MiniMax decode (row 49's duty probe,
+`docs/2026-09-21-row49-B-rerank-RESULTS.md`), restricted to BUSY time and capped at the ring pool
+(= device depth): depth 1 = 21.3 %, depth 2 = 20.5 %, depth 3 = 58.1 % -> DEPTH >= 2 FOR 78.6 % OF
+BUSY TIME**, against this row's *"≥ 60 % of busy time at depth 1"* trigger. Not close. The
+layer-boundary ramp hypothesis is REFUTED as the explanation of the rate: the boundaries do cost, but
+as **drive IDLE** (23.6 % of the span, one 1.57 ms gap per layer), not as low occupancy while busy.
+R2's coalescing verdict extends, as this row said it would.
+
+**The one thing it got wrong, and it is now fixed: `_NVME_READ_CONCURRENCY = 3` was NOT the optimum.**
+This row said *"target sustained 2-4, never more"*; in path the 2-4 zone is not flat and **2 is the
+peak** — shipped 2026-09-21 at +1.89 % MiniMax decode / +1.85 % prefill (row 49, `8e8e8d5`).
+**The concurrency axis is now exhausted on this box.** What survives as open work is NOT this row's
+hypothesis but the two row 49 successors: the **read shape** (3.04 reads per expert, bimodal) and the
+**per-layer idle gap** (>= +31 %, needs prediction).
+
+**Its Qwen arm can never be re-run** — Qwen3-235B was deleted 2026-09-20 — and Qwen3-Next's disk is
+0.42 % of a decode token, so MiniMax was the only live model for this question anyway.
+
+*Original text below, kept for the trail.*
 
 Qwen moves 4.84 GB in 0.772 s of busy time = **6.3 GB/s**; MiniMax 2.38 GB in 0.396 s = **6.0**. Row P8's plateau is
 **7.1 GB/s at 2 concurrent readers**; a single reader delivers **6.0–6.4**.
