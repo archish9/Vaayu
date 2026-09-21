@@ -5138,6 +5138,29 @@ module tree carries sinks and the GPU is not Hopper (sm_120 here), landing on ea
 picks for this model anyway. **§8: no knob** — every one of these is a correctness fix with no user choice
 in it. Probes: `a3_streamed_forward.py`, `a3_moe_block_compare.py`, `a3_layer_trace.py`, `a3_rope_cause.py`.
 
+**A3 Task 5 DONE (2026-09-21) — and the investigation found a CORRECTNESS bug where the plan expected a
+sizing question. Result: gpt-oss-20b is now BIT-IDENTICAL to stock transformers, logits sha256 equal at
+BOTH 4 tokens (`7bfd3bb0…`) and 256 tokens (`6668afdd…`), every traced tensor `max|diff| = 0`.** The plan
+asked whether sliding-window attention is a sizing tweak or a subsystem. **It is both, and the halves split
+cleanly:** **(a) CORRECTNESS — FIXED here.** transformers builds TWO masks and hands each layer the one its
+type asks for (`modeling_gpt_oss.py:492`, `causal_mask_mapping[config.layer_types[i]]`); **Vaayu's layer
+loop passed ONE mask to every layer**, so a windowed layer attended its whole history. Measured: at 256
+tokens (window 128) Vaayu's **top-1 token differed from stock** (18 vs 17). `get_attention_mask_args` now
+takes the layer and applies transformers' own overlay (*attend iff `kv_idx > q_idx - window`*) for any
+layer whose attention module declares a window — capability, not an architecture string — cached per
+(window, size, dtype). `tests/test_sliding_window_kv.py`, **9 tests**, parametrized over two window sizes.
+**(b) A SECOND, BIGGER CAUSE, found by the same trace and it is NOT gpt-oss-specific — it affects EVERY
+model Vaayu has ever run: `_precompute_rope` built the rotary module in `running_dtype`, so `inv_freq` —
+a table of FREQUENCIES — was bf16.** A relative error there grows with the position it multiplies:
+measured cos/sin **0.0039 off stock at position 3 (one bf16 ulp) and 0.51 off — 38 % of full scale — at
+position 255**, which is what moved the top-1 token. Stock keeps that table in fp32 for every model. Now
+built in fp32 with cos/sin cast back to the run dtype; **this changes numerics slightly for Qwen3-Next,
+MiniMax-M2.7 and both Llamas, in the direction of stock transformers** (and is the reason gpt-oss now
+matches bit-for-bit). Gates after both changes: suite **2406 passed / 16 skipped**, Qwen3-Next accumulator
+**8**, MiniMax accumulator **8**, Llama-3.2-1B prefix **1**. **§8: no knob** — neither is a user choice.
+**(c) THE SIZING HALF IS A SUBSYSTEM → NOT done here, opened as row 47-m4 below with its measured cost**,
+exactly the fallback the plan allows.
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
@@ -5151,6 +5174,23 @@ in it. Probes: `a3_streamed_forward.py`, `a3_moe_block_compare.py`, `a3_layer_tr
       index config-less**, and it runs FIRST (`vaayu_base.py:2210`, before `:2295`). For a fused-3D
       checkpoint it expects nothing, returns 0, and falls back to the 512 MB pinned-buffer guess.
       Harmless today — the real guard raises later in the same load — but the ordering is undocumented.
+- [ ] **47-m4 — sliding-window layers are STORED and BUDGETED at full length.** Split out of A3 task 5
+      (2026-09-21) because it is a subsystem, not a sizing line. Two places: (1) Vaayu's own KV cache
+      (`FP8DynamicCache`, `vaayu_base.py:1382`) keeps its ring buffers in `key_cache`/`value_cache` and
+      never consults the per-layer cache classes it constructs — measured: `cache.layers[0]` IS a
+      `DynamicSlidingWindowLayer` and holds NOTHING, while `key_cache[0]` holds all 512 tokens of a
+      512-token prefill; (2) `kv_bytes_per_token` (`vram_plan.py:63`) multiplies `num_hidden_layers` by the
+      full per-token cost with no per-layer awareness. **Measured waste on gpt-oss-20b: 12 of 24 layers are
+      windowed at 128, so 24,576 of 49,152 B/token — exactly HALF — is stored and reserved but unreadable.
+      At the derived `max_seq_len` of 33,206 that is 1.632 GB held against 0.819 GB needed: 0.813 GB, 49.8 %,
+      on a 16 GB card. It also halves the `max_seq_len` Vaayu derives for such a model.** Correctness is NOT
+      affected (A3 task 5 fixed the mask; the extra KV is simply masked out). Fix touches the cache's
+      per-layer capacity, `get_seq_length`/`_seq_len` bookkeeping, the prefix cache's snapshot/crop and the
+      KV persist format — hence its own row. **Second, smaller gap found with it: when the mask is None
+      (flash, and sdpa at `q_len == kv_len`) the window is NOT applied by Vaayu at all.** Flash is fine —
+      the attention module passes its own `sliding_window` to the kernel — but **sdpa with an implicit
+      causal mask would silently ignore the window**; no on-device model hits it today (gpt-oss refuses
+      sdpa), and it must be closed before a windowed model runs on sdpa.
 - [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
       `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
       **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE
