@@ -4878,13 +4878,115 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 
 | # | plan | delivers | depends on | gate | cost | doc |
 |---|---|---|---|---|---|---|
-| **A1** | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
+| **A1** `[x]` | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
 | **A2** | **Fused-3D expert indexing** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
 | **A3** | **gpt-oss-20b END TO END** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
 | **A4** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | none | ~2 days | brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
 | **A5** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | A4 | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
 | A7 | G3 `compute_device` parity · G5 NVMe re-measure | removes two latent generality traps | — | none | ~1 day | plan when picked |
+
+
+**A1 IS CLOSED — done and verified 2026-09-21, five commits `512f6b7..444afd1` on main.**
+Suite **2348 → 2373 passed / 16 skipped** (+25; the plan asserted +15 for its three tasks and got
+exactly that, then +5 for a task the plan did not have and +5 for the final-review fix wave).
+RESULTS: [`…-row47-A1-guards-RESULTS.md`](docs/2026-09-21-row47-A1-guards-RESULTS.md).
+Plan: [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md). Per-task reviews,
+reviews and the full ruling list are in `.superpowers/sdd/2026-09-20-arch-A1-guards/progress.md`
+(gitignored — this row is the durable copy).
+
+- [x] **Task 1 `5cb90cd` — `ExpertOffsetIndex.expected_expert_count()`.** The index had nothing to
+      compare an empty result against. The field name differs per family, so the lookup is an
+      EXPLICIT ORDERED LIST `("num_experts", "num_local_experts", "n_routed_experts")`, never a
+      substring scan — a scan also matches `num_experts_per_tok` (10 on Qwen3-Next against a real
+      512) and `shared_expert_intermediate_size` (512). `None` means "no expectation", never zero,
+      so dense checkpoints are unaffected.
+- [x] **Task 2 `cbe492d` — `build()` RAISES when the config implies experts and the index found
+      none.** Layout-agnostic by construction ("config says E, index holds zero"), so it stays
+      correct for the next layout nobody has seen. Runs BEFORE `_write_cache()`, so an empty index
+      can never be cached and bypass the guard on a later load. Also deleted the class docstring's
+      claim that the `.experts.N.` regex "covers … any future architecture" — untrue, and it is
+      what made G1 invisible for the life of the file.
+- [x] **Task 3 `9407c17` — `vaayu/persist/checkpoint_integrity.py` (G0).** Verifies the shard count
+      implied by the `-of-NNNNN` suffix and that every `weight_map` target resolves. Reads NAMES and
+      the index only, never a config field or an architecture string; silent on directories that are
+      not sharded checkpoints. Verified OK on all NINE directories under `models/` (the six named
+      checkpoints plus `venv`, `Qwen2.5-Coder-1.5B` and the MiniMax score-correction dir).
+- [x] **Task 4 `6bb438d` — NOT IN THE PLAN. Added 2026-09-21 at the user's direction after
+      measurement showed TASKS 1-3 SHIPPED GUARDS THAT COULD NEVER FIRE.** `vaayu_base.py:2073`
+      sets `checkpoint_path` from `find_or_create_local_splitted_path` → the `splitted_model/` dir,
+      **which carries no `config.json`** — so `expected_expert_count()` returned `None` on every
+      production load and the raise was skipped every time. Measured before the fix: Qwen3-Next
+      24576 indexed experts against `expected=None`; MiniMax 15872 against `None`. G0 was inert for
+      a different reason: the splitted output has neither `-of-NNNNN` names nor an index, and
+      nothing ever checked the ORIGINAL shard set. Fix: the index takes the config's directory
+      separately from the shards' (`vaayu_base.py:2295` passes `self.model_local_path`);
+      `build_or_load()` also asserts on the CACHED branch; G0 moves to `split_and_save_layers`.
+      After: Qwen3-Next `expected=512`, MiniMax `expected=256`, both Llamas `None`, none raising.
+      **The general lesson, and it is the second time this program has paid for it: three per-task
+      reviews all passed, because the defect lived entirely in UNCHANGED code that no single diff
+      contained.**
+- [x] **Final whole-branch review (opus) → READY TO MERGE**, no Critical, no regression, no
+      model-agnostic violation. Two Important, FIXED in one wave (`444afd1`); three Minor filed as
+      rows below by ruling rather than fixed, because each touches MoE detection or shard-name
+      arithmetic that is CORRECT for every checkpoint on disk today.
+  - **Important 1 — the guard fired AFTER the originals were deleted.** `split_and_save_layers`
+    deletes source shards at `utils.py:485` under the server's own `DELETE_ORIGINAL = True`
+    (`vaayu/server/config.py:62`); the expert guard was ~200 lines later at `vaayu_base.py:2295`.
+    Pointing the server at gpt-oss-20b would cost a ~13 GB split AND the only copy of the
+    checkpoint before the error arrived — and `remove_real_and_linked_file` follows symlinks, so a
+    shard linked into the shared HF cache takes the cached blob with it. Now
+    `assert_expert_layout_indexable` asks the same question at split time on the ORIGINAL keys,
+    before anything is written or deleted.
+  - **Important 2 — G0 never reached its own motivating case.** `find_or_create_local_splitted_path`
+    only calls `split_and_save_layers` when an index or model file exists, so "46-of-48 shards with
+    NO index" — the exact DeepSeek incident `checkpoint_integrity.py`'s docstring cites — fell
+    through to `snapshot_download(<absolute local path>)` and raised `HFValidationError` instead of
+    G0's message. Now guarded in the `else:` branch before the fallthrough.
+
+**HEADLINE, stated as measured and no wider.** Pointing Vaayu at `gpt-oss-20b` now RAISES:
+`config implies 32 routed experts, but no key in the checkpoint index matches …`, **at split time,
+before the split is written and before the original is deleted.** The four working models are
+unaffected — Qwen3-Next OK, MiniMax OK, Llama-3.3-70B OK, Llama-3.2-1B SKIP (single-file, no
+index.json, so the verification script cannot reach it; the re-reviewer traced that on the REAL path
+it does hit the guard, via the single-file branch that builds `index` from the tensor names, and its
+config has no expert field so the answer is `None` either way — but that branch was never re-exercised
+by a verification run, only by reading).
+**A1 does NOT make gpt-oss-20b load.** That is A2 (fused-3D indexing) + A3 (end to end). A1's whole
+deliverable is that the failure became VISIBLE and CHEAP instead of silent and destructive.
+
+**§8, re-answered after Task 4 changed the wiring — and ONE ANSWER IS NARROWER THAN THE PLAN's:**
+1. **Knob?** None needed, and none added. Both raises are tied to concretely-absent files or keys.
+   There is deliberately no escape hatch.
+2. **Plumbed?** Yes. `vaayu_base.py:2295` and `utils.py`'s `split_and_save_layers` are the only two
+   production seams, and both sit on the single entry path.
+3. **Reachable at N=1?** Yes for every model on this box — but **the plan's wording "on every load,
+   for every model" is REFUTED and must not be re-copied.** G0 reaches only loads whose source dir
+   holds an index or model file; G1 reaches only `cuda` + `is_moe` loads. True for the four working
+   models and for gpt-oss on CUDA, which is what matters today. A library caller gets the identical
+   guards — `VaayuBaseModel.__init__` is the path the server takes.
+4. **Banked?** Nothing.
+
+**Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
+- [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
+      matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
+      checkpoint whose only expert field is `n_routed_experts` — **the DeepSeek shape, which
+      `_EXPERT_COUNT_FIELDS` explicitly claims** — gets `is_moe=False`, so the index is never built
+      and G1 never runs. Same for `device="cpu"` (`server/config.py:27` is user-settable). NOT
+      silent-wrong output: with `is_moe=False` Vaayu streams whole layers and the experts come
+      along. A coverage-claim gap, not a correctness hole. Fix: add `n_routed_experts`, or gate on
+      `expected_expert_count() is not None`. **Bites row 28b/A5 directly.**
+- [ ] **47-m2 — `expert_read_buffer_bytes` (`safetensor_model_persister.py:888`) still builds the
+      index config-less**, and it runs FIRST (`vaayu_base.py:2210`, before `:2295`). For a fused-3D
+      checkpoint it expects nothing, returns 0, and falls back to the 512 MB pinned-buffer guess.
+      Harmless today — the real guard raises later in the same load — but the ordering is undocumented.
+- [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
+      `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
+      **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE
+      files against total=2** — which yields no raise today (correct), but a missing `00000` is
+      invisible and `len(present) > total` is silently ignored. Also: a PARTIAL `delete_original`
+      (an `OSError` at `utils.py:276` is caught and logged) leaves shards plus the retained index,
+      and the `weight_map` check would then raise on a model that had been loading fine.
 
 **A4 and A5 are BRIEFS, not plans, deliberately** — a TDD plan for kernel work of unproven
 feasibility would be placeholders. Each carries its scope, gate and abandon rule and becomes a plan
@@ -4943,12 +5045,12 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
 
 **The seven gaps, in bite-order (G1 first because it is the only one that fails SILENTLY):**
 
-- [ ] **G0 — an incomplete or inconsistent checkpoint must fail LOUDLY at persist time.** This checkpoint WAS 46-of-48
+- [x] **G0 — an incomplete or inconsistent checkpoint must fail LOUDLY at persist time.** This checkpoint WAS 46-of-48
       with no index for part of 2026-09-20 — a download that stopped, not an exotic case — and RC5 already shipped a
       `.done` marker over dropped tensors once. Verify shard count against the `-of-NNNNN` suffix AND that every
       `weight_map` ref resolves, before writing anything. Still worth building after this checkpoint completed: the
       next one will not be complete either.
-- [ ] **G1 — NOW REPRODUCIBLE, AND IT HAS A PLAN PROMPT. `gpt-oss-20b` arrived on disk 2026-09-20 and IS the
+- [x] **G1 — NOW REPRODUCIBLE, AND IT HAS A PLAN PROMPT. `gpt-oss-20b` arrived on disk 2026-09-20 and IS the
       silent failure.** Measured: **`r'\.experts\.(\d+)\.'` matches 0 of its 459 tensors**, because its experts
       are one 3D blob per layer (`model.layers.N.mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]` — the
       leading 32 IS the expert axis). **transformers 5.5.4 supports `gpt_oss` natively** (`AutoConfig` →
@@ -4964,7 +5066,7 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
       Brief + the fresh-session plan prompt:
       [`…-row47-G1-gptoss-BRIEF.md`](docs/2026-09-20-row47-G1-gptoss-BRIEF.md).
       The original gap text follows.
-- [ ] **G1 (original) — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
+- [x] **G1 (original) — `ExpertOffsetIndex` understands exactly ONE key scheme** (`vaayu/persist/expert_offset_index.py:8`,
       `_EXPERT_RE = re.compile(r'\.experts\.(\d+)\.')`). **Every fused-3D checkpoint is unsupported SILENTLY** — it
       finds zero experts rather than raising, and the docstring's claim that it "covers … any future architecture"
       is exactly the trap. Fused-3D (`experts.gate_up_proj` shaped `[E, …]`) is what modern transformers MoE ships.
