@@ -71,7 +71,11 @@ def test_json_cache_written(tmp_path):
     assert cache_file.exists()
     with open(cache_file) as f:
         data = json.load(f)
-    assert "model.layers.0" in data
+    # A2 wrapped the layer map in a versioned envelope so a fused checkpoint's
+    # whole-tensor metas survive the reload. Version 1 -- the bare layer map --
+    # is still READ, so caches written before this change still load.
+    assert data["__vaayu_index_version__"] == ExpertOffsetIndex.CACHE_VERSION
+    assert "model.layers.0" in data["index"]
 
 
 def test_load_cached(tmp_path):

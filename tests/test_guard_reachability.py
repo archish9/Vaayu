@@ -34,16 +34,20 @@ def _write_shard(path, tensors: dict):
 
 def test_config_in_a_separate_directory_is_found(tmp_path):
     """The production shape: shards in the splitted dir, config in the
-    original checkpoint dir. Fused-3D expert keys match nothing, so the
+    original checkpoint dir. The expert keys match NEITHER layout, so the
     index comes back empty -- and now there is a config to compare it
-    against, so the guard must fire."""
+    against, so the guard must fire.
+
+    The unindexable shape here used to be the fused-3D one; A2 indexes that,
+    so this test moved to a layout still outside both detectors. What it
+    covers is the two-directory config lookup, not any particular layout."""
     shards_dir = tmp_path / "splitted_model"
     shards_dir.mkdir()
     config_dir = tmp_path / "original"
     config_dir.mkdir()
     (config_dir / "config.json").write_text(json.dumps({"num_local_experts": 32}))
     _write_shard(shards_dir / "model.layers.0.safetensors", {
-        "model.layers.0.mlp.experts.gate_up_proj_blocks": ("U8", [32, 64, 9, 16], 294912),
+        "model.layers.0.mlp.expert_weights": ("U8", [32, 64, 9, 16], 294912),
     })
 
     index = ExpertOffsetIndex(str(shards_dir), config_path=str(config_dir))

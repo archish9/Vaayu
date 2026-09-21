@@ -60,19 +60,25 @@ def _write_shard(path, tensors: dict):
 
 
 def test_build_raises_when_config_implies_experts_and_none_were_found(tmp_path):
-    """The gpt-oss shape: experts live in one 3D blob per layer, so the
-    `.experts.N.` regex matches nothing and the index comes back empty."""
+    """A layout NEITHER detector covers: no `.experts.<N>.` key, and no tensor
+    under an `experts.` prefix either, so both paths index nothing.
+
+    This was written against the gpt-oss fused shape, which A2 now indexes --
+    so the case moved to one still outside both layouts. The guard's question
+    is unchanged and deliberately layout-agnostic: config says E, index holds
+    zero.
+    """
     (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
     _write_shard(tmp_path / "model-00001-of-00001.safetensors", {
-        "model.layers.0.mlp.experts.gate_up_proj_blocks": ("U8", [32, 64, 9, 16], 294912),
-        "model.layers.0.mlp.experts.gate_up_proj_scales": ("U8", [32, 64, 9], 18432),
+        "model.layers.0.mlp.expert_weights": ("U8", [32, 64, 9, 16], 294912),
+        "model.layers.0.mlp.expert_scales": ("U8", [32, 64, 9], 18432),
     })
     index = ExpertOffsetIndex(str(tmp_path))
     with pytest.raises(RuntimeError) as excinfo:
         index.build(write_cache=False)
     message = str(excinfo.value)
     assert "32" in message                                   # what was expected
-    assert "gate_up_proj_blocks" in message                   # what was actually seen
+    assert "expert_weights" in message                        # what was actually seen
     assert str(tmp_path) in message                           # which checkpoint
 
 
