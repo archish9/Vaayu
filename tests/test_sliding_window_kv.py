@@ -103,6 +103,20 @@ def test_two_layers_of_the_same_type_reuse_one_overlay():
     assert torch.equal(first["attention_mask"], second["attention_mask"])
 
 
+def test_a_different_mask_object_is_not_served_from_the_cache():
+    """Same shape, same dtype, different content -- which is exactly what two
+    batched requests' padding masks look like."""
+    engine = _engine()
+    first = _causal(8)
+    second = first.clone()
+    # (7, 5) is INSIDE a window of 4 and causal, so only the mask's own content
+    # decides it -- a cell the overlay would never touch on its own.
+    second[0, 0, 7, 5] = torch.finfo(second.dtype).min
+    a = engine.get_attention_mask_args(first, 0, 8, layer=_layer(4))["attention_mask"].clone()
+    b = engine.get_attention_mask_args(second, 0, 8, layer=_layer(4))["attention_mask"]
+    assert not torch.equal(a, b), "the overlay was reused across two different masks"
+
+
 def test_a_different_window_is_not_served_from_the_cache():
     engine = _engine()
     mask = _causal(8)

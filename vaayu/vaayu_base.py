@@ -4560,20 +4560,24 @@ class VaayuBaseModel(GenerationMixin):
         overlay is transformers' own rule -- attend iff `kv_idx > q_idx - window`
         (`masking_utils.sliding_window_overlay`).
 
-        Cached per (window, size, dtype, device): the mask is rebuilt per forward
-        but is the same for every layer of a given type within it.
+        Cached for the duration of ONE forward: every layer of a given type is
+        handed the same mask object, so the overlay is computed once and reused
+        across them. The cache key includes the mask OBJECT, not just its shape:
+        a batched padding mask (`build_batch_attention_mask`) differs in content
+        between requests at identical shape and dtype, and a shape-only key would
+        hand request B the overlay built on request A's padding.
         """
         size = mask.shape[-1]
         key = (window, size, mask.dtype, str(mask.device))
         cached = getattr(self, "_windowed_mask_cache", None)
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached[0] == key and cached[2] is mask:
             return cached[1]
         idx = torch.arange(size, device=mask.device)
         too_old = (idx[None, :] <= (idx[:, None] - window))[None, None]
         blocked = (False if mask.dtype == torch.bool
                    else torch.finfo(mask.dtype).min)
         out = mask.masked_fill(too_old, blocked)
-        self._windowed_mask_cache = (key, out)
+        self._windowed_mask_cache = (key, out, mask)
         return out
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s, layer=None):

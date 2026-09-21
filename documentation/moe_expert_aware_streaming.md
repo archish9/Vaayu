@@ -147,6 +147,42 @@ def _inject_expert_weights(expert_mod, raw, expert_idx, layer_name, device, dtyp
 
 **Direct assignment**: `moe_module.forward = sparse_fwd` (NOT `.__get__()`) — instance attribute assignment bypasses Python's descriptor protocol, so `sparse_fwd(hidden_states)` receives only `hidden_states` without a module self injection.
 
+### 3.4b Whole-layer streaming for fused-3D checkpoints — `vaayu/moe_patch.py`
+
+Some checkpoints do not store one tensor per expert. They store **one tensor per projection
+per layer**, with the expert count as the leading axis (`...mlp.experts.gate_up_proj_blocks`
+of shape `[num_experts, …]`), and their experts module is handed to a grouped-GEMM kernel
+that does the routing **inside** the kernel — `gpt-oss-20b` (MXFP4) is the example on this
+box. There is no per-expert delivery to make for such a model: the kernel wants every
+expert's bytes whether one token routed to them or five hundred did.
+
+`_make_sparse_moe_forward` therefore has a fourth branch, `_make_whole_layer_sparse_forward`,
+chosen when **both** are true:
+
+- the expert offset index holds whole-layer tensors for the layer
+  (`ExpertOffsetIndex.fused_layer_tensors`), i.e. the CHECKPOINT is fused, and
+- the live experts module carries fused parameters (`fused_param_experts()`).
+
+Both conditions matter. A module-only test is not enough: `Qwen3NextExperts` also carries
+fused parameters while its checkpoint stores one tensor per expert, and it must stay on the
+per-expert forward.
+
+Per visit the branch reads the layer's tensors with `load_fused_layer_tensors()`, hands them
+to the quantizer's own weight conversions (`hf_quantizer.get_weight_conversions()` — empty
+for a checkpoint that needs none, so this is inert elsewhere), calls the block's own forward
+unchanged, and releases the layer's expert attributes afterwards.
+
+**What this costs you, and it is not small.** The expert RAM cache, the VRAM expert cache and
+the top-k budget (`DECODE_TOP_K`) all exist to exploit sparsity, and none of them applies
+here — every token moves the whole expert set. On gpt-oss-20b that is 423.6 MB per layer,
+10.17 GB per token, and the per-token telemetry line reports `expert_cache=0hit/0miss`.
+In exchange the model runs in ~1.7 GB of VRAM instead of the ~13.8 GB a resident load needs.
+
+**Attention note for this family:** a model whose attention carries *sinks* cannot use the
+flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux is currently
+only supported for Hopper GPUs"* at the first token — so Vaayu skips flash for it and runs
+eager attention, which is what stock transformers picks for it too.
+
 ### 3.5 Router Gate Pinning — `vaayu/vaayu_base.py`
 
 `_init_pinned_layers()` Phase 1.5 (MoE only): scans shard headers for keys matching

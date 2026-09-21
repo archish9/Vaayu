@@ -207,13 +207,15 @@ still the binding constraint here, which is what re-priced row 46. Tree clean at
 
 * **SPEED: 36 (if its gate fires) → 35 (+11.7 % measured, machinery built) → 32 (×1.50 projected, a download and zero
   code; also the only thing that re-opens 37) → 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
-* **REACH: row 47, now five plans with a fixed order — `A1 → A2 → A3`, then `A4 → A5`. A1 AND A2 ARE CLOSED
-  (2026-09-21); A3 IS THE NEXT ONE TO PICK UP.** A1 (guards) shipped both raises and made them fire on the real
-  load path; A2 (fused-3D indexing) shipped unit-tested plus four green on-device gates — gpt-oss-20b now indexes
-  32 experts / 144 whole-tensor metas and BOTH guards let it through, though **it still does not run**; A3 takes
-  **gpt-oss-20b end to end** and opens with an abandon gate (does stock transformers run MXFP4 on this box, or is
-  the only path a ~40 GB bf16 dequant that does not fit?); A4 (shared experts) is A5's prerequisite; A5 is the
-  DeepSeek-V4 port, weeks, gated on sm_120 kernels at step 1. Row **28b** IS A5.
+* **REACH: row 47, five plans in a fixed order — `A1 → A2 → A3`, then `A4 → A5`. A1, A2 AND A3 ARE ALL CLOSED
+  (2026-09-21); A4 IS THE NEXT ONE TO PICK UP.** A1 (guards) shipped both raises and made them fire on the real
+  load path; A2 (fused-3D indexing) shipped unit-tested plus four green on-device gates; **A3 took gpt-oss-20b
+  END TO END — it generates through the server (server gate 9 passed) and its logits are BIT-IDENTICAL to stock
+  transformers at 4 and 256 tokens.** The abandon gate passed (packed MXFP4 runs here, no bf16 dequant), and
+  getting there took SEVEN defects, five of them in code every model runs — see A3's rows below. Cost of the
+  reach: **0.17 tok/s, 13.28 GB/token**, because whole-layer delivery moves every expert per token; A6 exists to
+  cut that and now has a baseline. A4 (shared experts) is A5's prerequisite; A5 is the DeepSeek-V4 port, weeks,
+  gated on sm_120 kernels at step 1. Row **28b** IS A5.
   Program: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architecture-support-PROGRAM.md).
 
 **Model set re-set by the user 2026-09-20: Qwen3-235B is RETIRED AND DELETED — do not test it, do not put it in a gate;
@@ -242,7 +244,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | ~~1~~ | ~~**36 gate re-check**~~ | **DONE 2026-09-20 — IT FIRED: strict 32.34 / 32.73 % vs ≥ 30 % (`main` `da118ab`, 2 replicates, spread 1.2 %). `serial` FLAT at 0.0368 / 0.0374 s across three builds; the share rose because the token shrank to 0.1141 s. → **row 36 is now the next BUILD, ~1 week, plan first.** Same run: `disk_load` 8.41 → 0.42 %, RAM hit 96.6 % → row 46's mechanism is near-dead on Qwen3-Next; S3 gate 1 = 8.15 / 8.25 %, still closed.** | — | — | done, ~30 min | [`…-row36-gate-recheck-RESULTS.md`](docs/2026-09-20-row36-gate-recheck-RESULTS.md) |
 | ~~1~~ | ~~**36**~~ | **PARKED 2026-09-20 — gate fired, then two spikes killed every lever.** `serial` is **74.8 % GPU-bound**; its matmul half (12.59 ms) is at **80–86 % of the RTX 5060 Ti's 448 GB/s**, a floor; `use_torch_compile` **CRASHES** (cudagraph-trees step boundary, reproduced 2×); without cudagraphs it is **24–35 % SLOWER** (46 dynamo graphs — broken by the engine's own `time.perf_counter` instrumentation and by `aten.bincount`). Elementwise term still real but **not ~1 day**. | — | — | done, ~1 day | [`…-SPIKE.md`](docs/2026-09-20-row36-serial-split-SPIKE.md) · [`…-torchcompile-AB-RESULTS.md`](docs/2026-09-20-row36-torchcompile-AB-RESULTS.md) |
 | **1 (NEXT — SPEED)** | **49** | **STEP 2A SHIPPED 2026-09-20 (+6.90 % decode); B RE-RANKED AND REFUTED 2026-09-21 (<= +6 %).** The probe that killed B also priced its successors on the same run: **the drive is busy 75.7-76.4 % of a MiniMax decode token at 6.03-6.05 GB/s, idling 1.57 ms in EVERY layer** — **BOTH SUCCESSORS ARE NOW SPENT OR IN DOUBT (2026-09-21).** (a) The ring-pool / read-shape arm ran and the rate hypothesis was BACKWARDS: `VAAYU_RING_POOL_N=4` REGRESSES -2.07 %, the optimum is **n=2, shipped at +1.89 % decode / +1.85 % 2k prefill** — and the read-shape half was then BUILT AND REVERTED, because removing **66.7 % of the reads** and raising delivered bandwidth **6.07 -> 6.50 GB/s** bought **-0.40 % decode**. That is a direct experiment refuting the **<= +12.8 %** rate lever. (b) The per-layer gap's **>= +31 %** came from the same "token collapses onto disk-busy time" arithmetic the read-shape arm just falsified (busy fell 5.4 pp, token did not move, and the >= 1 ms gap COUNT was unchanged) — do not quote it as measured. Its built form, `VAAYU_LOOKAHEAD`, is **+2.5 % on MiniMax at N=1** (the -3.7 % is the N=3 arm the server never runs) and costs **+18.0 % bytes/token**, which alone caps the token floor near **+11 %**. Original text: **MiniMax-M2.7's expert H2D is SYNCHRONOUS on purpose** (`moe_patch.py:1110`/`:1119`, `non_blocking=False`), so it cannot hide behind the disk read the way the fused forward's does. Row 26 measured it at **0.180 s of a 0.596 s token — 30.2 %, the largest removable phase on that model**, and ORDERED this priced before any CPU path. Never done. **Bigger than the CPU hybrid's whole 0.114 s prize, and needs no CPU kernel or new on-disk format.** | open now — row 26's precondition 1 (after row 27) was met 2026-09-12 | **step 1: `h2d_pct` < ~15 % of `T_prof` → close the row AND the CPU-hybrid half with the number** | step 0 ~1 h · step 1 ~1 h · step 2 1–3 days | [`…-row49-minimax-h2d-BRIEF.md`](docs/2026-09-20-row49-minimax-h2d-BRIEF.md) · row **49** below |
-| **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. **A1** guards (raise instead of silently finding zero experts) · **A2** fused-3D indexing · **A3** gpt-oss-20b end to end · **A4** shared-expert pinning · **A5** DeepSeek-V4 port. | **A1 open now**, no dependency, no on-device risk | A3 and A5 each have an abandon gate at their first task | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
+| **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. ~~**A1** guards~~ · ~~**A2** fused-3D indexing~~ · ~~**A3** gpt-oss-20b end to end~~ **(all three CLOSED 2026-09-21; gpt-oss generates through the server, bit-identical to stock)** · **A4** shared-expert pinning (NEXT) · **A5** DeepSeek-V4 port. | **A4 open now** (A1-A3 closed 2026-09-21), no dependency | A5 has an abandon gate at its first task; A3's PASSED (packed MXFP4 runs here) | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 ~2d · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | ~~2~~ | **35** | ~~Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block.~~ **BLOCKED 2026-09-20 — DO NOT PICK.** Its +11.7 % was measured on **Qwen3-235B, deleted 2026-09-20**, so its stop rule (*reproduce +11.7 % on Qwen at N=1 through the server*) is **unrunnable**. Its own kill condition (*dies if S2 lands*) **fired 2026-09-13**, and Qwen3-Next's disk is now 0.42 % of a token. The only still-streaming model, MiniMax, is the **−3.7 %** arm — **but that is its N=3 arm, and the server runs N=1, where the same post-P4 measurement reads +2.5 %** (`check_lookahead_flag_safe`). **CLOSABLE ON ARITHMETIC 2026-09-21:** at +18.0 % bytes/token against a drive busy 76 % of a MiniMax decode token, the token floor is ~+11 % — **below this row's own ≥ +15 % re-open bar**, so the bar cannot be met by this predictor. | **blocked** | re-opens only on a measured **≥ +15 % on MiniMax at N=1** on a current build | — | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
 | **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
@@ -4883,7 +4885,7 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 |---|---|---|---|---|---|---|
 | **A1** `[x]` | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
 | **A2** `[x]` | **Fused-3D expert indexing** — **CLOSED 2026-09-21** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
-| **A3** | **gpt-oss-20b END TO END** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
+| **A3** `[x]` | **gpt-oss-20b END TO END — CLOSED 2026-09-21** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
 | **A4** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | none | ~2 days | brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
 | **A5** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | A4 | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
@@ -5161,6 +5163,35 @@ matches bit-for-bit). Gates after both changes: suite **2406 passed / 16 skipped
 **(c) THE SIZING HALF IS A SUBSYSTEM → NOT done here, opened as row 47-m4 below with its measured cost**,
 exactly the fallback the plan allows.
 
+**A3 Task 6 DONE — A3 IS CLOSED, 2026-09-21. gpt-oss-20b GENERATES THROUGH `vaayu/server`, and
+row 47's mandate now holds for a FOURTH architecture family (MXFP4 · fused-3D experts ·
+sliding-window attention).** **Server gate on this checkpoint: 9 passed** (472 s). **Generation
+(`test_generate.py`, its own code prompt, `MODEL_PATH` pointed at gpt-oss locally and NOT committed):
+497 prompt tokens → 254 output, TTFT 33.17 s, decode 0.17 tok/s (5.8 s/token), load 7.6 s, 24.85 min end
+to end.** Text READ, not just gated — first characters verbatim: *"analysisWe need to produce a single
+Python file async_watcher.py implementing the described classes, context manager, CLI, etc. Must be
+production-grade, with type hints, error handling, no external deps. Use asyncio, pathlib, logging,
+argparse, signal."* — continuing into a correct design (snapshot dict of `Path → (mtime, size)`, set
+difference for created/deleted/modified, debounce on last-event time). Coherent, on-task English. **Two
+honest notes on its shape, neither a Vaayu defect:** it is gpt-oss's **`analysis` channel** (the model
+speaks the harmony format and this script sends a plain prompt, not its chat template), and the
+256-token ceiling ended the run before the `final` channel. **On 0.17 tok/s — REPORTED, NOT TUNED (this
+row buys REACH):** the per-token line reads `bytes=13,281,935,360  gb_tok=13.28` — the WHOLE model moves
+per token (10.17 GB experts + a 1.10 GB embedding + a 1.10 GB head, neither of which fits the pin budget
+here) against Qwen3-Next's 0.030 GB/token — and `compute=5.2s` of a 5.8 s token against `io_wait=0.3s`,
+so **most of the token is NOT the disk**; the per-visit MXFP4 swizzle is inside that 5.2 s and separating
+the two is A6's first measurement. **A6 (per-expert MXFP4 streaming, 1.27 GB working set instead of
+10.17 GB) now has a baseline to beat.** Final gate sweep: suite **2416 passed / 16 skipped** (2393
+entering A3, +23 tests), Qwen3-Next accumulator **8**, MiniMax-M2.7 accumulator **8**, Llama-3.2-1B
+prefix **1**, gpt-oss server **9**. **§8 for A3: (1) NO KNOB — every change is a correctness fix or a
+layout detection, nothing added to `vaayu/server/config.py`; (2) nothing new to plumb — the dispatch runs
+on every load; (3) REACHABLE at N=1 through the server's own knobs, which is where it was measured;
+(4) banked: nothing from A3 itself — the two costs it declined to pay are rows 47-m4 and 47-m5.**
+User-facing documentation updated in the same commit (`documentation/moe_expert_aware_streaming.md`
+§3.4b: what a fused-3D checkpoint is, the two dispatch conditions, what whole-layer delivery costs, and
+the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20-A3-gptoss-RESULTS.md)
+(gitignored — this row is the durable copy).
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
@@ -5191,6 +5222,19 @@ exactly the fallback the plan allows.
       the attention module passes its own `sliding_window` to the kernel — but **sdpa with an implicit
       causal mask would silently ignore the window**; no on-device model hits it today (gpt-oss refuses
       sdpa), and it must be closed before a windowed model runs on sdpa.
+- [ ] **47-m5 — a whole-layer-dispatch model still pays for the expert cache it never touches.**
+      Found by A3's own generation run (2026-09-21). `_make_whole_layer_sparse_forward` reads the layer
+      itself and consults NEITHER the expert RAM cache nor the VRAM expert cache, yet the engine sizes and
+      allocates both from `_moe_geometry` at load: measured on gpt-oss-20b, **`Expert slab arena: 1388 x
+      13.3MB in 6 power-of-two chunks (pinned, 18.45 GB charged)` and a per-token telemetry line reading
+      `expert_cache=0hit/0miss/0evict … usage=0.00GB/18.31GB` for every token of a 256-token generation** —
+      18.45 GB of PINNED (unswappable) RAM on a 32 GB box, doing nothing, with RSS at 25.87 GB against the
+      29 GB gate ceiling. Fix sketch: the engine already runs `detect_moe_blocks` before sizing the arena
+      (that is why `patch_moe_blocks` takes `blocks=`), so it can ask the same two questions the dispatch
+      asks — index holds `fused_layer_tensors` for the layer AND `fused_param_experts(experts_mod)` — and
+      size the arena to zero for those layers. Derived, no model number. Related to row **40** (the arena is
+      never capped at the model's own expert bytes) but distinct: this one is about a model whose forward
+      never reads the cache at all. Touches shared sizing → all three accumulator gates.
 - [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
       `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
       **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE
@@ -5203,7 +5247,8 @@ exactly the fallback the plan allows.
 feasibility would be placeholders. Each carries its scope, gate and abandon rule and becomes a plan
 the day its gate passes.
 
-**Sequence in one line: ~~A1~~ → ~~A2~~ → **A3 (next)**, then A4 → A5. A6/A7 are opportunistic.**
+**Sequence in one line: ~~A1~~ → ~~A2~~ → ~~A3~~ → **A4 (next)**, then A5. A6 now has a baseline to
+beat (0.17 tok/s, 13.28 GB/token) and A7 stays opportunistic.**
 
 **A3 does NOT make DeepSeek cheaper.** gpt-oss is MXFP4 / fused-3D / sliding-window and natively
 supported by transformers; DeepSeek is I8+fp8 / per-expert / MLA+sparse-index and unsupported, needing
