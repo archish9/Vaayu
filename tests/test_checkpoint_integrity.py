@@ -57,13 +57,29 @@ def test_directory_with_no_safetensors_passes(tmp_path):
 
 # G1: the same layout question, asked BEFORE a split writes or deletes anything.
 
-def test_assert_expert_layout_indexable_raises_for_fused_3d(tmp_path):
+def test_assert_expert_layout_indexable_passes_for_fused_3d(tmp_path):
+    """A2 taught the index this layout, so refusing it here would block a
+    checkpoint Vaayu can now read -- at the one seam that deletes originals.
+
+    This test asserted the opposite until A2: the guard and the index must
+    answer the same question, and the index's answer changed.
+    """
     (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
     keys = ["model.layers.0.mlp.experts.gate_up_proj_blocks",
+            "model.layers.0.self_attn.q_proj.weight"]
+    assert_expert_layout_indexable(str(tmp_path), keys)   # must not raise
+
+
+def test_assert_expert_layout_indexable_raises_for_a_layout_neither_path_covers(tmp_path):
+    """Experts under no `experts.` prefix at all: still unindexable, still a
+    raise, and still BEFORE anything is written or deleted."""
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    keys = ["model.layers.0.mlp.expert_weights",
             "model.layers.0.self_attn.q_proj.weight"]
     with pytest.raises(RuntimeError) as excinfo:
         assert_expert_layout_indexable(str(tmp_path), keys)
     assert "32" in str(excinfo.value)
+    assert "expert_weights" in str(excinfo.value)
 
 
 def test_assert_expert_layout_indexable_passes_for_per_expert_keys(tmp_path):
@@ -79,8 +95,25 @@ def test_assert_expert_layout_indexable_passes_for_dense_config(tmp_path):
     assert_expert_layout_indexable(str(tmp_path), keys)   # must not raise
 
 
-def test_split_and_save_layers_refuses_a_fused_3d_original_before_writing(tmp_path):
+def test_split_and_save_layers_refuses_an_unindexable_original_before_writing(tmp_path):
     """The finding's actual guarantee: nothing is written before the raise."""
+    (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.mlp.expert_weights": "model.safetensors",
+            "model.layers.0.self_attn.q_proj.weight": "model.safetensors",
+        }
+    }))
+    with pytest.raises(RuntimeError, match="32"):
+        split_and_save_layers(str(tmp_path))
+    assert not (tmp_path / "splitted_model").exists()
+
+
+def test_split_and_save_layers_does_not_refuse_a_fused_3d_original(tmp_path):
+    """The gpt-oss shape must get PAST the layout guard now that the index
+    understands it. It still fails afterwards -- the shard file this fixture
+    names does not exist -- but not with the layout message, which is the
+    whole point: A2's work is unreachable if this seam keeps refusing."""
     (tmp_path / "config.json").write_text(json.dumps({"num_local_experts": 32}))
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {
@@ -88,9 +121,9 @@ def test_split_and_save_layers_refuses_a_fused_3d_original_before_writing(tmp_pa
             "model.layers.0.self_attn.q_proj.weight": "model.safetensors",
         }
     }))
-    with pytest.raises(RuntimeError, match="32"):
+    with pytest.raises(Exception) as excinfo:
         split_and_save_layers(str(tmp_path))
-    assert not (tmp_path / "splitted_model").exists()
+    assert "per-expert layout" not in str(excinfo.value)
 
 
 def test_find_or_create_local_splitted_path_raises_g0_for_shards_with_no_index(tmp_path):

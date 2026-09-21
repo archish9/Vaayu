@@ -68,22 +68,32 @@ def assert_expert_layout_indexable(checkpoint_dir: str, tensor_keys) -> None:
     while they still have the checkpoint.
 
     Layout-agnostic in the same way the later guard is: it asks "config says E,
-    no key carries a per-expert index", never anything about a named layout.
+    no key carries experts in a layout the index knows", never anything about a
+    named layout.
+
+    It accepts BOTH layouts the index reads: per-expert (`.experts.<N>.`) and
+    fused (a tensor under an `experts.` prefix carrying every expert on a
+    leading axis). This seam sees KEYS only, never shapes, so the fused answer
+    here is the weaker one -- it cannot confirm the leading axis really is the
+    expert axis. That is the right trade at this seam: its job is to refuse a
+    layout plainly outside both before the split deletes the original, and the
+    exact check still runs in `ExpertOffsetIndex.build()`, which has the shapes.
     """
-    from .expert_offset_index import ExpertOffsetIndex, _EXPERT_RE
+    from .expert_offset_index import ExpertOffsetIndex, _EXPERT_RE, _FUSED_EXPERTS_RE
 
     expected = ExpertOffsetIndex(checkpoint_dir).expected_expert_count()
     if expected is None:
         return
 
     keys = list(tensor_keys)
-    if any(_EXPERT_RE.search(k) for k in keys):
+    if any(_EXPERT_RE.search(k) or _FUSED_EXPERTS_RE.search(k) for k in keys):
         return
 
     seen = [k for k in keys if "expert" in k.lower()]
     raise RuntimeError(
         f"{checkpoint_dir}: config implies {expected} routed experts, but no key "
-        f"in the checkpoint index matches the per-expert layout ('.experts.<N>.'). "
-        f"Expert-ish keys actually present: {seen[:4] if seen else '(none)'}. "
-        f"The checkpoint was NOT split or deleted."
+        f"in the checkpoint index matches a layout the expert offset index reads "
+        f"(per-expert '.experts.<N>.', or one fused tensor under an 'experts.' "
+        f"prefix). Expert-ish keys actually present: "
+        f"{seen[:4] if seen else '(none)'}. The checkpoint was NOT split or deleted."
     )
