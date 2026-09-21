@@ -4970,9 +4970,9 @@ deliverable is that the failure became VISIBLE and CHEAP instead of silent and d
    guards — `VaayuBaseModel.__init__` is the path the server takes.
 4. **Banked?** Nothing.
 
-**A2 IS CLOSED — done and verified 2026-09-21, three commits on branch `row47-A2-fused3d-index`
-off `16b0fbe` (`9adc3c1` detect · `3beedad` index + versioned cache · `1653356` the split-time
-guard).** RESULTS: [`…-row47-A2-fused3d-index-RESULTS.md`](docs/2026-09-21-row47-A2-fused3d-index-RESULTS.md).
+**A2 IS CLOSED — done and verified 2026-09-21, MERGED to `main` (fast-forward `16b0fbe → b05f13e`):
+`9adc3c1` detect · `3beedad` index + versioned cache · `1653356` the split-time guard · `b05f13e`
+this ledger entry.** RESULTS: [`…-row47-A2-fused3d-index-RESULTS.md`](docs/2026-09-21-row47-A2-fused3d-index-RESULTS.md).
 Suite **2373 → 2393 passed / 16 skipped**. **A2 does NOT make gpt-oss-20b run — that is A3.** It
 makes the checkpoint DESCRIBABLE and stops both guards refusing it.
 
