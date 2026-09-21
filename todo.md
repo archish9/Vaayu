@@ -207,9 +207,12 @@ still the binding constraint here, which is what re-priced row 46. Tree clean at
 
 * **SPEED: 36 (if its gate fires) → 35 (+11.7 % measured, machinery built) → 32 (×1.50 projected, a download and zero
   code; also the only thing that re-opens 37) → 46 (re-priced to ~2.6 %) → 34 (×1.10, probe first, dead on Qwen3-Next).**
-* **REACH: row 47, now five plans with a fixed order — `A1 → A2 → A3`, then `A4 → A5`.** A1 (guards) is startable
-  right now with no dependency and no on-device risk; A2 (fused-3D indexing) is unit-tested only; A3 takes
-  **gpt-oss-20b end to end** and opens with an abandon gate; A4 (shared experts) is A5's prerequisite; A5 is the
+* **REACH: row 47, now five plans with a fixed order — `A1 → A2 → A3`, then `A4 → A5`. A1 AND A2 ARE CLOSED
+  (2026-09-21); A3 IS THE NEXT ONE TO PICK UP.** A1 (guards) shipped both raises and made them fire on the real
+  load path; A2 (fused-3D indexing) shipped unit-tested plus four green on-device gates — gpt-oss-20b now indexes
+  32 experts / 144 whole-tensor metas and BOTH guards let it through, though **it still does not run**; A3 takes
+  **gpt-oss-20b end to end** and opens with an abandon gate (does stock transformers run MXFP4 on this box, or is
+  the only path a ~40 GB bf16 dequant that does not fit?); A4 (shared experts) is A5's prerequisite; A5 is the
   DeepSeek-V4 port, weeks, gated on sm_120 kernels at step 1. Row **28b** IS A5.
   Program: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architecture-support-PROGRAM.md).
 
@@ -4879,7 +4882,7 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 | # | plan | delivers | depends on | gate | cost | doc |
 |---|---|---|---|---|---|---|
 | **A1** `[x]` | **Guards — stop failing silently** | an unusable checkpoint RAISES instead of loading with zero experts (G0 + G1-raise). **No model needed, unit tests only, no on-device risk** | — | none — **START HERE** | ~1 day | [`…-A1-guards.md`](docs/superpowers/plans/2026-09-20-arch-A1-guards.md) |
-| **A2** | **Fused-3D expert indexing** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
+| **A2** `[x]` | **Fused-3D expert indexing** — **CLOSED 2026-09-21** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
 | **A3** | **gpt-oss-20b END TO END** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
 | **A4** | **Shared-expert pinning (G7)** | always-active experts pinned, not streamed | — | none | ~2 days | brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
 | **A5** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | A4 | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
@@ -4967,6 +4970,68 @@ deliverable is that the failure became VISIBLE and CHEAP instead of silent and d
    guards — `VaayuBaseModel.__init__` is the path the server takes.
 4. **Banked?** Nothing.
 
+**A2 IS CLOSED — done and verified 2026-09-21, three commits on branch `row47-A2-fused3d-index`
+off `16b0fbe` (`9adc3c1` detect · `3beedad` index + versioned cache · `1653356` the split-time
+guard).** RESULTS: [`…-row47-A2-fused3d-index-RESULTS.md`](docs/2026-09-21-row47-A2-fused3d-index-RESULTS.md).
+Suite **2373 → 2393 passed / 16 skipped**. **A2 does NOT make gpt-oss-20b run — that is A3.** It
+makes the checkpoint DESCRIBABLE and stops both guards refusing it.
+
+- [x] **Task 1 `9adc3c1` — `_fused_expert_axis`, detection by capability.** Two conditions, both
+      required: an `experts.` prefix with NO numeric component, AND a leading dimension equal to
+      the config's expert count (A1's `expected_expert_count()`). Shape alone catches an attention
+      tensor that leads with the same number; the prefix alone catches per-layer scalars. **The
+      per-expert layout provably cannot move: the fused regex matches 0 keys across all four
+      checkpoints on this box** — Qwen3-Next 221,847 tensors, MiniMax 191,772, Llama-3.3-70B 2,406,
+      DeepSeek-V4 72,317 (measured before any code was written).
+- [x] **Task 2 `3beedad` — per-expert byte sub-ranges + whole-tensor metas.** safetensors is
+      row-major and the expert axis leads, so expert *i* is ONE contiguous range — **no new reader
+      capability and no 13.8 GB persist-time rewrite**; `load_expert_sparse` already reads
+      arbitrary ranges. Both views kept: `index` (per-expert, for a forward that streams only the
+      routed experts) and `fused_layer_tensors` (whole blob, for a kernel that routes internally —
+      **this is the handle A3 needs**, `Mxfp4GptOssExperts.forward` routes inside `matmul_ogs`).
+      **Raises** when the tensor does not divide evenly by the expert count. **Measured on the real
+      checkpoint: gpt-oss-20b yields 32 expert ids, 144 whole-tensor metas (24 layers × 6 tensors),
+      per-expert lengths 8,294,400 / 4,147,200 B, and the ranges tile each fused tensor exactly** —
+      the plan's three numbers, hit.
+      **Cache decision (plan step 6): EXTEND the format, keep reading the old one.** The layer map
+      is now wrapped in `{"__vaayu_index_version__": 2, "index": …, "fused_layer_tensors": …}`;
+      **version 1 — the bare map, which is what both caches on disk hold (Qwen3-Next 31 MB /
+      24,576 experts, MiniMax 26 MB / 15,872) — is still READ, never invalidated.** The rejected
+      alternative (`load_cached()` returns False for fused) would make a fused checkpoint re-scan
+      every header on every load forever.
+- [x] **Task 3 `1653356` — NOT IN THE PLAN, and it is the one that makes A2 reachable.** The plan
+      was written 2026-09-20; **A1's SPLIT-TIME guard `assert_expert_layout_indexable`
+      (`utils.py:343`) landed 2026-09-21 in `444afd1`, after it**, and asks the layout question on
+      `_EXPERT_RE` alone. So after task 2 the guard and the index DISAGREED — the index reads a
+      fused checkpoint, the guard still refused one, **at the one seam that deletes the original
+      under the server's `DELETE_ORIGINAL = True`. Measured: gpt-oss-20b raised there, before the
+      index ever ran.** The guard now accepts both layouts. It sees KEYS only, never shapes, so its
+      fused answer is deliberately the WEAKER one — it cannot confirm the leading axis is the
+      expert axis; that exact check still runs in `build()`, which has the shapes. Verified on the
+      real checkpoints: gpt-oss PASSES, DeepSeek-V4 / Llama-3.3-70B / Llama-3.2-1B unchanged.
+      **Same lesson as A1 task 4, third time in this program: the defect lived in UNCHANGED code no
+      single diff contained.**
+- [x] **Three pre-existing tests asserted the OLD behaviour of the fused shape (that it RAISES) and
+      were moved — all intended, none a regression:** A1's `test_build_raises_when_config_implies_…`,
+      `test_guard_reachability::test_config_in_a_separate_directory_is_found`, and
+      `test_checkpoint_integrity::…_raises_for_fused_3d` (→ `…_passes_for_fused_3d` plus a new raise
+      test). All three now use a layout outside BOTH detectors (`…mlp.expert_weights`), which is
+      what those guards were always about. `test_json_cache_written` asserted the v1 on-disk shape
+      and now asserts the envelope.
+- [x] **On-device gates, same day, this build, each in its own 29G scope, foreground: accumulator
+      Qwen3-Next 8 · accumulator MiniMax 8 · server smoke Qwen3-Next 9 · 1B prefix 1.** The server
+      gate's log prints `Expert offset index loaded from cache` — **that is the reachability
+      evidence: a v1 cache, 24,576 experts, read by the new `load_cached()` on the real checkpoint
+      through the server.** Dense has no committed gate; Llama-3.3-70B was covered by the
+      split-guard check and by reading, not by a run.
+
+**§8 for A2:** (1) **no knob** — layout detection is not a user choice; (2) nothing new to plumb —
+`build()`/`load_cached()` are on every load path and the split guard is on the single split seam;
+(3) **REACHABLE at N=1 on every load**, proven by the four gates; (4) **banked: the per-expert metas
+for a fused checkpoint are computed and unconsumed** until A3 (whole-layer, uses
+`fused_layer_tensors`) or A6 (per-expert streaming, uses `index`). They cost microseconds and exist
+so the layout is described once, not twice.
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
@@ -4992,7 +5057,7 @@ deliverable is that the failure became VISIBLE and CHEAP instead of silent and d
 feasibility would be placeholders. Each carries its scope, gate and abandon rule and becomes a plan
 the day its gate passes.
 
-**Sequence in one line: A1 → A2 → A3, then A4 → A5. A6/A7 are opportunistic.**
+**Sequence in one line: ~~A1~~ → ~~A2~~ → **A3 (next)**, then A4 → A5. A6/A7 are opportunistic.**
 
 **A3 does NOT make DeepSeek cheaper.** gpt-oss is MXFP4 / fused-3D / sliding-window and natively
 supported by transformers; DeepSeek is I8+fp8 / per-expert / MLA+sparse-index and unsupported, needing
