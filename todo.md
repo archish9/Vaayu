@@ -5051,6 +5051,40 @@ module's MXFP4 weights are NOT `nn.Parameter`s.** `experts.named_parameters()` r
 biases lead with the expert axis), but task 4 cannot "populate the module's parameters" as written —
 whatever the seam sets, it is not a parameter assignment.
 
+**A3 Task 2 — THE SEAM IS DECIDED (2026-09-21).** A **third branch in `_make_sparse_moe_forward`
+(`vaayu/moe_patch.py:1326`), tested BEFORE the `is_exl3` split** and selected by capability
+(`fused_param_experts(experts_mod)`, Task 3), producing `_make_whole_layer_sparse_forward`: it reads the
+layer's fused tensors by the whole-tensor metas A2 recorded (`ExpertOffsetIndex.fused_layer_tensors`),
+copies them H2D, hands them to **the quantizer's OWN weight conversions —
+`hf_quantizer.get_weight_conversions()`** — calls the block's captured `original_forward` unchanged, and
+frees the layer's expert attributes in a `finally`. **Four findings decided it, each verified on device or
+in the source, not assumed:** (1) `original_forward` **is already the MXFP4 kernel path** — transformers
+rebinds `GptOssMLP.forward` to its own `mlp_forward` inside `preprocess_model`
+(`integrations/mxfp4.py:703`), which Vaayu captures at `moe_patch.py:1273`; on the real skeleton, 24 blocks
+detect as `style=fused`, `router=router`, `forward=mlp_forward`. (2) **It returns a TUPLE**
+`(routed_out, router_logits)` (`modeling_gpt_oss.py:384` unpacks it) while all three existing Vaayu
+forwards return a bare tensor — the new branch must return it unexamined. (3) **`_make_fused_sparse_forward`
+cannot be bent to serve it**: it computes the FFN ITSELF with `F.linear` ×3 and `experts_mod.act_fn`
+(`:1859`, `:2060-2062`), and `Mxfp4GptOssExperts` **has no `act_fn`** — so today this model raises
+`AttributeError` on layer 0 rather than computing wrong output. (4) **Populating is not assignment**:
+`get_weight_conversions()` returns two `Mxfp4Deserialize` converters for gpt-oss and **`[]` for
+Qwen3-Next's `CompressedTensorsHfQuantizer`** (measured), so the seam is quant-agnostic and inert on every
+other model here; the converter swizzles and sets a triton tensor + `{proj}_precision_config`, deleting the
+`nn.Parameter`. **The expert RAM/VRAM caches are NOT used on this path and that is deliberate** — `matmul_ogs`
+consumes the whole fused tensor and routes inside the kernel, so the layer's full 423.6 MB is needed however
+few tokens route; per-expert streaming is A6. **REJECTED alternative, recorded so it is not re-derived:**
+dropping `is_moe` and streaming the MoE layer through the DENSE whole-layer path. Same bytes/token and less
+new code, but it edits `_detect_moe`, `move_layer_to_device` and `free_from_gpu` — shared code the three
+working models run — and it LEAKS, because the swizzled triton tensor is neither parameter nor buffer, so
+neither `set_module_tensor_to_device(..., "meta")` (`loader_strategy.py:200-204`) nor
+`_to_meta_preserving_buffers` frees it (423.6 MB/layer, 10.17 GB/sweep). **`_expert_history` gets EVERY
+expert index** from this forward (the spec-decode gate at `vaayu_base.py:5756` sizes a verify pass off it,
+and an empty dict trips its `off_no_routing` warning); `_maybe_record_usage` and `DECODE_TOP_K` stay unwired
+here — nothing to clamp when the kernel routes. **Costs accepted, to be MEASURED in Task 6 and not tuned:**
+10.17 GB/token of expert bytes, one swizzle per projection per visit (unmeasured), and per-chunk re-reads
+during chunked prefill (the row 44-F2 / row 45 defect class, arriving by construction). Decision doc:
+[`…-A3-seam-DECISION.md`](docs/2026-09-20-A3-seam-DECISION.md) (gitignored — this paragraph is the durable copy).
+
 **Three follow-up rows, opened from A1's final review (§6 — they must not vanish):**
 - [ ] **47-m1 — `_detect_moe` does not recognize `n_routed_experts`** (`vaayu_base.py:3483-3489`
       matches only `num_local_experts` / `num_experts` / a `Moe|MoE|Mixtral` arch string). A
