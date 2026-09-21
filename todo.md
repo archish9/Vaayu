@@ -61,10 +61,17 @@ ring-pool optimum is n=2 (shipped, +1.89 % decode) and the read-shape arm was bu
 (−0.40 % decode despite removing 66.7 % of the reads). Nothing in the speed track is pickable
 without a new idea, which is why the REACH track leads this list.
 
-**Also open, smaller, no doc needed — the row carries them:** 47-m5 (18.45 GB pinned expert arena the
+**Also pickable cold, and cheaper than any of the three above — a VERIFICATION with its own
+self-contained document:** **47-m7**, [`…-fp8-gating-verification-HANDOFF.md`](docs/2026-09-21-fp8-gating-verification-HANDOFF.md)
+— ~30 minutes, one model, one variable, ships no code. A3 gated a workaround that used to run for
+every quantizer, and **Qwen3-Next is the only model on this box that was silently receiving it**;
+the green gates prove determinism, not "same as the previous build". Expected inert, unverified.
+**Do this one first if the box is free but the session is short.**
+
+**Also open, smaller, the row carries them:** 47-m5 (18.45 GB pinned expert arena the
 whole-layer path never reads — cheap, and it improves the model that just landed), 47-m4
-(sliding-window KV, 0.813 GB), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`, and **47-m6** (the one
-open question A3's own fixes created).
+(sliding-window KV, 0.813 GB), 47-m6 (A3's fp32 rotary table changed numerics for EVERY model and
+only gpt-oss's side was measured), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`.
 
 
 **Nothing is in flight. No §0 P-row is open, so nothing here makes Vaayu faster on Qwen3-235B, MiniMax-M2.7
@@ -5297,6 +5304,25 @@ the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20
       is unchanged within noise on both models, close with the number — the fix is still right, it just did not
       matter below 33k context. If it improved, that is a quality win nothing else on this board delivers. If it
       REGRESSED, stop and investigate: that would mean something downstream depended on the bf16 table.**
+- [ ] **47-m7 — VERIFY that A3's FP8-compat gating is inert for Qwen3-Next.** Opened 2026-09-21, by the
+      session that made the change, because it was NOT verified there. **FRESH-SESSION HANDOFF, fully
+      self-contained: [`…-fp8-gating-verification-HANDOFF.md`](docs/2026-09-21-fp8-gating-verification-HANDOFF.md)**
+      (gitignored — this row is the durable copy). A3 gated `_patch_fp8_quantizer_compat`
+      (`vaayu_base.py:3184`, call site `:3396`, commit `35c2b8f`) behind `FineGrainedFP8HfQuantizer`; it used
+      to run for EVERY quantizer, appending `"experts"` to `modules_to_not_convert`. That is why gpt-oss could
+      not run, and gating it is a BEHAVIOUR CHANGE for any non-FP8 quantizer that was silently receiving it.
+      **Scope is exactly ONE model** (checked against each `config.json` and `vaayu_base.py:3383`'s exl3
+      skip): **Qwen3-Next (`compressed-tensors`)** — MiniMax and Llama-3.3-70B are exl3 and never reach
+      `AutoHfQuantizer`, Llama-3.2-1B has no `quantization_config`, and gpt-oss is the intended beneficiary.
+      **Why the green gates do not answer it:** suite 2416, both accumulator gates and the 1B prefix gate all
+      test determinism and self-consistency — **none asks whether this build matches the PREVIOUS build.**
+      **The test is one variable:** revert ONLY the gating hunk (NOT the fp32 rotary change from `cac352e`,
+      which moves Qwen3-Next's numerics by design — that is 47-m6) and compare greedy ids + logits sha on
+      Qwen3-Next. **Expected inert**, because the fused non-EXL3 forward never reads the experts module's
+      parameters — it streams each expert off disk and computes the FFN itself — so module replacement cannot
+      reach the arithmetic. **Stop rule: identical ids and sha → close with the shas; different ids → STOP,
+      diff the module tree on both builds and record what the quantizer now converts before changing
+      anything.** ~30 minutes, ships no code.
 - [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
       `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
       **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE
