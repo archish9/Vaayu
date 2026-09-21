@@ -35,8 +35,14 @@ class ExpertOffsetIndex:
 
     CACHE_FILENAME = "vaayu_expert_offsets.json"
 
-    def __init__(self, checkpoint_path: str):
+    def __init__(self, checkpoint_path: str, config_path: str | None = None):
         self.checkpoint_path = Path(checkpoint_path)
+        # The config does NOT always sit beside the shards. Vaayu indexes its own
+        # splitted_model/ directory, which carries no config.json, while the expert
+        # count lives in the ORIGINAL checkpoint dir -- so without this the guard
+        # reads no config, expects nothing, and never fires. Defaults to the
+        # checkpoint dir, which is the single-directory case the tests construct.
+        self.config_path = Path(config_path) if config_path is not None else self.checkpoint_path
         self.index: dict[str, dict[int, dict[str, ExpertTensorMeta]]] = {}
 
     # Total routed-expert count, by config field name. ORDERED and EXPLICIT, not a
@@ -54,7 +60,7 @@ class ExpertOffsetIndex:
         "no expectation", never as zero: a dense model legitimately indexes no
         experts and must not be made to raise.
         """
-        config_path = self.checkpoint_path / "config.json"
+        config_path = self.config_path / "config.json"
         if not config_path.exists():
             return None
         try:
@@ -184,6 +190,9 @@ class ExpertOffsetIndex:
                   f"{len(self.index)} MoE layers")
         else:
             print("[Vaayu-MoE] Expert offset index loaded from cache")
+            # A cache written before this guard existed can hold an empty index.
+            # build() cannot catch that -- it never runs on this branch.
+            self._assert_experts_found()
 
     def get_expert_offsets(
         self, layer_name: str, expert_idx: int

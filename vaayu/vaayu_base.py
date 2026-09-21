@@ -2292,7 +2292,8 @@ class VaayuBaseModel(GenerationMixin):
         self._expert_offset_index = None
         if device.startswith("cuda") and self.is_moe:
             from .persist.expert_offset_index import ExpertOffsetIndex
-            self._expert_offset_index = ExpertOffsetIndex(str(self.checkpoint_path))
+            self._expert_offset_index = ExpertOffsetIndex(
+                str(self.checkpoint_path), config_path=str(self.model_local_path))
             self._expert_offset_index.build_or_load()
 
         # Geometry is needed by plan_vram below (for its min_resident floor), so

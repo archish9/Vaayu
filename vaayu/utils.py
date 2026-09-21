@@ -293,6 +293,11 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     checkpoint_path = Path(checkpoint_path)
 
+    # G0: refuse an incomplete checkpoint BEFORE splitting it. This is the only
+    # seam that sees the original shard set -- the splitted output carries neither
+    # -of-NNNNN names nor an index, so a guard downstream of here sees nothing.
+    from .persist.checkpoint_integrity import assert_checkpoint_complete
+    assert_checkpoint_complete(str(checkpoint_path))
 
     saving_path = checkpoint_path / splitted_model_dir_name
 
