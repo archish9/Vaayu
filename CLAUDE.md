@@ -19,8 +19,22 @@ ROADMAP — the deferral was lifted 2026-09-02.** (It previously read "a planned
 FUTURE target, deferred until the MoE path is solid"; that is no longer the
 policy, and anything still citing the deferral as a reason to sit on dense work
 is stale.) The first dense item is already banked and measured: speculative
-decoding, **5.57×** on Llama-3.3-70B with the Llama-3.2-1B drafter — `todo.md`
-row P7, which ships with two known bugs that bite on the day it lands. Optimize
+decoding, **5.57×** on Llama-3.3-70B with the Llama-3.2-1B drafter (0.155 →
+0.864 tok/s). **That is ROW 12, closed 2026-08-16 and PRUNED from `todo.md`
+2026-09-10 — it is not a live row, and "P7" is NOT its name.** Corrected
+2026-09-21: the P-series `P7` slot holds a different item entirely (sizing the
+batch VRAM prefix on the observed routing union), which was **built, measured
+and REFUTED 2026-09-06 at −10.85 / −11.54 %, and reverted** — so following the
+old pointer lands on a refutation and reads it as this win. The 5.57× itself
+stands: row 19's audit (2026-09-09) confirmed every arm ran
+`flash_attention_2`, not `sdpa`. Evidence:
+`plans/2026-08-16-row12-speculative-decoding-RESULTS.md`; full text of the
+pruned row in `git log -p -- todo.md` at `63ae7fb`. **Its two bugs are FIXED,
+not pending** (this clause used to read "ships with two known bugs that bite on
+the day it lands"): **12a** the drafter's VRAM was in nobody's budget
+(`93dea7c`; the fix is load-order — see the comment at `vaayu_base.py:2503`)
+and **12b** no drafter/target vocabulary check (`086d43d`), both fixed
+2026-08-16 and verified on-device. Optimize
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
 the MoE tests green, and treat any change to shared infra (staging, prefix
 cache, NVMe warmup, io_uring) as touching both paths. MoE changes still must not
