@@ -45,7 +45,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, 47-m7 AND 47-m5 were picked up and CLOSED, and row 46 was RE-VERIFIED ON DEVICE so it starts cold) ◀◀
+## ▶▶ PICK THIS NEXT (re-set 2026-09-23, later the same day: **ROW 46 IS NOW CLOSED TOO** — measured and REFUTED. A4, 47-m7, 47-m5 and now 46 all closed today; the user DECLINED row 32's download) ◀◀
 
 **A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
 document that carries its own start gate, stop rule, numbers and commands.**
@@ -55,8 +55,8 @@ routed regex `\.experts\.(\d+)\.` does not match `...mlp.shared_expert.*`, so th
 non-expert set and Phase-2 pinning puts them in VRAM — **48 of 48 Qwen3-Next layers, 4.83 GB
 reserved, ~302 MB of shared expert (6.2956 MB × 48, BF16, un-quantized by AWQ)**. The compute path
 was verified to BIND on the real module tree, which byte accounting alone could not show. Detail in
-the A4 bullets under row 47. **A5 is now the head of the REACH track — but it is weeks and
-kernel-gated, so the cheaper rows in the table below lead it.**
+the A4 bullets under row 47. **A5 is now the head of the REACH track — and with row 46 closed the same day, it is the ONLY row
+left in the table below, weeks-long and kernel-gated as it is.**
 
 **ROW 32 IS OUT OF THIS TABLE — `[!]` BLOCKED 2026-09-23, by the user, on cost.** It was order 1 that
 morning; the session verified its route (a full HF sweep: the build on disk ships `2.0…8.0bpw` as
@@ -83,19 +83,23 @@ and both sites call it. Qwen3-Next and MiniMax keep their arenas, verified — t
 Gates: suite 2422/16, accumulator 8+8, 1B prefix 1, server 9+9. It left **47-m5-b** behind (a whole-layer model
 still ADVERTISES caches it never fills — misleading telemetry, zero bytes). Numbers in the 47-m5 bullet under row 47.
 
-**ROW 46 IS READY TO START COLD — re-verified on device 2026-09-23, and its old handoff was stale in
-four places.** A fresh session opens the 2026-09-23 handoff and begins at step 1; the start gate is
-already passed (MiniMax's 6.24 GB confirmed live under server knobs). **The four corrections, in case
-`docs/` is gone: (1) Qwen3-Next reserves 4.83 GB TODAY, not 0 — 42-B's RC7 lift has applied; (2) gpt-oss
-is a third payer at 4.89 GB but the lever is INERT there since 47-m5, so do not spend an arm on it;
-(3) `derive_expert_ceiling` is `vaayu_base.py:355`, called `:2703`; (4) the accumulator gate loads with
-`enable_prefix_cache=False`, so an arm taken through its config measures ZERO reservation.** The old
-checklist also said to measure on Qwen3-235B, which was deleted 2026-09-20 — corrected to Qwen3-Next.
+**ROW 46 IS CLOSED 2026-09-23 — MEASURED, PREMISE REFUTED, ZERO CODE.** It was order 1 that afternoon
+and it is done. Step 1 FIRED (returning the whole reservation is **+13.36 %** decode on MiniMax, ABBA,
+8 replicates, ids identical) — but step 2 showed the bytes are not idle: **`max_seq_len` is the VRAM
+plan's own cap**, so MiniMax's reservation is **1.02×** a real full-context session (**0.14 GB**
+recoverable), while Qwen3-Next's genuinely-idle **4.12 GB** is worth **−2.56 %** (42-B). Prize and
+recoverable bytes are anti-correlated; all three candidate mechanisms die on that. **Full verdict in
+SETTLED — do not re-open it.** Two things it leaves behind, both live: **MiniMax's RAM cache is priced
+at ~+2 % decode per GB returned to the expert arena** (a yardstick for any future MiniMax RAM lever —
+Qwen3-Next's 0.42 %-disk regime does NOT generalise), and two probe traps (`row26_decode.py:36`
+defaults to the DELETED Qwen3-235B path; `BALLAST_GB` can make a ceiling A/B inert — run the 1-token
+binding check first).
+
+**With 46 closed, the queue below is down to ONE row, and it is the weeks-long REACH item.**
 
 | order | item | what to open FIRST | cost | why this order |
 |---|---|---|---|---|
-| **1** | **Row 46 — size the prefix reservation** | [`…-2026-09-23-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-23-row46-prefix-reservation-HANDOFF.md) — **RE-VERIFIED ON DEVICE 2026-09-23; the 2026-09-21 handoff is SUPERSEDED, do not read it** | ½ day to measure, 1-2 days to build | **START GATE IS ALREADY PASSED: MiniMax's 6.24 GB reservation was confirmed LIVE under server knobs on 2026-09-23** (ceiling 16.11 of 26.11 GB), and it is the ONLY live target — Qwen3-Next's mechanism is measured away (disk 0.42 % of a token, −2.56 % measured by 42-B) and gpt-oss's 4.89 GB is INERT since 47-m5 (no arena, no cache). Magnitude measured: +43 % cache slots (1814 → 2594). **STEP 1 IS DONE 2026-09-23 AND IT FIRED: +13.36 % decode (ABBA, 8 reps, ids identical) — the stop rule did NOT close it. But the winning arm zeroes the prefix pool (5.90 → 0.00 GB budget), so 13.36 % is the UPPER BOUND, not the answer; step 2 (the design) is what remains.** A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts. |
-| **2** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
+| **1** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | **The only row left in this table now that 46 is closed (2026-09-23).** Head of the REACH track since A4 closed, and the user's mandate fixes that order. It was ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
 
 **The SPEED slot is empty, and with row 32 blocked there is now NO large speed lever pickable at
 all.** Row 49's two successors were both spent or refuted on 2026-09-21: the ring-pool optimum is
@@ -314,7 +318,7 @@ while an 8k session holds 0.20 GB — an 8× over-reservation that IS the −13 
 | **1b (REACH track — user mandate, NON-NEGOTIABLE 2026-09-20)** | **47 = A1→A2→A3, then A4→A5** | **Vaayu must serve different architectures.** Decomposed into 5 plans. ~~**A1** guards~~ · ~~**A2** fused-3D indexing~~ · ~~**A3** gpt-oss-20b end to end~~ **(all three CLOSED 2026-09-21; gpt-oss generates through the server, bit-identical to stock)** · ~~**A4** shared-expert pinning~~ **(CLOSED 2026-09-23, premise REFUTED, zero code — already pinned, 48/48 layers, 4.83 GB)** · **A5** DeepSeek-V4 port (NEXT). | **A5 open now** (A1-A4 closed), no dependency | A5 has an abandon gate at its first task; A3's PASSED (packed MXFP4 runs here) | A1 ~1d · A2 ~1d · A3 ~3–5d · A4 **closed in ½ day, no build** · A5 weeks | [`PROGRAM`](docs/2026-09-20-architecture-support-PROGRAM.md) · row **47** below |
 | ~~2~~ | **35** | ~~Per-model measured gate for `VAAYU_LOOKAHEAD` instead of the hard block.~~ **BLOCKED 2026-09-20 — DO NOT PICK.** Its +11.7 % was measured on **Qwen3-235B, deleted 2026-09-20**, so its stop rule (*reproduce +11.7 % on Qwen at N=1 through the server*) is **unrunnable**. Its own kill condition (*dies if S2 lands*) **fired 2026-09-13**, and Qwen3-Next's disk is now 0.42 % of a token. The only still-streaming model, MiniMax, is the **−3.7 %** arm — **but that is its N=3 arm, and the server runs N=1, where the same post-P4 measurement reads +2.5 %** (`check_lookahead_flag_safe`). **CLOSABLE ON ARITHMETIC 2026-09-21:** at +18.0 % bytes/token against a drive busy 76 % of a MiniMax decode token, the token floor is ~+11 % — **below this row's own ≥ +15 % re-open bar**, so the bar cannot be met by this predictor. | **blocked** | re-opens only on a measured **≥ +15 % on MiniMax at N=1** on a current build | — | row **35** below |
 | **3** | **32** | Lower-bpw EXL3 build (5.01 → ~3.0 bpw) of a model already on disk. | open | **×1.50 projected, a download and ZERO code**; under ~3.25 bpw Qwen's working set fits its VRAM budget, and it is the only thing that re-opens row **37** | a download | row **32** below |
-| **4** | **46** | **Size the prefix reservation to what the pool holds.** Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | open (needs no hybrid) | row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version) | price offline ½ day · build ~1–2 days | row **46** below |
+| ~~4~~ | ~~**46**~~ | **CLOSED 2026-09-23 — MEASURED, PREMISE REFUTED, ZERO CODE (see SETTLED).** The "stored 8k session holds 0.20 GB" figure was Qwen3-Next's read onto MiniMax; real sessions measured **248.0 KiB/token** (MiniMax) and **24.0 KiB/token + 40.13 MB** (Qwen3-Next), and the engine's charge is EXACT. Returning the whole reservation is **+13.36 %** on MiniMax but only **0.14 GB** is recoverable there, while Qwen3-Next's recoverable **4.12 GB** is worth **−2.56 %**. ~~Size the prefix reservation to what the pool holds.~~ Split out of 42-B 2026-09-20. `derive_expert_ceiling` takes 3 × `MAX_SEQ_LEN` × kv/token — **4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today** — while a stored 8k session holds 0.20 GB (8× over; 32× at 2k). ~~Row 30 measured returning 4.83 GB as +15.09 % decode~~ — **RE-PRICED 2026-09-20 by 42-B's own A/B: returning 4.83 GB (ceiling 13.78 → 18.77 GB) moved decode only −2.56 %, so the prize is ~2.6 %, not ~15 %. Row 30's number predates row 44.** | ~~open (needs no hybrid)~~ **CLOSED** | ~~row 31's 7.4k two-session arm must not collapse (it measured −8.9 % / match 7422→44 for the naive `PREFIX_SESSIONS=1` version)~~ — nothing was built for it to kill | ~~price offline ½ day · build ~1–2 days~~ **spent: 2 on-device spikes, ~2 h** | row **46** below + **SETTLED** |
 | **3** | 44's **F3 remnant** | pinned-H2D half only (~0.6 s of an 18 s 2k prefill). **Not recommended** — listed so nobody re-derives it. | — | — | ~1 day | row **44** below |
 
 **Why 45 went first (settled — it is closed):** 45 was the same defect class row 44 had just fixed, on the second
@@ -941,6 +945,50 @@ Known-open minors (none blocking):
 **Read this before proposing any perf work.** Each line is something that was BUILT or MEASURED and
 then refuted. A refutation closes its row; it is not re-scoped. Full text in
 `docs/2026-09-03-todo-archive-preprune.md` and `git log -p -- todo.md`.
+
+**Sizing the prefix reservation to "what the pool actually holds" cannot pay on this box — measured
+2026-09-23 (row 46, two on-device spikes, no engine line changed).**
+- **The premise — "the reservation over-reserves 8× at 8k, 32× at 2k" — is REFUTED, and it came from
+  reading ONE model's numbers onto another.** Real stored sessions were measured by prefilling and
+  reading the pool entry's own `nbytes` (the exact figure the budget is spent against), two lengths
+  per model so `bytes(n) = a·n + b` is determined: **MiniMax 248.0 KiB/token** (fixed term 0.25 MB),
+  **Qwen3-Next 24.0 KiB/token + 40.13 MB** fixed (the 36 linear layers' recurrent state).
+  **The engine's accounting is EXACT on both** — `derive_expert_ceiling` is fed
+  `kv_bearing_layer_count(self)` (`vaayu_base.py:2691`), not `config.num_hidden_layers`, so it
+  already charges 12-of-48 layers on the hybrid. **There was no accounting bug on this path**, and
+  47-m4's "counts every layer" concern does NOT reach it. The handoff's "a stored 8k session holds
+  0.20 GB" was Qwen3-Next's 2k figure (0.201 GB) applied to MiniMax.
+- **What the reservation actually is: one full-context session, and `max_seq_len` is the VRAM plan's
+  own cap (`vaayu_base.py:2446`) — not an arbitrary ceiling.** MiniMax `max_seq_len` **8192**,
+  reserved 2.080 GB/session, a real 8000-token session **2.0319 GB = 1.02×**; three of them leave
+  **0.14 GB** to recover. Qwen3-Next `max_seq_len` **65536**, reserved 1.610 GB, a real 8000-token
+  session 0.2367 GB = 6.80×; **4.12 GB** genuinely recoverable there.
+- **THE PRIZE AND THE RECOVERABLE BYTES ARE ANTI-CORRELATED, and that is structural.** Returning the
+  whole reservation measured **+13.36 % decode on MiniMax** (ABBA `off,base,base,off`, 4 processes ×
+  2 in-process replicates, `PREFIX_SESSIONS=0` vs `=3`: **2.3467 vs 2.0701 tok/s**, within-arm spread
+  1.4 %, greedy ids bit-identical across all 8 arms; mechanism: RAM-cache hit **20.0 → 35.7 %**,
+  expert disk reads **−19.6 %**, bytes/token **2.19 → 1.76 GB**, stall **43.1 → 36.2 %** of decode)
+  — and **−2.56 % on Qwen3-Next** (row 42-B). MiniMax's context is capped at 8192 *because that is
+  all the VRAM allows*, so a full agent session IS 8192 tokens and the bytes are not idle.
+- **All three candidate mechanisms die on the same number** (reserve to a measured typical length;
+  grow the reservation dynamically; shrink the pool instead of the arena). Each is a way of guessing
+  a session length below `max_seq_len`; on MiniMax the guess must be ~4× short to pay, the arena is
+  **pinned at load and cannot shrink**, and a wrong guess buys row 31's collapse at full price
+  (−8.9 %, turn-2 match 7422/7517 → 44/7517, TTFT 25.0 → 51.3 s).
+- **Do NOT re-open as "measure the typical length better", "grow the arena later", or "just cut
+  `PREFIX_SESSIONS`".** The first two are the refuted mechanisms; the third is row 31, already swept
+  and closed with "defaults STAY". **§8: no new knob — `PREFIX_SESSIONS` and `MAX_SEQ_LEN` already
+  span the trade.**
+- **WHAT SURVIVES, and it is worth carrying:** the A/B prices MiniMax's RAM cache at roughly
+  **+2 % decode per GB returned to the expert arena** (6.3 GB → 13.36 %), on a model whose hit rate
+  is only 20 %. That is a measured yardstick for any FUTURE MiniMax RAM lever — Qwen3-Next's
+  near-dead 0.42 %-disk regime does NOT generalise to it. Two probe traps also survive:
+  `plans/probes/row26_decode.py:36` defaults `MODEL=qwen`, a **deleted** checkpoint; and `BALLAST_GB`
+  can trim the arena below both arms' ceilings, silently making a ceiling A/B inert — run the
+  1-token binding check (`NEW_TOK=1 ARMS=W`) first.
+  [`docs/2026-09-23-row46-step1-minimax-AB-RESULTS.md`](docs/2026-09-23-row46-step1-minimax-AB-RESULTS.md),
+  [`docs/2026-09-23-row46-step2-session-bytes-RESULTS.md`](docs/2026-09-23-row46-step2-session-bytes-RESULTS.md)
+  (**gitignored — row 46 itself is the durable copy**).
 
 **Re-evaluating a latched speculation decision cannot pay at its own re-entry price — measured
 2026-09-10 (row 24, offline replay of row 13's six alternating MiniMax-M2.7 traces).**
@@ -5603,7 +5651,7 @@ expert count and byte size from the checkpoint, never from a config literal.
 
 ---
 
-# 46 · [~] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B) — **RE-PRICED DOWN 2026-09-20: the prize is ~2.6 %, not ~15 %**
+# 46 · [x] **CLOSED 2026-09-23 — MEASURED, PREMISE REFUTED, ZERO CODE.** The prefix reservation is sized to `MAX_SEQ_LEN` — and `MAX_SEQ_LEN` is the VRAM plan's own cap, so on the ONE model where returning the reservation pays (MiniMax, **+13.36 %**) it is already right-sized (**1.02×** a real full-context session, **0.14 GB** recoverable), and on the model where **4.12 GB** IS recoverable (Qwen3-Next) returning all of it measured **−2.56 %**. Prize and recoverable bytes are anti-correlated. See SETTLED.
 
 **FRESH-SESSION HANDOFF, RE-VERIFIED 2026-09-23: [`…-2026-09-23-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-23-row46-prefix-reservation-HANDOFF.md)**
 (gitignored; this row remains the durable copy). **It SUPERSEDES the 2026-09-21 handoff, which is stale in
@@ -5742,17 +5790,25 @@ time real prompts grow. Any design here must say what happens when the guess is 
 - [x] **Step 1 A/B on MiniMax — DONE 2026-09-23, +13.36 %, stop rule NOT met (see the block above).**
 - [x] **Verify what a stored session ACTUALLY holds — DONE 2026-09-23 on BOTH models: the 0.20 GB
       figure was Qwen3-Next's, the accounting is exact, and the sizing premise is REFUTED (block above).**
-- [ ] Price offline first (`vaayu/expert_sim.py`, `plans/probes/row31_price.py` — row 31's own tooling).
-- [ ] Decide the mechanism: reserve to a measured typical length; grow the reservation dynamically; or
+- [x] ~~Price offline first~~ — **NOT NEEDED: the on-device measurement answered it outright.** The offline
+      pricer models what the pool holds; the pool's own `nbytes` was read directly instead (step-2 spike).
+- [x] ~~Decide the mechanism~~ — **ALL THREE ARE REFUTED BY THE SAME NUMBER.** Each is a way of guessing a
+      session length shorter than `max_seq_len`; on MiniMax that guess must be ~4× short to pay, against an
+      arena pinned at load, which is row 31's collapse at full price. ~~reserve to a measured typical length;
+      grow the reservation dynamically; or~~
       shrink the pool instead of the arena. Each must answer the over-capacity case.
-- [ ] Measure on **MiniMax AND Qwen3-Next** (§5 — a fix proved on one model is not done), including **row
+- [x] **DONE on BOTH (§5): MiniMax and Qwen3-Next, step 1 and step 2.** Row 31's 7.4k two-session arm was not
+      needed — nothing was built for it to kill. ~~including **row
       31's 7.4k two-session arm**, which is the arm that kills a naive version. **CORRECTED 2026-09-23: this
       read "Qwen3-235B AND MiniMax" — Qwen3-235B was retired and DELETED 2026-09-20, so that instruction was
       dead and would send a cold session after a checkpoint that is not on disk.** gpt-oss is NOT a target
       (correction 3 above).
-- [ ] §8: `PREFIX_SESSIONS` and `MAX_SEQ_LEN` are existing knobs (`server/config.py:193` / `:128`); say
+- [x] **§8 ANSWERED: NO NEW KNOB.** `PREFIX_SESSIONS` (`server/config.py:193`) and `MAX_SEQ_LEN` (`:128`) already
+      span every trade this row could have added, and row 31 swept them and closed with "defaults STAY".
+      ~~say
       whether the sizing needs a new one, or state that it does not.
-- [ ] Gates: full suite, accumulator on Qwen3-Next AND MiniMax, the 1B prefix gate, the server gate on
+- [x] **Gates NOT RUN and NOT OWED — no engine line changed.** Had this shipped they would have been: ~~full
+      suite, accumulator on Qwen3-Next AND MiniMax, the 1B prefix gate, the server gate on
       Qwen3-Next, **and the server gate on gpt-oss-20b** — `derive_expert_ceiling` is shared sizing and
       gpt-oss now loads through the server (added 2026-09-23).
 
