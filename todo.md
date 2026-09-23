@@ -45,7 +45,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, then 47-m7 AND 47-m5 were picked up and CLOSED the same day) ◀◀
+## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, 47-m7 AND 47-m5 were picked up and CLOSED, and row 46 was RE-VERIFIED ON DEVICE so it starts cold) ◀◀
 
 **A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
 document that carries its own start gate, stop rule, numbers and commands.**
@@ -83,9 +83,18 @@ and both sites call it. Qwen3-Next and MiniMax keep their arenas, verified — t
 Gates: suite 2422/16, accumulator 8+8, 1B prefix 1, server 9+9. It left **47-m5-b** behind (a whole-layer model
 still ADVERTISES caches it never fills — misleading telemetry, zero bytes). Numbers in the 47-m5 bullet under row 47.
 
+**ROW 46 IS READY TO START COLD — re-verified on device 2026-09-23, and its old handoff was stale in
+four places.** A fresh session opens the 2026-09-23 handoff and begins at step 1; the start gate is
+already passed (MiniMax's 6.24 GB confirmed live under server knobs). **The four corrections, in case
+`docs/` is gone: (1) Qwen3-Next reserves 4.83 GB TODAY, not 0 — 42-B's RC7 lift has applied; (2) gpt-oss
+is a third payer at 4.89 GB but the lever is INERT there since 47-m5, so do not spend an arm on it;
+(3) `derive_expert_ceiling` is `vaayu_base.py:355`, called `:2703`; (4) the accumulator gate loads with
+`enable_prefix_cache=False`, so an arm taken through its config measures ZERO reservation.** The old
+checklist also said to measure on Qwen3-235B, which was deleted 2026-09-20 — corrected to Qwen3-Next.
+
 | order | item | what to open FIRST | cost | why this order |
 |---|---|---|---|---|
-| **1** | **Row 46 — size the prefix reservation** | [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md) | ½ day to measure, 1-2 days to build | Re-priced DOWN to **~2.6 %** on Qwen3-Next and its mechanism is measured away there (disk 0.42 % of a token). Its remaining hope is MiniMax's unmeasured 6.24 GB. Measure first; the stop rule closes it under ~3 %. **A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts.** |
+| **1** | **Row 46 — size the prefix reservation** | [`…-2026-09-23-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-23-row46-prefix-reservation-HANDOFF.md) — **RE-VERIFIED ON DEVICE 2026-09-23; the 2026-09-21 handoff is SUPERSEDED, do not read it** | ½ day to measure, 1-2 days to build | **START GATE IS ALREADY PASSED: MiniMax's 6.24 GB reservation was confirmed LIVE under server knobs on 2026-09-23** (ceiling 16.11 of 26.11 GB), and it is the ONLY live target — Qwen3-Next's mechanism is measured away (disk 0.42 % of a token, −2.56 % measured by 42-B) and gpt-oss's 4.89 GB is INERT since 47-m5 (no arena, no cache). Magnitude measured: +43 % cache slots (1814 → 2594). **Measure first; the stop rule closes it under ~3 %.** A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts. |
 | **2** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
 
 **The SPEED slot is empty, and with row 32 blocked there is now NO large speed lever pickable at
@@ -5596,9 +5605,30 @@ expert count and byte size from the checkpoint, never from a config literal.
 
 # 46 · [ ] The prefix reservation is sized to `MAX_SEQ_LEN`, not to what the pool actually holds — 4.74 GB on Qwen3-235B, 6.24 GB on MiniMax, live today (added 2026-09-20, split out of row 42-B) — **RE-PRICED DOWN 2026-09-20: the prize is ~2.6 %, not ~15 %**
 
-**FRESH-SESSION HANDOFF: [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md)**
-(gitignored; this row remains the durable copy). **Its step 1 is a MEASUREMENT on MiniMax-M2.7 with a stop
-rule — under ~3 % and the row closes**, the way Qwen3-Next's measured 2.56 % already closed the case there.
+**FRESH-SESSION HANDOFF, RE-VERIFIED 2026-09-23: [`…-2026-09-23-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-23-row46-prefix-reservation-HANDOFF.md)**
+(gitignored; this row remains the durable copy). **It SUPERSEDES the 2026-09-21 handoff, which is stale in
+four places — do not read that one.** Step 1 is a MEASUREMENT on MiniMax-M2.7 with a stop rule — **under
+~3 % and the row closes**, the way Qwen3-Next's measured 2.56 % already closed the case there.
+
+**RE-VERIFIED ON DEVICE 2026-09-23 — five corrections, all measured under SERVER knobs, so the row is
+pickable cold without the doc:**
+1. **MiniMax-M2.7 reserves 3 × 2.08 = 6.24 GB and it is LIVE** (`Expert cache ceiling 16.11 GB … reserving
+   3 prefix session(s) of 2.08 GB each`, of 26.11 GB available). **It is the ONLY live target.**
+2. **Qwen3-Next reserves 4.83 GB TODAY** (ceiling 19.14 of 27.73 available). The old handoff said "0 today,
+   4.83 GB once 42-B's RC7 lift applies" — **that lift HAS applied.**
+3. **gpt-oss-20b is a THIRD payer (3 × 1.63 = 4.89 GB, ceiling 15.95 of 24.61) and on it this lever is
+   INERT.** Since 47-m5 a whole-layer model allocates NO slab arena and its forward reads neither cache, so
+   the reservation shrinks a budget NUMBER and no bytes. **Do not spend an arm on gpt-oss.**
+4. **Line pointers drifted: `derive_expert_ceiling` is `vaayu_base.py:355`, called at `:2703`** (not
+   `:354` / `:2651`).
+5. **TRAP that silently zeroes an arm: `tests/test_moe_accumulator_determinism.py` loads with
+   `enable_prefix_cache=False` (`:70`)**, so MiniMax under that gate prints `reserving 0 prefix session(s)`
+   and a ceiling of 23.03 GB — the reservation looks already gone. **An arm MUST load on the server's own
+   knobs** (`vaayu/server/config.py`), as `plans/probes/m7_fp8_gating.py` and `row26_decode.py` do.
+
+**The magnitude of the prize, measured today (NOT the A/B — the two arms differ in more than the
+reservation):** MiniMax with the reservation ON gets a 1820-slab / 16.22 GB arena and ~1814 cache slots;
+with it OFF, 2599 slabs / 23.14 GB and ~2594 slots, same 4.40 GB working set. **+43 % cache slots.**
 
 **Split out of row 42-B on 2026-09-20 at the user's call: 42-B lifts RC7 with the reservation AS-IS,
 this row prices the reservation on its own, on the two models that pay it TODAY.** Splitting keeps
@@ -5648,9 +5678,16 @@ time real prompts grow. Any design here must say what happens when the guess is 
 - [ ] Price offline first (`vaayu/expert_sim.py`, `plans/probes/row31_price.py` — row 31's own tooling).
 - [ ] Decide the mechanism: reserve to a measured typical length; grow the reservation dynamically; or
       shrink the pool instead of the arena. Each must answer the over-capacity case.
-- [ ] Measure on Qwen3-235B AND MiniMax (§5 — a fix proved on one model is not done), including **row
-      31's 7.4k two-session arm**, which is the arm that kills a naive version.
-- [ ] §8: `PREFIX_SESSIONS` and `MAX_SEQ_LEN` are existing knobs; say whether the sizing needs a new one.
+- [ ] Measure on **MiniMax AND Qwen3-Next** (§5 — a fix proved on one model is not done), including **row
+      31's 7.4k two-session arm**, which is the arm that kills a naive version. **CORRECTED 2026-09-23: this
+      read "Qwen3-235B AND MiniMax" — Qwen3-235B was retired and DELETED 2026-09-20, so that instruction was
+      dead and would send a cold session after a checkpoint that is not on disk.** gpt-oss is NOT a target
+      (correction 3 above).
+- [ ] §8: `PREFIX_SESSIONS` and `MAX_SEQ_LEN` are existing knobs (`server/config.py:193` / `:128`); say
+      whether the sizing needs a new one, or state that it does not.
+- [ ] Gates: full suite, accumulator on Qwen3-Next AND MiniMax, the 1B prefix gate, the server gate on
+      Qwen3-Next, **and the server gate on gpt-oss-20b** — `derive_expert_ceiling` is shared sizing and
+      gpt-oss now loads through the server (added 2026-09-23).
 
 ---
 
