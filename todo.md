@@ -45,7 +45,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT (re-set 2026-09-23, after A4 closed) ◀◀
+## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, and 47-m7 was picked up and CLOSED the same day) ◀◀
 
 **A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
 document that carries its own start gate, stop rule, numbers and commands.**
@@ -56,31 +56,42 @@ non-expert set and Phase-2 pinning puts them in VRAM — **48 of 48 Qwen3-Next l
 reserved, ~302 MB of shared expert (6.2956 MB × 48, BF16, un-quantized by AWQ)**. The compute path
 was verified to BIND on the real module tree, which byte accounting alone could not show. Detail in
 the A4 bullets under row 47. **A5 is now the head of the REACH track — but it is weeks and
-kernel-gated, so the two cheap rows below lead.**
+kernel-gated, so the cheaper rows in the table below lead it.**
+
+**ROW 32 IS OUT OF THIS TABLE — `[!]` BLOCKED 2026-09-23, by the user, on cost.** It was order 1 that
+morning; the session verified its route (a full HF sweep: the build on disk ships `2.0…8.0bpw` as
+BRANCHES of the SAME repo, so route 1 is live and route 2 is dead) and then the user **declined the
+download**. **Row 32's entire cost IS that download — there is nothing else in it to build — so it
+cannot proceed and is not pickable.** Do not re-open it by re-deriving the projection; it unblocks
+only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and two handoff
+corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
+otherwise: every item below runs on checkpoints already on this disk.**
+
+**47-m7 CLOSED 2026-09-23 — INERT, byte-identical, zero code.** It was order 1 that afternoon and it is done:
+A3's FP8-compat gating does not change Qwen3-Next. Both arms' `prefill_sha256` and `decode_logits_sha256` matched
+exactly, all 32 greedy ids matched, and the negative control fired (the ungated arm logged the patch, the gated arm
+logged nothing). The mechanism is now known: the compressed-tensors quantizer never reads `modules_to_not_convert`.
+**The live consequence for the next session: A3's ONLY remaining unverified behaviour change on Qwen3-Next is the
+fp32 rotary table (`cac352e`) — that is 47-m6, still open, and it is now the last A3 loose end.** Numbers in the
+47-m7 bullet under row 47.
 
 | order | item | what to open FIRST | cost | why this order |
 |---|---|---|---|---|
-| **1** | **Row 32 — a lower-bpw EXL3 build** | [`…-row32-lower-bpw-HANDOFF.md`](docs/2026-09-21-row32-lower-bpw-HANDOFF.md) | a download, **zero code** | The only large speed lever left, but **row 32's own table is STALE** — it was written for Qwen3-235B, which was deleted, and its kill clause already fired for Qwen3-Next. The handoff re-anchors it on **MiniMax-M2.7**: **×1.44 projected at 3.0 bpw**, derived from a measured 75.7-76.4 % drive-busy token. |
+| **1** | **47-m5 — a whole-layer model pays for an expert cache it never reads** | row **47**'s 47-m5 bullet (no separate handoff) | ~½ day, real fix | Cheapest item that ships code, and it improves the model that just landed. Measured on gpt-oss-20b: **18.45 GB of PINNED unswappable RAM on a 32 GB box** doing nothing (`usage=0.00GB/18.31GB` for every token of a 256-token run), RSS 25.87 GB against the 29 GB gate ceiling. The engine already runs `detect_moe_blocks` before sizing the arena, so it can ask the dispatch's own two questions. Touches shared sizing → all three accumulator gates. |
 | **2** | **Row 46 — size the prefix reservation** | [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md) | ½ day to measure, 1-2 days to build | Re-priced DOWN to **~2.6 %** on Qwen3-Next and its mechanism is measured away there (disk 0.42 % of a token). Its remaining hope is MiniMax's unmeasured 6.24 GB. Measure first; the stop rule closes it under ~3 %. **A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts.** |
-| **3** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked below 32/46 only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. |
+| **3** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
 
-**The SPEED slot is empty.** Row 49's two successors were both spent or refuted on 2026-09-21: the
-ring-pool optimum is n=2 (shipped, +1.89 % decode) and the read-shape arm was built and REVERTED
-(−0.40 % decode despite removing 66.7 % of the reads). Nothing in the speed track is pickable
-without a new idea. **Row 32 leads anyway because it is a download and zero code; the REACH track's
-own head is now A5, which is weeks.**
+**The SPEED slot is empty, and with row 32 blocked there is now NO large speed lever pickable at
+all.** Row 49's two successors were both spent or refuted on 2026-09-21: the ring-pool optimum is
+n=2 (shipped, +1.89 % decode) and the read-shape arm was built and REVERTED (−0.40 % decode despite
+removing 66.7 % of the reads). **Everything in the table above is correctness, hygiene or reach —
+none of it makes Vaayu faster on a target run here.** A new speed idea has to cut bytes per token
+or raise delivered GB/s (rows 31-39's decomposition), and must not need a download.
 
-**Also pickable cold, and cheaper than any of the three above — a VERIFICATION with its own
-self-contained document:** **47-m7**, [`…-fp8-gating-verification-HANDOFF.md`](docs/2026-09-21-fp8-gating-verification-HANDOFF.md)
-— ~30 minutes, one model, one variable, ships no code. A3 gated a workaround that used to run for
-every quantizer, and **Qwen3-Next is the only model on this box that was silently receiving it**;
-the green gates prove determinism, not "same as the previous build". Expected inert, unverified.
-**Do this one first if the box is free but the session is short.**
-
-**Also open, smaller, the row carries them:** 47-m5 (18.45 GB pinned expert arena the
-whole-layer path never reads — cheap, and it improves the model that just landed), 47-m4
-(sliding-window KV, 0.813 GB), 47-m6 (A3's fp32 rotary table changed numerics for EVERY model and
-only gpt-oss's side was measured), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`.
+**Also open, smaller, the row carries them:** **47-m6 — now the LAST A3 loose end**, since 47-m7
+closed: A3's fp32 rotary table (`cac352e`) changed numerics for EVERY model and only gpt-oss's side
+was measured. Then 47-m4 (sliding-window KV, 0.813 GB), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`.
+(47-m5 was promoted into the table above; 47-m7 is CLOSED.)
 
 
 **Nothing is in flight. No §0 P-row is open, so nothing here makes Vaayu faster on Qwen3-235B, MiniMax-M2.7
@@ -3096,7 +3107,9 @@ which moves the reservation itself rather than the prediction of it.
 
 ---
 
-# 32 · [ ] Run a lower-bpw EXL3 build of the models already on disk — a download, zero code (added 2026-09-12) — **RE-ANCHORED 2026-09-21: the table below is Qwen3-235B's and that checkpoint is GONE**
+# 32 · [!] Run a lower-bpw EXL3 build of the models already on disk — a download, zero code (added 2026-09-12) — **RE-ANCHORED 2026-09-21: the table below is Qwen3-235B's and that checkpoint is GONE** — **BLOCKED 2026-09-23: the user declined the download. Row 32's ENTIRE cost is that download; there is nothing else in it to build, so it cannot proceed.**
+
+**Unblocks on: the user authorising an ~81.6 GiB pull.** Route 1 was VERIFIED LIVE 2026-09-23 and is better than the handoff knew — a full HuggingFace sweep found exactly ONE EXL3 build of M2.7 (`NeuroSenko/MiniMax-M2.7-exl3`, already on disk), **but it ships bpw as BRANCHES: `2.0 / 3.0 / 4.0 / 5.0 / 6.0 / 7.0 / 8.0`**, all `quant_method: exl3`, `version 0.0.29`, `head_bits: 6`, `codebook: mcg`. Same repo, same module-list forward, same loader. **Route 2 (local quantize) is therefore DEAD — no original weights are needed.** Measured branch sizes from the tree API: **3.0bpw = 87.6 GB (81.6 GiB), 4.0bpw = 116.1 GB (108 GiB), 5.0bpw = 144.5 GB (134.6 GiB — matching the 135 GiB on disk byte-for-byte)**. **Two handoff corrections banked 2026-09-23:** (a) the disk budget is a PEAK not a steady state — the on-disk 5.0bpw dir holds ONLY `splitted_model/`, no original safetensors (`tests/test_delete_original.py`), so a 3.0bpw pull costs **163 GiB peak, 81.6 GiB steady** against **232 GiB free**, with the 5.0bpw build surviving for the A/B; (b) the handoff's *"there is no committed MoE perplexity baseline"* is **STALE** — row 33 (`todo.md` §33) records MiniMax **ppl 7.2626** at k=8, 256 scored tokens, via `scripts/decode_top_k_ppl.py`, alongside decode **1.8168 tok/s**. That is ONE draw, so D6's several-draws rule still binds, but the anchor and the tooling already exist.
 
 **READ THE HANDOFF FIRST: [`…-row32-lower-bpw-HANDOFF.md`](docs/2026-09-21-row32-lower-bpw-HANDOFF.md)
 (gitignored — the corrected numbers are repeated here so this row survives without it).** Two things
@@ -5315,7 +5328,8 @@ the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20
       is unchanged within noise on both models, close with the number — the fix is still right, it just did not
       matter below 33k context. If it improved, that is a quality win nothing else on this board delivers. If it
       REGRESSED, stop and investigate: that would mean something downstream depended on the bf16 table.**
-- [ ] **47-m7 — VERIFY that A3's FP8-compat gating is inert for Qwen3-Next.** Opened 2026-09-21, by the
+- [x] **47-m7 — VERIFY that A3's FP8-compat gating is inert for Qwen3-Next. CLOSED 2026-09-23 — IT IS INERT, BYTE-IDENTICAL, zero code shipped, branch deleted.**
+      **The numbers, so this row survives without its doc:** both arms on `main` at **`753b104`**, same box, same day, back to back, each in its own 29G foreground scope; `ungated` = that commit with ONE hunk reverted (the `if isinstance(...)` line deleted, the call dedented), `cac352e`'s fp32 rotary LEFT IN on both so there was exactly one variable. **`prefill_sha256` `c45857cd6fade36c6f4e7187872274b48ae5e0938085daad7668ef74943bd77d` and `decode_logits_sha256` `cf886697a59edd2fee4aba7b14e4105f9a03c8d05ef931b071c930d58827f958` are IDENTICAL across the two arms**, as are all 32 greedy decode ids, `attn_impl=flash_attention_2`, the forward census (`_make_fused_sparse_forward` ×48) and the module tree (48 `experts`, all `Qwen3NextExperts`). **NEGATIVE CONTROL PASSED — the arms really did differ:** the `ungated` log carries `[Vaayu] FP8 compat: set modules_to_not_convert = ['experts']` plus the Blackwell deep-gemm disable, and the `gated` log has ZERO `FP8 compat` lines. **MECHANISM, now verified rather than assumed and SIMPLER than the handoff predicted: `transformers/quantizers/quantizer_compressed_tensors.py` (5.5.4) contains ZERO occurrences of `modules_to_not_convert`** — it delegates to `compressed_tensors.quantization.apply_quantization_config` with the library's own config — **so the patch set a field nobody on this path reads**, and the quantizer replaced no experts module in EITHER arm. The handoff's own reasoning (the fused non-EXL3 forward computes the FFN from streamed bytes and never reads the module's parameters) also holds, but it is not the proximate cause. **Consequence: A3's ONLY behaviour change on Qwen3-Next is the fp32 rotary table (`cac352e`) — that is 47-m6 and it is STILL OPEN.** §8: no knob, nothing to plumb, nothing to reach; no gates run because no code changed. Probe `plans/probes/m7_fp8_gating.py` (a3_streamed_forward.py was UNUSABLE for this — its reference prompt ids are gpt-oss's, max **165916** against Qwen3-Next's **151936** vocab). [`…-47m7-fp8-gating-verification-RESULTS.md`](docs/2026-09-23-47m7-fp8-gating-verification-RESULTS.md). Original text follows. Opened 2026-09-21, by the
       session that made the change, because it was NOT verified there. **FRESH-SESSION HANDOFF, fully
       self-contained: [`…-fp8-gating-verification-HANDOFF.md`](docs/2026-09-21-fp8-gating-verification-HANDOFF.md)**
       (gitignored — this row is the durable copy). A3 gated `_patch_fp8_quantizer_compat`
