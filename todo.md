@@ -95,6 +95,30 @@ Qwen3-Next's 0.42 %-disk regime does NOT generalise), and two probe traps (`row2
 defaults to the DELETED Qwen3-235B path; `BALLAST_GB` can make a ceiling A/B inert — run the 1-token
 binding check first).
 
+## ▶ PICK THIS NEXT: **A5.1** (row 28b). Then A5.2 → A5.3 → A5.4 → A5.5 → A5.6 → A5.7, one per session.
+
+**A5 step 2 is DESIGNED as of 2026-09-23 — seven sub-plans, each with a self-contained document and
+its own durable row under row 28b.** A fresh session needs nothing but the row it is picking.
+**Work them IN ORDER: each module only has a golden reference once its dependencies are correct.**
+
+| order | item | kind | what to open FIRST | cost |
+|---|---|---|---|---|
+| **1 (NEXT)** | **A5.1** config + `auto_map` | design | [`…A5.1-config-skeleton-design.md`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) | ~½ d |
+| 2 | **A5.2** parity harness | design | [`…A5.2-parity-harness-design.md`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) | ~½ d |
+| 3 | **A5.3** dequant + `Linear` | design | [`…A5.3-dequant-linear-design.md`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) | 1–2 d |
+| 4 | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
+| 5 | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
+| 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
+| 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
+
+**A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
+plans by the session that reaches them (their inputs need measuring first — a stale design is worse
+than a brief, because the next session implements it instead of questioning it). **`docs/` is
+gitignored: row 28b's A5.x bullets carry every number and stop rule and are the durable copy.**
+
+**A5.5 is where A5 dies if it dies** — everything else has a golden reference or a Vaayu precedent;
+the attention path has neither. Its step-0 gate exists to find that out in ~1 day, not ~3 weeks.
+
 **A5 / row 28b IS IN FLIGHT `[~]` — ITS STEP-1 GATE PASSED 2026-09-23, 6/6.** The abandon branch
 (*kernels will not build on sm_120 → decide Triton-or-abandon, ~2 days not weeks*) **did NOT fire**:
 all six of DeepSeek's TileLang kernels build and validate here, both GEMMs at rel err ~0.0027, suite
@@ -2351,6 +2375,132 @@ the unchanged baseline. Detail:
 - **NOT established by this gate:** anything in `model.py` (only `kernel.py` was exercised) — the
   MLA/DSA modeling code, key remap, dual dequant and MLA KV sizing are all step 2+.
   `fast_hadamard_transform` is still absent but `kernel.py` never imports it: a step-2 concern.
+
+## A5 STEP 2 — decomposed into A5.1 … A5.7 (designed 2026-09-23, user-directed)
+
+**Step 2 ("HF modeling code") was too large for one spec — it is six subsystems, three of which the
+A5 brief does not mention (hash routing, hyper-connections, DSpark/MTP).** Decomposed into seven
+sub-plans, each with a SELF-CONTAINED document under `docs/superpowers/specs/` and its own row
+below. **Work them IN ORDER: each module only has a golden reference if its dependencies are
+already correct.** Implement one per fresh session.
+
+**A5.1–A5.4 are full DESIGNS** (their inputs are knowable today). **A5.5–A5.7 are BRIEFS with start
+gates and stop rules** — their inputs need measurement, and a stale design is worse than a brief
+because the next session implements it instead of questioning it. Each is promoted to a plan by the
+session that reaches it. Same ratchet A5 itself went through.
+
+**Three decisions taken by the user 2026-09-23, do not re-litigate:**
+1. **Verification is PER-MODULE golden parity, not end-to-end logits.** Row 28b's "verify against
+   `inference/generate.py`" is **unrunnable and always will be** — the reference has no streaming
+   and the checkpoint is **155.42 GiB against ~45.3 GiB** of VRAM+RAM (**3.4×** the box). But
+   `world_size = 1` is the reference's default with **no `dist` init**, so ONE module runs here
+   (~119 MiB for a layer's attention, 76.5 MiB for six experts). A5.2 builds that harness.
+2. **Hash routing stashes `input_ids` on the model** — zero engine changes.
+3. **MTP is OUT and excluded explicitly** (A5.7).
+
+| # | sub-plan | kind | delivers | cost | doc |
+|---|---|---|---|---|---|
+| **A5.1** `[ ]` | config + `auto_map` | design | `AutoConfig` resolves `deepseek_v4` | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
+| **A5.2** `[ ]` | **parity harness** | design | golden values from the reference's own modules | ~½ d | [`…A5.2…`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) |
+| **A5.3** `[ ]` | dequant + `Linear` | design | both weight formats through the gated kernels | 1–2 d | [`…A5.3…`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) |
+| **A5.4** `[ ]` | MoE | design | 94.3 % of the bytes, on the module-list forward | 2–3 d | [`…A5.4…`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) |
+| **A5.5** `[ ]` | **attention** | **BRIEF + gate** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
+| **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
+| **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
+
+**≈3 weeks. A5.5 is where this dies if it dies** — everything else has either a golden reference or
+a Vaayu precedent; the attention path has neither.
+
+### Durable summaries — each row survives its `docs/` file going missing (§7)
+
+- [ ] **A5.1 — config + `auto_map`.** transformers 5.5.4 has `deepseek_v2/v3/vl`, **not**
+      `deepseek_v4`, and the checkpoint ships no `auto_map` → Vaayu dies at `vaayu_base.py:2131`.
+      Template is MiniMax (`configuration_*.py` + `modeling_*.py` + `auto_map`). **Do NOT port
+      `ModelArgs`** — it is a second source of truth with its own defaults, and carrying both is how
+      they drift. **Back up `config.json` before editing: it is the only copy, under a standing
+      NO-DOWNLOAD constraint.** Decide explicitly whether to expose `quantization_config`
+      (**default: hide it** — A5.3 does its own dequant; 47-m7 closed on exactly this class of
+      surprise). Confirm A1's `expected_expert_count()` returns **256** via its third key
+      `n_routed_experts` — A1 Task 4 exists because that lookup silently returned `None`.
+      **Verify:** every config field round-trips **field by field, no spot check**.
+- [ ] **A5.2 — the parity harness. BUILD IT BEFORE PORTING ANYTHING.** Record goldens from the
+      reference's own modules, cache them as **committed `.npz` fixtures** so A5.3–A5.7 need
+      **neither the 157 G checkpoint nor a GPU**. Goldens: `linear_fp4/fp8/bf16`, `expert`,
+      `gate_hash`, `gate_score`, `moe`, `attn_prefill`, `attn_decode`, **`attn_chunked`**, `block`.
+      **`attn_chunked` is the important one:** `model.py:537` does
+      `kv_cache[:bsz, start_pos % win] = kv.squeeze(1)`, assuming `seqlen == 1`, and Vaayu chunks
+      prefill at 512 — **row-43 class, silent context corruption**. If the reference itself raises
+      or corrupts there, **that IS the golden** and it is the most valuable thing A5.2 buys.
+      **Traps:** `Attention.__init__` allocates `kv_cache` from `max_seq_len` (use a small one, or
+      it sizes for 1,048,576); `sparse_attn` needs the **`block=16`** patch or every attention
+      golden dies at launch; import `model.py` under an explicit name (it defines a module called
+      `kernel`).
+- [ ] **A5.3 — dequant + `Linear`.** Two formats: routed experts **`I8` (fp4 packed 2/byte) +
+      `F8_E8M0` per-row/32**; shared+attention **`F8_E4M3` + `F8_E8M0` per-128×128-block**. The
+      scale **shapes** differ, not just the dtypes. **THE MANDATORY DIVERGENCE: read `self.scale`,
+      never `self.weight.scale`.** The reference aliases scale onto the Parameter
+      (`model.py:145`); `_inject_expert_weights` (`moe_patch.py:1225`) rebinds each key with
+      `setattr(submod, base, nn.Parameter(t))`, so `weight` becomes a **fresh object with no
+      `.scale`** → `AttributeError` on every streamed expert, every token. **Both keys DO bind, so
+      streaming a dual-tensor quantized expert needs ZERO engine changes** — the biggest de-risking
+      fact for A5.4. `wo_a` is `F8_E4M3` on disk but the module declares **bf16** and uses the raw
+      weight in an einsum → **dequantise once at load**. Kernels imported lazily (config must stay
+      importable without tilelang). **Verify:** a test that rebinds `weight` to a fresh Parameter
+      and asserts forward still works — without it the bug returns the first time someone
+      "simplifies" back to the reference idiom.
+- [ ] **A5.4 — MoE, 94.3 % of the bytes.** **Keep the reference's names** (`ffn`, `experts`,
+      `gate`, `w1/w2/w3`): `detect_moe_blocks` is name-driven on exactly those, so it works with
+      **zero engine changes** and A5.7's remap stays near-free. Two required changes:
+      `Gate.forward` must return **raw scores** `[N, n_routed_experts]` (the reference returns
+      `(weights, indices)`), and `MoE` must add **`route_tokens_to_experts`** — Vaayu's own
+      documented contract (`moe_patch.py:155`), where all model-specific scoring lives:
+      `sqrtsoftplus` → bias for **selection only** → topk → weights from the **UNBIASED** scores →
+      normalise → ×1.5. **Scoring a MoE with the wrong function is what made MiniMax emit
+      incoherent text** while loading and streaming perfectly. **Weights inside vs outside the
+      expert are EQUIVALENT** (`w2` is bias-free linear, `w` a per-token scalar) — write that down,
+      it looks like a bug. Hash layers (0–2) read the stashed `input_ids`. **Shared experts:
+      24 MiB/layer → ~1.01 GiB over 43 layers**, A4 Check 1 discharged **by running, not reading**.
+      **Verify:** `detect_moe_blocks` finds 43 `module_list` blocks on a **meta-device** tree; the
+      MoE gates for Qwen3-Next and MiniMax stay green (prove the "zero engine changes" claim).
+- [ ] **A5.5 — attention. BRIEF WITH A GATE; THIS IS WHERE A5 DIES IF IT DIES.** MLA (one 512-dim
+      latent shared by 64 heads), grouped low-rank O, circular 128-window KV, `Compressor`, and on
+      `ratio == 4` layers a learned `Indexer` over `index_topk 512`. `compress_ratios` over 43
+      layers: **2 at 0, 21 at 4, 20 at 128**. **KV IS TINY — G4 is an API problem, not a VRAM one:
+      50.99 MB/sequence at 8k = 0.0062 MB/token, 41× SMALLER than MiniMax's 0.254.** Do not spend a
+      week on `vram_plan`. **Shared-memory ladder vs sm_120's 101,376 B** (`num_stages` has no
+      effect): **block 64 → 141,312 B (1.394× over) · 32 → 104,448 B (over by 3,072 B, 3.0 %) ·
+      16 → fits**. **STEP-0 GATE before any modeling code:** (1) correctness at **`topk=512`** and a
+      real length against A5.2's golden — **fails ⇒ STOP, the port has no attention**; (2) the cost
+      of the ¼ tile — **if attention alone dominates the 3.2124 GiB/token disk floor (~0.49 s),
+      escalate before building**; (3) only if (2) hurts, try to recover 3,072 B for `block=32`.
+      Open: ring-buffer KV vs HF `Cache` (and 42-B's snapshot); chunked prefill; **in-place rotary,
+      applied again INVERTED to the attention output**; `act_quant(..., 64, inplace=True)` FP8 QAT
+      sim (**group 64, not 128**, and not in `config.json`); `attn_sink`; two rope variants.
+- [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
+      block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
+      twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
+      sees `[b,s,d]`, so A5.4's zero-engine-changes result holds. CONFIRM THAT; the whole
+      decomposition rests on it, and if it is false, STOP and re-plan.** `hc_*` params are fp32 by
+      construction → **~3.1 MB/layer, ~135 MB over 43 layers** of always-resident weight (feeds A4
+      Check 2 with A5.4's ~1.01 GiB). The head uses `hc_head`, a **plain sigmoid with NO Sinkhorn**
+      — same-looking code, different arithmetic. Also owns the **`start_pos` → HF `Cache`**
+      migration (shape decided by A5.5), the `input_ids` stash lifetime, `tie_word_embeddings:
+      false`, and `precompute_freqs_cis`'s `@lru_cache(2)` holding **exactly two** rope variants.
+- [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
+      it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
+      `\.experts\.(\d+)\.` finds **11,776** — the extra **768 experts = 9.56 GiB** are
+      `mtp.0/1/2.ffn.experts.*`. MTP is OUT, so **the index must skip `mtp.*` and find 11,008**.
+      **It is a correctness hazard, not just waste:** `detect_moe_blocks` takes the layer index from
+      the **first `.N.` in the path**, and `mtp.0.ffn` contains `.0.` → detected as **layer 0**,
+      colliding with the real one. Same defect class as A1 Task 4 and 47-m5 — an index asking a
+      question the load path answers differently, **third time this program has paid for it**.
+      Also: key remap (should be ~a `model.` prefix — **verify, it is A5.4's claim**); splitter runs
+      A1's guards **before** `DELETE_ORIGINAL` deletes the only copy — **dry-run it**; A4 Check 1
+      (pinning half) and Check 2 (**~1.01 GiB shared + ~135 MB hc + ~5.33 GiB attention** vs the pin
+      budget; Phase 2 **`break`s** on miss at `vaayu_base.py:3956` — count the layers); then row 28b
+      step 5's measurement. **§8: answer all four.** **Expect ~1.75–2.06 tok/s** (3.2124 GiB/token
+      ÷ the NVMe plateau) — **A5 buys REACH, not speed; ~5× slower than Qwen3-Next. Do not present
+      it as a perf win.**
 
 **Steps (each with its own verify):** 1 **kernels first, standalone, on sm_120** (2–5 days; **stop rule: if TileLang
 will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
@@ -5083,7 +5233,7 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 | **A2** `[x]` | **Fused-3D expert indexing** — **CLOSED 2026-09-21** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
 | **A3** `[x]` | **gpt-oss-20b END TO END — CLOSED 2026-09-21** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
 | **A4** `[x]` | **Shared-expert pinning (G7) — CLOSED 2026-09-23, PREMISE REFUTED** | nothing to build: always-active experts were **already** pinned, not streamed. Stop rule fired on Q1 | — | stop rule fired; Q2 never run | **½ day, zero code** | [`…-A4-shared-experts-RESULTS.md`](docs/2026-09-23-A4-shared-experts-RESULTS.md) · brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
-| **A5** `[~]` | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | ~~A4~~ **(closed)** | ~~kernels must build on sm_120~~ **GATE PASSED 2026-09-23: 6/6 build+validate. `sparse_attn` needs block=16 (shipped 64 exceeds sm_120's 101,376 B smem); `apache-tvm-ffi==0.1.9` is an exact pin. Step 2 next.** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
+| **A5** `[~]` | **DeepSeek-V4-Flash port — step 2 DECOMPOSED into A5.1…A5.7 2026-09-23; PICK A5.1** | the 157 GB I8/fp8 MoE loads and runs | ~~A4~~ **(closed)** | ~~kernels must build on sm_120~~ **GATE PASSED 2026-09-23: 6/6 build+validate. `sparse_attn` needs block=16 (shipped 64 exceeds sm_120's 101,376 B smem); `apache-tvm-ffi==0.1.9` is an exact pin. Step 2 next.** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
 | A7 | G3 `compute_device` parity · G5 NVMe re-measure | removes two latent generality traps | — | none | ~1 day | plan when picked |
 
