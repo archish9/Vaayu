@@ -1473,6 +1473,66 @@ a Vaayu precedent; the attention path has neither.
       **§8:** (1) **no knob** — a gate measures, it configures nothing; (2) nothing to plumb, the
       probe does not touch `vaayu/`; (3) **NOT reachable** — `deepseek_v4` still has no model class;
       (4) it unblocks A5.5's plan and ships **zero user-visible capability**. Banked, said so.
+      **DESIGNED 2026-09-23, SAME DAY — `docs/superpowers/specs/2026-09-23-A5.5-attention-design.md`
+      (gitignored; these bullets are the durable copy). TWO USER DECISIONS, both widening the
+      brief:**
+      **(D1) A5.5 OWNS THE KV CACHE CLASS, not just its shape** (the brief gave the migration to
+      A5.6). Writing attention against module buffers and migrating later is not a refactor, it is
+      a second module. A5.6 keeps only the plumbing (`past_key_values`, `cache_position`,
+      `attention_mask`, `position_ids`).
+      **(D2) A5.5 WRITES THE MULTI-TOKEN PATH.** Refusing chunked prefill (the
+      `recurrent_state.continuation_refusal` / `PREFILL_CHUNK_SIZE=0` precedent) was costed and
+      REJECTED: it forfeits Vaayu's VRAM model, row 45's retention win and 42-B's partial prefix
+      reuse, and does not scale past ~8k (the Indexer's score matrix alone is ~2.1 GB of transient
+      at 8k).
+      **THE REFERENCE BREAKS AT FOUR SITES, NOT ONE.** A5.2 proved site 1 raises; the other three
+      were read off the source: (1) `Attention.forward` `model.py:535` one-slot ring write; (2)
+      **`Compressor.forward`'s else-branch `:351-367`** — `kv.squeeze(1)`, `state[…start_pos %
+      ratio]`, `should_compress = (start_pos+1) % ratio == 0`; (3) `get_window_topk_idxs` `:262-266`
+      returns a `[window]` vector, not `[seqlen, window]`; (4) `get_compress_topk_idxs` `:276-277`
+      and **`Indexer`'s mask `:430-436`** mask causally only under `start_pos == 0`.
+      **CACHE DESIGN: `DeepseekV4CacheLayer(CacheLayerMixin)` per layer + `DeepseekV4Cache(Cache)`.**
+      transformers 5.5.4's `CacheLayerMixin` has FIVE abstract methods (`lazy_initialization`,
+      `update`, `get_mask_sizes`, `get_seq_length`, `get_max_cache_shape`). **`values` IS `keys`** —
+      MLA's one 512-dim latent is both operands of `sparse_attn`. **That aliasing breaks three
+      INHERITED methods**, so the layer overrides all three: `offload`/`prefetch` move keys and
+      values independently (splitting the alias) and `reorder_cache` index_selects both —
+      **`reorder_cache` RAISES** (beam search is unreachable in Vaayu's server; a half-reordered
+      ring is worse than a refusal). **`get_mask_sizes` returns `(ring capacity, 0)` and says so in
+      its docstring: this model builds NO HF mask** — `sparse_attn` masks by writing `-1` into
+      `topk_idxs` and causality lives in the index builders.
+      **SIZING CORRECTION — THE BRIEF'S KV NUMBER IS THE RING ALONE.** "50.99 MB at 8k = 0.0062
+      MB/token, 41× smaller than MiniMax" counts only `keys`. Derived from the shipped config at
+      8k: **ring 50.99 MB + Indexer rings 11.01 + Compressor states 12.21 = 74.20 MB/sequence =
+      0.0091 MB/token, 28.0× smaller than MiniMax's 0.254** (not 41×). The conclusion is unchanged
+      — KV is tiny, G4 is an API problem not a VRAM one — but **`vram_plan` must get the TOTAL, not
+      the ring.**
+      **`crop()` REFUSES, AND THAT IS A CORRECTNESS PROPERTY.** The window holds absolute positions
+      `[L-win, L-1]` at slots `pos % win`; cropping to `keep` needs `[keep-win, keep-1]` and the
+      `L-keep` positions below `L-win` were OVERWRITTEN. Exact only at `keep == L` — 42-B's
+      "servable at exactly ONE length", reached by a different mechanism.
+      **[bug] THE TRAP THIS CREATES — REQUIRED BEFORE A5.7 CAN CLAIM REACHABILITY.** With `values`
+      aliased, the cache LOOKS like an ordinary KV cache to `batch.cache_holds_recurrent_state`
+      (`batch.py:500`), which detects state by `conv_states`/`update_conv_state` and returns
+      **False** — so `prefix_cache.py:112` (lookup), `prefix_cache.py:364` (abort-path restore) and
+      `kv_persist` would all treat it as croppable. Extending that check is a **both-paths change
+      under CLAUDE.md §0** and the user scoped it OUT of A5.5. **Until it is paid, this model must
+      not be served with prefix caching or KV persistence enabled.**
+      **ACCEPTANCE (§5.1) IS CHUNK EQUIVALENCE, and A5.5 has no model, so the object under test is
+      ONE `Attention` module on real weights, one per ratio (0/4/128):** reference whole-prompt
+      forward vs our port fed the same prompt in 512-token slices, rel-L2 on the final chunk's
+      outputs **against a null-perturbation floor measured in the same run**, at TWO chunk counts.
+      Row 43's precedent (0.314 vs a 0.051 floor) and D6's bit-sensitivity finding are why a fixed
+      epsilon is not evidence. **Widening the tolerance to fit the result is the row-43 failure
+      re-run — STOP and raise instead.** The two `attn_chunked` goldens store NO output (their
+      content is the reference's RuntimeError + `prefill_x`; the chunk input is reproducible as
+      `seeded_input(1, 512, dim, seed=1)`), so they become the test that our port does NOT raise.
+      The four `attn_{prefill,decode}_{r4,r128}` goldens carry real outputs: reproduce them and
+      **state which — `torch.equal`, or a measured divergence naming the op** (A5.3/A5.4 both
+      landed bit-identical where the arithmetic was shared).
+      **PERF IS OUT OF SCOPE and becomes its own row**, with the gate's breakdown as its opening
+      position: `indexer` 26.1 % · `compressor` 18.5 % · `wo_a` einsum 15.1 % · `sparse_attn`
+      10.1 %.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
