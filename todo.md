@@ -57,12 +57,13 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.1** — jump to "PICK THIS NEXT: **A5.1**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.2** — jump to "PICK THIS NEXT: **A5.2**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
-durable row. START AT A5.1.** Everything below is PENDING work only — the closed rows were pruned
-2026-09-23 and live in `git log -p -- todo.md`.
+durable row; A5.1 CLOSED the same day — `AutoConfig` now resolves `deepseek_v4`, and the next
+failure is the model class. START AT A5.2.** Everything below is PENDING work only — the closed
+rows were pruned 2026-09-23 and live in `git log -p -- todo.md`.
 
 ---
 
@@ -75,7 +76,14 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.1** (row 28b). Then A5.2 → A5.3 → A5.4 → A5.5 → A5.6 → A5.7, one per session.
+## ▶ PICK THIS NEXT: **A5.2** (row 28b). Then A5.3 → A5.4 → A5.5 → A5.6 → A5.7, one per session.
+
+**A5.1 is CLOSED (2026-09-23).** It left two things every later sub-plan uses:
+`tests/fixtures/deepseek_v4_config.json` (a committed copy of the shipped config — **no 157 G
+checkpoint and no GPU needed to test this path**) and
+`vaayu/model_code/deepseek_v4/configuration_deepseek_v4.py`, the repo-tracked SOURCE OF TRUTH that
+is copied into the checkpoint dir. **Put A5.x modeling code in that package and copy it the same
+way** — a drift test enforces the copy.
 
 **A5 step 2 is DESIGNED as of 2026-09-23 — seven sub-plans, each with a self-contained document and
 its own durable row under row 28b.** A fresh session needs nothing but the row it is picking.
@@ -83,8 +91,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 
 | order | item | kind | what to open FIRST | cost |
 |---|---|---|---|---|
-| **1 (NEXT)** | **A5.1** config + `auto_map` | design | [`…A5.1-config-skeleton-design.md`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) | ~½ d |
-| 2 | **A5.2** parity harness | design | [`…A5.2-parity-harness-design.md`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) | ~½ d |
+| ~~1~~ | ~~**A5.1** config + `auto_map`~~ | **CLOSED 2026-09-23** | [`…A5.1-config-RESULTS.md`](docs/2026-09-23-A5.1-config-RESULTS.md) | done |
+| **2 (NEXT)** | **A5.2** parity harness | design | [`…A5.2-parity-harness-design.md`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) | ~½ d |
 | 3 | **A5.3** dequant + `Linear` | design | [`…A5.3-dequant-linear-design.md`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) | 1–2 d |
 | 4 | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
 | 5 | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
@@ -1188,7 +1196,7 @@ session that reaches it. Same ratchet A5 itself went through.
 
 | # | sub-plan | kind | delivers | cost | doc |
 |---|---|---|---|---|---|
-| **A5.1** `[ ]` | config + `auto_map` | design | `AutoConfig` resolves `deepseek_v4` | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
+| **A5.1** `[x]` | config + `auto_map` | **DONE 2026-09-23** | `AutoConfig` resolves `deepseek_v4`; next failure is the model class | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
 | **A5.2** `[ ]` | **parity harness** | design | golden values from the reference's own modules | ~½ d | [`…A5.2…`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) |
 | **A5.3** `[ ]` | dequant + `Linear` | design | both weight formats through the gated kernels | 1–2 d | [`…A5.3…`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) |
 | **A5.4** `[ ]` | MoE | design | 94.3 % of the bytes, on the module-list forward | 2–3 d | [`…A5.4…`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) |
@@ -1201,16 +1209,45 @@ a Vaayu precedent; the attention path has neither.
 
 ### Durable summaries — each row survives its `docs/` file going missing (§7)
 
-- [ ] **A5.1 — config + `auto_map`.** transformers 5.5.4 has `deepseek_v2/v3/vl`, **not**
-      `deepseek_v4`, and the checkpoint ships no `auto_map` → Vaayu dies at `vaayu_base.py:2131`.
-      Template is MiniMax (`configuration_*.py` + `modeling_*.py` + `auto_map`). **Do NOT port
-      `ModelArgs`** — it is a second source of truth with its own defaults, and carrying both is how
-      they drift. **Back up `config.json` before editing: it is the only copy, under a standing
-      NO-DOWNLOAD constraint.** Decide explicitly whether to expose `quantization_config`
-      (**default: hide it** — A5.3 does its own dequant; 47-m7 closed on exactly this class of
-      surprise). Confirm A1's `expected_expert_count()` returns **256** via its third key
-      `n_routed_experts` — A1 Task 4 exists because that lookup silently returned `None`.
-      **Verify:** every config field round-trips **field by field, no spot check**.
+- [x] **A5.1 — config + `auto_map`. DONE 2026-09-23.**
+      `AutoConfig.from_pretrained(CKPT, trust_remote_code=True)` now returns a `DeepseekV4Config`
+      (43 layers) on this box; **the next failure moved downstream to `AutoModelForCausalLM`** —
+      `ValueError: Unrecognized configuration class ... DeepseekV4Config`, which is A5.6/A5.7.
+      Suite **2528 passed / 16 skipped** (2422 baseline + 106 new). Evidence:
+      `tests/test_deepseek_v4_config.py`, `docs/2026-09-23-A5.1-config-RESULTS.md`.
+      **What shipped:** `vaayu/model_code/deepseek_v4/configuration_deepseek_v4.py` is the
+      SOURCE OF TRUTH (repo-tracked; the checkpoint dir is untracked and dies with the disk); a
+      byte copy sits in the checkpoint, and a test asserts the two never drift.
+      `tests/fixtures/deepseek_v4_config.json` is a committed copy of the shipped config — it is
+      both the mandated backup and what lets A5.2–A5.7 test this path with **no 157 G checkpoint
+      and no GPU**. Second backup in the checkpoint: `config.json.orig-2026-09-23`.
+      **`auto_map` carries `AutoConfig` ONLY** — a dangling `AutoModelForCausalLM` pointing at a
+      file A5.6 has not written yet turns the legible ValueError above into an ImportError out of
+      HF's module cache. A5.6/A5.7 adds the second entry in the commit that creates the file.
+      **Every field defaults to `None`, none is invented** (a parametrized test asserts the
+      dataclass default of all 47 own fields), and every one of the 52 shipped keys round-trips
+      field by field. `ModelArgs` NOT ported.
+      **THREE FACTS FOUND BY RE-VERIFICATION, each durable:**
+      **(1) The fp8-quantizer risk is VAAYU'S OWN, not transformers'.** `vaayu_base.py:3394` reads
+      `config.quantization_config` and hands any non-exl3 `quant_method` to `AutoHfQuantizer` → a
+      `FineGrainedFP8HfQuantizer` replacing every Linear. So the config **renames** the block to
+      `checkpoint_quantization_config`: `getattr(config, "quantization_config", None)` is now
+      `None` and no quantizer attaches. **Renamed, NOT dropped** — `fmt`/`scale_fmt` are the only
+      source for the reference `ModelArgs`' `dtype="fp8"` / `scale_fmt="ue8m0"` (A5.2 needs them).
+      **(2) `num_nextn_predict_layers: 1` IN THE SHIPPED CONFIG IS WRONG.** The reference's own
+      `inference/config.json` says `n_mtp_layers: 3`, the disk holds `mtp.0/1/2`, A5.7's 768 extra
+      experts are 3×256, and `compress_ratios` has **46 entries for 43 layers** (= 43 + 3).
+      **A5.7 must not derive the MTP skip from that field.**
+      **(3) transformers 5.5.4 rewrites two keys on load, and the tests pin both:** `torch_dtype`
+      → `config.dtype` as a real `torch.dtype` (`configuration_utils.py:239`), and `rope_scaling`
+      → `config.rope_parameters`, standardized — `rope_theta` folded IN and `rope_type: "yarn"`
+      added (`modeling_rope_utils.py:706`). A5.5/A5.6 read `rope_parameters`, not `rope_scaling`.
+      A1's `expected_expert_count()` **confirmed 256** against the real shipped config (third key
+      `n_routed_experts`), not a hand-written dict.
+      **§8:** (1) **no knob** — config resolution is automatic and there is nothing to configure;
+      (2) nothing to plumb, `vaayu_base.py:2131` already calls `AutoConfig`; (3) **reachable but
+      inert** — the server gets past 2131 on this checkpoint and dies at the model class instead;
+      (4) it unblocks A5.2–A5.7 and ships **zero user-visible capability**. Banked, said so.
 - [ ] **A5.2 — the parity harness. BUILD IT BEFORE PORTING ANYTHING.** Record goldens from the
       reference's own modules, cache them as **committed `.npz` fixtures** so A5.3–A5.7 need
       **neither the 157 G checkpoint nor a GPU**. Goldens: `linear_fp4/fp8/bf16`, `expert`,
@@ -1278,6 +1315,9 @@ a Vaayu precedent; the attention path has neither.
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
       `\.experts\.(\d+)\.` finds **11,776** — the extra **768 experts = 9.56 GiB** are
       `mtp.0/1/2.ffn.experts.*`. MTP is OUT, so **the index must skip `mtp.*` and find 11,008**.
+      **DO NOT derive that count from `num_nextn_predict_layers`: it says 1 and the disk holds 3**
+      (A5.1, 2026-09-23 — the reference's own `inference/config.json` says `n_mtp_layers: 3`, and
+      `compress_ratios` carries 46 entries for 43 layers = 43 + 3). 768 = **3**×256.
       **It is a correctness hazard, not just waste:** `detect_moe_blocks` takes the layer index from
       the **first `.N.` in the path**, and `mtp.0.ffn` contains `.0.` → detected as **layer 0**,
       colliding with the real one. Same defect class as A1 Task 4 and 47-m5 — an index asking a
