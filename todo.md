@@ -57,13 +57,16 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.3** — jump to "PICK THIS NEXT: **A5.3**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.4** — jump to "PICK THIS NEXT: **A5.4**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
-durable row; A5.1 and A5.2 both CLOSED the same day — `AutoConfig` resolves `deepseek_v4`, and the
-parity harness now has 15 committed goldens from DeepSeek's OWN modules, so A5.3–A5.7 are TDD-able
-with NEITHER the 157 G checkpoint NOR a GPU. START AT A5.3.** Everything below is PENDING work only — the closed
+durable row; A5.1, A5.2 AND A5.3 all CLOSED the same day — `AutoConfig` resolves `deepseek_v4`, the
+parity harness has 15 committed goldens from DeepSeek's OWN modules, and `DeepseekV4Linear`
+reproduces all three `linear_*` goldens BIT-IDENTICALLY. START AT A5.4.** **Correction carried from
+A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
+need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
+import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
 rows were pruned 2026-09-23 and live in `git log -p -- todo.md`.
 
 ---
@@ -77,11 +80,12 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.3** (row 28b). Then A5.4 → A5.5 → A5.6 → A5.7, one per session.
+## ▶ PICK THIS NEXT: **A5.4** (row 28b). Then A5.5 → A5.6 → A5.7, one per session.
 
-**A5.1 AND A5.2 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
-goldens in `tests/deepseek/goldens/` (1.1 MB) — **build A5.3 against those, with no checkpoint and
-no GPU**; the recorder is `python -m tests.deepseek.parity`. A5.1 left two things every later
+**A5.1, A5.2 AND A5.3 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
+goldens in `tests/deepseek/goldens/` (1.1 MB); the recorder is `python -m tests.deepseek.parity`.
+A5.3 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` — **build A5.4's `Expert` on
+`DeepseekV4Linear`, and read `KERNEL_DIR` before writing any kernel call.** A5.1 left two things every later
 sub-plan uses:
 `tests/fixtures/deepseek_v4_config.json` (a committed copy of the shipped config — **no 157 G
 checkpoint and no GPU needed to test this path**) and
@@ -97,8 +101,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 |---|---|---|---|---|
 | ~~1~~ | ~~**A5.1** config + `auto_map`~~ | **CLOSED 2026-09-23** | [`…A5.1-config-RESULTS.md`](docs/2026-09-23-A5.1-config-RESULTS.md) | done |
 | ~~2~~ | ~~**A5.2** parity harness~~ | **CLOSED 2026-09-23** | [`…A5.2-parity-harness-RESULTS.md`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) | done |
-| **3 (NEXT)** | **A5.3** dequant + `Linear` | design | [`…A5.3-dequant-linear-design.md`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) | 1–2 d |
-| 4 | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
+| ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
+| **4 (NEXT)** | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
 | 5 | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
 | 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
@@ -536,7 +540,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 1979 passed, 15 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 2569 passed, 16 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-23 after A5.3 (+19: its new test file; the 2550 / 16 it starts from was re-measured on the
+same HEAD that morning, before any A5.3 code, and MATCHED A5.2's figure). The 1979 / 15 was verified
 2026-09-11 after row 18 (+3 skipped: its new on-device gate, skipped without `HIDDEN_CKPT`; the
 1979 / 12 was re-measured against a stashed HEAD the same day and MATCHED). The 1979 / 12 was verified
 2026-09-11 after row 3's `auto` → `bf16` (1972 + 7). The 1972 was verified
@@ -1203,7 +1209,7 @@ session that reaches it. Same ratchet A5 itself went through.
 |---|---|---|---|---|---|
 | **A5.1** `[x]` | config + `auto_map` | **DONE 2026-09-23** | `AutoConfig` resolves `deepseek_v4`; next failure is the model class | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
 | **A5.2** `[x]` | **parity harness** | **DONE 2026-09-23** | 15 goldens from the reference's own modules | done | [`…A5.2-RESULTS…`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) |
-| **A5.3** `[ ]` | dequant + `Linear` | design | both weight formats through the gated kernels | 1–2 d | [`…A5.3…`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) |
+| **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
 | **A5.4** `[ ]` | MoE | design | 94.3 % of the bytes, on the module-list forward | 2–3 d | [`…A5.4…`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) |
 | **A5.5** `[ ]` | **attention** | **BRIEF + gate** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
 | **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
@@ -1255,8 +1261,10 @@ a Vaayu precedent; the attention path has neither.
       (4) it unblocks A5.2–A5.7 and ships **zero user-visible capability**. Banked, said so.
 - [x] **A5.2 — the parity harness. DONE 2026-09-23. THE PREMISE HOLDS: DeepSeek's own reference
       modules RUN on this box with real weights.** `tests/deepseek/parity.py` + **15 committed
-      goldens** in `tests/deepseek/goldens/` (**1.1 MB**), so **A5.3–A5.7 need NEITHER the 157 G
-      checkpoint NOR a GPU**. Recorder: `python -m tests.deepseek.parity [name…]`. Suite **2550
+      goldens** in `tests/deepseek/goldens/` (**1.1 MB**). **NARROWED BY A5.3 (2026-09-23): the
+      goldens hold the INPUT and the OUTPUT, not the weights, so a test that REPRODUCES one still
+      needs the 157 G checkpoint and a GPU. What needs neither is the structural half — shapes,
+      contracts, import rules — which was 15 of A5.3's 19 tests.** Recorder: `python -m tests.deepseek.parity [name…]`. Suite **2550
       passed / 16 skipped** (2528 baseline + 22 new). Evidence:
       `tests/test_deepseek_v4_parity.py`, `docs/2026-09-23-A5.2-parity-harness-RESULTS.md`.
       **Goldens:** `linear_fp4/fp8/bf16`, `expert`, `gate_hash`, `gate_score`, `moe_hash`,
@@ -1313,19 +1321,49 @@ a Vaayu precedent; the attention path has neither.
       **§8:** (1) **no knob** — test infrastructure; (2) nothing to plumb; (3) **NOT reachable by
       users at all, by design** — it does not touch `vaayu/`; (4) it unblocks A5.3–A5.7 and ships
       **zero user-visible capability**. Banked, said so.
-- [ ] **A5.3 — dequant + `Linear`.** Two formats: routed experts **`I8` (fp4 packed 2/byte) +
-      `F8_E8M0` per-row/32**; shared+attention **`F8_E4M3` + `F8_E8M0` per-128×128-block**. The
-      scale **shapes** differ, not just the dtypes. **THE MANDATORY DIVERGENCE: read `self.scale`,
-      never `self.weight.scale`.** The reference aliases scale onto the Parameter
-      (`model.py:145`); `_inject_expert_weights` (`moe_patch.py:1225`) rebinds each key with
-      `setattr(submod, base, nn.Parameter(t))`, so `weight` becomes a **fresh object with no
-      `.scale`** → `AttributeError` on every streamed expert, every token. **Both keys DO bind, so
-      streaming a dual-tensor quantized expert needs ZERO engine changes** — the biggest de-risking
-      fact for A5.4. `wo_a` is `F8_E4M3` on disk but the module declares **bf16** and uses the raw
-      weight in an einsum → **dequantise once at load**. Kernels imported lazily (config must stay
-      importable without tilelang). **Verify:** a test that rebinds `weight` to a fresh Parameter
-      and asserts forward still works — without it the bug returns the first time someone
-      "simplifies" back to the reference idiom.
+- [x] **A5.3 — dequant + `Linear`. DONE 2026-09-23. ALL THREE `linear_*` GOLDENS REPRODUCE
+      BIT-IDENTICALLY (`torch.equal`), not within the design's 0.0027 tolerance** — same kernels,
+      same arguments, so any difference would have meant a different dispatch. Delivered
+      `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (`DeepseekV4Linear`,
+      `dequantize_block_scaled`, `dequantize_at_load`, lazy `kernels()`), copied verbatim into the
+      checkpoint dir with a drift test, + `tests/test_deepseek_v4_linear.py` (**19 tests**). Suite
+      **2569 passed / 16 skipped** (2550 baseline + 19). Evidence:
+      `docs/2026-09-23-A5.3-dequant-linear-RESULTS.md`.
+      **THE MANDATORY DIVERGENCE HELD AND IS NOW GATED: read `self.scale`, never
+      `self.weight.scale`.** The reference aliases scale onto the Parameter (`model.py:145`);
+      `_inject_expert_weights` (`moe_patch.py:1225`) rebinds each key with
+      `setattr(submod, base, nn.Parameter(t))`, so `weight` becomes a fresh object with no
+      `.scale`. **Mutation-checked: restoring the reference idiom fails BOTH rebind tests with
+      `AttributeError: 'Parameter' object has no attribute 'scale'`, including the real fp4
+      golden.** Three more mutants each killed their gate (drop the default-dtype scope → 2 fail;
+      transpose the dequant block dims → 3; hardcode `scale_fmt = None` → 2).
+      **CONFIRMED ON REAL WEIGHTS: both keys bind, so streaming a dual-tensor quantized expert
+      needs ZERO engine changes** — the fp4 golden is asserted through a weight rebound exactly the
+      way the engine rebinds a streamed expert. Biggest de-risking fact for A5.4, now measured.
+      **FOUR FINDINGS THE DESIGN DID NOT HAVE:**
+      **(1) Both GEMM wrappers allocate their output with `torch.get_default_dtype()`**
+      (`kernel.py:268`, `:533`) while the kernels are compiled to write **bf16**. The reference
+      survives on `generate.py:77`'s bf16 process default; **Vaayu's default is float32**, so the
+      forward scopes the default dtype to the activation's around the two kernel calls. Same class
+      as A5.2 finding (1) — a module global nobody sets.
+      **(2) `KERNEL_DIR` is unavoidable and A5.7 MUST set it.** transformers copies remote code
+      into its own module cache WITHOUT the siblings, so a `__file__`-relative
+      `inference/kernel.py` resolves only for the copy sitting beside the shards. The module
+      exposes `modeling_deepseek_v4.KERNEL_DIR`; point it at the checkpoint's `inference/`.
+      **(3) The fp4 group size is in NO config field** — an fp4 `DeepseekV4Linear` built without
+      `fp4_group_size` RAISES rather than defaulting to this checkpoint's 32 (§5). Callers derive
+      it as `in_features // scale.shape[-1]`.
+      **(4) A5.2's goldens store the INPUT and the OUTPUT, not the weights** — so reproducing one
+      needs the 157 G checkpoint AND a GPU. "Neither" holds only for the structural half (shapes,
+      the rebinding contract, the lazy import, the dequant rule): 15 of the 19 tests. The other 4
+      carry `needs_checkpoint` / `needs_gpu` and skip elsewhere.
+      `dequantize_at_load` reproduces A5.2's harness transform on the real `wo_a` **bit-for-bit**;
+      that test is what keeps the two copies from drifting.
+      **§8:** (1) **no knob** — modeling code for one architecture, nothing to tune; `KERNEL_DIR`
+      is load-time wiring for A5.7, not a server knob; (2) **not plumbed by design** — nothing
+      outside its tests imports it yet; (3) **NOT reachable** — `deepseek_v4` still has no model
+      class, so the checkpoint still cannot load; (4) unblocked by A5.4 → A5.5 → A5.6 → A5.7.
+      Banked, said so.
 - [ ] **A5.4 — MoE, 94.3 % of the bytes.** **Keep the reference's names** (`ffn`, `experts`,
       `gate`, `w1/w2/w3`): `detect_moe_blocks` is name-driven on exactly those, so it works with
       **zero engine changes** and A5.7's remap stays near-free. Two required changes:
