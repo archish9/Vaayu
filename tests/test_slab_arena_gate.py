@@ -149,3 +149,124 @@ def test_no_call_site_uses_a_single_conflated_gate():
     assert 'getattr(self, "_moe_stager_capable", False)' in src, \
         "stager guard does not check _moe_stager_capable"
     assert "moe_supports_slab_pipeline" not in src, "old conflated gate still referenced"
+
+
+# ---------------------------------------------------------------------------
+# 47-m5: a whole-layer-dispatch model must not be charged for the arena.
+#
+# `moe_supports_slab_arena` answers from the expert STYLE, and a fused-3D
+# checkpoint's style is legitimately "fused" -- so the predicate says yes while
+# `_make_sparse_moe_forward` goes on to install `_make_whole_layer_sparse_forward`,
+# which takes no expert_cache argument at all and reads neither cache. Measured
+# on gpt-oss-20b (2026-09-21): a 18.45 GB pinned arena with
+# `expert_cache=0hit/0miss/0evict ... usage=0.00GB/18.31GB` for every token of a
+# 256-token generation, on a 32 GB box.
+#
+# The condition that decides the dispatch has TWO parts and both are load-bearing
+# (moe_patch.py's own dispatch comment, measured 2026-09-21). `dispatches_whole_layer`
+# is the one place it is written, so the guard and the dispatch cannot drift apart.
+# ---------------------------------------------------------------------------
+import torch
+import torch.nn as nn
+
+from vaayu.moe_patch import MoEBlockInfo, dispatches_whole_layer
+
+
+class _FakeIndex:
+    """Only the attribute the dispatch reads."""
+
+    def __init__(self, fused_layer_tensors):
+        self.fused_layer_tensors = fused_layer_tensors
+
+
+def _block(layer_idx, num_experts, fused_param_shape, expert_style="fused"):
+    """A block whose experts module reports what the real one reports.
+
+    `fused_param_shape` is the shape of the module's own direct parameter, which
+    is what `fused_param_experts` reads -- never a name, never an architecture
+    string (CLAUDE.md §5).
+    """
+    experts = nn.Module()
+    experts.num_experts = num_experts
+    if fused_param_shape is not None:
+        experts.register_parameter(
+            "gate_up_proj", nn.Parameter(torch.empty(fused_param_shape), requires_grad=False))
+    moe = nn.Module()
+    moe.experts = experts
+    moe.gate = nn.Linear(8, num_experts, bias=False)
+    return MoEBlockInfo(
+        layer_idx=layer_idx, layer_name=f"model.layers.{layer_idx}",
+        module_path=f"model.layers.{layer_idx}.mlp", moe_module=moe,
+        router_attr="gate", experts_attr="experts", expert_style=expert_style,
+    )
+
+
+# Two contrasting geometries, per CLAUDE.md §5 -- and they are contrasting in
+# exactly the axis that decides this, not merely in size.
+def _gptoss_like(layer_idx=0):
+    """Fused-3D: the module reports fused params AND the checkpoint stores the
+    layer whole, so the index carries fused_layer_tensors for it. 32 experts."""
+    return _block(layer_idx, 32, (32, 5760, 90))
+
+
+def _qwen3next_like(layer_idx=0):
+    """The measured FALSE POSITIVE: Qwen3NextExperts reports fused parameters
+    (gate_up_proj [512, 1024, 2048]) but its checkpoint stores ONE TENSOR PER
+    EXPERT, so the index holds no whole-layer metas and the tuned per-expert
+    fused forward -- which DOES read the arena -- must keep it."""
+    return _block(layer_idx, 512, (512, 1024, 2048))
+
+
+def _minimax_like(layer_idx=0):
+    """Module-list: 256 per-expert submodules, no direct fused parameter."""
+    return _block(layer_idx, 256, None, expert_style="module_list")
+
+
+def test_whole_layer_needs_both_the_index_metas_and_the_module_shape():
+    b = _gptoss_like()
+    with_metas = _FakeIndex({b.layer_name: {"gate_up_proj_blocks": object()}})
+    assert dispatches_whole_layer(b, with_metas) is True
+    # Same module, no whole-layer metas -> per-expert streaming, arena needed.
+    assert dispatches_whole_layer(b, _FakeIndex({})) is False
+
+
+def test_fused_params_alone_do_not_make_it_whole_layer():
+    """Qwen3-Next reports fused params too. If this ever returns True its arena
+    disappears and every miss upload goes pageable (row 30-P: -10.62 % decode)."""
+    b = _qwen3next_like()
+    assert dispatches_whole_layer(b, _FakeIndex({})) is False
+
+
+def test_module_list_is_never_whole_layer():
+    b = _minimax_like()
+    idx = _FakeIndex({b.layer_name: {"anything": object()}})
+    assert dispatches_whole_layer(b, idx) is False
+
+
+def test_missing_index_is_never_whole_layer():
+    """A model loaded without an offset index must not lose its arena."""
+    assert dispatches_whole_layer(_gptoss_like(), None) is False
+
+
+def test_returns_real_bool_for_whole_layer():
+    b = _gptoss_like()
+    idx = _FakeIndex({b.layer_name: {"gate_up_proj_blocks": object()}})
+    assert isinstance(dispatches_whole_layer(b, idx), bool)
+    assert isinstance(dispatches_whole_layer(b, _FakeIndex({})), bool)
+
+
+def test_the_dispatch_and_the_arena_guard_share_one_condition():
+    """Drift guard. moe_patch's own dispatch docstring warns that a second copy
+    of this table drifts; the condition is written once and BOTH sites call it."""
+    import inspect
+    from vaayu import moe_patch, vaayu_base
+
+    disp = inspect.getsource(moe_patch._make_sparse_moe_forward)
+    assert "dispatches_whole_layer(block_info, offset_index)" in disp, \
+        "the dispatch site no longer calls the shared predicate"
+    assert "fused_param_experts(" not in disp, \
+        "the whole-layer condition was re-inlined at the dispatch site"
+
+    src = inspect.getsource(vaayu_base)
+    assert "dispatches_whole_layer(" in src, \
+        "the arena guard does not consult the whole-layer predicate"
