@@ -79,3 +79,17 @@ pylint>=3.0
 # package can move this venv's torch.
 apache-tvm-ffi==0.1.9
 tilelang==0.1.8
+
+# fast_hadamard_transform — OPTIONAL, and deliberately NOT a requirement here.
+# DeepSeek-V4-Flash's `rotate_activation` (its `model.py:253`) imports it, so the
+# Indexer path on `compress_ratio == 4` layers needs it; nothing else in Vaayu
+# does, and CLAUDE.md §5 forbids making the engine depend on a per-model compiled
+# CUDA extension. `tests/deepseek/parity.py` carries an exact torch Sylvester
+# fallback and routes the reference through it, so this is a speed/fidelity
+# convenience, not a dependency.
+#
+# PyPI's sdist ships WITHOUT `csrc/`, so `pip install fast_hadamard_transform`
+# fails at `cc1plus: fatal error: csrc/fast_hadamard_transform.cpp: No such file`.
+# Install from git instead (measured 2026-09-23, builds and runs on sm_120):
+#   TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation \
+#       "git+https://github.com/Dao-AILab/fast-hadamard-transform.git"

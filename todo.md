@@ -57,12 +57,13 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.2** — jump to "PICK THIS NEXT: **A5.2**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.3** — jump to "PICK THIS NEXT: **A5.3**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
-durable row; A5.1 CLOSED the same day — `AutoConfig` now resolves `deepseek_v4`, and the next
-failure is the model class. START AT A5.2.** Everything below is PENDING work only — the closed
+durable row; A5.1 and A5.2 both CLOSED the same day — `AutoConfig` resolves `deepseek_v4`, and the
+parity harness now has 15 committed goldens from DeepSeek's OWN modules, so A5.3–A5.7 are TDD-able
+with NEITHER the 157 G checkpoint NOR a GPU. START AT A5.3.** Everything below is PENDING work only — the closed
 rows were pruned 2026-09-23 and live in `git log -p -- todo.md`.
 
 ---
@@ -76,9 +77,12 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.2** (row 28b). Then A5.3 → A5.4 → A5.5 → A5.6 → A5.7, one per session.
+## ▶ PICK THIS NEXT: **A5.3** (row 28b). Then A5.4 → A5.5 → A5.6 → A5.7, one per session.
 
-**A5.1 is CLOSED (2026-09-23).** It left two things every later sub-plan uses:
+**A5.1 AND A5.2 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
+goldens in `tests/deepseek/goldens/` (1.1 MB) — **build A5.3 against those, with no checkpoint and
+no GPU**; the recorder is `python -m tests.deepseek.parity`. A5.1 left two things every later
+sub-plan uses:
 `tests/fixtures/deepseek_v4_config.json` (a committed copy of the shipped config — **no 157 G
 checkpoint and no GPU needed to test this path**) and
 `vaayu/model_code/deepseek_v4/configuration_deepseek_v4.py`, the repo-tracked SOURCE OF TRUTH that
@@ -92,8 +96,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | order | item | kind | what to open FIRST | cost |
 |---|---|---|---|---|
 | ~~1~~ | ~~**A5.1** config + `auto_map`~~ | **CLOSED 2026-09-23** | [`…A5.1-config-RESULTS.md`](docs/2026-09-23-A5.1-config-RESULTS.md) | done |
-| **2 (NEXT)** | **A5.2** parity harness | design | [`…A5.2-parity-harness-design.md`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) | ~½ d |
-| 3 | **A5.3** dequant + `Linear` | design | [`…A5.3-dequant-linear-design.md`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) | 1–2 d |
+| ~~2~~ | ~~**A5.2** parity harness~~ | **CLOSED 2026-09-23** | [`…A5.2-parity-harness-RESULTS.md`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) | done |
+| **3 (NEXT)** | **A5.3** dequant + `Linear` | design | [`…A5.3-dequant-linear-design.md`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) | 1–2 d |
 | 4 | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
 | 5 | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
 | 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
@@ -1190,14 +1194,15 @@ session that reaches it. Same ratchet A5 itself went through.
    `inference/generate.py`" is **unrunnable and always will be** — the reference has no streaming
    and the checkpoint is **155.42 GiB against ~45.3 GiB** of VRAM+RAM (**3.4×** the box). But
    `world_size = 1` is the reference's default with **no `dist` init**, so ONE module runs here
-   (~119 MiB for a layer's attention, 76.5 MiB for six experts). A5.2 builds that harness.
+   (measured 2026-09-23: 102.01-130.53 MiB for a layer's attention by compress ratio, 76.5 MiB for
+   six experts). **A5.2 built that harness and it WORKS — see its row below.**
 2. **Hash routing stashes `input_ids` on the model** — zero engine changes.
 3. **MTP is OUT and excluded explicitly** (A5.7).
 
 | # | sub-plan | kind | delivers | cost | doc |
 |---|---|---|---|---|---|
 | **A5.1** `[x]` | config + `auto_map` | **DONE 2026-09-23** | `AutoConfig` resolves `deepseek_v4`; next failure is the model class | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
-| **A5.2** `[ ]` | **parity harness** | design | golden values from the reference's own modules | ~½ d | [`…A5.2…`](docs/superpowers/specs/2026-09-23-A5.2-parity-harness-design.md) |
+| **A5.2** `[x]` | **parity harness** | **DONE 2026-09-23** | 15 goldens from the reference's own modules | done | [`…A5.2-RESULTS…`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) |
 | **A5.3** `[ ]` | dequant + `Linear` | design | both weight formats through the gated kernels | 1–2 d | [`…A5.3…`](docs/superpowers/specs/2026-09-23-A5.3-dequant-linear-design.md) |
 | **A5.4** `[ ]` | MoE | design | 94.3 % of the bytes, on the module-list forward | 2–3 d | [`…A5.4…`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) |
 | **A5.5** `[ ]` | **attention** | **BRIEF + gate** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
@@ -1248,18 +1253,66 @@ a Vaayu precedent; the attention path has neither.
       (2) nothing to plumb, `vaayu_base.py:2131` already calls `AutoConfig`; (3) **reachable but
       inert** — the server gets past 2131 on this checkpoint and dies at the model class instead;
       (4) it unblocks A5.2–A5.7 and ships **zero user-visible capability**. Banked, said so.
-- [ ] **A5.2 — the parity harness. BUILD IT BEFORE PORTING ANYTHING.** Record goldens from the
-      reference's own modules, cache them as **committed `.npz` fixtures** so A5.3–A5.7 need
-      **neither the 157 G checkpoint nor a GPU**. Goldens: `linear_fp4/fp8/bf16`, `expert`,
-      `gate_hash`, `gate_score`, `moe`, `attn_prefill`, `attn_decode`, **`attn_chunked`**, `block`.
-      **`attn_chunked` is the important one:** `model.py:537` does
-      `kv_cache[:bsz, start_pos % win] = kv.squeeze(1)`, assuming `seqlen == 1`, and Vaayu chunks
-      prefill at 512 — **row-43 class, silent context corruption**. If the reference itself raises
-      or corrupts there, **that IS the golden** and it is the most valuable thing A5.2 buys.
-      **Traps:** `Attention.__init__` allocates `kv_cache` from `max_seq_len` (use a small one, or
-      it sizes for 1,048,576); `sparse_attn` needs the **`block=16`** patch or every attention
-      golden dies at launch; import `model.py` under an explicit name (it defines a module called
-      `kernel`).
+- [x] **A5.2 — the parity harness. DONE 2026-09-23. THE PREMISE HOLDS: DeepSeek's own reference
+      modules RUN on this box with real weights.** `tests/deepseek/parity.py` + **15 committed
+      goldens** in `tests/deepseek/goldens/` (**1.1 MB**), so **A5.3–A5.7 need NEITHER the 157 G
+      checkpoint NOR a GPU**. Recorder: `python -m tests.deepseek.parity [name…]`. Suite **2550
+      passed / 16 skipped** (2528 baseline + 22 new). Evidence:
+      `tests/test_deepseek_v4_parity.py`, `docs/2026-09-23-A5.2-parity-harness-RESULTS.md`.
+      **Goldens:** `linear_fp4/fp8/bf16`, `expert`, `gate_hash`, `gate_score`, `moe_hash`,
+      `moe_score`, `attn_{prefill,decode,chunked}_r128`, `attn_{prefill,decode,chunked}_r4`,
+      `block`. **Attention is recorded on TWO compress geometries, not one** — `compress_ratios` is
+      2×0, 21×4, 20×128 over 43 layers and only `ratio == 4` carries an `Indexer`; layers are found
+      by searching `compress_ratios`, never numbered. Shapes are small (seqlen 8 / 4 tokens)
+      because these are committed fixtures — **correctness at real length and `topk=512` is still
+      A5.5's step-0 gate, NOT discharged here**.
+      **`attn_chunked` — the answer, and the most valuable thing A5.2 bought: the reference CANNOT
+      do chunked prefill, and it RAISES rather than corrupting.**
+      `seqlen=512 at start_pos=8 raised RuntimeError: The expanded size of the tensor (1) must
+      match the existing size (512) at non-singleton dimension 0` (`[1, 512]` vs `[512, 512]`;
+      the r4 layer reads `[1, 256]`). `model.py:535` is
+      `kv_cache[:bsz, start_pos % win] = kv.squeeze(1)` — the ring-buffer branch assumes
+      `seqlen == 1` and Vaayu chunks at 512. Raising is the GOOD outcome: A5.5 cannot inherit the
+      bug by accident, but **A5.5 must WRITE a chunked path, not port one.** Row-43 class.
+      **SIX FINDINGS THE DESIGN DID NOT HAVE, each a silent failure if missed:**
+      **(1) Module globals are load-bearing and fail SILENTLY.** `linear()` reads `scale_fmt`/
+      `scale_dtype`, `Linear.__init__` reads `default_dtype` — all set ONLY in
+      `Transformer.__init__` (`model.py:881-886`), which a bare module never runs. Leave them and
+      `default_dtype` stays bf16, so an F8_E4M3 disk tensor loads **cast without its scale**, no
+      exception. **(2) `torch.set_default_device("cuda")` is NOT optional** (`generate.py:91`):
+      `get_window_topk_idxs` uses a bare `torch.arange`, so `sparse_attn` otherwise gets CPU
+      indices and raises. Scope it and clear both `lru_cache`s on exit. **(3) The reference must
+      run under `torch.inference_mode()`** — `Transformer.forward` is decorated with it and leans
+      on it: `fp4_act_quant` writes in place over the view `fast_hadamard_transform` returns, which
+      autograd forbids. Hits the `r4` path only. **(4) Two VALUE transforms are mandatory at load;
+      the key RENAMES are not** — this checkpoint already ships the reference's own key names, but
+      `wo_a.weight` is F8_E4M3 + per-128×128 scale on disk and **bf16 in the module** (load it raw
+      and `load_state_dict` casts FP8 into bf16 WITHOUT the scale, silently), and routed experts are
+      `I8` on disk / `float4_e2m1fn_x2` in the module. **(5) `fast_hadamard_transform`'s PyPI sdist
+      is BROKEN** — ships without `csrc/`, fails at `cc1plus: fatal error:
+      csrc/fast_hadamard_transform.cpp: No such file`. From **git** it builds and runs on sm_120
+      (`TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation
+      "git+https://github.com/Dao-AILab/fast-hadamard-transform.git"`). It is **OPTIONAL, not a
+      Vaayu requirement** (§5): the harness carries an exact torch Sylvester fallback and
+      **replaces the reference's own `rotate_activation` binding**, since that function imports the
+      extension directly. With the extension present the reroute is **bit-identical** — verified by
+      re-recording both `r4` goldens. **(6) The config → `ModelArgs` mapping is VERIFIED, not
+      assumed:** `inference/config.json` IS a `ModelArgs` JSON (`generate.py:81`), so all 38 of its
+      keys are derived and match **value for value**, with exactly one disagreement —
+      `num_nextn_predict_layers: 1` vs `n_mtp_layers: 3`, which turns A5.1's finding (2) into an
+      enforced test. `norm_eps`/`hc_eps` are derived from the shipped config rather than taking
+      `ModelArgs` defaults (§5).
+      **MEASURED module costs** (shard headers, superseding the design's estimates): `Attention`
+      **102.01 MiB** (ratio 0) / **110.26** (128) / **130.53** (4) — not "~119"; routed `Expert`
+      12.750 MiB; `shared_experts` 24.00 MiB; `Gate` 2.00 MiB + `tid2eid` **5.92 MiB** (I64).
+      **Traps that survived into the code:** `Attention.__init__` sizes `kv_cache` AND the RoPE
+      table from `max_seq_len` (harness uses 4096, not the shipped 1,048,576); `sparse_attn` needs
+      **`block=16, num_stages=1`** — the tile is a LOCAL, so the harness rewrites `kernel.py` to a
+      temp file, and tilelang's `inspect.getsource` means it must be a REAL file; `model.py` is
+      imported under an explicit name with `kernel` shadowed only for the import.
+      **§8:** (1) **no knob** — test infrastructure; (2) nothing to plumb; (3) **NOT reachable by
+      users at all, by design** — it does not touch `vaayu/`; (4) it unblocks A5.3–A5.7 and ships
+      **zero user-visible capability**. Banked, said so.
 - [ ] **A5.3 — dequant + `Linear`.** Two formats: routed experts **`I8` (fp4 packed 2/byte) +
       `F8_E8M0` per-row/32**; shared+attention **`F8_E4M3` + `F8_E8M0` per-128×128-block**. The
       scale **shapes** differ, not just the dtypes. **THE MANDATORY DIVERGENCE: read `self.scale`,
