@@ -45,7 +45,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, and 47-m7 was picked up and CLOSED the same day) ◀◀
+## ▶▶ PICK THIS NEXT (re-set 2026-09-23: A4 closed, the user DECLINED row 32's download, then 47-m7 AND 47-m5 were picked up and CLOSED the same day) ◀◀
 
 **A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
 document that carries its own start gate, stop rule, numbers and commands.**
@@ -75,11 +75,18 @@ logged nothing). The mechanism is now known: the compressed-tensors quantizer ne
 fp32 rotary table (`cac352e`) — that is 47-m6, still open, and it is now the last A3 loose end.** Numbers in the
 47-m7 bullet under row 47.
 
+**47-m5 CLOSED 2026-09-23 — BUILT, MEASURED, SHIPPED.** It was order 1 and it is done: gpt-oss-20b's load RSS
+went **19.20 → 3.81 GB (−15.39 GB)** with the output BIT-IDENTICAL, and the win is reachable through the server at
+N=1 on defaults (the gpt-oss server gate logs the arena SKIPPED and `rss=3.78GB`). The guard and the dispatch were
+asking different questions; the whole-layer condition is now written once, in `moe_patch.dispatches_whole_layer`,
+and both sites call it. Qwen3-Next and MiniMax keep their arenas, verified — that was the dangerous direction.
+Gates: suite 2422/16, accumulator 8+8, 1B prefix 1, server 9+9. It left **47-m5-b** behind (a whole-layer model
+still ADVERTISES caches it never fills — misleading telemetry, zero bytes). Numbers in the 47-m5 bullet under row 47.
+
 | order | item | what to open FIRST | cost | why this order |
 |---|---|---|---|---|
-| **1** | **47-m5 — a whole-layer model pays for an expert cache it never reads** | row **47**'s 47-m5 bullet (no separate handoff) | ~½ day, real fix | Cheapest item that ships code, and it improves the model that just landed. Measured on gpt-oss-20b: **18.45 GB of PINNED unswappable RAM on a 32 GB box** doing nothing (`usage=0.00GB/18.31GB` for every token of a 256-token run), RSS 25.87 GB against the 29 GB gate ceiling. The engine already runs `detect_moe_blocks` before sizing the arena, so it can ask the dispatch's own two questions. Touches shared sizing → all three accumulator gates. |
-| **2** | **Row 46 — size the prefix reservation** | [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md) | ½ day to measure, 1-2 days to build | Re-priced DOWN to **~2.6 %** on Qwen3-Next and its mechanism is measured away there (disk 0.42 % of a token). Its remaining hope is MiniMax's unmeasured 6.24 GB. Measure first; the stop rule closes it under ~3 %. **A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts.** |
-| **3** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
+| **1** | **Row 46 — size the prefix reservation** | [`…-row46-prefix-reservation-HANDOFF.md`](docs/2026-09-21-row46-prefix-reservation-HANDOFF.md) | ½ day to measure, 1-2 days to build | Re-priced DOWN to **~2.6 %** on Qwen3-Next and its mechanism is measured away there (disk 0.42 % of a token). Its remaining hope is MiniMax's unmeasured 6.24 GB. Measure first; the stop rule closes it under ~3 %. **A4 found a second reason to care: Phase-2 pinning `break`s on budget miss, so shrinking this budget is what would un-pin the always-active shared experts.** |
+| **2** | **A5 — the DeepSeek-V4 port** (row 28b) | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) | **weeks**, abandon decided at step 1 | Head of the REACH track now that A4 is closed, and the user's mandate fixes that order. Ranked last only on cost: it is kernel-gated on sm_120 and the model still does not load. It inherits A4's two carried checks. No download — the checkpoint is on disk, complete (48/48 shards, 157 G). |
 
 **The SPEED slot is empty, and with row 32 blocked there is now NO large speed lever pickable at
 all.** Row 49's two successors were both spent or refuted on 2026-09-21: the ring-pool optimum is
@@ -90,8 +97,8 @@ or raise delivered GB/s (rows 31-39's decomposition), and must not need a downlo
 
 **Also open, smaller, the row carries them:** **47-m6 — now the LAST A3 loose end**, since 47-m7
 closed: A3's fp32 rotary table (`cac352e`) changed numerics for EVERY model and only gpt-oss's side
-was measured. Then 47-m4 (sliding-window KV, 0.813 GB), 47-m1/m2/m3, row 40 `[bug]`, row 48 `[bug]`.
-(47-m5 was promoted into the table above; 47-m7 is CLOSED.)
+was measured. Then 47-m4 (sliding-window KV, 0.813 GB), **47-m5-b** (new, from 47-m5), 47-m1/m2/m3,
+row 40 `[bug]`, row 48 `[bug]`. (47-m5 and 47-m7 are CLOSED.)
 
 
 **Nothing is in flight. No §0 P-row is open, so nothing here makes Vaayu faster on Qwen3-235B, MiniMax-M2.7
@@ -5297,7 +5304,14 @@ the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20
       the attention module passes its own `sliding_window` to the kernel — but **sdpa with an implicit
       causal mask would silently ignore the window**; no on-device model hits it today (gpt-oss refuses
       sdpa), and it must be closed before a windowed model runs on sdpa.
-- [ ] **47-m5 — a whole-layer-dispatch model still pays for the expert cache it never touches.**
+- [x] **47-m5 — a whole-layer-dispatch model still pays for the expert cache it never touches. CLOSED 2026-09-23 — BUILT, MEASURED, ALL GATES GREEN, REACHABLE THROUGH THE SERVER.**
+      **gpt-oss-20b load RSS 19.20 → 3.81 GB (−15.39 GB), available RAM 11.59 → 24.59 GB (+13.00), and the output is BIT-IDENTICAL** — `prefill_sha256 c78ba616…5700d38` and `decode_logits_sha256 c02f5a07…27cd2b1a` matched across the two arms, as did all 32 greedy ids and the forward census (`_make_whole_layer_sparse_forward` ×24). Same box, back to back, 29G scopes, baseline taken with `vaayu/` stashed so it was the same tree minus exactly this change.
+      **The row over-counted by two of three: only `SlabArena` allocates.** `ExpertRAMCache` and `ExpertVRAMCache` are empty `OrderedDict`s at construction — they cost a budget NUMBER, not bytes. The arena was the whole cost.
+      **ROOT CAUSE: the guard and the dispatch asked different questions.** `_moe_slab_capable` (`vaayu_base.py:2657`) answers from `expert_style`, and a fused-3D checkpoint's style is legitimately `"fused"`, so it said yes — while `_make_sparse_moe_forward` (`moe_patch.py:1364`) went on to install `_make_whole_layer_sparse_forward` using two facts the style predicate cannot see (the index holds `fused_layer_tensors` for the layer AND `fused_param_experts(experts_mod)`), and that forward takes NO `expert_cache` argument at all.
+      **FIX: the whole-layer condition is now written ONCE — `moe_patch.dispatches_whole_layer(block_info, offset_index)` — and the dispatch site and the arena guard both call it**, because moe_patch's own docstring warns that a second copy of that table drifts. The guard uses **`all`, not `any`**: a mixed model's other blocks do read the arena, so it is skipped only when EVERY block dispatches whole-layer — strictly a reduction, never a removal from something in use. The SKIPPED message's old *'cached via the clone path instead'* was false here (nothing is cached at all) and whole-layer got its own wording.
+      **THE REGRESSION THAT MATTERED, and it is guarded:** `fused_param_experts` returns True for `Qwen3NextExperts` too (`gate_up_proj [512, 1024, 2048]`) while its checkpoint stores one tensor per expert. Keying on the module alone would have taken Qwen3-Next's arena away and sent every miss upload pageable — **row 30-P measured that at −10.62 % decode**. **Arena KEPT and verified on: Qwen3-Next 19.16 GB (probe) / 24.31 GB (accumulator) / 18.87 GB (server), MiniMax 23.14 GB.** Qwen3-Next's shas on this branch are IDENTICAL to 47-m7's same-day measurement on unmodified `main`, so the change is bit-neutral there too.
+      **Gates: suite 2422 passed / 16 skipped** (2416 + 6 new tests, parametrized over the gpt-oss-like and Qwen3-Next-like geometries per §5); accumulator Qwen3-Next 8, MiniMax 8; 1B prefix 1; server Qwen3-Next 9; **server gpt-oss 9**. The gpt-oss accumulator gate is not a target — it asserts `_expert_vram_cache.hits > 0` as its own premise and this forward never touches that cache.
+      **§8: (1) NO KNOB — derived from the checkpoint layout and the live module tree, and a knob could only let the two sites disagree again, which is the defect. (2) nothing to plumb. (3) REACHABLE, proven directly: the server smoke gate on gpt-oss logs `Expert slab arena: SKIPPED … Freed ~18.5 GB of pinned RAM` and `avail=27.13GB rss=3.78GB` at N=1 on server defaults — NOT banked. (4) n/a.** Note the freed figure moves between arms (15.97 / 18.45 / ~18.5 GB) because the arena is sized from free RAM AT LOAD — quote the arm, never a single number. [`…-47m5-whole-layer-arena-RESULTS.md`](docs/2026-09-23-47m5-whole-layer-arena-RESULTS.md). Original text follows.
       Found by A3's own generation run (2026-09-21). `_make_whole_layer_sparse_forward` reads the layer
       itself and consults NEITHER the expert RAM cache nor the VRAM expert cache, yet the engine sizes and
       allocates both from `_moe_geometry` at load: measured on gpt-oss-20b, **`Expert slab arena: 1388 x
@@ -5348,6 +5362,17 @@ the eager-attention note). RESULTS: [`…-A3-gptoss-RESULTS.md`](docs/2026-09-20
       reach the arithmetic. **Stop rule: identical ids and sha → close with the shas; different ids → STOP,
       diff the module tree on both builds and record what the quantizer now converts before changing
       anything.** ~30 minutes, ships no code.
+- [ ] **47-m5-b — a whole-layer model still ADVERTISES caches it will never fill.** Split out of
+      47-m5 2026-09-23 rather than folded in (§3: every changed line traces to the request, and the
+      request was the pinned RAM). With the arena correctly skipped, gpt-oss-20b still prints
+      `Expert RAM cache: 16.0 GB budget (~1205 expert slots, max 32/layer, ...)` and `Expert VRAM cache:
+      0.5 GB (~37 experts resident on GPU)` for a forward that reads neither. **Neither costs BYTES** —
+      both are empty `OrderedDict`s at construction, verified while closing 47-m5 — so this is
+      misleading telemetry, not a leak, and it is why the row's 'sizes and ALLOCATES both' was an
+      over-count. Cheap fix: the same `_moe_whole_layer_only` flag the arena guard now sets can zero
+      these budgets or say `n/a (whole-layer dispatch)`. Check first whether anything downstream reads
+      `_expert_cache.budget_bytes` as a real number — the speculative-decode gate does
+      (`spec_decode_fits`), so zeroing it is NOT obviously free.
 - [ ] **47-m3 — shard-name arithmetic assumes 5 digits and 1-based numbering.**
       `checkpoint_integrity.py` uses `_SHARD_RE` with `\d{5}` and `set(range(1, total + 1))`.
       **`gpt-oss-20b` on disk is `model-00000-of-00002` … `model-00002-of-00002` — 0-based, THREE

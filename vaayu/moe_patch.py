@@ -1079,6 +1079,36 @@ def fused_param_experts(experts_module) -> bool:
     return False
 
 
+def dispatches_whole_layer(block_info: "MoEBlockInfo", offset_index) -> bool:
+    """True iff this block's forward will be `_make_whole_layer_sparse_forward`.
+
+    THE ONE PLACE the whole-layer condition is written. `_make_sparse_moe_forward`
+    calls it to choose the forward, and the engine calls it before sizing the
+    pinned slab arena -- because that forward takes no `expert_cache` argument and
+    reads NEITHER the expert RAM cache nor the VRAM one, so an arena allocated for
+    it is pinned, unswappable RAM nothing ever touches (47-m5). Measured on
+    gpt-oss-20b: skipping it took load RSS 19.20 -> 3.81 GB with the generated
+    logits bit-identical. The arena is sized from FREE RAM AT LOAD, so the figure
+    freed moves by arm (15.97 GB there, ~18.5 GB under the server gate) -- quote
+    the arm, never a single number.
+
+    Both conditions are load-bearing, and the module predicate alone does NOT
+    discriminate: `Qwen3NextExperts` reports fused parameters too (measured
+    2026-09-21) while its checkpoint stores one tensor per expert, which the tuned
+    per-expert fused forward streams -- and that forward DOES read the arena. So
+    the index's whole-tensor metas decide and the module predicate only confirms
+    the module can take them. Derived from the checkpoint layout and the live
+    module tree, never from an architecture string (CLAUDE.md §5).
+    """
+    if block_info.expert_style != "fused" or offset_index is None:
+        return False
+    metas = offset_index.fused_layer_tensors.get(block_info.layer_name)
+    if not metas:
+        return False
+    return fused_param_experts(
+        getattr(block_info.moe_module, block_info.experts_attr))
+
+
 def _copy_async_ok(pinned_source: bool, tensor, dtype) -> bool:
     """Whether ONE host-to-device copy of `tensor` may run non_blocking.
 
@@ -1355,16 +1385,11 @@ def _make_sparse_moe_forward(
     """
     if block_info.expert_style == "fused":
         # Whole-layer delivery, ahead of the quant split: the question is where the
-        # CHECKPOINT keeps this layer's experts, not how they are quantised. Both
-        # conditions are load-bearing. The module predicate alone does NOT
-        # discriminate -- Qwen3NextExperts reports fused parameters too (measured
-        # 2026-09-21) while its checkpoint stores one tensor per expert, which is
-        # what the tuned forward below streams -- so the index's whole-tensor metas
-        # decide, and the predicate only confirms the module can take them.
-        _fused_metas = (offset_index.fused_layer_tensors.get(block_info.layer_name)
-                        if offset_index is not None else None)
-        if _fused_metas and fused_param_experts(
-                getattr(block_info.moe_module, block_info.experts_attr)):
+        # CHECKPOINT keeps this layer's experts, not how they are quantised. The
+        # condition lives in dispatches_whole_layer() because the engine's arena
+        # guard has to ask the same question before it pins RAM this forward never
+        # reads (47-m5); written twice, the two drift.
+        if dispatches_whole_layer(block_info, offset_index):
             fwd = _make_whole_layer_sparse_forward(
                 block_info, offset_index, checkpoint_path, device, vaayu_ref,
                 original_forward=original_forward,

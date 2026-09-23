@@ -2637,7 +2637,7 @@ class VaayuBaseModel(GenerationMixin):
             # io_uring state — see io_uring_cqe_overflow_bug memory).
             self._overlap_trace = os.environ.get("VAAYU_OVERLAP_TRACE") == "1"
             from .persist.expert_cache import ExpertRAMCache, ExpertVRAMCache, LRUTensorCache, SlabArena
-            from .moe_patch import detect_moe_blocks, patch_moe_blocks
+            from .moe_patch import detect_moe_blocks, dispatches_whole_layer, patch_moe_blocks
             from .persist.loader_strategy import EXL3LoaderStrategy
             import psutil as _psutil
 
@@ -2655,6 +2655,18 @@ class VaayuBaseModel(GenerationMixin):
             # The module-list layout reads the arena but does not consume staged
             # layers, a combination the previous single gate could not express.
             self._moe_slab_capable = moe_supports_slab_arena(_styles_detected, _is_exl3, cuda=str(self.running_device).startswith("cuda"))
+            # 47-m5: the style predicate above cannot see this. A fused-3D
+            # checkpoint's style is legitimately "fused", so it answers yes --
+            # but dispatch then installs _make_whole_layer_sparse_forward, which
+            # takes no expert_cache and reads neither cache, and the arena is
+            # pinned, unswappable RAM nothing ever touches. ALL, not ANY: a mixed
+            # model's other blocks do read the arena, so it is only skipped when
+            # every block dispatches whole-layer.
+            self._moe_whole_layer_only = bool(self._detected_moe_blocks) and all(
+                dispatches_whole_layer(b, self._expert_offset_index)
+                for b in self._detected_moe_blocks)
+            if self._moe_whole_layer_only:
+                self._moe_slab_capable = False
             self._moe_stager_capable = moe_supports_prefill_stager(_styles_detected, _is_exl3)
 
             _mem = _psutil.virtual_memory()
@@ -2724,10 +2736,21 @@ class VaayuBaseModel(GenerationMixin):
                 # reads. Skip compute_slab_bytes too: it rescans the whole offset
                 # index for a number no one will use.
                 _styles = sorted({b.expert_style for b in self._detected_moe_blocks})
-                print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — expert layout "
-                      f"{_styles or ['none detected']} does not read the pinned "
-                      f"slab arena. Freed ~{_expert_budget / 1e9:.1f} GB of pinned "
-                      f"RAM; experts are cached via the clone path instead.")
+                if self._moe_whole_layer_only:
+                    # Nothing is cached at all here -- the whole-layer forward
+                    # reads the layer, computes it and releases it inside the
+                    # call -- so do not promise a clone path that never runs.
+                    print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — every MoE "
+                          f"block streams its layer WHOLE ({len(self._detected_moe_blocks)} "
+                          f"blocks, layout {_styles}), and that forward reads neither "
+                          f"the expert RAM cache nor the VRAM one. Freed ~"
+                          f"{_expert_budget / 1e9:.1f} GB of pinned RAM; experts are "
+                          f"not cached at all on this path.")
+                else:
+                    print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — expert layout "
+                          f"{_styles or ['none detected']} does not read the pinned "
+                          f"slab arena. Freed ~{_expert_budget / 1e9:.1f} GB of pinned "
+                          f"RAM; experts are cached via the clone path instead.")
                 _slab_bytes = 0
             else:
                 _slab_bytes = compute_slab_bytes(self._expert_offset_index)
