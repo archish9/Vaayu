@@ -57,13 +57,15 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.4** — jump to "PICK THIS NEXT: **A5.4**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.5** — jump to "PICK THIS NEXT: **A5.5**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
-durable row; A5.1, A5.2 AND A5.3 all CLOSED the same day — `AutoConfig` resolves `deepseek_v4`, the
-parity harness has 15 committed goldens from DeepSeek's OWN modules, and `DeepseekV4Linear`
-reproduces all three `linear_*` goldens BIT-IDENTICALLY. START AT A5.4.** **Correction carried from
+durable row; A5.1–A5.4 ALL CLOSED the same day — `AutoConfig` resolves `deepseek_v4`, the parity
+harness has 15 committed goldens from DeepSeek's OWN modules, `DeepseekV4Linear` reproduces all
+three `linear_*` goldens BIT-IDENTICALLY, and the MoE block lands on Vaayu's module-list forward
+with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, `expert` and both
+`moe_*` goldens. START AT A5.5 — the attention BRIEF, and the step where A5 dies if it dies.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -80,12 +82,14 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.4** (row 28b). Then A5.5 → A5.6 → A5.7, one per session.
+## ▶ PICK THIS NEXT: **A5.5** (row 28b). Then A5.6 → A5.7, one per session.
 
-**A5.1, A5.2 AND A5.3 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
+**A5.1–A5.4 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
 goldens in `tests/deepseek/goldens/` (1.1 MB); the recorder is `python -m tests.deepseek.parity`.
-A5.3 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` — **build A5.4's `Expert` on
-`DeepseekV4Linear`, and read `KERNEL_DIR` before writing any kernel call.** A5.1 left two things every later
+A5.3 + A5.4 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (`DeepseekV4Linear`,
+`Gate`, `Expert`, `MoE`, `input_ids_scope`) — **A5.5 adds attention to that same file, reads
+`KERNEL_DIR` before any kernel call, and A5.6's model forward MUST run its layers inside
+`input_ids_scope` or the three hash layers raise.** A5.1 left two things every later
 sub-plan uses:
 `tests/fixtures/deepseek_v4_config.json` (a committed copy of the shipped config — **no 157 G
 checkpoint and no GPU needed to test this path**) and
@@ -102,8 +106,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~1~~ | ~~**A5.1** config + `auto_map`~~ | **CLOSED 2026-09-23** | [`…A5.1-config-RESULTS.md`](docs/2026-09-23-A5.1-config-RESULTS.md) | done |
 | ~~2~~ | ~~**A5.2** parity harness~~ | **CLOSED 2026-09-23** | [`…A5.2-parity-harness-RESULTS.md`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) | done |
 | ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
-| **4 (NEXT)** | **A5.4** MoE | design | [`…A5.4-moe-design.md`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) | 2–3 d |
-| 5 | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
+| ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
+| **5 (NEXT)** | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
 | 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
 
@@ -540,7 +544,8 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 2569 passed, 16 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 2593 passed, 16 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-23 after A5.4 (+24: its new test file). The 2569 / 16 was verified
 2026-09-23 after A5.3 (+19: its new test file; the 2550 / 16 it starts from was re-measured on the
 same HEAD that morning, before any A5.3 code, and MATCHED A5.2's figure). The 1979 / 15 was verified
 2026-09-11 after row 18 (+3 skipped: its new on-device gate, skipped without `HIDDEN_CKPT`; the
@@ -1064,6 +1069,9 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 | hidden states (row 18) | `HIDDEN_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_output_hidden_states.py -q -s` | 6 s (1B) / 30 s (MiniMax) | `output_hidden_states` broken: count `num_hidden_layers + 1`, shapes, a shifted or pre-norm entry (values vs stock HF — non-quantized checkpoints only; skips on EXL3), `output_attentions` refused by name. Seen to fail: RED on the unfixed forward, and on a shifted-layer mutant |
 
 **Run each under its own `systemd-run --user --scope -p MemoryMax=22G -p MemorySwapMax=0`** — except
+**Qwen3-Next, which ALSO needs 29G as of 2026-09-23 (A5.4): the accumulator gate was OOM-killed
+(exit 137) at 22G, after its 6 fixture tests and during the on-device load, and passes at 29G in
+49.22 s** — and except
 **MiniMax-M2.7, which needs 29G: at 22G its LOAD is OOM-killed (exit 137) at the pinning stage, measured twice
 2026-09-11 (row 18); every recent MiniMax arm already runs at 29–30G** — and except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
@@ -1210,7 +1218,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.1** `[x]` | config + `auto_map` | **DONE 2026-09-23** | `AutoConfig` resolves `deepseek_v4`; next failure is the model class | ~½ d | [`…A5.1…`](docs/superpowers/specs/2026-09-23-A5.1-config-skeleton-design.md) |
 | **A5.2** `[x]` | **parity harness** | **DONE 2026-09-23** | 15 goldens from the reference's own modules | done | [`…A5.2-RESULTS…`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) |
 | **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
-| **A5.4** `[ ]` | MoE | design | 94.3 % of the bytes, on the module-list forward | 2–3 d | [`…A5.4…`](docs/superpowers/specs/2026-09-23-A5.4-moe-design.md) |
+| **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
 | **A5.5** `[ ]` | **attention** | **BRIEF + gate** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
 | **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
 | **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
@@ -1364,20 +1372,43 @@ a Vaayu precedent; the attention path has neither.
       outside its tests imports it yet; (3) **NOT reachable** — `deepseek_v4` still has no model
       class, so the checkpoint still cannot load; (4) unblocked by A5.4 → A5.5 → A5.6 → A5.7.
       Banked, said so.
-- [ ] **A5.4 — MoE, 94.3 % of the bytes.** **Keep the reference's names** (`ffn`, `experts`,
-      `gate`, `w1/w2/w3`): `detect_moe_blocks` is name-driven on exactly those, so it works with
-      **zero engine changes** and A5.7's remap stays near-free. Two required changes:
-      `Gate.forward` must return **raw scores** `[N, n_routed_experts]` (the reference returns
-      `(weights, indices)`), and `MoE` must add **`route_tokens_to_experts`** — Vaayu's own
-      documented contract (`moe_patch.py:155`), where all model-specific scoring lives:
-      `sqrtsoftplus` → bias for **selection only** → topk → weights from the **UNBIASED** scores →
-      normalise → ×1.5. **Scoring a MoE with the wrong function is what made MiniMax emit
-      incoherent text** while loading and streaming perfectly. **Weights inside vs outside the
-      expert are EQUIVALENT** (`w2` is bias-free linear, `w` a per-token scalar) — write that down,
-      it looks like a bug. Hash layers (0–2) read the stashed `input_ids`. **Shared experts:
-      24 MiB/layer → ~1.01 GiB over 43 layers**, A4 Check 1 discharged **by running, not reading**.
-      **Verify:** `detect_moe_blocks` finds 43 `module_list` blocks on a **meta-device** tree; the
-      MoE gates for Qwen3-Next and MiniMax stay green (prove the "zero engine changes" claim).
+- [x] **A5.4 — MoE, 94.3 % of the bytes. DONE 2026-09-23. "ZERO ENGINE CHANGES" HELD AND IS NOW
+      MEASURED:** the diff touches `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` and one
+      new test file — **nothing under `vaayu/` proper** — and **both MoE gates are green**
+      (Qwen3-Next 8 passed, MiniMax-M2.7 8 passed). Delivered `DeepseekV4Gate` / `DeepseekV4Expert`
+      / `DeepseekV4MoE` / `input_ids_scope`, + `tests/test_deepseek_v4_moe.py` (**24 tests**).
+      Suite **2593 passed / 16 skipped**. Evidence: `docs/2026-09-23-A5.4-moe-RESULTS.md`.
+      **PARITY — bit-identical wherever the arithmetic is shared:** `gate_score`, `gate_hash` and
+      `expert` all `torch.equal`, and **both `moe_*` goldens are `torch.equal` when the routing
+      weight is applied INSIDE**. Through Vaayu's convention (weight OUTSIDE, `moe_patch.py:1710`)
+      the same block reads **max rel 0.02653 / 0.03125, cos 0.99958 / 0.99944** — and the
+      bit-identical row is what proves that gap is the **fp8 activation rounding** (`w2` quantizes
+      its input, so scaling before lands in different fp8 buckets than scaling after) and NOT a
+      scoring slip, a mis-selected expert or a dropped shared expert. Do not "fix" it.
+      **The reference's names are kept and are load-bearing:** `detect_moe_blocks` finds **43
+      `module_list` blocks, `router_attr == "gate"`, `experts_attr == "experts"`** on a
+      meta-device tree at the shipped geometry (43 × 256, ~4.6 s, no weights, no GPU); renaming
+      `experts` kills 8 tests. `_shared_expert_output` (`moe_patch.py:536`) binds the **ungated**
+      branch **on the real tree, by running** — A4 Check 1 discharged.
+      **A4 CHECK 2, MEASURED OFF THE SHARDS (was unmeasured): shared experts are 1.0079 GiB over
+      the 43 body layers, 24.001 MiB/layer, always resident.** MTP's three modules add 72.00 MiB
+      (A5.7 excludes them); the 43 gates are 103.79 MiB including the hash layers' `tid2eid`.
+      **HASH ROUTING IS A `ContextVar`, NOT A MODEL ATTRIBUTE.** Same user decision (stash the ids,
+      no engine change), less coupling: `input_ids_scope(ids)` / `current_input_ids()` in the
+      modeling file, so the MoE needs no back-reference and two generations cannot read each
+      other's ids. **A5.6's model forward MUST run its layers inside that scope** — a hash layer
+      with nothing stashed RAISES naming it, rather than falling back to score routing (silently
+      wrong on 3 of 43 layers).
+      **Mutants each killed their gate:** softmax instead of sqrtsoftplus → 8 fail; weights from
+      the BIASED scores (the MiniMax bug) → 4; hash layers routed by score → 6; symmetric
+      `swiglu_limit` clamp on `gate` → 1 (**the `expert` golden is the ONLY test covering the
+      asymmetry**); `experts` renamed → 8.
+      **RECORDED, NOT BUILT:** hash-layer routing is knowable from the token id BEFORE any compute,
+      so those layers' experts could be prefetched a layer ahead — needs the engine change this
+      plan avoided, so it belongs to a later row.
+      **§8:** (1) **no knob** — routing, scoring and the swiglu limit all come from the config;
+      (2) **not plumbed by design**; (3) **NOT reachable** — no model class yet, the checkpoint
+      still cannot load; (4) unblocked by A5.5 → A5.6 → A5.7. Banked, said so.
 - [ ] **A5.5 — attention. BRIEF WITH A GATE; THIS IS WHERE A5 DIES IF IT DIES.** MLA (one 512-dim
       latent shared by 64 heads), grouped low-rank O, circular 128-window KV, `Compressor`, and on
       `ratio == 4` layers a learned `Indexer` over `index_topk 512`. `compress_ratios` over 43

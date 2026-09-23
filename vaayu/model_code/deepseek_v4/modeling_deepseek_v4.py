@@ -29,6 +29,7 @@ byte-identical.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import importlib.util
 from pathlib import Path
 
@@ -210,3 +211,210 @@ class DeepseekV4Linear(nn.Module):
             quantized, act_scale = kernel.act_quant(x, self.act_block_size,
                                                     scale_fmt, scale.dtype)
             return gemm(quantized, act_scale, weight, scale, scale.dtype)
+
+
+# ── A5.4: the MoE block ─────────────────────────────────────────────────────
+
+_INPUT_IDS = contextvars.ContextVar("deepseek_v4_input_ids", default=None)
+
+
+@contextlib.contextmanager
+def input_ids_scope(input_ids: torch.Tensor):
+    """Stash the batch's token ids for the hash-routed layers.
+
+    Layers below `num_hash_layers` route by TOKEN ID, not by score, and Vaayu's
+    `sparse_forward(hidden_states, **kwargs)` never receives `input_ids`.
+    Threading them through would edit MoE infra that Qwen3-Next and MiniMax
+    also run (CLAUDE.md §0 makes that a change to BOTH paths); excluding those
+    layers from patching would strand three whole layers of experts resident.
+    So the model stashes them here instead -- entirely inside this file, zero
+    engine changes.
+
+    A `ContextVar` rather than a plain global: the server runs one request at a
+    time today, but two generations sharing a process must never read each
+    other's ids.
+    """
+    token = _INPUT_IDS.set(input_ids)
+    try:
+        yield
+    finally:
+        _INPUT_IDS.reset(token)
+
+
+def current_input_ids() -> torch.Tensor:
+    """The stashed ids, or a message naming what forgot to stash them."""
+    input_ids = _INPUT_IDS.get()
+    if input_ids is None:
+        raise RuntimeError(
+            "a hash-routed MoE layer routes by token id and no input_ids are stashed "
+            "-- the model's forward must run its layers inside `input_ids_scope`.")
+    return input_ids
+
+
+def _expert_dtypes(config) -> tuple:
+    """(routed, shared) expert weight dtypes, both read off the config.
+
+    `expert_dtype` names the routed experts' format; everything else takes the
+    checkpoint's declared `fmt`. Neither is assumed -- a bf16 checkpoint of this
+    architecture builds bf16 experts and never touches a kernel.
+    """
+    quant = config.checkpoint_quantization_config or {}
+    shared = torch.float8_e4m3fn if quant.get("fmt") == "e4m3" else torch.bfloat16
+    routed = torch.float4_e2m1fn_x2 if config.expert_dtype == "fp4" else shared
+    return routed, shared
+
+
+class DeepseekV4Gate(nn.Module):
+    """Router scores, plus the selection Vaayu asks the model to own.
+
+    Split from the reference's `Gate`, which returns `(weights, indices)` from
+    its forward. Vaayu's forwards call `router(hidden_states) -> router_logits`
+    and then `route_tokens_to_experts(logits)` (`moe_patch.py:155`) -- the
+    contract transformers standardizes across 25+ MoE architectures. So
+    `forward` returns the RAW scores and `route` does the scoring, the
+    selection and the mixing.
+
+    **The bias steers SELECTION ONLY.** Taking the weights from the biased
+    scores is what made MiniMax emit incoherent text while loading, patching
+    and streaming perfectly.
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.score_func = config.scoring_func
+        self.route_scale = config.routed_scaling_factor
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hash = layer_idx < config.num_hash_layers
+        self.weight = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.hidden_size,
+                        dtype=torch.bfloat16), requires_grad=False)
+        if self.hash:
+            # `[vocab_size, top_k]`, and the shards hold it I64 -- declaring the
+            # reference's int32 would cast every id table at load.
+            self.tid2eid = nn.Parameter(
+                torch.empty(config.vocab_size, config.num_experts_per_tok,
+                            dtype=torch.int64), requires_grad=False)
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(torch.empty(config.n_routed_experts,
+                                                 dtype=torch.float32),
+                                     requires_grad=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden_states.float(), self.weight.float())
+
+    def _score(self, router_logits: torch.Tensor) -> torch.Tensor:
+        if self.score_func == "softmax":
+            return router_logits.softmax(dim=-1)
+        if self.score_func == "sigmoid":
+            return router_logits.sigmoid()
+        return F.softplus(router_logits).sqrt()          # sqrtsoftplus
+
+    def route(self, router_logits: torch.Tensor) -> tuple:
+        """`(indices, weights)` -- `route_experts` tells them apart by dtype."""
+        unbiased = self._score(router_logits)
+        scores = unbiased if self.bias is None else unbiased + self.bias
+        if self.hash:
+            indices = self.tid2eid[current_input_ids().flatten()]
+        else:
+            indices = scores.topk(self.top_k, dim=-1)[1]
+        weights = unbiased.gather(1, indices)
+        if self.norm_topk_prob:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        return indices, weights * self.route_scale
+
+
+class DeepseekV4Expert(nn.Module):
+    """One SwiGLU FFN, with the reference's numerics kept exactly.
+
+    `gate` and `up` are computed in float32, the `swiglu_limit` clamp is
+    ASYMMETRIC on purpose (`up` two-sided, `gate` capped above only), and the
+    product is cast back before `w2`. Each of those is a logits-level
+    difference, not a style choice.
+
+    `weights` is optional because Vaayu's module-list forward calls the expert
+    with ONE argument and applies the routing weight itself, OUTSIDE
+    (`moe_patch.py:1710`). The two are equal -- `w2` is a bias-free linear map
+    and the weight is a per-token scalar, so it commutes through -- and this is
+    written down because it reads like a bug.
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int, *,
+                 dtype: torch.dtype | None = None, swiglu_limit: float = 0.0,
+                 weight_block_size: list | tuple | None = None,
+                 fp4_group_size: int | None = None):
+        super().__init__()
+        shape = dict(dtype=dtype, weight_block_size=weight_block_size,
+                     fp4_group_size=fp4_group_size)
+        self.w1 = DeepseekV4Linear(hidden_size, intermediate_size, **shape)
+        self.w2 = DeepseekV4Linear(intermediate_size, hidden_size, **shape)
+        self.w3 = DeepseekV4Linear(hidden_size, intermediate_size, **shape)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        dtype = x.dtype
+        gate = self.w1(x).float()
+        up = self.w3(x).float()
+        if self.swiglu_limit > 0:
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        x = F.silu(gate) * up
+        if weights is not None:
+            x = weights * x
+        return self.w2(x.to(dtype))
+
+
+class DeepseekV4MoE(nn.Module):
+    """`gate` + `experts` + an ungated `shared_experts`, on Vaayu's module-list
+    forward with **zero engine changes**.
+
+    The reference's names are load-bearing and are kept: `detect_moe_blocks`
+    (`moe_patch.py:992`) wants an `nn.ModuleList` child with more than four
+    entries and a sibling named one of `gate`/`router`/`w_gate`/
+    `router_weights` carrying `.weight`, and `_shared_expert_output`
+    (`moe_patch.py:536`) finds the shared expert by the `shared_expert` in its
+    name, gating it only when a `*_gate` sibling exists. Renaming any of them to
+    HF's `mlp`/`gate_proj` would cost a key remap AND a silent detector miss.
+    """
+
+    def __init__(self, config, layer_idx: int, *, fp4_group_size: int | None = None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.n_routed_experts = config.n_routed_experts
+        routed_dtype, shared_dtype = _expert_dtypes(config)
+        block = (config.checkpoint_quantization_config or {}).get("weight_block_size")
+
+        def expert(dtype, intermediate_size):
+            return DeepseekV4Expert(config.hidden_size, intermediate_size, dtype=dtype,
+                                    swiglu_limit=config.swiglu_limit,
+                                    weight_block_size=block,
+                                    fp4_group_size=fp4_group_size)
+
+        self.gate = DeepseekV4Gate(config, layer_idx)
+        self.experts = nn.ModuleList([expert(routed_dtype, config.moe_intermediate_size)
+                                      for _ in range(config.n_routed_experts)])
+        # One fused module of `n_shared_experts` experts' width, always on.
+        self.shared_experts = expert(
+            shared_dtype, config.moe_intermediate_size * config.n_shared_experts)
+
+    def route_tokens_to_experts(self, router_logits: torch.Tensor) -> tuple:
+        """Vaayu's routing contract (`route_experts`, `moe_patch.py:155`)."""
+        return self.gate.route(router_logits)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shape = hidden_states.shape
+        x = hidden_states.view(-1, self.hidden_size)
+        indices, weights = self.route_tokens_to_experts(self.gate(x))
+        y = torch.zeros_like(x, dtype=torch.float32)
+        counts = torch.bincount(indices.flatten(),
+                                minlength=self.n_routed_experts).tolist()
+        for expert_idx, count in enumerate(counts):
+            if count == 0:
+                continue
+            token, slot = torch.where(indices == expert_idx)
+            # The routing weight OUTSIDE the expert, as the engine applies it.
+            y[token] += weights[token, slot, None] * self.experts[expert_idx](x[token])
+        y += self.shared_experts(x)
+        return y.type_as(hidden_states).view(shape)
