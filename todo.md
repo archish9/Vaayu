@@ -45,7 +45,16 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT (re-set 2026-09-23, later the same day: **ROW 46 IS NOW CLOSED TOO** — measured and REFUTED. A4, 47-m7, 47-m5 and now 46 all closed today; the user DECLINED row 32's download) ◀◀
+## ▶▶ PICK THIS NEXT: **A5.1** — jump to "PICK THIS NEXT: **A5.1**" below for the order and the links ◀◀
+
+**One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
+2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
+durable row. START AT A5.1. Everything between here and there is the day's closed rows, kept for
+the trail.**
+
+---
+
+### (closed 2026-09-23, kept for the trail: **ROW 46 IS NOW CLOSED TOO** — measured and REFUTED. A4, 47-m7, 47-m5 and now 46 all closed that day; the user DECLINED row 32's download)
 
 **A fresh session starts here and needs nothing else: each item below has a SELF-CONTAINED handoff
 document that carries its own start gate, stop rule, numbers and commands.**
