@@ -65,7 +65,9 @@ durable row; A5.1–A5.4 ALL CLOSED the same day — `AutoConfig` resolves `deep
 harness has 15 committed goldens from DeepSeek's OWN modules, `DeepseekV4Linear` reproduces all
 three `linear_*` goldens BIT-IDENTICALLY, and the MoE block lands on Vaayu's module-list forward
 with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, `expert` and both
-`moe_*` goldens. START AT A5.5 — the attention BRIEF, and the step where A5 dies if it dies.** **Correction carried from
+`moe_*` goldens. **A5.5's STEP-0 GATE THEN PASSED 3/3 the same day — the step where A5 was
+expected to die did not kill it. START AT A5.5's PLAN**, with the gate's numbers in hand:
+`docs/2026-09-23-A5.5-step0-gate-RESULTS.md`, and the durable copy in row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -107,7 +109,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~2~~ | ~~**A5.2** parity harness~~ | **CLOSED 2026-09-23** | [`…A5.2-parity-harness-RESULTS.md`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) | done |
 | ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
-| **5 (NEXT)** | **A5.5** attention | **BRIEF + gate** | [`…A5.5-attention-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
+| **5 (NEXT)** | **A5.5** attention — **STEP-0 GATE PASSED 2026-09-23, 3/3. Write the plan.** | **plan next** | [`…A5.5-step0-gate-RESULTS.md`](docs/2026-09-23-A5.5-step0-gate-RESULTS.md) then the [BRIEF](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
 | 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
 
@@ -116,8 +118,13 @@ plans by the session that reaches them (their inputs need measuring first — a 
 than a brief, because the next session implements it instead of questioning it). **`docs/` is
 gitignored: row 28b's A5.x bullets carry every number and stop rule and are the durable copy.**
 
-**A5.5 is where A5 dies if it dies** — everything else has a golden reference or a Vaayu precedent;
-the attention path has neither. Its step-0 gate exists to find that out in ~1 day, not ~3 weeks.
+~~**A5.5 is where A5 dies if it dies**~~ — **IT DID NOT. Step-0 gate PASSED 2026-09-23, 3/3, in
+~1.5 h.** `sparse_attn` at `block=16` is correct at the real working point (topk 640, rel 0.00205),
+the module runs at real length with the Indexer saturating `index_topk`, and attention costs
+**8.4–9.9 % of the 3.2124 GiB/token disk floor** (48.08 ms against 486–575 ms). **Gate (3) is
+cancelled — its precondition did not fire.** And the tile was the wrong worry: `sparse_attn` is
+**10 %** of attention, behind the **Indexer (26 %)**, the **Compressor (18.5 %)** and **`wo_a`'s
+einsum (15 %)**. Full numbers in row 28b's A5.5 bullets.
 
 **A5 / row 28b IS IN FLIGHT `[~]` — ITS STEP-1 GATE PASSED 2026-09-23, 6/6.** The abandon branch
 (*kernels will not build on sm_120 → decide Triton-or-abandon, ~2 days not weeks*) **did NOT fire**:
@@ -1219,7 +1226,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.2** `[x]` | **parity harness** | **DONE 2026-09-23** | 15 goldens from the reference's own modules | done | [`…A5.2-RESULTS…`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) |
 | **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
-| **A5.5** `[ ]` | **attention** | **BRIEF + gate** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
+| **A5.5** `[~]` | **attention** | **GATE PASSED 3/3, plan next** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
 | **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
 | **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
@@ -1409,20 +1416,63 @@ a Vaayu precedent; the attention path has neither.
       **§8:** (1) **no knob** — routing, scoring and the swiglu limit all come from the config;
       (2) **not plumbed by design**; (3) **NOT reachable** — no model class yet, the checkpoint
       still cannot load; (4) unblocked by A5.5 → A5.6 → A5.7. Banked, said so.
-- [ ] **A5.5 — attention. BRIEF WITH A GATE; THIS IS WHERE A5 DIES IF IT DIES.** MLA (one 512-dim
-      latent shared by 64 heads), grouped low-rank O, circular 128-window KV, `Compressor`, and on
-      `ratio == 4` layers a learned `Indexer` over `index_topk 512`. `compress_ratios` over 43
-      layers: **2 at 0, 21 at 4, 20 at 128**. **KV IS TINY — G4 is an API problem, not a VRAM one:
-      50.99 MB/sequence at 8k = 0.0062 MB/token, 41× SMALLER than MiniMax's 0.254.** Do not spend a
-      week on `vram_plan`. **Shared-memory ladder vs sm_120's 101,376 B** (`num_stages` has no
-      effect): **block 64 → 141,312 B (1.394× over) · 32 → 104,448 B (over by 3,072 B, 3.0 %) ·
-      16 → fits**. **STEP-0 GATE before any modeling code:** (1) correctness at **`topk=512`** and a
-      real length against A5.2's golden — **fails ⇒ STOP, the port has no attention**; (2) the cost
-      of the ¼ tile — **if attention alone dominates the 3.2124 GiB/token disk floor (~0.49 s),
-      escalate before building**; (3) only if (2) hurts, try to recover 3,072 B for `block=32`.
-      Open: ring-buffer KV vs HF `Cache` (and 42-B's snapshot); chunked prefill; **in-place rotary,
-      applied again INVERTED to the attention output**; `act_quant(..., 64, inplace=True)` FP8 QAT
-      sim (**group 64, not 128**, and not in `config.json`); `attn_sink`; two rope variants.
+- [~] **A5.5 — attention. STEP-0 GATE PASSED 2026-09-23, ALL THREE QUESTIONS. A5 DOES NOT DIE
+      HERE.** MLA (one 512-dim latent shared by 64 heads), grouped low-rank O, circular 128-window
+      KV, `Compressor`, and on `ratio == 4` layers a learned `Indexer` over `index_topk 512`.
+      `compress_ratios` over 43 layers: **2 at 0, 21 at 4, 20 at 128 — confirmed on the real tree.**
+      **KV IS TINY — G4 is an API problem, not a VRAM one: 50.99 MB/sequence at 8k = 0.0062
+      MB/token, 41× SMALLER than MiniMax's 0.254** (recomputed from the config, holds). Do not spend
+      a week on `vram_plan`. **THE PLAN IS NOW WRITABLE; the numbers below are its inputs.**
+      Evidence: `docs/2026-09-23-A5.5-step0-gate-RESULTS.md`, probe
+      `plans/probes/a5_5_attn_gate.py` (both gitignored — this row is the durable copy). ~1.5 h.
+      **GATE RESULT (1) CORRECT.** `sparse_attn` at `block=16`, at the REAL working point
+      (heads 64, head_dim 512, **topk 640 = window 128 + index_topk 512**, kv_slots 2176, m = 1 and
+      m = 2048): **rel 0.002049 decode / 0.001955 prefill**, finite — same magnitude as step 1's
+      GEMM validations (0.00275). **`block` does not change the math:** 16/32/64 agree to within
+      6e-5 at a head_dim where all three fit.
+      **THE BRIEF'S GATE (1) WAS UNRUNNABLE AS WRITTEN AND IS NOW CORRECTED.** It said to check
+      against A5.2's `attn_prefill` golden. That golden is **seqlen 8**, so `index_topk` never binds
+      (window alone is 128), **and it was RECORDED at `block=16`** (`parity.SPARSE_ATTN_BLOCK`) —
+      reproducing it is CIRCULAR for the tile question. The gate instead compares the kernel to an
+      independent write-out of `sparse_attn_kernel`'s own arithmetic (`kernel.py:294-348`). Two
+      details there fail SILENTLY if a port drops them: **`attn_sink` enters the DENOMINATOR only**
+      (`:343`, mass not value) and **the second GEMM consumes the probabilities cast to BF16**
+      (`acc_s_cast`, `:338` — doing it in fp32 makes the kernel look wrong by ~1e-3).
+      **GATE RESULT (2) COSTS 8.4–9.9 % OF THE DISK FLOOR, a 10× margin.** Per decode token over all
+      43 layers: **`Attention.forward` 48.08 ms, of which `sparse_attn` is 4.65 ms**, against the
+      **3.2124 GiB/token expert stream = 485.8–574.9 ms** at row P8's 6.0–7.1 GB/s. (The 3.2124
+      GiB/token is **re-derived independently here from the shard headers** and reproduces row 28b's
+      figure exactly.) Prefill of 2048 tokens, all layers: **932.8 ms = 0.455 ms/token.** Decode is
+      timed at `start_pos = CONTEXT-1`, not at the prefill boundary — a ratio-128 layer's selection
+      keeps growing as `start_pos // ratio` long after ratio-4's has saturated, and timing at the
+      boundary under-charges 20 of 43 layers (192 vs 144 topk).
+      **GATE (3) NOT RUN AND SHOULD NOT BE — its precondition did not fire.** The ¼ tile can cost at
+      most what `sparse_attn` costs: **9.7 % of attention, 0.8–1.0 % of a token.** A perfect
+      `block=64` recovers under 1 %. **Banked lever, nobody had written it down: the HEAD AXIS IS
+      FREE.** The kernel pads heads to 16 and grids over `(m, b)`, so the fixed `q_shared`/`o_shared`
+      pair scales with heads per launch — **4 launches at h=16 run the SHIPPED `block=64` tile on
+      sm_120 (86,016 B ≤ 101,376)**, no allocation shaving. The ladder as a validated formula
+      (reproduces step 1's three points exactly): **`h·d·2 + 2048 + block·d·2 + h·block·2`**.
+      **THE FINDING THAT REORDERS A5.5: THE TILE WAS THE WRONG THING TO WORRY ABOUT.** Decode split
+      by stage (96.1 % accounted, of 45.35 ms): **`indexer` 11.83 ms / 26.1 %** (21 layers only) ·
+      **`compressor` 8.41 ms / 18.5 %** · **`wo_a` einsum 6.87 ms / 15.1 %** · `sparse_attn` 4.59 ms
+      / 10.1 % · `wq_a`+`q_norm` 3.35 / 7.4 · `wkv`+`kv_norm` 3.27 / 7.2 · `wq_b` 2.18 / 4.8 ·
+      `wo_b` 1.99 / 4.4 · `act_quant` 1.08 / 2.4. Per-layer forwards: **ratio 0 = 0.538 ms, ratio 4
+      = 1.353, ratio 128 = 0.793.** **`wo_a` is bandwidth-bound and the reference itself flags the
+      fix** (`model.py:544`): A5.2/A5.3 dequantise it to bf16 at load, so the einsum reads a 67 MB
+      bf16 weight at ~420 GB/s against this card's 448 GB/s — an fp8 einsum roughly halves it.
+      **Honest limit:** stages are timed by repeating ONE layer, so weights stay hot in this card's
+      32 MB L2. It does not carry the result — 43 layers hold ~5.03 GiB of attention weight, a
+      **~12 ms/token floor at 448 GB/s**, and the measured 45–48 ms is already 4× that.
+      **STILL OPEN FOR THE PLAN (the gate did not touch these):** ring-buffer KV vs HF `Cache` (and
+      42-B's snapshot); **chunked prefill — A5.2 proved the reference RAISES, so A5.5 must WRITE
+      that path, not port one**; **in-place rotary, applied again INVERTED to the attention output**
+      (`model.py:539`); `act_quant(..., 64, inplace=True)` FP8 QAT sim (**group 64, not 128**, and
+      not in `config.json`); `attn_sink`; two rope variants (ratio-0 disables YaRN, base
+      `rope_theta`).
+      **§8:** (1) **no knob** — a gate measures, it configures nothing; (2) nothing to plumb, the
+      probe does not touch `vaayu/`; (3) **NOT reachable** — `deepseek_v4` still has no model class;
+      (4) it unblocks A5.5's plan and ships **zero user-visible capability**. Banked, said so.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
