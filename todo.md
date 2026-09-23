@@ -5620,6 +5620,38 @@ ABBA-balanced. **Greedy ids bit-identical across all 8 arms.** Mechanism measure
 (0.42 % disk at a 96.6 % hit there vs 20 % here). RESULTS:
 [`...-row46-step1-minimax-AB-RESULTS.md`](docs/2026-09-23-row46-step1-minimax-AB-RESULTS.md).
 
+**AND THE SIZING PREMISE IS NOW REFUTED — 2026-09-23, the session-bytes spike.** The row was sized off
+"a stored 8k session holds 0.20 GB" against a `max_seq_len` reservation. Measured on device by storing real
+sessions and reading the pool entry's own `nbytes` (`plans/probes/row46_session_bytes.py`, two lengths per
+model so `bytes(n)=a*n+b` is determined): **MiniMax 248.0 KiB/token** (+0.25 MB fixed), **Qwen3-Next 24.0
+KiB/token + 40.13 MB fixed** (the 36 linear layers' recurrent state). **The engine's accounting is EXACT on
+both** — `derive_expert_ceiling` is fed `kv_bearing_layer_count(self)` (`vaayu_base.py:2691`), not
+`config.num_hidden_layers`, so it already charges 12-of-48 layers on Qwen3-Next. **There is no accounting bug
+here to fix**, and 47-m4's "counts every layer" concern does NOT apply to this path.
+
+| | MiniMax | Qwen3-Next |
+|---|---|---|
+| `max_seq_len` (from the VRAM plan, `:2446`) | **8192** | **65536** |
+| reserved / session | 2.080 GB | 1.610 GB |
+| real session @ 8000 tok | 2.0319 GB = **1.02x** | 0.2367 GB = **6.80x** |
+| real session @ 2048 tok | 0.5203 GB = 4.00x | 0.0905 GB = 17.80x |
+| **recoverable, 3 x 8k** | **0.14 GB** | **4.12 GB** |
+| decode worth of returning it all | **+13.36 %** (step 1) | **-2.56 %** (42-B) |
+
+**THE PRIZE AND THE RECOVERABLE BYTES ARE ANTI-CORRELATED, and not by accident.** MiniMax's `max_seq_len` is
+8192 *because that is all this box's VRAM allows*, so a full-context agent session IS 8192 tokens and the
+reservation is exactly one of them. "Size to what the pool holds" can only return bytes there by assuming
+sessions stay ~4x shorter than the context the engine advertises -- and the arena is pinned at load and
+cannot shrink, so a wrong guess buys row 31's collapse at full price. Qwen3-Next is the mirror image: 4.12 GB
+genuinely idle, worth -2.56 %. **The handoff's "0.20 GB per 8k session" was Qwen3-Next's numbers read onto
+MiniMax** (0.201 GB is exactly Qwen3-Next's formula 2k figure) -- that single cross-model transfer is what
+made the reservation look 8x over everywhere. RESULTS:
+[`...-row46-step2-session-bytes-RESULTS.md`](docs/2026-09-23-row46-step2-session-bytes-RESULTS.md).
+
+**§8, settled for the whole row: NO NEW KNOB is needed.** `PREFIX_SESSIONS` (`server/config.py:193`) and
+`MAX_SEQ_LEN` (`:128`) already span every trade this row could have added, and row 31 swept them and closed
+with "defaults STAY".
+
 **BUT THE ARM THAT WON IS NOT SHIPPABLE, AND THAT IS NOW MEASURED TOO.** `compute_prefix_cache_budget`
 (`vaayu_base.py:705`) runs AFTER the arena is pinned and takes what is left minus a 3.76 GB reserve, so the
 returned bytes come straight out of the pool: free RAM post-arena **9.66 -> 3.61 GB** and the **prefix pool
@@ -5708,8 +5740,8 @@ so an under-reservation that guessed prompt lengths too low buys exactly row 31'
 time real prompts grow. Any design here must say what happens when the guess is wrong.
 
 - [x] **Step 1 A/B on MiniMax — DONE 2026-09-23, +13.36 %, stop rule NOT met (see the block above).**
-- [ ] Verify what a stored session ACTUALLY holds on MiniMax (the 0.20 GB-per-8k figure) — every
-      candidate design is sized off it.
+- [x] **Verify what a stored session ACTUALLY holds — DONE 2026-09-23 on BOTH models: the 0.20 GB
+      figure was Qwen3-Next's, the accounting is exact, and the sizing premise is REFUTED (block above).**
 - [ ] Price offline first (`vaayu/expert_sim.py`, `plans/probes/row31_price.py` — row 31's own tooling).
 - [ ] Decide the mechanism: reserve to a measured typical length; grow the reservation dynamically; or
       shrink the pool instead of the arena. Each must answer the over-capacity case.
