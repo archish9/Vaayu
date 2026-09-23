@@ -1533,6 +1533,31 @@ a Vaayu precedent; the attention path has neither.
       **PERF IS OUT OF SCOPE and becomes its own row**, with the gate's breakdown as its opening
       position: `indexer` 26.1 % · `compressor` 18.5 % · `wo_a` einsum 15.1 % · `sparse_attn`
       10.1 %.
+      **PLANNED 2026-09-23, SAME DAY — 7 TDD tasks,
+      `docs/superpowers/plans/2026-09-23-A5.5-attention.md` (gitignored; this row is durable).**
+      **ONE SPEC AMENDMENT, FOUND WHILE WRITING THE PLAN'S REAL CODE AND MATERIAL: A 512-TOKEN
+      CHUNK OVERRUNS A 128-SLOT WINDOW.** Generalising the four `seqlen == 1` sites is necessary
+      but NOT sufficient — the reference attends the ring IN PLACE, and writing 512 new positions
+      into a `sliding_window = 128` ring destroys the history the chunk's own early queries need
+      (a query at absolute 512 must see 385…512; after the write the ring holds 896…1023). **So
+      attention attends a CONTIGUOUS `kv_view` assembled per forward: `cat([history(h), chunk(L),
+      compressed(C)])` with `h = min(start_pos, window_size - 1)` and absolute position `a` at
+      index `a - start_pos + h`.** It reduces EXACTLY to the reference at both supported shapes —
+      `start_pos == 0` → `h = 0`, index == absolute; `seqlen == 1` → the same `window_size`
+      positions in the same oldest-to-newest order the ring walk produces, so the online softmax
+      accumulates identically and **bit-identity with `attn_decode_*` is expected, not hoped for**.
+      The ring stays in the reference's `pos % window_size` layout as the CARRY between chunks.
+      **A5.6 MUST NOT "SIMPLIFY" THIS BACK TO THE RING.**
+      **Task order:** 1 rotary/RMSNorm/two rope variants (`precompute_freqs_cis` takes an explicit
+      device, killing A5.2 finding 2's `set_default_device` trap at the source) · 2 index builders
+      for any seqlen at any start_pos, each asserted to REDUCE to the reference · 3 the cache ·
+      4 `Compressor` (**flushes every block a chunk completes** — the reference flushes at most
+      one, and a miss leaves a hole nothing fills) · 5 `Indexer` (**per-query causal bound**; the
+      reference masks only at `start_pos == 0`) · 6 `Attention` + the four goldens · 7 chunk
+      equivalence + 5 mutants + both MoE gates + RESULTS.
+      **Two literals with NO config source, named rather than hidden (§5):** `_ACT_QUANT_GROUP =
+      64` (`model.py:512` — NOT `weight_block_size`'s 128) and `_FP4_BLOCK_SIZE = 32`
+      (`model.py:18`).
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
