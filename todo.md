@@ -95,6 +95,20 @@ Qwen3-Next's 0.42 %-disk regime does NOT generalise), and two probe traps (`row2
 defaults to the DELETED Qwen3-235B path; `BALLAST_GB` can make a ceiling A/B inert — run the 1-token
 binding check first).
 
+**A5 / row 28b IS IN FLIGHT `[~]` — ITS STEP-1 GATE PASSED 2026-09-23, 6/6.** The abandon branch
+(*kernels will not build on sm_120 → decide Triton-or-abandon, ~2 days not weeks*) **did NOT fire**:
+all six of DeepSeek's TileLang kernels build and validate here, both GEMMs at rel err ~0.0027, suite
+unchanged at 2422/16. **The next step is A5 step 2 — HF modeling code ported from the checkpoint's
+own `inference/model.py`, with `auto_map`, experts as `nn.ModuleList`.** Three things a fresh session
+must carry (full detail in row 28b, which is the durable copy):
+**(1) `apache-tvm-ffi==0.1.9` is an EXACT pin now in `requirements.txt`, and `import tilelang` is NOT
+a valid test of it** — 0.1.10 imports fine and dies at kernel COMPILE, 0.1.12+ dies at import.
+**(2) `sparse_attn` must run at `block=16`** — the shipped `block=64` needs 141,312 B of dynamic
+shared memory against this card's 101,376 B ceiling; `block=32` misses by only 3,072 B, so trimming
+3 KiB is the first optimisation if step 5 shows the ¼-size tile hurts. **(3) A5 is REACH, not speed:**
+3.2124 GiB/token of routed experts caps decode at **~1.75–2.06 tok/s** — MiniMax-class, ~5× slower
+than Qwen3-Next. **No download was needed; the pip install was authorised by the user 2026-09-23.**
+
 **With 46 closed, the queue below is down to ONE row, and it is the weeks-long REACH item.**
 
 | order | item | what to open FIRST | cost | why this order |
@@ -2275,7 +2289,7 @@ hybrid is unblocked by step 3's measurement, the 9–21× by steps 1–2 (a load
 
 ---
 
-# 28b · [ ] Port DeepSeek-V4-Flash-0731 so Vaayu can run it (added 2026-09-12) — sequence step S4
+# 28b · [~] Port DeepSeek-V4-Flash-0731 so Vaayu can run it (added 2026-09-12) — sequence step S4 — **= row 47's A5. STEP 1 (the kernel gate) PASSED 2026-09-23, 6/6 on sm_120 — the abandon branch did NOT fire. Step 2 (HF modeling code) is next.**
 
 **Source:** row 28's verdict. **Durable copy of the plan summary is this row.** Detail:
 [`docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md`](docs/2026-09-12-row28b-IMPL-deepseek-v4-port.md).
@@ -2292,6 +2306,51 @@ which exists in transformers; (4) ~155 GiB more disk for the `splitted_model/` c
 
 **The template is MiniMax-M2.7** — also unknown to transformers, runs here anyway because its repo ships
 `modeling_minimax_m2.py`. **Write HF modeling code, drop it in the checkpoint dir with `auto_map`. Do not upstream.**
+
+**STEP 1 IS DONE AND IT PASSED — 2026-09-23, ~1 h, no engine code.** `6/6` TileLang kernels build
+AND validate on sm_120 / torch 2.11+cu130 / py3.12. Probe `plans/probes/a5_kernel_gate.py` (shapes
+derived from `config.json`, one subprocess per kernel); suite after: **2422 passed / 16 skipped**,
+the unchanged baseline. Detail:
+[`…-A5-step1-kernel-gate-RESULTS.md`](docs/2026-09-23-row47-A5-step1-kernel-gate-RESULTS.md)
+(gitignored — this row is the durable copy).
+
+- **`act_quant`, `fp4_act_quant`, `hc_split_sinkhorn` run as shipped.** Both GEMMs validate against
+  an exact-dequant reference (kernel vs the MATH, not vs the unquantised input, which would only
+  re-measure fp4/fp8 rounding): **`fp8_gemm` rel 0.002753**, **`fp4_gemm` rel 0.002744**.
+- **`apache-tvm-ffi==0.1.9` IS A LOAD-BEARING EXACT PIN, and `import tilelang` IS NOT A VALID TEST
+  OF IT.** tilelang 0.1.8 declares `>=0.1.2,~=0.1.0`, so pip takes **0.1.14** → dies at import
+  (`AttributeError: attribute '__dict__' of 'type' objects is not writable`,
+  `tvm_ffi/registry.py:410`). **0.1.10 imports FINE and then dies when any kernel is COMPILED**
+  (`'_NestedLoopCheckVisitor' object has no attribute '_inst'`, bundled
+  `tvm/runtime/support.py:159`) — a bisect using import as its test stops there and reports a false
+  pass, and the gate then "fails" six kernels for a reason unrelated to sm_120. **0.1.9 builds all
+  six.** Both pins are in `requirements.txt` with this table. **`nvcc` is NOT needed** — tilelang
+  compiles through nvrtc, already present for torch. Neither package can move this venv's torch
+  (tilelang does not pin torch on Linux; verified by dry-run before and by version check after).
+- **The ONE real sm_120 limit is `sparse_attn`'s tile — and it is TUNABLE, not an unsupported
+  instruction.** `num_stages` has NO effect on the demand; `block` (KV positions/tile) is the only
+  lever, against this card's **101,376 B** opt-in dynamic-smem ceiling:
+  **block=64 (shipped) → 141,312 B (1.394× over) · block=32 → 104,448 B (over by only 3,072 B) ·
+  block=16, stages=1 → FITS, runs, output finite.** So DeepSeek's sparse attention runs here at
+  **¼ the shipped KV tile**; the throughput cost is **UNMEASURED** and belongs to step 5 — do not
+  assume it is small, ¼ the tile is 4× the iterations over `index_topk=512`. **First optimisation
+  if step 5 shows it hurts: recover 3 KiB of shared allocation and block=32 doubles the tile back.**
+- **CORRECTION to the A5 brief — `fp4 4.2500 bpw` in the checkpoint table is RIGHT, not wrong.**
+  Per expert matrix: weight `[2048,2048]` I8 = 4,194,304 B + scale `[2048,128]` F8_E8M0 = 262,144 B
+  → ×3 = 13,369,344 B = **12.750 MiB exactly** over 25,165,824 params = **4.25 bits/param exactly**
+  (4 for the fp4 weight + 8 bits per 32-param block = 0.25). The brief is right about the
+  *container* — the dtype is `I8` holding two fp4 nibbles, and `quantization_config` names only the
+  fp8 half of the checkpoint — but the bpw figure stands.
+- **NEW NUMBER FOR A4's INHERITED CHECK 2:** shared experts are **24 MiB/layer** (3 × `[2048,4096]`
+  F8_E4M3) → **~1.01 GiB across 43 layers**, previously unmeasured. That is what the VRAM pin
+  budget has to cover.
+- **Decode ceiling re-derived, and it prices A5 as REACH not speed:** 43 × top-6 = 258 routed
+  slots/token × 12.750 MiB = **3.2124 GiB/token** → **~2.06 tok/s** at the NVMe plateau (7.1 GB/s,
+  2 readers), **~1.75 tok/s** at the 1-reader 6.0–6.4 GB/s in-path rate. Consistent with row 28's
+  2.1–2.3. That lands near MiniMax, ~5× slower than Qwen3-Next.
+- **NOT established by this gate:** anything in `model.py` (only `kernel.py` was exercised) — the
+  MLA/DSA modeling code, key remap, dual dequant and MLA KV sizing are all step 2+.
+  `fast_hadamard_transform` is still absent but `kernel.py` never imports it: a step-2 concern.
 
 **Steps (each with its own verify):** 1 **kernels first, standalone, on sm_120** (2–5 days; **stop rule: if TileLang
 will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
@@ -5024,7 +5083,7 @@ Program doc: [`…-architecture-support-PROGRAM.md`](docs/2026-09-20-architectur
 | **A2** `[x]` | **Fused-3D expert indexing** — **CLOSED 2026-09-21** | the index understands one-blob-per-layer checkpoints and derives per-expert byte ranges. **Unit tests only** | A1 | none | ~1 day | [`…-A2-fused3d-index.md`](docs/superpowers/plans/2026-09-20-arch-A2-fused3d-index.md) |
 | **A3** `[x]` | **gpt-oss-20b END TO END — CLOSED 2026-09-21** | a 4th architecture family (MXFP4 · fused-3D · sliding-window) generates through the server, gates green | A1, A2 | **Task 1 IS an abandon gate: stock transformers must run MXFP4 on this box** | ~3–5 days | [`…-A3-gptoss-e2e.md`](docs/superpowers/plans/2026-09-20-arch-A3-gptoss-e2e.md) |
 | **A4** `[x]` | **Shared-expert pinning (G7) — CLOSED 2026-09-23, PREMISE REFUTED** | nothing to build: always-active experts were **already** pinned, not streamed. Stop rule fired on Q1 | — | stop rule fired; Q2 never run | **½ day, zero code** | [`…-A4-shared-experts-RESULTS.md`](docs/2026-09-23-A4-shared-experts-RESULTS.md) · brief: [`…-A4-shared-experts-BRIEF.md`](docs/2026-09-20-arch-A4-shared-experts-BRIEF.md) |
-| **A5** **(NEXT)** | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | ~~A4~~ **(closed)** | **kernels must build on sm_120 — decided at step 1, abandon costs ~2 days not weeks** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
+| **A5** `[~]` | **DeepSeek-V4-Flash port** | the 157 GB I8/fp8 MoE loads and runs | ~~A4~~ **(closed)** | ~~kernels must build on sm_120~~ **GATE PASSED 2026-09-23: 6/6 build+validate. `sparse_attn` needs block=16 (shipped 64 exceeds sm_120's 101,376 B smem); `apache-tvm-ffi==0.1.9` is an exact pin. Step 2 next.** | **weeks** | brief: [`…-A5-deepseek-port-BRIEF.md`](docs/2026-09-20-arch-A5-deepseek-port-BRIEF.md) |
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
 | A7 | G3 `compute_device` parity · G5 NVMe re-measure | removes two latent generality traps | — | none | ~1 day | plan when picked |
 

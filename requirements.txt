@@ -60,3 +60,22 @@ uvicorn[standard]>=0.30
 # `pylint E0606` catches used-before-assign in a branch; ruff/pyflakes do not.
 # Enforced by tests/test_no_unbound_locals.py.
 pylint>=3.0
+
+# TileLang — DeepSeek-V4-Flash's reference kernels (MLA / sparse-index attention,
+# fp8+fp4 block-scaled GEMM, sinkhorn). Required only by that architecture's port
+# (todo.md row 47 A5 / row 28b); no other model path imports it.
+#
+# BOTH PINS ARE LOAD-BEARING, and the tvm-ffi one is exact. tilelang 0.1.8 declares
+# `apache-tvm-ffi>=0.1.2,~=0.1.0`, so pip resolves 0.1.14 — which is broken two
+# different ways, and IMPORTING IS NOT A SUFFICIENT TEST of the pin:
+#   0.1.12+  dies at import   — AttributeError: attribute '__dict__' of 'type'
+#                               objects is not writable (tvm_ffi/registry.py:410)
+#   0.1.10   imports FINE but dies when any kernel is COMPILED —
+#            AttributeError: '_NestedLoopCheckVisitor' object has no attribute '_inst'
+#            (bundled tvm/runtime/support.py:159, TVMDerivedObject.__init__)
+#   0.1.9    builds and validates all 6 kernels.
+# Measured 2026-09-23 on py3.12 / torch 2.11+cu130 / sm_120 by
+# plans/probes/a5_kernel_gate.py. tilelang does NOT pin torch on Linux, so neither
+# package can move this venv's torch.
+apache-tvm-ffi==0.1.9
+tilelang==0.1.8
