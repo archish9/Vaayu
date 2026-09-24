@@ -683,6 +683,9 @@ def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
 # ── A5.5: the cache ─────────────────────────────────────────────────────────
 
 from transformers.cache_utils import Cache, CacheLayerMixin
+from transformers.modeling_utils import PreTrainedModel
+
+from .configuration_deepseek_v4 import DeepseekV4Config
 
 _ONE_LENGTH = (
     "a DeepSeek-V4 cache is servable at exactly one length: the circular "
@@ -1427,3 +1430,68 @@ class DeepseekV4DecoderLayer(nn.Module):
         # ids from `current_input_ids()`, which the model's forward stashes.
         x = self.ffn(x)
         return self.hc_post(x, residual, post, comb)
+
+
+class DeepseekV4PreTrainedModel(PreTrainedModel):
+    """`config_class` is set explicitly rather than by annotation: transformers
+    keeps the attribute path specifically for remote-code models
+    (`modeling_utils.py:1220-1226`), which is what this is.
+    """
+
+    config_class = DeepseekV4Config
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = False
+    _no_split_modules = ["DeepseekV4DecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+
+
+class DeepseekV4Model(DeepseekV4PreTrainedModel):
+    """`model.py:877`'s `Transformer`, without the MTP half.
+
+    embed -> expand to `hc_mult` copies -> the blocks -> `hc_head` -> norm.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([DeepseekV4DecoderLayer(config, layer_idx)
+                                     for layer_idx in range(config.num_hidden_layers)])
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        # `hc_head_*` belong to the MODEL, not to a block -- see `hc_head`.
+        fp32 = dict(dtype=torch.float32)
+        self.hc_head_fn = nn.Parameter(
+            torch.empty(config.hc_mult, config.hc_mult * config.hidden_size, **fp32),
+            requires_grad=False)
+        self.hc_head_base = nn.Parameter(torch.empty(config.hc_mult, **fp32),
+                                         requires_grad=False)
+        self.hc_head_scale = nn.Parameter(torch.empty(1, **fp32),
+                                          requires_grad=False)
+
+        self.post_init()
+
+    def hc_head(self, x):
+        """`model.py:709`. The final `hc_mult` -> 1 reduction.
+
+        The reference defines this on `Block` and calls it as
+        `layer.hc_head(...)` on whatever layer its loop left bound
+        (`model.py:921`), passing the MODEL's parameters. The body reads `self`
+        only for `norm_eps`, `hc_eps` and the `hc_mult` implied by the input's
+        shape -- all three per-block copies of the same config fields -- so it
+        lives here, where its parameters do. The `hc_head` golden proves the
+        move is arithmetically free rather than asserting it.
+
+        **This is NOT `hc_pre`.** Plain sigmoid, no Sinkhorn, no `post`, no
+        `comb`, and `hc_head_fn` has `hc_mult` rows, not `(2+hc_mult)*hc_mult`.
+        """
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_head_fn) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype)

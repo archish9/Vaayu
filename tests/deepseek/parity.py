@@ -544,6 +544,35 @@ def _recipe_block(reference, args):
 RECIPES["block"] = _recipe_block
 
 
+def _recipe_hc_head(reference, args):
+    """`Block.hc_head` (`model.py:709`), the reduction `Transformer.forward`
+    applies once, after the last block.
+
+    The `Block` is built on META on purpose: `hc_head` reads no parameter of
+    its own -- only `self.norm_eps`, `self.hc_eps` and, through
+    `x.view(shape)`, `hc_mult` -- so the instance is there to supply three
+    scalars. Verified 2026-09-24: `reference.Block(0, args)` constructs on meta
+    and carries them. That makes this golden cost the 262 KB of `hc_head_*`
+    instead of a 3.3 GiB layer.
+
+    The three parameters are stored IN the fixture, so the test that reads it
+    needs a GPU but not the 157 G checkpoint.
+    """
+    with torch.device("meta"):
+        block = reference.Block(0, args)
+    weights = load_module_weights("hc_head_")
+    fn = weights["fn"].cuda()
+    scale = weights["scale"].cuda()
+    base = weights["base"].cuda()
+    x = seeded_input(1, GOLDEN_TOKENS, args.hc_mult, args.dim)
+    return {"x": x, "hc_head_fn": fn, "hc_head_scale": scale,
+            "hc_head_base": base,
+            "out": block.hc_head(x, fn, scale, base)}, None
+
+
+RECIPES["hc_head"] = _recipe_hc_head
+
+
 def _shipped_config():
     from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
