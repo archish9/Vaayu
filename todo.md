@@ -1701,6 +1701,23 @@ a Vaayu precedent; the attention path has neither.
       yet; (4) unblocked by A5.6 → A5.7, with the two carried items above. Banked, said so.
       Detail: `docs/2026-09-24-A5.5-attention-RESULTS.md` (gitignored; this bullet is the durable
       copy). Report: `.superpowers/sdd/2026-09-23-A5.5-attention/task-7-report.md`.
+      **FIX ROUND 1 (2026-09-24): the coordinator caught what two independent reviews had flagged
+      from opposite ends — every original chunk split (`[512,512]`, `[256]x4`) has boundaries
+      divisible by both compress_ratios, so `held = start_pos % ratio` was always 0 and the
+      Compressor's `if held:` partial-block-resume prepend (exactly where Task 4's only real bug
+      lived) was never entered.** Added a third `chunks` parametrization, `[511, 513]` (511 % 4 ==
+      3, 511 % 128 == 127 -- genuinely off both boundaries), same gate, same threshold. **Passes on
+      correct code:** ratio 4 rel-L2 0.00498729 vs floor 0.0117829 (2.36x inside), ratio 0/128
+      exact 0 -- in line with the aligned splits. Full file: **40 passed**. **Mutation check:
+      reinstated Task 4's exact original `_hold` bug** (the shift `kv_state[:bsz, :offset] =
+      kv_state[:bsz, offset:]` restored, the explicit carry write removed from `forward`) --
+      **new split FAILS at 0.0476728 vs floor 0.0117829 (4.05x over).** Outcome 1 (expected): gap
+      closed and proven. Reverted; modeling file `git diff` clean.
+      **Side-finding, not asked for:** the two PRE-EXISTING aligned splits also fail under this
+      same mutation (3.85x and 5.14x over the floor) -- the overlap-carry READ
+      (`first >= ratio`) fires on any call after the first regardless of alignment, so it was
+      already reachable; only the NEW split's `if held:` prepend branch was genuinely uncovered
+      before. Both observations consistent with the coordinator's finding.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still

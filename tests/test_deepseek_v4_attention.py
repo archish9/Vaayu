@@ -713,7 +713,8 @@ def _null_floor(layer, cache_factory, x):
 @needs_checkpoint
 @needs_gpu
 @pytest.mark.parametrize("ratio", [0, 4, 128])
-@pytest.mark.parametrize("chunks", [[512, 512], [256, 256, 256, 256]])
+@pytest.mark.parametrize("chunks", [[512, 512], [256, 256, 256, 256],
+                                    [511, 513]])
 def test_chunked_prefill_equals_whole_prompt(ratio, chunks, checkpoint_kernels):
     """THE ACCEPTANCE CRITERION for A5.5.
 
@@ -722,9 +723,12 @@ def test_chunked_prefill_equals_whole_prompt(ratio, chunks, checkpoint_kernels):
     and compare the outputs at the final slice's positions against a
     null-perturbation floor measured in the SAME run.
 
-    Two different chunk counts, because a boundary bug can hide in one
-    alignment. Widening the tolerance to fit the result is the row-43 failure
-    re-run -- STOP and raise instead.
+    Two aligned chunk counts, plus one ([511, 513]) whose boundary is NOT a
+    multiple of either compress_ratio (4 or 128) -- every other split here
+    lands on a block boundary for both ratios, so the Compressor's `held > 0`
+    partial-block carry path (exactly where Task 4's only real bug lived) was
+    otherwise never exercised by this gate. Widening the tolerance to fit the
+    result is the row-43 failure re-run -- STOP and raise instead.
     """
     config = shipped_config()
     reference = parity.reference_modules()
