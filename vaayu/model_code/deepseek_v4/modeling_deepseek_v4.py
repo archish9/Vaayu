@@ -1331,7 +1331,7 @@ class DeepseekV4Attention(nn.Module):
 
 # ── A5.6: the block, hyper-connections and the model ────────────────────────
 
-# `hc_*_scale` is `[3]` in the reference (`model.py:676`) because
+# `hc_*_scale` is `[3]` in the reference (`model.py:677-678`) because
 # `hc_split_sinkhorn` splits its projection into exactly three parts --
 # `pre`, `post` and `comb`. No config field carries it, so it is named here
 # rather than typed as a bare 3 (CLAUDE.md §5 allows a literal only when there
@@ -1582,8 +1582,13 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)
         start_pos = self._start_pos(past_key_values, cache_position,
                                     hidden_states.shape[1])
-        # `repeat`, not `expand` (`model.py:916`): hc_post adds into this and
-        # hc_pre flattens it, so it has to be real storage.
+        # `repeat`, not `expand` (`model.py:916`): matches the reference, which
+        # is this port's whole method. Checked on-device with `hc_mult=4`:
+        # `expand` (stride `(15,5,0,1)`) is numerically indistinguishable here
+        # -- its `flatten(2)` (hc_pre) is `torch.equal` to `repeat`'s, hc_post's
+        # output is `torch.equal` either way (it never writes into `residual`),
+        # and the residual stays unmutated -- so this is a fidelity choice, not
+        # a correctness one.
         hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
         with input_ids_scope(input_ids):
@@ -1599,13 +1604,21 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     """The head. `tie_word_embeddings` is false in this checkpoint, so
     `lm_head` is a separate tensor and `_tied_weights_keys` stays unset.
 
-    **The head is bf16, where the reference's is fp32.** `model.py:727-728`
-    upcasts the checkpoint's bf16 `head.weight` "for easier computation of
-    logits later"; keeping the disk dtype returns 0.986 GiB to a pin budget
-    that also carries the shared experts, the hc_* tensors and attention on a
-    15.47 GiB card. The matmul still accumulates in fp32; only the output
-    rounds through bf16 before the cast below. The `head` golden gates that
-    choice on argmax, not just on rel-L2.
+    **The head takes whatever dtype the model is constructed with, where the
+    reference's is unconditionally fp32.** `nn.Linear` here inherits the
+    ambient default dtype rather than pinning one -- the dtype-agnostic
+    behaviour this engine wants -- so under Vaayu's own construction path
+    (`from_config(dtype=self.running_dtype)`) it comes out bf16; a plain
+    `DeepseekV4ForCausalLM(config)` with no ambient dtype set yields an fp32
+    head instead. `model.py:727-728` upcasts the checkpoint's bf16
+    `head.weight` "for easier computation of logits later"; under Vaayu's
+    bf16 construction, keeping the disk dtype returns 0.986 GiB (against the
+    reference's unconditional fp32 upcast) to a pin budget that also carries
+    the shared experts, the hc_* tensors and attention on a 15.47 GiB card --
+    that saving does not apply if the head ends up fp32. The matmul still
+    accumulates in fp32; only the output rounds through bf16 before the cast
+    below, when the head is bf16. The `head` golden gates that choice on
+    argmax, not just on rel-L2.
     """
 
     def __init__(self, config):

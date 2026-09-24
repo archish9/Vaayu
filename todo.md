@@ -91,7 +91,8 @@ otherwise: every item below runs on checkpoints already on this disk.**
 ## ▶ PICK THIS NEXT: **A5.7** (row 28b). Last sub-plan. One per session.
 
 **A5.1–A5.6 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 and A5.6 on 2026-09-24).**
-**FIVE THINGS A5.7 MUST CARRY, from A5.5 and A5.6, all in row 28b:** (1) attention attends a
+**SEVEN THINGS A5.7 MUST CARRY, from A5.5 and A5.6, all in row 28b (two added by final review,
+2026-09-24 — see below):** (1) attention attends a
 contiguous `kv_view = cat([history, chunk, compressed])`, NOT the reference's in-place ring —
 **do not "simplify" it back**, a 512-token chunk overruns the 128-slot window; (2) the open
 `[bug]` — `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`/`:364`,
@@ -103,10 +104,35 @@ shard headers) before `from_config`, or the skeleton raises A5.4's named `ValueE
 pending bug in A5.5 code: all three `.get("weight_block_size")` sites in `modeling_deepseek_v4.py`
 (lines 493, 1166, 1236) pass `None` through to `DeepseekV4Linear` and raise an unnamed `TypeError`
 instead of naming the missing field, when a config's `checkpoint_quantization_config` omits it;
-(5) A5.6's deferred minors — see row 28b's A5.6 bullet for the full list. A5.5 left
+(5) A5.6's deferred minors — see row 28b's A5.6 bullet for the full list.
+(6) **The streamed path does not call this forward at all.** `VaayuBaseModel.forward`
+(`vaayu_base.py`) is a layer-major loop, not a call into `DeepseekV4Model.forward` /
+`DeepseekV4ForCausalLM.forward`: it calls the embedding directly (`batch[j] = layer(seq)`,
+`:5182`), then each decoder layer as
+`layer(seq, use_cache=…, **get_past_key_value_args(…), **get_pos_emb_args(…),
+**get_attention_mask_args(…), **get_position_ids_args(…))` (`:5208-5215`), then `run_norm` and
+`run_lm_head`. None of that (a) can call
+`DeepseekV4DecoderLayer.forward(hidden_states, past_key_values, start_pos)` — `start_pos` is
+missing and `use_cache`/`position_embeddings`/`attention_mask` are unexpected kwargs it doesn't
+take; (b) expands the residual to `[b, s, hc, d]` at embed time; (c) calls `hc_head`; or (d)
+enters `input_ids_scope` — so the three hash-routed layers would raise out of
+`current_input_ids()`. **Closing this is a both-paths change under CLAUDE.md §0** (it needs a
+`VaayuDeepseekV4` subclass over the existing `get_pos_emb_args`/`get_past_key_value_args`/
+`get_attention_mask_args`/`run_norm` hooks, plus something for the embed-time HC expand and
+`input_ids_scope` lifetime — neither has a hook today — or a non-streamed path), which obliges
+the Qwen3-Next and MiniMax on-device gates, not just this model.
+(7) **Nothing constructs a `DeepseekV4Cache`.** `_create_kv_cache` (`vaayu_base.py:3789`) only
+returns `DynamicCache`/`FP8DynamicCache`/`TurboQuantKVCache`, and `GenerationMixin` manufactures a
+`DynamicCache` when the caller supplies none — either route hits A5.6's `TypeError` guard on the
+first token. Distinct from the existing `[bug]` above (item 2), which is about existing
+cache-management code *mistreating* an already-constructed `DeepseekV4Cache`; this is that one is
+never built in the first place.
+**A5.5 left
 `DeepseekV4Cache`/`DeepseekV4CacheLayer`, and A5.6 left `DeepseekV4ForCausalLM` + the `auto_map`
-entry proving `AutoModelForCausalLM.from_config` builds the real skeleton in 1.44 s — A5.7 is
-purely weights + index + first token from here. A5.2 left `tests/deepseek/parity.py` + 15 committed
+entry proving `AutoModelForCausalLM.from_config` builds the real skeleton in 1.44 s under
+`from_config` — but that is skeleton construction only, not a working forward; items (6) and (7)
+above are what is actually left, and the row's prior "purely weights + index + first token" framing
+undersold both.** A5.2 left `tests/deepseek/parity.py` + 15 committed
 goldens in `tests/deepseek/goldens/` (1.1 MB); the recorder is `python -m tests.deepseek.parity`.
 A5.3 + A5.4 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (`DeepseekV4Linear`,
 `Gate`, `Expert`, `MoE`, `input_ids_scope`) — **A5.5 adds attention to that same file, reads
@@ -131,7 +157,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
 | ~~6~~ | ~~**A5.6** block + model~~ | **CLOSED 2026-09-24** — 5 commits, suite 2686/16, both MoE gates green | [`…A5.6-block-model-RESULTS.md`](docs/2026-09-24-A5.6-block-model-RESULTS.md) | done |
-| 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
+| 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | **2–3 d is STALE** — predates the final-review finding (2026-09-24) that the streamed path never calls this forward and constructs no `DeepseekV4Cache` (items 6–7 above); that is a both-paths change obliging both on-device gates, not "weights + index + first token." Re-derive the estimate when A5.7 is picked. |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
 plans by the session that reaches them (their inputs need measuring first — a stale design is worse
@@ -1842,8 +1868,11 @@ and both have a golden reference or a Vaayu precedent.
       15.47 GiB card. Head golden is therefore rel-L2 **plus `argmax` equality**; **STOP RULE: if
       argmax ever disagrees, escalate to a vocab-chunked fp32 head — do not build it first.**
       (b) **A5.6 ships through `DeepseekV4ForCausalLM` + the `auto_map` entry**, proving
-      `AutoModelForCausalLM.from_config` under `init_empty_weights()`; A5.7 is then purely weights +
-      index + first token. (c) **Two goldens + structural tests**, no composed multi-layer golden —
+      `AutoModelForCausalLM.from_config` under `init_empty_weights()` — skeleton construction only.
+      **CORRECTED by final review, 2026-09-24: A5.7 is NOT "purely weights + index + first token"
+      from here** — the streamed path never calls this forward and constructs no `DeepseekV4Cache`;
+      see the "SEVEN THINGS A5.7 MUST CARRY" items (6)–(7) near the top of this file for the full
+      finding and the `vaayu_base.py` line numbers. (c) **Two goldens + structural tests**, no composed multi-layer golden —
       it would cover layers 0–1 only (both ratio 0, both hash-routed) for ~9.8 GiB to record and
       ~9.8 GiB to test.
       **NAMING — HF convention outside, reference names inside** (`model.embed_tokens`,
@@ -1936,23 +1965,34 @@ and both have a golden reference or a Vaayu precedent.
       above refused to make. The three tests that surfaced it were fixed to use `stub_layers`
       instead of constructing a real `DeepseekV4Attention`.
       **DEFERRED MINORS, collected for final review / A5.7 triage (each is low-stakes, none is a
-      correctness bug in shipped behavior):** `test_deepseek_v4_block.py:136-168`'s `loaded_block`
+      correctness bug in shipped behavior):** `test_deepseek_v4_block.py:119-151`'s `loaded_block`
       fixture hand-saves/restores `KERNEL_DIR`/`_KERNELS` because `monkeypatch` is function-scoped —
       needs a comment so a future reader doesn't "fix" it back and break the sharing;
-      `test_the_residual_stream_is_hc_mult_copies_wide` (`test_deepseek_v4_model.py:159-179`)
-      asserts only `.shape`, which doesn't distinguish `.repeat()` (real storage) from `.expand()`
-      (a view) as its docstring claims; `_start_pos`'s `cache_position.numel() != seqlen` branch has
+      `test_the_residual_stream_is_hc_mult_copies_wide` (`test_deepseek_v4_model.py:179-199`)
+      asserts only `.shape` — **checked on-device (final review, 2026-09-24) with `hc_mult=4`:
+      `expand` (stride `(15,5,0,1)`) is numerically indistinguishable from `repeat` through
+      `hc_pre`/`hc_post` (`hc_post` never writes into `residual`; `hc_pre`'s `flatten(2)` gives
+      `torch.equal` results either way), so `.shape` is correct and sufficient given that — the
+      docstring previously claimed `.repeat()` proves real storage vs. `.expand()`'s view, which is
+      false and has been corrected** (the production code still uses `repeat`, matching the
+      reference, as a fidelity choice, not a correctness one); `_start_pos`'s
+      `cache_position.numel() != seqlen` branch has
       no test; no `get_output_embeddings`/`set_output_embeddings` on `DeepseekV4ForCausalLM`
       (harmless while `tie_word_embeddings` is `False`); `test_the_head_tracks_the_references_fp32_logits`
       exercises a standalone RMSNorm+Linear rather than the production `lm_head` (partially covered
-      by Task 5's dtype assertion); the `labels`/`loss_function` branch is unexercised; `hc_head_*`
-      and per-layer `hc_*` are bare `nn.Parameter(torch.empty(...))`, uncovered by `_init_weights`
-      (dispatches only on `nn.Linear`/`nn.Embedding`/norm-named modules) — `from_config` on a real
-      device holds inf/NaN there until a checkpoint loads over it; harmless in Vaayu's own path
+      by Task 5's dtype assertion); the `labels`/`loss_function` branch is unexercised; **no
+      parameter in this file is covered by `_init_weights`** (dispatches only on
+      `nn.Linear`/`nn.Embedding`/norm-named modules) — `hc_head_*` and per-layer `hc_*` are bare
+      `nn.Parameter(torch.empty(...))` (measured `hc_head_fn` |max| 5.47e+36), and so is every other
+      weight in the file: `DeepseekV4Linear._parameter`, `DeepseekV4Gate.weight`/`tid2eid`/`bias`,
+      and every expert weight — none reached by HF's `_init_weights`, and the reference does the
+      same. `from_config` on a real
+      device holds inf/NaN/garbage there until a checkpoint loads over it; harmless in Vaayu's own path
       (meta-only construction, always overwritten by real weights) but a surprise to any other
       caller — this is what caused (and was root-caused via) an order-dependent test flake, fixed
       test-side with a `seeded_parameters()` helper, not a production `_init_weights` override
-      (would be dead code under `init_empty_weights`); 16 pre-existing pytest warnings (14x
+      (would be dead code under `init_empty_weights`, and one covering only `hc_*` would be
+      arbitrary given every other weight in the file is equally uninitialized); 16 pre-existing pytest warnings (14x
       `torch.jit.script_method` deprecation, 2x `SwigPyPacked`/`SwigPyObject`) are environment noise
       untouched by this branch.
 - [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**

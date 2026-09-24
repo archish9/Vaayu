@@ -177,9 +177,12 @@ def test_the_model_carries_the_checkpoints_own_layout(stub_layers):
 
 
 def test_the_residual_stream_is_hc_mult_copies_wide(stub_layers):
-    """`model.py:916` expands with `repeat`, not `expand`: `hc_post` adds into
-    the residual and `hc_pre` flattens it, so the first block's residual has to
-    be real storage, not a broadcast view.
+    """`model.py:916` expands with `repeat`, not `expand`, matching the
+    reference (this port's whole method). The distinction is not load-bearing
+    here: checked on-device with `hc_mult=4`, `expand` is numerically
+    indistinguishable from `repeat` through `hc_pre`/`hc_post` (`hc_post`
+    never writes into `residual`), so this test asserts only `.shape`, which
+    is correct and sufficient given that.
     """
     config = small_config()
     model = modeling.DeepseekV4Model(config).eval()
