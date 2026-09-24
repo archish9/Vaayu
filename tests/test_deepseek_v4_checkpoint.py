@@ -11,6 +11,7 @@ from safetensors.torch import save_file
 
 from tests.deepseek import parity
 from vaayu.model_code.deepseek_v4 import checkpoint
+from vaayu.model_code.deepseek_v4 import modeling_deepseek_v4 as modeling
 from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
 
 needs_checkpoint = pytest.mark.skipif(
@@ -172,7 +173,7 @@ def test_the_real_checkpoint_measures_32():
     assert shapes[key][-1] * 2 // shapes[key.replace(".weight", ".scale")][-1] == 32
 
 
-def test_init_model_sets_the_group_size_before_calling_super(monkeypatch):
+def test_init_model_sets_the_group_size_before_calling_super(monkeypatch, tmp_path):
     """A5.4's skeleton raises a named ValueError if the config has no
     `fp4_group_size`, so it has to be on the config BEFORE `from_config`."""
     seen = {}
@@ -180,8 +181,21 @@ def test_init_model_sets_the_group_size_before_calling_super(monkeypatch):
     class Config:
         fp4_group_size = None
 
+    # Task 6c: `init_model` also points `KERNEL_DIR` at `model_local_path /
+    # "inference"` once the model exists, so this fake `super().init_model()`
+    # must leave both in place -- same real-directory + fake-model-class
+    # pattern as tests/test_deepseek_v4_engine.py's KERNEL_DIR tests.
+    (tmp_path / "inference").mkdir()
+    (tmp_path / "inference" / "kernel.py").write_text("# stub")
+
+    class FakeLoadedModel:
+        pass
+
+    FakeLoadedModel.__module__ = modeling.__name__
+
     def fake_init_model(self):
         seen["at_super"] = self.config.fp4_group_size
+        self.model = FakeLoadedModel()
 
     monkeypatch.setattr("vaayu.vaayu_base.VaayuBaseModel.init_model", fake_init_model)
     monkeypatch.setattr(checkpoint, "fp4_group_size_from_split", lambda *a, **k: 32)
@@ -189,13 +203,15 @@ def test_init_model_sets_the_group_size_before_calling_super(monkeypatch):
     model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
     model.config = Config()
     model.checkpoint_path = "/some/split"
+    model.model_local_path = tmp_path
     model.layer_names_dict = {"layer_prefix": "model.layers"}
     model.init_model()
 
     assert seen["at_super"] == 32
 
 
-def test_init_model_adds_the_hc_head_remap_without_dropping_base_entries(monkeypatch):
+def test_init_model_adds_the_hc_head_remap_without_dropping_base_entries(
+        monkeypatch, tmp_path):
     """Task 4b: `remap_checkpoint_key` names the hc_head_* tensors
     `model.norm.hc_head_*` so they land in a real shard (see checkpoint.py);
     `init_model` must map that back to the real module path, `model.hc_head_*`,
@@ -206,14 +222,25 @@ def test_init_model_adds_the_hc_head_remap_without_dropping_base_entries(monkeyp
     class Config:
         fp4_group_size = 32
 
+    # Task 6c: see the same setup's comment above.
+    (tmp_path / "inference").mkdir()
+    (tmp_path / "inference" / "kernel.py").write_text("# stub")
+
+    class FakeLoadedModel:
+        pass
+
+    FakeLoadedModel.__module__ = modeling.__name__
+
     def fake_init_model(self):
         self._path_remappings = {"some.base.path": "some.other.path"}
+        self.model = FakeLoadedModel()
 
     monkeypatch.setattr("vaayu.vaayu_base.VaayuBaseModel.init_model", fake_init_model)
 
     model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
     model.config = Config()
     model.checkpoint_path = "/some/split"
+    model.model_local_path = tmp_path
     model.layer_names_dict = {"layer_prefix": "model.layers"}
     model.init_model()
 

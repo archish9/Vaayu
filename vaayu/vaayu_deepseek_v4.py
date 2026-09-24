@@ -10,6 +10,9 @@ Design: `docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md`.
 The durable copy is row 28b's A5.7a bullet in `todo.md`.
 """
 
+import sys
+from pathlib import Path
+
 import torch
 
 from .vaayu_base import VaayuBaseModel
@@ -151,6 +154,35 @@ class VaayuDeepseekV4(VaayuBaseModel):
         # one for this to still be safe.
         self._path_remappings = getattr(self, "_path_remappings", {})
         self._path_remappings["model.norm.hc_head_"] = "model.hc_head_"
+
+        # DeepSeek-V4's TileLang kernels ship inside the checkpoint, under
+        # `inference/`, beside the ORIGINAL shards -- `model_local_path`, not
+        # `checkpoint_path` (the `splitted_model/` subdirectory Vaayu writes
+        # for its own streamed reads, which holds no `inference/`). `kernels()`
+        # (`model_code/deepseek_v4/modeling_deepseek_v4.py`) reads a module
+        # global, `KERNEL_DIR`, that A5.7's loader was always meant to set and
+        # never did.
+        #
+        # The class `super().init_model()` just built is loaded through
+        # `trust_remote_code`, so it lives in the HuggingFace modules cache
+        # (`~/.cache/huggingface/modules/transformers_modules/...`) -- a
+        # DIFFERENT module object than this repo's own copy of
+        # `modeling_deepseek_v4.py`, with its own separate `KERNEL_DIR` global.
+        # Setting the repo module's global would be silently useless: resolve
+        # the module the loaded class actually lives in, at runtime, rather
+        # than importing the repo module or hardcoding the cache's mangled
+        # path.
+        kernel_dir = Path(self.model_local_path) / "inference"
+        kernel_source = kernel_dir / "kernel.py"
+        if not kernel_source.is_file():
+            raise FileNotFoundError(
+                f"DeepSeek-V4's TileLang kernels are not at {kernel_source}. "
+                f"They ship inside the checkpoint, under `inference/`, beside "
+                f"the original shards at {self.model_local_path}.")
+
+        target_module = sys.modules[type(self.model).__module__]
+        target_module.KERNEL_DIR = kernel_dir
+        print(f"[Vaayu] DeepSeek-V4 kernels found at {kernel_dir}")
 
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward

@@ -474,3 +474,162 @@ def test_the_servers_explicit_none_still_resolves_to_eager(monkeypatch):
     monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
     VaayuDeepseekV4("/some/path", attn_implementation=None)
     assert seen["attn_implementation"] == "eager"
+
+
+def _init_model_subject(tmp_path, model_local_path=None, checkpoint_path=None):
+    """A `VaayuDeepseekV4` with just enough state for `init_model` to run,
+    plus a config that already carries `fp4_group_size` -- so the shard-header
+    derivation earlier in the method (untouched by this task) never runs and
+    never needs a real checkpoint.
+    """
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = shipped_config(num_hidden_layers=2)
+    model.checkpoint_path = checkpoint_path if checkpoint_path is not None \
+        else tmp_path / "splitted_model"
+    model.model_local_path = model_local_path if model_local_path is not None \
+        else tmp_path
+    model.layer_names_dict = {"layer_prefix": "model.layers."}
+    return model
+
+
+def _fake_loaded_model_in(monkeypatch, module_name, module_obj):
+    """Registers `module_obj` in `sys.modules` and returns a fake model class
+    whose `__module__` names it -- standing in for the class transformers'
+    `trust_remote_code` loads into the HuggingFace modules cache, which is a
+    different module object than `vaayu.model_code.deepseek_v4.modeling_deepseek_v4`.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, module_name, module_obj)
+
+    class FakeLoadedModel:
+        pass
+
+    FakeLoadedModel.__module__ = module_name
+    return FakeLoadedModel
+
+
+def test_init_model_sets_kernel_dir_on_the_loaded_models_module_not_the_repo_module(
+        monkeypatch, tmp_path):
+    """The class that raised in the field lives in the HuggingFace modules
+    cache, not `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` -- two
+    distinct module objects, two distinct `KERNEL_DIR` globals. Setting the
+    repo module's global would look right in a diff and do nothing for the
+    model that actually calls `kernels()`. This is the test that would catch
+    that mistake.
+    """
+    import types
+
+    (tmp_path / "inference").mkdir()
+    (tmp_path / "inference" / "kernel.py").write_text("# stub")
+
+    monkeypatch.setattr(modeling, "KERNEL_DIR", None)
+    fake_module = types.ModuleType("fake_transformers_modules_deepseek_v4")
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+
+    def fake_super_init_model(self):
+        self.model = FakeLoadedModel()
+
+    monkeypatch.setattr(VaayuBaseModel, "init_model", fake_super_init_model)
+
+    model = _init_model_subject(tmp_path)
+    model.init_model()
+
+    assert fake_module.KERNEL_DIR == tmp_path / "inference"
+    assert modeling.KERNEL_DIR is None
+
+
+def test_init_model_points_at_model_local_path_not_checkpoint_path(
+        monkeypatch, tmp_path):
+    """`checkpoint_path` is the `splitted_model/` subdirectory Vaayu writes
+    for its own streaming reads; the checkpoint's own `inference/` ships
+    beside the ORIGINAL shards, at `model_local_path`."""
+    import types
+
+    model_local_path = tmp_path / "original"
+    checkpoint_path = model_local_path / "splitted_model"
+    (model_local_path / "inference").mkdir(parents=True)
+    (model_local_path / "inference" / "kernel.py").write_text("# stub")
+    checkpoint_path.mkdir(parents=True)
+    # No "inference" under checkpoint_path -- if the code looked there
+    # instead, this test would fail with FileNotFoundError, not a wrong path.
+
+    fake_module = types.ModuleType("fake_transformers_modules_for_path_test")
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+
+    def fake_super_init_model(self):
+        self.model = FakeLoadedModel()
+
+    monkeypatch.setattr(VaayuBaseModel, "init_model", fake_super_init_model)
+
+    model = _init_model_subject(
+        tmp_path, model_local_path=model_local_path,
+        checkpoint_path=checkpoint_path)
+    model.init_model()
+
+    assert fake_module.KERNEL_DIR == model_local_path / "inference"
+
+
+def test_init_model_sets_kernel_dir_after_super_init_model(monkeypatch, tmp_path):
+    """The model -- and therefore its module -- does not exist until
+    `super().init_model()` returns. Setting `KERNEL_DIR` any earlier would
+    resolve `type(self.model)` against whatever `self.model` was left over
+    from a previous load, or raise `AttributeError` on the first one."""
+    import sys
+
+    (tmp_path / "inference").mkdir()
+    (tmp_path / "inference" / "kernel.py").write_text("# stub")
+
+    order = []
+
+    class RecordingModule:
+        def __setattr__(self, name, value):
+            if name == "KERNEL_DIR":
+                order.append("kernel_dir_set")
+            object.__setattr__(self, name, value)
+
+    module_name = "fake_transformers_modules_for_ordering_test"
+    fake_module = RecordingModule()
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    class FakeLoadedModel:
+        pass
+
+    FakeLoadedModel.__module__ = module_name
+
+    def fake_super_init_model(self):
+        order.append("super_init_model_ran")
+        self.model = FakeLoadedModel()
+
+    monkeypatch.setattr(VaayuBaseModel, "init_model", fake_super_init_model)
+
+    model = _init_model_subject(tmp_path)
+    model.init_model()
+
+    assert order == ["super_init_model_ran", "kernel_dir_set"]
+
+
+def test_init_model_raises_when_the_inference_directory_is_missing(
+        monkeypatch, tmp_path):
+    """CLAUDE.md §5: raise, never silently degrade. A no-op here would
+    resurface as the same confusing `FileNotFoundError` from deep inside a
+    forward pass, minutes into a load."""
+    import re
+    import types
+
+    # tmp_path has no "inference" subdirectory.
+    fake_module = types.ModuleType("fake_transformers_modules_for_missing_test")
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+
+    def fake_super_init_model(self):
+        self.model = FakeLoadedModel()
+
+    monkeypatch.setattr(VaayuBaseModel, "init_model", fake_super_init_model)
+
+    model = _init_model_subject(tmp_path)
+    expected = tmp_path / "inference"
+    with pytest.raises(FileNotFoundError, match=re.escape(str(expected))):
+        model.init_model()
