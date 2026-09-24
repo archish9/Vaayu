@@ -132,6 +132,20 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         super().init_model()
 
+        # `remap_checkpoint_key` names the hc_head_* tensors `model.norm.hc_head_*`
+        # so they land in the `model.norm.` shard (the substring split has no
+        # other prefix they match -- see checkpoint.py and utils.py's G2 guard).
+        # Their real module path is `model.hc_head_*`: `hc_head` is a method
+        # and its parameters live directly on `DeepseekV4Model`, not under its
+        # `norm` submodule. Added to the dict `super().init_model()` just
+        # created, never replacing it -- the base fills it for its own reasons
+        # (`_resolve_and_map_path`). `getattr` defends the same way
+        # `vaayu_base.py` reads this dict elsewhere: a stubbed-out
+        # `super().init_model()` (as in this file's own tests) need not create
+        # one for this to still be safe.
+        self._path_remappings = getattr(self, "_path_remappings", {})
+        self._path_remappings["model.norm.hc_head_"] = "model.hc_head_"
+
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward
         accepts (it raises `TypeError` on any other).

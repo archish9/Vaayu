@@ -187,3 +187,77 @@ def test_the_base_hook_defaults_to_no_remap():
     from vaayu.vaayu_base import VaayuBaseModel
 
     assert VaayuBaseModel.get_checkpoint_key_remap(object()) is None
+
+
+# Task 4b (G2): a key matching no shard prefix is silently DROPPED by the
+# substring assignment loop -- the split still writes every expected shard and
+# stamps every .done marker, so completeness looks fine. Found on DeepSeek-V4's
+# real, remapped index: 3 of 67,612 keys (`model.hc_head_base/_fn/_scale`)
+# matched no prefix. Measured 2026-09-24 against every on-device checkpoint
+# with the DEFAULT layer names: Qwen3-Next-80B-A3B leaves 4,625 `mtp.*` keys
+# homeless TODAY, unremapped -- so a hard raise unconditionally would break a
+# model that works. The guard therefore raises only when a key_remap ran, and
+# otherwise warns (CLAUDE.md 5).
+
+def _well_formed_checkpoint(tmp_path):
+    return _write_checkpoint(tmp_path, {
+        "model-00001-of-00001.safetensors": {
+            "model.embed_tokens.weight": _t(1),
+            "model.layers.0.a.weight": _t(2),
+            "model.norm.weight": _t(3),
+            "lm_head.weight": _t(4),
+        },
+    })
+
+
+def _checkpoint_with_a_homeless_key(tmp_path):
+    return _write_checkpoint(tmp_path, {
+        "model-00001-of-00001.safetensors": {
+            "model.embed_tokens.weight": _t(1),
+            "model.layers.0.a.weight": _t(2),
+            "model.norm.weight": _t(3),
+            "lm_head.weight": _t(4),
+            "homeless.weight": _t(5),
+        },
+    })
+
+
+def test_a_homeless_key_raises_when_a_key_remap_ran(tmp_path):
+    """A caller that took the trouble to rename every root (DeepSeek-V4's
+    `remap_checkpoint_key`) means every renamed key to land somewhere -- a
+    homeless one is a real bug, not a pre-existing gap."""
+    _checkpoint_with_a_homeless_key(tmp_path)
+
+    with pytest.raises(RuntimeError, match="homeless.weight"):
+        split_and_save_layers(str(tmp_path), delete_original=False,
+                              key_remap=lambda k: k)
+
+
+def test_a_homeless_key_only_warns_with_no_key_remap(tmp_path, capsys):
+    """Absent a key_remap, this is a pre-existing gap this guard did not
+    create (Qwen3-Next's own unremapped `mtp.*` keys) -- warn, don't raise."""
+    _checkpoint_with_a_homeless_key(tmp_path)
+
+    split_and_save_layers(str(tmp_path), delete_original=False)
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "homeless.weight" in out
+
+    written = {}
+    for shard in sorted((tmp_path / "splitted_model").glob("*.safetensors")):
+        written.update(load_file(str(shard)))
+    assert "homeless.weight" not in written
+
+
+def test_a_well_formed_checkpoint_splits_cleanly_with_no_warning(tmp_path, capsys):
+    weight_map = _well_formed_checkpoint(tmp_path)
+
+    split_and_save_layers(str(tmp_path), delete_original=False)
+
+    assert "match no shard prefix" not in capsys.readouterr().out
+
+    written = {}
+    for shard in sorted((tmp_path / "splitted_model").glob("*.safetensors")):
+        written.update(load_file(str(shard)))
+    assert set(written) == set(weight_map)

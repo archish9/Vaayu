@@ -467,6 +467,38 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             if layer in k:
                 keys_by_layer[layer].append((k, fname))
 
+    # G2: a key matching no shard prefix above is silently DROPPED -- the split
+    # still writes every expected shard and stamps every .done marker, so
+    # `all(found_layers.values())` at the top of this function calls the
+    # result complete. Task 4b's controller replayed this same assignment
+    # against DeepSeek-V4's `key_remap` output and found 3 of 67,612 renamed
+    # keys (`model.hc_head_base/_fn/_scale`) homeless -- the hyper-connection
+    # head, read on every token by `run_norm`, silently missing.
+    #
+    # Measured 2026-09-24 against the real index of every on-device checkpoint
+    # with the DEFAULT layer names before choosing how loud to make this:
+    # Qwen3-Next-80B-A3B-Instruct-AWQ-4bit leaves 4,625 keys homeless TODAY,
+    # all `mtp.*` (its own MTP draft module, unremapped -- this checkpoint
+    # never passes key_remap). MiniMax-M2.7-exl3, Llama-3.3-70B-exl3,
+    # Llama-3.2-1B-Instruct and gpt-oss-20b are all clean (0 homeless). A hard
+    # raise here would therefore break a model that works today, so it is
+    # conditioned on key_remap: a caller that took the trouble to rename every
+    # root (DeepSeek-V4's `remap_checkpoint_key`, which itself raises on any
+    # root it does not recognise) means every renamed key to land somewhere,
+    # and a homeless one there is a real bug, not a pre-existing gap. Absent a
+    # remap, this is CLAUDE.md 5's "warn -- don't silently degrade": a real
+    # limit worth surfacing, not one this guard gets to newly break on.
+    assigned = {k for ks in keys_by_layer.values() for k, _ in ks}
+    homeless = sorted(set(index) - assigned)
+    if homeless:
+        shown = homeless[:10]
+        more = f" (+{len(homeless) - 10} more)" if len(homeless) > 10 else ""
+        msg = (f"{len(homeless)} checkpoint key(s) match no shard prefix and "
+               f"would be silently dropped by the split: {shown}{more}")
+        if key_remap is not None:
+            raise RuntimeError(msg)
+        print(f"WARNING: {msg}")
+
     shard_readers = contextlib.ExitStack()
     open_shards = {}          # safetensors: fname -> safe_open handle
     bin_state_dicts = {}      # .bin: fname -> the whole loaded state dict

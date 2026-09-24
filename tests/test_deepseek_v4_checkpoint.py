@@ -22,9 +22,14 @@ needs_checkpoint = pytest.mark.skipif(
     ("layers.0.attn.wq_a.weight", "model.layers.0.attn.wq_a.weight"),
     ("layers.42.ffn.experts.255.w1.scale", "model.layers.42.ffn.experts.255.w1.scale"),
     ("norm.weight", "model.norm.weight"),
-    ("hc_head_fn", "model.hc_head_fn"),
-    ("hc_head_base", "model.hc_head_base"),
-    ("hc_head_scale", "model.hc_head_scale"),
+    # Not "model.hc_head_*": that string is a substring of no shard prefix in
+    # utils.py's ['model.embed_tokens.', ..., 'model.norm.', 'lm_head.'] list,
+    # so it would land in no shard and be silently dropped (Task 4b). Routed
+    # into the `model.norm.` shard instead; `VaayuDeepseekV4.init_model` maps
+    # it back to the real module path via `_path_remappings`.
+    ("hc_head_fn", "model.norm.hc_head_fn"),
+    ("hc_head_base", "model.norm.hc_head_base"),
+    ("hc_head_scale", "model.norm.hc_head_scale"),
     ("head.weight", "lm_head.weight"),
 ])
 def test_every_kept_root_maps_to_its_module_path(disk, module):
@@ -81,6 +86,34 @@ def test_the_mapping_covers_every_key_in_the_real_index():
     assert len(weight_map) == 72317
     assert len(mapped) == 67612
     assert dropped == 4705
+
+
+@needs_checkpoint
+def test_the_real_remapped_index_leaves_no_key_homeless():
+    """Task 4b: replay `vaayu/utils.py`'s own shard-assignment substring loop
+    against the real, REMAPPED index. This is the exact check that found
+    `model.hc_head_base/_fn/_scale` (3 of 67,612 remapped keys) matching no
+    shard prefix before the `model.norm.` fix -- `utils.py`'s G2 guard now
+    raises on this too, but this test proves the real checkpoint independently
+    of that guard ever running."""
+    weight_map = json.loads(
+        (parity.CKPT / "model.safetensors.index.json").read_text())["weight_map"]
+
+    remapped = {}
+    for key in weight_map:
+        new = checkpoint.remap_checkpoint_key(key)
+        if new is not None:
+            remapped[new] = key
+
+    n_layers = len(set(
+        int(k.split("model.layers.")[1].split(".")[0])
+        for k in remapped if "model.layers." in k))
+    layers = (["model.embed_tokens."]
+              + [f"model.layers.{i}." for i in range(n_layers)]
+              + ["model.norm.", "lm_head."])
+
+    homeless = [k for k in remapped if not any(layer in k for layer in layers)]
+    assert not homeless, f"keys matching no shard prefix: {homeless}"
 
 
 def _fake_split_layer(tmp_path, in_features=64, scale_last=32):
@@ -160,3 +193,31 @@ def test_init_model_sets_the_group_size_before_calling_super(monkeypatch):
     model.init_model()
 
     assert seen["at_super"] == 32
+
+
+def test_init_model_adds_the_hc_head_remap_without_dropping_base_entries(monkeypatch):
+    """Task 4b: `remap_checkpoint_key` names the hc_head_* tensors
+    `model.norm.hc_head_*` so they land in a real shard (see checkpoint.py);
+    `init_model` must map that back to the real module path, `model.hc_head_*`,
+    by ADDING to `_path_remappings` -- never replacing it, since
+    `super().init_model()` fills that dict for its own reasons
+    (`VaayuBaseModel._resolve_and_map_path`)."""
+
+    class Config:
+        fp4_group_size = 32
+
+    def fake_init_model(self):
+        self._path_remappings = {"some.base.path": "some.other.path"}
+
+    monkeypatch.setattr("vaayu.vaayu_base.VaayuBaseModel.init_model", fake_init_model)
+
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = Config()
+    model.checkpoint_path = "/some/split"
+    model.layer_names_dict = {"layer_prefix": "model.layers"}
+    model.init_model()
+
+    assert model._path_remappings == {
+        "some.base.path": "some.other.path",
+        "model.norm.hc_head_": "model.hc_head_",
+    }

@@ -34,7 +34,18 @@ def remap_checkpoint_key(key: str) -> "str | None":
         # builds its layer list with a bare `lm_head.`.
         return "lm_head.weight"
     if key.startswith("hc_head_"):
-        return "model." + key
+        # NOT "model." + key. `vaayu/utils.py` assigns a checkpoint key to a
+        # shard by SUBSTRING match against ['model.embed_tokens.', ...,
+        # 'model.norm.', 'lm_head.'] -- and 'model.hc_head_base' contains none
+        # of those as a substring, so it would land in no shard and be
+        # silently dropped (Task 4b; caught by utils.py's G2 guard, which
+        # raises on exactly this because key_remap is not None here). Routing
+        # it into the `model.norm.` shard is also correct on the merits: that
+        # shard loads exactly when `run_norm` -- the only caller of `hc_head`
+        # -- runs. `VaayuDeepseekV4.init_model` undoes the rename back to the
+        # real module path (`model.hc_head_*`) via `_path_remappings` after
+        # the shard is read.
+        return "model.norm." + key
     root = key.split(".", 1)[0]
     if root in _KEPT_ROOTS:
         return "model." + key
