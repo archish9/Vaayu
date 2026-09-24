@@ -1852,12 +1852,37 @@ and both have a golden reference or a Vaayu precedent.
       **§8, answered in advance:** (1) **no knob** — the classes are reached through `auto_map`;
       (2) N/A; (3) **NOT reachable** — the checkpoint still cannot load, `from_config` succeeds but
       `from_pretrained` does not; (4) unblocked by A5.7. Banked, said so.
+      **BLOCKER FOUND WHILE WRITING THE PLAN 2026-09-24, and it changes A5.7 too:**
+      `DeepseekV4MoE(config, layer_idx)` **RAISES** on the shipped config —
+      `ValueError: fp4_group_size is in no config field -- read it off the shipped scale shape`.
+      A5.4 made it an explicit keyword on purpose (knowable only from the checkpoint), but **A5.6
+      builds 43 layers inside `from_config` under `init_empty_weights()`, where there is no
+      checkpoint**, and Vaayu's call site is fixed and off-limits
+      (`AutoModelForCausalLM.from_config(self.config, dtype=…, attn_implementation=…,
+      trust_remote_code=True)`, `vaayu_base.py:3361` — editing it is a both-paths change under §0).
+      **The config object is the only channel, and it already is one:** `DeepseekV4Config` gains
+      `fp4_group_size: int | None = None` (precedent: `checkpoint_quantization_config`, a field the
+      shipped `config.json` also does not name), and the decoder layer passes it through. **A5.4's
+      keyword API is NOT touched** — its tests keep passing the value explicitly.
+      **MEASURED so nobody re-derives it: `fp4_group_size = 32`** — routed `w1.weight [2048,2048] I8`
+      (packed 2/byte → in_features 4096) against `w1.scale [2048,128] F8_E8M0`; 32 on all 40 of a
+      random sample from the checkpoint's **33,024** routed expert weight tensors. **Still not a
+      literal in code** — read off the shard HEADERS (`get_slice(...).get_shape()`, no tensor data).
+      **HARD PRECONDITION FOR A5.7: the loader MUST set `config.fp4_group_size` before
+      `from_config`, or the skeleton raises.** That is the correct failure — it names what is
+      missing instead of inventing a group size — and A5.6 ships a test for each side of it.
       **Verified on-device 2026-09-24 while designing, so the plan does not gamble on either:**
       `with torch.device("meta"): reference.Block(0, args)` constructs (carrying
       `norm_eps=1e-06`, `hc_eps=1e-06`, `hc_mult=4`, `hc_sinkhorn_iters=20`), which is what makes the
       `hc_head` golden cost 262 KB instead of a 3.3 GiB layer; and `tests/test_deepseek_v4_*.py` is
       at **234 passed, 27.64 s** — A5.6 may only add. A5.6 touches nothing under `vaayu/`, so the two
-      on-device MoE gates are a claim to CHECK, not assume.
+      on-device MoE gates are a claim to CHECK, not assume — and **there is no `tests/gates/`
+      directory**: the gate is `MOE_CKPT=<ckpt> pytest tests/test_moe_accumulator_determinism.py -q`,
+      one arm per `systemd-run` scope at **29G** (22G exit-137s both models), in the FOREGROUND.
+      Also measured: a full 43-layer meta skeleton is **~5 s** (0.11 s per MoE layer), which is why
+      the structural tests stub the layer and only the `from_config` test builds the true geometry.
+      **PLAN:** `docs/superpowers/plans/2026-09-24-A5.6-block-model.md` — 6 tasks, TDD, one commit
+      each (gitignored; this bullet is the durable copy).
 - [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
 - [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
