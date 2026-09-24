@@ -682,7 +682,12 @@ def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
 
 # ── A5.5: the cache ─────────────────────────────────────────────────────────
 
+from transformers import GenerationMixin
 from transformers.cache_utils import Cache, CacheLayerMixin
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+
+from .configuration_deepseek_v4 import DeepseekV4Config
 
 _ONE_LENGTH = (
     "a DeepSeek-V4 cache is servable at exactly one length: the circular "
@@ -1322,3 +1327,329 @@ class DeepseekV4Attention(nn.Module):
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))
+
+
+# ── A5.6: the block, hyper-connections and the model ────────────────────────
+
+# `hc_*_scale` is `[3]` in the reference (`model.py:677-678`) because
+# `hc_split_sinkhorn` splits its projection into exactly three parts --
+# `pre`, `post` and `comb`. No config field carries it, so it is named here
+# rather than typed as a bare 3 (CLAUDE.md §5 allows a literal only when there
+# is no source to derive it from, and only if it says so).
+_HC_SPLIT_PARTS = 3
+
+
+class DeepseekV4DecoderLayer(nn.Module):
+    """`model.py:652`. Attention and the MoE wrapped in hyper-connections.
+
+    The residual stream is `hc_mult` copies wide -- `[b, s, hc, d]` -- and the
+    block mixes it down to one copy before attention and again before the FFN,
+    then expands it back. `hc_pre` and `hc_post` are the whole of it.
+
+    **Both of them live inside this class, and that is load-bearing:** what
+    reaches `self.ffn` is an ordinary `[b, s, d]`, which is why Vaayu's MoE
+    patch needs no change (A5.4's "zero engine changes"). If the width ever
+    escapes this block, that result no longer holds.
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+
+        self.attn = DeepseekV4Attention(config, layer_idx)
+        # `fp4_group_size` reaches us on the config because `from_config` runs
+        # under `init_empty_weights` with no checkpoint in reach and Vaayu's
+        # call site passes nothing else (`vaayu_base.py:3361`). A5.7's loader
+        # sets it; without it A5.4's named ValueError fires, which is the right
+        # failure -- it says what is missing instead of inventing a group size.
+        self.ffn = DeepseekV4MoE(config, layer_idx,
+                                 fp4_group_size=config.fp4_group_size)
+        self.attn_norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.ffn_norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * config.hidden_size
+        # fp32 EXPLICITLY, never through the default dtype. These tensors are
+        # F32 on disk; `from_config(dtype=bf16)` sets torch's default around
+        # `__init__`, and accelerate then casts every injected tensor to the
+        # dtype the skeleton already has -- so a bf16 skeleton would silently
+        # round the checkpoint's fp32 hyper-connection weights down.
+        fp32 = dict(dtype=torch.float32)
+        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, **fp32),
+                                       requires_grad=False)
+        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, **fp32),
+                                      requires_grad=False)
+        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, **fp32),
+                                         requires_grad=False)
+        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, **fp32),
+                                        requires_grad=False)
+        self.hc_attn_scale = nn.Parameter(torch.empty(_HC_SPLIT_PARTS, **fp32),
+                                          requires_grad=False)
+        self.hc_ffn_scale = nn.Parameter(torch.empty(_HC_SPLIT_PARTS, **fp32),
+                                         requires_grad=False)
+
+    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
+        """`model.py:680`. `[b,s,hc,d]` -> `[b,s,d]`, plus the expand weights.
+
+        The normalisation here is a BARE `rsqrt` over the flattened copies, not
+        a `DeepseekV4RMSNorm`: there is no learned weight, and it runs in fp32
+        whatever the stream's dtype.
+        """
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre, post, comb = kernels().hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters,
+            self.hc_eps)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
+
+    def hc_post(self, x, residual, post, comb):
+        """`model.py:690`. `[b,s,d]` back out to `[b,s,hc,d]`."""
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        return y.type_as(x)
+
+    def forward(self, hidden_states, past_key_values, start_pos: int):
+        residual = hidden_states
+        x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn,
+                                    self.hc_attn_scale, self.hc_attn_base)
+        x = self.attn_norm(x)
+        x = self.attn(x, past_key_values, start_pos)
+        hidden_states = self.hc_post(x, residual, post, comb)
+
+        residual = hidden_states
+        x, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn,
+                                    self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.ffn_norm(x)
+        # The reference calls `self.ffn(x, input_ids)`. A5.4's MoE takes only
+        # `hidden_states` -- Vaayu's forward contract -- and reads the batch's
+        # ids from `current_input_ids()`, which the model's forward stashes.
+        x = self.ffn(x)
+        return self.hc_post(x, residual, post, comb)
+
+
+class DeepseekV4PreTrainedModel(PreTrainedModel):
+    """`config_class` is set explicitly rather than by annotation: transformers
+    keeps the attribute path specifically for remote-code models
+    (`modeling_utils.py:1220-1226`), which is what this is.
+    """
+
+    config_class = DeepseekV4Config
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = False
+    _no_split_modules = ["DeepseekV4DecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+
+    # Honest: this model runs DeepSeek's own `sparse_attn` and participates in
+    # no HF attention backend. The override below is what makes a request for
+    # one harmless.
+    _supports_flash_attn = False
+    _supports_sdpa = False
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation,
+                                              is_init_check: bool = False,
+                                              allow_all_kernels: bool = False) -> str:
+        """Accept any request and report `eager`.
+
+        `DeepseekV4Attention` calls DeepSeek's `sparse_attn` unconditionally --
+        it is the only attention kernel this architecture has, and A5 step 1
+        fitted its tile to sm_120 at `block=16`. No HF backend is reachable, so
+        there is nothing for this argument to select.
+
+        Left to the base class, the honest `_supports_*` flags above would make
+        `flash_attention_2` raise at `_flash_attn_can_dispatch` and `sdpa` at
+        `_sdpa_can_dispatch`, and Vaayu's loop (`vaayu_base.py:3330-3378`)
+        would build and throw away two 11,008-expert skeletons before reaching
+        `eager`. The return value is what transformers stores as
+        `config._attn_implementation_internal` (`modeling_utils.py:1255`).
+        """
+        return "eager"
+
+
+class DeepseekV4Model(DeepseekV4PreTrainedModel):
+    """`model.py:877`'s `Transformer`, without the MTP half.
+
+    embed -> expand to `hc_mult` copies -> the blocks -> `hc_head` -> norm.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([DeepseekV4DecoderLayer(config, layer_idx)
+                                     for layer_idx in range(config.num_hidden_layers)])
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        # `hc_head_*` belong to the MODEL, not to a block -- see `hc_head`.
+        fp32 = dict(dtype=torch.float32)
+        self.hc_head_fn = nn.Parameter(
+            torch.empty(config.hc_mult, config.hc_mult * config.hidden_size, **fp32),
+            requires_grad=False)
+        self.hc_head_base = nn.Parameter(torch.empty(config.hc_mult, **fp32),
+                                         requires_grad=False)
+        self.hc_head_scale = nn.Parameter(torch.empty(1, **fp32),
+                                          requires_grad=False)
+
+        self.post_init()
+
+    def hc_head(self, x):
+        """`model.py:709`. The final `hc_mult` -> 1 reduction.
+
+        The reference defines this on `Block` and calls it as
+        `layer.hc_head(...)` on whatever layer its loop left bound
+        (`model.py:921`), passing the MODEL's parameters. The body reads `self`
+        only for `norm_eps`, `hc_eps` and the `hc_mult` implied by the input's
+        shape -- all three per-block copies of the same config fields -- so it
+        lives here, where its parameters do. The `hc_head` golden proves the
+        move is arithmetically free rather than asserting it.
+
+        **This is NOT `hc_pre`.** Plain sigmoid, no Sinkhorn, no `post`, no
+        `comb`, and `hc_head_fn` has `hc_mult` rows, not `(2+hc_mult)*hc_mult`.
+        """
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_head_fn) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype)
+
+    def _start_pos(self, past_key_values, cache_position, seqlen: int) -> int:
+        """One absolute position for the whole forward.
+
+        This model has no per-token position vector: the ring indexes by
+        `pos % window_size`, the Compressor flushes on block boundaries counted
+        from `start_pos`, and `window_topk_idxs` builds its indices from it. So
+        `cache_position` must be exactly `arange(start_pos, start_pos+seqlen)`,
+        and anything else is refused rather than silently mis-indexed.
+        """
+        if cache_position is None:
+            return int(past_key_values.get_seq_length())
+        if cache_position.numel() != seqlen:
+            raise ValueError(
+                f"cache_position has {cache_position.numel()} entries for a "
+                f"{seqlen}-token forward")
+        start_pos = int(cache_position[0])
+        expected = torch.arange(start_pos, start_pos + seqlen,
+                                device=cache_position.device,
+                                dtype=cache_position.dtype)
+        if not torch.equal(cache_position, expected):
+            raise ValueError(
+                "DeepSeek-V4 needs a contiguous cache_position -- the sliding "
+                "window indexes by `pos % window_size` and the Compressor "
+                "flushes on block boundaries counted from the first position, "
+                f"so {cache_position.tolist()} would read the wrong slots "
+                f"rather than fail. Expected {expected.tolist()}.")
+        return start_pos
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, use_cache=None,
+                cache_position=None, **kwargs):
+        if input_ids is None:
+            raise ValueError(
+                "DeepSeek-V4 needs input_ids: its first `num_hash_layers` MoE "
+                "layers route by TOKEN ID, not by score, so inputs_embeds "
+                "alone has nothing to route on. Refusing rather than routing "
+                "every token to the same experts.")
+        if past_key_values is None:
+            raise ValueError(
+                "DeepSeek-V4 needs a past_key_values built by the caller. Its "
+                "cache is PREALLOCATED -- `sliding_window + max_seq_len // "
+                "compress_ratio` slots per layer -- and the config's "
+                f"max_position_embeddings ({self.config.max_position_embeddings}) "
+                "is a context limit, not a cache size: defaulting to it would "
+                "reserve hundreds of MB per layer. Pass "
+                "DeepseekV4Cache(config, max_seq_len=<your budget>).")
+        if not isinstance(past_key_values, DeepseekV4Cache):
+            raise TypeError(
+                f"DeepSeek-V4 needs a DeepseekV4Cache, got "
+                f"{type(past_key_values).__name__}: a generic cache holds no "
+                f"compressed half and no index state, so attention would read "
+                f"an empty compressed view instead of failing.")
+
+        # `attention_mask` and `position_ids` are accepted and unused: this
+        # model builds no HF mask (`sparse_attn` masks by reading -1 out of
+        # `topk_idxs`, `kernel.py:322`) and carries position in `start_pos`.
+        hidden_states = self.embed_tokens(input_ids)
+        start_pos = self._start_pos(past_key_values, cache_position,
+                                    hidden_states.shape[1])
+        # `repeat`, not `expand` (`model.py:916`): matches the reference, which
+        # is this port's whole method. Checked on-device with `hc_mult=4`:
+        # `expand` (stride `(15,5,0,1)`) is numerically indistinguishable here
+        # -- its `flatten(2)` (hc_pre) is `torch.equal` to `repeat`'s, hc_post's
+        # output is `torch.equal` either way (it never writes into `residual`),
+        # and the residual stays unmutated -- so this is a fidelity choice, not
+        # a correctness one.
+        hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+
+        with input_ids_scope(input_ids):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, past_key_values, start_pos)
+
+        hidden_states = self.norm(self.hc_head(hidden_states))
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states,
+                                       past_key_values=past_key_values)
+
+
+class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
+    """The head. `tie_word_embeddings` is false in this checkpoint, so
+    `lm_head` is a separate tensor and `_tied_weights_keys` stays unset.
+
+    **The head takes whatever dtype the model is constructed with, where the
+    reference's is unconditionally fp32.** `nn.Linear` here inherits the
+    ambient default dtype rather than pinning one -- the dtype-agnostic
+    behaviour this engine wants -- so under Vaayu's own construction path
+    (`from_config(dtype=self.running_dtype)`) it comes out bf16; a plain
+    `DeepseekV4ForCausalLM(config)` with no ambient dtype set yields an fp32
+    head instead. `model.py:727-728` upcasts the checkpoint's bf16
+    `head.weight` "for easier computation of logits later"; under Vaayu's
+    bf16 construction, keeping the disk dtype returns 0.986 GiB (against the
+    reference's unconditional fp32 upcast) to a pin budget that also carries
+    the shared experts, the hc_* tensors and attention on a 15.47 GiB card --
+    that saving does not apply if the head ends up fp32. The matmul still
+    accumulates in fp32; only the output rounds through bf16 before the cast
+    below, when the head is bf16. The `head` golden gates that choice on
+    argmax, not just on rel-L2.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = DeepseekV4Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, labels=None,
+                use_cache=None, cache_position=None, logits_to_keep=0, **kwargs):
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache,
+            cache_position=cache_position, **kwargs)
+
+        slice_indices = (slice(-logits_to_keep, None)
+                         if isinstance(logits_to_keep, int) else logits_to_keep)
+        logits = self.lm_head(outputs.last_hidden_state[:, slice_indices, :]).float()
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(loss=loss, logits=logits,
+                                      past_key_values=outputs.past_key_values)

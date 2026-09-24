@@ -544,6 +544,59 @@ def _recipe_block(reference, args):
 RECIPES["block"] = _recipe_block
 
 
+def _recipe_hc_head(reference, args):
+    """`Block.hc_head` (`model.py:709`), the reduction `Transformer.forward`
+    applies once, after the last block.
+
+    The `Block` is built on META on purpose: `hc_head` reads no parameter of
+    its own -- only `self.norm_eps`, `self.hc_eps` and, through
+    `x.view(shape)`, `hc_mult` -- so the instance is there to supply three
+    scalars. Verified 2026-09-24: `reference.Block(0, args)` constructs on meta
+    and carries them. That makes this golden cost the 262 KB of `hc_head_*`
+    instead of a 3.3 GiB layer.
+
+    The three parameters are stored IN the fixture, so the test that reads it
+    needs a GPU but not the 157 G checkpoint.
+    """
+    with torch.device("meta"):
+        block = reference.Block(0, args)
+    weights = load_module_weights("hc_head_")
+    fn = weights["fn"].cuda()
+    scale = weights["scale"].cuda()
+    base = weights["base"].cuda()
+    x = seeded_input(1, GOLDEN_TOKENS, args.hc_mult, args.dim)
+    return {"x": x, "hc_head_fn": fn, "hc_head_scale": scale,
+            "hc_head_base": base,
+            "out": block.hc_head(x, fn, scale, base)}, None
+
+
+RECIPES["hc_head"] = _recipe_hc_head
+
+
+def _recipe_head(reference, args):
+    """`RMSNorm` + `ParallelHead` (`model.py:719`) -- the fp32 logits.
+
+    Only `x` and `out` are stored: `head.weight` is 0.986 GiB and does not
+    belong in a committed fixture, so the test that reads this reads the two
+    weights off the checkpoint itself.
+
+    `full_logits=True` so the golden carries every position. The default
+    (`model.py:733`) keeps only the last, which is the reference's own
+    `logits_to_keep=1`.
+    """
+    with torch.device("cuda"):
+        norm = reference.RMSNorm(args.dim, args.norm_eps)
+        head = reference.ParallelHead(args.vocab_size, args.dim,
+                                      args.norm_eps, args.hc_eps)
+    norm.load_state_dict(load_module_weights("norm."))
+    head.load_state_dict(load_module_weights("head."))
+    x = seeded_input(1, GOLDEN_TOKENS, args.dim)
+    return {"x": x, "out": head(norm(x), full_logits=True)}, None
+
+
+RECIPES["head"] = _recipe_head
+
+
 def _shipped_config():
     from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
