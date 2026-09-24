@@ -1669,6 +1669,14 @@ a Vaayu precedent; the attention path has neither.
       (`test_crop_refuses_below_full_length`); (5) reference ring semantics (`view = kv`, same as
       2b) → 8 failed (2 goldens + all 6 `chunked_prefill` parametrizations). No mutant stayed
       green; no new gate had to be written.
+      **The design spec (§5.4) named SIX mutants; five shipped, and it is a coverage gap, not a
+      shortfall — say why:** the other two, drop `attn_sink` and cast the second GEMM's
+      probabilities to bf16, are arithmetic that lives entirely inside the checkpoint's own
+      `inference/kernel.py` (`sparse_attn_kernel`), not in anything this port wrote — there is no
+      line in `modeling_deepseek_v4.py` to mutate for either. Mutant (5) above (`view = kv`) was
+      substituted in their place; it is not one of the spec's original six, it is A5.5's own
+      load-bearing detail (the `kv_view` amendment, §0 of this row) getting the same mutation
+      discipline.
       **Two one-line deferred findings folded in and BOTH VERIFIED TO ACTUALLY FAIL when
       violated, not just added:** `test_indexer_matches_the_reference_at_prefill` gained a runtime
       assertion `seqlen // 4 > config.index_topk` (derived, not literal) guarding the vacuous
@@ -1688,12 +1696,21 @@ a Vaayu precedent; the attention path has neither.
       **Qwen3-Next 8 passed (35.69 s), MiniMax-M2.7 8 passed (73.76 s).** The fused-EXL3 forward
       still has no on-device model (Qwen3-235B retired 2026-09-20) — no coverage claim made there.
       **Two things carried forward for A5.6/A5.7, restated here because `docs/` is gitignored:**
-      (1) **`[bug]`, required before A5.7 can claim reachability:**
+      (1) **`[bug]`, required before A5.7 can claim reachability — WIDENED by the final review,
+      same family, more sites than croppability alone:**
       `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`,
       `prefix_cache.py:364` and `kv_persist` all detect recurrent state by
       `conv_states`/`update_conv_state` and would treat this cache as an ordinary croppable KV
       cache — it is not. **Until fixed, this model must not be served with prefix caching or KV
-      persistence enabled.** (2) The `kv_view` amendment (chunk overruns the 128-slot ring →
+      persistence enabled.** The final review found the base `transformers.Cache`'s
+      `max_cache_len`, `max_batch_size` (properties that read `layer.max_cache_len` /
+      `layer.max_batch_size` for every layer) and `batch_repeat_interleave` /
+      `batch_select_indices` (which call the same-named method per layer) all read/call
+      attributes `DeepseekV4CacheLayer` does not define — a loud `AttributeError`, not a silent
+      mistreat-as-croppable like the four above. **Nothing under `vaayu/` calls any of these four
+      today (grepped clean)**, so this is not a new bug, just not yet a live one — A5.7 needs the
+      full list before it can claim this cache is reachable through the generic `Cache` surface.
+      (2) The `kv_view` amendment (chunk overruns the 128-slot ring →
       contiguous `cat([history, chunk, compressed])` per forward) is load-bearing, proven by
       Step 2b/mutant 5 above — **A5.6 must not "simplify" it back to the ring.**
       **§8:** (1) **no knob** — this task is a test suite + docs, no user-facing behaviour; (2)
@@ -1718,6 +1735,39 @@ a Vaayu precedent; the attention path has neither.
       (`first >= ratio`) fires on any call after the first regardless of alignment, so it was
       already reachable; only the NEW split's `if held:` prepend branch was genuinely uncovered
       before. Both observations consistent with the coordinator's finding.
+      **FIX ROUND 2 (2026-09-24), the final whole-branch review's six small items, all closed in
+      one pass:** (1) **closed the `compress_ratio == 0` coverage gap** — no test anywhere had
+      compared a ratio-0 layer against the reference (goldens exist only at r4/r128, and the
+      chunk-equivalence gate at ratio 0 runs OUR module against itself). Added
+      `test_attention_matches_the_reference_at_a_ratio_0_layer` in `test_deepseek_v4_attention.py`,
+      same pattern as `test_indexer_matches_the_reference_at_prefill`
+      (`parity.reference_modules`/`reference_args`/`build_attention`, real weights, seqlen 300,
+      `start_pos == 0`). **`torch.equal` — bit-identical, first try, no divergence.** Full suite
+      234 passed (233 baseline + this one), 33.07 s. (2) Named the `compress_ratio == 4`
+      discriminator: new module constant `_INDEXER_COMPRESS_RATIO = 4` beside `_ACT_QUANT_GROUP`/
+      `_FP4_BLOCK_SIZE`, used at all four sites (`modeling_deepseek_v4.py`, the `coff` calc, the
+      Indexer-construction guard in both `DeepseekV4CacheLayer` and `DeepseekV4Attention`, and
+      `DeepseekV4Compressor.overlap`). No behaviour change. (3) Fixed the `kernels()` tempdir leak
+      (`modeling_deepseek_v4.py:172` pre-fix) — `tempfile.mkdtemp` per load was never cleaned up;
+      now `atexit.register(shutil.rmtree, ...)` on the same directory, so it is removed at process
+      exit instead of never. The rewrite still happens at the same point (tilelang's JIT is LAZY —
+      `inspect.getsource` fires on first kernel call, not at `kernels()` return — so the directory
+      must outlive the function; it cannot be cleaned up synchronously inside it). (4) Corrected
+      the `_have_hadamard_extension`/`rotate_activation` docstrings: selection is by importability
+      only, not device — with the extension installed, a CPU tensor reaches it and raises
+      `RuntimeError: Expected x.is_cuda()` rather than falling back. Harmless today (the Indexer
+      path is CUDA-only) but the old wording overclaimed. (5) **Corrected the mutant count's
+      record** — see the "Five required mutants" bullet above, now annotated: the spec (§5.4)
+      named six, `attn_sink` and the bf16-probability-cast GEMM are arithmetic inside the
+      checkpoint's own `inference/kernel.py`, not in ported code, so neither has a line to mutate;
+      mutant (5) (`view = kv`) was substituted and is A5.5's own finding, not one of the spec's
+      six. (6) **Widened the carried `[bug]` row** above (A5.7 reachability) — the final review
+      found `Cache.max_cache_len`/`max_batch_size`/`batch_repeat_interleave`/`batch_select_indices`
+      all read or call per-layer attributes `DeepseekV4CacheLayer` doesn't define (loud
+      `AttributeError`, distinct from the four existing sites' silent mistreat-as-croppable);
+      nothing under `vaayu/` calls any of the four today, so not a new bug, just now a complete
+      list for A5.7. **Checkpoint copy refreshed and `diff -q` clean before commit** (items 2-4
+      touched the modeling file). Full `tests/test_deepseek_v4_*.py`: **234 passed**, 33.07 s.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still

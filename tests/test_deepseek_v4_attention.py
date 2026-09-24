@@ -473,6 +473,59 @@ def _raw_module_weights(prefix: str) -> dict:
 
 @needs_checkpoint
 @needs_gpu
+def test_attention_matches_the_reference_at_a_ratio_0_layer(checkpoint_kernels):
+    """Value-level parity against the reference `Attention` (`model.py:442`) on
+    a `compress_ratio == 0` layer, at `start_pos == 0`.
+
+    Every other parity test in this file exercises a compressed layer (ratio 4
+    or 128); the `attn_*` goldens A5.2 recorded only cover those two, and
+    `test_chunked_prefill_equals_whole_prompt[0-*]` compares OUR module against
+    itself on both arms, so it is true by construction and proves nothing
+    against the reference. Ratio-0 layers (layers 0-1 of the real model) are
+    the ONLY users of the YaRN-off rope variant (`rope_settings(config, 0)` --
+    `original_seq_len = 0`, base `rope_theta`, model.py:483-484) -- a wrong
+    YaRN-off table would leave every existing r0 gate green, because none of
+    them check it against anything outside this port.
+
+    A ratio-0 layer skips `compressor`/`indexer` entirely and every op
+    (`q`/`kv` projections, rotary, the window-only `sparse_attn`) is
+    position-local, so both sides run identical arithmetic at identical
+    shapes -- this compares `torch.equal`, not a tolerance. A mismatch here
+    means the YaRN-off path itself diverges, not a reassociation artifact.
+    """
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=parity.MAX_SEQ_LEN)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == 0)
+    assert config.compress_ratios[layer_id] == 0
+
+    seqlen = 300
+    with parity.reference_device(reference):
+        x = parity.seeded_input(1, seqlen, config.hidden_size)
+
+        reference_layer = parity.build_attention(reference, args, layer_id)
+        reference_out = reference_layer(x, 0)
+
+        ours = modeling.DeepseekV4Attention(config, layer_id)
+        ours.load_state_dict(modeling.dequantize_at_load(
+            _raw_module_weights(f"layers.{layer_id}.attn.")))
+        ours = ours.cuda().eval()
+        cache = modeling.DeepseekV4Cache(config, max_seq_len=parity.MAX_SEQ_LEN,
+                                         device=torch.device("cuda"))
+        our_out = ours(x, cache, 0)
+
+    assert our_out.shape == reference_out.shape
+    assert torch.equal(our_out.cpu(), reference_out.cpu()), (
+        f"ratio-0 layer {layer_id} diverges from the reference at start_pos == "
+        f"0: rel-L2 "
+        f"{((our_out.cpu().float() - reference_out.cpu().float()).norm() / reference_out.cpu().float().norm()).item():.6g}"
+        f" -- the YaRN-off rope table or another position-local op is wrong, "
+        f"not a reassociation artifact (see docstring)")
+
+
+@needs_checkpoint
+@needs_gpu
 @pytest.mark.parametrize("ratio", [4, 128])
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 def test_attention_reproduces_a5_2_golden(ratio, phase, checkpoint_kernels):

@@ -60,6 +60,13 @@ _SCALE_DTYPE = torch.float8_e8m0fnu
 _ACT_QUANT_GROUP = 64          # model.py:512 -- 64, NOT weight_block_size's 128
 _FP4_BLOCK_SIZE = 32           # model.py:18  -- the Indexer's fp4 simulation
 
+# The reference's own discriminator for "this layer has an Indexer and its
+# ring/compressor state overlaps `head_dim`" (`model.py`'s `Attention.__init__`
+# and `Compressor.__init__`) -- a fixed property of the architecture, not a
+# config field, so it is named here rather than typed as a bare `4` at each
+# call site.
+_INDEXER_COMPRESS_RATIO = 4
+
 # Tensors the module declares bf16 although the checkpoint stores them
 # quantized: `Attention.forward` uses `wo_a`'s RAW weight in an einsum, so it
 # never passes through a GEMM that could apply the scale. Declared here as a
@@ -168,8 +175,15 @@ def kernels():
                                 properties.shared_memory_per_block_optin)
     fitted = directory / "kernel.py"
     if text != source.read_text():
+        import atexit
+        import shutil
         import tempfile
-        fitted = Path(tempfile.mkdtemp(prefix="vaayu_ds4_kernel_")) / "kernel.py"
+        tmpdir = tempfile.mkdtemp(prefix="vaayu_ds4_kernel_")
+        # tilelang's JIT is lazy (compiles -- and calls `inspect.getsource` --
+        # on first kernel invocation, not here), so this directory must
+        # outlive `kernels()`. Removed at process exit instead of never.
+        atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
+        fitted = Path(tmpdir) / "kernel.py"
         fitted.write_text(text)
 
     spec = importlib.util.spec_from_file_location("vaayu_deepseek_v4_kernel", fitted)
@@ -712,7 +726,7 @@ class DeepseekV4CacheLayer(CacheLayerMixin):
         self.values = self.keys
         self.is_initialized = True
 
-        coff = 1 + (compress_ratio == 4)
+        coff = 1 + (compress_ratio == _INDEXER_COMPRESS_RATIO)
         if compress_ratio:
             shape = (max_batch_size, coff * compress_ratio, coff * head_dim)
             # fp32: the reference compresses in fp32 (`model.py:330`), and the
@@ -723,7 +737,7 @@ class DeepseekV4CacheLayer(CacheLayerMixin):
         else:
             self.kv_state = self.score_state = None
 
-        if compress_ratio == 4:
+        if compress_ratio == _INDEXER_COMPRESS_RATIO:
             self.index_keys = torch.zeros(max_batch_size,
                                           max_seq_len // compress_ratio,
                                           index_head_dim, dtype=dtype, device=device)
@@ -888,7 +902,16 @@ class DeepseekV4Cache(Cache):
 
 
 def _have_hadamard_extension() -> bool:
-    """Is DeepSeek's own `fast_hadamard_transform` importable here?"""
+    """Is DeepSeek's own `fast_hadamard_transform` importable here?
+
+    This is an importability check, not a device check. If the package is
+    installed, `rotate_activation` calls it unconditionally -- including on a
+    CPU tensor, where it raises `RuntimeError: Expected x.is_cuda()` rather
+    than falling back. Harmless today because the whole Indexer path
+    (`rotate_activation`'s only caller) is CUDA-only, but the torch fallback
+    below is reachable only when the extension is NOT installed, not whenever
+    CUDA is unavailable.
+    """
     import importlib.util
 
     return importlib.util.find_spec("fast_hadamard_transform") is not None
@@ -916,7 +939,9 @@ def _torch_hadamard(x: torch.Tensor, scale: float) -> torch.Tensor:
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """`model.py:253`. DeepSeek's compiled extension when it is importable,
     the exact torch fallback otherwise -- a config-only import path must not
-    need nvcc.
+    need nvcc. The fallback is selected by importability alone, not by
+    device: with the extension installed, a CPU `x` reaches the extension and
+    raises rather than falling back (see `_have_hadamard_extension`).
     """
     assert x.dtype == torch.bfloat16
     scale = x.size(-1) ** -0.5
@@ -957,7 +982,7 @@ class DeepseekV4Compressor(nn.Module):
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.overlap = compress_ratio == 4
+        self.overlap = compress_ratio == _INDEXER_COMPRESS_RATIO
         self.rotate = rotate
         coff = 1 + self.overlap
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim,
@@ -1230,7 +1255,8 @@ class DeepseekV4Attention(nn.Module):
             self.compressor = DeepseekV4Compressor(config, self.compress_ratio,
                                                    config.head_dim)
             self.indexer = (DeepseekV4Indexer(config, self.compress_ratio)
-                            if self.compress_ratio == 4 else None)
+                            if self.compress_ratio == _INDEXER_COMPRESS_RATIO
+                            else None)
         else:
             self.compressor = self.indexer = None
         self._rope = rope_settings(config, self.compress_ratio)
