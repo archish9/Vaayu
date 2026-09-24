@@ -614,3 +614,47 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor,
         freqs_cis = freqs_cis.view(1, z.size(1), 1, z.size(-1))
     out.copy_(torch.view_as_real(z * freqs_cis).flatten(-2))
     return out
+
+
+def view_history(window_size: int, start_pos: int) -> int:
+    """How many pre-chunk positions the `kv_view` must carry.
+
+    A query at absolute `p` attends `[max(0, p - window_size + 1), p]`, so a
+    chunk starting at `start_pos` needs `window_size - 1` earlier positions --
+    capped by how many exist. THIS is why a chunk cannot attend the ring in
+    place: 512 new positions overwrite a 128-slot ring before its own early
+    queries have read it.
+    """
+    return min(start_pos, window_size - 1)
+
+
+def window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int,
+                     device) -> torch.Tensor:
+    """Sliding-window indices INTO THE `kv_view`, for any seqlen at any
+    start_pos (`model.py:261` supports only seqlen==1 past position 0).
+
+    Absolute position `a` sits at `a - start_pos + h`. Masked entries are -1,
+    which the kernel reads as "skip" (`kernel.py:322-326`).
+    """
+    h = view_history(window_size, start_pos)
+    positions = start_pos + torch.arange(seqlen, device=device).unsqueeze(1)
+    oldest = (positions - window_size + 1).clamp(min=0)
+    absolute = oldest + torch.arange(window_size, device=device)
+    matrix = torch.where(absolute > positions, -1, absolute - start_pos + h)
+    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+
+def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
+                       offset: int, device) -> torch.Tensor:
+    """Compressed-block indices, for any seqlen at any start_pos
+    (`model.py:275` masks causally only when start_pos == 0).
+
+    Block `j` summarises positions `[j*ratio, (j+1)*ratio)`, so a query at
+    absolute `p` may see blocks `j < (p + 1) // ratio`.
+    """
+    blocks = (start_pos + seqlen) // ratio
+    positions = start_pos + torch.arange(seqlen, device=device).unsqueeze(1)
+    index = torch.arange(blocks, device=device)
+    visible = index < ((positions + 1) // ratio)
+    matrix = torch.where(visible, index + offset, -1)
+    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()

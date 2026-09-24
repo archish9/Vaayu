@@ -4,9 +4,6 @@ Split the way A5.3's tests are: the structural half needs neither the 157 G
 checkpoint nor a GPU, and only the parity half carries both markers.
 """
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -84,3 +81,105 @@ def test_apply_rotary_emb_is_in_place_and_inverse_undoes_it():
 
     modeling.apply_rotary_emb(x, freqs[:4], inverse=True)
     assert torch.allclose(x.float(), original.float(), atol=2e-2)
+
+
+def _reference_window_idxs(window_size, bsz, seqlen, start_pos):
+    """`model.py:261`, transcribed, for the two cases it supports.
+
+    Transcribed rather than imported: importing the reference drags in the
+    kernels and a GPU, and the point of this test is that our general form
+    REDUCES to the reference at both of its supported call shapes.
+    """
+    if start_pos >= window_size - 1:
+        s = start_pos % window_size
+        m = torch.cat([torch.arange(s + 1, window_size), torch.arange(0, s + 1)])
+    elif start_pos > 0:
+        m = torch.nn.functional.pad(torch.arange(start_pos + 1),
+                                    (0, window_size - start_pos - 1), value=-1)
+    else:
+        base = torch.arange(seqlen).unsqueeze(1)
+        m = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        m = torch.where(m > base, -1, m)
+    return m.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+
+def test_window_idxs_reduce_to_the_reference_at_prefill():
+    """start_pos == 0: h == 0, so view index == absolute position."""
+    got = modeling.window_topk_idxs(128, 1, 300, 0, torch.device("cpu"))
+    want = _reference_window_idxs(128, 1, 300, 0)
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("start_pos", [1, 64, 127, 128, 200, 1023])
+def test_window_idxs_reduce_to_the_reference_at_decode(start_pos):
+    """seqlen == 1. The reference indexes RING SLOTS; we index the kv_view.
+
+    Both are the same window of positions in oldest-to-newest order, so the
+    two agree entry for entry once the reference's slots are read as offsets
+    from the oldest -- which is what `- (s + 1) % window` does.
+    """
+    window = 128
+    got = modeling.window_topk_idxs(window, 1, 1, start_pos, torch.device("cpu"))
+    want = _reference_window_idxs(window, 1, 1, start_pos)
+
+    assert got.shape == want.shape
+    h = min(start_pos, window - 1)
+    for k in range(window):
+        absolute = start_pos - h + int(got[0, 0, k]) if got[0, 0, k] >= 0 else -1
+        if want[0, 0, k] < 0:
+            assert got[0, 0, k] < 0
+        else:
+            # the reference's entry is a ring slot for the same absolute position
+            assert absolute % window == int(want[0, 0, k])
+
+
+def test_window_idxs_never_index_before_the_view_starts():
+    """The bug this whole task exists to prevent: a 512-token chunk needs
+    window-1 positions of history, and an index below 0 would silently read
+    the wrong end of the view."""
+    window, start, length = 128, 512, 512
+    idx = modeling.window_topk_idxs(window, 1, length, start, torch.device("cpu"))
+    valid = idx[idx >= 0]
+    assert valid.min() >= 0
+    h = min(start, window - 1)
+    assert valid.max() < h + length
+
+
+def test_window_idxs_are_causal_within_a_chunk():
+    """Query i may see absolute positions up to start_pos+i and no further."""
+    window, start, length = 128, 512, 512
+    h = min(start, window - 1)
+    idx = modeling.window_topk_idxs(window, 1, length, start, torch.device("cpu"))
+    for i in range(0, length, 37):
+        row = idx[0, i]
+        absolute = row[row >= 0].long() + start - h
+        assert absolute.max() == start + i
+        assert absolute.min() == max(0, start + i - window + 1)
+
+
+def test_compress_idxs_reduce_to_the_reference_at_prefill():
+    ratio, seqlen, offset = 128, 1024, 1024
+    m = torch.arange(seqlen // ratio).repeat(seqlen, 1)
+    mask = m >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+    want = torch.where(mask, -1, m + offset).int().unsqueeze(0)
+    got = modeling.compress_topk_idxs(ratio, 1, seqlen, 0, offset, torch.device("cpu"))
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("start_pos", [128, 511, 4096])
+def test_compress_idxs_reduce_to_the_reference_at_decode(start_pos):
+    ratio, offset = 128, 640
+    want = (torch.arange(0, (start_pos + 1) // ratio) + offset).int()
+    got = modeling.compress_topk_idxs(ratio, 1, 1, start_pos, offset,
+                                      torch.device("cpu"))
+    assert torch.equal(got[0, 0], want)
+
+
+def test_compress_idxs_are_causal_across_a_chunk():
+    """Each query sees only blocks that finished at or before it."""
+    ratio, start, length, offset = 4, 512, 512, 127
+    got = modeling.compress_topk_idxs(ratio, 1, length, start, offset,
+                                      torch.device("cpu"))
+    for i in (0, 1, 255, 511):
+        row = got[0, i]
+        assert int((row >= 0).sum()) == (start + i + 1) // ratio
