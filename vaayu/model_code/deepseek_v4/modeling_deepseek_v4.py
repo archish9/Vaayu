@@ -504,3 +504,113 @@ class DeepseekV4MoE(nn.Module):
             y[token] += weights[token, slot, None] * self.experts[expert_idx](x[token])
         y += self.shared_experts(x)
         return y.type_as(hidden_states).view(shape)
+
+
+# ── A5.5: attention primitives ──────────────────────────────────────────────
+
+import math
+from functools import lru_cache
+
+
+class DeepseekV4RMSNorm(nn.Module):
+    """`model.py:189`. Normalises in fp32 and casts back.
+
+    The weight is fp32 although the checkpoint stores it bf16 -- the reference
+    declares it that way and relies on `load_state_dict` upcasting. Declaring
+    bf16 would change the norm's precision on every layer of the model.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32),
+                                   requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
+
+
+@lru_cache(2)
+def _freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow,
+               device_str):
+    """`model.py:205`, with the device made explicit.
+
+    `lru_cache(2)` is the reference's own size and it is exactly right: this
+    model has TWO rope variants (YaRN-off at base theta for `compress_ratio ==
+    0`, YaRN-on at `compress_rope_theta` otherwise). A third distinct call
+    pattern evicts one and re-derives it every layer.
+
+    The reference builds its `torch.arange` on the default device, which is why
+    its harness must `set_default_device("cuda")` (A5.2 finding 2). Taking the
+    device as an argument removes that trap at the source instead of working
+    around it.
+    """
+    device = torch.device(device_str)
+
+    def correction_dim(rotations):
+        return (dim * math.log(original_seq_len / (rotations * 2 * math.pi))
+                / (2 * math.log(base)))
+
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32,
+                                         device=device) / dim))
+    if original_seq_len > 0:
+        low = max(math.floor(correction_dim(beta_fast)), 0)
+        high = min(math.ceil(correction_dim(beta_slow)), dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = ((torch.arange(dim // 2, dtype=torch.float32, device=device) - low)
+                / (high - low)).clamp(0, 1)
+        smooth = 1 - ramp
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+    t = torch.arange(seqlen, device=device)
+    return torch.polar(torch.ones_like(torch.outer(t, freqs)), torch.outer(t, freqs))
+
+
+def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor,
+                         beta_fast, beta_slow, device) -> torch.Tensor:
+    return _freqs_cis(dim, seqlen, original_seq_len, float(base), float(factor),
+                      beta_fast, beta_slow, str(device))
+
+
+def rope_settings(config, compress_ratio: int) -> dict:
+    """The two variants, read off the config (never a literal theta).
+
+    `compress_ratio == 0` layers are pure sliding-window attention: the
+    reference disables YaRN for them by passing `original_seq_len = 0` and uses
+    the BASE `rope_theta` (`model.py:484`). Everything else uses
+    `compress_rope_theta` with YaRN.
+    """
+    rope = config.rope_parameters or {}
+    if not compress_ratio:
+        return {"original_seq_len": 0, "base": config.rope_theta,
+                "factor": 1.0, "beta_fast": rope["beta_fast"],
+                "beta_slow": rope["beta_slow"]}
+    return {"original_seq_len": rope["original_max_position_embeddings"],
+            "base": config.compress_rope_theta, "factor": rope["factor"],
+            "beta_fast": rope["beta_fast"], "beta_slow": rope["beta_slow"]}
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor,
+                     inverse: bool = False) -> torch.Tensor:
+    """`model.py:238`. Rotates IN PLACE and returns the same tensor.
+
+    In place is not a style choice: every call site in the reference mutates a
+    SLICE and ignores the return (`apply_rotary_emb(q[..., -rd:], ...)`).
+    `inverse=True` de-rotates, and the reference applies it a second time to
+    the attention OUTPUT (`model.py:539`) -- unusual, and easy to drop.
+    """
+    out = x
+    z = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs_cis = freqs_cis.conj()
+    if z.ndim == 3:
+        freqs_cis = freqs_cis.view(1, z.size(1), z.size(-1))
+    else:
+        freqs_cis = freqs_cis.view(1, z.size(1), 1, z.size(-1))
+    out.copy_(torch.view_as_real(z * freqs_cis).flatten(-2))
+    return out
