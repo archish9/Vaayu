@@ -276,3 +276,32 @@ def test_the_refusal_happens_before_the_load(monkeypatch):
     monkeypatch.setattr(VaayuBaseModel, "__init__", exploding_init)
     with pytest.raises(NotImplementedError):
         VaayuDeepseekV4("/some/path", enable_prefix_cache=True)
+
+
+def test_the_architecture_dispatches_to_the_subclass(monkeypatch, tmp_path):
+    from vaayu import auto_model
+
+    class FakeConfig:
+        architectures = ["DeepseekV4ForCausalLM"]
+
+    monkeypatch.setattr(auto_model.AutoConfig, "from_pretrained",
+                        lambda *a, **k: FakeConfig())
+    cls, extra = auto_model.AutoModel.get_module_class(str(tmp_path))
+    assert cls is VaayuDeepseekV4
+    assert extra == {}
+
+
+def test_the_chunk_major_prefill_gate_stays_closed_for_this_model():
+    """Tripwire for Task 5's list refusal.
+
+    Two unrelated decisions keep the chunk-major branch away from this model:
+    it is gated on flash/sdpa, and this model reports eager unconditionally.
+    If either changes, this fails BEFORE a user meets the TypeError.
+    """
+    for requested in ("flash_attention_2", "sdpa", "eager", None):
+        resolved = modeling.DeepseekV4PreTrainedModel._check_and_adjust_attn_implementation(
+            None, requested)
+        assert resolved == "eager"
+
+    gate = inspect.getsource(VaayuBaseModel._chunked_prefill)
+    assert 'self._active_attn_impl in ("flash_attention_2", "sdpa")' in gate
