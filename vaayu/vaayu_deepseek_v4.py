@@ -21,7 +21,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
     are already the names A5.6 gave this model."""
 
     def __init__(self, *args, **kwargs):
-        """Refuse the two cache features that do not understand this cache.
+        """Refuse speculative decoding, which nothing else refuses.
 
         `DeepseekV4CacheLayer` holds a preallocated sliding window plus a
         compressed half and index state. `batch.cache_holds_recurrent_state`
@@ -35,20 +35,32 @@ class VaayuDeepseekV4(VaayuBaseModel):
         passed by name everywhere a model is built, and refusing afterwards
         would mean refusing at the end of a multi-minute load.
         """
-        _unsupported = {
-            "enable_prefix_cache": "cross-turn prefix caching",
-            "enable_kv_persist": "KV disk persistence",
-        }
-        for flag, what in _unsupported.items():
-            if kwargs.get(flag):
-                raise NotImplementedError(
-                    f"{flag}=True is not supported for DeepSeek-V4: {what} "
-                    f"reasons about a DynamicCache-shaped cache, and "
-                    f"DeepseekV4CacheLayer is a preallocated sliding window "
-                    f"plus a compressed half and index state. Restoring or "
-                    f"slicing a prefix out of it would return plausible tokens "
-                    f"computed against the wrong history. Run with {flag}=False "
-                    f"until that cache-management code understands this layout.")
+        # Prefix caching and KV persistence are NOT refused here. The engine's
+        # own generic check does it -- `_refuse_unsupported_prefix_cache`
+        # (`vaayu_base.py:3755`) probes the cache for to_cpu / to_device /
+        # resident_bytes, finds none on `DeepseekV4CacheLayer`, prints one
+        # WARNING and clears the flag; `kv_persist` then prints `ignored:
+        # enable_prefix_cache is False` (`:3097`). A hard refusal here ran
+        # FIRST and made `:3755` dead code on this path, which meant the
+        # server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
+        # unconditionally at `app.py:406`) could not load this model at all.
+        #
+        # Speculative decoding IS refused, because nothing else refuses it:
+        # `cache_holds_recurrent_state` finds no conv_states here, so
+        # `spec_recurrent_refusal` returns None and drafting starts -- and then
+        # the first REJECTED draft reaches `_trim_kv_cache`
+        # (`vaayu_base.py:5428`) -> `DeepseekV4Cache.crop`, which cannot rewind
+        # a sliding window plus a compressed half. Read out of kwargs BEFORE
+        # `super().__init__`, so a bad flag is not learned at the end of a
+        # multi-minute load.
+        if kwargs.get("drafter_model_path"):
+            raise NotImplementedError(
+                "drafter_model_path is not supported for DeepSeek-V4: rejecting "
+                "a draft rewinds the KV cache through _trim_kv_cache, and this "
+                "cache is a preallocated sliding window indexed by "
+                "pos % window_size plus a Compressor that flushes on boundaries "
+                "counted from start_pos -- crop() cannot put either back. Run "
+                "without a drafter until that is built.")
 
         # This architecture has NO HF attention backend -- `sparse_attn` is its
         # only kernel, which is why DeepseekV4PreTrainedModel reports "eager"
@@ -62,7 +74,17 @@ class VaayuDeepseekV4(VaayuBaseModel):
         # `prefill_chunk_size`. Requesting eager collapses the candidate list to
         # one (`vaayu_base.py:3321`) and keeps that gate shut.
         # `setdefault`, so an explicit caller choice still wins.
-        kwargs.setdefault("attn_implementation", "eager")
+        #
+        # Absent AND explicitly-None both mean "no choice made" -- `setdefault`
+        # only covers absent, and the server never omits the key
+        # (`app.py:418` passes `config.attn_implementation`, default None at
+        # `server/config.py:209`). With None left in place, `_forced_attn_impl`
+        # stays None, `init_model`'s candidate list becomes
+        # ["flash_attention_2", "sdpa", "eager"], and the chunk-major prefill
+        # gate (`vaayu_base.py:4666`) opens -- which hands `forward` a LIST of
+        # chunks that this class refuses. A real explicit choice still wins.
+        if kwargs.get("attn_implementation") is None:
+            kwargs["attn_implementation"] = "eager"
 
         super().__init__(*args, **kwargs)
 
@@ -140,13 +162,42 @@ class VaayuDeepseekV4(VaayuBaseModel):
         """
         return layer(self.model.model.hc_head(seq))
 
+    def get_past_key_value_args(self, past_key_values):
+        """Pass the cache through, and remember how far it has advanced.
+
+        `DeepseekV4Model._start_pos` validates that `cache_position` is
+        `arange(start_pos, start_pos + seqlen)` and raises otherwise. The
+        streamed path never calls that forward, so the check has to live in the
+        hooks -- recorded here and asserted in `get_pos_emb_args`, which the
+        layer-major loop evaluates immediately after this one
+        (`vaayu_base.py:5222`).
+        """
+        self._cache_seq_len = (
+            past_key_values.get_seq_length() if past_key_values is not None else None)
+        return {"past_key_values": past_key_values}
+
     def get_pos_emb_args(self, len_p, len_s):
         """`start_pos` IS the past length.
 
         This model builds no rotary table for the engine to slice: attention
         takes a scalar `start_pos` and `precompute_freqs_cis` does the rest
         inside the layer.
+
+        Checked against the cache, because nothing else checks it: the window
+        indexes by `pos % window_size` and the Compressor flushes on block
+        boundaries counted from `start_pos`, so a cache that was rewound under a
+        `start_pos` that was not writes into the wrong slots and returns
+        plausible tokens computed against the wrong history.
         """
+        _cached = getattr(self, "_cache_seq_len", None)
+        if _cached is not None and _cached != len_p:
+            raise RuntimeError(
+                f"DeepSeek-V4 start_pos {len_p} disagrees with the cache's "
+                f"{_cached} tokens. This cache is a preallocated sliding window "
+                f"indexed by pos % window_size; a discontiguous start_pos writes "
+                f"into the wrong slots and the Compressor flushes on the wrong "
+                f"boundary. Something rewound or replayed the cache without "
+                f"telling the engine.")
         return {"start_pos": len_p}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s,

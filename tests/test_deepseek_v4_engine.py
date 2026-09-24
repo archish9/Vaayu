@@ -199,7 +199,7 @@ def test_the_hooks_produce_exactly_the_layers_signature():
     """The union of what the loop passes must be what the layer takes."""
     model = engine()
     emitted = {"use_cache"}
-    emitted |= set(model.get_past_key_value_args(object()))
+    emitted |= set(model.get_past_key_value_args(None))
     emitted |= set(model.get_pos_emb_args(0, 4))
     emitted |= set(model.get_attention_mask_args(None, 0, 4))
     emitted |= set(model.get_position_ids_args(None, 0, 4))
@@ -242,18 +242,68 @@ def test_forward_refuses_more_than_one_sequence():
         engine().forward(torch.tensor([[1, 2], [3, 4]]))
 
 
-def test_prefix_caching_is_refused_with_the_bug_named(monkeypatch):
-    monkeypatch.setattr(VaayuBaseModel, "__init__",
-                        lambda self, *a, **k: None)
-    with pytest.raises(NotImplementedError, match="DeepseekV4CacheLayer"):
-        VaayuDeepseekV4("/some/path", enable_prefix_cache=True)
+def test_prefix_caching_is_not_refused_at_construction(monkeypatch):
+    """The server's DEFAULT config sets ENABLE_PREFIX_CACHE = True and
+    `app.py:406` passes it unconditionally, so a hard refusal here made the
+    default config unable to load this model at all. The engine's own generic
+    path handles it instead: `_refuse_unsupported_prefix_cache`
+    (`vaayu_base.py:3755`) finds none of to_cpu / to_device / resident_bytes on
+    this cache, warns once, and clears the flag."""
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path", enable_prefix_cache=True, enable_kv_persist=True)
+    assert seen["kwargs"]["enable_prefix_cache"] is True
 
 
-def test_kv_persistence_is_refused_with_the_bug_named(monkeypatch):
-    monkeypatch.setattr(VaayuBaseModel, "__init__",
-                        lambda self, *a, **k: None)
-    with pytest.raises(NotImplementedError, match="DeepseekV4CacheLayer"):
-        VaayuDeepseekV4("/some/path", enable_kv_persist=True)
+def test_this_cache_is_one_the_generic_refusal_catches():
+    """What makes the downgrade safe. If `DeepseekV4Cache` ever grew these
+    three methods the generic path would silently START storing prefixes out of
+    a preallocated sliding window, which is the wrong-history bug."""
+    from vaayu.batch import cache_supports_prefix_store
+
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
+                                     device="cpu", dtype=torch.float32)
+    assert not cache_supports_prefix_store(cache)
+
+
+def test_speculative_decoding_is_refused_by_name(monkeypatch):
+    """Not covered by anything today: `cache_holds_recurrent_state` finds no
+    conv_states here, so `spec_recurrent_refusal` returns None and drafting
+    starts -- then the first rejected draft reaches `_trim_kv_cache`
+    (`vaayu_base.py:5428`) -> `DeepseekV4Cache.crop` -> RuntimeError."""
+    monkeypatch.setattr(VaayuBaseModel, "__init__", lambda self, *a, **k: None)
+    with pytest.raises(NotImplementedError, match="drafter_model_path"):
+        VaayuDeepseekV4("/some/path", drafter_model_path="/some/drafter")
+
+
+def test_a_start_pos_that_disagrees_with_the_cache_raises():
+    """`DeepseekV4Model._start_pos` validates this and the streamed path never
+    calls it. The sliding window indexes by `pos % window_size` and the
+    Compressor flushes on boundaries counted from `start_pos`, so a rewound
+    cache with an un-rewound start_pos writes into the wrong slots and returns
+    plausible tokens computed against the wrong history."""
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
+                                     device="cpu", dtype=torch.float32)
+    cache.advance(7)
+
+    model.get_past_key_value_args(cache)
+    with pytest.raises(RuntimeError, match="start_pos"):
+        model.get_pos_emb_args(3, 1)
+
+
+def test_a_start_pos_that_agrees_with_the_cache_passes_through():
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
+                                     device="cpu", dtype=torch.float32)
+    cache.advance(7)
+
+    model.get_past_key_value_args(cache)
+    assert model.get_pos_emb_args(7, 1) == {"start_pos": 7}
 
 
 def test_the_default_construction_is_not_refused(monkeypatch):
@@ -265,17 +315,6 @@ def test_the_default_construction_is_not_refused(monkeypatch):
     monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
     VaayuDeepseekV4("/some/path")
     assert seen["args"] == ("/some/path",)
-
-
-def test_the_refusal_happens_before_the_load(monkeypatch):
-    """Refusing after super().__init__ would refuse at the END of a 157 G
-    load, which is the wrong time to learn about a bad flag."""
-    def exploding_init(self, *args, **kwargs):
-        raise AssertionError("super().__init__ ran before the refusal")
-
-    monkeypatch.setattr(VaayuBaseModel, "__init__", exploding_init)
-    with pytest.raises(NotImplementedError):
-        VaayuDeepseekV4("/some/path", enable_prefix_cache=True)
 
 
 def test_the_architecture_dispatches_to_the_subclass(monkeypatch, tmp_path):
@@ -315,7 +354,7 @@ def test_the_chunk_major_prefill_gate_stays_closed_for_this_model():
     assert 'self._active_attn_impl in ("flash_attention_2", "sdpa")' in gate
 
     init_source = inspect.getsource(VaayuDeepseekV4.__init__)
-    assert 'kwargs.setdefault("attn_implementation", "eager")' in init_source
+    assert 'kwargs["attn_implementation"] = "eager"' in init_source
 
 
 def test_the_subclass_requests_eager_so_the_chunk_major_gate_stays_shut(monkeypatch):
@@ -344,3 +383,23 @@ def test_an_explicit_attn_implementation_still_wins(monkeypatch):
     monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
     VaayuDeepseekV4("/some/path", attn_implementation="sdpa")
     assert seen["attn_implementation"] == "sdpa"
+
+
+def test_the_servers_explicit_none_still_resolves_to_eager(monkeypatch):
+    """The server is the only interface users have (CLAUDE.md §8) and it never
+    omits this key: `app.py:418` passes `config.attn_implementation`, default
+    None. A `setdefault` sees the key PRESENT and does nothing, so the candidate
+    list becomes ["flash_attention_2", "sdpa", "eager"], `_active_attn_impl`
+    records the request, the chunk-major prefill gate opens, and every prompt
+    over `prefill_chunk_size` reaches this class's TypeError for a list
+    `input_ids`. The test above passes with the key ABSENT, which is not how
+    this model is ever constructed in production.
+    """
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path", attn_implementation=None)
+    assert seen["attn_implementation"] == "eager"
