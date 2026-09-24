@@ -1558,6 +1558,23 @@ a Vaayu precedent; the attention path has neither.
       **Two literals with NO config source, named rather than hidden (§5):** `_ACT_QUANT_GROUP =
       64` (`model.py:512` — NOT `weight_block_size`'s 128) and `_FP4_BLOCK_SIZE = 32`
       (`model.py:18`).
+      **Task 4 (`Compressor`) DONE 2026-09-24, commit `bb1c3ef`.** Parity test
+      (`test_compressor_chunked_equals_whole_prompt`, both ratios 4 and 128) found TWO bugs in the
+      brief's draft, both fixed: **(a)** the overlap "carry" (previous block's raw kv/score, needed
+      by the next block's overlap window) can't be produced by shifting `kv_state` the way the
+      reference's decode branch does (`model.py:359-360`) — that shift only works because the
+      decode branch fills the current window one position at a time; this port pools a whole block
+      from a local tensor and never touches `kv_state` while doing it, so the shift copied
+      stale/zero data. Fixed by writing the carry explicitly from the local tensor whenever a block
+      flushes. **(b)** `wkv`/`wgate`'s plain `F.linear` is NOT invariant to the batch (M) dimension
+      on this GPU (RTX 5060 Ti, torch 2.11+cu130) — the same position's projection differs by a few
+      ULPs depending on how many other positions ride the same GEMM call (confirmed against the real
+      checkpoint weight; ruled out TF32, cuBLAS-vs-cuBLASLt, determinism flags; fp64 measured
+      bit-invariant to M). The reference never meets this since it never chunks past
+      `start_pos == 0`; fixed by routing `wkv`/`wgate` through fp64 internally in `Compressor`
+      only (`_project`), rounded back to fp32 — `DeepseekV4Linear` itself is untouched. Full DeepSeek-V4
+      suite green (214 passed) after refreshing the checkpoint's copy. Report:
+      `.superpowers/sdd/2026-09-23-A5.5-attention/task-4-report.md`.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
