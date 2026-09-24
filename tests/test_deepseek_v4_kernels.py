@@ -37,6 +37,23 @@ def test_it_raises_rather_than_returning_a_tile_that_cannot_fit():
         modeling.sparse_attn_tile(16384, heads=64, head_dim=512)
 
 
+def test_a_stub_kernel_module_is_left_unchanged():
+    """A source with no DeepSeek markers at all -- a test double, not a
+    drifted checkpoint -- must no-op rather than raise."""
+    source = "def act_quant(x):\n    pass\n"
+    assert modeling._fit_sparse_attn(source, heads=64, head_dim=512,
+                                      smem_optin=SM120_OPTIN) == source
+
+
+def test_a_real_kernel_module_missing_sparse_attn_kernel_raises():
+    """`hc_split_sinkhorn_kernel` present but `sparse_attn_kernel` gone (renamed
+    or moved): this IS DeepSeek's kernel module, so a no-op here would silently
+    ship the un-fitted, oversized-tile source instead of naming the drift."""
+    source = "def hc_split_sinkhorn_kernel(hc, sinkhorn_iters, eps):\n    pass\n"
+    with pytest.raises(RuntimeError, match="sparse_attn_kernel"):
+        modeling._fit_sparse_attn(source, heads=64, head_dim=512, smem_optin=SM120_OPTIN)
+
+
 @needs_checkpoint
 @needs_gpu
 def test_sparse_attn_runs_through_kernels_on_this_card(monkeypatch):

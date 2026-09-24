@@ -101,14 +101,25 @@ def _fit_sparse_attn(source: str, heads: int, head_dim: int, smem_optin: int) ->
 
     Both are LOCALS in the kernel factory, so there is no argument to turn --
     the source is the only handle. Returns the source unchanged when the
-    shipped tile already fits, or when the source has no `sparse_attn_kernel`
-    to fit (a test double standing in for the real `kernel.py`).
+    shipped tile already fits, or when the source is not DeepSeek's kernel
+    module at all (a test double standing in for the real `kernel.py`).
+
+    "Is this DeepSeek's kernel module" is decided by `hc_split_sinkhorn_kernel`,
+    a NEIGHBOR def -- never `sparse_attn_kernel`'s own name. The failure this
+    guards against is exactly `sparse_attn_kernel` being renamed or moved;
+    discriminating on its own name would make that failure indistinguishable
+    from "not DeepSeek's module" and silently no-op instead of raising.
     """
     import re
 
     block, stages = sparse_attn_tile(smem_optin, heads, head_dim)
-    if (block, stages) == (64, 2) or "def sparse_attn_kernel" not in source:
+    if (block, stages) == (64, 2) or "def hc_split_sinkhorn_kernel" not in source:
         return source
+    if "def sparse_attn_kernel" not in source:
+        raise RuntimeError(
+            "this is DeepSeek's kernel module (hc_split_sinkhorn_kernel is "
+            "present) but sparse_attn_kernel is not -- it was renamed or moved, "
+            "and the sm_120 fit must be re-derived.")
     start = source.index("def sparse_attn_kernel")
     end = source.index("def hc_split_sinkhorn_kernel")
     tile = source[start:end]
