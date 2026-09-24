@@ -57,7 +57,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.7a** — jump to "PICK THIS NEXT: **A5.7a**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.7b** — jump to "PICK THIS NEXT: **A5.7b**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -70,8 +70,11 @@ with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, 
 main). A5.6 IS CLOSED TOO — `AutoModelForCausalLM.from_config` now builds the real 43-layer,
 11,008-expert skeleton under `init_empty_weights` in 1.44 s, both new goldens hold (`hc_head`
 bit-identical, `head` rel-L2 0.00166 + exact argmax). The step where A5 was expected to die did
-not kill it. START AT A5.7**, whose brief is already written; A5.6's durable record, including
-everything A5.7 MUST carry, is row 28b.** **Correction carried from
+not kill it. A5.7a IS CLOSED TOO (2026-09-24) — seven commits teach the streamed path the
+architecture end to end (cache, layer signature, `hc_head`, the id scope, a new `run_embed` hook,
+`auto_model` dispatch); DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both on-device
+gates green. **START AT A5.7b**, whose brief is already written; A5.7a's durable record, including
+everything A5.7b MUST carry, is row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -88,7 +91,7 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.7a** (row 28b). A5.7 was SPLIT 2026-09-24. One per session.
+## ▶ PICK THIS NEXT: **A5.7b** (row 28b). A5.7 was SPLIT 2026-09-24. One per session.
 
 **A5.7's §0 gate was DECIDED 2026-09-24: TEACH THE ENGINE, and A5.7 was SPLIT into A5.7a (engine)
 and A5.7b (load + first token), both approved by the user that day.** Unstreamed is dead on
@@ -101,7 +104,17 @@ lines with an identity default at `vaayu_base.py:5182`. **That one hook is the w
 surface, and it is why A5.7a is separable.** Re-cost: **A5.7a ≈ 1 day, A5.7b ≈ 1–2 days** (mostly
 wall-clock on the irreversible split) — the brief's 2–3 days survives, redistributed.
 
-**A5.1–A5.6 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 and A5.6 on 2026-09-24).**
+**A5.1–A5.7a ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5/A5.6/A5.7a on 2026-09-24).**
+**Items (6) and (7) below are now CLOSED by A5.7a** — the streamed path calls this forward through
+`VaayuDeepseekV4`'s hooks, and `_create_kv_cache` now builds a real `DeepseekV4Cache`; they are kept
+below for the historical record of the problem, not as open work. **Item (2)'s severity is
+corrected by A5.7a**: the pre-existing generic surface check auto-disables prefix caching with a
+warning even before A5.7a's own explicit refusal, so this is "feature unavailable, announced," not
+"silent wrong-history serving" — see row 28b's A5.7a bullet, carried item (b), for the full
+correction. **A5.7a also found a NEW, still-open vector into the same class of risk: the
+`_start_pos` contiguity guard is bypassed on the streamed path, and speculative decoding is the one
+residual path into it that today's refusals do not cover — see row 28b's A5.7a bullet, carried item
+(a). A5.7b must add that check when it wires generation.**
 **SEVEN THINGS A5.7 MUST CARRY, from A5.5 and A5.6, all in row 28b (two added by final review,
 2026-09-24 — see below):** (1) attention attends a
 contiguous `kv_view = cat([history, chunk, compressed])`, NOT the reference's in-place ring —
@@ -168,7 +181,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
 | ~~6~~ | ~~**A5.6** block + model~~ | **CLOSED 2026-09-24** — 5 commits, suite 2686/16, both MoE gates green | [`…A5.6-block-model-RESULTS.md`](docs/2026-09-24-A5.6-block-model-RESULTS.md) | done |
-| 7 | **A5.7a** engine change | **DESIGN, approved 2026-09-24** | [`…A5.7a-streamed-path-design.md`](docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md) | **~1 day** — §0 decided: teach the engine. Shared surface is ONE 2-line hook. |
+| 7 | ~~**A5.7a** engine change~~ | **CLOSED 2026-09-24** — 7 commits, DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both MoE gates green | [`…A5.7a-streamed-path-RESULTS.md`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md) | done |
 | 8 | **A5.7b** load + first token | **BRIEF's remainder** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | **~1–2 days**, mostly wall-clock on the irreversible 157 G split. |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
@@ -1288,7 +1301,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
 | **A5.5** `[x]` | **attention** | **DONE 2026-09-24** | MLA + sparse index on a contiguous `kv_view`; 3/4 goldens bit-identical, chunked prefill works where the reference RAISES | done | [`…A5.5-RESULTS…`](docs/2026-09-24-A5.5-attention-RESULTS.md) |
 | **A5.6** `[x]` | block + model | **DONE 2026-09-24** | `from_config` builds the real skeleton in 1.44 s; `hc_head` bit-identical, `head` rel-L2 0.00166 + exact argmax; 30 new tests | done | [`…A5.6-RESULTS…`](docs/2026-09-24-A5.6-block-model-RESULTS.md) |
-| **A5.7a** `[~]` | **engine: teach the streamed path** | **DESIGNED 2026-09-24, approved** | new `run_embed` hook (2 lines, identity default) + `VaayuDeepseekV4` subclass + `auto_model` dispatch + 2 refusals + the `weight_block_size` bug. **No checkpoint, no split, no token.** | **~1 day** | [`…A5.7a-design…`](docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md) |
+| **A5.7a** `[x]` | **engine: teach the streamed path** | **DONE 2026-09-24** | `run_embed` hook (identity default) + `VaayuDeepseekV4` subclass + `auto_model` dispatch + 2 refusals + the `weight_block_size` bug fixed; DeepSeek suite 289 passed, repo 2711/16, both MoE gates green; 25 new tests. **No checkpoint, no split, no token.** | done | [`…A5.7a-RESULTS…`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md) |
 | **A5.7b** `[ ]` | load + first token | **BRIEF's remainder** | `fp4_group_size` into the loader, key remap (prefix + 2 renames + `mtp.*` skip), MTP index skip (11,008 not 11,776), split/persist, A4's two checks, first generation, row 26 probe | **~1–2 d**, mostly wall-clock | [`…A5.7…BRIEF`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
 ~~**≈3 weeks. A5.5 is where this dies if it dies**~~ — **IT DID NOT.** A5.5 closed 2026-09-24:
@@ -2008,8 +2021,12 @@ and both have a golden reference or a Vaayu precedent.
       arbitrary given every other weight in the file is equally uninitialized); 16 pre-existing pytest warnings (14x
       `torch.jit.script_method` deprecation, 2x `SwigPyPacked`/`SwigPyObject`) are environment noise
       untouched by this branch.
-- [~] **A5.7a — teach the streamed path DeepSeek-V4. ENGINE ONLY. DESIGNED AND APPROVED
-      2026-09-24; IN PROGRESS.** Design:
+- [x] **A5.7a — teach the streamed path DeepSeek-V4. ENGINE ONLY. CLOSED 2026-09-24.** Seven
+      commits, one per task: `da21ec6` (weight_block_size guard), `974b3ee` (run_embed hook),
+      `fd4fe40` (decoder layer use_cache), `7de88ec` (VaayuDeepseekV4 cache + compute hooks),
+      `87d8bcb` (id scope + three refusals), `a5d6bde` (prefix-cache / kv_persist refusal),
+      `9fdfbcc` (auto_model dispatch). RESULTS:
+      [`…A5.7a-streamed-path-RESULTS.md`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md). Design:
       `docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md` (gitignored — this bullet is
       the durable copy).
       **§0 DECIDED: TEACH THE ENGINE.** Unstreamed is dead on arithmetic — **157 G** against
@@ -2099,12 +2116,68 @@ and both have a golden reference or a Vaayu precedent.
       `weight_block_size` guard · 2 the `run_embed` hook · 3 the decoder layer's `use_cache` · 4 the
       subclass's cache + compute hooks · 5 the `forward` wrapper and its three refusals · 6 the
       prefix-cache / `kv_persist` refusal · 7 `auto_model` dispatch + the eager-gate tripwire · 8
-      full suite + both on-device gates + close. **27 new tests, none needing the checkpoint or a
-      GPU** (floors: DeepSeek 264 → 291, repo 2686/16 → 2713/16).
+      full suite + both on-device gates + close. **25 new tests, none needing the checkpoint or a
+      GPU** (one of the design's planned 27 was deleted during Task 5 review as redundant with
+      existing `tests/test_deepseek_v4_model.py` coverage — floors: DeepSeek 264 → **289** [not
+      291], repo 2686/16 → **2711/16** [not 2713/16]).
       **Two facts measured while designing, so A5.7b does not re-derive them: 230 G free on the
       models volume** (a split needs ~157 G — it fits, 73 G slack) and `DELETE_ORIGINAL = True`
       (`vaayu/server/config.py:62`) confirmed, which is what makes the first split irreversible under
       the standing NO-DOWNLOAD constraint. **A5.7a touches the checkpoint ZERO times.**
+
+      **CLOSED 2026-09-24 — MEASURED, the durable copy (full detail in the RESULTS doc above):**
+      **DeepSeek suite: `289 passed`, zero failed, 32.33s.** **Full repo suite: `2711 passed, 16
+      skipped`, zero failed, 202.36s.** Both exactly match the floors above; nothing outside
+      `tests/test_deepseek_v4_*` changed state. **Both on-device gates green, foreground,
+      `MemoryMax=29G`:** Qwen3-Next-80B-A3B-AWQ-4bit **8 passed, 34.38s (wall 38.33s)** — A5.6's
+      figure was 35.07s, consistent; MiniMax-M2.7-exl3 **8 passed, 72.72s (wall 76.80s)** — A5.6's
+      figure was 73.92s, consistent. **No fused-EXL3 claim** (no model on disk since Qwen3-235B was
+      retired 2026-09-20). **Dense has no committed gate** (`test_batched_dense_smoke.py` deleted
+      2026-09-03); the argument dense is unaffected is `run_embed`'s identity default
+      (`return layer(seq)`, `vaayu_base.py:4628`) — every model that doesn't override the hook gets
+      back exactly what it got before the hook existed. Stated, not assumed.
+      **§8, the durable answers: (1) NO KNOB** — the subclass is selected by `auto_model.py` off the
+      checkpoint's own `architectures` field; a knob would let a user pick the wrong forward.
+      **(2) PLUMBED** — `auto_model.get_module_class`, `elif "DeepseekV4" in arch: return
+      VaayuDeepseekV4, {}`, with a Task 7 test confirming real-call reachability against the actual
+      on-disk `config.json`. **(3) NOT REACHABLE — banked, said so plainly.** `from_pretrained`
+      still fails on this checkpoint for three independent A5.7b reasons: `config.fp4_group_size`
+      unset before `from_config`, the key remap unwritten, and the expert offset index finding
+      11,776 entries (regex `\.experts\.(\d+)\.`) against the real 11,008 (`mtp.0/1/2.ffn.experts.*`
+      = 768 extra = 3×256, colliding with layer 0 under `detect_moe_blocks` unless skipped).
+      Separately, prefix caching and KV persistence are refused for this model outright. N=1 being
+      the server's only mode is necessary but not sufficient here. **(4) unblocked by A5.7b.**
+
+      **FIVE THINGS CARRIED FORWARD TO A5.7b (from the Tasks 1–7 reviews, not the brief):**
+      **(a) The contiguity guard is bypassed on the streamed path.**
+      `DeepseekV4Model._start_pos` validates `cache_position == arange(start_pos, start_pos+seqlen)`
+      and raises otherwise — this cache's sliding window indexes by `pos % window_size` and its
+      Compressor flushes on block boundaries counted from `start_pos`. The streamed path never
+      calls `_start_pos`: `get_pos_emb_args` returns `{"start_pos": len_p}` with no check.
+      Deliberately NOT fixed here — every other model's hook is equally unvalidated, and today's
+      vectors are closed (prefix caching / KV persistence refused, batch>1 refused). **The residual
+      vector is SPECULATIVE DECODING** (`drafter_model_path`, `draft_tokens`), which those refusals
+      do **not** cover. A5.7b must add this check when it wires generation.
+      **(b) The open `[bug]`'s severity is lower than previously stated.** Measured:
+      `_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")`, and neither
+      `DeepseekV4Cache` nor `DeepseekV4CacheLayer` has any of them — so the pre-existing
+      `_refuse_unsupported_prefix_cache` (`vaayu_base.py:3755`) would already auto-disable prefix
+      caching with a warning, and KV persistence then no-ops (it requires a live prefix cache). Real
+      bug, but "feature unavailable, announced" — NOT "silent wrong-history serving." A5.7b should
+      not over-engineer a fix.
+      **(c) DeepSeek-V4 cannot use the layer-major chunked prefill.** That branch (row 45's win) is
+      gated on flash/sdpa; this model forces eager unconditionally, so a 4k prompt at
+      `PREFILL_CHUNK_SIZE=512` re-reads its routed expert set 8×. Structural, not a bug. **A5.7b's
+      measured TTFT must NOT be compared against MiniMax's post-row-45 figure.**
+      **(d) A positional bypass exists in theory.** The construction-time refusal reads
+      `enable_prefix_cache`/`enable_kv_persist` from `kwargs`, and they are positional slots 21 and
+      24 of `VaayuBaseModel.__init__`. Every construction path in the repo passes keyword-only
+      (grepped clean) — unreachable today, but defended by convention, not code.
+      **(e) Deferred minors:** two committed citations of `vaayu_base.py:5209` are stale (the
+      kwargs dict moved to `:5222`) — in the new docstring in `vaayu_deepseek_v4.py` and a comment
+      in `tests/test_deepseek_v4_engine.py`; the `run_embed` source-text test pins that the hook
+      call exists but not WHERE; the Task 7 eager-gate tripwire is a source-text substring match,
+      brittle to harmless reformatting (confirmed today-correct by the reviewer; not a live defect).
 
 - [ ] **A5.7b — load, index, first token. BRIEF's remainder.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
