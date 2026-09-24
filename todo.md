@@ -2061,9 +2061,17 @@ and both have a golden reference or a Vaayu precedent.
       `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`/`:364`, and
       `Cache.max_cache_len`/`max_batch_size`/`batch_repeat_interleave`/`batch_select_indices` do not
       understand `DeepseekV4CacheLayer`. **A5.7b cannot claim reachability while this stands.**
-      **ALSO FOLDED IN (A5.5 inheritance, same file):** the three `.get("weight_block_size")` sites
-      (`modeling_deepseek_v4.py:493`, `:1166`, `:1236` — re-verified exact 2026-09-24) raise a named
-      `ValueError` instead of `TypeError: cannot unpack non-iterable NoneType object`.
+      **ALSO FOLDED IN (A5.5 inheritance, same file): the `weight_block_size` `None` bug — and the
+      OBVIOUS FIX IS A REGRESSION, corrected while writing the plan 2026-09-24.** Raising at the
+      three `.get("weight_block_size")` call sites (`modeling_deepseek_v4.py:493`, `:1166`, `:1236`
+      — line numbers re-verified exact) **would refuse a VALID checkpoint**: the unpack
+      `out_block, in_block = weight_block_size` is reached ONLY inside
+      `DeepseekV4Linear.__init__`'s `dtype == torch.float8_e4m3fn` branch (`:288`), and
+      `_expert_dtypes` returns **bf16** whenever `checkpoint_quantization_config["fmt"] != "e4m3"`,
+      where `None` is legitimate and never unpacked. That is the file's own documented contract
+      (*"a bf16 checkpoint of this architecture builds bf16 experts and never touches a kernel"*)
+      and CLAUDE.md §5's mandate. **The guard therefore goes in ONE place — inside the fp8 branch —
+      mirroring the `fp4_group_size` error at `:280-284`; the three call sites are untouched.**
       **WHERE IT LIVES:** `vaayu/vaayu_deepseek_v4.py`, following `vaayu_qwen.py` (58 lines) /
       `vaayu_chatglm.py` (53), reached by `auto_model.get_module_class` branching on
       `config.architectures[0]` — the checkpoint already declares `"DeepseekV4ForCausalLM"`.
@@ -2086,6 +2094,13 @@ and both have a golden reference or a Vaayu precedent.
       prefix caching / KV persistence are refused for this model. N=1 being the server's only mode is
       **necessary but not sufficient** — the brief's §0 correction still holds at A5.7a's close.
       **(4) unblocked by A5.7b.**
+      **PLAN:** `docs/superpowers/plans/2026-09-24-A5.7a-streamed-path.md` — **8 tasks, TDD, one
+      commit each** (gitignored; this bullet is the durable copy). Task order: 1 the
+      `weight_block_size` guard · 2 the `run_embed` hook · 3 the decoder layer's `use_cache` · 4 the
+      subclass's cache + compute hooks · 5 the `forward` wrapper and its three refusals · 6 the
+      prefix-cache / `kv_persist` refusal · 7 `auto_model` dispatch + the eager-gate tripwire · 8
+      full suite + both on-device gates + close. **27 new tests, none needing the checkpoint or a
+      GPU** (floors: DeepSeek 264 → 291, repo 2686/16 → 2713/16).
       **Two facts measured while designing, so A5.7b does not re-derive them: 230 G free on the
       models volume** (a split needs ~157 G — it fits, 73 G slack) and `DELETE_ORIGINAL = True`
       (`vaayu/server/config.py:62`) confirmed, which is what makes the first split irreversible under
