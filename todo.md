@@ -57,7 +57,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.7a** — jump to "PICK THIS NEXT: **A5.7a**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.7b** — jump to "PICK THIS NEXT: **A5.7b**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -70,8 +70,11 @@ with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, 
 main). A5.6 IS CLOSED TOO — `AutoModelForCausalLM.from_config` now builds the real 43-layer,
 11,008-expert skeleton under `init_empty_weights` in 1.44 s, both new goldens hold (`hc_head`
 bit-identical, `head` rel-L2 0.00166 + exact argmax). The step where A5 was expected to die did
-not kill it. START AT A5.7**, whose brief is already written; A5.6's durable record, including
-everything A5.7 MUST carry, is row 28b.** **Correction carried from
+not kill it. A5.7a IS CLOSED TOO (2026-09-24) — seven commits teach the streamed path the
+architecture end to end (cache, layer signature, `hc_head`, the id scope, a new `run_embed` hook,
+`auto_model` dispatch); DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both on-device
+gates green. **START AT A5.7b**, whose brief is already written; A5.7a's durable record, including
+everything A5.7b MUST carry, is row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -88,7 +91,7 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.7a** (row 28b). A5.7 was SPLIT 2026-09-24. One per session.
+## ▶ PICK THIS NEXT: **A5.7b** (row 28b). A5.7 was SPLIT 2026-09-24. One per session.
 
 **A5.7's §0 gate was DECIDED 2026-09-24: TEACH THE ENGINE, and A5.7 was SPLIT into A5.7a (engine)
 and A5.7b (load + first token), both approved by the user that day.** Unstreamed is dead on
@@ -101,7 +104,19 @@ lines with an identity default at `vaayu_base.py:5182`. **That one hook is the w
 surface, and it is why A5.7a is separable.** Re-cost: **A5.7a ≈ 1 day, A5.7b ≈ 1–2 days** (mostly
 wall-clock on the irreversible split) — the brief's 2–3 days survives, redistributed.
 
-**A5.1–A5.6 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 and A5.6 on 2026-09-24).**
+**A5.1–A5.7a ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5/A5.6/A5.7a on 2026-09-24).**
+**Items (6) and (7) below are now CLOSED by A5.7a** — the streamed path calls this forward through
+`VaayuDeepseekV4`'s hooks, and `_create_kv_cache` now builds a real `DeepseekV4Cache`; they are kept
+below for the historical record of the problem, not as open work. **Item (2)'s severity was
+claimed corrected by A5.7a, but that claim was ITSELF WRONG** — the pre-existing generic surface
+check (`vaayu_base.py:3755`) does NOT run for this model; A5.7a's own hard refusal in
+`VaayuDeepseekV4.__init__` raises first, making `:3755` dead code on this path, so the real outcome
+is a hard load failure, not an announced downgrade — see row 28b's A5.7a bullet, carried item (b),
+for the full correction (found and fixed in the final whole-branch review, 2026-09-24). **A5.7a
+also found a NEW, still-open vector into the same class of risk: the
+`_start_pos` contiguity guard is bypassed on the streamed path, and speculative decoding is the one
+residual path into it that today's refusals do not cover — see row 28b's A5.7a bullet, carried item
+(a). A5.7b must add that check when it wires generation.**
 **SEVEN THINGS A5.7 MUST CARRY, from A5.5 and A5.6, all in row 28b (two added by final review,
 2026-09-24 — see below):** (1) attention attends a
 contiguous `kv_view = cat([history, chunk, compressed])`, NOT the reference's in-place ring —
@@ -168,7 +183,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
 | ~~6~~ | ~~**A5.6** block + model~~ | **CLOSED 2026-09-24** — 5 commits, suite 2686/16, both MoE gates green | [`…A5.6-block-model-RESULTS.md`](docs/2026-09-24-A5.6-block-model-RESULTS.md) | done |
-| 7 | **A5.7a** engine change | **DESIGN, approved 2026-09-24** | [`…A5.7a-streamed-path-design.md`](docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md) | **~1 day** — §0 decided: teach the engine. Shared surface is ONE 2-line hook. |
+| 7 | ~~**A5.7a** engine change~~ | **CLOSED 2026-09-24** — 7 commits, DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both MoE gates green | [`…A5.7a-streamed-path-RESULTS.md`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md) | done |
 | 8 | **A5.7b** load + first token | **BRIEF's remainder** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | **~1–2 days**, mostly wall-clock on the irreversible 157 G split. |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
@@ -1288,7 +1303,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
 | **A5.5** `[x]` | **attention** | **DONE 2026-09-24** | MLA + sparse index on a contiguous `kv_view`; 3/4 goldens bit-identical, chunked prefill works where the reference RAISES | done | [`…A5.5-RESULTS…`](docs/2026-09-24-A5.5-attention-RESULTS.md) |
 | **A5.6** `[x]` | block + model | **DONE 2026-09-24** | `from_config` builds the real skeleton in 1.44 s; `hc_head` bit-identical, `head` rel-L2 0.00166 + exact argmax; 30 new tests | done | [`…A5.6-RESULTS…`](docs/2026-09-24-A5.6-block-model-RESULTS.md) |
-| **A5.7a** `[~]` | **engine: teach the streamed path** | **DESIGNED 2026-09-24, approved** | new `run_embed` hook (2 lines, identity default) + `VaayuDeepseekV4` subclass + `auto_model` dispatch + 2 refusals + the `weight_block_size` bug. **No checkpoint, no split, no token.** | **~1 day** | [`…A5.7a-design…`](docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md) |
+| **A5.7a** `[x]` | **engine: teach the streamed path** | **DONE 2026-09-24** | `run_embed` hook (identity default) + `VaayuDeepseekV4` subclass + `auto_model` dispatch + 2 refusals + the `weight_block_size` bug fixed; DeepSeek suite 289 passed, repo 2711/16, both MoE gates green; 25 new tests. **No checkpoint, no split, no token.** | done | [`…A5.7a-RESULTS…`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md) |
 | **A5.7b** `[ ]` | load + first token | **BRIEF's remainder** | `fp4_group_size` into the loader, key remap (prefix + 2 renames + `mtp.*` skip), MTP index skip (11,008 not 11,776), split/persist, A4's two checks, first generation, row 26 probe | **~1–2 d**, mostly wall-clock | [`…A5.7…BRIEF`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
 ~~**≈3 weeks. A5.5 is where this dies if it dies**~~ — **IT DID NOT.** A5.5 closed 2026-09-24:
@@ -2008,8 +2023,12 @@ and both have a golden reference or a Vaayu precedent.
       arbitrary given every other weight in the file is equally uninitialized); 16 pre-existing pytest warnings (14x
       `torch.jit.script_method` deprecation, 2x `SwigPyPacked`/`SwigPyObject`) are environment noise
       untouched by this branch.
-- [~] **A5.7a — teach the streamed path DeepSeek-V4. ENGINE ONLY. DESIGNED AND APPROVED
-      2026-09-24; IN PROGRESS.** Design:
+- [x] **A5.7a — teach the streamed path DeepSeek-V4. ENGINE ONLY. CLOSED 2026-09-24.** Seven
+      commits, one per task: `da21ec6` (weight_block_size guard), `974b3ee` (run_embed hook),
+      `fd4fe40` (decoder layer use_cache), `7de88ec` (VaayuDeepseekV4 cache + compute hooks),
+      `87d8bcb` (id scope + three refusals), `a5d6bde` (prefix-cache / kv_persist refusal),
+      `9fdfbcc` (auto_model dispatch). RESULTS:
+      [`…A5.7a-streamed-path-RESULTS.md`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md). Design:
       `docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md` (gitignored — this bullet is
       the durable copy).
       **§0 DECIDED: TEACH THE ENGINE.** Unstreamed is dead on arithmetic — **157 G** against
@@ -2032,19 +2051,29 @@ and both have a golden reference or a Vaayu precedent.
       choice) and reads `hc_mult` **off the config, never the literal 4**. The rejected alternative
       was a `dim()==3` guard inside `DeepseekV4DecoderLayer.forward` — zero engine edit, but it
       makes the layer's input contract conditional and hides model state in a shape test.
-      **`use_cache` is hardcoded into the kwargs dict at `:5209` and NO hook can remove it**, so the
+      **`use_cache` is hardcoded into the kwargs dict at `:5222` and NO hook can remove it**, so the
       modeling file accepts `use_cache=None` explicitly — **NOT `**kwargs`**, which would swallow a
       future engine kwarg silently (A1 Task 4 / 47-m5 / the MTP index, three times now).
       **NEW FINDING, from the design's own self-review — `_chunked_prefill` HAS TWO BRANCHES and
-      only one is safe.** The **chunk-major** branch (`vaayu_base.py:4661`) calls
+      only one is safe.** The **chunk-major** branch (`vaayu_base.py:4674`) calls
       `self.forward(input_ids=chunks, ...)` where `chunks` is a **Python LIST of 1-D tensors**; the
       scope wrapper would stash a list and `current_input_ids()` would hand a list to the
-      hash-routed layers. **It is not taken for this model** — that branch is gated on
-      `_active_attn_impl in ("flash_attention_2","sdpa")` and
-      `_check_and_adjust_attn_implementation` returns `"eager"` unconditionally, so DeepSeek-V4
-      takes the legacy per-chunk loop at `:4688`, which passes a 2-D tensor slice. **That is a
-      load-bearing coincidence between two unrelated decisions**, so the wrapper REFUSES a
-      non-tensor `input_ids` naming this branch rather than trusting the gate to stay closed.
+      hash-routed layers, so the wrapper REFUSES a non-tensor `input_ids`, naming this branch.
+      **CORRECTED BY THE FINAL WHOLE-BRANCH REVIEW, 2026-09-24 (commit `f4854f4`) — THIS BULLET
+      PREVIOUSLY CLAIMED THE BRANCH "IS NOT TAKEN FOR THIS MODEL", AND THAT WAS FALSE.** The model
+      REPORTS eager (`_check_and_adjust_attn_implementation` returns `"eager"` for any request,
+      without raising), but that is NOT what the engine records: `init_model` stores the
+      **REQUESTED** candidate (`vaayu_base.py:3373`), and because the model accepts any request,
+      `from_config` succeeds on the FIRST candidate — `"flash_attention_2"` wherever `flash_attn`
+      is installed, as it is here. So `_active_attn_impl` was `"flash_attention_2"`, the gate at
+      `:4666` was **OPEN**, and every prompt over `prefill_chunk_size` would have RAISED out of the
+      wrapper's own TypeError. The tripwire test passed for the wrong reason: it asserted the
+      METHOD's return value, while the gate reads `_active_attn_impl`, which that method never
+      sets. **FIXED IN THE SUBCLASS, no shared-infra edit:** `__init__` now does
+      `kwargs.setdefault("attn_implementation", "eager")`, which collapses `init_model`'s candidate
+      list to one (`:3321`) and shuts the gate for real. `setdefault`, so an explicit caller choice
+      still wins. With that in place DeepSeek-V4 does take the legacy per-chunk loop at `:4707`,
+      which passes a 2-D tensor slice.
       **TTFT CONSEQUENCE FOR A5.7b, and it is structural, not a bug:** the chunk-major branch IS
       row 45's layer-major prefill (every expert read ONCE per prefill instead of once per chunk —
       2.75× at 2k, 5.47× at 8k on the module-list forward). Being eager-only, **DeepSeek-V4 cannot
@@ -2099,12 +2128,106 @@ and both have a golden reference or a Vaayu precedent.
       `weight_block_size` guard · 2 the `run_embed` hook · 3 the decoder layer's `use_cache` · 4 the
       subclass's cache + compute hooks · 5 the `forward` wrapper and its three refusals · 6 the
       prefix-cache / `kv_persist` refusal · 7 `auto_model` dispatch + the eager-gate tripwire · 8
-      full suite + both on-device gates + close. **27 new tests, none needing the checkpoint or a
-      GPU** (floors: DeepSeek 264 → 291, repo 2686/16 → 2713/16).
+      full suite + both on-device gates + close. **25 new tests, none needing the checkpoint or a
+      GPU** (one of the design's planned 27 was deleted during Task 5 review as redundant with
+      existing `tests/test_deepseek_v4_model.py` coverage — floors: DeepSeek 264 → **289** [not
+      291], repo 2686/16 → **2711/16** [not 2713/16]).
       **Two facts measured while designing, so A5.7b does not re-derive them: 230 G free on the
       models volume** (a split needs ~157 G — it fits, 73 G slack) and `DELETE_ORIGINAL = True`
       (`vaayu/server/config.py:62`) confirmed, which is what makes the first split irreversible under
       the standing NO-DOWNLOAD constraint. **A5.7a touches the checkpoint ZERO times.**
+
+      **CLOSED 2026-09-24 — MEASURED, the durable copy (full detail in the RESULTS doc above):**
+      **DeepSeek suite: `289 passed`, zero failed, 32.33s.** **Full repo suite: `2711 passed, 16
+      skipped`, zero failed, 202.36s.** Both exactly match the floors above; nothing outside
+      `tests/test_deepseek_v4_*` changed state. **Both on-device gates green, foreground,
+      `MemoryMax=29G`:** Qwen3-Next-80B-A3B-AWQ-4bit **8 passed, 34.38s (wall 38.33s)** — A5.6's
+      figure was 35.07s, consistent; MiniMax-M2.7-exl3 **8 passed, 72.72s (wall 76.80s)** — A5.6's
+      figure was 73.92s, consistent. **No fused-EXL3 claim** (no model on disk since Qwen3-235B was
+      retired 2026-09-20). **Dense has no committed gate** (`test_batched_dense_smoke.py` deleted
+      2026-09-03); the argument dense is unaffected is `run_embed`'s identity default
+      (`return layer(seq)`, `vaayu_base.py:4628`) — every model that doesn't override the hook gets
+      back exactly what it got before the hook existed. Stated, not assumed.
+      **§8, the durable answers: (1) NO KNOB** — the subclass is selected by `auto_model.py` off the
+      checkpoint's own `architectures` field; a knob would let a user pick the wrong forward.
+      **(2) PLUMBED** — `auto_model.get_module_class`, `elif "DeepseekV4" in arch: return
+      VaayuDeepseekV4, {}`, with a Task 7 test confirming real-call reachability against the actual
+      on-disk `config.json`. **(3) NOT REACHABLE — banked, said so plainly.** `from_pretrained`
+      still fails on this checkpoint for three independent A5.7b reasons: `config.fp4_group_size`
+      unset before `from_config`, the key remap unwritten, and the expert offset index finding
+      11,776 entries (regex `\.experts\.(\d+)\.`) against the real 11,008 (`mtp.0/1/2.ffn.experts.*`
+      = 768 extra = 3×256, colliding with layer 0 under `detect_moe_blocks` unless skipped).
+      Separately, prefix caching and KV persistence are refused for this model outright. N=1 being
+      the server's only mode is necessary but not sufficient here. **(4) unblocked by A5.7b.**
+
+      **FIVE THINGS CARRIED FORWARD TO A5.7b (from the Tasks 1–7 reviews, not the brief):**
+      **(a) The contiguity guard is bypassed on the streamed path.**
+      `DeepseekV4Model._start_pos` validates `cache_position == arange(start_pos, start_pos+seqlen)`
+      and raises otherwise — this cache's sliding window indexes by `pos % window_size` and its
+      Compressor flushes on block boundaries counted from `start_pos`. The streamed path never
+      calls `_start_pos`: `get_pos_emb_args` returns `{"start_pos": len_p}` with no check.
+      Deliberately NOT fixed here — every other model's hook is equally unvalidated, and today's
+      vectors are closed (prefix caching / KV persistence refused, batch>1 refused). **The residual
+      vector is SPECULATIVE DECODING** (`drafter_model_path`, `draft_tokens`), which those refusals
+      do **not** cover. A5.7b must add this check when it wires generation.
+      **UPDATE from the final whole-branch review (2026-09-24): speculative decoding is confirmed
+      NOT refused for this model** — `cache_holds_recurrent_state` (`vaayu/batch.py:500`, the
+      `getattr(cache, "layers", None) or ()` loop at `:515`) finds no `update_conv_state` /
+      `conv_states` on `DeepseekV4Cache` / `DeepseekV4CacheLayer`, so `spec_recurrent_refusal`
+      returns `None` and speculative decoding is allowed to start. **But it fails LOUDLY, not
+      silently**: the first rejected draft reaches `_trim_kv_cache` (`vaayu_base.py:5461`) →
+      `DeepseekV4Cache.crop` → the sliding-window/Compressor state is not what `crop` expects →
+      `RuntimeError`. Also note `vaayu_base.py:2586` calls `self._create_kv_cache()` purely as a
+      probe to feed `spec_recurrent_refusal`, which for this subclass allocates a full preallocated
+      `DeepseekV4Cache` (43 layers) and immediately discards it — wasted, not wrong.
+      **(b) The open `[bug]`'s severity is lower than previously stated.** Measured:
+      `_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")`, and neither
+      `DeepseekV4Cache` nor `DeepseekV4CacheLayer` has any of them.
+      **CORRECTED by the final whole-branch review (2026-09-24): this does NOT mean the pre-existing
+      `_refuse_unsupported_prefix_cache` (`vaayu_base.py:3755`) auto-disables prefix caching with a
+      warning for this model.** Task 6's hard refusal in `VaayuDeepseekV4.__init__` runs FIRST (it
+      raises `NotImplementedError` before `super().__init__` is ever reached), so `:3755` is DEAD
+      CODE on this path. The actual outcome of requesting `enable_prefix_cache=True` on this model is
+      a hard load failure, not an announced downgrade. **Add prominently: the server's DEFAULT config
+      cannot load this model** — `vaayu/server/config.py:100` sets `ENABLE_PREFIX_CACHE = True`, and
+      `vaayu/server/app.py:406` passes `enable_prefix_cache=config.enable_prefix_cache` to
+      `from_pretrained` unconditionally — so **A5.7b must decide** between (i) defaulting that knob
+      off for this architecture, or (ii) downgrading Task 6's refusal to warn-and-disable, which is
+      the engine's own precedent (`:3755`'s behavior for models it does understand). Do **NOT** change
+      the refusal's behaviour as part of this correction; it is approved and correct as shipped — this
+      is a note for A5.7b, not a reopening of A5.7a.
+      **(c) DeepSeek-V4 cannot use the layer-major chunked prefill.** That branch (row 45's win) is
+      gated on flash/sdpa.
+      **CORRECTED by the final whole-branch review (2026-09-24): "this model forces eager
+      unconditionally" was FALSE as a description of what the engine does.** The model's own
+      `_check_and_adjust_attn_implementation` reports `"eager"` unconditionally, but `init_model`
+      records the REQUESTED candidate, not that report (`vaayu_base.py:3373`) — and because the
+      method accepts any request without raising, the first candidate tried wins. On a box with
+      `flash_attn` installed the candidate list is `["flash_attention_2", "sdpa", "eager"]` and
+      nothing refuses `"flash_attention_2"` for this architecture, so **the chunk-major gate
+      (`:4666`) was open**, and every prompt over `PREFILL_CHUNK_SIZE` would have hit this class's
+      own `TypeError` refusal for a list `input_ids`. Fixed in the commit that lands alongside this
+      correction (`fix(A5.7a): force eager attn_implementation in VaayuDeepseekV4 to keep the
+      chunk-major gate shut`): `VaayuDeepseekV4.__init__` now sets
+      `kwargs.setdefault("attn_implementation", "eager")` before `super().__init__`, which collapses
+      `init_model`'s candidate list to one (`vaayu_base.py:3321-3322`) and forces the requested and
+      resolved value to agree. **With that fix in place, the underlying TTFT consequence stands and
+      is real**: a 4k prompt at `PREFILL_CHUNK_SIZE=512` re-reads its routed expert set 8×.
+      Structural, not a bug. **A5.7b's measured TTFT must NOT be compared against MiniMax's
+      post-row-45 figure.**
+      **(d) A positional bypass exists in theory.** The construction-time refusal reads
+      `enable_prefix_cache`/`enable_kv_persist` from `kwargs`, and they are positional slots 21 and
+      24 of `VaayuBaseModel.__init__`. Every construction path in the repo passes keyword-only
+      (grepped clean) — unreachable today, but defended by convention, not code.
+      **(e) Deferred minors:** two committed citations of `vaayu_base.py:5209` are stale.
+      **CORRECTED by the final whole-branch review (2026-09-24): the file names above were wrong.**
+      Verified by grep against the current tree: the kwargs dict this cites is at
+      `vaayu_base.py:5222` (not `:5209`), and the two stale citations of the old line number are in
+      `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (~`:1430`) and
+      `tests/test_deepseek_v4_engine.py` (~`:87`) — **`vaayu/vaayu_deepseek_v4.py` carries none.** The
+      `run_embed` source-text test pins that the hook call exists but not WHERE; the Task 7 eager-gate
+      tripwire is a source-text substring match, brittle to harmless reformatting (confirmed
+      today-correct by the reviewer; not a live defect).
 
 - [ ] **A5.7b — load, index, first token. BRIEF's remainder.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex

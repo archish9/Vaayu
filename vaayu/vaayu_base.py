@@ -4625,6 +4625,17 @@ class VaayuBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def run_embed(self, layer, seq):
+        """The embedding's output, for architectures that reshape it.
+
+        Mirrors `run_norm` and `run_lm_head`: the layer-major loop calls the
+        embedding itself, so a model whose residual stream is not
+        `[b, s, hidden]` has nowhere else to say so. DeepSeek-V4 carries
+        `hc_mult` copies of the residual and expands here; every other model
+        takes this identity default and is unchanged.
+        """
+        return layer(seq)
+
     def _chunked_prefill(
         self,
         input_ids: torch.LongTensor,
@@ -5180,7 +5191,7 @@ class VaayuBaseModel(GenerationMixin):
 
                         if layer_name == self.layer_names_dict['embed']:
                             _tl = time.perf_counter()
-                            batch[j] = layer(seq)
+                            batch[j] = self.run_embed(layer, seq)
                             _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                         elif layer_name == self.layer_names_dict['norm']:
                             #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])

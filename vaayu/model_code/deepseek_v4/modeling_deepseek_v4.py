@@ -285,6 +285,13 @@ class DeepseekV4Linear(nn.Module):
             self._parameter("scale", (out_features, in_features // fp4_group_size),
                             _SCALE_DTYPE)
         elif dtype == torch.float8_e4m3fn:
+            if weight_block_size is None:
+                raise ValueError(
+                    "weight_block_size is in no config field -- an F8_E4M3 weight "
+                    "carries a per-tile scale and the tile shape lives only in the "
+                    "checkpoint's `checkpoint_quantization_config.weight_block_size`. "
+                    "Read it off the config and pass it. (A bf16 checkpoint of this "
+                    "architecture needs none and never reaches here.)")
             out_block, in_block = weight_block_size
             self._parameter("weight", (out_features, in_features), dtype)
             self._parameter("scale", (-(-out_features // out_block),
@@ -1415,7 +1422,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
-    def forward(self, hidden_states, past_key_values, start_pos: int):
+    def forward(self, hidden_states, past_key_values, start_pos: int,
+                use_cache: bool | None = None):
+        """`use_cache` is accepted and ignored.
+
+        Vaayu's layer-major loop hardcodes it into every layer call
+        (`vaayu_base.py:5209`) and no hook can remove it. This model's cache
+        is preallocated and always live -- there is no uncached mode to
+        select -- so the argument has nothing to do here.
+
+        Accepted EXPLICITLY rather than through `**kwargs`: a catch-all would
+        swallow a future engine kwarg without a word, which is the defect
+        class this port has already paid for three times.
+        """
         residual = hidden_states
         x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn,
                                     self.hc_attn_scale, self.hc_attn_base)

@@ -89,6 +89,7 @@ class AutoModel:
         from .vaayu_chatglm import VaayuChatGLM
         from .vaayu_qwen import VaayuQWen
         from .tokenization_baichuan import BaichuanTokenizer
+        from .vaayu_deepseek_v4 import VaayuDeepseekV4
 
         if 'hf_token' in kwargs:
             config = AutoConfig.from_pretrained(
@@ -117,6 +118,8 @@ class AutoModel:
             return VaayuBaseModel, {}
         elif "Gemma" in arch or "Llama" in arch:
             return VaayuLlama2, {}
+        elif "DeepseekV4" in arch:
+            return VaayuDeepseekV4, {}
         else:
             print(f"unknown architecture: {arch}, using VaayuBaseModel with auto-detect...")
             return VaayuBaseModel, {}
