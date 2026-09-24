@@ -2051,19 +2051,29 @@ and both have a golden reference or a Vaayu precedent.
       choice) and reads `hc_mult` **off the config, never the literal 4**. The rejected alternative
       was a `dim()==3` guard inside `DeepseekV4DecoderLayer.forward` — zero engine edit, but it
       makes the layer's input contract conditional and hides model state in a shape test.
-      **`use_cache` is hardcoded into the kwargs dict at `:5209` and NO hook can remove it**, so the
+      **`use_cache` is hardcoded into the kwargs dict at `:5222` and NO hook can remove it**, so the
       modeling file accepts `use_cache=None` explicitly — **NOT `**kwargs`**, which would swallow a
       future engine kwarg silently (A1 Task 4 / 47-m5 / the MTP index, three times now).
       **NEW FINDING, from the design's own self-review — `_chunked_prefill` HAS TWO BRANCHES and
-      only one is safe.** The **chunk-major** branch (`vaayu_base.py:4661`) calls
+      only one is safe.** The **chunk-major** branch (`vaayu_base.py:4674`) calls
       `self.forward(input_ids=chunks, ...)` where `chunks` is a **Python LIST of 1-D tensors**; the
       scope wrapper would stash a list and `current_input_ids()` would hand a list to the
-      hash-routed layers. **It is not taken for this model** — that branch is gated on
-      `_active_attn_impl in ("flash_attention_2","sdpa")` and
-      `_check_and_adjust_attn_implementation` returns `"eager"` unconditionally, so DeepSeek-V4
-      takes the legacy per-chunk loop at `:4688`, which passes a 2-D tensor slice. **That is a
-      load-bearing coincidence between two unrelated decisions**, so the wrapper REFUSES a
-      non-tensor `input_ids` naming this branch rather than trusting the gate to stay closed.
+      hash-routed layers, so the wrapper REFUSES a non-tensor `input_ids`, naming this branch.
+      **CORRECTED BY THE FINAL WHOLE-BRANCH REVIEW, 2026-09-24 (commit `f4854f4`) — THIS BULLET
+      PREVIOUSLY CLAIMED THE BRANCH "IS NOT TAKEN FOR THIS MODEL", AND THAT WAS FALSE.** The model
+      REPORTS eager (`_check_and_adjust_attn_implementation` returns `"eager"` for any request,
+      without raising), but that is NOT what the engine records: `init_model` stores the
+      **REQUESTED** candidate (`vaayu_base.py:3373`), and because the model accepts any request,
+      `from_config` succeeds on the FIRST candidate — `"flash_attention_2"` wherever `flash_attn`
+      is installed, as it is here. So `_active_attn_impl` was `"flash_attention_2"`, the gate at
+      `:4666` was **OPEN**, and every prompt over `prefill_chunk_size` would have RAISED out of the
+      wrapper's own TypeError. The tripwire test passed for the wrong reason: it asserted the
+      METHOD's return value, while the gate reads `_active_attn_impl`, which that method never
+      sets. **FIXED IN THE SUBCLASS, no shared-infra edit:** `__init__` now does
+      `kwargs.setdefault("attn_implementation", "eager")`, which collapses `init_model`'s candidate
+      list to one (`:3321`) and shuts the gate for real. `setdefault`, so an explicit caller choice
+      still wins. With that in place DeepSeek-V4 does take the legacy per-chunk loop at `:4707`,
+      which passes a 2-D tensor slice.
       **TTFT CONSEQUENCE FOR A5.7b, and it is structural, not a bug:** the chunk-major branch IS
       row 45's layer-major prefill (every expert read ONCE per prefill instead of once per chunk —
       2.75× at 2k, 5.47× at 8k on the module-list forward). Being eager-only, **DeepSeek-V4 cannot
