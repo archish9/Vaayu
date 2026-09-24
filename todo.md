@@ -57,7 +57,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.6** — jump to "PICK THIS NEXT: **A5.6**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.7** — jump to "PICK THIS NEXT: **A5.7**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -67,8 +67,11 @@ three `linear_*` goldens BIT-IDENTICALLY, and the MoE block lands on Vaayu's mod
 with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, `expert` and both
 `moe_*` goldens. **A5.5 IS CLOSED TOO — its step-0 gate passed 3/3 on
 2026-09-23 and the port itself landed 2026-09-24 in 17 commits (`e983e60..6d5beb5`, merged to
-main). The step where A5 was expected to die did not kill it. START AT A5.6**, whose brief is
-already written; A5.5's durable record, including two things A5.6 MUST carry, is row 28b.** **Correction carried from
+main). A5.6 IS CLOSED TOO — `AutoModelForCausalLM.from_config` now builds the real 43-layer,
+11,008-expert skeleton under `init_empty_weights` in 1.44 s, both new goldens hold (`hc_head`
+bit-identical, `head` rel-L2 0.00166 + exact argmax). The step where A5 was expected to die did
+not kill it. START AT A5.7**, whose brief is already written; A5.6's durable record, including
+everything A5.7 MUST carry, is row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -85,23 +88,30 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.6** (row 28b). Then A5.7. One per session.
+## ▶ PICK THIS NEXT: **A5.7** (row 28b). Last sub-plan. One per session.
 
-**A5.1–A5.5 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 on 2026-09-24).**
-**TWO THINGS A5.6 MUST CARRY, both from A5.5 and both in row 28b:** (1) attention attends a
+**A5.1–A5.6 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 and A5.6 on 2026-09-24).**
+**FIVE THINGS A5.7 MUST CARRY, from A5.5 and A5.6, all in row 28b:** (1) attention attends a
 contiguous `kv_view = cat([history, chunk, compressed])`, NOT the reference's in-place ring —
 **do not "simplify" it back**, a 512-token chunk overruns the 128-slot window; (2) the open
 `[bug]` — `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`/`:364`,
 `kv_persist`, and `Cache.max_cache_len`/`max_batch_size`/`batch_repeat_interleave`/
 `batch_select_indices` do not understand this cache, so **this model must run with prefix caching
-and KV persistence OFF until that is fixed**, and A5.7 cannot claim reachability before it is.
-A5.5 also left `DeepseekV4Cache`/`DeepseekV4CacheLayer`, so A5.6 inherits the cache rather than
-designing it. A5.2 left `tests/deepseek/parity.py` + 15 committed
+and KV persistence OFF until that is fixed**, and A5.7 cannot claim reachability before it is;
+(3) **hard precondition**: the loader MUST set `config.fp4_group_size` (measured = 32, off the
+shard headers) before `from_config`, or the skeleton raises A5.4's named `ValueError`; (4) a
+pending bug in A5.5 code: all three `.get("weight_block_size")` sites in `modeling_deepseek_v4.py`
+(lines 493, 1166, 1236) pass `None` through to `DeepseekV4Linear` and raise an unnamed `TypeError`
+instead of naming the missing field, when a config's `checkpoint_quantization_config` omits it;
+(5) A5.6's deferred minors — see row 28b's A5.6 bullet for the full list. A5.5 left
+`DeepseekV4Cache`/`DeepseekV4CacheLayer`, and A5.6 left `DeepseekV4ForCausalLM` + the `auto_map`
+entry proving `AutoModelForCausalLM.from_config` builds the real skeleton in 1.44 s — A5.7 is
+purely weights + index + first token from here. A5.2 left `tests/deepseek/parity.py` + 15 committed
 goldens in `tests/deepseek/goldens/` (1.1 MB); the recorder is `python -m tests.deepseek.parity`.
 A5.3 + A5.4 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (`DeepseekV4Linear`,
 `Gate`, `Expert`, `MoE`, `input_ids_scope`) — **A5.5 adds attention to that same file, reads
-`KERNEL_DIR` before any kernel call, and A5.6's model forward MUST run its layers inside
-`input_ids_scope` or the three hash layers raise.** A5.1 left two things every later
+`KERNEL_DIR` before any kernel call, and A5.6's model forward runs its layers inside
+`input_ids_scope` so the three hash layers don't raise.** A5.1 left two things every later
 sub-plan uses:
 `tests/fixtures/deepseek_v4_config.json` (a committed copy of the shipped config — **no 157 G
 checkpoint and no GPU needed to test this path**) and
@@ -120,7 +130,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
-| **6 (IN FLIGHT `[~]`)** | **A5.6** block + model | **DESIGNED 2026-09-24** — brief promoted; two brief errors corrected in row 28b | [`…A5.6-block-model-design.md`](docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md) | 3–5 d |
+| ~~6~~ | ~~**A5.6** block + model~~ | **CLOSED 2026-09-24** — 5 commits, suite 2686/16, both MoE gates green | [`…A5.6-block-model-RESULTS.md`](docs/2026-09-24-A5.6-block-model-RESULTS.md) | done |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
@@ -561,7 +571,9 @@ read it for method and for the traps, not for work.
 (`7d806e7`), not restored — the same commit deleted both on-device gate scripts (see the gates table below). `plans/` and `docs/` are GITIGNORED, so neither
 survives a fresh clone; `plans/settled_and_method_notes.md` is the older archive, on this disk only.
 
-**Suite baseline: 2593 passed, 16 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+**Suite baseline: 2686 passed, 16 skipped** (`./venv/bin/python -m pytest tests/ -q`), verified
+2026-09-24 after A5.6 (+30: its two new test files). The 2656 / 16 was verified
+2026-09-24 after A5.5 (+63: its new test file). The 2593 / 16 was verified
 2026-09-23 after A5.4 (+24: its new test file). The 2569 / 16 was verified
 2026-09-23 after A5.3 (+19: its new test file; the 2550 / 16 it starts from was re-measured on the
 same HEAD that morning, before any A5.3 code, and MATCHED A5.2's figure). The 1979 / 15 was verified
@@ -1237,7 +1249,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
 | **A5.5** `[x]` | **attention** | **DONE 2026-09-24** | MLA + sparse index on a contiguous `kv_view`; 3/4 goldens bit-identical, chunked prefill works where the reference RAISES | done | [`…A5.5-RESULTS…`](docs/2026-09-24-A5.5-attention-RESULTS.md) |
-| **A5.6** `[~]` | block + model | **DESIGN** (2026-09-24) | hyper-connections, HF `Cache` migration, `ForCausalLM` + `auto_map` | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md) |
+| **A5.6** `[x]` | block + model | **DONE 2026-09-24** | `from_config` builds the real skeleton in 1.44 s; `hc_head` bit-identical, `head` rel-L2 0.00166 + exact argmax; 30 new tests | done | [`…A5.6-RESULTS…`](docs/2026-09-24-A5.6-block-model-RESULTS.md) |
 | **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
 ~~**≈3 weeks. A5.5 is where this dies if it dies**~~ — **IT DID NOT.** A5.5 closed 2026-09-24:
@@ -1780,8 +1792,26 @@ and both have a golden reference or a Vaayu precedent.
       nothing under `vaayu/` calls any of the four today, so not a new bug, just now a complete
       list for A5.7. **Checkpoint copy refreshed and `diff -q` clean before commit** (items 2-4
       touched the modeling file). Full `tests/test_deepseek_v4_*.py`: **234 passed**, 33.07 s.
-- [~] **A5.6 — block + model. DESIGNED 2026-09-24** (`docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md`,
-      gitignored — this bullet is the durable copy). **Hyper-connections are not in the A5 brief at
+- [x] **A5.6 — block + model. CLOSED 2026-09-24.** 5 commits (`dce2657..9a5e056`). **SUCCESS
+      CRITERION MET: `AutoModelForCausalLM.from_config` builds the real 43-layer, 11,008-expert
+      skeleton under `init_empty_weights` in 1.44 s** (budget ~5 s) — this checkpoint has been
+      unloadable since it landed on disk 2026-09-20; this is the first time `AutoModelForCausalLM`
+      has resolved its class and built the full module tree. `fp4_group_size` derived = **32** off
+      the shard headers (never a literal). **Goldens:** `hc_head` bit-identical (`torch.equal`,
+      373.1 KiB fixture); `head` rel-L2 **0.0016627010190859437** vs gate `< 5e-3`, **exact
+      argmax** — the bf16-head stop rule did NOT fire, the 0.986 GiB saving stands. **Block**: not
+      bit-identical with the MoE weight applied outside (rel **0.00725** vs A5.4's own `< 5e-2`
+      bound) but **bit-identical (`torch.equal`) with the weight applied inside**, isolating the
+      whole gap to A5.4's documented weight-placement choice — nothing in HC, norms or attention.
+      **Suite: DeepSeek 264 passed, 32.18 s (234 baseline + 30); full repo 2686 passed / 16
+      skipped, 205.80 s** (= A5.5's 2656/16 close + these 30 — no drift elsewhere). **Both
+      on-device MoE gates CHECKED (A5.6 touches nothing under `vaayu/`) and green: Qwen3-Next 8
+      passed 35.07 s, MiniMax-M2.7 8 passed 73.92 s.** No fused-EXL3 coverage claim (no model on
+      disk since 2026-09-20). **§8: (1) no knob — reached via `auto_map`; (2) N/A; (3) NOT
+      reachable — `from_config` succeeds, `from_pretrained` does not; (4) unblocked by A5.7.**
+      Detail: `docs/2026-09-24-A5.6-block-model-RESULTS.md` (gitignored; this bullet is the
+      durable copy). Design: `docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md`.
+      **Hyper-connections are not in the A5 brief at
       all:** every block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs
       `hc_pre`/`hc_post` twice per block around a 20-iteration Sinkhorn
       (`kernels().hc_split_sinkhorn`, validated by A5 step 1).
@@ -1883,7 +1913,48 @@ and both have a golden reference or a Vaayu precedent.
       the structural tests stub the layer and only the `from_config` test builds the true geometry.
       **PLAN:** `docs/superpowers/plans/2026-09-24-A5.6-block-model.md` — 6 tasks, TDD, one commit
       each (gitignored; this bullet is the durable copy).
-- [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
+      **THREE BRIEF/PLAN CORRECTIONS PROVEN DURING THE WORK (all folded into the text above, restated
+      here as the durable summary):** (1) `hc_head` lives on `Block`, not `ParallelHead` — a method
+      reading only per-block copies of model-level config fields, moved to `DeepseekV4Model`,
+      golden-proven not asserted; (2) its parameters are `[hc_mult, hc_mult*hidden_size]` =
+      `[4, 16384]`, NOT the brief's `[24, 16384]` (that shape is `mix_hc`, used by `hc_pre`/`hc_post`,
+      not `hc_head`'s plain sigmoid); (3) A5.7's key remap is NOT "~a `model.` prefix" — disk keys are
+      flat (`embed.weight`, `layers.N.*`, `norm.weight`, `head.weight`, `hc_head_*`, `mtp.N.*`,
+      72,317 tensors); the real remap is a `model.` prefix **plus two renames**
+      (`embed.`→`model.embed_tokens.`, `head.weight`→`lm_head.weight`) **plus a skip** (`mtp.*`
+      dropped).
+      **NEW PENDING BUG for A5.7 — A5.5 code, out of A5.6's scope:** all three
+      `.get("weight_block_size")` sites in `modeling_deepseek_v4.py` (current lines **493, 1166,
+      1236**) pass `None` through to `DeepseekV4Linear` when `checkpoint_quantization_config` omits
+      the field; `DeepseekV4Linear` unpacks it as `out_block, in_block = weight_block_size` and
+      raises `TypeError: cannot unpack non-iterable NoneType object` instead of a message naming
+      what's missing. Found investigating a Task 3 test failure; the fix that would have hidden it
+      (a hardcoded `_WEIGHT_BLOCK_SIZE = (128, 128)` fallback) was REJECTED and reverted — `128` is
+      on CLAUDE.md §5's forbidden-literal list, and unlike `_ACT_QUANT_GROUP`/`_FP4_BLOCK_SIZE`
+      (which have no config source anywhere) this field DOES have one and the real checkpoint
+      carries it, so inventing a default here repeats the exact mistake the `fp4_group_size` ruling
+      above refused to make. The three tests that surfaced it were fixed to use `stub_layers`
+      instead of constructing a real `DeepseekV4Attention`.
+      **DEFERRED MINORS, collected for final review / A5.7 triage (each is low-stakes, none is a
+      correctness bug in shipped behavior):** `test_deepseek_v4_block.py:136-168`'s `loaded_block`
+      fixture hand-saves/restores `KERNEL_DIR`/`_KERNELS` because `monkeypatch` is function-scoped —
+      needs a comment so a future reader doesn't "fix" it back and break the sharing;
+      `test_the_residual_stream_is_hc_mult_copies_wide` (`test_deepseek_v4_model.py:159-179`)
+      asserts only `.shape`, which doesn't distinguish `.repeat()` (real storage) from `.expand()`
+      (a view) as its docstring claims; `_start_pos`'s `cache_position.numel() != seqlen` branch has
+      no test; no `get_output_embeddings`/`set_output_embeddings` on `DeepseekV4ForCausalLM`
+      (harmless while `tie_word_embeddings` is `False`); `test_the_head_tracks_the_references_fp32_logits`
+      exercises a standalone RMSNorm+Linear rather than the production `lm_head` (partially covered
+      by Task 5's dtype assertion); the `labels`/`loss_function` branch is unexercised; `hc_head_*`
+      and per-layer `hc_*` are bare `nn.Parameter(torch.empty(...))`, uncovered by `_init_weights`
+      (dispatches only on `nn.Linear`/`nn.Embedding`/norm-named modules) — `from_config` on a real
+      device holds inf/NaN there until a checkpoint loads over it; harmless in Vaayu's own path
+      (meta-only construction, always overwritten by real weights) but a surprise to any other
+      caller — this is what caused (and was root-caused via) an order-dependent test flake, fixed
+      test-side with a `seeded_parameters()` helper, not a production `_init_weights` override
+      (would be dead code under `init_empty_weights`); 16 pre-existing pytest warnings (14x
+      `torch.jit.script_method` deprecation, 2x `SwigPyPacked`/`SwigPyObject`) are environment noise
+      untouched by this branch.
 - [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
       `\.experts\.(\d+)\.` finds **11,776** — the extra **768 experts = 9.56 GiB** are
@@ -1895,7 +1966,9 @@ and both have a golden reference or a Vaayu precedent.
       the **first `.N.` in the path**, and `mtp.0.ffn` contains `.0.` → detected as **layer 0**,
       colliding with the real one. Same defect class as A1 Task 4 and 47-m5 — an index asking a
       question the load path answers differently, **third time this program has paid for it**.
-      Also: key remap (should be ~a `model.` prefix — **verify, it is A5.4's claim**); splitter runs
+      Also: key remap — **CONFIRMED by A5.6, not "~a `model.` prefix"**: it is that prefix PLUS
+      `embed`→`model.embed_tokens`, `head`→`lm_head`, and a `mtp.*` skip (full detail in the A5.6
+      bullet above); splitter runs
       A1's guards **before** `DELETE_ORIGINAL` deletes the only copy — **dry-run it**; A4 Check 1
       (pinning half) and Check 2 (**~1.01 GiB shared + ~135 MB hc + ~5.33 GiB attention** vs the pin
       budget; Phase 2 **`break`s** on miss at `vaayu_base.py:3956` — count the layers); then row 28b
