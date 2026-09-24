@@ -207,3 +207,36 @@ def test_the_hooks_produce_exactly_the_layers_signature():
         inspect.signature(modeling.DeepseekV4DecoderLayer.forward).parameters)
     accepted -= {"self", "hidden_states"}
     assert emitted == accepted
+
+
+def test_forward_stashes_the_ids_and_releases_them(monkeypatch):
+    seen = {}
+
+    def fake_super_forward(self, input_ids, **kwargs):
+        seen["ids"] = modeling.current_input_ids()
+        return "out"
+
+    monkeypatch.setattr(VaayuBaseModel, "forward", fake_super_forward)
+    model = engine()
+    ids = torch.tensor([[4, 5, 6]])
+    assert model.forward(ids) == "out"
+    assert torch.equal(seen["ids"], ids)
+    with pytest.raises(RuntimeError, match="input_ids_scope"):
+        modeling.current_input_ids()
+
+
+def test_forward_refuses_inputs_embeds_without_input_ids():
+    with pytest.raises(ValueError, match="route"):
+        engine().forward(None, inputs_embeds=torch.zeros(1, 2, 8))
+
+
+def test_forward_refuses_a_list_of_chunks():
+    """The chunk-major prefill branch passes a list of 1-D tensors."""
+    with pytest.raises(TypeError, match="chunk-major"):
+        engine().forward([torch.tensor([1, 2]), torch.tensor([3, 4])])
+
+
+def test_forward_refuses_more_than_one_sequence():
+    """One ContextVar cannot hold two sequences' ids."""
+    with pytest.raises(NotImplementedError, match="ContextVar"):
+        engine().forward(torch.tensor([[1, 2], [3, 4]]))

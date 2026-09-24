@@ -10,6 +10,8 @@ Design: `docs/superpowers/specs/2026-09-24-A5.7a-streamed-path-design.md`.
 The durable copy is row 28b's A5.7a bullet in `todo.md`.
 """
 
+import torch
+
 from .vaayu_base import VaayuBaseModel
 
 
@@ -81,3 +83,50 @@ class VaayuDeepseekV4(VaayuBaseModel):
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
         """Nothing. Position is carried in `start_pos`."""
         return {}
+
+    def forward(self, input_ids=None, **kwargs):
+        """`VaayuBaseModel.forward`, wrapped in this model's id scope.
+
+        The first `num_hash_layers` MoE layers route by TOKEN ID. Vaayu's
+        `sparse_forward(hidden_states, **kwargs)` never receives ids, so
+        `DeepseekV4Model.forward` stashes them in a `ContextVar` for the
+        duration of its layer loop. The streamed path never reaches that
+        forward, so the stash has to happen here instead.
+
+        Chunked prefill re-enters through `self.forward` per chunk
+        (`vaayu_base.py:4707`), so each chunk opens its own scope with its own
+        ids -- which is correct, because those are the tokens its layers
+        route. `ContextVar` makes the nesting and the release exception-safe.
+        """
+        from .model_code.deepseek_v4.modeling_deepseek_v4 import input_ids_scope
+
+        if input_ids is None:
+            raise ValueError(
+                "DeepSeek-V4 needs input_ids: its first `num_hash_layers` MoE "
+                "layers route by TOKEN ID, not by score, so inputs_embeds alone "
+                "has nothing to route on. Refusing rather than routing every "
+                "token to the same experts.")
+
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError(
+                f"DeepSeek-V4 needs input_ids as a tensor, got "
+                f"{type(input_ids).__name__}. The chunk-major prefill branch "
+                f"(`vaayu_base.py:4674`) passes a LIST of 1-D chunks, and the "
+                f"hash-routed layers would be handed that list. That branch is "
+                f"gated on flash/sdpa and this model forces eager, so it should "
+                f"not be reachable -- if you are seeing this, that gate changed "
+                f"and this model needs per-chunk scoping before it can use it.")
+
+        if input_ids.shape[0] > 1:
+            raise NotImplementedError(
+                f"DeepSeek-V4 runs one sequence at a time, got "
+                f"{input_ids.shape[0]}. The ids the hash-routed layers read are "
+                f"held in a ContextVar -- one per REQUEST, not per batch element "
+                f"-- and the layer-major loop runs every batch element inside a "
+                f"single scope, so sequence 1 onward would route on sequence 0's "
+                f"ids and silently return plausible logits from the wrong "
+                f"experts. The server is N=1 today; batching this model needs "
+                f"per-element scoping first.")
+
+        with input_ids_scope(input_ids):
+            return super().forward(input_ids, **kwargs)
