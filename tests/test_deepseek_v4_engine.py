@@ -80,3 +80,19 @@ def test_the_layer_major_loop_calls_run_embed_rather_than_the_layer():
     source = inspect.getsource(VaayuBaseModel.forward)
     assert "self.run_embed(layer, seq)" in source
     assert "batch[j] = layer(seq)" not in source
+
+
+def test_the_decoder_layer_accepts_the_loops_use_cache_kwarg():
+    """`vaayu_base.py:5209` hardcodes use_cache into every layer call."""
+    params = inspect.signature(modeling.DeepseekV4DecoderLayer.forward).parameters
+    assert "use_cache" in params
+    assert params["use_cache"].default is None
+
+
+def test_the_decoder_layer_still_refuses_an_unknown_kwarg():
+    """No `**kwargs`. A catch-all would swallow a future engine kwarg."""
+    params = inspect.signature(modeling.DeepseekV4DecoderLayer.forward).parameters
+    assert not any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())
+    assert set(params) == {"self", "hidden_states", "past_key_values",
+                           "start_pos", "use_cache"}

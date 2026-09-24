@@ -1422,7 +1422,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
-    def forward(self, hidden_states, past_key_values, start_pos: int):
+    def forward(self, hidden_states, past_key_values, start_pos: int,
+                use_cache: bool | None = None):
+        """`use_cache` is accepted and ignored.
+
+        Vaayu's layer-major loop hardcodes it into every layer call
+        (`vaayu_base.py:5209`) and no hook can remove it. This model's cache
+        is preallocated and always live -- there is no uncached mode to
+        select -- so the argument has nothing to do here.
+
+        Accepted EXPLICITLY rather than through `**kwargs`: a catch-all would
+        swallow a future engine kwarg without a word, which is the defect
+        class this port has already paid for three times.
+        """
         residual = hidden_states
         x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn,
                                     self.hc_attn_scale, self.hc_attn_base)
