@@ -1955,6 +1955,20 @@ class VaayuBaseModel(GenerationMixin):
         }
         self.layer_names_dict.update(self._layer_names_override)
 
+    def get_checkpoint_key_remap(self):
+        """A `str -> str | None` rename applied to checkpoint keys BEFORE the split.
+
+        None -- the default, and what every model on this box uses -- means the
+        checkpoint's keys already name the module tree, which is the case for
+        every HF-conventional checkpoint. A model whose keys do not (DeepSeek-V4
+        ships `layers.3.ffn.experts.7.w1.weight`, not `model.layers.3.…`)
+        returns a callable; a key it maps to None is dropped from the split.
+
+        Renaming here rather than at load time is not a preference: the splitter
+        matches keys by SUBSTRING, so this checkpoint's own names would put 248
+        layer-internal `*norm` keys into the `norm` shard.
+        """
+        return None
 
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=None,
@@ -2076,7 +2090,8 @@ class VaayuBaseModel(GenerationMixin):
                                                                                          compression=compression,
                                                                                          layer_names=self.layer_names_dict,
                                                                                          hf_token=hf_token,
-                                                                                         delete_original=delete_original)
+                                                                                         delete_original=delete_original,
+                                                                                         key_remap=self.get_checkpoint_key_remap())
         self.running_device = device
         self.device = torch.device(self.running_device)
         if dtype == torch.float16 and device.startswith("cuda"):

@@ -282,7 +282,8 @@ def delete_original_shards(checkpoint_path, index, safetensors_format):
 
 
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
-                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None):
+                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None,
+                          key_remap=None):
     """
     Save the all layers of a model sharded checkpoint using safetensors.
     """
@@ -342,6 +343,40 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     from .persist.checkpoint_integrity import assert_expert_layout_indexable
     assert_expert_layout_indexable(str(checkpoint_path), index.keys())
 
+    # A checkpoint whose keys do not already name the module tree gets ONE pass
+    # of renaming here, before anything below reads a key: `n_layers`, the
+    # `layers` list, `keys_by_layer` and the written tensor names all follow
+    # from it. `_fetch` keeps reading by the ORIGINAL key, so a remap only ever
+    # has to describe the naming -- never the file layout.
+    #
+    # Deliberately AFTER G1, which asks its layout question of the original
+    # keys, and deliberately before everything else, because the splitter
+    # matches keys by SUBSTRING: DeepSeek-V4's own names would put 248
+    # layer-internal `*norm` keys in the `norm` shard.
+    #
+    # A key the callable maps to None is DROPPED (DeepSeek-V4's `mtp.*` draft
+    # module: 10.117 GiB, and 768 experts that `detect_moe_blocks` would read
+    # as a second layer 0). `original_index` survives for the delete path,
+    # which names FILES and must keep naming the checkpoint's own keys.
+    original_index = index
+    source_key = {}
+    if key_remap is not None:
+        remapped = {}
+        for orig_key, fname in index.items():
+            new_key = key_remap(orig_key)
+            if new_key is None:
+                continue
+            if new_key in remapped:
+                raise ValueError(
+                    f"key_remap maps two checkpoint keys to {new_key!r} "
+                    f"({source_key[new_key]!r} and {orig_key!r}). The split "
+                    f"would write one and silently lose the other.")
+            remapped[new_key] = fname
+            source_key[new_key] = orig_key
+        print(f"key_remap: {len(remapped)} tensors renamed, "
+              f"{len(index) - len(remapped)} dropped")
+        index = remapped
+
     if layer_names is None:
         prefix = 'model.layers'
     else:
@@ -398,7 +433,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 # layer has both its .safetensors and its .done marker, which
                 # is what all(found_layers.values()) above means. IRREVERSIBLE
                 # -- recovery is a re-download.
-                delete_original_shards(checkpoint_path, index, safetensors_format)
+                delete_original_shards(checkpoint_path, original_index, safetensors_format)
             return str(saving_path)
         else:
             print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
@@ -437,6 +472,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     bin_state_dicts = {}      # .bin: fname -> the whole loaded state dict
 
     def _fetch(key, fname):
+        key = source_key.get(key, key)
         path = checkpoint_path / fname
         if not os.path.exists(path):
             assert repo_id is not None
@@ -477,7 +513,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # Free memory
         for k, fname in keys_by_layer[layer]:
             if fname in bin_state_dicts:
-                bin_state_dicts[fname].pop(k, None)
+                bin_state_dicts[fname].pop(source_key.get(k, k), None)
         del layer_state_dict
         clean_memory()
 
@@ -500,7 +536,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             print(f"WARNING: keeping the original shards -- the split under "
                   f"{saving_path} is INCOMPLETE, missing: {', '.join(missing)}")
         else:
-            delete_original_shards(checkpoint_path, index, safetensors_format)
+            delete_original_shards(checkpoint_path, original_index, safetensors_format)
 
     return str(saving_path)
 
@@ -529,7 +565,7 @@ def drop_absent_lm_head(layers, index, lm_head):
 
 
 def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
-                                       layer_names=None, hf_token=None, delete_original=False):
+                                       layer_names=None, hf_token=None, delete_original=False, key_remap=None):
     """
     find the model's local cache path, download the cache if not exists, then split and save the model.
 
@@ -560,7 +596,8 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
            os.path.exists(Path(model_local_path_or_repo_id) / 'pytorch_model.bin'):
             print(f"found index file...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original)
+                                                                            compression=compression, layer_names=layer_names,
+                                                                            delete_original=delete_original, key_remap=key_remap)
         else:
             # G0: a directory holding shards but no index is an interrupted
             # download (the 46-of-48-with-no-index case G0 was written for),
@@ -607,4 +644,5 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     # if splitted_model subdir exists under cache use it, otherwise split and save
     return Path(hf_cache_path), split_and_save_layers(hf_cache_path, layer_shards_saving_path,
                                                       compression=compression, layer_names=layer_names,
-                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id, hf_token=hf_token)
+                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id,
+                                                      hf_token=hf_token, key_remap=key_remap)
