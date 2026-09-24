@@ -245,10 +245,11 @@ def test_forward_refuses_more_than_one_sequence():
 def test_prefix_caching_is_not_refused_at_construction(monkeypatch):
     """The server's DEFAULT config sets ENABLE_PREFIX_CACHE = True and
     `app.py:406` passes it unconditionally, so a hard refusal here made the
-    default config unable to load this model at all. The engine's own generic
-    path handles it instead: `_refuse_unsupported_prefix_cache`
-    (`vaayu_base.py:3755`) finds none of to_cpu / to_device / resident_bytes on
-    this cache, warns once, and clears the flag."""
+    default config unable to load this model at all. `__init__` itself does
+    not refuse it -- this class's `_refuse_unsupported_prefix_cache` override
+    does that (Task 6a), and `VaayuBaseModel.__init__` is faked out entirely
+    here, so this test only pins that `__init__` passes the flag through
+    unmodified rather than rejecting it up front."""
     seen = {}
 
     def fake_init(self, *args, **kwargs):
@@ -259,15 +260,85 @@ def test_prefix_caching_is_not_refused_at_construction(monkeypatch):
     assert seen["kwargs"]["enable_prefix_cache"] is True
 
 
-def test_this_cache_is_one_the_generic_refusal_catches():
+def test_this_cache_is_one_the_class_level_detection_catches():
     """What makes the downgrade safe. If `DeepseekV4Cache` ever grew these
-    three methods the generic path would silently START storing prefixes out of
-    a preallocated sliding window, which is the wrong-history bug."""
+    three methods, both the base's instance probe and this class's own
+    class-level `cache_supports_prefix_store` check (Task 6a) would silently
+    START storing prefixes out of a preallocated sliding window, which is the
+    wrong-history bug."""
     from vaayu.batch import cache_supports_prefix_store
 
     cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
                                      device="cpu", dtype=torch.float32)
     assert not cache_supports_prefix_store(cache)
+
+
+def test_refuse_unsupported_prefix_cache_does_not_crash_with_no_max_seq_len(capsys):
+    """The regression test for Task 6a's crash.
+
+    `VaayuBaseModel.__init__` calls this before the VRAM plan derives
+    `max_seq_len` (`vaayu_base.py:2255,2274,2461`), so `max_seq_len` is `None`
+    here exactly as it is on every real load. The base's own
+    `_refuse_unsupported_prefix_cache` would construct a probe cache via
+    `_create_kv_cache()` and crash inside `DeepseekV4Cache.__init__` on
+    `None // int`. This override must disable prefix caching, print the one
+    warning, and return -- never raise.
+    """
+    model = engine(enable_prefix_cache=True, max_seq_len=None,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+    model._refuse_unsupported_prefix_cache()
+    assert model.enable_prefix_cache is False
+    assert "DISABLED" in capsys.readouterr().out
+
+
+def test_cache_holds_recurrent_state_is_set_false_even_when_prefix_cache_is_off():
+    """The base's own contract (vaayu_base.py:3788): the KV-only side
+    channels read `_cache_holds_recurrent_state` and need it to be False, not
+    absent, regardless of whether the prefix cache is enabled at all."""
+    model = engine(enable_prefix_cache=False)
+    model._refuse_unsupported_prefix_cache()
+    assert model._cache_holds_recurrent_state is False
+
+
+def test_refuse_unsupported_prefix_cache_never_constructs_a_real_cache(monkeypatch):
+    """Pins the fix: the override must answer without building a
+    `DeepseekV4Cache`. If it ever regressed to calling `_create_kv_cache`
+    (the base's approach), this raises instead of reporting a bug."""
+    model = engine(enable_prefix_cache=True, max_seq_len=None,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+
+    def boom():
+        raise AssertionError("must not construct a probe cache")
+
+    monkeypatch.setattr(model, "_create_kv_cache", boom)
+    model._refuse_unsupported_prefix_cache()  # must not raise
+    assert model.enable_prefix_cache is False
+
+
+def test_refuse_unsupported_prefix_cache_is_detected_not_hardcoded(monkeypatch):
+    """If `DeepseekV4Cache` ever grows the prefix-store surface, the override
+    must start ALLOWING prefix caching -- proving the decision reads the
+    class's actual capabilities rather than a hardcoded refusal.
+
+    Adds real `to_cpu` / `to_device` / `resident_bytes` methods directly to
+    the `DeepseekV4Cache` class (monkeypatch undoes this after the test) --
+    exactly the class the override's `cache_supports_prefix_store` check
+    reads. `batch.py`'s predicate itself is untouched: this exercises the
+    override's real detection path, not a stubbed-out answer.
+    """
+    monkeypatch.setattr(modeling.DeepseekV4Cache, "to_cpu",
+                        lambda self: None, raising=False)
+    monkeypatch.setattr(modeling.DeepseekV4Cache, "to_device",
+                        lambda self, device: None, raising=False)
+    monkeypatch.setattr(modeling.DeepseekV4Cache, "resident_bytes",
+                        lambda self: 0, raising=False)
+    model = engine(enable_prefix_cache=True, max_seq_len=None,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+    model._refuse_unsupported_prefix_cache()
+    assert model.enable_prefix_cache is True
 
 
 def test_speculative_decoding_is_refused_by_name(monkeypatch):

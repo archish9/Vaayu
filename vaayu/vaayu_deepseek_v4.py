@@ -31,13 +31,17 @@ class VaayuDeepseekV4(VaayuBaseModel):
         window plus a compressed half. Nothing else refuses it, so it is
         refused here.
 
-        Prefix caching and KV persistence are NOT refused here -- the engine's
-        own generic path handles them: `_refuse_unsupported_prefix_cache`
-        (`vaayu_base.py:3755`) probes the cache for `to_cpu` / `to_device` /
-        `resident_bytes`, finds none on `DeepseekV4CacheLayer`, warns once and
-        clears the flag; `kv_persist` then prints `ignored: enable_prefix_cache
-        is False` (`:3097`). That matters because a hard refusal here used to
-        run FIRST and make `:3755` dead code on this path, which left the
+        Prefix caching and KV persistence are NOT refused here -- this class's
+        own `_refuse_unsupported_prefix_cache` override (below) handles them
+        by detection against `DeepseekV4Cache` / `DeepseekV4CacheLayer`,
+        without constructing a probe cache (Task 6a: the base's own probe,
+        `vaayu_base.py:3770`, constructs one via `_create_kv_cache` and
+        crashes there -- `DeepseekV4Cache` is preallocated from `max_seq_len`,
+        which is still `None` at the point this runs). It still finds no
+        prefix-store surface on `DeepseekV4Cache`, warns once and clears the
+        flag; `kv_persist` then prints `ignored: enable_prefix_cache is False`
+        (`:3097`). That matters because a hard refusal here used to run FIRST
+        and make the prefix-cache check dead code on this path, which left the
         server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
         unconditionally at `app.py:406`) unable to load this model at all.
 
@@ -49,13 +53,15 @@ class VaayuDeepseekV4(VaayuBaseModel):
         passed by name everywhere a model is built, and refusing afterwards
         would mean refusing at the end of a multi-minute load.
         """
-        # Prefix caching and KV persistence are NOT refused here. The engine's
-        # own generic check does it -- `_refuse_unsupported_prefix_cache`
-        # (`vaayu_base.py:3755`) probes the cache for to_cpu / to_device /
-        # resident_bytes, finds none on `DeepseekV4CacheLayer`, prints one
-        # WARNING and clears the flag; `kv_persist` then prints `ignored:
+        # Prefix caching and KV persistence are NOT refused here. This class's
+        # own `_refuse_unsupported_prefix_cache` override (below) does it, by
+        # detection against the CLASSES rather than by probing an instance --
+        # see that method's docstring for why (Task 6a: the base's instance
+        # probe, vaayu_base.py:3770, crashes on this model). It finds no
+        # prefix-store surface on `DeepseekV4Cache`, prints one WARNING and
+        # clears the flag; `kv_persist` then prints `ignored:
         # enable_prefix_cache is False` (`:3097`). A hard refusal here ran
-        # FIRST and made `:3755` dead code on this path, which meant the
+        # FIRST and made that check dead code on this path, which meant the
         # server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
         # unconditionally at `app.py:406`) could not load this model at all.
         #
@@ -168,6 +174,75 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return DeepseekV4Cache(self.config, max_seq_len=self.max_seq_len,
                                max_batch_size=1, device=self.running_device,
                                dtype=self.running_dtype)
+
+    def _refuse_unsupported_prefix_cache(self):
+        """Answer the base's question (`vaayu_base.py:3770`) WITHOUT
+        constructing a probe cache -- constructing one is exactly what crashes
+        this model's `__init__`.
+
+        Ordering, by line number: `VaayuBaseModel.__init__` assigns the
+        CALLER's `max_seq_len` (`None` by default) at `:2255`, calls
+        `_refuse_unsupported_prefix_cache` at `:2274`, and only assigns the
+        VRAM-plan-derived value (`self._vram_plan.max_seq_len`) at `:2461` --
+        after this call. The base answers by building a real cache
+        (`self._create_kv_cache()`) and inspecting it, which is fine for
+        every other model: `DynamicCache` / `FP8DynamicCache` /
+        `TurboQuantKVCache` all size lazily and construct fine with
+        `max_seq_len=None`. `DeepseekV4Cache` is PREALLOCATED from
+        `max_seq_len` (`modeling_deepseek_v4.py:728`: `window_size +
+        max_seq_len // compress_ratio`) and raises `TypeError` on `None //
+        int` before `max_seq_len` exists -- and this is unconditional:
+        `_create_kv_cache` above always returns a `DeepseekV4Cache`
+        regardless of `kv_cache_mode`, so the base's probe would crash on
+        every load, not just some configurations of this model.
+
+        So this override answers by DETECTION against the CLASSES
+        (`DeepseekV4Cache`, `DeepseekV4CacheLayer`) instead of an instance:
+
+        - `cache_supports_prefix_store` (`batch.py:479`) only does
+          `callable(getattr(cache, m, None))` for the three prefix-store
+          methods. Methods are class attributes, so this answers identically
+          for the class and for any instance -- called unchanged, on
+          `DeepseekV4Cache` itself.
+        - `cache_holds_recurrent_state` (`batch.py:500`) walks `cache.layers`
+          and checks each layer for `update_conv_state`/`conv_states` --
+          again a `hasattr` capability test, but `layers` itself only exists
+          on a constructed instance, and no instance is available here (that
+          is the whole problem). A `SimpleNamespace(layers=[DeepseekV4CacheLayer])`
+          stands in: the class is the closest thing to a layer instance short
+          of building one, and the two attributes the predicate checks for
+          are class-level (methods) or absent either way, so the class
+          answers exactly as a real instance would.
+
+        If `DeepseekV4Cache` ever grows `to_cpu`/`to_device`/`resident_bytes`,
+        `cache_supports_prefix_store` starts returning `True` off the class
+        alone and this override starts ALLOWING prefix caching automatically
+        -- exactly as the base's instance probe would. Do not delete this as
+        redundant with the base: the base's own probe is unreachable here (it
+        would raise before it could answer), which is the whole reason this
+        override exists.
+        """
+        from types import SimpleNamespace
+
+        from .batch import cache_holds_recurrent_state, cache_supports_prefix_store
+        from .model_code.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4Cache, DeepseekV4CacheLayer)
+
+        # Recorded whether or not the cache is refused -- see the base's own
+        # comment (vaayu_base.py:3788): the KV-only side channels (disk
+        # persistence, TurboQuant pooling) read this and need False, not
+        # absent, when the prefix cache is off entirely.
+        self._cache_holds_recurrent_state = cache_holds_recurrent_state(
+            SimpleNamespace(layers=[DeepseekV4CacheLayer]))
+        if not getattr(self, "enable_prefix_cache", False):
+            return
+        if not cache_supports_prefix_store(DeepseekV4Cache):
+            print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
+                  f"{DeepseekV4Cache.__name__} does not implement "
+                  f"to_cpu/to_device/resident_bytes, and DeepSeek-V4 has no "
+                  f"other cache layout to fall back to (kv_cache_mode is "
+                  f"ignored for this model -- see _create_kv_cache above).")
+            self.enable_prefix_cache = False
 
     def run_embed(self, layer, seq):
         """`[b, s, d]` -> `[b, s, hc_mult, d]`.
