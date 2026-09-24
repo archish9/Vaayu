@@ -418,3 +418,113 @@ def test_indexer_matches_the_reference_at_prefill(checkpoint_kernels):
         f"{len(mismatches)}/{seqlen} rows selected a different block set than "
         f"the reference at the same start_pos == 0 input -- not a shape or "
         f"offset issue, a real disagreement in which blocks were chosen")
+
+
+# ── A5.5 step 6: DeepseekV4Attention, and the four goldens ─────────────────
+
+
+def _golden(name):
+    import numpy as np
+    z = np.load(parity.GOLDENS / f"{name}.npz", allow_pickle=True)
+    out = {}
+    for key in z.files:
+        if key.startswith("__"):
+            continue
+        dtype = str(z[f"__dtype__{key}"])
+        out[key] = torch.from_numpy(z[key]).view(getattr(torch, dtype))
+    return out
+
+
+def _raw_module_weights(prefix: str) -> dict:
+    """The tensors under `prefix` exactly as the shards hold them -- no value
+    transforms.
+
+    NOT `parity.load_module_weights`: that loader pre-dequantizes `wo_a` for
+    feeding the REFERENCE module (whose `wo_a` Parameter is declared plain
+    bf16) and drops `wo_a.scale` entirely in the process. Our own
+    `DeepseekV4Attention.load_state_dict` needs the RAW fp8 weight + scale so
+    `modeling.dequantize_at_load` -- the production rule -- has something to
+    consume; calling it on `parity.load_module_weights`'s already-transformed
+    output raises `KeyError: 'wo_a.scale'`, exactly as `_raw_module_weights` in
+    `test_deepseek_v4_linear.py` (whose `test_the_production_dequant_...` test
+    exists to prove these two paths agree) is used, not `parity`'s.
+    """
+    from safetensors import safe_open
+
+    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
+    wanted = sorted(key for key in index["weight_map"] if key.startswith(prefix))
+    raw = {}
+    for shard in sorted({index["weight_map"][key] for key in wanted}):
+        with safe_open(parity.CKPT / shard, framework="pt", device="cpu") as handle:
+            for key in wanted:
+                if index["weight_map"][key] == shard:
+                    raw[key[len(prefix):]] = handle.get_tensor(key)
+    return raw
+
+
+@needs_checkpoint
+@needs_gpu
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_attention_reproduces_a5_2_golden(ratio, phase, checkpoint_kernels):
+    """A5.3 and A5.4 both landed bit-identical wherever the arithmetic was
+    shared. Anything less here is a FINDING that must name the diverging op --
+    not a tolerance to widen.
+    """
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=parity.MAX_SEQ_LEN)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == ratio)
+    golden = _golden(f"attn_{phase}_r{ratio}")
+
+    with parity.reference_device(reference):
+        layer = modeling.DeepseekV4Attention(config, layer_id)
+        layer.load_state_dict(modeling.dequantize_at_load(
+            _raw_module_weights(f"layers.{layer_id}.attn.")))
+        layer = layer.cuda().eval()
+        cache = modeling.DeepseekV4Cache(config, max_seq_len=parity.MAX_SEQ_LEN,
+                                         device=torch.device("cuda"))
+        prefill = golden.get("prefill_x", golden.get("x")).cuda()
+        out = layer(prefill, cache, 0)
+        if phase == "decode":
+            out = layer(golden["x"].cuda(), cache, prefill.shape[1])
+
+    assert torch.equal(out.cpu(), golden["out"]), \
+        f"max rel {((out.cpu().float() - golden['out'].float()).norm() / golden['out'].float().norm()).item()}"
+
+
+@needs_checkpoint
+@needs_gpu
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_attention_does_not_raise_where_the_reference_did(ratio, checkpoint_kernels):
+    """A5.2's `attn_chunked` goldens store NO output -- their content is the
+    reference's RuntimeError plus `prefill_x`, with the chunk input
+    reproducible as seeded_input(1, 512, dim, seed=1). The port must run it.
+    """
+    import numpy as np
+    note = str(np.load(parity.GOLDENS / f"attn_chunked_r{ratio}.npz",
+                       allow_pickle=True)["__note__"])
+    assert "RuntimeError" in note, "the golden's premise changed"
+
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=parity.MAX_SEQ_LEN)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == ratio)
+    golden = _golden(f"attn_chunked_r{ratio}")
+
+    with parity.reference_device(reference):
+        layer = modeling.DeepseekV4Attention(config, layer_id)
+        layer.load_state_dict(modeling.dequantize_at_load(
+            _raw_module_weights(f"layers.{layer_id}.attn.")))
+        layer = layer.cuda().eval()
+        cache = modeling.DeepseekV4Cache(config, max_seq_len=parity.MAX_SEQ_LEN,
+                                         device=torch.device("cuda"))
+        prefill = golden["prefill_x"].cuda()
+        layer(prefill, cache, 0)
+        step = parity.seeded_input(1, parity.CHUNK_LEN, config.hidden_size, seed=1)
+        out = layer(step, cache, prefill.shape[1])
+
+    assert out.shape == (1, parity.CHUNK_LEN, config.hidden_size)
+    assert torch.isfinite(out.float()).all()

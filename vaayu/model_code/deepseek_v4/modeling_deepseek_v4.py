@@ -1165,3 +1165,134 @@ class DeepseekV4Indexer(nn.Module):
         score = score + torch.where(visible, 0.0, float("-inf"))
         topk = score.topk(min(self.index_topk, blocks), dim=-1)[1]
         return torch.where(topk < bound, topk + offset, -1).int()
+
+
+# ── A5.5: DeepseekV4Attention ────────────────────────────────────────────────
+
+
+class DeepseekV4Attention(nn.Module):
+    """`model.py:442`. MLA + sliding window + optional KV compression.
+
+    Differs from the reference in exactly one structural way, and it is the
+    point of A5.5: attention attends a contiguous `kv_view` it assembles per
+    forward -- `[history | this chunk | compressed]` -- instead of the ring in
+    place. A 512-token chunk overruns a 128-slot ring, so the reference's
+    decode branch cannot be generalised, only replaced.
+
+    At both of the reference's supported call shapes the view reduces to what
+    it already does: `start_pos == 0` gives `history = 0` and index == absolute
+    position, and `seqlen == 1` gives the same `window_size` positions in the
+    same oldest-to-newest order the ring walk produces.
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        if (config.num_attention_heads, config.head_dim) != (_TILE_HEADS, _TILE_HEAD_DIM):
+            raise ValueError(
+                f"the sparse_attn tile was fitted for {_TILE_HEADS} heads x "
+                f"{_TILE_HEAD_DIM}, but this config asks for "
+                f"{config.num_attention_heads} x {config.head_dim}; re-derive it "
+                f"in `kernels()` before loading this checkpoint.")
+        self.layer_idx = layer_idx
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.n_groups = config.o_groups
+        self.o_lora_rank = config.o_lora_rank
+        self.window_size = config.sliding_window
+        self.compress_ratio = config.compress_ratios[layer_idx]
+        self.softmax_scale = config.head_dim ** -0.5
+        eps = config.rms_norm_eps
+        block = (config.checkpoint_quantization_config or {}).get("weight_block_size")
+        fp8 = dict(dtype=torch.float8_e4m3fn, weight_block_size=block)
+
+        # F32, per head, inside the softmax -- see `forward`.
+        self.attn_sink = nn.Parameter(
+            torch.empty(config.num_attention_heads, dtype=torch.float32),
+            requires_grad=False)
+        self.wq_a = DeepseekV4Linear(config.hidden_size, config.q_lora_rank, **fp8)
+        self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps)
+        self.wq_b = DeepseekV4Linear(config.q_lora_rank,
+                                     config.num_attention_heads * config.head_dim,
+                                     **fp8)
+        self.wkv = DeepseekV4Linear(config.hidden_size, config.head_dim, **fp8)
+        self.kv_norm = DeepseekV4RMSNorm(config.head_dim, eps)
+        # bf16 in the module, F8_E4M3 + per-128x128 scale on disk. A5.3's
+        # `dequantize_at_load` multiplies the scale out once, at load, because
+        # `forward` uses the raw weight in an einsum (`model.py:543`).
+        self.wo_a = DeepseekV4Linear(
+            config.num_attention_heads * config.head_dim // config.o_groups,
+            config.o_groups * config.o_lora_rank, dtype=torch.bfloat16)
+        self.wo_b = DeepseekV4Linear(config.o_groups * config.o_lora_rank,
+                                     config.hidden_size, **fp8)
+
+        if self.compress_ratio:
+            self.compressor = DeepseekV4Compressor(config, self.compress_ratio,
+                                                   config.head_dim)
+            self.indexer = (DeepseekV4Indexer(config, self.compress_ratio)
+                            if self.compress_ratio == 4 else None)
+        else:
+            self.compressor = self.indexer = None
+        self._rope = rope_settings(config, self.compress_ratio)
+        self._rope_dim = config.qk_rope_head_dim
+
+    def _freqs(self, max_seq_len, device):
+        return precompute_freqs_cis(self._rope_dim, max_seq_len,
+                                    device=device, **self._rope)
+
+    def forward(self, hidden_states, past_key_values, start_pos: int):
+        state = past_key_values.layers[self.layer_idx]
+        bsz, seqlen, _ = hidden_states.size()
+        rd, win = self.rope_head_dim, self.window_size
+        device = hidden_states.device
+        freqs_cis = self._freqs(past_key_values.max_seq_len, device)
+        positions = freqs_cis[start_pos:start_pos + seqlen]
+
+        qr = self.q_norm(self.wq_a(hidden_states))
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_norm.eps)
+        apply_rotary_emb(q[..., -rd:], positions)
+
+        kv = self.kv_norm(self.wkv(hidden_states))
+        apply_rotary_emb(kv[..., -rd:], positions)
+        # FP8 QAT simulation on the NON-rope dims, group 64 (not 128), in place.
+        kernels().act_quant(kv[..., :-rd], _ACT_QUANT_GROUP, "ue8m0",
+                            _SCALE_DTYPE, True)
+
+        history = state.history(start_pos)
+        h = history.shape[1]
+        topk_idxs = window_topk_idxs(win, bsz, seqlen, start_pos, device)
+        view = torch.cat([history, kv], dim=1)
+
+        if self.compress_ratio:
+            offset = h + seqlen
+            # The reference calls its OWN Attention-level `self.compressor`
+            # unconditionally here (`model.py:530` / `:537`), regardless of
+            # whether an Indexer exists -- it fills `state.keys`' compressed
+            # half that `view` reads just below. The Indexer (present only on
+            # compress_ratio == 4 layers) carries a SEPARATE `Compressor`
+            # instance over `index_head_dim`, writing `state.index_keys` for
+            # its own scoring; it is not a substitute for this call.
+            self.compressor(hidden_states, start_pos, state, freqs_cis)
+            if self.indexer is not None:
+                compress_idxs = self.indexer(hidden_states, qr, start_pos,
+                                             offset, state, freqs_cis)
+            else:
+                compress_idxs = compress_topk_idxs(
+                    self.compress_ratio, bsz, seqlen, start_pos, offset, device)
+            blocks = (start_pos + seqlen) // self.compress_ratio
+            view = torch.cat([view, state.keys[:bsz, win:win + blocks]], dim=1)
+            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+
+        state.write(kv, start_pos)
+        state.cumulative_length = start_pos + seqlen
+
+        o = kernels().sparse_attn(q, view, self.attn_sink, topk_idxs,
+                                  self.softmax_scale)
+        # Applied a SECOND time, INVERTED, to the output (`model.py:539`).
+        apply_rotary_emb(o[..., -rd:], positions, True)
+
+        o = o.view(bsz, seqlen, self.n_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        return self.wo_b(o.flatten(2))
