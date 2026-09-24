@@ -979,27 +979,6 @@ class DeepseekV4Compressor(nn.Module):
         out[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return out
 
-    @staticmethod
-    def _project(linear: "DeepseekV4Linear", x: torch.Tensor) -> torch.Tensor:
-        """`linear(x)`, computed in fp64 and rounded back to fp32.
-
-        `DeepseekV4Linear`'s plain (non-quantized) branch is `F.linear`, and
-        its CUDA fp32 GEMM is NOT invariant to the batch (M) dimension: on
-        this GPU, the SAME position's projection comes out a few ULPs
-        different depending on how many other positions ride along in the
-        same call (measured directly against the checkpoint's real `wkv`
-        weight -- every one of 512 rows differed between an M=1024 and an
-        M=512 call of the identical positions; confirmed shape-dependent, not
-        TF32, not cuBLAS-vs-cuBLASLt, and not this call site's own logic).
-        The reference never meets this because it never chunks a multi-token
-        prompt past `start_pos == 0`; Vaayu's whole reason to chunk is
-        prefill, so reintroducing chunk-boundary drift here would be a real
-        correctness regression, not a cosmetic one. fp64 measured bit-exact
-        across M=1024 vs M=512 on the real weights; rounding back to fp32
-        keeps the reference's own fp32 declaration for the compression math.
-        """
-        return F.linear(x.double(), linear.weight.double()).float()
-
     def forward(self, x, start_pos, state, freqs_cis):
         """Compress every block this chunk completes; buffer the remainder.
 
@@ -1012,8 +991,8 @@ class DeepseekV4Compressor(nn.Module):
         bsz, seqlen, _ = x.size()
         dtype = x.dtype
         x = x.float()
-        kv = self._project(self.wkv, x)
-        score = self._project(self.wgate, x) + self.ape[
+        kv = self.wkv(x)
+        score = self.wgate(x) + self.ape[
             (start_pos + torch.arange(seqlen, device=x.device)) % ratio]
 
         # Prepend whatever of the current block `state` is holding, so the

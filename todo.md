@@ -1558,23 +1558,28 @@ a Vaayu precedent; the attention path has neither.
       **Two literals with NO config source, named rather than hidden (§5):** `_ACT_QUANT_GROUP =
       64` (`model.py:512` — NOT `weight_block_size`'s 128) and `_FP4_BLOCK_SIZE = 32`
       (`model.py:18`).
-      **Task 4 (`Compressor`) DONE 2026-09-24, commit `bb1c3ef`.** Parity test
-      (`test_compressor_chunked_equals_whole_prompt`, both ratios 4 and 128) found TWO bugs in the
-      brief's draft, both fixed: **(a)** the overlap "carry" (previous block's raw kv/score, needed
-      by the next block's overlap window) can't be produced by shifting `kv_state` the way the
-      reference's decode branch does (`model.py:359-360`) — that shift only works because the
-      decode branch fills the current window one position at a time; this port pools a whole block
-      from a local tensor and never touches `kv_state` while doing it, so the shift copied
-      stale/zero data. Fixed by writing the carry explicitly from the local tensor whenever a block
-      flushes. **(b)** `wkv`/`wgate`'s plain `F.linear` is NOT invariant to the batch (M) dimension
-      on this GPU (RTX 5060 Ti, torch 2.11+cu130) — the same position's projection differs by a few
-      ULPs depending on how many other positions ride the same GEMM call (confirmed against the real
-      checkpoint weight; ruled out TF32, cuBLAS-vs-cuBLASLt, determinism flags; fp64 measured
-      bit-invariant to M). The reference never meets this since it never chunks past
-      `start_pos == 0`; fixed by routing `wkv`/`wgate` through fp64 internally in `Compressor`
-      only (`_project`), rounded back to fp32 — `DeepseekV4Linear` itself is untouched. Full DeepSeek-V4
-      suite green (214 passed) after refreshing the checkpoint's copy. Report:
-      `.superpowers/sdd/2026-09-23-A5.5-attention/task-4-report.md`.
+      **Task 4 (`Compressor`) DONE 2026-09-24, commits `bb1c3ef` + a fix round (see report).**
+      The parity test (`test_compressor_chunked_equals_whole_prompt`, both ratios 4 and 128) found
+      ONE real bug, fixed: the overlap "carry" (previous block's raw kv/score, needed by the next
+      block's overlap window) can't be produced by shifting `kv_state` the way the reference's
+      decode branch does (`model.py:359-360`) — that shift only works because the decode branch
+      fills the current window one position at a time; this port pools a whole block from a local
+      tensor and never touches `kv_state` while doing it, so the shift copied stale/zero data.
+      Fixed by writing the carry explicitly from the local tensor whenever a block flushes.
+      **A second finding was NOT a bug and is NOT worked around in production code:** `wkv`/`wgate`'s
+      plain `F.linear` is not invariant to the batch (M) dimension on this GPU (RTX 5060 Ti, torch
+      2.11+cu130) — the same position's projection differs by a few ULPs depending on how many other
+      positions ride the same GEMM call. This is expected cuBLAS behaviour (shape-dependent
+      tile/split-k selection, confirmed by ruling out TF32, cuBLAS-vs-cuBLASLt, and determinism
+      flags) — no BLAS guarantees bit-invariance across shapes, and `wkv`/`wgate` stay plain fp32
+      `F.linear` exactly as the reference declares them. **The chunked-vs-whole comparison is
+      instead gated the way spec §5.1 (Task 7's methodology) actually specifies: rel-L2 against a
+      null-perturbation floor measured in the same run** (perturb the input by one ULP, re-run the
+      whole-prompt path against itself), not `torch.equal`. Measured on device: ratio 4 chunked-vs-
+      whole rel-L2 0.000375 vs a 0.0216 null floor (58x inside it); ratio 128 exactly 0 vs a 0.0219
+      floor. Chunk-boundary drift for the full attention stack remains Task 7's job to gate, on the
+      same null-floor methodology. Full DeepSeek-V4 suite green (214 passed) after refreshing the
+      checkpoint's copy. Report: `.superpowers/sdd/2026-09-23-A5.5-attention/task-4-report.md`.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still

@@ -199,6 +199,10 @@ def checkpoint_kernels(monkeypatch):
     monkeypatch.setattr(modeling, "_KERNELS", None)
 
 
+def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
 @needs_checkpoint
 @needs_gpu
 @pytest.mark.parametrize("ratio", [4, 128])
@@ -206,8 +210,22 @@ def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
     """The acceptance shape, at the Compressor alone.
 
     Feeding 1024 tokens as one call and as two 512-token calls must leave the
-    SAME compressed cache. The reference cannot do the second; this is the
-    path A5.5 writes.
+    SAME compressed cache, up to the model's own numerical noise. The
+    reference cannot do the second; this is the path A5.5 writes.
+
+    Gated by spec §5.1's methodology, NOT a fixed tolerance: no BLAS
+    guarantees bit-invariance across the batch (M) dimension (cuBLAS picks
+    tile/split-k strategy by shape), so `wkv`/`wgate` computed over a
+    512-token chunk and over the same positions inside a 1024-token call are
+    allowed to reduce in a different order and disagree by a few ULPs -- that
+    is expected GPU behaviour, not a bug, and a `torch.equal` gate here would
+    be measuring the hardware, not the port. So the gate is calibrated
+    against the model's OWN noise, measured in the same run: perturb the
+    input by one ULP (`nextafter`) and re-run the WHOLE-prompt path against
+    itself. That rel-L2 is the floor no implementation can beat. A REAL
+    chunking bug (a dropped block, a wrong carry) would land far above it --
+    see 2026-09-19's row-43 hybrid-state regression for the shape such a
+    failure takes (rel-L2 0.314 vs a 0.051 floor, ~6x over).
     """
     reference = parity.reference_modules()
     args = parity.reference_args(reference, shipped_config(), max_seq_len=2048)
@@ -221,7 +239,7 @@ def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
             args.rope_head_dim, 2048, device=torch.device("cuda"),
             **modeling.rope_settings(config, ratio))
 
-        def run(chunks):
+        def run(chunks, x):
             comp = modeling.DeepseekV4Compressor(config, ratio, config.head_dim)
             comp.load_state_dict(parity.load_module_weights(
                 f"layers.{layer_id}.attn.compressor."))
@@ -235,11 +253,20 @@ def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
                 pos += length
             return state.keys[:, config.sliding_window:].clone()
 
-        whole = run([1024])
-        split = run([512, 512])
+        whole = run([1024], x)
+        split = run([512, 512], x)
+        # The smallest possible perturbation this dtype can represent -- pure
+        # numerical noise, no logic difference at all.
+        whole_perturbed = run([1024], torch.nextafter(x, x + 1))
 
-    assert torch.equal(whole, split), \
-        f"max abs diff {(whole.float() - split.float()).abs().max().item()}"
+    got = _rel_l2(whole, split)
+    floor = _rel_l2(whole, whole_perturbed)
+    print(f"\nratio={ratio}: chunked-vs-whole rel-L2 {got:.6g}, "
+          f"null (1-ULP) floor {floor:.6g}")
+    assert got <= 3 * floor + 1e-8, (
+        f"chunked-vs-whole rel-L2 {got:.6g} exceeds 3x the null floor "
+        f"{floor:.6g} (ratio {ratio}) -- this looks like a real chunking bug, "
+        f"not GPU noise")
 
 
 def test_compressor_flushes_once_per_ratio_positions():
