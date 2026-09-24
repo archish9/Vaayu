@@ -316,7 +316,7 @@ EXPECTED_GOLDENS = {
     "moe_hash", "moe_score",                         # A5.4
     "attn_prefill_r128", "attn_decode_r128", "attn_chunked_r128",   # A5.5
     "attn_prefill_r4", "attn_decode_r4", "attn_chunked_r4",         # A5.5
-    "block", "hc_head",                              # A5.6
+    "block", "hc_head", "head",                       # A5.6
 }
 
 

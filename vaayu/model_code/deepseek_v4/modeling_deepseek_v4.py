@@ -682,8 +682,9 @@ def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
 
 # ── A5.5: the cache ─────────────────────────────────────────────────────────
 
+from transformers import GenerationMixin
 from transformers.cache_utils import Cache, CacheLayerMixin
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_deepseek_v4 import DeepseekV4Config
@@ -1567,3 +1568,50 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         hidden_states = self.norm(self.hc_head(hidden_states))
         return BaseModelOutputWithPast(last_hidden_state=hidden_states,
                                        past_key_values=past_key_values)
+
+
+class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
+    """The head. `tie_word_embeddings` is false in this checkpoint, so
+    `lm_head` is a separate tensor and `_tied_weights_keys` stays unset.
+
+    **The head is bf16, where the reference's is fp32.** `model.py:727-728`
+    upcasts the checkpoint's bf16 `head.weight` "for easier computation of
+    logits later"; keeping the disk dtype returns 0.986 GiB to a pin budget
+    that also carries the shared experts, the hc_* tensors and attention on a
+    15.47 GiB card. The matmul still accumulates in fp32; only the output
+    rounds through bf16 before the cast below. The `head` golden gates that
+    choice on argmax, not just on rel-L2.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = DeepseekV4Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, labels=None,
+                use_cache=None, cache_position=None, logits_to_keep=0, **kwargs):
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache,
+            cache_position=cache_position, **kwargs)
+
+        slice_indices = (slice(-logits_to_keep, None)
+                         if isinstance(logits_to_keep, int) else logits_to_keep)
+        logits = self.lm_head(outputs.last_hidden_state[:, slice_indices, :]).float()
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(loss=loss, logits=logits,
+                                      past_key_values=outputs.past_key_values)

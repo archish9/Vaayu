@@ -307,3 +307,113 @@ def test_the_config_yields_exactly_two_rope_variants():
                 for i in range(config.num_hidden_layers)}
 
     assert len(variants) == 2, f"{len(variants)} rope variants: {variants}"
+
+
+@needs_checkpoint
+@needs_gpu
+def test_the_head_tracks_the_references_fp32_logits():
+    """The reference upcasts `head.weight` to fp32 (`model.py:727-728`) and
+    computes `F.linear(x.float(), weight)`. A5.6 keeps the checkpoint's bf16,
+    returning 0.986 GiB to a pin budget that also has to hold ~1.01 GiB of
+    shared experts, 129 MiB of hc_* and ~5.33 GiB of attention on a 15.47 GiB
+    card. The matmul still accumulates in fp32 on the tensor cores; only the
+    output rounds through bf16 before the cast.
+
+    So this is a tolerance gate, not `torch.equal` -- and the assertion that
+    matters is ARGMAX: greedy decoding only cares which logit wins. If argmax
+    ever disagrees, the design's stop rule fires and the head becomes a
+    vocab-chunked fp32 one (design doc Section 3.5). Do not pre-build that.
+    """
+    config = shipped_config()
+    golden = parity.load_golden("head")
+
+    norm = modeling.DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+    norm.load_state_dict({"weight": _norm_weight()})
+    head = nn.Linear(config.hidden_size, config.vocab_size, bias=False,
+                     dtype=torch.bfloat16)
+    head.load_state_dict({"weight": _head_weight()})
+    norm, head = norm.cuda().eval(), head.cuda().eval()
+
+    with torch.inference_mode():
+        ours = head(norm(golden["x"].cuda())).float()
+
+    reference = golden["out"].cuda().float()
+    rel = ((ours - reference).norm() / reference.norm()).item()
+    assert rel < 5e-3, f"head logits diverge: rel-L2 {rel:.6g}"
+    assert torch.equal(ours.argmax(-1), reference.argmax(-1)), (
+        "bf16 lm_head picks a different token than the reference's fp32 head "
+        "-- the design's stop rule fires: escalate to a vocab-chunked fp32 "
+        "head rather than shipping this")
+
+
+def _norm_weight() -> torch.Tensor:
+    from safetensors import safe_open
+
+    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
+    with safe_open(parity.CKPT / index["weight_map"]["norm.weight"],
+                   framework="pt", device="cpu") as handle:
+        return handle.get_tensor("norm.weight").float()
+
+
+def _head_weight() -> torch.Tensor:
+    from safetensors import safe_open
+
+    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
+    with safe_open(parity.CKPT / index["weight_map"]["head.weight"],
+                   framework="pt", device="cpu") as handle:
+        return handle.get_tensor("head.weight")
+
+
+def test_the_lm_head_is_untied_from_the_embedding(stub_layers):
+    """`tie_word_embeddings: false` -- the head is a separate 0.986 GiB tensor.
+    Llama-3.2-1B's tied-head bug (fixed 2026-08-09) is the precedent for
+    getting this wrong in the other direction.
+    """
+    config = small_config()
+    assert config.tie_word_embeddings is False
+    model = modeling.DeepseekV4ForCausalLM(config)
+
+    with torch.no_grad():
+        model.lm_head.weight.fill_(1.0)
+    assert not torch.allclose(model.model.embed_tokens.weight,
+                              model.lm_head.weight)
+    assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+
+
+def test_logits_are_fp32_and_logits_to_keep_slices(stub_layers):
+    """`ParallelHead.forward`'s `if not full_logits: x = x[:, -1]`
+    (`model.py:733`) is exactly `logits_to_keep=1`; the HF mechanism replaces
+    it. Logits come back fp32 whatever the stream's dtype -- sampling reads
+    them.
+
+    Not `torch.equal` on the values: HF slices BEFORE the matmul
+    (`self.lm_head(hidden_states[:, slice_indices, :])`), precisely so the
+    full logits are never materialized -- so `logits_to_keep=1` runs a 1-row
+    GEMM where the unsliced call runs a 6-row one. Same information, different
+    reduction order, differing in the last bits: measured max abs diff
+    3.58e-07 over 30 seeds at these dimensions (a bare `nn.Linear(16, 32)`
+    reproduces it 30/30), with argmax identical on all of them. Bit-equality
+    across two different matmul shapes is not a property fp32 has.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4ForCausalLM(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    input_ids = torch.randint(0, config.vocab_size, (1, 6))
+
+    with torch.inference_mode():
+        every = model(input_ids=input_ids, past_key_values=cache,
+                      cache_position=torch.arange(6))
+    assert every.logits.shape == (1, 6, config.vocab_size)
+    assert every.logits.dtype is torch.float32
+
+    cache.reset()
+    stub_layers.seen = []
+    with torch.inference_mode():
+        last = model(input_ids=input_ids, past_key_values=cache,
+                     cache_position=torch.arange(6), logits_to_keep=1)
+    assert last.logits.shape == (1, 1, config.vocab_size)
+    assert torch.allclose(last.logits, every.logits[:, -1:],
+                          rtol=1e-5, atol=1e-6), (
+        "logits_to_keep=1 did not select the last position: max abs diff "
+        f"{(last.logits - every.logits[:, -1:]).abs().max().item():.3g}")
+    assert torch.equal(last.logits.argmax(-1), every.logits[:, -1:].argmax(-1))

@@ -573,6 +573,30 @@ def _recipe_hc_head(reference, args):
 RECIPES["hc_head"] = _recipe_hc_head
 
 
+def _recipe_head(reference, args):
+    """`RMSNorm` + `ParallelHead` (`model.py:719`) -- the fp32 logits.
+
+    Only `x` and `out` are stored: `head.weight` is 0.986 GiB and does not
+    belong in a committed fixture, so the test that reads this reads the two
+    weights off the checkpoint itself.
+
+    `full_logits=True` so the golden carries every position. The default
+    (`model.py:733`) keeps only the last, which is the reference's own
+    `logits_to_keep=1`.
+    """
+    with torch.device("cuda"):
+        norm = reference.RMSNorm(args.dim, args.norm_eps)
+        head = reference.ParallelHead(args.vocab_size, args.dim,
+                                      args.norm_eps, args.hc_eps)
+    norm.load_state_dict(load_module_weights("norm."))
+    head.load_state_dict(load_module_weights("head."))
+    x = seeded_input(1, GOLDEN_TOKENS, args.dim)
+    return {"x": x, "out": head(norm(x), full_logits=True)}, None
+
+
+RECIPES["head"] = _recipe_head
+
+
 def _shipped_config():
     from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
