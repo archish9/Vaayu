@@ -120,7 +120,7 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
-| **6 (NEXT)** | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
+| **6 (IN FLIGHT `[~]`)** | **A5.6** block + model | **DESIGNED 2026-09-24** — brief promoted; two brief errors corrected in row 28b | [`…A5.6-block-model-design.md`](docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md) | 3–5 d |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
@@ -1237,7 +1237,7 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
 | **A5.5** `[x]` | **attention** | **DONE 2026-09-24** | MLA + sparse index on a contiguous `kv_view`; 3/4 goldens bit-identical, chunked prefill works where the reference RAISES | done | [`…A5.5-RESULTS…`](docs/2026-09-24-A5.5-attention-RESULTS.md) |
-| **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
+| **A5.6** `[~]` | block + model | **DESIGN** (2026-09-24) | hyper-connections, HF `Cache` migration, `ForCausalLM` + `auto_map` | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md) |
 | **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
 ~~**≈3 weeks. A5.5 is where this dies if it dies**~~ — **IT DID NOT.** A5.5 closed 2026-09-24:
@@ -1780,16 +1780,85 @@ and both have a golden reference or a Vaayu precedent.
       nothing under `vaayu/` calls any of the four today, so not a new bug, just now a complete
       list for A5.7. **Checkpoint copy refreshed and `diff -q` clean before commit** (items 2-4
       touched the modeling file). Full `tests/test_deepseek_v4_*.py`: **234 passed**, 33.07 s.
-- [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
-      block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
-      twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
-      sees `[b,s,d]`, so A5.4's zero-engine-changes result holds. CONFIRM THAT; the whole
-      decomposition rests on it, and if it is false, STOP and re-plan.** `hc_*` params are fp32 by
-      construction → **~3.1 MB/layer, ~135 MB over 43 layers** of always-resident weight (feeds A4
-      Check 2 with A5.4's ~1.01 GiB). The head uses `hc_head`, a **plain sigmoid with NO Sinkhorn**
-      — same-looking code, different arithmetic. Also owns the **`start_pos` → HF `Cache`**
-      migration (shape decided by A5.5), the `input_ids` stash lifetime, `tie_word_embeddings:
-      false`, and `precompute_freqs_cis`'s `@lru_cache(2)` holding **exactly two** rope variants.
+- [~] **A5.6 — block + model. DESIGNED 2026-09-24** (`docs/superpowers/specs/2026-09-24-A5.6-block-model-design.md`,
+      gitignored — this bullet is the durable copy). **Hyper-connections are not in the A5 brief at
+      all:** every block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs
+      `hc_pre`/`hc_post` twice per block around a 20-iteration Sinkhorn
+      (`kernels().hc_split_sinkhorn`, validated by A5 step 1).
+      **STOP RULE DISCHARGED BEFORE BUILDING: HC IS contained inside `Block`** — `model.py:705` is
+      `x = self.ffn(x, input_ids)` and `x` left `hc_pre` as `[b,s,d]`, so **A5.4's
+      zero-engine-changes result holds**. A spy test keeps it true; if anything outside the layer
+      ever sees `[b,s,hc,d]`, STOP and re-plan.
+      **`hc_*` sizing re-derived, not inherited:** `mix_hc = (2+hc_mult)*hc_mult = 24`,
+      `hc_dim = hc_mult*dim = 16384`; per layer `2×[24,16384] + 2×[24] + 2×[3]` fp32 =
+      **3,145,944 B = 3.146 MB (3.00 MiB)**, over 43 layers **135.3 MB (129.0 MiB)** always-resident
+      (feeds A4 Check 2 with A5.4's ~1.01 GiB). **They are F32 ON DISK** — not a load-time cast — so
+      they are allocated with an explicit `dtype=torch.float32`, never via the default dtype, or
+      `from_config(dtype=bf16)` makes a bf16 skeleton and accelerate casts the checkpoint's fp32
+      DOWN to match it.
+      **TWO BRIEF CORRECTIONS, both found by re-verification 2026-09-24:** (1) **`hc_head` is NOT on
+      `ParallelHead`** — it is a method on `Block` (`model.py:709`) that `Transformer.forward` calls
+      on whatever `layer` its loop left bound (`model.py:921`), passing the MODEL's params. It reads
+      `self` only for `norm_eps`/`hc_eps`/`hc_mult`, all per-block copies of the same config fields,
+      so it moves to `DeepseekV4Model` — arithmetically identical, and its golden proves it rather
+      than asserting it. (2) **its params are `hc_head_fn [4,16384]`, `hc_head_base [4]`,
+      `hc_head_scale [1]`** (`hc_mult` rows, 262,164 B) — **NOT the `[24,16384]` the brief says**.
+      Arithmetic is a **plain sigmoid, NO Sinkhorn, no `post`/`comb`** — same-looking code,
+      different shapes; that is the copy-paste hazard and why it gets its own golden.
+      **DECISIONS (user, 2026-09-24).** (a) **`lm_head` stays bf16** — the disk dtype — matmul
+      accumulating fp32 on the tensor cores, output cast to fp32 for sampling. The reference keeps
+      it fp32 (`model.py:727`); **that would cost 1.973 GiB instead of 0.986 GiB**, against a Check-2
+      budget already holding ~1.01 GiB shared experts + 129 MiB `hc_*` + ~5.33 GiB attention on a
+      15.47 GiB card. Head golden is therefore rel-L2 **plus `argmax` equality**; **STOP RULE: if
+      argmax ever disagrees, escalate to a vocab-chunked fp32 head — do not build it first.**
+      (b) **A5.6 ships through `DeepseekV4ForCausalLM` + the `auto_map` entry**, proving
+      `AutoModelForCausalLM.from_config` under `init_empty_weights()`; A5.7 is then purely weights +
+      index + first token. (c) **Two goldens + structural tests**, no composed multi-layer golden —
+      it would cover layers 0–1 only (both ratio 0, both hash-routed) for ~9.8 GiB to record and
+      ~9.8 GiB to test.
+      **NAMING — HF convention outside, reference names inside** (`model.embed_tokens`,
+      `model.layers.N.{attn,ffn,attn_norm,ffn_norm,hc_*}`, `model.norm`, `model.hc_head_*`,
+      `lm_head`). Forced, not taste: `loader_strategy.py:673` globs `model.layers.0.safetensors` to
+      decide if a checkpoint is already split, `utils.py:359` defaults the streaming order to those
+      names, and MiniMax uses them. `detect_moe_blocks` does not care that the MoE's parent is
+      `ffn`: it matches the `nn.ModuleList` + router sibling and takes `layer_idx` from the first
+      `\.?(\d+)\.`.
+      **CORRECTION FOR A5.7 — the remap is NOT "~a `model.` prefix" (A5.4's claim, now checked
+      against the index).** Disk keys are FLAT: `embed.weight`, `layers.N.*`, `norm.weight`,
+      `head.weight`, `hc_head_*`, `mtp.N.*` (72,317 tensors). The remap is prefix **plus two renames
+      plus a skip**: `embed.`→`model.embed_tokens.`, `head.weight`→`lm_head.weight`, `mtp.*`
+      dropped. `head`→`lm_head` cannot be avoided by naming — `lm_head` sits outside `model.` by HF
+      convention and `utils.py:359` expects it there. `config.json` already declares
+      `"architectures": ["DeepseekV4ForCausalLM"]`, so the class name is fixed by the checkpoint.
+      **Also owns:** the **`start_pos` → HF `Cache`** migration — the MODEL becomes HF-shaped
+      (`cache_position` → one `start_pos`, passed down) while A5.5's attention signature does not
+      churn — plus a **contiguity guard** (a `cache_position` gap/reorder RAISES; the ring, the
+      Compressor's flushes and `window_topk_idxs` all assume `arange(start_pos, start_pos+seqlen)`,
+      and a silent mis-index here is the same defect class A5.7 already calls out as the third time
+      this program has paid for it); the `input_ids_scope` lifetime (whole layer loop, released
+      after; **`inputs_embeds` without `input_ids` is REFUSED** — hash routing has no fallback);
+      `tie_word_embeddings: false`; and `precompute_freqs_cis`'s `@lru_cache(2)` holding **exactly
+      two** rope variants.
+      **`attn_implementation`: `DeepseekV4PreTrainedModel` overrides
+      `_check_and_adjust_attn_implementation` to return `"eager"` unconditionally** (its return is
+      stored at `modeling_utils.py:1255`), `_supports_*` left `False`. This model has no HF
+      attention backend — `sparse_attn` is its only kernel. Honest, and it saves Vaayu two
+      thrown-away constructions of an 11,008-expert skeleton before its loop reaches `eager`.
+      **DELIBERATELY NOT PORTED:** `Transformer.forward`'s `main_hiddens` collection at
+      `dspark_target_layer_ids` (**non-empty in the shipped config: `[40,41,42]`** — live reference
+      code, but consumed only by `forward_spec`, which A5 excludes) and its `sample()` call
+      (that is `GenerationMixin`'s job). Recorded so a later reader does not read the omission as a
+      miss.
+      **§8, answered in advance:** (1) **no knob** — the classes are reached through `auto_map`;
+      (2) N/A; (3) **NOT reachable** — the checkpoint still cannot load, `from_config` succeeds but
+      `from_pretrained` does not; (4) unblocked by A5.7. Banked, said so.
+      **Verified on-device 2026-09-24 while designing, so the plan does not gamble on either:**
+      `with torch.device("meta"): reference.Block(0, args)` constructs (carrying
+      `norm_eps=1e-06`, `hc_eps=1e-06`, `hc_mult=4`, `hc_sinkhorn_iters=20`), which is what makes the
+      `hc_head` golden cost 262 KB instead of a 3.3 GiB layer; and `tests/test_deepseek_v4_*.py` is
+      at **234 passed, 27.64 s** — A5.6 may only add. A5.6 touches nothing under `vaayu/`, so the two
+      on-device MoE gates are a claim to CHECK, not assume.
+- [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
 - [ ] **A5.7 — load, index, first token. BRIEF.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
       `\.experts\.(\d+)\.` finds **11,776** — the extra **768 experts = 9.56 GiB** are
