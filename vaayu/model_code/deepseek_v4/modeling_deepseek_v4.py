@@ -658,3 +658,216 @@ def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
     visible = index < ((positions + 1) // ratio)
     matrix = torch.where(visible, index + offset, -1)
     return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+
+# ── A5.5: the cache ─────────────────────────────────────────────────────────
+
+from transformers.cache_utils import Cache, CacheLayerMixin
+
+_ONE_LENGTH = (
+    "a DeepSeek-V4 cache is servable at exactly one length: the circular "
+    "sliding window holds the last `sliding_window` positions at slots "
+    "`pos % sliding_window`, so the positions a shorter crop would need were "
+    "overwritten. Drop the entry instead of cropping it."
+)
+
+
+class DeepseekV4CacheLayer(CacheLayerMixin):
+    """One layer's whole per-sequence state.
+
+    The reference keeps all of this in `register_buffer`s on the modules. It
+    lives here instead so the modules hold weights only: two sequences cannot
+    share state, and 42-B can snapshot a cache rather than reach into module
+    internals.
+    """
+
+    is_compileable = False
+
+    def __init__(self, *, compress_ratio, window_size, head_dim, max_seq_len,
+                 index_head_dim, max_batch_size=1, dtype=torch.bfloat16,
+                 device=None):
+        super().__init__()
+        self.compress_ratio = compress_ratio
+        self.window_size = window_size
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.cumulative_length = 0
+
+        slots = window_size + (max_seq_len // compress_ratio if compress_ratio else 0)
+        self.keys = torch.zeros(max_batch_size, slots, head_dim,
+                                dtype=dtype, device=device)
+        # MLA keeps ONE latent per position and sparse_attn reads it as both
+        # operands. The alias is the honest encoding -- see the overrides below.
+        self.values = self.keys
+        self.is_initialized = True
+
+        coff = 1 + (compress_ratio == 4)
+        if compress_ratio:
+            shape = (max_batch_size, coff * compress_ratio, coff * head_dim)
+            # fp32: the reference compresses in fp32 (`model.py:330`), and the
+            # score state is seeded -inf so an unfilled slot cannot win a softmax.
+            self.kv_state = torch.zeros(shape, dtype=torch.float32, device=device)
+            self.score_state = torch.full(shape, float("-inf"),
+                                          dtype=torch.float32, device=device)
+        else:
+            self.kv_state = self.score_state = None
+
+        if compress_ratio == 4:
+            self.index_keys = torch.zeros(max_batch_size,
+                                          max_seq_len // compress_ratio,
+                                          index_head_dim, dtype=dtype, device=device)
+            ishape = (max_batch_size, coff * compress_ratio, coff * index_head_dim)
+            self.index_kv_state = torch.zeros(ishape, dtype=torch.float32,
+                                              device=device)
+            self.index_score_state = torch.full(ishape, float("-inf"),
+                                                dtype=torch.float32, device=device)
+        else:
+            self.index_keys = self.index_kv_state = self.index_score_state = None
+
+    # -- CacheLayerMixin's five abstract methods ----------------------------
+    def lazy_initialization(self, key_states, value_states):
+        """Nothing to do: every buffer is preallocated from the config, because
+        the ring's size IS `window + max_seq_len // ratio` and is not a function
+        of what arrives."""
+
+    def update(self, key_states, value_states, **kwargs):
+        """`key_states` is the chunk's latents `[b, seqlen, head_dim]`.
+
+        Returns the contiguous view attention reads -- history, then this
+        chunk. The compressed tail is appended by the caller, which is the only
+        thing that knows whether its Compressor flushed a block this forward.
+        """
+        start_pos = int(kwargs.get("start_pos", self.cumulative_length))
+        view = torch.cat([self.history(start_pos), key_states], dim=1)
+        self.write(key_states, start_pos)
+        self.cumulative_length = start_pos + key_states.shape[1]
+        return view, view
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        """Ring capacity and zero offset.
+
+        **This model builds no HF attention mask.** `sparse_attn` masks by
+        reading -1 out of `topk_idxs` (`kernel.py:322`), and causality lives in
+        `window_topk_idxs` / `compress_topk_idxs`. The pair exists to satisfy
+        `CacheLayerMixin`; nothing in the forward consults `attention_mask`.
+        """
+        return self.keys.shape[1], 0
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_max_cache_shape(self) -> int:
+        return self.max_seq_len
+
+    # -- the ring -----------------------------------------------------------
+    def history(self, start_pos: int) -> torch.Tensor:
+        """The `window_size - 1` positions before `start_pos`, oldest first."""
+        h = view_history(self.window_size, start_pos)
+        if h == 0:
+            return self.keys[:, :0]
+        slots = (torch.arange(start_pos - h, start_pos, device=self.keys.device)
+                 % self.window_size)
+        return self.keys[:, slots]
+
+    def write(self, kv: torch.Tensor, start_pos: int) -> None:
+        """Carry the chunk's tail into the ring for the next forward."""
+        seqlen = kv.shape[1]
+        keep = min(seqlen, self.window_size)
+        tail = kv[:, seqlen - keep:]
+        slots = (torch.arange(start_pos + seqlen - keep, start_pos + seqlen,
+                              device=self.keys.device) % self.window_size)
+        self.keys[:, slots] = tail.to(self.keys.dtype)
+
+    def nbytes(self) -> int:
+        total = self.keys.numel() * self.keys.element_size()   # values IS keys
+        for tensor in (self.kv_state, self.score_state, self.index_keys,
+                       self.index_kv_state, self.index_score_state):
+            if tensor is not None:
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    # -- three inherited methods the alias breaks ---------------------------
+    def offload(self):
+        """The inherited version moves `keys` and `values` independently, which
+        splits the alias into two tensors that then drift apart."""
+        self._move("cpu")
+
+    def prefetch(self):
+        self._move(self.keys.device)
+
+    def _move(self, device):
+        self.keys = self.keys.to(device, non_blocking=True)
+        self.values = self.keys
+        for name in ("kv_state", "score_state", "index_keys",
+                     "index_kv_state", "index_score_state"):
+            tensor = getattr(self, name)
+            if tensor is not None:
+                setattr(self, name, tensor.to(device, non_blocking=True))
+
+    def reorder_cache(self, beam_idx):
+        raise RuntimeError(
+            "DeepSeek-V4 does not support beam search: `values` aliases `keys`, "
+            "so the inherited reorder would index_select the same ring twice "
+            "and desynchronise the alias. Vaayu's server never beams.")
+
+    def reset(self):
+        self.keys.zero_()
+        self.cumulative_length = 0
+        if self.kv_state is not None:
+            self.kv_state.zero_()
+            self.score_state.fill_(float("-inf"))
+        if self.index_keys is not None:
+            self.index_keys.zero_()
+            self.index_kv_state.zero_()
+            self.index_score_state.fill_(float("-inf"))
+
+
+class DeepseekV4Cache(Cache):
+    """One `DeepseekV4CacheLayer` per body layer, sized from the config.
+
+    Nothing below is a literal: `sliding_window`, `head_dim`, `index_head_dim`
+    and `compress_ratios` all come off the config (CLAUDE.md §5).
+    """
+
+    def __init__(self, config, max_seq_len: int, max_batch_size: int = 1,
+                 device=None, dtype=torch.bfloat16):
+        layers = [
+            DeepseekV4CacheLayer(
+                compress_ratio=config.compress_ratios[layer_idx],
+                window_size=config.sliding_window,
+                head_dim=config.head_dim,
+                max_seq_len=max_seq_len,
+                index_head_dim=config.index_head_dim,
+                max_batch_size=max_batch_size, dtype=dtype, device=device)
+            for layer_idx in range(config.num_hidden_layers)
+        ]
+        super().__init__(layers=layers)
+        self.max_seq_len = max_seq_len
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self.layers[layer_idx].get_seq_length()
+
+    def advance(self, n: int) -> None:
+        """Move every layer's counter. Tests and the model's own bookkeeping
+        use it; a real forward advances through `update`."""
+        for layer in self.layers:
+            layer.cumulative_length = n
+
+    def crop(self, max_length: int) -> None:
+        """Refuses below the current length -- see `_ONE_LENGTH`.
+
+        A no-op crop TO the current length is allowed, because that is what
+        `prefix_cache`'s `min(...)` clamp produces on the common path and it
+        asks nothing of the ring.
+        """
+        current = self.get_seq_length()
+        if max_length >= current:
+            return
+        raise RuntimeError(_ONE_LENGTH)
+
+    def nbytes(self) -> int:
+        return sum(layer.nbytes() for layer in self.layers)
+
+    def reset(self) -> None:
+        for layer in self.layers:
+            layer.reset()
