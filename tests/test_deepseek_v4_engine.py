@@ -718,3 +718,160 @@ def test_init_model_raises_when_the_inference_directory_is_missing(
     expected = tmp_path / "inference"
     with pytest.raises(FileNotFoundError, match=re.escape(str(expected))):
         model.init_model()
+
+
+# ── Task 6e: every borrowed symbol resolved off the RUNNING module ─────────
+#
+# `KERNEL_DIR` (above) was one instance of a general defect: `modeling.py`
+# and the HuggingFace-modules-cache copy `trust_remote_code` actually loads
+# are two distinct module objects with two distinct copies of every
+# module-level global. `DeepseekV4Cache`, `DeepseekV4CacheLayer`, and
+# `input_ids_scope`'s `ContextVar` are the other three. These tests build a
+# SECOND module with the same source-level shape as `modeling.py` -- its own
+# `ContextVar`-backed `input_ids_scope`/`current_input_ids` pair and its own
+# `DeepseekV4Cache` stand-in -- and pin that the subclass reads and writes
+# THAT module's state when a fake loaded class reports it as `__module__`.
+
+def _fake_running_deepseek_module():
+    """A module with the same source-level SHAPE as `modeling_deepseek_v4.py`
+    -- its own `ContextVar`, its own `input_ids_scope`/`current_input_ids`
+    closing over it, and its own `DeepseekV4Cache`/`DeepseekV4CacheLayer`
+    stand-ins -- standing in for the HuggingFace modules cache copy.
+    """
+    import contextlib
+    import contextvars
+    import types
+
+    module = types.ModuleType("fake_transformers_modules_deepseek_v4_running")
+    ids_var = contextvars.ContextVar("fake_deepseek_v4_input_ids", default=None)
+
+    @contextlib.contextmanager
+    def input_ids_scope(input_ids):
+        token = ids_var.set(input_ids)
+        try:
+            yield
+        finally:
+            ids_var.reset(token)
+
+    def current_input_ids():
+        ids = ids_var.get()
+        if ids is None:
+            raise RuntimeError(
+                "a hash-routed MoE layer routes by token id and no input_ids "
+                "are stashed -- the model's forward must run its layers "
+                "inside `input_ids_scope`.")
+        return ids
+
+    class DeepseekV4Cache:
+        def __init__(self, config, max_seq_len, max_batch_size, device, dtype):
+            self.config = config
+            self.max_seq_len = max_seq_len
+            self.max_batch_size = max_batch_size
+            self.device = device
+            self.dtype = dtype
+            self.layers = [object() for _ in range(config.num_hidden_layers)]
+
+    class DeepseekV4CacheLayer:
+        pass
+
+    module.input_ids_scope = input_ids_scope
+    module.current_input_ids = current_input_ids
+    module.DeepseekV4Cache = DeepseekV4Cache
+    module.DeepseekV4CacheLayer = DeepseekV4CacheLayer
+    return module
+
+
+def test_forward_scopes_ids_on_the_running_module_not_the_repo_copy(monkeypatch):
+    """The real bug (Task 6e): the running model's `current_input_ids()`
+    reads a `ContextVar` that lives on ITS module, not on
+    `vaayu.model_code.deepseek_v4.modeling_deepseek_v4`. Before the fix,
+    `forward` always stashed ids on the repo module's `ContextVar` --
+    invisible to a running model loaded from anywhere else -- so this fails
+    against the pre-fix code (confirmed: pre-fix, `fake_module.current_input_ids()`
+    raises "no input_ids are stashed" instead of returning `ids`, because the
+    ids landed on the repo module's ContextVar instead).
+    """
+    fake_module = _fake_running_deepseek_module()
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+
+    seen = {}
+
+    def fake_super_forward(self, input_ids, **kwargs):
+        # Visible on the RUNNING module's current_input_ids() during forward.
+        seen["ids"] = fake_module.current_input_ids()
+        # NOT visible on the repo module's -- a different ContextVar entirely.
+        with pytest.raises(RuntimeError, match="input_ids_scope"):
+            modeling.current_input_ids()
+        return "out"
+
+    monkeypatch.setattr(VaayuBaseModel, "forward", fake_super_forward)
+    model = engine(model=FakeLoadedModel())
+    ids = torch.tensor([[4, 5, 6]])
+
+    assert model.forward(ids) == "out"
+    assert torch.equal(seen["ids"], ids)
+    # Cleared after forward returns.
+    with pytest.raises(RuntimeError, match="input_ids_scope"):
+        fake_module.current_input_ids()
+
+
+def test_create_kv_cache_builds_the_running_modules_cache_not_the_repo_ones(
+        monkeypatch):
+    """`isinstance` against the running model's own `DeepseekV4Cache` is the
+    concrete failure mode named in the brief: building the repo module's
+    class object here would fail that check even though the cache is
+    functionally identical.
+    """
+    fake_module = _fake_running_deepseek_module()
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+
+    config = shipped_config(num_hidden_layers=2)
+    model = engine(model=FakeLoadedModel(), config=config, max_seq_len=256,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+
+    cache = model._create_kv_cache()
+
+    assert isinstance(cache, fake_module.DeepseekV4Cache)
+    assert not isinstance(cache, modeling.DeepseekV4Cache)
+
+
+def test_running_symbol_raises_naming_the_missing_symbol(monkeypatch):
+    """CLAUDE.md §5: raise, never silently fall back to the repo copy.
+
+    A running module that lacks an expected symbol must fail loudly, naming
+    both the module and the symbol -- not quietly resolve off
+    `vaayu`'s own copy, which would reintroduce the exact bug this task
+    fixes with no visible symptom.
+    """
+    import types
+
+    empty_module = types.ModuleType(
+        "fake_transformers_modules_deepseek_v4_missing")
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, empty_module.__name__, empty_module)
+    model = engine(model=FakeLoadedModel())
+
+    with pytest.raises(AttributeError, match="DeepseekV4Cache"):
+        model._running_symbol("DeepseekV4Cache")
+
+
+def test_running_module_falls_back_to_the_repo_copy_before_any_model_loads():
+    """When `self.model` is unset -- every test above this section, and every
+    real call site before `init_model()` has run -- there is no "running
+    module" to distinguish from the repo copy yet, so this must resolve to
+    the repo module itself. This is what keeps every pre-existing test in
+    this file (none of which set `self.model`) passing unmodified.
+    """
+    assert engine()._running_module() is modeling
+
+
+def test_running_module_resolves_off_a_loaded_models_module_when_set(
+        monkeypatch):
+    fake_module = _fake_running_deepseek_module()
+    FakeLoadedModel = _fake_loaded_model_in(
+        monkeypatch, fake_module.__name__, fake_module)
+    model = engine(model=FakeLoadedModel())
+    assert model._running_module() is fake_module

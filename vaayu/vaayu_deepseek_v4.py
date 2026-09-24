@@ -14,6 +14,7 @@ import sys
 
 import torch
 
+from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
 from .vaayu_base import VaayuBaseModel
 
 
@@ -110,6 +111,50 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         super().__init__(*args, **kwargs)
 
+    def _running_module(self):
+        """The module object the LOADED model actually runs from.
+
+        `trust_remote_code` loads this architecture's class into the
+        HuggingFace modules cache (`~/.cache/huggingface/modules/
+        transformers_modules/...`), a different module object than this
+        repo's own copy at `model_code/deepseek_v4/modeling_deepseek_v4.py`
+        -- and every module-level global (`KERNEL_DIR`, the `ContextVar`
+        behind `input_ids_scope`, `DeepseekV4Cache`) is duplicated across the
+        two. Every symbol this class borrows from that source file must be
+        read off the module the running class actually lives in, never off
+        this repo's copy, or it silently talks to the wrong ContextVar/class
+        object.
+
+        Before any model is loaded (`self.model` unset -- every call site
+        that runs during `VaayuBaseModel.__init__` before `init_model()` has
+        assigned it, and every existing unit test in this file), there is no
+        running module yet to distinguish from the repo copy, so this falls
+        back to the repo copy itself.
+        """
+        model = getattr(self, "model", None)
+        if model is None:
+            return _repo_modeling
+        return sys.modules[type(model).__module__]
+
+    def _running_symbol(self, name):
+        """A symbol off the running module (see `_running_module` above).
+
+        Raises, naming the module and the symbol, if the running module
+        lacks it -- CLAUDE.md §5: detection over assumption, never silently
+        fall back to the repo copy for a symbol that should be there. A
+        silent fallback here is exactly how the bug this method fixes would
+        reappear with no symptom.
+        """
+        module = self._running_module()
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            raise AttributeError(
+                f"{module.__name__!r} has no {name!r}. DeepSeek-V4's running "
+                f"module (loaded via trust_remote_code) is expected to "
+                f"define it, the same way this repo's own copy of "
+                f"modeling_deepseek_v4.py does.") from None
+
     def get_checkpoint_key_remap(self):
         """This checkpoint's keys do not name the module tree A5.6 built.
 
@@ -179,8 +224,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
                 f"They ship inside the checkpoint, under `inference/`, beside "
                 f"the original shards at {self.model_local_path}.")
 
-        target_module = sys.modules[type(self.model).__module__]
-        target_module.KERNEL_DIR = kernel_dir
+        self._running_module().KERNEL_DIR = kernel_dir
         print(f"[Vaayu] DeepSeek-V4 kernels found at {kernel_dir}")
 
     def _create_kv_cache(self):
@@ -194,7 +238,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
         `DeepseekV4Model.forward` refuses to default it from
         `max_position_embeddings`.
         """
-        from .model_code.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Cache
+        DeepseekV4Cache = self._running_symbol("DeepseekV4Cache")
 
         if self.kv_cache_mode not in (None, "auto"):
             print(f"[Vaayu] kv_cache_mode={self.kv_cache_mode!r} ignored: "
@@ -256,8 +300,9 @@ class VaayuDeepseekV4(VaayuBaseModel):
         from types import SimpleNamespace
 
         from .batch import cache_holds_recurrent_state, cache_supports_prefix_store
-        from .model_code.deepseek_v4.modeling_deepseek_v4 import (
-            DeepseekV4Cache, DeepseekV4CacheLayer)
+
+        DeepseekV4Cache = self._running_symbol("DeepseekV4Cache")
+        DeepseekV4CacheLayer = self._running_symbol("DeepseekV4CacheLayer")
 
         # Recorded whether or not the cache is refused -- see the base's own
         # comment (vaayu_base.py:3788): the KV-only side channels (disk
@@ -393,7 +438,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
         ids -- which is correct, because those are the tokens its layers
         route. `ContextVar` makes the nesting and the release exception-safe.
         """
-        from .model_code.deepseek_v4.modeling_deepseek_v4 import input_ids_scope
+        input_ids_scope = self._running_symbol("input_ids_scope")
 
         if input_ids is None:
             raise ValueError(
