@@ -16,6 +16,7 @@ from torch import nn
 from vaayu.model_code.deepseek_v4 import modeling_deepseek_v4 as modeling
 from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from vaayu.vaayu_base import VaayuBaseModel
+from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "deepseek_v4_config.json"
 
@@ -96,3 +97,113 @@ def test_the_decoder_layer_still_refuses_an_unknown_kwarg():
                    for p in params.values())
     assert set(params) == {"self", "hidden_states", "past_key_values",
                            "start_pos", "use_cache"}
+
+
+def engine(**attrs):
+    """A `VaayuDeepseekV4` with only the attributes under test.
+
+    `VaayuBaseModel.__init__` loads a model; these hooks need none of it.
+    """
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    for name, value in attrs.items():
+        setattr(model, name, value)
+    return model
+
+
+def test_the_cache_is_a_deepseek_cache_sized_off_the_engines_max_seq_len():
+    # A SMALL max_seq_len on purpose: this cache is PREALLOCATED across every
+    # layer, so the shipped 43 at a real context would allocate hundreds of MB
+    # in a unit test.
+    config = shipped_config(num_hidden_layers=2)
+    model = engine(config=config, max_seq_len=256, kv_cache_mode="auto",
+                   running_device="cpu", running_dtype=torch.bfloat16)
+    cache = model._create_kv_cache()
+    assert isinstance(cache, modeling.DeepseekV4Cache)
+    assert cache.max_seq_len == 256
+    assert len(cache.layers) == config.num_hidden_layers
+
+
+def test_a_non_default_kv_cache_mode_is_overridden_loudly(capsys):
+    """The knob is not silently ignored.
+
+    This cache has no fp8 / bf16 / TurboQuant variant, so honouring
+    kv_cache_mode is impossible -- but ignoring it without a word is how a
+    user spends an afternoon wondering why their setting did nothing.
+    """
+    model = engine(config=shipped_config(num_hidden_layers=2), max_seq_len=256,
+                   kv_cache_mode="turboquant:4", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+    model._create_kv_cache()
+    assert "turboquant:4" in capsys.readouterr().out
+
+
+def test_run_embed_widens_the_residual_to_hc_mult_copies():
+    config = shipped_config()
+    model = engine(config=config)
+    layer = nn.Embedding(8, config.hidden_size)
+    seq = torch.tensor([[1, 2, 3]])
+    out = model.run_embed(layer, seq)
+    assert out.shape == (1, 3, config.hc_mult, config.hidden_size)
+    # Every copy is the embedding, unchanged.
+    for i in range(config.hc_mult):
+        assert torch.equal(out[:, :, i, :], layer(seq))
+
+
+def test_run_embed_reads_hc_mult_off_the_config_not_a_literal():
+    config = shipped_config(hc_mult=3)
+    model = engine(config=config)
+    layer = nn.Embedding(8, config.hidden_size)
+    out = model.run_embed(layer, torch.tensor([[1, 2]]))
+    assert out.shape[2] == 3
+
+
+def test_run_norm_calls_hc_head_before_the_norm_module():
+    """Ordering is the whole point: hc_head collapses [b,s,hc,d] -> [b,s,d],
+    so a norm that ran first would normalise the wrong axis."""
+    calls = []
+
+    class FakeInner:
+        def hc_head(self, x):
+            calls.append("hc_head")
+            return x.sum(dim=2)
+
+    class FakeOuter:
+        model = FakeInner()
+
+    class RecordingNorm(nn.Module):
+        def forward(self, x):
+            calls.append("norm")
+            return x
+
+    model = engine(model=FakeOuter())
+    seq = torch.zeros(1, 3, 4, 8)
+    out = model.run_norm(RecordingNorm(), seq)
+    assert calls == ["hc_head", "norm"]
+    assert out.shape == (1, 3, 8)
+
+
+def test_get_pos_emb_args_passes_the_past_length_as_start_pos():
+    assert engine().get_pos_emb_args(17, 5) == {"start_pos": 17}
+
+
+def test_the_mask_and_position_id_hooks_pass_nothing():
+    """sparse_attn masks itself by reading -1 out of topk_idxs
+    (`kernel.py:322`) and position lives in start_pos, so an HF mask or
+    position_ids would be an unexpected kwarg on the decoder layer."""
+    model = engine()
+    assert model.get_attention_mask_args(torch.ones(1, 1, 4, 4), 0, 4) == {}
+    assert model.get_position_ids_args(torch.arange(4)[None], 0, 4) == {}
+
+
+def test_the_hooks_produce_exactly_the_layers_signature():
+    """The union of what the loop passes must be what the layer takes."""
+    model = engine()
+    emitted = {"use_cache"}
+    emitted |= set(model.get_past_key_value_args(object()))
+    emitted |= set(model.get_pos_emb_args(0, 4))
+    emitted |= set(model.get_attention_mask_args(None, 0, 4))
+    emitted |= set(model.get_position_ids_args(None, 0, 4))
+    accepted = set(
+        inspect.signature(modeling.DeepseekV4DecoderLayer.forward).parameters)
+    accepted -= {"self", "hidden_states"}
+    assert emitted == accepted
