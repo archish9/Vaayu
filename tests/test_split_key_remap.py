@@ -261,3 +261,39 @@ def test_a_well_formed_checkpoint_splits_cleanly_with_no_warning(tmp_path, capsy
     for shard in sorted((tmp_path / "splitted_model").glob("*.safetensors")):
         written.update(load_file(str(shard)))
     assert set(written) == set(weight_map)
+
+
+def test_a_homeless_key_raises_before_the_already_split_early_return_can_delete(tmp_path):
+    """Review finding (2026-09-24): the guard must run before EITHER
+    `delete_original_shards` call site, not just before the write loop. A
+    checkpoint split by an earlier run that silently dropped a homeless key
+    presents every expected shard AND every `.done` marker -- exactly what
+    `all(found_layers.values())` in the "already split" early return calls
+    complete. Fabricate exactly that state, then load again with
+    `delete_original=True` and a `key_remap` in play: the guard must raise
+    before that branch's `delete_original_shards(...)` call, so the untouched
+    originals are still on disk afterwards."""
+    weight_map = _checkpoint_with_a_homeless_key(tmp_path)
+    original_files = {tmp_path / fname for fname in weight_map.values()}
+    original_index = tmp_path / "model.safetensors.index.json"
+    assert all(f.exists() for f in original_files)
+
+    # The state an earlier run that silently dropped "homeless.weight" would
+    # leave: every OTHER expected shard, each with its .done marker. Content
+    # does not matter -- G2 must fire before anything downstream reads these.
+    split_dir = tmp_path / "splitted_model"
+    split_dir.mkdir()
+    for layer in ("model.embed_tokens", "model.layers.0", "model.norm", "lm_head"):
+        (split_dir / f"{layer}.safetensors").touch()
+        (split_dir / f"{layer}.safetensors.done").touch()
+
+    with pytest.raises(RuntimeError, match="homeless.weight"):
+        split_and_save_layers(str(tmp_path), delete_original=True,
+                              key_remap=lambda k: k)
+
+    assert all(f.exists() for f in original_files), (
+        "the homeless-key guard ran too late: the original shard(s) were "
+        "deleted before it fired")
+    assert original_index.exists(), (
+        "the homeless-key guard ran too late: the original index was "
+        "deleted before it fired")
