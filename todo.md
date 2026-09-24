@@ -1594,51 +1594,54 @@ a Vaayu precedent; the attention path has neither.
       coverage of the carry bug** (it never enters the `overlap` branch the bug lives in, so its
       rel-L2 is 0 with or without the bug) — noted in the test's own docstring so "2 passed" is
       never misread as two independent confirmations of the carry path.
-      **Task 6 (`DeepseekV4Attention`) DONE 2026-09-24, one open finding.** `DeepseekV4Attention`
-      assembles `kv_view = cat([history, chunk, compressed])` exactly as designed. **One brief bug
-      found and fixed against the reference (`model.py:530`/`:537`): the brief's Step 3 code called
-      `self.compressor` only in the non-indexer branch; the reference calls its OWN
-      Attention-level `Compressor` (head_dim-wide, filling `state.keys`' compressed half)
-      UNCONDITIONALLY whenever `compress_ratio` is set, regardless of whether an `Indexer` also
-      runs — the Indexer's internal `Compressor` (index_head_dim-wide, `state.index_keys`) is a
-      separate object for scoring only. Fixed: `self.compressor(...)` now runs before either
-      branch of the topk-index selection.** Also fixed the brief's golden-loading line itself:
-      `modeling.dequantize_at_load(parity.load_module_weights(...))` raises `KeyError:
-      'wo_a.scale'` because `parity.load_module_weights` already pre-dequantizes `wo_a` for the
-      REFERENCE module and drops the scale key — added a local `_raw_module_weights` (the same
-      helper `test_deepseek_v4_linear.py` already uses) and load through
-      `dequantize_at_load(_raw_module_weights(...))` instead, matching the production rule's own
-      contract.
-      **`attn_prefill_r4` is NOT `torch.equal` — rel error 0.004234586842358112, diagnosed, not a
-      correctness bug.** All other three goldens (`attn_prefill_r128`, `attn_decode_r4`,
-      `attn_decode_r128`) ARE bit-identical, and both `attn_chunked_*` run to completion with a
-      finite, correctly-shaped output (the reference's own RuntimeError golden). Root cause,
-      confirmed by a diagnostic rerun with `topk_idxs` manually shrunk to `min(seqlen,
-      window_size)` columns (rel error then measured exactly 0.0, bit-identical): `sparse_attn_kernel`
-      tiles its online-softmax reduction in `block=64`-wide chunks; `window_topk_idxs` always
-      returns `window_size=128` columns (decision #3 — intentional, needed for general seqlen),
-      so at prefill (2 compressed blocks appended) the combined width is 130 → 3 tiles, with the 2
-      real compressed indices landing in the THIRD tile. The reference's own prefill branch
+      **Task 6 (`DeepseekV4Attention`) DONE 2026-09-24, CLOSED — fix round 1 landed, suite green.**
+      `DeepseekV4Attention` assembles `kv_view = cat([history, chunk, compressed])` exactly as
+      designed. **One brief bug found and fixed against the reference (`model.py:530`/`:537`):
+      the brief's Step 3 code called `self.compressor` only in the non-indexer branch; the
+      reference calls its OWN Attention-level `Compressor` (head_dim-wide, filling `state.keys`'
+      compressed half) UNCONDITIONALLY whenever `compress_ratio` is set, regardless of whether an
+      `Indexer` also runs — the Indexer's internal `Compressor` (index_head_dim-wide,
+      `state.index_keys`) is a separate object for scoring only. Fixed: `self.compressor(...)` now
+      runs before either branch of the topk-index selection.** Also fixed the brief's
+      golden-loading line itself: `modeling.dequantize_at_load(parity.load_module_weights(...))`
+      raises `KeyError: 'wo_a.scale'` because `parity.load_module_weights` already pre-dequantizes
+      `wo_a` for the REFERENCE module and drops the scale key — added a local
+      `_raw_module_weights` (the same helper `test_deepseek_v4_linear.py` already uses) and load
+      through `dequantize_at_load(_raw_module_weights(...))` instead, matching the production
+      rule's own contract.
+      **3 of 4 `attn_*` goldens are `torch.equal` bit-identical** (`attn_prefill_r128`,
+      `attn_decode_r4`, `attn_decode_r128`), and both `attn_chunked_*` run to completion with a
+      finite, correctly-shaped output (the reference's own RuntimeError golden).
+      **`attn_prefill_r4` is NOT `torch.equal`, and is now GATED rather than left failing.** Root
+      cause: `sparse_attn_kernel` tiles its online-softmax reduction in `block=64`-wide chunks;
+      `window_topk_idxs` always returns `window_size=128` columns (decision #3 — intentional,
+      needed so ONE function serves prefill/chunk/decode at any `start_pos`/`seqlen`), so at this
+      golden's prefill (2 compressed blocks appended) the combined width is 130 → 3 tiles, with
+      the 2 real compressed indices landing in the THIRD tile. The reference's own prefill branch
       SHRINKS its window index to `min(seqlen, window_size)` (8, here) so its combined width is 10
       → 1 tile, with the same compressed indices in the SAME tile as the window ones. An
       online-softmax merge across tiles (`scores_max`/`sum_exp` rescaled by `exp(prev_max -
       new_max)`) is exact in real arithmetic but NOT bit-identical to a single-pass reduction over
       the same values — classic floating-point reassociation, confirmed algebraically (an
       ALL-masked extra tile, as in `attn_prefill_r128`'s blocks=0 case, IS an exact no-op:
-      multiply-by-1.0 and add-0.0 are both exact in IEEE754) and then empirically (the shrink
-      experiment above). This is a bit-exactness cost of `window_topk_idxs`'s already-accepted
-      general-seqlen design (decision #3: "the extra columns are -1 and contribute nothing" is
-      true in exact arithmetic; this is the case where it is not true bit-for-bit), not a logic
-      bug, and reproduces on-device deterministically. Left the test as strict `torch.equal` per
-      instructions ("never weaken a test to fit an implementation") — it correctly FAILS and
-      reports the rel error via its own assertion message. Task 7's chunk-equivalence gate already
-      uses a rel-L2-vs-null-floor methodology (Task 4's precedent) rather than `torch.equal`; this
-      finding is exactly the kind of noise that methodology exists to absorb, and Task 7 should
-      decide whether prefill vs. reference needs the same treatment or stays out of scope.
-      Full suite after refreshing the checkpoint's copy: `185 passed` CPU+GPU combined across
-      `test_deepseek_v4_{attention,linear,moe,kernels,config}.py`, with exactly this one documented
-      failure (`test_attention_reproduces_a5_2_golden[prefill-4]`). Report:
-      `.superpowers/sdd/2026-09-23-A5.5-attention/task-6-report.md`.
+      multiply-by-1.0 and add-0.0 are both exact in IEEE754).
+      **Ruling (coordinator, fix round 1): `window_topk_idxs` keeps its fixed `window_size` width
+      — NOT re-branched for `start_pos == 0` — because that fixed-width contract is what lets one
+      code path serve prefill, chunk and decode; re-adding the reference's shrink would be the
+      design regressing to satisfy a fixture.** Instead, `attn_prefill_r4` is gated the way Task 4
+      gates chunk equivalence: a same-run one-ULP null-perturbation floor, threshold exactly the
+      floor (not a multiple). **Measured: rel-L2 vs golden 0.00423459, null floor 0.0488187 — the
+      divergence sits at 8.7 % of the floor, 11.5× inside it.** The other three goldens stay on
+      strict `torch.equal`. **Root cause pinned by a dedicated test, not just narrative:**
+      `test_attn_prefill_r4_divergence_is_tile_width_not_masking` replays the forward with
+      `window_topk_idxs`' output manually shrunk to the reference's own prefill width and asserts
+      `torch.equal` against the golden — **it reproduces the golden bit-for-bit**, confirming tile
+      width is the only source of divergence (a masking/indexing bug would not have healed by
+      narrowing an unrelated tensor's width). Full suite: `31 passed` in
+      `test_deepseek_v4_attention.py` alone, `224 passed` across all `test_deepseek_v4_*.py`
+      (attention/config/kernels/linear/moe/parity), zero failures. Checkpoint copy unchanged this
+      round (`diff -q` clean — no modeling-file edits were needed, only tests). Report:
+      `.superpowers/sdd/2026-09-23-A5.5-attention/task-6-report.md` (see "Fix round 1").
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still

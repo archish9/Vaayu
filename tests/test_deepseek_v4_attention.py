@@ -470,6 +470,27 @@ def test_attention_reproduces_a5_2_golden(ratio, phase, checkpoint_kernels):
     """A5.3 and A5.4 both landed bit-identical wherever the arithmetic was
     shared. Anything less here is a FINDING that must name the diverging op --
     not a tolerance to widen.
+
+    `attn_prefill_r4` is the one exception, and it is gated the way Task 4
+    gates chunk equivalence rather than left on `torch.equal`. Root cause
+    (pinned by `test_attn_prefill_r4_divergence_is_tile_width_not_masking`
+    below): `sparse_attn_kernel` tiles its online-softmax reduction in
+    64-wide chunks; `window_topk_idxs`' general-`seqlen` width (128, needed
+    so one function serves prefill/chunk/decode -- the reference's own
+    prefill branch instead shrinks to `min(seqlen, window_size)`) pushes this
+    golden's 2 real compressed indices into a THIRD kernel tile the
+    reference's shrunk, 1-tile call never creates. An online-softmax merge
+    across REAL tiles is exact in real arithmetic but not bit-identical to a
+    single-pass reduction -- confirmed algebraically (an all-masked EXTRA
+    tile, exactly `attn_prefill_r128`'s case since it has zero compressed
+    blocks, IS an exact IEEE754 no-op: multiply-by-1.0 and add-0.0 are both
+    exact) and empirically (shrinking the window index to the reference's
+    width reproduces the golden bit-for-bit -- the pinning test). So the gate
+    here is calibrated against the model's OWN last-bit sensitivity, measured
+    in the same run: perturb the golden's input by one ULP, re-run OUR
+    forward on a fresh cache, and take that rel-L2 as the floor. The
+    threshold is exactly that floor, not a multiple of it -- same principle
+    as `test_compressor_chunked_equals_whole_prompt`.
     """
     config = shipped_config()
     reference = parity.reference_modules()
@@ -490,8 +511,112 @@ def test_attention_reproduces_a5_2_golden(ratio, phase, checkpoint_kernels):
         if phase == "decode":
             out = layer(golden["x"].cuda(), cache, prefill.shape[1])
 
+        if ratio == 4 and phase == "prefill":
+            perturbed_cache = modeling.DeepseekV4Cache(
+                config, max_seq_len=parity.MAX_SEQ_LEN, device=torch.device("cuda"))
+            perturbed_out = layer(torch.nextafter(prefill, prefill + 1),
+                                  perturbed_cache, 0)
+            floor = _rel_l2(out.cpu(), perturbed_out.cpu())
+            got = _rel_l2(out.cpu(), golden["out"])
+            print(f"\nattn_prefill_r4: rel-L2 vs golden {got:.6g}, "
+                  f"null (1-ULP) floor {floor:.6g}")
+            assert got <= max(floor, 1e-6), (
+                f"attn_prefill_r4 rel-L2 {got:.6g} exceeds the null floor "
+                f"{floor:.6g} -- no longer explained by tile-width "
+                f"reassociation alone, this looks like a real bug")
+            return
+
     assert torch.equal(out.cpu(), golden["out"]), \
         f"max rel {((out.cpu().float() - golden['out'].float()).norm() / golden['out'].float().norm()).item()}"
+
+
+@needs_checkpoint
+@needs_gpu
+def test_attn_prefill_r4_divergence_is_tile_width_not_masking(checkpoint_kernels):
+    """Pins the root cause of `attn_prefill_r4`'s rel-L2 divergence as tile
+    width, not a masking or indexing bug.
+
+    Replays `DeepseekV4Attention.forward`'s exact sequence of operations
+    (duplicated rather than parametrizing `forward` itself -- this is a
+    diagnostic for exactly one golden, not a knob production code should
+    grow) with ONE change: `window_topk_idxs`' output is narrowed to the
+    reference's own prefill width, `min(seqlen, window_size)`, before the
+    compressed indices are appended -- so the 2 real compressed indices land
+    in the SAME `sparse_attn_kernel` tile as the window ones, exactly as the
+    reference's own (shrunk) call does. If tile width is really the only
+    source of divergence, this reproduces the golden bit-for-bit.
+
+    If it does NOT, `test_attention_reproduces_a5_2_golden`'s null-floor gate
+    is hiding a real bug behind FP-noise framing, and that must be
+    re-diagnosed before trusting it.
+    """
+    ratio = 4
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=parity.MAX_SEQ_LEN)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == ratio)
+    golden = _golden(f"attn_prefill_r{ratio}")
+
+    with parity.reference_device(reference):
+        layer = modeling.DeepseekV4Attention(config, layer_id)
+        layer.load_state_dict(modeling.dequantize_at_load(
+            _raw_module_weights(f"layers.{layer_id}.attn.")))
+        layer = layer.cuda().eval()
+        cache = modeling.DeepseekV4Cache(config, max_seq_len=parity.MAX_SEQ_LEN,
+                                         device=torch.device("cuda"))
+        state = cache.layers[layer_id]
+        hidden_states = golden["x"].cuda()
+        start_pos = 0
+        bsz, seqlen, _ = hidden_states.size()
+        rd, win = layer.rope_head_dim, layer.window_size
+        device = hidden_states.device
+        freqs_cis = layer._freqs(cache.max_seq_len, device)
+        positions = freqs_cis[start_pos:start_pos + seqlen]
+
+        qr = layer.q_norm(layer.wq_a(hidden_states))
+        q = layer.wq_b(qr).unflatten(-1, (layer.n_heads, layer.head_dim))
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + layer.q_norm.eps)
+        modeling.apply_rotary_emb(q[..., -rd:], positions)
+
+        kv = layer.kv_norm(layer.wkv(hidden_states))
+        modeling.apply_rotary_emb(kv[..., -rd:], positions)
+        modeling.kernels().act_quant(kv[..., :-rd], modeling._ACT_QUANT_GROUP,
+                                     "ue8m0", modeling._SCALE_DTYPE, True)
+
+        history = state.history(start_pos)
+        h = history.shape[1]
+        # THE ONE CHANGE: shrink to the reference's own prefill width instead
+        # of `window_topk_idxs`' general-seqlen `window_size` columns.
+        shrink = min(seqlen, win)
+        window_idxs = modeling.window_topk_idxs(win, bsz, seqlen, start_pos,
+                                                device)[:, :, :shrink].contiguous()
+        view = torch.cat([history, kv], dim=1)
+
+        offset = h + seqlen
+        layer.compressor(hidden_states, start_pos, state, freqs_cis)
+        compress_idxs = layer.indexer(hidden_states, qr, start_pos, offset,
+                                      state, freqs_cis)
+        blocks = (start_pos + seqlen) // layer.compress_ratio
+        view = torch.cat([view, state.keys[:bsz, win:win + blocks]], dim=1)
+        topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
+
+        state.write(kv, start_pos)
+        state.cumulative_length = start_pos + seqlen
+
+        o = modeling.kernels().sparse_attn(q, view, layer.attn_sink, topk_idxs,
+                                           layer.softmax_scale)
+        modeling.apply_rotary_emb(o[..., -rd:], positions, True)
+        o = o.view(bsz, seqlen, layer.n_groups, -1)
+        wo_a = layer.wo_a.weight.view(layer.n_groups, layer.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        out = layer.wo_b(o.flatten(2))
+
+    assert torch.equal(out.cpu(), golden["out"]), (
+        "shrinking window_topk_idxs to the reference's own prefill width did "
+        "NOT reproduce the golden bit-for-bit -- the divergence is not "
+        "(only) tile-width reassociation; re-diagnose before trusting the "
+        "null-floor gate in test_attention_reproduces_a5_2_golden")
 
 
 @needs_checkpoint
