@@ -222,10 +222,26 @@ def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
     be measuring the hardware, not the port. So the gate is calibrated
     against the model's OWN noise, measured in the same run: perturb the
     input by one ULP (`nextafter`) and re-run the WHOLE-prompt path against
-    itself. That rel-L2 is the floor no implementation can beat. A REAL
-    chunking bug (a dropped block, a wrong carry) would land far above it --
-    see 2026-09-19's row-43 hybrid-state regression for the shape such a
-    failure takes (rel-L2 0.314 vs a 0.051 floor, ~6x over).
+    itself. That rel-L2 is the floor no implementation can beat -- the
+    threshold is exactly that floor (`rel-L2 <= floor`), not a multiple of
+    it: "chunking must perturb the output no more than a last-bit change to
+    the input does" is a property, not a tuned constant.
+
+    Mutation-verified (2026-09-24, see the A5.5 task-4 report): reinstating
+    the overlap-carry bug this test's Task 4 fix removed (`_hold`'s
+    `state.kv_state[:, :offset] = state.kv_state[:, offset:]` shift, with the
+    explicit carry write deleted) makes `ratio=4` FAIL at rel-L2 2.82x the
+    floor, comfortably outside the `<= 1x` gate; correct code sits at 0.017x
+    the floor -- a ~160x separation, all margin. A first attempt at this gate
+    used `<= 3 * floor` and did NOT catch that same bug (0.0609 landed 6.1%
+    under a 0.0648 threshold) -- the statistic (whole-tensor rel-L2) was
+    always fine, the multiplier was the defect.
+
+    `ratio=128` never enters the overlap branch the carry bug lives in (it
+    isn't `compress_ratio == 4`), so its rel-L2 is 0 with or without that bug
+    -- it gives ZERO coverage of the carry logic. Do not read "both
+    parametrizations passed" as two independent confirmations of the carry
+    path; only `ratio=4` exercises it.
     """
     reference = parity.reference_modules()
     args = parity.reference_args(reference, shipped_config(), max_seq_len=2048)
@@ -263,10 +279,12 @@ def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
     floor = _rel_l2(whole, whole_perturbed)
     print(f"\nratio={ratio}: chunked-vs-whole rel-L2 {got:.6g}, "
           f"null (1-ULP) floor {floor:.6g}")
-    assert got <= 3 * floor + 1e-8, (
-        f"chunked-vs-whole rel-L2 {got:.6g} exceeds 3x the null floor "
-        f"{floor:.6g} (ratio {ratio}) -- this looks like a real chunking bug, "
-        f"not GPU noise")
+    threshold = max(floor, 1e-6)
+    assert got <= threshold, (
+        f"chunked-vs-whole rel-L2 {got:.6g} exceeds the null floor "
+        f"{floor:.6g} (ratio {ratio}) -- chunking must perturb the output no "
+        f"more than a last-bit change to the input does; this looks like a "
+        f"real chunking bug, not GPU noise")
 
 
 def test_compressor_flushes_once_per_ratio_positions():

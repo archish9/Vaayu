@@ -1580,6 +1580,20 @@ a Vaayu precedent; the attention path has neither.
       floor. Chunk-boundary drift for the full attention stack remains Task 7's job to gate, on the
       same null-floor methodology. Full DeepSeek-V4 suite green (214 passed) after refreshing the
       checkpoint's copy. Report: `.superpowers/sdd/2026-09-23-A5.5-attention/task-4-report.md`.
+      **The first gate design FAILED ITS OWN MUTATION CHECK and was tightened, on device, before
+      being trusted (2026-09-24).** Reinstating the overlap-carry bug above and running the test
+      with the original `rel-L2 <= 3 * floor` threshold did NOT fail: mutant rel-L2 0.0608655 =
+      2.82x the floor, but the 3x threshold (0.0648) sat just outside that, so `ratio=4` PASSED
+      with the bug present (`2 passed`, no failure) — a gate with zero margin on the wrong side of
+      the thing it exists to catch. The statistic (whole-tensor rel-L2) was never the problem; the
+      multiplier was. **Threshold corrected to exactly the floor** (`rel-L2 <= max(floor, 1e-6)`,
+      not a multiple — "chunking must perturb the output no more than a last-bit input change
+      does" is a property, not a tuned constant). Re-run under the corrected threshold: `ratio=4`
+      now FAILS on the same mutation (0.0608655 vs threshold 0.0216088), correct code still passes
+      at 0.017x the floor — a ~160x separation, all margin either side. **`ratio=128` gives ZERO
+      coverage of the carry bug** (it never enters the `overlap` branch the bug lives in, so its
+      rel-L2 is 0 with or without the bug) — noted in the test's own docstring so "2 passed" is
+      never misread as two independent confirmations of the carry path.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still
