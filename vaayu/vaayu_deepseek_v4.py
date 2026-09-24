@@ -21,17 +21,31 @@ class VaayuDeepseekV4(VaayuBaseModel):
     are already the names A5.6 gave this model."""
 
     def __init__(self, *args, **kwargs):
-        """Refuse speculative decoding, which nothing else refuses.
+        """Refuse speculative decoding by name; normalise attn_implementation.
 
-        `DeepseekV4CacheLayer` holds a preallocated sliding window plus a
-        compressed half and index state. `batch.cache_holds_recurrent_state`
-        (`batch.py:500`), `prefix_cache.py:112`/`:364`, `kv_persist`, and
-        `Cache.max_cache_len` / `max_batch_size` / `batch_repeat_interleave` /
-        `batch_select_indices` all reason about a `DynamicCache`-shaped one.
-        Serving a restored or sliced prefix out of this cache would return
-        plausible tokens computed against the wrong history.
+        `drafter_model_path` is refused: `cache_holds_recurrent_state` finds no
+        recurrent state on `DeepseekV4CacheLayer`, so `spec_recurrent_refusal`
+        returns `None` and drafting would start -- then the first REJECTED
+        draft reaches `_trim_kv_cache` (`vaayu_base.py:5428`) ->
+        `DeepseekV4Cache.crop`, which cannot rewind a preallocated sliding
+        window plus a compressed half. Nothing else refuses it, so it is
+        refused here.
 
-        Read out of `kwargs` BEFORE `super().__init__`: both options are
+        Prefix caching and KV persistence are NOT refused here -- the engine's
+        own generic path handles them: `_refuse_unsupported_prefix_cache`
+        (`vaayu_base.py:3755`) probes the cache for `to_cpu` / `to_device` /
+        `resident_bytes`, finds none on `DeepseekV4CacheLayer`, warns once and
+        clears the flag; `kv_persist` then prints `ignored: enable_prefix_cache
+        is False` (`:3097`). That matters because a hard refusal here used to
+        run FIRST and make `:3755` dead code on this path, which left the
+        server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
+        unconditionally at `app.py:406`) unable to load this model at all.
+
+        `attn_implementation` is normalised from absent-or-`None` to `"eager"`
+        (an explicit non-`None` request still wins), which keeps the
+        chunk-major prefill gate shut -- see the comment below.
+
+        Read out of `kwargs` BEFORE `super().__init__`: every option here is
         passed by name everywhere a model is built, and refusing afterwards
         would mean refusing at the end of a multi-minute load.
         """
