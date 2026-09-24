@@ -57,7 +57,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.5** — jump to "PICK THIS NEXT: **A5.5**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.6** — jump to "PICK THIS NEXT: **A5.6**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -65,9 +65,10 @@ durable row; A5.1–A5.4 ALL CLOSED the same day — `AutoConfig` resolves `deep
 harness has 15 committed goldens from DeepSeek's OWN modules, `DeepseekV4Linear` reproduces all
 three `linear_*` goldens BIT-IDENTICALLY, and the MoE block lands on Vaayu's module-list forward
 with **zero engine changes** (both MoE gates green), bit-identical on `gate_*`, `expert` and both
-`moe_*` goldens. **A5.5's STEP-0 GATE THEN PASSED 3/3 the same day — the step where A5 was
-expected to die did not kill it. START AT A5.5's PLAN**, with the gate's numbers in hand:
-`docs/2026-09-23-A5.5-step0-gate-RESULTS.md`, and the durable copy in row 28b.** **Correction carried from
+`moe_*` goldens. **A5.5 IS CLOSED TOO — its step-0 gate passed 3/3 on
+2026-09-23 and the port itself landed 2026-09-24 in 17 commits (`e983e60..6d5beb5`, merged to
+main). The step where A5 was expected to die did not kill it. START AT A5.6**, whose brief is
+already written; A5.5's durable record, including two things A5.6 MUST carry, is row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
 import rules), which is 15 of A5.3's 19 tests.** Everything below is PENDING work only — the closed
@@ -84,9 +85,18 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.5** (row 28b). Then A5.6 → A5.7, one per session.
+## ▶ PICK THIS NEXT: **A5.6** (row 28b). Then A5.7. One per session.
 
-**A5.1–A5.4 ARE CLOSED (2026-09-23).** A5.2 left `tests/deepseek/parity.py` + 15 committed
+**A5.1–A5.5 ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5 on 2026-09-24).**
+**TWO THINGS A5.6 MUST CARRY, both from A5.5 and both in row 28b:** (1) attention attends a
+contiguous `kv_view = cat([history, chunk, compressed])`, NOT the reference's in-place ring —
+**do not "simplify" it back**, a 512-token chunk overruns the 128-slot window; (2) the open
+`[bug]` — `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`/`:364`,
+`kv_persist`, and `Cache.max_cache_len`/`max_batch_size`/`batch_repeat_interleave`/
+`batch_select_indices` do not understand this cache, so **this model must run with prefix caching
+and KV persistence OFF until that is fixed**, and A5.7 cannot claim reachability before it is.
+A5.5 also left `DeepseekV4Cache`/`DeepseekV4CacheLayer`, so A5.6 inherits the cache rather than
+designing it. A5.2 left `tests/deepseek/parity.py` + 15 committed
 goldens in `tests/deepseek/goldens/` (1.1 MB); the recorder is `python -m tests.deepseek.parity`.
 A5.3 + A5.4 left `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (`DeepseekV4Linear`,
 `Gate`, `Expert`, `MoE`, `input_ids_scope`) — **A5.5 adds attention to that same file, reads
@@ -109,8 +119,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~2~~ | ~~**A5.2** parity harness~~ | **CLOSED 2026-09-23** | [`…A5.2-parity-harness-RESULTS.md`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) | done |
 | ~~3~~ | ~~**A5.3** dequant + `Linear`~~ | **CLOSED 2026-09-23** | [`…A5.3-dequant-linear-RESULTS.md`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) | done |
 | ~~4~~ | ~~**A5.4** MoE~~ | **CLOSED 2026-09-23** | [`…A5.4-moe-RESULTS.md`](docs/2026-09-23-A5.4-moe-RESULTS.md) | done |
-| **5 (NEXT)** | **A5.5** attention — **STEP-0 GATE PASSED 2026-09-23, 3/3. Write the plan.** | **plan next** | [`…A5.5-step0-gate-RESULTS.md`](docs/2026-09-23-A5.5-step0-gate-RESULTS.md) then the [BRIEF](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) | ~1 w |
-| 6 | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
+| ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
+| **6 (NEXT)** | **A5.6** block + model | **BRIEF** | [`…A5.6-block-model-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) | 3–5 d |
 | 7 | **A5.7** load + first token | **BRIEF** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | 2–3 d |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
@@ -1226,12 +1236,14 @@ session that reaches it. Same ratchet A5 itself went through.
 | **A5.2** `[x]` | **parity harness** | **DONE 2026-09-23** | 15 goldens from the reference's own modules | done | [`…A5.2-RESULTS…`](docs/2026-09-23-A5.2-parity-harness-RESULTS.md) |
 | **A5.3** `[x]` | dequant + `Linear` | **DONE 2026-09-23** | all three `linear_*` goldens bit-identical; 19 tests | done | [`…A5.3-RESULTS…`](docs/2026-09-23-A5.3-dequant-linear-RESULTS.md) |
 | **A5.4** `[x]` | MoE | **DONE 2026-09-23** | zero engine changes, both `moe_*` goldens bit-identical inside; 24 tests | done | [`…A5.4-RESULTS…`](docs/2026-09-23-A5.4-moe-RESULTS.md) |
-| **A5.5** `[~]` | **attention** | **GATE PASSED 3/3, plan next** | MLA + sparse index at `block=16` | ~1 w | [`…A5.5…`](docs/superpowers/specs/2026-09-23-A5.5-attention-BRIEF.md) |
+| **A5.5** `[x]` | **attention** | **DONE 2026-09-24** | MLA + sparse index on a contiguous `kv_view`; 3/4 goldens bit-identical, chunked prefill works where the reference RAISES | done | [`…A5.5-RESULTS…`](docs/2026-09-24-A5.5-attention-RESULTS.md) |
 | **A5.6** `[ ]` | block + model | **BRIEF** | hyper-connections, HF `Cache` migration | 3–5 d | [`…A5.6…`](docs/superpowers/specs/2026-09-23-A5.6-block-model-BRIEF.md) |
 | **A5.7** `[ ]` | load + first token | **BRIEF** | remap, index, first generation, gates | 2–3 d | [`…A5.7…`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) |
 
-**≈3 weeks. A5.5 is where this dies if it dies** — everything else has either a golden reference or
-a Vaayu precedent; the attention path has neither.
+~~**≈3 weeks. A5.5 is where this dies if it dies**~~ — **IT DID NOT.** A5.5 closed 2026-09-24:
+chunked prefill equals the whole prompt inside a measured null floor, and the acceptance gate was
+mutation-verified to FAIL at 45–74× floor with the ring semantics restored. A5.6 and A5.7 remain,
+and both have a golden reference or a Vaayu precedent.
 
 ### Durable summaries — each row survives its `docs/` file going missing (§7)
 
