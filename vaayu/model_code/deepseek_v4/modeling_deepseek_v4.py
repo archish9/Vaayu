@@ -696,6 +696,11 @@ class DeepseekV4CacheLayer(CacheLayerMixin):
         slots = window_size + (max_seq_len // compress_ratio if compress_ratio else 0)
         self.keys = torch.zeros(max_batch_size, slots, head_dim,
                                 dtype=dtype, device=device)
+        # Captured once, from the tensor torch just placed -- so `device=None`
+        # resolves the same way torch resolves it. `prefetch` must move BACK to
+        # this fixed target, never re-read it off `keys` (which `offload` has
+        # by then moved to cpu, making that read report the wrong place).
+        self.compute_device = self.keys.device
         # MLA keeps ONE latent per position and sparse_attn reads it as both
         # operands. The alias is the honest encoding -- see the overrides below.
         self.values = self.keys
@@ -793,7 +798,7 @@ class DeepseekV4CacheLayer(CacheLayerMixin):
         self._move("cpu")
 
     def prefetch(self):
-        self._move(self.keys.device)
+        self._move(self.compute_device)
 
     def _move(self, device):
         self.keys = self.keys.to(device, non_blocking=True)

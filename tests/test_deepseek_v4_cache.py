@@ -5,6 +5,7 @@ committed config fixture, and none of it runs a kernel.
 """
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -97,12 +98,36 @@ def test_reorder_cache_raises_rather_than_half_reordering():
 
 def test_offload_and_prefetch_keep_the_alias():
     """The inherited pair moves keys and values independently, which splits
-    the alias into two tensors that then drift."""
+    the alias into two tensors that then drift.
+
+    Also the regression test for a real bug in the first cut of `prefetch`:
+    `self._move(self.keys.device)` re-read the CURRENT device instead of a
+    recorded compute target, so once `offload()` had set `keys.device` to cpu,
+    `prefetch` computed cpu->cpu and never returned to the compute device.
+    This box has no second real device, so the destination is checked two
+    ways: the real (cpu-only) round trip below, and -- because that round
+    trip is cpu->cpu either way and can't by itself tell the fixed code from
+    the buggy one -- a final check that swaps `keys` for a double reporting an
+    unrelated device string and asserts `prefetch` still targets the recorded
+    `compute_device`, not whatever `keys.device` claims.
+    """
     layer = build().layers[0]
+    assert layer.compute_device == torch.device("cpu")
+
     layer.offload()
+    assert layer.keys.device == torch.device("cpu")
     assert layer.values is layer.keys
+
     layer.prefetch()
+    assert layer.keys.device == layer.compute_device
     assert layer.values is layer.keys
+
+    layer.keys = SimpleNamespace(device="somewhere-else",
+                                 to=lambda device, non_blocking=False: layer.keys)
+    calls = []
+    layer._move = lambda device: calls.append(device)
+    layer.prefetch()
+    assert calls == [layer.compute_device]
 
 
 def test_get_mask_sizes_is_the_ring_capacity_and_says_why():
@@ -156,3 +181,57 @@ def test_two_contrasting_contexts_size_correctly(context):
     for layer_idx, layer in enumerate(cache.layers):
         ratio = config.compress_ratios[layer_idx]
         assert layer.keys.shape[1] == win + (context // ratio if ratio else 0)
+
+
+def test_lazy_initialization_is_a_deliberate_no_op():
+    """Every buffer is preallocated from the config in __init__; there is
+    nothing for lazy_initialization to size, so calling it must change
+    nothing."""
+    layer = build().layers[0]
+    before = layer.keys.clone()
+    layer.lazy_initialization(torch.zeros(1, 1, layer.head_dim),
+                              torch.zeros(1, 1, layer.head_dim))
+    assert torch.equal(layer.keys, before)
+    assert layer.is_initialized is True
+
+
+def test_get_max_cache_shape_is_the_configured_context():
+    cache = build()
+    for layer in cache.layers:
+        assert layer.get_max_cache_shape() == CONTEXT
+
+
+def test_update_returns_history_then_chunk_and_advances_the_ring():
+    """`update()` is the transformers-facing entry point: history + concat +
+    ring write + counter advance in one call. Nothing exercised it before."""
+    config = shipped_config()
+    layer = build().layers[0]
+    win = config.sliding_window
+
+    with torch.no_grad():
+        for pos in range(5):
+            layer.write(torch.full((1, 1, config.head_dim), float(pos)), pos)
+    layer.cumulative_length = 5
+
+    chunk = torch.full((1, 3, config.head_dim), 100.0, dtype=layer.keys.dtype)
+    keys_out, values_out = layer.update(chunk, chunk, start_pos=5)
+
+    assert keys_out is values_out                   # same view twice, by design
+    assert keys_out.shape == (1, 5 + 3, config.head_dim)
+    assert keys_out[0, :5, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert keys_out[0, 5:, 0].tolist() == [100.0, 100.0, 100.0]
+    assert layer.get_seq_length() == 5 + 3
+    # the chunk is now in the ring, so the NEXT call's history sees its tail
+    assert layer.history(8)[0, -3:, 0].tolist() == [100.0, 100.0, 100.0]
+    assert win > 8, "the window must not have wrapped yet for that check to mean anything"
+
+
+def test_update_with_a_mismatched_chunk_dtype_does_not_corrupt_the_ring():
+    """A chunk arriving in a different dtype than the ring must not silently
+    corrupt what gets written -- `write` casts via `.to(self.keys.dtype)`."""
+    layer = build().layers[0]
+    assert layer.keys.dtype is torch.bfloat16
+    chunk = torch.full((1, 2, layer.head_dim), 3.5, dtype=torch.float32)
+    layer.update(chunk, chunk, start_pos=0)
+    assert layer.keys.dtype is torch.bfloat16
+    assert layer.keys[0, :2, 0].tolist() == [3.5, 3.5]
