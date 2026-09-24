@@ -301,3 +301,47 @@ def test_compressor_flush_positions_reduce_to_the_reference_at_decode():
         got = modeling.compressor_flush_positions(4, start_pos, 1)
         want = [start_pos] if (start_pos + 1) % 4 == 0 else []
         assert got == want, start_pos
+
+
+# ── A5.5 step 5: DeepseekV4Indexer ──────────────────────────────────────────
+
+
+def test_indexer_causal_bound_is_per_query_not_per_chunk():
+    """The reference masks only when start_pos == 0. Inside a chunk, query i
+    may see blocks j < (start_pos + i + 1) // ratio -- NOT the chunk's bound.
+    Without this a query early in the chunk reads its own future, which is
+    silently plausible text.
+    """
+    bound = modeling.indexer_causal_bound(ratio=4, start_pos=512, seqlen=512,
+                                          device=torch.device("cpu"))
+    assert bound.shape == (512, 1)
+    assert int(bound[0]) == (512 + 0 + 1) // 4
+    assert int(bound[511]) == (512 + 511 + 1) // 4
+
+
+@needs_checkpoint
+@needs_gpu
+def test_indexer_selects_index_topk_once_saturated(checkpoint_kernels):
+    """Vaayu's working point: at 2048 fed positions the Indexer really does
+    return index_topk = 512 columns, which is what makes topk 640."""
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=8192)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == 4)
+
+    with parity.reference_device(reference):
+        indexer = modeling.DeepseekV4Indexer(config, 4)
+        indexer.load_state_dict(parity.load_module_weights(
+            f"layers.{layer_id}.attn.indexer."))
+        indexer = indexer.cuda().eval()
+        state = modeling.DeepseekV4Cache(
+            config, max_seq_len=8192, device=torch.device("cuda")).layers[layer_id]
+        freqs = modeling.precompute_freqs_cis(
+            args.rope_head_dim, 8192, device=torch.device("cuda"),
+            **modeling.rope_settings(config, 4))
+        x = parity.seeded_input(1, 2048, config.hidden_size)
+        qr = parity.seeded_input(1, 2048, config.q_lora_rank, seed=2)
+        idx = indexer(x, qr, 0, config.sliding_window, state, freqs)
+
+    assert idx.shape[-1] == config.index_topk

@@ -995,28 +995,36 @@ class DeepseekV4Compressor(nn.Module):
         score = self.wgate(x) + self.ape[
             (start_pos + torch.arange(seqlen, device=x.device)) % ratio]
 
+        # The Indexer builds a SECOND instance of this module over the same
+        # cache layer (`rotate=True`, `head_dim=index_head_dim`), so its
+        # scratch space cannot be the main compressor's `kv_state`/
+        # `score_state` -- those are shaped off `head_dim`, not
+        # `index_head_dim`, and the two compressors run in the same forward.
+        kv_state = state.index_kv_state if self.rotate else state.kv_state
+        score_state = state.index_score_state if self.rotate else state.score_state
+
         # Prepend whatever of the current block `state` is holding, so the
         # blocks below are always whole.
         held = start_pos % ratio
         offset = ratio if self.overlap else 0
         if held:
-            kv = torch.cat([state.kv_state[:bsz, offset:offset + held], kv], dim=1)
-            score = torch.cat([state.score_state[:bsz, offset:offset + held],
+            kv = torch.cat([kv_state[:bsz, offset:offset + held], kv], dim=1)
+            score = torch.cat([score_state[:bsz, offset:offset + held],
                                score], dim=1)
         first = start_pos - held
         total = kv.shape[1]
         cutoff = total - total % ratio
 
         if cutoff < ratio:                       # no block completes here
-            self._hold(state, kv, score, offset, bsz)
+            self._hold(kv_state, score_state, kv, score, offset, bsz)
             return None
 
         if self.overlap and first >= ratio:
             # The previous block's raw kv/score, carried forward the last
             # time a block flushed (see the write at the bottom of this
             # branch) -- the overlap window needs it whole.
-            kv = torch.cat([state.kv_state[:bsz, :ratio], kv], dim=1)
-            score = torch.cat([state.score_state[:bsz, :ratio], score], dim=1)
+            kv = torch.cat([kv_state[:bsz, :ratio], kv], dim=1)
+            score = torch.cat([score_state[:bsz, :ratio], score], dim=1)
             cutoff += ratio
 
         whole_kv, tail_kv = kv[:, :cutoff], kv[:, cutoff:]
@@ -1041,9 +1049,9 @@ class DeepseekV4Compressor(nn.Module):
             # it, so a shift here would carry forward whatever stale (zero)
             # data happened to be sitting in the current-window slots, not the
             # block that was actually just completed. Write it explicitly.
-            state.kv_state[:bsz, :ratio] = whole_kv[:, cutoff - ratio:cutoff]
-            state.score_state[:bsz, :ratio] = whole_score[:, cutoff - ratio:cutoff]
-        self._hold(state, tail_kv, score[:, cutoff:], offset, bsz)
+            kv_state[:bsz, :ratio] = whole_kv[:, cutoff - ratio:cutoff]
+            score_state[:bsz, :ratio] = whole_score[:, cutoff - ratio:cutoff]
+        self._hold(kv_state, score_state, tail_kv, score[:, cutoff:], offset, bsz)
 
         pooled = self.norm(pooled.to(dtype))
         blocks = compressor_flush_positions(ratio, start_pos, seqlen)
@@ -1062,7 +1070,7 @@ class DeepseekV4Compressor(nn.Module):
         target[:bsz, base + slots] = pooled.to(target.dtype)
         return pooled
 
-    def _hold(self, state, kv, score, offset, bsz):
+    def _hold(self, kv_state, score_state, kv, score, offset, bsz):
         """Buffer the chunk's trailing partial block so a later call can
         complete it. Only `[offset:offset+held]` is ever read back (the
         `held` prepend above), so nothing else here needs clearing -- the
@@ -1071,5 +1079,89 @@ class DeepseekV4Compressor(nn.Module):
         """
         held = kv.shape[1]
         if held:
-            state.kv_state[:bsz, offset:offset + held] = kv
-            state.score_state[:bsz, offset:offset + held] = score
+            kv_state[:bsz, offset:offset + held] = kv
+            score_state[:bsz, offset:offset + held] = score
+
+
+# ── A5.5: the Indexer ────────────────────────────────────────────────────────
+
+
+def indexer_causal_bound(ratio: int, start_pos: int, seqlen: int,
+                         device) -> torch.Tensor:
+    """`[seqlen, 1]` -- the exclusive block bound each query may select from.
+
+    The reference computes this only for `start_pos == 0` (`model.py:431`); a
+    chunk at any other position needs it just as much, and without it a query
+    early in the chunk can select a compressed block summarising positions it
+    has not reached. Same subexpression `compress_topk_idxs` already uses
+    above, factored out because the Indexer needs the bound itself, not the
+    finished index matrix.
+    """
+    positions = start_pos + torch.arange(seqlen, device=device).unsqueeze(1)
+    return (positions + 1) // ratio
+
+
+class DeepseekV4Indexer(nn.Module):
+    """`model.py:386`. Scores compressed positions and keeps `index_topk`.
+
+    Carries its own `Compressor` with the Hadamard rotation on
+    (`rotate=True`), writing into the cache layer's `index_*` buffers rather
+    than a buffer of its own.
+
+    Generalises BOTH of the reference's `if start_pos == 0:` masks
+    (`model.py:430-436`) to every `start_pos`: the score mask (so a query
+    never scores its own future) and the post-topk mask (so a selection that
+    only exists because there weren't `index_topk` visible blocks yet becomes
+    `-1`, not a real index into the future). The reference's `else` branch
+    (`topk_idxs += offset`, no masking at all) is exactly the bug a chunk
+    boundary at `start_pos > 0` would hit.
+
+    **`wq_b` is quantized, unlike the brief's plain-bf16 proposal.** The
+    checkpoint ships `indexer.wq_b.{weight,scale}` -- F8_E4M3 with a block
+    scale, the same "shared experts + attention" format `_expert_dtypes`
+    already derives off the config, not the fp4 routed-expert format. A bf16
+    `DeepseekV4Linear` here raises on load (`Unexpected key(s): "wq_b.scale"`)
+    before a single token runs it.
+    """
+
+    def __init__(self, config, compress_ratio: int):
+        super().__init__()
+        self.compress_ratio = compress_ratio
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
+        self.softmax_scale = config.index_head_dim ** -0.5
+        _, attn_dtype = _expert_dtypes(config)
+        block = (config.checkpoint_quantization_config or {}).get("weight_block_size")
+        self.wq_b = DeepseekV4Linear(config.q_lora_rank,
+                                     config.index_n_heads * config.index_head_dim,
+                                     dtype=attn_dtype, weight_block_size=block)
+        self.weights_proj = DeepseekV4Linear(config.hidden_size,
+                                             config.index_n_heads,
+                                             dtype=torch.bfloat16)
+        self.compressor = DeepseekV4Compressor(config, compress_ratio,
+                                               config.index_head_dim, rotate=True)
+
+    def forward(self, x, qr, start_pos, offset, state, freqs_cis):
+        bsz, seqlen, _ = x.size()
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        end_pos = start_pos + seqlen
+
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], freqs_cis[start_pos:end_pos])
+        q = rotate_activation(q)
+        kernels().fp4_act_quant(q, _FP4_BLOCK_SIZE, True)
+
+        self.compressor(x, start_pos, state, freqs_cis)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+
+        blocks = end_pos // ratio
+        score = torch.einsum("bshd,btd->bsht", q, state.index_keys[:bsz, :blocks])
+        score = (score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+
+        bound = indexer_causal_bound(ratio, start_pos, seqlen, x.device)
+        visible = torch.arange(blocks, device=x.device) < bound
+        score = score + torch.where(visible, 0.0, float("-inf"))
+        topk = score.topk(min(self.index_topk, blocks), dim=-1)[1]
+        return torch.where(topk < bound, topk + offset, -1).int()
