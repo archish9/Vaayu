@@ -69,6 +69,14 @@ class DeepseekV4Config(PretrainedConfig):
     routed_scaling_factor: float | None = None
     swiglu_limit: float | None = None
     expert_dtype: str | None = None
+    # No shipped config field carries this: fp4 packs 2 values per byte and the
+    # scale is per row per group, so the group size is knowable only from the
+    # shard headers (`in_features // scale.shape[-1]`). A5.4 made it an explicit
+    # keyword on `DeepseekV4Linear` for that reason; it is ALSO needed here
+    # because `from_config` builds every layer under `init_empty_weights` with
+    # no checkpoint in reach, and Vaayu's call site
+    # (`vaayu_base.py:3361`) passes only the config. A5.7's loader sets it.
+    fp4_group_size: int | None = None
 
     # hyper-connections (A5.6)
     hc_mult: int | None = None

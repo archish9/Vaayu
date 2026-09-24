@@ -1322,3 +1322,108 @@ class DeepseekV4Attention(nn.Module):
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))
+
+
+# ── A5.6: the block, hyper-connections and the model ────────────────────────
+
+# `hc_*_scale` is `[3]` in the reference (`model.py:676`) because
+# `hc_split_sinkhorn` splits its projection into exactly three parts --
+# `pre`, `post` and `comb`. No config field carries it, so it is named here
+# rather than typed as a bare 3 (CLAUDE.md §5 allows a literal only when there
+# is no source to derive it from, and only if it says so).
+_HC_SPLIT_PARTS = 3
+
+
+class DeepseekV4DecoderLayer(nn.Module):
+    """`model.py:652`. Attention and the MoE wrapped in hyper-connections.
+
+    The residual stream is `hc_mult` copies wide -- `[b, s, hc, d]` -- and the
+    block mixes it down to one copy before attention and again before the FFN,
+    then expands it back. `hc_pre` and `hc_post` are the whole of it.
+
+    **Both of them live inside this class, and that is load-bearing:** what
+    reaches `self.ffn` is an ordinary `[b, s, d]`, which is why Vaayu's MoE
+    patch needs no change (A5.4's "zero engine changes"). If the width ever
+    escapes this block, that result no longer holds.
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+
+        self.attn = DeepseekV4Attention(config, layer_idx)
+        # `fp4_group_size` reaches us on the config because `from_config` runs
+        # under `init_empty_weights` with no checkpoint in reach and Vaayu's
+        # call site passes nothing else (`vaayu_base.py:3361`). A5.7's loader
+        # sets it; without it A5.4's named ValueError fires, which is the right
+        # failure -- it says what is missing instead of inventing a group size.
+        self.ffn = DeepseekV4MoE(config, layer_idx,
+                                 fp4_group_size=config.fp4_group_size)
+        self.attn_norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.ffn_norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * config.hidden_size
+        # fp32 EXPLICITLY, never through the default dtype. These tensors are
+        # F32 on disk; `from_config(dtype=bf16)` sets torch's default around
+        # `__init__`, and accelerate then casts every injected tensor to the
+        # dtype the skeleton already has -- so a bf16 skeleton would silently
+        # round the checkpoint's fp32 hyper-connection weights down.
+        fp32 = dict(dtype=torch.float32)
+        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, **fp32),
+                                       requires_grad=False)
+        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, **fp32),
+                                      requires_grad=False)
+        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, **fp32),
+                                         requires_grad=False)
+        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, **fp32),
+                                        requires_grad=False)
+        self.hc_attn_scale = nn.Parameter(torch.empty(_HC_SPLIT_PARTS, **fp32),
+                                          requires_grad=False)
+        self.hc_ffn_scale = nn.Parameter(torch.empty(_HC_SPLIT_PARTS, **fp32),
+                                         requires_grad=False)
+
+    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
+        """`model.py:680`. `[b,s,hc,d]` -> `[b,s,d]`, plus the expand weights.
+
+        The normalisation here is a BARE `rsqrt` over the flattened copies, not
+        a `DeepseekV4RMSNorm`: there is no learned weight, and it runs in fp32
+        whatever the stream's dtype.
+        """
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre, post, comb = kernels().hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters,
+            self.hc_eps)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
+
+    def hc_post(self, x, residual, post, comb):
+        """`model.py:690`. `[b,s,d]` back out to `[b,s,hc,d]`."""
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        return y.type_as(x)
+
+    def forward(self, hidden_states, past_key_values, start_pos: int):
+        residual = hidden_states
+        x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn,
+                                    self.hc_attn_scale, self.hc_attn_base)
+        x = self.attn_norm(x)
+        x = self.attn(x, past_key_values, start_pos)
+        hidden_states = self.hc_post(x, residual, post, comb)
+
+        residual = hidden_states
+        x, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn,
+                                    self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.ffn_norm(x)
+        # The reference calls `self.ffn(x, input_ids)`. A5.4's MoE takes only
+        # `hidden_states` -- Vaayu's forward contract -- and reads the batch's
+        # ids from `current_input_ids()`, which the model's forward stashes.
+        x = self.ffn(x)
+        return self.hc_post(x, residual, post, comb)
