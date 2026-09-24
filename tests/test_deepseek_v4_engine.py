@@ -351,6 +351,91 @@ def test_speculative_decoding_is_refused_by_name(monkeypatch):
         VaayuDeepseekV4("/some/path", drafter_model_path="/some/drafter")
 
 
+def test_generate_hands_a_real_deepseek_cache_to_the_ordinary_path(monkeypatch):
+    """Task 6d's regression test.
+
+    `_refuse_unsupported_prefix_cache` above force-disables prefix caching
+    for this model, so `VaayuBaseModel.generate` always takes its
+    `self._prefix_cache is None` branch and delegates straight to
+    `transformers`' own `generate()` with no cache seeded. Left alone,
+    `transformers` manufactures a stock `DynamicCache`
+    (`GenerationMixin._prepare_cache_for_generation`) and this model's
+    forward only accepts `DeepseekV4Cache` -- hence the
+    `'DynamicCache' object has no attribute 'max_seq_len'` crash this task
+    starts from. `VaayuBaseModel.generate` is monkeypatched out (never
+    exercising the real prefix-cache branching -- that is Task 6a/base's
+    territory), so this only pins what `VaayuDeepseekV4.generate` itself
+    hands to whatever comes next.
+    """
+    seen = {}
+
+    def fake_base_generate(self, *args, **kwargs):
+        seen["past_key_values"] = kwargs.get("past_key_values")
+        return "generated"
+
+    monkeypatch.setattr(VaayuBaseModel, "generate", fake_base_generate)
+    model = engine(config=shipped_config(num_hidden_layers=2), max_seq_len=256,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+
+    result = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1)
+
+    assert isinstance(seen["past_key_values"], modeling.DeepseekV4Cache)
+    from transformers.cache_utils import DynamicCache
+    assert not isinstance(seen["past_key_values"], DynamicCache)
+    assert result == "generated"
+
+
+def test_generate_respects_a_caller_supplied_cache(monkeypatch):
+    """A caller-supplied `past_key_values` must not be clobbered -- the
+    override only fills the gap when there is none."""
+    seen = {}
+
+    def fake_base_generate(self, *args, **kwargs):
+        seen["past_key_values"] = kwargs.get("past_key_values")
+        return "generated"
+
+    monkeypatch.setattr(VaayuBaseModel, "generate", fake_base_generate)
+    model = engine(config=shipped_config(num_hidden_layers=2), max_seq_len=256,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+
+    def boom():
+        raise AssertionError("must not build a cache when the caller supplied one")
+
+    monkeypatch.setattr(model, "_create_kv_cache", boom)
+    sentinel = object()
+    model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1,
+                   past_key_values=sentinel)
+    assert seen["past_key_values"] is sentinel
+
+
+def test_generate_delegates_args_and_return_value_unchanged(monkeypatch):
+    """Pins the seam: positional args, the rest of kwargs, and the return
+    value all pass through `VaayuDeepseekV4.generate` untouched."""
+    seen = {}
+
+    def fake_base_generate(self, *args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return "the-result"
+
+    monkeypatch.setattr(VaayuBaseModel, "generate", fake_base_generate)
+    model = engine(config=shipped_config(num_hidden_layers=2), max_seq_len=256,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16)
+    ids = torch.tensor([[1, 2, 3]])
+
+    result = model.generate(ids, max_new_tokens=5, do_sample=False,
+                            session_id="abc")
+
+    assert seen["args"] == (ids,)
+    assert seen["kwargs"]["max_new_tokens"] == 5
+    assert seen["kwargs"]["do_sample"] is False
+    assert seen["kwargs"]["session_id"] == "abc"
+    assert result == "the-result"
+
+
 def test_a_start_pos_that_disagrees_with_the_cache_raises():
     """`DeepseekV4Model._start_pos` validates this and the streamed path never
     calls it. The sliding window indexes by `pos % window_size` and the

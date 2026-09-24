@@ -276,6 +276,40 @@ class VaayuDeepseekV4(VaayuBaseModel):
                   f"ignored for this model -- see _create_kv_cache above).")
             self.enable_prefix_cache = False
 
+    def generate(self, *args, **kwargs):
+        """Seed a real `DeepseekV4Cache` before delegating, so the ordinary
+        (non-prefix-cache) `generate()` path does not crash.
+
+        `VaayuBaseModel.generate` (`vaayu_base.py:5548`) only seeds
+        `past_key_values` on the prefix-cache path; when `self._prefix_cache`
+        is `None` -- always true here, since `_refuse_unsupported_prefix_cache`
+        above force-disables it -- it delegates straight to `transformers`'
+        own `generate()` with no cache in `kwargs`. That manufactures a stock
+        `DynamicCache` itself (`GenerationMixin._prepare_cache_for_generation`,
+        `transformers/generation/utils.py:1898`) -- this is NOT specific to
+        this model; the check gating it (`_supports_default_dynamic_cache`,
+        same file `:1783`) excludes a short, unrelated, hardcoded list of
+        class-name substrings (reformer/minimax/xlnet/olmohybrid/rwkv/xlstm)
+        and DeepSeek-V4 is not on it, so every model this repo runs gets the
+        same manufactured `DynamicCache` whenever it takes this branch.
+        `prepare_inputs_for_generation` (`vaayu_base.py:4407`) then forwards
+        that cache unchanged, so `forward`'s own fallback
+        (`_create_kv_cache` at `vaayu_base.py:4942`) never fires -- it only
+        fires when `past_key_values is None`, and by then it never is. This
+        model's forward accepts only `DeepseekV4Cache` (see `_create_kv_cache`
+        above), which is why the stock `DynamicCache` crashes here instead of
+        just silently ignoring `kv_cache_mode` the way it would for every
+        other model.
+
+        A caller-supplied `past_key_values` wins -- this only fills the gap.
+        If `self._prefix_cache` is ever not `None` again in the future, the
+        base's own `pc.lookup()` miss path builds a fresh cache and
+        overwrites this one, so that path is untouched.
+        """
+        if kwargs.get("past_key_values") is None:
+            kwargs["past_key_values"] = self._create_kv_cache()
+        return super().generate(*args, **kwargs)
+
     def run_embed(self, layer, seq):
         """`[b, s, d]` -> `[b, s, hc_mult, d]`.
 
