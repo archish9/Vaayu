@@ -31,6 +31,29 @@ if hasattr(torch, "float8_e4m3fn"):
     _DTYPE_MAP["F8_E4M3"] = torch.float8_e4m3fn
 if hasattr(torch, "float8_e5m2"):
     _DTYPE_MAP["F8_E5M2"] = torch.float8_e5m2
+# MXFP8-style block-scale dtype (E8M0), added to PyTorch in 2.7 — add if available
+if hasattr(torch, "float8_e8m0fnu"):
+    _DTYPE_MAP["F8_E8M0"] = torch.float8_e8m0fnu
+
+
+def _resolve_dtype(dtype_str: str, tensor_name: str, file_path: str) -> "torch.dtype":
+    """Map a safetensors on-disk dtype string to its torch dtype, or raise.
+
+    The five readers below used to fall back to `torch.float32` for any dtype
+    missing from `_DTYPE_MAP` (`.get(meta['dtype'], torch.float32)`). That
+    silently reinterpreted the tensor's bytes at the wrong element width and
+    only surfaced as a confusing reshape error far from the real cause (e.g. a
+    128-byte F8_E8M0 tensor read as 32 float32 elements instead of 128 uint8
+    elements). CLAUDE.md §5: warn/raise, don't silently degrade.
+    """
+    dtype = _DTYPE_MAP.get(dtype_str)
+    if dtype is None:
+        raise RuntimeError(
+            f"Unmapped safetensors dtype {dtype_str!r} for tensor "
+            f"{tensor_name!r} in {file_path!r} — add it to _DTYPE_MAP in "
+            f"safetensor_model_persister.py"
+        )
+    return dtype
 
 _ALIGN = 4096  # O_DIRECT sector-alignment requirement
 _TENSOR_ALIGN = 16  # CUDA uint4/float4 vector-load width. EXL3's GEMV kernel
@@ -521,7 +544,7 @@ def _load_pinned(file_path: str) -> dict:
     result = {}
     source_buf = buf_view if _USE_IOURING else buf
     for name, meta in tensors_meta.items():
-        dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
+        dtype = _resolve_dtype(meta['dtype'], name, file_path)
         start, end = meta['data_offsets']
         result[name] = source_buf[start:end].view(dtype).reshape(meta['shape'])
     _tensor_reconstruct_us = int((time.perf_counter() - _t_recon) * 1e6)
@@ -725,7 +748,7 @@ def _read_grouped_ranges(file_path: str, items: list, dedicated: bool = False) -
             for key, meta, file_offset, byte_len in group:
                 rel_start = file_offset - group_start
                 rel_end = rel_start + byte_len
-                dtype = _DTYPE_MAP.get(meta['dtype'], torch.float32)
+                dtype = _resolve_dtype(meta['dtype'], key, file_path)
                 tensor = data_buf[rel_start:rel_end].view(dtype).reshape(meta['shape'])
                 result[key] = tensor.clone()
 
@@ -878,7 +901,7 @@ def load_expert_sparse(
                 rel_start = meta.file_offset - group_start
                 rel_end = rel_start + meta.byte_length
                 shape = meta.shape
-                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+                dt = _resolve_dtype(meta.dtype, key, file_path)
 
                 tensor = data_buf[rel_start:rel_end].view(dt).view(shape)
                 result[key] = tensor.clone()
@@ -1102,7 +1125,7 @@ def load_expert_into_slab(
             data = dest[prefix_pad:]
             for key, meta in group:
                 rel = meta.file_offset - group_start
-                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+                dt = _resolve_dtype(meta.dtype, key, file_path)
                 out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
             slab_off += slab_span
             continue
@@ -1146,7 +1169,7 @@ def load_expert_into_slab(
             packed_off = 0
             for key, meta in group:
                 rel = meta.file_offset - group_start
-                dt = _DTYPE_MAP.get(meta.dtype, torch.float32)
+                dt = _resolve_dtype(meta.dtype, key, file_path)
                 chunk = data_raw[rel:rel + meta.byte_length]
                 dst_slice = packed[packed_off:packed_off + meta.byte_length]
                 dst_slice.copy_(chunk)
