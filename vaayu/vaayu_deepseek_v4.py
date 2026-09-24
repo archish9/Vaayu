@@ -66,6 +66,18 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         super().__init__(*args, **kwargs)
 
+    def get_checkpoint_key_remap(self):
+        """This checkpoint's keys do not name the module tree A5.6 built.
+
+        `layers.3.ffn.experts.7.w1.weight` on disk, `model.layers.3.…` in the
+        tree, and `mtp.*` dropped. Applied before the split, which is what makes
+        `ExpertOffsetIndex` find 43 x 256 rather than the 11,776 its regex sees
+        in the raw checkpoint.
+        """
+        from .model_code.deepseek_v4.checkpoint import remap_checkpoint_key
+
+        return remap_checkpoint_key
+
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward
         accepts (it raises `TypeError` on any other).
