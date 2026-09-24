@@ -85,6 +85,26 @@ def small_config(**overrides) -> DeepseekV4Config:
         "quantization_config": None, **overrides})
 
 
+def seeded_parameters(model, seed: int = 0):
+    """Give a constructed model deterministic parameters.
+
+    `hc_head_*` on the model and `hc_*` on each layer are bare
+    `nn.Parameter(torch.empty(...))`, and `post_init()`'s `_init_weights` only
+    dispatches on `nn.Linear` / `nn.Embedding` / norm-named modules -- so they
+    come out of construction holding whatever was in memory (measured on a
+    fresh process: `hc_head_fn` |max| 5.47e+36). A forward over that overflows
+    to inf/NaN depending on what ran before, which is exactly what made this
+    file's value-reading test flap under full-suite ordering. Tests that read
+    VALUES must seed; tests that read shapes or control flow need not.
+    """
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.is_floating_point():
+                param.normal_(std=0.02)
+    return model
+
+
 @needs_gpu
 def test_hc_head_matches_the_reference_and_is_not_hc_pre(stub_layers):
     """`Block.hc_head` (`model.py:709`) -- the head's HC reduction.
@@ -396,7 +416,7 @@ def test_logits_are_fp32_and_logits_to_keep_slices(stub_layers):
     across two different matmul shapes is not a property fp32 has.
     """
     config = small_config()
-    model = modeling.DeepseekV4ForCausalLM(config).eval()
+    model = seeded_parameters(modeling.DeepseekV4ForCausalLM(config)).eval()
     cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
     input_ids = torch.randint(0, config.vocab_size, (1, 6))
 
@@ -417,3 +437,125 @@ def test_logits_are_fp32_and_logits_to_keep_slices(stub_layers):
         "logits_to_keep=1 did not select the last position: max abs diff "
         f"{(last.logits - every.logits[:, -1:]).abs().max().item():.3g}")
     assert torch.equal(last.logits.argmax(-1), every.logits[:, -1:].argmax(-1))
+
+
+@pytest.mark.parametrize("requested",
+                         ["flash_attention_2", "sdpa", "eager", None])
+def test_any_attention_implementation_is_accepted_and_ignored(stub_layers, requested):
+    """Vaayu tries flash_attention_2, then sdpa, then eager, rebuilding the
+    model each time (`vaayu_base.py:3330-3378`). This model has no HF attention
+    backend at all -- `sparse_attn` is its only kernel -- so it accepts any
+    request and reports `eager`, rather than claiming support for a kernel it
+    does not run and making Vaayu throw away two 11,008-expert skeletons first.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4ForCausalLM._from_config(
+        config, attn_implementation=requested)
+
+    assert model.config._attn_implementation == "eager"
+
+
+def test_the_supports_flags_claim_nothing():
+    """The override above is what makes any request work; the flags stay honest
+    so a reader of the class does not conclude sdpa or flash are wired.
+    """
+    assert modeling.DeepseekV4PreTrainedModel._supports_flash_attn is False
+    assert modeling.DeepseekV4PreTrainedModel._supports_sdpa is False
+
+
+@needs_checkpoint
+def test_the_checkpoint_points_auto_model_at_this_file():
+    """A5.1 left the `auto_map` with only an `AutoConfig` entry, so `AutoConfig`
+    resolved and any attempt at the model raised
+    `ValueError: Unrecognized configuration class`. The second entry lands in
+    the commit that creates the class -- a half-written `auto_map` turns that
+    legible error into an ImportError out of HF's module cache.
+    """
+    auto_map = json.loads((parity.CKPT / "config.json").read_text())["auto_map"]
+
+    assert auto_map["AutoConfig"] == "configuration_deepseek_v4.DeepseekV4Config"
+    assert auto_map["AutoModelForCausalLM"] == \
+        "modeling_deepseek_v4.DeepseekV4ForCausalLM"
+
+
+@needs_checkpoint
+def test_the_checkpoints_copy_of_the_modeling_file_has_not_drifted():
+    """`docs/` is gitignored and so is the checkpoint; the repo copy is the
+    source of truth, and two copies drift unless something checks.
+    """
+    repo = Path(modeling.__file__)
+    assert (parity.CKPT / "modeling_deepseek_v4.py").read_bytes() == repo.read_bytes()
+
+
+@needs_checkpoint
+def test_auto_model_for_causal_lm_builds_the_whole_skeleton_on_meta():
+    """The success criterion for A5.6. Vaayu builds every model this way
+    (`vaayu_base.py:3361`): `from_config` under `init_empty_weights`, with the
+    dtype Vaayu will RUN in rather than whatever the config names.
+
+    43 real layers, 11,008 real experts, ~5 s on meta -- the only test in this
+    file that builds the true geometry.
+
+    `fp4_group_size` is set here the way A5.7's loader must set it: read off
+    the shard HEADERS, which costs no tensor data. Without it the skeleton
+    raises A5.4's named ValueError, which is the correct failure -- the group
+    size is in no config field and must not be invented.
+
+    The hc_* parameters must come out fp32 against a bf16 `dtype=`: they are
+    fp32 on disk, and accelerate casts injected tensors to whatever dtype the
+    skeleton already has.
+    """
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(str(parity.CKPT), trust_remote_code=True)
+    config.fp4_group_size = _fp4_group_size_from_headers()
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(
+            config, dtype=torch.bfloat16, attn_implementation="flash_attention_2",
+            trust_remote_code=True)
+
+    assert type(model).__name__ == "DeepseekV4ForCausalLM"
+    assert len(model.model.layers) == config.num_hidden_layers
+    assert model.model.hc_head_fn.dtype is torch.float32
+    assert model.model.layers[0].hc_attn_fn.dtype is torch.float32
+    assert model.lm_head.weight.dtype is torch.bfloat16
+    assert model.config._attn_implementation == "eager"
+
+
+@needs_checkpoint
+def test_the_skeleton_refuses_to_invent_an_fp4_group_size():
+    """A5.4's rule, reached through `from_config`: the group size is knowable
+    only from the shards, so a config that does not carry it must fail loudly
+    at construction rather than pick one.
+    """
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(str(parity.CKPT), trust_remote_code=True)
+    assert config.fp4_group_size is None
+
+    with pytest.raises(ValueError, match="fp4_group_size"):
+        with init_empty_weights():
+            AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16,
+                                             trust_remote_code=True)
+
+
+def _fp4_group_size_from_headers() -> int:
+    """`in_features // scale.shape[-1]`, undoing fp4's 2-per-byte packing.
+
+    Headers only -- `get_slice(...).get_shape()` reads no tensor data. This is
+    what A5.7's loader has to do before `from_config`.
+    """
+    from safetensors import safe_open
+
+    index = json.loads(
+        (parity.CKPT / "model.safetensors.index.json").read_text())["weight_map"]
+    key = next(k for k in index
+               if k.endswith("w1.weight") and ".ffn.experts." in k
+               and not k.startswith("mtp."))
+    shapes = {}
+    for name in (key, key.replace(".weight", ".scale")):
+        with safe_open(parity.CKPT / index[name], framework="pt") as handle:
+            shapes[name] = handle.get_slice(name).get_shape()
+    return shapes[key][-1] * 2 // shapes[key.replace(".weight", ".scale")][-1]

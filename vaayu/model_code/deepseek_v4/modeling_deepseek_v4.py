@@ -1446,6 +1446,31 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     _no_split_modules = ["DeepseekV4DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
 
+    # Honest: this model runs DeepSeek's own `sparse_attn` and participates in
+    # no HF attention backend. The override below is what makes a request for
+    # one harmless.
+    _supports_flash_attn = False
+    _supports_sdpa = False
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation,
+                                              is_init_check: bool = False,
+                                              allow_all_kernels: bool = False) -> str:
+        """Accept any request and report `eager`.
+
+        `DeepseekV4Attention` calls DeepSeek's `sparse_attn` unconditionally --
+        it is the only attention kernel this architecture has, and A5 step 1
+        fitted its tile to sm_120 at `block=16`. No HF backend is reachable, so
+        there is nothing for this argument to select.
+
+        Left to the base class, the honest `_supports_*` flags above would make
+        `flash_attention_2` raise at `_flash_attn_can_dispatch` and `sdpa` at
+        `_sdpa_can_dispatch`, and Vaayu's loop (`vaayu_base.py:3330-3378`)
+        would build and throw away two 11,008-expert skeletons before reaching
+        `eager`. The return value is what transformers stores as
+        `config._attn_implementation_internal` (`modeling_utils.py:1255`).
+        """
+        return "eager"
+
 
 class DeepseekV4Model(DeepseekV4PreTrainedModel):
     """`model.py:877`'s `Transformer`, without the MTP half.
