@@ -345,3 +345,76 @@ def test_indexer_selects_index_topk_once_saturated(checkpoint_kernels):
         idx = indexer(x, qr, 0, config.sliding_window, state, freqs)
 
     assert idx.shape[-1] == config.index_topk
+
+
+@needs_checkpoint
+@needs_gpu
+def test_indexer_matches_the_reference_at_prefill(checkpoint_kernels):
+    """Value-level parity, not shape-only: at `start_pos == 0` our Indexer and
+    the checkpoint's own `Indexer` (`model.py:386`) run the same masking
+    formula over the same weights, so their selected block-index SETS must
+    agree exactly.
+
+    Fed length is 4096, not 2048: at exactly 2048 tokens `blocks == index_topk
+    == 512`, so `score.topk(min(index_topk, blocks), ...)` is asked for
+    EVERY candidate and returns a trivial permutation of `0..511` on both
+    sides regardless of the scores -- a scorer that always returned the WORST
+    512 would pass an index-set comparison at that length exactly as well as
+    a correct one, because the causal mask alone (not the score) decides
+    which of "all of them" survive. `blocks > index_topk` is required for the
+    comparison to actually exercise the einsum/weights_proj/relu path; 4096
+    tokens gives `blocks = 1024`, so every row from i=2047 on has more
+    visible candidates than slots and a real top-512 selection happens.
+
+    `offset=0` on both sides: offset only shifts VALID selections uniformly
+    (`-1` stays `-1`), so it cannot change which blocks are chosen -- passing
+    0 makes the returned values the raw block indices directly, comparable
+    set-for-set with no conversion.
+    """
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=4096)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == 4)
+    seqlen = 4096
+
+    with parity.reference_device(reference):
+        x = parity.seeded_input(1, seqlen, config.hidden_size)
+        qr = parity.seeded_input(1, seqlen, config.q_lora_rank, seed=2)
+        freqs = modeling.precompute_freqs_cis(
+            args.rope_head_dim, seqlen, device=torch.device("cuda"),
+            **modeling.rope_settings(config, 4))
+        weights = parity.load_module_weights(f"layers.{layer_id}.attn.indexer.")
+
+        with torch.device("cuda"):
+            reference_indexer = reference.Indexer(args, 4)
+        reference_indexer.load_state_dict(weights)
+        reference_indexer = reference_indexer.eval()
+        # Normally wired by Attention.forward (model.py:499-500); nothing
+        # else does it when the Indexer is exercised standalone.
+        reference_indexer.freqs_cis = freqs
+        reference_idx = reference_indexer(x, qr, 0, 0)
+
+        ours = modeling.DeepseekV4Indexer(config, 4)
+        ours.load_state_dict(weights)
+        ours = ours.cuda().eval()
+        state = modeling.DeepseekV4Cache(
+            config, max_seq_len=seqlen, device=torch.device("cuda")).layers[layer_id]
+        our_idx = ours(x, qr, 0, 0, state, freqs)
+
+    assert reference_idx.shape == our_idx.shape
+
+    reference_sets = [set(row[row >= 0].tolist()) for row in reference_idx[0]]
+    our_sets = [set(row[row >= 0].tolist()) for row in our_idx[0]]
+    mismatches = [i for i in range(seqlen) if reference_sets[i] != our_sets[i]]
+    if mismatches:
+        i = mismatches[0]
+        only_reference = reference_sets[i] - our_sets[i]
+        only_ours = our_sets[i] - reference_sets[i]
+        print(f"\nrow {i}: {len(mismatches)}/{seqlen} rows differ; "
+              f"row {i} reference-only={sorted(only_reference)[:10]} "
+              f"ours-only={sorted(only_ours)[:10]}")
+    assert not mismatches, (
+        f"{len(mismatches)}/{seqlen} rows selected a different block set than "
+        f"the reference at the same start_pos == 0 input -- not a shape or "
+        f"offset issue, a real disagreement in which blocks were chosen")
