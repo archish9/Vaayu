@@ -13,9 +13,18 @@ The durable copy is row 28b's A5.7a bullet in `todo.md`.
 import sys
 
 import torch
+from accelerate.utils.modeling import set_module_tensor_to_device
 
 from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
 from .vaayu_base import VaayuBaseModel
+
+# Packed/opaque torch dtypes that must be REINTERPRETED (`.view`) rather than
+# numerically cast when injected -- see `move_layer_to_device` below. This
+# names a torch dtype class, not a model number (CLAUDE.md §5): today only
+# DeepSeek-V4's routed-expert weights (`config.expert_dtype == "fp4"`) are
+# this shape, but the set is written for the class of problem, not the one
+# checkpoint.
+_PACKED_INJECTION_DTYPES = (torch.float4_e2m1fn_x2,)
 
 
 class VaayuDeepseekV4(VaayuBaseModel):
@@ -166,6 +175,128 @@ class VaayuDeepseekV4(VaayuBaseModel):
         from .model_code.deepseek_v4.checkpoint import remap_checkpoint_key
 
         return remap_checkpoint_key
+
+    def _detect_moe(self) -> None:
+        """Recognise this checkpoint as MoE under the field name it actually
+        uses, then let the base do everything else.
+
+        `VaayuBaseModel._detect_moe` (`vaayu_base.py:3582`) decides `is_moe`
+        from `hasattr(config, "num_local_experts")`,
+        `hasattr(config, "num_experts")`, or a Moe/MoE/Mixtral substring in
+        `config.architectures`. DeepSeek-V4-Flash's config names the field
+        `n_routed_experts` and its architecture string is
+        `DeepseekV4ForCausalLM` -- none of the base's checks fire, so
+        `is_moe` came back False and everything MoE-specific downstream
+        (`_moe_key_remapper`, `detect_moe_blocks`/`patch_moe_blocks`, expert
+        cache sizing) never ran, even though `detect_moe_blocks` itself finds
+        all 43 module-list blocks fine (Task 6f, Q1).
+
+        Fix: alias the field onto the name the base already reads, the same
+        pattern `_patch_fp8_quantizer_compat` uses for MiniMax's
+        `num_local_experts` (`vaayu_base.py:3253`), then delegate. The base's
+        `moe_top_k` lookup already reads `num_experts_per_tok` first
+        (`vaayu_base.py:3595`) -- this checkpoint's own field name -- so only
+        the expert-count alias is needed. Delegating (rather than
+        reimplementing) means `is_moe`, `moe_num_experts`, `moe_top_k`,
+        `_decode_top_k`, `_decode_top_k_auto`, `_decode_top_k_status`, and
+        the base's own prints all come from ONE implementation, and this
+        override tracks any future change to that contract for free.
+        """
+        if (getattr(self.config, "n_routed_experts", None) is not None
+                and not hasattr(self.config, "num_experts")):
+            self.config.num_experts = self.config.n_routed_experts
+        super()._detect_moe()
+
+    def move_layer_to_device(self, state_dict):
+        """Inject this checkpoint's two quantized weight formats correctly,
+        and never swallow an injection failure.
+
+        Two stacked defects (Task 6f, Q2/Q3), both fixed here without
+        touching the base:
+
+        1. **Packed fp4 experts.** The base's per-tensor loop
+           (`vaayu_base.py:4382`) unconditionally does
+           `tensor.to(self.running_device, dtype=self.running_dtype)` ahead
+           of injection. The routed-expert weights are `I8` on disk (fp4
+           packed 2 values/byte) and the skeleton declares them
+           `torch.float4_e2m1fn_x2` -- a packed, non-arithmetic dtype. The
+           base's blanket cast NUMERICALLY reinterprets those bytes as if
+           they were literal bf16 values (a real, silently-succeeding
+           corruption), and only fails loudly here because `copy_()` refuses
+           to write the result into a `float4_e2m1fn_x2` Parameter. The fix:
+           when the skeleton's OWN declared dtype for a parameter is one of
+           `_PACKED_INJECTION_DTYPES`, move the raw bytes to device WITHOUT a
+           dtype cast and reinterpret them (`.view(target_dtype)`) -- the
+           disk tensor and the packed dtype have the same per-element byte
+           count, so this is a bit-reinterpret, never a reshape. Ordinary
+           tensors (including this checkpoint's own `F8_E8M0` scales, an
+           arithmetic float8 format that casts through `running_dtype`
+           without incident) are untouched -- only the packed-dtype target
+           takes this branch.
+        2. **`wo_a.scale`.** `wo_a` is declared bf16 in the skeleton (a
+           deliberate choice -- see `modeling_deepseek_v4.py`'s comment
+           beside it), so its `scale` Parameter is `None` by design, and
+           injecting a tensor into a `None` attribute crashes
+           `set_module_tensor_to_device` with `'NoneType' object has no
+           attribute 'device'`. The checkpoint's own `dequantize_at_load`
+           (`modeling_deepseek_v4.py:217`, already unit-tested against golden
+           values) folds `wo_a`'s F8_E4M3 weight and its per-tile scale into
+           one bf16 tensor and drops the `.scale` key -- called here, once,
+           on the whole layer's state dict, before injection.
+
+        `dequantize_at_load` is resolved via `_running_symbol` (Task 6e): it
+        is a plain module-level function, unaffected by which `ContextVar`
+        or class it shares a module with, but reading it off any OTHER
+        module than the one the loaded class actually lives in would still
+        be reading the wrong copy if the two ever diverge.
+
+        Injection failures RAISE here, naming the parameter and the reason,
+        rather than the base's `print`-and-continue (CLAUDE.md §5) --
+        printing and continuing is exactly how 769 parameters were left on
+        meta while the load reported success.
+        """
+        dequantize_at_load = self._running_symbol("dequantize_at_load")
+
+        if getattr(self, "_moe_key_remapper", None) is not None:
+            state_dict = self._moe_key_remapper.remap_state_dict(state_dict)
+
+        remapped_state_dict = {}
+        for param_name, param_tensor in state_dict.items():
+            new_param_name = param_name
+            for old_path, new_path in getattr(self, "_path_remappings", {}).items():
+                if param_name.startswith(old_path):
+                    new_param_name = param_name.replace(old_path, new_path, 1)
+                    break
+            remapped_state_dict[new_param_name] = param_tensor
+
+        remapped_state_dict = dequantize_at_load(remapped_state_dict)
+
+        layers = list(remapped_state_dict)
+        for param_name in layers:
+            tensor = remapped_state_dict[param_name]
+
+            try:
+                target_dtype = self.model.get_parameter(param_name).dtype
+            except AttributeError:
+                target_dtype = None
+
+            if target_dtype in _PACKED_INJECTION_DTYPES:
+                target = tensor.to(self.running_device,
+                                   non_blocking=True).view(target_dtype)
+            else:
+                target = tensor.to(self.running_device, dtype=self.running_dtype,
+                                   non_blocking=True)
+
+            try:
+                set_module_tensor_to_device(self.model, param_name,
+                                            self.running_device, value=target)
+            except Exception as e:
+                raise RuntimeError(
+                    f"DeepSeek-V4: could not inject {param_name!r}: {e}") from e
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return layers
 
     def init_model(self):
         """Put `fp4_group_size` on the config before the skeleton is built.

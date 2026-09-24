@@ -875,3 +875,183 @@ def test_running_module_resolves_off_a_loaded_models_module_when_set(
         monkeypatch, fake_module.__name__, fake_module)
     model = engine(model=FakeLoadedModel())
     assert model._running_module() is fake_module
+
+
+# ── Task 6g: is_moe never True, packed fp4 injection corrupted, wo_a.scale
+#    crashed injection ──────────────────────────────────────────────────────
+#
+# `_detect_moe`'s override and `move_layer_to_device`'s override both need a
+# real `self.model` tree so `get_parameter`/`set_module_tensor_to_device` can
+# resolve real paths -- built here with plain `nn.Module`s rather than the
+# `_fake_running_deepseek_module()` stand-in above, since these tests exercise
+# real injection, not module-divergence. Setting `__module__` to the real
+# `modeling` module's name (the same technique `_fake_loaded_model_in` uses)
+# is enough for `_running_symbol` to find the real `dequantize_at_load` --
+# there is no second, divergent copy involved in these tests.
+
+
+def test_detect_moe_sets_is_moe_true_for_the_shipped_config():
+    """The shipped fixture: 256 routed experts, top-6 -- the base's own
+    heuristic misses both `n_routed_experts` and the `DeepseekV4ForCausalLM`
+    architecture string (Task 6f, Q1), so this must be what turns it on."""
+    model = engine(config=shipped_config())
+    model._detect_moe()
+    assert model.is_moe is True
+    assert model.moe_num_experts == 256
+    assert model.moe_top_k == 6
+
+
+def test_detect_moe_derives_expert_count_and_top_k_from_config_not_a_literal():
+    """A second, contrasting geometry (CLAUDE.md §5): if the override ever
+    hardcoded the shipped fixture's 256/6, this would still pass with the
+    shipped config but fail here."""
+    model = engine(config=shipped_config(n_routed_experts=32,
+                                         num_experts_per_tok=4))
+    model._detect_moe()
+    assert model.is_moe is True
+    assert model.moe_num_experts == 32
+    assert model.moe_top_k == 4
+
+
+def test_detect_moe_leaves_a_non_moe_config_alone():
+    """No `n_routed_experts` at all must fall through to the base's ordinary
+    (non-MoE) result -- this override must not force `is_moe` True for every
+    DeepSeek-V4 config, only ones that actually declare routed experts."""
+    model = engine(config=shipped_config(n_routed_experts=None))
+    model._detect_moe()
+    assert model.is_moe is False
+    assert model.moe_num_experts == 0
+    assert model.moe_top_k == 0
+
+
+def _packed_fp4_engine(**extra_attrs):
+    """A `VaayuDeepseekV4` whose `self.model` is a real tiny module tree, its
+    `__module__` pointed at the real `modeling` module so `_running_symbol`
+    resolves the real `dequantize_at_load`."""
+
+    class TinyExpertLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.zeros(2, 2, dtype=torch.float4_e2m1fn_x2),
+                requires_grad=False)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = TinyExpertLinear()
+
+    TinyModel.__module__ = modeling.__name__
+
+    attrs = dict(model=TinyModel(), running_device="cpu",
+                running_dtype=torch.bfloat16, _moe_key_remapper=None,
+                _path_remappings={})
+    attrs.update(extra_attrs)
+    return engine(**attrs)
+
+
+def test_move_layer_to_device_reinterprets_packed_fp4_bytes_instead_of_casting():
+    """Task 6f Q2: the base's blanket `.to(dtype=running_dtype)` numerically
+    corrupts these bytes (it is what produced the 'Source dtype is BFloat16
+    target dtype is Float4_e2m1fn_x2' crash) -- this must reinterpret them
+    instead, so the on-disk bytes land in the skeleton unchanged.
+    """
+    model = _packed_fp4_engine()
+    raw_bytes = torch.randint(-128, 127, (2, 2), dtype=torch.int8)
+
+    model.move_layer_to_device({"linear.weight": raw_bytes.clone()})
+
+    injected = model.model.linear.weight
+    assert injected.dtype == torch.float4_e2m1fn_x2
+    assert torch.equal(injected.view(torch.int8), raw_bytes)
+
+
+def test_move_layer_to_device_does_not_numerically_cast_packed_bytes():
+    """The regression this guards against: a numeric `.to(dtype=bf16)` cast
+    would either raise (pre-fix, on this exact dtype pair) or -- if some
+    future torch version silently allowed it -- change the byte pattern.
+    Comparing against the naive cast-then-view path pins that this is a
+    real bit-reinterpret, not a value-preserving-by-luck cast.
+    """
+    model = _packed_fp4_engine()
+    raw_bytes = torch.tensor([[1, -2], [3, -4]], dtype=torch.int8)
+
+    model.move_layer_to_device({"linear.weight": raw_bytes.clone()})
+
+    injected_bytes = model.model.linear.weight.view(torch.int8)
+    assert torch.equal(injected_bytes, raw_bytes)
+
+
+def _wo_a_dequant_engine():
+    """A real `wo_a`-shaped module: `DeepseekV4Linear(dtype=bf16)`, whose
+    `scale` is `None` by construction -- exactly the shape that crashes
+    injection without `dequantize_at_load` (Task 6f, Q3)."""
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wo_a = modeling.DeepseekV4Linear(4, 4, dtype=torch.bfloat16)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+
+    TinyModel.__module__ = modeling.__name__
+
+    return engine(model=TinyModel(), running_device="cpu",
+                 running_dtype=torch.bfloat16, _moe_key_remapper=None,
+                 _path_remappings={})
+
+
+def test_move_layer_to_device_dequantizes_wo_a_before_injection():
+    """Without `dequantize_at_load`, `wo_a.scale` is `None` and injecting it
+    crashes `set_module_tensor_to_device` with `'NoneType' object has no
+    attribute 'device'`. This must fold the scale into the weight and never
+    attempt to inject the scale key at all.
+    """
+    model = _wo_a_dequant_engine()
+    weight = torch.randn(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 2), 2.0).to(torch.float8_e8m0fnu)
+    expected = modeling.dequantize_block_scaled(weight, scale, torch.bfloat16)
+
+    layers = model.move_layer_to_device(
+        {"attn.wo_a.weight": weight, "attn.wo_a.scale": scale})
+
+    assert "attn.wo_a.scale" not in layers
+    injected = model.model.attn.wo_a.weight
+    assert injected.dtype == torch.bfloat16
+    assert torch.equal(injected, expected)
+    assert model.model.attn.wo_a.scale is None
+
+
+def test_move_layer_to_device_raises_naming_the_parameter_on_injection_failure(
+        monkeypatch):
+    """CLAUDE.md §5: the base prints a warning and continues -- that is
+    exactly how 769 parameters were left on meta while the load reported
+    success. This override must raise instead, naming the parameter.
+
+    An ordinary (non-`wo_a`, non-packed) parameter, so `dequantize_at_load`
+    passes it through unchanged and the only thing under test is the
+    raise-vs-warn behaviour of the injection call itself.
+    """
+    import vaayu.vaayu_deepseek_v4 as vaayu_deepseek_v4_module
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4, bias=False)
+
+    TinyModel.__module__ = modeling.__name__
+    model = engine(model=TinyModel(), running_device="cpu",
+                  running_dtype=torch.bfloat16, _moe_key_remapper=None,
+                  _path_remappings={})
+
+    def boom(*args, **kwargs):
+        raise ValueError("simulated injection failure")
+
+    monkeypatch.setattr(vaayu_deepseek_v4_module, "set_module_tensor_to_device", boom)
+
+    with pytest.raises(RuntimeError, match="linear.weight") as excinfo:
+        model.move_layer_to_device({"linear.weight": torch.zeros(4, 4, dtype=torch.bfloat16)})
+    assert "simulated injection failure" in str(excinfo.value)
