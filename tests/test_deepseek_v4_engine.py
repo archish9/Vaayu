@@ -15,6 +15,7 @@ from torch import nn
 
 from vaayu.model_code.deepseek_v4 import modeling_deepseek_v4 as modeling
 from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from vaayu.vaayu_base import VaayuBaseModel
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "deepseek_v4_config.json"
 
@@ -57,3 +58,25 @@ def test_a_bf16_linear_needs_no_weight_block_size():
     assert linear.weight.dtype == torch.bfloat16
     assert linear.scale is None
     assert linear.act_block_size is None
+
+
+def test_run_embed_defaults_to_calling_the_embedding_unchanged():
+    """Every model that is not DeepSeek-V4 must be untouched by this hook."""
+    model = VaayuBaseModel.__new__(VaayuBaseModel)
+    layer = nn.Embedding(8, 4)
+    seq = torch.tensor([[1, 2, 3]])
+    assert torch.equal(model.run_embed(layer, seq), layer(seq))
+
+
+def test_the_layer_major_loop_calls_run_embed_rather_than_the_layer():
+    """Pins the call site.
+
+    `VaayuBaseModel.forward` is a ~1400-line loop that needs a loaded model
+    and a GPU to run, so this reads the source instead. That is the point:
+    the regression this guards against is someone "simplifying"
+    `self.run_embed(layer, seq)` back to `layer(seq)`, which would silently
+    stop hyper-connections from ever happening and leave every test green.
+    """
+    source = inspect.getsource(VaayuBaseModel.forward)
+    assert "self.run_embed(layer, seq)" in source
+    assert "batch[j] = layer(seq)" not in source
