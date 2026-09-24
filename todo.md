@@ -1416,7 +1416,7 @@ a Vaayu precedent; the attention path has neither.
       **§8:** (1) **no knob** — routing, scoring and the swiglu limit all come from the config;
       (2) **not plumbed by design**; (3) **NOT reachable** — no model class yet, the checkpoint
       still cannot load; (4) unblocked by A5.5 → A5.6 → A5.7. Banked, said so.
-- [~] **A5.5 — attention. STEP-0 GATE PASSED 2026-09-23, ALL THREE QUESTIONS. A5 DOES NOT DIE
+- [x] **A5.5 — attention. STEP-0 GATE PASSED 2026-09-23, ALL THREE QUESTIONS. A5 DOES NOT DIE
       HERE.** MLA (one 512-dim latent shared by 64 heads), grouped low-rank O, circular 128-window
       KV, `Compressor`, and on `ratio == 4` layers a learned `Indexer` over `index_topk 512`.
       `compress_ratios` over 43 layers: **2 at 0, 21 at 4, 20 at 128 — confirmed on the real tree.**
@@ -1642,6 +1642,65 @@ a Vaayu precedent; the attention path has neither.
       (attention/config/kernels/linear/moe/parity), zero failures. Checkpoint copy unchanged this
       round (`diff -q` clean — no modeling-file edits were needed, only tests). Report:
       `.superpowers/sdd/2026-09-23-A5.5-attention/task-6-report.md` (see "Fix round 1").
+      **Task 7 (acceptance gate) DONE 2026-09-24, A5.5 CLOSED.** The acceptance test
+      (`test_chunked_prefill_equals_whole_prompt`) feeds one `DeepseekV4Attention` module per
+      ratio (0/4/128) 1024 tokens whole vs. in slices at two chunk counts, against a same-run
+      null-perturbation floor, threshold exactly the floor (Task 4/6's methodology): **6/6 passed
+      honestly — ratio 0 and 128 land at rel-L2 exactly 0 (floors 0.0117058 / 0.0125609); ratio 4
+      (the layer with an Indexer + overlap Compressor) lands at 0.0049874/0.00539576 against
+      floors 0.0117829, 2.2-2.4x inside.** Two verbatim-brief bugs fixed before it would even run
+      (both already-known failure modes from Task 6): `parity.load_module_weights` drops
+      `wo_a.scale` (use `_raw_module_weights`, as the golden test already does), and the brief's
+      test signature omitted the `checkpoint_kernels` fixture (`KERNEL_DIR` unset →
+      `FileNotFoundError`).
+      **STEP 2B, THE LOAD-BEARING CHECK, PASSED WITH LARGE MARGIN — THIS GATE CAN SEE ITS OWN
+      DEFECT.** Mutated `view = torch.cat([history, kv], dim=1)` → `view = kv` (the reference's
+      ring semantics, exactly what `kv_view` exists to prevent): **all 6 parametrizations FAILED,
+      at 44.9x-73.8x the floor** (e.g. ratio 4/[512,512]: rel-L2 0.624875 vs floor 0.0117829, 53x
+      over) — nowhere near the 1x boundary on either side. Reverted; `git diff` on the modeling
+      file clean.
+      **Five required mutants, each turned at least one test red, each reverted clean:** (1) drop
+      the inverted output rotary → 5 failed (4 goldens + `attn_prefill_r4_divergence`); (2)
+      `_ACT_QUANT_GROUP = 128` not 64 → 15 failed (4 goldens, `attn_prefill_r4_divergence`,
+      `attention_does_not_raise` x2, all 6 `chunked_prefill` parametrizations); (3) swap rope
+      variants (compressed dict for `compress_ratio == 0`) → 1 failed
+      (`test_rope_settings_splits_the_two_variants_off_the_config`, structural, no GPU); (4)
+      `DeepseekV4Cache.crop` returns instead of raising → 1 failed
+      (`test_crop_refuses_below_full_length`); (5) reference ring semantics (`view = kv`, same as
+      2b) → 8 failed (2 goldens + all 6 `chunked_prefill` parametrizations). No mutant stayed
+      green; no new gate had to be written.
+      **Two one-line deferred findings folded in and BOTH VERIFIED TO ACTUALLY FAIL when
+      violated, not just added:** `test_indexer_matches_the_reference_at_prefill` gained a runtime
+      assertion `seqlen // 4 > config.index_topk` (derived, not literal) guarding the vacuous
+      `blocks == index_topk` length the docstring only warned about — verified by setting
+      `seqlen = 2048` and watching `assert (2048 // 4) > 512` fail before touching the GPU, then
+      reverting to 4096.
+      `test_attn_prefill_r4_divergence_is_tile_width_not_masking` (which duplicates `forward`'s
+      body rather than calling it, so it pinned a COPY) gained a drift guard: the duplicated body
+      is now a `replay(shrink: bool)` closure, and `replay(shrink=False)` (a plain unrolling of
+      `forward` with no behavioural change) is asserted `torch.equal` against
+      `layer(hidden_states, cache, 0)`'s own real output — verified by mutating real `forward`'s
+      `apply_rotary_emb(..., True)` → `..., False)` (a change the copy does not mirror) and
+      watching the new assertion fail; reverted.
+      **Full suite 2652 passed / 16 skipped** (above the expected 2593/16 floor — the difference
+      is A5.5's own added tests), **199.37 s**. **Both on-device MoE gates verified green** (this
+      plan touched nothing under `vaayu/` proper, so this was a claim to check, not assume):
+      **Qwen3-Next 8 passed (35.69 s), MiniMax-M2.7 8 passed (73.76 s).** The fused-EXL3 forward
+      still has no on-device model (Qwen3-235B retired 2026-09-20) — no coverage claim made there.
+      **Two things carried forward for A5.6/A5.7, restated here because `docs/` is gitignored:**
+      (1) **`[bug]`, required before A5.7 can claim reachability:**
+      `batch.cache_holds_recurrent_state` (`batch.py:500`), `prefix_cache.py:112`,
+      `prefix_cache.py:364` and `kv_persist` all detect recurrent state by
+      `conv_states`/`update_conv_state` and would treat this cache as an ordinary croppable KV
+      cache — it is not. **Until fixed, this model must not be served with prefix caching or KV
+      persistence enabled.** (2) The `kv_view` amendment (chunk overruns the 128-slot ring →
+      contiguous `cat([history, chunk, compressed])` per forward) is load-bearing, proven by
+      Step 2b/mutant 5 above — **A5.6 must not "simplify" it back to the ring.**
+      **§8:** (1) **no knob** — this task is a test suite + docs, no user-facing behaviour; (2)
+      N/A, nothing importable is produced; (3) **NOT reachable** — no `deepseek_v4` model class
+      yet; (4) unblocked by A5.6 → A5.7, with the two carried items above. Banked, said so.
+      Detail: `docs/2026-09-24-A5.5-attention-RESULTS.md` (gitignored; this bullet is the durable
+      copy). Report: `.superpowers/sdd/2026-09-23-A5.5-attention/task-7-report.md`.
 - [ ] **A5.6 — block + model. BRIEF.** **Hyper-connections are not in the A5 brief at all:** every
       block keeps **`hc_mult=4` copies of the residual** (`[b,s,4,d]`) and runs `hc_pre`/`hc_post`
       twice per block around a 20-iteration Sinkhorn. **Contained inside `Block` — the MoE still

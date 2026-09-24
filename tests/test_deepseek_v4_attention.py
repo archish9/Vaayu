@@ -377,6 +377,15 @@ def test_indexer_matches_the_reference_at_prefill(checkpoint_kernels):
     layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
                     if r == 4)
     seqlen = 4096
+    # Runtime guard for the vacancy the docstring above warns about: at
+    # blocks == index_topk, topk returns every candidate regardless of score
+    # and this comparison would pass just as well for a broken scorer. Derived
+    # from the config, not a literal, so a future edit to seqlen or
+    # index_topk can't silently reopen the vacuous length.
+    assert seqlen // 4 > config.index_topk, (
+        f"seqlen={seqlen} gives blocks={seqlen // 4} <= index_topk="
+        f"{config.index_topk}: topk would return every candidate and this "
+        f"test would not exercise real scoring")
 
     with parity.reference_device(reference):
         x = parity.seeded_input(1, seqlen, config.hidden_size)
@@ -549,6 +558,15 @@ def test_attn_prefill_r4_divergence_is_tile_width_not_masking(checkpoint_kernels
     If it does NOT, `test_attention_reproduces_a5_2_golden`'s null-floor gate
     is hiding a real bug behind FP-noise framing, and that must be
     re-diagnosed before trusting it.
+
+    DRIFT GUARD: this replay duplicates `forward`'s body rather than calling
+    it, so it pins a COPY -- if `forward` changes and this copy does not, the
+    copy keeps passing while pinning nothing. So the replay also runs once
+    WITHOUT the window shrink (`shrink=False` below) and asserts THAT result
+    matches `layer(hidden_states, cache, 0)`'s own output exactly: with no
+    shrink, the replay is a plain unrolling of `forward` with zero behavioural
+    change, so it must agree with the real call bit-for-bit. Drift in either
+    body breaks that agreement loudly instead of silently.
     """
     ratio = 4
     config = shipped_config()
@@ -563,60 +581,75 @@ def test_attn_prefill_r4_divergence_is_tile_width_not_masking(checkpoint_kernels
         layer.load_state_dict(modeling.dequantize_at_load(
             _raw_module_weights(f"layers.{layer_id}.attn.")))
         layer = layer.cuda().eval()
-        cache = modeling.DeepseekV4Cache(config, max_seq_len=parity.MAX_SEQ_LEN,
-                                         device=torch.device("cuda"))
-        state = cache.layers[layer_id]
         hidden_states = golden["x"].cuda()
         start_pos = 0
-        bsz, seqlen, _ = hidden_states.size()
-        rd, win = layer.rope_head_dim, layer.window_size
-        device = hidden_states.device
-        freqs_cis = layer._freqs(cache.max_seq_len, device)
-        positions = freqs_cis[start_pos:start_pos + seqlen]
 
-        qr = layer.q_norm(layer.wq_a(hidden_states))
-        q = layer.wq_b(qr).unflatten(-1, (layer.n_heads, layer.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + layer.q_norm.eps)
-        modeling.apply_rotary_emb(q[..., -rd:], positions)
+        def replay(shrink: bool):
+            cache = modeling.DeepseekV4Cache(
+                config, max_seq_len=parity.MAX_SEQ_LEN, device=torch.device("cuda"))
+            state = cache.layers[layer_id]
+            bsz, seqlen, _ = hidden_states.size()
+            rd, win = layer.rope_head_dim, layer.window_size
+            device = hidden_states.device
+            freqs_cis = layer._freqs(cache.max_seq_len, device)
+            positions = freqs_cis[start_pos:start_pos + seqlen]
 
-        kv = layer.kv_norm(layer.wkv(hidden_states))
-        modeling.apply_rotary_emb(kv[..., -rd:], positions)
-        modeling.kernels().act_quant(kv[..., :-rd], modeling._ACT_QUANT_GROUP,
-                                     "ue8m0", modeling._SCALE_DTYPE, True)
+            qr = layer.q_norm(layer.wq_a(hidden_states))
+            q = layer.wq_b(qr).unflatten(-1, (layer.n_heads, layer.head_dim))
+            q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + layer.q_norm.eps)
+            modeling.apply_rotary_emb(q[..., -rd:], positions)
 
-        history = state.history(start_pos)
-        h = history.shape[1]
-        # THE ONE CHANGE: shrink to the reference's own prefill width instead
-        # of `window_topk_idxs`' general-seqlen `window_size` columns.
-        shrink = min(seqlen, win)
-        window_idxs = modeling.window_topk_idxs(win, bsz, seqlen, start_pos,
-                                                device)[:, :, :shrink].contiguous()
-        view = torch.cat([history, kv], dim=1)
+            kv = layer.kv_norm(layer.wkv(hidden_states))
+            modeling.apply_rotary_emb(kv[..., -rd:], positions)
+            modeling.kernels().act_quant(kv[..., :-rd], modeling._ACT_QUANT_GROUP,
+                                         "ue8m0", modeling._SCALE_DTYPE, True)
 
-        offset = h + seqlen
-        layer.compressor(hidden_states, start_pos, state, freqs_cis)
-        compress_idxs = layer.indexer(hidden_states, qr, start_pos, offset,
-                                      state, freqs_cis)
-        blocks = (start_pos + seqlen) // layer.compress_ratio
-        view = torch.cat([view, state.keys[:bsz, win:win + blocks]], dim=1)
-        topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
+            history = state.history(start_pos)
+            h = history.shape[1]
+            # THE ONE CHANGE under test: shrink to the reference's own
+            # prefill width instead of `window_topk_idxs`' general-seqlen
+            # `window_size` columns. shrink=False takes the real, unmodified
+            # width -- i.e. plain `forward`, unrolled.
+            width = min(seqlen, win) if shrink else win
+            window_idxs = modeling.window_topk_idxs(win, bsz, seqlen, start_pos,
+                                                    device)[:, :, :width].contiguous()
+            view = torch.cat([history, kv], dim=1)
 
-        state.write(kv, start_pos)
-        state.cumulative_length = start_pos + seqlen
+            offset = h + seqlen
+            layer.compressor(hidden_states, start_pos, state, freqs_cis)
+            compress_idxs = layer.indexer(hidden_states, qr, start_pos, offset,
+                                          state, freqs_cis)
+            blocks = (start_pos + seqlen) // layer.compress_ratio
+            view = torch.cat([view, state.keys[:bsz, win:win + blocks]], dim=1)
+            topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
 
-        o = modeling.kernels().sparse_attn(q, view, layer.attn_sink, topk_idxs,
-                                           layer.softmax_scale)
-        modeling.apply_rotary_emb(o[..., -rd:], positions, True)
-        o = o.view(bsz, seqlen, layer.n_groups, -1)
-        wo_a = layer.wo_a.weight.view(layer.n_groups, layer.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        out = layer.wo_b(o.flatten(2))
+            state.write(kv, start_pos)
+            state.cumulative_length = start_pos + seqlen
 
-    assert torch.equal(out.cpu(), golden["out"]), (
+            o = modeling.kernels().sparse_attn(q, view, layer.attn_sink, topk_idxs,
+                                               layer.softmax_scale)
+            modeling.apply_rotary_emb(o[..., -rd:], positions, True)
+            o = o.view(bsz, seqlen, layer.n_groups, -1)
+            wo_a = layer.wo_a.weight.view(layer.n_groups, layer.o_lora_rank, -1)
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+            return layer.wo_b(o.flatten(2))
+
+        shrunk_out = replay(shrink=True)
+        unshrunk_out = replay(shrink=False)
+        real_cache = modeling.DeepseekV4Cache(
+            config, max_seq_len=parity.MAX_SEQ_LEN, device=torch.device("cuda"))
+        real_out = layer(hidden_states, real_cache, start_pos)
+
+    assert torch.equal(shrunk_out.cpu(), golden["out"]), (
         "shrinking window_topk_idxs to the reference's own prefill width did "
         "NOT reproduce the golden bit-for-bit -- the divergence is not "
         "(only) tile-width reassociation; re-diagnose before trusting the "
         "null-floor gate in test_attention_reproduces_a5_2_golden")
+    assert torch.equal(unshrunk_out.cpu(), real_out.cpu()), (
+        "the unshrunk replay no longer matches DeepseekV4Attention.forward's "
+        "own output -- this test pins a COPY of forward's body, and the copy "
+        "has drifted from the real implementation; update the replay before "
+        "trusting the tile-width diagnosis above")
 
 
 @needs_checkpoint
@@ -653,3 +686,87 @@ def test_attention_does_not_raise_where_the_reference_did(ratio, checkpoint_kern
 
     assert out.shape == (1, parity.CHUNK_LEN, config.hidden_size)
     assert torch.isfinite(out.float()).all()
+
+
+# ── A5.5 step 7: chunk equivalence, the acceptance gate ─────────────────────
+
+
+def _null_floor(layer, cache_factory, x):
+    """How far apart two runs land for reasons that are NOT the chunking.
+
+    Perturb the input in its last representable bit and re-run whole. The
+    spread that produces is the floor a chunking difference must beat. D6
+    (2026-09-18) is why a fixed epsilon is not evidence here: a null bit change
+    moves this model's numbers by more than a careless tolerance would allow.
+    """
+    cache = cache_factory()
+    base = layer(x, cache, 0)
+    perturbed = x.clone()
+    flat = perturbed.view(-1)
+    flat[::997] = (flat[::997].float() * (1 + 2 ** -8)).to(flat.dtype)
+    cache = cache_factory()
+    other = layer(perturbed, cache, 0)
+    return ((base.float() - other.float()).norm()
+            / base.float().norm()).item(), base
+
+
+@needs_checkpoint
+@needs_gpu
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("chunks", [[512, 512], [256, 256, 256, 256]])
+def test_chunked_prefill_equals_whole_prompt(ratio, chunks, checkpoint_kernels):
+    """THE ACCEPTANCE CRITERION for A5.5.
+
+    A5.5 has no model, so the object under test is one Attention module on real
+    weights, one per compress_ratio. Feed 1024 tokens whole, then in slices,
+    and compare the outputs at the final slice's positions against a
+    null-perturbation floor measured in the SAME run.
+
+    Two different chunk counts, because a boundary bug can hide in one
+    alignment. Widening the tolerance to fit the result is the row-43 failure
+    re-run -- STOP and raise instead.
+    """
+    config = shipped_config()
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, config, max_seq_len=2048)
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == ratio)
+    total = sum(chunks)
+
+    with parity.reference_device(reference):
+        layer = modeling.DeepseekV4Attention(config, layer_id)
+        # Not parity.load_module_weights: that loader pre-dequantizes wo_a for
+        # the REFERENCE module and drops wo_a.scale, which raises KeyError
+        # here exactly as it does in test_attention_reproduces_a5_2_golden --
+        # see _raw_module_weights's docstring above.
+        layer.load_state_dict(modeling.dequantize_at_load(
+            _raw_module_weights(f"layers.{layer_id}.attn.")))
+        layer = layer.cuda().eval()
+
+        def fresh():
+            return modeling.DeepseekV4Cache(config, max_seq_len=2048,
+                                            device=torch.device("cuda"))
+
+        x = parity.seeded_input(1, total, config.hidden_size)
+        floor, whole = _null_floor(layer, fresh, x)
+
+        cache, pos, pieces = fresh(), 0, []
+        for length in chunks:
+            pieces.append(layer(x[:, pos:pos + length], cache, pos))
+            pos += length
+        tail = pieces[-1]
+
+    want = whole[:, total - tail.shape[1]:]
+    got = ((tail.float() - want.float()).norm() / want.float().norm()).item()
+    print(f"\nratio={ratio} chunks={chunks}: chunked-vs-whole rel-L2 {got:.6g}, "
+          f"null floor {floor:.6g}")
+    # The bound is ONE floor, not a multiple of it, and that is a measured
+    # choice rather than a taste: chunking must perturb the output no more than
+    # a last-bit change to the input does. Task 4 learned this the hard way --
+    # its `3 x floor` gate PASSED with its own motivating bug reinstated
+    # (2.82 x floor), while correct code sat at 0.017x floor. Correct and
+    # broken are separated by ~160x, so any threshold in between works and the
+    # principled one is 1.
+    assert got <= max(floor, 1e-6), (
+        f"chunked prefill diverges: rel-L2 {got:.6f} against a null floor of "
+        f"{floor:.6f}. Do NOT widen this bound -- find the site.")
