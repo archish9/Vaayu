@@ -54,6 +54,12 @@ _KERNELS = None
 _QUANTIZED = (torch.float4_e2m1fn_x2, torch.float8_e4m3fn)
 _SCALE_DTYPE = torch.float8_e8m0fnu
 
+# Both are literals in the reference with NO config field, and both are
+# load-bearing (CLAUDE.md §5 allows this only because there is no source to
+# derive them from -- say so, do not hide them).
+_ACT_QUANT_GROUP = 64          # model.py:512 -- 64, NOT weight_block_size's 128
+_FP4_BLOCK_SIZE = 32           # model.py:18  -- the Indexer's fp4 simulation
+
 # Tensors the module declares bf16 although the checkpoint stores them
 # quantized: `Attention.forward` uses `wo_a`'s RAW weight in an einsum, so it
 # never passes through a GEMM that could apply the scale. Declared here as a
@@ -876,3 +882,215 @@ class DeepseekV4Cache(Cache):
     def reset(self) -> None:
         for layer in self.layers:
             layer.reset()
+
+
+# ── A5.5: the Compressor ─────────────────────────────────────────────────────
+
+
+def _have_hadamard_extension() -> bool:
+    """Is DeepSeek's own `fast_hadamard_transform` importable here?"""
+    import importlib.util
+
+    return importlib.util.find_spec("fast_hadamard_transform") is not None
+
+
+def _torch_hadamard(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """The Sylvester Hadamard transform in plain torch -- exact for a
+    power-of-two last dimension, which both reference call sites have
+    (`index_head_dim`). Ported from `tests/deepseek/parity.py`'s
+    `torch_hadamard` so this path never hard-requires the compiled extension
+    (CLAUDE.md §5).
+    """
+    n = x.shape[-1]
+    assert n & (n - 1) == 0, f"Hadamard needs a power-of-two dim, got {n}"
+    out = x.float().reshape(-1, n)
+    step = 1
+    while step < n:
+        out = out.view(-1, n // (2 * step), 2, step)
+        top, bottom = out[:, :, 0], out[:, :, 1]
+        out = torch.stack([top + bottom, top - bottom], dim=2)
+        step *= 2
+    return (out.reshape(x.shape) * scale).to(x.dtype)
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """`model.py:253`. DeepSeek's compiled extension when it is importable,
+    the exact torch fallback otherwise -- a config-only import path must not
+    need nvcc.
+    """
+    assert x.dtype == torch.bfloat16
+    scale = x.size(-1) ** -0.5
+    if _have_hadamard_extension():
+        from fast_hadamard_transform import hadamard_transform
+
+        return hadamard_transform(x, scale=scale)
+    return _torch_hadamard(x, scale=scale)
+
+
+def compressor_flush_positions(ratio: int, start_pos: int, seqlen: int) -> list:
+    """The absolute positions at which a block completes inside this chunk.
+
+    The reference's decode branch flushes iff `(start_pos + 1) % ratio == 0`
+    (`model.py:352`) -- one position, one possible flush. A chunk may complete
+    many blocks, and missing any of them leaves a hole in the compressed cache
+    that nothing ever fills.
+    """
+    return [p for p in range(start_pos, start_pos + seqlen)
+            if (p + 1) % ratio == 0]
+
+
+class DeepseekV4Compressor(nn.Module):
+    """`model.py:285`. Learned gated pooling over `compress_ratio` positions.
+
+    `wkv`/`wgate` are fp32 Parameters although the checkpoint stores them bf16
+    -- the reference declares them that way (`model.py:303`) and compresses in
+    fp32. `overlap` (ratio == 4 only) doubles the projected width and pools
+    over a window that straddles the block boundary.
+
+    State lives in the cache layer, not here, so this module is reusable across
+    sequences.
+    """
+
+    def __init__(self, config, compress_ratio: int, head_dim: int,
+                 rotate: bool = False):
+        super().__init__()
+        self.compress_ratio = compress_ratio
+        self.head_dim = head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.overlap = compress_ratio == 4
+        self.rotate = rotate
+        coff = 1 + self.overlap
+        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim,
+                                            dtype=torch.float32),
+                                requires_grad=False)
+        self.wkv = DeepseekV4Linear(config.hidden_size, coff * head_dim,
+                                    dtype=torch.float32)
+        self.wgate = DeepseekV4Linear(config.hidden_size, coff * head_dim,
+                                      dtype=torch.float32)
+        self.norm = DeepseekV4RMSNorm(head_dim, config.rms_norm_eps)
+
+    def _overlap_transform(self, tensor, value):
+        """`model.py:314`. `[b, s, ratio, 2d] -> [b, s, 2*ratio, d]`, with the
+        previous block's half shifted in so the pooling window overlaps."""
+        b, s, _, _ = tensor.size()
+        ratio, d = self.compress_ratio, self.head_dim
+        out = tensor.new_full((b, s, 2 * ratio, d), value)
+        out[:, :, ratio:] = tensor[:, :, :, d:]
+        out[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return out
+
+    @staticmethod
+    def _project(linear: "DeepseekV4Linear", x: torch.Tensor) -> torch.Tensor:
+        """`linear(x)`, computed in fp64 and rounded back to fp32.
+
+        `DeepseekV4Linear`'s plain (non-quantized) branch is `F.linear`, and
+        its CUDA fp32 GEMM is NOT invariant to the batch (M) dimension: on
+        this GPU, the SAME position's projection comes out a few ULPs
+        different depending on how many other positions ride along in the
+        same call (measured directly against the checkpoint's real `wkv`
+        weight -- every one of 512 rows differed between an M=1024 and an
+        M=512 call of the identical positions; confirmed shape-dependent, not
+        TF32, not cuBLAS-vs-cuBLASLt, and not this call site's own logic).
+        The reference never meets this because it never chunks a multi-token
+        prompt past `start_pos == 0`; Vaayu's whole reason to chunk is
+        prefill, so reintroducing chunk-boundary drift here would be a real
+        correctness regression, not a cosmetic one. fp64 measured bit-exact
+        across M=1024 vs M=512 on the real weights; rounding back to fp32
+        keeps the reference's own fp32 declaration for the compression math.
+        """
+        return F.linear(x.double(), linear.weight.double()).float()
+
+    def forward(self, x, start_pos, state, freqs_cis):
+        """Compress every block this chunk completes; buffer the remainder.
+
+        Unlike the reference, `seqlen` may be anything at any `start_pos`. The
+        chunk's leading partial block is completed out of `state`, the whole
+        blocks run the reference's own pooling arithmetic, and the trailing
+        partial block goes back into `state`.
+        """
+        ratio, d, rd = self.compress_ratio, self.head_dim, self.rope_head_dim
+        bsz, seqlen, _ = x.size()
+        dtype = x.dtype
+        x = x.float()
+        kv = self._project(self.wkv, x)
+        score = self._project(self.wgate, x) + self.ape[
+            (start_pos + torch.arange(seqlen, device=x.device)) % ratio]
+
+        # Prepend whatever of the current block `state` is holding, so the
+        # blocks below are always whole.
+        held = start_pos % ratio
+        offset = ratio if self.overlap else 0
+        if held:
+            kv = torch.cat([state.kv_state[:bsz, offset:offset + held], kv], dim=1)
+            score = torch.cat([state.score_state[:bsz, offset:offset + held],
+                               score], dim=1)
+        first = start_pos - held
+        total = kv.shape[1]
+        cutoff = total - total % ratio
+
+        if cutoff < ratio:                       # no block completes here
+            self._hold(state, kv, score, offset, bsz)
+            return None
+
+        if self.overlap and first >= ratio:
+            # The previous block's raw kv/score, carried forward the last
+            # time a block flushed (see the write at the bottom of this
+            # branch) -- the overlap window needs it whole.
+            kv = torch.cat([state.kv_state[:bsz, :ratio], kv], dim=1)
+            score = torch.cat([state.score_state[:bsz, :ratio], score], dim=1)
+            cutoff += ratio
+
+        whole_kv, tail_kv = kv[:, :cutoff], kv[:, cutoff:]
+        whole_score = score[:, :cutoff]
+        pooled = whole_kv.unflatten(1, (-1, ratio))
+        pooled_score = whole_score.unflatten(1, (-1, ratio))
+        if self.overlap:
+            pooled = self._overlap_transform(pooled, 0)
+            pooled_score = self._overlap_transform(pooled_score, float("-inf"))
+        pooled = (pooled * pooled_score.softmax(dim=2)).sum(dim=2)
+        if self.overlap:
+            if first >= ratio:
+                pooled = pooled[:, 1:]           # the carried block re-pooled
+            # Carry the block THIS call just completed forward raw, for the
+            # next call's overlap window. The reference does this by shifting
+            # its "current window" into the "overlap window" once a block
+            # flushes (model.py:359-360) -- that only works there because its
+            # decode branch fills the current window one position at a time,
+            # so by the time a block flushes the current window already IS
+            # that block's raw data. This path computes a whole block from a
+            # local tensor and never touches kv_state/score_state while doing
+            # it, so a shift here would carry forward whatever stale (zero)
+            # data happened to be sitting in the current-window slots, not the
+            # block that was actually just completed. Write it explicitly.
+            state.kv_state[:bsz, :ratio] = whole_kv[:, cutoff - ratio:cutoff]
+            state.score_state[:bsz, :ratio] = whole_score[:, cutoff - ratio:cutoff]
+        self._hold(state, tail_kv, score[:, cutoff:], offset, bsz)
+
+        pooled = self.norm(pooled.to(dtype))
+        blocks = compressor_flush_positions(ratio, start_pos, seqlen)
+        rows = torch.tensor([p + 1 - ratio for p in blocks], device=x.device)
+        apply_rotary_emb(pooled[..., -rd:], freqs_cis[rows])
+        kernel = kernels()
+        if self.rotate:
+            pooled = rotate_activation(pooled)
+            kernel.fp4_act_quant(pooled, _FP4_BLOCK_SIZE, True)
+        else:
+            kernel.act_quant(pooled[..., :-rd], _ACT_QUANT_GROUP, "ue8m0",
+                             _SCALE_DTYPE, True)
+        target = state.index_keys if self.rotate else state.keys
+        base = 0 if self.rotate else state.window_size
+        slots = torch.tensor([p // ratio for p in blocks], device=x.device)
+        target[:bsz, base + slots] = pooled.to(target.dtype)
+        return pooled
+
+    def _hold(self, state, kv, score, offset, bsz):
+        """Buffer the chunk's trailing partial block so a later call can
+        complete it. Only `[offset:offset+held]` is ever read back (the
+        `held` prepend above), so nothing else here needs clearing -- the
+        overlap "previous block" carry lives in `[:offset]` and is written
+        only when a block actually flushes, in `forward` above.
+        """
+        held = kv.shape[1]
+        if held:
+            state.kv_state[:bsz, offset:offset + held] = kv
+            state.score_state[:bsz, offset:offset + held] = score

@@ -183,3 +183,76 @@ def test_compress_idxs_are_causal_across_a_chunk():
     for i in (0, 1, 255, 511):
         row = got[0, i]
         assert int((row >= 0).sum()) == (start + i + 1) // ratio
+
+
+# ── A5.5 step 4: DeepseekV4Compressor ───────────────────────────────────────
+
+
+@pytest.fixture
+def checkpoint_kernels(monkeypatch):
+    """The TileLang kernels ship inside the checkpoint. `act_quant` /
+    `fp4_act_quant` are called from `DeepseekV4Compressor.forward`, and
+    `KERNEL_DIR` is not set by anything in this test module -- A5.7's loader
+    is what normally does it in the server.
+    """
+    monkeypatch.setattr(modeling, "KERNEL_DIR", parity.CKPT / "inference")
+    monkeypatch.setattr(modeling, "_KERNELS", None)
+
+
+@needs_checkpoint
+@needs_gpu
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_compressor_chunked_equals_whole_prompt(ratio, checkpoint_kernels):
+    """The acceptance shape, at the Compressor alone.
+
+    Feeding 1024 tokens as one call and as two 512-token calls must leave the
+    SAME compressed cache. The reference cannot do the second; this is the
+    path A5.5 writes.
+    """
+    reference = parity.reference_modules()
+    args = parity.reference_args(reference, shipped_config(), max_seq_len=2048)
+    config = shipped_config()
+    layer_id = next(i for i, r in enumerate(args.compress_ratios[:args.n_layers])
+                    if r == ratio)
+
+    with parity.reference_device(reference):
+        x = parity.seeded_input(1, 1024, args.dim)
+        freqs = modeling.precompute_freqs_cis(
+            args.rope_head_dim, 2048, device=torch.device("cuda"),
+            **modeling.rope_settings(config, ratio))
+
+        def run(chunks):
+            comp = modeling.DeepseekV4Compressor(config, ratio, config.head_dim)
+            comp.load_state_dict(parity.load_module_weights(
+                f"layers.{layer_id}.attn.compressor."))
+            comp = comp.cuda().eval()
+            state = modeling.DeepseekV4Cache(
+                config, max_seq_len=2048, device=torch.device("cuda")
+            ).layers[layer_id]
+            pos = 0
+            for length in chunks:
+                comp(x[:, pos:pos + length], pos, state, freqs)
+                pos += length
+            return state.keys[:, config.sliding_window:].clone()
+
+        whole = run([1024])
+        split = run([512, 512])
+
+    assert torch.equal(whole, split), \
+        f"max abs diff {(whole.float() - split.float()).abs().max().item()}"
+
+
+def test_compressor_flushes_once_per_ratio_positions():
+    """Structural, no weights: a chunk spanning many block boundaries must
+    flush every block it completes, not just the last one."""
+    written = modeling.compressor_flush_positions(ratio=4, start_pos=6, seqlen=20)
+    # blocks completing in [6, 26): those ending at 7, 11, 15, 19, 23
+    assert written == [7, 11, 15, 19, 23]
+
+
+def test_compressor_flush_positions_reduce_to_the_reference_at_decode():
+    """seqlen == 1 flushes iff (start_pos + 1) % ratio == 0 (model.py:352)."""
+    for start_pos in range(0, 40):
+        got = modeling.compressor_flush_positions(4, start_pos, 1)
+        want = [start_pos] if (start_pos + 1) % 4 == 0 else []
+        assert got == want, start_pos
