@@ -184,7 +184,12 @@ def test_init_model_sets_the_group_size_before_calling_super(monkeypatch, tmp_pa
     # Task 6c: `init_model` also points `KERNEL_DIR` at `model_local_path /
     # "inference"` once the model exists, so this fake `super().init_model()`
     # must leave both in place -- same real-directory + fake-model-class
-    # pattern as tests/test_deepseek_v4_engine.py's KERNEL_DIR tests.
+    # pattern as tests/test_deepseek_v4_engine.py's KERNEL_DIR tests. This test
+    # runs `init_model` against the REAL `modeling` module (its `__module__`
+    # resolves there), which really sets `modeling.KERNEL_DIR` -- restored via
+    # `monkeypatch` the same way every other file that touches this global
+    # does (`test_deepseek_v4_attention.py:198` et al.).
+    monkeypatch.setattr(modeling, "KERNEL_DIR", None)
     (tmp_path / "inference").mkdir()
     (tmp_path / "inference" / "kernel.py").write_text("# stub")
 
@@ -222,7 +227,9 @@ def test_init_model_adds_the_hc_head_remap_without_dropping_base_entries(
     class Config:
         fp4_group_size = 32
 
-    # Task 6c: see the same setup's comment above.
+    # Task 6c: see the same setup's comment above -- restores the real
+    # `modeling.KERNEL_DIR` global via `monkeypatch` too.
+    monkeypatch.setattr(modeling, "KERNEL_DIR", None)
     (tmp_path / "inference").mkdir()
     (tmp_path / "inference" / "kernel.py").write_text("# stub")
 

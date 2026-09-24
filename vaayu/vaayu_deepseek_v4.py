@@ -11,7 +11,6 @@ The durable copy is row 28b's A5.7a bullet in `todo.md`.
 """
 
 import sys
-from pathlib import Path
 
 import torch
 
@@ -172,7 +171,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
         # the module the loaded class actually lives in, at runtime, rather
         # than importing the repo module or hardcoding the cache's mangled
         # path.
-        kernel_dir = Path(self.model_local_path) / "inference"
+        kernel_dir = self.model_local_path / "inference"
         kernel_source = kernel_dir / "kernel.py"
         if not kernel_source.is_file():
             raise FileNotFoundError(
