@@ -285,6 +285,13 @@ class DeepseekV4Linear(nn.Module):
             self._parameter("scale", (out_features, in_features // fp4_group_size),
                             _SCALE_DTYPE)
         elif dtype == torch.float8_e4m3fn:
+            if weight_block_size is None:
+                raise ValueError(
+                    "weight_block_size is in no config field -- an F8_E4M3 weight "
+                    "carries a per-tile scale and the tile shape lives only in the "
+                    "checkpoint's `checkpoint_quantization_config.weight_block_size`. "
+                    "Read it off the config and pass it. (A bf16 checkpoint of this "
+                    "architecture needs none and never reaches here.)")
             out_block, in_block = weight_block_size
             self._parameter("weight", (out_features, in_features), dtype)
             self._parameter("scale", (-(-out_features // out_block),
