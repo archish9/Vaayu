@@ -240,3 +240,39 @@ def test_forward_refuses_more_than_one_sequence():
     """One ContextVar cannot hold two sequences' ids."""
     with pytest.raises(NotImplementedError, match="ContextVar"):
         engine().forward(torch.tensor([[1, 2], [3, 4]]))
+
+
+def test_prefix_caching_is_refused_with_the_bug_named(monkeypatch):
+    monkeypatch.setattr(VaayuBaseModel, "__init__",
+                        lambda self, *a, **k: None)
+    with pytest.raises(NotImplementedError, match="DeepseekV4CacheLayer"):
+        VaayuDeepseekV4("/some/path", enable_prefix_cache=True)
+
+
+def test_kv_persistence_is_refused_with_the_bug_named(monkeypatch):
+    monkeypatch.setattr(VaayuBaseModel, "__init__",
+                        lambda self, *a, **k: None)
+    with pytest.raises(NotImplementedError, match="DeepseekV4CacheLayer"):
+        VaayuDeepseekV4("/some/path", enable_kv_persist=True)
+
+
+def test_the_default_construction_is_not_refused(monkeypatch):
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen["args"] = args
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path")
+    assert seen["args"] == ("/some/path",)
+
+
+def test_the_refusal_happens_before_the_load(monkeypatch):
+    """Refusing after super().__init__ would refuse at the END of a 157 G
+    load, which is the wrong time to learn about a bad flag."""
+    def exploding_init(self, *args, **kwargs):
+        raise AssertionError("super().__init__ ran before the refusal")
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", exploding_init)
+    with pytest.raises(NotImplementedError):
+        VaayuDeepseekV4("/some/path", enable_prefix_cache=True)

@@ -20,6 +20,38 @@ class VaayuDeepseekV4(VaayuBaseModel):
     defaults (`model.embed_tokens`, `model.layers`, `model.norm`, `lm_head`)
     are already the names A5.6 gave this model."""
 
+    def __init__(self, *args, **kwargs):
+        """Refuse the two cache features that do not understand this cache.
+
+        `DeepseekV4CacheLayer` holds a preallocated sliding window plus a
+        compressed half and index state. `batch.cache_holds_recurrent_state`
+        (`batch.py:500`), `prefix_cache.py:112`/`:364`, `kv_persist`, and
+        `Cache.max_cache_len` / `max_batch_size` / `batch_repeat_interleave` /
+        `batch_select_indices` all reason about a `DynamicCache`-shaped one.
+        Serving a restored or sliced prefix out of this cache would return
+        plausible tokens computed against the wrong history.
+
+        Read out of `kwargs` BEFORE `super().__init__`: both options are
+        passed by name everywhere a model is built, and refusing afterwards
+        would mean refusing at the end of a multi-minute load.
+        """
+        _unsupported = {
+            "enable_prefix_cache": "cross-turn prefix caching",
+            "enable_kv_persist": "KV disk persistence",
+        }
+        for flag, what in _unsupported.items():
+            if kwargs.get(flag):
+                raise NotImplementedError(
+                    f"{flag}=True is not supported for DeepSeek-V4: {what} "
+                    f"reasons about a DynamicCache-shaped cache, and "
+                    f"DeepseekV4CacheLayer is a preallocated sliding window "
+                    f"plus a compressed half and index state. Restoring or "
+                    f"slicing a prefix out of it would return plausible tokens "
+                    f"computed against the wrong history. Run with {flag}=False "
+                    f"until that cache-management code understands this layout.")
+
+        super().__init__(*args, **kwargs)
+
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward
         accepts (it raises `TypeError` on any other).
