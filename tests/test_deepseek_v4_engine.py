@@ -294,9 +294,17 @@ def test_the_architecture_dispatches_to_the_subclass(monkeypatch, tmp_path):
 def test_the_chunk_major_prefill_gate_stays_closed_for_this_model():
     """Tripwire for Task 5's list refusal.
 
-    Two unrelated decisions keep the chunk-major branch away from this model:
-    it is gated on flash/sdpa, and this model reports eager unconditionally.
-    If either changes, this fails BEFORE a user meets the TypeError.
+    The first two assertions are true but do NOT, by themselves, keep the gate
+    shut: the gate reads `_active_attn_impl`, which `init_model` sets to the
+    REQUESTED candidate (`vaayu_base.py:3373`), not to what this method
+    resolves to. Because the model accepts any request without raising and
+    `flash_attn` is installed on this box, the first candidate
+    ("flash_attention_2") would win the load and open the gate regardless of
+    what this method reports. What actually keeps the gate shut is the
+    subclass requesting `attn_implementation="eager"` itself (Fix 1, this
+    file's third assertion) -- that collapses `init_model`'s candidate list to
+    one (`vaayu_base.py:3321`) so the requested and resolved value are forced
+    to agree.
     """
     for requested in ("flash_attention_2", "sdpa", "eager", None):
         resolved = modeling.DeepseekV4PreTrainedModel._check_and_adjust_attn_implementation(
@@ -305,3 +313,34 @@ def test_the_chunk_major_prefill_gate_stays_closed_for_this_model():
 
     gate = inspect.getsource(VaayuBaseModel._chunked_prefill)
     assert 'self._active_attn_impl in ("flash_attention_2", "sdpa")' in gate
+
+    init_source = inspect.getsource(VaayuDeepseekV4.__init__)
+    assert 'kwargs.setdefault("attn_implementation", "eager")' in init_source
+
+
+def test_the_subclass_requests_eager_so_the_chunk_major_gate_stays_shut(monkeypatch):
+    """`_active_attn_impl` is the REQUESTED candidate, not the resolved one.
+
+    Without this the engine records "flash_attention_2", the chunk-major
+    prefill gate opens, and `forward` is handed a list of chunks -- which this
+    class refuses, so every prompt over `prefill_chunk_size` would raise.
+    """
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path")
+    assert seen["attn_implementation"] == "eager"
+
+
+def test_an_explicit_attn_implementation_still_wins(monkeypatch):
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path", attn_implementation="sdpa")
+    assert seen["attn_implementation"] == "sdpa"

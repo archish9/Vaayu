@@ -107,11 +107,13 @@ wall-clock on the irreversible split) — the brief's 2–3 days survives, redis
 **A5.1–A5.7a ARE ALL CLOSED (A5.1–A5.4 on 2026-09-23, A5.5/A5.6/A5.7a on 2026-09-24).**
 **Items (6) and (7) below are now CLOSED by A5.7a** — the streamed path calls this forward through
 `VaayuDeepseekV4`'s hooks, and `_create_kv_cache` now builds a real `DeepseekV4Cache`; they are kept
-below for the historical record of the problem, not as open work. **Item (2)'s severity is
-corrected by A5.7a**: the pre-existing generic surface check auto-disables prefix caching with a
-warning even before A5.7a's own explicit refusal, so this is "feature unavailable, announced," not
-"silent wrong-history serving" — see row 28b's A5.7a bullet, carried item (b), for the full
-correction. **A5.7a also found a NEW, still-open vector into the same class of risk: the
+below for the historical record of the problem, not as open work. **Item (2)'s severity was
+claimed corrected by A5.7a, but that claim was ITSELF WRONG** — the pre-existing generic surface
+check (`vaayu_base.py:3755`) does NOT run for this model; A5.7a's own hard refusal in
+`VaayuDeepseekV4.__init__` raises first, making `:3755` dead code on this path, so the real outcome
+is a hard load failure, not an announced downgrade — see row 28b's A5.7a bullet, carried item (b),
+for the full correction (found and fixed in the final whole-branch review, 2026-09-24). **A5.7a
+also found a NEW, still-open vector into the same class of risk: the
 `_start_pos` contiguity guard is bypassed on the streamed path, and speculative decoding is the one
 residual path into it that today's refusals do not cover — see row 28b's A5.7a bullet, carried item
 (a). A5.7b must add that check when it wires generation.**
@@ -2158,26 +2160,64 @@ and both have a golden reference or a Vaayu precedent.
       vectors are closed (prefix caching / KV persistence refused, batch>1 refused). **The residual
       vector is SPECULATIVE DECODING** (`drafter_model_path`, `draft_tokens`), which those refusals
       do **not** cover. A5.7b must add this check when it wires generation.
+      **UPDATE from the final whole-branch review (2026-09-24): speculative decoding is confirmed
+      NOT refused for this model** — `cache_holds_recurrent_state` (`vaayu/batch.py:500`, the
+      `getattr(cache, "layers", None) or ()` loop at `:515`) finds no `update_conv_state` /
+      `conv_states` on `DeepseekV4Cache` / `DeepseekV4CacheLayer`, so `spec_recurrent_refusal`
+      returns `None` and speculative decoding is allowed to start. **But it fails LOUDLY, not
+      silently**: the first rejected draft reaches `_trim_kv_cache` (`vaayu_base.py:5461`) →
+      `DeepseekV4Cache.crop` → the sliding-window/Compressor state is not what `crop` expects →
+      `RuntimeError`. Also note `vaayu_base.py:2586` calls `self._create_kv_cache()` purely as a
+      probe to feed `spec_recurrent_refusal`, which for this subclass allocates a full preallocated
+      `DeepseekV4Cache` (43 layers) and immediately discards it — wasted, not wrong.
       **(b) The open `[bug]`'s severity is lower than previously stated.** Measured:
       `_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")`, and neither
-      `DeepseekV4Cache` nor `DeepseekV4CacheLayer` has any of them — so the pre-existing
-      `_refuse_unsupported_prefix_cache` (`vaayu_base.py:3755`) would already auto-disable prefix
-      caching with a warning, and KV persistence then no-ops (it requires a live prefix cache). Real
-      bug, but "feature unavailable, announced" — NOT "silent wrong-history serving." A5.7b should
-      not over-engineer a fix.
+      `DeepseekV4Cache` nor `DeepseekV4CacheLayer` has any of them.
+      **CORRECTED by the final whole-branch review (2026-09-24): this does NOT mean the pre-existing
+      `_refuse_unsupported_prefix_cache` (`vaayu_base.py:3755`) auto-disables prefix caching with a
+      warning for this model.** Task 6's hard refusal in `VaayuDeepseekV4.__init__` runs FIRST (it
+      raises `NotImplementedError` before `super().__init__` is ever reached), so `:3755` is DEAD
+      CODE on this path. The actual outcome of requesting `enable_prefix_cache=True` on this model is
+      a hard load failure, not an announced downgrade. **Add prominently: the server's DEFAULT config
+      cannot load this model** — `vaayu/server/config.py:100` sets `ENABLE_PREFIX_CACHE = True`, and
+      `vaayu/server/app.py:406` passes `enable_prefix_cache=config.enable_prefix_cache` to
+      `from_pretrained` unconditionally — so **A5.7b must decide** between (i) defaulting that knob
+      off for this architecture, or (ii) downgrading Task 6's refusal to warn-and-disable, which is
+      the engine's own precedent (`:3755`'s behavior for models it does understand). Do **NOT** change
+      the refusal's behaviour as part of this correction; it is approved and correct as shipped — this
+      is a note for A5.7b, not a reopening of A5.7a.
       **(c) DeepSeek-V4 cannot use the layer-major chunked prefill.** That branch (row 45's win) is
-      gated on flash/sdpa; this model forces eager unconditionally, so a 4k prompt at
-      `PREFILL_CHUNK_SIZE=512` re-reads its routed expert set 8×. Structural, not a bug. **A5.7b's
-      measured TTFT must NOT be compared against MiniMax's post-row-45 figure.**
+      gated on flash/sdpa.
+      **CORRECTED by the final whole-branch review (2026-09-24): "this model forces eager
+      unconditionally" was FALSE as a description of what the engine does.** The model's own
+      `_check_and_adjust_attn_implementation` reports `"eager"` unconditionally, but `init_model`
+      records the REQUESTED candidate, not that report (`vaayu_base.py:3373`) — and because the
+      method accepts any request without raising, the first candidate tried wins. On a box with
+      `flash_attn` installed the candidate list is `["flash_attention_2", "sdpa", "eager"]` and
+      nothing refuses `"flash_attention_2"` for this architecture, so **the chunk-major gate
+      (`:4666`) was open**, and every prompt over `PREFILL_CHUNK_SIZE` would have hit this class's
+      own `TypeError` refusal for a list `input_ids`. Fixed in the commit that lands alongside this
+      correction (`fix(A5.7a): force eager attn_implementation in VaayuDeepseekV4 to keep the
+      chunk-major gate shut`): `VaayuDeepseekV4.__init__` now sets
+      `kwargs.setdefault("attn_implementation", "eager")` before `super().__init__`, which collapses
+      `init_model`'s candidate list to one (`vaayu_base.py:3321-3322`) and forces the requested and
+      resolved value to agree. **With that fix in place, the underlying TTFT consequence stands and
+      is real**: a 4k prompt at `PREFILL_CHUNK_SIZE=512` re-reads its routed expert set 8×.
+      Structural, not a bug. **A5.7b's measured TTFT must NOT be compared against MiniMax's
+      post-row-45 figure.**
       **(d) A positional bypass exists in theory.** The construction-time refusal reads
       `enable_prefix_cache`/`enable_kv_persist` from `kwargs`, and they are positional slots 21 and
       24 of `VaayuBaseModel.__init__`. Every construction path in the repo passes keyword-only
       (grepped clean) — unreachable today, but defended by convention, not code.
-      **(e) Deferred minors:** two committed citations of `vaayu_base.py:5209` are stale (the
-      kwargs dict moved to `:5222`) — in the new docstring in `vaayu_deepseek_v4.py` and a comment
-      in `tests/test_deepseek_v4_engine.py`; the `run_embed` source-text test pins that the hook
-      call exists but not WHERE; the Task 7 eager-gate tripwire is a source-text substring match,
-      brittle to harmless reformatting (confirmed today-correct by the reviewer; not a live defect).
+      **(e) Deferred minors:** two committed citations of `vaayu_base.py:5209` are stale.
+      **CORRECTED by the final whole-branch review (2026-09-24): the file names above were wrong.**
+      Verified by grep against the current tree: the kwargs dict this cites is at
+      `vaayu_base.py:5222` (not `:5209`), and the two stale citations of the old line number are in
+      `vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py` (~`:1430`) and
+      `tests/test_deepseek_v4_engine.py` (~`:87`) — **`vaayu/vaayu_deepseek_v4.py` carries none.** The
+      `run_embed` source-text test pins that the hook call exists but not WHERE; the Task 7 eager-gate
+      tripwire is a source-text substring match, brittle to harmless reformatting (confirmed
+      today-correct by the reviewer; not a live defect).
 
 - [ ] **A5.7b — load, index, first token. BRIEF's remainder.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex

@@ -50,6 +50,20 @@ class VaayuDeepseekV4(VaayuBaseModel):
                     f"computed against the wrong history. Run with {flag}=False "
                     f"until that cache-management code understands this layout.")
 
+        # This architecture has NO HF attention backend -- `sparse_attn` is its
+        # only kernel, which is why DeepseekV4PreTrainedModel reports "eager"
+        # unconditionally. But that report is not what the engine records:
+        # `init_model` stores the REQUESTED candidate (`vaayu_base.py:3373`),
+        # and because the model accepts any request without raising, the first
+        # candidate wins -- "flash_attention_2" on a box that has it installed.
+        # `_active_attn_impl` would then open the chunk-major prefill gate
+        # (`vaayu_base.py:4666`), which passes `input_ids` as a LIST of chunks
+        # and trips this class's own TypeError on any prompt over
+        # `prefill_chunk_size`. Requesting eager collapses the candidate list to
+        # one (`vaayu_base.py:3321`) and keeps that gate shut.
+        # `setdefault`, so an explicit caller choice still wins.
+        kwargs.setdefault("attn_implementation", "eager")
+
         super().__init__(*args, **kwargs)
 
     def _create_kv_cache(self):
