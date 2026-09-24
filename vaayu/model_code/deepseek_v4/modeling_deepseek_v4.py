@@ -60,6 +60,67 @@ _SCALE_DTYPE = torch.float8_e8m0fnu
 # per-tensor rule rather than hidden in a forward.
 DEQUANTIZE_AT_LOAD = ("wo_a",)
 
+# `sparse_attn_kernel` is compiled per (heads, head_dim), and the tile has to be
+# chosen before the source is exec'd -- before any config is in scope. These are
+# this architecture's only shape, read back out of the config by the assertion in
+# `DeepseekV4Attention.__init__` rather than trusted here.
+_TILE_HEADS, _TILE_HEAD_DIM = 64, 512
+
+
+def sparse_attn_smem(heads: int, head_dim: int, block: int) -> int:
+    """Dynamic shared memory `sparse_attn_kernel` asks for, in bytes.
+
+    Fitted to the three points A5's step-1 gate MEASURED on sm_120 (block 64 ->
+    141,312 B, 32 -> 104,448, 16 -> fits): tilelang aliases `q_shared` and
+    `o_shared` into one `heads x head_dim` bf16 buffer, adds ~2 KiB of index and
+    alignment, and then pays per tile for `kv_shared` (`block x head_dim` bf16)
+    and `acc_s_cast` (`heads x block` bf16). `num_stages` does not move it.
+    """
+    return heads * head_dim * 2 + 2048 + block * head_dim * 2 + heads * block * 2
+
+
+def sparse_attn_tile(smem_optin: int, heads: int, head_dim: int) -> tuple:
+    """The largest shipped-or-smaller `(block, num_stages)` this GPU can run.
+
+    `smem_optin` is a HARDWARE property read off the device, not a constant:
+    a datacenter card keeps the shipped `block = 64, num_stages = 2`, and only
+    a consumer card (sm_120 offers 101,376 B) steps down. Stages drop to 1 with
+    the block because a 1/4-size tile has nothing to pipeline against.
+    """
+    for block, stages in ((64, 2), (32, 1), (16, 1)):
+        if sparse_attn_smem(heads, head_dim, block) <= smem_optin:
+            return block, stages
+    raise RuntimeError(
+        f"no sparse_attn tile fits this GPU: the smallest asks "
+        f"{sparse_attn_smem(heads, head_dim, 16)} B of dynamic shared memory and "
+        f"the device offers {smem_optin} B per block.")
+
+
+def _fit_sparse_attn(source: str, heads: int, head_dim: int, smem_optin: int) -> str:
+    """`kernel.py` with `sparse_attn_kernel`'s tile constants rewritten.
+
+    Both are LOCALS in the kernel factory, so there is no argument to turn --
+    the source is the only handle. Returns the source unchanged when the
+    shipped tile already fits, or when the source has no `sparse_attn_kernel`
+    to fit (a test double standing in for the real `kernel.py`).
+    """
+    import re
+
+    block, stages = sparse_attn_tile(smem_optin, heads, head_dim)
+    if (block, stages) == (64, 2) or "def sparse_attn_kernel" not in source:
+        return source
+    start = source.index("def sparse_attn_kernel")
+    end = source.index("def hc_split_sinkhorn_kernel")
+    tile = source[start:end]
+    tile, a = re.subn(r"\n    num_stages = \d+", f"\n    num_stages = {stages}",
+                      tile, count=1)
+    tile, b = re.subn(r"\n    block = \d+", f"\n    block = {block}", tile, count=1)
+    if a != 1 or b != 1:
+        raise RuntimeError(
+            "sparse_attn_kernel's tile constants are not where this build expects "
+            "them; the kernel source changed and the sm_120 fit must be re-derived.")
+    return source[:start] + tile + source[end:]
+
 
 def kernels():
     """DeepSeek's `act_quant` / `fp4_gemm` / `fp8_gemm`, imported on first use.
@@ -80,7 +141,21 @@ def kernels():
             f"the checkpoint, under `inference/`; point "
             f"`modeling_deepseek_v4.KERNEL_DIR` at that directory.")
 
-    spec = importlib.util.spec_from_file_location("vaayu_deepseek_v4_kernel", source)
+    text = source.read_text()
+    if torch.cuda.is_available():
+        properties = torch.cuda.get_device_properties(0)
+        # `sparse_attn`'s tile is the one kernel whose shared-memory demand
+        # exceeds a consumer card's budget. Fit it before tilelang's JIT calls
+        # `inspect.getsource`, which is why this has to be a REAL file on disk.
+        text = _fit_sparse_attn(text, _TILE_HEADS, _TILE_HEAD_DIM,
+                                properties.shared_memory_per_block_optin)
+    fitted = directory / "kernel.py"
+    if text != source.read_text():
+        import tempfile
+        fitted = Path(tempfile.mkdtemp(prefix="vaayu_ds4_kernel_")) / "kernel.py"
+        fitted.write_text(text)
+
+    spec = importlib.util.spec_from_file_location("vaayu_deepseek_v4_kernel", fitted)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
