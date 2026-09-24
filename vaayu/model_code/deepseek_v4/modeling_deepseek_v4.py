@@ -683,6 +683,7 @@ def compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int,
 # ── A5.5: the cache ─────────────────────────────────────────────────────────
 
 from transformers.cache_utils import Cache, CacheLayerMixin
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_deepseek_v4 import DeepseekV4Config
@@ -1495,3 +1496,74 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype)
+
+    def _start_pos(self, past_key_values, cache_position, seqlen: int) -> int:
+        """One absolute position for the whole forward.
+
+        This model has no per-token position vector: the ring indexes by
+        `pos % window_size`, the Compressor flushes on block boundaries counted
+        from `start_pos`, and `window_topk_idxs` builds its indices from it. So
+        `cache_position` must be exactly `arange(start_pos, start_pos+seqlen)`,
+        and anything else is refused rather than silently mis-indexed.
+        """
+        if cache_position is None:
+            return int(past_key_values.get_seq_length())
+        if cache_position.numel() != seqlen:
+            raise ValueError(
+                f"cache_position has {cache_position.numel()} entries for a "
+                f"{seqlen}-token forward")
+        start_pos = int(cache_position[0])
+        expected = torch.arange(start_pos, start_pos + seqlen,
+                                device=cache_position.device,
+                                dtype=cache_position.dtype)
+        if not torch.equal(cache_position, expected):
+            raise ValueError(
+                "DeepSeek-V4 needs a contiguous cache_position -- the sliding "
+                "window indexes by `pos % window_size` and the Compressor "
+                "flushes on block boundaries counted from the first position, "
+                f"so {cache_position.tolist()} would read the wrong slots "
+                f"rather than fail. Expected {expected.tolist()}.")
+        return start_pos
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, use_cache=None,
+                cache_position=None, **kwargs):
+        if input_ids is None:
+            raise ValueError(
+                "DeepSeek-V4 needs input_ids: its first `num_hash_layers` MoE "
+                "layers route by TOKEN ID, not by score, so inputs_embeds "
+                "alone has nothing to route on. Refusing rather than routing "
+                "every token to the same experts.")
+        if past_key_values is None:
+            raise ValueError(
+                "DeepSeek-V4 needs a past_key_values built by the caller. Its "
+                "cache is PREALLOCATED -- `sliding_window + max_seq_len // "
+                "compress_ratio` slots per layer -- and the config's "
+                f"max_position_embeddings ({self.config.max_position_embeddings}) "
+                "is a context limit, not a cache size: defaulting to it would "
+                "reserve hundreds of MB per layer. Pass "
+                "DeepseekV4Cache(config, max_seq_len=<your budget>).")
+        if not isinstance(past_key_values, DeepseekV4Cache):
+            raise TypeError(
+                f"DeepSeek-V4 needs a DeepseekV4Cache, got "
+                f"{type(past_key_values).__name__}: a generic cache holds no "
+                f"compressed half and no index state, so attention would read "
+                f"an empty compressed view instead of failing.")
+
+        # `attention_mask` and `position_ids` are accepted and unused: this
+        # model builds no HF mask (`sparse_attn` masks by reading -1 out of
+        # `topk_idxs`, `kernel.py:322`) and carries position in `start_pos`.
+        hidden_states = self.embed_tokens(input_ids)
+        start_pos = self._start_pos(past_key_values, cache_position,
+                                    hidden_states.shape[1])
+        # `repeat`, not `expand` (`model.py:916`): hc_post adds into this and
+        # hc_pre flattens it, so it has to be real storage.
+        hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+
+        with input_ids_scope(input_ids):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, past_key_values, start_pos)
+
+        hidden_states = self.norm(self.hc_head(hidden_states))
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states,
+                                       past_key_values=past_key_values)

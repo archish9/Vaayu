@@ -154,3 +154,156 @@ def test_the_model_carries_the_checkpoints_own_layout(stub_layers):
     assert len(model.layers) == config.num_hidden_layers
     assert isinstance(model.norm, modeling.DeepseekV4RMSNorm)
     assert model.embed_tokens.weight.shape == (config.vocab_size, config.hidden_size)
+
+
+def test_the_residual_stream_is_hc_mult_copies_wide(stub_layers):
+    """`model.py:916` expands with `repeat`, not `expand`: `hc_post` adds into
+    the residual and `hc_pre` flattens it, so the first block's residual has to
+    be real storage, not a broadcast view.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    input_ids = torch.randint(0, config.vocab_size, (1, 5))
+
+    with torch.inference_mode():
+        out = model(input_ids=input_ids, past_key_values=cache,
+                    cache_position=torch.arange(5))
+
+    assert len(stub_layers.seen) == config.num_hidden_layers
+    for record in stub_layers.seen:
+        assert record["shape"] == (1, 5, config.hc_mult, config.hidden_size)
+    # hc_head reduced it back to one copy before the norm.
+    assert out.last_hidden_state.shape == (1, 5, config.hidden_size)
+
+
+def test_start_pos_comes_from_cache_position(stub_layers):
+    """A5.5's attention keeps its explicit `start_pos`; the MODEL is what
+    becomes HF-shaped. One value, derived once, handed to every layer.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    input_ids = torch.randint(0, config.vocab_size, (1, 3))
+
+    with torch.inference_mode():
+        model(input_ids=input_ids, past_key_values=cache,
+              cache_position=torch.arange(9, 12))
+
+    assert {record["start_pos"] for record in stub_layers.seen} == {9}
+
+
+def test_start_pos_falls_back_to_the_caches_own_length(stub_layers):
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    cache.advance(7)
+    input_ids = torch.randint(0, config.vocab_size, (1, 2))
+
+    with torch.inference_mode():
+        model(input_ids=input_ids, past_key_values=cache)
+
+    assert {record["start_pos"] for record in stub_layers.seen} == {7}
+
+
+@pytest.mark.parametrize("positions, why", [
+    (torch.tensor([0, 1, 3]), "a gap"),
+    (torch.tensor([2, 1, 0]), "descending"),
+    (torch.tensor([0, 0, 1]), "a repeat"),
+])
+def test_a_non_contiguous_cache_position_raises(stub_layers, positions, why):
+    """The ring, the Compressor's block flushes and `window_topk_idxs` all
+    assume `arange(start_pos, start_pos + seqlen)`. Anything else must raise
+    rather than mis-index: an index that answers a different question than the
+    load path is the defect class row 28b has already paid for three times.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    input_ids = torch.randint(0, config.vocab_size, (1, len(positions)))
+
+    with pytest.raises(ValueError, match="contiguous"):
+        with torch.inference_mode():
+            model(input_ids=input_ids, past_key_values=cache,
+                  cache_position=positions)
+
+
+def test_use_cache_without_a_cache_raises_instead_of_inventing_a_size(stub_layers):
+    """`max_position_embeddings` is 1,048,576 and
+    `DeepseekV4CacheLayer` PREALLOCATES `window + max_seq_len // ratio` slots --
+    268 MB for one ratio-4 layer's ring alone, on a 15.47 GiB card. There is no
+    safe default; only the caller knows the budget (A5.7 sizes it from Vaayu's
+    VRAM plan).
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 3))
+
+    with pytest.raises(ValueError, match="past_key_values"):
+        with torch.inference_mode():
+            model(input_ids=input_ids, use_cache=True)
+
+
+def test_a_foreign_cache_raises(stub_layers):
+    """A `DynamicCache` would appear to work and silently drop the compressed
+    half of every ratio-4 and ratio-128 layer.
+    """
+    from transformers.cache_utils import DynamicCache
+
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 3))
+
+    with pytest.raises(TypeError, match="DeepseekV4Cache"):
+        with torch.inference_mode():
+            model(input_ids=input_ids, past_key_values=DynamicCache())
+
+
+def test_the_token_ids_are_stashed_for_every_layer_and_released_after(stub_layers):
+    """Layers below `num_hash_layers` route by TOKEN ID, and Vaayu's
+    `sparse_forward(hidden_states, **kwargs)` never receives `input_ids` -- so
+    the model stashes them in a `ContextVar` for the whole layer loop (A5.4).
+    It must be set before layer 0 and released afterwards; a leak would let one
+    request route on another's ids.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    cache = modeling.DeepseekV4Cache(config, max_seq_len=64)
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+
+    with torch.inference_mode():
+        model(input_ids=input_ids, past_key_values=cache,
+              cache_position=torch.arange(4))
+
+    assert len(stub_layers.seen) == config.num_hidden_layers
+    for record in stub_layers.seen:
+        assert torch.equal(record["input_ids"], input_ids)
+    with pytest.raises(RuntimeError, match="input_ids_scope"):
+        modeling.current_input_ids()
+
+
+def test_inputs_embeds_without_input_ids_is_refused(stub_layers):
+    """Hash routing has no fallback: without ids the three hash layers would
+    have nothing to index `tid2eid` with. Refuse rather than route wrongly.
+    """
+    config = small_config()
+    model = modeling.DeepseekV4Model(config).eval()
+    embeds = torch.randn(1, 3, config.hidden_size)
+
+    with pytest.raises(ValueError, match="input_ids"):
+        with torch.inference_mode():
+            model(inputs_embeds=embeds)
+
+
+def test_the_config_yields_exactly_two_rope_variants():
+    """`_freqs_cis` is `@lru_cache(2)`. Across all 43 layers the shipped
+    `compress_ratios` must produce exactly two distinct settings dicts -- the
+    YaRN-off variant for `ratio == 0` and the compressed one for everything
+    else -- or the cache thrashes and rebuilds a table per layer per forward.
+    """
+    config = shipped_config()
+    variants = {tuple(sorted(modeling.rope_settings(
+                    config, config.compress_ratios[i]).items()))
+                for i in range(config.num_hidden_layers)}
+
+    assert len(variants) == 2, f"{len(variants)} rope variants: {variants}"
