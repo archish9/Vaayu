@@ -78,6 +78,24 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         return remap_checkpoint_key
 
+    def init_model(self):
+        """Put `fp4_group_size` on the config before the skeleton is built.
+
+        A5.4's `DeepseekV4Linear` refuses to invent a group size and raises a
+        named `ValueError`, and `init_model` is the first thing that calls
+        `AutoModelForCausalLM.from_config`. Derived from the split shards, so
+        it keeps working after `delete_original` has reclaimed the originals.
+        """
+        from .model_code.deepseek_v4.checkpoint import fp4_group_size_from_split
+
+        if getattr(self.config, "fp4_group_size", None) is None:
+            self.config.fp4_group_size = fp4_group_size_from_split(
+                self.checkpoint_path, self.layer_names_dict["layer_prefix"])
+            print(f"[Vaayu] DeepSeek-V4 fp4_group_size={self.config.fp4_group_size} "
+                  f"(derived from the shard headers; the config carries none)")
+
+        super().init_model()
+
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward
         accepts (it raises `TypeError` on any other).

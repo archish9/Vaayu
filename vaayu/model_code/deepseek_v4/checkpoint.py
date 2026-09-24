@@ -43,3 +43,43 @@ def remap_checkpoint_key(key: str) -> "str | None":
         f"Known roots: embed, layers, norm, hc_head_*, head, mtp (dropped). "
         f"Refusing to guess -- a key dropped here is a weight that stays "
         f"meta-initialized with nothing to say so.")
+
+
+def fp4_group_size_from_split(split_dir, layer_prefix: str = "model.layers") -> int:
+    """`in_features // scale.shape[-1]`, undoing fp4's 2-per-byte packing.
+
+    Read off the SPLIT shards, not the originals: `delete_original_shards` keeps
+    `model.safetensors.index.json` and deletes the shards it names, so a deriver
+    that reads the original checkpoint works exactly once.
+
+    Headers only -- `get_slice(...).get_shape()` reads no tensor data.
+
+    The group size is in no config field. A5.4's skeleton refuses to invent one
+    and raises a named ValueError, so this has to run before `from_config`.
+    """
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    shard = Path(split_dir) / f"{layer_prefix}.0.safetensors"
+    if not shard.exists():
+        raise FileNotFoundError(
+            f"cannot derive fp4_group_size: no {layer_prefix}.0 shard under "
+            f"{split_dir}. The split has not been written yet.")
+
+    with safe_open(str(shard), framework="pt") as handle:
+        keys = set(handle.keys())
+        weight_key = next(
+            (k for k in sorted(keys)
+             if k.endswith("w1.weight") and ".experts." in k), None)
+        scale_key = weight_key.replace(".weight", ".scale") if weight_key else None
+        if weight_key is None or scale_key not in keys:
+            raise ValueError(
+                f"cannot derive fp4_group_size from {shard}: no routed-expert "
+                f"weight/scale pair (looked for '*.experts.*.w1.weight' and its "
+                f"'.scale'). The group size is in no config field and must not "
+                f"be invented.")
+        in_features = handle.get_slice(weight_key).get_shape()[-1] * 2
+        groups = handle.get_slice(scale_key).get_shape()[-1]
+
+    return in_features // groups
