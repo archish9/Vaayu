@@ -164,6 +164,12 @@ class SlabArena:
         self.n_slabs = placed
         self._free: list[int] = list(range(self.n_slabs))
         self._lock = threading.Lock()
+        # Slabs withheld from `_free` for TRANSIENT prefill staging (S1-L1). They
+        # are never handed to the cache, and the condition below is what lets a
+        # loader thread WAIT for one instead of falling back to a pageable clone.
+        self._staging: list[int] = []
+        self._staging_free: list[int] = []
+        self._staging_cv = threading.Condition(self._lock)
         # slab idx -> CUDA event marking the most recent async (non_blocking)
         # H2D copy that reads FROM this slab's pinned memory. acquire()
         # synchronizes on it before handing the slab out for a fresh CPU-side
@@ -202,6 +208,68 @@ class SlabArena:
         if ev is not None:
             ev.synchronize()
         return idx
+
+    @property
+    def staging_slabs(self) -> int:
+        """Slabs reserved for prefill staging (0 = the feature is not armed)."""
+        return len(self._staging)
+
+    @property
+    def staging_free(self) -> int:
+        """Reserved staging slabs not currently held by a loader thread."""
+        return len(self._staging_free)
+
+    def reserve_staging(self, n: int) -> int:
+        """Withhold up to `n` slabs for TRANSIENT prefill staging; returns how many
+        were actually reserved (never more than the arena holds free).
+
+        Prefill does not insert into the RAM cache — it routes ~every expert once,
+        so caching would clone content decode replaces — which is why its reads
+        used to go through load_expert_sparse and land in PAGEABLE clones
+        (safetensor_model_persister.py's clone-out, S1-L1: 67-89 us of host stall
+        per expert, 6.6-8.8 % of a prefill, because a pageable copy cannot honour
+        non_blocking). A reserved slab gives prefill page-locked bytes to upload
+        from without making it a cache filler. Reserved slabs leave `_free`, so
+        `acquire()` — the cache's path — can never hand one out.
+        """
+        with self._lock:
+            n = max(0, min(int(n), len(self._free)))
+            for _ in range(n):
+                self._staging.append(self._free.pop())
+            self._staging_free = list(self._staging)
+        return n
+
+    def acquire_staging(self, timeout: "float | None" = None) -> "int | None":
+        """A free staging slab, waiting up to `timeout` for one. None when nothing
+        is reserved or the wait expired — the caller then takes the clone path.
+
+        Waiting (rather than falling back immediately) is deliberate: it bounds
+        prefill's read-ahead to the staging depth. Completed-but-unconsumed loads
+        hold their slabs, so an immediate fallback would leave all but the first
+        few experts on the pageable path this reservation exists to remove.
+        """
+        with self._staging_cv:
+            if not self._staging:
+                return None
+            if not self._staging_free and not self._staging_cv.wait_for(
+                    lambda: bool(self._staging_free), timeout=timeout):
+                return None
+            idx = self._staging_free.pop()
+            ev = self._pending_read.pop(idx, None)
+        # Same torn-read guard as acquire(), and for the same reason: the caller is
+        # about to rewrite these bytes with io_uring, which the DMA engine driving
+        # a still-draining H2D of them cannot see.
+        if ev is not None:
+            ev.synchronize()
+        return idx
+
+    def release_staging(self, idx: int) -> None:
+        """Return a staging slab. Idempotent, and it never reaches `_free`: a
+        staging slab stays staging for the process's life."""
+        with self._staging_cv:
+            if idx in self._staging and idx not in self._staging_free:
+                self._staging_free.append(idx)
+                self._staging_cv.notify()
 
     def release(self, idx: int) -> None:
         # NOTE: no event bookkeeping here on purpose — a slab may be released
