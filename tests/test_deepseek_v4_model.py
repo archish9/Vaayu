@@ -512,7 +512,12 @@ def test_auto_model_for_causal_lm_builds_the_whole_skeleton_on_meta():
     from transformers import AutoConfig, AutoModelForCausalLM
 
     config = AutoConfig.from_pretrained(str(parity.CKPT), trust_remote_code=True)
-    config.fp4_group_size = _fp4_group_size_from_headers()
+    # The loader derives this from the SPLIT shards
+    # (`checkpoint.fp4_group_size_from_split`); this test has only the original
+    # checkpoint, so it reads the same quantity from the same kind of
+    # weight/scale pair. Kept in step by
+    # `tests/test_deepseek_v4_checkpoint.py::test_the_real_checkpoint_measures_32`.
+    config.fp4_group_size = _fp4_group_size_from_original_shards()
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
             config, dtype=torch.bfloat16, attn_implementation="flash_attention_2",
@@ -544,11 +549,12 @@ def test_the_skeleton_refuses_to_invent_an_fp4_group_size():
                                              trust_remote_code=True)
 
 
-def _fp4_group_size_from_headers() -> int:
-    """`in_features // scale.shape[-1]`, undoing fp4's 2-per-byte packing.
+def _fp4_group_size_from_original_shards() -> int:
+    """`in_features // scale.shape[-1]` off the ORIGINAL shards.
 
-    Headers only -- `get_slice(...).get_shape()` reads no tensor data. This is
-    what A5.7's loader has to do before `from_config`.
+    The production deriver is
+    `vaayu.model_code.deepseek_v4.checkpoint.fp4_group_size_from_split`, which
+    reads the SPLIT shards because `delete_original_shards` removes these.
     """
     from safetensors import safe_open
 

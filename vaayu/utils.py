@@ -282,7 +282,8 @@ def delete_original_shards(checkpoint_path, index, safetensors_format):
 
 
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
-                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None):
+                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None,
+                          key_remap=None):
     """
     Save the all layers of a model sharded checkpoint using safetensors.
     """
@@ -342,6 +343,40 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     from .persist.checkpoint_integrity import assert_expert_layout_indexable
     assert_expert_layout_indexable(str(checkpoint_path), index.keys())
 
+    # A checkpoint whose keys do not already name the module tree gets ONE pass
+    # of renaming here, before anything below reads a key: `n_layers`, the
+    # `layers` list, `keys_by_layer` and the written tensor names all follow
+    # from it. `_fetch` keeps reading by the ORIGINAL key, so a remap only ever
+    # has to describe the naming -- never the file layout.
+    #
+    # Deliberately AFTER G1, which asks its layout question of the original
+    # keys, and deliberately before everything else, because the splitter
+    # matches keys by SUBSTRING: DeepSeek-V4's own names would put 248
+    # layer-internal `*norm` keys in the `norm` shard.
+    #
+    # A key the callable maps to None is DROPPED (DeepSeek-V4's `mtp.*` draft
+    # module: 10.117 GiB, and 768 experts that `detect_moe_blocks` would read
+    # as a second layer 0). `original_index` survives for the delete path,
+    # which names FILES and must keep naming the checkpoint's own keys.
+    original_index = index
+    source_key = {}
+    if key_remap is not None:
+        remapped = {}
+        for orig_key, fname in index.items():
+            new_key = key_remap(orig_key)
+            if new_key is None:
+                continue
+            if new_key in remapped:
+                raise ValueError(
+                    f"key_remap maps two checkpoint keys to {new_key!r} "
+                    f"({source_key[new_key]!r} and {orig_key!r}). The split "
+                    f"would write one and silently lose the other.")
+            remapped[new_key] = fname
+            source_key[new_key] = orig_key
+        print(f"key_remap: {len(remapped)} tensors renamed, "
+              f"{len(index) - len(remapped)} dropped")
+        index = remapped
+
     if layer_names is None:
         prefix = 'model.layers'
     else:
@@ -375,6 +410,74 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         print(f"no {_lm_head.rstrip('.')} weight in the checkpoint index "
               f"(tied embeddings) -- not expecting a shard for it")
 
+    # A layer's tensors may live in ANY set of shards, in ANY order. This used to
+    # load, per layer, only `max(shard number)`, and only when that number differed
+    # from the shard already held -- which assumes the index is layer-major and
+    # monotonic, so that every lower-numbered shard was pulled in by an earlier
+    # layer. Modern quantized MoE checkpoints break that: one layer spreads over
+    # several NON-ADJACENT shards and the numbers do not rise with the layer index.
+    # The layer was then written anyway, minus the tensors from the shards that were
+    # never loaded, with its .done marker stamped beside it -- so the completeness
+    # check below called the split good. Measured on a 48-layer / 512-expert int4
+    # checkpoint: 24356 of 24576 experts, two layers short, and no error anywhere.
+    # See tests/test_split_shard_spanning.py.
+    #
+    # Group the index by layer once, then read each layer's keys out of whichever
+    # files hold them. safetensors is read ONE TENSOR AT A TIME, so the resident set
+    # is a single layer rather than a growing pile of whole shards.
+    #
+    # Built HERE -- before the "already split" early return below, and before
+    # `check_space` and the write loop -- so this one pass also feeds G2
+    # immediately next, which must run before ANY write or delete. Reused
+    # as-is by the write loop further down; no second pass.
+    keys_by_layer = {layer: [] for layer in layers}
+    for k, fname in index.items():
+        for layer in layers:
+            if layer in k:
+                keys_by_layer[layer].append((k, fname))
+
+    # G2: a key matching no shard prefix above is silently DROPPED -- the split
+    # still writes every expected shard and stamps every .done marker, so
+    # `all(found_layers.values())` below calls the result complete. Task 4b's
+    # controller replayed this same assignment against DeepSeek-V4's
+    # `key_remap` output and found 3 of 67,612 renamed keys
+    # (`model.hc_head_base/_fn/_scale`) homeless -- the hyper-connection head,
+    # read on every token by `run_norm`, silently missing.
+    #
+    # Placed before EITHER `delete_original_shards` call site (the "already
+    # split" early return just below, and the end-of-function delete after a
+    # fresh split) -- not just before the write loop. A checkpoint split by an
+    # earlier run that silently dropped homeless keys presents every shard and
+    # every `.done` marker, which is exactly what `all(found_layers.values())`
+    # calls complete; a guard that ran only after `keys_by_layer` fed the write
+    # loop would let that checkpoint's originals be deleted on a later
+    # `delete_original=True` load having never been checked (found in review,
+    # 2026-09-24).
+    #
+    # Measured 2026-09-24 against the real index of every on-device checkpoint
+    # with the DEFAULT layer names before choosing how loud to make this:
+    # Qwen3-Next-80B-A3B-Instruct-AWQ-4bit leaves 4,625 keys homeless TODAY,
+    # all `mtp.*` (its own MTP draft module, unremapped -- this checkpoint
+    # never passes key_remap). MiniMax-M2.7-exl3, Llama-3.3-70B-exl3,
+    # Llama-3.2-1B-Instruct and gpt-oss-20b are all clean (0 homeless). A hard
+    # raise here would therefore break a model that works today, so it is
+    # conditioned on key_remap: a caller that took the trouble to rename every
+    # root (DeepSeek-V4's `remap_checkpoint_key`, which itself raises on any
+    # root it does not recognise) means every renamed key to land somewhere,
+    # and a homeless one there is a real bug, not a pre-existing gap. Absent a
+    # remap, this is CLAUDE.md 5's "warn -- don't silently degrade": a real
+    # limit worth surfacing, not one this guard gets to newly break on.
+    assigned = {k for ks in keys_by_layer.values() for k, _ in ks}
+    homeless = sorted(set(index) - assigned)
+    if homeless:
+        shown = homeless[:10]
+        more = f" (+{len(homeless) - 10} more)" if len(homeless) > 10 else ""
+        msg = (f"{len(homeless)} checkpoint key(s) match no shard prefix and "
+               f"would be silently dropped by the split: {shown}{more}")
+        if key_remap is not None:
+            raise RuntimeError(msg)
+        print(f"WARNING: {msg}")
+
     # check if splitting exists and all files are there
     found_layers = None
     #print(f"checking exists: {saving_path}")
@@ -398,7 +501,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 # layer has both its .safetensors and its .done marker, which
                 # is what all(found_layers.values()) above means. IRREVERSIBLE
                 # -- recovery is a re-download.
-                delete_original_shards(checkpoint_path, index, safetensors_format)
+                delete_original_shards(checkpoint_path, original_index, safetensors_format)
             return str(saving_path)
         else:
             print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
@@ -410,33 +513,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     # data is not the mode that gets no free-space check.
     check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
-
-    # A layer's tensors may live in ANY set of shards, in ANY order. This used to
-    # load, per layer, only `max(shard number)`, and only when that number differed
-    # from the shard already held -- which assumes the index is layer-major and
-    # monotonic, so that every lower-numbered shard was pulled in by an earlier
-    # layer. Modern quantized MoE checkpoints break that: one layer spreads over
-    # several NON-ADJACENT shards and the numbers do not rise with the layer index.
-    # The layer was then written anyway, minus the tensors from the shards that were
-    # never loaded, with its .done marker stamped beside it -- so the completeness
-    # check above called the split good. Measured on a 48-layer / 512-expert int4
-    # checkpoint: 24356 of 24576 experts, two layers short, and no error anywhere.
-    # See tests/test_split_shard_spanning.py.
-    #
-    # Group the index by layer once, then read each layer's keys out of whichever
-    # files hold them. safetensors is read ONE TENSOR AT A TIME, so the resident set
-    # is a single layer rather than a growing pile of whole shards.
-    keys_by_layer = {layer: [] for layer in layers}
-    for k, fname in index.items():
-        for layer in layers:
-            if layer in k:
-                keys_by_layer[layer].append((k, fname))
-
     shard_readers = contextlib.ExitStack()
     open_shards = {}          # safetensors: fname -> safe_open handle
     bin_state_dicts = {}      # .bin: fname -> the whole loaded state dict
 
     def _fetch(key, fname):
+        key = source_key.get(key, key)
         path = checkpoint_path / fname
         if not os.path.exists(path):
             assert repo_id is not None
@@ -477,7 +559,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # Free memory
         for k, fname in keys_by_layer[layer]:
             if fname in bin_state_dicts:
-                bin_state_dicts[fname].pop(k, None)
+                bin_state_dicts[fname].pop(source_key.get(k, k), None)
         del layer_state_dict
         clean_memory()
 
@@ -500,7 +582,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             print(f"WARNING: keeping the original shards -- the split under "
                   f"{saving_path} is INCOMPLETE, missing: {', '.join(missing)}")
         else:
-            delete_original_shards(checkpoint_path, index, safetensors_format)
+            delete_original_shards(checkpoint_path, original_index, safetensors_format)
 
     return str(saving_path)
 
@@ -529,7 +611,7 @@ def drop_absent_lm_head(layers, index, lm_head):
 
 
 def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
-                                       layer_names=None, hf_token=None, delete_original=False):
+                                       layer_names=None, hf_token=None, delete_original=False, key_remap=None):
     """
     find the model's local cache path, download the cache if not exists, then split and save the model.
 
@@ -560,7 +642,8 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
            os.path.exists(Path(model_local_path_or_repo_id) / 'pytorch_model.bin'):
             print(f"found index file...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original)
+                                                                            compression=compression, layer_names=layer_names,
+                                                                            delete_original=delete_original, key_remap=key_remap)
         else:
             # G0: a directory holding shards but no index is an interrupted
             # download (the 46-of-48-with-no-index case G0 was written for),
@@ -607,4 +690,5 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     # if splitted_model subdir exists under cache use it, otherwise split and save
     return Path(hf_cache_path), split_and_save_layers(hf_cache_path, layer_shards_saving_path,
                                                       compression=compression, layer_names=layer_names,
-                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id, hf_token=hf_token)
+                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id,
+                                                      hf_token=hf_token, key_remap=key_remap)
