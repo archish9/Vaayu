@@ -2550,6 +2550,37 @@ and both have a golden reference or a Vaayu precedent.
       above). `attn impl: eager`, `fp4_group_size: 32`. Log: `/tmp/a57c-first-token.log` (gitignored,
       not preserved — this row is the durable copy).
 
+- [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
+      the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
+      code had the same defect at a different index.** `VaayuDeepseekV4.get_past_key_value_args`
+      derives the cache's past length from ONE fixed layer index, but `DeepseekV4Cache` gives every
+      layer an independent `cumulative_length`, and the hook is called once per **(layer, chunk)**
+      pair (`vaayu_base.py:5222-5241`, `_past_lens` from `compute_chunk_past_lens` at `:1044`).
+      **No fixed index can be right:** for the layer currently executing chunk *j*, the correct past
+      is `past0 + sum(len(chunks) < j)`; layers already done read `past0 + total`, layers not yet
+      started read `past0`. So `max()` and `min()` over layers are both wrong too. Before A5.7c the
+      hook read `get_seq_length()` (layer 0 by default) and was self-consistent only at layer 0 by
+      coincidence; `05a9cf6` moved it to the LAST layer, which fixes the single-chunk case it was
+      raising on (decode and prefill ≤ 512 — that is what unblocked the first token) and leaves the
+      multi-chunk case broken: **layer 0 raises `RuntimeError` on its SECOND chunk**, before
+      execution ever reaches the "safe" last layer.
+      **Reachability, measured:** `tests/test_server_smoke.py`'s real prompt is ~16 tokens
+      (`PROMPT`, `:34`) and its oversized prompt is refused with 400 before any forward (`:186`), so
+      the §8(3) smoke does NOT cover this. Every prompt over 512 tokens does — i.e. **the normal case
+      for the agentic workload Vaayu exists to serve.**
+      **THREE FIX OPTIONS, in preference order:** (1) **subclass-only, and the pattern already
+      exists** — `05a9cf6` wraps each patched `moe_module.forward`; wrap each decoder layer's
+      `forward` the same way to record the executing layer index, and have the hook read THAT
+      layer's `cumulative_length`. Blast radius stays zero for other models. (2) pass the layer into
+      `get_past_key_value_args` — correct but a shared-infra signature change touching every model's
+      hook, so it carries the both-paths gate burden. (3) move the contiguity check into
+      `DeepseekV4Cache` itself, which is the only object that knows its own per-layer counters.
+      **STOPGAP available today:** `prefill_chunk_size=0` disables chunking, at the cost of a
+      single-shot prefill's VRAM on a 4096-hidden, 43-layer model — untested for this checkpoint.
+      **Why A5.7c did not fix it:** its stop rule is that it must not grow into shared
+      infrastructure, and options (2) and (3) are exactly that; option (1) is new design with no
+      chunked-prefill test coverage to land it against. Parked with this row, not silently.
+
 - [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
       2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
       goldens straight out of the ORIGINAL shards via `model.safetensors.index.json`'s `weight_map`,
