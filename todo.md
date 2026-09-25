@@ -2582,6 +2582,43 @@ and both have a golden reference or a Vaayu precedent.
       model subclass supply the template/renderer, which keeps the blast radius at one model. Full
       log: `/tmp/a57c-server-smoke.log` (gitignored, not preserved — this row is the durable copy).
 
+      **THEN, still A5.7c (Task 6, 2026-09-25): row 28b step 5, the decode measurement.** `plans/probes/
+      row26_decode.py` (untracked, `plans/` is gitignored) got a `"deepseek"` `MODELS` entry pointing at
+      `/home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731`; `delete_original=False` was
+      confirmed hardcoded before running, so the probe cannot consume the checkpoint it measures. **The
+      probe's own `render_prompt` call also hit the no-`chat_template` gap above** (`NoChatTemplate`) —
+      worked around IN THE PROBE ONLY, for the `deepseek` arm alone, with a raw `tokenizer(...)` encode
+      of the same system+task text (no chat markup), exactly the pattern Task 4's `a57b_first_token.py`
+      already used on this checkpoint. No `vaayu/` file touched. Prompt came to 127 tokens, under the
+      512-token `prefill_chunk_size` default, so the `[bug]` two rows below did NOT fire and
+      `prefill_chunk_size` was left at its default (NOT set to 0).
+      **Arm: `MODEL=deepseek BALLAST_GB=15 NEW_TOK=64 ARMS=W,U1,P,U2,Usi,Uspin`** (systemd unit
+      `a57c-row26`, `MemoryMax=29G`). **`BALLAST_GB` CHANGED FROM THE BRIEF'S 25 TO 15**: the first run
+      at `BALLAST_GB=25` was OOM-killed by the cgroup (`status=9/KILL`, "killed by the OOM killer") after
+      completing arm P, with `rss=29.75GB` logged one token before the kill — this model's RAM footprint
+      under that squeeze does not fit a 29G ceiling. Re-run once at `BALLAST_GB=15` per the brief's
+      standing rule, and it is labelled here as the changed arm, not a quiet substitution.
+      **Result (the 15 GB-ballast run, wall ≈22m16s, 11:04:31→11:26:47):** all 6 arms completed, greedy
+      ids identical across every arm (deterministic). Decode rate: **W 0.3335, U1 0.3267 (the TRUE
+      unprofiled figure), P 0.3195, U2 0.3203, Usi 0.3186, Uspin 0.2537 tok/s** (Uspin is the
+      SCHED_IDLE-spinner diagnostic arm, not the headline number). VRAM peak `max_allocated 7.15 GiB /
+      max_reserved 7.27 GiB`, device used 7.92 of 15.47 GiB; VRAM expert-cache hit_rate 35% overall
+      (usage 3.52/3.53 GB). Raw output: `plans/probes/row26_out/decode-deepseek.json` (gitignored).
+      **Verdict against the ~1.75–2.06 tok/s prediction: REFUTED, not confirmed — measured ~0.32–0.33
+      tok/s is 5.4–6.4× SLOWER than the prediction's low end**, not the ~5× (vs Qwen3-Next) the row
+      called REACH-not-speed and accepted going in — this is slower even than that acceptance covered.
+      **One-sentence explanation from the log's own per-token `[VAAYU-IO] token summary` lines:** bytes
+      moved per token sit at **~7.0–7.8 GB, roughly 2× the 3.2124 GiB/token projection**, with the
+      expert RAM cache pinned at **~20% hit_rate** (evict count tracking miss count 1:1 — a thrashing
+      cache, not a warming one) under the `BALLAST_GB=15`-derived 9.13 GB budget, AND the breakdown is
+      **GPU-load bound, not NVMe-stall bound** (`gpu_load` ~2.7 s of a ~3.9–4.0 s token vs `expert_disk`
+      only ~0.2–0.3 s) — so the shortfall traces to roughly double the projected bytes plus a GPU-side
+      (H2D/dequant) cost the NVMe-plateau projection never modelled, not to a disk-bandwidth shortfall.
+      **This also means the row 28b projection's method (bytes/token ÷ delivered NVMe GB/s) does not
+      hold for this model as measured** — a follow-up would need to explain the 2× byte inflation and
+      the GPU-load dominance before re-projecting, and that is not built here (measurement only, per
+      this task's scope).
+
 - [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
       the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
       code had the same defect at a different index.** `VaayuDeepseekV4.get_past_key_value_args`
@@ -2680,8 +2717,9 @@ and both have a golden reference or a Vaayu precedent.
 will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
 machinery stripped, **experts as `nn.ModuleList`** so it lands on the module-list forward MiniMax already exercises
 (1–2 weeks; verify logits against `inference/generate.py` BEFORE measuring) → 3 key remap + persist (verify
-`ExpertOffsetIndex` finds **43 × 256 = 11,008** derived entries) → 4 first on-device generation → 5 run
-`row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)
+`ExpertOffsetIndex` finds **43 × 256 = 11,008** derived entries) → 4 first on-device generation → **5 DONE
+2026-09-25 (A5.7c Task 6) — see the A5.7c bullet above for the figure and the caveats; run
+`row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)**
 → 6 *optional* the **10.12 GiB MTP draft module** already in the checkpoint (free speculative drafter; dense spec
 measured 5.57× in **row 12** — NOT "row P7", which is a different, REFUTED item; see §0's warning
 and this file's `P7`/`P8`/`P9` note — but **the MoE mechanism differs — do not assume it
