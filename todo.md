@@ -2549,6 +2549,33 @@ and both have a golden reference or a Vaayu precedent.
       expert set several times per step, as expected — reach, not speed, per this row's own note
       above). `attn impl: eager`, `fp4_group_size: 32`. Log: `/tmp/a57c-first-token.log` (gitignored,
       not preserved — this row is the durable copy).
+      **TASK 5, RUN 2026-09-25 — server smoke, §8(3).** `SERVER_CKPT=.../deepseek-ai--DeepSeek-V4-Flash-0731`
+      (checkpoint ROOT, matching `a57b_first_token.py`'s `CKPT`, NOT `splitted_model/`), foreground
+      `systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0 env PYTHONPATH=$PWD SERVER_CKPT=…
+      ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s`. **3 failed, 6 passed, 17 warnings
+      in 8.47s; load 4.8s** (`[Vaayu-Server] loaded in 4.8s; derived max_seq_len=16766`). **PASSED:**
+      `test_health` (status ready, max_seq_len=16766, decode_top_k present), `test_oversized_prompt_refused`,
+      `test_prefix_reuse` (reported "disabled" — expected, same `DeepseekV4Cache` no-`to_cpu`/`to_device`/
+      `resident_bytes` gap as row 28b), `test_env_json_is_written_and_clean`,
+      `test_requests_jsonl_has_one_row_per_request`, `test_no_absolute_paths_leaked_into_the_bundle`.
+      **FAILED:** `test_non_stream`, `test_stream`, `test_the_token_summary_reports_nvme_bytes_consistent_with_pinning`
+      (the third is downstream of the first two — no completion ever ran, so no `gb_tok=` line existed
+      to assert on). **Root cause, verbatim (`tests/test_server_smoke.py:131`/`:148`, `assert 400 == 200`):**
+      `{"error":{"message":"this checkpoint's tokenizer ships no chat_template, so /v1/chat/completions
+      cannot render messages for it. Use a chat/instruct checkpoint, or send an already-formatted single
+      user message..."}}`. **NOT caused by A5.7c's change** — verified `tokenizer_config.json` carries no
+      `chat_template` key, and the checkpoint's own `README.md` states it outright: "This release does
+      not include a Jinja-format chat template. Instead, we provide a dedicated `encoding` folder..." —
+      DeepSeek ships a custom Python encode/decode scheme instead of a Jinja template, and
+      `vaayu/server/chat.py:render_prompt` (pre-existing, untouched by this branch) hard-requires
+      `tokenizer.chat_template`. A checkpoint/server-default gap, not a `moe_patch.py` /
+      `vaayu_deepseek_v4.py` defect — filed as its own `[bug]` row below, not scope creep into this one.
+      **So §8(3) is NOT proven for this checkpoint through `/v1/chat/completions`, short prompt or long:**
+      load, health, refusal-plumbing, and logging all work, but the actual completion path — the
+      reachability proof this task exists to produce — never runs, because every request 400s at
+      template-render time before length is even checked. That is EARLIER than the `prefill_chunk_size`
+      `[bug]` two rows below (>512 tokens): this run never got far enough to reach it either way. Full
+      log: `/tmp/a57c-server-smoke.log` (gitignored, not preserved — this row is the durable copy).
 
 - [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
       the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
@@ -2580,6 +2607,26 @@ and both have a golden reference or a Vaayu precedent.
       **Why A5.7c did not fix it:** its stop rule is that it must not grow into shared
       infrastructure, and options (2) and (3) are exactly that; option (1) is new design with no
       chunked-prefill test coverage to land it against. Parked with this row, not silently.
+
+- [bug] **DeepSeek-V4-Flash-0731 ships no `chat_template`, so `/v1/chat/completions` 400s on every
+      request. FOUND 2026-09-25 by A5.7c Task 5's server smoke; NOT caused by A5.7c.**
+      `tokenizer_config.json` has no `chat_template` key, and the checkpoint's own `README.md` says so
+      by design: "This release does not include a Jinja-format chat template. Instead, we provide a
+      dedicated `encoding` folder with Python scripts... to encode messages in OpenAI-compatible format
+      into input strings for the model." `vaayu/server/chat.py:render_prompt` (pre-existing, unedited
+      by A5.7c) hard-requires `tokenizer.chat_template` and raises `NoChatTemplate` → 400 otherwise; this
+      is a correct, working guard, not a defect in it. **Effect on §8(3):** `tests/test_server_smoke.py`'s
+      `test_non_stream` and `test_stream` both fail (`assert 400 == 200`), and
+      `test_the_token_summary_reports_nvme_bytes_consistent_with_pinning` fails downstream of them (no
+      completion ever ran, so no `gb_tok=` line to assert on) — 3 of 9 checks, see the A5.7c row's Task 5
+      entry for the full pass/fail list. Every other server-smoke check (load, health, oversized-prompt
+      refusal, prefix-cache reporting, env.json, requests.jsonl, path-leak check) passes on this
+      checkpoint. **Not fixed here** — no production code touched, per A5.7c Task 5's scope (verification
+      only). **What unblocks it:** either (1) build a Jinja `chat_template` from the checkpoint's own
+      `encoding/` Python scripts and ship it in `tokenizer_config.json` (checkpoint-side, not a Vaayu
+      code change), or (2) teach `vaayu/server/chat.py` a non-Jinja rendering path that calls the
+      checkpoint's `encoding/` module directly — a real server feature, not a one-line fix, and its own
+      row if picked up.
 
 - [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
       2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
