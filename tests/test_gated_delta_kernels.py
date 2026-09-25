@@ -307,3 +307,148 @@ def test_patched_norm_hands_gateless_calls_to_stock():
     gdk._patch_norm(norm)
     assert norm(torch.zeros(2, 4)) == "stock"
     assert hasattr(norm.forward, gdk._MARK)
+
+
+# ── installer ────────────────────────────────────────────────────────────────
+
+def _seam_fns(model):
+    """Every seam callable. Compared with ==, not `is`: an unpatched norm.forward
+    is a fresh bound method on every attribute access."""
+    s = gdk.gated_delta_seams(model)
+    return ([m.recurrent_gated_delta_rule for m in s["rule"]]
+            + [m.causal_conv1d_update for m in s["conv"]]
+            + [m.norm.forward for m in s["norm"]])
+
+
+def test_nothing_installed_on_cpu():
+    model = _qwen3_next_model()
+    before = _seam_fns(model)
+    assert gdk.install_gated_delta_kernels(model, "cpu", torch.float32) == NO_SEAMS
+    assert all(a == b for a, b in zip(before, _seam_fns(model)))
+
+
+def test_nothing_installed_without_triton(monkeypatch):
+    monkeypatch.setattr(gdk, "triton", None)
+    model = _qwen3_next_model()
+    before = _seam_fns(model)
+    assert gdk.install_gated_delta_kernels(model, "cuda", torch.bfloat16) == NO_SEAMS
+    assert all(a == b for a, b in zip(before, _seam_fns(model)))
+
+
+@cuda
+def test_install_covers_every_seam_and_is_idempotent():
+    model = _qwen3_next_model().cuda().bfloat16()
+    n = model.config.layer_types.count("linear_attention")
+    want = {"rule": n, "conv": n, "norm": n}
+    assert gdk.install_gated_delta_kernels(model, "cuda", torch.bfloat16) == want
+    first = _seam_fns(model)
+    assert all(hasattr(f, gdk._MARK) for f in first)
+    assert gdk.install_gated_delta_kernels(model, "cuda", torch.bfloat16) == want
+    assert all(a == b for a, b in zip(first, _seam_fns(model)))   # never double-wrapped
+
+
+@cuda
+def test_a_seam_that_fails_its_self_check_stays_stock_and_warns(monkeypatch, capsys):
+    def wrong(q, k, v, g, beta, initial_state, output_final_state,
+              use_qk_l2norm_in_kernel=False):
+        B, T_, HV, K = k.shape
+        return (torch.zeros_like(v),
+                torch.zeros(B, HV, K, v.shape[-1], device=v.device, dtype=torch.float32))
+
+    monkeypatch.setattr(gdk, "fused_recurrent_rule", wrong)
+    _, mixer = _mixer("qwen3_next")
+    mixer = mixer.cuda().bfloat16()
+    stock = mixer.recurrent_gated_delta_rule
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 0, "conv": 1, "norm": 1}
+    assert mixer.recurrent_gated_delta_rule is stock
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "'rule'" in out and "relL2" in out
+
+
+@cuda
+def test_a_seam_whose_kernel_raises_stays_stock_and_warns(monkeypatch, capsys):
+    def broken(*args, **kwargs):
+        raise RuntimeError("triton could not compile for this device")
+
+    monkeypatch.setattr(gdk, "fused_conv_update", broken)
+    _, mixer = _mixer("qwen3_next")
+    mixer = mixer.cuda().bfloat16()
+    stock = mixer.causal_conv1d_update
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 0, "norm": 1}
+    assert mixer.causal_conv1d_update is stock
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "'conv'" in out and "RuntimeError" in out
+
+
+@cuda
+def test_a_norm_with_different_math_stays_stock_and_warns(capsys):
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    mixer = _RuleAndNormOnly(norm=LlamaRMSNorm(16)).cuda()
+    stock = mixer.norm.forward
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 0, "norm": 0}
+    assert not hasattr(mixer.norm.forward, gdk._MARK)
+    assert mixer.norm.forward == stock
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "'norm'" in out
+
+
+@cuda
+def test_install_does_not_read_meta_weights():
+    """A streamed layer's weights are still on the meta device at install."""
+    from accelerate import init_empty_weights
+    cfg, cls = _qwen3_next()
+    with init_empty_weights():
+        mixer = cls(cfg, layer_idx=0)
+    assert mixer.norm.weight.is_meta
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 1, "norm": 1}
+
+
+@cuda
+@pytest.mark.parametrize("prefill_len", [2, 12], ids=["shorter-than-conv", "prefill12"])
+@pytest.mark.parametrize("kind", ["transformers", "vaayu"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_full_mixer_decode_is_no_further_from_fp64_than_stock(family, kind, prefill_len):
+    cfg, cpu_mixer = _mixer(family)
+    stock = copy.deepcopy(cpu_mixer).cuda().bfloat16()
+    fused = copy.deepcopy(cpu_mixer).cuda().bfloat16()
+    ref = copy.deepcopy(cpu_mixer).cuda().double()
+    assert gdk.install_gated_delta_kernels(fused, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 1, "norm": 1}
+    torch.manual_seed(1)
+    x = torch.randn(1, prefill_len + 8, cfg.hidden_size, device="cuda")
+
+    def decode(mixer, dtype, cache):
+        with torch.no_grad():
+            mixer(x[:, :prefill_len].to(dtype), cache_params=cache)
+            return torch.cat([mixer(x[:, t:t + 1].to(dtype), cache_params=cache)
+                              for t in range(prefill_len, prefill_len + 8)], 1)
+
+    so = decode(stock, torch.bfloat16, _cache(kind, cfg))
+    fo = decode(fused, torch.bfloat16, _cache(kind, cfg))
+    ro = decode(ref, torch.float64, DynamicCache(config=cfg))
+    assert _rel(fo, ro) <= 1.25 * _rel(so, ro)
+
+
+@cuda
+@pytest.mark.parametrize("family", FAMILIES)
+def test_fused_decode_after_a_chunked_prefill_matches_one_forward(family):
+    """Row 43's continuation wrapper and these seams compose: decode reads what a
+    chunked prefill left exactly as it reads what one prefill forward left."""
+    cfg, mixer = _mixer(family)
+    mixer = mixer.cuda()
+    install_state_continuation(mixer)
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.float32) == \
+        {"rule": 1, "conv": 1, "norm": 1}
+    x = torch.randn(1, T + 4, cfg.hidden_size, device="cuda")
+    with torch.no_grad():
+        c_full = _cache("vaayu", cfg)
+        mixer(x[:, :T], cache_params=c_full)
+        want = torch.cat([mixer(x[:, t:t + 1], cache_params=c_full) for t in range(T, T + 4)], 1)
+        c_split = _cache("vaayu", cfg)
+        _run(mixer, x[:, :T], c_split, [10, 22, 24])
+        got = torch.cat([mixer(x[:, t:t + 1], cache_params=c_split) for t in range(T, T + 4)], 1)
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
