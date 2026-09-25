@@ -1888,6 +1888,11 @@ def _make_modulelist_sparse_forward(
                     # on the key is held until the layer's finally, so the window
                     # between the copy and the event is covered by the pin.
                     _arena.record_read(_rd)
+                # A prefill staging slab's job ends here: the copies are issued and
+                # the read event now guards them, so hand it back for the next
+                # expert's read (S1-L1). A decode slab is the cache's, not ours.
+                _release_prefill_staged(expert_cache, vaayu_ref,
+                                        lambda k: k == (layer_idx, eidx))
                 if _prof:
                     _mp['h2d'] += _timing.get('h2d', 0.0)
                     _mp['construct'] += _timing.get('construct', 0.0)
@@ -1980,6 +1985,12 @@ def _make_modulelist_sparse_forward(
             # through — a leaked pin permanently blocks that key's eviction.
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+            # Same for this layer's prefill staging slabs: the loop returns each one
+            # as its upload issues, this drains experts it never reached (S1-L1).
+            # The flag closes the layer first, so a load still in flight releases its
+            # own slab instead of registering one after this sweep has passed.
+            vaayu_ref._prefill_staging_closed = layer_idx
+            _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
 
         if _cm_last_call:
             vaayu_ref._chunk_major_gpu = None
@@ -2358,6 +2369,10 @@ def _make_fused_sparse_forward(
                         _rd = _arena.slab_index_of(next(iter(raw.values())))
                         if _rd is not None:
                             _arena.record_read(_rd)
+                    # Prefill staging slab: uploads issued, read event armed, so it
+                    # goes back to the staging pool for the next expert (S1-L1).
+                    _release_prefill_staged(expert_cache, vaayu_ref,
+                                            lambda k: k == (layer_idx, eidx))
                     if (layer_idx, eidx) in _pinned_keys:
                         expert_cache.unpin(layer_idx, eidx)
                         _pinned_keys.discard((layer_idx, eidx))
@@ -2406,6 +2421,12 @@ def _make_fused_sparse_forward(
             # that key's eviction forever.
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+            # Same for this layer's prefill staging slabs: the loop returns each one
+            # as its upload issues, this drains experts it never reached (S1-L1).
+            # The flag closes the layer first, so a load still in flight releases its
+            # own slab instead of registering one after this sweep has passed.
+            vaayu_ref._prefill_staging_closed = layer_idx
+            _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
 
         if _cm_last_call:
             vaayu_ref._chunk_major_gpu = None
@@ -2435,6 +2456,87 @@ _LOAD_WAIT_BACKSTOP_S = 5.0
 # are on the GPU already, so reading them off NVMe again is pure waste. See
 # _dispatch_expert_misses' vram_resident parameter.
 VRAM_RESIDENT_NO_RAW = object()
+
+
+# Not a tuning knob, and the same idea as _LOAD_WAIT_BACKSTOP_S: a staging slab that
+# leaked (a worker that registered one after its layer already tore down) must make
+# prefill fall back to the clone path, never hang a layer.
+_STAGING_WAIT_BACKSTOP_S = 5.0
+
+
+def _prefill_staged(vaayu_ref) -> dict:
+    """{(layer_idx, expert_idx): slab_idx} for prefill experts whose bytes are still
+    sitting in a staging slab the forward has not finished uploading."""
+    staged = getattr(vaayu_ref, "_prefill_staged", None)
+    if staged is None:
+        staged = {}
+        vaayu_ref._prefill_staged = staged
+    return staged
+
+
+def _stage_prefill_expert(expert_cache, vaayu_ref, layer_idx, eidx, shard_file, metas):
+    """Read ONE prefill expert into a reserved staging slab, or return None.
+
+    Prefill does not cache, so before S1-L1 it read through load_expert_sparse, which
+    clones out of its pinned pool buffer into PAGEABLE RAM — and a pageable copy
+    cannot honour non_blocking, so every expert's upload drained the stream (measured:
+    202.8 us host vs 202.9 us device, i.e. fully serialising, against 113.6/159.8 from
+    pinned; 67-89 us of host stall per expert = 6.6-8.8 % of a prefill). A staging
+    slab is page-locked, so the upload the forward already issues becomes a real async
+    copy, and the read drops a 1.77 MB host clone per expert on the way.
+
+    None means "no staging slab available" — the caller takes the legacy clone path,
+    which is correct, just slower.
+    """
+    from .persist.safetensor_model_persister import load_expert_into_slab
+    arena = expert_cache.arena
+    if arena is None or not arena.staging_slabs:
+        return None
+    slab_idx = arena.acquire_staging(timeout=_STAGING_WAIT_BACKSTOP_S)
+    if slab_idx is None:
+        return None
+    try:
+        views = load_expert_into_slab(
+            shard_file, metas, arena.tensor(slab_idx),
+            # Mirrors the decode miss path exactly: O_DIRECT only from pinned
+            # memory, and no per-tensor repack (no production caller wants it).
+            allow_direct=arena.pin, tensor_align=False)
+    except Exception:
+        arena.release_staging(slab_idx)
+        raise
+    # Registered AFTER the read so a failed read cannot leave a phantom key, and
+    # keyed by (layer, expert) so the consuming forward can return exactly this slab.
+    _prefill_staged(vaayu_ref)[(layer_idx, eidx)] = slab_idx
+    # Register BEFORE this check, never after: the layer's finally may be sweeping
+    # right now (an exception mid-compute does not wait for in-flight loads). Either
+    # the sweep sees the key and releases it, or this does -- both are idempotent, so
+    # the slab cannot be stranded either way. A closed layer's expert falls back to
+    # the clone path rather than hold a slab nobody will consume.
+    if getattr(vaayu_ref, "_prefill_staging_closed", None) == layer_idx:
+        _release_prefill_staged(expert_cache, vaayu_ref,
+                                lambda k: k == (layer_idx, eidx))
+        return None
+    return views
+
+
+def _release_prefill_staged(expert_cache, vaayu_ref, pred) -> None:
+    """Return every staging slab whose (layer_idx, expert_idx) key matches `pred`.
+
+    Called three times per layer, and each one covers a case the others do not:
+    after an expert's uploads are issued (the fast path — the arena's read event,
+    already armed by record_read, covers the in-flight DMA); in the layer's finally
+    (experts the compute loop skipped, and an exception mid-layer); and at the next
+    layer's dispatch for any OTHER layer's leftovers, which self-heals a slab a
+    worker registered after its own layer had already swept.
+    """
+    arena = expert_cache.arena
+    staged = getattr(vaayu_ref, "_prefill_staged", None)
+    if arena is None or not staged:
+        return
+    for key in [k for k in list(staged) if pred(k)]:
+        slab_idx = staged.pop(key, None)
+        if slab_idx is not None:
+            arena.release_staging(slab_idx)
 
 
 def _dispatch_expert_misses(
@@ -2487,6 +2589,11 @@ def _dispatch_expert_misses(
     # compute raises partway through.
     _do_pin = expert_cache.arena is not None and not getattr(
         vaayu_ref, "_moe_prefill_pass", False)
+    if not _do_pin and expert_cache.arena is not None:
+        # Prefill. This layer is open for staging again, and any slab still
+        # registered for ANOTHER layer is a leftover nothing else will return.
+        vaayu_ref._prefill_staging_closed = None
+        _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] != layer_idx)
     pinned_keys: set = set()
     expert_tensors: dict = {}
     misses: list = []
@@ -2528,8 +2635,14 @@ def _dispatch_expert_misses(
                     f"[Vaayu-MoE] warn: no offset for {layer_name} expert {eidx}")
                 return eidx, None
             # Prefill: transient load, never cached (routes ~all experts
-            # once; caching would clone content decode replaces).
+            # once; caching would clone content decode replaces) -- but read into a
+            # reserved PINNED staging slab when one is armed, so the forward's
+            # upload is async instead of a stream-draining pageable copy (S1-L1).
             if getattr(vaayu_ref, "_moe_prefill_pass", False):
+                staged = _stage_prefill_expert(
+                    expert_cache, vaayu_ref, layer_idx, eidx, shard_file, metas)
+                if staged is not None:
+                    return eidx, staged
                 return eidx, load_expert_sparse(shard_file, metas)
             if expert_cache.arena is None:
                 # No arena (e.g. compute_slab_bytes()==0 or CUDA-less unit
@@ -2960,6 +3073,11 @@ def _make_fused_sparse_forward_exl3(
                         if _uk in _pinned_keys:
                             expert_cache.unpin(layer_idx, eidx)
                             _pinned_keys.discard(_uk)
+                    # Both branches above have issued this expert's copies and armed
+                    # the read event, so a prefill staging slab can go back to the
+                    # staging pool for the next expert's read (S1-L1).
+                    _release_prefill_staged(expert_cache, vaayu_ref,
+                                            lambda k: k == (layer_idx, eidx))
                     if _prof:
                         torch.cuda.synchronize(); _mp['h2d'] += time.perf_counter() - _t0
                     if _vram is not None:
@@ -3037,6 +3155,11 @@ def _make_fused_sparse_forward_exl3(
             # rest (VRAM hits, skipped/continued experts, exceptions).
             for _pk in _pinned_keys:
                 expert_cache.unpin(*_pk)
+            # Same for this layer's prefill staging slabs (S1-L1); the flag closes
+            # the layer so an in-flight load releases its own slab rather than
+            # registering one after this sweep.
+            vaayu_ref._prefill_staging_closed = layer_idx
+            _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
 
         if getattr(vaayu_ref, "_overlap_trace", False):
             print(f"[VAAYU-OVERLAP] compute_end layer={layer_idx} "

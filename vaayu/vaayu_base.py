@@ -453,6 +453,34 @@ def unclamped_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> 
     return max(1, int(budget_bytes) // int(slab_bytes)) + int(pool_size)
 
 
+# Pinned RAM this box will spend on prefill staging slabs (S1-L1). A HARDWARE
+# allowance, not a model number: 128 MiB of 32 GB, spent so prefill's expert
+# uploads leave page-locked memory instead of pageable clones (67-89 us of host
+# stall per expert load, 6.6-8.8 % of a prefill). The slab COUNT it buys is
+# derived from the model's own slab size.
+_PREFILL_STAGING_RAM_BYTES = 128 * 1024 * 1024
+
+
+def prefill_staging_slabs(pool_size: int, slab_bytes: int,
+                          max_bytes: int = _PREFILL_STAGING_RAM_BYTES) -> int:
+    """Slabs to reserve for transient prefill expert staging.
+
+    Twice the loader width, so a full set of worker threads can be reading while a
+    full set of completed loads waits for the compute loop to consume them — a
+    depth of exactly `pool_size` would idle the drive every time the consumer fell
+    behind. Capped by the pinned-RAM allowance above, which is what binds on a
+    large-expert model (MiniMax's ~8.4 MiB experts get 15 slabs, Qwen3-Next's
+    1.69 MiB ones get the full 16).
+
+    The depth is a read-ahead bound, never a capacity requirement: one slab still
+    serves a whole layer, just serialised.
+    """
+    slab_bytes = int(slab_bytes)
+    if slab_bytes <= 0:
+        return 0
+    return max(1, min(2 * int(pool_size), int(max_bytes) // slab_bytes))
+
+
 def clamp_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int,
                       working_set_bytes: int = 0) -> int:
     """Slab count whose pinned backing store is a power of two.
@@ -2770,6 +2798,8 @@ class VaayuBaseModel(GenerationMixin):
             else:
                 _slab_bytes = compute_slab_bytes(self._expert_offset_index)
             _pin = torch.cuda.is_available()
+            _staging_n = 0                      # S1-L1 prefill staging (armed below)
+            _staged = 0
             if _slab_bytes > 0:
                 # The pow2 clamp existed only because the backing store was ONE
                 # pinned allocation, which the caching host allocator charges at
@@ -2778,8 +2808,14 @@ class VaayuBaseModel(GenerationMixin):
                 # away: take the full unclamped count (Plan L; measured
                 # 2026-08-07, 9.14GB charged vs 17.18GB for one tensor, every
                 # slab kept, H2D unchanged).
+                # S1-L1: prefill stages its experts in slabs of their own, on TOP
+                # of the loader's landing zone, so neither the cache's budget nor
+                # the in-flight reserve pays for them. Derived from the loader width
+                # and this box's pinned-RAM allowance, never from the model.
+                _staging_n = prefill_staging_slabs(get_expert_pool_size(), _slab_bytes)
+                _withheld = get_expert_pool_size() + _staging_n
                 _n_slabs = unclamped_slab_count(
-                    _expert_budget, _slab_bytes, get_expert_pool_size())
+                    _expert_budget, _slab_bytes, _withheld)
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:
@@ -2805,7 +2841,7 @@ class VaayuBaseModel(GenerationMixin):
                 if _arena is not None and _arena.n_slabs < _arena.requested_n_slabs:
                     _kept, _why = degraded_arena_decision(
                         _arena.n_slabs, _arena.requested_n_slabs, _slab_bytes,
-                        get_expert_pool_size(), _geo["working_set_bytes"], _arena.pin)
+                        _withheld, _geo["working_set_bytes"], _arena.pin)
                     print(f"[Vaayu-MoE] WARNING: slab arena allocated only "
                           f"{_arena.n_slabs} of {_arena.requested_n_slabs} slabs "
                           f"({_arena.n_slabs * _slab_bytes / 1e9:.2f} of "
@@ -2836,10 +2872,28 @@ class VaayuBaseModel(GenerationMixin):
                           f"rss={_snap['rss'] / 1e9:.2f}GB priv_dirty={_snap['private_dirty'] / 1e9:.2f}GB "
                           f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
             if self._expert_slab_arena is not None:
+                # Arm prefill staging BEFORE the cache is built and budgeted: a
+                # reserved slab leaves the arena's free list, so the cache must be
+                # charged for what is actually left (S1-L1).
+                _staged = self._expert_slab_arena.reserve_staging(_staging_n)
+                if _staged:
+                    print(f"[Vaayu-MoE] Prefill expert staging: {_staged} x "
+                          f"{self._expert_slab_arena.slab_bytes / 1e6:.1f}MB "
+                          f"{'pinned' if self._expert_slab_arena.pin else 'pageable'} "
+                          f"slabs reserved ("
+                          f"{_staged * self._expert_slab_arena.slab_bytes / 1e6:.0f}MB) "
+                          f"— prefill uploads leave page-locked memory instead of "
+                          f"pageable clones")
+                elif _staging_n:
+                    # Never silent: without a staging slab prefill keeps the pageable
+                    # clone path, which costs 67-89 us of host stall per expert load.
+                    print(f"[Vaayu-MoE] WARNING: prefill expert staging DISABLED — "
+                          f"asked for {_staging_n} slabs, the arena had none free. "
+                          f"Prefill uploads stay pageable and synchronous.")
                 _arena_bytes = cache_budget_for_arena(
                     self._expert_slab_arena.n_slabs,
                     self._expert_slab_arena.slab_bytes,
-                    get_expert_pool_size())
+                    get_expert_pool_size() + _staged)
                 if _arena_bytes < _expert_budget:
                     # The trim fires whenever the arena's CACHE share is smaller
                     # than the requested budget — which includes the unclamped
@@ -2857,7 +2911,8 @@ class VaayuBaseModel(GenerationMixin):
                     print(f"[Vaayu-MoE] WARNING: Expert RAM cache DISABLED — the "
                           f"{self._expert_slab_arena.n_slabs}-slab arena has nothing "
                           f"beyond the {get_expert_pool_size()} in-flight staging slabs "
-                          f"the loader must keep free, so the cache gets 0 bytes. Every "
+                          f"the loader must keep free and the {_staged} reserved for "
+                          f"prefill staging, so the cache gets 0 bytes. Every "
                           f"expert streams from disk on every token; expect very slow "
                           f"decode (a real hardware limit on this box, not a bug).")
             self._expert_cache = ExpertRAMCache(

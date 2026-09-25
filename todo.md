@@ -81,8 +81,8 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5** | **DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2759 passed, 44 failed, 2 errors, 16 skipped` (~192 s,
-FOREGROUND).** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
+**Suite floor for every one of them: `2776 passed, 44 failed, 2 errors, 16 skipped` (~193 s,
+FOREGROUND) — raised from 2759 passed by S1-L1's 17 new tests on 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
 (attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors, checkpoint 1), never just the
 count. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -96,18 +96,143 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S1-L1** — then **S2**, then the rest of S3…S6 in order. ◀◀
+## ▶▶ PICK THIS NEXT: **S2** — then **S3…S6** in order. ◀◀
 
-**S1 CLOSED 2026-09-25 as a measured null (its row is immediately below). S1-L1 is taken OUT OF
-ORDER, ahead of S2, and the reason is written here because the S1…S6 table forbids silent
-reordering: S1-L1 is a PREFILL/TTFT item on the production model, and §0 ranks TTFT as this
-workload's top lever; S2 is a correctness cleanup on a counter. S2 is not dropped — it is next
-after S1-L1.** Handoff:
-[`…S1-L1-prefill-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-L1-prefill-pageable-h2d-HANDOFF.md).
+**S1 closed 2026-09-25 as a measured null and S1-L1 closed the same day as a WIN (+14.4 to +24.5 %
+prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax); both rows are below. S1-L1 was taken out of
+order ahead of S2 because it was a PREFILL/TTFT item on the production model and §0 ranks TTFT as this
+workload's top lever. That is done, so the sequence resumes at S2**, the chunk-major byte-counter leak
+(`moe_patch.py:1984-1986` resets OUTSIDE the `finally`) — hours of work, handoff
+[`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md).
 
-**S1-L1 is a LEAD, not a diagnosis.** The one thing S1 proves is that a copy COUNT is not a cost:
-its own headline number was wrong twice, and both of its candidate fixes lost. Attribute the 27,084
-copies to call sites and check whether they drain the stream BEFORE proposing anything.
+**Two live leads S1-L1 did NOT chase, still open in the S1 row below:** **S1-L2** (96.5 pageable DtoH
+per decode forward) and **S1-L3** (`fla` is not installed, which is why the pure-torch fallback runs at
+all — an S3 decision). **The suite floor is now `2776 passed, 44 failed, 2 errors, 16 skipped`** (was
+2759 passed; +17 from `tests/test_prefill_staging_slabs.py`), same failing SET.
+
+---
+
+## S1-L1 — `[x]` prefill's pageable HtoD. **CLOSED 2026-09-25, A WIN: prefill TTFT +14.4 % to +24.5 % on Qwen3-Next, +17.5 % to +18.9 % on MiniMax, greedy ids bit-identical, decode flat.**
+
+**Shipped, wired and reachable at N=1** (the fix, its A/B and §8 are at the end of this row).
+
+**It is no longer a lead. One call site is 99.85 % of the copies and 99.5 % of the bytes, the copies
+are FULLY SYNCHRONOUS (they drain the stream despite `non_blocking=True`, because the source is
+pageable), and the host-side prize is measured at 89.1 µs per expert load.** Detail:
+`docs/2026-09-25-S1-L1-prefill-pageable-h2d-RESULTS.md` (gitignored); probes
+`plans/probes/s1l1_attrib.py` (python `.to`/`.cuda`/`.copy_` interception by call site, cross-checked
+against CUPTI in the same forward) and `plans/probes/s1l1_copycost.py` (pageable-vs-pinned pricing at
+the real shapes); raw `plans/probes/s1_out/s1l1-*.json`.
+
+**Attribution — one 135-token prefill forward, Qwen3-Next, cold expert RAM cache.** The python
+counter and CUPTI agree EXACTLY (56,628 = 56,628), so the python table *is* the attribution; no
+trace parsing was needed.
+
+| site | n | bytes each | GB | what it is |
+|---|---|---|---|---|
+| **`moe_patch.py:600` `_expert_dense_weights`** | **56,544 (99.85 %)** | 524,288 + 65,536 | **16.676 (99.5 %)** | 9,424 expert loads × 3 roles × {`weight_packed`, `weight_scale`} |
+| `moe_patch.py:2310` `sparse_forward` | 48 | 21,600 | 0.001 | `_pair_gpu` — **this is S1-b, already refuted; do not re-chase** |
+| `modeling_qwen3_next.py:426` `torch_chunk_gated_delta_rule` | 36 | 2,097,152 | 0.075 | prefill's sibling of S1-a's `:470` (decode). 0.4 % of the bytes |
+
+**Root cause, in two lines of shipped code.** `moe_patch.py:2532` — on `_moe_prefill_pass` the shared
+miss loader returns `load_expert_sparse(...)`, deliberately bypassing the slab arena ("transient load,
+never cached"). `safetensor_model_persister.py:907` — `load_expert_sparse` reads into a PINNED pool
+buffer and then **`tensor.clone()`s every tensor out into pageable RAM**, because the pool buffer must
+go straight back to the pool. So prefill pays a 1.77 MB host memcpy per expert (**16.7 GB per
+prefill**) and then a pageable, stream-draining H2D of the clone. Decode escapes both via the arena
+(row 30-P, +10.62 %). The module-list forward is on the SAME path and says so at
+`moe_patch.py:1875-1878` ("a prefill clone … is in no slab -> None -> synchronous").
+
+**The count is cache-state-dependent; the per-expert cost is not.** 56,628 pageable copies cold
+(every expert a miss) vs S1's **27,084** on a warm arm — a warm RAM-cache hit copies from a PINNED
+slab view and is already async. Prefill itself never warms the cache (it does not insert), so only
+decode does: **a first request is ~100 % pageable, a steady-state one ~48 %.**
+
+**Priced (`s1l1_copycost.py`, 300 experts/arm, ABBA, real shapes, dequant+3 GEMMs queued behind each
+load so a blocking copy pays its drain):** pageable **202.8 µs host / 202.9 µs device** — host equals
+device to 0.05 %, i.e. **fully serialising** — vs pinned **113.6 µs host / 159.8 µs device** (host
+runs ahead, so it is genuinely async). **Delta 89.1 µs of host stall per expert load**, arms cleanly
+separated (pageable 205.5/200.1, pinned 113.5/113.8).
+
+| prompt | expert loads | prefill (unprofiled) | H2D bytes | host prize @89.1 µs | share |
+|---|---|---|---|---|---|
+| 135 tok, 1 chunk | 9,424 | **7.18–8.80 s** | 16.75 GB | 0.840 s | **11.7 %** cold, ~5.6 % steady-state |
+| 2,048 tok, 4 chunks | 16,276 | **16.57–16.98 s** | 28.89 GB | 1.451 s | **8.8 %** cold, ~4.2 % steady-state |
+
+Both are far above the handoff's ~1 %-of-prefill stop rule and above the 0.36 % real-arm resolution
+floor, and the clone at `:907` (16.7 GB of host memcpy) is deleted by the same fix on top of that.
+**Prefill is N=1 and is what the server runs, so unlike P8 (§8(3)) this is a real user win.**
+
+**The cheap fix was REFUTED before it was built, and this is the S1-b lesson repeating.** Cloning
+into PINNED RAM instead of pageable (a 3-line change in `load_expert_sparse`, every lifetime
+unchanged) measures **−10.0 µs/expert — SLOWER than the code already there**: the pinned clone costs
+**109.1 µs** against the pageable clone's **34.0 µs** (the CachingHostAllocator's `copy_` into a
+page-locked block is 3.2× a plain clone), which eats the whole async-upload gain. Do not rebuild it.
+Copying with NO clone, straight out of pinned memory, is **+67.4 µs/expert** in the same probe
+(`plans/probes/s1l1_pinnedclone.py`, arms A/B/C/C/B/A).
+
+**What SHIPPED (the handoff's own preference #1 — "put it in the arena, not pin at the copy").**
+`SlabArena` withholds slabs from its own free list for TRANSIENT prefill staging
+(`reserve_staging`/`acquire_staging`/`release_staging`, `vaayu/persist/expert_cache.py`); prefill's
+branch of the SHARED miss loader reads each expert into one with `load_expert_into_slab` — decode's
+zero-clone path — instead of `load_expert_sparse` (`_stage_prefill_expert`, `moe_patch.py`). A staging
+slab IS an arena slab, so `slab_index_of` keeps answering and **all three forwards' existing
+`record_read` guard and the module-list forward's `pinned_source=` flag light up with no per-forward
+special case**; each forward returns the slab as its uploads issue and sweeps the layer's leftovers in
+the `finally` it already had.
+
+- **`acquire_staging` BLOCKS** (5 s backstop, `_STAGING_WAIT_BACKSTOP_S`, the spirit of
+  `_LOAD_WAIT_BACKSTOP_S`). This is the design decision the win depends on: completed-but-unconsumed
+  loads hold their slabs and a layer routes 196-339 experts against 15-16 slabs, so an immediate
+  fallback would have left ~92 % of experts pageable. Blocking bounds read-ahead to the staging depth,
+  which is also what the drive wants (P8: past ~4 concurrent reads throughput FALLS). **Measured
+  coverage 100 %** (7,525/7,525 and 11,466/11,466 expert loads staged, zero clones).
+- **No deadlock:** `_iter_expert_loads` consumes in COMPLETION order, so the consumer always has
+  something to consume and release while workers wait. **No permanent leak:** the worker registers its
+  slab BEFORE checking whether its layer has torn down, so either the layer's sweep releases it or the
+  worker does (both idempotent), and the next layer's dispatch releases any other layer's leftovers.
+- **Sizing (§5):** `prefill_staging_slabs(pool_size, slab_bytes)` = twice the loader width, capped by a
+  **128 MiB pinned-RAM allowance (a HARDWARE number)** — Qwen 16 × 1.79 MB = 28 MB, MiniMax
+  15 × 8.89 MB = 133 MB. The arena is requested with these ON TOP of the loader's landing zone and the
+  cache is charged for what is left, so **the expert RAM cache loses nothing.** Reservation failure
+  WARNS at load and prefill keeps the clone path.
+
+**A/B — ABBA, arms alternating inside ONE model load, prefill forward wall clock, unprofiled, prefix
+cache OFF, arena byte-identical in both arms (`plans/probes/s1l1_ab.py`):**
+
+| model / forward | prompt | OFF (s) | ON (s) | delta | arm sd |
+|---|---|---|---|---|---|
+| **Qwen3-Next-80B int4**, fused non-EXL3 | 135 | 4.649 / 4.668 | 3.846 / 3.882 | **+17.06 %** | 0.55 % |
+| | 2,048 | 10.814 / 10.833 | 9.285 / 9.238 | **+14.43 %** | 0.31 % |
+| | 135, 3 arms/side | 4.228 / 4.293 / 4.250 | 3.102 / 3.338 / 3.201 | **+24.51 %** | 2.78 % |
+| **MiniMax-M2.7 EXL3**, module-list | 135 | 20.272 / 20.336 | 16.468 / 16.452 | **+18.93 %** | 0.23 % |
+| | 2,048 | 33.686 / 33.966 | 27.765 / 28.028 | **+17.53 %** | 0.59 % |
+
+Every ON arm is separated from every OFF arm with no overlap. **Greedy ids IDENTICAL across all arms,
+both models, both lengths** (plus a CPU bit-identity test in the suite). **Decode flat:** five paired
+comparisons read −5.17 / −1.74 / −0.87 / +0.07 / +1.93 %, no consistent sign, each inside its
+within-state arm spread (the −5.17 % is one ON arm at 353.6 ms against its twin at 308.3 ms); and
+mechanically decode cannot move — staging is reached only under `_moe_prefill_pass`, cache capacity is
+unchanged by construction, and the release helper early-returns on an empty dict. The realised win
+(195 µs/expert at 135 tok) EXCEEDS the 89 µs priced, because the fix also deletes the 1.77 MB host
+clone per expert and reads O_DIRECT into page-locked memory.
+
+**§8, all four:** (1) **no knob — stated, not assumed**: the depth derives from
+`get_expert_pool_size()` and a hardware allowance, the fallback is automatic and warns, so nothing was
+added to `vaayu/server/config.py`, `vaayu/server/README.md` or `documentation/` (which documents
+knobs, and there is no new one); (2) **plumbed** — armed at load in `vaayu_base.py` for every MoE model
+that gets an arena, and the A/B loaded through `AutoModel.from_pretrained` with the server's own
+config values, the path `app.py` uses; (3) **REACHABLE, and that is the point — prefill at N=1, which
+`engine.py` runs for every request.** A user's TTFT falls 14-25 % on the production model; this is not
+a P8-style N>1 effect; (4) n/a.
+
+**Gates run:** full suite FOREGROUND **2776 passed, 44 failed, 2 errors, 16 skipped in 193.44 s** —
+2759 + 17 new tests, failing SET verified member-by-member (attention 21, parity 8, moe 8, linear 4,
+model 2, block 2 errors, checkpoint 1, all the S4 shard-deletion class). Both MoE accumulator gates
+FOREGROUND at `MemoryMax=29G`: **Qwen 8 passed / 33.58 s, MiniMax 8 passed / 76.16 s**. New tests
+`tests/test_prefill_staging_slabs.py` (17). **No fused-EXL3 arm exists** (no model on disk) so that
+forward's release call is covered by unit tests only, and **dense has no committed gate** — said,
+neither claimed.
 
 ---
 
@@ -183,7 +308,7 @@ under `vaayu/` changed.** No fused-EXL3 arm exists and dense has no committed ga
 
 ### Leads S1 recorded and deliberately did NOT chase
 
-- **[~] S1-L1 — ~27,084 pageable HtoD in ONE 135-token PREFILL forward. PICKED NEXT 2026-09-25; handoff `docs/superpowers/specs/2026-09-25-S1-L1-prefill-pageable-h2d-HANDOFF.md`.** Counted in the S1 A/B
+- **[x] S1-L1 — ~27,084 pageable HtoD in ONE 135-token PREFILL forward. CLOSED 2026-09-25 as a WIN — see the S1-L1 row above, which supersedes this bullet** (one site, `moe_patch.py:600`, 99.85 % of the copies; 89.1 µs of host stall per expert load; prefill TTFT +14.4 to +24.5 % once they came out of pinned staging slabs). Handoff `docs/superpowers/specs/2026-09-25-S1-L1-prefill-pageable-h2d-HANDOFF.md`. Counted in the S1 A/B
   (fix off; 27,048 with S1-a's 36 removed). Decode's expert loads are NOT pageable — the slab
   arena's async path works there (row 30-P) — so this is **prefill-only**. Prefill is TTFT, this
   workload's top lever (CLAUDE.md §0), and the number is ~320× the entire decode-side finding.
