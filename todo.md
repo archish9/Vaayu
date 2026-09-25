@@ -2628,7 +2628,10 @@ and both have a golden reference or a Vaayu precedent.
       this task's scope).
 
       **A5.7c CLOSED 2026-09-25 — summary for a reader who only has this row.** Full suite:
-      **2748 passed, 44 failed, 2 errors, 16 skipped, 189.71s**; all 46 non-passing are the
+      **2748 passed, 44 failed, 2 errors, 16 skipped, 189.71s** at the Task-3 gate, and
+      **2756 passed, 44 failed, 2 errors, 16 skipped, 191.88s at the BRANCH TIP** (`2aea6dc`) — the
+      +8 are Task 4's 3 subclass tests and the final-review fix wave's 5, and the 46 non-passing are
+      the same set throughout; all 46 non-passing are the
       pre-existing shard-deletion breakage (its own `[bug]` row below), and 2748 + 46 = 2794 =
       the 2778 pre-deletion floor + A5.7c's 16 new tests, so nothing regressed. Both on-device MoE
       accumulator gates green, foreground at `MemoryMax=29G`: **Qwen3-Next-80B-A3B int4 AWQ (fused
