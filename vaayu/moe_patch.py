@@ -1109,6 +1109,93 @@ def dispatches_whole_layer(block_info: "MoEBlockInfo", offset_index) -> bool:
         getattr(block_info.moe_module, block_info.experts_attr))
 
 
+class PackedInjectionError(RuntimeError):
+    """A streamed expert tensor could not be reinterpreted into its target's
+    packed dtype.
+
+    Distinct from every other injection failure because skipping the expert
+    cannot recover it: the bytes on disk are right and the engine's handling of
+    them is wrong. _inject_expert_weights re-raises this past the warn-and-skip
+    every other failure takes — print-and-continue is how 769 parameters were
+    left on meta while a load reported success (A5.7b).
+    """
+
+
+# Target dtypes an injected tensor must be REINTERPRETED into (.view), never
+# numerically cast into. Two different silent corruptions live here:
+#   * float4_e2m1fn_x2 — packed, two values per byte. A cast reads the packed
+#     bytes as literal values, and the unpacked K axis is half the real one.
+#   * float8_e8m0fnu — a scale format a kernel reads back off scale.dtype
+#     (DeepseekV4Linear.forward: scale_fmt = "ue8m0" if scale.dtype is this).
+#     A cast to bf16 SUCCEEDS SILENTLY and turns scale_fmt into None.
+# This names a class of torch dtype, not a model number (CLAUDE.md §5). A model
+# that declares none of them injects exactly as it did before this list existed.
+# hasattr-guarded because moe_patch is shared infrastructure every model
+# imports: on a torch without these dtypes the tuple shrinks and the injector
+# keeps its old behaviour, rather than failing at import for every model.
+NO_CAST_INJECTION_DTYPES: tuple = tuple(
+    getattr(torch, _name)
+    for _name in ("float4_e2m1fn_x2", "float8_e8m0fnu")
+    if hasattr(torch, _name)
+)
+
+
+def _inject_no_cast(tensor, target, target_dtype, device, submod_path, base,
+                    layer_name, expert_idx, pinned_source):
+    """Move ONE streamed tensor to `device` and reinterpret its bytes as
+    `target_dtype`, which the target parameter declared and which must never be
+    cast into (see NO_CAST_INJECTION_DTYPES).
+
+    Both guards exist because `.view(dtype)` is not defensive: with a differing
+    element size it silently RESCALES the last dimension (a float32 (4, 2)
+    viewed as int8 is (4, 8)), so a wrong source dtype would reach the kernel as
+    a wrongly-shaped weight rather than as an error. No cast is requested, so
+    _copy_async_ok can still grant a non-blocking copy from the slab arena
+    (row 49) — which a cast would have forfeited.
+
+    A third guard runs first: the element-size check alone would pass a source
+    dtype that merely happens to share the target's width (e.g. float8_e4m3fn
+    against a float8_e8m0fnu target — both 1 B/elem, verified: `.view` between
+    them succeeds). This checkpoint ships both formats (routed-expert scales as
+    e8m0, shared-expert/attention weights as e4m3), so a repack or sibling
+    checkpoint that ships the wrong one against this skeleton would pass both
+    the width and shape guards and have its bits silently read as the wrong
+    format. Refusing anything but the target dtype itself or a raw byte
+    container (uint8/int8) closes that on the source side, the same way the
+    allowlist already closes it on the target side.
+    """
+    if tensor.dtype is not target_dtype and tensor.dtype not in (torch.uint8, torch.int8):
+        raise PackedInjectionError(
+            f"{layer_name} expert {expert_idx} {submod_path}.{base}: refusing to "
+            f"reinterpret a {tensor.dtype} tensor as {target_dtype} -- only the "
+            f"target dtype itself or a raw byte container (uint8/int8) may be "
+            f"reinterpreted, and every 1-byte dtype would pass the width check")
+    if tensor.element_size() != target_dtype.itemsize:
+        raise PackedInjectionError(
+            f"{layer_name} expert {expert_idx} {submod_path}.{base}: cannot "
+            f"reinterpret {tensor.dtype} ({tensor.element_size()} B/elem) as "
+            f"{target_dtype} ({target_dtype.itemsize} B/elem) — .view would "
+            f"rescale the last dimension instead of refusing")
+    if tuple(tensor.shape) != tuple(target.shape):
+        raise PackedInjectionError(
+            f"{layer_name} expert {expert_idx} {submod_path}.{base}: the "
+            f"checkpoint ships {tuple(tensor.shape)} but the skeleton declares "
+            f"{tuple(target.shape)} for {target_dtype}")
+    try:
+        return tensor.to(
+            device, non_blocking=_copy_async_ok(pinned_source, tensor, None)
+        ).view(target_dtype)
+    except torch.cuda.OutOfMemoryError:
+        # A transient VRAM shortage, not a packed-dtype defect: it must keep its
+        # own type so vaayu_base's isinstance-based OOM retry can still see it,
+        # and so it is not reported as "the bytes are right, the engine is wrong".
+        raise
+    except Exception as e:
+        raise PackedInjectionError(
+            f"{layer_name} expert {expert_idx} {submod_path}.{base}: "
+            f"{tensor.dtype} → {target_dtype} reinterpret failed: {e}") from e
+
+
 def _copy_async_ok(pinned_source: bool, tensor, dtype) -> bool:
     """Whether ONE host-to-device copy of `tensor` may run non_blocking.
 
@@ -1205,8 +1292,25 @@ def _inject_expert_weights(
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _t0 = time.perf_counter()
-                t = tensor.to(device, dtype=dtype,
-                              non_blocking=_copy_async_ok(pinned_source, tensor, dtype))
+                # The target parameter's OWN declared dtype decides this, read
+                # off the live module: one attribute read per streamed tensor
+                # (~6 per expert) instead of self.model.get_parameter()'s string
+                # walk through the whole tree, in the decode hot path. Safe
+                # because the dtype is a fixpoint of this forward's cycle —
+                # .to("meta") in _detach_expert preserves it, and
+                # _attach_cached_expert re-binds an already-reinterpreted
+                # tensor. None (no such attribute, as on an EXL3-swapped
+                # ExLlamaV3Linear, or a parameter registered None) is not in the
+                # tuple, so it takes the cast path unchanged.
+                target = getattr(submod, base, None)
+                target_dtype = target.dtype if target is not None else None
+                if target_dtype in NO_CAST_INJECTION_DTYPES:
+                    t = _inject_no_cast(tensor, target, target_dtype, device,
+                                        submod_path, base, layer_name,
+                                        expert_idx, pinned_source)
+                else:
+                    t = tensor.to(device, dtype=dtype,
+                                  non_blocking=_copy_async_ok(pinned_source, tensor, dtype))
                 if timing is not None:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -1224,6 +1328,12 @@ def _inject_expert_weights(
                         setattr(submod, base, nn.Parameter(t, requires_grad=False))
                 else:
                     setattr(submod, base, nn.Parameter(t, requires_grad=False))
+        except PackedInjectionError:
+            # Not skippable: the disk bytes are right and this engine's handling
+            # of them is wrong, so every expert in every layer would hit it.
+            # _load_inject_run's `finally` still runs _detach_expert, so nothing
+            # is left bound off-meta on the way out.
+            raise
         except Exception as e:
             _log.warning(
                 f"Expert weight inject failed: {submod_path} ({list(bases)}): {e}"

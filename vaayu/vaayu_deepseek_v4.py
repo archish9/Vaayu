@@ -17,14 +17,12 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 
 from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
 from .vaayu_base import VaayuBaseModel
-
 # Packed/opaque torch dtypes that must be REINTERPRETED (`.view`) rather than
-# numerically cast when injected -- see `move_layer_to_device` below. This
-# names a torch dtype class, not a model number (CLAUDE.md §5): today only
-# DeepSeek-V4's routed-expert weights (`config.expert_dtype == "fp4"`) are
-# this shape, but the set is written for the class of problem, not the one
-# checkpoint.
-_PACKED_INJECTION_DTYPES = (torch.float4_e2m1fn_x2,)
+# numerically cast when injected -- see `move_layer_to_device` below. ONE
+# definition, shared with `moe_patch`'s expert-streaming injector (A5.7c):
+# the invariant is a property of the dtype, not of a path or a model, and two
+# copies is how one path grows a dtype the other lacks.
+from .moe_patch import NO_CAST_INJECTION_DTYPES as _PACKED_INJECTION_DTYPES
 
 
 class VaayuDeepseekV4(VaayuBaseModel):
@@ -119,6 +117,36 @@ class VaayuDeepseekV4(VaayuBaseModel):
             kwargs["attn_implementation"] = "eager"
 
         super().__init__(*args, **kwargs)
+
+        # `patch_moe_blocks` (inside the `super().__init__()` call just above)
+        # replaces each block's `moe_module.forward` with `moe_patch`'s generic
+        # module-list forward, which ALWAYS returns `(hidden_states,
+        # router_logits)` -- every caller is expected to unpack it itself.
+        # `vaayu_base.py`'s own layer-major loop does that one level up, for
+        # the DECODER LAYER's return (`layer_out[0] if isinstance(tuple)`),
+        # but this architecture's decoder-layer code is DeepSeek's OWN
+        # reference implementation (loaded via `trust_remote_code`, not
+        # patched by Vaayu): `x = self.ffn(x)` expects a single tensor back
+        # and feeds it straight into `hc_post`'s `x.unsqueeze(-2)`. A tuple
+        # there raises `AttributeError: 'tuple' object has no attribute
+        # 'unsqueeze'` (Task 4, first on-device run). The pinned-layer branch
+        # of the same patched forward calls straight through to the
+        # ORIGINAL `DeepseekV4MoE.forward`, which returns a plain tensor
+        # already (`-> torch.Tensor`), so the unwrap below has to tolerate
+        # both shapes rather than assume a tuple.
+        #
+        # Fixed here, confined to this model class: every other model's
+        # `moe_module.forward` (patched by the same `moe_patch.py`) is left
+        # exactly as `patch_moe_blocks` set it.
+        for _block in getattr(self, "_moe_blocks", []):
+            _patched_forward = _block.moe_module.forward
+
+            def _unwrap_ffn_tuple(hidden_states, *fargs, _wrapped=_patched_forward,
+                                  **fkwargs):
+                out = _wrapped(hidden_states, *fargs, **fkwargs)
+                return out[0] if isinstance(out, tuple) else out
+
+            _block.moe_module.forward = _unwrap_ffn_tuple
 
     def _running_module(self):
         """The module object the LOADED model actually runs from.
@@ -229,10 +257,22 @@ class VaayuDeepseekV4(VaayuBaseModel):
            dtype cast and reinterpret them (`.view(target_dtype)`) -- the
            disk tensor and the packed dtype have the same per-element byte
            count, so this is a bit-reinterpret, never a reshape. Ordinary
-           tensors (including this checkpoint's own `F8_E8M0` scales, an
-           arithmetic float8 format that casts through `running_dtype`
-           without incident) are untouched -- only the packed-dtype target
-           takes this branch.
+           tensors are untouched -- only an allowlisted target takes this
+           branch.
+
+           **The `F8_E8M0` scales are safe HERE and were not safe on the
+           expert path, and the difference is the injection call (A5.7c).**
+           `set_module_tensor_to_device` coerces its `value` back to the
+           declared parameter dtype, and bf16 round-trips both `e8m0` and
+           `e4m3` losslessly, so a scale cast through `running_dtype` lands
+           back in `float8_e8m0fnu` on this path. `moe_patch`'s
+           `_inject_expert_weights` binds with
+           `setattr(submod, base, nn.Parameter(t))` and gets no such
+           coercion, so the same cast left the scale bf16 --
+           `DeepseekV4Linear.forward` reads the quantization format back off
+           `scale.dtype`, so that silently turned `scale_fmt` into None. The
+           allowlist now names `e8m0` for both paths, which on this one
+           replaces a lossless round-trip with no conversion at all.
         2. **`wo_a.scale`.** `wo_a` is declared bf16 in the skeleton (a
            deliberate choice -- see `modeling_deepseek_v4.py`'s comment
            beside it), so its `scale` Parameter is `None` by design, and
@@ -515,9 +555,26 @@ class VaayuDeepseekV4(VaayuBaseModel):
         hooks -- recorded here and asserted in `get_pos_emb_args`, which the
         layer-major loop evaluates immediately after this one
         (`vaayu_base.py:5222`).
+
+        Reads the LAST layer's own count, never the default `layer_idx=0`
+        (Task 4, first real forward pass): `DeepseekV4Cache` gives every layer
+        an INDEPENDENT `cumulative_length`, bumped only when that layer's own
+        `update()` runs. This hook and `get_pos_emb_args` are called once per
+        DECODER LAYER, in layer order, within a single token/chunk step
+        (`vaayu_base.py:5205-5222`) -- so by the time layer 1's kwargs are
+        built, layer 0 has already run and bumped ITS count for this step,
+        and `get_seq_length()`'s default (`layer_idx=0`) reports that
+        post-write number while every other layer is still pre-write. Checked
+        against the pre-step `len_p`, that looks exactly like "the cache moved
+        out from under us" and raised on the very first prefill
+        (`AttributeError`-adjacent RuntimeError, layer 1 of 43, every time).
+        The LAST layer is the only index that stays at the pre-step value for
+        every layer's kwargs within the step, including its own (built before
+        it runs) -- `num_hidden_layers` off the config, never a literal.
         """
         self._cache_seq_len = (
-            past_key_values.get_seq_length() if past_key_values is not None else None)
+            past_key_values.get_seq_length(self.config.num_hidden_layers - 1)
+            if past_key_values is not None else None)
         return {"past_key_values": past_key_values}
 
     def get_pos_emb_args(self, len_p, len_s):
