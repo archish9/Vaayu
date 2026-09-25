@@ -127,7 +127,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 **Done means:**
 - real-token ABBA ≤ −2 % (else revert);
-- `serial` ≤ −3.67 ms (half the microbench; else find out why before claiming);
+- `serial` ≤ −3.66 ms (half the microbench; else find out why before claiming);
 - D6 6-draw ppl band: fused mean − stock mean ≤ pooled sd (one retry with bf16 l2norm, else revert);
 - conv state bit-exact and fused ≤ 1.25× stock's fp64 error on 2 geometries;
 - suite floor → **2874 passed, 44 failed, 2 errors, 16 skipped** (+97), same failing SET;
@@ -174,9 +174,9 @@ on 2026-09-25. Re-prioritise then, not now.
   every phase gives r3/r4 above.
 
 **Leads banked:**
-- [ ] **S3-B** — the 18 forward-body ops per mixer (gating, `repeat_interleave`, cat, reshape copies),
-  measured ~3.9 ms/token of ceiling before this build; reaching them means replacing the stock forward
-  body, priced against what remains of the 11.15 ms ceiling now that `serial` has fallen 4.3 ms of it.
+- [ ] **S3-B** — the 18 forward-body ops per mixer (gating, `repeat_interleave`, cat, reshape copies);
+  reaching them means replacing the stock forward body — price against what remains of the 11.15 ms
+  ceiling after this build (`serial` fell 4.3 ms of it).
 - [ ] **S3-C** — `fla`'s prefill chunk kernel, ~10× the torch chunk fallback (0.36 → 0.03 s per 2k
   prompt, ~2 % TTFT); a new-dependency decision.
 
