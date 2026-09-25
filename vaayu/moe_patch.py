@@ -1152,7 +1152,24 @@ def _inject_no_cast(tensor, target, target_dtype, device, submod_path, base,
     a wrongly-shaped weight rather than as an error. No cast is requested, so
     _copy_async_ok can still grant a non-blocking copy from the slab arena
     (row 49) — which a cast would have forfeited.
+
+    A third guard runs first: the element-size check alone would pass a source
+    dtype that merely happens to share the target's width (e.g. float8_e4m3fn
+    against a float8_e8m0fnu target — both 1 B/elem, verified: `.view` between
+    them succeeds). This checkpoint ships both formats (routed-expert scales as
+    e8m0, shared-expert/attention weights as e4m3), so a repack or sibling
+    checkpoint that ships the wrong one against this skeleton would pass both
+    the width and shape guards and have its bits silently read as the wrong
+    format. Refusing anything but the target dtype itself or a raw byte
+    container (uint8/int8) closes that on the source side, the same way the
+    allowlist already closes it on the target side.
     """
+    if tensor.dtype is not target_dtype and tensor.dtype not in (torch.uint8, torch.int8):
+        raise PackedInjectionError(
+            f"{layer_name} expert {expert_idx} {submod_path}.{base}: refusing to "
+            f"reinterpret a {tensor.dtype} tensor as {target_dtype} -- only the "
+            f"target dtype itself or a raw byte container (uint8/int8) may be "
+            f"reinterpreted, and every 1-byte dtype would pass the width check")
     if tensor.element_size() != target_dtype.itemsize:
         raise PackedInjectionError(
             f"{layer_name} expert {expert_idx} {submod_path}.{base}: cannot "
@@ -1168,6 +1185,11 @@ def _inject_no_cast(tensor, target, target_dtype, device, submod_path, base,
         return tensor.to(
             device, non_blocking=_copy_async_ok(pinned_source, tensor, None)
         ).view(target_dtype)
+    except torch.cuda.OutOfMemoryError:
+        # A transient VRAM shortage, not a packed-dtype defect: it must keep its
+        # own type so vaayu_base's isinstance-based OOM retry can still see it,
+        # and so it is not reported as "the bytes are right, the engine is wrong".
+        raise
     except Exception as e:
         raise PackedInjectionError(
             f"{layer_name} expert {expert_idx} {submod_path}.{base}: "

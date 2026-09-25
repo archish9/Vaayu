@@ -2503,8 +2503,10 @@ and both have a golden reference or a Vaayu precedent.
       forward's twin cast** — `_make_fused_sparse_forward`'s injector casts the same way and
       gpt-oss's MXFP4 experts will hit it, but gpt-oss cannot load (G1: expert index matches 0/459
       tensors), so a fix there is untestable code on Qwen3-Next's perf-tuned path (user's call
-      2026-09-25); (b) **shared `warn` → `raise`** in `_inject_expert_weights`, a behaviour change on
-      two production forwards; (c) **A4 check 2's finding** (0 non-expert-pinned transformer layers,
+      2026-09-25); (b) **`warn` → `raise`** in `_inject_expert_weights` — corrected 2026-09-25
+      (final-review M3): that function has exactly one call site, the module-list forward, so this is
+      a behaviour change on MiniMax-M2.7 only, not "two production forwards" as first written here;
+      (c) **A4 check 2's finding** (0 non-expert-pinned transformer layers,
       budget 3.34 GiB vs an 8.24 GiB dense footprint).
       **TASK 3 GATES, RUN 2026-09-25.** Full suite `./venv/bin/python -m pytest -q` →
       **44 failed, 2748 passed, 16 skipped, 2 errors in 189.71s** — BELOW this row's own corrected
@@ -2653,24 +2655,31 @@ and both have a golden reference or a Vaayu precedent.
 
 - [!] **The fused forward's twin cast — BLOCKED 2026-09-25, decided out of scope by the user.**
       `_make_fused_sparse_forward`'s own expert injection casts streamed tensors to the running dtype
-      exactly as `_inject_expert_weights` did before A5.7c — same defect class, a different forward.
-      gpt-oss-20b's MXFP4 experts (fused-3D `mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]`)
-      would hit it. **Not fixed, and here is why:** gpt-oss cannot load at all today (row 47 / gap
-      G1 — the expert-offset index matches 0 of its 459 tensors and does not raise), so a fix on this
-      forward would be untestable code sitting on `_make_fused_sparse_forward` — Qwen3-Next's
-      perf-tuned, most-tested path (CLAUDE.md §0). **Unblocked by G1**: once gpt-oss loads, this
-      becomes testable; until then, leave this forward alone for this reason.
+      exactly as `_inject_expert_weights` did before A5.7c — same defect class, a different forward,
+      and a different FUNCTION: the fused cast lives in `_expert_dense_weights`
+      (`moe_patch.py:625-627`, called at `:2327`), not in `_inject_expert_weights` at all — the two
+      never shared code. gpt-oss-20b's MXFP4 experts (fused-3D `mlp.experts.gate_up_proj_blocks`, U8
+      `[32, 5760, 90, 16]`) would hit it. **Not fixed, and here is why:** gpt-oss cannot load at all
+      today (row 47 / gap G1 — the expert-offset index matches 0 of its 459 tensors and does not
+      raise), so a fix on this forward would be untestable code sitting on `_make_fused_sparse_forward`
+      — Qwen3-Next's perf-tuned, most-tested path (CLAUDE.md §0). **Unblocked by G1**: once gpt-oss
+      loads, this becomes testable; until then, leave this forward alone for this reason.
 
 - [ ] **`_inject_expert_weights`'s warn-and-skip stays a silent drop, deliberately, out of A5.7c's
       scope.** Every non-packed injection failure still logs a warning and `return None`s, silently
       dropping that expert from the token — unchanged, verbatim, from before A5.7c. A5.7c added
       `PackedInjectionError` only for its own new no-cast branch (`NO_CAST_INJECTION_DTYPES`),
-      deliberately leaving this shared path alone. **Why it is not a quick follow-up:** turning
-      `warn` + `return None` into a raise here is a behaviour change on BOTH forwards that share
-      `_inject_expert_weights` — the module-list forward (MiniMax-M2.7, production) and the fused
-      forward (Qwen3-Next, production) — so it needs both on-device MoE accumulator gates green AND a
-      deliberate decision about raising mid-decode (today a dropped expert degrades output silently;
-      a raise would kill the request instead). Not started.
+      deliberately leaving this shared path alone. **Corrected 2026-09-25 (final-review M3): this
+      does NOT touch both forwards.** `_inject_expert_weights` has exactly ONE call site
+      (`moe_patch.py:1858`), inside `_make_modulelist_sparse_forward` — the module-list forward
+      (MiniMax-M2.7, production). The fused forward (Qwen3-Next, production) never calls it; its own
+      cast is `_expert_dense_weights` (`moe_patch.py:625-627`), untouched by A5.7c. So Qwen3-Next's
+      green accumulator gate is a non-regression result on a forward this branch does not touch, not
+      both-paths coverage of it — the change is narrower and safer than this row previously claimed.
+      **Why it is not a quick follow-up regardless:** turning `warn` + `return None` into a raise on
+      the module-list forward still needs that on-device MoE accumulator gate green AND a deliberate
+      decision about raising mid-decode (today a dropped expert degrades output silently; a raise
+      would kill the request instead). Not started.
 
 - [ ] **Row 28's reach-projection METHOD does not hold on DeepSeek-V4-Flash, measured 2026-09-25
       (A5.7c Task 6) — a correction to the METHOD, not just this one model's number.** Row 28

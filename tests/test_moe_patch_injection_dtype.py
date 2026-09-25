@@ -236,3 +236,82 @@ def test_the_reinterpret_path_still_permits_an_async_copy(monkeypatch):
             pinned_source=True)
 
     assert seen == [None]
+
+
+def test_a_same_width_wrong_format_source_is_refused_not_reinterpreted():
+    """I2: `float8_e4m3fn` and `float8_e8m0fnu` are both 1 B/elem, so
+    `.view` between them SUCCEEDS on this torch — verified directly:
+    `torch.zeros(4, 2, dtype=torch.float8_e4m3fn).view(torch.float8_e8m0fnu)`
+    does not raise. This checkpoint ships both formats (routed-expert scales as
+    e8m0, shared-expert/attention weights as e4m3), so the element-size and
+    shape guards alone would silently read a mislabelled e4m3 scale as ue8m0
+    exponents. The source dtype must be refused before either of those guards
+    runs."""
+    mod = _expert(w1={"scale": torch.zeros(4, 1, dtype=E8M0)})
+
+    with pytest.raises(mp.PackedInjectionError) as excinfo:
+        _inject(mod, {PREFIX + "w1.scale":
+                     torch.zeros(4, 1, dtype=torch.float8_e4m3fn)})
+
+    msg = str(excinfo.value)
+    assert "float8_e4m3fn" in msg and "float8_e8m0fnu" in msg
+
+
+@pytest.mark.parametrize("src_dtype", [torch.uint8, torch.int8])
+def test_raw_byte_container_sources_are_still_accepted_for_fp4(src_dtype):
+    """I2 must not break the fp4 path: uint8 and int8 are the raw byte
+    containers a packed fp4 checkpoint actually ships, and both must still
+    reach the reinterpret."""
+    mod = _expert(w1={"weight": torch.zeros(4, 2, dtype=FP4)})
+    src = torch.zeros(4, 2, dtype=src_dtype)
+
+    entry = _inject(mod, {PREFIX + "w1.weight": src.clone()})
+
+    assert entry is not None
+    assert entry["w1"]["weight"].dtype == FP4
+
+
+def test_a_source_already_in_the_target_dtype_is_still_accepted():
+    """The e8m0 scale case: a tensor already declared `float8_e8m0fnu` (not a
+    raw byte container) must still pass — I2's guard allows the target dtype
+    itself, not only uint8/int8."""
+    mod = _expert(w1={"scale": torch.zeros(4, 1, dtype=E8M0)})
+    src = torch.randint(120, 136, (4, 1), dtype=torch.uint8).view(E8M0)
+
+    entry = _inject(mod, {PREFIX + "w1.scale": src.clone()})
+
+    assert entry is not None
+    assert entry["w1"]["scale"].dtype == E8M0
+    assert torch.equal(_bytes(entry["w1"]["scale"]), _bytes(src))
+
+
+def test_a_cuda_oom_during_the_device_copy_is_not_relabelled(monkeypatch):
+    """I1: `_inject_no_cast`'s blanket `except Exception` used to catch
+    `torch.cuda.OutOfMemoryError` (a RuntimeError subclass) off the H2D copy
+    and relabel it as `PackedInjectionError` — hiding it from
+    `vaayu_base.py`'s isinstance-based OOM retry and stating the opposite of
+    the truth (a transient VRAM shortage is not a packed-dtype defect). The OOM
+    must propagate as itself out of `_inject_no_cast`, where
+    `_inject_expert_weights`'s existing (unchanged, out of this fix's scope)
+    per-group `except Exception` warns and returns None — the same
+    warn-and-skip behaviour the pre-branch code had for a cast-side OOM."""
+
+    class _OOMOnTo:
+        """Stands in for a real tensor: `.to(device, ...)` raises OOM, exactly
+        like a real H2D copy would when VRAM is exhausted."""
+        dtype = FP4
+        shape = (4, 2)
+
+        def element_size(self):
+            return FP4.itemsize
+
+        def to(self, *a, **k):
+            raise torch.cuda.OutOfMemoryError("out of memory")
+
+    mod = _expert(w1={"weight": torch.zeros(4, 2, dtype=FP4)})
+    raw = {PREFIX + "w1.weight": _OOMOnTo()}
+
+    entry = mp._inject_expert_weights(mod, raw, EIDX, LAYER, "cpu",
+                                      torch.bfloat16, pinned_source=False)
+
+    assert entry is None
