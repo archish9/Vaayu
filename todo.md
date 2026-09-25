@@ -74,7 +74,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 
 | # | item | why here | cost | handoff |
 |---|---|---|---|---|
-| **S1** | **41.7 pageable HtoD memcpys per decode token** (Qwen3-Next) | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
+| **S1** ✅ | ~~**41.7 pageable HtoD memcpys per decode token** (Qwen3-Next)~~ **CLOSED 2026-09-25, NULL — really 84/token, and removing them LOSES 1.39 %. See the S1 row below** | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
 | **S2** | **chunk-major byte counter survives an aborted expert injection** | `moe_patch.py:1984-1986` resets OUTSIDE the `finally`, so an abort leaves `_chunk_major_gpu_bytes` stale for the process and silently shrinks row 45's retention on **MiniMax's production prefill path** | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
 | **S3** | **Qwen3-Next `GatedDeltaNet` elementwise fusion** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
 | **S4** | **restore the 46 DeepSeek-V4 tests** the shard deletion broke | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
@@ -96,7 +96,95 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S1** — the six-item sequence **S1…S6** is defined immediately below. ONE PER FRESH SESSION, IN ORDER. ◀◀
+## ▶▶ PICK THIS NEXT: **S2** — S1 CLOSED 2026-09-25 as a measured null (its row is immediately below). The sequence **S1…S6** is defined above. ONE PER FRESH SESSION, IN ORDER. ◀◀
+
+---
+
+## S1 — `[x]` pageable HtoD memcpys per decode token. **CLOSED 2026-09-25 as a measured NULL.**
+
+**Verdict: the copies are real and now fully priced, and removing them does not pay. The one fix
+that needs no copied upstream code was BUILT, unit-tested, MEASURED at −7.06 % on `serial` /
+−1.39 % on the real forward, and REVERTED. S1-b was refuted before it was built. Nothing in
+`vaayu/` changed — the tree is byte-identical to `8642a50`.** Full detail:
+`docs/2026-09-25-S1-pageable-h2d-RESULTS.md` (gitignored); probes `plans/probes/s1_h2d_attrib.py`,
+`s1_parse_trace.py`, `s1_ab.py`; raw `plans/probes/s1_out/`.
+
+**The spike's 41.7/token was wrong twice, and BOTH errors understated it.** Row 36 profiled
+**prefill and decode in one window and divided by the decode-forward count**, on the **NOEXP** arm.
+Bracketing each forward in a `VAAYU_FWD_<i>` annotation and starting the profiler *inside*
+`model.forward` gives **36.00/decode-forward on NOEXP** and **84.00 on the real forward**.
+
+**Exactly two call sites**, both per-layer, neither disk:
+
+| # | site | n/fwd | bytes | host µs each | host µs/fwd | stream drain |
+|---|---|---|---|---|---|---|
+| S1-a | `modeling_qwen3_next.py:470`, `core_attn_out = torch.zeros(...).to(value)` in `torch_recurrent_gated_delta_rule` | 36 = the `GatedDeltaNet` layers | 16,384 | 20.76 | 747 | **YES** — `cudaStreamSynchronize` in every one |
+| S1-b | `vaayu/moe_patch.py:2310`, `_pair_gpu = _pair.to(device, non_blocking=True)` | 48 = `num_moe_layers` | 160 = `2 × top_k × 8` | 8.48 | 407 | no |
+
+Device time for all 84 is **37.9 µs/fwd**; host time **1,154 µs/fwd — 30× the device time**. The
+spike's "0.98 ms" was the wrong quantity to quote.
+
+**S1-b — REFUTED, never built.** Idle-stream microbenchmark, 5,000 calls, the real 160-byte `_pair`:
+status quo **pageable `.to(non_blocking=True)` = 3.14 µs**, pre-pinned **3.28 µs**,
+`.pin_memory().to(...)` **5.80 µs**. **Every available fix is slower than the code already there** —
+`non_blocking=True` already skips the stream sync (confirmed in the trace) and 160 bytes is too
+small for pinning to repay itself. The 8.48 µs above is CUPTI overhead, not a user cost.
+
+**S1-a — BUILT, MEASURED, REVERTED.** Isolated cost: `torch.zeros(...).to("cuda")` **8.41 µs** vs
+`torch.zeros(..., device="cuda")` **3.22 µs** (with 8 GEMMs queued: **159.06 vs 17.56 µs** — the
+blocking copy drains the queue). Ceiling therefore **187–630 µs/token = 0.17–0.6 % of a 110 ms
+token**. Built as `install_device_local_factories` in `recurrent_state.py`, wrapping the
+`chunk_/recurrent_gated_delta_rule` module attributes (`modeling_qwen3_next.py:553-554`) in
+`with torch.device(value.device):` — detection by attribute surface, no copied upstream code, and it
+**worked**: on-device count 36 → **0** per forward, outputs bit-identical, 8 new tests green on both
+families. A/B in ONE model load, toggling in place, 8 alternating `serial` arms + 4 real arms,
+64 tokens each, medians:
+
+| phase | fix ON | fix OFF | delta | within-state arm sd = resolution floor |
+|---|---|---|---|---|
+| `serial` (NOEXP) | 41.096 ms | 38.384 ms | **−2.711 ms = −7.06 %** | 0.457 ms = 1.19 % |
+| real forward | 127.458 ms | 125.710 ms | **−1.748 ms = −1.39 %** | 0.458 ms = 0.36 % |
+
+Perfectly separated (ON 40.885/41.776/40.930/40.793, OFF 38.336/38.559/38.373/38.270); TTFT flat.
+**Root cause of the regression, confirmed directly: `torch.device` used as a CONTEXT MANAGER pushes a
+`DeviceContext` torch-function mode, so every torch op inside pays python dispatch — +0.906 µs/op
+measured (100 ops: 323.63 → 414.25 µs).** ~80–110 ops/layer × 36 layers ≈ 2.7 ms, which is the
+regression to the millisecond.
+
+**What is left and why it is not worth doing:** only a Vaayu-owned COPY of upstream's two torch
+fallbacks with `device=` on the zeros. It buys the 0.17–0.6 % ceiling — **below this box's 0.36 %
+real-arm floor and far below its ~3 % positional drift (rows 33, 44)** — for the cost of carrying
+someone else's numerics code across transformers upgrades. **Stop rule fires.**
+
+**§8, all four:** (1) no knob — nothing shipped, and a bit-identical change would need none;
+(2) n/a; (3) it WOULD have been reachable — both sites are per-layer in the N=1 decode path the
+server actually runs, not an N>1 effect, and that still was not enough; (4) n/a — what would revive
+this is not a knob but `fla` (see the S1-L3 lead).
+
+**Gates:** full suite FOREGROUND **2759 passed, 44 failed, 2 errors, 16 skipped in 192.44 s** — the
+floor, with the failing SET verified member-by-member (attention 21, parity 8, moe 8, linear 4,
+model 2, block 2 errors, checkpoint 1). **Both MoE accumulator gates NOT RUN and not owed: no file
+under `vaayu/` changed.** No fused-EXL3 arm exists and dense has no committed gate; neither claimed.
+
+### Leads S1 recorded and deliberately did NOT chase
+
+- **[ ] S1-L1 — ~27,084 pageable HtoD in ONE 135-token PREFILL forward.** Counted in the S1 A/B
+  (fix off; 27,048 with S1-a's 36 removed). Decode's expert loads are NOT pageable — the slab
+  arena's async path works there (row 30-P) — so this is **prefill-only**. Prefill is TTFT, this
+  workload's top lever (CLAUDE.md §0), and the number is ~320× the entire decode-side finding.
+  **This is the larger fish; it is a lead, not yet a diagnosis** — nobody has attributed those 27k
+  to a call site the way §2 above attributed the 84.
+- **[ ] S1-L2 — 96.5 `Memcpy DtoH (Device -> Pageable)` per real decode forward.** Never counted
+  before: the row 36 spike's top-25 only ever showed the 25.4 *pinned* DtoH. More numerous than the
+  84 HtoD and fully synchronous. Belongs with S3's routing-sync item; S1's handoff §5 forbade
+  chasing DtoH inside S1.
+- **[ ] S1-L3 — neither `fla` nor `causal_conv1d` is installed**, which is *why*
+  `self.recurrent_gated_delta_rule` is the pure-torch fallback at all
+  (`modeling_qwen3_next.py:59-61`). Installing `fla` deletes S1-a's 36 copies AND a large share of
+  S3's 4,353 elementwise launches in one move. **An S3 decision and a new dependency — weigh it
+  there, at the top of S3, before building a hand-written fusion.**
+
+---
 
 **A5.7c CLOSED 2026-09-25 and is merged (`6870dab`), so the old "PICK THIS NEXT: A5.7c" pointer further down is history, not an instruction. The >512-token prefill bug it surfaced is FIXED and merged too (`876865f`).**
 
@@ -914,6 +1002,28 @@ Known-open minors (none blocking):
 ---
 
 # ▶ SETTLED — DO NOT RE-OPEN
+
+**Removing the pageable host-to-device copies from the decode token cannot pay on this box —
+measured 2026-09-25 (S1; the change was built, A/B'd and reverted).** Two sites, both per-layer:
+36 × 16 KB from `torch.zeros(...).to(value)` in transformers' `torch_recurrent_gated_delta_rule`,
+and 48 × 160 B from `_pair.to(device, non_blocking=True)` at `moe_patch.py:2310`. **The real count
+is 84/token, not the spike's 41.7** (that figure divided prefill's copies into decode, on the NOEXP
+arm). **Do not rebuild either:**
+- **Pinning `_pair` is SLOWER than leaving it pageable** — 3.14 µs status quo, 3.28 pre-pinned,
+  5.80 via `.pin_memory()`, idle stream, 5,000 calls. `non_blocking=True` already skips the stream
+  sync; 160 bytes never repays a pin.
+- **Wrapping the delta rules in `with torch.device(...)` costs −7.06 % on `serial` and −1.39 % on the
+  real forward.** `torch.device` as a context manager pushes a `DeviceContext` torch-function mode,
+  so EVERY torch op inside pays **+0.906 µs** of python dispatch; at ~80–110 ops × 36 layers that is
+  ~2.7 ms against a 187–630 µs prize. **This trap applies to any future use of `torch.device` or
+  `torch.set_default_device` around a hot loop — it is not specific to this mixer.**
+- The only untried delivery is copying upstream's two torch fallbacks into Vaayu. Its ceiling is
+  **0.17–0.6 % of the token, below this box's 0.36 % resolution floor.** Not worth the maintenance.
+
+Still open from S1, as leads and NOT refuted: **S1-L1** (~27,084 pageable HtoD in one prefill
+forward — the larger fish), **S1-L2** (96.5 pageable DtoH per decode forward), **S1-L3** (`fla` is
+not installed; installing it subsumes S1-a and much of S3).
+
 
 **Read this before proposing any perf work.** Each line is something that was BUILT or MEASURED and
 then refuted. A refutation closes its row; it is not re-scoped. Full text in
