@@ -187,3 +187,52 @@ def _conv_seam(stock):
 
     setattr(seam, _MARK, stock)
     return seam
+
+
+if triton is not None:
+
+    @triton.jit
+    def _norm_kernel(x, z, w, o, sx_r, sx_n, sz_r, sz_n, sw, N, eps,
+                     BN: tl.constexpr, ROUND_MID: tl.constexpr):
+        # One row: rmsnorm in fp32 -> round -> x weight -> x silu(gate) in fp32 -> round.
+        r = tl.program_id(0)
+        on = tl.arange(0, BN)
+        m = on < N
+        bx = tl.load(x + r * sx_r + on * sx_n, mask=m, other=0.0).to(tl.float32)
+        y = bx * tl.rsqrt(tl.sum(bx * bx) / N + eps)
+        y = y.to(o.dtype.element_ty).to(tl.float32)
+        y = tl.load(w + on * sw, mask=m, other=0.0).to(tl.float32) * y
+        if ROUND_MID:  # weight * x stays in the input dtype unless weight promotes it
+            y = y.to(o.dtype.element_ty).to(tl.float32)
+        bz = tl.load(z + r * sz_r + on * sz_n, mask=m, other=0.0).to(tl.float32)
+        tl.store(o + r * N + on, (y * (bz * tl.sigmoid(bz))).to(o.dtype.element_ty), mask=m)
+
+
+def fused_gated_norm(weight, eps, hidden_states, gate):
+    """transformers' `*RMSNormGated.forward(hidden_states, gate)` in one launch,
+    at the stock rounding points. Rows are everything but the last dim."""
+    n = weight.numel()
+    x = hidden_states.reshape(-1, n)
+    z = gate.reshape(-1, n)
+    o = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    bn = triton.next_power_of_2(n)
+    _norm_kernel[(x.shape[0],)](
+        x, z, weight, o, *x.stride(), *z.stride(), weight.stride(0), n, eps,
+        BN=bn, ROUND_MID=torch.promote_types(weight.dtype, x.dtype) == x.dtype,
+        num_warps=1 if bn <= 256 else 4)
+    return o.view(hidden_states.shape)
+
+
+def _patch_norm(norm):
+    """Patch the norm's forward IN PLACE and read `norm.weight` at call time:
+    a streamed layer's Parameters are REPLACED on every load
+    (`set_module_tensor_to_device`), so a swapped-in module would go stale."""
+    stock = norm.forward
+
+    def forward(hidden_states, gate=None):
+        if gate is None:
+            return stock(hidden_states, gate)
+        return fused_gated_norm(norm.weight, norm.variance_epsilon, hidden_states, gate)
+
+    setattr(forward, _MARK, stock)
+    norm.forward = forward

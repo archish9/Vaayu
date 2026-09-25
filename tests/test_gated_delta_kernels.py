@@ -246,3 +246,64 @@ def test_conv_seam_delegates_multi_token_calls_to_stock():
     assert seam(torch.zeros(1, 8, 2), torch.zeros(1, 8, 4), torch.zeros(8, 4)) == "stock"
     assert len(calls) == 1
     assert getattr(seam, gdk._MARK) is stock
+
+
+# ── gated-norm kernel ────────────────────────────────────────────────────────
+
+def _ref_norm(x, z, w, eps):
+    x, z, w = x.double(), z.double(), w.double()
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w * F.silu(z)
+
+
+def _stock_norm(n, wdtype, seed=0):
+    torch.manual_seed(seed)
+    norm = Qwen3NextRMSNormGated(n, eps=1e-6)
+    with torch.no_grad():
+        norm.weight.copy_(1 + 0.1 * torch.randn(n))
+    return norm.cuda().to(wdtype)
+
+
+@cuda
+@pytest.mark.parametrize("xdtype", [torch.bfloat16, torch.float16], ids=["xbf16", "xfp16"])
+@pytest.mark.parametrize("rows", [1, 64])
+@pytest.mark.parametrize("wdtype", [torch.bfloat16, torch.float32], ids=["wbf16", "wfp32"])
+@pytest.mark.parametrize("geom", GEOMS)
+def test_norm_is_no_further_from_fp64_than_stock(geom, wdtype, rows, xdtype):
+    n = GEOMS[geom]["V"]
+    norm = _stock_norm(n, wdtype)
+    x = torch.randn(rows, n, device="cuda").to(xdtype)
+    z = torch.randn(rows, n, device="cuda").to(xdtype)
+    so = norm(x, z)
+    gdk._patch_norm(norm)
+    fo = norm(x, z)
+    assert fo.shape == so.shape and fo.dtype == so.dtype
+    ref = _ref_norm(x, z, norm.weight, 1e-6)
+    assert _rel(fo, ref) <= 1.25 * _rel(so, ref)
+
+
+@cuda
+def test_patched_norm_reads_a_weight_replaced_after_install():
+    norm = _stock_norm(128, torch.bfloat16)
+    gdk._patch_norm(norm)
+    # What set_module_tensor_to_device does to a streamed layer's parameter.
+    norm.weight = torch.nn.Parameter(torch.randn(128, device="cuda").bfloat16())
+    x = torch.randn(4, 128, device="cuda").bfloat16()
+    z = torch.randn(4, 128, device="cuda").bfloat16()
+    want = type(norm).forward(norm, x, z)
+    assert _rel(norm(x, z), want) < 1e-2
+
+
+def test_patched_norm_hands_gateless_calls_to_stock():
+    class Norm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(4))
+            self.variance_epsilon = 1e-6
+
+        def forward(self, hidden_states, gate=None):
+            return "stock"
+
+    norm = Norm()
+    gdk._patch_norm(norm)
+    assert norm(torch.zeros(2, 4)) == "stock"
+    assert hasattr(norm.forward, gdk._MARK)
