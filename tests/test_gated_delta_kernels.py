@@ -89,3 +89,78 @@ def test_no_seams_on_a_dense_model():
     # The trap this pins: a dense model's top-level norm HAS weight + variance_epsilon.
     assert hasattr(llama.model.norm, "variance_epsilon")
     assert _counts(llama) == NO_SEAMS
+
+
+# ── rule kernel (CUDA) ───────────────────────────────────────────────────────
+
+def _rule_inputs(geom, B, T_, dtype, h0_dtype, strided=False, seed=0):
+    torch.manual_seed(seed)
+    HV, K, V = geom["HV"], geom["K"], geom["V"]
+    q = torch.randn(B, T_, HV, K, device="cuda").to(dtype)
+    k = torch.randn(B, T_, HV, K, device="cuda").to(dtype)
+    v = torch.randn(B, T_, HV, 2 * V if strided else V, device="cuda").to(dtype)[..., :V]
+    g = -F.softplus(torch.randn(B, T_, HV, device="cuda"))          # log-decay, fp32
+    beta = torch.sigmoid(torch.randn(B, T_, HV, device="cuda")).to(dtype)
+    h0 = (None if h0_dtype is None
+          else (torch.randn(B, HV, K, V, device="cuda") * 0.1).to(h0_dtype))
+    return q, k, v, g, beta, h0
+
+
+def _ref_rule(q, k, v, g, beta, h0):
+    """The gated delta rule in fp64, qk-l2norm on -- an oracle independent of
+    both the stock fallback (which casts to fp32) and the kernel."""
+    q, k, v, g, beta = (x.double() for x in (q, k, v, g, beta))
+    q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * q.shape[-1] ** -0.5
+    k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    B, T_, HV, K = k.shape
+    h = (torch.zeros(B, HV, K, v.shape[-1], dtype=torch.float64, device=q.device)
+         if h0 is None else h0.double())
+    out = []
+    for t in range(T_):
+        h = h * g[:, t].exp()[..., None, None]
+        delta = (v[:, t] - (h * k[:, t, :, :, None]).sum(-2)) * beta[:, t, :, None]
+        h = h + k[:, t, :, :, None] * delta[:, :, None, :]
+        out.append((h * q[:, t, :, :, None]).sum(-2))
+    return torch.stack(out, 1), h
+
+
+def _both_rules(q, k, v, g, beta, h0, final=True):
+    kw = dict(g=g, beta=beta, output_final_state=final, use_qk_l2norm_in_kernel=True)
+    clone = (lambda: None) if h0 is None else h0.clone
+    return (stock_rule(q, k, v, initial_state=clone(), **kw),
+            gdk.fused_recurrent_rule(q, k, v, initial_state=clone(), **kw))
+
+
+@cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("h0_dtype", [None, torch.bfloat16, torch.float32],
+                         ids=["h0none", "h0bf16", "h0fp32"])
+@pytest.mark.parametrize("B,T_", [(1, 1), (2, 1), (1, 3)], ids=["decode", "batch2", "T3"])
+@pytest.mark.parametrize("geom", GEOMS)
+def test_rule_is_no_further_from_fp64_than_stock(geom, B, T_, h0_dtype, dtype):
+    q, k, v, g, beta, h0 = _rule_inputs(GEOMS[geom], B, T_, dtype, h0_dtype)
+    (so, sh), (fo, fh) = _both_rules(q, k, v, g, beta, h0)
+    ro, rh = _ref_rule(q, k, v, g, beta, h0)
+    assert fo.shape == so.shape and fo.dtype == so.dtype
+    assert fh.shape == sh.shape and fh.dtype == torch.float32
+    assert _rel(fo, ro) <= 1.25 * _rel(so, ro)
+    assert _rel(fh, rh) <= 1.25 * _rel(sh, rh)
+
+
+@cuda
+@pytest.mark.parametrize("geom", GEOMS)
+def test_rule_reads_strided_inputs(geom):
+    q, k, v, g, beta, h0 = _rule_inputs(GEOMS[geom], 1, 1, torch.bfloat16, torch.bfloat16,
+                                        strided=True)
+    assert not v.is_contiguous()
+    _, (fo, fh) = _both_rules(q, k, v, g, beta, h0)
+    _, (co, ch) = _both_rules(q, k, v.contiguous(), g, beta, h0)
+    assert torch.equal(fo, co) and torch.equal(fh, ch)
+
+
+@cuda
+def test_rule_without_final_state_returns_none():
+    q, k, v, g, beta, h0 = _rule_inputs(GEOMS["qwen3next"], 1, 1, torch.bfloat16, torch.bfloat16)
+    _, (with_state, _) = _both_rules(q, k, v, g, beta, h0, final=True)
+    _, (without, state) = _both_rules(q, k, v, g, beta, h0, final=False)
+    assert state is None and torch.equal(without, with_state)
