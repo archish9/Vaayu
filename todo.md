@@ -2702,6 +2702,20 @@ and both have a golden reference or a Vaayu precedent.
       only). Source: `plans/probes/row26_decode.py` output,
       `plans/probes/row26_out/decode-deepseek.json` (gitignored — this row is the durable copy).
 
+- [ ] **Four deferred minors from A5.7c's final whole-branch review (2026-09-25). Recorded here
+      because `docs/` is gitignored and the review document did not survive the workspace cleanup.**
+      **(M1)** `NO_CAST_INJECTION_DTYPES` (`moe_patch.py`) is OPT-IN, so the next packed dtype silently
+      re-enters the cast path — gpt-oss's MXFP4 is already on disk. Consider refusing a target dtype
+      that has neither `finfo` nor `iinfo` instead of allowlisting one at a time.
+      **(M2)** a `PackedInjectionError` escaping `_load_inject_run` skips `_arena.record_read` and the
+      `_chunk_major_gpu`/`_chunk_major_gpu_bytes` reset; the latter SURVIVES the abort and shrinks every
+      later retention budget in that process. Pre-existing for ANY exception escaping that function, and
+      it cannot tear a live tensor — but it is a real leak on the abort path.
+      **(M3)** `vaayu_deepseek_v4.py`'s `_wrapped` is keyword-only, hence caller-reachable.
+      **(M4)** no test drives a `PackedInjectionError` through the REAL forward to assert propagation,
+      the expert landing back on meta, and the pin being released — the unit tests call the injector
+      directly. **All four were triaged as correctly deferred by the reviewer; none blocks anything.**
+
 - [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
       the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
       code had the same defect at a different index.** `VaayuDeepseekV4.get_past_key_value_args`
