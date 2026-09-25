@@ -2425,9 +2425,13 @@ and both have a golden reference or a Vaayu precedent.
       (no model on disk since 2026-09-20) and **dense has no committed gate** — the argument dense
       is unaffected is the hook's `None` default, stated not assumed.
 
-- [ ] **A5.7c — streamed fp4 expert injection, then the first token. RE-PLAN IN A FRESH SESSION.**
-      **READ FIRST:** [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md)
-      (gitignored — this row is the durable copy).
+- [~] **A5.7c — streamed fp4 expert injection, then the first token. DESIGNED 2026-09-25.**
+      **READ FIRST:** [`…-A5.7c-expert-injection-design.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-design.md),
+      whose input was [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md)
+      (both gitignored — this row is the durable copy). **The handoff's "branch NOT merged" is
+      STALE: A5.7b IS merged (`4842250` + docs `4bc70b1`, `c89ea1e` on `main`), and per `4bc70b1`
+      the 48 original shards are DELETED after a byte-for-byte verify — 46 split shards, 231 G free,
+      MTP's 3 shards in `models/deepseek-v4-mtp-shards/`. A5.7c branches off `main`.**
       **THE ONE DEFECT:** `moe_patch.py:1208` (`t = tensor.to(device, dtype=dtype, non_blocking=True)`)
       casts every streamed expert tensor to the running dtype, so a packed-fp4 expert weight reaches
       `DeepseekV4Linear.forward` as **int8**, takes its `weight.dtype not in _QUANTIZED` branch
@@ -2440,13 +2444,40 @@ and both have a golden reference or a Vaayu precedent.
       defect for the NON-expert path inside the subclass (`9616c04`), but experts do not travel that
       path and `moe_patch.py` has **no subclass seam** — module-level functions over `block_info` /
       `vaayu_ref`. A5.7b's plan said "if it grows into the expert cache, STOP and re-plan"; it did.
-      **TWO DESIGN QUESTIONS THE PLAN MUST ANSWER:** (1) where the target dtype comes from at
-      `:1208` — the subclass uses `self.model.get_parameter(name).dtype`, but this is the decode hot
-      path, so it may need resolving once per layer and caching; (2) narrow hook called from
-      `moe_patch` (policy stays in the subclass, blast radius zero, but a hook in a hot path) vs an
-      explicit packed-dtype allowlist in `moe_patch` itself (simpler, but IS the shared change).
-      **MUST NOT CHANGE:** any tensor whose target dtype is not packed must inject byte-identically
-      to today. Use an explicit allowlist, NOT a general "dtypes differ → reinterpret" branch.
+      **SECOND DEFECT, SAME LINE — FOUND AND MEASURED WHILE DESIGNING 2026-09-25, and fixing only
+      the fp4 weight buys a crash-free WRONG token:** each fp4 weight's companion `scale` is
+      declared `_SCALE_DTYPE = torch.float8_e8m0fnu` (`modeling_deepseek_v4.py:55`) and `forward`
+      reads the quantization format back off it (`scale_fmt = "ue8m0" if scale.dtype == _SCALE_DTYPE
+      else None`, then `gemm(..., scale, scale.dtype)`). Line 1208 casts it to bf16 → `scale_fmt`
+      collapses to `None` and TileLang's `fp4_gemm` gets a bf16 scale. **`e8m0 → bf16` SUCCEEDS
+      SILENTLY (probed).** **Why the non-expert path never needed this:** it injects via
+      `set_module_tensor_to_device`, which **coerces the value back to the declared parameter dtype**
+      (probed: bf16 into an e4m3/e8m0 param keeps the declared dtype, and bf16 round-trips both
+      losslessly) — so `4995b0e`'s "F8_E8M0 casts without incident" is TRUE there. `moe_patch` uses
+      `setattr(submod, base, nn.Parameter(t))` — **no coercion**, the param just becomes bf16.
+      **THE TWO DESIGN QUESTIONS, ANSWERED (design §2):** (1) **target dtype = `getattr(submod,
+      base, None).dtype`**, read off the live expert module in the loop — one attr read + one tuple
+      test per streamed tensor (~6/expert), NOT `self.model.get_parameter()`'s string walk, and no
+      per-layer cache. Safe because the dtype is a **fixpoint** of the cache/detach cycle: probed,
+      `.to("meta")` preserves dtype, and re-binding a param to a `.view(fp4)` tensor then detaching
+      keeps fp4. `ExLlamaV3Linear` (no `weight` attr) and a `None` scale both fall to the old path,
+      so MiniMax is untouched. (2) **shared edit in `moe_patch`, NOT a subclass hook** — the rule is
+      a torch invariant (a packed dtype can only be reinterpreted, never cast), not model policy, so
+      gpt-oss's MXFP4 needs it with no subclass written; a hook costs an indirection per tensor in
+      the decode hot path; and the branch's blast radius is ZERO for any model declaring none of
+      these dtypes, which both gates prove rather than argue. `NO_CAST_INJECTION_DTYPES =
+      (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu)` at `moe_patch` module level;
+      `vaayu_deepseek_v4.py:27`'s `_PACKED_INJECTION_DTYPES` (referenced nowhere else) imports it.
+      **fp4 + e8m0 ONLY** (user's call): `float8_e4m3fn` is excluded because DeepSeek's e4m3 tensors
+      are PINNED, not streamed, so that arm would ship with no test reaching it.
+      **(3) FAILURE MODE, decided:** the NEW branch raises naming layer/expert/submod/base/both
+      dtypes; the existing cast branch keeps its `warn` + `return None` verbatim — no behaviour
+      change for MiniMax/Qwen, no silent path in new code.
+      **§8:** no knob — STATED, not assumed; a correctness invariant with nothing to tune.
+      Reachable in the server's only mode (N=1 decode), proven by the server smoke below.
+      **MUST NOT CHANGE:** any tensor whose target dtype is not in the allowlist must inject
+      byte-identically to today — explicit allowlist, NOT a general "dtypes differ → reinterpret"
+      branch. Unit test asserts that byte-identity directly.
       **GATES, NON-NEGOTIABLE:** full suite (floor **2778 passed, 16 skipped**) AND **both** MoE
       accumulator gates foreground at `MemoryMax=29G` — Qwen3-Next (~35 s) and **MiniMax-M2.7
       (~73 s), which shares this exact forward and is the whole point**. No fused-EXL3 arm exists;
@@ -2458,6 +2489,13 @@ and both have a golden reference or a Vaayu precedent.
       eat the checkpoint). **Expect ~1.75–2.06 tok/s — REACH, not speed, ~5× slower than
       Qwen3-Next. TTFT is NOT comparable to MiniMax's post-row-45 figure** (eager keeps the
       chunk-major branch shut, so a 4k prompt re-reads its expert set 8×).
+      **BANKED OUT OF SCOPE, as their own rows before this branch closes:** (a) the **fused
+      forward's twin cast** — `_make_fused_sparse_forward`'s injector casts the same way and
+      gpt-oss's MXFP4 experts will hit it, but gpt-oss cannot load (G1: expert index matches 0/459
+      tensors), so a fix there is untestable code on Qwen3-Next's perf-tuned path (user's call
+      2026-09-25); (b) **shared `warn` → `raise`** in `_inject_expert_weights`, a behaviour change on
+      two production forwards; (c) **A4 check 2's finding** (0 non-expert-pinned transformer layers,
+      budget 3.34 GiB vs an 8.24 GiB dense footprint).
 
 **Two checks CARRIED OUT OF A4 (row 47, closed 2026-09-23 with its premise refuted) — they belong to A5:**
 - [ ] **check 1: confirm DeepSeek's shared experts actually land in the pinned non-expert set** once
