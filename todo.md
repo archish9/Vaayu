@@ -57,7 +57,7 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.7b** — jump to "PICK THIS NEXT: **A5.7b**" below for the order and the links ◀◀
+## ▶▶ PICK THIS NEXT: **A5.7c** — jump to "PICK THIS NEXT: **A5.7c**" below for the order and the links ◀◀
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -73,7 +73,7 @@ bit-identical, `head` rel-L2 0.00166 + exact argmax). The step where A5 was expe
 not kill it. A5.7a IS CLOSED TOO (2026-09-24) — seven commits teach the streamed path the
 architecture end to end (cache, layer signature, `hc_head`, the id scope, a new `run_embed` hook,
 `auto_model` dispatch); DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both on-device
-gates green. **START AT A5.7b**, whose brief is already written; A5.7a's durable record, including
+gates green. **START AT A5.7b**, DESIGNED 2026-09-24 and `[~]` in flight; A5.7a's durable record, including
 everything A5.7b MUST carry, is row 28b.** **Correction carried from
 A5.3: the goldens store the INPUT and the OUTPUT, not the weights, so a golden-reproducing test DOES
 need the 157 G checkpoint and a GPU; "neither" holds only for the structural half (shapes, contracts,
@@ -91,7 +91,16 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.7b** (row 28b). A5.7 was SPLIT 2026-09-24. One per session.
+## ▶ PICK THIS NEXT: **A5.7c** (row 28b). A5.7b RAN 2026-09-24/25 and stopped on its own stop rule; A5.7c is its remainder. One per session.
+
+**A5.7b is `[~]` PARTIALLY DONE, branch `a5.7b-load-first-token`, 14 commits, NOT merged, suite
+green at 2778/16.** DeepSeek-V4-Flash is **SPLIT (46 shards, 146 G, originals intact), LOADS in
+4.0 s, and runs inside Vaayu's MoE streaming forward** — 11,008 experts indexed, all 43 layers
+patched. It does not yet emit a token: ONE defect remains and it is in `vaayu/moe_patch.py`, the
+expert-streaming injector, which is the module-list forward **MiniMax-M2.7 runs in production**.
+A5.7b's own stop rule ("if it grows into the expert cache, STOP and re-plan") fired, so the
+remainder is **A5.7c**, to be RE-PLANNED in a fresh session from
+[`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md).
 
 **A5.7's §0 gate was DECIDED 2026-09-24: TEACH THE ENGINE, and A5.7 was SPLIT into A5.7a (engine)
 and A5.7b (load + first token), both approved by the user that day.** Unstreamed is dead on
@@ -184,7 +193,8 @@ its own durable row under row 28b.** A fresh session needs nothing but the row i
 | ~~5~~ | ~~**A5.5** attention~~ | **CLOSED 2026-09-24** — 17 commits, suite 2656/16, both MoE gates green | [`…A5.5-attention-RESULTS.md`](docs/2026-09-24-A5.5-attention-RESULTS.md) | done |
 | ~~6~~ | ~~**A5.6** block + model~~ | **CLOSED 2026-09-24** — 5 commits, suite 2686/16, both MoE gates green | [`…A5.6-block-model-RESULTS.md`](docs/2026-09-24-A5.6-block-model-RESULTS.md) | done |
 | 7 | ~~**A5.7a** engine change~~ | **CLOSED 2026-09-24** — 7 commits, DeepSeek suite 289 passed, full repo 2711 passed/16 skipped, both MoE gates green | [`…A5.7a-streamed-path-RESULTS.md`](docs/2026-09-24-A5.7a-streamed-path-RESULTS.md) | done |
-| 8 | **A5.7b** load + first token | **BRIEF's remainder** | [`…A5.7-load-first-token-BRIEF.md`](docs/superpowers/specs/2026-09-23-A5.7-load-first-token-BRIEF.md) | **~1–2 days**, mostly wall-clock on the irreversible 157 G split. |
+| ~~8~~ | ~~**A5.7b** load + index + split~~ | **MOSTLY CLOSED 2026-09-25** — 14 commits on `a5.7b-load-first-token` (unmerged), suite 2778/16, split written and verified, model loads in 4.0 s and reaches the streaming forward. Stopped on its own stop rule. | [`…A5.7b-load-first-token-design.md`](docs/superpowers/specs/2026-09-24-A5.7b-load-first-token-design.md) | done |
+| **9** | **A5.7c** streamed fp4 expert injection → first token | **RE-PLAN FROM SCRATCH — shared-infra change** | [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md) | **unknown until planned**; the code change looks small, the gate burden is the cost |
 
 **A5.1–A5.4 are full designs; A5.5–A5.7 are briefs with start gates and stop rules**, promoted to
 plans by the session that reaches them (their inputs need measuring first — a stale design is worse
@@ -700,6 +710,57 @@ and the script that was meant to disable it could not do so without a reboot (fi
 
 Live items left behind by rows that closed and were pruned. **All of them are OPTIONAL by §0's
 test — none can make Vaayu faster.** No §0 P-row is open.
+
+- **[bug] `_detect_moe` decides `is_moe` from a FIELD-NAME LIST and an architecture substring, and
+  disagrees with `ExpertOffsetIndex` about the same question** (found by A5.7b Task 6f, 2026-09-25,
+  on the first streamed run of DeepSeek-V4). `_detect_moe` (`vaayu_base.py:3582`) tests
+  `num_local_experts` / `num_experts` / an arch-string match. DeepSeek-V4 declares
+  **`n_routed_experts`** — which `ExpertOffsetIndex._EXPERT_COUNT_FIELDS` ALREADY knows about — so
+  `is_moe` came back **False**, `patch_moe_blocks` and `_moe_key_remapper` never ran, the model fell
+  through to its own DENSE forward, and the engine loaded all 256 experts of layer 0 at once instead
+  of streaming any of them. **`detect_moe_blocks` is healthy** — a probe on the real meta skeleton
+  found all 43 module-list blocks; only the `is_moe` gate in front of it is wrong.
+  **This is CLAUDE.md §5 in its own words:** "Detection over assumption. Find MoE blocks, router
+  names, and expert tensor roles by probing the module tree / checkpoint keys (as `moe_patch.py`
+  already does), not by matching an architecture string." `_detect_moe` matches one.
+  **FOURTH occurrence of this defect class** — a guard or index asking a question the load path
+  answers differently (A1 Task 4, 47-m5, this row's own `mtp.*`/`detect_moe_blocks` layer-0
+  collision, now this). Row 47's whole premise is that the NEXT architecture should be cheap; this
+  gate silently un-MoEs any model that names its expert count differently, with no warning anywhere.
+  **Not fixed generally in A5.7b (its Ruling 12):** A5.7b overrode `_detect_moe` in
+  `VaayuDeepseekV4` so the blast radius stays zero. The general fix is to ask the module tree (or
+  reuse `ExpertOffsetIndex`'s own field list) instead of a hand-maintained name list — small, but it
+  is shared infra under §0 and obliges both on-device gates.
+  **Cheap first check when picked up:** does gpt-oss-20b's config name its expert count in a field
+  this gate knows? If not, row 47's G1 work has the same hole waiting.
+
+- **[bug] `kv_cache_mode` is INERT for EVERY model whenever prefix caching is OFF** (found by
+  A5.7b Task 6d, 2026-09-25, while porting DeepSeek-V4). **Measured, not inferred.**
+  `VaayuBaseModel.generate` seeds `kwargs["past_key_values"] = self._create_kv_cache()` **only on
+  the prefix-cache path** (`vaayu_base.py:5562`, `:5825`). When `self._prefix_cache is None` it
+  calls `super().generate(*args, **kwargs)` bare (`:5550`), and transformers'
+  `_prepare_cache_for_generation` then manufactures a stock `DynamicCache` — gated only by a
+  hardcoded class-name exclusion list (`reformer`, `minimax`, `xlnet`, `olmohybrid`, `rwkv`,
+  `xlstm`, plus a `minimaxm2` override; `transformers/generation/utils.py:1783-1898`) that names
+  **neither Llama, nor Qwen3-Next, nor DeepSeek-V4**. `prepare_inputs_for_generation` (`:4407`)
+  then forwards that object unchanged — **its comment claims it normalises the cache to `None`;
+  the code does not** — so `forward`'s `if use_cache and past_key_values is None:
+  past_key_values = self._create_kv_cache()` (`:4942`) never fires.
+  **CONFIRMED ON DEVICE:** a real CUDA load of **Llama-3.2-1B-Instruct**, unmodified repo code,
+  `enable_prefix_cache=False`, put a plain `transformers.cache_utils.DynamicCache` into `forward`
+  where `kv_cache_mode="auto"` should have produced `FP8DynamicCache`. Independently re-read and
+  confirmed by a second agent.
+  **Scope, stated carefully — do NOT overclaim:** `auto` resolves to bf16, i.e.
+  `FP8DynamicCache(quantize=False)` at 2.0 B/elem, and a stock `DynamicCache` is also 2 B/elem, so
+  the DEFAULT path's byte cost may be close. The clear casualties are explicit **`fp8`** and
+  **`turboquant`** modes, which are silently not applied — Plan H/I's work included. **The measured
+  cost is UNKNOWN; nobody should quote a number until one is taken.**
+  **Not fixed in A5.7b, deliberately (its Ruling 9):** the fix is in `vaayu_base.py`, shared infra
+  under §0 serving Qwen3-Next, MiniMax, dense Llama and gpt-oss, so it needs its own plan and both
+  on-device gates. A5.7b fixed only `VaayuDeepseekV4.generate` in the subclass (`a2d7280`), which is
+  why DeepSeek-V4 is unaffected by this row.
+  **First step when picked up:** measure what it actually costs on MiniMax at `kv_cache_mode="fp8"`
+  with prefix caching off — if the answer is ~0, this is a docs-and-comment fix, not a perf row.
 
 - **[bug] `prefix_hit` in `requests.jsonl` cannot detect a reuse COLLAPSE** (found by row 31,
   2026-09-12). It is `True` for a 1-token match, so an arm whose turn-2 match had fallen from
@@ -2229,7 +2290,48 @@ and both have a golden reference or a Vaayu precedent.
       tripwire is a source-text substring match, brittle to harmless reformatting (confirmed
       today-correct by the reviewer; not a live defect).
 
-- [ ] **A5.7b — load, index, first token. BRIEF's remainder.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
+- [~] **A5.7b — load, index, split. RAN 2026-09-24/25; STOPPED ON ITS OWN STOP RULE. Remainder is
+      A5.7c below.** **WHAT LANDED — branch `a5.7b-load-first-token`, 14 commits off `1995382`, NOT
+      MERGED, full suite green at `2778 passed, 16 skipped`:** `cda7f3b` key_remap hook on
+      `split_and_save_layers` + `get_checkpoint_key_remap` base hook (identity default) · `e553137`
+      DeepSeek's disk-key→module-tree mapping with `mtp.*` dropped · `6dfd041` `fp4_group_size`
+      derived from the SPLIT shards before `from_config` · `a3a5a17` prefix cache / KV persist
+      downgraded to the engine's generic warn-and-disable, drafting refused by name, `start_pos`
+      contiguity check · `0d895a5` docstring · `eaba376` **G2 homeless-key guard** + `hc_head_*`
+      routed into the `model.norm` shard · `b21dd49` guard moved ahead of BOTH delete sites ·
+      `01dbad6` prefix-cache refusal answered by class detection, not a probe cache · `4995b0e`
+      **`F8_E8M0` mapped and the silent float32 dtype fallback replaced by a raise at all five
+      reader sites** · `0816094` `KERNEL_DIR` pointed at the checkpoint's `inference/` ·
+      `a2d7280` a real `DeepseekV4Cache` seeded before `generate()` delegates · `ab2e8cb` test
+      hygiene · `64e7036` all 4 borrowed symbols resolved off the RUNNING module (the two-module
+      split) · `9616c04` `_detect_moe` override, fp4 reinterpret + `dequantize_at_load`, injection
+      failures now RAISE.
+      **ON DISK AND IRREPLACEABLE — DO NOT RE-SPLIT:**
+      `deepseek-ai--DeepSeek-V4-Flash-0731/splitted_model/` = **46 shards + 46 `.done`, 146 G**,
+      written in 186.4 s; **the 48 originals are STILL PRESENT** (`delete_original=False`, the
+      user's decision); 85 G free. `model.norm.safetensors` carries `hc_head_{base,fn,scale}`.
+      **MEASURED ON DEVICE (run 7):** zero injection warnings (was 769); **11,008 expert entries
+      across 43 MoE layers**; every layer patched `router=gate, experts=experts, n=256, top_k=6`;
+      Expert VRAM cache 5.2 GB (~386 experts), RAM cache 23.4 GB (~1749 slots, expert=13.4 MB,
+      working_set=3.45 GB); slab arena SKIPPED (module_list does not read it); **LOADED in 4.0 s**;
+      `fp4_group_size=32`; `attn impl: eager`; prefix cache warn-and-disabled from an
+      `enable_prefix_cache=True` call, i.e. the server's default.
+      **A4 CHECK 2 IS ANSWERED, and it is a finding:** the pin summary reads `3 fully-pinned
+      (0 transformer + 3 shared), 0 non-expert-pinned transformer` against `pinning budget=3.34 GiB`
+      and an 8.24 GiB dense footprint — **NOT ONE transformer layer was pinned**, stronger than the
+      design's predicted "budget exhausted partway".
+      **STILL NOT DONE: no token, no server gate, no row-28b step-5 measurement.** All three are
+      A5.7c's.
+      (Original A5.7b row text follows.) **DESIGNED 2026-09-24 —
+      [`…-A5.7b-load-first-token-design.md`](docs/superpowers/specs/2026-09-24-A5.7b-load-first-token-design.md)
+      · PLANNED the same day, 6 tasks:
+      [`…-A5.7b-load-first-token.md`](docs/superpowers/plans/2026-09-24-A5.7b-load-first-token.md)
+      (both gitignored; the bullets under "DESIGN, the durable copy" at the end of this row carry every
+      decision and number). Task order: 1 `key_remap` in the splitter + hook · 2 DeepSeek's mapping ·
+      3 `fp4_group_size` off the SPLIT shards · 4 prefix-cache downgrade + drafting refusal +
+      `start_pos` contiguity check · 5 dry-run, split at `delete_original=False`, index = 11,008 ·
+      6 first token, server gate, row-26 measurement, gates, close. **Suite floors as the plan leaves
+      them: repo 2744/16, DeepSeek subset 314.** **ROW 28b's STEP-3 VERIFY IS WRONG AS WRITTEN:**
       it expects `ExpertOffsetIndex` to find `43 × 256 = 11,008`, but the regex
       `\.experts\.(\d+)\.` finds **11,776** — the extra **768 experts = 9.56 GiB** are
       `mtp.0/1/2.ffn.experts.*`. MTP is OUT, so **the index must skip `mtp.*` and find 11,008**.
@@ -2249,6 +2351,89 @@ and both have a golden reference or a Vaayu precedent.
       step 5's measurement. **§8: answer all four.** **Expect ~1.75–2.06 tok/s** (3.2124 GiB/token
       ÷ the NVMe plateau) — **A5 buys REACH, not speed; ~5× slower than Qwen3-Next. Do not present
       it as a perf win.**
+
+      **DESIGN, the durable copy (2026-09-24). Re-verification of this row against the disk first —
+      three citations here DRIFTED:** the test floors are **+2** on the A5.7a RESULTS doc —
+      **DeepSeek 291 passed, full repo 2713 passed / 16 skipped** (`f4854f4`, the eager fix, added
+      two tests after that doc was written; both re-run 2026-09-24, and these are A5.7b's floors);
+      the `weight_block_size` sites are `modeling_deepseek_v4.py` **500 / 1173 / 1243**, not
+      493/1166/1236; Phase 2's budget `break` is **~`vaayu_base.py:3977`** — `:3956` is the
+      gate-pinning loop. Everything else in this row HELD, including 11,776 = 11,008 + 768 and the
+      `mtp.0.ffn` → layer-0 collision.
+      **Measured from the shard headers, so nothing below is carried:** total **155.42 GiB**;
+      `mtp.*` is **10.117 GiB** (the brief's 9.56 GiB is 768 × 12.75 MiB, the experts ONLY);
+      **split output 145.3 GiB against 230 GiB free — both copies fit, ~85 GiB slack**; per layer
+      3264 MiB routed (256 × 12.75 MiB) + **136.9 MiB non-expert**; **dense footprint 8.24 GiB**
+      (6.27 layers + 0.986 embed + 0.986 head), which reproduces this row's 8.24 independently.
+      **THREE DECISIONS (user, 2026-09-24):** **(1) the first split runs `delete_original=False`** —
+      under NO-DOWNLOAD it is the only undo there is, and it fits. **(2) The key remap happens
+      BEFORE the split**, through a new `VaayuBaseModel.get_checkpoint_key_remap()` hook returning
+      `None` by default (identity, same shape as A5.7a's `run_embed`), threaded
+      `__init__` → `find_or_create_local_splitted_path` → `split_and_save_layers(key_remap=…)`.
+      **The load-time alternative is DEAD, and here is why, so nobody re-derives it:** the splitter
+      matches keys by SUBSTRING (`if layer in k`), so disk-named `layer_names` pulls **248
+      layer-internal `*norm` keys into the `norm` shard and 3 `mtp` heads into the `head` shard`**,
+      and the embed-shape probe at `vaayu_base.py:2141` breaks. Remapping first also makes the
+      `mtp` skip and the 11,008 count fall out for free, with **no `mtp` filter anywhere else**.
+      **(3) Prefix cache / KV persistence downgrade to warn-and-disable** — delete the hard refusal
+      in `VaayuDeepseekV4.__init__` (KEEP the `attn_implementation` `setdefault("eager")`, which is
+      load-bearing) and let the pre-existing generic path run (`_refuse_unsupported_prefix_cache`,
+      `vaayu_base.py:3755`; `kv_persist` already prints `ignored` at `:3097`). Reason: the server's
+      DEFAULT config sets `ENABLE_PREFIX_CACHE = True` and `app.py:406` passes it unconditionally,
+      so the hard refusal made the default config unable to load this model at all.
+      **TWO BLOCKERS FOUND IN RE-VERIFICATION, not in the brief:** (a)
+      `_fp4_group_size_from_headers` reads the ORIGINAL index + shards, and
+      `delete_original_shards` keeps the index but DELETES the shards — so the loader must derive
+      the group size (**32**) from the SPLIT shards; the helper moves out of
+      `tests/test_deepseek_v4_model.py` into `vaayu/model_code/deepseek_v4/` and the test imports
+      it. (b) The substring-match problem in decision 2 above.
+      **Two things SIZED rather than assumed:** the whole 43-layer `DeepseekV4Cache` is **70.8 MiB
+      at `max_seq_len=8192`** (43.9 at 4096, 124.5 at 16384), so A5.7a's "wasted, not wrong" probe
+      allocation needs no gating; and A4 Check 2 should EXPECT the pin budget exhausted partway —
+      6.27 GiB of layers + 1.97 GiB embed/head against a budget near 4.8 GB, with the remainder
+      falling back to `LRUTensorCache(_ne_budget)` (RAM re-reads, NOT per-token streaming).
+      **Also carried in from A5.7a item (a): speculative decoding is NOT refused today** and dies
+      in `_trim_kv_cache` (`vaayu_base.py:5428`) on the first rejected draft — A5.7b refuses
+      `drafter_model_path` by name and adds the `_start_pos` contiguity assert to
+      `get_pos_emb_args`.
+      **Gates obliged (shared infra → both paths, CLAUDE.md §0):** full suite **2713/16**, DeepSeek
+      **291**, BOTH MoE accumulator gates foreground at `MemoryMax=29G`. **No fused-EXL3 arm exists**
+      (no model on disk since 2026-09-20) and **dense has no committed gate** — the argument dense
+      is unaffected is the hook's `None` default, stated not assumed.
+
+- [ ] **A5.7c — streamed fp4 expert injection, then the first token. RE-PLAN IN A FRESH SESSION.**
+      **READ FIRST:** [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md)
+      (gitignored — this row is the durable copy).
+      **THE ONE DEFECT:** `moe_patch.py:1208` (`t = tensor.to(device, dtype=dtype, non_blocking=True)`)
+      casts every streamed expert tensor to the running dtype, so a packed-fp4 expert weight reaches
+      `DeepseekV4Linear.forward` as **int8**, takes its `weight.dtype not in _QUANTIZED` branch
+      (`modeling_deepseek_v4.py:314`) and dies in `F.linear` with
+      `mat1 and mat2 shapes cannot be multiplied (1x4096 and 2048x2048)` — the packed [2048, 2048]
+      weight against a [1, 4096] activation. It must be **reinterpreted** (`.view(target_dtype)`),
+      never cast; a cast corrupts the packed bytes even when it does not raise (A5.7b Task 6f, Q2).
+      **WHY IT IS A RE-PLAN, NOT A FIX:** `moe_patch.py` is the expert-streaming path, and its
+      module-list forward is the one **MiniMax-M2.7 runs in production**. A5.7b fixed the identical
+      defect for the NON-expert path inside the subclass (`9616c04`), but experts do not travel that
+      path and `moe_patch.py` has **no subclass seam** — module-level functions over `block_info` /
+      `vaayu_ref`. A5.7b's plan said "if it grows into the expert cache, STOP and re-plan"; it did.
+      **TWO DESIGN QUESTIONS THE PLAN MUST ANSWER:** (1) where the target dtype comes from at
+      `:1208` — the subclass uses `self.model.get_parameter(name).dtype`, but this is the decode hot
+      path, so it may need resolving once per layer and caching; (2) narrow hook called from
+      `moe_patch` (policy stays in the subclass, blast radius zero, but a hook in a hot path) vs an
+      explicit packed-dtype allowlist in `moe_patch` itself (simpler, but IS the shared change).
+      **MUST NOT CHANGE:** any tensor whose target dtype is not packed must inject byte-identically
+      to today. Use an explicit allowlist, NOT a general "dtypes differ → reinterpret" branch.
+      **GATES, NON-NEGOTIABLE:** full suite (floor **2778 passed, 16 skipped**) AND **both** MoE
+      accumulator gates foreground at `MemoryMax=29G` — Qwen3-Next (~35 s) and **MiniMax-M2.7
+      (~73 s), which shares this exact forward and is the whole point**. No fused-EXL3 arm exists;
+      dense has no committed gate — say both rather than claiming coverage.
+      **THEN, still A5.7c:** first token · `SERVER_CKPT=… tests/test_server_smoke.py -q -s` (the only
+      proof of §8(3)) · row 28b step 5 via `plans/probes/row26_decode.py`, which takes **no
+      `--ckpt`** — add a `"deepseek"` entry to its hardcoded `MODELS` dict and run
+      `MODEL=deepseek BALLAST_GB=25` (it hardcodes `delete_original=False`, verified, so it cannot
+      eat the checkpoint). **Expect ~1.75–2.06 tok/s — REACH, not speed, ~5× slower than
+      Qwen3-Next. TTFT is NOT comparable to MiniMax's post-row-45 figure** (eager keeps the
+      chunk-major branch shut, so a 4k prompt re-reads its expert set 8×).
 
 **Two checks CARRIED OUT OF A4 (row 47, closed 2026-09-23 with its premise refuted) — they belong to A5:**
 - [ ] **check 1: confirm DeepSeek's shared experts actually land in the pinned non-expert set** once
