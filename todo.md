@@ -1187,7 +1187,7 @@ it must not be "restored", both locked by test.**
 | MiniMax-M2.7 | `NeuroSenko--MiniMax-M2.7-exl3` | 62 / 8 / 128 / 3072 / 48 / 200064 | 0.254 MB/tok | MoE module-list | 8192 |
 | Llama-3.3-70B | `archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` | 80 / 8 / 128 / 8192 / 64 / 128256 | 0.328 MB/tok | dense, streamed | 8192 (sdpa) |
 | Llama-3.2-1B | `Llama-3.2-1B-Instruct` | 16 / 8 / 64 / 2048 / 32 / 128256 | 0.033 MB/tok | dense, small/fast | 71981 (sdpa) |
-| **DeepSeek-V4-Flash-0731** ⛔ **COMPLETE ON DISK 2026-09-20 (48/48, 157 G) — STILL CANNOT LOAD** | `deepseek-ai--DeepSeek-V4-Flash-0731` | 43 / 1 / 512 / 4096 / 64 / 129280 · 256 experts, top-6, **fp4 4.2500 bpw**, 12.750 MiB/expert, 155.42 GiB (137.06 experts + 8.24 dense + 10.12 MTP draft) | n/a | none — `deepseek_v4` unknown to transformers 5.5.4, no HF remote code in repo, TileLang kernels absent (row 28) | n/a |
+| **DeepSeek-V4-Flash-0731** ✅ **SPLIT + LOADS as of 2026-09-25 (A5.7b); originals DELETED after a byte-for-byte verify, MTP's 3 shards moved to `models/deepseek-v4-mtp-shards/`. Loads in 3.7 s; does NOT yet emit a token — A5.7c.** | `deepseek-ai--DeepSeek-V4-Flash-0731` | 43 / 1 / 512 / 4096 / 64 / 129280 · 256 experts, top-6, **fp4 4.2500 bpw**, 12.750 MiB/expert, 155.42 GiB (137.06 experts + 8.24 dense + 10.12 MTP draft) | n/a | none — `deepseek_v4` unknown to transformers 5.5.4, no HF remote code in repo, TileLang kernels absent (row 28) | n/a |
 
 (`max_seq_len` is KERNEL-DEPENDENT — the sdpa score term is charged from 2026-08-15 (rows 6/7), and
 the sdpa reserve floor is raised to flash parity from 2026-08-16 (archived row 8). Every figure above is
@@ -2306,10 +2306,25 @@ and both have a golden reference or a Vaayu precedent.
       hygiene · `64e7036` all 4 borrowed symbols resolved off the RUNNING module (the two-module
       split) · `9616c04` `_detect_moe` override, fp4 reinterpret + `dequantize_at_load`, injection
       failures now RAISE.
-      **ON DISK AND IRREPLACEABLE — DO NOT RE-SPLIT:**
+      **ON DISK AND IRREPLACEABLE — DO NOT RE-SPLIT. THE ORIGINALS ARE GONE AS OF 2026-09-25:**
       `deepseek-ai--DeepSeek-V4-Flash-0731/splitted_model/` = **46 shards + 46 `.done`, 146 G**,
-      written in 186.4 s; **the 48 originals are STILL PRESENT** (`delete_original=False`, the
-      user's decision); 85 G free. `model.norm.safetensors` carries `hc_head_{base,fn,scale}`.
+      written in 186.4 s. `model.norm.safetensors` carries `hc_head_{base,fn,scale}`.
+      **The split was BYTE-VERIFIED against the originals before they were deleted**
+      (`plans/probes/a57b_verify_split.py`, gitignored): all **67,612 non-mtp tensors compared via
+      `.view(torch.uint8)` through safetensors' OWN reader on both sides — 0 mismatches, 88 s.**
+      Then **45 of the 48 originals were deleted, reclaiming 145.3 GiB** (free 85 G -> **231 G**),
+      and the split was re-verified to load without them: **3.7 s, `is_moe=True`, experts=256,
+      top_k=6, fp4_group_size=32, attn=eager**.
+      **THE 3 PURE-MTP SHARDS WERE MOVED, NOT DELETED**, to
+      **`/home/a/code/ai-ml/models/deepseek-v4-mtp-shards/`** (10.1 GiB: shards 46/47/48 plus a
+      README and an `mtp_weight_map.json` slice of the original index) — so **row 28b step 6, the
+      free speculative drafter, is STILL POSSIBLE** under the no-download constraint. That directory
+      is **NOT a loadable checkpoint** (no config, no tokenizer, no complete shard set).
+      **Why they were moved OUT rather than left in place — a trap worth remembering:**
+      `assert_checkpoint_complete` returns early ONLY when **zero** `*.safetensors` remain
+      (`checkpoint_integrity.py:28`). Leaving 3 of 48 would fail both its shard-numbering check
+      (missing 1-45) and its index cross-check, and **break every future load of that directory**.
+      Deleting all and deleting none are the only safe in-place states.
       **MEASURED ON DEVICE (run 7):** zero injection warnings (was 769); **11,008 expert entries
       across 43 MoE layers**; every layer patched `router=gate, experts=experts, n=256, top_k=6`;
       Expert VRAM cache 5.2 GB (~386 experts), RAM cache 23.4 GB (~1749 slots, expert=13.4 MB,
