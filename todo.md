@@ -96,7 +96,18 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S2** — S1 CLOSED 2026-09-25 as a measured null (its row is immediately below). The sequence **S1…S6** is defined above. ONE PER FRESH SESSION, IN ORDER. ◀◀
+## ▶▶ PICK THIS NEXT: **S1-L1** — then **S2**, then the rest of S3…S6 in order. ◀◀
+
+**S1 CLOSED 2026-09-25 as a measured null (its row is immediately below). S1-L1 is taken OUT OF
+ORDER, ahead of S2, and the reason is written here because the S1…S6 table forbids silent
+reordering: S1-L1 is a PREFILL/TTFT item on the production model, and §0 ranks TTFT as this
+workload's top lever; S2 is a correctness cleanup on a counter. S2 is not dropped — it is next
+after S1-L1.** Handoff:
+[`…S1-L1-prefill-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-L1-prefill-pageable-h2d-HANDOFF.md).
+
+**S1-L1 is a LEAD, not a diagnosis.** The one thing S1 proves is that a copy COUNT is not a cost:
+its own headline number was wrong twice, and both of its candidate fixes lost. Attribute the 27,084
+copies to call sites and check whether they drain the stream BEFORE proposing anything.
 
 ---
 
@@ -145,7 +156,11 @@ families. A/B in ONE model load, toggling in place, 8 alternating `serial` arms 
 | `serial` (NOEXP) | 41.096 ms | 38.384 ms | **−2.711 ms = −7.06 %** | 0.457 ms = 1.19 % |
 | real forward | 127.458 ms | 125.710 ms | **−1.748 ms = −1.39 %** | 0.458 ms = 0.36 % |
 
-Perfectly separated (ON 40.885/41.776/40.930/40.793, OFF 38.336/38.559/38.373/38.270); TTFT flat.
+Perfectly separated (ON 40.885/41.776/40.930/40.793, OFF 38.336/38.559/38.373/38.270).
+**Correction 2026-09-25, same day: "TTFT flat" was WRONG and is withdrawn — TTFT was never tested.**
+The A/B's prefill column is the forward the probe profiles with CUPTI to count memcpys, so ~53 s of
+it is profiler overhead; a real unprofiled 135-token prefill is **4.6-4.9 s** (0.16 s on NOEXP).
+The verdict is unchanged — the decode regression settles it on its own.
 **Root cause of the regression, confirmed directly: `torch.device` used as a CONTEXT MANAGER pushes a
 `DeviceContext` torch-function mode, so every torch op inside pays python dispatch — +0.906 µs/op
 measured (100 ops: 323.63 → 414.25 µs).** ~80–110 ops/layer × 36 layers ≈ 2.7 ms, which is the
@@ -168,12 +183,16 @@ under `vaayu/` changed.** No fused-EXL3 arm exists and dense has no committed ga
 
 ### Leads S1 recorded and deliberately did NOT chase
 
-- **[ ] S1-L1 — ~27,084 pageable HtoD in ONE 135-token PREFILL forward.** Counted in the S1 A/B
+- **[~] S1-L1 — ~27,084 pageable HtoD in ONE 135-token PREFILL forward. PICKED NEXT 2026-09-25; handoff `docs/superpowers/specs/2026-09-25-S1-L1-prefill-pageable-h2d-HANDOFF.md`.** Counted in the S1 A/B
   (fix off; 27,048 with S1-a's 36 removed). Decode's expert loads are NOT pageable — the slab
   arena's async path works there (row 30-P) — so this is **prefill-only**. Prefill is TTFT, this
   workload's top lever (CLAUDE.md §0), and the number is ~320× the entire decode-side finding.
   **This is the larger fish; it is a lead, not yet a diagnosis** — nobody has attributed those 27k
-  to a call site the way §2 above attributed the 84.
+  to a call site the way §2 above attributed the 84. **Calibration: that prefill really costs
+  4.6-4.9 s** (unprofiled, 135 tokens; 0.16 s on NOEXP). 27,084 copies at S1-b's measured 3.14 µs
+  floor for a *non-draining* pageable copy is ~85 ms = ~1.8 % of it; if they drain the stream the way
+  S1-a's did, far more. **The count alone establishes nothing — S1 is the cautionary tale.** Attribute
+  first, at a realistic agentic prompt (2k-8k, several chunks), not at 135 tokens.
 - **[ ] S1-L2 — 96.5 `Memcpy DtoH (Device -> Pageable)` per real decode forward.** Never counted
   before: the row 36 spike's top-25 only ever showed the 25.4 *pinned* DtoH. More numerous than the
   84 HtoD and fully synchronous. Belongs with S3's routing-sync item; S1's handoff §5 forbade
