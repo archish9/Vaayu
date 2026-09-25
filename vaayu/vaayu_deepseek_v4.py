@@ -17,14 +17,12 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 
 from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
 from .vaayu_base import VaayuBaseModel
-
 # Packed/opaque torch dtypes that must be REINTERPRETED (`.view`) rather than
-# numerically cast when injected -- see `move_layer_to_device` below. This
-# names a torch dtype class, not a model number (CLAUDE.md §5): today only
-# DeepSeek-V4's routed-expert weights (`config.expert_dtype == "fp4"`) are
-# this shape, but the set is written for the class of problem, not the one
-# checkpoint.
-_PACKED_INJECTION_DTYPES = (torch.float4_e2m1fn_x2,)
+# numerically cast when injected -- see `move_layer_to_device` below. ONE
+# definition, shared with `moe_patch`'s expert-streaming injector (A5.7c):
+# the invariant is a property of the dtype, not of a path or a model, and two
+# copies is how one path grows a dtype the other lacks.
+from .moe_patch import NO_CAST_INJECTION_DTYPES as _PACKED_INJECTION_DTYPES
 
 
 class VaayuDeepseekV4(VaayuBaseModel):
@@ -229,10 +227,22 @@ class VaayuDeepseekV4(VaayuBaseModel):
            dtype cast and reinterpret them (`.view(target_dtype)`) -- the
            disk tensor and the packed dtype have the same per-element byte
            count, so this is a bit-reinterpret, never a reshape. Ordinary
-           tensors (including this checkpoint's own `F8_E8M0` scales, an
-           arithmetic float8 format that casts through `running_dtype`
-           without incident) are untouched -- only the packed-dtype target
-           takes this branch.
+           tensors are untouched -- only an allowlisted target takes this
+           branch.
+
+           **The `F8_E8M0` scales are safe HERE and were not safe on the
+           expert path, and the difference is the injection call (A5.7c).**
+           `set_module_tensor_to_device` coerces its `value` back to the
+           declared parameter dtype, and bf16 round-trips both `e8m0` and
+           `e4m3` losslessly, so a scale cast through `running_dtype` lands
+           back in `float8_e8m0fnu` on this path. `moe_patch`'s
+           `_inject_expert_weights` binds with
+           `setattr(submod, base, nn.Parameter(t))` and gets no such
+           coercion, so the same cast left the scale bf16 --
+           `DeepseekV4Linear.forward` reads the quantization format back off
+           `scale.dtype`, so that silently turned `scale_fmt` into None. The
+           allowlist now names `e8m0` for both paths, which on this one
+           replaces a lossless round-trip with no conversion at all.
         2. **`wo_a.scale`.** `wo_a` is declared bf16 in the skeleton (a
            deliberate choice -- see `modeling_deepseek_v4.py`'s comment
            beside it), so its `scale` Parameter is `None` by design, and

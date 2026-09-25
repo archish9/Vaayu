@@ -982,6 +982,63 @@ def test_move_layer_to_device_does_not_numerically_cast_packed_bytes():
     assert torch.equal(injected_bytes, raw_bytes)
 
 
+def test_the_packed_dtype_allowlist_has_a_single_home():
+    """A5.7c: the same invariant governs the expert path (moe_patch) and the
+    non-expert path (this subclass). Two copies of the tuple is how one of them
+    grows a dtype the other does not have -- which is exactly the shape of the
+    e8m0 defect that reached the forward."""
+    import vaayu.moe_patch as mp
+    from vaayu.vaayu_deepseek_v4 import _PACKED_INJECTION_DTYPES
+
+    assert _PACKED_INJECTION_DTYPES is mp.NO_CAST_INJECTION_DTYPES
+    assert torch.float8_e8m0fnu in _PACKED_INJECTION_DTYPES
+
+
+def _e8m0_scale_engine():
+    """A module declaring an `float8_e8m0fnu` scale, which is what every
+    quantized `DeepseekV4Linear` does (`_SCALE_DTYPE`)."""
+
+    class TinyScaled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.zeros(2, 2, dtype=torch.float4_e2m1fn_x2),
+                requires_grad=False)
+            self.scale = nn.Parameter(
+                torch.zeros(2, 1, dtype=torch.float8_e8m0fnu),
+                requires_grad=False)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = TinyScaled()
+
+    TinyModel.__module__ = modeling.__name__
+    return engine(model=TinyModel(), running_device="cpu",
+                  running_dtype=torch.bfloat16, _moe_key_remapper=None,
+                  _path_remappings={})
+
+
+def test_move_layer_to_device_keeps_an_e8m0_scale_in_its_declared_dtype():
+    """`DeepseekV4Linear.forward` reads the quantization format back off
+    `scale.dtype`, so this dtype is load-bearing, not cosmetic. It already held
+    on this path (accelerate coerces an injected value back to the declared
+    parameter dtype, and bf16 round-trips e8m0 losslessly) -- A5.7c pins it,
+    because the SAME cast on the expert path had no such coercion and did break
+    it."""
+    model = _e8m0_scale_engine()
+    raw_scale = torch.randint(120, 136, (2, 1), dtype=torch.uint8)
+
+    model.move_layer_to_device({
+        "linear.weight": torch.randint(-120, 120, (2, 2), dtype=torch.int8),
+        "linear.scale": raw_scale.clone().view(torch.float8_e8m0fnu),
+    })
+
+    injected = model.model.linear.scale
+    assert injected.dtype == torch.float8_e8m0fnu
+    assert torch.equal(injected.view(torch.uint8), raw_scale)
+
+
 def _wo_a_dequant_engine():
     """A real `wo_a`-shaped module: `DeepseekV4Linear(dtype=bf16)`, whose
     `scale` is `None` by construction -- exactly the shape that crashes
