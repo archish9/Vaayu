@@ -118,6 +118,36 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         super().__init__(*args, **kwargs)
 
+        # `patch_moe_blocks` (inside the `super().__init__()` call just above)
+        # replaces each block's `moe_module.forward` with `moe_patch`'s generic
+        # module-list forward, which ALWAYS returns `(hidden_states,
+        # router_logits)` -- every caller is expected to unpack it itself.
+        # `vaayu_base.py`'s own layer-major loop does that one level up, for
+        # the DECODER LAYER's return (`layer_out[0] if isinstance(tuple)`),
+        # but this architecture's decoder-layer code is DeepSeek's OWN
+        # reference implementation (loaded via `trust_remote_code`, not
+        # patched by Vaayu): `x = self.ffn(x)` expects a single tensor back
+        # and feeds it straight into `hc_post`'s `x.unsqueeze(-2)`. A tuple
+        # there raises `AttributeError: 'tuple' object has no attribute
+        # 'unsqueeze'` (Task 4, first on-device run). The pinned-layer branch
+        # of the same patched forward calls straight through to the
+        # ORIGINAL `DeepseekV4MoE.forward`, which returns a plain tensor
+        # already (`-> torch.Tensor`), so the unwrap below has to tolerate
+        # both shapes rather than assume a tuple.
+        #
+        # Fixed here, confined to this model class: every other model's
+        # `moe_module.forward` (patched by the same `moe_patch.py`) is left
+        # exactly as `patch_moe_blocks` set it.
+        for _block in getattr(self, "_moe_blocks", []):
+            _patched_forward = _block.moe_module.forward
+
+            def _unwrap_ffn_tuple(hidden_states, *fargs, _wrapped=_patched_forward,
+                                  **fkwargs):
+                out = _wrapped(hidden_states, *fargs, **fkwargs)
+                return out[0] if isinstance(out, tuple) else out
+
+            _block.moe_module.forward = _unwrap_ffn_tuple
+
     def _running_module(self):
         """The module object the LOADED model actually runs from.
 
@@ -525,9 +555,26 @@ class VaayuDeepseekV4(VaayuBaseModel):
         hooks -- recorded here and asserted in `get_pos_emb_args`, which the
         layer-major loop evaluates immediately after this one
         (`vaayu_base.py:5222`).
+
+        Reads the LAST layer's own count, never the default `layer_idx=0`
+        (Task 4, first real forward pass): `DeepseekV4Cache` gives every layer
+        an INDEPENDENT `cumulative_length`, bumped only when that layer's own
+        `update()` runs. This hook and `get_pos_emb_args` are called once per
+        DECODER LAYER, in layer order, within a single token/chunk step
+        (`vaayu_base.py:5205-5222`) -- so by the time layer 1's kwargs are
+        built, layer 0 has already run and bumped ITS count for this step,
+        and `get_seq_length()`'s default (`layer_idx=0`) reports that
+        post-write number while every other layer is still pre-write. Checked
+        against the pre-step `len_p`, that looks exactly like "the cache moved
+        out from under us" and raised on the very first prefill
+        (`AttributeError`-adjacent RuntimeError, layer 1 of 43, every time).
+        The LAST layer is the only index that stays at the pre-step value for
+        every layer's kwargs within the step, including its own (built before
+        it runs) -- `num_hidden_layers` off the config, never a literal.
         """
         self._cache_seq_len = (
-            past_key_values.get_seq_length() if past_key_values is not None else None)
+            past_key_values.get_seq_length(self.config.num_hidden_layers - 1)
+            if past_key_values is not None else None)
         return {"past_key_values": past_key_values}
 
     def get_pos_emb_args(self, len_p, len_s):

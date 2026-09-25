@@ -443,6 +443,7 @@ def test_a_start_pos_that_disagrees_with_the_cache_raises():
     cache with an un-rewound start_pos writes into the wrong slots and returns
     plausible tokens computed against the wrong history."""
     model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = shipped_config()
     cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
                                      device="cpu", dtype=torch.float32)
     cache.advance(7)
@@ -454,12 +455,38 @@ def test_a_start_pos_that_disagrees_with_the_cache_raises():
 
 def test_a_start_pos_that_agrees_with_the_cache_passes_through():
     model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = shipped_config()
     cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
                                      device="cpu", dtype=torch.float32)
     cache.advance(7)
 
     model.get_past_key_value_args(cache)
     assert model.get_pos_emb_args(7, 1) == {"start_pos": 7}
+
+
+def test_get_past_key_value_args_reads_the_last_layer_not_the_default_first():
+    """Task 4 (first real forward pass): the engine's layer-major loop calls
+    this hook once per DECODER LAYER, in order, within a single token/chunk
+    step. `DeepseekV4Cache.get_seq_length()` defaults to `layer_idx=0`, and
+    each layer's `cumulative_length` only advances when THAT layer's own
+    `update()` runs -- so once layer 0 has run, the default arg reports this
+    step's POST-write count while every other layer is still pre-write,
+    which reads as a rewound cache and raised `RuntimeError` on the very
+    first prefill, at layer 1 of 43, every time. Reading the LAST layer
+    (`num_hidden_layers - 1`) instead must stay at the pre-step count no
+    matter which layer already ran this step."""
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = shipped_config()
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
+                                     device="cpu", dtype=torch.float32)
+    cache.advance(5)          # every layer starts this step at 5, like a fresh
+                               # prefill's cache would after step 1.
+    cache.layers[0].cumulative_length = 10  # layer 0 already ran THIS step
+
+    model.get_past_key_value_args(cache)
+    # Must not raise: the last layer's count (5) still agrees with len_p=5,
+    # even though the default (layer 0's count, 10) would not.
+    assert model.get_pos_emb_args(5, 1) == {"start_pos": 5}
 
 
 def test_the_default_construction_is_not_refused(monkeypatch):
@@ -922,6 +949,61 @@ def test_detect_moe_leaves_a_non_moe_config_alone():
     assert model.is_moe is False
     assert model.moe_num_experts == 0
     assert model.moe_top_k == 0
+
+
+def test_construction_unwraps_a_tuple_returning_moe_forward(monkeypatch):
+    """Task 4 (first on-device run): DeepSeek-V4's own decoder-layer code
+    (loaded via `trust_remote_code`, DeepSeek's reference implementation, not
+    patched by Vaayu) does `x = self.ffn(x)` expecting a single tensor back,
+    then feeds it straight into `hc_post`'s `x.unsqueeze(-2)`.
+    `moe_patch.patch_moe_blocks` (which runs inside `VaayuBaseModel.__init__`,
+    faked out below) always leaves the module-list forward returning
+    `(hidden_states, router_logits)` -- the convention its OTHER caller (the
+    generic layer-major loop's own `layer_out[0] if isinstance(tuple)`
+    unwrap, one level up, for the whole decoder LAYER) relies on. Left
+    unwrapped at the `ffn` boundary, this raised exactly `AttributeError:
+    'tuple' object has no attribute 'unsqueeze'` on the real checkpoint."""
+    from types import SimpleNamespace
+
+    class _FakeMoEModule:
+        def forward(self, hidden_states):
+            return hidden_states * 2, "router_logits_placeholder"
+
+    fake_block = SimpleNamespace(moe_module=_FakeMoEModule())
+
+    def fake_init(self, *args, **kwargs):
+        self._moe_blocks = [fake_block]
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path")
+
+    x = torch.tensor([1.0, 2.0])
+    out = fake_block.moe_module.forward(x)
+    assert torch.equal(out, x * 2)  # unwrapped: no longer a tuple
+
+
+def test_construction_leaves_a_plain_tensor_returning_moe_forward_alone(monkeypatch):
+    """The same patched forward's pinned-layer branch calls straight through
+    to DeepSeek's ORIGINAL `DeepseekV4MoE.forward`, which already returns a
+    plain tensor (`-> torch.Tensor`). The wrap must tolerate that shape too,
+    not assume every patched forward returns a tuple."""
+    from types import SimpleNamespace
+
+    class _FakeMoEModule:
+        def forward(self, hidden_states):
+            return hidden_states * 3
+
+    fake_block = SimpleNamespace(moe_module=_FakeMoEModule())
+
+    def fake_init(self, *args, **kwargs):
+        self._moe_blocks = [fake_block]
+
+    monkeypatch.setattr(VaayuBaseModel, "__init__", fake_init)
+    VaayuDeepseekV4("/some/path")
+
+    x = torch.tensor([1.0, 2.0])
+    out = fake_block.moe_module.forward(x)
+    assert torch.equal(out, x * 3)
 
 
 def _packed_fp4_engine(**extra_attrs):
