@@ -57,7 +57,48 @@ detail each entry points to.**
 
 # ▶ START HERE — the whole open queue, re-prioritised 2026-09-11
 
-## ▶▶ PICK THIS NEXT: **A5.7c** — jump to "PICK THIS NEXT: **A5.7c**" below for the order and the links ◀◀
+---
+
+# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25. One per fresh session, in order. ◀◀◀
+
+**Each S-item has its own self-contained HANDOFF in `docs/superpowers/specs/` — gitignored, so THIS
+row is the durable copy of why it exists and what "done" means.** Read the handoff first; it carries
+the file:line evidence, the gates, the stop rules and the environment. **Do not reorder without a
+reason written here.** The ordering rule used: *(a)* does it help the model that actually serves the
+agent (Qwen3-Next, 9.06 tok/s), *(b)* is it cheap, *(c)* does it protect something already built.
+
+**Why NOT DeepSeek-V4 first, stated once so it is not re-litigated:** it decodes at **0.3267 tok/s**,
+**27.7× slower than Qwen3-Next**. A 500-token function takes ~25 minutes. It is a generality fixture —
+the proof that Vaayu runs a 147 G two-quant-format fp4 MoE on 16 GB VRAM — not a production model. So
+its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is deliberate.
+
+| # | item | why here | cost | handoff |
+|---|---|---|---|---|
+| **S1** | **41.7 pageable HtoD memcpys per decode token** (Qwen3-Next) | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
+| **S2** | **chunk-major byte counter survives an aborted expert injection** | `moe_patch.py:1984-1986` resets OUTSIDE the `finally`, so an abort leaves `_chunk_major_gpu_bytes` stale for the process and silently shrinks row 45's retention on **MiniMax's production prefill path** | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
+| **S3** | **Qwen3-Next `GatedDeltaNet` elementwise fusion** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
+| **S4** | **restore the 46 DeepSeek-V4 tests** the shard deletion broke | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
+| **S5** | **DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) |
+| **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
+
+**Suite floor for every one of them: `2759 passed, 44 failed, 2 errors, 16 skipped` (~192 s,
+FOREGROUND).** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
+(attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors, checkpoint 1), never just the
+count. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
+-p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
+fused-EXL3 arm exists** (no model on disk since Qwen3-235B was retired 2026-09-20) and **dense has no
+committed gate** (`test_batched_dense_smoke.py` deleted 2026-09-03) — say both, claim neither.
+
+**After S1…S6**, the remaining open work is the long tail already on the board: the `47-m*` minors,
+the G3–G6 generality gaps, the `_inject_expert_weights` warn-and-skip row, the fused forward's twin
+cast (`[!]`, blocked on G1), and the order-dependent `test_slab_arena` failure that did not reproduce
+on 2026-09-25. Re-prioritise then, not now.
+
+---
+
+## ▶▶ PICK THIS NEXT: **S1** — the six-item sequence **S1…S6** is defined immediately below. ONE PER FRESH SESSION, IN ORDER. ◀◀
+
+**A5.7c CLOSED 2026-09-25 and is merged (`6870dab`), so the old "PICK THIS NEXT: A5.7c" pointer further down is history, not an instruction. The >512-token prefill bug it surfaced is FIXED and merged too (`876865f`).**
 
 **One line, so nobody reads fifty before finding it: A5 step 1 (the kernel gate) PASSED 6/6 on
 2026-09-23; step 2 was decomposed the same day into A5.1…A5.7, each with its own document and
@@ -91,7 +132,7 @@ only on the user authorising an ~81.6 GiB pull. Its verified branch sizes and tw
 corrections are banked in row 32 itself. **NO DOWNLOAD is a standing constraint until the user says
 otherwise: every item below runs on checkpoints already on this disk.**
 
-## ▶ PICK THIS NEXT: **A5.7c** (row 28b). A5.7b RAN 2026-09-24/25 and stopped on its own stop rule; A5.7c is its remainder. One per session.
+## ~~▶ PICK THIS NEXT: **A5.7c** (row 28b)~~ — **HISTORY, NOT AN INSTRUCTION. A5.7c CLOSED and MERGED 2026-09-25 (`6870dab`); the >512-token prefill bug it surfaced is fixed and merged too (`876865f`). The live queue is the S1…S6 sequence at the top of this file.** The text below is kept for the reasoning it records, not to be acted on.
 
 **A5.7b is `[~]` PARTIALLY DONE, branch `a5.7b-load-first-token`, 14 commits, NOT merged, suite
 green at 2778/16.** DeepSeek-V4-Flash is **SPLIT (46 shards, 146 G, originals intact), LOADS in
@@ -283,7 +324,7 @@ spikes killed every lever); and the blocked pair **32** (download declined) and 
 
 | # | one line | gate that opens it | why it is worth it then | state |
 |---|---|---|---|---|
-| **36** | **CUDA graphs / fused per-layer dispatch.** | **a resident model measures `serial / T` ≥ 30 %** — **MEASURED 2026-09-13 (S3-pre): 23.0 / 23.4 % strict (NOEXP), 32.5 / 32.8 % wide (`other`/T). Straddles the rule; does NOT fire strictly.** **Re-read 2026-09-18 on the 30-P build (S3 re-gate runs): 26.4 / 26.7 % strict, 35.9 / 35.9 % wide — `serial` unchanged at ~0.036 s, the share rose only because the token shrank; still does NOT fire strictly (derived: fires once `T_unprof` ≤ ~0.120 s).** **RE-CHECK IS NOW THE NEXT TASK ON THE BOARD (2026-09-20): row 44 + row 30's RAM-ceiling fix took Qwen3-Next decode to 9.06 tok/s = `T_unprof` 0.1104 s, UNDER the trigger, so the strict share is ≈ 32.6 % if `serial` still sits at ~0.036 s — but row 44 rewrote the very dispatch the NOEXP arm brackets (F5 replaced a per-expert `torch.where` one-hot mask, ~960 tiny H2D copies/token), so `serial` may have moved either way. MEASURE IT, do not estimate — the row says so. Brief: [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md).** | `serial` is 0.074 s of Qwen's 0.930 s today — 8 %, invisible. Row 29 projected it becomes the LARGEST phase once experts are resident (38 ms of Qwen3-30B-int4's projected 49 ms). Nothing owns it today. | `[ ]` |
+| **36** | **CUDA graphs / fused per-layer dispatch. PARKED 2026-09-25 — the gate FIRED and the build was REFUSED anyway, on three documents from 2026-09-20 that must not be re-derived. (a) `…row36-gate-recheck-RESULTS.md`: strict `serial / T_unprof` = **32.34 / 32.73 %** vs the ≥ 30 % rule, two replicates within 1.2 % — it fires, and `serial` itself never moved (0.0363 → 0.0360 → 0.0368 s/tok across three builds; the share rose only because the token shrank). (b) `…row36-serial-split-SPIKE.md`: **the build's own stop rule then fired against it — `serial` is GPU-bound, 74.8 % GPU kernel time vs only 25.2 % host gap against a ≥ 40 % host-gap rule.** Host time is 9.34 ms = **8.3 % of the token**, and a whole-step capture is impossible regardless: the MoE path does a blocking D2H routing sync **48× per token**, so only non-expert segments are capturable. (c) `…row36-torchcompile-AB-RESULTS.md`: the cheap version does not pay twice over — `use_torch_compile=True` as shipped (`mode="reduce-overhead"` = compile **plus** CUDA graphs) **CRASHES**, reproduced twice; with graphs off (`mode="default"`) it is correct but **24–35 % SLOWER**. **The re-scoped successor is S3 in the sequence at the top of this file** — the 4,353 elementwise launches (7.80 ms/token) in `Qwen3NextGatedDeltaNet`, which attacks device time AND host gap at once where graphs attack only the smaller one.** | **a resident model measures `serial / T` ≥ 30 %** — **MEASURED 2026-09-13 (S3-pre): 23.0 / 23.4 % strict (NOEXP), 32.5 / 32.8 % wide (`other`/T). Straddles the rule; does NOT fire strictly.** **Re-read 2026-09-18 on the 30-P build (S3 re-gate runs): 26.4 / 26.7 % strict, 35.9 / 35.9 % wide — `serial` unchanged at ~0.036 s, the share rose only because the token shrank; still does NOT fire strictly (derived: fires once `T_unprof` ≤ ~0.120 s).** **RE-CHECK IS NOW THE NEXT TASK ON THE BOARD (2026-09-20): row 44 + row 30's RAM-ceiling fix took Qwen3-Next decode to 9.06 tok/s = `T_unprof` 0.1104 s, UNDER the trigger, so the strict share is ≈ 32.6 % if `serial` still sits at ~0.036 s — but row 44 rewrote the very dispatch the NOEXP arm brackets (F5 replaced a per-expert `torch.where` one-hot mask, ~960 tiny H2D copies/token), so `serial` may have moved either way. MEASURE IT, do not estimate — the row says so. Brief: [`…-row36-gate-recheck-BRIEF.md`](docs/2026-09-20-row36-gate-recheck-BRIEF.md).** | `serial` is 0.074 s of Qwen's 0.930 s today — 8 %, invisible. Row 29 projected it becomes the LARGEST phase once experts are resident (38 ms of Qwen3-30B-int4's projected 49 ms). Nothing owns it today. | `[x]` PARKED |
 | **37** | **Re-gate speculative decoding on MoE.** The gate refuses Qwen with `off_union` — observed verify union **19.31 GB against a ~17 GB budget**. That is a **byte** bound. | row 30's S2, or row 32's lower-bpw build, lands | At 3.0 bpw Qwen's union falls to ~11.6 GB and fits. The break-even acceptance falls too: with experts resident, extra drafted positions cost ~0 extra disk bytes, which is the dominant term today. Machinery is BUILT (`speculative/adaptive_gate.py`, row 13's `even-4` trial, P9's +4.16 %). **Prefer a checkpoint that ships an MTP module** — a free drafter, no vocab mismatch, no second load. | `[ ]` **Gate MET 2026-09-13 (S2 landed). CLOSED FOR HYBRIDS 2026-09-19 (row 42 (b): verify 2.6–4.8× t_dec, drafter needs p ≥ 0.87). Open only for row 32's route.** |
 | **38** | **Mixed-bpw by expert hotness** — hot experts high bpw, cold tail 2–3 bpw. | **trace arithmetic clears a 20 % byte reduction** | NOT the refuted pinning idea: Plan F/B-ph2 refuted **residency** by hotness; this is **precision**, which pays on every disk read whether or not the expert is ever cached. Plan F's "share is linear in N" is the argument FOR it — the tail holds most of the bytes. Likely loses to row 32 at a fraction of the effort; do the arithmetic first. | `[ ]` |
 | **39** | **Expert slimming** — structured row / N:M prune of the intermediate dim, re-pack, stream fewer bytes per expert. | rows 31–35 measured | Research, not engineering; quality risk real and unbounded. Priced honestly: a 30 % row prune is a 30 % byte cut — roughly what downloading a 3.5 bpw build gets for free in an afternoon. | `[ ]` |
@@ -2778,6 +2819,24 @@ and both have a golden reference or a Vaayu precedent.
       **Why A5.7c did not fix it:** its stop rule is that it must not grow into shared
       infrastructure, and options (2) and (3) are exactly that; option (1) is new design with no
       chunked-prefill test coverage to land it against. Parked with this row, not silently.
+
+- [bug] **`use_torch_compile=True` CRASHES on Qwen3-Next, and `vaayu/server/config.py:328`'s stated
+      reason for declining the knob is FACTUALLY WRONG. Found 2026-09-20 by row 36's re-scope A/B
+      (`docs/2026-09-20-row36-torchcompile-AB-RESULTS.md`); recorded as its own row 2026-09-25 because
+      it was buried in a parked row's document.**
+      **The crash:** with the shipped `mode="reduce-overhead"` (torch.compile **plus** CUDA graphs,
+      `vaayu_base.py:5064`), `effective=True` at load and the run dies with
+      `RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a
+      subsequent run`, inside transformers' `modeling_qwen3_next.py` resume block. **Reproduced twice.**
+      **The wrong reason:** `config.py:328` declines the knob saying *"`__init__` overrides these in
+      places; they are not live paths"* — but the only `__init__` guard (`vaayu_base.py:2118`) disables
+      it for NON-CUDA devices and leaves it ON for CUDA, so it IS a live path. **The right reason to
+      decline it is that it crashes** — fix the comment, whatever else happens.
+      **Also measured:** with the CUDA-graph half removed (`mode="default"`) it is CORRECT but
+      **24–35 % SLOWER** on Qwen3-Next, so there is no win hiding behind the crash.
+      **Scope:** a comment fix plus either a named refusal at load or a real fix of the graph
+      interaction. The knob defaults `False`, so nothing is broken for users today — this is a trap
+      waiting for whoever flips it, plus a false statement in the config that would mislead them.
 
 - [bug] **DeepSeek-V4-Flash-0731 ships no `chat_template`, so `/v1/chat/completions` 400s on every
       request. FOUND 2026-09-25 by A5.7c Task 5's server smoke; NOT caused by A5.7c.**
