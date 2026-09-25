@@ -2427,7 +2427,11 @@ and both have a golden reference or a Vaayu precedent.
 
 - [~] **A5.7c — streamed fp4 expert injection, then the first token. DESIGNED 2026-09-25.**
       **READ FIRST:** [`…-A5.7c-expert-injection-design.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-design.md),
-      whose input was [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md)
+      **PLANNED 2026-09-25 — 7 tasks in
+      [`…-A5.7c-expert-injection.md`](docs/superpowers/plans/2026-09-25-A5.7c-expert-injection.md)**
+      (1 injector + tests, 2 allowlist single home, 3 suite + both gates, 4 first token, 5 server
+      smoke, 6 row-26 measurement, 7 bank + close). Branch `a5.7c-expert-injection` off `main`.
+      Its input was [`…-A5.7c-expert-injection-HANDOFF.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-HANDOFF.md)
       (both gitignored — this row is the durable copy). **The handoff's "branch NOT merged" is
       STALE: A5.7b IS merged (`4842250` + docs `4bc70b1`, `c89ea1e` on `main`), and per `4bc70b1`
       the 48 original shards are DELETED after a byte-for-byte verify — 46 split shards, 231 G free,
