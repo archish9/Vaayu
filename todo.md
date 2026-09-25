@@ -2478,7 +2478,24 @@ machinery stripped, **experts as `nn.ModuleList`** so it lands on the module-lis
 `ExpertOffsetIndex` finds **43 × 256 = 11,008** derived entries) → 4 first on-device generation → 5 run
 `row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)
 → 6 *optional* the **10.12 GiB MTP draft module** already in the checkpoint (free speculative drafter; dense spec
-measured 5.57× in row P7 but **the MoE mechanism differs — do not assume it transfers**).
+measured 5.57× in **row 12** — NOT "row P7", which is a different, REFUTED item; see §0's warning
+and this file's `P7`/`P8`/`P9` note — but **the MoE mechanism differs — do not assume it
+transfers**). **Why it differs, so nobody re-derives it:** dense spec wins because verifying k
+drafted tokens costs ONE pass over the weights, the same bytes as a single decode step. MoE decode
+reads only the ROUTED experts (here top-6 of 256, 3.2124 GiB/token), so verifying k tokens needs the
+UNION of the experts those k tokens route to; if routing locality is weak that union grows ~linearly
+with k and the win vanishes. **Three measurements on this box already point that way:**
+`VAAYU_LOOKAHEAD` costs **+18.0 % bytes/token** (token floor capped near +11 %); the P-series `P7`
+slot — sizing the batch VRAM prefix on the observed routing union — was built and **REFUTED at
+−10.85 / −11.54 %**; and Plan F's top_n sweep found expert share **linear in N**, 2–4× below the
+cost line, which is the signature of the weak locality MTP would need to be strong.
+**ALSO BLOCKED TODAY, independent of any of that:** A5.7b refuses `drafter_model_path` for this
+model, because rejecting a draft rewinds the KV cache through `_trim_kv_cache` ->
+`DeepseekV4Cache.crop`, which cannot rewind a preallocated sliding window plus its compressed half.
+MTP needs that built first — it is a project, not a flag.
+**The weights survive:** the 3 pure-MTP shards were moved to
+`/home/a/code/ai-ml/models/deepseek-v4-mtp-shards/` (10.1 GiB) on 2026-09-25 rather than deleted, so
+this step is still POSSIBLE — but it is an unproven option, not a banked win.
 
 **Good news that is not obvious:** its disk keys are `layers.3.ffn.experts.7.w1.weight` — they already match
 `ExpertOffsetIndex`'s only rule (`\.experts\.(\d+)\.`), so streaming works once the model loads. **The hard part is
