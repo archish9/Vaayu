@@ -76,13 +76,13 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 |---|---|---|---|---|
 | **S1** ✅ | ~~**41.7 pageable HtoD memcpys per decode token** (Qwen3-Next)~~ **CLOSED 2026-09-25, NULL — really 84/token, and removing them LOSES 1.39 %. See the S1 row below** | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
 | **S2** ✅ | ~~**chunk-major byte counter survives an aborted expert injection**~~ **CLOSED 2026-09-25, REFUTED — the reset really is outside the `finally`, in all THREE forwards, but `_chunked_prefill`'s own `finally` already clears both fields. See the S2 row below** | it was on MiniMax's production prefill path — but the harm needed the state to outlive the abort, and it cannot | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
-| **S3** | **Qwen3-Next `GatedDeltaNet` elementwise fusion** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
+| **S3** ✅ | ~~**Qwen3-Next `GatedDeltaNet` elementwise fusion** — **STARTED 2026-09-25. STEP 1 DONE: census re-derived DECODE-ONLY and the handoff's does NOT reproduce — row 36's CUPTI arm had the prefill forward in its window (S1's flaw again), and its "653 µs/layer" was the whole decoder layer. Real: 4,586 launches / 15.9 ms device per `serial` token (not 7,702 / 27.70), so `serial` is ~55 % HOST gap — row 36's "GPU-bound" verdict used the contaminated number. GDN non-matmul = 63 launches/mixer (rule 29, norm 12, conv 4, body 18) = 49 % of `serial`'s launches; mixer host wall 438.8 µs = 15.80 ms/token on the real forward. CEILING MEASURED (ABBA, one load): dropping every GDN non-matmul op cuts `serial` 35.5 → 24.35 ms = −11.15 ms = 10.3 % of T_unprof 0.1085 s — ABOVE the handoff's 6.9 %. The three stock seams (`recurrent_gated_delta_rule`, `norm`, `causal_conv1d_update`) hold 45 of the 63. Detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`. STEP 2 DONE (bake-off, user-approved incl. a scratch `fla` 0.5.2 install): one real mixer's decode call, ABBA x4 — stock 400.2 µs/66 kernels, narrow `torch.compile` 327.0 (−18 %), **Vaayu Triton prototype at the 3 seams 196.6 µs/24 kernels (−51 %)**, `fla` 391.1 (−2 %: it cuts launches but gives the time back in Python wrappers — REJECTED for decode). All closer to fp64 than stock. Two upstream traps: HF's `conv_states` is CHANNELS-LAST after any ≥4-token prefill (`fla`'s conv kernel silently corrupts it — kernels must be stride-aware), and the cache keeps the recurrent state in bf16. Banked lead: `fla`'s chunk kernel is ~10× the torch prefill fallback (0.36 → 0.03 s per 2k prompt, ~2 % TTFT). DESIGN APPROVED 2026-09-25 (scope A, user-chosen over B = body rewrite and C = `fla` prefill chunk, both banked): new `vaayu/gated_delta_kernels.py` — three stride-aware Triton kernels (rule with fp32 l2norm, conv update, gated norm) installed PER SEAM by surface detection (norm patched in place, streaming-safe), behavioural self-check at install falls back to stock with a WARNING, CUDA + triton only (CPU keeps stock), one call beside `install_state_continuation`; reaches qwen3_next/qwen3_5/qwen3_5_moe (3 seams), olmo_hybrid (2), MiniMax/dense/DeepSeek (0). Acceptance: conv state bit-exact, fused ≤ 1.25× stock's fp64 error over 2 geometries, D6 6-draw ppl band, ABBA real-token win ≥ 2 % (else revert), on-device win ≥ half the microbench's −204 µs/mixer. §8: no knob, reachable at N=1. Spec `docs/superpowers/specs/2026-09-25-S3-gated-delta-kernels-design.md`. Next: user reviews spec → implementation plan**~~ **CLOSED 2026-09-25, A WIN — real decode token −4.3 to −5.6 %, quality PASS. See the S3 row below** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
 | **S4** | **restore the 46 DeepSeek-V4 tests** the shard deletion broke | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** | **DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2777 passed, 44 failed, 2 errors, 16 skipped` (~191 s,
-FOREGROUND) — raised from 2759 by S1-L1's 17 new tests and from 2776 by S2's 1, both 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
+**Suite floor for every one of them: `2874 passed, 44 failed, 2 errors, 16 skipped` (~192 s,
+FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, and from 2777 by S3's 97, 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
 (attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors, checkpoint 1), never just the
 count. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -96,23 +96,99 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S3** — then **S4…S6** in order. ◀◀
+## ▶▶ PICK THIS NEXT: **S4** — then **S5, S6** in order. ◀◀
 
-**S1, S1-L1 and S2 all closed 2026-09-25 — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill
-TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION; all three rows are below.** S1-L1
-was taken out of order ahead of S2 because it was a PREFILL/TTFT item on the production model and §0
-ranks TTFT as this workload's top lever. **So the sequence resumes at S3**, the Qwen3-Next
-`GatedDeltaNet` elementwise fusion — ~1 week, the first real perf BUILD in the sequence, handoff
-[`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md).
-**Read S1-L3 first (below): `fla` is not installed, which is why the pure-torch fallback S3 targets
-runs at all — installing it may move the whole baseline S3 is priced against.**
+**S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −4.32 % / −5.58 %, `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **The sequence resumes at S4** — restore the 46 DeepSeek-V4 tests the shard deletion broke, handoff [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) — then **S5, S6**. **The suite floor is now `2874 passed, 44 failed, 2 errors, 16 skipped`** (was 2777; +97 from S3, 2026-09-25), same failing SET.
 
-**Two live leads S1-L1 did NOT chase, still open in the S1 row below:** **S1-L2** (96.5 pageable DtoH
-per decode forward) and **S1-L3** (`fla` is not installed, which is why the pure-torch fallback runs at
-all — an S3 decision). **The suite floor is now `2777 passed, 44 failed, 2 errors, 16 skipped`** (was
-2759; +17 from `tests/test_prefill_staging_slabs.py`, +1 from S2's abort test), same failing SET.
+**One live lead S1-L1 did NOT chase, still open in the S1 row below: S1-L2** (96.5 pageable DtoH per decode forward). **S1-L3** (`fla` is not installed) is now answered in part by S3: `fla` was measured at the three seams and REJECTED for decode (−2 %, Python wrappers eat the launch savings), and its prefill chunk kernel is banked as **S3-C** (0.36 → 0.03 s per 2k prompt, ~2 % TTFT) rather than installed.
 
 ---
+
+## S3 — `[x]` fused Triton kernels on the gated-delta mixers' three decode seams. **CLOSED 2026-09-25, A WIN — real decode token −4.32 % / −5.58 % (two in-process ABBA replicates, 9.7 → 10.2–10.3 tok/s), `serial` −4.3 ms, prefill flat, greedy ids identical, D6 quality band PASS. On branch `s3-gated-delta-kernels`, merge pending the final review.**
+
+**Why (measured 2026-09-25, HEAD `18ef01c`, detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`):**
+- **The row-36 spike's census was wrong.** Prefill sat inside its CUPTI window, and its "653 µs/layer" was the whole decoder layer, not the mixer. Decode-only, `serial` is **4,586 launches / 15.9 ms device against a ~35.5 ms wall**, so it is HOST-bound.
+- **The GDN mixers:** 63 non-matmul launches each; mixer host wall **438.8 µs = 15.80 ms/token**.
+- **Ceiling (ABBA):** 35.5 → 24.35 ms of `serial` = **−11.15 ms = 10.3 % of T_unprof 0.1085 s**.
+- **Bake-off (one real mixer, ABBA ×4):**
+
+  | mechanism | µs per mixer call | kernels | vs stock |
+  |---|---|---|---|
+  | stock | 400.2 | 66 | — |
+  | `torch.compile` | 327.0 | — | −18 % |
+  | `fla` 0.5.2 | 391.1 | — | −2 % (Python wrappers eat the saving) |
+  | **hand-written Triton** | **196.6** | **24** | **−51 %** |
+
+- **Scope A, user-chosen.** Banked, not built:
+  - **S3-B:** the 18 forward-body ops (~3.9 ms/token of ceiling left after A);
+  - **S3-C:** `fla`'s prefill chunk kernel (0.36 → 0.03 s per 2k prompt, ~2 % TTFT; a dependency decision).
+
+**Spec** `docs/superpowers/specs/2026-09-25-S3-gated-delta-kernels-design.md`; **plan** `docs/superpowers/plans/2026-09-25-S3-gated-delta-kernels.md` (both gitignored — the lines below are the durable copy).
+
+**Done means:**
+- real-token ABBA ≤ −2 % (else revert);
+- `serial` ≤ −3.67 ms (half the microbench; else find out why before claiming);
+- D6 6-draw ppl band: fused mean − stock mean ≤ pooled sd (one retry with bf16 l2norm, else revert);
+- conv state bit-exact and fused ≤ 1.25× stock's fp64 error on 2 geometries;
+- suite floor → **2874 passed, 44 failed, 2 errors, 16 skipped** (+97), same failing SET;
+- both MoE accumulator gates green, MiniMax and Llama-1B reporting 0 fused seams;
+- §8: no knob, reachable at N=1.
+
+- [x] **T1** (`2bb8165`) branch `s3-gated-delta-kernels`; `vaayu/gated_delta_kernels.py` with `gated_delta_seams()` (surface detection); 4 CPU tests (all-3 seams on Qwen3-Next and qwen3_5; rule+norm only for an olmo-shaped mixer; 0 on a dense model despite its top-level `norm`)
+- [x] **T2** (`106a968`, worst ratio 0.737/1.25) rule kernel `fused_recurrent_rule` — 39 CUDA tests (2 geometries × B/T × h0 None/bf16/fp32 × bf16/fp16 vs stock vs fp64; strided inputs; no-final-state)
+- [x] **T3** (`0504f61`, state bit-exact) conv kernel `fused_conv_update` + `_conv_seam` — 19 tests (state bit-exact on channels-last AND contiguous, B 1/2, bf16/fp16; bias; prefix-cache round trip; T>1 delegates to stock)
+- [x] **T4** (`61bf9dd`) gated-norm kernel `fused_gated_norm` + in-place `_patch_norm` — 18 tests (weight bf16/fp32 × x bf16/fp16 × rows; weight replaced after install; gateless call → stock)
+- [x] **T5** (`3d3f4fa`, 97 passed) `install_gated_delta_kernels(hf_model, device, dtype)` with per-seam on-device self-check → WARNING + stock on failure — 17 tests (CPU/no-triton install nothing; idempotent; bad/raising kernel and different-math norm stay stock; meta weights; full mixer both families × both caches × prefill 2/12; row-43 chunked-prefill coexistence)
+- [x] **T6** (`a07d0cc` pylint-gate fix + `68b6448`; suite 2874/44/2/16 in 192 s, same failing SET) one call in `vaayu_base.py` `init_model` beside `install_state_continuation`; full suite FOREGROUND = 2874/44/2/16, failing SET verified by composition
+- [x] **T7** DONE — Qwen3-Next gate 8 passed + `rule=36 conv=36 norm=36`; MiniMax 8 passed, 0 fused; Llama-1B 1 passed, 0 fused; no self-check WARNING; server reaches it (app.py:400 → init_model); §8(2) confirmed by grepping the server's `from_pretrained` path
+- [x] **T8** DONE — real token −5.58 % / −4.32 % (r3/r4, warm-up arms; r1/r2 cold-arm artifact, ruling R9), `serial` −4.36 / −4.26 ms, prefill flat at 135/2048, greedy ids identical fused vs stock; `plans/probes/s3_ab.py` — in-process ABBA (seams toggled via `_MARK`; deviation from the spec's cross-process ABBA, S1's method): N/U decode + P prefill at 135/2048, two replicates; apply the stop rules
+- [x] **T9** DONE — VERDICT PASS: code 1.8933 → 1.8945 (+0.06 %, pooled sd 0.0026), prose 8.5756 → 8.5613 (−0.17 %, pooled sd 0.0360); no retry needed; `plans/probes/s3_quality.py` — D6 band at the server's untruncated default (null perturbation on EVERY `truncate_top_k` call, not only truncated ones as `d6_band.py` did), 6 draws × stock/fused × 2 texts, 256 scored tokens; PASS/FAIL (+ the one bf16-l2norm retry)
+- [x] **T10** RESULTS section appended (`docs/2026-09-25-S3-census-rederive-RESULTS.md`), this row → `[x]`, suite floor → 2874, PICK THIS NEXT → S4, S3-B/S3-C banked below, row 36 note added; finishing the branch is the controller's call after final review, not this task's
+
+**Verdict (durable):**
+- **A/B** (in-process ABBA, `plans/probes/s3_ab.py`, Qwen3-Next, two replicates r3/r4, a discarded
+  warm arm leading every phase per ruling R9): real decode token r3 97.159→102.902 ms = **−5.58 %**,
+  r4 97.887→102.310 ms = **−4.32 %** (OFF ~9.72–9.77 → ON ~10.22–10.29 tok/s); `serial` (NOEXP) r3
+  25.664→30.018 ms = **−4.355 ms (−14.51 %)**, r4 25.632→29.889 ms = **−4.258 ms (−14.24 %)**; prefill
+  flat at 135/2048 tokens (inside arm sd both replicates); greedy ids IDENTICAL fused vs stock over 64
+  tokens, all four replicates.
+- **Quality** (D6, `plans/probes/s3_quality.py`, 6 null draws × stock/fused × 2 texts, 256 scored
+  tokens): code +0.06 % (pooled sd 0.0026), prose −0.17 % (pooled sd 0.0360), both inside pooled sd →
+  **PASS**, no retry needed.
+- **Gates** (T7, FOREGROUND under `systemd-run --user --scope`): Qwen3-Next MoE accumulator (29G) 8
+  passed, `rule=36 conv=36 norm=36`, no self-check WARNING; MiniMax-M2.7 MoE accumulator (29G) 8
+  passed, 0 fused seams; Llama-3.2-1B prefix-equivalence (22G) 1 passed, 0 fused seams. No fused-EXL3
+  arm exists (no model on disk since 2026-09-20); dense has no committed gate (the Llama-1B prefix
+  gate is a sanity check, not the deleted `test_batched_dense_smoke.py`).
+- **Suite** (T6): 2874 passed, 44 failed, 2 errors, 16 skipped in 192.11 s, FOREGROUND — floor +97
+  (was 2777), failing SET unchanged by composition.
+- **§8:** (1) no knob — faster, closer to fp64, self-checks back to stock with a WARNING; (2) plumbed
+  by construction, `app.py:400` → `vaayu_base.py:2263 init_model()` → `vaayu_base.py:3520
+  install_gated_delta_kernels`, no server change; (3) reachable at N=1, a per-token decode effect in
+  the server's own one-request-at-a-time mode; (4) n/a.
+- **R5:** the repo's pylint used-before-assignment gate flagged the three kernel launches (bound under
+  `if triton is not None:`); fixed with the gate's own prescribed inline
+  `# pylint: disable=possibly-used-before-assignment` (`a07d0cc`).
+- **R9:** r1/r2's first-reported U +0.78 % / +0.93 % was an ordering artifact — the U phase's first
+  `on` arm ran with a cold expert RAM cache and no warm-up; re-run with a discarded warm arm leading
+  every phase gives r3/r4 above.
+
+**Leads banked:**
+- [ ] **S3-B** — the 18 forward-body ops per mixer (gating, `repeat_interleave`, cat, reshape copies),
+  measured ~3.9 ms/token of ceiling before this build; reaching them means replacing the stock forward
+  body, priced against what remains of the 11.15 ms ceiling now that `serial` has fallen 4.3 ms of it.
+- [ ] **S3-C** — `fla`'s prefill chunk kernel, ~10× the torch chunk fallback (0.36 → 0.03 s per 2k
+  prompt, ~2 % TTFT); a new-dependency decision.
+
+Row 36's "GPU-bound" verdict rested on a prefill-contaminated census (`serial` is really ~55 %
+HOST-bound); it stays PARKED for its other two reasons (`use_torch_compile` crashes; 48 blocking D2H
+routing syncs per token).
+HF's cache `conv_states` goes channels-last after any prefill ≥ the conv width and `fla`'s
+conv-update kernel silently corrupts it on that layout; every kernel installed here is stride-aware
+instead, and the cache keeps the recurrent state in bf16 regardless.
+Method lesson: in an in-process multi-phase A/B, lead EVERY phase with a discarded warm arm — a
+phase change (NOEXP → real forward) leaves the expert RAM cache cold and can flip the sign, as it did
+in r1/r2.
 
 ## S2 — `[x]` chunk-major byte counter survives an aborted expert injection. **CLOSED 2026-09-25, REFUTED: the shape is real in all three MoE forwards, the harm is unreachable.**
 
