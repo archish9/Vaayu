@@ -2500,6 +2500,26 @@ and both have a golden reference or a Vaayu precedent.
       2026-09-25); (b) **shared `warn` → `raise`** in `_inject_expert_weights`, a behaviour change on
       two production forwards; (c) **A4 check 2's finding** (0 non-expert-pinned transformer layers,
       budget 3.34 GiB vs an 8.24 GiB dense footprint).
+      **TASK 3 GATES, RUN 2026-09-25.** Full suite `./venv/bin/python -m pytest -q` →
+      **44 failed, 2748 passed, 16 skipped, 2 errors in 189.71s** — BELOW this row's own corrected
+      floor of "2786 passed, 8 failed, 16 skipped" (the `[bug]` row directly below). Investigated,
+      not papered over: all 46 non-passing tests (44 failed + 2 errors) are the SAME
+      `FileNotFoundError` from A5.7b's original-shard deletion (`4bc70b1`) — each traced to
+      `tests/deepseek/parity.py:96` or an equivalent `needs_checkpoint` fixture reading a now-deleted
+      `model-000NN-of-00048.safetensors`, dying before any engine code runs. **The `[bug]` row's
+      count of 8 UNDERCOUNTS the true blast radius, which is 46**, spanning
+      `test_deepseek_v4_attention.py` (21), `test_deepseek_v4_checkpoint.py` (1),
+      `test_deepseek_v4_linear.py` (4), `test_deepseek_v4_model.py` (2), `test_deepseek_v4_moe.py`
+      (8, the originally-tracked list), `test_deepseek_v4_parity.py` (8), and 2 setup ERRORs in
+      `test_deepseek_v4_block.py`. None touch `moe_patch.py`'s injection logic or Tasks 1-2's
+      allowlist. Needs a follow-up correction to the `[bug]` row's count; not fixed here — no
+      checkpoint restore/re-split/delete, per this task's scope. **Both on-device MoE accumulator
+      gates ARE green, unaffected by the above:** Qwen3-Next-80B-A3B int4 AWQ (fused non-EXL3
+      forward), `tests/test_moe_accumulator_determinism.py` → **8 passed in 36.82s**; MiniMax-M2.7
+      EXL3 (module-list forward, the one this change edits) → **8 passed in 73.40s**. No fused-EXL3
+      arm exists (no model on disk since Qwen3-235B was retired 2026-09-20) and dense has no
+      committed gate (`test_batched_dense_smoke.py` deleted 2026-09-03). Neither is claimed as
+      coverage.
 
 - [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
       2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
