@@ -2501,6 +2501,26 @@ and both have a golden reference or a Vaayu precedent.
       two production forwards; (c) **A4 check 2's finding** (0 non-expert-pinned transformer layers,
       budget 3.34 GiB vs an 8.24 GiB dense footprint).
 
+- [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
+      2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
+      goldens straight out of the ORIGINAL shards via `model.safetensors.index.json`'s `weight_map`,
+      and `4bc70b1` deleted all 48 originals after a byte-for-byte verify. Every affected test now
+      dies at FIXTURE time with
+      `FileNotFoundError: .../deepseek-ai--DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors`,
+      before any engine code runs. **The 8:** `test_the_gate_goldens_reproduce_through_the_split_gate`
+      [gate_score, gate_hash], `test_the_expert_golden_reproduces_with_the_weight_inside`,
+      `test_the_moe_goldens_reproduce_with_the_weight_applied_outside` [moe_score, moe_hash],
+      `test_the_moe_is_bit_identical_to_the_reference_when_the_weight_goes_inside` [moe_score,
+      moe_hash], `test_the_shared_expert_helper_runs_on_the_real_module_tree` — all in
+      `tests/test_deepseek_v4_moe.py`, 8 failed / 16 passed in 4.91 s.
+      **CONSEQUENCE, and it is why this row exists rather than a note: the suite floor of "2778
+      passed, 16 skipped" is STALE for every row after `4bc70b1`.** A5.7c gates against **2786
+      passed, 8 failed, 16 skipped** with these 8 named, so a NEW failure is still caught.
+      **Fix direction:** point `tests/deepseek/parity.py` at `splitted_model/` and apply the same
+      disk-key → module-tree remap the loader uses (`cda7f3b`/`e553137`), or commit a small golden
+      fixture so the parity tests stop needing 157 G of checkpoint at all. **Real coverage loss
+      meanwhile:** DeepSeek-V4's gate/expert/MoE bit-identity goldens do not run.
+
 **Two checks CARRIED OUT OF A4 (row 47, closed 2026-09-23 with its premise refuted) — they belong to A5:**
 - [ ] **check 1: confirm DeepSeek's shared experts actually land in the pinned non-expert set** once
       the model loads. A4's key-shape argument (`\.experts\.(\d+)\.` does not match
