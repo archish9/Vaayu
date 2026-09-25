@@ -132,3 +132,58 @@ def fused_recurrent_rule(query, key, value, g, beta, initial_state, output_final
         HAS_H0=initial_state is not None, L2=use_qk_l2norm_in_kernel,
         STORE_HT=output_final_state, num_warps=4)
     return o, (ht if output_final_state else None)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _conv_kernel(x, s, w, bias, o, D, sx_b, sx_d, ss_b, ss_d, ss_w, sw_d, sw_w,
+                     W: tl.constexpr, BD: tl.constexpr, HAS_BIAS: tl.constexpr):
+        # Shift the state left one slot, append x, depthwise dot, silu -- in place.
+        i_b = tl.program_id(0)
+        od = tl.program_id(1) * BD + tl.arange(0, BD)
+        md = od < D
+        bx = tl.load(x + i_b * sx_b + od * sx_d, mask=md, other=0.0)
+        sp = s + i_b * ss_b + od * ss_d
+        wp = w + od * sw_d
+        acc = tl.zeros([BD], dtype=tl.float32)
+        # the fallback builds cat([state, x]).to(weight.dtype) and copies its tail
+        # back into the state: every value passes through weight.dtype
+        for j in tl.static_range(W - 1):
+            sj = tl.load(sp + (j + 1) * ss_w, mask=md, other=0.0).to(w.dtype.element_ty)
+            tl.store(sp + j * ss_w, sj.to(s.dtype.element_ty), mask=md)
+            acc += sj.to(tl.float32) * tl.load(wp + j * sw_w, mask=md, other=0.0).to(tl.float32)
+        tl.store(sp + (W - 1) * ss_w, bx.to(w.dtype.element_ty).to(s.dtype.element_ty), mask=md)
+        acc += (bx.to(w.dtype.element_ty).to(tl.float32)
+                * tl.load(wp + (W - 1) * sw_w, mask=md, other=0.0).to(tl.float32))
+        if HAS_BIAS:
+            acc += tl.load(bias + od, mask=md, other=0.0).to(tl.float32)
+        # the fallback convolves in weight.dtype: round there before silu
+        acc = acc.to(w.dtype.element_ty).to(tl.float32)
+        y = (acc * tl.sigmoid(acc)).to(w.dtype.element_ty)
+        tl.store(o + i_b * D + od, y.to(o.dtype.element_ty), mask=md)
+
+
+def fused_conv_update(hidden_states, conv_state, weight, bias=None, activation=None):
+    """One-token drop-in for transformers' `torch_causal_conv1d_update`: shifts
+    `conv_state` in place (any strides -- HF's cache is channels-last after a
+    >= W-token prefill) and returns silu(conv) as [B, D, 1]. Like the fallback,
+    it applies silu whatever `activation` says."""
+    B, D, _ = hidden_states.shape
+    o = torch.empty(B, D, 1, device=hidden_states.device, dtype=hidden_states.dtype)
+    _conv_kernel[(B, triton.cdiv(D, _CONV_BD))](
+        hidden_states, conv_state, weight, bias if bias is not None else weight, o, D,
+        hidden_states.stride(0), hidden_states.stride(1), *conv_state.stride(),
+        *weight.stride(),
+        W=conv_state.shape[-1], BD=_CONV_BD, HAS_BIAS=bias is not None, num_warps=4)
+    return o
+
+
+def _conv_seam(stock):
+    def seam(hidden_states, conv_state, weight, bias=None, activation=None):
+        if hidden_states.shape[-1] != 1:   # HF's decode path never sends more
+            return stock(hidden_states, conv_state, weight, bias, activation)
+        return fused_conv_update(hidden_states, conv_state, weight, bias, activation)
+
+    setattr(seam, _MARK, stock)
+    return seam

@@ -164,3 +164,85 @@ def test_rule_without_final_state_returns_none():
     _, (with_state, _) = _both_rules(q, k, v, g, beta, h0, final=True)
     _, (without, state) = _both_rules(q, k, v, g, beta, h0, final=False)
     assert state is None and torch.equal(without, with_state)
+
+
+# ── conv-update kernel ───────────────────────────────────────────────────────
+
+def _conv_inputs(D, W, B, dtype, layout, seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(B, 1, D, device="cuda").to(dtype).transpose(1, 2)    # [B, D, 1], as HF passes it
+    base = torch.randn(B, W, D, device="cuda").to(dtype)
+    state = base.transpose(1, 2)                                          # channels-last, like HF's cache
+    if layout == "contiguous":
+        state = state.contiguous()
+    w = torch.randn(D, 1, W, device="cuda").to(dtype).squeeze(1)          # conv1d.weight.squeeze(1)
+    return x, state, w
+
+
+def _ref_conv(x, state, w, bias):
+    full = torch.cat([state.double(), x.double()], -1)[..., 1:]
+    out = (full * w.double()[None]).sum(-1, keepdim=True)
+    if bias is not None:
+        out = out + bias.double()[None, :, None]
+    return F.silu(out)
+
+
+def _both_convs(x, state, w, bias=None):
+    s_state, f_state = state.clone(), state.clone()
+    assert s_state.stride() == state.stride()      # clone keeps the layout under test
+    so = stock_conv(x, s_state, w, bias, "silu")
+    fo = gdk.fused_conv_update(x, f_state, w, bias, "silu")
+    return so, s_state, fo, f_state
+
+
+@cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("layout", ["channels_last", "contiguous"])
+@pytest.mark.parametrize("geom", GEOMS)
+def test_conv_update_state_is_bit_exact(geom, layout, B, dtype):
+    D, W = _conv_dim(GEOMS[geom]), GEOMS[geom]["W"]
+    x, state, w = _conv_inputs(D, W, B, dtype, layout)
+    so, s_state, fo, f_state = _both_convs(x, state, w)
+    assert torch.equal(f_state, s_state)
+    assert f_state.stride() == state.stride()      # updated in place, layout kept
+    assert fo.shape == so.shape and fo.dtype == so.dtype
+    ref = _ref_conv(x, state, w, None)
+    assert _rel(fo, ref) <= 1.25 * _rel(so, ref)
+
+
+@cuda
+def test_conv_update_adds_bias():
+    D, W = _conv_dim(GEOMS["qwen3next"]), GEOMS["qwen3next"]["W"]
+    x, state, w = _conv_inputs(D, W, 1, torch.bfloat16, "contiguous")
+    bias = torch.randn(D, device="cuda").bfloat16()
+    so, s_state, fo, f_state = _both_convs(x, state, w, bias)
+    assert torch.equal(f_state, s_state)
+    ref = _ref_conv(x, state, w, bias)
+    assert _rel(fo, ref) <= 1.25 * _rel(so, ref)
+
+
+@cuda
+def test_conv_update_after_a_prefix_cache_round_trip():
+    """FP8DynamicCache.to_cpu/to_device move the state with .to()/.pin_memory();
+    whatever layout comes back, the update must stay bit-exact with stock."""
+    D, W = _conv_dim(GEOMS["qwen3next"]), GEOMS["qwen3next"]["W"]
+    x, state, w = _conv_inputs(D, W, 1, torch.bfloat16, "channels_last")
+    state = state.to("cpu").pin_memory().to("cuda")
+    so, s_state, fo, f_state = _both_convs(x, state, w)
+    assert torch.equal(f_state, s_state)
+    ref = _ref_conv(x, state, w, None)
+    assert _rel(fo, ref) <= 1.25 * _rel(so, ref)
+
+
+def test_conv_seam_delegates_multi_token_calls_to_stock():
+    calls = []
+
+    def stock(*args):
+        calls.append(args)
+        return "stock"
+
+    seam = gdk._conv_seam(stock)
+    assert seam(torch.zeros(1, 8, 2), torch.zeros(1, 8, 4), torch.zeros(8, 4)) == "stock"
+    assert len(calls) == 1
+    assert getattr(seam, gdk._MARK) is stock
