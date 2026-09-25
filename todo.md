@@ -2574,7 +2574,12 @@ and both have a golden reference or a Vaayu precedent.
       load, health, refusal-plumbing, and logging all work, but the actual completion path — the
       reachability proof this task exists to produce — never runs, because every request 400s at
       template-render time before length is even checked. That is EARLIER than the `prefill_chunk_size`
-      `[bug]` two rows below (>512 tokens): this run never got far enough to reach it either way. Full
+      `[bug]` two rows below (>512 tokens): this run never got far enough to reach it either way.
+      **AND THERE IS NO SECOND ROUTE TO TRY: the server exposes exactly three endpoints —
+      `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (`vaayu/server/app.py:534/578/592`).
+      No raw `/v1/completions`, so no prompt-string path bypasses the template.** Confirmed by the
+      controller, 2026-09-25. A third fix option therefore exists beside the two on that row: have the
+      model subclass supply the template/renderer, which keeps the blast radius at one model. Full
       log: `/tmp/a57c-server-smoke.log` (gitignored, not preserved — this row is the durable copy).
 
 - [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
@@ -2624,7 +2629,8 @@ and both have a golden reference or a Vaayu precedent.
       checkpoint. **Not fixed here** — no production code touched, per A5.7c Task 5's scope (verification
       only). **What unblocks it:** either (1) build a Jinja `chat_template` from the checkpoint's own
       `encoding/` Python scripts and ship it in `tokenizer_config.json` (checkpoint-side, not a Vaayu
-      code change), or (2) teach `vaayu/server/chat.py` a non-Jinja rendering path that calls the
+      code change — and a write into the user's model directory, so it is their call, not an agent's),
+      or (2) teach `vaayu/server/chat.py` a non-Jinja rendering path that calls the
       checkpoint's `encoding/` module directly — a real server feature, not a one-line fix, and its own
       row if picked up.
 
