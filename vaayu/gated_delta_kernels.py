@@ -123,7 +123,13 @@ def fused_recurrent_rule(query, key, value, g, beta, initial_state, output_final
     h0 = initial_state if initial_state is not None else o
     sh = initial_state.stride() if initial_state is not None else (0, 0, 0, 0)
     BV = min(_RULE_BV, triton.next_power_of_2(V))
-    _rule_kernel[(triton.cdiv(V, BV), B * HV)](
+    # pylint's possibly-used-before-assignment is a false positive on all three
+    # kernel launches below (here, fused_conv_update, fused_gated_norm): each
+    # kernel name is bound under the module-level `if triton is not None:`
+    # guard, and every fused_* wrapper is reachable only after
+    # install_gated_delta_kernels has already returned early when triton is
+    # None -- so the kernel is always bound before its launch runs.
+    _rule_kernel[(triton.cdiv(V, BV), B * HV)](  # pylint: disable=possibly-used-before-assignment
         query, key, value, g, beta, h0, o, ht,
         *query.stride()[:3], *key.stride()[:3], *value.stride()[:3],
         *g.stride(), *beta.stride(), *sh,
@@ -171,7 +177,7 @@ def fused_conv_update(hidden_states, conv_state, weight, bias=None, activation=N
     it applies silu whatever `activation` says."""
     B, D, _ = hidden_states.shape
     o = torch.empty(B, D, 1, device=hidden_states.device, dtype=hidden_states.dtype)
-    _conv_kernel[(B, triton.cdiv(D, _CONV_BD))](
+    _conv_kernel[(B, triton.cdiv(D, _CONV_BD))](  # pylint: disable=possibly-used-before-assignment
         hidden_states, conv_state, weight, bias if bias is not None else weight, o, D,
         hidden_states.stride(0), hidden_states.stride(1), *conv_state.stride(),
         *weight.stride(),
@@ -216,7 +222,7 @@ def fused_gated_norm(weight, eps, hidden_states, gate):
     z = gate.reshape(-1, n)
     o = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     bn = triton.next_power_of_2(n)
-    _norm_kernel[(x.shape[0],)](
+    _norm_kernel[(x.shape[0],)](  # pylint: disable=possibly-used-before-assignment
         x, z, weight, o, *x.stride(), *z.stride(), weight.stride(0), n, eps,
         BN=bn, ROUND_MID=torch.promote_types(weight.dtype, x.dtype) == x.dtype,
         num_warps=1 if bn <= 256 else 4)
