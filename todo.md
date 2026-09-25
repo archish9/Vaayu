@@ -2527,7 +2527,15 @@ and both have a golden reference or a Vaayu precedent.
       and `4bc70b1` deleted all 48 originals after a byte-for-byte verify. Every affected test now
       dies at FIXTURE time with
       `FileNotFoundError: .../deepseek-ai--DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors`,
-      before any engine code runs. **The 8:** `test_the_gate_goldens_reproduce_through_the_split_gate`
+      before any engine code runs. **BLAST RADIUS CORRECTED 2026-09-25 after the full suite ran:
+      it is 46 tests across 6 files, not 8 — 44 failed + 2 errors.** Per file: `attention` 21,
+      `parity` 8, `moe` 8, `linear` 4, `model` 2, `block` 2 errors, `checkpoint` 1. Every one of the
+      46 was confirmed by hand to read an ORIGINAL shard (`model-00002/00004/00005/00045-of-00048`)
+      and to die before engine code runs; none touches `moe_patch.py`. Arithmetic closes: 2748
+      passed + 46 = 2794 = the 2778 pre-deletion floor + A5.7c's 16 new tests, so nothing regressed.
+      **`model-00046/00047/00048` are NOT missing — they were MOVED to
+      `models/deepseek-v4-mtp-shards/` with an `mtp_weight_map.json`; only 00001-00045 are gone.**
+      **The 8 in `test_deepseek_v4_moe.py`:** `test_the_gate_goldens_reproduce_through_the_split_gate`
       [gate_score, gate_hash], `test_the_expert_golden_reproduces_with_the_weight_inside`,
       `test_the_moe_goldens_reproduce_with_the_weight_applied_outside` [moe_score, moe_hash],
       `test_the_moe_is_bit_identical_to_the_reference_when_the_weight_goes_inside` [moe_score,
@@ -2536,6 +2544,8 @@ and both have a golden reference or a Vaayu precedent.
       **CONSEQUENCE, and it is why this row exists rather than a note: the suite floor of "2778
       passed, 16 skipped" is STALE for every row after `4bc70b1`.** A5.7c gates against **2786
       passed, 8 failed, 16 skipped** with these 8 named, so a NEW failure is still caught.
+      **Superseded by the measured suite, same day: A5.7c's gate is `2748 passed, 44 failed, 2
+      errors, 16 skipped` in 189.71 s, all 46 non-passing in the class above.**
       **Fix direction:** point `tests/deepseek/parity.py` at `splitted_model/` and apply the same
       disk-key → module-tree remap the loader uses (`cda7f3b`/`e553137`), or commit a small golden
       fixture so the parity tests stop needing 157 G of checkpoint at all. **Real coverage loss
