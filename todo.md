@@ -2520,6 +2520,35 @@ and both have a golden reference or a Vaayu precedent.
       arm exists (no model on disk since Qwen3-235B was retired 2026-09-20) and dense has no
       committed gate (`test_batched_dense_smoke.py` deleted 2026-09-03). Neither is claimed as
       coverage.
+      **TASK 4, RUN 2026-09-25 — DeepSeek-V4-Flash emits its first token.** `plans/probes/a57b_first_token.py`
+      launched as a detached `systemd-run --user` unit (`a57c-first-token`, `MemoryMax=29G`), log
+      `/tmp/a57c-first-token.log`. Zero `Expert weight inject failed` warnings, zero
+      `PackedInjectionError` (both greps: 0) — Tasks 1-2's fix holds on the real checkpoint. **Two
+      NEW bugs found and fixed, both confined to `vaayu/vaayu_deepseek_v4.py`, zero blast radius on
+      other models:** (1) `moe_patch`'s module-list forward (the same one MiniMax runs) always
+      returns `(hidden_states, router_logits)`; DeepSeek's own reference decoder-layer code (loaded
+      via `trust_remote_code`, never touched by Vaayu) does `x = self.ffn(x)` expecting a single
+      tensor and feeds it straight into `hc_post`'s `x.unsqueeze(-2)` → `AttributeError: 'tuple'
+      object has no attribute 'unsqueeze'`. Fixed in `VaayuDeepseekV4.__init__`, after
+      `super().__init__()`: wraps each `_moe_blocks[i].moe_module.forward` to unwrap a tuple return
+      down to its first element (tolerates the pinned-layer branch's plain-tensor return too).
+      (2) `get_past_key_value_args` read `past_key_values.get_seq_length()` (defaults to
+      `layer_idx=0`); `DeepseekV4Cache` gives every layer an INDEPENDENT `cumulative_length`, and the
+      layer-major loop calls this hook once per decoder layer within one token step, so once layer 0
+      ran and bumped its own count, layer 1's kwargs saw a "moved" cache and raised `RuntimeError:
+      start_pos 0 disagrees with the cache's 5 tokens` on literally the first prefill, every time.
+      Fixed by reading `get_seq_length(self.config.num_hidden_layers - 1)` (the last layer, the only
+      index that stays at the pre-step value for every layer's kwargs within the step). Both fixes
+      covered by new tests in `tests/test_deepseek_v4_engine.py`
+      (`test_construction_unwraps_a_tuple_returning_moe_forward`,
+      `test_construction_leaves_a_plain_tensor_returning_moe_forward_alone`,
+      `test_get_past_key_value_args_reads_the_last_layer_not_the_default_first`); full file
+      58 passed (was 55). **Result: prompt `"The capital of France is"` → decoded
+      `' Paris. The capital of Spain is Madrid'` — coherent, factually correct continuation, not
+      garbage.** Load 3.7s; 8 tokens in 31.8s = **0.252 tok/s** (eager attention re-reads the routed
+      expert set several times per step, as expected — reach, not speed, per this row's own note
+      above). `attn impl: eager`, `fp4_group_size: 32`. Log: `/tmp/a57c-first-token.log` (gitignored,
+      not preserved — this row is the durable copy).
 
 - [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
       2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
