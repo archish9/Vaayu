@@ -2320,6 +2320,15 @@ and both have a golden reference or a Vaayu precedent.
       (0 transformer + 3 shared), 0 non-expert-pinned transformer` against `pinning budget=3.34 GiB`
       and an 8.24 GiB dense footprint — **NOT ONE transformer layer was pinned**, stronger than the
       design's predicted "budget exhausted partway".
+      **BOTH ON-DEVICE MoE GATES GREEN, run 2026-09-25 at the branch tip before the merge**
+      (they were owed from the start: this branch changes `vaayu/utils.py`, `vaayu/vaayu_base.py`
+      and — the one that matters — `vaayu/persist/safetensor_model_persister.py`, whose dtype
+      resolver Task 6b replaced at all five reader sites, THREE of them the expert readers
+      Qwen3-Next and MiniMax stream through). Foreground, `MemoryMax=29G`:
+      **Qwen3-Next-80B-A3B-AWQ-4bit 8 passed, 35.35 s** (A5.7a's figure was 34.38 s) ·
+      **MiniMax-M2.7-exl3 8 passed, 73.22 s** (A5.7a's was 72.72 s). Both within a second of
+      baseline. **No fused-EXL3 arm exists** (no model on disk since 2026-09-20) and **dense has no
+      committed gate** (`test_batched_dense_smoke.py` deleted 2026-09-03) — stated, not assumed.
       **STILL NOT DONE: no token, no server gate, no row-28b step-5 measurement.** All three are
       A5.7c's.
       (Original A5.7b row text follows.) **DESIGNED 2026-09-24 —
