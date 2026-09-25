@@ -797,7 +797,13 @@ test — none can make Vaayu faster.** No §0 P-row is open.
   small-budget regime (at 16 GB it predicted 20.3 % for MiniMax against a measured 21.3 %).
   **Do not quote its small-budget absolutes.**
 - [bug] **`tests/test_slab_arena.py::test_load_expert_into_slab_tensor_align_gates_pool_usage` fails in the full suite
-  only** (found 2026-09-15 during D4's suite run: 1 failed / 2206 passed / 15 skipped, 18 min). It passes alone (58
+  only** (found 2026-09-15 during D4's suite run: 1 failed / 2206 passed / 15 skipped, 18 min).
+  **DID NOT REPRODUCE 2026-09-25**: two full-suite runs that day (2756 and 2759 passed) showed zero
+  failures in `test_slab_arena.py`, and the file passes alone (58 passed). Every failure in both runs
+  was the DeepSeek-V4 shard-deletion class. Left OPEN rather than closed because the defect is
+  order-dependent process-global state, so one clean pair of runs is weak evidence of a fix — nothing
+  was done to fix it, and the suite has grown by ~550 tests since it was found, which can reorder it
+  back into failing. Close it only with a deliberate repro attempt, not with another incidental pass. It passes alone (58
   passed), with `test_decode_top_k.py` (119 passed) and with `test_ring_pool_sizing.py` (63 passed). The test asserts on
   process-global state — `_EXPERT_BUF_POOL` (`vaayu/persist/safetensor_model_persister.py:155`) via a wrapped
   `get` `call_count` and `qsize() == 1` — so something earlier in suite order leaves that state dirty. **Which assertion
@@ -2794,8 +2800,11 @@ and both have a golden reference or a Vaayu precedent.
       checkpoint's `encoding/` module directly — a real server feature, not a one-line fix, and its own
       row if picked up.
 
-- [bug] **A5.7b's original-shard deletion broke 8 committed DeepSeek-V4 parity tests. FOUND
-      2026-09-25 while gating A5.7c; NOT caused by A5.7c.** `tests/deepseek/parity.py:96` reads the
+- [bug] **A5.7b's original-shard deletion broke 46 committed DeepSeek-V4 tests across 6 files
+      (44 failed + 2 errors). FOUND 2026-09-25 while gating A5.7c; NOT caused by A5.7c.** (Title said
+      "8 parity tests" until 2026-09-25 — that was the scoped first look at one file; the full suite
+      put it at 46. Per file: attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors,
+      checkpoint 1. Re-confirmed unchanged by the 2026-09-25 post-fix suite: same 46, same files.) `tests/deepseek/parity.py:96` reads the
       goldens straight out of the ORIGINAL shards via `model.safetensors.index.json`'s `weight_map`,
       and `4bc70b1` deleted all 48 originals after a byte-for-byte verify. Every affected test now
       dies at FIXTURE time with
@@ -3517,7 +3526,7 @@ stands; nothing re-tests it. `CLAUDE.md` §0/§5 were updated the same day.
 
 **The gaps still open (G0, G1 and G7 were closed by A1/A2/A3/A4 and pruned 2026-09-23 — `git log -p -- todo.md`):**
 
-- [ ] **G2 — ~~`_make_fused_sparse_forward` (non-EXL3) has never executed on device~~ CLOSED by row 30's S2
+- [x] **G2 — ~~`_make_fused_sparse_forward` (non-EXL3) has never executed on device~~ CLOSED by row 30's S2
       (2026-09-13).** Qwen3-Next runs it daily and 30-P/44 perf-tuned it. Kept here so the playbook's stale line is
       not re-copied into a plan.
 - [ ] **G3 — only ONE of the three MoE forwards takes `compute_device`** (`_make_fused_sparse_forward`); the other two
