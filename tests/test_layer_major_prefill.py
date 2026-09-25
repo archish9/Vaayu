@@ -201,3 +201,58 @@ def test_chunked_prefill_threads_caller_cache_through_legacy_loop():
     # key_cache despite a "successful" chunked prefill.
     assert len(caller_cache.key_cache) > 0
     assert caller_cache.get_seq_length() == total_len
+
+
+class _FakeSelfForAbortedLayerMajor:
+    """Stand-in that takes _chunked_prefill's MoE layer-major branch and then
+    aborts inside forward(), having already retained experts -- exactly the
+    state moe_patch.py leaves behind when its `if _cm_last_call:` teardown is
+    skipped by an exception (the teardown sits after the forward's finally, in
+    all three MoE forwards)."""
+
+    prefill_chunk_size = 2
+    is_moe = True
+    _active_attn_impl = "sdpa"
+    _state_continuation_layers = 0
+
+    def forward(self, **kwargs):
+        # What the MoE forward has done by the time an expert injection raises:
+        # a layer's retention dict is live and its byte count is charged.
+        self._chunk_major_gpu = {0: {"weight": object()}}
+        self._chunk_major_gpu_bytes = 12_345_678
+        raise RuntimeError("expert injection aborted mid-layer")
+
+
+def test_aborted_layer_major_prefill_clears_chunk_major_retention():
+    """All three MoE forwards reset `_chunk_major_gpu`/`_chunk_major_gpu_bytes`
+    OUTSIDE their own try/finally (moe_patch.py:1995, 2431, 3196), so an
+    exception unwinding mid-layer skips it. What makes that safe is this
+    finally, and nothing else: `_chunk_major_n` is set here and only here
+    (vaayu_base.py:4741), so retention cannot be live outside this try.
+
+    Both forwards' comments name this finally as the reason a missing dict
+    always starts a fresh count, and both retention suites hand-simulate it
+    ("what _chunked_prefill's finally does") rather than run it. This test runs
+    it: if it is ever removed, a stale byte count would pre-charge every later
+    prefill's budget check and silently shrink row 45's retention win."""
+    fake_self = _FakeSelfForAbortedLayerMajor()
+    input_ids = torch.arange(6).unsqueeze(0)  # chunk_size=2 -> 3 chunks
+
+    with pytest.raises(RuntimeError, match="aborted mid-layer"):
+        VaayuBaseModel._chunked_prefill(
+            fake_self,
+            input_ids=input_ids,
+            attention_mask=None,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            past_key_values=None,
+        )
+
+    assert fake_self._chunk_major_gpu is None, "retained GPU experts survived the abort"
+    assert fake_self._chunk_major_gpu_bytes == 0, "stale byte count survived the abort"
+    # The call counter and chunk lengths gate retention on; a survivor would let
+    # a later non-chunked forward think it is mid-prefill.
+    assert fake_self._chunk_major_n is None
+    assert fake_self._chunk_major_lens is None

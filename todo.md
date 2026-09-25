@@ -75,14 +75,14 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | # | item | why here | cost | handoff |
 |---|---|---|---|---|
 | **S1** ✅ | ~~**41.7 pageable HtoD memcpys per decode token** (Qwen3-Next)~~ **CLOSED 2026-09-25, NULL — really 84/token, and removing them LOSES 1.39 %. See the S1 row below** | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
-| **S2** | **chunk-major byte counter survives an aborted expert injection** | `moe_patch.py:1984-1986` resets OUTSIDE the `finally`, so an abort leaves `_chunk_major_gpu_bytes` stale for the process and silently shrinks row 45's retention on **MiniMax's production prefill path** | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
+| **S2** ✅ | ~~**chunk-major byte counter survives an aborted expert injection**~~ **CLOSED 2026-09-25, REFUTED — the reset really is outside the `finally`, in all THREE forwards, but `_chunked_prefill`'s own `finally` already clears both fields. See the S2 row below** | it was on MiniMax's production prefill path — but the harm needed the state to outlive the abort, and it cannot | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
 | **S3** | **Qwen3-Next `GatedDeltaNet` elementwise fusion** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
 | **S4** | **restore the 46 DeepSeek-V4 tests** the shard deletion broke | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** | **DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2776 passed, 44 failed, 2 errors, 16 skipped` (~193 s,
-FOREGROUND) — raised from 2759 passed by S1-L1's 17 new tests on 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
+**Suite floor for every one of them: `2777 passed, 44 failed, 2 errors, 16 skipped` (~191 s,
+FOREGROUND) — raised from 2759 by S1-L1's 17 new tests and from 2776 by S2's 1, both 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
 (attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors, checkpoint 1), never just the
 count. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -96,21 +96,74 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S2** — then **S3…S6** in order. ◀◀
+## ▶▶ PICK THIS NEXT: **S3** — then **S4…S6** in order. ◀◀
 
-**S1 closed 2026-09-25 as a measured null and S1-L1 closed the same day as a WIN (+14.4 to +24.5 %
-prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax); both rows are below. S1-L1 was taken out of
-order ahead of S2 because it was a PREFILL/TTFT item on the production model and §0 ranks TTFT as this
-workload's top lever. That is done, so the sequence resumes at S2**, the chunk-major byte-counter leak
-(`moe_patch.py:1984-1986` resets OUTSIDE the `finally`) — hours of work, handoff
-[`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md).
+**S1, S1-L1 and S2 all closed 2026-09-25 — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill
+TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION; all three rows are below.** S1-L1
+was taken out of order ahead of S2 because it was a PREFILL/TTFT item on the production model and §0
+ranks TTFT as this workload's top lever. **So the sequence resumes at S3**, the Qwen3-Next
+`GatedDeltaNet` elementwise fusion — ~1 week, the first real perf BUILD in the sequence, handoff
+[`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md).
+**Read S1-L3 first (below): `fla` is not installed, which is why the pure-torch fallback S3 targets
+runs at all — installing it may move the whole baseline S3 is priced against.**
 
 **Two live leads S1-L1 did NOT chase, still open in the S1 row below:** **S1-L2** (96.5 pageable DtoH
 per decode forward) and **S1-L3** (`fla` is not installed, which is why the pure-torch fallback runs at
-all — an S3 decision). **The suite floor is now `2776 passed, 44 failed, 2 errors, 16 skipped`** (was
-2759 passed; +17 from `tests/test_prefill_staging_slabs.py`), same failing SET.
+all — an S3 decision). **The suite floor is now `2777 passed, 44 failed, 2 errors, 16 skipped`** (was
+2759; +17 from `tests/test_prefill_staging_slabs.py`, +1 from S2's abort test), same failing SET.
 
 ---
+
+## S2 — `[x]` chunk-major byte counter survives an aborted expert injection. **CLOSED 2026-09-25, REFUTED: the shape is real in all three MoE forwards, the harm is unreachable.**
+
+**No production code changed. One test added.** Detail:
+`docs/2026-09-25-S2-chunk-major-counter-leak-RESULTS.md` (gitignored).
+
+**The claim** (A5.7c review finding M2, carried into the S2 handoff): the `if _cm_last_call:` reset
+sits outside the forward's `finally`, so an abort leaves `_chunk_major_gpu_bytes` stale **for the
+process**, pre-charging every later prefill's budget check and silently shrinking row 45's retention
+win (2k 2.75× / 8k 5.47×).
+
+**The shape is real, and worse than reported — it is THREE sites, not one** (HEAD `38aba5c`; +12 from
+the handoff's line numbers after S1-L1 landed): `moe_patch.py:1995-1997` (module-list, MiniMax),
+`:2431-2433` (fused non-EXL3, Qwen3-Next), `:3196-3200` (fused-EXL3). All three reset outside their
+own `finally`.
+
+**The harm is not.** `vaayu_base.py:4746-4757` — `_chunked_prefill`'s layer-major `finally` — already
+clears `_chunk_major_gpu`, `_chunk_major_gpu_bytes`, `_chunk_major_n` and `_chunk_major_lens` on ANY
+exception, and its comment says exactly why ("Defensive: if an exception unwound mid-layer,
+moe_patch.py's last-chunk teardown never ran"). **Retention can only be live inside that `try`:**
+it arms on `_chunk_major_n > 1`, and `_chunk_major_n` has exactly ONE production assignment,
+`vaayu_base.py:4741`, inside it. Nothing swallows the exception in between either — the only catch on
+that path, `moe_patch.py:1330-1335`, **re-raises** `PackedInjectionError` by name.
+
+**Measured:** the real `_chunked_prefill` bound to a stub whose `forward()` sets
+`_chunk_major_gpu={...}` / `_chunk_major_gpu_bytes=12_345_678` and raises → exception propagates and
+all four fields come back `None`/`0`. The handoff's "red before the fix" test is **green before any
+fix**. That is the refutation.
+
+**What WAS missing: coverage.** Both forwards' comments cite this `finally` by name
+(`moe_patch.py:1741-1742`, `:2259-2260`), but no test ran it — `test_modulelist_chunk_retention.py:143`
+and `test_fused_nonexl3_chunk_retention.py:115` hand-simulate it
+(`ref._chunk_major_gpu = None  # what _chunked_prefill's finally does`), so deleting the guard left
+both green. **Added** `tests/test_layer_major_prefill.py::test_aborted_layer_major_prefill_clears_chunk_major_retention`
+(+55 lines). **Mutation-proved:** deleting the guard's two lines turns it RED
+("retained GPU experts survived the abort"), rest of the file green.
+
+**Decision, argued because the handoff asked:** the reset lines were **NOT moved**. Resetting on abort
+when `_cm_last_call` is False is moot — the layer-major path is ONE forward carrying every chunk, so an
+exception ends the whole prefill and there is no next chunk to mistrust. Moving them buys nothing
+measurable and reshapes the hottest loop in the engine (CLAUDE.md §3; the handoff's own §6 stop rule).
+
+**Gates:** full suite FOREGROUND **2777 passed, 44 failed, 2 errors, 16 skipped in 191.07 s** — floor
++1, SET verified by composition (attention 21, parity 8, moe 8, linear 4, model 2, checkpoint 1, block
+2 errors). **The two on-device MoE accumulator gates were NOT run and are not owed** — the handoff
+required them for a `moe_patch.py` edit, and there is none; the diff is one test file. No fused-EXL3
+arm exists, dense has no committed gate. **§8: no knob** — no behaviour change to configure; the guard
+itself is on the server's own N=1 prefill path, so the invariant is live for users.
+
+**Lesson, reusable:** M2 was found by reading `moe_patch.py` and never checking the one caller that
+arms the mechanism. Same class as row 13 — replay the real path, not a model of it.
 
 ## S1-L1 — `[x]` prefill's pageable HtoD. **CLOSED 2026-09-25, A WIN: prefill TTFT +14.4 % to +24.5 % on Qwen3-Next, +17.5 % to +18.9 % on MiniMax, greedy ids bit-identical, decode flat.**
 
