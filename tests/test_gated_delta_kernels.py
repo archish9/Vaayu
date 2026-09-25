@@ -56,7 +56,8 @@ def _qwen3_next_model():
 
 
 class _RuleAndNormOnly(torch.nn.Module):
-    """olmo_hybrid's shape: a gated-delta mixer with no conv-update seam."""
+    """A synthetic mixer with no conv-update seam (not olmo_hybrid's real shape
+    -- see test_olmo_hybrid_mixer_exposes_only_the_rule_seam for that)."""
 
     def __init__(self, norm=None):
         super().__init__()
@@ -80,6 +81,21 @@ def test_qwen3_5_mixer_exposes_all_three_seams():
 
 def test_a_mixer_without_conv_update_gets_rule_and_norm_only():
     assert _counts(_RuleAndNormOnly()) == {"rule": 1, "conv": 0, "norm": 1}
+
+
+def test_olmo_hybrid_mixer_exposes_only_the_rule_seam():
+    """The real family (M1): olmo_hybrid's gated norm is `o_norm`, not `norm`,
+    and its conv is a per-q/k/v `ShortConvolution`, not `causal_conv1d_update`
+    -- neither matches this module's surface detection."""
+    from transformers import OlmoHybridConfig
+    from transformers.models.olmo_hybrid.modeling_olmo_hybrid import OlmoHybridGatedDeltaNet
+    cfg = OlmoHybridConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2,
+        linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16,
+        linear_value_head_dim=16, linear_conv_kernel_dim=4)
+    mixer = OlmoHybridGatedDeltaNet(cfg, layer_idx=0)
+    assert _counts(mixer) == {"rule": 1, "conv": 0, "norm": 0}
 
 
 def test_no_seams_on_a_dense_model():
@@ -336,6 +352,19 @@ def test_nothing_installed_without_triton(monkeypatch):
 
 
 @cuda
+def test_refuses_a_non_current_cuda_device(capsys):
+    """I2: Triton launches on `torch.cuda.current_device()`, not the tensors'
+    device. On this single-GPU box index 1 is never current, so this must
+    refuse without touching anything -- no cuda:1 tensor is ever allocated."""
+    model = _qwen3_next_model().cuda().bfloat16()
+    before = _seam_fns(model)
+    assert gdk.install_gated_delta_kernels(model, "cuda:1", torch.bfloat16) == NO_SEAMS
+    assert all(a == b for a, b in zip(before, _seam_fns(model)))
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "cuda:1" in out and "current CUDA device" in out
+
+
+@cuda
 def test_install_covers_every_seam_and_is_idempotent():
     model = _qwen3_next_model().cuda().bfloat16()
     n = model.config.layer_types.count("linear_attention")
@@ -345,6 +374,25 @@ def test_install_covers_every_seam_and_is_idempotent():
     assert all(hasattr(f, gdk._MARK) for f in first)
     assert gdk.install_gated_delta_kernels(model, "cuda", torch.bfloat16) == want
     assert all(a == b for a, b in zip(first, _seam_fns(model)))   # never double-wrapped
+
+
+@cuda
+def test_self_check_specializes_on_the_mixers_real_rule_geometry(monkeypatch):
+    """I1: the self-check must compile and run the geometry decode actually
+    uses. Spy on `_check_rule`, delegating to the real one, and assert it ran
+    at the mixer's own (HV, K, V) -- not the tiny fallback geometry."""
+    seen = []
+    real_check_rule = gdk._check_rule
+
+    def spy(stock, device, dtype, geom):
+        seen.append(geom)
+        return real_check_rule(stock, device, dtype, geom)
+
+    monkeypatch.setattr(gdk, "_check_rule", spy)
+    _, mixer = _mixer("qwen3_next")
+    mixer = mixer.cuda().bfloat16()
+    gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16)
+    assert seen == [(mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim)]
 
 
 @cuda
@@ -383,6 +431,44 @@ def test_a_seam_whose_kernel_raises_stays_stock_and_warns(monkeypatch, capsys):
 
 
 @cuda
+def test_a_conv_seam_with_a_state_mismatch_stays_stock_and_warns(monkeypatch, capsys):
+    """M3(b): the CONV self-check's state-mismatch branch (`math.isinf` path),
+    untested until now -- a shape/dtype-correct output that does NOT update
+    the conv state."""
+    def no_state_update(hidden_states, conv_state, weight, bias=None, activation=None):
+        B, D, _ = hidden_states.shape
+        return torch.zeros(B, D, 1, device=hidden_states.device, dtype=hidden_states.dtype)
+
+    monkeypatch.setattr(gdk, "fused_conv_update", no_state_update)
+    _, mixer = _mixer("qwen3_next")
+    mixer = mixer.cuda().bfloat16()
+    stock = mixer.causal_conv1d_update
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 0, "norm": 1}
+    assert mixer.causal_conv1d_update is stock
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "'conv'" in out and "not bit-identical" in out
+
+
+@cuda
+def test_a_norm_seam_with_wrong_output_stays_stock_and_warns(monkeypatch, capsys):
+    """M3(a): the NORM self-check's relL2-mismatch branch, untested until now
+    -- a shape/dtype-correct but numerically wrong fused kernel."""
+    def wrong(weight, eps, hidden_states, gate):
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(gdk, "fused_gated_norm", wrong)
+    _, mixer = _mixer("qwen3_next")
+    mixer = mixer.cuda().bfloat16()
+    stock = mixer.norm.forward
+    assert gdk.install_gated_delta_kernels(mixer, "cuda", torch.bfloat16) == \
+        {"rule": 1, "conv": 1, "norm": 0}
+    assert mixer.norm.forward == stock
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "'norm'" in out and "relL2" in out
+
+
+@cuda
 def test_a_norm_with_different_math_stays_stock_and_warns(capsys):
     from transformers.models.llama.modeling_llama import LlamaRMSNorm
     mixer = _RuleAndNormOnly(norm=LlamaRMSNorm(16)).cuda()
@@ -412,25 +498,32 @@ def test_install_does_not_read_meta_weights():
 @pytest.mark.parametrize("kind", ["transformers", "vaayu"])
 @pytest.mark.parametrize("family", FAMILIES)
 def test_full_mixer_decode_is_no_further_from_fp64_than_stock(family, kind, prefill_len):
-    cfg, cpu_mixer = _mixer(family)
-    stock = copy.deepcopy(cpu_mixer).cuda().bfloat16()
-    fused = copy.deepcopy(cpu_mixer).cuda().bfloat16()
-    ref = copy.deepcopy(cpu_mixer).cuda().double()
-    assert gdk.install_gated_delta_kernels(fused, "cuda", torch.bfloat16) == \
-        {"rule": 1, "conv": 1, "norm": 1}
-    torch.manual_seed(1)
-    x = torch.randn(1, prefill_len + 8, cfg.hidden_size, device="cuda")
+    """M2/F3: a single seed's fused/stock error ratio ranges 0.75-1.37 across
+    seeds -- one draw can fail by noise alone. Gate on the MEAN over 4 seeds."""
+    fused_errs, stock_errs = [], []
+    for seed in range(4):
+        cfg, cpu_mixer = _mixer(family, seed=seed)
+        stock = copy.deepcopy(cpu_mixer).cuda().bfloat16()
+        fused = copy.deepcopy(cpu_mixer).cuda().bfloat16()
+        ref = copy.deepcopy(cpu_mixer).cuda().double()
+        assert gdk.install_gated_delta_kernels(fused, "cuda", torch.bfloat16) == \
+            {"rule": 1, "conv": 1, "norm": 1}
+        torch.manual_seed(seed)
+        x = torch.randn(1, prefill_len + 8, cfg.hidden_size, device="cuda")
 
-    def decode(mixer, dtype, cache):
-        with torch.no_grad():
-            mixer(x[:, :prefill_len].to(dtype), cache_params=cache)
-            return torch.cat([mixer(x[:, t:t + 1].to(dtype), cache_params=cache)
-                              for t in range(prefill_len, prefill_len + 8)], 1)
+        def decode(mixer, dtype, cache):
+            with torch.no_grad():
+                mixer(x[:, :prefill_len].to(dtype), cache_params=cache)
+                return torch.cat([mixer(x[:, t:t + 1].to(dtype), cache_params=cache)
+                                  for t in range(prefill_len, prefill_len + 8)], 1)
 
-    so = decode(stock, torch.bfloat16, _cache(kind, cfg))
-    fo = decode(fused, torch.bfloat16, _cache(kind, cfg))
-    ro = decode(ref, torch.float64, DynamicCache(config=cfg))
-    assert _rel(fo, ro) <= 1.25 * _rel(so, ro)
+        so = decode(stock, torch.bfloat16, _cache(kind, cfg))
+        fo = decode(fused, torch.bfloat16, _cache(kind, cfg))
+        ro = decode(ref, torch.float64, DynamicCache(config=cfg))
+        fused_errs.append(_rel(fo, ro))
+        stock_errs.append(_rel(so, ro))
+
+    assert sum(fused_errs) / 4 <= 1.25 * sum(stock_errs) / 4
 
 
 @cuda

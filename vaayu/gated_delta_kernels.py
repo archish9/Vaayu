@@ -1,9 +1,11 @@
 """Fused decode kernels for gated-delta-net mixers (S3, 2026-09-25).
 
-transformers' gated-delta-net mixers (qwen3_next, qwen3_5, qwen3_5_moe,
-olmo_hybrid) decode through three swappable seams -- `recurrent_gated_delta_rule`,
-`causal_conv1d_update` and the gated `norm` -- that fall back to torch when `fla`
-/ `causal_conv1d` are absent. The fallbacks cost 45 kernel launches per mixer per
+transformers' gated-delta-net mixers decode through up to three swappable seams
+-- `recurrent_gated_delta_rule`, `causal_conv1d_update` and the gated `norm` --
+that fall back to torch when `fla` / `causal_conv1d` are absent. qwen3_next,
+qwen3_5 and qwen3_5_moe expose all three; olmo_hybrid exposes only the rule seam
+(its gated norm is `o_norm`, its conv is a per-q/k/v `ShortConvolution`, neither
+matching this module's surface detection). The fallbacks cost 45 kernel launches per mixer per
 decode token on a HOST-bound phase: on Qwen3-Next the 36 mixers' host wall was
 15.8 ms of a 108.5 ms token, and one hand-written Triton kernel per seam cut a
 mixer's decode call 400 -> 197 us (`fla` itself: 391 -- its Python wrappers give
@@ -263,27 +265,55 @@ def _randn(gen, device, *shape):
     return torch.randn(*shape, generator=gen, device=device)
 
 
-# The self-checks run each seam once, stock vs fused, on tiny random inputs in
-# the model's dtype. Geometry does not matter to the MATH they compare; the
-# kernels' geometry handling is the unit tests' job.
+# I1 (2026-09-25): HV, K, V, BK, BV and W are Triton constexprs, so a self-check
+# at a tiny synthetic geometry compiles a DIFFERENT binary than the mixer's real
+# decode call -- it never touches the kernel decode actually runs. These read
+# the real geometry off the mixer when it exposes one (every transformers
+# gated-delta-net family defines num_v_heads/head_k_dim/head_v_dim as plain
+# ints, and a conv1d weight is [D, 1, W]); otherwise they fall back to the
+# original tiny geometry (harmless -- just no longer what ships).
 
-def _check_rule(stock, device, dtype) -> float:
+def _rule_geometry(mixer):
+    hv, k, v = (getattr(mixer, "num_v_heads", None), getattr(mixer, "head_k_dim", None),
+                getattr(mixer, "head_v_dim", None))
+    if isinstance(hv, int) and isinstance(k, int) and isinstance(v, int):
+        return hv, k, v
+    return 2, 16, 16
+
+
+def _conv_geometry(mixer):
+    weight = getattr(getattr(mixer, "conv1d", None), "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.dim() == 3:   # [D, 1, W]; shape-only, safe on meta
+        d, _, w = weight.shape
+        return d, w
+    return 64, 4
+
+
+# The self-checks run each seam once per distinct geometry, stock vs fused, on
+# random inputs in the model's dtype, at B=1 T=1 -- the decode shape (T>1 is
+# the unit tests' job).
+
+def _check_rule(stock, device, dtype, geom) -> float:
+    HV, K, V = geom
     gen = torch.Generator(device=device).manual_seed(0)
-    q, k, v = (_randn(gen, device, 1, 2, 2, 16).to(dtype) for _ in range(3))
-    g = -torch.rand(1, 2, 2, generator=gen, device=device)
-    beta = torch.rand(1, 2, 2, generator=gen, device=device).to(dtype)
-    h0 = (_randn(gen, device, 1, 2, 16, 16) * 0.1).to(dtype)
+    q = _randn(gen, device, 1, 1, HV, K).to(dtype)
+    k = _randn(gen, device, 1, 1, HV, K).to(dtype)
+    v = _randn(gen, device, 1, 1, HV, V).to(dtype)
+    g = -torch.rand(1, 1, HV, generator=gen, device=device)
+    beta = torch.rand(1, 1, HV, generator=gen, device=device).to(dtype)
+    h0 = (_randn(gen, device, 1, HV, K, V) * 0.1).to(dtype)
     kw = dict(g=g, beta=beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
     so, sh = stock(q, k, v, initial_state=h0.clone(), **kw)
     fo, fh = fused_recurrent_rule(q, k, v, initial_state=h0.clone(), **kw)
     return max(_rel(fo, so), _rel(fh, sh))
 
 
-def _check_conv(stock, device, dtype) -> float:
+def _check_conv(stock, device, dtype, geom) -> float:
+    D, W = geom
     gen = torch.Generator(device=device).manual_seed(0)
-    x = _randn(gen, device, 1, 1, 64).to(dtype).transpose(1, 2)       # [B, D, 1], as HF passes it
-    state = _randn(gen, device, 1, 4, 64).to(dtype).transpose(1, 2)   # channels-last, like HF's cache
-    w = _randn(gen, device, 64, 4).to(dtype)
+    x = _randn(gen, device, 1, 1, D).to(dtype).transpose(1, 2)       # [B, D, 1], as HF passes it
+    state = _randn(gen, device, 1, W, D).to(dtype).transpose(1, 2)   # channels-last, like HF's cache
+    w = _randn(gen, device, D, W).to(dtype)
     s_state, f_state = state.clone(), state.clone()
     so = stock(x, s_state, w, None, "silu")
     fo = fused_conv_update(x, f_state, w, None, "silu")
@@ -308,9 +338,9 @@ def _passes_self_check(seam, stock, mixer, device, dtype) -> bool:
         if seam == "norm":
             err = _check_norm(mixer.norm, device, dtype)
         elif seam == "rule":
-            err = _check_rule(stock, device, dtype)
+            err = _check_rule(stock, device, dtype, _rule_geometry(mixer))
         else:
-            err = _check_conv(stock, device, dtype)
+            err = _check_conv(stock, device, dtype, _conv_geometry(mixer))
     except Exception as exc:  # a Triton compile/launch failure, or a stock seam with another contract
         why = f"{type(exc).__name__}: {exc}"
     else:
@@ -336,18 +366,32 @@ def install_gated_delta_kernels(hf_model, device, dtype) -> dict:
     """Put a fused kernel on every gated-delta seam under `hf_model` whose
     on-device self-check passes. Returns {"rule": n, "conv": n, "norm": n},
     already-fused seams included, so a second call is a no-op. Nothing is
-    installed off CUDA or without triton: CPU compute keeps the torch path."""
+    installed off CUDA or without triton: CPU compute keeps the torch path.
+    Also refuses -- all-zero counts, nothing touched -- when `device` names a
+    CUDA index that is not `torch.cuda.current_device()` (I2): Triton launches
+    on the CURRENT device, not the tensors' device, so a model on cuda:N would
+    otherwise launch on device 0 against device-N pointers."""
     counts = {"rule": 0, "conv": 0, "norm": 0}
     if triton is None or torch.device(device).type != "cuda":
+        return counts
+    dev_index = torch.device(device).index
+    if dev_index is not None and dev_index != torch.cuda.current_device():
+        print(f"[Vaayu] WARNING: fused gated-delta kernels not installed: model device {device} "
+              f"is not the current CUDA device ({torch.cuda.current_device()}); decode keeps the "
+              f"stock torch path")
         return counts
     verdicts = {}
     for seam, mixers in gated_delta_seams(hf_model).items():
         for mixer in mixers:
             current = mixer.norm.forward if seam == "norm" else getattr(mixer, _ATTR[seam])
             if not hasattr(current, _MARK):
-                key = ((seam, type(mixer.norm), mixer.norm.weight.numel(),
-                        mixer.norm.weight.dtype, mixer.norm.variance_epsilon)
-                       if seam == "norm" else (seam, current))
+                if seam == "norm":
+                    key = (seam, type(mixer.norm), mixer.norm.weight.numel(),
+                           mixer.norm.weight.dtype, mixer.norm.variance_epsilon)
+                elif seam == "rule":
+                    key = (seam, current, *_rule_geometry(mixer))
+                else:
+                    key = (seam, current, *_conv_geometry(mixer))
                 if key not in verdicts:
                     verdicts[key] = _passes_self_check(seam, current, mixer, device, dtype)
                 if not verdicts[key]:
