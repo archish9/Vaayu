@@ -2425,7 +2425,7 @@ and both have a golden reference or a Vaayu precedent.
       (no model on disk since 2026-09-20) and **dense has no committed gate** — the argument dense
       is unaffected is the hook's `None` default, stated not assumed.
 
-- [~] **A5.7c — streamed fp4 expert injection, then the first token. DESIGNED 2026-09-25.**
+- [x] **A5.7c — streamed fp4 expert injection, then the first token. DESIGNED 2026-09-25, CLOSED 2026-09-25.**
       **READ FIRST:** [`…-A5.7c-expert-injection-design.md`](docs/superpowers/specs/2026-09-25-A5.7c-expert-injection-design.md),
       **PLANNED 2026-09-25 — 7 tasks in
       [`…-A5.7c-expert-injection.md`](docs/superpowers/plans/2026-09-25-A5.7c-expert-injection.md)**
@@ -2477,8 +2477,14 @@ and both have a golden reference or a Vaayu precedent.
       **(3) FAILURE MODE, decided:** the NEW branch raises naming layer/expert/submod/base/both
       dtypes; the existing cast branch keeps its `warn` + `return None` verbatim — no behaviour
       change for MiniMax/Qwen, no silent path in new code.
-      **§8:** no knob — STATED, not assumed; a correctness invariant with nothing to tune.
-      Reachable in the server's only mode (N=1 decode), proven by the server smoke below.
+      **§8, four answers (this line's original claim — "reachable, proven by the server smoke below" —
+      is STALE as of Task 5; corrected here, restated in full at the row's close below):** (1) no
+      knob — STATED, not assumed; a correctness invariant with nothing to tune. (2) not applicable —
+      no knob, nothing to plumb. (3) claimed going in as "reachable in the server's only mode (N=1
+      decode), proven by the server smoke below" — **Task 5 REFUTES that for the completion path: see
+      below, the missing-`chat_template` `[bug]` blocks every `/v1/chat/completions` request before
+      the injection fix is ever exercised.** (4) said out loud at the row's close, with the three
+      banked rows immediately below it.
       **MUST NOT CHANGE:** any tensor whose target dtype is not in the allowlist must inject
       byte-identically to today — explicit allowlist, NOT a general "dtypes differ → reinterpret"
       branch. Unit test asserts that byte-identity directly.
@@ -2619,6 +2625,71 @@ and both have a golden reference or a Vaayu precedent.
       the GPU-load dominance before re-projecting, and that is not built here (measurement only, per
       this task's scope).
 
+      **A5.7c CLOSED 2026-09-25 — summary for a reader who only has this row.** Full suite:
+      **2748 passed, 44 failed, 2 errors, 16 skipped, 189.71s**; all 46 non-passing are the
+      pre-existing shard-deletion breakage (its own `[bug]` row below), and 2748 + 46 = 2794 =
+      the 2778 pre-deletion floor + A5.7c's 16 new tests, so nothing regressed. Both on-device MoE
+      accumulator gates green, foreground at `MemoryMax=29G`: **Qwen3-Next-80B-A3B int4 AWQ (fused
+      non-EXL3 forward) 8 passed / 36.82s; MiniMax-M2.7 EXL3 (module-list forward, the one this
+      change edits) 8 passed / 73.40s.** First token: prompt `"The capital of France is"` →
+      `" Paris. The capital of Spain is Madrid"`, coherent and factually correct; load 3.7s, 8 tokens
+      in 31.8s; zero `Expert weight inject failed`, zero `PackedInjectionError` — the injection fix
+      was clean on the first on-device run. Server smoke: **3 failed, 6 passed, 8.47s** — load,
+      health, oversized-prompt refusal, prefix-cache reporting, `env.json`, `requests.jsonl` and the
+      path-leak check all pass; the two completion tests and the token-summary check fail purely on
+      the checkpoint's missing `chat_template` (its own `[bug]` row below), not on anything this
+      branch touched. Decode (row 28b step 5): **U1 0.3267 tok/s**, arm `MODEL=deepseek
+      BALLAST_GB=15 NEW_TOK=64` (changed from 25 after an OOM kill), 127-token prompt (chunking
+      stayed enabled), wall 22m16s — the plan's ~1.75–2.06 tok/s prediction is **REFUTED**, 5.4–6.4×
+      slower than its low end. **No fused-EXL3 arm exists** (no model on disk since Qwen3-235B was
+      retired 2026-09-20) and **dense has no committed gate** (`test_batched_dense_smoke.py` deleted
+      2026-09-03) — neither is claimed as coverage. **§8, final answer, all four:** (1) no knob — a
+      correctness invariant, nothing to tune. (2) not applicable — no knob to plumb. (3) **NOT
+      reachable through the server today** — the missing-`chat_template` `[bug]` row below is what
+      unblocks it; library-reachable (Task 4's first token) and server-BANKED, stated in those terms,
+      not claimed as shipped. (4) said out loud, right here, and as the three dedicated rows
+      immediately below: the fused forward's twin cast, `_inject_expert_weights`'s warn-and-skip, and
+      A4 check 2's finding (also closed below, in the A4 checks section).
+
+- [!] **The fused forward's twin cast — BLOCKED 2026-09-25, decided out of scope by the user.**
+      `_make_fused_sparse_forward`'s own expert injection casts streamed tensors to the running dtype
+      exactly as `_inject_expert_weights` did before A5.7c — same defect class, a different forward.
+      gpt-oss-20b's MXFP4 experts (fused-3D `mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]`)
+      would hit it. **Not fixed, and here is why:** gpt-oss cannot load at all today (row 47 / gap
+      G1 — the expert-offset index matches 0 of its 459 tensors and does not raise), so a fix on this
+      forward would be untestable code sitting on `_make_fused_sparse_forward` — Qwen3-Next's
+      perf-tuned, most-tested path (CLAUDE.md §0). **Unblocked by G1**: once gpt-oss loads, this
+      becomes testable; until then, leave this forward alone for this reason.
+
+- [ ] **`_inject_expert_weights`'s warn-and-skip stays a silent drop, deliberately, out of A5.7c's
+      scope.** Every non-packed injection failure still logs a warning and `return None`s, silently
+      dropping that expert from the token — unchanged, verbatim, from before A5.7c. A5.7c added
+      `PackedInjectionError` only for its own new no-cast branch (`NO_CAST_INJECTION_DTYPES`),
+      deliberately leaving this shared path alone. **Why it is not a quick follow-up:** turning
+      `warn` + `return None` into a raise here is a behaviour change on BOTH forwards that share
+      `_inject_expert_weights` — the module-list forward (MiniMax-M2.7, production) and the fused
+      forward (Qwen3-Next, production) — so it needs both on-device MoE accumulator gates green AND a
+      deliberate decision about raising mid-decode (today a dropped expert degrades output silently;
+      a raise would kill the request instead). Not started.
+
+- [ ] **Row 28's reach-projection METHOD does not hold on DeepSeek-V4-Flash, measured 2026-09-25
+      (A5.7c Task 6) — a correction to the METHOD, not just this one model's number.** Row 28
+      projected decode from `bytes/token ÷ delivered NVMe GB/s` = **3.2124 GiB/token** for this
+      checkpoint, giving the ~1.75–2.06 tok/s prediction row 28b step 5 REFUTED (measured **U1
+      0.3267 tok/s**, 5.4–6.4× slower). **Measured breakdown of why, from the per-token `[VAAYU-IO]
+      token summary` lines:** actual bytes moved per token are **~7.0–7.8 GB, roughly 2× the
+      3.2124 GiB/token projection**; the expert RAM cache is **thrashing, not warming** (~20% hit
+      rate, evict count tracking miss count 1:1, under a 9.13 GiB budget at `BALLAST_GB=15`); and the
+      per-token cost is **GPU-load bound (~2.7s of a ~3.9–4.0s token), NOT NVMe-stall bound (~0.2–0.3s,
+      `expert_disk`)**. **What the method is missing:** it has no term for GPU-side H2D-plus-dequant
+      work per token — it treats the NVMe transfer as the whole cost, so the delivered-bandwidth
+      denominator is not the binding constraint here. **Why this matters beyond one model:** row 28's
+      method is the one every future "can this checkpoint reach the hardware?" projection uses; as
+      measured, it under-predicts cost by 5–6×. **Not built here** — explaining the 2× byte inflation
+      and adding a GPU-load term to the method is follow-up work, out of A5.7c's scope (measurement
+      only). Source: `plans/probes/row26_decode.py` output,
+      `plans/probes/row26_out/decode-deepseek.json` (gitignored — this row is the durable copy).
+
 - [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
       the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
       code had the same defect at a different index.** `VaayuDeepseekV4.get_past_key_value_args`
@@ -2701,17 +2772,24 @@ and both have a golden reference or a Vaayu precedent.
       fixture so the parity tests stop needing 157 G of checkpoint at all. **Real coverage loss
       meanwhile:** DeepSeek-V4's gate/expert/MoE bit-identity goldens do not run.
 
-**Two checks CARRIED OUT OF A4 (row 47, closed 2026-09-23 with its premise refuted) — they belong to A5:**
-- [ ] **check 1: confirm DeepSeek's shared experts actually land in the pinned non-expert set** once
-      the model loads. A4's key-shape argument (`\.experts\.(\d+)\.` does not match
-      `...shared_expert.*`, so shared experts are pinned, not streamed), executed on this checkpoint.
-- [ ] **check 2: confirm the pinning budget covers DeepSeek's non-expert set.** 43 MoE layers, MLA
-      attention, F8_E4M3 shared experts and attention — unmeasured. **Why it matters: the pinning is
-      INCIDENTAL to the budget, not structural.** Phase 2 `break`s on budget miss
-      (`vaayu_base.py:3956`); Qwen3-Next's ~3.55 GB fits inside 4.83 GB today. Un-pinned layers fall
-      back to `LRUTensorCache(_ne_budget)` (`vaayu_base.py:2710`, byte-budgeted, derived) — RAM-cached
-      re-reads, **not** per-token NVMe streaming — and the loop prints `budget exhausted at <layer>`,
-      but that warning says nothing about shared experts specifically.
+**Two checks CARRIED OUT OF A4 (row 47, closed 2026-09-23 with its premise refuted) — they belong to
+A5. BOTH CLOSED 2026-09-25, on the A5.7b/A5.7c on-device load:**
+- [x] **check 1: DeepSeek's shared experts DO land in the pinned non-expert set — discharged by
+      inspection AND NOW BY A LIVE LOAD, not inspection alone.** A4's key-shape argument
+      (`\.experts\.(\d+)\.` does not match `...shared_expert.*`, so shared experts are pinned, not
+      streamed) held on paper; A5.7c's Task 4 first-token run then loaded the real checkpoint with
+      the shared experts inside the pinned non-expert set — the same load check 2's pin summary
+      below is measured from.
+- [x] **check 2 — CLOSED AS A FINDING, not a pending check: the pinning budget does NOT cover
+      DeepSeek's non-expert set.** Measured on the A5.7b/A5.7c load: pin summary `3 fully-pinned
+      (0 transformer + 3 shared), 0 non-expert-pinned transformer` against `pinning budget=3.34 GiB`
+      and an **8.24 GiB dense footprint** — **not one transformer layer was pinned**, stronger than
+      the design's predicted "budget exhausted partway" (which expected some layers to fit before the
+      budget ran out). **Why it matters: the pinning is INCIDENTAL to the budget, not structural.**
+      Phase 2 `break`s on budget miss (`vaayu_base.py:3956`/`:3977`); Qwen3-Next's ~3.55 GB fits
+      inside 4.83 GB today, DeepSeek's does not. Un-pinned layers fall back to
+      `LRUTensorCache(_ne_budget)` (`vaayu_base.py:2710`, byte-budgeted, derived) — RAM-cached
+      re-reads for the WHOLE transformer stack, **not** per-token NVMe streaming for it.
 
 **Steps (each with its own verify):** 1 **kernels first, standalone, on sm_120** (2–5 days; **stop rule: if TileLang
 will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
