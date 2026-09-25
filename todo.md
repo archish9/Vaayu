@@ -2290,8 +2290,9 @@ and both have a golden reference or a Vaayu precedent.
       tripwire is a source-text substring match, brittle to harmless reformatting (confirmed
       today-correct by the reviewer; not a live defect).
 
-- [~] **A5.7b — load, index, split. RAN 2026-09-24/25; STOPPED ON ITS OWN STOP RULE. Remainder is
-      A5.7c below.** **WHAT LANDED — branch `a5.7b-load-first-token`, 14 commits off `1995382`, NOT
+- [x] **A5.7b — load, index, split. RAN 2026-09-24/25; STOPPED ON ITS OWN STOP RULE. CLOSED
+      2026-09-25 when its remainder A5.7c closed — nothing of A5.7b is still pending.** (Was `[~]`;
+      corrected 2026-09-25.) **WHAT LANDED — branch `a5.7b-load-first-token`, 14 commits off `1995382`, NOT
       MERGED, full suite green at `2778 passed, 16 skipped`:** `cda7f3b` key_remap hook on
       `split_and_save_layers` + `get_checkpoint_key_remap` base hook (identity default) · `e553137`
       DeepSeek's disk-key→module-tree mapping with `mtp.*` dropped · `6dfd041` `fp4_group_size`
@@ -2716,8 +2717,33 @@ and both have a golden reference or a Vaayu precedent.
       the expert landing back on meta, and the pin being released — the unit tests call the injector
       directly. **All four were triaged as correctly deferred by the reviewer; none blocks anything.**
 
-- [bug] **DeepSeek-V4 cannot prefill a prompt longer than `prefill_chunk_size` (512 by default, and
-      the server's default). FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
+- [x] **FIXED 2026-09-25 — DeepSeek-V4 prefills prompts longer than `prefill_chunk_size`.**
+      Fix option (1) from this row, the subclass-only one: the contiguity check moved out of
+      `get_pos_emb_args` into `get_attention_mask_args`, the ONLY hook the layer-major loop tells
+      which layer it is about to run (`vaayu_base.py:5241`, `layer=layer`), and it now reads **that
+      layer's** `get_seq_length(layer_idx)` instead of any fixed index. `get_past_key_value_args`
+      stops reading a length at all and just stashes the cache; `layer=None` skips the check rather
+      than guessing an index. `DeepseekV4DecoderLayer.layer_idx` supplies the index
+      (`modeling_deepseek_v4.py:1364`). **Subclass-only — no shared file touched, so blast radius is
+      one model.**
+      **ON-DEVICE GATE, 2026-09-25** (`plans/probes/a57d_chunked_prefill.py`, gitignored; detached
+      unit, `MemoryMax=29G`, log `/tmp/a57d-chunked-prefill.log`): load 3.5 s,
+      `prefill_chunk_size=512`, `attn=eager`. **SHORT arm 53 tokens / 1 chunk → OK in 25.0 s
+      (0.160 tok/s), `'2.5x'`. LONG arm 729 tokens / 2 chunks → OK in 44.8 s (0.089 tok/s),
+      `'</think>Vaayu streams'`.** Exit 0, zero tracebacks, zero contiguity raises; the only warning
+      is the known prefix-cache warn-and-disable. The LONG arm is the case that could not run at all.
+      **Tests:** 6 in `tests/test_deepseek_v4_engine.py`, each with a mirrored negative so none can
+      pass with the check absent — a pre-write layer must REJECT a post-write layer's legitimate
+      `start_pos` and vice versa, and a layer midway through chunked prefill validates against its
+      own partial count. 309 passed across the engine/cache/config/moe-patch files. **The full suite
+      was NOT re-run after this change** (the user declined the 3-minute run); the change touches one
+      subclass file only.
+      **Why `len_p` itself is sound, checked while fixing:** `vaayu_base.py:4844`'s
+      `_past_len_for_pos` uses the base's `get_past_key_values_cache_seq_len`, which does default to
+      layer 0 — but it is read ONCE per `forward` entry, when every layer's count is equal, and
+      chunk-major derives `_past_lens` from that single `past0` (`compute_chunk_past_lens`,
+      `:1044`). So the layer-0 default is correct there and needs no override.
+      (Original row follows.) **FOUND 2026-09-25 by A5.7c's Task 4 review; NOT a regression — the old
       code had the same defect at a different index.** `VaayuDeepseekV4.get_past_key_value_args`
       derives the cache's past length from ONE fixed layer index, but `DeepseekV4Cache` gives every
       layer an independent `cumulative_length`, and the hook is called once per **(layer, chunk)**

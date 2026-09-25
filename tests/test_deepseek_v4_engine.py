@@ -8,6 +8,7 @@ and `tests/test_keepawake_wiring.py:30` already use.
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -436,57 +437,117 @@ def test_generate_delegates_args_and_return_value_unchanged(monkeypatch):
     assert result == "the-result"
 
 
+def _executing_layer(layer_idx):
+    """The engine hands `get_attention_mask_args` the decoder layer it is about
+    to run (`vaayu_base.py:5241`, `layer=layer`). `DeepseekV4DecoderLayer`
+    carries its own `layer_idx` (`modeling_deepseek_v4.py:1364`), which is all
+    the contiguity check needs off it."""
+    return SimpleNamespace(layer_idx=layer_idx)
+
+
+def _cache_at(*, every_layer, **per_layer):
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=1024,
+                                    device="cpu", dtype=torch.float32)
+    cache.advance(every_layer)
+    for idx, count in per_layer.items():
+        cache.layers[int(idx.lstrip("l"))].cumulative_length = count
+    return cache
+
+
+def _hooks_for(cache):
+    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
+    model.config = shipped_config()
+    model.get_past_key_value_args(cache)
+    return model
+
+
 def test_a_start_pos_that_disagrees_with_the_cache_raises():
     """`DeepseekV4Model._start_pos` validates this and the streamed path never
     calls it. The sliding window indexes by `pos % window_size` and the
     Compressor flushes on boundaries counted from `start_pos`, so a rewound
     cache with an un-rewound start_pos writes into the wrong slots and returns
-    plausible tokens computed against the wrong history."""
-    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
-    model.config = shipped_config()
-    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
-                                     device="cpu", dtype=torch.float32)
-    cache.advance(7)
+    plausible tokens computed against the wrong history.
 
-    model.get_past_key_value_args(cache)
+    The check lives in `get_attention_mask_args` because that is the only hook
+    the layer-major loop tells WHICH layer it is about to run."""
+    model = _hooks_for(_cache_at(every_layer=7))
+
     with pytest.raises(RuntimeError, match="start_pos"):
-        model.get_pos_emb_args(3, 1)
+        model.get_attention_mask_args(None, 3, 1, layer=_executing_layer(3))
 
 
 def test_a_start_pos_that_agrees_with_the_cache_passes_through():
-    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
-    model.config = shipped_config()
-    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
-                                     device="cpu", dtype=torch.float32)
-    cache.advance(7)
+    model = _hooks_for(_cache_at(every_layer=7))
 
-    model.get_past_key_value_args(cache)
+    assert model.get_attention_mask_args(None, 7, 1,
+                                         layer=_executing_layer(3)) == {}
     assert model.get_pos_emb_args(7, 1) == {"start_pos": 7}
 
 
-def test_get_past_key_value_args_reads_the_last_layer_not_the_default_first():
-    """Task 4 (first real forward pass): the engine's layer-major loop calls
-    this hook once per DECODER LAYER, in order, within a single token/chunk
-    step. `DeepseekV4Cache.get_seq_length()` defaults to `layer_idx=0`, and
-    each layer's `cumulative_length` only advances when THAT layer's own
-    `update()` runs -- so once layer 0 has run, the default arg reports this
-    step's POST-write count while every other layer is still pre-write,
-    which reads as a rewound cache and raised `RuntimeError` on the very
-    first prefill, at layer 1 of 43, every time. Reading the LAST layer
-    (`num_hidden_layers - 1`) instead must stay at the pre-step count no
-    matter which layer already ran this step."""
-    model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
-    model.config = shipped_config()
-    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
-                                     device="cpu", dtype=torch.float32)
-    cache.advance(5)          # every layer starts this step at 5, like a fresh
-                               # prefill's cache would after step 1.
-    cache.layers[0].cumulative_length = 10  # layer 0 already ran THIS step
+def test_the_check_reads_the_EXECUTING_layers_own_count():
+    """`DeepseekV4Cache` gives every layer an independent `cumulative_length`,
+    bumped only when that layer's own `update()` runs, and the engine builds
+    kwargs once per DECODER LAYER within a step. So mid-step the layers that
+    already ran are POST-write and the rest are pre-write, and the only count
+    that can validate a given layer's `start_pos` is that layer's own."""
+    cache = _cache_at(every_layer=5, l0=10)   # layer 0 already ran this step
+    model = _hooks_for(cache)
 
-    model.get_past_key_value_args(cache)
-    # Must not raise: the last layer's count (5) still agrees with len_p=5,
-    # even though the default (layer 0's count, 10) would not.
-    assert model.get_pos_emb_args(5, 1) == {"start_pos": 5}
+    # A pre-write layer validates against the pre-write count...
+    assert model.get_attention_mask_args(None, 5, 1,
+                                         layer=_executing_layer(3)) == {}
+    # ...and layer 0, which has already advanced, validates against ITS count.
+    # A fixed index -- first or last -- gets exactly one of these two right.
+    assert model.get_attention_mask_args(None, 10, 1,
+                                         layer=_executing_layer(0)) == {}
+    # Mirrored, so neither assertion above can pass by the check being absent:
+    # each layer must REJECT the other layer's legitimate start_pos.
+    with pytest.raises(RuntimeError, match="start_pos"):
+        model.get_attention_mask_args(None, 10, 1, layer=_executing_layer(3))
+    with pytest.raises(RuntimeError, match="start_pos"):
+        model.get_attention_mask_args(None, 5, 1, layer=_executing_layer(0))
+
+
+def test_a_layer_midway_through_chunked_prefill_validates_against_its_partial_count():
+    """The bug this replaces. Above `prefill_chunk_size` the loop runs
+    (layer, chunk) pairs, so while layer 0 works through chunk 1 of a
+    900-token prompt its own count is 512 while every later layer is still at
+    0. Reading any FIXED layer index raises here -- layer 0 on its SECOND
+    chunk, before execution ever reaches the last layer -- which is why a
+    prompt over 512 tokens could not prefill at all."""
+    cache = _cache_at(every_layer=0, l0=512)  # layer 0 finished chunk 0 (512)
+    model = _hooks_for(cache)
+
+    assert model.get_attention_mask_args(None, 512, 388,
+                                         layer=_executing_layer(0)) == {}
+    # The layers that have not run yet are still at 0, and each validates
+    # against that -- the same step, a different legitimate start_pos.
+    assert model.get_attention_mask_args(None, 0, 512,
+                                         layer=_executing_layer(1)) == {}
+    # And layer 1 must refuse layer 0's start_pos, so this cannot pass with the
+    # check absent: 512 is right for layer 0 here and wrong for layer 1.
+    with pytest.raises(RuntimeError, match="start_pos"):
+        model.get_attention_mask_args(None, 512, 388, layer=_executing_layer(1))
+
+
+def test_a_rewound_count_still_raises_for_the_layer_that_owns_it():
+    """Relocating the check must not weaken it: a layer whose own count
+    disagrees with its `start_pos` is still the error case."""
+    cache = _cache_at(every_layer=0, l0=512)
+    model = _hooks_for(cache)
+
+    with pytest.raises(RuntimeError, match="start_pos"):
+        model.get_attention_mask_args(None, 256, 388,
+                                      layer=_executing_layer(0))
+
+
+def test_the_check_is_skipped_when_the_caller_names_no_layer():
+    """`layer=None` is the base signature's default. Without a layer there is
+    no right count to check against, so the check is SKIPPED rather than
+    guessing an index -- guessing an index is the defect being removed."""
+    model = _hooks_for(_cache_at(every_layer=7))
+
+    assert model.get_attention_mask_args(None, 3, 1) == {}
 
 
 def test_the_default_construction_is_not_refused(monkeypatch):

@@ -547,34 +547,27 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return layer(self.model.model.hc_head(seq))
 
     def get_past_key_value_args(self, past_key_values):
-        """Pass the cache through, and remember how far it has advanced.
+        """Pass the cache through, and keep a reference for the contiguity
+        check that `get_attention_mask_args` performs a moment later.
 
-        `DeepseekV4Model._start_pos` validates that `cache_position` is
-        `arange(start_pos, start_pos + seqlen)` and raises otherwise. The
-        streamed path never calls that forward, so the check has to live in the
-        hooks -- recorded here and asserted in `get_pos_emb_args`, which the
-        layer-major loop evaluates immediately after this one
-        (`vaayu_base.py:5222`).
-
-        Reads the LAST layer's own count, never the default `layer_idx=0`
-        (Task 4, first real forward pass): `DeepseekV4Cache` gives every layer
-        an INDEPENDENT `cumulative_length`, bumped only when that layer's own
-        `update()` runs. This hook and `get_pos_emb_args` are called once per
-        DECODER LAYER, in layer order, within a single token/chunk step
-        (`vaayu_base.py:5205-5222`) -- so by the time layer 1's kwargs are
-        built, layer 0 has already run and bumped ITS count for this step,
-        and `get_seq_length()`'s default (`layer_idx=0`) reports that
-        post-write number while every other layer is still pre-write. Checked
-        against the pre-step `len_p`, that looks exactly like "the cache moved
-        out from under us" and raised on the very first prefill
-        (`AttributeError`-adjacent RuntimeError, layer 1 of 43, every time).
-        The LAST layer is the only index that stays at the pre-step value for
-        every layer's kwargs within the step, including its own (built before
-        it runs) -- `num_hidden_layers` off the config, never a literal.
+        This hook does NOT read a sequence length any more, and that is the
+        whole point. `DeepseekV4Cache` gives every layer an INDEPENDENT
+        `cumulative_length`, bumped only when that layer's own `update()` runs,
+        and the engine builds kwargs once per DECODER LAYER -- and, above
+        `prefill_chunk_size`, once per (layer, chunk) pair
+        (`vaayu_base.py:5222-5241`, `_past_lens` from `compute_chunk_past_lens`).
+        Mid-step the layers that already ran are post-write and the rest are
+        pre-write, so NO fixed index is correct for every layer's kwargs: the
+        executing layer needs `past0 + sum(earlier chunks)`, finished layers
+        report `past0 + total`, and unstarted ones report `past0`. Reading
+        layer 0 raised on the first prefill; reading the last layer fixed the
+        single-chunk case and still raised on layer 0's SECOND chunk, which is
+        why a prompt longer than `prefill_chunk_size` could not prefill at all.
+        The only count that can validate a given `start_pos` is that layer's
+        own, and this hook is not told which layer it is -- `get_attention_mask_args`
+        is.
         """
-        self._cache_seq_len = (
-            past_key_values.get_seq_length(self.config.num_hidden_layers - 1)
-            if past_key_values is not None else None)
+        self._cache_for_start_pos_check = past_key_values
         return {"past_key_values": past_key_values}
 
     def get_pos_emb_args(self, len_p, len_s):
@@ -584,28 +577,55 @@ class VaayuDeepseekV4(VaayuBaseModel):
         takes a scalar `start_pos` and `precompute_freqs_cis` does the rest
         inside the layer.
 
-        Checked against the cache, because nothing else checks it: the window
-        indexes by `pos % window_size` and the Compressor flushes on block
-        boundaries counted from `start_pos`, so a cache that was rewound under a
-        `start_pos` that was not writes into the wrong slots and returns
-        plausible tokens computed against the wrong history.
+        The cache-agreement check used to live here and now lives in
+        `get_attention_mask_args`, which the same loop calls immediately after
+        this hook and BEFORE the layer runs -- and which, unlike this one, is
+        told which layer it is building kwargs for. See that method.
         """
-        _cached = getattr(self, "_cache_seq_len", None)
-        if _cached is not None and _cached != len_p:
-            raise RuntimeError(
-                f"DeepSeek-V4 start_pos {len_p} disagrees with the cache's "
-                f"{_cached} tokens. This cache is a preallocated sliding window "
-                f"indexed by pos % window_size; a discontiguous start_pos writes "
-                f"into the wrong slots and the Compressor flushes on the wrong "
-                f"boundary. Something rewound or replayed the cache without "
-                f"telling the engine.")
         return {"start_pos": len_p}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s,
                                 layer=None):
-        """Nothing. `sparse_attn` masks by reading `-1` out of `topk_idxs`
+        """No mask args -- and the `start_pos` contiguity check, which needs
+        the one thing only this hook is given: the layer about to run.
+
+        `sparse_attn` masks by reading `-1` out of `topk_idxs`
         (`kernel.py:322`); there is no HF mask for this architecture, and
-        passing one would be an unexpected kwarg on the decoder layer."""
+        passing one would be an unexpected kwarg on the decoder layer. So this
+        returns nothing, and carries the check instead.
+
+        **Why the check is here.** `DeepseekV4Model._start_pos` validates that
+        `cache_position` is `arange(start_pos, start_pos + seqlen)` and raises
+        otherwise; the streamed path never calls that forward, so the check has
+        to live in the hooks. It matters because the window indexes by
+        `pos % window_size` and the Compressor flushes on block boundaries
+        counted from `start_pos`: a cache that was rewound under a `start_pos`
+        that was not writes into the wrong slots and returns plausible tokens
+        computed against the wrong history. And it has to be THIS hook because
+        the engine passes `layer=` only here (`vaayu_base.py:5241`), while
+        every layer of `DeepseekV4Cache` counts independently -- see
+        `get_past_key_value_args`. The loop builds this hook's args after
+        `get_pos_emb_args` and before `layer(**kwargs)`, so raising here still
+        stops the bad call.
+
+        `layer=None` (the base signature's default, and what a caller that
+        names no layer sends) SKIPS the check: without a layer there is no
+        right count to compare against, and guessing an index is the defect
+        this replaced.
+        """
+        cache = getattr(self, "_cache_for_start_pos_check", None)
+        layer_idx = getattr(layer, "layer_idx", None)
+        if cache is not None and layer_idx is not None:
+            counted = cache.get_seq_length(layer_idx)
+            if counted != len_p:
+                raise RuntimeError(
+                    f"DeepSeek-V4 start_pos {len_p} disagrees with layer "
+                    f"{layer_idx}'s cache, which holds {counted} tokens. This "
+                    f"cache is a preallocated sliding window indexed by "
+                    f"pos % window_size; a discontiguous start_pos writes into "
+                    f"the wrong slots and the Compressor flushes on the wrong "
+                    f"boundary. Something rewound or replayed the cache without "
+                    f"telling the engine.")
         return {}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
