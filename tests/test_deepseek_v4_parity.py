@@ -221,9 +221,14 @@ def test_importing_the_reference_writes_nothing_into_the_checkpoint(tmp_path, mo
     `model.py` that imports `kernel`.
     """
     import sys
+    import tempfile
 
     inference = tmp_path / "inference"
     inference.mkdir()
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    # The harness never removes its patched-kernel tempdir; keep this one in tmp_path.
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *args, **kwargs: str(variant))
     (inference / "kernel.py").write_text(
         "def sparse_attn_kernel():\n    num_stages = 2\n    block = 64\n\n\n"
         "def hc_split_sinkhorn_kernel():\n    pass\n")
@@ -235,8 +240,9 @@ def test_importing_the_reference_writes_nothing_into_the_checkpoint(tmp_path, mo
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     monkeypatch.setattr(sys, "pycache_prefix", None)
 
-    parity.reference_modules(tmp_path)
+    module = parity.reference_modules(tmp_path)
 
+    assert Path(module.__file__) == inference / "model.py"
     assert sorted(p.name for p in inference.iterdir()) == ["kernel.py", "model.py"]
     assert sys.dont_write_bytecode is False
 

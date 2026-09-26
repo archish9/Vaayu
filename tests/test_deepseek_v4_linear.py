@@ -135,6 +135,20 @@ def test_the_lazy_kernel_import_writes_nothing_beside_the_checkpoints_kernel_py(
     assert sys.dont_write_bytecode is False
 
 
+@pytest.mark.parametrize("before", [False, True], ids=["default", "python-B"])
+def test_no_bytecode_puts_the_flag_back_as_it_found_it_even_when_the_import_fails(
+        monkeypatch, before):
+    """The flag is process-global. A user running with `-B` /
+    `PYTHONDONTWRITEBYTECODE` must keep it after a kernel import, and a failed
+    import (tilelang missing) must not leave bytecode off for the process."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", before)
+
+    with pytest.raises(ImportError), modeling.no_bytecode():
+        raise ImportError("No module named 'tilelang'")
+
+    assert sys.dont_write_bytecode is before
+
+
 def test_a_quantized_forward_without_the_kernels_names_both_pins(kernel_dir, block_size):
     """tilelang 0.1.8 declares `apache-tvm-ffi>=0.1.2,~=0.1.0`, so pip resolves
     a version that imports fine and dies at kernel COMPILE. A bare
