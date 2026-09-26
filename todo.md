@@ -106,7 +106,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit.**
+## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit. MERGED to `main` 2026-09-26 (`906675c`).**
 
 **Root cause (re-verified 2026-09-26, not taken from the handoff):** all 46 died with
 `FileNotFoundError: …/model-000NN-of-00048.safetensors` at fixture time — every reader resolved a key
