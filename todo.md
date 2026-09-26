@@ -105,7 +105,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## S3 — `[x]` fused Triton kernels on the gated-delta mixers' three decode seams. **CLOSED 2026-09-25, A WIN — real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, prefill flat, greedy ids identical, D6 quality band PASS. On branch `s3-gated-delta-kernels`, merge pending the final review.**
+## S3 — `[x]` fused Triton kernels on the gated-delta mixers' three decode seams. **CLOSED 2026-09-25, A WIN — real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, prefill flat, greedy ids identical, D6 quality band PASS. MERGED to `main` 2026-09-26 (`87a7f4d`) after the final whole-branch review (Opus: ready with fixes → I1 real-geometry self-check, I2 non-current-device guard, M1-M5, all fixed and re-reviewed).**
 
 **Why (measured 2026-09-25, HEAD `18ef01c`, detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`):**
 - **The row-36 spike's census was wrong.** Prefill sat inside its CUPTI window, and its "653 µs/layer" was the whole decoder layer, not the mixer. Decode-only, `serial` is **4,586 launches / 15.9 ms device against a ~35.5 ms wall**, so it is HOST-bound.
