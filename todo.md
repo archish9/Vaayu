@@ -81,18 +81,18 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the S5-M `[bug]` row below, pre-existing, not fixed here (filed as expert-RAM sizing; measured 2026-09-26 as glibc malloc retention on the clone path, and FIXED).** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
 | **S5-M** ✅ | ~~**DeepSeek-V4 through the server is OOM-killed on its 2nd request**~~ **CLOSED 2026-09-26, FIXED, MERGED (`2d78f71`) — not a reference leak: glibc malloc kept the freed expert clones (live tensors flat, `malloc_trim(0)` handed back 5.5 GB). Non-EXL3 module-list was denied the slab arena ("never measured"), so DeepSeek cached through the double-clone path. `6596c49` gives it the arena on CUDA. Through the probe's monkeypatched predicate (same answer for DeepSeek): RSS flat over 128 decode tokens, greedy ids identical over 48. On the committed code: server smoke 9/9 (RSS 26.67 GB at the last token). MiniMax never leaked (it already had the arena). See the S5-M row below** | S5 made DeepSeek serving reachable, and this capped it at ONE request per server process | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) · RESULTS `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` |
 | **S5-M-H** ✅ | ~~**DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts**~~ **CLOSED 2026-09-26, PASS (measurement, no change), MERGED (`bc69193`) — one server process served 4,019 then 8,018 prompt tokens, both 200 (TTFT 166.9 s / 296.6 s). cgroup peak 27.36 GB = 3.78 GB margin to the 31.14 GB cap; the peak is the first request's warm-up (set inside A's first 512-token chunk), and no host-RAM column grows with prompt length at ≤ 8k (malloc free ≤ 0.47 GB, no clone churn). Host `MemAvailable` min 1.63 GB — not a FAIL; opened as the unsequenced **S5-M-HR** row. See the S5-M-H row below** — was: S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
-| **S5-W** 🔶 | **FIXED ON BRANCH `s5w-model-dir-writes` 2026-09-26, NOT MERGED (user's call) — `no_bytecode()` holds `sys.dont_write_bytecode` around both `exec_module`s; 2 new tests RED→GREEN; DeepSeek files on a clean view 362 passed / 0 failed; suite real dir 2951 passed / 3 failed (EXACTLY the 3 `modeling_deepseek_v4.py` stale-copy guards — any edit to that file trips them until S5-R) / 16 skipped, clean view 2950 / 0 / 20. Real-dir proof BLOCKED on S5-R. See the S5-W row below** — was: **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
+| **S5-W** ✅ | ~~**Vaayu still writes bytecode into a DeepSeek model dir**~~ **CLOSED 2026-09-26, FIXED — `no_bytecode()` holds `sys.dont_write_bytecode` around both `exec_module`s (the runtime `kernels()` and the parity harness); 4 new tests (RED→GREEN + a mutation-verified restore test). S5-R done the same session (user-authorised agent restore), so the proof is on the REAL dir and non-vacuous: DeepSeek files, a library load + generate and a server smoke 9/9 all left it byte+mtime identical with no `__pycache__`. Suite `2952 passed, 0 failed, 0 errors, 20 skipped`. Review: ready to merge, 5 minors all fixed. See the S5-W row below** — was: **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
 | **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2952 passed, 0 failed, 0 errors, 16 skipped` (216.47 s,
-FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
+**Suite floor for every one of them: `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
+FOREGROUND; set 2026-09-26 by S5-W's +4 tests and S5-R's restore, which turned the 4 DeepSeek
+stale-copy guards from passes into SKIPS — any other skip count means the DeepSeek folder changed) — was
+`2952 passed, 0 failed, 0 errors, 16 skipped` (216.47 s), raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
 from 2874 by +5 from S3's final-review fix wave (2026-09-25), from 2879 by S4's 46 restored + 3 new,
 from 2928 by S5's net +23, and from 2951 by S5-M's net +1 (2026-09-26; +2 at `6596c49`, −1 when its review
 wave dropped a no-op parametrization).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.**
-**S5-W caveat (branch `s5w-model-dir-writes`, unmerged, 2026-09-26):** with it merged and S5-R NOT done,
-the real-dir suite is `2951 passed, 3 failed, 0 errors, 16 skipped` — the 3 are the `modeling_deepseek_v4.py`
-stale-copy guards, EXPECTED until S5-R; on a clean view (= after S5-R) `2950 passed, 0 failed, 20 skipped`. Wall time
+Wall time
 rose ~16 s (192 → 208 s) because the 46 restored tests now read real weights off the split and run
 DeepSeek's reference modules on the GPU. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -106,12 +106,12 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S5-P** — then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; **S5-W fixed on branch `s5w-model-dir-writes` 2026-09-26, awaiting the user's merge call** — its real-dir proof waits on S5-R)
+## ▶▶ PICK THIS NEXT: **S5-P** — then **S6**, each in its own fresh session (user, 2026-09-26). ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
-the sequence table and in the S5 rows below). **Every session in this run starts with the S5-R check**
-(S5-W handoff §0). If the user has restored this box's DeepSeek folder, do S5-R's ~15-min agent
-follow-up first; if not, S5-R stays `[!]` and the run proceeds. **Order rationale:**
+the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
+**S5-R is DONE (2026-09-26); no session needs the check any more.** The DeepSeek folder is a plain download:
+no `auto_map`, no copied `.py`, no `__pycache__`. Keep it that way — nothing may be written into it. **Order rationale:**
 - S5-M first: it is the one that makes DeepSeek unusable (one request per server process), and it may
   reach MiniMax.
 - S5-M-H next (user, 2026-09-26): S5-M's fix pins ~23 GB up front, and only short prompts were ever
@@ -176,9 +176,16 @@ real-dir DeepSeek smoke was skipped for the same reason.
 
 Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
 
-- [!] **S5-R (USER, then agent) — restore this box's DeepSeek folder so it matches a user's download.**
-  **Blocked on the user.** Every S5-M/S5-W/S5-P session checks it first (S5-W handoff §0 has the
-  check).
+- [x] **S5-R (USER, then agent) — restore this box's DeepSeek folder so it matches a user's download.**
+  **CLOSED 2026-09-26 in the S5-W session — the user authorised the agent to run the restore.** Targets
+  inspected first (`config.json` = upstream + `auto_map` + a re-indent; both `.py` copies byte-identical to
+  git; `__pycache__` held only 3 pycs); the `auto_map` config saved to
+  `docs/evidence/2026-09-26-S5-R-config.json.with-auto_map`; then step 1's command, verbatim. After: all five
+  gone, 0 `auto_map`, 0 pycs, 133 → 125 paths. Optional items NOT removed: the 917 MB
+  `.goutputstream-LZUPV3` in the model dir and the HF modules-cache entry (the user's call).
+  Step 2: DeepSeek files on the real dir **362 passed, exactly 4 guard skips, 0 failed** (39.70 s), no
+  `__pycache__` gained; the deferred `configuration_deepseek_v4.py` docstring applied verbatim. Step 3: S5-W's
+  real-dir proof done (S5-W row). Original text:
   1. The user runs:
      `cd /home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731 && mv config.json.orig-2026-09-23 config.json && rm configuration_deepseek_v4.py modeling_deepseek_v4.py && rm -r encoding/__pycache__ inference/__pycache__`
      (both `__pycache__` dirs are bytecode left by agent and test runs, not upstream files;
@@ -189,7 +196,6 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
      failed), confirms `encoding/` gains no `__pycache__` (makes the no-write check non-vacuous), and applies the DEFERRED docstring update to `configuration_deepseek_v4.py`. It was reverted in
      S5 because the guard correctly flagged this box's copy as stale; the new text is in the S5 plan, Task 1
      Step 7.
-  **Blocked on the user**, not dropped.
   3. **Added 2026-09-26 by S5-W:** S5-W edits `modeling_deepseek_v4.py`, so once it is merged the three
      modeling-copy guards FAIL on the un-restored dir (the copy is `beaa65a`'s bytes). The restore turns
      them into skips — step 2's "4 guard skips, 0 failed" already expects that. Then run S5-W's real-dir
@@ -386,7 +392,7 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     - §8.
   - Do NOT "fix" it by lowering the ceiling.
 
-- [~] **S5-W — Vaayu still writes bytecode into a DeepSeek model dir** (found 2026-09-26, while writing
+- [x] **S5-W — Vaayu still writes bytecode into a DeepSeek model dir** (found 2026-09-26, while writing
   S5's follow-ups). **Sequence: SECOND.** Handoff:
   [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md); its §0 is the S5-R check.
   - **STARTED 2026-09-26 (branch `s5w-model-dir-writes`, off `beaa65a`).** S5-R check: **all five
@@ -401,7 +407,9 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     checkpoint in `tmp_path` makes this RED-able without S5-R — the handoff expected it needed one) —
     failed on `['__pycache__', 'kernel.py', 'model.py']`
   - [x] GREEN: one `no_bytecode()` context manager in `modeling_deepseek_v4.py` around both
-    `exec_module` calls (parity imports it) — 2 passed. Both tests also pin the flag is restored.
+    `exec_module` calls (parity imports it) — 2 passed. ~~Both tests also pin the flag is restored.~~
+    **Overstated (review):** they only checked `is False` from a `False` start, so a `finally` restoring the
+    constant `False` survived. Fixed in the review wave below.
   - **Found while doing it:** editing `modeling_deepseek_v4.py` at all makes its THREE stale-copy guards
     (`test_deepseek_v4_{linear,moe,model}.py`) FAIL on this box's real dir — its hand-placed copy is
     byte-identical to `beaa65a` and S5-R has not removed it. The guards are right (on the real dir that
@@ -420,22 +428,35 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     size+mtime) and the HF modules cache unchanged. On this sm_120 GPU `kernels()` always refits into a
     tempdir, so NO on-device run here exercises the checkpoint's own `kernel.py` branch — the unit test
     (a stub takes it on any box) is the only proof of that branch. Real-dir diff vacuous for the pycs.
-  - [!] on-device no-write proof on the REAL dir (handoff §3.4: `find $M` before/after the DeepSeek test
-    files + a library load/generate + a server request, no `__pycache__` anywhere) — **blocked on S5-R**,
-    not waived.
+  - [x] on-device no-write proof on the REAL dir (handoff §3.4) — ~~blocked on S5-R~~ **DONE after S5-R, same
+    session, and NON-vacuous (no `__pycache__` existed first).** `find $M -printf '%p %s %T@'` identical
+    (125 paths), no `__pycache__`, HF modules cache unchanged, across: the DeepSeek test files (real
+    `inference/model.py` imported in place by the harness); a library load + 8-token greedy generate (load
+    8.4 s, `return s[::-1]`); the DeepSeek server smoke on the real dir **9/9** (114.01 s); and both suites
+    below.
+  - [x] **Whole-branch review** (fresh reviewer, `beaa65a..6d5e10b`): **ready to merge**, 0 Critical, 0
+    Important, 5 Minor — ALL fixed: (1) new `test_no_bytecode_puts_the_flag_back_as_it_found_it_even_when_the_import_fails`
+    (start flag False/True, `ImportError` inside) — mutation-verified to kill hard-coded `False`, hard-coded
+    `True` and a missing `finally`; (2) `no_bytecode()` docstring now says it covers the file's whole
+    first-import graph (tilelang: ~0 on a pip-compiled venv, ~+0.4 s/start uncompiled) and is not
+    thread-safe (every caller is on the one-request forward path); (3) the parity test asserts the
+    import ran (`module.__file__`); (4) that test no longer leaks a `/tmp/a5_kernel_*` (272 → 272);
+    (5) `modeling_deepseek_v4.py`'s module docstring lost the same stale "copied verbatim" claim.
+  - [x] **Suites on the restored real dir, FOREGROUND:** before the review wave **2950 passed, 0 failed, 0
+    errors, 20 skipped** (217.81 s, as the clean view predicted); final code **2952 passed, 0 failed, 0
+    errors, 20 skipped** (209.57 s) = the NEW FLOOR.
   - **§8:** (1) no knob — nothing to tune, the only visible effect is a clean model dir; (2) nothing to
     plumb — `kernels()` is on the server's DeepSeek load path (smoke: `DeepSeek-V4 kernels found at
     …/inference`); (3) REACHABLE at N=1 on every DeepSeek load that imports the kernels — on a GPU whose
     shared memory fits DeepSeek's own tile the download no longer gains `inference/__pycache__/kernel.*.pyc`
     (this box's GPU was already clean via the refit tempdir); a dir still carrying `auto_map` + a copy
     (this box's real dir only) runs the stale copy instead; (4) n/a.
-  - **Awaiting the user:** merge (not done, as instructed), and whether to merge BEFORE S5-R — doing so
-    leaves the real-dir suite at 3 failed (the guards) until the restore.
+  - **Merge:** the user chose review → restore → proof → merge (2026-09-26).
   - Minor, pre-existing, unsequenced: `parity.reference_modules()` leaks one `/tmp/a5_kernel_*` dir per
-    call (250 at session start, 263 after; the new stub test adds one per suite run).
+    REAL call (250 at session start, 272 by the end). The new stub test no longer adds to it.
   - Detail: `docs/2026-09-26-S5-W-model-dir-writes-RESULTS.md`; evidence
-    `docs/evidence/2026-09-26-S5-W-{viewA-prefix,viewB-postfix,suite-real,suite-view,smoke-viewB}.log`,
-    `…-real-before.txt`, `…-make_view.sh` (all gitignored).
+    `docs/evidence/2026-09-26-S5-W-{viewA-prefix,viewB-postfix,suite-real,suite-view,smoke-viewB,s5r-real-dsfiles,s5w-library-load,s5w-smoke-real,suite-restored,suite-final}.log`,
+    `…-{real-before,real-pre-restore,real-final-before}.txt`, `…-make_view.sh`, `…-s5w_library_load.py` (all gitignored).
   - **Runtime:** `modeling_deepseek_v4.kernels()` (`:149`, `exec_module` at `:192`) imports the
     checkpoint's own `inference/kernel.py` whenever `_fit_sparse_attn` leaves the text unchanged (GPUs
     with enough shared memory). That writes `inference/__pycache__/kernel.cpython-312.pyc` into the
@@ -459,7 +480,8 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     `_prompt_renderer = None` (`vaayu/vaayu_deepseek_v4.py:434`).
   - **(C)** `documentation/server.md`: a §9 troubleshooting row for the 400 naming
     `encoding/encoding_dsv4.py`, plus one sentence in §6.6 that a model-rendered prompt refuses `tools`.
-  - TDD for A and B. No GPU. Suite floor 2952 (raised by S5-M).
+  - TDD for A and B. No GPU. Suite floor `2952 passed, 0 failed, 0 errors, 20 skipped` (S5-W + S5-R,
+    2026-09-26; the handoff's §5 is updated to match).
 
 ## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit. MERGED to `main` 2026-09-26 (`906675c`).**
 
