@@ -71,6 +71,29 @@ def test_an_encoder_without_encode_messages_is_refused_not_guessed(tmp_path, cap
         renderer.render(MESSAGES, True)
 
 
+@pytest.mark.parametrize("source, error", [
+    ("import a_module_that_does_not_exist\n", "ModuleNotFoundError"),
+    ("def (:\n", "SyntaxError"),
+])
+def test_an_encoder_that_cannot_load_is_refused_not_a_crashed_load(tmp_path, capsys,
+                                                                    source, error):
+    """S5-P (A): a revision with a SyntaxError or a dependency this venv lacks
+    is the same situation as a missing file -- WARNING + 400 -- not an
+    exception out of `init_model` that stops the server starting."""
+    renderer = prompt.load_prompt_renderer(_checkpoint(tmp_path, source))
+
+    out = capsys.readouterr().out
+    assert "encoding_dsv4.py" in out and error in out
+    with pytest.raises(FileNotFoundError, match="encoding_dsv4.py"):
+        renderer.render(MESSAGES, True)
+
+
+def test_the_renderer_is_none_before_init_model():
+    """S5-P (B): the hook's defined answer, not a bare AttributeError, on an
+    instance `init_model` has not run on."""
+    assert VaayuDeepseekV4.__new__(VaayuDeepseekV4).get_prompt_renderer() is None
+
+
 def test_init_model_builds_the_renderer_from_the_checkpoint_root(monkeypatch, tmp_path):
     """Same real-directory + fake-model-class pattern as
     tests/test_deepseek_v4_checkpoint.py's init_model tests."""

@@ -56,7 +56,14 @@ def load_prompt_renderer(checkpoint_root):
                        f"checkpoint download.")
     module = types.ModuleType("_vaayu_deepseek_v4_encoding")
     module.__file__ = str(path)
-    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+    try:
+        exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+    except Exception as failure:
+        # A revision with a SyntaxError, or an import this venv lacks, is the
+        # same situation as a missing file -- not a reason to stop the load.
+        return _refuse(f"{path} could not be loaded ({type(failure).__name__}: "
+                       f"{failure}). Refusing rather than guessing the prompt "
+                       f"format.")
     encode = getattr(module, "encode_messages", None)
     if encode is None:
         return _refuse(f"{path} defines no encode_messages, the entry point "

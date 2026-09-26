@@ -58,6 +58,10 @@ class VaayuDeepseekV4(VaayuBaseModel):
     defaults (`model.embed_tokens`, `model.layers`, `model.norm`, `lm_head`)
     are already the names A5.6 gave this model."""
 
+    # `init_model` replaces it; until then `get_prompt_renderer` answers the
+    # base hook's None rather than raising AttributeError (S5-P).
+    _prompt_renderer = None
+
     def __init__(self, *args, **kwargs):
         """Refuse speculative decoding by name; normalise attn_implementation.
 
