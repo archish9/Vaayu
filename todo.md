@@ -81,10 +81,10 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the expert-RAM sizing `[bug]` row (S5-M) below, pre-existing, not fixed here.** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2950 passed, 0 failed, 0 errors, 16 skipped` (216.43 s,
+**Suite floor for every one of them: `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s,
 FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
 from 2874 by +5 from S3's final-review fix wave (2026-09-25), from 2879 by S4's 46 restored + 3 new, and
-from 2928 by S5's net +22 (2026-09-26).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.** Wall time
+from 2928 by S5's net +23 (2026-09-26).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.** Wall time
 rose ~16 s (192 → 208 s) because the 46 restored tests now read real weights off the split and run
 DeepSeek's reference modules on the GPU. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -106,7 +106,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## S5 — `[x]` DeepSeek-V4 works from a plain download: in-process registration + the checkpoint's own prompt encoder. **CLOSED 2026-09-26. Suite `2950 passed, 0 failed, 0 errors, 16 skipped` (216.43 s).**
+## S5 — `[x]` DeepSeek-V4 works from a plain download: in-process registration + the checkpoint's own prompt encoder. **CLOSED 2026-09-26. Suite `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s).**
 
 **Re-scoped by the user 2026-09-26:** "no write into the model directory; a user downloads the model and it
 works with Vaayu". Found while re-verifying: a plain download did not even LOAD — this box ran on three
@@ -119,18 +119,27 @@ make them.
   `add_special_tokens=False`; `tools` → named 400; `FileNotFoundError` → `NoChatTemplate` naming the file;
   the Jinja path is byte-identical.
 - `2010e03` — `vaayu/model_code/deepseek_v4/prompt.py` loads the checkpoint's own `encoding/encoding_dsv4.py`
-  in place (`enable_thinking` → `"thinking"`/`"chat"`; a missing or unusable encoder → load WARNING + 400
-  naming it).
+  in place (`enable_thinking` → `"thinking"`/`"chat"`). A MISSING encoder, or one without
+  `encode_messages`, → load WARNING + 400 naming it. One that fails to IMPORT stops the model load with its
+  own traceback (deferred minor).
+- Final-review fix — the encoder is compiled and executed, NOT imported. An import had cached bytecode as
+  `encoding/__pycache__/*.pyc` INSIDE the model dir, so the no-write promise was false on a fresh download.
+  Pinned by `test_loading_the_encoder_writes_nothing_into_the_checkpoint`.
 - `7115af5` — a fourth copy-drift test the spec missed, now a guard.
 - Every copy-drift test is now a stale-copy guard: it skips when there is no copy.
 
 **Proof:**
+- Suite after the final-review fix: **2951 passed, 0 failed, 16 skipped** (209.15 s).
 - DeepSeek's own 4 encoder goldens reproduce through `render()`.
 - Clean-download view (scratchpad symlinks + the upstream `config.json`, no `auto_map`, no copies):
   - server `test_health` + **`test_non_stream` PASSED** (correct `reverse_string` code, 16 tokens,
     `finish_reason=stop`);
   - the real model dir's 133 paths were **identical** (size + mtime) before and after, and the HF
-    remote-code cache gained nothing;
+    remote-code cache gained nothing. **CORRECTION (final review):** that check was vacuous for the encoder:
+    the agent's OWN design-phase probe (2026-09-26 09:28:31, before any S5 commit) had already written
+    `encoding/__pycache__/encoding_dsv4.cpython-312.pyc` into this box's model dir, so the run found it
+    current. The loader no longer writes it (fix above; a scratch copy of the real encoder stays clean). The
+    stray pyc is removed by S5-R;
   - all DeepSeek test files on the view: **359 passed, 4 skipped** (the 4 guards), 0 failed.
 - Qwen3-Next server smoke **9/9** (21.70 s).
 - MoE gates: Qwen **8/8** (40.08 s), MiniMax **8/8** (74.95 s).
@@ -150,11 +159,12 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
 
 - [ ] **S5-R (USER, then agent) — restore this box's DeepSeek folder so it matches a user's download.**
   1. The user runs:
-     `cd /home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731 && mv config.json.orig-2026-09-23 config.json && rm configuration_deepseek_v4.py modeling_deepseek_v4.py`
+     `cd /home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731 && mv config.json.orig-2026-09-23 config.json && rm configuration_deepseek_v4.py modeling_deepseek_v4.py && rm -r encoding/__pycache__`
+     (the last one is the stray pyc the agent's design probe wrote)
      (optional: remove `~/.cache/huggingface/modules/transformers_modules/deepseek_hyphen_ai_hyphen__hyphen_DeepSeek_hyphen_V4_hyphen_Flash_hyphen_0731`
      and the 917 MB `.goutputstream-LZUPV3`).
   2. The agent then re-runs `tests/test_deepseek_v4_*.py` against the real dir (expect 4 guard skips, 0
-     failed) and applies the DEFERRED docstring update to `configuration_deepseek_v4.py`. It was reverted in
+     failed), confirms `encoding/` gains no `__pycache__` (makes the no-write check non-vacuous), and applies the DEFERRED docstring update to `configuration_deepseek_v4.py`. It was reverted in
      S5 because the guard correctly flagged this box's copy as stale; the new text is in the S5 plan, Task 1
      Step 7.
   **Blocked on the user**, not dropped.

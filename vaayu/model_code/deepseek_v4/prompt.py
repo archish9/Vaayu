@@ -6,7 +6,7 @@ download. Vaayu reads it from there and never copies it: each download brings
 the encoder that matches its own weights, and nothing is written into the model
 directory (S5).
 """
-import importlib.util
+import types
 from pathlib import Path
 
 ENCODER = Path("encoding") / "encoding_dsv4.py"
@@ -44,15 +44,19 @@ def load_prompt_renderer(checkpoint_root):
     Loaded under a private name and never registered in `sys.modules`: a module
     called `encoding_dsv4` left lying around is a collision waiting to happen
     (the rule `tests/deepseek/parity.py` applies to the checkpoint's `kernel`).
+
+    Compiled and executed directly rather than imported: an import caches
+    bytecode as `encoding/__pycache__/*.pyc` BESIDE the source, which is a
+    write into the user's download -- the one thing S5 promises never happens.
     """
     path = Path(checkpoint_root) / ENCODER
     if not path.is_file():
         return _refuse(f"{path} is missing. DeepSeek-V4 ships no chat_template; its "
                        f"prompt format lives in that file, part of the full "
                        f"checkpoint download.")
-    spec = importlib.util.spec_from_file_location("_vaayu_deepseek_v4_encoding", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = types.ModuleType("_vaayu_deepseek_v4_encoding")
+    module.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     encode = getattr(module, "encode_messages", None)
     if encode is None:
         return _refuse(f"{path} defines no encode_messages, the entry point "

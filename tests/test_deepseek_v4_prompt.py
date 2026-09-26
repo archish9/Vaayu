@@ -42,6 +42,18 @@ def test_the_encoder_is_not_left_in_sys_modules(tmp_path):
     assert not leaked, f"loader left {leaked} in sys.modules"
 
 
+def test_loading_the_encoder_writes_nothing_into_the_checkpoint(tmp_path):
+    """S5's promise is that nothing is written into the model directory. A
+    plain `exec_module` caches bytecode as `encoding/__pycache__/*.pyc` beside
+    the source -- a write into the user's download (final review, 2026-09-26)."""
+    _checkpoint(tmp_path)
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    prompt.load_prompt_renderer(tmp_path).render(MESSAGES, True)
+
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+
+
 def test_a_download_without_the_encoder_warns_and_refuses_naming_the_file(tmp_path, capsys):
     renderer = prompt.load_prompt_renderer(tmp_path)
 
