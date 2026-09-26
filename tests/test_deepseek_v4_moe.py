@@ -455,9 +455,12 @@ def test_the_shared_expert_helper_runs_on_the_real_module_tree(config, checkpoin
 
 @needs_checkpoint
 def test_the_checkpoints_copy_of_the_modeling_file_has_not_drifted():
-    """A5.3 established the rule; A5.4 adds to the same file, so the copy has
-    to move with it.
-    """
+    """Stale-copy guard -- see test_deepseek_v4_config.py's twin. No copy is
+    needed since S5; one that exists must not have drifted."""
+    copy = parity.CKPT / "modeling_deepseek_v4.py"
+    if not copy.exists():
+        pytest.skip("no checkpoint-side copy -- none is needed since S5 registers "
+                    "DeepseekV4ForCausalLM in-process")
     repo = Path(__file__).parents[1] / "vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py"
 
-    assert (parity.CKPT / "modeling_deepseek_v4.py").read_bytes() == repo.read_bytes()
+    assert copy.read_bytes() == repo.read_bytes()

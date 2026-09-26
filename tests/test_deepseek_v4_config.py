@@ -2,8 +2,9 @@
 
 transformers 5.5.4 ships `deepseek_v2/v3/vl` and no `deepseek_v4`, and the
 checkpoint ships no `auto_map`, so Vaayu dies at `vaayu_base.py:2131` before it
-reaches a single weight. The fix is MiniMax's: a `PretrainedConfig` subclass in
-the checkpoint dir plus an `auto_map` entry pointing at it.
+reaches a single weight. The fix was MiniMax's (a `PretrainedConfig` subclass in
+the checkpoint dir plus an `auto_map` entry); since S5 Vaayu registers the
+subclass in-process instead, so a plain download needs neither.
 
 Every test here runs off `tests/fixtures/deepseek_v4_config.json`, a byte copy
 of the shipped config -- so A5.2-A5.7 can test this path without the 157 G
@@ -109,6 +110,33 @@ def test_the_expert_guard_resolves_this_checkpoints_expert_count(tmp_path):
     assert ExpertOffsetIndex(str(tmp_path)).expected_expert_count() == 256
 
 
+# ── a plain download: no `auto_map`, no copied files (S5) ──────────────────
+
+
+def test_a_plain_download_resolves_through_vaayus_registration(tmp_path):
+    """The upstream `config.json` has no `auto_map`, and transformers 5.5.4 has
+    no `deepseek_v4`, so without Vaayu's registration `AutoConfig` raises and a
+    user's fresh download never loads. The fixture IS the shipped config minus
+    `auto_map` (`test_the_fixture_still_matches_the_shipped_config`)."""
+    import vaayu.vaayu_deepseek_v4  # noqa: F401 -- registers deepseek_v4
+    from transformers import AutoConfig
+
+    (tmp_path / "config.json").write_text(FIXTURE.read_text())
+
+    config = AutoConfig.from_pretrained(str(tmp_path), trust_remote_code=True)
+
+    assert type(config) is DeepseekV4Config
+    assert getattr(config, "auto_map", None) is None
+
+
+def test_registering_twice_is_harmless():
+    """It runs at every import of the module; a second call must not raise."""
+    from vaayu import vaayu_deepseek_v4
+
+    vaayu_deepseek_v4._register_with_transformers()
+    vaayu_deepseek_v4._register_with_transformers()
+
+
 # ── on the checkpoint itself ────────────────────────────────────────────────
 
 CKPT = Path(os.environ.get(
@@ -120,24 +148,17 @@ _needs_ckpt = pytest.mark.skipif(not CKPT.is_dir(), reason=f"checkpoint not on t
 
 @_needs_ckpt
 def test_the_checkpoints_copy_of_this_file_has_not_drifted():
-    """transformers loads remote code from the checkpoint dir, which is
-    untracked; the repo copy is the source of truth. Two copies drift unless
-    something says so.
-    """
+    """No copy is NEEDED: Vaayu registers `DeepseekV4Config` in-process (S5).
+    But a checkpoint that still carries one (an older hand-placed `auto_map`)
+    loads THAT copy under `trust_remote_code`, so a stale one runs stale code
+    silently. Guard it while it exists."""
+    copy = CKPT / "configuration_deepseek_v4.py"
+    if not copy.exists():
+        pytest.skip("no checkpoint-side copy -- none is needed since S5 registers "
+                    "DeepseekV4Config in-process")
     repo = Path(__file__).parents[1] / "vaayu/model_code/deepseek_v4/configuration_deepseek_v4.py"
 
-    assert (CKPT / "configuration_deepseek_v4.py").read_bytes() == repo.read_bytes()
-
-
-@_needs_ckpt
-def test_the_checkpoint_points_auto_config_at_that_file():
-    """`AutoModelForCausalLM` is deliberately NOT mapped yet -- the modeling
-    file lands in A5.6/A5.7, and a dangling entry turns a legible "unknown
-    architecture" into an ImportError out of HF's module cache.
-    """
-    auto_map = json.loads((CKPT / "config.json").read_text())["auto_map"]
-
-    assert auto_map["AutoConfig"] == "configuration_deepseek_v4.DeepseekV4Config"
+    assert copy.read_bytes() == repo.read_bytes()
 
 
 @_needs_ckpt
@@ -151,6 +172,7 @@ def test_the_fixture_still_matches_the_shipped_config():
 @_needs_ckpt
 def test_auto_config_resolves_deepseek_v4_from_the_checkpoint():
     """The deliverable: `vaayu_base.py:2131` gets a config instead of a raise."""
+    import vaayu.vaayu_deepseek_v4  # noqa: F401 -- holds with or without an auto_map
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(str(CKPT), trust_remote_code=True)
 

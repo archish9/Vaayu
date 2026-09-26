@@ -52,6 +52,9 @@ class _RecordingModel:
         self.entered = threading.Event()
         self.saw_cancel = None
 
+    def get_prompt_renderer(self):
+        return None
+
     def generate(self, **kw):
         crit = kw["stopping_criteria"]
         ids = kw["input_ids"]

@@ -55,6 +55,13 @@ Keeping `MODEL_PATH` there means your checkpoint paths never land in a diff.
 | `DEFAULT_STREAM` | **`True`** | what `stream` means when a request omits it. **Not** OpenAI's `false`: a non-streaming response sends nothing until the last token, and an uncapped one on a slow checkpoint outlives every client. An explicit `"stream": false` still wins |
 | `ENABLE_THINKING` | **`False`** | let the model emit a reasoning block before the answer. Off: the trace costs the same tok/s as the answer. Templates with their own flag are told; one that hard-codes an open `<think>` (MiniMax-M2.7) gets the block closed for it — detected from the rendered generation prompt, never from a model name. Per-request override: `"enable_thinking": true` |
 
+**Prompt format.** Every model is prompted through its tokenizer's own `chat_template`, except a
+checkpoint that ships none on purpose: **DeepSeek-V4** is prompted by DeepSeek's own
+`encoding/encoding_dsv4.py`, read in place from the checkpoint — download the **full** repository,
+`encoding/` included, or every chat request is refused with a message naming the missing file.
+Nothing is written into the model directory for this. A request carrying `tools` is refused for
+DeepSeek-V4 (its tool-call format is not parsed yet).
+
 ## Speed
 
 Defaults are already the fast ones, and they differ deliberately from `vaayu_base`'s

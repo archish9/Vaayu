@@ -15,7 +15,11 @@ import sys
 import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
 
+from transformers import AutoConfig, AutoModelForCausalLM
+
 from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
+from .model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from .model_code.deepseek_v4.prompt import load_prompt_renderer
 from .vaayu_base import VaayuBaseModel
 # Packed/opaque torch dtypes that must be REINTERPRETED (`.view`) rather than
 # numerically cast when injected -- see `move_layer_to_device` below. ONE
@@ -23,6 +27,30 @@ from .vaayu_base import VaayuBaseModel
 # the invariant is a property of the dtype, not of a path or a model, and two
 # copies is how one path grows a dtype the other lacks.
 from .moe_patch import NO_CAST_INJECTION_DTYPES as _PACKED_INJECTION_DTYPES
+
+
+def _register_with_transformers():
+    """Tell transformers about `deepseek_v4`, in this process only.
+
+    transformers 5.5.4 has no `deepseek_v4`, and the checkpoint DeepSeek ships
+    has no `auto_map`, so a plain download raises at `AutoConfig` -- before the
+    tokenizer, before any weight. Registering the repo's own classes makes that
+    download load as it comes, with nothing written into the model directory
+    (S5). `AutoModel.get_module_class` imports this module before it reads the
+    config, so every entry point sees the registration.
+
+    A checkpoint that DOES carry an `auto_map` still loads its own copy under
+    `trust_remote_code=True` -- transformers' order, deliberately left alone;
+    `_running_module()` resolves either way. `exist_ok=True` makes a re-import,
+    or a future transformers that ships `deepseek_v4` itself, harmless: this
+    class is written against the repo's modeling module, so the repo's wins.
+    """
+    AutoConfig.register("deepseek_v4", DeepseekV4Config, exist_ok=True)
+    AutoModelForCausalLM.register(DeepseekV4Config, _repo_modeling.DeepseekV4ForCausalLM,
+                                  exist_ok=True)
+
+
+_register_with_transformers()
 
 
 class VaayuDeepseekV4(VaayuBaseModel):
@@ -397,6 +425,16 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         self._running_module().KERNEL_DIR = kernel_dir
         print(f"[Vaayu] DeepSeek-V4 kernels found at {kernel_dir}")
+
+        # This checkpoint ships no chat_template; its prompt format is DeepSeek's
+        # own `encoding/encoding_dsv4.py`, read in place from the ROOT (beside
+        # `inference/`), never copied (S5, `model_code/deepseek_v4/prompt.py`).
+        self._prompt_renderer = load_prompt_renderer(self.model_local_path)
+
+    def get_prompt_renderer(self):
+        """DeepSeek's own encoder, built by `init_model` -- see
+        `model_code/deepseek_v4/prompt.py`."""
+        return self._prompt_renderer
 
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward

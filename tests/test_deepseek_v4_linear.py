@@ -444,10 +444,12 @@ def test_the_bf16_golden_reproduces_through_the_load_time_dequant(config, block_
 
 @needs_checkpoint
 def test_the_checkpoints_copy_of_this_file_has_not_drifted():
-    """Same rule as the config: transformers loads remote code from the
-    checkpoint dir, which is untracked, so the repo copy is the source of truth
-    and something has to say when the two diverge.
-    """
+    """Stale-copy guard -- see test_deepseek_v4_config.py's twin. No copy is
+    needed since S5; one that exists must not have drifted."""
+    copy = parity.CKPT / "modeling_deepseek_v4.py"
+    if not copy.exists():
+        pytest.skip("no checkpoint-side copy -- none is needed since S5 registers "
+                    "DeepseekV4ForCausalLM in-process")
     repo = Path(__file__).parents[1] / "vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py"
 
-    assert (parity.CKPT / "modeling_deepseek_v4.py").read_bytes() == repo.read_bytes()
+    assert copy.read_bytes() == repo.read_bytes()

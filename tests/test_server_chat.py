@@ -104,3 +104,77 @@ def test_a_tensor_like_return_is_converted():
             return TensorLike()
 
     assert render_prompt(TensorTokenizer(PLAIN_TEMPLATE), MESSAGES) == [1, 2]
+
+
+# ── a model-supplied renderer (S5) ──────────────────────────────────────────
+
+
+class FakeRenderer:
+    def __init__(self, text="ab", error=None):
+        self.text, self.error, self.calls = text, error, []
+
+    def render(self, messages, enable_thinking):
+        self.calls.append((messages, enable_thinking))
+        if self.error is not None:
+            raise self.error
+        return self.text
+
+
+class TextTokenizer(FakeTokenizer):
+    """Encodes by character code, so the ids prove WHICH text was tokenized."""
+
+    def __call__(self, text, add_special_tokens=True):
+        self.encoded = (text, add_special_tokens)
+        return {"input_ids": [ord(c) for c in text]}
+
+
+def test_a_model_renderer_is_used_instead_of_the_template():
+    tok = TextTokenizer(PLAIN_TEMPLATE)
+    assert render_prompt(tok, MESSAGES, renderer=FakeRenderer("ab")) == [97, 98]
+    assert tok.calls == [], "the template must not be consulted when the model renders"
+
+
+def test_a_model_renderer_works_where_there_is_no_template():
+    assert render_prompt(TextTokenizer(None), MESSAGES,
+                         renderer=FakeRenderer("ab")) == [97, 98]
+
+
+def test_the_renderers_text_is_tokenized_without_adding_special_tokens():
+    # The renderer writes BOS itself; a second one shifts every position.
+    tok = TextTokenizer(None)
+    render_prompt(tok, MESSAGES, renderer=FakeRenderer("ab"))
+    assert tok.encoded == ("ab", False)
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_enable_thinking_reaches_the_renderer(thinking):
+    renderer = FakeRenderer()
+    render_prompt(TextTokenizer(None), MESSAGES, enable_thinking=thinking, renderer=renderer)
+    assert renderer.calls == [(MESSAGES, thinking)]
+
+
+def test_tools_are_refused_by_a_model_renderer():
+    renderer = FakeRenderer()
+    with pytest.raises(TemplateLacksToolSupport):
+        render_prompt(TextTokenizer(None), MESSAGES, tools=TOOLS, renderer=renderer)
+    assert renderer.calls == [], "refused before rendering, never rendered without them"
+
+
+def test_an_empty_tools_list_is_no_tools_for_a_model_renderer():
+    # Review Focus 1: the Jinja path treats `tools=[]` as absent; so must this one.
+    assert render_prompt(TextTokenizer(None), MESSAGES, tools=[],
+                         renderer=FakeRenderer("ab")) == [97, 98]
+
+
+def test_a_renderer_that_cannot_load_its_encoder_is_refused_naming_the_file():
+    renderer = FakeRenderer(error=FileNotFoundError("/ckpt/encoding/encoding_dsv4.py is missing"))
+    with pytest.raises(NoChatTemplate, match="encoding_dsv4.py"):
+        render_prompt(TextTokenizer(None), MESSAGES, renderer=renderer)
+
+
+def test_a_renderer_rejecting_a_message_propagates_unchanged():
+    # Review Focus 2: same as a Jinja template that raises today -- no relabel.
+    renderer = FakeRenderer(error=ValueError("unknown role: narrator"))
+    with pytest.raises(ValueError, match="narrator") as raised:
+        render_prompt(TextTokenizer(None), MESSAGES, renderer=renderer)
+    assert not isinstance(raised.value, NoChatTemplate)
