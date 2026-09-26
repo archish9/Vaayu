@@ -315,17 +315,7 @@ def _raw_module_weights(prefix: str) -> dict:
     """The tensors under `prefix` exactly as the shards hold them -- no value
     transforms, which is the point: the production rule applies them.
     """
-    from safetensors import safe_open
-
-    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
-    wanted = sorted(key for key in index["weight_map"] if key.startswith(prefix))
-    raw = {}
-    for shard in sorted({index["weight_map"][key] for key in wanted}):
-        with safe_open(parity.CKPT / shard, framework="pt", device="cpu") as handle:
-            for key in wanted:
-                if index["weight_map"][key] == shard:
-                    raw[key[len(prefix):]] = handle.get_tensor(key)
-    return raw
+    return parity.raw_module_weights(prefix)
 
 
 @needs_checkpoint

@@ -458,17 +458,7 @@ def _raw_module_weights(prefix: str) -> dict:
     `test_deepseek_v4_linear.py` (whose `test_the_production_dequant_...` test
     exists to prove these two paths agree) is used, not `parity`'s.
     """
-    from safetensors import safe_open
-
-    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
-    wanted = sorted(key for key in index["weight_map"] if key.startswith(prefix))
-    raw = {}
-    for shard in sorted({index["weight_map"][key] for key in wanted}):
-        with safe_open(parity.CKPT / shard, framework="pt", device="cpu") as handle:
-            for key in wanted:
-                if index["weight_map"][key] == shard:
-                    raw[key[len(prefix):]] = handle.get_tensor(key)
-    return raw
+    return parity.raw_module_weights(prefix)
 
 
 @needs_checkpoint

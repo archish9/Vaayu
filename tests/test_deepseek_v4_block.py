@@ -55,25 +55,15 @@ def _raw_module_weights(prefix: str) -> dict:
     `modeling.dequantize_at_load` -- the production rule -- has something to
     consume. Same helper, same reason, as `tests/test_deepseek_v4_attention.py`.
     """
-    from safetensors import safe_open
-
-    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
-    wanted = sorted(key for key in index["weight_map"] if key.startswith(prefix))
-    raw = {}
-    for shard in sorted({index["weight_map"][key] for key in wanted}):
-        with safe_open(parity.CKPT / shard, framework="pt", device="cpu") as handle:
-            for key in wanted:
-                if index["weight_map"][key] == shard:
-                    relative = key[len(prefix):]
-                    tensor = handle.get_tensor(key)
-                    # Routed-expert weights ship fp4 packed 2/byte, stored I8
-                    # (module docstring) -- `DeepseekV4Linear`'s Parameter is
-                    # allocated `float4_e2m1fn_x2`, and `load_state_dict`
-                    # cannot cast I8 into it. Same reinterpret, same condition,
-                    # as `parity.load_module_weights`.
-                    if ".experts." in relative and tensor.dtype == torch.int8:
-                        tensor = tensor.view(torch.float4_e2m1fn_x2)
-                    raw[relative] = tensor
+    raw = parity.raw_module_weights(prefix)
+    for relative, tensor in raw.items():
+        # Routed-expert weights ship fp4 packed 2/byte, stored I8
+        # (module docstring) -- `DeepseekV4Linear`'s Parameter is
+        # allocated `float4_e2m1fn_x2`, and `load_state_dict`
+        # cannot cast I8 into it. Same reinterpret, same condition,
+        # as `parity.load_module_weights`.
+        if ".experts." in relative and tensor.dtype == torch.int8:
+            raw[relative] = tensor.view(torch.float4_e2m1fn_x2)
     return raw
 
 
