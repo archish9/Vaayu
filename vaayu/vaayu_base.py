@@ -3514,6 +3514,15 @@ class VaayuBaseModel(GenerationMixin):
             print(f"[Vaayu] {self._state_continuation_layers} linear-attention "
                   f"mixers continue from cached state across prefill chunks")
 
+        # S3: the same mixers decode through three torch-fallback seams (45
+        # launches each per token on Qwen3-Next); put one Triton kernel on each.
+        # CUDA + triton only, self-checked on this device; zero elsewhere.
+        from .gated_delta_kernels import install_gated_delta_kernels
+        fused = install_gated_delta_kernels(self.model, self.running_device, self.running_dtype)
+        if any(fused.values()):
+            print(f"[Vaayu] fused gated-delta decode kernels on rule={fused['rule']} "
+                  f"conv={fused['conv']} norm={fused['norm']} mixers")
+
     def _apply_missing_buffers(self):
         """Persistent buffers with no checkpoint tensor keep their init values
         silently -- MiniMax-M2.7's EXL3 build routed with a zero bias. Fill them
