@@ -399,7 +399,8 @@ class EngineHandle:
         messages = [m.model_dump(exclude_none=True) for m in req.messages]
         tools = [t.model_dump(exclude_none=True) for t in req.tools] if req.tools else None
         prompt_ids = render_prompt(self.model.tokenizer, messages, tools=tools,
-                                   enable_thinking=self.resolve_thinking(req))
+                                   enable_thinking=self.resolve_thinking(req),
+                                   renderer=self.model.get_prompt_renderer())
         cap = resolve_max_tokens(req.max_tokens, len(prompt_ids), self.max_seq_len)
         return prompt_ids, cap
 

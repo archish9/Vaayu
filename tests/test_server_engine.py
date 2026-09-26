@@ -31,6 +31,9 @@ class FakeModel:
         self.running_device = "cpu"
         self._vram_plan = object()      # not the CPU fallback path
 
+    def get_prompt_renderer(self):
+        return None
+
 
 def _req(**over):
     base = {"model": "vaayu", "messages": [{"role": "user", "content": "hi"}]}
@@ -736,3 +739,22 @@ def test_a_non_streaming_request_without_a_speculator_is_unaffected():
     model = _TwoPathFakeModel(max_seq_len=100, speculator=None)
     asyncio.run(EngineHandle(model).generate(_req(max_tokens=5)))
     assert model.called == "generate"
+
+
+def test_prepare_renders_with_the_models_own_renderer_when_it_has_one():
+    class Renderer:
+        def render(self, messages, enable_thinking):
+            return "xyz"
+
+    class TextTokenizer(FakeTokenizer):
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": [ord(c) for c in text]}
+
+    model = FakeModel(chat_template=None)
+    model.tokenizer = TextTokenizer(None)
+    renderer = Renderer()
+    model.get_prompt_renderer = lambda: renderer
+
+    ids, _ = EngineHandle(model).prepare(_req())
+
+    assert ids == [120, 121, 122]

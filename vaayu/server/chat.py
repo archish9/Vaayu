@@ -54,14 +54,21 @@ class TemplateLacksToolSupport(ValueError):
     """The request carries `tools` but the template cannot render them."""
 
 
-def render_prompt(tokenizer, messages, tools=None, enable_thinking=True):
+def render_prompt(tokenizer, messages, tools=None, enable_thinking=True, renderer=None):
     """messages: list[dict] as sent on the wire. Returns a list of token ids.
 
     `enable_thinking=False` suppresses a reasoning block two ways, because
     templates disagree: the template's own flag when it has one (Qwen3), and
     closing a block the template hard-codes when it does not (MiniMax-M2.7,
     whose generation prompt ends with a bare `<think>` and offers no flag).
+
+    `renderer` is the model's own (`VaayuBaseModel.get_prompt_renderer`), for a
+    checkpoint whose prompt format is not a Jinja template. Given, it is used
+    instead of the template; None leaves the template path exactly as it was.
     """
+    if renderer is not None:
+        return _render_with(renderer, tokenizer, messages, tools, enable_thinking)
+
     template = getattr(tokenizer, "chat_template", None)
     if not template:
         raise NoChatTemplate(
@@ -101,6 +108,25 @@ def render_prompt(tokenizer, messages, tools=None, enable_thinking=True):
 
     ids = tokenizer.apply_chat_template(messages, **kwargs)
     return _as_token_ids(ids)
+
+
+def _render_with(renderer, tokenizer, messages, tools, enable_thinking):
+    """A model-supplied renderer: its text, tokenized with NO special tokens
+    added -- the renderer writes BOS itself, and a second one shifts every
+    position."""
+    if tools:
+        raise TemplateLacksToolSupport(
+            "this model's prompt renderer takes no tools, so the `tools` in this "
+            "request cannot be rendered. Refusing rather than dropping them "
+            "silently -- the model would never be told the tools exist and the "
+            "agent would wait for a call that can never come.")
+    try:
+        text = renderer.render(messages, enable_thinking)
+    except FileNotFoundError as missing:
+        raise NoChatTemplate(
+            f"this model renders prompts with its own encoder, and it cannot be "
+            f"loaded: {missing}") from missing
+    return _as_token_ids(tokenizer(text, add_special_tokens=False))
 
 
 def _as_token_ids(ids):

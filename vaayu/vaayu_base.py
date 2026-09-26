@@ -1998,6 +1998,18 @@ class VaayuBaseModel(GenerationMixin):
         """
         return None
 
+    def get_prompt_renderer(self):
+        """The model's own prompt renderer, for a checkpoint whose prompt format
+        is not a Jinja `chat_template`. None -- the default, and what every model
+        with a template uses -- leaves rendering to the tokenizer's template.
+
+        A renderer is an object with `render(messages, enable_thinking) -> str`
+        returning the WHOLE prompt text, BOS included. If it cannot load what it
+        renders with, `render` raises FileNotFoundError naming the file, and the
+        server answers 400 with that reason (`vaayu/server/chat.py`).
+        """
+        return None
+
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=None,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
