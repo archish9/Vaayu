@@ -79,15 +79,15 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S3** ✅ | ~~**Qwen3-Next `GatedDeltaNet` elementwise fusion** — **STARTED 2026-09-25. STEP 1 DONE: census re-derived DECODE-ONLY and the handoff's does NOT reproduce — row 36's CUPTI arm had the prefill forward in its window (S1's flaw again), and its "653 µs/layer" was the whole decoder layer. Real: 4,586 launches / 15.9 ms device per `serial` token (not 7,702 / 27.70), so `serial` is ~55 % HOST gap — row 36's "GPU-bound" verdict used the contaminated number. GDN non-matmul = 63 launches/mixer (rule 29, norm 12, conv 4, body 18) = 49 % of `serial`'s launches; mixer host wall 438.8 µs = 15.80 ms/token on the real forward. CEILING MEASURED (ABBA, one load): dropping every GDN non-matmul op cuts `serial` 35.5 → 24.35 ms = −11.15 ms = 10.3 % of T_unprof 0.1085 s — ABOVE the handoff's 6.9 %. The three stock seams (`recurrent_gated_delta_rule`, `norm`, `causal_conv1d_update`) hold 45 of the 63. Detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`. STEP 2 DONE (bake-off, user-approved incl. a scratch `fla` 0.5.2 install): one real mixer's decode call, ABBA x4 — stock 400.2 µs/66 kernels, narrow `torch.compile` 327.0 (−18 %), **Vaayu Triton prototype at the 3 seams 196.6 µs/24 kernels (−51 %)**, `fla` 391.1 (−2 %: it cuts launches but gives the time back in Python wrappers — REJECTED for decode). All closer to fp64 than stock. Two upstream traps: HF's `conv_states` is CHANNELS-LAST after any ≥4-token prefill (`fla`'s conv kernel silently corrupts it — kernels must be stride-aware), and the cache keeps the recurrent state in bf16. Banked lead: `fla`'s chunk kernel is ~10× the torch prefill fallback (0.36 → 0.03 s per 2k prompt, ~2 % TTFT). DESIGN APPROVED 2026-09-25 (scope A, user-chosen over B = body rewrite and C = `fla` prefill chunk, both banked): new `vaayu/gated_delta_kernels.py` — three stride-aware Triton kernels (rule with fp32 l2norm, conv update, gated norm) installed PER SEAM by surface detection (norm patched in place, streaming-safe), behavioural self-check at install falls back to stock with a WARNING, CUDA + triton only (CPU keeps stock), one call beside `install_state_continuation`; reaches qwen3_next/qwen3_5/qwen3_5_moe (3 seams), olmo_hybrid (2), MiniMax/dense/DeepSeek (0). Acceptance: conv state bit-exact, fused ≤ 1.25× stock's fp64 error over 2 geometries, D6 6-draw ppl band, ABBA real-token win ≥ 2 % (else revert), on-device win ≥ half the microbench's −204 µs/mixer. §8: no knob, reachable at N=1. Spec `docs/superpowers/specs/2026-09-25-S3-gated-delta-kernels-design.md`. Next: user reviews spec → implementation plan**~~ **CLOSED 2026-09-25, A WIN — real decode token −3.6 to −5.6 %, quality PASS. See the S3 row below** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
 | **S4** ✅ | ~~**restore the 46 DeepSeek-V4 tests** the shard deletion broke~~ **CLOSED 2026-09-26, FIXED — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`. One resolver in `tests/deepseek/parity.py` reads either layout; no `vaayu/` change. See the S4 row below** | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the expert-RAM sizing `[bug]` row (S5-M) below, pre-existing, not fixed here.** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
-| **S5-M** | **DeepSeek-V4 through the server is OOM-killed on its 2nd request** — memory OUTSIDE the expert cache grows **~0.19 GB per decode token and keeps growing after the cache plateaus** (rss − cache 5.50 → 9.90 GB over 24 tokens; +1.49 GB over tokens 16→24 with the cache flat at 19.85 GB) — a LEAK, not sizing | S5 made DeepSeek serving reachable, and this caps it at ONE request per server process; the same module-list forward serves MiniMax, so check first whether MiniMax leaks too (that would make it production) | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) |
+| **S5-M** ✅ | ~~**DeepSeek-V4 through the server is OOM-killed on its 2nd request**~~ **CLOSED 2026-09-26, FIXED — not a reference leak: glibc malloc kept the freed expert clones (live tensors flat, `malloc_trim(0)` handed back 5.5 GB). Non-EXL3 module-list was denied the slab arena ("never measured"), so DeepSeek cached through the double-clone path. `6596c49` gives it the arena on CUDA: RSS flat over 128 decode tokens, greedy ids identical, server smoke 9/9 (RSS 26.67 GB at the last token). MiniMax never leaked (it already had the arena). See the S5-M row below** | S5 made DeepSeek serving reachable, and this capped it at ONE request per server process | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) · RESULTS `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` |
 | **S5-W** | **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
 | **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s,
+**Suite floor for every one of them: `2953 passed, 0 failed, 0 errors, 16 skipped` (215.31 s,
 FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
-from 2874 by +5 from S3's final-review fix wave (2026-09-25), from 2879 by S4's 46 restored + 3 new, and
-from 2928 by S5's net +23 (2026-09-26).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.** Wall time
+from 2874 by +5 from S3's final-review fix wave (2026-09-25), from 2879 by S4's 46 restored + 3 new,
+from 2928 by S5's net +23, and from 2951 by S5-M's net +2 (2026-09-26).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.** Wall time
 rose ~16 s (192 → 208 s) because the 46 restored tests now read real weights off the split and run
 DeepSeek's reference modules on the GPU. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
@@ -101,7 +101,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S5-M** — then **S5-W, S5-P**, then **S6**. ◀◀
+## ▶▶ PICK THIS NEXT: **S5-W** — then **S5-P**, then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED — row below)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). **Every session in this run starts with the S5-R check**
@@ -184,10 +184,60 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
      Step 7.
   **Blocked on the user**, not dropped.
 
-- [bug] **S5-M — DeepSeek-V4 through the server is OOM-killed on its SECOND request at the 29 GB cap:
+- [x] **S5-M — DeepSeek-V4 through the server is OOM-killed on its SECOND request at the 29 GB cap:
   a LEAK of ~0.19 GB per decode token outside the expert cache** (found by S5, 2026-09-26). It is
   PRE-EXISTING: before S5 no DeepSeek completion ever reached generation. **Sequence: FIRST of the S5
   bug-fix run.** Handoff: [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md).
+  - **STARTED 2026-09-26. ROOT CAUSE MEASURED — NOT a reference leak: glibc malloc retaining freed
+    expert clones.** Library probe (`plans/probes/s5m_rss_probe.py`, clean view, expert cache capped
+    at 8 GB so the plateau comes early; log `docs/evidence/2026-09-26-S5-M-ds-probe1-malloc.log`):
+    - live CPU tensors (gc census) FLAT at 3,704 storages / 8.48 GB = cache 7.99 + non-expert LRU
+      0.48, at tokens 8/16/24/32/40/48 → suspects 1, 3, 4, 5 REFUTED;
+    - pinned host allocator FLAT at 1.61 GB → suspect 2 REFUTED;
+    - `mallinfo2` free-in-arena grew 2.52 → 5.51 GB (tokens 5→31) with in-use flat at ~9.5 GB — RSS
+      growth IS glibc free space; it saturated near 5.4 GB (~0.68× an 8 GB cache). At the server's
+      21.9 GB budget that overhead never saturates before the 29 GB cap;
+    - the engine's own every-32-pass `malloc_trim(0)` dropped RSS **18.06 → 12.56 GB** at pass 32, and
+      the probe's at token 48 **17.08 → 12.54 GB**; RSS then refills ~1 GB/token. The server smoke died
+      at pass 24, before any trim ran.
+    - **Why only DeepSeek:** `moe_supports_slab_arena` (`vaayu_base.py:789`) gives EXL3 module-list
+      (MiniMax) the pinned slab arena but NOT non-EXL3 module-list (DeepSeek) — "never measured" — so
+      DeepSeek caches through `ExpertRAMCache.put()`: `load_expert_sparse` clones each component, then
+      `put()` clones AGAIN, on executor threads (per-thread arenas); evictions free them.
+  - **MiniMax does NOT leak (checked first, per the handoff):** 128 decode tokens, RSS flat 20.95-20.97
+    GB, `m_free` ≤ 0.04 GB, `malloc_trim` at token 96 freed 0.02 GB
+    (`docs/evidence/2026-09-26-S5-M-minimax-probe.log`). Not a production-path bug.
+  - [x] Hypothesis test: DeepSeek on the arena (predicate monkeypatched in the probe, no engine edit),
+    server-default sizing (arena 1,754 × 13.4 MB pinned, 23.49 GB): **RSS 28.20 → 27.88 GB over 128
+    decode tokens**, flat while the cache filled to 23.01 GB and churned; malloc free ≤ 0.26 GB;
+    `malloc_trim` at token 96 freed 0.01 GB. **Greedy ids identical to the clone path over 48 tokens.**
+    ~3.0 s/token on both paths, but not an A/B (budgets differ) — no speed claim.
+    (`docs/evidence/2026-09-26-S5-M-ds-probe2-arena.log`, `…-probe3-clone-ids.log`)
+  - [x] **Fix `6596c49` (branch `s5m-deepseek-arena`):** `moe_supports_slab_arena` non-EXL3 →
+    `cuda and style in ("fused", "module_list")`. CPU compute still gets no arena. Gate test rewritten
+    (DeepSeek-like 43 / MiniMax-like 62 layers + a no-CUDA case): RED 2 failed before, GREEN after.
+    Suite **2953 passed, 0 failed, 0 errors, 16 skipped (215.31 s) FOREGROUND**.
+  - [x] **Gates, all on `6596c49`:** DeepSeek clean-view server smoke **9/9** (113.19 s; arena 1,721 ×
+    13.4 MB pinned; RSS 27.07 → **26.67 GB at the last token**, flat over 32 passes / 2 requests —
+    before: 5.50 → 29.75 GB and OOM); MoE gates Qwen **8/8** (43.62 s), MiniMax **8/8** (74.45 s);
+    server smokes Qwen **9/9** (22.25 s), MiniMax **9/9** (52.36 s). The ≥128-token check is §4's probe
+    run (its monkeypatched predicate answers exactly what the commit does for DeepSeek). No fused-EXL3
+    arm exists and dense has no committed gate; neither is claimed, and the change reaches neither.
+  - **§8:** (1) no knob — the arena is derived from layout + device, and the only thing a knob could
+    offer is the clone path, which OOMs this model; (2) nothing to plumb — the predicate runs in
+    `init_model` (`vaayu_base.py:2712`), proven reachable by the smoke's `Expert slab arena` line;
+    (3) REACHABLE at N=1 — every DeepSeek server load on CUDA, and DeepSeek is no longer limited to one
+    request per server process; (4) n/a.
+  - Detail: `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` (gitignored). Not yet merged to `main`.
+  - [bug] **S5-M-C — the CLONE path itself still fragments glibc arenas** (found by S5-M, NOT fixed by
+    it). Any cache with `arena is None` stores `load_expert_sparse`'s clones cloned a SECOND time by
+    `ExpertRAMCache.put()` (`persist/expert_cache.py:577`), on executor threads; evictions free them
+    and glibc keeps the pages. Measured on DeepSeek at an 8 GB cache: +5.4 GB of RSS held as malloc
+    free space (~0.68× the cache). After S5-M no on-device model reaches it on CUDA, but CPU compute
+    (every layout — `moe_supports_slab_arena` answers False without CUDA) and the arena-exhausted
+    fallback still do. Candidates, unmeasured: drop `put()`'s redundant second clone (halves the
+    churn, does not end it), or a pageable `SlabArena` for arena-less layouts. Unblocks when a
+    CPU-compute model is run here, or the fallback is seen in a log.
   - **Evidence** (clean-view server smoke, detached unit `MemoryMax=29G`; log kept at
     `docs/evidence/2026-09-26-S5-M-clean-view-smoke-oom.log`):
     - `test_health` and `test_non_stream` PASSED;
@@ -249,7 +299,7 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     `_prompt_renderer = None` (`vaayu/vaayu_deepseek_v4.py:434`).
   - **(C)** `documentation/server.md`: a §9 troubleshooting row for the 400 naming
     `encoding/encoding_dsv4.py`, plus one sentence in §6.6 that a model-rendered prompt refuses `tools`.
-  - TDD for A and B. No GPU. Suite floor 2951.
+  - TDD for A and B. No GPU. Suite floor 2953 (raised by S5-M).
 
 ## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit. MERGED to `main` 2026-09-26 (`906675c`).**
 
