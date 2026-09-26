@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from .model_code.deepseek_v4 import modeling_deepseek_v4 as _repo_modeling
 from .model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from .model_code.deepseek_v4.prompt import load_prompt_renderer
 from .vaayu_base import VaayuBaseModel
 # Packed/opaque torch dtypes that must be REINTERPRETED (`.view`) rather than
 # numerically cast when injected -- see `move_layer_to_device` below. ONE
@@ -424,6 +425,16 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         self._running_module().KERNEL_DIR = kernel_dir
         print(f"[Vaayu] DeepSeek-V4 kernels found at {kernel_dir}")
+
+        # This checkpoint ships no chat_template; its prompt format is DeepSeek's
+        # own `encoding/encoding_dsv4.py`, read in place from the ROOT (beside
+        # `inference/`), never copied (S5, `model_code/deepseek_v4/prompt.py`).
+        self._prompt_renderer = load_prompt_renderer(self.model_local_path)
+
+    def get_prompt_renderer(self):
+        """DeepSeek's own encoder, built by `init_model` -- see
+        `model_code/deepseek_v4/prompt.py`."""
+        return self._prompt_renderer
 
     def _create_kv_cache(self):
         """A `DeepseekV4Cache`, which is the only cache this model's forward
