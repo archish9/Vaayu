@@ -289,7 +289,7 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
         +3,999 tokens, inside the decode jitter.
       - **(4)** Pinned stays flat at 23.74 GB (arena + 1.63 GB).
     - **→ No prefill reserve is needed in `derive_expert_ceiling` up to 8k. Nothing built.**
-    - **Observation, NOT a FAIL** (outside this item's question; no row opened, the user decides): the
+    - **Observation, NOT a FAIL** (outside this item's question; the user opened **S5-M-HR** for it, below): the
       HOST-level margin is thinner than the cgroup one.
       - host `MemAvailable` min **1.63 GB**;
       - `SwapFree` 4.72 → 4.57 GB, i.e. ~0.15 GB of OTHER processes swapped out (the unit used 0 swap).
@@ -312,6 +312,37 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     Vaayu's workload is prefill-heavy. **Closes when:** one long-prompt DeepSeek server request (4-8k
     tokens) completes with RSS recorded per token. If it OOMs, the fix is a MEASURED prefill reserve in
     the derivation — never a blind cut to the ceiling (handoff §6).
+  - [ ] **S5-M-HR — the HOST RAM left after the expert arena is ~1.6 GB, not the 3.5 GiB the reserve
+    names** (opened by the user 2026-09-26 from S5-M-H's observation. **Not in THE SEQUENCE**; the user
+    places it.)
+    - **Measured (S5-M-H, DeepSeek-V4, server path):**
+      - `derive_expert_ceiling` (`vaayu_base.py:355`) pins the arena at host `available` −
+        `_EXPERT_CEILING_RESERVE` (3.5 GiB = 3.76 GB, `:352`). DeepSeek has no prefix pool, so that is
+        the whole reserve.
+      - The process's own FIRST-REQUEST warm-up then spends ~2.1 GB of it: `RssAnon` 0.97 → ~3.0 GB,
+        inside request A's first 512-token chunk. It did not grow with 2× the prompt.
+      - Host `MemAvailable` min **1.63 GB** (1.63–2.10 through both requests); `SwapFree` 4.72 → 4.57
+        GB, so the kernel swapped ~0.15 GB of OTHER processes out. The unit was capped at 0 swap and
+        used 0.
+      - The cgroup margin was 3.78 GB (peak 27.36 of 31.14). The 29 GiB cap is the harness's; a real
+        server runs uncapped and lives on the host figure.
+    - **Why it holds at any load:** the ceiling tracks `available`, so the post-warm-up host margin is
+      ~reserve − warm-up ≈ 1.6 GB whatever `available` reads at load. It is thin, not negative: nothing
+      OOMed.
+    - **Unknown (measure before any fix):**
+      - what the ~2.1 GB warm-up is (not decomposed; the non-expert LRU is ≤ 0.5 GB of it);
+      - whether it has the same size on Qwen3-Next and MiniMax;
+      - on models WITH a prefix pool, whether the warm-up eats into the pool's reserved sessions or the
+        OS's share.
+    - **Fix shape, if one is warranted:** DERIVE a warm-up term into the reserve from a measured
+      post-first-request growth, with a test over two geometries (CLAUDE.md §5). Or WARN at load when the
+      post-warm-up margin is under a stated floor. **Never** a blind raise of `_EXPERT_CEILING_RESERVE`
+      or cut to the ceiling.
+    - **Closes when:** the warm-up is decomposed and measured on ≥ 2 models, and either the reserve
+      derives it or the ~1.6 GB margin is written down as accepted. **§8 on a fix:** no new knob
+      expected; the derivation already runs in every server load.
+    - Evidence: `docs/2026-09-26-S5-M-H-long-prompt-headroom-RESULTS.md` §5,
+      `docs/evidence/2026-09-26-S5-M-H-host-meminfo.log`.
   - **Evidence** (clean-view server smoke, detached unit `MemoryMax=29G`; log kept at
     `docs/evidence/2026-09-26-S5-M-clean-view-smoke-oom.log`):
     - `test_health` and `test_non_stream` PASSED;
