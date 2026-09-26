@@ -31,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import importlib.util
+import sys
 from pathlib import Path
 
 import torch
@@ -146,6 +147,23 @@ def _fit_sparse_attn(source: str, heads: int, head_dim: int, smem_optin: int) ->
     return source[:start] + tile + source[end:]
 
 
+@contextlib.contextmanager
+def no_bytecode():
+    """Import a checkpoint's own source without caching bytecode beside it.
+
+    `exec_module` writes `__pycache__/*.pyc` next to the file it runs, and that
+    file is inside the user's download (S5-W). It stays a real import -- not
+    S5's `exec(compile())` -- because tilelang's JIT reads the kernels back with
+    `inspect.getsource`. The flag is process-global, so it is held only here.
+    """
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = previous
+
+
 def kernels():
     """DeepSeek's `act_quant` / `fp4_gemm` / `fp8_gemm`, imported on first use.
 
@@ -189,7 +207,8 @@ def kernels():
     spec = importlib.util.spec_from_file_location("vaayu_deepseek_v4_kernel", fitted)
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
+        with no_bytecode():
+            spec.loader.exec_module(module)
     except ImportError as missing:
         raise ImportError(
             f"DeepSeek-V4's quantized weights go through its own TileLang kernels "
