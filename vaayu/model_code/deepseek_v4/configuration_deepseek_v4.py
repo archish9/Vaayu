@@ -6,10 +6,12 @@ ships no `auto_map`, so `AutoConfig.from_pretrained` raises and Vaayu dies at
 unknown to transformers, runs here because its repo carries its own
 `configuration_*.py` plus an `auto_map` entry.
 
-This file is copied verbatim into the checkpoint directory, where that
-`auto_map` points at it. The repo holds the source of truth; the checkpoint
-holds the copy, and `tests/test_deepseek_v4_config.py` asserts the two are
-byte-identical.
+Vaayu registers this class with `AutoConfig` in-process
+(`vaayu/vaayu_deepseek_v4.py`'s `_register_with_transformers`), so a plain
+download -- no `auto_map`, no copied file -- loads as it comes, and nothing is
+written into the model directory (S5). A checkpoint that still carries a
+hand-placed copy loads that copy instead; `tests/test_deepseek_v4_config.py`
+checks such a copy has not drifted, and skips when there is none.
 
 Every field defaults to `None`. The checkpoint sets all of them, and a
 plausible-but-wrong default loads silently -- `deepseek_v3`'s 61 layers where
