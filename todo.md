@@ -59,7 +59,7 @@ detail each entry points to.**
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"). One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"); S5-M-H inserted before S5-W by the USER 2026-09-26. One per fresh session, in order. ◀◀◀
 
 **Each S-item has its own self-contained HANDOFF in `docs/superpowers/specs/` — gitignored, so THIS
 row is the durable copy of why it exists and what "done" means.** Read the handoff first; it carries
@@ -80,6 +80,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S4** ✅ | ~~**restore the 46 DeepSeek-V4 tests** the shard deletion broke~~ **CLOSED 2026-09-26, FIXED — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`. One resolver in `tests/deepseek/parity.py` reads either layout; no `vaayu/` change. See the S4 row below** | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the S5-M `[bug]` row below, pre-existing, not fixed here (filed as expert-RAM sizing; measured 2026-09-26 as glibc malloc retention on the clone path, and FIXED).** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
 | **S5-M** ✅ | ~~**DeepSeek-V4 through the server is OOM-killed on its 2nd request**~~ **CLOSED 2026-09-26, FIXED, MERGED (`2d78f71`) — not a reference leak: glibc malloc kept the freed expert clones (live tensors flat, `malloc_trim(0)` handed back 5.5 GB). Non-EXL3 module-list was denied the slab arena ("never measured"), so DeepSeek cached through the double-clone path. `6596c49` gives it the arena on CUDA. Through the probe's monkeypatched predicate (same answer for DeepSeek): RSS flat over 128 decode tokens, greedy ids identical over 48. On the committed code: server smoke 9/9 (RSS 26.67 GB at the last token). MiniMax never leaked (it already had the arena). See the S5-M row below** | S5 made DeepSeek serving reachable, and this capped it at ONE request per server process | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) · RESULTS `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` |
+| **S5-M-H** | **DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts** — S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
 | **S5-W** | **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
 | **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
@@ -102,7 +103,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S5-W** — then **S5-P**, then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED — row below)
+## ▶▶ PICK THIS NEXT: **S5-M-H** — then **S5-W**, **S5-P**, then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H put first by the user the same day)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). **Every session in this run starts with the S5-R check**
@@ -110,7 +111,9 @@ the sequence table and in the S5 rows below). **Every session in this run starts
 follow-up first; if not, S5-R stays `[!]` and the run proceeds. **Order rationale:**
 - S5-M first: it is the one that makes DeepSeek unusable (one request per server process), and it may
   reach MiniMax.
-- S5-W next: cheap, and it finishes S5's no-write promise.
+- S5-M-H next (user, 2026-09-26): S5-M's fix pins ~23 GB up front, and only short prompts were ever
+  measured on it — confirm the long-prompt headroom before anything else builds on DeepSeek serving.
+- S5-W after that: cheap, and it finishes S5's no-write promise.
 - S5-P last: pure polish.
 
 **S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **S4 closed 2026-09-26, FIXED** (the 46 DeepSeek-V4 tests are green — row below). **The sequence resumes at S5** — DeepSeek-V4 ships no `chat_template`, handoff [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) — then **S6**. **The suite floor is now `2928 passed, 0 failed, 0 errors, 16 skipped`** (208.49 s; +46 restored and +3 new from S4, 2026-09-26) — green, so any failure is new.
@@ -251,7 +254,9 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     probe 1's flat `m_mmap`; drop `put()`'s redundant second clone (halves the churn, does not end it);
     or a pageable `SlabArena` for arena-less layouts. Unblocks when a CPU-compute model is run here,
     or the fallback is seen in a log.
-  - [ ] **S5-M-H — DeepSeek's RAM headroom on the arena path is unmeasured for LONG prompts** (review of
+  - [ ] **S5-M-H — DeepSeek's RAM headroom on the arena path is unmeasured for LONG prompts** (**Sequence:
+    FIRST of the remaining S5 run**, set by the user 2026-09-26. Handoff:
+    [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md).) (review of
     S5-M, 2026-09-26). The arena is pinned at load at host `available` − 3.5 GiB
     (`derive_expert_ceiling`, `vaayu_base.py:355`; no prefix reserve, since DeepSeek's cache has no
     `to_cpu`). Measured: post-arena host `available` 3.40 GB; RSS 26.67-28.28 GB against the 29 GiB
