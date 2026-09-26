@@ -252,6 +252,10 @@ vanish silently.
   the exact failure mode this ledger prevents.
 - **Blocked ≠ gone.** A task waiting on something gets `[!]` + a one-line reason and what
   unblocks it — never deletion.
+- **Backlog ≠ gone either.** OPEN items with no user value today (dead, blocked on a user decision,
+  N>1-only, internal tooling, cosmetic) live in `todo-backlog.md`. Each keeps its full text, its
+  marker and a re-open condition, and a pointer line marks its old spot in `todo.md`. Pick work
+  from `todo.md` only; re-open a backlog item by moving it back.
 - Separate from any harness/session TODO tool: `todo.md` is on disk and survives across
   sessions. Write it there.
 
@@ -270,6 +274,7 @@ deliberate choice, not an oversight to route around.
 | `docs/` | plans, specs, investigations, RESULTS, verdicts, handoffs, probe notes | **no** (`.gitignore:28`) |
 | `documentation/` | Vaayu's own product documentation — what the engine is and how to use it (`architecture.md`, `server.md`, `TUNING.md`, …) | yes |
 | `todo.md` | the task ledger (§6) | yes |
+| `todo-backlog.md` | the ledger's backlog (§6): open items parked with a re-open condition. Part of the ledger, not a new doc | yes |
 
 **`documentation/` is user-facing product docs only.** Do not put a plan, an investigation, a
 review verdict or a task list there because it "should ship" — that is the exact mistake this
