@@ -157,19 +157,19 @@ def test_a_missing_layer_shard_says_so(tmp_path):
 
 @needs_checkpoint
 def test_the_real_checkpoint_measures_32():
-    """The value A5.4's skeleton refuses to invent. Read off the ORIGINAL
-    shards here, because the split may not exist yet when this runs; the
-    loader reads the same quantity off the split ones."""
-    weight_map = json.loads(
-        (parity.CKPT / "model.safetensors.index.json").read_text())["weight_map"]
-    key = next(k for k in weight_map
+    """The value A5.4's skeleton refuses to invent. Read by the checkpoint's
+    own key names through `parity.locate`, because the split may not exist yet
+    when this runs -- and after `delete_original_shards` only the split does;
+    the loader reads the same quantity off the split ones."""
+    key = next(k for k in parity.weight_map()
                if k.endswith("w1.weight") and ".ffn.experts." in k
                and not k.startswith("mtp."))
     from safetensors import safe_open
     shapes = {}
     for name in (key, key.replace(".weight", ".scale")):
-        with safe_open(parity.CKPT / weight_map[name], framework="pt") as handle:
-            shapes[name] = handle.get_slice(name).get_shape()
+        path, stored = parity.locate(name)
+        with safe_open(str(path), framework="pt") as handle:
+            shapes[name] = handle.get_slice(stored).get_shape()
     assert shapes[key][-1] * 2 // shapes[key.replace(".weight", ".scale")][-1] == 32
 
 

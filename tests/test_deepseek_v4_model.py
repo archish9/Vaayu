@@ -370,21 +370,11 @@ def test_the_head_tracks_the_references_fp32_logits():
 
 
 def _norm_weight() -> torch.Tensor:
-    from safetensors import safe_open
-
-    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
-    with safe_open(parity.CKPT / index["weight_map"]["norm.weight"],
-                   framework="pt", device="cpu") as handle:
-        return handle.get_tensor("norm.weight").float()
+    return parity.read_checkpoint_tensors(["norm.weight"])["norm.weight"].float()
 
 
 def _head_weight() -> torch.Tensor:
-    from safetensors import safe_open
-
-    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
-    with safe_open(parity.CKPT / index["weight_map"]["head.weight"],
-                   framework="pt", device="cpu") as handle:
-        return handle.get_tensor("head.weight")
+    return parity.read_checkpoint_tensors(["head.weight"])["head.weight"]
 
 
 def test_the_lm_head_is_untied_from_the_embedding(stub_layers):
@@ -513,11 +503,11 @@ def test_auto_model_for_causal_lm_builds_the_whole_skeleton_on_meta():
 
     config = AutoConfig.from_pretrained(str(parity.CKPT), trust_remote_code=True)
     # The loader derives this from the SPLIT shards
-    # (`checkpoint.fp4_group_size_from_split`); this test has only the original
-    # checkpoint, so it reads the same quantity from the same kind of
-    # weight/scale pair. Kept in step by
+    # (`checkpoint.fp4_group_size_from_split`); this test reads the same
+    # quantity from the same kind of weight/scale pair, in whichever layout the
+    # checkpoint is in. Kept in step by
     # `tests/test_deepseek_v4_checkpoint.py::test_the_real_checkpoint_measures_32`.
-    config.fp4_group_size = _fp4_group_size_from_original_shards()
+    config.fp4_group_size = _fp4_group_size_from_checkpoint()
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
             config, dtype=torch.bfloat16, attn_implementation="flash_attention_2",
@@ -549,22 +539,22 @@ def test_the_skeleton_refuses_to_invent_an_fp4_group_size():
                                              trust_remote_code=True)
 
 
-def _fp4_group_size_from_original_shards() -> int:
-    """`in_features // scale.shape[-1]` off the ORIGINAL shards.
+def _fp4_group_size_from_checkpoint() -> int:
+    """`in_features // scale.shape[-1]` off the shard headers.
 
     The production deriver is
     `vaayu.model_code.deepseek_v4.checkpoint.fp4_group_size_from_split`, which
-    reads the SPLIT shards because `delete_original_shards` removes these.
+    reads only the SPLIT shards. This one resolves through `parity.locate`, so
+    it answers before the split exists and after `delete_original_shards`.
     """
     from safetensors import safe_open
 
-    index = json.loads(
-        (parity.CKPT / "model.safetensors.index.json").read_text())["weight_map"]
-    key = next(k for k in index
+    key = next(k for k in parity.weight_map()
                if k.endswith("w1.weight") and ".ffn.experts." in k
                and not k.startswith("mtp."))
     shapes = {}
     for name in (key, key.replace(".weight", ".scale")):
-        with safe_open(parity.CKPT / index[name], framework="pt") as handle:
-            shapes[name] = handle.get_slice(name).get_shape()
+        path, stored = parity.locate(name)
+        with safe_open(str(path), framework="pt") as handle:
+            shapes[name] = handle.get_slice(stored).get_shape()
     return shapes[key][-1] * 2 // shapes[key.replace(".weight", ".scale")][-1]

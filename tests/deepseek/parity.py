@@ -13,6 +13,7 @@ have a golden reference that needs neither the checkpoint nor a GPU.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 from pathlib import Path
@@ -78,6 +79,78 @@ def have_checkpoint() -> bool:
     return (CKPT / "model.safetensors.index.json").is_file()
 
 
+@functools.lru_cache(maxsize=None)
+def weight_map(ckpt: Path = None) -> dict:
+    """The index's key -> original shard. It outlives the shards it names:
+    `delete_original_shards` keeps it so the checkpoint stays discoverable."""
+    ckpt = ckpt or CKPT
+    return json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
+
+
+@functools.lru_cache(maxsize=None)
+def _split_index(split_dir: Path) -> dict:
+    """Split key -> the file holding it, read off the headers (~0.7 s for all
+    46), so nothing here re-derives the split's file naming."""
+    from safetensors import safe_open
+
+    index = {}
+    for path in sorted(split_dir.glob("*.safetensors")):
+        with safe_open(str(path), framework="pt") as handle:
+            index.update(dict.fromkeys(handle.keys(), path))
+    return index
+
+
+def locate(key: str, ckpt: Path = None) -> tuple:
+    """(file, name inside it) for a key named the way the checkpoint names it.
+
+    Two layouts are real. A fresh download holds only the ORIGINAL shards the
+    index names. A checkpoint Vaayu has loaded with `delete_original=True` --
+    the server's default -- holds only `splitted_model/`, every key renamed by
+    the loader's own `remap_checkpoint_key` (this box since `4bc70b1`). The
+    goldens were recorded off the originals; the split is their byte-for-byte
+    copy. Going through the remap rather than a hardcoded `model.` prefix keeps
+    the harness tracking the loader instead of guessing its naming.
+    """
+    from vaayu.model_code.deepseek_v4.checkpoint import remap_checkpoint_key
+
+    ckpt = ckpt or CKPT
+    original = ckpt / weight_map(ckpt)[key]
+    if original.is_file():
+        return original, key
+    stored = remap_checkpoint_key(key)
+    split = _split_index(ckpt / "splitted_model")
+    if stored not in split:
+        raise FileNotFoundError(
+            f"{key}: its original shard {original.name} is gone and no shard under "
+            f"{ckpt / 'splitted_model'} holds it as {stored!r}"
+            + (" (remap_checkpoint_key drops it)" if stored is None else ""))
+    return split[stored], stored
+
+
+def read_checkpoint_tensors(keys, ckpt: Path = None) -> dict:
+    """{key: tensor} exactly as stored, from whichever layout holds each key."""
+    from safetensors import safe_open
+
+    by_file = {}
+    for key in keys:
+        path, stored = locate(key, ckpt)
+        by_file.setdefault(path, []).append((key, stored))
+    out = {}
+    for path, pairs in sorted(by_file.items()):
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            for key, stored in pairs:
+                out[key] = handle.get_tensor(stored)
+    return out
+
+
+def raw_module_weights(prefix: str, ckpt: Path = None) -> dict:
+    """The tensors under `prefix`, keyed relative to it, with NO value
+    transforms -- what the production loader consumes."""
+    wanted = sorted(key for key in weight_map(ckpt or CKPT) if key.startswith(prefix))
+    return {key[len(prefix):]: tensor
+            for key, tensor in read_checkpoint_tensors(wanted, ckpt).items()}
+
+
 def load_module_weights(prefix: str, ckpt: Path = None) -> dict:
     """Read exactly the tensors under `prefix`, keyed relative to it.
 
@@ -85,18 +158,7 @@ def load_module_weights(prefix: str, ckpt: Path = None) -> dict:
     also does are no-ops on this checkpoint, whose shards already ship the
     reference's own names (`layers.7.attn.wq_a.weight`, not `self_attn`).
     """
-    from safetensors import safe_open
-
-    ckpt = ckpt or CKPT
-    weight_map = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
-    wanted = sorted(key for key in weight_map if key.startswith(prefix))
-
-    raw = {}
-    for shard in sorted({weight_map[key] for key in wanted}):
-        with safe_open(ckpt / shard, framework="pt", device="cpu") as handle:
-            for key in wanted:
-                if weight_map[key] == shard:
-                    raw[key[len(prefix):]] = handle.get_tensor(key)
+    raw = raw_module_weights(prefix, ckpt)
 
     out = {}
     for key, tensor in raw.items():

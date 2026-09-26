@@ -155,6 +155,64 @@ def test_the_torch_fallback_agrees_with_the_extension():
     assert rel < 2e-2, f"torch fallback differs from the extension by {rel:.4g}"
 
 
+# ------------------------------------------------ where a checkpoint key lives
+#
+# Two layouts are real: a fresh download holds only the ORIGINAL shards the
+# index names; a checkpoint the server has loaded (`delete_original=True`, its
+# default) holds only `splitted_model/`, every key renamed by
+# `remap_checkpoint_key`. This box is the second, so the first is proven here.
+
+def _fake_checkpoint(root: Path, *, originals: bool, split: bool) -> Path:
+    """Three keys with three different remaps: `layers.*` gains `model.`,
+    `head.weight` becomes `lm_head.weight`, `hc_head_*` lands in the norm shard."""
+    import torch
+    from safetensors.torch import save_file
+
+    tensors = {"layers.0.attn.wq_a.weight": torch.full((2, 2), 1.0),
+               "head.weight": torch.full((3, 2), 2.0),
+               "hc_head_fn": torch.full((4,), 3.0)}
+    shard = "model-00001-of-00001.safetensors"
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: shard for key in tensors}}))
+    if originals:
+        save_file(tensors, str(root / shard))
+    if split:
+        (root / "splitted_model").mkdir()
+        for name, key, stored in (("model.layers.0", "layers.0.attn.wq_a.weight",
+                                   "model.layers.0.attn.wq_a.weight"),
+                                  ("lm_head", "head.weight", "lm_head.weight"),
+                                  ("model.norm", "hc_head_fn", "model.norm.hc_head_fn")):
+            save_file({stored: tensors[key]},
+                      str(root / "splitted_model" / f"{name}.safetensors"))
+    return root
+
+
+@pytest.mark.parametrize("originals, split", [(True, False), (False, True)],
+                         ids=["fresh-download", "split-only"])
+def test_every_key_reads_back_by_its_checkpoint_name_in_either_layout(
+        tmp_path, originals, split):
+    import torch
+
+    ckpt = _fake_checkpoint(tmp_path, originals=originals, split=split)
+
+    got = parity.read_checkpoint_tensors(
+        ["layers.0.attn.wq_a.weight", "head.weight", "hc_head_fn"], ckpt=ckpt)
+
+    assert torch.equal(got["layers.0.attn.wq_a.weight"], torch.full((2, 2), 1.0))
+    assert torch.equal(got["head.weight"], torch.full((3, 2), 2.0))
+    assert torch.equal(got["hc_head_fn"], torch.full((4,), 3.0))
+    assert parity.load_module_weights("layers.0.attn.", ckpt=ckpt).keys() == {"wq_a.weight"}
+
+
+def test_a_key_in_neither_layout_names_itself(tmp_path):
+    """A missing weight must say which one -- not a bare KeyError on a split
+    name the caller never asked for."""
+    ckpt = _fake_checkpoint(tmp_path, originals=False, split=False)
+
+    with pytest.raises(FileNotFoundError, match="head.weight"):
+        parity.read_checkpoint_tensors(["head.weight"], ckpt=ckpt)
+
+
 # ------------------------------------------------------- reading real weights
 #
 # These need the 157 G checkpoint. Everything above does not.
