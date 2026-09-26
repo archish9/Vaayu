@@ -182,8 +182,12 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
   inspected first (`config.json` = upstream + `auto_map` + a re-indent; both `.py` copies byte-identical to
   git; `__pycache__` held only 3 pycs); the `auto_map` config saved to
   `docs/evidence/2026-09-26-S5-R-config.json.with-auto_map`; then step 1's command, verbatim. After: all five
-  gone, 0 `auto_map`, 0 pycs, 133 → 125 paths. Optional items NOT removed: the 917 MB
-  `.goutputstream-LZUPV3` in the model dir and the HF modules-cache entry (the user's call).
+  gone, 0 `auto_map`, 0 pycs, 133 → 125 paths. The optional items were then removed at the user's
+  request, after checking neither was needed: `.goutputstream-LZUPV3` (917 MB of raw data dated
+  2026-09-20, an interrupted GNOME write — no valid safetensors header, not open, referenced by
+  nothing) and the DeepSeek entry in `~/.cache/huggingface/modules/transformers_modules/` (the old
+  `auto_map` remote-code copies; the MiniMax entry kept). Re-checked after: DeepSeek files 364
+  passed / 4 skipped, library load + generate OK, the cache entry not re-created, 124 paths.
   Step 2: DeepSeek files on the real dir **362 passed, exactly 4 guard skips, 0 failed** (39.70 s), no
   `__pycache__` gained; the deferred `configuration_deepseek_v4.py` docstring applied verbatim. Step 3: S5-W's
   real-dir proof done (S5-W row). Original text:
