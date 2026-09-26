@@ -59,7 +59,7 @@ detail each entry points to.**
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25. One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"). One per fresh session, in order. ◀◀◀
 
 **Each S-item has its own self-contained HANDOFF in `docs/superpowers/specs/` — gitignored, so THIS
 row is the durable copy of why it exists and what "done" means.** Read the handoff first; it carries
@@ -79,6 +79,9 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S3** ✅ | ~~**Qwen3-Next `GatedDeltaNet` elementwise fusion** — **STARTED 2026-09-25. STEP 1 DONE: census re-derived DECODE-ONLY and the handoff's does NOT reproduce — row 36's CUPTI arm had the prefill forward in its window (S1's flaw again), and its "653 µs/layer" was the whole decoder layer. Real: 4,586 launches / 15.9 ms device per `serial` token (not 7,702 / 27.70), so `serial` is ~55 % HOST gap — row 36's "GPU-bound" verdict used the contaminated number. GDN non-matmul = 63 launches/mixer (rule 29, norm 12, conv 4, body 18) = 49 % of `serial`'s launches; mixer host wall 438.8 µs = 15.80 ms/token on the real forward. CEILING MEASURED (ABBA, one load): dropping every GDN non-matmul op cuts `serial` 35.5 → 24.35 ms = −11.15 ms = 10.3 % of T_unprof 0.1085 s — ABOVE the handoff's 6.9 %. The three stock seams (`recurrent_gated_delta_rule`, `norm`, `causal_conv1d_update`) hold 45 of the 63. Detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`. STEP 2 DONE (bake-off, user-approved incl. a scratch `fla` 0.5.2 install): one real mixer's decode call, ABBA x4 — stock 400.2 µs/66 kernels, narrow `torch.compile` 327.0 (−18 %), **Vaayu Triton prototype at the 3 seams 196.6 µs/24 kernels (−51 %)**, `fla` 391.1 (−2 %: it cuts launches but gives the time back in Python wrappers — REJECTED for decode). All closer to fp64 than stock. Two upstream traps: HF's `conv_states` is CHANNELS-LAST after any ≥4-token prefill (`fla`'s conv kernel silently corrupts it — kernels must be stride-aware), and the cache keeps the recurrent state in bf16. Banked lead: `fla`'s chunk kernel is ~10× the torch prefill fallback (0.36 → 0.03 s per 2k prompt, ~2 % TTFT). DESIGN APPROVED 2026-09-25 (scope A, user-chosen over B = body rewrite and C = `fla` prefill chunk, both banked): new `vaayu/gated_delta_kernels.py` — three stride-aware Triton kernels (rule with fp32 l2norm, conv update, gated norm) installed PER SEAM by surface detection (norm patched in place, streaming-safe), behavioural self-check at install falls back to stock with a WARNING, CUDA + triton only (CPU keeps stock), one call beside `install_state_continuation`; reaches qwen3_next/qwen3_5/qwen3_5_moe (3 seams), olmo_hybrid (2), MiniMax/dense/DeepSeek (0). Acceptance: conv state bit-exact, fused ≤ 1.25× stock's fp64 error over 2 geometries, D6 6-draw ppl band, ABBA real-token win ≥ 2 % (else revert), on-device win ≥ half the microbench's −204 µs/mixer. §8: no knob, reachable at N=1. Spec `docs/superpowers/specs/2026-09-25-S3-gated-delta-kernels-design.md`. Next: user reviews spec → implementation plan**~~ **CLOSED 2026-09-25, A WIN — real decode token −3.6 to −5.6 %, quality PASS. See the S3 row below** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
 | **S4** ✅ | ~~**restore the 46 DeepSeek-V4 tests** the shard deletion broke~~ **CLOSED 2026-09-26, FIXED — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`. One resolver in `tests/deepseek/parity.py` reads either layout; no `vaayu/` change. See the S4 row below** | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the expert-RAM sizing `[bug]` row (S5-M) below, pre-existing, not fixed here.** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
+| **S5-M** | **DeepSeek-V4 through the server is OOM-killed on its 2nd request** — memory OUTSIDE the expert cache grows **~0.19 GB per decode token and keeps growing after the cache plateaus** (rss − cache 5.50 → 9.90 GB over 24 tokens; +1.49 GB over tokens 16→24 with the cache flat at 19.85 GB) — a LEAK, not sizing | S5 made DeepSeek serving reachable, and this caps it at ONE request per server process; the same module-list forward serves MiniMax, so check first whether MiniMax leaks too (that would make it production) | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) |
+| **S5-W** | **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
+| **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
 **Suite floor for every one of them: `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s,
@@ -98,7 +101,16 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S6**. ◀◀ (S5 closed 2026-09-26 — and it surfaced **S5-M**, DeepSeek's server OOM on the 2nd request; whether S5-M jumps ahead of S6 is the user's call, not reordered here)
+## ▶▶ PICK THIS NEXT: **S5-M** — then **S5-W, S5-P**, then **S6**. ◀◀
+
+**Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
+the sequence table and in the S5 rows below). **Every session in this run starts with the S5-R check**
+(S5-W handoff §0). If the user has restored this box's DeepSeek folder, do S5-R's ~15-min agent
+follow-up first; if not, S5-R stays `[!]` and the run proceeds. **Order rationale:**
+- S5-M first: it is the one that makes DeepSeek unusable (one request per server process), and it may
+  reach MiniMax.
+- S5-W next: cheap, and it finishes S5's no-write promise.
+- S5-P last: pure polish.
 
 **S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **S4 closed 2026-09-26, FIXED** (the 46 DeepSeek-V4 tests are green — row below). **The sequence resumes at S5** — DeepSeek-V4 ships no `chat_template`, handoff [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) — then **S6**. **The suite floor is now `2928 passed, 0 failed, 0 errors, 16 skipped`** (208.49 s; +46 restored and +3 new from S4, 2026-09-26) — green, so any failure is new.
 
@@ -157,10 +169,13 @@ real-dir DeepSeek smoke was skipped for the same reason.
 
 Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
 
-- [ ] **S5-R (USER, then agent) — restore this box's DeepSeek folder so it matches a user's download.**
+- [!] **S5-R (USER, then agent) — restore this box's DeepSeek folder so it matches a user's download.**
+  **Blocked on the user.** Every S5-M/S5-W/S5-P session checks it first (S5-W handoff §0 has the
+  check).
   1. The user runs:
-     `cd /home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731 && mv config.json.orig-2026-09-23 config.json && rm configuration_deepseek_v4.py modeling_deepseek_v4.py && rm -r encoding/__pycache__`
-     (the last one is the stray pyc the agent's design probe wrote)
+     `cd /home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731 && mv config.json.orig-2026-09-23 config.json && rm configuration_deepseek_v4.py modeling_deepseek_v4.py && rm -r encoding/__pycache__ inference/__pycache__`
+     (both `__pycache__` dirs are bytecode left by agent and test runs, not upstream files;
+     `inference/__pycache__` was added 2026-09-26 with S5-W)
      (optional: remove `~/.cache/huggingface/modules/transformers_modules/deepseek_hyphen_ai_hyphen__hyphen_DeepSeek_hyphen_V4_hyphen_Flash_hyphen_0731`
      and the 917 MB `.goutputstream-LZUPV3`).
   2. The agent then re-runs `tests/test_deepseek_v4_*.py` against the real dir (expect 4 guard skips, 0
@@ -169,24 +184,72 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
      Step 7.
   **Blocked on the user**, not dropped.
 
-- [bug] **S5-M — DeepSeek-V4 through the server is OOM-killed on its SECOND request at the 29 GB cap
-  (found by S5, 2026-09-26; PRE-EXISTING — before S5 no DeepSeek completion ever reached generation).**
-  - Evidence (clean-view server smoke, detached unit `MemoryMax=29G`): journal `killed by the OOM killer`,
-    `memory peak 29.0G`, after 24 decode tokens across two requests.
-  - Load log: `Expert cache ceiling 21.90 GB (derived: available 25.66 GB, reserving 0 prefix session(s))`,
-    then `Expert RAM cache: 21.9 GB budget (~1638 expert slots … expert=13.4MB)`, on top of `rss=3.00GB` at
-    sizing.
-  - Evictions begin around token 10 (the cache is full), yet memory kept growing to the cap by token 24.
-    So the cache budget alone does not explain it: ~4 GB more grows after the cache fills.
-  - Suspects, unverified:
-    - `derive_expert_ceiling` (`vaayu_base.py` ~`:2757`) sizes from HOST `available` and reserves nothing
-      when the prefix cache is off (it is off for DeepSeek);
-    - the module-list CLONE path ("slab arena SKIPPED … experts are cached via the clone path") may hold
-      transient or duplicate copies;
-    - non-expert layers 8–42 are streamed every token.
-  - Same forward as MiniMax, whose gates pass at 29G but are short.
-  - Blocks DeepSeek serving beyond one request. Systematic debugging first — measure RSS per token before
-    guessing.
+- [bug] **S5-M — DeepSeek-V4 through the server is OOM-killed on its SECOND request at the 29 GB cap:
+  a LEAK of ~0.19 GB per decode token outside the expert cache** (found by S5, 2026-09-26). It is
+  PRE-EXISTING: before S5 no DeepSeek completion ever reached generation. **Sequence: FIRST of the S5
+  bug-fix run.** Handoff: [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md).
+  - **Evidence** (clean-view server smoke, detached unit `MemoryMax=29G`; log kept at
+    `docs/evidence/2026-09-26-S5-M-clean-view-smoke-oom.log`):
+    - `test_health` and `test_non_stream` PASSED;
+    - the 2nd request (`test_stream`) was OOM-killed at `memory peak 29.0G`, 95 s in.
+  - **Sizing at load:** `Expert cache ceiling 21.90 GB (derived: available 25.66 GB, reserving 0 prefix
+    session(s))` on top of `rss=3.00GB`.
+  - **Per-token growth** (from the `token summary` lines' `usage=`/`rss=`):
+
+    | token | rss − cache |
+    |---|---|
+    | 1 | 5.50 GB |
+    | 16 | 8.41 GB |
+    | 24 | **9.90 GB** |
+
+    The cache PLATEAUS at 19.85/21.90 GB from token 16 (the `max 38/layer` cap binds first), yet RSS
+    rises +1.49 GB over tokens 16→24 with the cache flat. That is a leak or unbounded accumulation of
+    ~0.18–0.19 GB/token. At that rate no budget survives a long answer.
+  - **Secondary:** `derive_expert_ceiling` (`vaayu_base.py:355`) uses host `available` minus 3.5 GiB, and
+    reserves nothing when the prefix cache is off.
+  - **Ranked suspects (all unverified, the handoff has a test for each):**
+    1. evicted module-list CLONES still referenced;
+    2. pinned-host caching-allocator growth from streaming non-expert layers 8–42 every token;
+    3. the non-expert `LRUTensorCache` overrunning its 0.5 GB budget;
+    4. DeepSeek CPU-side cache/ContextVar state;
+    5. Python-level accumulation.
+  - **Check MiniMax early:** same module-list forward. If it leaks too, this is production — tell the
+    user and re-rank.
+  - **Done means:**
+    - DeepSeek clean-view server smoke 9/9;
+    - ≥128-token decode with `rss − cache` flat after the plateau;
+    - if shared code changed: MoE gates plus the MiniMax long-decode check;
+    - suite green;
+    - §8.
+  - Do NOT "fix" it by lowering the ceiling.
+
+- [bug] **S5-W — Vaayu still writes bytecode into a DeepSeek model dir** (found 2026-09-26, while writing
+  S5's follow-ups). **Sequence: SECOND.** Handoff:
+  [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md); its §0 is the S5-R check.
+  - **Runtime:** `modeling_deepseek_v4.kernels()` (`:149`, `exec_module` at `:192`) imports the
+    checkpoint's own `inference/kernel.py` whenever `_fit_sparse_attn` leaves the text unchanged (GPUs
+    with enough shared memory). That writes `inference/__pycache__/kernel.cpython-312.pyc` into the
+    user's download. On this sm_120 box the tile IS refitted into a tempdir, so it is invisible here.
+  - **Tests:** `tests/deepseek/parity.py:239-243` writes `inference/__pycache__/model.cpython-312.pyc`
+    the same way.
+  - **Recommended fix:** `sys.dont_write_bytecode = True` around `exec_module`, restored in `finally`.
+    NOT S5's `exec(compile())`: TileLang's JIT calls `inspect.getsource`.
+  - **Test first:** the no-refit branch writes no `__pycache__` beside a stub `kernel.py`.
+  - **Proof:** the non-vacuous no-write check on the real dir, which needs S5-R.
+  - **OUT of scope:** the by-design `splitted_model/` cache, `DELETE_ORIGINAL`, and
+    `vaayu_expert_offsets.json`. Moving the split out of the model dir would need a server knob
+    (`layer_shards_saving_path` is library-only); that is the user's decision.
+
+- [ ] **S5-P — S5's deferred minors (final review, 2026-09-26).** **Sequence: THIRD.** Handoff:
+  [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md).
+  - **(A)** An encoder that fails to IMPORT (SyntaxError, or a missing third-party import) crashes
+    `init_model` → route it through `_refuse` (WARNING + 400) like a missing file.
+    `vaayu/model_code/deepseek_v4/prompt.py:57-59`; keep the `exec(compile())` form.
+  - **(B)** `get_prompt_renderer()` raises AttributeError before `init_model` → class attribute
+    `_prompt_renderer = None` (`vaayu/vaayu_deepseek_v4.py:434`).
+  - **(C)** `documentation/server.md`: a §9 troubleshooting row for the 400 naming
+    `encoding/encoding_dsv4.py`, plus one sentence in §6.6 that a model-rendered prompt refuses `tools`.
+  - TDD for A and B. No GPU. Suite floor 2951.
 
 ## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit. MERGED to `main` 2026-09-26 (`906675c`).**
 
