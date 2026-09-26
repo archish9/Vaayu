@@ -53,14 +53,17 @@ README's suggested speculative-decoding drafter) — use it when you need a dens
 run in seconds rather than minutes.
 
 **Dispatch table (`_make_sparse_moe_forward` in `vaayu/moe_patch.py`). It branches
-on `block_info.expert_style` FIRST, and only then on `is_exl3` — so the expert
-layout, not the quant format, picks the forward:**
+on `block_info.expert_style` FIRST. Within `fused`, it asks whether the CHECKPOINT
+stores each layer's experts whole (`dispatches_whole_layer`), and only then looks at
+`is_exl3` — so the expert layout, not the quant format, picks the forward. There are
+FOUR MoE forwards (row 47 A3 added the whole-layer one on 2026-09-21):**
 
 | Expert layout | Quant | Compute | Code path | On-device today |
 |---|---|---|---|---|
+| fused, checkpoint stores whole fused-3D tensors (`dispatches_whole_layer`) | any (MXFP4 today) | as the module's own kernel needs (gpt-oss: CUDA, the quantizer's triton kernel) | `_make_whole_layer_sparse_forward` | **gpt-oss-20b (MXFP4)** — runs since 2026-09-21, logits bit-identical to stock, 0.17 tok/s. It streams the whole model every token; that is S8. |
 | fused (experts module with `num_experts`) | EXL3 | CUDA-only (kernel-forced) | `_make_fused_sparse_forward_exl3` | **NO MODEL ON DISK since 2026-09-20** — Qwen3-235B was retired at the user's request and deleted. This forward is now UNCOVERED on device: its perf history stands, but nothing re-tests it. Treat a change here as unverifiable without a new fused-EXL3 checkpoint. |
-| fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | **Qwen3-Next-80B-A3B int4 (AWQ)** — actively tested, and the most perf-tuned path here (rows 30/30-P/44/42-B). The fastest model on this box. |
-| module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested. Also the intended landing spot for **DeepSeek-V4-Flash** once ported (row 28b / row 47). |
+| fused | non-EXL3 | CUDA or CPU (`device=` chooses) | `_make_fused_sparse_forward` | **Qwen3-Next-80B-A3B int4 (AWQ)** — actively tested, and the most perf-tuned path here (rows 30/30-P/44/42-B). The fastest model on this box. Its module ALSO reports fused parameters, but its checkpoint stores one tensor per expert, so it lands here, not on the whole-layer row. |
+| module-list (`nn.ModuleList` of experts) | either, incl. EXL3 | as loaded | `_make_modulelist_sparse_forward` | **MiniMax-M2.7 (EXL3)** — actively tested. **DeepSeek-V4-Flash (non-EXL3: fp4 experts + fp8)** — runs since 2026-09-25 and serves since 2026-09-26, at 0.3267 tok/s. |
 | dense | either | as configured | non-MoE forward | **Llama-3.3-70B-exl3** (path below), ppl 8.78 — a first-class test target, confirmed on disk 2026-09-20; tied-`lm_head` checkpoints (Llama-3.2-1B) fixed 2026-08-09, ppl 11.94 |
 
 **An EXL3 model does NOT imply the EXL3 fused forward.** `detect_moe_blocks`
@@ -68,9 +71,10 @@ reads the layout off the module tree: an experts module exposing `num_experts`
 is `"fused"`, an `nn.ModuleList` of per-expert submodules is `"module_list"`.
 MiniMax's EXL3 repo ships custom modeling code with per-expert submodules
 (`...block_sparse_moe.experts.10.w1.*`), so it is EXL3-quantized yet runs the
-module-list forward. **The actively-tested models sit on three different rows, and
-only one of them is still EXL3** (2026-09-20: MiniMax is EXL3/module-list,
-Qwen3-Next is non-EXL3/fused, Llama-3.3-70B is dense/EXL3) — and every MiniMax perf number on record is a module-list
+module-list forward. **The on-device models sit on four different rows**
+(2026-09-26: MiniMax is EXL3/module-list, DeepSeek-V4 is non-EXL3/module-list,
+Qwen3-Next is non-EXL3/fused, gpt-oss is MXFP4/whole-layer, Llama-3.3-70B is
+dense/EXL3) — and every MiniMax perf number on record is a module-list
 number. (Measured 2026-08-02; see
 `docs/superpowers/plans/2026-08-02-expert-pin-and-routing-locality-RESULTS.md`.)
 
@@ -171,10 +175,10 @@ deleted — do not test it, do not add it back to a gate):**
 | **MiniMax-M2.7 (EXL3)** | module-list, 62 layers, 256 experts | `_make_modulelist_sparse_forward` | the streamed-MoE case |
 | **Llama-3.3-70B-Instruct EXL3 4.5bpw** | dense, 80 layers | non-MoE forward | the dense case |
 | **Llama-3.2-1B-Instruct** | dense, unquantized | non-MoE forward | seconds-not-minutes smoke |
-| **gpt-oss-20b** | **fused-3D** experts (`mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]`), MXFP4, 24 layers, 32 experts top-4, 13.24 MB/expert, alternating sliding/full attention | `_make_fused_sparse_forward` (by module-tree detection) | **ON DISK 2026-09-20, NOT YET RUN. transformers supports it natively — the blocker is Vaayu: the expert-offset index matches 0 of its 459 tensors (gap G1), so it would find no experts and not raise.** Row 47 / G1. |
-| **DeepSeek-V4-Flash-0731** | module-list keys; **routed experts I8 + E8M0 scales (147.2 GB), shared experts and attention F8_E4M3** — two formats, and `config.json` names only one; 43 MoE layers, 256 experts top-6, 1 shared expert, 12.750 MiB/expert, MLA + sparse-index attention (`index_topk 512`) | — | **ON DISK AND COMPLETE (48/48 shards, 157 G), STILL CANNOT LOAD** (`deepseek_v4` unknown to transformers 5.5.4, no `auto_map`). Rows 47 → 28b. |
+| **gpt-oss-20b** | **fused-3D** experts (`mlp.experts.gate_up_proj_blocks`, U8 `[32, 5760, 90, 16]`), MXFP4, 24 layers, 32 experts top-4, 13.24 MB/expert, alternating sliding/full attention | `_make_whole_layer_sparse_forward` (the checkpoint stores each layer's experts WHOLE — `dispatches_whole_layer`) | **RUNS since row 47 A3 (2026-09-21):** server gate 9/9, logits bit-identical to stock transformers, eager attention. It streams the WHOLE model every token (13.28 GB) and decodes at **0.17 tok/s**, though stock fits it in 13.79 GB of VRAM — that is S8. The first run needs the network (`triton_kernels_hub` is fetched from the Hub). |
+| **DeepSeek-V4-Flash-0731** | module-list keys; **routed experts I8 + E8M0 scales (147.2 GB), shared experts and attention F8_E4M3** — two formats, and `config.json` names only one; 43 MoE layers, 256 experts top-6, 1 shared expert, 12.750 MiB/expert, MLA + sparse-index attention (`index_topk 512`) | `_make_modulelist_sparse_forward` | **RUNS (A5.7c, 2026-09-25) AND SERVES FROM A PLAIN DOWNLOAD (S5, 2026-09-26).** `vaayu_deepseek_v4.py` registers it with transformers in-process, and prompts render through the checkpoint's own encoder. **Nothing may be written into its model dir.** Decodes at **0.3267 tok/s** (measured before S5-M's arena change), eager attention, and 35 of 43 layers stream their non-expert weights every token (S6; S9 is the first fix). |
 
-Three forwards therefore have a model and **the fused-EXL3 forward no longer does** —
+Four MoE forwards therefore have a model, and **the fused-EXL3 forward is the only one that does not** —
 that is a real coverage loss, not an oversight; say so rather than claiming a change
 there is verified.
 The dense gate that covered Llama-3.3-70B (`test_batched_dense_smoke.py`) was
