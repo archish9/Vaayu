@@ -106,7 +106,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## S5 — `[x]` DeepSeek-V4 works from a plain download: in-process registration + the checkpoint's own prompt encoder. **CLOSED 2026-09-26. Suite `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s).**
+## S5 — `[x]` DeepSeek-V4 works from a plain download: in-process registration + the checkpoint's own prompt encoder. **CLOSED 2026-09-26. Suite `2951 passed, 0 failed, 0 errors, 16 skipped` (209.15 s). MERGED to `main` 2026-09-26 (`5b215b5`) after the final whole-branch review (Opus: with fixes → the encoder bytecode write, fixed); merged suite 2951 passed in 210.01 s.**
 
 **Re-scoped by the user 2026-09-26:** "no write into the model directory; a user downloads the model and it
 works with Vaayu". Found while re-verifying: a plain download did not even LOAD — this box ran on three
