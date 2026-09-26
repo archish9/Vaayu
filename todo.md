@@ -80,7 +80,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S4** ✅ | ~~**restore the 46 DeepSeek-V4 tests** the shard deletion broke~~ **CLOSED 2026-09-26, FIXED — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`. One resolver in `tests/deepseek/parity.py` reads either layout; no `vaayu/` change. See the S4 row below** | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** ✅ | ~~**DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion~~ **CLOSED 2026-09-26 — a PLAIN DOWNLOAD now loads and serves, with nothing written into the model dir. `vaayu_deepseek_v4.py` registers `DeepseekV4Config`/`DeepseekV4ForCausalLM` with transformers at import (no `auto_map`, no copied `.py`); a new `VaayuBaseModel.get_prompt_renderer()` hook (None default, 41 lines of shared code) lets the server render with DeepSeek's OWN `encoding/encoding_dsv4.py`, read in place. PROOF on a clean-download view (symlinks + upstream `config.json`): `test_non_stream` PASSED with a correct 16-token completion, and the real model dir was byte+mtime identical before/after. **NOT 9/9: the 2nd request OOM-killed at the 29 GB cap — the S5-M `[bug]` row below, pre-existing, not fixed here (filed as expert-RAM sizing; measured 2026-09-26 as glibc malloc retention on the clone path, and FIXED).** See the S5 row below** | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) · spec [`…S5-portable-deepseek-v4-design.md`](docs/superpowers/specs/2026-09-26-S5-portable-deepseek-v4-design.md) |
 | **S5-M** ✅ | ~~**DeepSeek-V4 through the server is OOM-killed on its 2nd request**~~ **CLOSED 2026-09-26, FIXED, MERGED (`2d78f71`) — not a reference leak: glibc malloc kept the freed expert clones (live tensors flat, `malloc_trim(0)` handed back 5.5 GB). Non-EXL3 module-list was denied the slab arena ("never measured"), so DeepSeek cached through the double-clone path. `6596c49` gives it the arena on CUDA. Through the probe's monkeypatched predicate (same answer for DeepSeek): RSS flat over 128 decode tokens, greedy ids identical over 48. On the committed code: server smoke 9/9 (RSS 26.67 GB at the last token). MiniMax never leaked (it already had the arena). See the S5-M row below** | S5 made DeepSeek serving reachable, and this capped it at ONE request per server process | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) · RESULTS `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` |
-| **S5-M-H** | **DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts** — S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
+| **S5-M-H** ✅ | ~~**DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts**~~ **CLOSED 2026-09-26, PASS (measurement, no change; branch `s5mh-long-prompt-headroom`, not merged) — one server process served 4,019 then 8,018 prompt tokens, both 200 (TTFT 166.9 s / 296.6 s). cgroup peak 27.36 GB = 3.78 GB margin to the 31.14 GB cap; the peak is the first request's warm-up (set inside A's first 512-token chunk), and no host-RAM column grows with prompt length at ≤ 8k (malloc free ≤ 0.47 GB, no clone churn). Host `MemAvailable` min 1.63 GB — noted, not a FAIL. See the S5-M-H row below** — was: S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
 | **S5-W** | **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
 | **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
@@ -103,7 +103,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S5-M-H** — then **S5-W**, **S5-P**, then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H put first by the user the same day)
+## ▶▶ PICK THIS NEXT: **S5-W** — then **S5-P**, then **S6**. ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). **Every session in this run starts with the S5-R check**
@@ -254,8 +254,56 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     probe 1's flat `m_mmap`; drop `put()`'s redundant second clone (halves the churn, does not end it);
     or a pageable `SlabArena` for arena-less layouts. Unblocks when a CPU-compute model is run here,
     or the fallback is seen in a log.
-  - [ ] **S5-M-H — DeepSeek's RAM headroom on the arena path is unmeasured for LONG prompts** (**Sequence:
-    FIRST of the remaining S5 run**, set by the user 2026-09-26. Handoff:
+  - [x] **S5-M-H — DeepSeek's RAM headroom on the arena path is unmeasured for LONG prompts** (**Sequence:
+    FIRST of the remaining S5 run**, set by the user 2026-09-26.) **CLOSED 2026-09-26, PASS — a
+    measurement, no engine change** (branch `s5mh-long-prompt-headroom`, NOT merged).
+    - **Pre-work:** S5-R check = all five artefacts present → S5-R stays `[!]`, so the run used the
+      clean-download view. Handoff anchors re-verified against `3e9f4c9`. One handoff figure was wrong:
+      code tokenizes at **3.85** chars/token with DeepSeek's `tokenizer.json`, not 3.3. The probe cut
+      the prompts by the tokenizer instead.
+    - **Run:** one server process (`create_app` + `TestClient`), detached unit `MemoryMax=29G`,
+      `MemorySwapMax=0`, per-second in-process sampler plus an external host `MemAvailable` sampler.
+      Arena 1,652 × 13.4 MB = 22.11 GB pinned (ceiling 21.86 GB from `available` 25.62); derived
+      `max_seq_len` 16,766.
+    - **Both requests returned 200:**
+
+      | request | prompt_tokens | TTFT | per 512-token chunk | decode |
+      |---|---|---|---|---|
+      | A | 4,019 | 166.9 s | 20.2–21.4 s | 2.85 s/tok |
+      | B | 8,018 | 296.6 s | 16.6–19.1 s | 2.81 s/tok |
+
+      B's chunks found ~16 % of their experts in the RAM cache A's decode filled (A's: 0 %); coincident
+      with B's faster chunks, not isolated as the cause.
+    - **Headroom: cgroup peak 27.36 GB** (in-process `memory.peak` = `MemoryPeak` 27,360,894,976 B =
+      journal `25.4G`) → **3.78 GB margin** to the 31.14 GB cap. PASS needs ≥ 1 GB. Not borderline
+      (the repeat rule is < 2 GB), so one draw stands.
+    - **The peak is the FIRST request's warm-up, not prompt length.** It was set 9 s into A's first
+      512-token chunk, with `RssAnon` 0.97 → 2.75 GB. Nothing later exceeded it: 23 more chunks, 2× the
+      prompt, and both decodes. Peak RSS was 27.10 (A prefill) vs 27.10 (B prefill), `VmHWM` 27.24.
+    - **Hypotheses:**
+      - **(1)** The legacy per-chunk loop is what runs; its cost is time, not RAM.
+      - **(2)** Staging-fallback clone churn was NOT seen. malloc free stayed 0.14–0.47 GB over all 24
+        prefill chunks, 17 of them before the run's only engine `malloc_trim` (`vaayu_base.py:5451`,
+        every 32 passes). S5-M's clone path went 2.52 → 5.51 GB.
+      - **(3)** No per-prompt-token host cost is measurable at ≤ 8k: `RssAnon` peak 2.96 → 3.09 GB for
+        +3,999 tokens, inside the decode jitter.
+      - **(4)** Pinned stays flat at 23.74 GB (arena + 1.63 GB).
+    - **→ No prefill reserve is needed in `derive_expert_ceiling` up to 8k. Nothing built.**
+    - **Observation, NOT a FAIL** (outside this item's question; the user opened **S5-M-HR** for it, below): the
+      HOST-level margin is thinner than the cgroup one.
+      - host `MemAvailable` min **1.63 GB**;
+      - `SwapFree` 4.72 → 4.57 GB, i.e. ~0.15 GB of OTHER processes swapped out (the unit used 0 swap).
+      - Cause: the 3.5 GiB reserve left after the arena is ~2.1 GB consumed by this process's own
+        prompt-independent warm-up. Because the ceiling tracks `available`, that ~1.6 GB host margin
+        holds at any load-time `available`.
+    - **§8:** n/a — no change; the measurement ran through the server at N=1, its only mode.
+    - **Scope:** DeepSeek only. No suite or gate run (no code change). No fused-EXL3 arm and no dense
+      gate; neither claimed. The real model dir had 0 files newer than the launch. Not measured: > 8k
+      and N>1.
+    - Detail: `docs/2026-09-26-S5-M-H-long-prompt-headroom-RESULTS.md`; evidence
+      `docs/evidence/2026-09-26-S5-M-H-{long-prompt.log,host-meminfo.log,probe.py}` (all gitignored).
+
+    **Original row text:** Handoff:
     [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md).) (review of
     S5-M, 2026-09-26). The arena is pinned at load at host `available` − 3.5 GiB
     (`derive_expert_ceiling`, `vaayu_base.py:355`; no prefix reserve, since DeepSeek's cache has no
@@ -264,6 +312,37 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     Vaayu's workload is prefill-heavy. **Closes when:** one long-prompt DeepSeek server request (4-8k
     tokens) completes with RSS recorded per token. If it OOMs, the fix is a MEASURED prefill reserve in
     the derivation — never a blind cut to the ceiling (handoff §6).
+  - [ ] **S5-M-HR — the HOST RAM left after the expert arena is ~1.6 GB, not the 3.5 GiB the reserve
+    names** (opened by the user 2026-09-26 from S5-M-H's observation. **Not in THE SEQUENCE**; the user
+    places it.)
+    - **Measured (S5-M-H, DeepSeek-V4, server path):**
+      - `derive_expert_ceiling` (`vaayu_base.py:355`) pins the arena at host `available` −
+        `_EXPERT_CEILING_RESERVE` (3.5 GiB = 3.76 GB, `:352`). DeepSeek has no prefix pool, so that is
+        the whole reserve.
+      - The process's own FIRST-REQUEST warm-up then spends ~2.1 GB of it: `RssAnon` 0.97 → ~3.0 GB,
+        inside request A's first 512-token chunk. It did not grow with 2× the prompt.
+      - Host `MemAvailable` min **1.63 GB** (1.63–2.10 through both requests); `SwapFree` 4.72 → 4.57
+        GB, so the kernel swapped ~0.15 GB of OTHER processes out. The unit was capped at 0 swap and
+        used 0.
+      - The cgroup margin was 3.78 GB (peak 27.36 of 31.14). The 29 GiB cap is the harness's; a real
+        server runs uncapped and lives on the host figure.
+    - **Why it holds at any load:** the ceiling tracks `available`, so the post-warm-up host margin is
+      ~reserve − warm-up ≈ 1.6 GB whatever `available` reads at load. It is thin, not negative: nothing
+      OOMed.
+    - **Unknown (measure before any fix):**
+      - what the ~2.1 GB warm-up is (not decomposed; the non-expert LRU is ≤ 0.5 GB of it);
+      - whether it has the same size on Qwen3-Next and MiniMax;
+      - on models WITH a prefix pool, whether the warm-up eats into the pool's reserved sessions or the
+        OS's share.
+    - **Fix shape, if one is warranted:** DERIVE a warm-up term into the reserve from a measured
+      post-first-request growth, with a test over two geometries (CLAUDE.md §5). Or WARN at load when the
+      post-warm-up margin is under a stated floor. **Never** a blind raise of `_EXPERT_CEILING_RESERVE`
+      or cut to the ceiling.
+    - **Closes when:** the warm-up is decomposed and measured on ≥ 2 models, and either the reserve
+      derives it or the ~1.6 GB margin is written down as accepted. **§8 on a fix:** no new knob
+      expected; the derivation already runs in every server load.
+    - Evidence: `docs/2026-09-26-S5-M-H-long-prompt-headroom-RESULTS.md` §5,
+      `docs/evidence/2026-09-26-S5-M-H-host-meminfo.log`.
   - **Evidence** (clean-view server smoke, detached unit `MemoryMax=29G`; log kept at
     `docs/evidence/2026-09-26-S5-M-clean-view-smoke-oom.log`):
     - `test_health` and `test_non_stream` PASSED;
@@ -282,7 +361,7 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     rises +1.49 GB over tokens 16→24 with the cache flat. That is a leak or unbounded accumulation of
     ~0.18–0.19 GB/token (as read at filing; measured cause: glibc malloc retention, above). At that rate no budget survives a long answer.
   - **Secondary:** `derive_expert_ceiling` (`vaayu_base.py:355`) uses host `available` minus 3.5 GiB, and
-    reserves nothing when the prefix cache is off. (Now tracked as the open **S5-M-H** above.)
+    reserves nothing when the prefix cache is off. (Tracked as **S5-M-H** above — closed 2026-09-26, PASS: no prefill reserve needed up to 8k.)
   - **Ranked suspects (as filed — ALL FIVE REFUTED 2026-09-26 by the measurements above):**
     1. evicted module-list CLONES still referenced;
     2. pinned-host caching-allocator growth from streaming non-expert layers 8–42 every token;
