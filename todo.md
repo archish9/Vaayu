@@ -59,7 +59,60 @@ detail each entry points to.**
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S1…S6, set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"); S5-M-H inserted before S5-W by the USER 2026-09-26. One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S7…S10, set 2026-09-26 at the USER's request ("do all these in fresh sessions"). One per fresh session, in order. ◀◀◀
+
+**HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row below that is not ✅**. Read its
+handoff in full, re-verify its evidence against HEAD, mark its `todo.md` row `[~]`, and work it. When
+it closes: mark ✅ in this table with a one-line verdict, `[x]` its row below, update the suite floor if
+it moved, and point the PICK THIS NEXT line at the next row. **Do not reorder without a reason written
+here.** **After S10:** re-prioritise with the user (the long tail is listed under "After S1…S6" in the
+old table below).
+
+**Ordering rule** (the same as S1…S6): *(a)* helps the model that serves the agent (Qwen3-Next), *(b)*
+the biggest multiplier a user can reach at N=1 (CLAUDE.md §8), *(c)* cheap, and last *(d)* a bug no
+server user can reach. All four were surfaced by S6's decomposition (2026-09-26).
+
+| # | item | why here | cost | handoff |
+|---|---|---|---|---|
+| **S7** | **Qwen3-Next per-expert dispatch** — ~66 ms of the 0.112 s decode token (57 %), 0.138 ms × 480 slots; a VRAM HIT still dequantizes the packed int4 expert to ~6.3 MB of dense bf16 before three M=1 `F.linear` calls | (a): the production model's largest term; no row covers it, SETTLED refutes nothing | ~1 day measure; build unknown | [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md) |
+| **S8** | **gpt-oss-20b at 0.17 tok/s on a model that FITS the GPU** — stock peaks at 13.79 GB VRAM; Vaayu streams 13.28 GB/token, and `compute` 5.2 s of 5.8 s includes a per-visit MXFP4 swizzle. Split the 5.8 s, then the user picks: pin it whole / cache the converted layer / A6 | (b): ~100× projected (→ ~20 tok/s); it already serves | hours to measure; route cost varies | [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md) |
+| **S9** | **DeepSeek `wo_a` folded on the CPU every token** — 1.42 s of 3.06 s (46 %); fold on the GPU instead, which should be bit-identical (= S6 lead **L-a**) | (c): cheap, ~1.9× on DeepSeek, but a fixture model | hours + one ~10 min A/B | [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md) |
+| **S10** | **refuse `use_torch_compile=True`** (warn-and-disable) instead of crashing, and correct `config.py:328`'s false reason (= **row 48**, fix (b)) | (d): a real bug, but the server declines the knob, so no server user reaches it | hours | [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md) |
+
+**Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
+- [ ] **S7 — Qwen3-Next per-expert dispatch.** Evidence (r36recheck1, pre-S3): U 0.1123 s, NOEXP
+      0.0368 s, bytes ~9 ms, so dispatch ≈ 0.138 ms/slot ≈ 66 ms/token. Per slot (`moe_patch.py:2329-2413`):
+      gather, `expert_weights_from_entry` (compiled int4 dequant, 31.8 µs even on a VRAM hit), 3 `F.linear`,
+      scale, append; plus 48 blocking `expert_indices.cpu()` syncs per token (`:2317`). Steps: re-baseline at
+      HEAD (NOEXP arm) → U-level decode-only census → price L1 (fused w4a16 MoE decode kernel reading the
+      packed blob), L2 (dense cache for hot experts), L3 (host trim); L4 = CUDA graphs stays PARKED (row 36)
+      → brainstorm → user approval → build. **Stop if the pool is < 25 % of T at HEAD, or the best lever's
+      ceiling is < 5 % of the real token.** Done = ABBA ≥ 2 % (else revert), greedy ids identical, D6 band,
+      expert-id accumulation order kept, gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next
+      server smoke). §8: no knob (S3 precedent), reachable at N=1.
+- [ ] **S8 — gpt-oss-20b: attribute the 5.8 s, then the user picks a route.** It runs the FOURTH forward
+      `_make_whole_layer_sparse_forward` (`moe_patch.py:2090`), which is NOT in CLAUDE.md's dispatch table.
+      **CLAUDE.md §0/§5 still say "NOT YET RUN / G1"; that is stale since A3 (2026-09-21).** Evidence (A3):
+      decode 0.17 tok/s = 5.8 s/token, 13.28 GB/token (the whole model), `compute` 5.2 / `io_wait` 0.3 s,
+      eager attention, a Hub kernel fetched at run time; stock transformers peaks at **13.79 GB of 16.31**.
+      That forward already short-circuits a PINNED layer. Steps: load log (why is nothing pinned — the eager
+      floor?) → split read / conversions (`_populate_fused_experts`) / `original_forward` / release → price
+      **R-A pin whole** (costs context), **R-B cache the converted layer**, **R-C A6 per-expert MXFP4
+      streaming** (~3 days) → the USER picks. Traps: row 40 `[bug]` goes LIVE (experts 10.17 GB < arena);
+      R-C must not reach the twin cast. Done = logits bit-identical to stock (A3's sha bar), server 9/9,
+      gates.
+- S9 = the S6 row's **L-a** `[ ]` (not duplicated here). Fix: fold `wo_a` on the device
+      (`vaayu_deepseek_v4.py:344` folds it on the CPU today). **Stop if the device fold is not bit-identical
+      to the CPU fold.** Re-baseline first: 0.3267 predates S5-M's arena. Rejected: a RAM cache of the folded
+      bf16 (2.35 GB against S5-M-H's 3.78 GB margin).
+- S10 = **row 48** `[bug]`, fix (b) (not duplicated here). The guard lives at `vaayu_base.py:2180-2189` and
+      the compiled call at `:5332-5339` — row 48's own line numbers are stale. Fix the declined-reason text at
+      `config.py:328` and `test_engine_param_reachability.py:65`. It also closes the duplicate `[bug]` bullet
+      near row 28b.
+
+---
+
+# ▶▶▶ ~~THE SEQUENCE — S1…S6~~ — **COMPLETE 2026-09-26; history, not the queue — the live queue is S7…S10 above.** Set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"); S5-M-H inserted before S5-W by the USER 2026-09-26. One per fresh session, in order. ◀◀◀
 
 **Each S-item has its own self-contained HANDOFF in `docs/superpowers/specs/` — gitignored, so THIS
 row is the durable copy of why it exists and what "done" means.** Read the handoff first; it carries
@@ -83,7 +136,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5-M-H** ✅ | ~~**DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts**~~ **CLOSED 2026-09-26, PASS (measurement, no change), MERGED (`bc69193`) — one server process served 4,019 then 8,018 prompt tokens, both 200 (TTFT 166.9 s / 296.6 s). cgroup peak 27.36 GB = 3.78 GB margin to the 31.14 GB cap; the peak is the first request's warm-up (set inside A's first 512-token chunk), and no host-RAM column grows with prompt length at ≤ 8k (malloc free ≤ 0.47 GB, no clone churn). Host `MemAvailable` min 1.63 GB — not a FAIL; opened as the unsequenced **S5-M-HR** row. See the S5-M-H row below** — was: S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
 | **S5-W** ✅ | ~~**Vaayu still writes bytecode into a DeepSeek model dir**~~ **CLOSED 2026-09-26, FIXED — `no_bytecode()` holds `sys.dont_write_bytecode` around both `exec_module`s (the runtime `kernels()` and the parity harness); 4 new tests (RED→GREEN + a mutation-verified restore test). S5-R done the same session (user-authorised agent restore), so the proof is on the REAL dir and non-vacuous: DeepSeek files, a library load + generate and a server smoke 9/9 all left it byte+mtime identical with no `__pycache__`. Suite `2952 passed, 0 failed, 0 errors, 20 skipped`. Review: ready to merge, 5 minors all fixed. MERGED (`41b7488`). See the S5-W row below** — was: **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
 | **S5-P** ✅ | ~~**S5's deferred minors**~~ **CLOSED 2026-09-26, FIXED — an unloadable encoder now WARNs + 400s instead of stopping the load; the hook answers None before `init_model`; `documentation/server.md` has the §9 row, the §6.6 sentence, and §3's `refused` list corrected (user-approved). Suite `2955 passed, 0 failed, 0 errors, 20 skipped`. MERGED (`5fbb5c6`). See the S5-P row below** — was: an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
-| **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
+| **S6** ✅ | ~~**row 28's reach-projection METHOD does not hold**~~ **CLOSED 2026-09-26, METHOD CORRECTED — one MISSING term, not a mis-sized one: row 28 never checked whether the non-expert weights fit the VRAM pin budget. On DeepSeek, 35 of 43 layers streamed 5.496 GB/token of non-expert weights through `inject_to_gpu` = `gpu_load` 2.20 s of the 3.06 s token (72 %), and 1.42 s of that is the CPU re-running `dequantize_at_load(wo_a)` on every streamed layer, every token. The handoff's three explanations did NOT reproduce: the expert bytes were HALVED by the caches (1.786 of 3.449 GB), not inflated by re-reads; row 28's 54 % miss assumption was right (51.8 %); and "2.7 s of 3.9–4.0" was the Uspin diagnostic arm, not GPU work. Corrected method cross-predicts DeepSeek 0.440 tok/s (+35 %; old 5.3–7.0×), Llama-70B +9 %, MiniMax −17 %, spec-decoding bound −4.8 %; Qwen3-Next misses 0.43× cross-forward (its dispatch constant has no donor) — the stated blind spot. gpt-oss-20b (already serving at 0.17 tok/s since A3): regime R like DeepSeek — whole model streamed per token + a per-visit MXFP4 swizzle; A6's per-expert streaming could take it to ~20 tok/s dispatch-bound. See the S6 row below** — was: it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
 **Suite floor for every one of them: `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
 FOREGROUND; set 2026-09-26 by S5-P's +3 tests) — was `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
@@ -107,7 +160,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S6** (user, 2026-09-26). ◀◀ (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). ◀◀ (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
@@ -123,6 +176,111 @@ no `auto_map`, no copied `.py`, no `__pycache__`. Keep it that way — nothing m
 **S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **S4 closed 2026-09-26, FIXED** (the 46 DeepSeek-V4 tests are green — row below). **The sequence resumes at S5** — DeepSeek-V4 ships no `chat_template`, handoff [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) — then **S6**. **The suite floor is now `2928 passed, 0 failed, 0 errors, 16 skipped`** (208.49 s; +46 restored and +3 new from S4, 2026-09-26) — green, so any failure is new.
 
 **One live lead S1-L1 did NOT chase, still open in the S1 row below: S1-L2** (96.5 pageable DtoH per decode forward). **S1-L3** (`fla` is not installed) is now answered in part by S3: `fla` was measured at the three seams and REJECTED for decode (−2 %, Python wrappers eat the launch savings), and its prefill chunk kernel is banked as **S3-C** (0.36 → 0.03 s per 2k prompt, ~2 % TTFT) rather than installed.
+
+---
+
+## S6 — `[x]` the reach-projection method, corrected and back-tested. **CLOSED 2026-09-26. No engine code changed, no on-device run. Suite not re-run: nothing under `vaayu/` or `tests/` was touched (floor stays `2955 passed, 0 failed, 0 errors, 20 skipped`).**
+
+**Root cause — one MISSING term, not a mis-sized one.** Row 28 (2026-09-12) and row 28b step 1 both
+projected DeepSeek-V4 as if every non-expert weight were VRAM-resident. Row 28 wrote the assumption down
+(`docs/2026-09-12-row28-…-VERDICT.md` §4.3: "dense weights are 8.24 GiB … and those have to be
+VRAM-resident"). **They were not.** `attn='eager'` raises the planner's reserve floor to 8.03 GiB to buy
+back flash-parity context (`reserve_floor_bytes`, `vram_plan.py:538`), leaving a **3.33 GiB pin budget**.
+Embed, head and 8 layers used it; **35 of 43 layers streamed their non-expert weights, 5.496 GB/token**.
+The fallback RAM tier is an LRU of `_ne_budget` = 0.5 GB, and on a 5.5 GB cyclic scan it hits 0 %, so
+every byte comes from the drive every token. Measured U1 (3.061 s): **`gpu_load` 2.20 s (72 %)** —
+`inject_to_gpu` of those layers, NOT GPU work (`vaayu_base.py:5236-5241`, `:5275-5280`). **1.42 s of it
+(46 % of the token) is the CPU re-running `dequantize_at_load(wo_a)`** (40.6 ms per layer, microbenched
+2026-09-26 on layer 10), because a streamed layer is re-loaded every token. The rest moves ~6.67 GB at
+8.6 GB/s. Compute + expert work is 0.68 s; `other` 0.21 s is unattributed.
+**A4 check 2 had the residency finding BEFORE the run** ("0 non-expert-pinned") but concluded "RAM-cached
+re-reads, not per-token NVMe streaming". That conclusion was wrong: the 0.5 GB LRU never hits.
+
+**The handoff's three explanations did NOT reproduce** (raw data re-read: `decode-deepseek.json`, 384
+forwards; `/tmp/a57c-row26.log`):
+- **(1) "~2× bytes from re-reads" — WRONG.** Expert bytes from disk were **1.786 GB/token = 0.52× the
+  3.449 GB working set**: the caches halve them. The extra **5.496 GB is non-expert**, constant to ±1 MB
+  on every token of every arm, and it equals layers 8–42's summed non-expert bytes (5.494 GB).
+- **(2) "thrashing, ~20 % hit" — WRONG.** 20 % is the RAM tier's hit rate among VRAM misses. The combined
+  hit rate is 48 %, and row 28's assumed 54 % miss was right (measured 51.8 %).
+- **(3) "2.7 s of a 3.9–4.0 s token was GPU work" — WRONG.** Those figures are the **Uspin** diagnostic arm.
+  U1 is 2.20 of 3.06 s, and that is the non-expert inject, not per-expert H2D/dequant: all per-expert
+  work is 0.58 s (19 %).
+- Also stale: the §3 row-36 census (superseded by S1: 84 HtoD/token; S3: 4,586 launches / 15.9 ms per
+  `serial`). MiniMax **1.794** is a 2026-09-03 server figure, and the same checkpoint's U arm measures
+  2.081 (09-23). Llama-70B **0.155** is from 2026-08-16, and it measures **0.3044 on 2026-09-21**.
+
+**THE METHOD (durable copy):**
+```
+T_token = T_fixed + T_ne + T_slot + T_h2d + T_disk            (s / decode token, N=1)
+T_fixed = L · c_layer                                          resident non-expert work
+T_ne    = N_stream · (b'/R_inject + x)                         NEW — non-expert OUTSIDE the pin budget
+        + N_disk · max(0, b/R_read − (b'/R_inject + x + c_layer))   (prefetch is one layer ahead)
+T_slot  = S · c_slot(forward)          T_h2d = S · (1−h_v) · e / R_h2d          T_disk = φ · S · m · e / R_busy
+```
+Steps: **(1) residency FIRST.** Non-expert bytes (headers) against the `pinning budget` a ~5 s load
+prints (`[Vaayu-VRAM]` / `[Vaayu-Pin]`). The budget depends on the kernel as well as on geometry:
+10.57 / 9.09 / 10.78 GiB on Qwen3-Next / MiniMax / Llama-70B at the 3.50 GiB floor, 3.33 on DeepSeek
+under `eager`. A streamed layer is read from the DRIVE every token unless its RAM tier holds the whole
+streamed set. **(2) transforms.** Every load-time weight transform in the model code
+(`DEQUANTIZE_AT_LOAD`, casts, repacks) runs again per token on every streamed layer; CPU-microbench it.
+**(3) routing.** At 8–16 % per-layer cache coverage, `m` ≈ 50–55 % and `h_v` ≈ 28–37 %, on three
+checkpoints, DeepSeek out-of-sample. No rule exists above that (Qwen3-Next: 30–47 % coverage — its tiers overlap — `m` 2–3 %).
+If the whole expert set fits the RAM tier, `m` → 0. **(4) name the binding term:** **R**
+residency-bound (DeepSeek, dense 70B), **D** expert-byte-bound (MiniMax), **G** dispatch-bound
+(Qwen3-Next).
+Constants: hardware `R_busy` 6.14, `R_read` 6.2, `R_pcie` 20.1 GB/s. Per forward: `c_layer` 0.77–0.84 ms
+(three checkpoints); `c_slot` **0.138** fused non-EXL3 / **0.438** module-list EXL3 / **0.588**
+module-list fp4 ms; `R_inject` 15.7 (EXL3 path) / 8.6 (Standard path, DeepSeek) GB/s; `R_h2d`
+(experts) 14.8 arena / 8.1 clone path; `φ` 0.23 MiniMax / 0.50 DeepSeek.
+
+**Back-test** (tolerance: binding term right AND within **1.5×** cross-predicted, ±10 % in-sample. 1.5×
+because it is 3.5–4.7× tighter than the error being fixed, the borrowed software constants themselves
+span 1.8–4.3× between forwards, and engine drift on an unchanged checkpoint is the same size: MiniMax
++20 % in 12 days, Llama ×1.96 in 36):
+
+| figure | cross-predicted (constants from elsewhere) | in-sample | binds | verdict |
+|---|---|---|---|---|
+| DeepSeek 0.3267 | **0.440 (+35 %)**; with `T_ne` dropped = row 28's error: 2.36 (+623 %) | 0 % (by construction) | `T_ne` | PASS |
+| MiniMax 1.731 (1.794 server) | **1.440 (−17 % / −20 %)**; with DeepSeek's clone-path `R_h2d`: 1.07 (−38 %) | +6 % | expert terms | PASS |
+| Qwen3-Next 8.91 (9.06) | **3.83 (−57 %)** — `c_slot` borrowed from module-list; no donor exists | −4 % | `T_slot` | **MISS 0.43× cross-forward — the stated blind spot** |
+| Llama-70B 0.3044 (09-21) | **0.332 (+9 %)**, `R_inject` = `R_pcie` | +2 % | `T_ne` | PASS |
+| Llama-70B 0.155 (08-16) | not retrodictable — no decomposition survives; the same checkpoint is 1.96× faster on today's engine | — | — | MISS, stated |
+| spec decoding 5.57× | ≤ tokens/round = **5.30× (−4.8 %)**; a verify pass streams `T_ne` once | — | `T_ne` | PASS |
+
+**Blind spot:** in the dispatch-bound regime, `c_slot` is software with no hardware-derived substitute.
+A new checkpoint on an existing forward inherits that forward's `c_slot`; a new forward needs one
+profiled arm first. **N>1 is not modelled** (MiniMax's 2.94–3.28 at N=3) — not reachable through the
+server (§8).
+
+**gpt-oss-20b, one line (CORRECTED same day — the first version said "cannot load, G1", which is
+STALE: A3 closed 2026-09-21 and it serves at 0.17 tok/s):** TODAY it is **regime R, the same failure
+as DeepSeek**. Whole-layer delivery streams the entire model every token (13.28 GB/token; embed and
+head do not fit the pin budget). The byte floor is 13.28 / 6.2 ≈ 2.1 s → **≤ 0.47 tok/s**; measured
+**5.8 s** (`compute` 5.2 s, `io_wait` 0.3 s). The ~3.7 s gap is the method's `x` term: the per-visit
+`Mxfp4Deserialize` swizzle, GPU-side and not yet separated (A6's first measurement). So the method names
+the regime and the binding term, but it gives only an upper bound until `x` is measured. **What A6 could
+buy:** per-expert streaming + resident non-expert weights puts it dispatch-bound at ~0.049 s/token
+≈ 20 tok/s (fused forward's `c_slot`; whole expert set fits the RAM tier), pending the MXFP4 dequant
+cost per slot.
+
+**Leads recorded, NOT chased (stop rule) — unsequenced, re-prioritise with the user:**
+- [ ] **L-a — SEQUENCED AS S9 (2026-09-26). DeepSeek re-dequantizes `wo_a` on the CPU every token: 1.42 s/token (46 %).** Keeping the
+      folded bf16 (35 × 67 MB ≈ 2.35 GB RAM), or folding on the GPU, removes it. Ceiling ≈ 0.6 tok/s.
+- [ ] **L-b — DeepSeek's reserve floor may be over-charged.** 8.03 GiB comes from charging `eager` a
+      materialized-score term. DSA attends to `index_topk` selected keys, so whether its real peak
+      materializes S×S scores is UNVERIFIED. If it does not, up to 4.53 GiB of pin budget ≈ 30 more
+      resident layers ≈ −1.9 s/token, traded against context length. Needs a VRAM measurement.
+- [ ] **L-c — the planner's VRAM priority is unpriced.** DeepSeek's expert VRAM tier (3.5 GB) hits 34.9 %,
+      while the non-expert layers it streams are used on 100 % of tokens.
+- [ ] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
+      amortise that share (row 37's re-gate).
+- Note: the 0.3267 predates S5-M (arena on CUDA), so today's DeepSeek decode is unmeasured.
+
+**§8:** (1) no knob — no engine behaviour changed. (2) nothing to plumb; the method is the gitignored
+probe `plans/probes/s6_reach_method.py` (no GPU, reproduces every number above). (3) all figures are N=1
+decode, the server's only mode. (4) n/a.
+Detail: `docs/2026-09-26-S6-reach-projection-method-RESULTS.md` (gitignored).
 
 ---
 
@@ -1072,7 +1230,7 @@ a valid test of it** — 0.1.10 imports fine and dies at kernel COMPILE, 0.1.12+
 shared memory against this card's 101,376 B ceiling; `block=32` misses by only 3,072 B, so trimming
 3 KiB is the first optimisation if step 5 shows the ¼-size tile hurts. **(3) A5 is REACH, not speed:**
 3.2124 GiB/token of routed experts caps decode at **~1.75–2.06 tok/s** — MiniMax-class, ~5× slower
-than Qwen3-Next. **No download was needed; the pip install was authorised by the user 2026-09-23.**
+than Qwen3-Next. **[S6 2026-09-26: this projection is REFUTED — measured 0.3267 tok/s. It omitted the non-expert weights that do not fit the VRAM pin budget (35 of 43 layers streamed, 72 % of the token). Use the S6 method, not this figure.]** **No download was needed; the pip install was authorised by the user 2026-09-23.**
 
 **With 46 closed, the queue below is down to ONE row, and it is the weeks-long REACH item.**
 
@@ -2212,7 +2370,7 @@ the unchanged baseline. Detail:
 - **Decode ceiling re-derived, and it prices A5 as REACH not speed:** 43 × top-6 = 258 routed
   slots/token × 12.750 MiB = **3.2124 GiB/token** → **~2.06 tok/s** at the NVMe plateau (7.1 GB/s,
   2 readers), **~1.75 tok/s** at the 1-reader 6.0–6.4 GB/s in-path rate. Consistent with row 28's
-  2.1–2.3. That lands near MiniMax, ~5× slower than Qwen3-Next.
+  2.1–2.3. That lands near MiniMax, ~5× slower than Qwen3-Next. **[S6 2026-09-26: this projection is REFUTED — measured 0.3267 tok/s. It omitted the non-expert weights that do not fit the VRAM pin budget (35 of 43 layers streamed, 72 % of the token). Use the S6 method, not this figure.]**
 - **NOT established by this gate:** anything in `model.py` (only `kernel.py` was exercised) — the
   MLA/DSA modeling code, key remap, dual dequant and MLA KV sizing are all step 2+.
   `fast_hadamard_transform` is still absent but `kernel.py` never imports it: a step-2 concern.
@@ -3258,7 +3416,7 @@ and both have a golden reference or a Vaayu precedent.
       (pinning half) and Check 2 (**~1.01 GiB shared + ~135 MB hc + ~5.33 GiB attention** vs the pin
       budget; Phase 2 **`break`s** on miss at `vaayu_base.py:3956` — count the layers); then row 28b
       step 5's measurement. **§8: answer all four.** **Expect ~1.75–2.06 tok/s** (3.2124 GiB/token
-      ÷ the NVMe plateau) — **A5 buys REACH, not speed; ~5× slower than Qwen3-Next. Do not present
+      ÷ the NVMe plateau) **[S6 2026-09-26: this projection is REFUTED — measured 0.3267 tok/s. It omitted the non-expert weights that do not fit the VRAM pin budget (35 of 43 layers streamed, 72 % of the token). Use the S6 method, not this figure.]** — **A5 buys REACH, not speed; ~5× slower than Qwen3-Next. Do not present
       it as a perf win.**
 
       **DESIGN, the durable copy (2026-09-24). Re-verification of this row against the disk first —
@@ -3382,7 +3540,7 @@ and both have a golden reference or a Vaayu precedent.
       `--ckpt`** — add a `"deepseek"` entry to its hardcoded `MODELS` dict and run
       `MODEL=deepseek BALLAST_GB=25` (it hardcodes `delete_original=False`, verified, so it cannot
       eat the checkpoint). **Expect ~1.75–2.06 tok/s — REACH, not speed, ~5× slower than
-      Qwen3-Next. TTFT is NOT comparable to MiniMax's post-row-45 figure** (eager keeps the
+      Qwen3-Next. **[S6 2026-09-26: this projection is REFUTED — measured 0.3267 tok/s. It omitted the non-expert weights that do not fit the VRAM pin budget (35 of 43 layers streamed, 72 % of the token). Use the S6 method, not this figure.]** TTFT is NOT comparable to MiniMax's post-row-45 figure** (eager keeps the
       chunk-major branch shut, so a 4k prompt re-reads its expert set 8×).
       **BANKED OUT OF SCOPE, as their own rows before this branch closes:** (a) the **fused
       forward's twin cast** — `_make_fused_sparse_forward`'s injector casts the same way and
@@ -3500,6 +3658,10 @@ and both have a golden reference or a Vaayu precedent.
       **Verdict against the ~1.75–2.06 tok/s prediction: REFUTED, not confirmed — measured ~0.32–0.33
       tok/s is 5.4–6.4× SLOWER than the prediction's low end**, not the ~5× (vs Qwen3-Next) the row
       called REACH-not-speed and accepted going in — this is slower even than that acceptance covered.
+      **[S6 2026-09-26: the explanation in this paragraph is WRONG — see the S6 row. The ~2× bytes are
+      non-expert weights of 35 streamed layers (5.496 GB/token), not expert re-reads, and the caches
+      HALVED the expert stream. `gpu_load` is their inject — mostly CPU `dequantize_at_load(wo_a)` —
+      not GPU work. The "2.7 of 3.9–4.0 s" figures are the Uspin arm; U1 is 2.20 of 3.06 s.]**
       **One-sentence explanation from the log's own per-token `[VAAYU-IO] token summary` lines:** bytes
       moved per token sit at **~7.0–7.8 GB, roughly 2× the 3.2124 GiB/token projection**, with the
       expert RAM cache pinned at **~20% hit_rate** (evict count tracking miss count 1:1 — a thrashing
@@ -3542,6 +3704,10 @@ and both have a golden reference or a Vaayu precedent.
       A4 check 2's finding (also closed below, in the A4 checks section).
 
 - [!] **The fused forward's twin cast — BLOCKED 2026-09-25, decided out of scope by the user.**
+      **[S6 2026-09-26: the blocker named below is STALE. gpt-oss has loaded and served since A3
+      (2026-09-21), through a FOURTH forward, `_make_whole_layer_sparse_forward`, which never calls
+      `_expert_dense_weights`. So the cast is still unreachable by gpt-oss, but the thing that would
+      make it reachable is A6 (per-expert MXFP4 streaming), not G1.]**
       `_make_fused_sparse_forward`'s own expert injection casts streamed tensors to the running dtype
       exactly as `_inject_expert_weights` did before A5.7c — same defect class, a different forward,
       and a different FUNCTION: the fused cast lives in `_expert_dense_weights`
@@ -3569,7 +3735,14 @@ and both have a golden reference or a Vaayu precedent.
       decision about raising mid-decode (today a dropped expert degrades output silently; a raise
       would kill the request instead). Not started.
 
-- [ ] **Row 28's reach-projection METHOD does not hold on DeepSeek-V4-Flash, measured 2026-09-25
+- [x] **CLOSED 2026-09-26 by S6 — METHOD CORRECTED; see the S6 row at the top. THIS ROW'S "why" IS
+      WRONG AND MUST NOT BE RE-COPIED:** the ~2× bytes are **non-expert weights** (35 of 43 layers were
+      outside the 3.33 GiB pin budget: 5.496 GB/token read from the drive), not expert re-reads — the
+      caches HALVED the expert stream to 1.786 GB. The ~20 % is the RAM tier's hit rate among VRAM
+      misses (combined 48 %; row 28's 54 % miss assumption held at 51.8 %). `gpu_load` is the inject
+      of those streamed layers, 65 % of it CPU `dequantize_at_load(wo_a)`, not GPU work. And "3.9–4.0 s"
+      is the Uspin arm; U1 is 3.06 s. Original text:
+      **Row 28's reach-projection METHOD does not hold on DeepSeek-V4-Flash, measured 2026-09-25
       (A5.7c Task 6) — a correction to the METHOD, not just this one model's number.** Row 28
       projected decode from `bytes/token ÷ delivered NVMe GB/s` = **3.2124 GiB/token** for this
       checkpoint, giving the ~1.75–2.06 tok/s prediction row 28b step 5 REFUTED (measured **U1
@@ -3657,7 +3830,7 @@ and both have a golden reference or a Vaayu precedent.
       infrastructure, and options (2) and (3) are exactly that; option (1) is new design with no
       chunked-prefill test coverage to land it against. Parked with this row, not silently.
 
-- [bug] **`use_torch_compile=True` CRASHES on Qwen3-Next, and `vaayu/server/config.py:328`'s stated
+- [bug] **(SAME ISSUE AS ROW 48 — sequenced as S10.) `use_torch_compile=True` CRASHES on Qwen3-Next, and `vaayu/server/config.py:328`'s stated
       reason for declining the knob is FACTUALLY WRONG. Found 2026-09-20 by row 36's re-scope A/B
       (`docs/2026-09-20-row36-torchcompile-AB-RESULTS.md`); recorded as its own row 2026-09-25 because
       it was buried in a parked row's document.**
@@ -3752,6 +3925,11 @@ A5. BOTH CLOSED 2026-09-25, on the A5.7b/A5.7c on-device load:**
       inside 4.83 GB today, DeepSeek's does not. Un-pinned layers fall back to
       `LRUTensorCache(_ne_budget)` (`vaayu_base.py:2710`, byte-budgeted, derived) — RAM-cached
       re-reads for the WHOLE transformer stack, **not** per-token NVMe streaming for it.
+      **CORRECTED 2026-09-26 (S6): the last sentence is WRONG as measured.** `_ne_budget` was **0.5 GB**
+      against a 5.5 GB per-token cyclic scan, so the LRU evicts every layer before it comes round and
+      NEVER hits. The row-28b step-5 run read **5.496 GB/token of non-expert weights from the drive**
+      (8 layers pinned, 35 streamed), and their inject was **72 % of the token**. This finding was the
+      residency evidence the projection needed, and it went unused.
 
 **Steps (each with its own verify):** 1 **kernels first, standalone, on sm_120** (2–5 days; **stop rule: if TileLang
 will not build or validate, decide Triton-or-abandon HERE**, before any modeling code) → 2 HF modeling code, MP
@@ -3759,7 +3937,7 @@ machinery stripped, **experts as `nn.ModuleList`** so it lands on the module-lis
 (1–2 weeks; verify logits against `inference/generate.py` BEFORE measuring) → 3 key remap + persist (verify
 `ExpertOffsetIndex` finds **43 × 256 = 11,008** derived entries) → 4 first on-device generation → **5 DONE
 2026-09-25 (A5.7c Task 6) — see the A5.7c bullet above for the figure and the caveats; run
-`row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)**
+`row26_decode.py`, compare against row 28's prediction (serial 0.035–0.070 s, device-busy 0.305 s, T 0.439–0.474 s)** **[S6 2026-09-26: this projection is REFUTED — measured 0.3267 tok/s. It omitted the non-expert weights that do not fit the VRAM pin budget (35 of 43 layers streamed, 72 % of the token). Use the S6 method, not this figure.]**
 → 6 *optional* the **10.12 GiB MTP draft module** already in the checkpoint (free speculative drafter; dense spec
 measured 5.57× in **row 12** — NOT "row P7", which is a different, REFUTED item; see §0's warning
 and this file's `P7`/`P8`/`P9` note — but **the MoE mechanism differs — do not assume it
@@ -4224,7 +4402,7 @@ hatch lands in `vaayu/server/config.py` in the SAME commit. (2) n/a, forward-int
 
 ---
 
-# 48 · [bug] `use_torch_compile=True` CRASHES on CUDA — and `config.py` declines it for the wrong reason (added 2026-09-20, found by row 36's A/B)
+# 48 · [bug] `use_torch_compile=True` CRASHES on CUDA — and `config.py` declines it for the wrong reason (added 2026-09-20, found by row 36's A/B) — **SEQUENCED AS S10 (2026-09-26), fix (b); handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). Line numbers below are stale: guard `vaayu_base.py:2180-2189`, compiled call `:5332-5339`.**
 
 **Reproduced in two independent processes on Qwen3-Next**, both during the first generation:
 `RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent
