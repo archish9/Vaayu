@@ -820,11 +820,11 @@ def moe_supports_slab_arena(expert_styles, is_exl3: bool, cuda: bool = False) ->
 
     S5-M (2026-09-26): the non-EXL3 MODULE-LIST forward reads it too, on the
     same CUDA terms. Excluded until then as "never measured", which sent
-    DeepSeek-V4-Flash down the clone path: every miss cloned twice into glibc's
-    per-thread arenas, which kept the evicted clones' pages. RSS grew ~0.19
-    GB/token past a flat expert cache (live tensors flat; malloc_trim(0) handed
-    back 5.5 GB) and the server was OOM-killed on its 2nd request. On the arena:
-    RSS flat over 128 decode tokens, greedy ids identical over 48.
+    DeepSeek-V4-Flash down the clone path: every miss cloned twice, and glibc
+    malloc kept the evicted clones' pages (free space 2.52 -> 5.51 GB). RSS grew
+    ~0.19 GB/token past a flat expert cache (live tensors flat; malloc_trim(0)
+    handed back 5.5 GB) and the server was OOM-killed on its 2nd request. On the
+    arena: RSS flat over 128 decode tokens, greedy ids identical over 48.
     """
     styles = list(expert_styles)
     if not styles or len(set(styles)) != 1:
@@ -2809,7 +2809,8 @@ class VaayuBaseModel(GenerationMixin):
                           f"not cached at all on this path.")
                 else:
                     print(f"[Vaayu-MoE] Expert slab arena: SKIPPED — expert layout "
-                          f"{_styles or ['none detected']} does not read the pinned "
+                          f"{_styles or ['none detected']} on {self.running_device} "
+                          f"does not read the pinned "
                           f"slab arena. Freed ~{_expert_budget / 1e9:.1f} GB of pinned "
                           f"RAM; experts are cached via the clone path instead.")
                 _slab_bytes = 0

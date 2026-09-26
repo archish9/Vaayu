@@ -220,8 +220,9 @@ def test_the_reinterpret_path_still_permits_an_async_copy(monkeypatch):
     synchronous (`_copy_async_ok` refuses a dtype change, because the host cast
     makes the real source a pageable temp). Reinterpreting carries no cast, so
     `dtype=None` must reach `_copy_async_ok` and async must stay available —
-    this branch is on MiniMax's per-token path, so losing it would be a silent
-    perf regression."""
+    this branch is on DeepSeek-V4's per-token path (since S5-M gave its
+    non-EXL3 module-list experts the slab arena), so losing it would be a
+    silent perf regression."""
     seen = []
     real = mp._copy_async_ok
 
