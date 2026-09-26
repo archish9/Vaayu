@@ -77,15 +77,16 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S1** ✅ | ~~**41.7 pageable HtoD memcpys per decode token** (Qwen3-Next)~~ **CLOSED 2026-09-25, NULL — really 84/token, and removing them LOSES 1.39 %. See the S1 row below** | cheapest thing on the board with a real win on the production model; pageable copies are SYNCHRONOUS, so the prize is host stall, not the 0.98 ms of device time | ~1 day, mostly measurement | [`…S1-pageable-h2d-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S1-pageable-h2d-HANDOFF.md) |
 | **S2** ✅ | ~~**chunk-major byte counter survives an aborted expert injection**~~ **CLOSED 2026-09-25, REFUTED — the reset really is outside the `finally`, in all THREE forwards, but `_chunked_prefill`'s own `finally` already clears both fields. See the S2 row below** | it was on MiniMax's production prefill path — but the harm needed the state to outlive the abort, and it cannot | hours | [`…S2-chunk-major-counter-leak-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S2-chunk-major-counter-leak-HANDOFF.md) |
 | **S3** ✅ | ~~**Qwen3-Next `GatedDeltaNet` elementwise fusion** — **STARTED 2026-09-25. STEP 1 DONE: census re-derived DECODE-ONLY and the handoff's does NOT reproduce — row 36's CUPTI arm had the prefill forward in its window (S1's flaw again), and its "653 µs/layer" was the whole decoder layer. Real: 4,586 launches / 15.9 ms device per `serial` token (not 7,702 / 27.70), so `serial` is ~55 % HOST gap — row 36's "GPU-bound" verdict used the contaminated number. GDN non-matmul = 63 launches/mixer (rule 29, norm 12, conv 4, body 18) = 49 % of `serial`'s launches; mixer host wall 438.8 µs = 15.80 ms/token on the real forward. CEILING MEASURED (ABBA, one load): dropping every GDN non-matmul op cuts `serial` 35.5 → 24.35 ms = −11.15 ms = 10.3 % of T_unprof 0.1085 s — ABOVE the handoff's 6.9 %. The three stock seams (`recurrent_gated_delta_rule`, `norm`, `causal_conv1d_update`) hold 45 of the 63. Detail `docs/2026-09-25-S3-census-rederive-RESULTS.md`. STEP 2 DONE (bake-off, user-approved incl. a scratch `fla` 0.5.2 install): one real mixer's decode call, ABBA x4 — stock 400.2 µs/66 kernels, narrow `torch.compile` 327.0 (−18 %), **Vaayu Triton prototype at the 3 seams 196.6 µs/24 kernels (−51 %)**, `fla` 391.1 (−2 %: it cuts launches but gives the time back in Python wrappers — REJECTED for decode). All closer to fp64 than stock. Two upstream traps: HF's `conv_states` is CHANNELS-LAST after any ≥4-token prefill (`fla`'s conv kernel silently corrupts it — kernels must be stride-aware), and the cache keeps the recurrent state in bf16. Banked lead: `fla`'s chunk kernel is ~10× the torch prefill fallback (0.36 → 0.03 s per 2k prompt, ~2 % TTFT). DESIGN APPROVED 2026-09-25 (scope A, user-chosen over B = body rewrite and C = `fla` prefill chunk, both banked): new `vaayu/gated_delta_kernels.py` — three stride-aware Triton kernels (rule with fp32 l2norm, conv update, gated norm) installed PER SEAM by surface detection (norm patched in place, streaming-safe), behavioural self-check at install falls back to stock with a WARNING, CUDA + triton only (CPU keeps stock), one call beside `install_state_continuation`; reaches qwen3_next/qwen3_5/qwen3_5_moe (3 seams), olmo_hybrid (2), MiniMax/dense/DeepSeek (0). Acceptance: conv state bit-exact, fused ≤ 1.25× stock's fp64 error over 2 geometries, D6 6-draw ppl band, ABBA real-token win ≥ 2 % (else revert), on-device win ≥ half the microbench's −204 µs/mixer. §8: no knob, reachable at N=1. Spec `docs/superpowers/specs/2026-09-25-S3-gated-delta-kernels-design.md`. Next: user reviews spec → implementation plan**~~ **CLOSED 2026-09-25, A WIN — real decode token −3.6 to −5.6 %, quality PASS. See the S3 row below** | the real perf build: **4,353 elementwise launches @1.8 µs = 7.80 ms/token (~6.9 %)** + 653 µs/layer CPU across 36 of 48 layers. Replaces row 36, which is PARKED on evidence | ~1 week | [`…S3-gateddeltanet-fusion-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S3-gateddeltanet-fusion-HANDOFF.md) |
-| **S4** | **restore the 46 DeepSeek-V4 tests** the shard deletion broke | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
+| **S4** ✅ | ~~**restore the 46 DeepSeek-V4 tests** the shard deletion broke~~ **CLOSED 2026-09-26, FIXED — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`. One resolver in `tests/deepseek/parity.py` reads either layout; no `vaayu/` change. See the S4 row below** | the only coverage proving that checkpoint's numerics, on a model the engine now runs | ~1 day | [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) |
 | **S5** | **DeepSeek-V4 ships no `chat_template`** → the server 400s on every completion | the ONLY thing between that model and §8(3) reachability; fifth because nobody will serve a 0.33 tok/s model | ~1 day | [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2879 passed, 44 failed, 2 errors, 16 skipped` (~190 s,
-FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97, and
-from 2874 by +5 from the final-review fix wave, 2026-09-25.** The 46 non-passing are S4's shard-deletion class — **verify the SET is unchanged**
-(attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors, checkpoint 1), never just the
-count. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
+**Suite floor for every one of them: `2928 passed, 0 failed, 0 errors, 16 skipped` (208.49 s,
+FOREGROUND) — raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
+from 2874 by +5 from S3's final-review fix wave (2026-09-25), and from 2879 by S4's 46 restored + 3 new
+(2026-09-26).** **The suite is GREEN for the first time since `4bc70b1`: any failure is new.** Wall time
+rose ~16 s (192 → 208 s) because the 46 restored tests now read real weights off the split and run
+DeepSeek's reference modules on the GPU. On-device gates run FOREGROUND under `systemd-run --user --scope -p MemoryMax=29G
 -p MemorySwapMax=0`, one GPU job at a time; long scripts run as a DETACHED systemd unit. **No
 fused-EXL3 arm exists** (no model on disk since Qwen3-235B was retired 2026-09-20) and **dense has no
 committed gate** (`test_batched_dense_smoke.py` deleted 2026-09-03) — say both, claim neither.
@@ -97,13 +98,54 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S4** — then **S5, S6** in order. ◀◀
+## ▶▶ PICK THIS NEXT: **S5** — then **S6**. ◀◀
 
-**S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **The sequence resumes at S4** — restore the 46 DeepSeek-V4 tests the shard deletion broke, handoff [`…S4-parity-tests-split-shards-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S4-parity-tests-split-shards-HANDOFF.md) — then **S5, S6**. **The suite floor is now `2879 passed, 44 failed, 2 errors, 16 skipped`** (was 2777; +97 from S3, +5 from the final-review fix wave, 2026-09-25), same failing SET.
+**S1, S1-L1, S2 and S3 are all closed 2026-09-25** — S1 a measured null, S1-L1 a WIN (+14.4 to +24.5 % prefill TTFT on Qwen3-Next, +17.5 to +18.9 % on MiniMax), S2 a REFUTATION, and **S3 a WIN** (real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, quality PASS, prefill flat, greedy ids identical — detail in the rows below). **S4 closed 2026-09-26, FIXED** (the 46 DeepSeek-V4 tests are green — row below). **The sequence resumes at S5** — DeepSeek-V4 ships no `chat_template`, handoff [`…S5-chat-template-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S5-chat-template-HANDOFF.md) — then **S6**. **The suite floor is now `2928 passed, 0 failed, 0 errors, 16 skipped`** (208.49 s; +46 restored and +3 new from S4, 2026-09-26) — green, so any failure is new.
 
 **One live lead S1-L1 did NOT chase, still open in the S1 row below: S1-L2** (96.5 pageable DtoH per decode forward). **S1-L3** (`fla` is not installed) is now answered in part by S3: `fla` was measured at the three seams and REJECTED for decode (−2 %, Python wrappers eat the launch savings), and its prefill chunk kernel is banked as **S3-C** (0.36 → 0.03 s per 2k prompt, ~2 % TTFT) rather than installed.
 
 ---
+
+## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit.**
+
+**Root cause (re-verified 2026-09-26, not taken from the handoff):** all 46 died with
+`FileNotFoundError: …/model-000NN-of-00048.safetensors` at fixture time — every reader resolved a key
+through `model.safetensors.index.json` (still on disk) to an original shard `4bc70b1` deleted. **The
+handoff named ONE reader; there were SEVEN**: `tests/deepseek/parity.py:96` (23 tests),
+`test_deepseek_v4_attention.py:467` (16), `test_deepseek_v4_linear.py:324` (2),
+`test_deepseek_v4_block.py:64` (2 errors), `test_deepseek_v4_checkpoint.py:171` (1),
+`test_deepseek_v4_model.py:376` (1), `:568` (1) — four of them copy-pasted raw readers.
+
+**Fix (Route A, with a correction):** one resolver in `tests/deepseek/parity.py` — `locate(key)` returns
+the ORIGINAL shard while it exists, else the `splitted_model/` file holding
+`remap_checkpoint_key(key)` (split index read off the 46 headers, ~0.7 s, cached — the split's file
+naming is not re-derived); `read_checkpoint_tensors` / `raw_module_weights` on top; all seven sites
+call it. **Why BOTH layouts, not the handoff's "point the harness at the split":** the server's default
+`delete_original=True` (`app.py:115`) leaves split-only (this box), the library default keeps the
+originals, and two tests (`test_the_real_checkpoint_measures_32`, `model.py`'s group-size helper, now
+`_fp4_group_size_from_checkpoint`) exist precisely because "the split may not exist yet". A split-only
+resolver would have re-broken a fresh download. **Route B (commit fixtures) not taken:** the goldens —
+the OUTPUTS — are already committed; what went missing is WEIGHTS, GiB per MoE layer.
+
+**Evidence:** the 7 files 44 failed + 2 errors → **162 passed** (113 + 46 + 3 new) in 34 s; every
+bit-identity golden passes (`test_a_golden_regenerates_bit_identically`,
+`test_the_moe_is_bit_identical_to_the_reference_…`), so the split reproduces goldens recorded off the
+originals. **3 new CPU tests** in `test_deepseek_v4_parity.py` prove the layout this box cannot: fake
+checkpoints, fresh-download vs split-only, three remap shapes (`layers.*`→`model.layers.*`,
+`head.weight`→`lm_head.weight`, `hc_head_*`→`model.norm.hc_head_*`), and a missing key names itself.
+`plans/probes/a5_5_attn_gate.py` imports `parity` and is fixed by the same change; the other probes
+that read originals (`a57b_split_dryrun.py`, `a57b_verify_split.py`, `row28_dsv4_projection.py`,
+`task6f_detect_probe.py`) are one-shot historical scripts, left alone.
+
+**Handoff corrections banked:** its §4 gate (2805 passed) predates S3 — the real target was 2925 + the
+3 new = 2928; its §6 "no GPU needed" is wrong — the golden tests build DeepSeek's reference modules on
+CUDA.
+
+**§8:** (1) no knob — test harness only, nothing a user reaches; (2) n/a; (3) n/a — no engine
+behaviour changed; (4) n/a. **No gates beyond the suite:** no `vaayu/` line changed, so no on-device
+arm is owed.
+
+Detail: `docs/2026-09-26-S4-split-shard-tests-RESULTS.md` (gitignored — this row is the durable copy).
 
 ## S3 — `[x]` fused Triton kernels on the gated-delta mixers' three decode seams. **CLOSED 2026-09-25, A WIN — real decode token −3.6 % to −5.6 % across four replicates (r1/r2 with their cold first arm excluded: −3.57 % / −3.68 %; r3/r4 with a warm-up arm: −4.32 % / −5.58 %), `serial` −4.3 ms, prefill flat, greedy ids identical, D6 quality band PASS. MERGED to `main` 2026-09-26 (`87a7f4d`) after the final whole-branch review (Opus: ready with fixes → I1 real-geometry self-check, I2 non-current-device guard, M1-M5, all fixed and re-reviewed).**
 
@@ -1204,7 +1246,8 @@ test — none can make Vaayu faster.** No §0 P-row is open.
   only** (found 2026-09-15 during D4's suite run: 1 failed / 2206 passed / 15 skipped, 18 min).
   **DID NOT REPRODUCE 2026-09-25**: two full-suite runs that day (2756 and 2759 passed) showed zero
   failures in `test_slab_arena.py`, and the file passes alone (58 passed). Every failure in both runs
-  was the DeepSeek-V4 shard-deletion class. Left OPEN rather than closed because the defect is
+  was the DeepSeek-V4 shard-deletion class. **Passed again 2026-09-26 in S4's green 2928-test run —
+  a third incidental pass, not a repro attempt, so the rule below still holds.** Left OPEN rather than closed because the defect is
   order-dependent process-global state, so one clean pair of runs is weak evidence of a fix — nothing
   was done to fix it, and the suite has grown by ~550 tests since it was found, which can reorder it
   back into failing. Close it only with a deliberate repro attempt, not with another incidental pass. It passes alone (58
@@ -3248,8 +3291,11 @@ and both have a golden reference or a Vaayu precedent.
       checkpoint's `encoding/` module directly — a real server feature, not a one-line fix, and its own
       row if picked up.
 
-- [bug] **A5.7b's original-shard deletion broke 46 committed DeepSeek-V4 tests across 6 files
-      (44 failed + 2 errors). FOUND 2026-09-25 while gating A5.7c; NOT caused by A5.7c.** (Title said
+- [x] **A5.7b's original-shard deletion broke 46 committed DeepSeek-V4 tests across 6 files
+      (44 failed + 2 errors). FOUND 2026-09-25 while gating A5.7c; NOT caused by A5.7c.
+      FIXED 2026-09-26 by S4 — all 46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped`;
+      one resolver in `tests/deepseek/parity.py` reads the originals while they exist, else the split
+      via `remap_checkpoint_key`. Seven reader sites, not one — see the S4 row.** (Title said
       "8 parity tests" until 2026-09-25 — that was the scoped first look at one file; the full suite
       put it at 46. Per file: attention 21, parity 8, moe 8, linear 4, model 2, block 2 errors,
       checkpoint 1. Re-confirmed unchanged by the 2026-09-25 post-fix suite: same 46, same files.) `tests/deepseek/parity.py:96` reads the
