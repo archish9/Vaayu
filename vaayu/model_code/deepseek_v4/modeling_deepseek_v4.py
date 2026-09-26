@@ -22,15 +22,20 @@ divergences, both forced by how Vaayu streams experts rather than by taste:
    weights with the scale silently discarded. Everything here is read from the
    config or off the tensors themselves.
 
-This file is copied verbatim into the checkpoint directory; the repo holds the
-source of truth and `tests/test_deepseek_v4_linear.py` asserts the two are
-byte-identical.
+Vaayu registers `DeepseekV4ForCausalLM` in-process
+(`vaayu/vaayu_deepseek_v4.py`'s `_register_with_transformers`), so a plain
+download -- no `auto_map`, no copied file -- loads as it comes, and nothing is
+written into the model directory (S5, S5-W). A checkpoint that still carries a
+hand-placed copy loads that copy instead; `tests/test_deepseek_v4_linear.py`
+(and its `model`/`moe` twins) check such a copy has not drifted, and skip when
+there is none.
 """
 from __future__ import annotations
 
 import contextlib
 import contextvars
 import importlib.util
+import sys
 from pathlib import Path
 
 import torch
@@ -146,6 +151,26 @@ def _fit_sparse_attn(source: str, heads: int, head_dim: int, smem_optin: int) ->
     return source[:start] + tile + source[end:]
 
 
+@contextlib.contextmanager
+def no_bytecode():
+    """Import a checkpoint's own source without caching bytecode beside it.
+
+    `exec_module` writes `__pycache__/*.pyc` next to the file it runs, and that
+    file is inside the user's download (S5-W). It stays a real import -- not
+    S5's `exec(compile())` -- because tilelang's JIT reads the kernels back with
+    `inspect.getsource`. The flag is process-global: it covers everything that
+    file imports for the first time too (tilelang included), and it is not
+    thread-safe, so it is held only for the one import. Every caller is on the
+    single-request forward path.
+    """
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = previous
+
+
 def kernels():
     """DeepSeek's `act_quant` / `fp4_gemm` / `fp8_gemm`, imported on first use.
 
@@ -189,7 +214,8 @@ def kernels():
     spec = importlib.util.spec_from_file_location("vaayu_deepseek_v4_kernel", fitted)
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
+        with no_bytecode():
+            spec.loader.exec_module(module)
     except ImportError as missing:
         raise ImportError(
             f"DeepSeek-V4's quantized weights go through its own TileLang kernels "

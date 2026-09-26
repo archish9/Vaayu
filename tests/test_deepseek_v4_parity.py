@@ -213,6 +213,40 @@ def test_a_key_in_neither_layout_names_itself(tmp_path):
         parity.read_checkpoint_tensors(["head.weight"], ckpt=ckpt)
 
 
+def test_importing_the_reference_writes_nothing_into_the_checkpoint(tmp_path, monkeypatch):
+    """`reference_modules` imports the checkpoint's own `inference/model.py`. A
+    plain `exec_module` caches it as `inference/__pycache__/model.*.pyc` -- a
+    write into the user's download on every suite run (S5-W). The stubs carry
+    only what the harness touches: the attention tile it refits, and a
+    `model.py` that imports `kernel`.
+    """
+    import sys
+    import tempfile
+
+    inference = tmp_path / "inference"
+    inference.mkdir()
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    # The harness never removes its patched-kernel tempdir; keep this one in tmp_path.
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *args, **kwargs: str(variant))
+    (inference / "kernel.py").write_text(
+        "def sparse_attn_kernel():\n    num_stages = 2\n    block = 64\n\n\n"
+        "def hc_split_sinkhorn_kernel():\n    pass\n")
+    (inference / "model.py").write_text("from kernel import sparse_attn_kernel\n")
+    monkeypatch.setattr(parity, "_reference", None)
+    # The harness registers the module under this name; put back what was there.
+    monkeypatch.setitem(sys.modules, "a5_reference_model", None)
+    # Bytecode caching as a default interpreter does it, whatever the runner sets.
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+
+    module = parity.reference_modules(tmp_path)
+
+    assert Path(module.__file__) == inference / "model.py"
+    assert sorted(p.name for p in inference.iterdir()) == ["kernel.py", "model.py"]
+    assert sys.dont_write_bytecode is False
+
+
 # ------------------------------------------------------- reading real weights
 #
 # These need the 157 G checkpoint. Everything above does not.

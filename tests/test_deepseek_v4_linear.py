@@ -115,6 +115,40 @@ def test_importing_the_modeling_module_does_not_import_tilelang():
     assert out.stdout.strip().splitlines()[-1] == "False"
 
 
+def test_the_lazy_kernel_import_writes_nothing_beside_the_checkpoints_kernel_py(
+        kernel_dir, monkeypatch):
+    """When the attention tile needs no refit (a GPU with the shared memory for
+    DeepSeek's own), `kernels()` imports `inference/kernel.py` where it lies --
+    inside the user's download. A plain `exec_module` caches bytecode as
+    `inference/__pycache__/*.pyc` beside it (S5-W). A stub has no attention tile
+    to fit, so it takes that branch on any box.
+    """
+    # Bytecode caching as a default interpreter does it, whatever the runner sets.
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+    directory = kernel_dir(STUB_KERNELS)
+
+    module = modeling.kernels()
+
+    assert Path(module.__file__) == directory / "kernel.py"
+    assert sorted(p.name for p in directory.rglob("*")) == ["kernel.py"]
+    assert sys.dont_write_bytecode is False
+
+
+@pytest.mark.parametrize("before", [False, True], ids=["default", "python-B"])
+def test_no_bytecode_puts_the_flag_back_as_it_found_it_even_when_the_import_fails(
+        monkeypatch, before):
+    """The flag is process-global. A user running with `-B` /
+    `PYTHONDONTWRITEBYTECODE` must keep it after a kernel import, and a failed
+    import (tilelang missing) must not leave bytecode off for the process."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", before)
+
+    with pytest.raises(ImportError), modeling.no_bytecode():
+        raise ImportError("No module named 'tilelang'")
+
+    assert sys.dont_write_bytecode is before
+
+
 def test_a_quantized_forward_without_the_kernels_names_both_pins(kernel_dir, block_size):
     """tilelang 0.1.8 declares `apache-tvm-ffi>=0.1.2,~=0.1.0`, so pip resolves
     a version that imports fine and dies at kernel COMPILE. A bare

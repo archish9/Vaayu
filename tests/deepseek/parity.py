@@ -218,6 +218,8 @@ def reference_modules(ckpt: Path = None):
     import sys
     import tempfile
 
+    from vaayu.model_code.deepseek_v4.modeling_deepseek_v4 import no_bytecode
+
     inference = (ckpt or CKPT) / "inference"
     source = (inference / "kernel.py").read_text()
     start = source.index("def sparse_attn_kernel")
@@ -240,7 +242,8 @@ def reference_modules(ckpt: Path = None):
                                                       inference / "model.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        with no_bytecode():
+            spec.loader.exec_module(module)
     finally:
         sys.path.remove(str(variant))
         sys.path.remove(str(inference))
