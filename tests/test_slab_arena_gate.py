@@ -49,12 +49,25 @@ def test_non_exl3_fused_without_cuda_gets_no_arena():
     assert moe_supports_slab_arena(["fused"] * 48, is_exl3=False) is False
 
 
-def test_non_exl3_module_list_supports_neither():
-    """Never measured with an arena on a non-EXL3 checkpoint (none on this
-    box) -- an unverified layout must not be assumed slab-capable."""
-    for cuda in (True, False):
-        assert moe_supports_slab_arena(["module_list"] * 62, is_exl3=False, cuda=cuda) is False
-    assert moe_supports_prefill_stager(["module_list"] * 62, is_exl3=False) is False
+@pytest.mark.parametrize("n_layers", [43, 62])  # DeepSeek-V4-like, MiniMax-like
+def test_non_exl3_module_list_on_cuda_supports_arena_not_stager(n_layers):
+    """S5-M (2026-09-26): without the arena this layout caches through
+    ExpertRAMCache.put(), cloning every miss twice into glibc per-thread arenas
+    that keep the evicted clones' pages. Measured on DeepSeek-V4-Flash: RSS grew
+    ~0.19 GB/token past a flat expert cache (live tensors flat, malloc free space
+    2.52 -> 5.51 GB, malloc_trim(0) handed back 5.5 GB) and the server was
+    OOM-killed on its 2nd request. On the arena RSS stayed flat. It never reads
+    staged layers."""
+    styles = ["module_list"] * n_layers
+    assert moe_supports_slab_arena(styles, is_exl3=False, cuda=True) is True
+    assert moe_supports_prefill_stager(styles, is_exl3=False) is False
+
+
+def test_non_exl3_module_list_without_cuda_gets_no_arena():
+    """Same reason as the non-EXL3 fused layout: CPU compute has no
+    host-to-device copy to make async."""
+    assert moe_supports_slab_arena(["module_list"] * 62, is_exl3=False, cuda=False) is False
+    assert moe_supports_slab_arena(["module_list"] * 62, is_exl3=False) is False
 
 
 @pytest.mark.parametrize("cuda", [True, False])
