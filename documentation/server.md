@@ -205,10 +205,10 @@ telemetry. `finish` is one of:
 | `tool_calls` | the model called a tool |
 | `cancelled` | the client disconnected before the stream finished |
 | `error` | the request raised |
-| `refused` | rejected before generation started — an oversized prompt, a missing `session_id`, a full queue |
+| `refused` | rejected before generation started — an oversized prompt, a missing `session_id`, a full queue, a request the model cannot render (no chat template, or `tools` it cannot take) |
 
 The dividing line between the last two is the **status code, not the moment**:
-`refused` is a 400 or 503 the client can fix (the three cases named above);
+`refused` is a 400 or 503 the client — or, for a missing chat template, the operator — can fix (the cases named above);
 anything that raised and answers 500 is `error`, including a failure inside the
 chat template, which is rejected before generation starts but is not the
 client's to fix. Both values are **path-independent** — the same failure gets
@@ -630,7 +630,9 @@ function schemas, and passes them as `tools`. Results come back as `tool` messag
 The call format is detected by **probing the chat template**, never by model name. If
 the template has no tool support, a request carrying `tools` is a `400` with a named
 reason — deliberately, rather than silently dropping the tools and leaving your agent
-waiting for a call the model was never told about.
+waiting for a call the model was never told about. A model that renders its own prompts
+instead of shipping a template (DeepSeek-V4 today) refuses every request carrying `tools`
+the same way, because its tool-call format is not parsed yet.
 
 Check before you rely on it:
 
@@ -866,6 +868,7 @@ Do not spend time here; each is measured and settled.
 | generation is ~10× slower than expected | `MAX_PINNED_LAYERS = 0` | set it back to `-1`, the default |
 | `400` naming a token count | prompt exceeds the derived window | shorten by the number the message gives |
 | `400` mentioning tool support | the checkpoint's template cannot render `tools` | use a tool-capable checkpoint |
+| `400` naming `encoding/encoding_dsv4.py`; a startup WARNING naming the same file | a DeepSeek-V4 download without its `encoding/` folder, or with an encoder that cannot load (the WARNING gives the error). The model ships no chat template; its prompt format lives in that file | download the full repository, `encoding/` included. If the WARNING names a missing module, install it and restart |
 | `503` + `Retry-After` | queue full | retry; raise `QUEUE_DEPTH`; reduce client concurrency |
 | a non-streaming request never returns; the client times out with no status | uncapped generation on a slow model — nothing is sent until the last token | set `max_tokens`, or `stream: true`. The startup log carries a WARNING naming the token count |
 | `422` on `n` | `n>1` requested | this server returns one choice |

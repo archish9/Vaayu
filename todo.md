@@ -82,10 +82,11 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5-M** ✅ | ~~**DeepSeek-V4 through the server is OOM-killed on its 2nd request**~~ **CLOSED 2026-09-26, FIXED, MERGED (`2d78f71`) — not a reference leak: glibc malloc kept the freed expert clones (live tensors flat, `malloc_trim(0)` handed back 5.5 GB). Non-EXL3 module-list was denied the slab arena ("never measured"), so DeepSeek cached through the double-clone path. `6596c49` gives it the arena on CUDA. Through the probe's monkeypatched predicate (same answer for DeepSeek): RSS flat over 128 decode tokens, greedy ids identical over 48. On the committed code: server smoke 9/9 (RSS 26.67 GB at the last token). MiniMax never leaked (it already had the arena). See the S5-M row below** | S5 made DeepSeek serving reachable, and this capped it at ONE request per server process | days, GPU, systematic debugging | [`…S5-M-deepseek-server-oom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-deepseek-server-oom-HANDOFF.md) · RESULTS `docs/2026-09-26-S5-M-deepseek-server-oom-RESULTS.md` |
 | **S5-M-H** ✅ | ~~**DeepSeek-V4's RAM headroom on the arena path is unmeasured for LONG prompts**~~ **CLOSED 2026-09-26, PASS (measurement, no change), MERGED (`bc69193`) — one server process served 4,019 then 8,018 prompt tokens, both 200 (TTFT 166.9 s / 296.6 s). cgroup peak 27.36 GB = 3.78 GB margin to the 31.14 GB cap; the peak is the first request's warm-up (set inside A's first 512-token chunk), and no host-RAM column grows with prompt length at ≤ 8k (malloc free ≤ 0.47 GB, no clone churn). Host `MemAvailable` min 1.63 GB — not a FAIL; opened as the unsequenced **S5-M-HR** row. See the S5-M-H row below** — was: S5-M pinned the arena up front at host `available` − 3.5 GiB (23.0–23.5 GB); post-arena `available` 3.40 GB, RSS 26.67–28.28 GB vs the 31.1 GB cap, and every run used a prompt under ~40 tokens. A MEASUREMENT: one server process, a ~4k then a ~8k request, per-second RSS/HWM/pinned/malloc timeline + cgroup peak. PASS = both complete with ≥ ~1 GB margin; FAIL = root-cause, then STOP and report before any (derived) fix. **Starts with the S5-R check (§0)** | S5-M made DeepSeek serve past one request — this checks it survives the prefill-heavy workload Vaayu exists for, before more S5 work builds on it | ~1 hour, GPU, mostly waiting | [`…S5-M-H-long-prompt-headroom-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-M-H-long-prompt-headroom-HANDOFF.md) |
 | **S5-W** ✅ | ~~**Vaayu still writes bytecode into a DeepSeek model dir**~~ **CLOSED 2026-09-26, FIXED — `no_bytecode()` holds `sys.dont_write_bytecode` around both `exec_module`s (the runtime `kernels()` and the parity harness); 4 new tests (RED→GREEN + a mutation-verified restore test). S5-R done the same session (user-authorised agent restore), so the proof is on the REAL dir and non-vacuous: DeepSeek files, a library load + generate and a server smoke 9/9 all left it byte+mtime identical with no `__pycache__`. Suite `2952 passed, 0 failed, 0 errors, 20 skipped`. Review: ready to merge, 5 minors all fixed. MERGED (`41b7488`). See the S5-W row below** — was: **Vaayu still writes bytecode into a DeepSeek model dir** — `kernels()` `exec_module`s the checkpoint's own `inference/kernel.py` whenever the attention tile needs no refit (bigger-smem GPUs; not this sm_120 box) → `inference/__pycache__/kernel.cpython-312.pyc`; the test harness writes `model.cpython-312.pyc` the same way. **Starts with the S5-R precondition check (§0)** | finishes S5's user-set promise: nothing written into a user's download | hours | [`…S5-W-model-dir-writes-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-W-model-dir-writes-HANDOFF.md) |
-| **S5-P** | **S5's deferred minors** — an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
+| **S5-P** ✅ | ~~**S5's deferred minors**~~ **CLOSED 2026-09-26, FIXED — an unloadable encoder now WARNs + 400s instead of stopping the load; the hook answers None before `init_model`; `documentation/server.md` has the §9 row, the §6.6 sentence, and §3's `refused` list corrected (user-approved). Suite `2955 passed, 0 failed, 0 errors, 20 skipped`. See the S5-P row below** — was: an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** | **row 28's reach-projection METHOD does not hold** | it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor for every one of them: `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
+**Suite floor for every one of them: `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
+FOREGROUND; set 2026-09-26 by S5-P's +3 tests) — was `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
 FOREGROUND; set 2026-09-26 by S5-W's +4 tests and S5-R's restore, which turned the 4 DeepSeek
 stale-copy guards from passes into SKIPS — any other skip count means the DeepSeek folder changed) — was
 `2952 passed, 0 failed, 0 errors, 16 skipped` (216.47 s), raised from 2759 by S1-L1's 17 new tests, from 2776 by S2's 1, from 2777 by S3's 97,
@@ -106,7 +107,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S5-P** — then **S6**, each in its own fresh session (user, 2026-09-26). ◀◀ (S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S6** (user, 2026-09-26). ◀◀ (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
@@ -478,7 +479,7 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     `vaayu_expert_offsets.json`. Moving the split out of the model dir would need a server knob
     (`layer_shards_saving_path` is library-only); that is the user's decision.
 
-- [ ] **S5-P — S5's deferred minors (final review, 2026-09-26).** **Sequence: THIRD.** Handoff:
+- [x] **S5-P — S5's deferred minors (final review, 2026-09-26).** **Sequence: THIRD. CLOSED 2026-09-26, FIXED — A and B reproduced exactly as the handoff states (A: `ModuleNotFoundError` and `SyntaxError` both escaped `load_prompt_renderer` out of `prompt.py:59`; B: bare `AttributeError` at `vaayu_deepseek_v4.py:437`), 3 new tests RED → GREEN, suite `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s, FOREGROUND, capped) = floor + 3, skip count unchanged. Branch `s5-p-renderer-polish`.** Handoff:
   [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md).
   - **(A)** An encoder that fails to IMPORT (SyntaxError, or a missing third-party import) crashes
     `init_model` → route it through `_refuse` (WARNING + 400) like a missing file.
@@ -489,6 +490,26 @@ Detail: `docs/2026-09-26-S5-portable-deepseek-v4-RESULTS.md` (gitignored).
     `encoding/encoding_dsv4.py`, plus one sentence in §6.6 that a model-rendered prompt refuses `tools`.
   - TDD for A and B. No GPU. Suite floor `2952 passed, 0 failed, 0 errors, 20 skipped` (S5-W + S5-R,
     2026-09-26; the handoff's §5 is updated to match).
+  - **Done:** (A) the `exec(compile(...))` is wrapped in `except Exception` → `_refuse` naming the path
+    and the error type; the no-bytecode form is kept (`test_loading_the_encoder_writes_nothing_…` still
+    green). (B) `_prompt_renderer = None` as a class attribute, so the hook answers the base's None and
+    `render_prompt` falls to the ordinary "ships no chat_template" 400. (C) §9 row (covers the missing
+    AND the unloadable encoder, since (A) now makes both a 400 naming the file) + one §6.6 sentence.
+    Tests: `test_an_encoder_that_cannot_load_is_refused_not_a_crashed_load` ×2 (import, SyntaxError),
+    `test_the_renderer_is_none_before_init_model`, in `tests/test_deepseek_v4_prompt.py`.
+  - **One deviation from the handoff, user-approved 2026-09-26:** its §3 said `documentation/server.md`'s
+    `refused`/`error` paragraph "needs no change". Re-verified, it was INCOMPLETE — it said `refused` is
+    "the three cases named above" (oversized prompt, missing `session_id`, full queue), but the code
+    files `TemplateLacksToolSupport` and `NoChatTemplate` as `refused` too (`engine.py:618-632`,
+    `app.py:961-965`). Both predate S5. Fixed with a two-line edit (the table cell + "the client — or,
+    for a missing chat template, the operator — can fix").
+  - **§8:** (1) no knob. (2)/(3) reachable at N=1 through `/v1/chat/completions` on DeepSeek-V4 —
+    `init_model` always runs under the server, so (A) is what a user with a broken encoder now sees
+    (server starts, WARNING, 400) instead of a server that never starts. (B) is library/tooling-only;
+    unreachable through the server by construction. (4) n/a.
+  - **No on-device gates:** `prompt.py` and `vaayu_deepseek_v4.py` are DeepSeek-only and change no
+    behaviour on Qwen3-Next, MiniMax or dense; the rest is docs. No fused-EXL3 arm exists; dense has no
+    committed gate — neither was claimed.
 
 ## S4 — `[x]` restore the 46 DeepSeek-V4 tests the original-shard deletion broke. **CLOSED 2026-09-26, FIXED — 46/46 green, suite `2928 passed, 0 failed, 0 errors, 16 skipped` in 208.49 s FOREGROUND. Test-only change, no `vaayu/` edit. MERGED to `main` 2026-09-26 (`906675c`).**
 
