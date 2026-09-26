@@ -16,6 +16,7 @@ from torch import nn
 from tests.deepseek import parity
 from vaayu.model_code.deepseek_v4 import modeling_deepseek_v4 as modeling
 from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+import vaayu.vaayu_deepseek_v4  # noqa: F401 -- registers deepseek_v4 (S5); the AutoConfig tests below need it once the checkpoint has no auto_map
 
 needs_checkpoint = pytest.mark.skipif(
     not parity.CKPT.exists(), reason="DeepSeek-V4 checkpoint not on this disk")
@@ -456,28 +457,24 @@ def test_the_supports_flags_claim_nothing():
     assert modeling.DeepseekV4PreTrainedModel._supports_sdpa is False
 
 
-@needs_checkpoint
-def test_the_checkpoint_points_auto_model_at_this_file():
-    """A5.1 left the `auto_map` with only an `AutoConfig` entry, so `AutoConfig`
-    resolved and any attempt at the model raised
-    `ValueError: Unrecognized configuration class`. The second entry lands in
-    the commit that creates the class -- a half-written `auto_map` turns that
-    legible error into an ImportError out of HF's module cache.
-    """
-    auto_map = json.loads((parity.CKPT / "config.json").read_text())["auto_map"]
+def test_auto_model_for_causal_lm_maps_the_registered_config_to_this_model():
+    """A plain download carries no `auto_map`, so `from_config` finds the model
+    class through Vaayu's registration (S5), never through a copied file."""
+    import vaayu.vaayu_deepseek_v4  # noqa: F401 -- registers deepseek_v4
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
-    assert auto_map["AutoConfig"] == "configuration_deepseek_v4.DeepseekV4Config"
-    assert auto_map["AutoModelForCausalLM"] == \
-        "modeling_deepseek_v4.DeepseekV4ForCausalLM"
+    assert MODEL_FOR_CAUSAL_LM_MAPPING[DeepseekV4Config] is modeling.DeepseekV4ForCausalLM
 
 
 @needs_checkpoint
 def test_the_checkpoints_copy_of_the_modeling_file_has_not_drifted():
-    """`docs/` is gitignored and so is the checkpoint; the repo copy is the
-    source of truth, and two copies drift unless something checks.
-    """
-    repo = Path(modeling.__file__)
-    assert (parity.CKPT / "modeling_deepseek_v4.py").read_bytes() == repo.read_bytes()
+    """Stale-copy guard -- see the config twin in test_deepseek_v4_config.py.
+    No copy is needed since S5; one that exists must not have drifted."""
+    copy = parity.CKPT / "modeling_deepseek_v4.py"
+    if not copy.exists():
+        pytest.skip("no checkpoint-side copy -- none is needed since S5 registers "
+                    "DeepseekV4ForCausalLM in-process")
+    assert copy.read_bytes() == Path(modeling.__file__).read_bytes()
 
 
 @needs_checkpoint
