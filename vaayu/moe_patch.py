@@ -2170,6 +2170,19 @@ def _make_whole_layer_sparse_forward(
             # compute stream, so layer i+1 cannot overwrite rows layer i's kernels
             # are still reading. Same peak as the whole-layer transient it replaces.
             _all_buffers[_gkey] = allocate_expert_buffers(_layer_metas, device)
+            if len(_all_buffers) > 1:
+                # The planner's layer_slack budgets ONE fused layer, so only the
+                # first geometry's buffer is inside the plan (CLAUDE.md §5: warn,
+                # don't silently degrade). No model on this box has two.
+                def _fmt(bufs):
+                    n = sum(t.nbytes for t in bufs.values())
+                    return f"{n / 1e6:.1f} MB ({n} B)"
+                _held = ", ".join(_fmt(b) for k, b in _all_buffers.items() if k != _gkey)
+                print(f"[Vaayu-MoE] WARNING: {layer_name} is another routed fused-3D "
+                      f"geometry; its expert buffer {_fmt(_all_buffers[_gkey])} is allocated "
+                      f"beside the {_held} already held. The VRAM planner budgets one "
+                      f"fused layer (layer_slack), so this extra buffer is not charged to "
+                      f"it: expect less VRAM headroom than the plan printed.")
         experts_mod.forward = make_routed_experts_forward(
             experts_mod=experts_mod, prior_forward=experts_mod.forward,
             experts_path=experts_path, layer_idx=layer_idx, layer_name=layer_name,

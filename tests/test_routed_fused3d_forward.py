@@ -168,3 +168,35 @@ def test_the_toggle_restores_whole_layer_delivery(tmp_path):
     assert ref._expert_history[0] == list(range(NUM_EXPERTS))
     assert torch.equal(routed, whole)
     assert blocks[0].moe_module.experts.gate_up_proj.is_meta
+
+
+def test_a_second_geometry_buffer_warns_that_the_planner_does_not_charge_it(tmp_path, capsys):
+    """The VRAM planner's layer_slack budgets ONE fused layer, so one routed
+    geometry's buffer fits the plan and a second one does not (CLAUDE.md §5: warn,
+    don't silently degrade). Two geometries here: layer 1 stored in another dtype."""
+    from safetensors.torch import save_file
+    model, idx, weights = build(tmp_path, n_layers=2)
+    w, b = weights[1]
+    save_file({"layers.1.mlp.experts.gate_up_proj": w.half().contiguous(),
+               "layers.1.mlp.experts.gate_up_proj_bias": b.half().contiguous()},
+              str(tmp_path / "layers.1.safetensors"))
+    idx.build()
+    ref = Ref(model, routed_ok(idx))
+    capsys.readouterr()
+    patch(tmp_path, model, idx, ref)
+    out = capsys.readouterr().out
+    assert len(ref._fused3d_buffers) == 2
+    warnings = [line for line in out.splitlines() if "WARNING" in line and "geometry" in line]
+    assert len(warnings) == 1, out
+    for bufs in ref._fused3d_buffers.values():
+        assert f"({sum(t.nbytes for t in bufs.values())} B)" in warnings[0]
+    assert "not charged" in warnings[0]
+
+
+def test_one_geometry_allocates_one_buffer_and_warns_nothing(tmp_path, capsys):
+    model, idx, _ = build(tmp_path, n_layers=2)
+    ref = Ref(model, routed_ok(idx))
+    capsys.readouterr()
+    patch(tmp_path, model, idx, ref)
+    assert len(ref._fused3d_buffers) == 1
+    assert "WARNING" not in capsys.readouterr().out
