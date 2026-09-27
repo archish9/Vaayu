@@ -51,9 +51,11 @@ if triton is not None:
         applied wherever the stock path stores into that dtype."""
         if CODE == 0:
             # bf16 in integer ops: add half an ulp (ties to even), drop the low 16 bits.
+            # A NaN is passed through untouched: the integer carry would turn it into a
+            # signed zero and mask a fault the stock path propagates.
             u = v.to(tl.uint32, bitcast=True)
             u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
-            return u.to(tl.float32, bitcast=True)
+            return tl.where(v == v, u.to(tl.float32, bitcast=True), v)
         elif CODE == 1:
             return v.to(tl.float16).to(tl.float32)
         else:
@@ -328,8 +330,15 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
     out             [1, hidden] float32, overwritten
     act_fn          the experts' activation; only the stock fallback calls it (the kernels
                     compute SiLU, which `install_packed_expert_kernels` verified it is)
+
+    A call whose entries are not all blobs of ONE geometry -- an unpacked expert's dense
+    entry, a packed expert with no fused pass, a layer mixing formats -- runs the stock
+    arithmetic over the entries: no kernel can take it, and the stock loop would have.
     """
-    if _checked(x, pairs, routing_weights, act_fn):
+    geoms = {blob.get("geom") for blob, _slot in pairs}
+    if len(geoms) != 1 or None in geoms:
+        stock_experts_decode(x, pairs, routing_weights, out, act_fn)
+    elif _checked(x, pairs, routing_weights, act_fn):
         _launch(x, pairs, routing_weights, out)
     else:
         stock_experts_decode(x, pairs, routing_weights, out, act_fn)

@@ -178,9 +178,27 @@ def test_profiling_mode_books_the_kernel_branch(tmp_path):
 
 
 @cuda
-def test_a_packed_expert_without_a_blob_is_refused_not_dropped(tmp_path, monkeypatch):
-    """Spec §9.4: stock would have computed it, so skipping it would change the output."""
-    model, _, _ = _cuda_model(tmp_path)
+def test_a_packed_expert_without_a_blob_is_computed_like_the_per_slot_loop(tmp_path, monkeypatch):
+    """Roles at different widths have no fused pass. Stock dequantizes them role by role;
+    the branch must too -- not drop the expert, not refuse the request (final review I1)."""
+    model, ref, _ = _cuda_model(tmp_path)
     monkeypatch.setattr(mp, "build_expert_blob", lambda by_role: None)
-    with pytest.raises(NotImplementedError, match="different widths"):
-        model.layers[0].mlp.forward(_x())
+    x = _x()
+    fused = model.layers[0].mlp.forward(x)
+    ref._packed_moe_kernel = None
+    assert torch.equal(fused, model.layers[0].mlp.forward(x))
+
+
+@cuda
+def test_an_unpacked_expert_is_computed_like_the_per_slot_loop(tmp_path):
+    """A checkpoint that leaves experts unquantized (a compressed-tensors ignore list) in a
+    layer the installer never read: cold and warm (dense VRAM entries) both match stock,
+    bit for bit -- they run the same arithmetic (final review I1)."""
+    model, ref, _ = _cuda_model(tmp_path, packed=False)
+    x = _x()
+    cold = model.layers[0].mlp.forward(x)
+    warm = model.layers[0].mlp.forward(x)
+    assert ref._expert_vram_cache.hits > 0, "premise: the warm call was served from VRAM"
+    ref._packed_moe_kernel = None
+    stock = model.layers[0].mlp.forward(x)
+    assert torch.equal(cold, stock) and torch.equal(warm, stock)

@@ -2371,23 +2371,30 @@ def _make_fused_sparse_forward(
                         if _prof:
                             _mp['slots_hit'] += 1
                         continue
+                    # `_entry` is what the VRAM tier stores, exactly as the loop below
+                    # stores it; `_math` is what this call computes with. They differ
+                    # only for packed roles at different widths (no fused pass): stock
+                    # dequantizes those role by role and caches nothing, and so does this.
+                    # The installer read ONE expert, so a later layer may be unpacked or
+                    # mixed; packed_experts_decode runs any such call the stock way.
                     _packed = _group_packed_tensors_by_weight(raw)
-                    _entry = None
-                    if _packed_roles_complete(_packed):
-                        _entry = build_expert_blob(
-                            _upload_packed_expert(_packed, device, _mp))
-                        if _entry is None:
-                            raise NotImplementedError(
-                                f"layer {layer_idx} expert {eidx}: its projections are "
-                                f"packed at different widths, which the fused decode kernel "
-                                f"cannot run (install_packed_expert_kernels checked one "
-                                f"expert of this model)")
+                    if not _packed["gate"]:
+                        _wg, _wd, _wu, _entry = _expert_dense_weights(
+                            raw, device, dtype, timing=_mp)
+                        _math = _entry if _wg is not None else None
+                    elif _packed_roles_complete(_packed):
+                        _on_dev = _upload_packed_expert(_packed, device, _mp)
+                        _entry = build_expert_blob(_on_dev)
+                        _math = (_entry if _entry is not None
+                                 else {"dense": dequantize_expert_weights(_on_dev, dtype)})
+                    else:
+                        _entry = _math = None      # a missing role: stock skips it too
                     _settle_miss_upload(
                         eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
                         vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
                         cm_last_call=_cm_last_call, cm_budget=_cm_budget)
-                    if _entry is not None:
-                        _blobs[eidx] = _entry
+                    if _math is not None:
+                        _blobs[eidx] = _math
                         if _prof:
                             _mp['slots_miss'] += 1
                 # The per-slot loop's order -- expert id, then slot -- which is the

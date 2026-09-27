@@ -134,16 +134,41 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             L3 (host trim, no kernel) ≤ ~18 ms — dominated. Stop rule (< 5 %) does not fire. Open design
             questions: the miss path (80.5 slots/token, H2D of packed blobs 7.8 ms on the compute stream),
             M > 1 (prefill chunks, spec verify), the per-layer syncs.
-      - [~] **Step 3 — design (brainstorming) → spec → user approval → plan → build.** Design approved in
+      - [x] **Step 3 — design (brainstorming) → spec → user approval → plan → build.** Design approved in
             brainstorming 2026-09-27 (approach **A "L1 exact"**, user-chosen over B = scale-factored V4 and C =
             host trim only); spec `docs/superpowers/specs/2026-09-27-S7-packed-expert-kernels-design.md`
             (**approved by the user 2026-09-27**; §9 = four refinements found while planning: behavioural SiLU check, per-geometry verdict with stock fallback, one shared `_settle_miss_upload`, loud refusal instead of dropping an expert). Plan `docs/superpowers/plans/2026-09-27-S7-packed-expert-kernels.md` (6 tasks: kernel module, miss-path helpers, forward branch, installer + engine wiring, docs + suite, on-device verdict) — **approved 2026-09-27, executing NATIVE (inline) on branch `s7-packed-expert-kernels`**.
             - [x] T1 kernel module  - [x] T2 miss-path helpers  - [x] T3 forward branch
             - [x] T4 installer + engine wiring  - [x] T5 docs + suite  - [x] T6 on-device verdict
-            Suite (branch, 2026-09-27, FOREGROUND): `2998 passed, 0 failed, 0 errors, 20 skipped` (212.03 s) = floor 2955 + 43 new S7 tests. Floor moves at merge. Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
+            **Rulings made while building (durable copy; ledger was `.superpowers/`, gitignored):**
+            (1) the spec's output-level "≥ 99 % bit-equal to stock" bar failed only on the MiniMax-like
+            geometry (98.73 %, max 6 ulp) — fp32 dot-product order noise amplified by cancellation in the
+            sum over experts, not a missed rounding point (h 99.967 %, fp64 error 4.514e-3 vs stock
+            4.512e-3) — replaced by per-stage bars (gate/up ≥ 99 %, down ≥ 99 %; measured ≥ 99.95 % /
+            ≥ 99.98 %; the down stage with its rounding removed = 0 %) + an EXACT table-order sum test +
+            output accuracy (relL2 ≤ 1e-3, fp64 ≤ 1.25× stock); (2) that exact test caught LLVM contracting
+            `out += o * w` into an FMA (skips stock's fp32 product rounding) → `libdevice.mul_rn`; (3) the
+            unbound-locals lint gate: kernel launches carry the gated_delta_kernels-style disable, the
+            kernel branch BINDS the per-slot loop's dispatch names (no suppression in the core forward).
+            **Final whole-branch review (fresh Opus reviewer): "with fixes", 0 Critical.** Fixed, each
+            RED→GREEN: **I1** — the branch assumed every expert of every layer is a fusable blob (the
+            installer reads ONE expert): an unpacked expert was silently DROPPED, mixed-width roles RAISED,
+            a dense VRAM entry crashed; now `packed_experts_decode` runs any call that is not all blobs of
+            one geometry through `stock_experts_decode`, and misses build the stock loop's own entry
+            (supersedes spec §9.4's raise); **M1→Important** — the bf16 integer rounding turned NaN into ±0
+            (masking faults stock propagates) → NaN passed through (+4.4 µs/layer gate_up, ≈ 0.2
+            ms/token); **M5→Important** — this row's text (install site, Step 3 marker, rulings not durable).
+            **Deferred minors:** SiLU uses approximate exp/div (libdevice exp/div_rn would sit closer to
+            stock; D6 PASS, ids identical as is); the evict-mid-call test cannot prove blob lifetime and the
+            `_TableRing` docstring credits per-slot device buffers where single-stream ordering protects;
+            `gemm_hit`/`construct_hit` stay 0 on the kernel branch (`vram_split` reads "hits are free"); the
+            installer checks SiLU before packedness; Triton specialises `n_pairs` (a `DECODE_TOP_K` in another
+            class JIT-compiles at decode). Not built: load-time seeding of every layer's geometry (a model
+            whose layers differ pays that geometry's JIT + verdict at its first decode token).
+            Suite (branch, 2026-09-27, FOREGROUND): `3001 passed, 0 failed, 0 errors, 20 skipped` (219.32 s, after the review fix pass) = floor 2955 + 46 new S7 tests. Floor moves at merge. Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
             kernels (V3: gate_up grid pairs×I/BN, down grid H/BN looping pairs in expert-id order into the
             fp32 accumulator), pointer table per routed PAIR sorted by (expert id, slot) via an event-guarded
-            pinned ring; installed in `init_model` beside S3 only on CUDA + triton + a fused non-EXL3 packed,
+            pinned ring; installed in `VaayuBaseModel.__init__` right after `patch_moe_blocks` (NOT beside S3 in `init_model`: that runs before patching, and the installer reads each block's `forward_name`) only on CUDA + triton + a fused non-EXL3 packed,
             blob-fusable MoE block, self-checked on ONE REAL expert read at load (relL2 ≤ 1e-2), else
             WARNING + stock. ONE forward branch in `_make_fused_sparse_forward`, taken iff installed AND M=1
             AND not prefill; **misses go through the kernel too** (the accumulator gate compares logits

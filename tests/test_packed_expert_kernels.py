@@ -268,3 +268,31 @@ def test_layout_walks_the_blob_streams_in_role_order():
     assert lay["gate"] == (0, 0, 512, 2048)
     assert lay["down"] == (512 * 2048 * 4 // 32, 512 * 2048 // 32, 2048, 512)
     assert lay["up"] == (2 * 512 * 2048 * 4 // 32, 2 * 512 * 2048 // 32, 512, 2048)
+
+
+@cuda
+def test_a_call_that_is_not_all_one_geometry_runs_the_stock_arithmetic(monkeypatch, capsys):
+    """A dense entry, or blobs of two geometries, in one call: no kernel can take it, so
+    the whole call runs the stock arithmetic -- exactly, and without a WARNING (final
+    review I1 / minor 3)."""
+    monkeypatch.setattr(pk, "_VERDICTS", {})
+    x, pairs, w = _case(2048, 512, 4, 32, 10)
+    blob0 = pairs[0][0]
+    dense = {"dense": dict(zip(("gate", "down", "up"),
+                               expert_weights_from_entry(blob0, x.dtype)))}
+    for mixed in ([(dense, pairs[0][1])] + pairs[1:],
+                  pairs[:9] + [(_blobs(2048, 512, 4, 64, 1)[0], pairs[9][1])]):
+        got = _run(_decode, x, mixed, w)
+        assert torch.equal(got, _run(_stock, x, mixed, w))
+    assert "WARNING" not in capsys.readouterr().out
+
+
+@cuda
+def test_a_nan_inside_the_experts_is_not_masked():
+    """Stock propagates a NaN; rounding must not turn it into a zero (final review M1)."""
+    x, pairs, w = _case(2048, 512, 4, 32, 10)
+    x = x.clone()
+    x[0, 5] = float("nan")
+    got, ref = _run(pk._launch, x, pairs, w), _run(_stock, x, pairs, w)
+    assert torch.isnan(ref).all(), "premise: a NaN input poisons every stock output"
+    assert torch.isnan(got).all()
