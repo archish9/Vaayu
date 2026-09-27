@@ -172,11 +172,26 @@ to the quantizer's own weight conversions (`hf_quantizer.get_weight_conversions(
 for a checkpoint that needs none, so this is inert elsewhere), calls the block's own forward
 unchanged, and releases the layer's expert attributes afterwards.
 
-**What this costs you, and it is not small.** The expert RAM cache, the VRAM expert cache and
-the top-k budget (`DECODE_TOP_K`) all exist to exploit sparsity, and none of them applies
-here — every token moves the whole expert set. On gpt-oss-20b that is 423.6 MB per layer,
-10.17 GB per token, and the per-token telemetry line reports `expert_cache=0hit/0miss`.
-In exchange the model runs in ~1.7 GB of VRAM instead of the ~13.8 GB a resident load needs.
+**Routed delivery (S8, 2026-09-27).** The kernel a fused-3D experts module calls reads only
+the rows of the experts it routed to. Vaayu proves that at load, on one real layer: it runs the
+block's own forward once with the real bytes and once with random bytes in every non-routed
+expert, and requires a bit-identical output (at 1 token and at a few tokens). When the proof
+passes, every visit moves only the routed experts: the experts submodule's call is wrapped, the
+routed set is read off the routing the model itself computed (`routing_data.expt_hist`), those
+experts come through the same per-expert RAM cache the other MoE forwards use (a pinned slab
+arena, capped at the model's own expert bytes), their rows are copied into one persistent
+`[num_experts, …]` GPU buffer, and the module's own forward runs over it. The load log says which
+you got:
+
+- `Routed fused-3D delivery ON for …` — routed; env.json reports `forward_delivery: "routed"`.
+- `WARNING: routed fused-3D delivery OFF for … — <reason>` — the proof failed or could not run
+  (for example a CPU load, or an experts call that carries no per-expert histogram). The model
+  keeps whole-layer delivery: correct, and slow — every token moves every expert (10.17 GB per
+  token on gpt-oss-20b).
+
+On gpt-oss-20b routed delivery moves top_k × layers = 96 experts (1.27 GB) per token instead of
+10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
+the disk. The output is bit-identical to stock transformers. There is no setting for it.
 
 **Attention note for this family:** a model whose attention carries *sinks* cannot use the
 flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux is currently
