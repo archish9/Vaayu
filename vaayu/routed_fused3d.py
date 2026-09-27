@@ -244,11 +244,15 @@ def self_check_routed_delivery(block_info, *, offset_index, checkpoint_path, vaa
                     continue
                 for t in layer.values():
                     row = t[e]
-                    if row.dtype.is_floating_point:
-                        row.copy_(torch.randn(row.shape, generator=g_dev, device=device) * 100)
-                    else:
-                        row.copy_(torch.randint(0, 100, row.shape, generator=g_dev,
-                                                device=device))
+                    # Full-range random BYTES through a uint8 view, for every dtype:
+                    # a finite-but-wrong value (the old float/int branches) only
+                    # proves the kernel is insensitive to magnitude, not that it
+                    # never reads the row. An unread row can hold NaN/Inf bf16
+                    # patterns or an E8M0 scale of 0xFF in production, and only a
+                    # byte-level corruption exercises that.
+                    rb = row.view(torch.uint8)
+                    rb.copy_(torch.randint(0, 256, rb.shape, dtype=torch.uint8,
+                                           generator=g_dev, device=device))
             out_bad, used_bad = run(layer, hidden)
             if used_bad != used:
                 return False, f"routing changed between the two arms at M={m}"
@@ -257,7 +261,8 @@ def self_check_routed_delivery(block_info, *, offset_index, checkpoint_path, vaa
                 return False, (f"non-routed expert rows change the output at M={m} "
                                f"(max|diff| {diff:.3e}): the kernel reads rows it did "
                                f"not route to")
-        return True, f"non-routed expert rows unread at M=1 and M={m_multi}"
+        return True, (f"non-routed expert rows do not change the output at M=1 "
+                     f"and M={m_multi}")
     except Exception as e:  # noqa: BLE001 -- fails closed; the reason is printed
         return False, f"self-check raised {type(e).__name__}: {e}"
     finally:

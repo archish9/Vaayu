@@ -33,6 +33,28 @@ def test_a_kernel_that_reads_every_row_fails(tmp_path):
     assert "change the output" in why
 
 
+def test_a_kernel_that_zero_weights_non_routed_rows_fails(tmp_path, monkeypatch):
+    """A kernel that DOES read non-routed rows but multiplies their contribution
+    by 0.0 must still be caught: finite-but-wrong corruption lets `0 * value`
+    cancel out, but full-range random BYTES can land on NaN/Inf bit patterns,
+    and `0 * NaN` is NaN, not 0 -- so a truly unread row is the only way to pass.
+    """
+    model, idx, _ = build(tmp_path)
+
+    def reads_but_zero_weights(self, hidden_states, routing_data, gather_idx,
+                               scatter_idx=None):
+        out = torch.zeros_like(hidden_states)
+        for t in range(hidden_states.shape[0]):
+            for j in range(gather_idx.shape[1]):
+                e = int(gather_idx[t, j])
+                out[t] += routing_data.gate_scal[t, j] * (
+                    hidden_states[t] @ self.gate_up_proj[e] + self.gate_up_proj_bias[e])
+        return out + 0.0 * (self.gate_up_proj.sum() + self.gate_up_proj_bias.sum())
+    monkeypatch.setattr(RoutedExperts, "forward", reads_but_zero_weights)
+    (ok, why), _ = _check(tmp_path, model, idx)
+    assert not ok, why
+
+
 def test_a_check_that_routes_every_expert_is_vacuous_and_fails(tmp_path):
     model, idx, _ = build(tmp_path, top_k=NUM_EXPERTS)
     (ok, why), _ = _check(tmp_path, model, idx, top_k=NUM_EXPERTS)
