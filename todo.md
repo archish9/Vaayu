@@ -89,7 +89,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
 | **S10** | **refuse `use_torch_compile=True`** (warn-and-disable) instead of crashing, and correct `config.py:328`'s false reason (= **row 48**, fix (b)) | (d): a real bug, but the server declines the knob, so no server user reaches it | hours | [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md) |
 
 **Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
-- [ ] **S7 — Qwen3-Next per-expert dispatch.** Evidence (r36recheck1, pre-S3): U 0.1123 s, NOEXP
+- [~] **S7 — Qwen3-Next per-expert dispatch.** **STARTED 2026-09-27: handoff re-verified against HEAD — §2 numbers reproduce exactly from r36recheck1.json; line refs drift ≤2 (call `:2349`, F.linear `:2397-2399`, accumulate `:2417`); a 2nd per-layer sync the handoff omits: `unique().tolist()` `:2219`; NOEXP stubs the WHOLE block, so the pool also holds the shared expert + per-layer overhead.** Evidence (r36recheck1, pre-S3): U 0.1123 s, NOEXP
       0.0368 s, bytes ~9 ms, so dispatch ≈ 0.138 ms/slot ≈ 66 ms/token. Per slot (`moe_patch.py:2329-2413`):
       gather, `expert_weights_from_entry` (compiled int4 dequant, 31.8 µs even on a VRAM hit), 3 `F.linear`,
       scale, append; plus 48 blocking `expert_indices.cpu()` syncs per token (`:2317`). Steps: re-baseline at
@@ -99,6 +99,58 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       ceiling is < 5 % of the real token.** Done = ABBA ≥ 2 % (else revert), greedy ids identical, D6 band,
       expert-id accumulation order kept, gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next
       server smoke). §8: no knob (S3 precedent), reachable at N=1.
+      - [x] **Step 0 — re-baseline at HEAD `cab066a` (2026-09-27, `row26_decode.py -s7base1`, BALLAST 25):**
+            U1 0.1110 / U2 0.1109 s (9.01 tok/s), NOEXP 0.0333; pool 77.7 ms = 70 %; minus bytes (80.5 VRAM
+            misses × 1.77 MB @ 19.7 GB/s = 7.2 ms + 1.5 ms stall) → **dispatch 68.9 ms = 62.1 % of T_U =
+            143.6 µs/slot. Stop rule 0 does not fire.** Greedy ids W/U1/U2 identical.
+      - [x] **Step 1 — attribution: HOST-BOUND (2026-09-27, `plans/probes/s7_dispatch.py -r1`, one load).**
+            U_HOST (unprofiled, inert: 0.1089 = U1): MoE blocks 78.6 ms host/token = 1,637 µs/layer —
+            hit dequant 17.6 ms (**44.1 µs host per call for a 7.8 µs kernel** — torch.compile call
+            overhead), miss path 9.8 (122 µs/call), CPU argsort `compute_expert_dispatch` 3.8 (80 µs/layer),
+            shared expert 2.9, router 2.2, accumulate 2.0, miss dispatch 1.1, block exclusive (per-slot
+            gather / 3 `F.linear` / silu / mul / weight index+mul + per-layer syncs) 39.2. U_SYNC: MoE issue
+            76.0 ms vs **drain 3.8 ms/token (79 µs/block)** — the GPU trails the host by < 80 µs. CUPTI
+            (8 decode fwds, 0 unmatched incl. Triton): 39.6 ms device per 108.9 ms token; MoE 6,733
+            launches (~14/slot), **27.5 ms device busy vs 78.6 ms host** → GPU idle ~65 % of MoE time.
+            **Per slot ≈ 135 µs host vs ≈ 33 µs device** (dequant 7.8 + 3 `gemvx` 15.2 + elementwise ~9 +
+            acc 1). **L2 REJECTED on arithmetic:** dense entries are 3.56× the packed ones (VRAM tier ≈4,210
+            → ≈1,184 experts) to save only the 17.6 ms hit dequant; L1 removes that AND the GEMV/elementwise
+            host cost at no capacity loss. **L3-via-`bmm` batching is risky:** cuBLAS may pick a kernel per
+            batch size, so an expert's output could depend on how many OTHER experts hit — cache state —
+            breaking the row 44 F6 determinism invariant; a Triton kernel with a fixed per-expert
+            reduction does not. Trap: an unprofiled arm AFTER a CUPTI arm reads +16 % (profiler residue) —
+            put CUPTI last. RESULTS `docs/2026-09-27-S7-dispatch-census-RESULTS.md`.
+      - [x] **Step 2 — priced (2026-09-27, `plans/probes/s7_microbench.py` / `s7_kvariants.py` /
+            `s7_numcheck.py`; one real layer's 10 experts, M=1, ABBA).** Per layer, synced: **stock 995–1,021 µs**
+            (×48 ≈ 48.6 ms), stock-with-dense-weights 518–532 (dequant ≈ 490 µs/layer), L1 first cut 179.
+            Kernel variants (layer 10, do_bench, 17.69 MB packed/layer): 3-D-reshape tiles 149–159 µs (~111
+            GB/s — the reshape layout was the limiter, not `cvt`); **V3 = exact 2-D (static nibble loop,
+            magic-number int→float, integer RNE to bf16) 75.3 µs (235 GB/s)**; V4 scale-factored 66.1 µs (not
+            stock-equal). **V3 over all 48 layers × 8 draws: `h` 99.98 % / output 99.87 % bit-equal to stock**
+            (cuBLAS `gemvx` summation order is not replicable — one-ulp flips; fp64 error identical).
+            Expert-id accumulation order kept exactly (down kernel sums fp32 in table order); an expert's
+            result is independent of which others share the launch → F6 invariant holds by construction.
+            **Price: L1 ≈ 100–110 µs/layer vs ~1,010 → ~43 ms/token ≈ 39 % of T_U on VRAM hits alone.**
+            L3 (host trim, no kernel) ≤ ~18 ms — dominated. Stop rule (< 5 %) does not fire. Open design
+            questions: the miss path (80.5 slots/token, H2D of packed blobs 7.8 ms on the compute stream),
+            M > 1 (prefill chunks, spec verify), the per-layer syncs.
+      - [~] **Step 3 — design (brainstorming) → spec → user approval → plan → build.** Design approved in
+            brainstorming 2026-09-27 (approach **A "L1 exact"**, user-chosen over B = scale-factored V4 and C =
+            host trim only); spec `docs/superpowers/specs/2026-09-27-S7-packed-expert-kernels-design.md`
+            (**approved by the user 2026-09-27**; §9 = four refinements found while planning: behavioural SiLU check, per-geometry verdict with stock fallback, one shared `_settle_miss_upload`, loud refusal instead of dropping an expert). Plan `docs/superpowers/plans/2026-09-27-S7-packed-expert-kernels.md` (6 tasks: kernel module, miss-path helpers, forward branch, installer + engine wiring, docs + suite, on-device verdict) — **approved 2026-09-27, executing NATIVE (inline) on branch `s7-packed-expert-kernels`**.
+            - [ ] T1 kernel module  - [ ] T2 miss-path helpers  - [ ] T3 forward branch
+            - [ ] T4 installer + engine wiring  - [ ] T5 docs + suite  - [ ] T6 on-device verdict Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
+            kernels (V3: gate_up grid pairs×I/BN, down grid H/BN looping pairs in expert-id order into the
+            fp32 accumulator), pointer table per routed PAIR sorted by (expert id, slot) via an event-guarded
+            pinned ring; installed in `init_model` beside S3 only on CUDA + triton + a fused non-EXL3 packed,
+            blob-fusable MoE block, self-checked on ONE REAL expert read at load (relL2 ≤ 1e-2), else
+            WARNING + stock. ONE forward branch in `_make_fused_sparse_forward`, taken iff installed AND M=1
+            AND not prefill; **misses go through the kernel too** (the accumulator gate compares logits
+            across different VRAM residency, so hit/miss must not change an expert's math). Split
+            `_expert_dense_weights` into upload+blob / dequant. No knob; private `_packed_moe_kernel` is the
+            A/B toggle. Out (banked): removing the 2 per-layer syncs, M>1 kernel, hit/miss-read overlap.
+            Accepted cost: disk stall no longer hidden by the slow loop. Unit tests over Qwen3-Next-like
+            (2048/512 int4 g32 top-10), MiniMax-like (3072/1536 int4 g128 top-8) + int8. Acceptance = §4.
 - [ ] **S8 — gpt-oss-20b: attribute the 5.8 s, then the user picks a route.** It runs the FOURTH forward
       `_make_whole_layer_sparse_forward` (`moe_patch.py:2090`), which is NOT in CLAUDE.md's dispatch table.
       **CLAUDE.md §0/§5 still say "NOT YET RUN / G1"; that is stale since A3 (2026-09-21).** Evidence (A3):
