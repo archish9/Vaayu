@@ -2337,7 +2337,12 @@ def _make_fused_sparse_forward(
             # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
             expert_indices_cpu = expert_indices.cpu()
-            if not _use_pk:
+            if _use_pk:
+                # The per-slot loop below never runs on this branch: the kernel branch
+                # consumes every load first. Bound anyway, so no name in that loop is
+                # ever unbound (tests/test_no_unbound_locals.py).
+                _pair_gpu = _starts = _counts_l = None
+            else:
                 _pair, _starts, _counts_l = compute_expert_dispatch(
                     expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
                     experts_mod.num_experts)

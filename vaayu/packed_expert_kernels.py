@@ -235,7 +235,11 @@ def _gate_up(x, tbl, n, geom, sc):
     lay = _layout(geom)
     inter, hid = lay["gate"][2], lay["gate"][3]
     h = torch.empty(n, inter, dtype=x.dtype, device=x.device)
-    _gate_up_kernel[(n, inter // _GU_BLOCK_N)](
+    # pylint's possibly-used-before-assignment is a false positive on both kernel launches
+    # (here and in _down): the kernels are bound under the module-level `if triton is not
+    # None:` guard, and nothing reaches a launch without install_packed_expert_kernels,
+    # which returns early when triton is None (the gated_delta_kernels precedent).
+    _gate_up_kernel[(n, inter // _GU_BLOCK_N)](  # pylint: disable=possibly-used-before-assignment
         x, tbl, h, hid, inter, bits, gs, lay["gate"][0], lay["gate"][1],
         lay["up"][0], lay["up"][1], _DTYPE_CODE[x.dtype], sc, _GU_BLOCK_N, _block_k(hid, gs),
         num_warps=_GU_WARPS, num_stages=_GU_STAGES)
@@ -252,7 +256,7 @@ def _down(h, tbl, routing_weights, out, n, geom, sc) -> None:
     # torch promotes `out * routing_weights[...]` to fp32 unless the weight is already the
     # activation dtype; only then does the product round.
     w_round = rw.dtype == h.dtype and h.dtype != torch.float32
-    _down_kernel[(hid // bn,)](
+    _down_kernel[(hid // bn,)](  # pylint: disable=possibly-used-before-assignment
         h, tbl, rw, out, n, hid, inter, bits, gs, lay["down"][0], lay["down"][1],
         _DTYPE_CODE[h.dtype], sc, w_round, bn, _block_k(inter, gs),
         num_warps=_DN_WARPS, num_stages=_DN_STAGES)
