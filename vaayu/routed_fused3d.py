@@ -20,7 +20,10 @@ switched to routed delivery.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+import torch.nn as nn
 
 
 def routed_experts_from_call(args, kwargs, num_experts: int) -> list[int] | None:
@@ -159,3 +162,133 @@ def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str
             _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
 
     return forward
+
+
+def self_check_routed_delivery(block_info, *, offset_index, checkpoint_path, vaayu_ref,
+                               device, dtype, hidden_size: int, top_k: int,
+                               seed: int = 0) -> tuple[bool, str]:
+    """Prove, on ONE real layer, that this block's experts kernel reads only the
+    routed experts' rows. Returns (passed, reason).
+
+    Must run BEFORE patch_moe_blocks: it drives the block's own, still-unpatched
+    forward. The router's parameters are swapped for fixed-seed random ones for the
+    duration -- a streamed layer's router may still be on meta at load, and routing
+    correctness is not what is checked -- and restored by identity afterwards.
+
+    For M = 1 and M = max(2, E // (2 * top_k)) tokens: populate the real bytes, run,
+    record the output and the routed set the adapter reads off the call; then
+    overwrite every NON-routed expert's rows with random values, run again, and
+    require the same routed set and a torch.equal output. Fails closed: an
+    unrecognised call, a call that routes every expert (nothing left to corrupt),
+    a difference, or any exception -> (False, reason).
+    """
+    from .moe_patch import _populate_fused_experts, _release_fused_experts
+    from .persist.safetensor_model_persister import load_fused_layer_tensors
+
+    moe = block_info.moe_module
+    experts_mod = getattr(moe, block_info.experts_attr)
+    router = getattr(moe, block_info.router_attr)
+    experts_path = f"{block_info.module_path}.{block_info.experts_attr}"
+    num_experts = int(experts_mod.num_experts)
+    metas = offset_index.fused_layer_tensors[block_info.layer_name]
+    shard_file = str(Path(checkpoint_path) / f"{block_info.layer_name}.safetensors")
+
+    meta_params = dict(experts_mod._parameters)
+    orig_attrs = dict(experts_mod.__dict__)
+    router_params = dict(router._parameters)
+    prior_forward = experts_mod.forward
+    seen: dict = {}
+
+    def capture(*args, **kwargs):
+        seen["used"] = routed_experts_from_call(args, kwargs, num_experts)
+        return prior_forward(*args, **kwargs)
+
+    g = torch.Generator().manual_seed(seed)
+    g_dev = torch.Generator(device=device).manual_seed(seed)
+    try:
+        for name, p in router_params.items():
+            if p is not None:
+                router._parameters[name] = nn.Parameter(
+                    torch.randn(tuple(p.shape), generator=g).to(device=device, dtype=p.dtype),
+                    requires_grad=False)
+        experts_mod.forward = capture
+        run_attrs = dict(experts_mod.__dict__)      # keeps `capture` across releases
+
+        def run(layer, hidden):
+            seen.pop("used", None)
+            _populate_fused_experts(experts_mod, experts_path, layer, device, vaayu_ref)
+            try:
+                with torch.no_grad():
+                    out = moe(hidden)
+            finally:
+                _release_fused_experts(experts_mod, meta_params, run_attrs)
+            out = out[0] if isinstance(out, tuple) else out
+            return out.detach().clone(), seen.get("used")
+
+        m_multi = max(2, num_experts // (2 * max(1, int(top_k))))
+        for m in (1, m_multi):
+            layer = {k: t.to(device)
+                     for k, t in load_fused_layer_tensors(shard_file, metas).items()}
+            hidden = torch.randn(1, m, int(hidden_size), generator=g).to(device=device,
+                                                                         dtype=dtype)
+            out_real, used = run(layer, hidden)
+            if used is None:
+                return False, (f"the experts call carries no routed set the adapter "
+                               f"recognises (no `expt_hist` of length {num_experts})")
+            if len(used) >= num_experts:
+                return False, (f"vacuous at M={m}: all {num_experts} experts were routed, "
+                               f"so no row was left to corrupt")
+            routed = set(used)
+            for e in range(num_experts):
+                if e in routed:
+                    continue
+                for t in layer.values():
+                    row = t[e]
+                    if row.dtype.is_floating_point:
+                        row.copy_(torch.randn(row.shape, generator=g_dev, device=device) * 100)
+                    else:
+                        row.copy_(torch.randint(0, 100, row.shape, generator=g_dev,
+                                                device=device))
+            out_bad, used_bad = run(layer, hidden)
+            if used_bad != used:
+                return False, f"routing changed between the two arms at M={m}"
+            if not torch.equal(out_real, out_bad):
+                diff = (out_real.float() - out_bad.float()).abs().max().item()
+                return False, (f"non-routed expert rows change the output at M={m} "
+                               f"(max|diff| {diff:.3e}): the kernel reads rows it did "
+                               f"not route to")
+        return True, f"non-routed expert rows unread at M=1 and M={m_multi}"
+    except Exception as e:  # noqa: BLE001 -- fails closed; the reason is printed
+        return False, f"self-check raised {type(e).__name__}: {e}"
+    finally:
+        router._parameters.clear()
+        router._parameters.update(router_params)
+        _release_fused_experts(experts_mod, meta_params, orig_attrs)
+
+
+def run_routed_self_checks(vaayu_ref, blocks, offset_index, *, checkpoint_path, device,
+                           dtype, hidden_size: int, top_k: int) -> dict:
+    """One self-check per distinct fused-3D geometry among the whole-layer blocks;
+    returns {geometry_key: passed}. Prints one line per geometry either way: a FAIL
+    is a WARNING (CLAUDE.md §5 -- the model still runs, on the slow path)."""
+    from .moe_patch import dispatches_whole_layer
+    verdicts: dict = {}
+    for b in blocks:
+        if not dispatches_whole_layer(b, offset_index):
+            continue
+        key = fused3d_geometry_key(offset_index.fused_layer_tensors[b.layer_name])
+        if key in verdicts:
+            continue
+        ok, why = self_check_routed_delivery(
+            b, offset_index=offset_index, checkpoint_path=checkpoint_path,
+            vaayu_ref=vaayu_ref, device=device, dtype=dtype, hidden_size=hidden_size,
+            top_k=top_k)
+        verdicts[key] = ok
+        if ok:
+            print(f"[Vaayu-MoE] Routed fused-3D delivery ON for {b.layer_name}'s geometry "
+                  f"({why}): only the routed experts' rows move per layer visit.")
+        else:
+            print(f"[Vaayu-MoE] WARNING: routed fused-3D delivery OFF for {b.layer_name}'s "
+                  f"geometry -- {why}. This model keeps whole-layer delivery: every token "
+                  f"moves every expert (slow, but correct).")
+    return verdicts
