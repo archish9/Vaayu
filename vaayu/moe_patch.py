@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from .packed_expert_kernels import packed_experts_decode
+
 if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
     from .persist.expert_offset_index import ExpertOffsetIndex
@@ -2312,6 +2314,12 @@ def _make_fused_sparse_forward(
             # Their RAM lookup still runs inside the helper (LRU refresh).
             vram_resident=set(_vram_hold),
         )
+        # S7: a one-token call runs the fused packed-expert kernels (installed at load
+        # by install_packed_expert_kernels). Prefill, multi-token calls and every
+        # checkpoint the installer did not accept keep the per-slot loop below.
+        _use_pk = (getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
+                   and flat_hidden.shape[0] == 1
+                   and not getattr(vaayu_ref, "_moe_prefill_pass", False))
         try:
             # fp32 accumulator, cast back at the return. Experts are CONSUMED in
             # arrival order (that is what overlaps the reads with compute, row 44
@@ -2329,10 +2337,11 @@ def _make_fused_sparse_forward(
             # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
             expert_indices_cpu = expert_indices.cpu()
-            _pair, _starts, _counts_l = compute_expert_dispatch(
-                expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
-                experts_mod.num_experts)
-            _pair_gpu = _pair.to(device, non_blocking=True)
+            if not _use_pk:
+                _pair, _starts, _counts_l = compute_expert_dispatch(
+                    expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
+                    experts_mod.num_experts)
+                _pair_gpu = _pair.to(device, non_blocking=True)
             if _prof:
                 _mp['mask_sync'] += time.perf_counter() - _t_mask
 
@@ -2340,8 +2349,56 @@ def _make_fused_sparse_forward(
             final_hidden = torch.zeros_like(flat_hidden, dtype=torch.float32)
             _contribs: list = []
 
-            for eidx, raw in _iter_expert_loads(
-                    expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None):
+            _loads = _iter_expert_loads(
+                expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None)
+            if _use_pk:
+                # One token: every routed expert, VRAM hit or miss alike, goes through
+                # ONE fused kernel pair over the layer's packed blobs instead of ~14
+                # launches each in the loop below (~135 us of host per expert for
+                # ~33 us of GPU work, measured -- S7). Hits and misses MUST share it:
+                # the accumulator gate compares logits across different residency,
+                # so residency may not change an expert's arithmetic.
+                _blobs: dict = {}
+                for eidx, raw in _loads:
+                    _held = _vram_hold.get(eidx)
+                    if _held is not None:
+                        _blobs[eidx] = _held
+                        if _prof:
+                            _mp['slots_hit'] += 1
+                        continue
+                    _packed = _group_packed_tensors_by_weight(raw)
+                    _entry = None
+                    if _packed_roles_complete(_packed):
+                        _entry = build_expert_blob(
+                            _upload_packed_expert(_packed, device, _mp))
+                        if _entry is None:
+                            raise NotImplementedError(
+                                f"layer {layer_idx} expert {eidx}: its projections are "
+                                f"packed at different widths, which the fused decode kernel "
+                                f"cannot run (install_packed_expert_kernels checked one "
+                                f"expert of this model)")
+                    _settle_miss_upload(
+                        eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                        vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
+                        cm_last_call=_cm_last_call, cm_budget=_cm_budget)
+                    if _entry is not None:
+                        _blobs[eidx] = _entry
+                        if _prof:
+                            _mp['slots_miss'] += 1
+                # The per-slot loop's order -- expert id, then slot -- which is the
+                # order the fp32 sum runs in (row 44 F6).
+                _eids = expert_indices_cpu.view(-1).tolist()
+                _pairs = [(_blobs[_eids[s]], s)
+                          for s in sorted(range(len(_eids)), key=_eids.__getitem__)
+                          if _eids[s] in _blobs]
+                if _pairs:
+                    _t_gemm = _mark() if _prof else 0.0
+                    packed_experts_decode(flat_hidden, _pairs, routing_weights,
+                                          final_hidden, act_fn)
+                    if _prof:
+                        _mp['gemm'] += _mark() - _t_gemm
+                _loads = ()      # every expert was consumed above
+            for eidx, raw in _loads:
                 _s, _c = _starts[eidx], _counts_l[eidx]
                 if _c == 0:
                     continue
