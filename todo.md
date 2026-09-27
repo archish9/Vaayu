@@ -83,13 +83,13 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
 
 | # | item | why here | cost | handoff |
 |---|---|---|---|---|
-| **S7** | **Qwen3-Next per-expert dispatch** — ~66 ms of the 0.112 s decode token (57 %), 0.138 ms × 480 slots; a VRAM HIT still dequantizes the packed int4 expert to ~6.3 MB of dense bf16 before three M=1 `F.linear` calls | (a): the production model's largest term; no row covers it, SETTLED refutes nothing | ~1 day measure; build unknown | [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md) |
+| **S7** ✅ | ~~**Qwen3-Next per-expert dispatch** — ~66 ms of the 0.112 s decode token (57 %), 0.138 ms × 480 slots; a VRAM HIT still dequantizes the packed int4 expert to ~6.3 MB of dense bf16 before three M=1 `F.linear` calls | (a): the production model's largest term; no row covers it, SETTLED refutes nothing~~ **CLOSED 2026-09-27, A WIN: fused packed-expert decode kernel, decode −48.4 % / −48.9 % (1.94×), ids identical, D6 PASS, gates green. See the S7 row below** | ~1 day measure; build unknown | [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md) |
 | **S8** | **gpt-oss-20b at 0.17 tok/s on a model that FITS the GPU** — stock peaks at 13.79 GB VRAM; Vaayu streams 13.28 GB/token, and `compute` 5.2 s of 5.8 s includes a per-visit MXFP4 swizzle. Split the 5.8 s, then the user picks: pin it whole / cache the converted layer / A6 | (b): ~100× projected (→ ~20 tok/s); it already serves | hours to measure; route cost varies | [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md) |
 | **S9** | **DeepSeek `wo_a` folded on the CPU every token** — 1.42 s of 3.06 s (46 %); fold on the GPU instead, which should be bit-identical (= S6 lead **L-a**) | (c): cheap, ~1.9× on DeepSeek, but a fixture model | hours + one ~10 min A/B | [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md) |
 | **S10** | **refuse `use_torch_compile=True`** (warn-and-disable) instead of crashing, and correct `config.py:328`'s false reason (= **row 48**, fix (b)) | (d): a real bug, but the server declines the knob, so no server user reaches it | hours | [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md) |
 
 **Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
-- [ ] **S7 — Qwen3-Next per-expert dispatch.** Evidence (r36recheck1, pre-S3): U 0.1123 s, NOEXP
+- [x] **S7 — Qwen3-Next per-expert dispatch.** **CLOSED 2026-09-27, A WIN — decode median 100.4–100.5 → 51.3–51.9 ms = −48.37 % / −48.85 % (two ABBA replicates, sd ≤ 0.6 ms), ≈ 9.95 → 19.4 tok/s (1.94×); greedy ids ON == OFF 64/64 both; prefill flat (±0.8 %); D6 band PASS (code +0.09 %, prose −0.10 %); accumulator gate Qwen3-Next 8/8 with the kernel live + MiniMax 8/8; server smoke 9/9 with the kernel live; branch suite `2998 passed, 0 failed, 0 errors, 20 skipped`. **After the final review's fix pass (`df8ec7d`): A/B r3 −48.66 %, ids identical, prefill flat, accumulator Qwen3-Next 8/8 + server smoke 9/9 (kernel live), suite `3001 passed, 0 failed, 0 errors, 20 skipped`.** New `vaayu/packed_expert_kernels.py` (two Triton kernels over the packed int4 blobs, pointer table, per-geometry verdict vs the stock arithmetic, installer); ONE branch in `_make_fused_sparse_forward` for one-token decode; miss bookkeeping shared via `_settle_miss_upload`. §8: no knob, plumbed in `__init__` after `patch_moe_blocks` (test-pinned), reachable at N=1. No fused-EXL3 arm exists. Branch `s7-packed-expert-kernels`, awaiting the final whole-branch review + merge.** Was: **STARTED 2026-09-27: handoff re-verified against HEAD — §2 numbers reproduce exactly from r36recheck1.json; line refs drift ≤2 (call `:2349`, F.linear `:2397-2399`, accumulate `:2417`); a 2nd per-layer sync the handoff omits: `unique().tolist()` `:2219`; NOEXP stubs the WHOLE block, so the pool also holds the shared expert + per-layer overhead.** Evidence (r36recheck1, pre-S3): U 0.1123 s, NOEXP
       0.0368 s, bytes ~9 ms, so dispatch ≈ 0.138 ms/slot ≈ 66 ms/token. Per slot (`moe_patch.py:2329-2413`):
       gather, `expert_weights_from_entry` (compiled int4 dequant, 31.8 µs even on a VRAM hit), 3 `F.linear`,
       scale, append; plus 48 blocking `expert_indices.cpu()` syncs per token (`:2317`). Steps: re-baseline at
@@ -99,6 +99,84 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       ceiling is < 5 % of the real token.** Done = ABBA ≥ 2 % (else revert), greedy ids identical, D6 band,
       expert-id accumulation order kept, gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next
       server smoke). §8: no knob (S3 precedent), reachable at N=1.
+      - [x] **Step 0 — re-baseline at HEAD `cab066a` (2026-09-27, `row26_decode.py -s7base1`, BALLAST 25):**
+            U1 0.1110 / U2 0.1109 s (9.01 tok/s), NOEXP 0.0333; pool 77.7 ms = 70 %; minus bytes (80.5 VRAM
+            misses × 1.77 MB @ 19.7 GB/s = 7.2 ms + 1.5 ms stall) → **dispatch 68.9 ms = 62.1 % of T_U =
+            143.6 µs/slot. Stop rule 0 does not fire.** Greedy ids W/U1/U2 identical.
+      - [x] **Step 1 — attribution: HOST-BOUND (2026-09-27, `plans/probes/s7_dispatch.py -r1`, one load).**
+            U_HOST (unprofiled, inert: 0.1089 = U1): MoE blocks 78.6 ms host/token = 1,637 µs/layer —
+            hit dequant 17.6 ms (**44.1 µs host per call for a 7.8 µs kernel** — torch.compile call
+            overhead), miss path 9.8 (122 µs/call), CPU argsort `compute_expert_dispatch` 3.8 (80 µs/layer),
+            shared expert 2.9, router 2.2, accumulate 2.0, miss dispatch 1.1, block exclusive (per-slot
+            gather / 3 `F.linear` / silu / mul / weight index+mul + per-layer syncs) 39.2. U_SYNC: MoE issue
+            76.0 ms vs **drain 3.8 ms/token (79 µs/block)** — the GPU trails the host by < 80 µs. CUPTI
+            (8 decode fwds, 0 unmatched incl. Triton): 39.6 ms device per 108.9 ms token; MoE 6,733
+            launches (~14/slot), **27.5 ms device busy vs 78.6 ms host** → GPU idle ~65 % of MoE time.
+            **Per slot ≈ 135 µs host vs ≈ 33 µs device** (dequant 7.8 + 3 `gemvx` 15.2 + elementwise ~9 +
+            acc 1). **L2 REJECTED on arithmetic:** dense entries are 3.56× the packed ones (VRAM tier ≈4,210
+            → ≈1,184 experts) to save only the 17.6 ms hit dequant; L1 removes that AND the GEMV/elementwise
+            host cost at no capacity loss. **L3-via-`bmm` batching is risky:** cuBLAS may pick a kernel per
+            batch size, so an expert's output could depend on how many OTHER experts hit — cache state —
+            breaking the row 44 F6 determinism invariant; a Triton kernel with a fixed per-expert
+            reduction does not. Trap: an unprofiled arm AFTER a CUPTI arm reads +16 % (profiler residue) —
+            put CUPTI last. RESULTS `docs/2026-09-27-S7-dispatch-census-RESULTS.md`.
+      - [x] **Step 2 — priced (2026-09-27, `plans/probes/s7_microbench.py` / `s7_kvariants.py` /
+            `s7_numcheck.py`; one real layer's 10 experts, M=1, ABBA).** Per layer, synced: **stock 995–1,021 µs**
+            (×48 ≈ 48.6 ms), stock-with-dense-weights 518–532 (dequant ≈ 490 µs/layer), L1 first cut 179.
+            Kernel variants (layer 10, do_bench, 17.69 MB packed/layer): 3-D-reshape tiles 149–159 µs (~111
+            GB/s — the reshape layout was the limiter, not `cvt`); **V3 = exact 2-D (static nibble loop,
+            magic-number int→float, integer RNE to bf16) 75.3 µs (235 GB/s)**; V4 scale-factored 66.1 µs (not
+            stock-equal). **V3 over all 48 layers × 8 draws: `h` 99.98 % / output 99.87 % bit-equal to stock**
+            (cuBLAS `gemvx` summation order is not replicable — one-ulp flips; fp64 error identical).
+            Expert-id accumulation order kept exactly (down kernel sums fp32 in table order); an expert's
+            result is independent of which others share the launch → F6 invariant holds by construction.
+            **Price: L1 ≈ 100–110 µs/layer vs ~1,010 → ~43 ms/token ≈ 39 % of T_U on VRAM hits alone.**
+            L3 (host trim, no kernel) ≤ ~18 ms — dominated. Stop rule (< 5 %) does not fire. Open design
+            questions: the miss path (80.5 slots/token, H2D of packed blobs 7.8 ms on the compute stream),
+            M > 1 (prefill chunks, spec verify), the per-layer syncs.
+      - [x] **Step 3 — design (brainstorming) → spec → user approval → plan → build.** Design approved in
+            brainstorming 2026-09-27 (approach **A "L1 exact"**, user-chosen over B = scale-factored V4 and C =
+            host trim only); spec `docs/superpowers/specs/2026-09-27-S7-packed-expert-kernels-design.md`
+            (**approved by the user 2026-09-27**; §9 = four refinements found while planning: behavioural SiLU check, per-geometry verdict with stock fallback, one shared `_settle_miss_upload`, loud refusal instead of dropping an expert). Plan `docs/superpowers/plans/2026-09-27-S7-packed-expert-kernels.md` (6 tasks: kernel module, miss-path helpers, forward branch, installer + engine wiring, docs + suite, on-device verdict) — **approved 2026-09-27, executing NATIVE (inline) on branch `s7-packed-expert-kernels`**.
+            - [x] T1 kernel module  - [x] T2 miss-path helpers  - [x] T3 forward branch
+            - [x] T4 installer + engine wiring  - [x] T5 docs + suite  - [x] T6 on-device verdict
+            **Rulings made while building (durable copy; ledger was `.superpowers/`, gitignored):**
+            (1) the spec's output-level "≥ 99 % bit-equal to stock" bar failed only on the MiniMax-like
+            geometry (98.73 %, max 6 ulp) — fp32 dot-product order noise amplified by cancellation in the
+            sum over experts, not a missed rounding point (h 99.967 %, fp64 error 4.514e-3 vs stock
+            4.512e-3) — replaced by per-stage bars (gate/up ≥ 99 %, down ≥ 99 %; measured ≥ 99.95 % /
+            ≥ 99.98 %; the down stage with its rounding removed = 0 %) + an EXACT table-order sum test +
+            output accuracy (relL2 ≤ 1e-3, fp64 ≤ 1.25× stock); (2) that exact test caught LLVM contracting
+            `out += o * w` into an FMA (skips stock's fp32 product rounding) → `libdevice.mul_rn`; (3) the
+            unbound-locals lint gate: kernel launches carry the gated_delta_kernels-style disable, the
+            kernel branch BINDS the per-slot loop's dispatch names (no suppression in the core forward).
+            **Final whole-branch review (fresh Opus reviewer): "with fixes", 0 Critical.** Fixed, each
+            RED→GREEN: **I1** — the branch assumed every expert of every layer is a fusable blob (the
+            installer reads ONE expert): an unpacked expert was silently DROPPED, mixed-width roles RAISED,
+            a dense VRAM entry crashed; now `packed_experts_decode` runs any call that is not all blobs of
+            one geometry through `stock_experts_decode`, and misses build the stock loop's own entry
+            (supersedes spec §9.4's raise); **M1→Important** — the bf16 integer rounding turned NaN into ±0
+            (masking faults stock propagates) → NaN passed through (+4.4 µs/layer gate_up, ≈ 0.2
+            ms/token); **M5→Important** — this row's text (install site, Step 3 marker, rulings not durable).
+            **Deferred minors:** SiLU uses approximate exp/div (libdevice exp/div_rn would sit closer to
+            stock; D6 PASS, ids identical as is); the evict-mid-call test cannot prove blob lifetime and the
+            `_TableRing` docstring credits per-slot device buffers where single-stream ordering protects;
+            `gemm_hit`/`construct_hit` stay 0 on the kernel branch (`vram_split` reads "hits are free"); the
+            installer checks SiLU before packedness; Triton specialises `n_pairs` (a `DECODE_TOP_K` in another
+            class JIT-compiles at decode). Not built: load-time seeding of every layer's geometry (a model
+            whose layers differ pays that geometry's JIT + verdict at its first decode token).
+            Suite (branch, 2026-09-27, FOREGROUND): `3001 passed, 0 failed, 0 errors, 20 skipped` (219.32 s, after the review fix pass) = floor 2955 + 46 new S7 tests. Floor moves at merge. Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
+            kernels (V3: gate_up grid pairs×I/BN, down grid H/BN looping pairs in expert-id order into the
+            fp32 accumulator), pointer table per routed PAIR sorted by (expert id, slot) via an event-guarded
+            pinned ring; installed in `VaayuBaseModel.__init__` right after `patch_moe_blocks` (NOT beside S3 in `init_model`: that runs before patching, and the installer reads each block's `forward_name`) only on CUDA + triton + a fused non-EXL3 packed,
+            blob-fusable MoE block, self-checked on ONE REAL expert read at load (relL2 ≤ 1e-2), else
+            WARNING + stock. ONE forward branch in `_make_fused_sparse_forward`, taken iff installed AND M=1
+            AND not prefill; **misses go through the kernel too** (the accumulator gate compares logits
+            across different VRAM residency, so hit/miss must not change an expert's math). Split
+            `_expert_dense_weights` into upload+blob / dequant. No knob; private `_packed_moe_kernel` is the
+            A/B toggle. Out (banked): removing the 2 per-layer syncs, M>1 kernel, hit/miss-read overlap.
+            Accepted cost: disk stall no longer hidden by the slow loop. Unit tests over Qwen3-Next-like
+            (2048/512 int4 g32 top-10), MiniMax-like (3072/1536 int4 g128 top-8) + int8. Acceptance = §4.
 - [ ] **S8 — gpt-oss-20b: attribute the 5.8 s, then the user picks a route.** It runs the FOURTH forward
       `_make_whole_layer_sparse_forward` (`moe_patch.py:2090`), which is NOT in CLAUDE.md's dispatch table.
       **CLAUDE.md §0/§5 still say "NOT YET RUN / G1"; that is stale since A3 (2026-09-21).** Evidence (A3):
@@ -169,7 +247,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). ◀◀ (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). ◀◀ (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —

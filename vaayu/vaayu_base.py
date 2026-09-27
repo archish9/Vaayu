@@ -3065,6 +3065,11 @@ class VaayuBaseModel(GenerationMixin):
                 loader_strategy=self.loader_strategy,
                 blocks=self._detected_moe_blocks,
             )
+            # S7: one-token decode of a fused non-EXL3 pack-quantized block runs two
+            # fused kernels per layer instead of ~14 launches per routed expert. CUDA +
+            # triton only; checked against the stock loop on one real expert, at load.
+            from .packed_expert_kernels import install_packed_expert_kernels
+            install_packed_expert_kernels(self)
             # Lookahead predictor (Task 12): O(1) next-block lookup by layer idx.
             self._moe_block_by_idx = {b.layer_idx: b for b in self._moe_blocks}
             self._lookahead_state = {"hits": 0, "total": 0}
