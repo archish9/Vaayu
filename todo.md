@@ -276,19 +276,38 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             arms both times; decode whole/routed = **9.61× (r1) / 9.69× (r2)** — clears the 3× stop rule by
             ~3.2×; routed decode 2.26-2.29 tok/s vs whole-layer 0.234-0.240 tok/s (matches the pre-S8 baseline
             4.44-4.59 s/token within noise); prefill routed/whole = 0.243-0.279 (routed is *faster* to first
-            token, well under the 1.05 flag). **One probe-only deviation** (not engine code, `plans/`
-            gitignored): running the brief's `s8_ab.py` verbatim crashed arm 1 —
+            token, well under the 1.05 flag). Per-arm table, copied from `ab-r1.log` / `ab-r2.log` (`s8ab`
+            lines; prompt 198 tokens, `NEW_TOK=24`):
+
+            | arm | r1 prefill (s) | r1 decode median (s) | r2 prefill (s) | r2 decode median (s) |
+            |---|---:|---:|---:|---:|
+            | W (routed, warm-up, discarded) | 3.43 | 0.4824 | 3.27 | 0.4676 |
+            | R1 (routed) | 1.21 | 0.4366 | 1.01 | 0.4395 |
+            | X1 (whole-layer) | 3.51 | 4.1831 | 3.93 | 4.2529 |
+            | X2 (whole-layer) | 4.27 | 4.2484 | 4.23 | 4.2988 |
+            | R2 (routed) | 0.96 | 0.4404 | 0.97 | 0.4433 |
+
+            **One probe-only deviation** (not engine code, `plans/`
+            gitignored): running the brief's `s8_ab.py` verbatim crashed arm 1 with
+            `RuntimeError: The size of tensor a (128) must match the size of tensor b (199) at
+            non-singleton dimension 3` (`eager_attention_forward`) —
             `enable_prefix_cache=False` makes `generate()` skip Vaayu's own `_create_kv_cache()`, so HF
             auto-selects a cache that truncates gpt-oss's sliding layers to 128 tokens while Vaayu's mask
-            code assumes full length; **confirmed on `main` too (678bdb9, pre-S8)** via a worktree repro —
+            code assumes full length; **confirmed on `main` too (678bdb9, pre-S8)** via a worktree repro
+            (`plans/probes/s8_out/repro-main-prefixoff2.log`) —
             pre-existing, not server-reachable at the default `ENABLE_PREFIX_CACHE=True`. Worked around by
-            passing `model._create_kv_cache()` explicitly per arm (documented inline in `s8_ab.py`).
-            **Step 5 (64-tok vs stock): `identical over 64: False`** (first diff at token 50) — investigated,
+            passing `model._create_kv_cache()` explicitly per arm (documented inline in `s8_ab.py`). **This
+            is the same code path as the open `[bug]` row below at "`kv_cache_mode` is INERT ... whenever
+            prefix caching is OFF" (`vaayu_base.py:5684-5688`) — see that row's 2026-09-27 S8 T6 sub-bullet
+            for the sharpened finding.**
+            **Step 5 (64-tok vs stock): `identical over 64: False`** (first diff at index 50: stock token
+            `558`, vaayu token `350`) — investigated,
             not a stop (no stop clause on this step): isolated by comparing routed vs whole-layer **on the
             same branch, same cache**, at 64 tokens — **identical to each other at every position**, so the
             stock divergence is a pre-existing Vaayu-vs-stock KV-cache numerics artifact over long
             autoregressive decode (near-tied-logit flip, plausible for code-gen whitespace tokens), not
-            caused by routed delivery. **Gates:** gpt-oss server `9 passed`; Qwen3-Next accumulator
+            caused by routed delivery. **Tracked as its own open row below** ("gpt-oss greedy decode
+            diverges from stock ... at token 50"). **Gates:** gpt-oss server `9 passed`; Qwen3-Next accumulator
             `8 passed`, no `capped`/`Routed fused-3D` line, arena `13293` slabs; MiniMax accumulator
             `8 passed`, no `capped`/`Routed fused-3D` line, arena `2629` slabs. **Arena vs `main`**
             (`/tmp/claude-1000/s8-main` worktree, removed after): MiniMax `2636→2629` (7 slabs, 0.27%, RAM
@@ -297,13 +316,30 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             never engaged for either model; attributed to ordinary free-RAM-at-load variance across separate
             invocations, not independently re-measured under tighter control. §8 all four: no knob (private
             `_routed_fused3d`); plumbed at load; reachable at N=1 (server gate is the proof); nothing banked.
-            **Three findings recorded, not fixed** (pending bugs, see RESULTS doc): the stale 256-tok
-            fixture; `enable_prefix_cache=False` + gpt-oss + >128 tokens crashes (pre-existing,
-            `vaayu_base.py:5684`); Vaayu-vs-stock 64-tok decode drift at token ~50 (routed==whole, so not
-            S8-caused). **PICK THIS NEXT → S9.**
+            **Three findings recorded, not fixed:** the stale 256-tok fixture (RESULTS doc only, no
+            row — a fixture problem, not a code bug); `enable_prefix_cache=False` + gpt-oss + >128 tokens
+            crashes (now a dated sub-bullet on the open `kv_cache_mode` INERT row, cross-referenced
+            above); Vaayu-vs-stock 64-tok decode drift at token ~50 (now its own open `[bug]` row below,
+            routed==whole so not S8-caused). **PICK THIS NEXT → S9.**
       - [ ] **gpt-oss non-expert stream** — embed (1.16 GB/token to read one row), `lm_head` 1.16 GB/token,
             12 attention layers 0.64 GB/token, ≈ 0.46 s/token; CPU gather for the embedding, pinned-RAM
             head/attention.
+- [bug] **gpt-oss greedy decode diverges from stock transformers at token 50** (found by S8 T6,
+      2026-09-27, `plans/probes/s8_out/ab-r64.json`, `ab-x64.json`, `stock-r64.json`). 198-token
+      server-rendered prompt, `NEW_TOK=64`, greedy: Vaayu's ids match stock through position 49, then
+      diverge at index 50 (**stock token `558`, Vaayu token `350`**) and every position after. **Isolated
+      as independent of routed delivery**: re-ran with `ARMS=X1` (whole-layer) at the same `NEW_TOK=64` and
+      diffed against the `R1` (routed) run — **identical to each other at all 64 positions**, including 50
+      — so both delivery paths hit the same divergence; it is **pre-existing**, not caused by S8's routed
+      fused-3D work. **Single-forward logits are bit-identical to stock** at both 4 and 256 tokens (S8 T6
+      Steps 1-2, sha match both), so the divergence is specific to **multi-step decode through the KV-cache
+      path**, not the forward pass itself. **Cause not established** — likely candidates are a near-tied
+      logit flip (plausible in code generation, where whitespace/formatting tokens can be genuinely close)
+      or a numerics difference between Vaayu's `_create_kv_cache()` (`FP8DynamicCache(quantize=False)`,
+      the bf16 ring buffer) and stock's native `DynamicCache` accumulating over many steps. **First step
+      when picked up:** repeat the 64-token comparison at a few different `kv_cache_mode` settings and with
+      per-step logit-diff instrumentation to localise where the drift starts, rather than only where
+      argmax first flips.
 - S9 = the S6 row's **L-a** `[ ]` (not duplicated here). Fix: fold `wo_a` on the device
       (`vaayu_deepseek_v4.py:344` folds it on the CPU today). **Stop if the device fold is not bit-identical
       to the CPU fold.** Re-baseline first: 0.3267 predates S5-M's arena. Rejected: a RAM cache of the folded
@@ -1969,6 +2005,23 @@ test — none can make Vaayu faster.** No §0 P-row is open.
   why DeepSeek-V4 is unaffected by this row.
   **First step when picked up:** measure what it actually costs on MiniMax at `kv_cache_mode="fp8"`
   with prefix caching off — if the answer is ~0, this is a docs-and-comment fix, not a perf row.
+  **2026-09-27, S8 T6 (`todo.md`'s S8 row above), sharper consequence found:** on gpt-oss-20b, the
+  SAME code path (`generate()` bypassing `self._create_kv_cache()` when `self._prefix_cache is
+  None`, `vaayu_base.py:5684-5688`) is not just a silently-wrong dtype — with
+  `enable_prefix_cache=False` and a prompt/generation crossing gpt-oss's 128-token sliding window,
+  it **crashes outright**: `RuntimeError: The size of tensor a (128) must match the size of tensor
+  b (199) at non-singleton dimension 3` (`eager_attention_forward`,
+  `transformers/models/gpt_oss/modeling_gpt_oss.py:259`) — HF's own `generate()` auto-selects a
+  cache that truncates gpt-oss's sliding layers to 128 tokens, which Vaayu's mask-building code
+  (written only for Vaayu's own always-full-length `_create_kv_cache()`) cannot handle.
+  **Reproduces on `main`** (678bdb9, pre-S8) as well as on `s8-routed-fused3d`, so it predates S8
+  and is not caused by routed delivery — `plans/probes/s8_out/repro-main-prefixoff2.log`.
+  **Server-reachable only if a user sets `ENABLE_PREFIX_CACHE=False`** (the default is `True`,
+  `server/config.py:100`, which takes the other `generate()` branch and always passes
+  `_create_kv_cache()`). **Probe workaround** (not an engine fix): pass
+  `past_key_values=model._create_kv_cache()` explicitly into `stream_generate(...)`/`generate(...)`
+  per call — `plans/probes/s8_ab.py`. The underlying fix is still the one described above: make
+  `generate()` pass its own cache (or refuse the config) even when `pc is None`.
 
 - **[bug] `prefix_hit` in `requests.jsonl` cannot detect a reuse COLLAPSE** (found by row 31,
   2026-09-12). It is `True` for a 1-token match, so an arm whose turn-2 match had fallen from
