@@ -113,7 +113,11 @@ def test_a_prefill_visit_caches_nothing(tmp_path):
     blocks, cache = patch(tmp_path, model, idx, ref)
     hidden = torch.randn(6, WIDTH)
     ref._moe_prefill_pass = True
+    router = blocks[0].moe_module.router
+    want = sorted(set(torch.topk(router(hidden), 2, dim=-1).indices.flatten().tolist()))
+    assert len(want) < NUM_EXPERTS, "a visit routing every expert cannot tell the paths apart"
     routed = _run(blocks[0], hidden)
+    assert ref._expert_history[0] == want, "the routed branch did not run"
     whole = _whole(ref, blocks[0], hidden)
     assert cache.resident_set(0) == set()
     assert torch.equal(routed, whole)
