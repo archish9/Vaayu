@@ -231,7 +231,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             (new) whole layers in pinned RAM** — ~1 tok/s, same RAM as R-C, dominated. Other levers on the
             table: CPU gather for the embedding (streams 1.16 GB/token to read ONE row), smaller prefill chunk
             (eager score term), 47-m4 (halves KV).
-      - [~] **Step 3 — route: USER PICKED R-C (per-expert streaming, stock kernel over an `[E,…]` buffer)
+      - [x] **Step 3 — route: USER PICKED R-C (per-expert streaming, stock kernel over an `[E,…]` buffer)
             2026-09-27**, over R-A (pin whole + context knob), R-C-then-R-A, and parking S8. Row 40 is fixed in
             scope. The non-expert stream (embed/head/attn, ≈ 0.46 s) is a separate follow-up. **Design
             approved in brainstorming 2026-09-27 (approach A, user-chosen over B = pre-route with own `topk` —
@@ -275,8 +275,10 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             `ARMS=W,R1,X1,X2,R2`, `NEW_TOK=24`, `BALLAST_GB=25`), two replicates:** ids identical across all 5
             arms both times; decode whole/routed = **9.61× (r1) / 9.69× (r2)** — clears the 3× stop rule by
             ~3.2×; routed decode 2.26-2.29 tok/s vs whole-layer 0.234-0.240 tok/s (matches the pre-S8 baseline
-            4.44-4.59 s/token within noise); prefill routed/whole = 0.243-0.279 (routed is *faster* to first
-            token, well under the 1.05 flag). Per-arm table, copied from `ab-r1.log` / `ab-r2.log` (`s8ab`
+            4.44-4.59 s/token within noise); prefill routed/whole = 0.243-0.279 **WARM** — the R arms follow a
+            warm-up arm (W) that filled the RAM cache, so that ratio is a warm-cache figure; the **cold first
+            request is at parity**: W arm (routed, cold) 3.27-3.43 s vs whole-layer 3.51-4.27 s — under the
+            1.05 flag either way. Per-arm table, copied from `ab-r1.log` / `ab-r2.log` (`s8ab`
             lines; prompt 198 tokens, `NEW_TOK=24`):
 
             | arm | r1 prefill (s) | r1 decode median (s) | r2 prefill (s) | r2 decode median (s) |
@@ -313,14 +315,36 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             (`/tmp/claude-1000/s8-main` worktree, removed after): MiniMax `2636→2629` (7 slabs, 0.27%, RAM
             variance); Qwen3-Next `13668→13293` (375 slabs, 2.7%) — bigger than "a few," flagged, but no
             `capped`/`Routed fused-3D` line fired in any of the 4 runs (main×2, branch×2), so the S8 cap code
-            never engaged for either model; attributed to ordinary free-RAM-at-load variance across separate
-            invocations, not independently re-measured under tighter control. §8 all four: no knob (private
+            never engaged for either model; it is free RAM at load: `avail` at cache-sizing was 27.46 GB
+            (branch) vs 28.12 GB (main) with RSS 3.10 vs 3.09 GB (`gate-qwen.log` vs `gate-qwen-main.log`),
+            and the 0.66 GB gap = 375 slabs × 1.77 MB — the arena tracked what the box had free, not S8. §8 all four: no knob (private
             `_routed_fused3d`); plumbed at load; reachable at N=1 (server gate is the proof); nothing banked.
             **Three findings recorded, not fixed:** the stale 256-tok fixture (RESULTS doc only, no
             row — a fixture problem, not a code bug); `enable_prefix_cache=False` + gpt-oss + >128 tokens
             crashes (now a dated sub-bullet on the open `kv_cache_mode` INERT row, cross-referenced
             above); Vaayu-vs-stock 64-tok decode drift at token ~50 (now its own open `[bug]` row below,
             routed==whole so not S8-caused). **PICK THIS NEXT → S9.**
+      - [x] **Final-review fix wave, 2026-09-27** (review 678bdb9..77cbfc3: ready to merge WITH FIXES, no
+            Critical). Commits: `466d1f8` I1+I2 — `run_routed_self_checks` now, only when a check ran,
+            `gc.collect()` + `torch.cuda.empty_cache()` + new `release_fused_staging_buffer()` (persister; frees
+            the 512 MiB dedicated pinned `_FUSED_BUF`); `a96b92d` I3 — `tests/test_routed_fused3d_arena.py`
+            (CPU `SlabArena(pin=False)`: decode miss→hit with eviction, declined insert, prefill staging, a load
+            failure mid-visit) + the prefill test now proves the routed branch ran; `562e7e5` M5 — WARNING when
+            a second routed geometry's buffer is allocated (not charged to the planner); `315620c` M1-M3 —
+            docstrings + `documentation/moe_expert_aware_streaming.md` §3.4b; this ledger commit (M4 + the
+            two reviewer ledger items above). **Re-verified on device (FOREGROUND, one job at a time):**
+            gpt-oss server gate `9 passed`; the false `WARNING: Expert VRAM cache disabled` is GONE —
+            `Expert VRAM cache: 0.4 GB (~31 experts resident on GPU)` (main, same pin layout: 0.5 GB, ~36-37;
+            the ~6-expert ≈ 80 MB residual is not attributed — hypothesis, unmeasured: CUDA kernel modules /
+            cuBLAS workspace the check's forwards load early, outside the caching allocator);
+            `free fused-layer staging 512.0MB` logged; RSS at cache-sizing 4.59 → **3.79 GB** (main 3.80-3.82),
+            post-load 15.07 → **14.19 GB** (−0.88 GB). 4-tok sha `7bfd3bb0…` `VERDICT BIT-IDENTICAL`; 256-tok sha
+            `2e4aad53…` == refreshed stock, `ids_tail match: True`; A/B r3 **8.92×** (routed 0.4414/0.4429 s,
+            whole 3.934/3.954 s — the whole arms ran faster than r1/r2, routed unchanged; ids identical across
+            all 5 arms; prefill cold W 3.26 s vs whole 4.03/3.97 s). Suite (FOREGROUND, full):
+            `3058 passed, 0 failed, 0 errors, 20 skipped` (+12). **§8:** no knob (load-time internals and a
+            warning); nothing new to plumb; reachable at N=1 through the server (the gate is the proof);
+            nothing banked. Logs `plans/probes/s8_out/*-fix.log`, `ab-r3.log`.
       - [ ] **gpt-oss non-expert stream** — embed (1.16 GB/token to read one row), `lm_head` 1.16 GB/token,
             12 attention layers 0.64 GB/token, ≈ 0.46 s/token; CPU gather for the embedding, pinned-RAM
             head/attention.
