@@ -562,6 +562,35 @@ def _shared_expert_output(moe_mod: nn.Module, flat_hidden: "torch.Tensor"):
     return out
 
 
+def _timing_mark(timing) -> float:
+    """perf_counter, synchronised first when a profiling `timing` dict is live -- the
+    split between an async copy and the work after it is only truthful after a sync."""
+    if timing is not None and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _packed_roles_complete(packed: dict) -> bool:
+    """Every role of a `_group_packed_tensors_by_weight` result has its codes and scales."""
+    return all("weight_packed" in packed[r] and "weight_scale" in packed[r]
+               for r in ("gate", "down", "up"))
+
+
+def _upload_packed_expert(packed: dict, device: str, timing: dict = None) -> dict:
+    """On-device copies of one pack-quantized expert's components (weight_shape stays on the
+    host: it is read, never computed on). The H2D half of `_expert_dense_weights`, shared
+    with the S7 kernel branch, which skips the dequant half. Books `timing["h2d"]`."""
+    _t0 = _timing_mark(timing)
+    on_device = {
+        r: {k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
+            for k, v in packed[r].items()}
+        for r in ("gate", "down", "up")
+    }
+    if timing is not None:
+        timing["h2d"] += _timing_mark(timing) - _t0
+    return on_device
+
+
 def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: dict = None):
     """(w_gate, w_down, w_up) for one expert, on `device`, ready for `F.linear`.
 
@@ -584,26 +613,13 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
 
     Returns (None, None, None, None) if any of the three roles is missing.
     """
-    def _mark():
-        if timing is not None and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter()
-
     packed = _group_packed_tensors_by_weight(raw)
     if packed["gate"]:
         roles = ("gate", "down", "up")
-        if any("weight_packed" not in packed[r] or "weight_scale" not in packed[r]
-               for r in roles):
+        if not _packed_roles_complete(packed):
             return None, None, None, None
-        _t0 = _mark()
-        on_device = {
-            r: {k: (v if k == "weight_shape" else v.to(device, non_blocking=True))
-                for k, v in packed[r].items()}
-            for r in roles
-        }
-        if timing is not None:
-            _t1 = _mark()
-            timing["h2d"] += _t1 - _t0
+        on_device = _upload_packed_expert(packed, device, timing)
+        _t1 = _timing_mark(timing)
         # ONE dequant pass for the whole expert, not three. The cost is kernel
         # launches, not arithmetic -- 114.3 us/expert for three per-linear calls
         # against 17.6 for one compiled pass, on work a trivial kernel does in
@@ -615,18 +631,18 @@ def _expert_dense_weights(raw: dict, device: str, dtype: "torch.dtype", timing: 
         else:
             dense = dequantize_expert_blob(blob, dtype)
         if timing is not None:
-            timing["construct"] += _mark() - _t1
+            timing["construct"] += _timing_mark(timing) - _t1
         return dense["gate"], dense["down"], dense["up"], blob
 
     w_gate, w_down, w_up = _classify_expert_tensors(raw)
     if w_gate is None or w_down is None or w_up is None:
         return None, None, None, None
-    _t0 = _mark()
+    _t0 = _timing_mark(timing)
     dense = (w_gate.to(device, dtype=dtype, non_blocking=True),
              w_down.to(device, dtype=dtype, non_blocking=True),
              w_up.to(device, dtype=dtype, non_blocking=True))
     if timing is not None:
-        timing["h2d"] += _mark() - _t0
+        timing["h2d"] += _timing_mark(timing) - _t0
     # Nothing to dequantize on this path, so the cache entry IS the weights.
     return dense + ({"dense": dict(zip(("gate", "down", "up"), dense))},)
 
@@ -2164,7 +2180,6 @@ def _make_fused_sparse_forward(
     original_forward = None,
 ):
     import torch.nn.functional as F
-    from .persist.expert_cache import ExpertVRAMCache
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
@@ -2288,7 +2303,6 @@ def _make_fused_sparse_forward(
         # arena (CPU compute, unit tests) the helper takes the legacy clone path,
         # which is what this forward used to do inline.
         shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
-        _arena = expert_cache.arena
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
             unique_experts,
             layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
@@ -2359,37 +2373,12 @@ def _make_fused_sparse_forward(
                     # ratio of exactly those two.
                     w_gate_gpu, w_down_gpu, w_up_gpu, _entry = _expert_dense_weights(
                         raw, device, dtype, timing=_mp)
-                    # This expert's copies out of the RAM tier are now issued. If they
-                    # read from a pinned slab, arm the arena's read event so acquire()
-                    # cannot recycle the slab under the in-flight DMA, then release
-                    # this forward's pin on the key -- the same order as
-                    # _make_fused_sparse_forward_exl3. A legacy clone is in no slab
-                    # (slab_index_of -> None) and needs neither.
-                    if _arena is not None:
-                        _rd = _arena.slab_index_of(next(iter(raw.values())))
-                        if _rd is not None:
-                            _arena.record_read(_rd)
-                    # Prefill staging slab: uploads issued, read event armed, so it
-                    # goes back to the staging pool for the next expert (S1-L1).
-                    _release_prefill_staged(expert_cache, vaayu_ref,
-                                            lambda k: k == (layer_idx, eidx))
-                    if (layer_idx, eidx) in _pinned_keys:
-                        expert_cache.unpin(layer_idx, eidx)
-                        _pinned_keys.discard((layer_idx, eidx))
+                    _settle_miss_upload(
+                        eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                        vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
+                        cm_last_call=_cm_last_call, cm_budget=_cm_budget)
                     if w_gate_gpu is None:
                         continue
-                    if _vram is not None and _entry is not None:
-                        # put() False means the cache refused ownership (duplicate key,
-                        # or one expert larger than the whole budget). These are plain
-                        # torch tensors — unlike the EXL3 forward's BC objects there is
-                        # no C++ heap to free, so dropping the reference is the free.
-                        _vram.put(layer_idx, eidx, _entry)
-                    elif _cm is not None and _entry is not None and not _cm_last_call:
-                        # Overflow past the budget simply re-reads on a later chunk.
-                        _sz = ExpertVRAMCache._group_bytes(_entry)
-                        if vaayu_ref._chunk_major_gpu_bytes + _sz <= _cm_budget:
-                            _cm[eidx] = _entry
-                            vaayu_ref._chunk_major_gpu_bytes += _sz
                     if _prof:
                         _mp['slots_miss'] += 1
 
@@ -2537,6 +2526,45 @@ def _release_prefill_staged(expert_cache, vaayu_ref, pred) -> None:
         slab_idx = staged.pop(key, None)
         if slab_idx is not None:
             arena.release_staging(slab_idx)
+
+
+def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,
+                        pinned_keys, vram, cm, cm_last_call, cm_budget) -> None:
+    """Everything a missed expert owes once its host-to-device copies are ISSUED.
+
+    Shared by the non-EXL3 fused forward's per-slot loop and its S7 kernel branch so
+    the order below cannot drift between them. If the copies read from a pinned slab,
+    arm the arena's read event so acquire() cannot recycle the slab under the in-flight
+    DMA, then release the forward's pin on the key -- the same order as
+    _make_fused_sparse_forward_exl3. A legacy clone is in no slab (slab_index_of ->
+    None) and needs neither. A prefill staging slab goes back to the staging pool
+    (S1-L1). Then the cache entry, if there is one: the VRAM tier in decode, the
+    chunk-major dict in a chunked prefill.
+    """
+    arena = expert_cache.arena
+    if arena is not None:
+        _rd = arena.slab_index_of(next(iter(raw.values())))
+        if _rd is not None:
+            arena.record_read(_rd)
+    _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k == (layer_idx, eidx))
+    if (layer_idx, eidx) in pinned_keys:
+        expert_cache.unpin(layer_idx, eidx)
+        pinned_keys.discard((layer_idx, eidx))
+    if entry is None:
+        return
+    if vram is not None:
+        # put() False means the cache refused ownership (duplicate key, or one expert
+        # larger than the whole budget). These are plain torch tensors -- unlike the
+        # EXL3 forward's BC objects there is no C++ heap to free, so dropping the
+        # reference is the free.
+        vram.put(layer_idx, eidx, entry)
+    elif cm is not None and not cm_last_call:
+        # Overflow past the budget simply re-reads on a later chunk.
+        from .persist.expert_cache import ExpertVRAMCache
+        _sz = ExpertVRAMCache._group_bytes(entry)
+        if vaayu_ref._chunk_major_gpu_bytes + _sz <= cm_budget:
+            cm[eidx] = entry
+            vaayu_ref._chunk_major_gpu_bytes += _sz
 
 
 def _dispatch_expert_misses(
