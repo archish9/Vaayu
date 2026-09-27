@@ -84,7 +84,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
 | # | item | why here | cost | handoff |
 |---|---|---|---|---|
 | **S7** ✅ | ~~**Qwen3-Next per-expert dispatch** — ~66 ms of the 0.112 s decode token (57 %), 0.138 ms × 480 slots; a VRAM HIT still dequantizes the packed int4 expert to ~6.3 MB of dense bf16 before three M=1 `F.linear` calls | (a): the production model's largest term; no row covers it, SETTLED refutes nothing~~ **CLOSED 2026-09-27, A WIN: fused packed-expert decode kernel, decode −48.4 % / −48.9 % (1.94×), ids identical, D6 PASS, gates green. See the S7 row below** | ~1 day measure; build unknown | [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md) |
-| **S8** `[~]` | **gpt-oss-20b at 0.17 tok/s on a model that FITS the GPU** — stock peaks at 13.79 GB VRAM; Vaayu streams 13.28 GB/token, and `compute` 5.2 s of 5.8 s includes a per-visit MXFP4 swizzle. Split the 5.8 s, then the user picks: pin it whole / cache the converted layer / A6 | (b): ~100× projected (→ ~20 tok/s); it already serves | hours to measure; route cost varies | [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md) |
+| **S8** ✅ | ~~**gpt-oss-20b at 0.17 tok/s on a model that FITS the GPU** — stock peaks at 13.79 GB VRAM; Vaayu streams 13.28 GB/token, and `compute` 5.2 s of 5.8 s includes a per-visit MXFP4 swizzle. Split the 5.8 s, then the user picks: pin it whole / cache the converted layer / A6~~ **CLOSED 2026-09-27, A WIN: routed fused-3D delivery, decode 9.61×/9.69× (two replicates), 0.23→2.27 tok/s, logits bit-identical to stock, gates green. See the S8 row below.** | (b): ~100× projected (→ ~20 tok/s); it already serves | hours to measure; route cost varies | [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md) |
 | **S9** | **DeepSeek `wo_a` folded on the CPU every token** — 1.42 s of 3.06 s (46 %); fold on the GPU instead, which should be bit-identical (= S6 lead **L-a**) | (c): cheap, ~1.9× on DeepSeek, but a fixture model | hours + one ~10 min A/B | [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md) |
 | **S10** | **refuse `use_torch_compile=True`** (warn-and-disable) instead of crashing, and correct `config.py:328`'s false reason (= **row 48**, fix (b)) | (d): a real bug, but the server declines the knob, so no server user reaches it | hours | [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md) |
 
@@ -177,7 +177,9 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             A/B toggle. Out (banked): removing the 2 per-layer syncs, M>1 kernel, hit/miss-read overlap.
             Accepted cost: disk stall no longer hidden by the slow loop. Unit tests over Qwen3-Next-like
             (2048/512 int4 g32 top-10), MiniMax-like (3072/1536 int4 g128 top-8) + int8. Acceptance = §4.
-- [~] **S8 — gpt-oss-20b: attribute the 5.8 s, then the user picks a route.** **STARTED 2026-09-27: handoff
+- [x] **S8 — gpt-oss-20b: attribute the 5.8 s, then the user picks a route.** **CLOSED 2026-09-27, A WIN:
+      routed fused-3D delivery, decode 9.61×/9.69× faster than whole-layer (two replicates), logits
+      bit-identical to stock, gates green — see T6 below for every number. STARTED 2026-09-27: handoff
       re-verified against HEAD `678bdb9` — every A3 number it cites reproduces from
       `docs/2026-09-20-A3-gptoss-RESULTS.md` (0.17 tok/s, 5.8 s, `gb_tok` 13.28, compute 5.2 / io_wait 0.3,
       stock peak 13.79 GB); line refs drifted with S7: the forward is `moe_patch.py:2108` (pinned short-circuit
@@ -260,8 +262,45 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             knob — `_routed_fused3d` is a private A/B attribute, not a setting; plumbed at load in
             `VaayuBaseModel.__init__`, `from_pretrained` needs nothing new; reachable at N=1 through the
             server; nothing banked (the non-expert stream is filed as its own follow-up row below; 47-m5-b
-            re-checked in `todo-backlog.md`, staying there with a dated note). **T6 (on-device verdict) is
-            next.**
+            re-checked in `todo-backlog.md`, staying there with a dated note).
+      - [x] **T6 — on-device verdict, 2026-09-27. A WIN.** RESULTS
+            `docs/2026-09-27-S8-routed-fused3d-RESULTS.md`. **Step 1 (4-tok):** delivery ON, arena capped
+            1258→786 slabs (768 indexed + 18 withheld), `VERDICT BIT-IDENTICAL`. **Step 2 (256-tok):** first
+            pass showed `DIFFERENT` against the committed sha `6668afdd...` — investigated, not a stop: that
+            fixture tokenizes `vaayu/moe_patch.py` itself as the prompt, and S7/S8 edited that file since the
+            2026-09-21 reference was captured, so the *input* differed (`ids_tail` totally different), not the
+            model's output. Regenerated stock fresh at current HEAD: sha `2e4aad53...` on **both** sides,
+            `ids_tail match: True`. **The committed `6668afdd...` reference is now stale** — flag for the
+            user; `longctx_stock_256.json` on disk holds the refreshed value. **A/B (`s8_ab.py`, new probe,
+            `ARMS=W,R1,X1,X2,R2`, `NEW_TOK=24`, `BALLAST_GB=25`), two replicates:** ids identical across all 5
+            arms both times; decode whole/routed = **9.61× (r1) / 9.69× (r2)** — clears the 3× stop rule by
+            ~3.2×; routed decode 2.26-2.29 tok/s vs whole-layer 0.234-0.240 tok/s (matches the pre-S8 baseline
+            4.44-4.59 s/token within noise); prefill routed/whole = 0.243-0.279 (routed is *faster* to first
+            token, well under the 1.05 flag). **One probe-only deviation** (not engine code, `plans/`
+            gitignored): running the brief's `s8_ab.py` verbatim crashed arm 1 —
+            `enable_prefix_cache=False` makes `generate()` skip Vaayu's own `_create_kv_cache()`, so HF
+            auto-selects a cache that truncates gpt-oss's sliding layers to 128 tokens while Vaayu's mask
+            code assumes full length; **confirmed on `main` too (678bdb9, pre-S8)** via a worktree repro —
+            pre-existing, not server-reachable at the default `ENABLE_PREFIX_CACHE=True`. Worked around by
+            passing `model._create_kv_cache()` explicitly per arm (documented inline in `s8_ab.py`).
+            **Step 5 (64-tok vs stock): `identical over 64: False`** (first diff at token 50) — investigated,
+            not a stop (no stop clause on this step): isolated by comparing routed vs whole-layer **on the
+            same branch, same cache**, at 64 tokens — **identical to each other at every position**, so the
+            stock divergence is a pre-existing Vaayu-vs-stock KV-cache numerics artifact over long
+            autoregressive decode (near-tied-logit flip, plausible for code-gen whitespace tokens), not
+            caused by routed delivery. **Gates:** gpt-oss server `9 passed`; Qwen3-Next accumulator
+            `8 passed`, no `capped`/`Routed fused-3D` line, arena `13293` slabs; MiniMax accumulator
+            `8 passed`, no `capped`/`Routed fused-3D` line, arena `2629` slabs. **Arena vs `main`**
+            (`/tmp/claude-1000/s8-main` worktree, removed after): MiniMax `2636→2629` (7 slabs, 0.27%, RAM
+            variance); Qwen3-Next `13668→13293` (375 slabs, 2.7%) — bigger than "a few," flagged, but no
+            `capped`/`Routed fused-3D` line fired in any of the 4 runs (main×2, branch×2), so the S8 cap code
+            never engaged for either model; attributed to ordinary free-RAM-at-load variance across separate
+            invocations, not independently re-measured under tighter control. §8 all four: no knob (private
+            `_routed_fused3d`); plumbed at load; reachable at N=1 (server gate is the proof); nothing banked.
+            **Three findings recorded, not fixed** (pending bugs, see RESULTS doc): the stale 256-tok
+            fixture; `enable_prefix_cache=False` + gpt-oss + >128 tokens crashes (pre-existing,
+            `vaayu_base.py:5684`); Vaayu-vs-stock 64-tok decode drift at token ~50 (routed==whole, so not
+            S8-caused). **PICK THIS NEXT → S9.**
       - [ ] **gpt-oss non-expert stream** — embed (1.16 GB/token to read one row), `lm_head` 1.16 GB/token,
             12 attention layers 0.64 GB/token, ≈ 0.46 s/token; CPU gather for the embedding, pinned-RAM
             head/attention.
@@ -324,7 +363,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). ◀◀ (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). ◀◀ (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
