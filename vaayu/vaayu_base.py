@@ -453,6 +453,26 @@ def unclamped_slab_count(budget_bytes: int, slab_bytes: int, pool_size: int) -> 
     return max(1, int(budget_bytes) // int(slab_bytes)) + int(pool_size)
 
 
+def cap_slabs_at_indexed_experts(n_slabs: int, n_indexed_experts: int,
+                                 withheld: int) -> int:
+    """Row 40 (fixed in S8): never ask for more slabs than the model has experts.
+
+    The arena is sized from the RAM budget, which knows nothing about the model's
+    own expert bytes. A model whose experts total less than that budget -- the first
+    one on this box is gpt-oss-20b, whose experts (10.17 GB) sit under a 12.81 GB
+    budget once S8 gives it the arena -- would pin RAM no expert can ever fill. The
+    cap is every indexed expert plus the `withheld` in-flight/staging slabs, which
+    are never cache capacity. Derived from the offset index, never a model number
+    (CLAUDE.md §5); a model larger than its budget is returned unchanged.
+    """
+    return min(int(n_slabs), int(n_indexed_experts) + int(withheld))
+
+
+def count_indexed_experts(offset_index) -> int:
+    """Experts the offset index can deliver, summed over every MoE layer."""
+    return sum(len(experts) for experts in offset_index.index.values())
+
+
 # Pinned RAM this box will spend on prefill staging slabs (S1-L1). A HARDWARE
 # allowance, not a model number: 128 MiB of 32 GB, spent so prefill's expert
 # uploads leave page-locked memory instead of pageable clones (67-89 us of host
@@ -2723,8 +2743,24 @@ class VaayuBaseModel(GenerationMixin):
             # pinned, unswappable RAM nothing ever touches. ALL, not ANY: a mixed
             # model's other blocks do read the arena, so it is only skipped when
             # every block dispatches whole-layer.
+            # S8: a fused-3D block whose kernel provably reads only the routed
+            # experts' rows takes ROUTED delivery, which reads the arena like any
+            # per-expert forward. The proof runs here -- before the arena decision,
+            # and before patch_moe_blocks, because it drives each block's own,
+            # still-unpatched forward on one real layer. CUDA only: the kernels that
+            # route inside a fused tensor are GPU kernels.
+            from .routed_fused3d import run_routed_self_checks, routed_delivery_enabled
+            self._routed_fused3d_ok = {}
+            if str(self.running_device).startswith("cuda"):
+                self._routed_fused3d_ok = run_routed_self_checks(
+                    self, self._detected_moe_blocks, self._expert_offset_index,
+                    checkpoint_path=str(self.checkpoint_path),
+                    device=self.running_device, dtype=self.running_dtype,
+                    hidden_size=int(self.config.hidden_size),
+                    top_k=int(self.moe_top_k))
             self._moe_whole_layer_only = bool(self._detected_moe_blocks) and all(
                 dispatches_whole_layer(b, self._expert_offset_index)
+                and not routed_delivery_enabled(b, self._expert_offset_index, self)
                 for b in self._detected_moe_blocks)
             if self._moe_whole_layer_only:
                 self._moe_slab_capable = False
@@ -2835,6 +2871,18 @@ class VaayuBaseModel(GenerationMixin):
                 _withheld = get_expert_pool_size() + _staging_n
                 _n_slabs = unclamped_slab_count(
                     _expert_budget, _slab_bytes, _withheld)
+                # Row 40: a model whose experts total less than the budget must not
+                # pin RAM no expert can fill. The cache budget follows automatically
+                # (the trim below charges the cache only for the arena's share).
+                _n_indexed = count_indexed_experts(self._expert_offset_index)
+                _n_capped = cap_slabs_at_indexed_experts(
+                    _n_slabs, _n_indexed, _withheld)
+                if _n_capped < _n_slabs:
+                    print(f"[Vaayu-MoE] Expert slab arena capped {_n_slabs} -> "
+                          f"{_n_capped} slabs: the model indexes only {_n_indexed} "
+                          f"experts (+{_withheld} in-flight/staging); the budget's "
+                          f"surplus would be pinned RAM no expert can fill (row 40).")
+                    _n_slabs = _n_capped
                 try:
                     self._expert_slab_arena = SlabArena(_n_slabs, _slab_bytes, pin=_pin)
                 except RuntimeError as _slab_err:

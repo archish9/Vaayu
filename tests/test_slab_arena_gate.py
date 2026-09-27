@@ -282,3 +282,33 @@ def test_the_dispatch_and_the_arena_guard_share_one_condition():
     src = inspect.getsource(vaayu_base)
     assert "dispatches_whole_layer(" in src, \
         "the arena guard does not consult the whole-layer predicate"
+
+
+# ---------------------------------------------------------------------------
+# S8: routed fused-3D delivery DOES read the arena, so a model whose blocks take it
+# must get one; the self-checks that decide it run before the arena decision and
+# before patching (they drive each block's own, unpatched forward).
+# ---------------------------------------------------------------------------
+def test_routed_self_checks_run_before_the_arena_decision_and_the_patch():
+    import inspect
+    from vaayu import vaayu_base
+    src = inspect.getsource(vaayu_base)
+    i_check = src.index("self._routed_fused3d_ok = run_routed_self_checks(")
+    i_decide = src.index("self._moe_whole_layer_only = ")
+    i_patch = src.index("self._moe_blocks = patch_moe_blocks(")
+    assert i_check < i_decide < i_patch
+
+
+def test_a_routed_block_is_not_whole_layer_only():
+    import inspect
+    from vaayu import vaayu_base
+    src = inspect.getsource(vaayu_base)
+    assert "and not routed_delivery_enabled(b, self._expert_offset_index, self)" in src
+
+
+def test_the_arena_slab_count_is_capped_at_the_indexed_experts():
+    import inspect
+    from vaayu import vaayu_base
+    src = inspect.getsource(vaayu_base)
+    assert "cap_slabs_at_indexed_experts(" in src
+    assert "_n_slabs = _n_capped" in src
