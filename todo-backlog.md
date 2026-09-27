@@ -448,6 +448,14 @@ prefix-reused turn, or a task score), not another score-error number.
       `_expert_cache.budget_bytes` as a real number — the speculative-decode gate does
       (`spec_decode_fits`), so zeroing it is NOT obviously free.
 
+      **2026-09-27 (S8):** the re-open trigger fired — S8 touches the whole-layer forward's cache
+      sizing — but the item is split, not closed. **RAM half RESOLVED:** routed gpt-oss now fills the
+      pinned slab arena / expert RAM cache for real (row 40's cap), so that budget line is no longer
+      advertising an empty cache. **VRAM half STILL HOLDS:** routed delivery copies rows straight into
+      its own persistent `[num_experts,…]` device buffer and never touches the expert VRAM cache, which
+      is still constructed and still prints its `~37 experts resident on GPU` line for a forward that
+      reads none of it. Stays in the backlog; re-open when the VRAM cache line is addressed.
+
 ---
 
 ## 12. G3 — only one MoE forward takes `compute_device`

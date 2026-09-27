@@ -451,6 +451,9 @@ def _model_section(c, model):
         "is_moe": lambda: is_moe,
         "expert_style": lambda: blocks[0].expert_style if blocks else None,
         "forward": forward,
+        # S8: which delivery the whole-layer forward installed ("routed" | "whole");
+        # None for the other forwards and for dense.
+        "forward_delivery": lambda: getattr(blocks[0], "delivery", None) if blocks else None,
         "num_layers": lambda: getattr(model.config, "num_hidden_layers", None),
         "num_moe_blocks": lambda: len(blocks) or None,
         "num_moe_layers": lambda: geo.get("num_moe_layers"),

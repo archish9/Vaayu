@@ -40,9 +40,10 @@ class _Cache:
 
 
 class _Block:
-    def __init__(self, style, forward_name):
+    def __init__(self, style, forward_name, delivery=None):
         self.expert_style = style
         self.forward_name = forward_name
+        self.delivery = delivery
         self.layer_idx = 0
 
 
@@ -54,7 +55,7 @@ class EXL3LoaderStrategy(_Strategy):
     pass
 
 
-def _model(*, is_moe, style=None, forward=None, strategy=_Strategy,
+def _model(*, is_moe, style=None, forward=None, delivery=None, strategy=_Strategy,
            layers=94, experts=128, top_k=8, expert_bytes=12_373_196):
     m = type("FakeVaayu", (), {})()
     m.is_moe = is_moe
@@ -71,7 +72,7 @@ def _model(*, is_moe, style=None, forward=None, strategy=_Strategy,
         m._moe_geometry = {"expert_bytes": expert_bytes, "num_moe_layers": layers,
                            "top_k": top_k, "num_experts": experts,
                            "working_set_bytes": top_k * layers * expert_bytes}
-        m._moe_blocks = [_Block(style, forward)]
+        m._moe_blocks = [_Block(style, forward, delivery)]
     else:
         m._moe_geometry = None
         m._moe_blocks = []
@@ -691,3 +692,19 @@ def test_kv_cache_mode_is_the_resolved_mode_not_the_requested_one(
     assert data["budgets"]["kv_cache_mode"] == resolved
     assert data["config"]["kv_cache_mode"] == "auto", \
         "the requested value stays readable in the config section"
+
+
+@pytest.mark.parametrize("delivery", ["routed", "whole"])
+def test_the_whole_layer_forward_reports_its_delivery(delivery):
+    data = envinfo.collect(_model(is_moe=True, style="fused",
+                                  forward="_make_whole_layer_sparse_forward",
+                                  delivery=delivery), _config())
+    assert data["model"]["forward_delivery"] == delivery
+
+
+def test_other_forwards_and_dense_report_no_delivery():
+    moe = envinfo.collect(_model(is_moe=True, style="fused",
+                                 forward="_make_fused_sparse_forward"), _config())
+    dense = envinfo.collect(_model(is_moe=False), _config())
+    assert moe["model"]["forward_delivery"] is None
+    assert dense["model"]["forward_delivery"] is None

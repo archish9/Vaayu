@@ -632,6 +632,28 @@ def load_fused_layer_tensors(file_path: str, metas: dict) -> dict:
     return _read_grouped_ranges(file_path, items, dedicated=True)
 
 
+def release_fused_staging_buffer() -> int:
+    """Free the dedicated fused-layer staging buffer; returns the bytes released.
+
+    The routed-delivery self-check (vaayu/routed_fused3d.py) reads one whole layer
+    through `load_fused_layer_tensors`, and on a routed install nothing reads that
+    way again -- so the buffer (next power of two above one fused layer, 512 MiB on
+    gpt-oss-20b) would stay pinned, unswappable and unread: 47-m5's bug class. The
+    whole-layer path re-allocates it lazily on its next visit, so this is always
+    safe. Dropping the reference is not enough on its own: the host caching
+    allocator keeps a freed pinned block, so it is emptied too. Idempotent.
+    """
+    with _FUSED_LOCK:
+        released = _FUSED_SIZE[0] if _FUSED_BUF[0] is not None else 0
+        _FUSED_BUF[0] = None
+        _FUSED_SIZE[0] = 0
+        if released and hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
+    if released:
+        print(f"[VAAYU-IO] free   fused-layer staging {released / (1024**2):.1f}MB")
+    return released
+
+
 @contextmanager
 def _staging_buffer(aligned_length: int, dedicated: bool):
     """Yield a pinned staging buffer large enough for one grouped read.

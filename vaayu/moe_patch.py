@@ -981,6 +981,10 @@ class MoEBlockInfo:
     # _make_sparse_moe_forward. None until the block is patched. env.json reports
     # it; nothing at runtime branches on it.
     forward_name: str | None = None
+    # Which delivery the whole-layer forward installed ("routed" | "whole"), recorded
+    # by patch_moe_blocks from the forward's __vaayu_delivery__ tag (S8). None for the
+    # other three forwards. env.json reports it beside forward_name.
+    delivery: str | None = None
 
 
 def detect_moe_blocks(model: nn.Module) -> list[MoEBlockInfo]:
@@ -1102,9 +1106,11 @@ def dispatches_whole_layer(block_info: "MoEBlockInfo", offset_index) -> bool:
 
     THE ONE PLACE the whole-layer condition is written. `_make_sparse_moe_forward`
     calls it to choose the forward, and the engine calls it before sizing the
-    pinned slab arena -- because that forward takes no `expert_cache` argument and
-    reads NEITHER the expert RAM cache nor the VRAM one, so an arena allocated for
-    it is pinned, unswappable RAM nothing ever touches (47-m5). Measured on
+    pinned slab arena -- because under WHOLE delivery that forward reads NEITHER
+    the expert RAM cache nor the VRAM one, so an arena allocated for it is pinned,
+    unswappable RAM nothing ever touches (47-m5). ROUTED delivery (S8,
+    vaayu/routed_fused3d.py) does read the RAM arena, which is why the engine's
+    arena guard also consults `routed_delivery_enabled`. Measured on
     gpt-oss-20b: skipping it took load RSS 19.20 -> 3.81 GB with the generated
     logits bit-identical. The arena is sized from FREE RAM AT LOAD, so the figure
     freed moves by arm (15.97 GB there, ~18.5 GB under the server gate) -- quote
@@ -1475,6 +1481,7 @@ def patch_moe_blocks(
         # Fix 1: direct assignment — no __get__ binding needed
         block_info.moe_module.forward = sparse_fwd
         block_info.forward_name = getattr(sparse_fwd, "__vaayu_forward__", None)
+        block_info.delivery = getattr(sparse_fwd, "__vaayu_delivery__", None)
         experts_mod = getattr(block_info.moe_module, block_info.experts_attr)
         if hasattr(experts_mod, 'num_experts'):
             n_experts = experts_mod.num_experts
@@ -1520,7 +1527,7 @@ def _make_sparse_moe_forward(
         if dispatches_whole_layer(block_info, offset_index):
             fwd = _make_whole_layer_sparse_forward(
                 block_info, offset_index, checkpoint_path, device, vaayu_ref,
-                original_forward=original_forward,
+                original_forward=original_forward, expert_cache=expert_cache,
             )
             fwd.__vaayu_forward__ = "_make_whole_layer_sparse_forward"
             return fwd
@@ -2112,6 +2119,7 @@ def _make_whole_layer_sparse_forward(
     device: str,
     vaayu_ref,
     original_forward=None,
+    expert_cache=None,
 ):
     """Stream a fused-3D layer WHOLE and let the module's own forward route it.
 
@@ -2128,19 +2136,67 @@ def _make_whole_layer_sparse_forward(
     untouched: gpt-oss's MoE block returns `(hidden_states, router_scores)`, not a
     bare tensor. Per-expert streaming of a fused-3D checkpoint is row 47's A6 and
     needs a kernel that takes one expert at a time.
+
+    S8: when the load-time self-check proved this geometry's kernel reads only the
+    routed experts' rows (`routed_delivery_enabled`), the layer is delivered ROUTED
+    instead: the experts submodule's forward is wrapped (vaayu/routed_fused3d.py) and
+    only the routed experts' rows move, through the shared per-expert RAM arena, into
+    one persistent device buffer per geometry. The private model attribute
+    `_routed_fused3d = False` switches a routed install back to whole-layer delivery
+    for A/B only.
     """
     from .persist.safetensor_model_persister import load_fused_layer_tensors
+    from .routed_fused3d import (allocate_expert_buffers, fused3d_geometry_key,
+                                 make_routed_experts_forward, routed_delivery_enabled)
 
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
     experts_mod = getattr(block_info.moe_module, block_info.experts_attr)
     experts_path = f"{block_info.module_path}.{block_info.experts_attr}"
     shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+    # S8 routed delivery: installed BEFORE the snapshot below, so a release (either
+    # path) restores the wrapper rather than deleting it.
+    routed = (expert_cache is not None
+              and routed_delivery_enabled(block_info, offset_index, vaayu_ref))
+    active = [False]
+    snapshot: dict = {}
+    if routed:
+        _layer_metas = offset_index.fused_layer_tensors[layer_name]
+        _all_buffers = getattr(vaayu_ref, "_fused3d_buffers", None)
+        if _all_buffers is None:
+            _all_buffers = {}
+            vaayu_ref._fused3d_buffers = _all_buffers
+        _gkey = fused3d_geometry_key(_layer_metas)
+        if _gkey not in _all_buffers:
+            # One per geometry, shared by every layer of it: copies run on the
+            # compute stream, so layer i+1 cannot overwrite rows layer i's kernels
+            # are still reading. Same peak as the whole-layer transient it replaces.
+            _all_buffers[_gkey] = allocate_expert_buffers(_layer_metas, device)
+            if len(_all_buffers) > 1:
+                # The planner's layer_slack budgets ONE fused layer, so only the
+                # first geometry's buffer is inside the plan (CLAUDE.md §5: warn,
+                # don't silently degrade). No model on this box has two.
+                def _fmt(bufs):
+                    n = sum(t.nbytes for t in bufs.values())
+                    return f"{n / 1e6:.1f} MB ({n} B)"
+                _held = ", ".join(_fmt(b) for k, b in _all_buffers.items() if k != _gkey)
+                print(f"[Vaayu-MoE] WARNING: {layer_name} is another routed fused-3D "
+                      f"geometry; its expert buffer {_fmt(_all_buffers[_gkey])} is allocated "
+                      f"beside the {_held} already held. The VRAM planner budgets one "
+                      f"fused layer (layer_slack), so this extra buffer is not charged to "
+                      f"it: expect less VRAM headroom than the plan printed.")
+        experts_mod.forward = make_routed_experts_forward(
+            experts_mod=experts_mod, prior_forward=experts_mod.forward,
+            experts_path=experts_path, layer_idx=layer_idx, layer_name=layer_name,
+            shard_file=shard_file, offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref, buffers=_all_buffers[_gkey], device=device,
+            snapshot=snapshot, active=active)
     # Snapshot taken at PATCH time, while the module is still meta-initialised:
     # this is what a visit restores, so a release can never leave the module
     # holding a live expert tensor.
     meta_params = dict(experts_mod._parameters)
     base_attrs = dict(experts_mod.__dict__)
+    snapshot.update(meta_params=meta_params, base_attrs=base_attrs)
     # Every expert, because the kernel is handed every expert. The spec-decode
     # gate sizes a verify pass off this (vaayu_base.py, gate.observe) and an empty
     # dict reads to it as "this forward does not report routing".
@@ -2150,6 +2206,12 @@ def _make_whole_layer_sparse_forward(
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
+        if routed and getattr(vaayu_ref, "_routed_fused3d", True):
+            active[0] = True
+            try:
+                return original_forward(hidden_states, **kwargs)
+            finally:
+                active[0] = False
 
         metas = offset_index.fused_layer_tensors.get(layer_name)
         if not metas:
@@ -2166,6 +2228,7 @@ def _make_whole_layer_sparse_forward(
         finally:
             _release_fused_experts(experts_mod, meta_params, base_attrs)
 
+    sparse_forward.__vaayu_delivery__ = "routed" if routed else "whole"
     return sparse_forward
 
 
@@ -2601,8 +2664,11 @@ def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,
                         pinned_keys, vram, cm, cm_last_call, cm_budget) -> None:
     """Everything a missed expert owes once its host-to-device copies are ISSUED.
 
-    Shared by the non-EXL3 fused forward's per-slot loop and its S7 kernel branch so
-    the order below cannot drift between them. If the copies read from a pinned slab,
+    Shared by the non-EXL3 fused forward's per-slot loop, its S7 kernel branch, and
+    the routed fused-3D wrapper (S8, vaayu/routed_fused3d.py) so the order below
+    cannot drift between them. The routed wrapper settles every RAM-tier expert, HITS
+    as well as misses, with `entry=None`: its rows go into a shared device buffer, not
+    a cache entry. If the copies read from a pinned slab,
     arm the arena's read event so acquire() cannot recycle the slab under the in-flight
     DMA, then release the forward's pin on the key -- the same order as
     _make_fused_sparse_forward_exl3. A legacy clone is in no slab (slab_index_of ->
@@ -2667,9 +2733,10 @@ def _dispatch_expert_misses(
     before it calls this helper and passes nothing, so its behaviour is
     unchanged.
 
-    Shared by all three MoE forwards (fused-EXL3, module-list, and since row
-    30-P the non-EXL3 fused forward): the slab/pin/arena discipline below is
-    subtle enough that a second copy would rot.
+    Shared by all three per-expert MoE forwards (fused-EXL3, module-list, and
+    since row 30-P the non-EXL3 fused forward) and, since S8, by the routed
+    fused-3D wrapper (vaayu/routed_fused3d.py): the slab/pin/arena discipline
+    below is subtle enough that a second copy would rot.
     """
     from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
 

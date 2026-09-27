@@ -742,3 +742,41 @@ def test_boundaries_of_the_working_set_floor():
     assert clamp_slab_count(**_GEO_QWEN, working_set_bytes=clamped_cache) == clamp_slab_count(**_GEO_QWEN)
     # exactly covered only before clamping -> skip
     assert clamp_slab_count(**_GEO_QWEN, working_set_bytes=unclamped_cache) == unclamped_slab_count(**_GEO_QWEN)
+
+
+# ---------------------------------------------------------------------------
+# Row 40 (fixed in S8): the arena is never larger than the model's own experts.
+# ---------------------------------------------------------------------------
+from vaayu.vaayu_base import (cache_budget_for_arena, cap_slabs_at_indexed_experts,
+                              count_indexed_experts)
+from vaayu.vaayu_base import unclamped_slab_count as _unclamped
+
+
+# (layers, experts/layer, aligned slab bytes, budget bytes, withheld) -- CLAUDE.md §5:
+# three contrasting geometries; only the gpt-oss-like one has fewer expert bytes
+# than its budget, so only it may be capped.
+_ROW40_GEOMETRIES = {
+    "qwen3next_like": (48, 512, 1_773_568, 18_540_000_000, 24),
+    "minimax_like": (62, 256, 8_810_496, 9_000_000_000, 23),
+    "gptoss_like": (24, 32, 13_238_272, 12_810_000_000, 18),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ROW40_GEOMETRIES))
+def test_the_arena_is_capped_only_where_the_experts_are_smaller(name):
+    layers, per_layer, slab, budget, withheld = _ROW40_GEOMETRIES[name]
+    n_indexed = layers * per_layer
+    n = _unclamped(budget, slab, withheld)
+    capped = cap_slabs_at_indexed_experts(n, n_indexed, withheld)
+    if n_indexed * slab < budget:
+        assert capped == n_indexed + withheld < n
+        # Every expert still fits: the cache share is exactly the model's experts.
+        assert cache_budget_for_arena(capped, slab, withheld) == n_indexed * slab
+    else:
+        assert capped == n, f"{name}: a model larger than its budget must be unchanged"
+
+
+def test_count_indexed_experts_sums_every_layer():
+    class _Idx:
+        index = {"model.layers.0": {0: {}, 1: {}, 2: {}}, "model.layers.1": {0: {}, 5: {}}}
+    assert count_indexed_experts(_Idx()) == 5

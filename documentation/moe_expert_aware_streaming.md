@@ -147,14 +147,16 @@ def _inject_expert_weights(expert_mod, raw, expert_idx, layer_name, device, dtyp
 
 **Direct assignment**: `moe_module.forward = sparse_fwd` (NOT `.__get__()`) — instance attribute assignment bypasses Python's descriptor protocol, so `sparse_fwd(hidden_states)` receives only `hidden_states` without a module self injection.
 
-### 3.4b Whole-layer streaming for fused-3D checkpoints — `vaayu/moe_patch.py`
+### 3.4b Whole-layer and routed delivery for fused-3D checkpoints — `vaayu/moe_patch.py`
 
 Some checkpoints do not store one tensor per expert. They store **one tensor per projection
 per layer**, with the expert count as the leading axis (`...mlp.experts.gate_up_proj_blocks`
 of shape `[num_experts, …]`), and their experts module is handed to a grouped-GEMM kernel
 that does the routing **inside** the kernel — `gpt-oss-20b` (MXFP4) is the example on this
-box. There is no per-expert delivery to make for such a model: the kernel wants every
-expert's bytes whether one token routed to them or five hundred did.
+box. The kernel is handed the whole tensor — every expert's rows — whether one token routed
+to an expert or five hundred did, so the module cannot be given one expert at a time. It only
+READS the routed experts' rows, though, so where Vaayu can prove that (routed delivery, below)
+only those rows need to be filled.
 
 `_make_sparse_moe_forward` therefore has a fourth branch, `_make_whole_layer_sparse_forward`,
 chosen when **both** are true:
@@ -172,11 +174,26 @@ to the quantizer's own weight conversions (`hf_quantizer.get_weight_conversions(
 for a checkpoint that needs none, so this is inert elsewhere), calls the block's own forward
 unchanged, and releases the layer's expert attributes afterwards.
 
-**What this costs you, and it is not small.** The expert RAM cache, the VRAM expert cache and
-the top-k budget (`DECODE_TOP_K`) all exist to exploit sparsity, and none of them applies
-here — every token moves the whole expert set. On gpt-oss-20b that is 423.6 MB per layer,
-10.17 GB per token, and the per-token telemetry line reports `expert_cache=0hit/0miss`.
-In exchange the model runs in ~1.7 GB of VRAM instead of the ~13.8 GB a resident load needs.
+**Routed delivery (S8, 2026-09-27).** The kernel a fused-3D experts module calls reads only
+the rows of the experts it routed to. Vaayu proves that at load, on one real layer: it runs the
+block's own forward once with the real bytes and once with random bytes in every non-routed
+expert, and requires a bit-identical output (at 1 token and at a few tokens). When the proof
+passes, every visit moves only the routed experts: the experts submodule's call is wrapped, the
+routed set is read off the routing the model itself computed (`routing_data.expt_hist`), those
+experts come through the same per-expert RAM cache the other MoE forwards use (a pinned slab
+arena, capped at the model's own expert bytes), their rows are copied into one persistent
+`[num_experts, …]` GPU buffer, and the module's own forward runs over it. The load log says which
+you got:
+
+- `Routed fused-3D delivery ON for …` — routed; env.json reports `forward_delivery: "routed"`.
+- `WARNING: routed fused-3D delivery OFF for … — <reason>` — the proof failed or could not run
+  (for example an experts call that carries no per-expert histogram). The model
+  keeps whole-layer delivery: correct, and slow — every token moves every expert (10.17 GB per
+  token on gpt-oss-20b).
+
+On gpt-oss-20b routed delivery moves top_k × layers = 96 experts (1.27 GB) per token instead of
+10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
+the disk. The output is bit-identical to stock transformers. There is no setting for it.
 
 **Attention note for this family:** a model whose attention carries *sinks* cannot use the
 flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux is currently
