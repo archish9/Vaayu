@@ -139,7 +139,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             host trim only); spec `docs/superpowers/specs/2026-09-27-S7-packed-expert-kernels-design.md`
             (**approved by the user 2026-09-27**; §9 = four refinements found while planning: behavioural SiLU check, per-geometry verdict with stock fallback, one shared `_settle_miss_upload`, loud refusal instead of dropping an expert). Plan `docs/superpowers/plans/2026-09-27-S7-packed-expert-kernels.md` (6 tasks: kernel module, miss-path helpers, forward branch, installer + engine wiring, docs + suite, on-device verdict) — **approved 2026-09-27, executing NATIVE (inline) on branch `s7-packed-expert-kernels`**.
             - [x] T1 kernel module  - [x] T2 miss-path helpers  - [x] T3 forward branch
-            - [ ] T4 installer + engine wiring  - [ ] T5 docs + suite  - [ ] T6 on-device verdict Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
+            - [x] T4 installer + engine wiring  - [ ] T5 docs + suite  - [ ] T6 on-device verdict Durable summary: new `vaayu/packed_expert_kernels.py` — two Triton
             kernels (V3: gate_up grid pairs×I/BN, down grid H/BN looping pairs in expert-id order into the
             fp32 accumulator), pointer table per routed PAIR sorted by (expert id, slot) via an event-guarded
             pinned ring; installed in `init_model` beside S3 only on CUDA + triton + a fused non-EXL3 packed,

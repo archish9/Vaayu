@@ -19,6 +19,8 @@ input (row 44 F6).
 CUDA + triton only. Each new (geometry, dtype) key is held to `stock_experts_decode` on its
 first call; a disagreement or an unsupported geometry stays on the stock arithmetic, loudly.
 """
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 
@@ -327,3 +329,89 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
         _launch(x, pairs, routing_weights, out)
     else:
         stock_experts_decode(x, pairs, routing_weights, out, act_fn)
+
+
+def _is_silu(act_fn, device, dtype) -> bool:
+    """Behavioural: does the experts' activation compute SiLU? (the kernels hardcode it)"""
+    if act_fn is None:
+        return False
+    t = torch.linspace(-8.0, 8.0, 257, device=device).to(dtype)
+    try:
+        return torch.equal(act_fn(t), F.silu(t))
+    except Exception:
+        return False
+
+
+def _one_real_blob(vaayu_ref, block, device):
+    """The VRAM-tier entry of `block`'s lowest-numbered expert, read off the checkpoint (one
+    expert's bytes), or None when its experts are not pack-quantized. A packed expert
+    `build_expert_blob` refuses is reported, not hidden."""
+    from .moe_patch import (_group_packed_tensors_by_weight, _packed_roles_complete,
+                            _upload_packed_expert, build_expert_blob)
+    from .persist.safetensor_model_persister import load_expert_sparse
+    metas = vaayu_ref._expert_offset_index.index.get(block.layer_name, {})
+    if not metas:
+        return None
+    raw = load_expert_sparse(
+        str(Path(vaayu_ref.checkpoint_path) / f"{block.layer_name}.safetensors"),
+        metas[min(metas)])
+    packed = _group_packed_tensors_by_weight(raw)
+    if not packed["gate"] or not _packed_roles_complete(packed):
+        return None
+    why = "its projections are packed at different bit widths or group sizes"
+    try:
+        blob = build_expert_blob(_upload_packed_expert(packed, device))
+    except NotImplementedError as exc:   # zero point / act-order: refused everywhere
+        blob, why = None, str(exc)
+    if blob is None:
+        print(f"[Vaayu] WARNING: fused packed-expert decode kernel not installed: {why}")
+    return blob
+
+
+def install_packed_expert_kernels(vaayu_ref) -> bool:
+    """Route one-token decode of every fused non-EXL3 pack-quantized MoE block through the
+    kernels -- if they agree with the stock per-expert loop on one real expert of this
+    model, on this device. Called once at load, after `patch_moe_blocks` (it reads each
+    block's `forward_name`). Seeds the verdict cache for fp32 and activation-dtype routing
+    weights, so the Triton JIT and the check are paid here, not at the first token.
+
+    Nothing is installed off CUDA, without triton, or with no block on the non-EXL3 fused
+    forward; a non-current CUDA device (Triton launches on the CURRENT device), a packed
+    expert that cannot be fused, or a disagreeing kernel is refused with a WARNING. The
+    stock path stays in every refused case."""
+    device = str(vaayu_ref.running_device)
+    if triton is None or torch.device(device).type != "cuda":
+        return False
+    blocks = [b for b in (getattr(vaayu_ref, "_moe_blocks", None) or [])
+              if getattr(b, "forward_name", None) == "_make_fused_sparse_forward"]
+    if not blocks or getattr(vaayu_ref, "_expert_offset_index", None) is None:
+        return False
+    dev_index = torch.device(device).index
+    if dev_index is not None and dev_index != torch.cuda.current_device():
+        print(f"[Vaayu] WARNING: fused packed-expert decode kernel not installed: model "
+              f"device {device} is not the current CUDA device "
+              f"({torch.cuda.current_device()}); decode keeps the stock per-expert path")
+        return False
+    block, dtype = blocks[0], vaayu_ref.running_dtype
+    act_fn = getattr(getattr(block.moe_module, block.experts_attr, None), "act_fn", None)
+    if not _is_silu(act_fn, device, dtype):
+        print("[Vaayu] fused packed-expert decode kernel not used: the experts' activation "
+              "is not SiLU")
+        return False
+    blob = _one_real_blob(vaayu_ref, block, device)
+    if blob is None:
+        return False
+    k = int(getattr(vaayu_ref, "moe_top_k", 0) or 1)
+    gen = torch.Generator(device=device).manual_seed(0)
+    x = (torch.randn(1, _layout(blob["geom"])["gate"][3], generator=gen, device=device)
+         * 0.5).to(dtype)
+    w = torch.rand(1, k, generator=gen, device=device) + 0.1
+    w = w / w.sum(-1, keepdim=True)
+    pairs = [(blob, s) for s in range(k)]
+    if not all(_checked(x, pairs, rw, act_fn) for rw in (w, w.to(dtype))):
+        return False
+    vaayu_ref._packed_moe_kernel = blob["geom"]
+    bits, gs, _roles = blob["geom"]
+    print(f"[Vaayu] fused packed-expert decode kernel on {len(blocks)} MoE layers "
+          f"({bits}-bit, group {gs})")
+    return True
