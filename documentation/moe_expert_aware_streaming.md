@@ -147,14 +147,16 @@ def _inject_expert_weights(expert_mod, raw, expert_idx, layer_name, device, dtyp
 
 **Direct assignment**: `moe_module.forward = sparse_fwd` (NOT `.__get__()`) — instance attribute assignment bypasses Python's descriptor protocol, so `sparse_fwd(hidden_states)` receives only `hidden_states` without a module self injection.
 
-### 3.4b Whole-layer streaming for fused-3D checkpoints — `vaayu/moe_patch.py`
+### 3.4b Whole-layer and routed delivery for fused-3D checkpoints — `vaayu/moe_patch.py`
 
 Some checkpoints do not store one tensor per expert. They store **one tensor per projection
 per layer**, with the expert count as the leading axis (`...mlp.experts.gate_up_proj_blocks`
 of shape `[num_experts, …]`), and their experts module is handed to a grouped-GEMM kernel
 that does the routing **inside** the kernel — `gpt-oss-20b` (MXFP4) is the example on this
-box. There is no per-expert delivery to make for such a model: the kernel wants every
-expert's bytes whether one token routed to them or five hundred did.
+box. The kernel is handed the whole tensor — every expert's rows — whether one token routed
+to an expert or five hundred did, so the module cannot be given one expert at a time. It only
+READS the routed experts' rows, though, so where Vaayu can prove that (routed delivery, below)
+only those rows need to be filled.
 
 `_make_sparse_moe_forward` therefore has a fourth branch, `_make_whole_layer_sparse_forward`,
 chosen when **both** are true:
@@ -185,7 +187,7 @@ you got:
 
 - `Routed fused-3D delivery ON for …` — routed; env.json reports `forward_delivery: "routed"`.
 - `WARNING: routed fused-3D delivery OFF for … — <reason>` — the proof failed or could not run
-  (for example a CPU load, or an experts call that carries no per-expert histogram). The model
+  (for example an experts call that carries no per-expert histogram). The model
   keeps whole-layer delivery: correct, and slow — every token moves every expert (10.17 GB per
   token on gpt-oss-20b).
 

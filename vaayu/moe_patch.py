@@ -1106,9 +1106,11 @@ def dispatches_whole_layer(block_info: "MoEBlockInfo", offset_index) -> bool:
 
     THE ONE PLACE the whole-layer condition is written. `_make_sparse_moe_forward`
     calls it to choose the forward, and the engine calls it before sizing the
-    pinned slab arena -- because that forward takes no `expert_cache` argument and
-    reads NEITHER the expert RAM cache nor the VRAM one, so an arena allocated for
-    it is pinned, unswappable RAM nothing ever touches (47-m5). Measured on
+    pinned slab arena -- because under WHOLE delivery that forward reads NEITHER
+    the expert RAM cache nor the VRAM one, so an arena allocated for it is pinned,
+    unswappable RAM nothing ever touches (47-m5). ROUTED delivery (S8,
+    vaayu/routed_fused3d.py) does read the RAM arena, which is why the engine's
+    arena guard also consults `routed_delivery_enabled`. Measured on
     gpt-oss-20b: skipping it took load RSS 19.20 -> 3.81 GB with the generated
     logits bit-identical. The arena is sized from FREE RAM AT LOAD, so the figure
     freed moves by arm (15.97 GB there, ~18.5 GB under the server gate) -- quote
@@ -2662,8 +2664,11 @@ def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,
                         pinned_keys, vram, cm, cm_last_call, cm_budget) -> None:
     """Everything a missed expert owes once its host-to-device copies are ISSUED.
 
-    Shared by the non-EXL3 fused forward's per-slot loop and its S7 kernel branch so
-    the order below cannot drift between them. If the copies read from a pinned slab,
+    Shared by the non-EXL3 fused forward's per-slot loop, its S7 kernel branch, and
+    the routed fused-3D wrapper (S8, vaayu/routed_fused3d.py) so the order below
+    cannot drift between them. The routed wrapper settles every RAM-tier expert, HITS
+    as well as misses, with `entry=None`: its rows go into a shared device buffer, not
+    a cache entry. If the copies read from a pinned slab,
     arm the arena's read event so acquire() cannot recycle the slab under the in-flight
     DMA, then release the forward's pin on the key -- the same order as
     _make_fused_sparse_forward_exl3. A legacy clone is in no slab (slab_index_of ->
@@ -2728,9 +2733,10 @@ def _dispatch_expert_misses(
     before it calls this helper and passes nothing, so its behaviour is
     unchanged.
 
-    Shared by all three MoE forwards (fused-EXL3, module-list, and since row
-    30-P the non-EXL3 fused forward): the slab/pin/arena discipline below is
-    subtle enough that a second copy would rot.
+    Shared by all three per-expert MoE forwards (fused-EXL3, module-list, and
+    since row 30-P the non-EXL3 fused forward) and, since S8, by the routed
+    fused-3D wrapper (vaayu/routed_fused3d.py): the slab/pin/arena discipline
+    below is subtle enough that a second copy would rot.
     """
     from .persist.safetensor_model_persister import load_expert_sparse, load_expert_into_slab
 
