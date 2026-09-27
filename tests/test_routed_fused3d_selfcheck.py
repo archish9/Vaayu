@@ -138,3 +138,79 @@ def test_a_failing_geometry_prints_a_warning(tmp_path, capsys):
         device="cpu", dtype=torch.float32, hidden_size=WIDTH, top_k=TOP_K)
     assert list(verdicts.values()) == [False]
     assert "WARNING: routed fused-3D delivery OFF" in capsys.readouterr().out
+
+
+# ── I1/I2: the checks hand back what they borrowed ────────────────────────────
+
+def _spy_cleanup(monkeypatch):
+    """Record the self-check cleanup calls, in order, without touching a GPU."""
+    import gc
+
+    import vaayu.persist.safetensor_model_persister as smp
+    calls: list = []
+    monkeypatch.setattr(gc, "collect", lambda *a, **k: calls.append("gc") or 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(smp, "release_fused_staging_buffer",
+                        lambda: calls.append("release_fused_staging") or 0)
+    return calls
+
+
+def _run_checks(tmp_path, model, idx, blocks=None):
+    from vaayu.moe_patch import detect_moe_blocks
+    return rf.run_routed_self_checks(
+        Ref(model), detect_moe_blocks(model) if blocks is None else blocks, idx,
+        checkpoint_path=str(tmp_path), device="cpu", dtype=torch.float32,
+        hidden_size=WIDTH, top_k=TOP_K)
+
+
+def test_a_check_that_ran_is_cleaned_up_once(tmp_path, monkeypatch):
+    """The check's device tensors sit in the caching allocator (mem_get_info cannot
+    see them, so the expert VRAM cache sized next came out disabled on gpt-oss), and
+    its read left the dedicated fused-layer pinned buffer nothing reads again."""
+    model, idx, _ = build(tmp_path, n_layers=2)
+    calls = _spy_cleanup(monkeypatch)
+    assert list(_run_checks(tmp_path, model, idx).values()) == [True]
+    assert calls.count("release_fused_staging") == 1
+    assert calls.count("empty_cache") == 1
+    assert calls.index("gc") < calls.index("empty_cache"), \
+        "collect first: a cycle still holding a check tensor keeps its block cached"
+
+
+def test_a_failed_check_is_cleaned_up_too(tmp_path, monkeypatch):
+    model, idx, _ = build(tmp_path, read_all_rows=True)
+    calls = _spy_cleanup(monkeypatch)
+    assert list(_run_checks(tmp_path, model, idx).values()) == [False]
+    assert "empty_cache" in calls and "release_fused_staging" in calls
+
+
+def test_no_check_no_cleanup(tmp_path, monkeypatch):
+    """A model with no fused-3D block (Qwen3-Next, MiniMax) must load exactly as
+    before: nothing collected, nothing emptied, nothing released."""
+    model, _idx, _ = build(tmp_path)
+    calls = _spy_cleanup(monkeypatch)
+    assert _run_checks(tmp_path, model, None) == {}      # no index -> no whole-layer block
+    assert _run_checks(tmp_path, model, None, blocks=[]) == {}
+    assert calls == []
+
+
+def test_release_fused_staging_buffer_frees_it_and_tolerates_repeats(monkeypatch):
+    import vaayu.persist.safetensor_model_persister as smp
+    host_empties: list = []
+    monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: host_empties.append(1),
+                        raising=False)
+    smp._FUSED_BUF[0] = torch.empty(4096, dtype=torch.uint8)
+    smp._FUSED_SIZE[0] = 4096
+    assert smp.release_fused_staging_buffer() == 4096
+    assert smp._FUSED_BUF[0] is None and smp._FUSED_SIZE[0] == 0
+    assert host_empties == [1], "the host caching allocator keeps a freed pinned block"
+    assert smp.release_fused_staging_buffer() == 0
+    assert smp._FUSED_BUF[0] is None and smp._FUSED_SIZE[0] == 0
+
+
+def test_release_fused_staging_buffer_without_host_empty_cache(monkeypatch):
+    import vaayu.persist.safetensor_model_persister as smp
+    monkeypatch.delattr(torch._C, "_host_emptyCache", raising=False)
+    smp._FUSED_BUF[0] = torch.empty(512, dtype=torch.uint8)
+    smp._FUSED_SIZE[0] = 512
+    assert smp.release_fused_staging_buffer() == 512
+    assert smp._FUSED_BUF[0] is None and smp._FUSED_SIZE[0] == 0

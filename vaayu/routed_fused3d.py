@@ -296,4 +296,17 @@ def run_routed_self_checks(vaayu_ref, blocks, offset_index, *, checkpoint_path, 
             print(f"[Vaayu-MoE] WARNING: routed fused-3D delivery OFF for {b.layer_name}'s "
                   f"geometry -- {why}. This model keeps whole-layer delivery: every token "
                   f"moves every expert (slow, but correct).")
+    if verdicts:
+        # Hand back what the checks borrowed, and only when one ran, so a model with
+        # no fused-3D block loads exactly as before. Their device tensors (about two
+        # fused layers) sit in PyTorch's caching allocator, which mem_get_info()
+        # cannot see: left there, the expert VRAM cache sized next disabled itself
+        # on gpt-oss with a false WARNING. Collect first -- a cycle still holding a
+        # check tensor keeps its block cached. And the whole-layer read staged
+        # through a dedicated pinned buffer nothing on a routed install reads again.
+        import gc
+        from .persist.safetensor_model_persister import release_fused_staging_buffer
+        gc.collect()
+        torch.cuda.empty_cache()
+        release_fused_staging_buffer()
     return verdicts
