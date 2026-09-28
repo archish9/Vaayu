@@ -325,8 +325,11 @@ DECODE_TOP_K_BUDGET = 0.035
 #   tokenizer_class                misreads -- detection is the supported path
 #   layer_shards_saving_path       library-facing: where a one-off split goes
 #   profiling_mode                 dev instrumentation
-#   compression, use_torch_compile `__init__` overrides these in places; they
-#                                  are not live paths
+#   compression                    `__init__` overrides it in places; not a
+#                                  live path
+#   use_torch_compile              crashes on CUDA (cudagraphs, row 48), so
+#                                  `__init__` refuses it with a warning; the
+#                                  no-cudagraph mode measured 24-35 % slower
 #   hf_token                       HF auth belongs in the environment
 # --------------------------------------------------------------------------
 

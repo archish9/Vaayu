@@ -1408,6 +1408,33 @@ def resolve_use_prompt_lookup(requested, is_moe: bool) -> bool:
         f'or "auto" (on for dense, off for MoE).')
 
 
+def resolve_use_torch_compile(requested: bool, device: str) -> bool:
+    """The `use_torch_compile` this load will actually honour: False, on every device.
+
+    On CUDA it crashes (todo.md row 48). The layer callable is compiled with
+    `mode="reduce-overhead"` -- torch.compile plus inductor's cudagraph trees,
+    which assume one model invocation per step -- and the forward replays that
+    ONE callable once per layer with no step boundary, so a layer's output is
+    overwritten by the next layer's replay before it is read. Reproduced on
+    Qwen3-Next and on the dense Llama-3.2-1B, on the first generation. Without
+    cudagraphs it runs, but measured 24-35 % slower on Qwen3-Next (row 36).
+    Refused, not raised: the same warn-and-disable the CPU branch has always done.
+    """
+    if not requested:
+        return False
+    if not hasattr(torch, 'compile'):
+        print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
+    elif not device.startswith("cuda"):
+        print("⚠️ torch.compile is most effective on CUDA. Disabling for CPU.")
+    else:
+        print("[Vaayu] WARNING: use_torch_compile DISABLED — its mode=\"reduce-overhead\" "
+              "cudagraphs crash on the first generation (\"accessing tensor output of "
+              "CUDAGraphs that has been overwritten by a subsequent run\"): the engine "
+              "replays one compiled callable per layer with no step boundary (todo.md "
+              "row 48). Without cudagraphs it measured 24-35 % slower (row 36).")
+    return False
+
+
 def cache_config_if_non_uniform(config):
     """The config to hand a Cache constructor, or None for uniform attention.
 
@@ -2192,20 +2219,11 @@ class VaayuBaseModel(GenerationMixin):
                 model_size_gb = 132.0
             _check_pcie_topology(gpu_index, model_size_gb)
 
-        self.use_torch_compile = use_torch_compile
+        self.use_torch_compile = resolve_use_torch_compile(use_torch_compile, device)
         self.kv_cache_mode = kv_cache_mode
         self.max_pinned_layers = max_pinned_layers
         self.prefill_chunk_size = prefill_chunk_size
         self._compiled_layer_fn = None
-        if use_torch_compile:
-            if not hasattr(torch, 'compile'):
-                print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
-                self.use_torch_compile = False
-            elif not device.startswith("cuda"):
-                print("⚠️ torch.compile is most effective on CUDA. Disabling for CPU.")
-                self.use_torch_compile = False
-            else:
-                print("✅ torch.compile enabled for layer forward passes")
 
         # Create model
         if hf_token is not None:
@@ -5382,6 +5400,8 @@ class VaayuBaseModel(GenerationMixin):
                             layer_out = None
                             for _oom_retry in range(_MAX_OOM_RETRIES + 1):
                                 try:
+                                    # Unreachable from __init__ (resolve_use_torch_compile refuses
+                                    # it, row 48); kept as the landing spot for a step-boundary fix.
                                     if self.use_torch_compile:
                                         if self._compiled_layer_fn is None:
                                             self._compiled_layer_fn = torch.compile(
