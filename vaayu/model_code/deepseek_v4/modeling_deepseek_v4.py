@@ -240,12 +240,19 @@ def dequantize_block_scaled(weight: torch.Tensor, scale: torch.Tensor,
     return tiled.flatten(2, 3).flatten(0, 1).to(dtype)
 
 
-def dequantize_at_load(weights: dict) -> dict:
+def dequantize_at_load(weights: dict, device=None) -> dict:
     """Apply `DEQUANTIZE_AT_LOAD` to one module's state dict.
 
     Without this, `load_state_dict` copies raw F8_E4M3 values into a bf16
     Parameter WITHOUT the scale -- no exception, wrong numbers -- and leaves
     the scale over as an unexpected key.
+
+    `device`, when given, is where the fold runs: its two inputs move there
+    first, and nothing else moves. The engine re-injects a streamed layer on
+    every token, and the CPU fold cost ~33 ms a layer there; folding on the
+    GPU took DeepSeek's decode token from 2.74 s to 1.58 s (S9). The result is
+    bit-identical on either device: both casts are exact and the scale is a
+    power of two, so the only rounding is the final bf16 one.
     """
     out = {}
     for key, tensor in weights.items():
@@ -253,7 +260,11 @@ def dequantize_at_load(weights: dict) -> dict:
         if prefix.rpartition(".")[2] not in DEQUANTIZE_AT_LOAD:
             out[key] = tensor
         elif leaf == "weight":
-            out[key] = dequantize_block_scaled(tensor, weights[f"{prefix}.scale"])
+            scale = weights[f"{prefix}.scale"]
+            if device is not None:
+                tensor = tensor.to(device, non_blocking=True)
+                scale = scale.to(device, non_blocking=True)
+            out[key] = dequantize_block_scaled(tensor, scale)
         elif leaf != "scale":
             out[key] = tensor
     return out
