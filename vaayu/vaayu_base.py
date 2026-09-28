@@ -913,6 +913,40 @@ def rekey_embed_as_lm_head(state_dict, embed_name: str, lm_head_name: str) -> di
     return {k.replace(embed_name, lm_head_name): v for k, v in state_dict.items()}
 
 
+def load_from_strategy_or_tied_head(loader_strategy, checkpoint_path,
+                                    layer_names_dict, layer_name, log_prefix=""):
+    """`loader_strategy.load_from_disk`, with the tied-head fallback.
+
+    Covers both shapes of a tied head (see `should_use_tied_lm_head`): an
+    EMPTY shard (a pre-D4 split, loads as `{}`) and an ABSENT one (a fresh
+    split since D4's `drop_absent_lm_head` writes none, so the load raises
+    FileNotFoundError). The pin path and the prefetch path each handled only
+    the empty shape, so a fresh split of Llama-3.2-1B skipped pinning the
+    head and then crashed the first forward (S10c, 2026-09-28).
+
+    Only a MISSING file counts as absent. That is safe because the splitter
+    drops the head only when the checkpoint INDEX has no head weight, and
+    otherwise refuses to call the split complete without its shard. Any other
+    failure on the head stays loud: falling back would silently swap an untied
+    model's trained head for its embedding.
+    """
+    lm_head_name = layer_names_dict.get("lm_head")
+    try:
+        tensors = loader_strategy.load_from_disk(layer_name, checkpoint_path)
+        load_failed = False
+    except FileNotFoundError:
+        if not should_use_tied_lm_head(layer_name, lm_head_name, None, load_failed=True):
+            raise
+        tensors, load_failed = None, True
+    if should_use_tied_lm_head(layer_name, lm_head_name, tensors, load_failed):
+        embed = layer_names_dict["embed"]
+        print(f"{log_prefix}{layer_name} shard is absent or holds no tensors (tied "
+              f"weights); loading them from {embed} instead.")
+        tensors = rekey_embed_as_lm_head(
+            loader_strategy.load_from_disk(embed, checkpoint_path), embed, layer_name)
+    return tensors
+
+
 def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
     """RoPE inverse frequencies for `config`, honouring PARTIAL rotary.
 
@@ -4120,20 +4154,14 @@ class VaayuBaseModel(GenerationMixin):
                            self.layer_names_dict["norm"],
                            self.layer_names_dict["lm_head"]]:
             try:
-                tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
-                # A tied-weight checkpoint has no lm_head tensor; the split still
-                # contains an empty-but-valid shard for it, so this load SUCCEEDS
-                # with zero tensors (bug D1). Pinning that marks the layer resident
-                # while it is still meta-initialized, and the forward then never
-                # loads it -- the model emits uniform-random logits.
-                if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
-                                           tensors, load_failed=False):
-                    print(f"[Vaayu-Pin] {layer_name} shard holds no tensors (tied weights); "
-                          f"loading them from {self.layer_names_dict['embed']} instead.")
-                    tensors = rekey_embed_as_lm_head(
-                        self.loader_strategy.load_from_disk(
-                            self.layer_names_dict["embed"], self.checkpoint_path),
-                        self.layer_names_dict["embed"], layer_name)
+                # A tied-weight checkpoint has no lm_head tensor: its shard is
+                # EMPTY (bug D1) or, on a fresh split, ABSENT (S10c). Pinning an
+                # empty head marks the layer resident while it is still
+                # meta-initialized -- uniform-random logits; skipping an absent
+                # one streamed it into a FileNotFoundError on the first forward.
+                tensors = load_from_strategy_or_tied_head(
+                    self.loader_strategy, self.checkpoint_path, self.layer_names_dict,
+                    layer_name, log_prefix="[Vaayu-Pin] ")
                 if not tensors:
                     # NOT `size == 0`: model.norm legitimately measures 0.00 GB.
                     print(f"[Vaayu-Pin] WARNING: {layer_name} yielded no tensors — refusing to "
@@ -4445,9 +4473,10 @@ class VaayuBaseModel(GenerationMixin):
 
         Carries the tied-head fallback (bug D1) for the same reason
         `_pin_shared_layers` and `load_layer_to_cpu` do: a checkpoint with
-        `tie_word_embeddings` ships no lm_head tensor, and Vaayu's splitter
-        writes a VALID but EMPTY shard for it, so this load SUCCEEDS with `{}`
-        and the head is left meta-initialized.
+        `tie_word_embeddings` ships no lm_head tensor. A pre-D4 split holds a
+        VALID but EMPTY shard for it, so this load SUCCEEDS with `{}` and the
+        head is left meta-initialized; a fresh split holds NO shard, so the load
+        raises (S10c). `load_from_strategy_or_tied_head` handles both.
 
         This is the PREFETCH route -- the one the forward takes for any
         non-pinned layer while prefetching is on -- and it was the third path
@@ -4461,15 +4490,8 @@ class VaayuBaseModel(GenerationMixin):
         correct 2.21 (uniform noise), while the same checkpoint under
         flash_attention_2 was correct.
         """
-        tensors = self.loader_strategy.load_from_disk(layer_name, self.checkpoint_path)
-        if should_use_tied_lm_head(layer_name, self.layer_names_dict.get("lm_head"),
-                                   tensors, load_failed=False):
-            _embed = self.layer_names_dict["embed"]
-            print(f"{layer_name} shard holds no tensors (tied weights); loading "
-                  f"them from {_embed} instead.")
-            tensors = rekey_embed_as_lm_head(
-                self.loader_strategy.load_from_disk(_embed, self.checkpoint_path),
-                _embed, layer_name)
+        tensors = load_from_strategy_or_tied_head(
+            self.loader_strategy, self.checkpoint_path, self.layer_names_dict, layer_name)
         # The strategy has a RAM cache of its own (loader_strategy._cache, live on
         # dense models -- is_moe forces its budget to 0). A hit returns with zero
         # disk I/O, so the layer loop must bill it as a cache hit for the same
