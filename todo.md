@@ -85,7 +85,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
 |---|---|---|---|---|
 | **S7** ✅ | ~~**Qwen3-Next per-expert dispatch** — ~66 ms of the 0.112 s decode token (57 %), 0.138 ms × 480 slots; a VRAM HIT still dequantizes the packed int4 expert to ~6.3 MB of dense bf16 before three M=1 `F.linear` calls | (a): the production model's largest term; no row covers it, SETTLED refutes nothing~~ **CLOSED 2026-09-27, A WIN: fused packed-expert decode kernel, decode −48.4 % / −48.9 % (1.94×), ids identical, D6 PASS, gates green. See the S7 row below** | ~1 day measure; build unknown | [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md) |
 | **S8** ✅ | ~~**gpt-oss-20b at 0.17 tok/s on a model that FITS the GPU** — stock peaks at 13.79 GB VRAM; Vaayu streams 13.28 GB/token, and `compute` 5.2 s of 5.8 s includes a per-visit MXFP4 swizzle. Split the 5.8 s, then the user picks: pin it whole / cache the converted layer / A6~~ **CLOSED 2026-09-27, A WIN: routed fused-3D delivery, decode 9.61×/9.69× (two replicates), 0.23→2.27 tok/s, logits bit-identical to stock, gates green. See the S8 row below.** | (b): ~100× projected (→ ~20 tok/s); it already serves | hours to measure; route cost varies | [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md) |
-| **S9** | **DeepSeek `wo_a` folded on the CPU every token** — 1.42 s of 3.06 s (46 %); fold on the GPU instead, which should be bit-identical (= S6 lead **L-a**) | (c): cheap, ~1.9× on DeepSeek, but a fixture model | hours + one ~10 min A/B | [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md) |
+| **S9** ✅ | ~~**DeepSeek `wo_a` folded on the CPU every token** — 1.42 s of 3.06 s (46 %); fold on the GPU instead, which should be bit-identical (= S6 lead **L-a**)~~ **CLOSED 2026-09-28, A WIN: fold on `running_device`, decode 2.738 → 1.583 s/token = −42.20 % (1.73×, ABBA), device fold bit-identical in all 43 layers, ids identical, gates green. See the S9 row below.** | (c): cheap, ~1.9× on DeepSeek, but a fixture model | hours + one ~10 min A/B | [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md) |
 | **S10** | **refuse `use_torch_compile=True`** (warn-and-disable) instead of crashing, and correct `config.py:328`'s false reason (= **row 48**, fix (b)) | (d): a real bug, but the server declines the knob, so no server user reaches it | hours | [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md) |
 
 **Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
@@ -369,10 +369,28 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       when picked up:** repeat the 64-token comparison at a few different `kv_cache_mode` settings and with
       per-step logit-diff instrumentation to localise where the drift starts, rather than only where
       argmax first flips.
-- S9 = the S6 row's **L-a** `[ ]` (not duplicated here). Fix: fold `wo_a` on the device
-      (`vaayu_deepseek_v4.py:344` folds it on the CPU today). **Stop if the device fold is not bit-identical
-      to the CPU fold.** Re-baseline first: 0.3267 predates S5-M's arena. Rejected: a RAM cache of the folded
-      bf16 (2.35 GB against S5-M-H's 3.78 GB margin).
+- [x] **S9 — DeepSeek `wo_a` folded on the GPU (= S6 lead L-a).** **CLOSED 2026-09-28, A WIN — ABBA (off, on, on,
+      off; one process each, W discarded, U1+U2; `BALLAST_GB=15`, 29G; OFF = `main` worktree via `VAAYU_ROOT`):
+      off 2.7181 / 2.7587, on 1.5811 / 1.5844 s/token → **code effect −42.20 % (2.738 → 1.583 s/token, 0.365 →
+      0.632 tok/s, 1.73×)**, order effect +22 ms; **greedy U1 ids identical across all four processes (64 tok)**.
+      `gpu_load` 2.10–2.14 → 0.606 s/token; `expert_disk` ROSE 0.22 → 0.50 s (net −1.16 s; hypothesis, unverified:
+      the 33 ms/layer CPU fold used to hide the next layers' expert reads). Peak VRAM `max_allocated` 7.37 → 7.38
+      GiB, `max_reserved` 7.51 → 7.69 GiB (fold transient 288 MiB/layer, cached). **Stop rule did not fire:** device
+      fold == CPU fold as int16 bits in all 43 decoder layers (new test, real checkpoint).** Re-verification drift:
+      pin budget now 3.76 GB → 10 non-expert-pinned layers, so **33 streamed, not 35**; idle-box CPU fold **33 ms**
+      /layer (S6's 40 ms was under load); GPU fold 3.75 ms incl. H2D. **Step 0 re-baseline at HEAD `8614d79`:** U1
+      2.655 / U2 2.684 s/token (0.377 / 0.373 tok/s; S5-M's arena had already moved it from 0.3267), `gpu_load`
+      2.03 s (76 %), ids identical. **Change:** `dequantize_at_load(weights, device=None)` moves only `wo_a.weight`
+      + `wo_a.scale` to `device` before folding; `VaayuDeepseekV4.move_layer_to_device` passes
+      `device=self.running_device` (CPU compute: unchanged). `wo_a` H2D halves (33.6 MB F8, not 67 MB bf16).
+      +3 tests (meta-device fold, all-layer bit identity, engine spy on CUDA), RED first. **Gates:** suite (branch,
+      FOREGROUND) `3061 passed, 0 failed, 0 errors, 20 skipped` (226.86 s) = floor 3058 + 3; DeepSeek tests 370
+      passed, 4 skipped; DeepSeek server smoke **9 passed** (68.62 s). Qwen3-Next/MiniMax gates not owed (no shared
+      infra touched). **§8:** no knob (always-on, bit-identical); plumbed inside `move_layer_to_device`; reachable
+      at N=1 (server smoke is the proof); nothing banked. **Next DeepSeek terms:** `gpu_load` 0.61 (non-expert H2D
+      of 33 streamed layers — L-b), `expert_disk` 0.50, compute 0.20, other 0.21. Detail
+      `docs/2026-09-28-S9-deepseek-wo_a-device-fold-RESULTS.md`; probes `plans/probes/s9_fold_bench.py`,
+      `s9_ab.sh`, `s9_ab_report.py`, logs `plans/probes/s9_out/`.
 - S10 = **row 48** `[bug]`, fix (b) (not duplicated here). The guard lives at `vaayu_base.py:2180-2189` and
       the compiled call at `:5332-5339` — row 48's own line numbers are stale. Fix the declined-reason text at
       `config.py:328` and `test_engine_param_reachability.py:65`. It also closes the duplicate `[bug]` bullet
@@ -428,7 +446,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). ◀◀ (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). ◀◀ (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
@@ -533,17 +551,26 @@ buy:** per-expert streaming + resident non-expert weights puts it dispatch-bound
 cost per slot.
 
 **Leads recorded, NOT chased (stop rule) — unsequenced, re-prioritise with the user:**
-- [ ] **L-a — SEQUENCED AS S9 (2026-09-26). DeepSeek re-dequantizes `wo_a` on the CPU every token: 1.42 s/token (46 %).** Keeping the
+- [x] **L-a — SEQUENCED AS S9 (2026-09-26). CLOSED 2026-09-28, A WIN — decode −42.20 % (2.738 → 1.583 s/token), see the S9 row at the top. STARTED 2026-09-28: handoff re-verified against HEAD `8614d79` — every
+      line ref exact (`vaayu_deepseek_v4.py:270` / `:330` / `:344`; `modeling_deepseek_v4.py:79` / `:228` / `:243` /
+      `:1286`); per-token path confirmed `StandardLoaderStrategy.inject_to_gpu` (`loader_strategy.py:191`) →
+      DeepSeek `move_layer_to_device` → CPU `dequantize_at_load`; the non-expert RAM LRU caches the RAW (pre-fold)
+      dict, so a RAM hit re-folds too. DeepSeek re-dequantizes `wo_a` on the CPU every token: 1.42 s/token (46 %).** Keeping the
       folded bf16 (35 × 67 MB ≈ 2.35 GB RAM), or folding on the GPU, removes it. Ceiling ≈ 0.6 tok/s.
 - [ ] **L-b — DeepSeek's reserve floor may be over-charged.** 8.03 GiB comes from charging `eager` a
       materialized-score term. DSA attends to `index_topk` selected keys, so whether its real peak
       materializes S×S scores is UNVERIFIED. If it does not, up to 4.53 GiB of pin budget ≈ 30 more
       resident layers ≈ −1.9 s/token, traded against context length. Needs a VRAM measurement.
+      **Re-priced by S9 (2026-09-28):** that −1.9 s counted each streamed layer with its CPU `wo_a` fold. After S9 a
+      streamed layer costs `gpu_load` 0.606 s / 33 layers ≈ 18 ms, so 30 more resident layers ≈ −0.55 s/token of
+      `gpu_load` (of a 1.58 s token) — before any effect on the `expert_disk` stall (0.50 s), which rose when the
+      fold left.
 - [ ] **L-c — the planner's VRAM priority is unpriced.** DeepSeek's expert VRAM tier (3.5 GB) hits 34.9 %,
       while the non-expert layers it streams are used on 100 % of tokens.
 - [ ] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
       amortise that share (row 37's re-gate).
-- Note: the 0.3267 predates S5-M (arena on CUDA), so today's DeepSeek decode is unmeasured.
+- Note: the 0.3267 predates S5-M (arena on CUDA). **Measured 2026-09-28 (S9 step 0): 0.377 / 0.373 tok/s at HEAD
+      `8614d79`, and 0.632 tok/s after S9.**
 
 **§8:** (1) no knob — no engine behaviour changed. (2) nothing to plumb; the method is the gitignored
 probe `plans/probes/s6_reach_method.py` (no GPU, reproduces every number above). (3) all figures are N=1
