@@ -331,7 +331,8 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         (6) L-sync 2.81 ms = 4.5 %; (7) L-overlap 7.08 ms formula but ≤1.15–2.65 ms = 1.9–4.3 % tight (≤15
         waiting layers × movable work; the one-kernel arithmetic rule stands); (8–10) ATTN / SHARED / KERNEL
         host trims 2.45 / 2.09 / 1.93 ms (< 5 %); (11) **L-VRAMpref** (prefill reads the VRAM tier, no
-        `put()`) 0.24–0.43 s = **8.0–14.0 % of HIT@8k** (≈0.22–0.24 realistic), hours; (12) S3-C ≤3.7 %
+        `put()`) 0.24–0.43 s = **8.0–14.0 % of HIT@8k** (the brief's upper bound divides h2d by disk loads, not
+        uploads, so it is ~2× high; by uploads it is ≈0.22–0.24 s, which matches the 19.7 GB/s lower bound), hours; (12) S3-C ≤3.7 %
         (cold@8k 1.02 s), new dependency; (13) L-deqretain (keep DEQUANTIZED experts across prefill chunks)
         cold@8k 6.17 s = 22.4 %, cold@2k 12.7 %, HIT 0, VRAM fit unverified, subsumed by (4); (14) row 37
         re-gate = 0. Not additive: one device floor. Unpriced: cross-layer expert prefetch (removes the 6.9 ms
