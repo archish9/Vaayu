@@ -68,7 +68,109 @@ detail each entry points to.**
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S7…S10, set 2026-09-26 at the USER's request ("do all these in fresh sessions"). One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S10b, S11…S16, set 2026-09-28 at the USER's request. One per fresh session, in order. ◀◀◀
+
+**HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row below that is not ✅**. Read its
+handoff in full — **a row whose handoff cell says "none yet" has no handoff: its durable row below IS the
+brief** (write one in `docs/superpowers/specs/` first if the row needs more than it carries) — re-verify its
+evidence against HEAD, mark its `todo.md` row `[~]`, and work it. When it closes: mark ✅ in this table with a
+one-line verdict, `[x]` its row below, update the suite floor if it moved, and point the PICK THIS NEXT line
+at the next row. **Do not reorder without a reason written here.** **After S16:** re-prioritise with the user.
+
+**Ordering rule** (the same as S7…S10): *(a)* helps the model that serves the agent (Qwen3-Next), *(b)* the
+biggest multiplier a user can reach at N=1 (CLAUDE.md §8), *(c)* cheap, and last *(d)* a bug no server user
+can reach. **Two deliberate exceptions, reasons stated so they are not re-litigated:**
+- **S10b first although it is (d)** — USER's call 2026-09-28: hours, context warm the day S10 merged, and
+  S10's own doc edit named `compression` as the "overrides it in places" example, so the false claim is now
+  explicit in 4 files.
+- **S13 ahead of S14** — a correctness question a server user can reach beats speed on the same model, and it
+  is hours.
+
+| # | item | why here | cost | handoff |
+|---|---|---|---|---|
+| **S10b** | **refuse `compression` where it cannot work, and correct its false decline reason** (= lead L-S10a) — live path, not "overridden"; bnb raises on every non-float dtype, so the split likely crashes on 4 of 5 on-device targets and writes into the model dir | exception: (d), but hours + context warm + S10 made the false claim explicit (user) | hours | [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md) |
+| **S11** | **Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | none yet — the S11 row below is the brief |
+| **S12** | **build S11's top lever** (brainstorm → spec → user approval → plan → build) | (a) | unknown until S11 | written after S11 |
+| **S13** | **gpt-oss greedy decode diverges from stock at token 50 — triage.** Top-2 logit margin at position 50; near-tie → close with evidence; else find the first step whose logits leave ulp distance (the KV-cache path — single-forward logits are bit-identical) | exception: correctness a server user reaches, hours | hours | none yet — the S13 row below is the brief |
+| **S14** | **gpt-oss non-expert stream** — measure its share of the 0.44 s token (≈0.46 s was estimated on the pre-S8 5.8 s token), then residency: CPU gather for the embedding row (1.16 GB/token streamed to read ONE row), pin `lm_head` + attention; stock fits 13.79 GB, 35.7 tok/s vs Vaayu 2.3; 47-m4 (sliding-window KV, 0.813 GB) may free room | (b): served, the biggest remaining gap to stock | ~1 day measure; build TBD | none yet — the S14 row below is the brief |
+| **S15** | **DeepSeek L-e, then L-b** — the expert-read stall S9 exposed (`expert_disk` 0.22 → 0.50 s/token, bytes identical); then whether the 8.03 GiB reserve floor is real (DSA `index_topk` may never materialize S×S scores) | (c): cheap, but a fixture model | hours each | none yet — the S15 row below is the brief |
+| **S16** | **(d) sweep** — verify-and-close row 40 (code says "fixed in S8", ledger still `[bug]`); S5-M-C (clone path fragments glibc arenas); gpt-oss + `enable_prefix_cache=False` + >128 tokens crash (server default is ON) | (d): no server user reaches any of them | hours each | none yet — the S16 row below is the brief |
+
+**Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
+- [ ] **S10b — `compression`: refuse where it cannot work; correct the false decline reason (= lead L-S10a,
+      evidence in the S10 row below).** Handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). **Also found writing it (suspect, unverified):** `check_space` (`utils.py:162-163`) DIVIDES by 0.2813 for 4bit — demands ~3.55× the model size free, not ~0.28×. **What is wrong:** `vaayu/server/config.py:328-329`, the `"compression"`
+      entry of `tests/test_engine_param_reachability.py`'s `SERVER_DELIBERATELY_NOT_EXPOSED`,
+      `vaayu/server/README.md` and `documentation/server.md` say "`__init__` overrides it in places; not a live
+      path". **Measured 2026-09-28 (static read + one bnb probe, no model):** it IS live — `__init__` always calls
+      `find_or_create_local_splitted_path(..., compression=)`; the split writes a full second copy to
+      `splitted_model.4bit|8bit` (in the MODEL DIR unless `layer_shards_saving_path` is set) and runs
+      `compress_layer_state_dict` over EVERY tensor of every layer (`utils.py:175-195`, `:551`); every layer load
+      decompresses (`utils.py:133-140`). bnb 0.49.2 RAISES on int32 / uint8 / int8 / fp8_e4m3 in both modes
+      (`Blockwise … quantization only supports 16/32-bit floats`); bf16 round-trips. **Likely, UNVERIFIED end to
+      end:** a split-time crash on every quantized target (Qwen3-Next AWQ, MiniMax EXL3, Llama-3.3-70B EXL3,
+      gpt-oss MXFP4, DeepSeek I8/F8), leaving a partial split dir. **Steps:** (0) re-verify at HEAD. (1) On
+      device, `layer_shards_saving_path` in the session scratchpad (NEVER a model dir): Llama-3.2-1B with
+      `compression="4bit"` — loads? generates? quality vs uncompressed; one quantized model — confirm the crash
+      and where. (2) RED: a pure decision from the checkpoint's safetensors header dtypes (no weights loaded) —
+      a non-float weight tensor → compression OFF + a loud WARNING naming why; test without loading a model.
+      (3) GREEN: decide BEFORE `find_or_create_local_splitted_path` in `__init__`, so nothing is written. If
+      step 1 shows the 1B fails too, refuse on every checkpoint (S10's shape). (4) Correct the reason in the 4
+      places. (5) Suite FOREGROUND + Qwen3-Next and MiniMax accumulator gates (29G, FOREGROUND) + final
+      whole-branch review. **Stop rules:** do not make compression work on already-quantized weights (re-
+      quantizing them is meaningless); do not change the default (`None`); no server knob. **§8 (expected):**
+      (1) no new knob, reason corrected; (2) nothing to plumb; (3) unreachable through the server by design;
+      (4) library callers get a warning instead of a split-time crash.
+- [ ] **S11 — Qwen3-Next census at HEAD: decode AND TTFT, measure only.** **Why:** S7 took decode to
+      51.3–51.9 ms (≈19.4 tok/s, `9e6f81d`); nothing has split the remaining token since, and S7 accepted that
+      the disk stall is no longer hidden by the slow loop. The agent workload (CLAUDE.md §0) ranks TTFT and
+      prefix reuse first; no Qwen3-Next TTFT figure exists since S7. **Levers to price, none to build:** S7's
+      banked three — the 2 per-layer syncs, an M>1 packed-expert kernel (prefill chunks, spec verify),
+      hit/miss-read overlap; S3-B (18 forward-body ops per mixer); S3-C (`fla` prefill chunk kernel, ~2 % TTFT,
+      a new-dependency decision); prompt lookup on MoE (row 37 — `resolve_use_prompt_lookup` turns `"auto"` OFF
+      for MoE on a Qwen3-235B TRIAL-cost measurement; if an M>1 kernel makes verify cheap, repetitive code
+      output could pay). **Method (S7's):** `plans/probes/row26_decode.py` (U arms + NOEXP, BALLAST 25),
+      `plans/probes/s7_dispatch.py` host/device attribution; TTFT at 2k and 8k, cold and prefix-HIT. **Traps:**
+      a discarded warm arm per phase (S3), ABBA not back-to-back (row 33), any CUPTI arm LAST (+16 % residue,
+      S7), 29G FOREGROUND. **Done:** a ranked list with a ceiling per lever in ms of the real token / s of
+      TTFT; S12 = the top one. **Stop:** no lever with a ceiling ≥ 5 % of the real token or TTFT → S12 is
+      skipped, say so.
+- [ ] **S12 — build S11's top lever.** Defined by S11's verdict. Brainstorm → spec → user approval → plan →
+      build. Done (S7's bar): ABBA ≥ 2 % (else revert), greedy ids identical, D6 band, gates (suite floor,
+      Qwen3-Next + MiniMax accumulator, Qwen3-Next server smoke), §8 answered.
+- [ ] **S13 — gpt-oss token-50 divergence triage (= the open `[bug]` row under S8 below).** Evidence:
+      198-token server-rendered prompt, `NEW_TOK=64`, greedy; ids match stock through position 49, then
+      stock `558` vs Vaayu `350`; routed == whole-layer at all 64 positions (not S8-caused); single-forward
+      logits bit-identical to stock at 4 and 256 tokens → multi-step decode through the KV path. Files
+      `plans/probes/s8_out/ab-r64.json`, `ab-x64.json`, `stock-r64.json`. **Steps:** (1) top-2 logit margin
+      at position 50, stock and Vaayu; (2) if within bf16 noise of a tie → close as a near-tie with the
+      numbers, no code change; (3) else per-step logits 0…50 against stock, first step leaving ulp distance →
+      KV-cache path (sliding-window layers are a suspect: 47-m4 stores them at full length). **Done:** cause
+      named with evidence; a fix only if (3) finds a real defect (then TDD + gpt-oss server gate 9/9).
+- [ ] **S14 — gpt-oss non-expert stream (= the `[ ]` sub-bullet under S8 below).** Evidence: embed
+      1.16 GB/token (streamed to read ONE row), `lm_head` 1.16 GB/token, 12 attention layers 0.64 GB/token;
+      ≈ 0.46 s/token was estimated on the pre-S8 5.8 s token, and the post-S8 token is 0.44 s — so its share
+      NOW is unmeasured. Stock fits the card (13.79 GB peak) at 35.7 tok/s; Vaayu 2.3. **Steps:** (1) split the
+      0.44 s token (the S6 residency-first method: does each non-expert weight fit the pin budget?); (2) price
+      CPU embedding gather, VRAM pinning of `lm_head` + attention against the expert VRAM tier and KV budget,
+      and 47-m4; (3) brainstorm → user picks → build. **Done:** ABBA ≥ 2 %, logits bit-identical to stock,
+      gpt-oss server gate 9/9, Qwen3-Next + MiniMax accumulator 8/8 if shared infra is touched.
+- [ ] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** L-e: `expert_disk` rose 0.22 → 0.50
+      s/token when S9 removed the CPU fold, bytes and hit/miss identical → exposed stall, hypothesis that the
+      33 ms/layer fold had hidden read latency; verify with per-layer read-submit vs read-need timestamps
+      (`row26_decode.py` `rust_durs`); ceiling ≤ 0.50 s of a 1.58 s token. L-b: measure the real `eager`
+      attention peak under DSA `index_topk 512`; if S×S scores never materialize, up to 4.53 GiB of pin budget
+      ≈ 30 more resident layers ≈ −0.55 s/token of `gpu_load` (S9's re-price). Fixture model: say so in §8.
+- [ ] **S16 — (d) sweep.** (i) **Row 40:** `cap_slabs_at_indexed_experts` (`vaayu_base.py:456`, called
+      ~`:2893`, S8 T4 `2b34fa5`) says "Row 40 (fixed in S8)" but row 40 still reads `[bug]` / "not started" —
+      verify it against row 40's own done rule (a test over Qwen-like, MiniMax-like and small-model geometries;
+      unchanged arena lines on the accumulator gates) and close it, or record what is missing. (ii) **S5-M-C:**
+      the non-arena CLONE path still fragments glibc arenas. (iii) **gpt-oss + `enable_prefix_cache=False` +
+      a prompt over 128 tokens crashes** (sub-bullet of the `kv_cache_mode` INERT row; the server defaults the
+      prefix cache ON, so no server user reaches it). Each: reproduce, TDD, fix or record why not.
+
+---
+
+# ▶▶▶ ~~THE SEQUENCE — S7…S10~~ — **COMPLETE 2026-09-28; history, not the queue — the live queue is S10b, S11…S16 above.** Set 2026-09-26 at the USER's request ("do all these in fresh sessions"). One per fresh session, in order. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row below that is not ✅**. Read its
 handoff in full, re-verify its evidence against HEAD, mark its `todo.md` row `[~]`, and work it. When
@@ -425,16 +527,29 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       branch's comment says the post-load attribute route still crashes; the source pin also asserts a single
       assignment). **MERGED to `main` 2026-09-28 (`5cbbc14`); merged suite `3067 passed, 0 failed, 0 errors,
       20 skipped` (216.87 s).**
-      - [ ] **Lead L-S10a (from the final review, UNVERIFIED): `compression`'s decline reason may be false the
+      - [ ] **Lead L-S10a — SEQUENCED AS S10b (user, 2026-09-28; see the S10b row at the top).** (From the final review, UNVERIFIED): `compression`'s decline reason may be false the
             same way `use_torch_compile`'s was.** `config.py`, the reachability dict, `vaayu/server/README.md` and
             `documentation/server.md` say "`__init__` overrides it in places; not a live path", but `compression`
             flows to the splitter (`utils.py:291-293, 551`), `bitsandbytes` imports in this venv, and `__init__`
             uses it only to override *prefetching*. Nobody checked whether it is live end to end. Check before
             re-wording; not a server-user bug (declined either way).
+            **Static read + one probe, 2026-09-28 (post-merge, no model loaded):** it IS live — `__init__` always
+            calls `find_or_create_local_splitted_path(..., compression=)`, which writes a full second split copy
+            to `splitted_model.4bit|8bit` (in the MODEL DIR unless `layer_shards_saving_path` is set — against the
+            DeepSeek "nothing written into its model dir" rule), running `compress_layer_state_dict` over EVERY
+            tensor of every layer (`utils.py:175-195`, `:551`); every layer load decompresses
+            (`utils.py:133-140`). **bnb 0.49.2 RAISES on every non-float dtype, both modes:** int32 (AWQ qweight
+            / EXL3), uint8 (MXFP4 blocks), int8 (DeepSeek experts), fp8_e4m3 (DeepSeek attn) —
+            `Blockwise … quantization only supports 16/32-bit floats`; bf16 round-trips fine. **So, likely: it
+            crashes at split time on 4 of 5 on-device targets (every quantized one), leaving a partial split
+            dir; only unquantized checkpoints (Llama-3.2-1B, Qwen2.5-Coder-1.5B) can use it.** UNVERIFIED end to
+            end (no model run). S10's doc edit named `compression` as the "overrides it in places" example, so
+            the false claim is now explicit in `config.py`, the reachability dict, `vaayu/server/README.md` and
+            `documentation/server.md`.
 
 ---
 
-# ▶▶▶ ~~THE SEQUENCE — S1…S6~~ — **COMPLETE 2026-09-26; history, not the queue — the live queue is S7…S10 above.** Set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"); S5-M-H inserted before S5-W by the USER 2026-09-26. One per fresh session, in order. ◀◀◀
+# ▶▶▶ ~~THE SEQUENCE — S1…S6~~ — **COMPLETE 2026-09-26; history, not the queue — the live queue is S10b, S11…S16 at the top.** Set 2026-09-25; S5-M/S5-W/S5-P inserted before S6 by the USER 2026-09-26 ("fix the bugs first"); S5-M-H inserted before S5-W by the USER 2026-09-26. One per fresh session, in order. ◀◀◀
 
 **Each S-item has its own self-contained HANDOFF in `docs/superpowers/specs/` — gitignored, so THIS
 row is the durable copy of why it exists and what "done" means.** Read the handoff first; it carries
@@ -482,7 +597,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). ◀◀ (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). ◀◀ (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
@@ -4511,6 +4626,8 @@ below is moved verbatim.
 **2026-09-26 (S5-M): the gate now ALSO pins the arena for every non-EXL3 MODULE-LIST model on CUDA**
 (`6596c49`), so one more layout is exposed. Still nothing on disk triggers it: DeepSeek-V4's routed experts
 are ~147 GB against a ~23 GB arena.
+
+**2026-09-28 (ledger check, not verified): the code says this is FIXED** — `cap_slabs_at_indexed_experts` (`vaayu/vaayu_base.py:456`, docstring "Row 40 (fixed in S8)", called ~`:2893`, S8 T4 `2b34fa5`) — but this row was never closed. Verifying it against the done rule below is sequenced as **S16 (i)**.
 
 **Status 2026-09-18: open, latent, not started. Nothing on disk triggers it.** Checkpoints under
 `/home/a/code/ai-ml/models/`: the only fused non-EXL3 MoE is Qwen3-Next (43.5 GB of experts > its arena). Qwen3-235B and
