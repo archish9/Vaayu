@@ -370,6 +370,57 @@ def test_the_production_dequant_reproduces_the_harness_wo_a_bit_for_bit():
     assert torch.equal(mine, theirs)
 
 
+def test_the_load_time_dequant_folds_on_the_device_it_is_given():
+    """S9: the engine re-runs this fold for every streamed layer on every
+    token, and on the CPU it cost ~33 ms a layer -- ~40 % of DeepSeek's
+    decode token. Given a device, the fold must run THERE (its two inputs moved
+    first), and every tensor it does not consume must pass through untouched.
+    `meta` stands in for the GPU: it shows where the arithmetic ran without
+    needing one.
+    """
+    weights = {
+        "wo_a.weight": torch.randn(64, 128).to(torch.float8_e4m3fn),
+        "wo_a.scale": torch.randn(1, 1).exp().to(torch.float8_e8m0fnu),
+        "wq_a.weight": torch.randn(64, 128).to(torch.float8_e4m3fn),
+    }
+
+    out = modeling.dequantize_at_load(weights, device="meta")
+
+    assert out["wo_a.weight"].device.type == "meta"
+    assert out["wo_a.weight"].dtype == torch.bfloat16
+    assert "wo_a.scale" not in out
+    assert out["wq_a.weight"] is weights["wq_a.weight"]
+
+
+@needs_checkpoint
+@needs_gpu
+def test_the_device_fold_is_bit_identical_to_the_cpu_fold_in_every_layer():
+    """S9's stop rule. fp8 -> fp32 and e8m0 -> fp32 are exact, the product is
+    a power-of-two rescale (exact in fp32), then one bf16 rounding -- so moving
+    the fold to the GPU should change nothing. Proved on the checkpoint's own
+    `wo_a` in every decoder layer, compared as raw bits (`torch.equal` calls
+    two NaNs unequal and -0 equal to +0). The `mtp.*` copies are left out:
+    the split does not keep them, because the engine never loads them.
+    """
+    index = json.loads((parity.CKPT / "model.safetensors.index.json").read_text())
+    prefixes = sorted({key[:-len("weight")] for key in index["weight_map"]
+                       if key.startswith("layers.")
+                       and key.endswith("attn.wo_a.weight")})
+    config = json.loads((parity.CKPT / "config.json").read_text())
+    assert len(prefixes) == config["num_hidden_layers"]
+
+    for prefix in prefixes:
+        raw = {f"wo_a.{leaf}": tensor
+               for leaf, tensor in _raw_module_weights(prefix).items()}
+
+        on_cpu = modeling.dequantize_at_load(raw)["wo_a.weight"]
+        on_gpu = modeling.dequantize_at_load(raw, device="cuda")["wo_a.weight"]
+
+        assert on_gpu.device.type == "cuda", prefix
+        assert torch.equal(on_gpu.cpu().view(torch.int16),
+                           on_cpu.view(torch.int16)), prefix
+
+
 # ── the goldens ─────────────────────────────────────────────────────────────
 
 

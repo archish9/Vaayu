@@ -1182,7 +1182,7 @@ def test_move_layer_to_device_keeps_an_e8m0_scale_in_its_declared_dtype():
     assert torch.equal(injected.view(torch.uint8), raw_scale)
 
 
-def _wo_a_dequant_engine():
+def _wo_a_dequant_engine(running_device="cpu"):
     """A real `wo_a`-shaped module: `DeepseekV4Linear(dtype=bf16)`, whose
     `scale` is `None` by construction -- exactly the shape that crashes
     injection without `dequantize_at_load` (Task 6f, Q3)."""
@@ -1199,7 +1199,7 @@ def _wo_a_dequant_engine():
 
     TinyModel.__module__ = modeling.__name__
 
-    return engine(model=TinyModel(), running_device="cpu",
+    return engine(model=TinyModel(), running_device=running_device,
                  running_dtype=torch.bfloat16, _moe_key_remapper=None,
                  _path_remappings={})
 
@@ -1223,6 +1223,36 @@ def test_move_layer_to_device_dequantizes_wo_a_before_injection():
     assert injected.dtype == torch.bfloat16
     assert torch.equal(injected, expected)
     assert model.model.attn.wo_a.scale is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_move_layer_to_device_folds_wo_a_on_the_running_device(monkeypatch):
+    """S9: a streamed layer is re-injected on every token, and folding `wo_a`
+    on the CPU there cost ~33 ms a layer -- ~40 % of DeepSeek's decode token.
+    The fold's inputs must reach the running device FIRST, so the arithmetic
+    runs there, and the injected weight must equal the CPU fold bit for bit.
+    """
+    real_fold = modeling.dequantize_block_scaled
+    seen = []
+
+    def spy(weight, scale, *args, **kwargs):
+        seen.append((weight.device.type, scale.device.type))
+        return real_fold(weight, scale, *args, **kwargs)
+
+    monkeypatch.setattr(modeling, "dequantize_block_scaled", spy)
+    model = _wo_a_dequant_engine(running_device="cuda")
+    weight = torch.randn(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.randn(2, 2).exp().to(torch.float8_e8m0fnu)
+    expected = real_fold(weight, scale, torch.bfloat16)
+
+    model.move_layer_to_device(
+        {"attn.wo_a.weight": weight, "attn.wo_a.scale": scale})
+
+    assert seen == [("cuda", "cuda")]
+    injected = model.model.attn.wo_a.weight
+    assert injected.device.type == "cuda"
+    assert torch.equal(injected.cpu().view(torch.int16),
+                       expected.view(torch.int16))
 
 
 def test_move_layer_to_device_raises_naming_the_parameter_on_injection_failure(

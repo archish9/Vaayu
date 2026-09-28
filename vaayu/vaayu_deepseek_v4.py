@@ -311,10 +311,13 @@ class VaayuDeepseekV4(VaayuBaseModel):
            injecting a tensor into a `None` attribute crashes
            `set_module_tensor_to_device` with `'NoneType' object has no
            attribute 'device'`. The checkpoint's own `dequantize_at_load`
-           (`modeling_deepseek_v4.py:217`, already unit-tested against golden
+           (`modeling_deepseek_v4.py:243`, already unit-tested against golden
            values) folds `wo_a`'s F8_E4M3 weight and its per-tile scale into
            one bf16 tensor and drops the `.scale` key -- called here, once,
-           on the whole layer's state dict, before injection.
+           on the whole layer's state dict, before injection, and ON
+           `running_device` (S9): a streamed layer comes through here on
+           every token, and folding on the CPU cost ~33 ms a layer (decode
+           2.74 -> 1.58 s/token once moved).
 
         `dequantize_at_load` is resolved via `_running_symbol` (Task 6e): it
         is a plain module-level function, unaffected by which `ContextVar`
@@ -341,7 +344,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
                     break
             remapped_state_dict[new_param_name] = param_tensor
 
-        remapped_state_dict = dequantize_at_load(remapped_state_dict)
+        remapped_state_dict = dequantize_at_load(remapped_state_dict,
+                                                 device=self.running_device)
 
         layers = list(remapped_state_dict)
         for param_name in layers:
