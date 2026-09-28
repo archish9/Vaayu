@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 19 items (moved 2026-09-26)
+## Index — 21 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -35,6 +35,8 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 17 | `test_slab_arena` order-dependent full-suite failure | STILL OPEN | not reproduced in three full-suite runs (2026-09-25 ×2, 2026-09-26) | the next full-suite failure of this test — record the run order |
 | 18 | Row 44's F3 remnant (pinned-H2D half of prefill) | STILL OPEN | recorded as NOT recommended: prefill is compute-bound since F6 | Qwen3-Next prefill turns disk- or H2D-bound again |
 | 19 | S1-L3 — `fla` / `causal_conv1d` not installed | S1 row | answered by S3: `fla` measured and REJECTED for decode; its prefill use is S3-C, still in `todo.md` | with S3-C |
+| 20 | S10b-a — VRAM reserve sizes a compressed layer from its FILE bytes | S10b row (added 2026-09-28) | `compression` is library-only (declined by the server) and every production model refuses it | a bf16 dense checkpoint too big for VRAM is run with `compression`, or compression reaches the server |
+| 21 | S10b-b — `check_space` crashes on a not-yet-existing `layer_shards_saving_path` | S10b row (added 2026-09-28) | `layer_shards_saving_path` is library-only (declined by the server) | the server exposes `layer_shards_saving_path`, or a library user reports it |
 
 ---
 
@@ -565,5 +567,34 @@ prefix-reused turn, or a task score), not another score-error number.
   (`modeling_qwen3_next.py:59-61`). Installing `fla` deletes S1-a's 36 copies AND a large share of
   S3's 4,353 elementwise launches in one move. **An S3 decision and a new dependency — weigh it
   there, at the top of S3, before building a hand-written fusion.**
+
+---
+
+## 20. S10b-a — VRAM reserve sizes a compressed layer from its FILE bytes
+
+*Added 2026-09-28 by S10b (found in its static read; not measured).* **Why here:** `compression` is
+library-only — the server declines it — and `resolve_compression` refuses it on every production model on
+this box, so no server user reaches it. **Re-open when:** a bf16 dense checkpoint too big for VRAM is run with
+`compression`, or compression reaches the server.
+
+- **[bug] The VRAM reserve under-counts a compressed streamed layer and head.** `_layer_slack` and
+  `_head_bytes` (`vaayu_base.py`, `__init__`'s reserve block, `:2502` / `:2517` after S10b's review fixes) are file `stat()`s
+  of the split shards, but `uncompress_layer_state_dict` dequantizes on the GPU into bf16/fp16, so the
+  resident bytes are ~2× (8bit) or ~3.55× (4bit) the file. Harmless on Llama-3.2-1B (fits many times over);
+  on a large bf16 dense model it could under-reserve and OOM mid-token. Fix shape: size those two terms from
+  the header's logical shapes (the 4bit quant state carries them, see `embed_shard_shape`), not the file.
+
+---
+
+## 21. S10b-b — `check_space` crashes on a not-yet-existing `layer_shards_saving_path`
+
+*Added 2026-09-28 by S10b (hit on device).* **Why here:** `layer_shards_saving_path` is library-only (the
+server declines it). **Re-open when:** the server exposes it, or a library user reports it.
+
+- **[bug] `check_space` (`vaayu/utils.py:167`) calls `shutil.disk_usage(layer_shards_saving_path)` before
+  `split_and_save_layers` creates it (`mkdir`, `:539`)**, so a fresh saving path raises `FileNotFoundError:
+  [Errno 2] No such file or directory` before anything is split. Workaround: create the dir first. Fix shape:
+  measure the nearest existing ancestor, or `mkdir` before `check_space`. Pre-existing, unrelated to
+  compression.
 
 ---

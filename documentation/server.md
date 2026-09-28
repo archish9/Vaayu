@@ -324,7 +324,8 @@ holds one model for its whole life and should fill the box.
 > misreads (detection is the supported path), dev instrumentation, a lossy option
 > that only works on an unquantized dense checkpoint (`compression`: `__init__`
 > refuses it with a warning on a quantized, MoE or originals-deleted one, which is
-> every model this server is tested with), a flag `__init__` refuses
+> every production model this server is tested with; only the small unquantized
+> Llama-3.2-1B smoke checkpoint keeps it), a flag `__init__` refuses
 > with a warning because it crashes on CUDA (`use_torch_compile`: its cudagraphs
 > are replayed once per layer with no step boundary; without them it measured
 > 24–35 % slower on Qwen3-Next), and HF auth, which belongs in the environment. The list is

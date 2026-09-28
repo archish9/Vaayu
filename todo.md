@@ -173,24 +173,32 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         and `None`, so the split writes nothing extra. (2) `embed_shard_shape` reads a 4bit split's logical
         embed shape from its packed nf4 quant state (`<key>.4bit.quant_state.bitsandbytes__nf4`). (3)
         `check_space` 4bit: `* 0.2813`, not `/`. (4) decline reason corrected in `config.py`, the reachability
-        dict, `vaayu/server/README.md`, `documentation/server.md`. **Design calls:** a repo id and a `.bin`
-        checkpoint are REFUSED (no header to decide from — loading uncompressed is always valid); dtype check
-        runs before the MoE check so a quantized MoE names its dtype. **Tests:** `tests/test_compression_refusal.py`,
-        25 (import RED → GREEN; source-pin RED → GREEN; embed-probe 4bit RED `[3072, 1] == [96, 64]` → GREEN
+        dict, `vaayu/server/README.md`, `documentation/server.md`. **Design calls:** with no original shard on
+        disk (a repo id — headers are not read before download; originals deleted; a `.bin` checkpoint) it is
+        REFUSED, UNLESS a finished `splitted_model.<mode>` (≥ 1 `.done` marker, beside the model or under
+        `layer_shards_saving_path`) can be reused — found by the final review: `delete_original=True` leaves
+        exactly that, and refusing it turned a same-arguments reload into WARNING + the bare `AssertionError`
+        (reproduced, then pinned by a real-splitter test); dtype check runs before the MoE check so a
+        quantized MoE names its dtype; the MoE check also applies to a reused split. **Tests:** `tests/test_compression_refusal.py`,
+        35 (import RED → GREEN; source-pin RED → GREEN; embed-probe 4bit RED `[3072, 1] == [96, 64]` → GREEN
         after a behaviour-preserving extraction; `check_space` 4bit RED → GREEN). **On device after the fix**
         (scratch splits; the 1B through the copied-empty-head-shard workaround, see S10c): 1B 4bit loads, 0
         inject failures, generates `' Paris. The capital of the United States is Washington D.C. …'` (diverges
         from uncompressed at token 4 — nf4 is lossy; recorded, not gated); 1B 8bit 16/16 greedy ids identical
         to uncompressed; gpt-oss-20b 4bit → WARNING naming `['U8']`, `compression=None`, generates, no file
         written anywhere (model dir checked with `find -newer`); Qwen3-Next 4bit → WARNING (no original shard),
-        generates, nothing written. **Gates:** suite `3092 passed, 0 failed, 0 errors, 20 skipped` (224.63 s,
-        FOREGROUND, +25); Qwen3-Next accumulator 8/8 (39 s), MiniMax accumulator 8/8 (76 s), both FOREGROUND
-        under 29G. **§8:** (1) no new knob — the decline reason is corrected; (2) nothing to plumb; (3) not
-        reachable through the server (declined), by design, and every on-device server target would be refused
-        anyway; (4) library callers get a warning instead of a split-time crash and a partial split dir, and
+        generates, nothing written. **Gates:** suite `3102 passed, 0 failed, 0 errors, 20 skipped` (224.69 s,
+        FOREGROUND, +35, after the review fixes; 3092 before them); Qwen3-Next accumulator 8/8 (39 s; 38 s after the review fixes), MiniMax accumulator 8/8 (76 s;
+        74 s after), all FOREGROUND under 29G. **Final whole-branch review (fresh Opus reviewer): with fixes →
+        0 Critical; Important 1 (the split-reuse regression above) and 2 (the corrected decline reason said
+        "every on-device target" is refused — false for Llama-3.2-1B) fixed; all 5 minors fixed (repo-id
+        wording, "non-float" not "already quantized", a source pin that `__init__` uses `embed_shard_shape`,
+        the two recorded defects moved to `todo-backlog.md` #20/#21, `__init__` docstring).** **§8:** (1) no new knob — the decline reason is corrected; (2) nothing to plumb; (3) not
+        reachable through the server (declined), by design; every production model here would be refused (only the
+        small unquantized smoke checkpoints — Llama-3.2-1B, Qwen2.5-Coder-1.5B — keep it); (4) library callers get a warning instead of a split-time crash and a partial split dir, and
         4bit now works on unquantized dense checkpoints. **Not fixed, recorded:** the VRAM-reserve file-byte
-        under-count (above); `check_space` `FileNotFoundError` on a not-yet-existing
-        `layer_shards_saving_path` (above); the `__init__` docstring's "speeds up 4x or 2x" claim is
+        under-count → **moved to `todo-backlog.md` #20 (S10b-a)**; `check_space` `FileNotFoundError` on a
+        not-yet-existing `layer_shards_saving_path` → **moved to `todo-backlog.md` #21 (S10b-b)**; the `__init__` docstring's "speeds up 4x or 2x" claim is
         unmeasured (prefetching is forced OFF under compression and every layer decompresses on load).
       - [bug] **Fresh split of a TIED-embedding checkpoint crashes on the first forward — found by S10b step 1,
         2026-09-28, compression OFF, server-default `prefetching=True`.** Llama-3.2-1B split fresh into the
@@ -671,7 +679,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5-P** ✅ | ~~**S5's deferred minors**~~ **CLOSED 2026-09-26, FIXED — an unloadable encoder now WARNs + 400s instead of stopping the load; the hook answers None before `init_model`; `documentation/server.md` has the §9 row, the §6.6 sentence, and §3's `refused` list corrected (user-approved). Suite `2955 passed, 0 failed, 0 errors, 20 skipped`. MERGED (`5fbb5c6`). See the S5-P row below** — was: an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** ✅ | ~~**row 28's reach-projection METHOD does not hold**~~ **CLOSED 2026-09-26, METHOD CORRECTED — one MISSING term, not a mis-sized one: row 28 never checked whether the non-expert weights fit the VRAM pin budget. On DeepSeek, 35 of 43 layers streamed 5.496 GB/token of non-expert weights through `inject_to_gpu` = `gpu_load` 2.20 s of the 3.06 s token (72 %), and 1.42 s of that is the CPU re-running `dequantize_at_load(wo_a)` on every streamed layer, every token. The handoff's three explanations did NOT reproduce: the expert bytes were HALVED by the caches (1.786 of 3.449 GB), not inflated by re-reads; row 28's 54 % miss assumption was right (51.8 %); and "2.7 s of 3.9–4.0" was the Uspin diagnostic arm, not GPU work. Corrected method cross-predicts DeepSeek 0.440 tok/s (+35 %; old 5.3–7.0×), Llama-70B +9 %, MiniMax −17 %, spec-decoding bound −4.8 %; Qwen3-Next misses 0.43× cross-forward (its dispatch constant has no donor) — the stated blind spot. gpt-oss-20b (already serving at 0.17 tok/s since A3): regime R like DeepSeek — whole model streamed per token + a per-visit MXFP4 swizzle; A6's per-expert streaming could take it to ~20 tok/s dispatch-bound. See the S6 row below** — was: it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor: `3092 passed, 0 failed, 0 errors, 20 skipped` (224.63 s, FOREGROUND; set 2026-09-28 by S10b's branch `d56d9db`, +25 tests) — was `3067 passed, 0 failed, 0 errors, 20 skipped` (216.87 s, FOREGROUND; set 2026-09-28 by S10's merge `5cbbc14`, +6 tests) — was `3061 passed, 0 failed, 0 errors, 20 skipped` (224.43 s, FOREGROUND; set 2026-09-28 by S9's merge `10a34b9`, +3 tests) — was `3058 passed, 0 failed, 0 errors, 20 skipped` (211.81 s, FOREGROUND; set 2026-09-28 by S8's merge `4580053`, +57 tests) — was `3001 passed, 0 failed, 0 errors, 20 skipped` (212.27 s, FOREGROUND; set 2026-09-27 by S7's merge `9e6f81d`, +46 tests) — was `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
+**Suite floor: `3102 passed, 0 failed, 0 errors, 20 skipped` (224.69 s, FOREGROUND; set 2026-09-28 by S10b's branch after its final-review fixes, +35 tests) — was `3067 passed, 0 failed, 0 errors, 20 skipped` (216.87 s, FOREGROUND; set 2026-09-28 by S10's merge `5cbbc14`, +6 tests) — was `3061 passed, 0 failed, 0 errors, 20 skipped` (224.43 s, FOREGROUND; set 2026-09-28 by S9's merge `10a34b9`, +3 tests) — was `3058 passed, 0 failed, 0 errors, 20 skipped` (211.81 s, FOREGROUND; set 2026-09-28 by S8's merge `4580053`, +57 tests) — was `3001 passed, 0 failed, 0 errors, 20 skipped` (212.27 s, FOREGROUND; set 2026-09-27 by S7's merge `9e6f81d`, +46 tests) — was `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
 FOREGROUND; set 2026-09-26 by S5-P's +3 tests) — was `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
 FOREGROUND; set 2026-09-26 by S5-W's +4 tests and S5-R's restore, which turned the 4 DeepSeek
 stale-copy guards from passes into SKIPS — any other skip count means the DeepSeek folder changed) — was

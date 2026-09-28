@@ -1442,17 +1442,20 @@ def resolve_use_torch_compile(requested: bool, device: str) -> bool:
 _COMPRESSIBLE_DTYPES = {"F16", "BF16", "F32"}
 
 
-def resolve_compression(requested, model_local_path_or_repo_id):
+def resolve_compression(requested, model_local_path_or_repo_id, layer_shards_saving_path=None):
     """The `compression` this load will actually honour: `requested`, or None.
 
     Decided from the ORIGINAL shards' safetensors headers and config.json,
     before the split, so a refused request writes nothing. Refused -- warn and
     disable, loading the checkpoint as it is -- when (todo.md S10b):
-    - no original `*.safetensors` shard is on disk: a repo id not yet
-      downloaded, originals deleted after an earlier split (the splitter then
-      dies on a bare AssertionError), or a `.bin` checkpoint;
-    - any tensor is not F16/BF16/F32: the checkpoint is already quantized, and
-      bitsandbytes raises on it mid-split, leaving a partial split dir;
+    - no original `*.safetensors` shard is on disk AND no finished
+      `splitted_model.<requested>` split to reuse: a repo id (its headers are
+      not read before download), originals deleted after an uncompressed split
+      (the splitter then dies on a bare AssertionError), or a `.bin` checkpoint.
+      A finished compressed split IS reused: `delete_original=True` leaves
+      exactly that behind, and a same-arguments reload must keep working;
+    - any tensor is not F16/BF16/F32: bitsandbytes raises on it mid-split,
+      leaving a partial split dir;
     - config.json names routed experts: the offset index streams experts as raw
       split bytes and never decompresses them.
     """
@@ -1466,9 +1469,14 @@ def resolve_compression(requested, model_local_path_or_repo_id):
     shards = sorted(path.glob("*.safetensors")) if path.is_dir() else []
     reason = None
     if not shards:
-        reason = (f"no original *.safetensors shard under {model_local_path_or_repo_id} to "
-                  f"compress from (a repo id not yet downloaded, originals deleted after an "
-                  f"earlier split, or a .bin checkpoint)")
+        # Where split_and_save_layers would put it; one `.done` marker tells a
+        # real split from the empty dir a crashed one leaves.
+        root = Path(layer_shards_saving_path) if layer_shards_saving_path is not None else path
+        if not any((root / f"splitted_model.{requested}").glob("*.done")):
+            reason = (f"no original *.safetensors shard under {model_local_path_or_repo_id} to "
+                      f"compress from, and no earlier {requested} split to reuse (a repo id, whose "
+                      f"headers are not read before download; originals deleted after an "
+                      f"uncompressed split; or a .bin checkpoint)")
     else:
         dtypes = set()
         for shard in shards:
@@ -1478,11 +1486,12 @@ def resolve_compression(requested, model_local_path_or_repo_id):
             dtypes |= {meta["dtype"] for key, meta in header.items() if key != "__metadata__"}
         others = sorted(dtypes - _COMPRESSIBLE_DTYPES)
         if others:
-            reason = (f"the checkpoint is already quantized (tensor dtypes {others}); bitsandbytes "
-                      f"only quantizes F16/BF16/F32 and would crash the split part-way")
-        elif ExpertOffsetIndex(str(path)).expected_expert_count() is not None:
-            reason = ("config.json names routed experts, and the offset index streams experts "
-                      "as raw split bytes that are never decompressed")
+            reason = (f"the checkpoint holds non-float tensors (dtypes {others}), typically an "
+                      f"already-quantized one; bitsandbytes only quantizes F16/BF16/F32 and would "
+                      f"crash the split part-way")
+    if reason is None and ExpertOffsetIndex(str(path)).expected_expert_count() is not None:
+        reason = ("config.json names routed experts, and the offset index streams experts "
+                  "as raw split bytes that are never decompressed")
     if reason is None:
         return requested
     print(f"[Vaayu] WARNING: compression DISABLED — {reason}. Loading the checkpoint as it is.")
@@ -2172,7 +2181,9 @@ class VaayuBaseModel(GenerationMixin):
             if to profile the model loading time, default to False
         compression: str, optinal
             setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
-            Refused with a warning (loaded uncompressed) on a quantized, MoE or originals-deleted checkpoint; see `resolve_compression`.
+            Refused with a warning (loaded uncompressed) on a quantized or MoE checkpoint, and wherever no original
+            safetensors shard is on disk (repo id, originals deleted, .bin) unless a finished compressed split can be reused;
+            see `resolve_compression`.
         hf_token: str, optional
             huggingface api token could be provided, by default None
         """
@@ -2217,7 +2228,7 @@ class VaayuBaseModel(GenerationMixin):
 
         # Before the split below, which is handed this resolved value: a refused
         # request must not write a second, partial copy of the checkpoint.
-        compression = resolve_compression(compression, model_local_path_or_repo_id)
+        compression = resolve_compression(compression, model_local_path_or_repo_id, layer_shards_saving_path)
         self.compression = compression
         self.hf_token = hf_token
         self._forced_attn_impl = attn_implementation

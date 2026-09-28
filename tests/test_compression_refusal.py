@@ -76,13 +76,57 @@ def test_a_moe_checkpoint_is_refused_even_in_bf16(tmp_path, field, capsys):
     assert "expert" in out
 
 
-def test_no_original_shards_is_refused(tmp_path, capsys):
+def _originals_deleted(tmp_path):
     # Originals deleted after an earlier split: only the index and config remain.
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}')
-    assert resolve_compression("4bit", str(tmp_path)) is None
+    return str(tmp_path)
+
+
+def _earlier_split(root, name):
+    (root / name).mkdir(parents=True)
+    (root / name / "model.embed_tokens.safetensors.done").touch()
+
+
+@pytest.mark.parametrize("earlier", [None, "splitted_model", "splitted_model.8bit"])
+def test_no_original_shards_is_refused(tmp_path, earlier, capsys):
+    # No original to compress from, and no finished 4bit split to reuse -- an
+    # uncompressed or other-mode split does not count.
+    path = _originals_deleted(tmp_path)
+    if earlier:
+        _earlier_split(tmp_path, earlier)
+    assert resolve_compression("4bit", path) is None
     out = capsys.readouterr().out
     assert "WARNING" in out and "DISABLED" in out
+
+
+def test_an_empty_split_dir_left_by_a_crash_is_not_reused(tmp_path, capsys):
+    path = _originals_deleted(tmp_path)
+    (tmp_path / "splitted_model.4bit").mkdir()
+    assert resolve_compression("4bit", path) is None
+    assert "DISABLED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["4bit", "8bit"])
+@pytest.mark.parametrize("beside", [True, False])
+def test_an_earlier_compressed_split_is_reused_after_the_originals_are_deleted(
+        tmp_path, mode, beside, capsys):
+    # `delete_original=True` leaves only splitted_model.<mode>; a reload with the
+    # same arguments must reuse it, as it did before S10b, not refuse and crash.
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    path = _originals_deleted(ckpt)
+    saving = None if beside else str(tmp_path / "splits")
+    _earlier_split(ckpt if beside else tmp_path / "splits", f"splitted_model.{mode}")
+    assert resolve_compression(mode, path, saving) == mode
+    assert capsys.readouterr().out == ""
+
+
+def test_an_earlier_compressed_split_of_a_moe_checkpoint_is_still_refused(tmp_path, capsys):
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts": 4}))
+    _earlier_split(tmp_path, "splitted_model.8bit")
+    assert resolve_compression("8bit", str(tmp_path)) is None
+    assert "expert" in capsys.readouterr().out
 
 
 def test_a_repo_id_is_refused(capsys):
@@ -105,10 +149,17 @@ def test_the_engine_resolves_compression_before_the_split():
     # §8 "is it plumbed?": the split must receive the RESOLVED value, so a refused
     # request writes nothing -- not a copy of the request taken before the refusal.
     src = inspect.getsource(VaayuBaseModel.__init__)
-    resolve = "compression = resolve_compression(compression, model_local_path_or_repo_id)"
+    resolve = ("compression = resolve_compression(compression, model_local_path_or_repo_id, "
+               "layer_shards_saving_path)")
     assert resolve in src
     assert src.index(resolve) < src.index("find_or_create_local_splitted_path(")
     assert src.count("self.compression =") == 1
+
+
+def test_the_engine_reads_the_embed_shape_through_the_4bit_aware_probe():
+    # The call site swallows every exception, so an inline probe that reads the
+    # PACKED shape again would silently re-break 4bit.
+    assert "embed_shard_shape(" in inspect.getsource(VaayuBaseModel.__init__)
 
 
 # --- 4bit on an unquantized checkpoint (S10b) ---------------------------------
@@ -155,3 +206,22 @@ def test_check_space_asks_for_the_compressed_size_not_more(tmp_path, monkeypatch
     else:
         with pytest.raises(utils.NotEnoughSpaceException):
             utils.check_space(ckpt, out, compression)
+
+
+@cuda
+def test_a_same_arguments_reload_after_delete_original_reuses_the_compressed_split(tmp_path, capsys):
+    # The real splitter end to end, as a library caller runs it: split with
+    # 8bit and delete_original=True, then resolve and split again, unchanged.
+    from vaayu.utils import split_and_save_layers
+    save_file({"model.embed_tokens.weight": torch.randn(32, 16, dtype=torch.bfloat16),
+               "model.layers.0.mlp.up_proj.weight": torch.randn(16, 16, dtype=torch.bfloat16),
+               "model.norm.weight": torch.ones(16, dtype=torch.bfloat16),
+               "lm_head.weight": torch.randn(32, 16, dtype=torch.bfloat16)},
+              str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 16}))
+    first = split_and_save_layers(tmp_path, compression=resolve_compression("8bit", str(tmp_path)),
+                                  delete_original=True)
+    assert not (tmp_path / "model.safetensors").exists()
+    again = split_and_save_layers(tmp_path, compression=resolve_compression("8bit", str(tmp_path)))
+    assert again == first and first.endswith("splitted_model.8bit")
+    assert "DISABLED" not in capsys.readouterr().out
