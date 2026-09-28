@@ -99,7 +99,7 @@ library defaults: a server holds one model for its whole life and should fill th
 > `__init__` already overrides in places (`compression`), a flag `__init__` refuses
 > with a warning because it crashes on CUDA (`use_torch_compile`: its cudagraphs
 > are replayed once per layer with no step boundary; without them it measured
-> 24–35 % slower), and HF auth, which belongs in the environment. The list is
+> 24–35 % slower on Qwen3-Next), and HF auth, which belongs in the environment. The list is
 > enforced: `tests/test_engine_param_reachability.py` fails the suite when a new
 > engine parameter appears with **neither** a knob **nor** a written-down decline.
 

@@ -90,11 +90,8 @@ KV_PERSIST_SYNC     = False   # async append (production default) — faster, ma
 # this run's prefix with corrupt keys and mask the fix.
 SESSION_ID          = "ramdiag-qwen"
 
-# torch.compile: shipped, but NOT enabled here. This model streams expert
-# weights from NVMe per-token (moe_patch.py) — a dynamic I/O-bound path
-# torch.compile's static-graph tracing isn't validated against on this
-# codebase's actively-tested MoE-EXL3 path. Flip on to experiment; not a
-# default recommendation.
+# torch.compile: refused at load with a warning (todo.md row 48 — its
+# cudagraphs crash on CUDA). Flipping this on only prints the refusal.
 USE_TORCH_COMPILE = False
 
 # ──────────────────────────────────────────────────────────────────────────────

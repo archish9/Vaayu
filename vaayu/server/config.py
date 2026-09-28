@@ -330,6 +330,7 @@ DECODE_TOP_K_BUDGET = 0.035
 #   use_torch_compile              crashes on CUDA (cudagraphs, row 48), so
 #                                  `__init__` refuses it with a warning; the
 #                                  no-cudagraph mode measured 24-35 % slower
+#                                  on Qwen3-Next
 #   hf_token                       HF auth belongs in the environment
 # --------------------------------------------------------------------------
 

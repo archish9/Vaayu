@@ -418,7 +418,18 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       reason is corrected. (2) nothing to plumb. (3) not reachable through the server (declined), by design.
       (4) library callers get a warning instead of a crash. No default changed (`False`). **No lead:** nothing
       seen suggests the step-boundary fix is cheap (stop rule); row 36 stays in the backlog. Repro script was
-      throwaway (session scratchpad).
+      throwaway (session scratchpad). **Final whole-branch review (fresh Opus reviewer): ready to merge,
+      0 Critical / 0 Important; all 6 minors fixed** (stale "flip on to experiment" comment in
+      `test_generate.py`; row 48 annotated CLOSED in the history list; "24-35 % slower" now says "on
+      Qwen3-Next" in the warning and every decline copy; CPU message no longer implies CUDA works; the kept
+      branch's comment says the post-load attribute route still crashes; the source pin also asserts a single
+      assignment).
+      - [ ] **Lead L-S10a (from the final review, UNVERIFIED): `compression`'s decline reason may be false the
+            same way `use_torch_compile`'s was.** `config.py`, the reachability dict, `vaayu/server/README.md` and
+            `documentation/server.md` say "`__init__` overrides it in places; not a live path", but `compression`
+            flows to the splitter (`utils.py:291-293, 551`), `bitsandbytes` imports in this venv, and `__init__`
+            uses it only to override *prefetching*. Nobody checked whether it is live end to end. Check before
+            re-wording; not a server-user bug (declined either way).
 
 ---
 
@@ -1564,7 +1575,7 @@ or raise delivered GB/s (rows 31-39's decomposition), and must not need a downlo
 **Also open, smaller, the row carries them:** **47-m6 — now the LAST A3 loose end**, since 47-m7
 closed: A3's fp32 rotary table (`cac352e`) changed numerics for EVERY model and only gpt-oss's side
 was measured. Then 47-m4 (sliding-window KV, 0.813 GB), **47-m5-b** (new, from 47-m5), 47-m1/m2/m3,
-row 40 `[bug]`, row 48 `[bug]`. (47-m5 and 47-m7 are CLOSED.)
+row 40 `[bug]`, row 48 `[bug]`. (47-m5 and 47-m7 are CLOSED; row 48 CLOSED 2026-09-28 as S10.)
 
 **Added 2026-09-12: rows 31–39**, from a user-requested sweep of *"what else can speed Vaayu up"*, priced against a
 measured decomposition of one decode token. Detail:

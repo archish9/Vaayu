@@ -1425,13 +1425,13 @@ def resolve_use_torch_compile(requested: bool, device: str) -> bool:
     if not hasattr(torch, 'compile'):
         print("⚠️ torch.compile requires PyTorch 2.0+. Disabling.")
     elif not device.startswith("cuda"):
-        print("⚠️ torch.compile is most effective on CUDA. Disabling for CPU.")
+        print("⚠️ use_torch_compile is refused off CUDA, and on CUDA too (todo.md row 48). Disabling.")
     else:
         print("[Vaayu] WARNING: use_torch_compile DISABLED — its mode=\"reduce-overhead\" "
               "cudagraphs crash on the first generation (\"accessing tensor output of "
               "CUDAGraphs that has been overwritten by a subsequent run\"): the engine "
               "replays one compiled callable per layer with no step boundary (todo.md "
-              "row 48). Without cudagraphs it measured 24-35 % slower (row 36).")
+              "row 48). Without cudagraphs it measured 24-35 % slower on Qwen3-Next (row 36).")
     return False
 
 
@@ -5402,6 +5402,7 @@ class VaayuBaseModel(GenerationMixin):
                                 try:
                                     # Unreachable from __init__ (resolve_use_torch_compile refuses
                                     # it, row 48); kept as the landing spot for a step-boundary fix.
+                                    # Setting the attribute after load still hits the row-48 crash.
                                     if self.use_torch_compile:
                                         if self._compiled_layer_fn is None:
                                             self._compiled_layer_fn = torch.compile(

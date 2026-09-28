@@ -46,4 +46,5 @@ def test_the_engine_resolves_the_flag_through_the_refusal():
     # not keep a private copy of the old CUDA branch that printed "enabled".
     src = inspect.getsource(VaayuBaseModel.__init__)
     assert "self.use_torch_compile = resolve_use_torch_compile(use_torch_compile, device)" in src
+    assert src.count("self.use_torch_compile =") == 1
     assert "torch.compile enabled" not in src
