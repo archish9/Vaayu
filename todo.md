@@ -93,7 +93,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
 |---|---|---|---|---|
 | **S10b** ✅ | ~~**refuse `compression` where it cannot work, and correct its false decline reason** (= lead L-S10a) — live path, not "overridden"; bnb raises on every non-float dtype, so the split likely crashes on 4 of 5 on-device targets and writes into the model dir~~ **CLOSED 2026-09-28, FIXED: `resolve_compression` refuses it (WARNING, nothing written) on a quantized / MoE / originals-deleted checkpoint; 4bit now loads on bf16 (it crashed on every checkpoint); `check_space` 4bit inversion fixed; decline reason corrected in 4 places. Tied-head bug split out as S10c. MERGED to `main` 2026-09-28 (`ff34de7`).** | exception: (d), but hours + context warm + S10 made the false claim explicit (user) | hours | [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md) |
 | **S10c** ✅ | ~~**fresh split of a TIED-embedding checkpoint crashes on the first forward** — D4 writes no head shard; the pin and prefetch paths handle only an EMPTY head shard, not an ABSENT one (server-default `prefetching=True`)~~ **CLOSED 2026-09-28, FIXED: server reach CONFIRMED first (fresh-split 1B → HTTP 500 on the first chat request); `load_from_strategy_or_tied_head` gives the pin and prefetch paths both shapes; fresh == old split 16/16 ids on Llama-3.2-1B and Qwen2.5-Coder-1.5B; server gate 9/9; suite 3112; accumulator gates 8/8 + 8/8; final review ready-to-merge, minors fixed. MERGED to `main` 2026-09-28 (`6b4e203`).** | exception: found by S10b, predicted server-reachable (user) | hours | [`…S10c-tied-head-absent-shard-RESULTS.md`](docs/superpowers/plans/2026-09-28-S10c-tied-head-absent-shard-RESULTS.md) |
-| **S11** | **Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | none yet — the S11 row below is the brief |
+| **S11** `[~]` | **Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | plan [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md) (STARTED 2026-09-28) |
 | **S12** | **build S11's top lever** (brainstorm → spec → user approval → plan → build) | (a) | unknown until S11 | written after S11 |
 | **S13** | **gpt-oss greedy decode diverges from stock at token 50 — triage.** Top-2 logit margin at position 50; near-tie → close with evidence; else find the first step whose logits leave ulp distance (the KV-cache path — single-forward logits are bit-identical) | exception: correctness a server user reaches, hours | hours | none yet — the S13 row below is the brief |
 | **S14** | **gpt-oss non-expert stream** — measure its share of the 0.44 s token (≈0.46 s was estimated on the pre-S8 5.8 s token), then residency: CPU gather for the embedding row (1.16 GB/token streamed to read ONE row), pin `lm_head` + attention; stock fits 13.79 GB, 35.7 tok/s vs Vaayu 2.3; 47-m4 (sliding-window KV, 0.813 GB) may free room | (b): served, the biggest remaining gap to stock | ~1 day measure; build TBD | none yet — the S14 row below is the brief |
@@ -268,7 +268,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         FOREGROUND, +10 over 3102); server gate on the fresh-split 1B copy 9/9. Accumulator gates not re-run: the
         only engine change after them is a `stat` inside the head's `except FileNotFoundError`, which an untied
         MoE checkpoint never enters.
-- [ ] **S11 — Qwen3-Next census at HEAD: decode AND TTFT, measure only.** **Why:** S7 took decode to
+- [~] **S11 — Qwen3-Next census at HEAD: decode AND TTFT, measure only.** **Why:** S7 took decode to
       51.3–51.9 ms (≈19.4 tok/s, `9e6f81d`); nothing has split the remaining token since, and S7 accepted that
       the disk stall is no longer hidden by the slow loop. The agent workload (CLAUDE.md §0) ranks TTFT and
       prefix reuse first; no Qwen3-Next TTFT figure exists since S7. **Levers to price, none to build:** S7's
@@ -282,6 +282,26 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       S7), 29G FOREGROUND. **Done:** a ranked list with a ceiling per lever in ms of the real token / s of
       TTFT; S12 = the top one. **Stop:** no lever with a ceiling ≥ 5 % of the real token or TTFT → S12 is
       skipped, say so.
+      **STARTED 2026-09-28 at HEAD `905f10f`:** no handoff (this row is the brief); plan
+      [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md) — three throwaway
+      probes, one load each, FOREGROUND at 29G, BALLAST 25: `s11_decode.py` (exclusive host attribution per
+      seam + host time BLOCKED in CUDA syncs + CUPTI device time, NOEXP floor), `s11_ttft.py` (two-turn agent
+      sessions at 2k/8k: turn 1 = prefix MISS, turn 2 = prefix HIT through the server's own re-render),
+      `s11_verify.py` (row 42's verify arms at HEAD + per-forward miss counters). **Static re-verify at
+      HEAD:** every wrapped seam present; the decode kernel is still the single `_use_pk` branch
+      (`moe_patch.py:2383`, one-token non-prefill); the two per-layer syncs are `:2299` (`unique().tolist()`)
+      and `:2402` (`expert_indices.cpu()`). Commits on the path since S7 (`9e6f81d`): S8 (routed fused-3D +
+      arena cap at the indexed experts, `2b34fa5`), S10, S10b, S10c — so S7's 51.3–51.9 ms is re-measured,
+      not reused. **Found reading the code (to be PRICED, not assumed):** every forward with `seq_len > 1`
+      is a prefill pass (`compute_prefill_pass`, no speculator) — so a prefix-HIT's diff prefill skips BOTH
+      the S7 kernel AND the VRAM expert tier (`_vram = None` under `_moe_prefill_pass`, `moe_patch.py:2312`)
+      and re-uploads experts already on the GPU. Last TTFT on record (S7 A/B, prefix cache OFF, warm):
+      **135 tok 2.91 s, 2048 tok 8.49 s** — a 135-token prefill costs ~57 decode tokens.
+      - [x] T1 re-verify at HEAD + open this row
+      - [ ] T2 decode census (`s11_decode.py`): T_U, T_NOEXP, host excl. per seam, sync waits, device busy
+      - [ ] T3 TTFT census (`s11_ttft.py`): 2k/8k × cold/HIT unprofiled ×2 reps, + one profiled session per L
+      - [ ] T4 verify cost at HEAD (`s11_verify.py`): cold verify(w)/t_dec for w=1,2,4,6 + acceptance re-check
+      - [ ] T5 price + rank every lever, RESULTS doc, this row → `[x]`, S12 defined or skipped
 - [ ] **S12 — build S11's top lever.** Defined by S11's verdict. Brainstorm → spec → user approval → plan →
       build. Done (S7's bar): ABBA ≥ 2 % (else revert), greedy ids identical, D6 band, gates (suite floor,
       Qwen3-Next + MiniMax accumulator, Qwen3-Next server smoke), §8 answered.
