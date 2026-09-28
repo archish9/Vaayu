@@ -1,7 +1,9 @@
 import atexit
 import contextlib
 import gc
+import json
 import os
+import struct
 import subprocess
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
@@ -1435,6 +1437,76 @@ def resolve_use_torch_compile(requested: bool, device: str) -> bool:
     return False
 
 
+# The only dtypes bitsandbytes' quantize_nf4 / quantize_blockwise accept; every
+# other one raises, and compress_layer_state_dict applies them to every tensor.
+_COMPRESSIBLE_DTYPES = {"F16", "BF16", "F32"}
+
+
+def resolve_compression(requested, model_local_path_or_repo_id):
+    """The `compression` this load will actually honour: `requested`, or None.
+
+    Decided from the ORIGINAL shards' safetensors headers and config.json,
+    before the split, so a refused request writes nothing. Refused -- warn and
+    disable, loading the checkpoint as it is -- when (todo.md S10b):
+    - no original `*.safetensors` shard is on disk: a repo id not yet
+      downloaded, originals deleted after an earlier split (the splitter then
+      dies on a bare AssertionError), or a `.bin` checkpoint;
+    - any tensor is not F16/BF16/F32: the checkpoint is already quantized, and
+      bitsandbytes raises on it mid-split, leaving a partial split dir;
+    - config.json names routed experts: the offset index streams experts as raw
+      split bytes and never decompresses them.
+    """
+    if requested is None:
+        return None
+    if requested not in ("4bit", "8bit"):
+        raise ValueError(f'compression={requested!r} is not recognised; pass "4bit", "8bit" or None.')
+    from .persist.expert_offset_index import ExpertOffsetIndex
+
+    path = Path(model_local_path_or_repo_id)
+    shards = sorted(path.glob("*.safetensors")) if path.is_dir() else []
+    reason = None
+    if not shards:
+        reason = (f"no original *.safetensors shard under {model_local_path_or_repo_id} to "
+                  f"compress from (a repo id not yet downloaded, originals deleted after an "
+                  f"earlier split, or a .bin checkpoint)")
+    else:
+        dtypes = set()
+        for shard in shards:
+            with open(shard, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(n))
+            dtypes |= {meta["dtype"] for key, meta in header.items() if key != "__metadata__"}
+        others = sorted(dtypes - _COMPRESSIBLE_DTYPES)
+        if others:
+            reason = (f"the checkpoint is already quantized (tensor dtypes {others}); bitsandbytes "
+                      f"only quantizes F16/BF16/F32 and would crash the split part-way")
+        elif ExpertOffsetIndex(str(path)).expected_expert_count() is not None:
+            reason = ("config.json names routed experts, and the offset index streams experts "
+                      "as raw split bytes that are never decompressed")
+    if reason is None:
+        return requested
+    print(f"[Vaayu] WARNING: compression DISABLED — {reason}. Loading the checkpoint as it is.")
+    return None
+
+
+def embed_shard_shape(embed_path, embed_key):
+    """The [vocab, hidden] shape of `embed_key` in the split's embedding shard, or None.
+
+    A 4bit split stores the weight nf4-PACKED ([vocab * hidden / 2, 1]); its
+    logical shape is kept in the packed quant state saved beside it. 8bit keeps
+    the shape, so its header is already right.
+    """
+    import safetensors.torch
+    with safetensors.torch.safe_open(embed_path, framework="pt", device="cpu") as f:
+        if embed_key not in f.keys():
+            return None
+        packed_state = f"{embed_key}.4bit.quant_state.bitsandbytes__nf4"
+        if packed_state in f.keys():
+            from bitsandbytes.utils import unpack_tensor_to_dict
+            return list(unpack_tensor_to_dict(f.get_tensor(packed_state))["shape"])
+        return f.get_slice(embed_key).get_shape()
+
+
 def cache_config_if_non_uniform(config):
     """The config to hand a Cache constructor, or None for uniform attention.
 
@@ -2100,6 +2172,7 @@ class VaayuBaseModel(GenerationMixin):
             if to profile the model loading time, default to False
         compression: str, optinal
             setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
+            Refused with a warning (loaded uncompressed) on a quantized, MoE or originals-deleted checkpoint; see `resolve_compression`.
         hf_token: str, optional
             huggingface api token could be provided, by default None
         """
@@ -2142,6 +2215,9 @@ class VaayuBaseModel(GenerationMixin):
                 )
 
 
+        # Before the split below, which is handed this resolved value: a refused
+        # request must not write a second, partial copy of the checkpoint.
+        compression = resolve_compression(compression, model_local_path_or_repo_id)
         self.compression = compression
         self.hf_token = hf_token
         self._forced_attn_impl = attn_implementation
@@ -2239,14 +2315,11 @@ class VaayuBaseModel(GenerationMixin):
         # Probe exact physical vocab/hidden dimensions from extracted shard metadata to prevent PyTorch embedding mismatches
         embed_path = Path(self.checkpoint_path) / f"{self.layer_names_dict['embed']}.safetensors"
         if os.path.exists(embed_path):
-            import safetensors.torch
             try:
-                with safetensors.torch.safe_open(embed_path, framework="pt", device="cpu") as f:
-                    real_embed_key = f"{self.layer_names_dict['embed']}.weight"
-                    if real_embed_key in f.keys():
-                        real_shape = f.get_slice(real_embed_key).get_shape()
-                        self.config.vocab_size = real_shape[0]
-                        self.config.hidden_size = real_shape[1]
+                real_shape = embed_shard_shape(embed_path, f"{self.layer_names_dict['embed']}.weight")
+                if real_shape is not None:
+                    self.config.vocab_size = real_shape[0]
+                    self.config.hidden_size = real_shape[1]
             except Exception:
                 pass
 

@@ -61,7 +61,9 @@ SERVER_DELIBERATELY_NOT_EXPOSED = {
     "tokenizer_class": "same -- a dev override for a checkpoint the loader misreads",
     "layer_shards_saving_path": "library-facing: where a one-off split is written",
     "profiling_mode": "dev instrumentation, not an operator control",
-    "compression": "`__init__` overrides it in places; not a live path",
+    "compression": "library-facing and lossy; works only on an unquantized dense checkpoint -- "
+                   "`__init__` refuses it with a warning on a quantized, MoE or "
+                   "originals-deleted one (every on-device target; todo.md S10b)",
     "use_torch_compile": "crashes on CUDA (cudagraphs, todo.md row 48), so `__init__` refuses "
                          "it with a warning; the no-cudagraph mode measured 24-35 % slower "
                          "on Qwen3-Next (row 36)",

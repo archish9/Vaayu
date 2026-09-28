@@ -325,8 +325,11 @@ DECODE_TOP_K_BUDGET = 0.035
 #   tokenizer_class                misreads -- detection is the supported path
 #   layer_shards_saving_path       library-facing: where a one-off split goes
 #   profiling_mode                 dev instrumentation
-#   compression                    `__init__` overrides it in places; not a
-#                                  live path
+#   compression                    library-facing and lossy; works only on an
+#                                  unquantized dense checkpoint -- `__init__`
+#                                  refuses it with a warning on a quantized,
+#                                  MoE or originals-deleted one (every
+#                                  on-device target; todo.md S10b)
 #   use_torch_compile              crashes on CUDA (cudagraphs, row 48), so
 #                                  `__init__` refuses it with a warning; the
 #                                  no-cudagraph mode measured 24-35 % slower
