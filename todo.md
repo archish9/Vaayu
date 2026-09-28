@@ -369,14 +369,15 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
       when picked up:** repeat the 64-token comparison at a few different `kv_cache_mode` settings and with
       per-step logit-diff instrumentation to localise where the drift starts, rather than only where
       argmax first flips.
-- [x] **S9 — DeepSeek `wo_a` folded on the GPU (= S6 lead L-a).** **CLOSED 2026-09-28, A WIN — ABBA (off, on, on,
+- [x] **S9 — DeepSeek `wo_a` folded on the GPU (= S6 lead L-a).** **CLOSED 2026-09-28, A WIN.** ABBA (off, on, on,
       off; one process each, W discarded, U1+U2; `BALLAST_GB=15`, 29G; OFF = `main` worktree via `VAAYU_ROOT`):
       off 2.7181 / 2.7587, on 1.5811 / 1.5844 s/token → **code effect −42.20 % (2.738 → 1.583 s/token, 0.365 →
       0.632 tok/s, 1.73×)**, order effect +22 ms; **greedy U1 ids identical across all four processes (64 tok)**.
       `gpu_load` 2.10–2.14 → 0.606 s/token; `expert_disk` ROSE 0.22 → 0.50 s (net −1.16 s; hypothesis, unverified:
       the 33 ms/layer CPU fold used to hide the next layers' expert reads). Peak VRAM `max_allocated` 7.37 → 7.38
-      GiB, `max_reserved` 7.51 → 7.69 GiB (fold transient 288 MiB/layer, cached). **Stop rule did not fire:** device
-      fold == CPU fold as int16 bits in all 43 decoder layers (new test, real checkpoint).** Re-verification drift:
+      GiB, `max_reserved` 7.51 → 7.69 GiB (fold transient 288 MiB per fold, reused). **Stop rule did not fire:** device
+      fold == CPU fold as int16 bits in all 43 decoder layers (new test, real checkpoint). Re-verification: every
+      handoff line ref exact; the non-expert RAM LRU caches the RAW (pre-fold) dict, so a RAM hit re-folded too. Drift:
       pin budget now 3.76 GB → 10 non-expert-pinned layers, so **33 streamed, not 35**; idle-box CPU fold **33 ms**
       /layer (S6's 40 ms was under load); GPU fold 3.75 ms incl. H2D. **Step 0 re-baseline at HEAD `8614d79`:** U1
       2.655 / U2 2.684 s/token (0.377 / 0.373 tok/s; S5-M's arena had already moved it from 0.3267), `gpu_load`
@@ -551,11 +552,7 @@ buy:** per-expert streaming + resident non-expert weights puts it dispatch-bound
 cost per slot.
 
 **Leads recorded, NOT chased (stop rule) — unsequenced, re-prioritise with the user:**
-- [x] **L-a — SEQUENCED AS S9 (2026-09-26). CLOSED 2026-09-28, A WIN — decode −42.20 % (2.738 → 1.583 s/token), see the S9 row at the top. STARTED 2026-09-28: handoff re-verified against HEAD `8614d79` — every
-      line ref exact (`vaayu_deepseek_v4.py:270` / `:330` / `:344`; `modeling_deepseek_v4.py:79` / `:228` / `:243` /
-      `:1286`); per-token path confirmed `StandardLoaderStrategy.inject_to_gpu` (`loader_strategy.py:191`) →
-      DeepSeek `move_layer_to_device` → CPU `dequantize_at_load`; the non-expert RAM LRU caches the RAW (pre-fold)
-      dict, so a RAM hit re-folds too. DeepSeek re-dequantizes `wo_a` on the CPU every token: 1.42 s/token (46 %).** Keeping the
+- [x] **L-a — SEQUENCED AS S9 (2026-09-26). CLOSED 2026-09-28, A WIN — decode −42.20 % (2.738 → 1.583 s/token), see the S9 row at the top. DeepSeek re-dequantizes `wo_a` on the CPU every token: 1.42 s/token (46 %).** Keeping the
       folded bf16 (35 × 67 MB ≈ 2.35 GB RAM), or folding on the GPU, removes it. Ceiling ≈ 0.6 tok/s.
 - [ ] **L-b — DeepSeek's reserve floor may be over-charged.** 8.03 GiB comes from charging `eager` a
       materialized-score term. DSA attends to `index_topk` selected keys, so whether its real peak
@@ -569,6 +566,11 @@ cost per slot.
       while the non-expert layers it streams are used on 100 % of tokens.
 - [ ] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
       amortise that share (row 37's re-gate).
+- [ ] **L-e — (added by S9, 2026-09-28) DeepSeek's expert-read stall was exposed when the CPU fold left: `expert_disk`
+      0.22 → 0.50 s/token**, while bytes read per token and expert-cache hit/miss counts were identical in both arms
+      (so it is exposed stall, not extra I/O). Hypothesis, UNVERIFIED: the 33 ms/layer fold gave the drive time to
+      land the next layers' expert reads. Verify: per-layer read-submit vs read-need timestamps on the ON arm (the
+      `row26_decode.py` `rust_durs` already record read durations). Ceiling ≤ 0.50 s of a 1.58 s token.
 - Note: the 0.3267 predates S5-M (arena on CUDA). **Measured 2026-09-28 (S9 step 0): 0.377 / 0.373 tok/s at HEAD
       `8614d79`, and 0.632 tok/s after S9.**
 

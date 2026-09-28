@@ -250,8 +250,8 @@ def dequantize_at_load(weights: dict, device=None) -> dict:
     `device`, when given, is where the fold runs: its two inputs move there
     first, and nothing else moves. The engine re-injects a streamed layer on
     every token, and the CPU fold cost ~33 ms a layer there; folding on the
-    GPU took DeepSeek's decode token from 2.74 s to 1.58 s (S9). The result is
-    bit-identical on either device: both casts are exact and the scale is a
+    GPU took DeepSeek's decode token from 2.74 s to 1.58 s (S9). For finite
+    inputs the result is bit-identical on either device: both casts are exact and the scale is a
     power of two, so the only rounding is the final bf16 one.
     """
     out = {}

@@ -311,7 +311,7 @@ class VaayuDeepseekV4(VaayuBaseModel):
            injecting a tensor into a `None` attribute crashes
            `set_module_tensor_to_device` with `'NoneType' object has no
            attribute 'device'`. The checkpoint's own `dequantize_at_load`
-           (`modeling_deepseek_v4.py:217`, already unit-tested against golden
+           (`modeling_deepseek_v4.py:243`, already unit-tested against golden
            values) folds `wo_a`'s F8_E4M3 weight and its per-tile scale into
            one bf16 tensor and drops the `.scale` key -- called here, once,
            on the whole layer's state dict, before injection, and ON

@@ -406,7 +406,8 @@ def test_the_device_fold_is_bit_identical_to_the_cpu_fold_in_every_layer():
     prefixes = sorted({key[:-len("weight")] for key in index["weight_map"]
                        if key.startswith("layers.")
                        and key.endswith("attn.wo_a.weight")})
-    assert prefixes
+    config = json.loads((parity.CKPT / "config.json").read_text())
+    assert len(prefixes) == config["num_hidden_layers"]
 
     for prefix in prefixes:
         raw = {f"wo_a.{leaf}": tensor
