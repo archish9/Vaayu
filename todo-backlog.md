@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 21 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b)
+## Index — 23 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -37,6 +37,8 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 19 | S1-L3 — `fla` / `causal_conv1d` not installed | S1 row | answered by S3: `fla` measured and REJECTED for decode; its prefill use is S3-C, still in `todo.md` | with S3-C |
 | 20 | S10b-a — VRAM reserve sizes a compressed layer from its FILE bytes | S10b row (added 2026-09-28) | `compression` is library-only (declined by the server) and every production model refuses it | a bf16 dense checkpoint too big for VRAM is run with `compression`, or compression reaches the server |
 | 21 | S10b-b — `check_space` crashes on a not-yet-existing `layer_shards_saving_path` | S10b row (added 2026-09-28) | `layer_shards_saving_path` is library-only (declined by the server) | the server exposes `layer_shards_saving_path`, or a library user reports it |
+| 22 | S10c-a — `load_layer_to_cpu` treats ANY head load failure as a tied head | S10c row (added 2026-09-28) | only the prefetching-OFF route, which the server never takes (`prefetching` not exposed, `compression` declined) | the server can run with `prefetching=False` or `compression`, or a library user reports a swapped head |
+| 23 | S10c-b — the absent-head fallback trusts that the splitter and the runtime agree on the head's NAME | S10c final review (added 2026-09-28) | needs a user-supplied `layer_names` without an `lm_head` entry on an untied model whose head is not `lm_head`; no on-device model qualifies | a supported model's head is named other than `lm_head` and is untied, or a user reports a tied-looking head on an untied model |
 
 ---
 
@@ -596,5 +598,40 @@ server declines it). **Re-open when:** the server exposes it, or a library user 
   [Errno 2] No such file or directory` before anything is split. Workaround: create the dir first. Fix shape:
   measure the nearest existing ancestor, or `mkdir` before `check_space`. Pre-existing, unrelated to
   compression.
+
+---
+
+## 22. S10c-a — `load_layer_to_cpu` treats ANY head load failure as a tied head
+
+*Added 2026-09-28 by S10c (final review).* **Why here:** `load_layer_to_cpu` is the prefetching-OFF route; the
+server never turns prefetching off (`prefetching` is not a server knob, and `compression`, which forces it off, is
+declined). **Re-open when:** the server can run with `prefetching=False` or `compression`, or a library user
+reports a swapped head.
+
+- **[bug] `load_layer_to_cpu` (`vaayu/vaayu_base.py:~4572`, `except Exception` at `:~4583`) falls back to the
+  embedding on ANY exception loading the head**, not only a missing file. On an UNTIED checkpoint whose head
+  shard exists but is unreadable or corrupt, it silently swaps the trained head for the embedding instead of
+  failing. S10c's `load_from_strategy_or_tied_head` is the narrow version (re-raises unless the error is
+  `FileNotFoundError` AND the file does not exist); fix shape: call it there too, or copy its catch. Pre-existing
+  (the catch-all predates D1).
+
+---
+
+## 23. S10c-b — the absent-head fallback trusts the splitter and the runtime to agree on the head's NAME
+
+*Added 2026-09-28 by S10c's final review, declined as a fix.* **Why here:** no on-device model can trigger it, and
+`load_layer_to_cpu` has always behaved this way. **Re-open when:** a supported model's head is named other than
+`lm_head` and is untied, or a user reports a tied-looking head on an untied model.
+
+- **[bug, latent] A missing head file is treated as "tied" because the splitter drops the head only when the
+  index has no head weight.** That holds for the NAME the splitter was given. `__init__` then re-resolves names
+  with `_auto_detect_layer_names` (`vaayu_base.py:~2447`), which can rename the head (e.g. `embed_out`). Case: an
+  untied model whose head is not `lm_head`, loaded with a user `layer_names` lacking an `lm_head` entry — the
+  splitter drops `lm_head` (absent from the index), the head's real keys land in no shard (G2 only warns), and at
+  runtime the renamed head is absent → the embedding is substituted. Before S10c the prefetch route crashed
+  loudly here. **Declined fix (reviewer's option):** require the live tree to report the head as tied
+  (`get_output_embeddings().weight is get_input_embeddings().weight`) before the absent-shard fallback. Not done:
+  the helper is module-level with no model, the skeleton is meta-initialized so tie identity at load time is
+  unverified, and the trigger needs a hand-written `layer_names`.
 
 ---

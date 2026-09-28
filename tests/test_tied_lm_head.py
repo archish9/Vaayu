@@ -18,7 +18,10 @@ back), so it is tested here without a model load — see CLAUDE.md's method note
 about load-time decisions verified by hand-run harnesses that copy the logic
 instead of executing it.
 """
+import os
+
 import pytest
+import torch
 
 from vaayu.vaayu_base import should_use_tied_lm_head, rekey_embed_as_lm_head
 
@@ -90,13 +93,13 @@ def test_no_lm_head_in_module_tree_never_falls_back():
 
 # --- The THIRD path, found 2026-09-07 (row 16) --------------------------------
 #
-# D1 was fixed in two places: `_pin_shared_layers` and `load_layer_to_cpu`.
+# D1 was fixed in two places: `_init_pinned_layers` and `load_layer_to_cpu`.
 # `_load_from_strategy` -- the PREFETCH route, which is what the forward uses
 # for any non-pinned layer while prefetching is on -- calls
 # `loader_strategy.load_from_disk` directly and had no fallback at all.
 #
 # It only fires when the head is NOT pinned, which is why it hid for so long:
-# the head is normally pinned first (it is in `_pin_shared_layers`' phase-1
+# the head is normally pinned first (it is in `_init_pinned_layers`' phase-1
 # list). Measured trigger on Llama-3.2-1B: `attn_implementation="sdpa"` charges
 # a score-buffer term flash does not (SCORE_ELEM_BYTES), which inflates
 # `reserve_bytes` until `pinning_budget` reaches EXACTLY 0 -- so nothing is
@@ -171,3 +174,195 @@ def test_prefetch_fallback_uses_the_models_own_names():
     m = _FakeModel(_names(embed="transformer.wte", head="output_head"))
     out = VaayuBaseModel._load_from_strategy(m, "output_head")
     assert out == {"output_head.weight": "EMBED_TENSOR"}
+
+
+# --- The ABSENT shard, found 2026-09-28 (S10c) --------------------------------
+#
+# D4 (`drop_absent_lm_head`, 2026-08-15) stopped the splitter writing the
+# empty head shard, so a FRESH split of a tied checkpoint has NO
+# `lm_head.safetensors` at all and `load_from_disk` RAISES FileNotFoundError.
+# The pin path and the prefetch path above handled only the EMPTY shape; only
+# `load_layer_to_cpu` handled both. Measured on Llama-3.2-1B, fresh split,
+# server defaults: the pin path logged `skip lm_head: [Errno 2]` and left the
+# head unpinned, then the forward streamed it through the prefetch route and
+# every chat request returned 500 FileNotFoundError. It hid because both tied
+# checkpoints on this box still carried pre-D4 splits with the 16-byte file.
+
+
+class _AbsentHeadStrategy(_FakeStrategy):
+    """load_from_disk that mimics a post-D4 split: no head file at all."""
+
+    def __init__(self, embed_name, absent=("lm_head",), error=FileNotFoundError, empty=()):
+        super().__init__(embed_name)
+        self._absent = set(absent)
+        self._empty = set(empty)
+        self._error = error
+        self.injected = {}
+
+    def load_from_disk(self, layer_name, checkpoint_path):
+        self.calls.append(layer_name)
+        if layer_name.rstrip(".") in self._absent:
+            raise self._error(f"[Errno 2] No such file or directory: "
+                              f"'{checkpoint_path}/{layer_name}.safetensors'")
+        if layer_name.rstrip(".") in self._empty:
+            return {}
+        if layer_name == self._embed:
+            return {f"{self._embed}.weight": torch.ones(4, 2)}
+        return {f"{layer_name}.weight": torch.zeros(2)}
+
+    def inject_to_gpu(self, model, layer_name, tensors, *args, **kwargs):
+        self.injected[layer_name] = tensors
+
+
+def test_prefetch_path_falls_back_for_an_absent_head_shard():
+    """The S10c bug: the head's file does not exist, the load raises, and the
+    prefetch route must still hand back the embedding re-keyed onto the head."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    m.loader_strategy = _AbsentHeadStrategy("model.embed_tokens")
+    out = VaayuBaseModel._load_from_strategy(m, "lm_head")
+    assert list(out) == ["lm_head.weight"], (
+        "a tied head whose shard is ABSENT (a fresh post-D4 split) did not fall "
+        "back to the embedding on the prefetch route -- the forward raises "
+        "FileNotFoundError on the first token")
+    assert torch.equal(out["lm_head.weight"], torch.ones(4, 2))
+
+
+def test_prefetch_path_absent_decoder_shard_still_raises():
+    """Only the head may be tied. A missing decoder shard is a broken split."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    m.loader_strategy = _AbsentHeadStrategy("model.embed_tokens",
+                                            absent=("model.layers.3",))
+    with pytest.raises(FileNotFoundError):
+        VaayuBaseModel._load_from_strategy(m, "model.layers.3")
+
+
+def test_prefetch_path_head_that_fails_for_another_reason_stays_loud():
+    """Only a MISSING file means "tied". Any other failure on the head (a
+    corrupt or unreadable file) must propagate: falling back would silently
+    swap an untied model's trained head for its embedding."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = _FakeModel(_names())
+    m.loader_strategy = _AbsentHeadStrategy("model.embed_tokens", error=ValueError)
+    with pytest.raises(ValueError):
+        VaayuBaseModel._load_from_strategy(m, "lm_head")
+
+
+class _FakePinModel(_FakeModel):
+    """Only the surface _init_pinned_layers' shared-layer phase touches."""
+
+    def __init__(self, names, strategy):
+        super().__init__(names)
+        self.loader_strategy = strategy
+        self.model = None
+        self.running_device = "cpu"
+        self.running_dtype = torch.float32
+        self.hf_quantizer = None
+        self.pinned_layer_names = set()
+        self.non_expert_pinned_layer_names = set()
+        self.is_moe = False
+        self.max_pinned_layers = 0  # shared layers only: skips phase 2
+
+    def _get_vram_pinning_budget(self):
+        return 1 << 30
+
+
+def _pin_names(embed="model.embed_tokens", head="lm_head"):
+    return {"embed": embed, "lm_head": head, "norm": "model.norm",
+            "layer_prefix": "model.layers"}
+
+
+@pytest.mark.parametrize("embed,head", [("model.embed_tokens", "lm_head"),
+                                        ("transformer.wte", "output_head")])
+def test_pin_path_pins_the_embedding_for_an_absent_head_shard(embed, head):
+    """The pin path swallowed the FileNotFoundError (`skip lm_head`), leaving
+    the head unpinned -- so it streamed into the prefetch crash above, and even
+    with that fixed would re-read the embedding from disk every token. It must
+    pin the embedding's tensors under the head's name, as it does for an EMPTY
+    shard. Names come from layer_names_dict, never Llama's (§5)."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    strategy = _AbsentHeadStrategy(embed, absent=(head,))
+    m = _FakePinModel(_pin_names(embed, head), strategy)
+    VaayuBaseModel._init_pinned_layers(m)
+    assert head in m.pinned_layer_names, (
+        f"tied head with an ABSENT shard was not pinned: {sorted(m.pinned_layer_names)}")
+    assert list(strategy.injected[head]) == [f"{head}.weight"]
+    assert torch.equal(strategy.injected[head][f"{head}.weight"], torch.ones(4, 2))
+
+
+def test_pin_path_pins_the_embedding_for_an_empty_head_shard():
+    """Bug D1 on the REAL pin path (a pre-D4 split's 16-byte `{}` shard).
+    Until now only the pure predicate covered this shape for the pin path."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    strategy = _AbsentHeadStrategy("model.embed_tokens", absent=(), empty=("lm_head",))
+    m = _FakePinModel(_pin_names(), strategy)
+    VaayuBaseModel._init_pinned_layers(m)
+    assert "lm_head" in m.pinned_layer_names
+    assert torch.equal(strategy.injected["lm_head"]["lm_head.weight"], torch.ones(4, 2))
+
+
+def test_head_error_is_not_absent_when_the_file_exists(tmp_path):
+    """FileNotFoundError is not proof the file is missing: safetensors'
+    `load_file` (the no-CUDA persister branch) raises it for ANY open failure,
+    permission denied included. A head file that exists must stay loud."""
+    from vaayu.vaayu_base import load_from_strategy_or_tied_head
+    (tmp_path / "lm_head.safetensors").write_bytes(b"x")
+    strategy = _AbsentHeadStrategy("model.embed_tokens")
+    with pytest.raises(FileNotFoundError):
+        load_from_strategy_or_tied_head(strategy, str(tmp_path), _names(), "lm_head")
+
+
+# --- Contract with the REAL persister -----------------------------------------
+#
+# The fakes above raise FileNotFoundError themselves. These pin the claim they
+# rest on -- a missing shard surfaces as exactly that type through the real
+# strategy and persister -- so a change of error type cannot turn the fallback
+# off with the suite still green (the way the absent shape hid for six weeks).
+def _write_embed_shard(dirpath):
+    from safetensors.torch import save_file
+    w = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    save_file({"model.embed_tokens.weight": w}, str(dirpath / "model.embed_tokens.safetensors"))
+    return w
+
+
+def test_real_persister_absent_head_falls_back(tmp_path, monkeypatch):
+    """No-CUDA branch (`load_file`), end to end through StandardSafetensorsStrategy."""
+    import vaayu.persist.safetensor_model_persister as P
+    from vaayu.persist.loader_strategy import StandardSafetensorsStrategy
+    from vaayu.vaayu_base import load_from_strategy_or_tied_head
+    monkeypatch.setattr(P, "_USE_PINNED", False)
+    w = _write_embed_shard(tmp_path)
+    out = load_from_strategy_or_tied_head(
+        StandardSafetensorsStrategy(None), str(tmp_path), _names(), "lm_head")
+    assert list(out) == ["lm_head.weight"]
+    assert torch.equal(out["lm_head.weight"], w)
+
+
+def test_real_pinned_loader_raises_file_not_found_for_a_missing_shard(tmp_path):
+    """CUDA branch: `_load_pinned` fails at `open()`, before any CUDA work."""
+    from vaayu.persist.safetensor_model_persister import _load_pinned
+    with pytest.raises(FileNotFoundError):
+        _load_pinned(str(tmp_path / "lm_head.safetensors"))
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                    reason="needs a non-root POSIX user for chmod 000 to deny")
+def test_real_persister_unreadable_head_stays_loud(tmp_path, monkeypatch):
+    """The reviewer's probe: on the no-CUDA branch an UNTIED head file with
+    mode 000 raised FileNotFoundError and got the embedding swapped in."""
+    import vaayu.persist.safetensor_model_persister as P
+    from safetensors.torch import save_file
+    from vaayu.persist.loader_strategy import StandardSafetensorsStrategy
+    from vaayu.vaayu_base import load_from_strategy_or_tied_head
+    monkeypatch.setattr(P, "_USE_PINNED", False)
+    _write_embed_shard(tmp_path)
+    head = tmp_path / "lm_head.safetensors"
+    save_file({"lm_head.weight": torch.zeros(4, 2)}, str(head))
+    head.chmod(0)
+    try:
+        with pytest.raises(OSError):
+            load_from_strategy_or_tied_head(
+                StandardSafetensorsStrategy(None), str(tmp_path), _names(), "lm_head")
+    finally:
+        head.chmod(0o644)
