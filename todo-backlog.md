@@ -252,6 +252,7 @@ ranking is stale on three counts:**
    **dies if row 30's S2 lands**."* **S2 landed 2026-09-13.** On Qwen3-Next the split spike measured
    `disk_load` at **0.42 / 0.32 % of a decode token** (2026-09-20, row 36) with a 96.6 % RAM-cache
    hit — there is essentially nothing left to prefetch, so lookahead has no mechanism there.
+   **STALE PREMISE (2026-09-28, S11 census):** Qwen3-Next's decode stall is back at ~11–12 % of the token (`S11_LOADWAIT` 7.08 ms, stall 6.89 ms of 57.32 ms server-mode / 62.12 library), but even perfect prefetch is +14.1 % tok/s (+12.9 % library) — still under this row's ≥ +15 % bar; priced as todo.md S11-L7.
 3. **The only remaining model where experts DO stream is the arm that LOST — at N=3.** MiniMax-M2.7
    measured **−3.7 %** there, and the server does not run N=3. **At N=1 the same post-P4 measurement
    reads +2.5 %** (`check_lookahead_flag_safe`, 2026-09-03: OFF 1.811, ON 1.873/1.838).

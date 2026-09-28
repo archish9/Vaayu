@@ -93,8 +93,8 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
 |---|---|---|---|---|
 | **S10b** ✅ | ~~**refuse `compression` where it cannot work, and correct its false decline reason** (= lead L-S10a) — live path, not "overridden"; bnb raises on every non-float dtype, so the split likely crashes on 4 of 5 on-device targets and writes into the model dir~~ **CLOSED 2026-09-28, FIXED: `resolve_compression` refuses it (WARNING, nothing written) on a quantized / MoE / originals-deleted checkpoint; 4bit now loads on bf16 (it crashed on every checkpoint); `check_space` 4bit inversion fixed; decline reason corrected in 4 places. Tied-head bug split out as S10c. MERGED to `main` 2026-09-28 (`ff34de7`).** | exception: (d), but hours + context warm + S10 made the false claim explicit (user) | hours | [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md) |
 | **S10c** ✅ | ~~**fresh split of a TIED-embedding checkpoint crashes on the first forward** — D4 writes no head shard; the pin and prefetch paths handle only an EMPTY head shard, not an ABSENT one (server-default `prefetching=True`)~~ **CLOSED 2026-09-28, FIXED: server reach CONFIRMED first (fresh-split 1B → HTTP 500 on the first chat request); `load_from_strategy_or_tied_head` gives the pin and prefetch paths both shapes; fresh == old split 16/16 ids on Llama-3.2-1B and Qwen2.5-Coder-1.5B; server gate 9/9; suite 3112; accumulator gates 8/8 + 8/8; final review ready-to-merge, minors fixed. MERGED to `main` 2026-09-28 (`6b4e203`).** | exception: found by S10b, predicted server-reachable (user) | hours | [`…S10c-tied-head-absent-shard-RESULTS.md`](docs/superpowers/plans/2026-09-28-S10c-tied-head-absent-shard-RESULTS.md) |
-| **S11** ✅ | ~~**Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap~~ **CLOSED 2026-09-28, MEASURED (no code): token 62.12 ms mean / 55.96 median, HOST-bound (host 60.3 vs device 26.7 ms); TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k (HIT fired 7/7 through the server's re-render); 7 levers ≥ 5 % → S12 NOT skipped; S12 = L-clean (every-32-forward `gc.collect()`, measured 5.95 ms = 9.6 %, hours); top TTFT lever = M>1 packed prefill kernel (≤32.8 % HIT@8k, ≤43.1 % cold@8k); row 37 stays closed.** | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | plan [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md); RESULTS [`…S11-qwen3next-census-RESULTS.md`](docs/2026-09-28-S11-qwen3next-census-RESULTS.md) |
-| **S12** | **L-clean — take the every-32-forward `gc.collect()` off the decode token, keeping the hygiene** (S11's pick; brainstorm → spec → user approval → plan → build; the user may swap in the M>1 packed prefill kernel or the layer-loop launch trim, see the S12 row) | (a)+(b): every decode token of every model at N=1, measured 9.6 % of Qwen3-Next's token | hours | none yet — the S12 row below is the brief |
+| **S11** ✅ | ~~**Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap~~ **CLOSED 2026-09-28, MEASURED (no code): token 57.32 ms in the SERVER's mode (56.64 without gc spikes + 0.68 frozen gc; a library caller, which gets no `gc.freeze()`, pays 62.12) / 55.96 median, HOST-bound (host 60.3 vs device 26.7 ms); TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k (HIT fired 7/7 through the server's re-render); levers ≥ 5 % remain → S12 NOT skipped; L-clean RE-PRICED by the final review under the server's post-load `gc.freeze()`: 5.95 → 0.68 ms = 1.2 %, below the stop line, banked (the first S12 pick was a library-mode number); S12 = the user's pick between the launch-overhead class (≈14.1 ms = 24.6 %, inferred) and the M>1 packed prefill kernel (≤32.8 % HIT@8k, ≤43.1 % cold@8k); row 37 stays closed.** | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | plan [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md); RESULTS [`…S11-qwen3next-census-RESULTS.md`](docs/2026-09-28-S11-qwen3next-census-RESULTS.md) |
+| **S12** | **Qwen3-Next's top remaining lever — the USER picks at the brainstorm: (i) the launch-overhead class (recommended, measure-first) or (ii) the M>1 packed prefill kernel** (S11's pick, re-made 2026-09-28 after the final review re-priced the first pick, L-clean, at 1.2 % in the server's mode; brainstorm → spec → user approval → plan → build) | (a)+(b): (i) every Qwen3-Next decode token at N=1, ≈14.1 ms = 24.6 % of the server-mode token, 3.61 s of a ≈21.3 s agent turn (INFERRED); (ii) every prefill, ≤1.00 s of a HIT@8k turn, ≤11.9 s of a cold 8k — it overtakes (i) once ≥ 24 % of turns are cold 8k | (i) days–weeks; (ii) ≥ a week | none yet — the S12 row below is the brief |
 | **S13** | **gpt-oss greedy decode diverges from stock at token 50 — triage.** Top-2 logit margin at position 50; near-tie → close with evidence; else find the first step whose logits leave ulp distance (the KV-cache path — single-forward logits are bit-identical) | exception: correctness a server user reaches, hours | hours | none yet — the S13 row below is the brief |
 | **S14** | **gpt-oss non-expert stream** — measure its share of the 0.44 s token (≈0.46 s was estimated on the pre-S8 5.8 s token), then residency: CPU gather for the embedding row (1.16 GB/token streamed to read ONE row), pin `lm_head` + attention; stock fits 13.79 GB, 35.7 tok/s vs Vaayu 2.3; 47-m4 (sliding-window KV, 0.813 GB) may free room | (b): served, the biggest remaining gap to stock | ~1 day measure; build TBD | none yet — the S14 row below is the brief |
 | **S15** | **DeepSeek L-e, then L-b** — the expert-read stall S9 exposed (`expert_disk` 0.22 → 0.50 s/token, bytes identical); then whether the 8.03 GiB reserve floor is real (DSA `index_topk` may never materialize S×S scores) | (c): cheap, but a fixture model | hours each | none yet — the S15 row below is the brief |
@@ -307,37 +307,58 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       - [x] T5 price + rank every lever, RESULTS doc, this row → `[x]`, S12 defined or skipped
       - **CLOSED 2026-09-28, MEASURED (no code; HEAD `a1f9e05`; RESULTS
         [`…S11-qwen3next-census-RESULTS.md`](docs/2026-09-28-S11-qwen3next-census-RESULTS.md); probes/logs/JSON in
-        `plans/probes/s11_*.py`, `plans/probes/s11_out/`).** **Decode (135-tok prompt, 62 fwds/arm):** T_U = U1
-        mean **62.12 ms** (median 55.96, without the 2 gc spikes 56.64; S7's medians were 51.3–51.9, so the median
-        is +7.8–9.1 %, not chased); T_NOEXP 31.64 mean / 26.38 median; U2 drift +0.06 %; U_HOST +3.71 %.
-        Forward device busy (CUPTI) **26.74 ms**, of which MoE 14.62. **HOST-BOUND:** host excl. − syncs =
-        60.33 ≥ 26.74; GPU idle 35.39 ms (57 %) = the whole host-side prize. Top host components (ms/tok):
-        `S11_FWD` 13.06 (incl. ≈5.78 of the clean below; 1,069 launches/tok = 97 eager RMSNorms), `S11_GDN`
-        10.58 (device 7.04), `S11_LOADWAIT` 7.08 (= disk stall 6.89; 15.0 disk reads + 78.4 VRAM misses/tok),
-        `S11_MOE` 5.95, `S11_ATTN` 4.82, `S11_KERNEL` 4.77, `S11_SHARED` 3.69, `SYNC@S11_MOE` 2.81
-        (entry_wait 0.70 ≈ 0: the syncs wait only on the router). **T2b, the spike, CONFIRMED:**
-        `vaayu_base.py:5636-5639` `clean_memory(cuda=False)` every 32 forwards (`_token_count` never resets,
-        `:2246`); `gc.collect()` 178.7 ms/call over ~1.02 M objects, collecting 0 in 12/12 calls; `malloc_trim`
-        0.4 ms; ON−OFF ABBA (4+4 arms) **+5.95 ms/tok (+8.35 % of ON)**; ids identical; RSS 17.16–17.17 GB on
-        and off. **TTFT (unprofiled, 2 reps):** cold **10.41 s @2k / 27.58 s @8k**; prefix HIT (199-token
-        diff) **3.12 s @2k / 3.04 s @8k**. The HIT fired and the server's re-render reproduced the stored ids on
-        7/7 sessions (prefill_q = delta + 1 = 199). A HIT@8k still reads 4,880 experts (8.70 GB) from disk
-        and re-uploads 2,706 already in the VRAM tier. MoE = 92–96 % of every prefill (profiled). **Ranked
-        (ceiling; s per representative turn = HIT@8k + 256 tok = 18.94 s):** (1) layer-loop remainder (97
-        eager RMSNorms) ≈6.0–6.6 ms = 9.7–10.6 %, **inferred**, 1.55–1.69 s; (2) **L-clean 5.95 ms = 9.6 %,
-        measured, 1.52 s, hours**; (3) expert-path host trim (DISP+SETTLE+BLOB+UPLOAD+MOE) 4.8–5.5 ms =
-        7.7–8.9 %, 1.23–1.41 s; (4) **M>1 packed prefill kernel ≤1.00 s = 32.8 % of HIT@8k TTFT, ≤11.88 s =
-        43.1 % of cold@8k** (38.4 % cold@2k), ≥ a week, D6 band not ids-identical; (5) S3-B 3.54 ms = 5.7 %;
-        (6) L-sync 2.81 ms = 4.5 %; (7) L-overlap 7.08 ms formula but ≤1.15–2.65 ms = 1.9–4.3 % tight (≤15
+        `plans/probes/s11_*.py`, `plans/probes/s11_out/`).** **Decode (135-tok prompt, 62 fwds/arm):**
+        **T_U(server) = 57.32 ms** = U1 without its 2 gc spikes 56.64 + the frozen gc 0.68 (final review, T2b's
+        c2 below). **Every S11 arm ran WITHOUT the server's post-load `gc.freeze()`** (`app.py:434` →
+        `utils.py:66-82`), so U1's raw mean **62.12 ms** is what a LIBRARY caller pays, not a server user.
+        Median 55.96 (S7's medians were 51.3–51.9, so the median is +7.8–9.1 %, not chased); T_NOEXP 31.64
+        mean / 26.38 median; U2 drift +0.06 %; U_HOST +3.71 %. Forward device busy (CUPTI) **26.74 ms**, of
+        which MoE 14.62. **HOST-BOUND:** host excl. − syncs = 60.33 ≥ 26.74 (≈55.2 with the gc frozen); GPU
+        idle 30.58 ms = 53.4 % of T_U(server) (35.39 in the library token) = the whole host-side prize. Top
+        host components (ms/tok, library window): `S11_FWD` 13.06 (incl. ≈5.78 of the clean below; 1,069
+        launches/tok = 97 eager RMSNorms), `S11_GDN` 10.58 (device 7.04), `S11_LOADWAIT` 7.08 (= disk stall
+        6.89; 15.0 disk reads + 78.4 VRAM misses/tok), `S11_MOE` 5.95, `S11_ATTN` 4.82, `S11_KERNEL` 4.77,
+        `S11_SHARED` 3.69, `SYNC@S11_MOE` 2.81 (entry_wait 0.70 ≈ 0: the syncs wait only on the router).
+        **T2b, the spike, CONFIRMED:** `vaayu_base.py:5636-5639` `clean_memory(cuda=False)` every 32 forwards
+        (`_token_count` never resets, `:2246`); `gc.collect()` 178.7 ms/call over ~1.02 M objects, collecting 0
+        in 12/12 calls; `malloc_trim` 0.4 ms; ON−OFF ABBA (4+4 arms) **+5.95 ms/tok (+8.35 % of ON)**; ids
+        identical; RSS 17.16–17.17 GB on and off — **library mode only.** **Re-priced in the server's mode
+        (final review C1, 2026-09-28, `s11-clean-c2.json`: the same probe with `FREEZE=1` →
+        `freeze_after_load()`, 1,016,437 objects frozen, 2 left tracked):** ON 66.30 − OFF 65.62 = **+0.68
+        ms/tok (+1.03 % of ON)**; `gc.collect()` 32.7 ms/call (26.7–37.5, rising arm by arm; 9.4 on the warm
+        arm's first call), collected 0 in 12/12; trim 0.21 ms; per-call timing predicts 1.05 ms/tok; ids
+        identical; RSS 17.20–17.21 GB on and off. **TTFT (unprofiled, 2 reps):** cold **10.41 s @2k /
+        27.58 s @8k**; prefix HIT (199-token diff) **3.12 s @2k / 3.04 s @8k**. The HIT fired and the server's
+        re-render reproduced the stored ids on 7/7 sessions (prefill_q = delta + 1 = 199). A HIT@8k still
+        reads 4,880 experts (8.70 GB) from disk and re-uploads 2,706 already in the VRAM tier. MoE = 92–96 %
+        of every prefill (profiled). **Ranked**
+        (ceiling as % of T_U(server) 57.32 ms or of its own TTFT; **s per representative turn in the server's
+        mode = HIT@8k 3.04 s + 256 tok at that context's own decode median, 69.1–73.3 ms in
+        `s11-ttft-u1.json` = ≈21.3 s** (20.7–21.8), decode 86 % of it. The census first used 18.94 s, built on
+        the 135-token-context library token; per-token savings are unchanged. The 199-token diff was the
+        probe's choice, not a measured workload figure): (1) layer-loop remainder (97 eager RMSNorms)
+        ≈6.0–6.6 ms = 10.5–11.5 %, **inferred**, 1.55–1.69 s; (2) **L-clean: 5.95 ms measured in library mode
+        only; in the server's mode (frozen) 0.68 ms = 1.2 %, 0.17 s — below the stop line, last of the decode
+        levers**; (3) expert-path host trim (DISP+SETTLE+BLOB+UPLOAD+MOE) 4.8–5.5 ms = 8.4–9.6 %, 1.23–1.41 s;
+        (4) **M>1 packed prefill kernel ≤1.00 s = 32.8 % of HIT@8k TTFT (4.7 % of the turn), ≤11.88 s = 43.1 %
+        of cold@8k** (38.4 % cold@2k, ≈4.0 s), ≥ a week, D6 band not ids-identical; (5) S3-B 3.54 ms = 6.2 %;
+        (6) L-sync 2.81 ms = 4.9 %; (7) L-overlap 7.08 ms formula but ≤1.15–2.65 ms = 2.0–4.6 % tight (≤15
         waiting layers × movable work; the one-kernel arithmetic rule stands); (8–10) ATTN / SHARED / KERNEL
-        host trims 2.45 / 2.09 / 1.93 ms (< 5 %); (11) **L-VRAMpref** (prefill reads the VRAM tier, no
-        `put()`) 0.24–0.43 s = **8.0–14.0 % of HIT@8k** (the brief's upper bound divides h2d by disk loads, not
-        uploads, so it is ~2× high; by uploads it is ≈0.22–0.24 s, which matches the 19.7 GB/s lower bound), hours; (12) S3-C ≤3.7 %
-        (cold@8k 1.02 s), new dependency; (13) L-deqretain (keep DEQUANTIZED experts across prefill chunks)
-        cold@8k 6.17 s = 22.4 %, cold@2k 12.7 %, HIT 0, VRAM fit unverified, subsumed by (4); (14) row 37
-        re-gate = 0. Not additive: one device floor. Unpriced: cross-layer expert prefetch (removes the 6.9 ms
-        stall itself), the unattributed 18–21 % of prefill `moe` (≈0.60 s @HIT 8k), a bigger VRAM tier. Also
-        an independent ~1.3× wobble at forwards 61–65/93 with the clean OFF, unexplained and not chased.
+        host trims 2.45 / 2.09 / 1.93 ms = 4.3 / 3.6 / 3.4 % (< 5 %); (11) **L-VRAMpref** (prefill reads the
+        VRAM tier, no `put()`) 0.24–0.43 s = **8.0–14.0 % of HIT@8k** (the brief's upper bound divides h2d by
+        disk loads, not uploads, so it is ~2× high; by uploads it is ≈0.22–0.24 s, which matches the 19.7 GB/s
+        lower bound), hours; (12) S3-C ≤3.7 % (cold@8k 1.02 s), new dependency; (13) L-deqretain (keep
+        DEQUANTIZED experts across prefill chunks) cold@8k 6.17 s = 22.4 %, cold@2k 12.7 %, HIT 0, VRAM fit
+        unverified, subsumed by (4); (14) row 37 re-gate = 0; **priced by the final review:** (15) HIT-diff
+        disk re-reads, exposed stall 0.37–0.46 s = 12–15 % of a HIT TTFT; (16) cross-layer expert prefetch
+        ≤7.08 ms = 12.3 %, 1.81 s (perfect prediction; no accuracy data). **The launch-overhead class** —
+        (1) + (5) + ATTN + SHARED — holds ≈14.1 ms of host above device = 24.6 %, 3.61 s/turn (inferred). Not
+        additive: one device floor. **Server-mode order by s/turn:** class 3.61 > (16) ≤1.81 > (1) 1.55–1.69 >
+        (3) 1.23–1.41 > (4) 1.00 (11.88 cold) > (5) 0.91 > (6) 0.72 > (7) 0.30–0.68 > (8–10) 0.63–0.49 > (15)
+        0.37 > (11) 0.22–0.43 > (2) 0.17. Re-checked, not assumed: no lever crosses 5 % either way except
+        L-clean (L-sync 4.90 %, L-overlap tight ≤4.62 %). Unpriced: the unattributed 18–21 % of prefill `moe`
+        (≈0.60 s @HIT 8k), a bigger VRAM tier. Also an independent ~1.3× wobble at forwards 61–65/93 with the
+        clean OFF, unexplained and not chased.
         **Verify / row 37:** cold verify ÷ cold t_dec at 2k is w1 1.09, w2 2.96, w4 3.62, w6 3.77 (4.38
         without the one gc-spiked sample), so every w ≥ 2 fails the ≤ ~2× re-open bar. With an ideal M>1
         kernel the ratios are 1.20 / 1.37 / 2.22 by the brief's formula, which omits the 36 mixers'
@@ -345,34 +366,108 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         2.02 / 2.19 / 3.05 and a mix ≤ ×1.07. With stepped mixers it is 1.30 / 1.66 / 2.71, mix ×1.23–1.34 at
         k=1–3, but novel output alone stays ≤ ×1.01. k5 tokens/round 5.12 / 2.87 / 1.35 (row 42 had 1.36 for
         novel). **Row 37 stays closed for hybrids; worth 0 today** (refused on MoE, §8(3)). It re-opens only with
-        M>1 + stepped mixers + an edit-heavy mix. **Stop rule: 7 levers ≥ 5 % → S12 NOT skipped. S12 = L-clean:**
-        it ties the top ceiling (1.52 vs (1)'s inferred 1.55–1.69 s/turn), it is the only top lever with a
-        measured A/B delta, and it takes hours. The S12 row lists the user's alternatives. **§8:** (1) no knob,
-        measurement; (2) nothing to plumb; (3) measured in the server's own mode (N=1, server knobs, prefix
-        cache ON, HIT through the server's re-render); (4) n/a. **Suite floor unchanged at 3112** (no code
-        touched).
-- [ ] **S12 — build S11's top lever: L-clean, take the every-32-forward `gc.collect()` off the decode token
-      and keep the hygiene** (S11's pick; the USER confirms or swaps at the brainstorm). **Evidence (S11 T2b,
-      `plans/probes/s11_out/s11-clean-c1.json`):** `vaayu_base.py:5636-5639` calls `clean_memory(cuda=False)`
-      when `_token_count % 32 == 0`. The counter is set once in `__init__` (`:2246`), never resets, and counts
-      prefill leaf forwards too. `gc.collect()` costs 178.7 ms/call scanning ~1.02 M tracked objects and
-      collected 0 in 12/12 calls; `malloc_trim(0)` costs 0.4 ms. ON−OFF ABBA (4+4 arms × 94 decode forwards)
-      measured **+5.95 ms/token = 9.6 % of the 62.12 ms token ≈ 1.52 s per representative turn** (8 × ~179 ms
-      per 256 tokens). Greedy ids were identical, and RSS was 17.16–17.17 GB on and off. **Reach:** every
-      decode token of every model, N=1, server default. **Keep the hygiene:** S5-M relied on the trim for
-      DeepSeek's clone-path RSS. Options for the brainstorm (not chosen here): `gc.freeze()` after load; keep
-      the trim and drop or rarefy the collect; run it between requests (a thread does not help, gc holds the
-      GIL); trigger on need instead of a count. **What shrinks the gain:** Python's automatic gen-2
-      collections; any full collect left on the token path. **Close alternatives, the user's call:** (i) the
-      layer-loop remainder, ≈6.0–6.6 ms (inferred, 1,069 launches/token from 97 eager RMSNorms). Its
-      mechanism class (norms + GDN body + attention + shared expert) holds ≈14.1 ms of host above device =
-      22.7 % of the token, days to weeks, ids risk. (ii) The M>1 packed prefill kernel, the top TTFT lever:
-      ≤1.00 s = 32.8 % of a HIT@8k TTFT, ≤11.9 s = 43.1 % of a cold 8k. It is the bigger win for cold or
-      large-delta turns, needs a week or more, and must meet the D6 band rather than identical ids. (iii)
-      L-clean takes hours, so the brainstorm may pair it with L-VRAMpref (hours, 8–14 % of a HIT TTFT).
-      Brainstorm → spec → user approval → plan → build. Done (S7's bar): ABBA ≥ 2 % (else revert), greedy ids
-      identical, D6 band, gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next server smoke), §8
-      answered; plus RSS flat over a long session, including S5-M's clone-path case.
+        M>1 + stepped mixers + an edit-heavy mix. **Stop rule: MET → S12 NOT skipped.** In the server's mode 6
+        of the census's 7 levers still clear 5 % ((1), (3), (5) on T_U; (4), (11), (13) on a TTFT), and so do
+        (15) and (16); L-clean fell to 1.2 %. ~~S12 = L-clean~~ — withdrawn by the final review (C1): it was
+        priced without the server's post-load `gc.freeze()`, which cuts it 8.8×. **S12 = the user's pick
+        between the launch-overhead class and (4) M>1**, with the break-even and a recommendation in the S12
+        row; every other lever ≥ 5 % is banked in the leads below. **§8:** (1) no knob, measurement; (2)
+        nothing to plumb; (3) N=1, server knobs, prefix cache ON, HIT through the server's re-render — **but
+        NOT the server's post-load `gc.freeze()`**: the decode, TTFT and verify arms all ran without it, so the
+        decode means carry library-mode gc spikes (L-clean re-priced frozen in c2; no clean landed in a TTFT
+        prefill window; verify's w=6 cold decode carries one 299 ms spike); (4) n/a. **Suite floor unchanged
+        at 3112** (no code touched).
+      - **Leads banked (S11)** — final review 2026-09-28; ceilings in the server's mode (T_U(server) 57.32 ms,
+        turn ≈21.3 s). S12's brainstorm moves L1 or L2 into S12; the other stays open here.
+        - [ ] **S11-L1 — launch-overhead class** (S12 candidate (i)): the layer-loop remainder 6.05–6.6 + S3-B
+          3.54 + ATTN 2.45 + SHARED 2.09 = **≈14.1 ms of host above device = 24.6 %, 3.61 s/turn, INFERRED**;
+          days–weeks (fused kernels or CUDA graphs over the static-shape segments between the MoE syncs; ids
+          risk on a fused norm); reach: every Qwen3-Next decode token at N=1, server default. Evidence
+          `s11-decode-r1.json` `arms.U_HOST.host_ms_per_tok` − `arms.U_CNT.census.per_fwd[*].dev_us`.
+        - [ ] **S11-L2 — M>1 packed prefill kernel** (S12 candidate (ii)): ≤0.997 s = **32.8 % of a HIT@8k
+          TTFT**, ≤11.88 s = **43.1 % of cold@8k**, ≈4.0 s = 38.4 % of cold@2k; ≥ a week, new Triton kernel,
+          D6 band (cannot bit-match cuBLAS); reach: every prefill at N=1 (cold and HIT diff); subsumes L5,
+          row 37's prerequisite. Evidence `s11-ttft-p1.json` `moe_profile.construct` + `scatter`,
+          `s11-ttft-u1.json` `prefill_s`.
+        - [ ] **S11-L3 — expert-path host trim** (DISP + SETTLE + BLOB + UPLOAD issue + MOE remainder):
+          4.81–5.50 ms = **8.4–9.6 %**, 1.23–1.41 s/turn; days (five seams, no single change covers them);
+          reach: every decode token at N=1. Evidence `arms.U_HOST.host_ms_per_tok.S11_{DISP,SETTLE,BLOB,
+          UPLOAD,MOE}` − `U_CNT` device of MOE / BLOB / UPLOAD.
+        - [ ] **S11-L4 — L-VRAMpref** (prefill reads the VRAM tier, no `put()`): 0.24–0.43 s = **8.0–14.0 %
+          of a HIT@8k TTFT** (≈0.22–0.24 s by uploads; the upper divides h2d by disk loads, ~2× high),
+          7.3–12.0 % HIT@2k; hours; reach: every HIT at N=1 (prefix cache ON by default). **Must cover all
+          three per-expert forwards:** the `_vram = None` prefill gate is in each — module-list
+          `moe_patch.py:1750`, fused non-EXL3 `:2312`, fused EXL3 `:3082` — and it was priced on the fused
+          non-EXL3 forward only (the fused-EXL3 one has no on-device model: unverifiable there). Evidence
+          `s11-ttft-u1.json` `vram_overlap`; `s11-ttft-p1.json` `moe_profile.h2d`, `slots_miss`, `loads_slab`.
+        - [ ] **S11-L5 — L-deqretain** (keep DEQUANTIZED experts across prefill chunks): cold@8k 6.17 s =
+          **22.4 %**, cold@2k 1.32 s = 12.7 %, HIT 0; 1–2 days, VRAM fit unverified (≈2.6 GB for a layer's 8k
+          union); subsumed by L2 — build one; reach: cold prefills > 512 tokens only. Evidence
+          `s11-ttft-p1.json` `moe_profile.construct_hit`.
+        - [ ] **S11-L6 — HIT-diff disk re-reads.** Prefill consults the RAM tier (`moe_patch.py:2769`) but its
+          misses are transient loads, never admitted (`:2801`), so every HIT re-reads the diff's cold experts:
+          4,880 loads / 8.70 GB at HIT@8k. Ceiling = the exposed stall, 0.374 s = **12.3 % of a HIT@8k TTFT**,
+          0.461 s = 14.8 % HIT@2k (0.37–0.46 s/turn); byte floor 1.22 s at 7.1 GB/s; build unpriced (prefill
+          routes ~every expert once, so admitting its loads churns the tier — why they are transient); reach:
+          every HIT at N=1. Evidence `s11-ttft-u1.json` `stall_s`, `loads_slab`, `read_gb`.
+        - [ ] **S11-L7 — cross-layer expert prefetch** (the only way to remove the stall itself, not overlap
+          it): ceiling = `S11_LOADWAIT` 7.08 ms = **12.3 %** (11.4 % of the library token), 1.81 s/turn, at
+          PERFECT prediction = +14.1 % tok/s (+12.9 % library) — below backlog #35's ≥ +15 % re-open bar even
+          then; no predictor accuracy data; days+; reach: every decode token with a disk miss, N=1. Evidence
+          `arms.U_HOST.host_ms_per_tok.S11_LOADWAIT`; U1 `per_tok.stall_s` 6.89 ms, `disk_reads` 15.0.
+          Backlog #35's kill premise (Qwen3-Next `disk_load` 0.42 %) is stale — annotated there, not moved.
+        - [ ] **S11-L8 — L-clean** (the every-32-forward `gc.collect()`, `vaayu_base.py:5636-5639`): a
+          LIBRARY caller pays +5.95 ms/tok = 9.6 % of the 62.12 token (≈1.52 s per 256 tokens measured; per
+          call 8 × 179.1 ms = 1.43 s); a SERVER user pays **+0.68 ms/tok = 1.2 % of T_U(server), 0.17 s/turn**
+          (per call 8 × 32.9 ms = 0.26 s = 1.8 %) — below the stop line; hours; §8(3): the 9.6 % reaches no
+          server user. Design option "(a) `gc.freeze()` after load" is ALREADY SHIPPED for the server by P1
+          (`80356e4`, `app.py:434`); a library caller does not get it. **Scope of the hygiene evidence:**
+          "collected 0 in 12/12" and "RSS flat" are Qwen3-Next decode over 96-token arms only (c1 and c2). In
+          c2 the per-call collect ROSE 9.4 → 37.5 ms over ~0.9k tokens with 0 collected — objects created after
+          load stay tracked; the long-session slope is unmeasured. **Re-open when:** a long server-mode session
+          shows the every-32 collect ≥ 5 % of the token. **Done bar if built:** collected counts, RSS AND VRAM
+          per forward class — MiniMax (EXL3 module-list), DeepSeek (non-EXL3 module-list, now on the arena),
+          gpt-oss (routed fused-3D), dense streamed (at least Llama-3.2-1B; dense has no committed gate) — not
+          only the Qwen3-Next + MiniMax gates; VRAM because with `cuda=False` the collect is the only prompt
+          release of cyclic garbage holding CUDA tensors. **Attribution:** S5-M's FIX was the arena
+          (`6596c49`); the trim was only OBSERVED returning 5.5 GB (18.06 → 12.56 GB) on the clone path, which
+          is still live for CPU compute (S5-M-C open). Reproducing that case on CUDA needs the
+          `moe_supports_slab_arena` predicate monkeypatched as S5-M's probe did — here back to the pre-fix
+          False (no engine edit). Evidence `s11-clean-c1.json`, `s11-clean-c2.json`.
+- [ ] **S12 — build S11's top remaining lever; the USER picks at the brainstorm between (i) the
+      launch-overhead class (S11-L1) and (ii) the M>1 packed prefill kernel (S11-L2).** Re-made 2026-09-28:
+      the first pick, L-clean, was priced without the server's post-load `gc.freeze()`; frozen it is 0.68
+      ms/token = 1.2 %, below the stop line (now S11-L8). **Axis (server mode):** T_U(server) = **57.32 ms**
+      (U1 56.64 without the gc spikes + the frozen gc 0.68; a library caller pays 62.12); representative
+      turn = HIT@8k 3.04 s + 256 tokens at that context's own decode median 69.1–73.3 ms = **≈21.3 s**. The
+      199-token diff was the S11 probe's choice, not a measured workload figure. **(i) Launch-overhead
+      class — the top decode lever, INFERRED:** on a host-bound token (host 60.3 vs device 26.7 ms), the
+      layer-loop remainder (97 eager RMSNorms, 1,069 launches/token, ≈6.05–6.6 ms) + S3-B's GDN body 3.54 +
+      ATTN 2.45 + SHARED 2.09 = **≈14.1 ms of host above device = 24.6 % of T_U(server), 3.61 s/turn (17 %
+      of the turn)**. One launch-removal design (fused kernels, or CUDA graphs over the static-shape
+      segments between the MoE syncs); days to weeks. Graphs replay the same kernels, so ids can stay
+      identical; a fused norm must match the eager chain exactly (S7's Triton traps). Reach: every
+      Qwen3-Next decode token at N=1, server default; the norm and attention parts exist in every model's
+      decode, but the prize is priced on Qwen3-Next only. **(ii) M>1 packed prefill kernel — the top TTFT
+      lever, a measured-share ceiling:** ≤0.997 s = 32.8 % of a HIT@8k TTFT (4.7 % of the turn), ≤11.88 s =
+      43.1 % of a cold 8k, ≈4.0 s on a 2k-token prefill; ≥ a week, a new Triton kernel that cannot
+      bit-match cuBLAS (D6 band, not identical ids); subsumes L-deqretain; row 37's prerequisite. Reach:
+      every prefill at N=1, cold and HIT diff. **Break-even:** with a fraction f of turns cold at 8k, (ii)
+      saves 0.997 + f × 10.88 s/turn; it overtakes (i)'s 3.61 s at **f ≈ 24 %** (the layer-loop remainder
+      alone, 1.55–1.69 s: f ≈ 5.1–6.4 %). On any single turn with a ≥ 2k-token diff, (ii) wins that turn
+      (≈4.0 vs 3.61 s), but a mix needs ≈87 % such turns before (ii) overtakes (i). **Recommendation: (i),
+      measured first.** On the representative turn it is worth 3.6× (ii), and (ii) needs a quarter of turns
+      cold at 8k to catch it. But its 14.1 ms is INFERRED, so S12 opens with a probe that splits `S11_FWD`'s
+      host remainder by label (launch overhead vs Vaayu's loop Python) and prices one graph-captured or fused
+      segment before any build; if the removable part measures below (ii)'s value on the user's mix, switch
+      to (ii). **The recommendation flips** if the agent's real mix is cold- or large-diff-heavy enough that
+      (ii)'s mean saving per turn tops (i)'s (e.g. ≥ 24 % cold-8k turns, or cold turns plus ≥ 2k-token
+      tool-output turns adding up to the same) — S11 did not measure the mix; the user knows Rudra's.
+      Brainstorm → spec → user approval → plan → build.
+      **Done (S7's bar):** ABBA ≥ 2 % (else revert), **run under `freeze_after_load()`** (`vaayu/utils.py:66`,
+      the server's mode — S11's c1 A/B ran without it and over-priced L-clean 8.8×); for (i) greedy ids
+      identical, for (ii) the D6 band; gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next
+      server smoke); §8 answered.
 - [ ] **S13 — gpt-oss token-50 divergence triage (= the open `[bug]` row under S8 below).** Evidence:
       198-token server-rendered prompt, `NEW_TOK=64`, greedy; ids match stock through position 49, then
       stock `558` vs Vaayu `350`; routed == whole-layer at all 64 positions (not S8-caused); single-forward
@@ -833,7 +928,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S12** — L-clean: take the every-32-forward `gc.collect()` off the decode token, keeping the hygiene (S11's pick; the user confirms or swaps at the brainstorm; the S12 row at the top is the brief). ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 62.12 ms, host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; 7 levers ≥ 5 %, so S12 is not skipped; top TTFT lever = M>1 packed prefill kernel; row 37 stays closed.) Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S12** — the user picks at the brainstorm between the launch-overhead class (top decode lever, ≈14.1 ms = 24.6 % of the server-mode token, inferred; recommended, measured first) and the M>1 packed prefill kernel (top TTFT lever; it overtakes the class once ≥ 24 % of turns are cold 8k); the S12 row at the top is the brief. ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 57.32 ms in the server's mode (62.12 for a library caller, which gets no `gc.freeze()`), host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; levers ≥ 5 % remain, so S12 is not skipped; L-clean re-priced frozen at 1.2 % and banked as S11-L8; row 37 stays closed.) Was: **S12** — L-clean, the every-32-forward `gc.collect()` (withdrawn 2026-09-28 by S11's final review: its 5.95 ms = 9.6 % was measured without the server's post-load `gc.freeze()`; frozen it is 0.68 ms = 1.2 %). Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
@@ -1466,9 +1561,12 @@ Detail: `docs/2026-09-26-S4-split-shard-tests-RESULTS.md` (gitignored — this r
 **Leads banked:**
 - [ ] **S3-B** — the 18 forward-body ops per mixer (gating, `repeat_interleave`, cat, reshape copies);
   reaching them means replacing the stock forward body — price against what remains of the 11.15 ms
-  ceiling after this build (`serial` fell 4.3 ms of it).
+  ceiling after this build (`serial` fell 4.3 ms of it). **S11 re-price (2026-09-28):** `S11_GDN` host
+  10.58 − device 7.04 = **3.54 ms = 6.2 % of the server-mode token** (57.32 ms; 5.7 % of the 62.12
+  library token), 0.91 s per ≈21.3 s agent turn; part of S11-L1's launch-overhead class.
 - [ ] **S3-C** — `fla`'s prefill chunk kernel, ~10× the torch chunk fallback (0.36 → 0.03 s per 2k
-  prompt, ~2 % TTFT); a new-dependency decision.
+  prompt, ~2 % TTFT); a new-dependency decision. **S11 re-price (2026-09-28):** ≤1.02 s = **≤3.7 % of a
+  cold@8k TTFT** (0.28 s = 2.7 % cold@2k, 0.06 s = 2.0 % of a HIT) — below 5 % everywhere.
 
 Row 36's "GPU-bound" verdict rested on a prefill-contaminated census (`serial` is really ~55 %
 HOST-bound); it stays PARKED for its other two reasons (`use_torch_compile` crashes; 48 blocking D2H
