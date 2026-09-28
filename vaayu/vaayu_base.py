@@ -880,15 +880,15 @@ def should_use_tied_lm_head(layer_name, lm_head_name, state_dict, load_failed: b
     """True iff `layer_name`'s weights must come from the embedding instead.
 
     A checkpoint with `tie_word_embeddings` stores no `lm_head` tensor. Two
-    shapes of that reach the loader, and only the first was ever handled:
+    shapes of that reach the loader:
 
     - the shard is ABSENT      -> `load_layer` raises      -> `load_failed=True`
     - the shard is EMPTY       -> `load_layer` SUCCEEDS with `{}` (bug D1)
 
-    Vaayu's splitter produces the second: it writes a valid 16-byte `{}`
-    safetensors file and its `.done` marker, so the split verifies as complete
-    and the load never raises. `lm_head` then keeps its meta-initialized
-    weights and the model emits uniform-random logits.
+    Splits written before D4 (2026-08-15) hold the second: a valid 16-byte
+    `{}` safetensors file and its `.done` marker, so the load never raises and
+    `lm_head` kept its meta-initialized weights -- uniform-random logits. Since
+    D4's `drop_absent_lm_head` a fresh split holds the first (S10c).
 
     Only the head can be tied, so every other layer keeps propagating its
     error — an empty decoder layer is a real failure, not something to paper
@@ -935,7 +935,11 @@ def load_from_strategy_or_tied_head(loader_strategy, checkpoint_path,
         tensors = loader_strategy.load_from_disk(layer_name, checkpoint_path)
         load_failed = False
     except FileNotFoundError:
-        if not should_use_tied_lm_head(layer_name, lm_head_name, None, load_failed=True):
+        # safetensors' `load_file` (the no-CUDA persister branch) raises
+        # FileNotFoundError for ANY open failure, permission denied included,
+        # so the type alone does not prove the file is missing.
+        if (not should_use_tied_lm_head(layer_name, lm_head_name, None, load_failed=True)
+                or (Path(checkpoint_path) / (layer_name + ".safetensors")).exists()):
             raise
         tensors, load_failed = None, True
     if should_use_tied_lm_head(layer_name, lm_head_name, tensors, load_failed):
@@ -4472,7 +4476,7 @@ class VaayuBaseModel(GenerationMixin):
         """Thin wrapper so ThreadPoolExecutor can call the strategy load.
 
         Carries the tied-head fallback (bug D1) for the same reason
-        `_pin_shared_layers` and `load_layer_to_cpu` do: a checkpoint with
+        `_init_pinned_layers` and `load_layer_to_cpu` do: a checkpoint with
         `tie_word_embeddings` ships no lm_head tensor. A pre-D4 split holds a
         VALID but EMPTY shard for it, so this load SUCCEEDS with `{}` and the
         head is left meta-initialized; a fresh split holds NO shard, so the load
@@ -4482,7 +4486,7 @@ class VaayuBaseModel(GenerationMixin):
         non-pinned layer while prefetching is on -- and it was the third path
         with this shape and the only one still unhandled (row 16, 2026-09-07).
         It hid because the head is normally pinned (it is in
-        `_pin_shared_layers`' phase-1 list) and so never streams. Measured
+        `_init_pinned_layers`' phase-1 list) and so never streams. Measured
         trigger on Llama-3.2-1B: `attn_implementation="sdpa"` charges a
         score-buffer term flash does not, inflating `reserve_bytes` until
         `pinning_budget` is EXACTLY 0 -- nothing pins, the head streams through
