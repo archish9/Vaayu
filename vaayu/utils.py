@@ -160,7 +160,7 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     if compression == '4bit':
-        total_shard_files_size_bytes = int(total_shard_files_size_bytes / 0.2813)
+        total_shard_files_size_bytes = int(total_shard_files_size_bytes * 0.2813)
     elif compression == '8bit':
         total_shard_files_size_bytes = total_shard_files_size_bytes // 2
 
