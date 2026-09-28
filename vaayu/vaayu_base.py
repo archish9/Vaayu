@@ -1448,12 +1448,14 @@ def resolve_compression(requested, model_local_path_or_repo_id, layer_shards_sav
     Decided from the ORIGINAL shards' safetensors headers and config.json,
     before the split, so a refused request writes nothing. Refused -- warn and
     disable, loading the checkpoint as it is -- when (todo.md S10b):
-    - no original `*.safetensors` shard is on disk AND no finished
-      `splitted_model.<requested>` split to reuse: a repo id (its headers are
-      not read before download), originals deleted after an uncompressed split
-      (the splitter then dies on a bare AssertionError), or a `.bin` checkpoint.
-      A finished compressed split IS reused: `delete_original=True` leaves
-      exactly that behind, and a same-arguments reload must keep working;
+    - no original `*.safetensors` shard is on disk AND no earlier
+      `splitted_model.<requested>` split (>= 1 `.done` marker) to reuse: a repo
+      id (its headers are not read before download), originals deleted after an
+      uncompressed split (the splitter then dies on a bare AssertionError), or a
+      `.bin` checkpoint. An earlier compressed split IS reused:
+      `delete_original=True` leaves exactly that behind, and a same-arguments
+      reload must keep working. One marker does not prove the split complete;
+      an incomplete one fails in the splitter as it did before this check;
     - any tensor is not F16/BF16/F32: bitsandbytes raises on it mid-split,
       leaving a partial split dir;
     - config.json names routed experts: the offset index streams experts as raw
@@ -1469,8 +1471,9 @@ def resolve_compression(requested, model_local_path_or_repo_id, layer_shards_sav
     shards = sorted(path.glob("*.safetensors")) if path.is_dir() else []
     reason = None
     if not shards:
-        # Where split_and_save_layers would put it; one `.done` marker tells a
-        # real split from the empty dir a crashed one leaves.
+        # Where split_and_save_layers would put it. At least one `.done` marker
+        # rules out the empty dir a crash at the first layer leaves; completeness
+        # is still the splitter's own check.
         root = Path(layer_shards_saving_path) if layer_shards_saving_path is not None else path
         if not any((root / f"splitted_model.{requested}").glob("*.done")):
             reason = (f"no original *.safetensors shard under {model_local_path_or_repo_id} to "
@@ -2182,7 +2185,7 @@ class VaayuBaseModel(GenerationMixin):
         compression: str, optinal
             setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
             Refused with a warning (loaded uncompressed) on a quantized or MoE checkpoint, and wherever no original
-            safetensors shard is on disk (repo id, originals deleted, .bin) unless a finished compressed split can be reused;
+            safetensors shard is on disk (repo id, originals deleted, .bin) unless an earlier compressed split (>= 1 `.done` marker) can be reused;
             see `resolve_compression`.
         hf_token: str, optional
             huggingface api token could be provided, by default None

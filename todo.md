@@ -179,7 +179,10 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         `layer_shards_saving_path`) can be reused — found by the final review: `delete_original=True` leaves
         exactly that, and refusing it turned a same-arguments reload into WARNING + the bare `AssertionError`
         (reproduced, then pinned by a real-splitter test); dtype check runs before the MoE check so a
-        quantized MoE names its dtype; the MoE check also applies to a reused split. **Tests:** `tests/test_compression_refusal.py`,
+        quantized MoE names its dtype; the MoE check also applies to a reused split. **Limit (re-review, accepted):** "≥ 1
+        `.done`" does not prove the split complete — an INCOMPLETE compressed split with originals deleted
+        still dies on the splitter's `_fetch` AssertionError, exactly as on `main` before S10b (the resolver runs
+        before layer names are known; the trigger is an interrupted bf16 split, then `delete_original=True`). **Tests:** `tests/test_compression_refusal.py`,
         35 (import RED → GREEN; source-pin RED → GREEN; embed-probe 4bit RED `[3072, 1] == [96, 64]` → GREEN
         after a behaviour-preserving extraction; `check_space` 4bit RED → GREEN). **On device after the fix**
         (scratch splits; the 1B through the copied-empty-head-shard workaround, see S10c): 1B 4bit loads, 0
