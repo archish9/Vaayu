@@ -252,8 +252,12 @@ Recorded so nobody spends an afternoon on them:
   correct, never batches.
 - **Expert pinning** — never built. Measurement refuted it: eviction share is
   linear in N and always 2–4× below the pin's cost, on both models.
-- **`use_torch_compile`** — shipped but not validated against the streamed-expert
-  MoE path. Experiment at your own risk; not a recommendation.
+- **`use_torch_compile`** — refused at load with a warning, on every device. On
+  CUDA its `reduce-overhead` cudagraphs crashed the first generation ("accessing
+  tensor output of CUDAGraphs that has been overwritten by a subsequent run") on
+  Qwen3-Next and on Llama-3.2-1B: the engine replays one compiled callable per
+  layer with no step boundary. Without cudagraphs it ran, but 24–35 % slower on
+  Qwen3-Next.
 - **`VAAYU_LOOKAHEAD`** — deliberately disabled; raises on use.
 
 ## 5b. `keep_awake` / `pin_engine_threads` — leave both on

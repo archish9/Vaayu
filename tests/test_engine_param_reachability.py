@@ -62,7 +62,9 @@ SERVER_DELIBERATELY_NOT_EXPOSED = {
     "layer_shards_saving_path": "library-facing: where a one-off split is written",
     "profiling_mode": "dev instrumentation, not an operator control",
     "compression": "`__init__` overrides it in places; not a live path",
-    "use_torch_compile": "same -- overridden in `__init__`, not a live path",
+    "use_torch_compile": "crashes on CUDA (cudagraphs, todo.md row 48), so `__init__` refuses "
+                         "it with a warning; the no-cudagraph mode measured 24-35 % slower "
+                         "on Qwen3-Next (row 36)",
     "prefetching": "loader plumbing with no measured operator reason to turn off",
 }
 

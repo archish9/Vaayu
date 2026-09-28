@@ -321,11 +321,13 @@ holds one model for its whole life and should fill the box.
 > exposed — `dtype`, `prefetching`, `layer_names_dict`, `tokenizer_class`,
 > `layer_shards_saving_path`, `profiling_mode`, `compression`, `use_torch_compile`,
 > `hf_token`. They are loader plumbing, dev overrides for a checkpoint the loader
-> misreads (detection is the supported path), dev instrumentation, two paths
-> `__init__` already overrides in places, and HF auth, which belongs in the
-> environment. The list is enforced: `tests/test_engine_param_reachability.py` fails
-> the suite when a new engine parameter appears with **neither** a knob **nor** a
-> written-down decline.
+> misreads (detection is the supported path), dev instrumentation, a path
+> `__init__` already overrides in places (`compression`), a flag `__init__` refuses
+> with a warning because it crashes on CUDA (`use_torch_compile`: its cudagraphs
+> are replayed once per layer with no step boundary; without them it measured
+> 24–35 % slower on Qwen3-Next), and HF auth, which belongs in the environment. The list is
+> enforced: `tests/test_engine_param_reachability.py` fails the suite when a new
+> engine parameter appears with **neither** a knob **nor** a written-down decline.
 
 
 > **`DRAFTER_MODEL_PATH` requires a vocabulary match.** The drafter and target must
