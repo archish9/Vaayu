@@ -392,7 +392,11 @@ figure from the startup line rather than estimating.
 
 Decode graphs are always on where they apply (see `architecture.md` §7) and have no
 setting: they change no output bit and refuse themselves, with a WARNING, wherever they
-cannot be trusted. Two log lines tell you what happened at load and on the first request:
-`decode graphs: pool … charged to the expert VRAM tier` (engaged; the expert VRAM cache
-is that much smaller) and `WARNING: decode graphs refused for …` / `… DISABLED …`
-(some or all layers decode eagerly, with the reason).
+cannot be trusted. Two log lines can appear once decode starts, never at load:
+`decode graphs: pool … charged to the expert VRAM tier`, printed at the first forward
+after the first captures (engaged; the expert VRAM cache is that much smaller), and
+`WARNING: decode graphs refused for …` / `… DISABLED …` (some or all layers decode
+eagerly, with the reason). **No line at all is a third, silent outcome, not a bug**: a
+model whose KV cache is not one of Vaayu's own seamed cache classes — DeepSeek-V4's
+`DeepseekV4Cache` today — is never eligible for decode graphs in the first place, and
+nothing is logged either way. See `architecture.md` §7 for the eligibility conditions.

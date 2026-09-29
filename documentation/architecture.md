@@ -262,16 +262,32 @@ therefore replays each resident decoder layer's static work as CUDA graphs
   flash-attention's wrapper syncs the host) and the MoE block after routing (expert ids
   must reach the CPU to dispatch). For the fused non-EXL3 MoE forward, routing and the
   shared expert are inside the graph (`decode_pre`).
-- **When.** Only on eligible forwards: one token, batch 1, CUDA, the Vaayu KV cache, no
-  speculative decoding, no `profiling_mode`, no `output_hidden_states`. Prefill is always
-  eager. The process's first eligible token warms up; each layer is captured on the next
-  and replayed after that, and recaptured when a new request brings new cache tensors.
+- **When.** Only on eligible forwards: one token, batch 1, CUDA, no speculative decoding,
+  no `profiling_mode`, no `output_hidden_states`. The KV cache must also be one of Vaayu's
+  own seamed cache classes (`FP8DynamicCache` and its subclasses); a model that brings its
+  own cache class — DeepSeek-V4's `DeepseekV4Cache` today — is never eligible, and no
+  decode-graph line appears in its log at all. Prefill is always eager. The process's
+  first eligible token warms up; each layer is captured on the next and replayed after
+  that, and recaptured when a new request brings new cache tensors.
 - **Correctness.** Graphs replay the same kernels in the same order, so outputs are
-  bit-identical. Each layer's first two graph tokens are checked bitwise against the stock
-  forward. A layer whose capture fails, whose check disagrees, or whose inputs change shape
-  every token is refused for the process and decodes eagerly; the log says
-  `WARNING: decode graphs refused for <layer> (<reason>)`.
+  bit-identical. A layer's first two tokens where its graph is used each run the graph,
+  then run the stock forward last from the same starting state and compare the two
+  bitwise; the stock result is always what is returned (and what the cache holds), so a
+  layer only ever serves a graph result outright once both checks pass. A layer is refused
+  for the process — stock forward from then on — the first time any of these happens: its
+  capture raises (including attention that never reaches transformers' attention-function
+  registry, e.g. `attn_implementation="eager"` as gpt-oss uses — `cache.update` runs but
+  nothing closes the attention core, so every layer of such a model is refused); its
+  checked tokens disagree bitwise with the stock forward; it needs a third capture within
+  one request (an input is changing shape every token); or a forward kwarg hides a tensor
+  inside a container the graphs cannot bind (a list, dict, or mixed tuple). Each distinct
+  reason logs once: `[Vaayu] WARNING: decode graphs refused for <layer> (<reason>); it
+  decodes eagerly.` — other layers refused for the same reason are not logged again.
 - **Memory.** The graphs' memory pool is measured at the first capture and charged to the
-  expert VRAM cache, which shrinks by that amount (logged as
-  `decode graphs: pool X GB charged to the expert VRAM tier (a -> b GB)`). If nothing can
-  pay for it, graphs are disabled for the process with a WARNING.
+  expert VRAM cache, which shrinks by that amount; the first forward after the first
+  captures prints where it went (`decode graphs: pool X GB charged to the expert VRAM tier
+  (a -> b GB)`). If nothing can pay for it, graphs are disabled for the process at once;
+  the pool itself is released and the expert VRAM tier's budget refunded at the start of
+  the next forward, with one WARNING naming the restored budget (`decode graphs DISABLED
+  for this process: <reason>. Decode runs eagerly. The expert VRAM tier's budget is
+  restored to <b> GB.`).
