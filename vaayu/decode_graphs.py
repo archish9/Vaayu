@@ -289,7 +289,7 @@ class _Capture:
     def end_graph(self):
         g, self.graph = self.graph, None
         try:
-            g.capture_end()
+            self._end(g)
         finally:
             torch.cuda.set_stream(self.cur)
         self.pool_growth += torch.cuda.memory_reserved() - self._reserved0
@@ -306,17 +306,42 @@ class _Capture:
         # share a buffer, but the same position across layers/tokens still does.
         return self.runner._static_out(result, role, len(self.steps))
 
+    def _end(self, g):
+        """`capture_end`, shared by `end_graph` (a healthy close) and `abort` (a
+        capture that already raised). Some failures are invalidated only HERE --
+        capture_begin succeeded, work ran, but capture_end itself raises (e.g.
+        unjoined side-stream work left open at capture time) -- so `abort` alone,
+        which only acts when `self.graph` is still set, would miss them (N1: it
+        clears `self.graph` to None before ever seeing this exception).
+        When capture_end raises, the POOL -- not just this graph -- is left stuck
+        "recording": PyTorch's device caching allocator's `captures_underway` entry
+        for it is never cleared, because capture_end raises at cudaStreamEndCapture,
+        BEFORE it would have called endAllocateToPool. That is allocator bookkeeping,
+        not a driver-level fault, and it is why plain torch.cuda.empty_cache() then
+        releases nothing and the failed begin's pool use-count increment leaks (N2).
+        These two calls are PyTorch's own private cleanup for exactly that; there is
+        no public API for it, so a test pins the behavior against a pytorch upgrade."""
+        try:
+            g.capture_end()
+        except Exception:
+            self.pool_broken = True
+            dev, pool = torch.cuda.current_device(), self.runner._pool
+            for name in ("_cuda_endAllocateToPool", "_cuda_releasePool"):
+                fn = getattr(torch._C, name, None)
+                if fn is not None:
+                    try:
+                        fn(dev, pool)
+                    except Exception:
+                        pass
+            raise
+
     def abort(self):
         g, self.graph = self.graph, None
         if g is not None:
             try:
-                g.capture_end()
-            except Exception:       # an invalidated capture raises here too, and when
-                # it does, the POOL -- not just this graph -- is left stuck "recording"
-                # at the driver level: confirmed with a standalone repro that even a
-                # brand-new STREAM into the same pool id fails the same way. The runner
-                # must mint (and re-anchor, F2) a fresh pool before its next capture.
-                self.pool_broken = True
+                self._end(g)
+            except Exception:
+                pass
         torch.cuda.set_stream(self.cur)
 
 
@@ -347,6 +372,11 @@ class DecodeGraphRunner:
 
     def __init__(self, model):
         self._model = model
+        # Created ONCE here, never inside `_new_pool` (a minor fix): a stream is not
+        # broken by a failed capture (only its POOL can be, see `_new_pool`), and a
+        # brand-new stream would skip the process's one-time warm-up and do its lazy
+        # setup (cuBLAS workspace, Triton JIT) INSIDE a capture instead of before it.
+        self._stream = torch.cuda.Stream()
         self._new_pool()
         self._records = {}        # layer name -> _Record
         self._bufs = {}           # (path, shape, dtype) -> static input buffer
@@ -507,7 +537,14 @@ class DecodeGraphRunner:
         except BaseException:
             cap.abort()
             if cap.pool_broken:
-                self._new_pool()
+                try:
+                    self._new_pool()
+                except Exception as anchor_exc:
+                    # Minting the replacement itself failed: graphs can no longer be
+                    # trusted for this process at all. Disable, but never let THIS
+                    # (secondary) failure mask the original exception being handled.
+                    self._disable(f"minting a fresh graph pool after a capture failure "
+                                  f"itself failed: {_why(anchor_exc)}")
             raise
         finally:
             _TL.cap = None
@@ -518,12 +555,16 @@ class DecodeGraphRunner:
         return out
 
     def _new_pool(self):
-        """A fresh graph pool, anchored (F2) so its use count never drops to zero:
-        called once at construction, and again whenever a capture invalidates the
-        current pool (an in-capture host sync corrupts the POOL itself, not just its
-        own graph -- confirmed with a standalone repro: even a brand-new stream into
-        the same pool id fails the same way afterward)."""
-        self._stream = torch.cuda.Stream()
+        """A fresh graph pool, anchored so its use count never drops to zero: called
+        once at construction (via the already-created `self._stream`, never a new
+        one -- see `__init__`) and again whenever a capture invalidates the current
+        pool. Recapturing into a pool whose use count has reached zero asserts in
+        PyTorch's device AND host caching allocators (F2); a capture that fails
+        mid-capture poisons its pool id outright, so even cleanup (N2) cannot make
+        it reusable -- only a fresh id does. The anchor graph, captured once and
+        held for the runner's life, keeps a live pool's use count above zero so its
+        freed blocks are reused across recaptures instead of abandoned and
+        re-charged to the tier."""
         self._pool = torch.cuda.graph_pool_handle()
         self._anchor_buf = torch.zeros(1, device=torch.cuda.current_device())
         self._anchor = torch.cuda.CUDAGraph()
@@ -577,12 +618,23 @@ class DecodeGraphRunner:
 
     def _disable(self, why):
         self._disabled = True
+        # Release the pool BEFORE refunding the tier (N3): the anchor graph keeps
+        # the pool's use count >= 1 forever, and `_stamps` holds the previous
+        # layer's static output tensors (live blocks in that same pool), so
+        # `_records.clear()` alone frees nothing -- refunding the tier first would
+        # let it grow into memory the dead pool still holds.
         self._records.clear()
+        self._anchor = None
+        self._anchor_buf = None
+        self._stamps.clear()
+        self._outs.clear()
+        self._bufs.clear()
+        torch.cuda.empty_cache()       # rare, one-time: only on the disable path
         refund = ""
         if self._tier_before is not None:
             tier = self._model._expert_vram_cache
             tier.set_budget(self._tier_before)
-            refund = (f" the expert VRAM tier's budget is restored to "
+            refund = (f" The expert VRAM tier's budget is restored to "
                       f"{self._tier_before / 1e9:.2f} GB.")
         print(f"[Vaayu] WARNING: decode graphs DISABLED for this process: {why}. "
               f"Decode runs eagerly.{refund}")

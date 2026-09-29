@@ -150,6 +150,33 @@ class ToyScaledMLP(ToyMLP):
         return super().forward(x) * self.k
 
 
+_UNJOINED_SIDE = None
+
+
+def _unjoined_side_stream():
+    # Lazy (not module-level-at-import): a CUDA stream must not be created while
+    # importing this file on a machine with no CUDA device.
+    global _UNJOINED_SIDE
+    if _UNJOINED_SIDE is None:
+        _UNJOINED_SIDE = torch.cuda.Stream()
+    return _UNJOINED_SIDE
+
+
+class ToyUnjoinedMLP(ToyMLP):
+    """Forks work onto a side stream during capture and never joins it back: legal
+    eagerly, but under capture the side stream is swept into the SAME capture (it
+    waits on the capturing stream) and must be rejoined before capture_end -- so
+    capture_end itself raises cudaErrorStreamCaptureUnjoined, AFTER capture_begin
+    succeeded and the forward ran clean (N1's case, distinct from ToySyncMLP's
+    in-capture host sync, which fails mid-forward instead)."""
+    def forward(self, x):
+        side = _unjoined_side_stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            x * 2
+        return super().forward(x)
+
+
 _MLPS = {"moe": ToyMoE, "dense": ToyMLP, "sync": ToySyncMLP, "scaled": ToyScaledMLP}
 
 
@@ -225,29 +252,33 @@ def _inputs(n_tok, seed=1):
 def _decode(layers, cache, runner=None, n_tok=T, extra=False, before_token=None,
             clone_between=False):
     """One request: a prefill-shaped forward first (a request boundary for the
-    runner), then n_tok one-token forwards through every layer."""
-    xs, cos, sin, pos = _inputs(n_tok)
-    if runner is not None:
-        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
-                                        output_hidden_states=False)
-    outs = []
-    for t in range(n_tok):
-        if before_token is not None:
-            before_token(t)
-        on = runner is not None and runner.begin_forward(
-            batch=[torch.zeros(1, 1)], past_key_values=cache, output_hidden_states=False)
-        h = xs[t]
-        for i, layer in enumerate(layers):
-            kw = dict(use_cache=True, past_key_values=cache,
-                      position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
-                      position_ids=pos[:, t:t + 1])
-            if extra:
-                kw["extra"] = torch.zeros(1, t + 1, device="cuda")
-            h = runner.run(f"l{i}", layer, h, kw) if on else layer(h, **kw)
-            if clone_between:          # frees the old address: an allocator can reuse it (I2)
-                h = h.clone()
-        outs.append(h.clone())
-    return outs
+    runner), then n_tok one-token forwards through every layer. Under
+    inference_mode, like the engine's own forward: grad-enabled runs keep pool
+    intermediates alive through autograd graphs attached to the static buffers,
+    masking memory-release bugs inference_mode does not have (fix round 2)."""
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(n_tok)
+        if runner is not None:
+            assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                            output_hidden_states=False)
+        outs = []
+        for t in range(n_tok):
+            if before_token is not None:
+                before_token(t)
+            on = runner is not None and runner.begin_forward(
+                batch=[torch.zeros(1, 1)], past_key_values=cache, output_hidden_states=False)
+            h = xs[t]
+            for i, layer in enumerate(layers):
+                kw = dict(use_cache=True, past_key_values=cache,
+                          position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+                          position_ids=pos[:, t:t + 1])
+                if extra:
+                    kw["extra"] = torch.zeros(1, t + 1, device="cuda")
+                h = runner.run(f"l{i}", layer, h, kw) if on else layer(h, **kw)
+                if clone_between:      # frees the old address: an allocator can reuse it (I2)
+                    h = h.clone()
+            outs.append(h.clone())
+        return outs
 
 
 def _same_outputs(a, b):
@@ -397,17 +428,23 @@ def test_work_between_update_and_attention_fails_the_capture():
     cache = _cache(1)
     runner = dg.install_decode_graphs(_model(layers))
     _decode(layers, cache, runner, n_tok=1)        # warm the process's first token
-    xs, cos, sin, pos = _inputs(2)
-    t = 1
-    kw = dict(use_cache=True, past_key_values=cache,
-              position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
-              position_ids=pos[:, t:t + 1])
-    assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
-                                 output_hidden_states=False)
-    x, kw2, shapes = runner._bind(xs[t], kw)
-    with pytest.raises(RuntimeError, match="between cache.update and the attention interface"):
-        runner._capture("l0", layers[0], x, kw2, (runner._fwd_sig, shapes))
-    assert torch.cuda.current_stream() == torch.cuda.default_stream()
+    # `_decode`'s warm-up ran under inference_mode (fix round 2), so the cache's own
+    # tensors (e.g. key_cache/value_cache) are now inference tensors: an in-place
+    # write to them OUTSIDE inference_mode raises immediately, before this test's own
+    # capture attempt ever reaches ToyGapAttention's extra op. Stay in the same
+    # context the engine (and `_decode`) actually runs under.
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(2)
+        t = 1
+        kw = dict(use_cache=True, past_key_values=cache,
+                  position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+                  position_ids=pos[:, t:t + 1])
+        assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                     output_hidden_states=False)
+        x, kw2, shapes = runner._bind(xs[t], kw)
+        with pytest.raises(RuntimeError, match="between cache.update and the attention interface"):
+            runner._capture("l0", layers[0], x, kw2, (runner._fwd_sig, shapes))
+        assert torch.cuda.current_stream() == torch.cuda.default_stream()
 
 
 @cuda
@@ -634,3 +671,59 @@ def test_one_warning_per_reason(capsys):
     assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
     assert "l0" in runner._refused and "l1" in runner._refused
     assert capsys.readouterr().out.count("decode graphs refused for") == 1
+
+
+# ---- Fix round 2 (re-review findings) ----
+
+
+@cuda
+def test_a_capture_that_fails_at_its_end_does_not_poison_later_layers():
+    """N1: a capture that fails only AT capture_end (unjoined side-stream work) must
+    still mark the pool broken, or the NEXT layer's capture inherits the poisoned
+    pool and fails with 'beginAllocateToPool: already recording'."""
+    spec = [("state", ToyUnjoinedMLP()), ("state", "dense")]
+    layers = _stack(spec)
+    ref_cache = _cache(2)
+    ref = _decode(layers, ref_cache)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(2)
+    got = _decode(layers, cache, runner)
+    assert "l0" in runner._refused
+    assert "l1" not in runner._refused
+    assert runner.stats["captures"] >= 1
+    assert _same_outputs(ref, got)
+
+
+@cuda
+def test_empty_cache_still_releases_after_a_failed_capture():
+    """N2: capture_end raises at cudaStreamEndCapture BEFORE endAllocateToPool, so
+    PyTorch's device caching allocator keeps a stale in-progress-capture entry for
+    the pool; without cleaning it, empty_cache() releases nothing afterward."""
+    layers = _stack([("state", "sync"), ("state", "dense")])
+    runner = dg.install_decode_graphs(_model(layers))
+    _decode(layers, _cache(2), runner, n_tok=4)
+    assert "l0" in runner._refused
+    probe = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    del probe
+    before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    after = torch.cuda.memory_reserved()
+    assert before - after >= 256 << 20
+
+
+@cuda
+def test_disabling_releases_the_pool():
+    """N3: the anchor keeps the pool's use count >= 1 forever and `_stamps` holds
+    live pool tensors (the previous layer's static output), so clearing `_records`
+    alone frees nothing -- `_disable` must drop the anchor and the static buffers
+    too before the freed memory is actually returned to the allocator."""
+    spec = SPECS["hybrid"]
+    layers = _stack(spec)
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
+    _decode(layers, _cache(3), runner, n_tok=4)
+    assert runner.stats["pool_bytes"] > 0
+    before = torch.cuda.memory_reserved()
+    runner._disable("test")
+    after = torch.cuda.memory_reserved()
+    assert before - after >= runner.stats["pool_bytes"]
