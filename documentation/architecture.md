@@ -287,7 +287,9 @@ therefore replays each resident decoder layer's static work as CUDA graphs
   expert VRAM cache, which shrinks by that amount; the first forward after the first
   captures prints where it went (`decode graphs: pool X GB charged to the expert VRAM tier
   (a -> b GB)`). If nothing can pay for it, graphs are disabled for the process at once;
-  the pool itself is released and the expert VRAM tier's budget refunded at the start of
-  the next forward, with one WARNING naming the restored budget (`decode graphs DISABLED
-  for this process: <reason>. Decode runs eagerly. The expert VRAM tier's budget is
-  restored to <b> GB.`).
+  the pool itself is released at the start of the next forward, with one WARNING
+  (`decode graphs DISABLED for this process: <reason>. Decode runs eagerly.`). That WARNING
+  also names the restored budget (`... The expert VRAM tier's budget is restored to <b>
+  GB.`) only if the pool had already been charged to the expert VRAM tier; a model with no
+  expert VRAM tier — dense, or disabled before any tier charge succeeded — has nothing to
+  refund, and the WARNING ends without that sentence.
