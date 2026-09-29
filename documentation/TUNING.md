@@ -387,3 +387,12 @@ figure from the startup line rather than estimating.
   non-zero if the budget failed to keep sessions resident, so it doubles as a gate.
   Raise `K_SESSIONS`, or the system-prompt size, to push the pool over budget and
   watch the cliff.
+
+## Decode CUDA graphs (no knob)
+
+Decode graphs are always on where they apply (see `architecture.md` §7) and have no
+setting: they change no output bit and refuse themselves, with a WARNING, wherever they
+cannot be trusted. Two log lines tell you what happened at load and on the first request:
+`decode graphs: pool … charged to the expert VRAM tier` (engaged; the expert VRAM cache
+is that much smaller) and `WARNING: decode graphs refused for …` / `… DISABLED …`
+(some or all layers decode eagerly, with the reason).

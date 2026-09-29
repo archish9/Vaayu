@@ -248,3 +248,30 @@ the top-k active experts per token via three layers of optimization:
 Implementation uses monkey-patch (`vaayu/moe_patch.py`): replace each MoE block's `forward()` at init time. Generic detection via `detect_moe_blocks()` covers Mixtral, DeepSeek, Kimi, Qwen MoE. Dense models unaffected (`is_moe=False`).
 
 See `documentation/moe_expert_aware_streaming.md` for full technical reference.
+
+## 7. Decode CUDA Graphs
+
+A one-token decode at batch 1 is host-bound on models whose weights stay resident: the
+CPU spends longer issuing eager kernel launches than the GPU spends running them. Vaayu
+therefore replays each resident decoder layer's static work as CUDA graphs
+(`vaayu/decode_graphs.py`).
+
+- **What is captured.** The stock transformers layer forward runs once under capture.
+  The graph is broken at two places that must stay eager: the attention core
+  (`cache.update` plus the attention kernel call — the KV cache grows every token, and
+  flash-attention's wrapper syncs the host) and the MoE block after routing (expert ids
+  must reach the CPU to dispatch). For the fused non-EXL3 MoE forward, routing and the
+  shared expert are inside the graph (`decode_pre`).
+- **When.** Only on eligible forwards: one token, batch 1, CUDA, the Vaayu KV cache, no
+  speculative decoding, no `profiling_mode`, no `output_hidden_states`. Prefill is always
+  eager. The process's first eligible token warms up; each layer is captured on the next
+  and replayed after that, and recaptured when a new request brings new cache tensors.
+- **Correctness.** Graphs replay the same kernels in the same order, so outputs are
+  bit-identical. Each layer's first two graph tokens are checked bitwise against the stock
+  forward. A layer whose capture fails, whose check disagrees, or whose inputs change shape
+  every token is refused for the process and decodes eagerly; the log says
+  `WARNING: decode graphs refused for <layer> (<reason>)`.
+- **Memory.** The graphs' memory pool is measured at the first capture and charged to the
+  expert VRAM cache, which shrinks by that amount (logged as
+  `decode graphs: pool X GB charged to the expert VRAM tier (a -> b GB)`). If nothing can
+  pay for it, graphs are disabled for the process with a WARNING.
