@@ -151,12 +151,18 @@ def _attention_seam(orig):
 
 
 def _moe_seam(orig):
-    """Breaks around a MoE block: its routing sync puts expert ids on the host."""
+    """Breaks around a MoE block: its routing sync puts expert ids on the host. A
+    forward exposing `decode_pre` (routing + shared expert, everything before that
+    sync) keeps that part INSIDE the graph; the rest runs eagerly on its outputs."""
     def forward(hidden_states, *args, **kwargs):
         cap = getattr(_TL, "cap", None)
         if cap is None or cap.graph is None:
             return orig(hidden_states, *args, **kwargs)
+        pre_fn = getattr(orig, "decode_pre", None)
+        pre = pre_fn(hidden_states) if pre_fn is not None else None   # captured
         cap.end_graph()
+        if pre is not None:
+            kwargs = dict(kwargs, _pre=pre)
 
         def call():
             return orig(hidden_states, *args, **kwargs)

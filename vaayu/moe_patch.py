@@ -2249,7 +2249,32 @@ def _make_fused_sparse_forward(
     layer_name = block_info.layer_name
     layer_idx = block_info.layer_idx
 
-    def sparse_forward(hidden_states, **kwargs):
+    def _route(flat_hidden):
+        """Router -> top-k -> the decode budget: the routed slots, on the GPU."""
+        router = getattr(block_info.moe_module, block_info.router_attr)
+        router_res = router(flat_hidden)
+        if isinstance(router_res, tuple) and len(router_res) >= 3:
+            _logits, routing_weights, expert_indices = router_res[:3]
+        else:
+            routing_weights, expert_indices = torch.topk(
+                router_res.float().softmax(dim=-1), top_k, dim=-1
+            )
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        return truncate_top_k(routing_weights, expert_indices, *_decode_limits(vaayu_ref))
+
+    def decode_pre(hidden_states):
+        """S12: the part of a visit BEFORE the routing sync -- routing and the shared
+        expert -- so a decode graph can capture it. None where sparse_forward would not
+        take this path (a fully pinned layer). No side effect beyond its tensors:
+        usage recording and the expert history stay in sparse_forward."""
+        if layer_name in vaayu_ref.pinned_layer_names:
+            return None
+        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
+        routing_weights, expert_indices = _route(flat_hidden)
+        return (routing_weights, expert_indices,
+                _shared_expert_output(block_info.moe_module, flat_hidden))
+
+    def sparse_forward(hidden_states, _pre=None, **kwargs):
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
@@ -2267,7 +2292,6 @@ def _make_fused_sparse_forward(
             return time.perf_counter()
 
         moe_mod = block_info.moe_module
-        router = getattr(moe_mod, block_info.router_attr)
         experts_mod = getattr(moe_mod, block_info.experts_attr)
         act_fn = experts_mod.act_fn
 
@@ -2278,22 +2302,15 @@ def _make_fused_sparse_forward(
         # unique().tolist() sync below -- the same window the other two forwards
         # call route.
         _t_route = _mark()
-        # Router runs on GPU (pinned in VRAM)
-        router_res = router(flat_hidden)
-        if isinstance(router_res, tuple) and len(router_res) >= 3:
-            router_logits, routing_weights, expert_indices = router_res[:3]
+        if _pre is None:
+            routing_weights, expert_indices = _route(flat_hidden)
+            _shared_pre = None
         else:
-            router_logits = router_res
-            routing_weights, expert_indices = torch.topk(
-                router_logits.float().softmax(dim=-1), top_k, dim=-1
-            )
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            # S12: a decode graph already ran routing + the shared expert (decode_pre).
+            routing_weights, expert_indices, _shared_pre = _pre
         _warn_cache_bias_inert(
             vaayu_ref, "this model takes the non-EXL3 fused forward, which has no "
                        "cache-aware routing")
-
-        routing_weights, expert_indices = truncate_top_k(
-            routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
         unique_experts: list[int] = expert_indices.flatten().unique().tolist()
@@ -2554,13 +2571,15 @@ def _make_fused_sparse_forward(
             vaayu_ref._chunk_major_gpu_bytes = 0
 
         result = final_hidden.to(flat_hidden.dtype)
-        _shared = _shared_expert_output(moe_mod, flat_hidden)
+        _shared = (_shared_pre if _pre is not None
+                   else _shared_expert_output(moe_mod, flat_hidden))
         if _shared is not None:
             result = result + _shared.to(result.dtype)
 
         vaayu_ref._expert_history[layer_idx] = unique_experts
         return result.view(B, S, H)
 
+    sparse_forward.decode_pre = decode_pre
     return sparse_forward
 
 
