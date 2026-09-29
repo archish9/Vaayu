@@ -535,6 +535,16 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
             prompt), each model recorded engaged/refused. Phases P0 (pure helpers + toy-layer tests) → P1
             (runner + seams + VRAM charge, Qwen3-Next ABBA) → P2 (MoE pre/post split) → P3 (cross-model gates,
             docs, review). Expected net ≈ 11–13 ms/token (19–23 %), not a bar.
+      - [x] **Step 2 — plan** [`…S12-decode-cuda-graphs.md`](docs/superpowers/plans/2026-09-29-S12-decode-cuda-graphs.md) (written 2026-09-29; approved by the user, subagent-driven).
+      - [~] **Step 3 — build** (branch `s12-decode-graphs`):
+        - [x] T0 branch + re-verify + ledger (anchors at HEAD `bb51f5c`: loop call `vaayu_base.py:5530`, end of `__init__` `:3412`, loop header `:5341`, fused `sparse_forward` `moe_patch.py:2252`, `ExpertVRAMCache` `expert_cache.py:813`)
+        - [ ] T1 `graph_pool_charge` + `ExpertVRAMCache.set_budget` (CPU tests, two geometries)
+        - [ ] T2 seams + capture-and-run + replay (`DecodeGraphRunner` core; CUDA toy tests)
+        - [ ] T3 safety: self-check, refusal + state restore, give-up rule, residency, pool charge
+        - [ ] T4 engine wiring (`__init__` install, loop call) + source pins + suite + Llama-1B smoke
+        - [ ] T5 Qwen3-Next ABBA (P1) + ids at 64 / 2k / 8k / HIT / 1,024 tok + TTFT + 8k no-OOM — STOP RULES
+        - [ ] T6 fused-forward `decode_pre` (router + shared expert into the graph, P2) + increment A/B
+        - [ ] T7 cross-model gates, docs, ledger close, final review, merge
 - [ ] **S13 — gpt-oss token-50 divergence triage (= the open `[bug]` row under S8 below).** Evidence:
       198-token server-rendered prompt, `NEW_TOK=64`, greedy; ids match stock through position 49, then
       stock `558` vs Vaayu `350`; routed == whole-layer at all 64 positions (not S8-caused); single-forward
