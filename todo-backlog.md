@@ -47,6 +47,8 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ## 36 · [!] CUDA graphs / fused per-layer dispatch — **PARKED 2026-09-20. Its gate fired (32.34 / 32.73 %), then TWO spikes killed every lever: `serial` is 74.8 % GPU-BOUND, its matmul half is at 80–86 % of this card's bandwidth, `use_torch_compile` CRASHES as shipped, and without cudagraphs it is 24–35 % SLOWER.** (added 2026-09-12)
 
+**RE-OPEN CONDITION MET 2026-09-29 (S12 step 0) — being worked in `todo.md` S12, NOT moved back yet.** Piecewise `torch.cuda.CUDAGraph` capture of each decoder layer's static segments (no torch.compile) captured 48/48 Qwen3-Next layers, bitwise identical to stock eager, projecting 14.00–15.23 ms/token (24–26 %). This row's kill was the pre-S3/S7 regime (`serial` 74.8 % GPU-bound on a 112 ms token); the post-S7 token is host-bound. Spec: `docs/superpowers/specs/2026-09-29-S12-decode-cuda-graphs-design.md`.
+
 **GATE RE-CHECK DONE 2026-09-20 on `main` `da118ab` — IT FIRES, for the first time in three readings.**
 **strict `serial / T_unprof` = 32.34 % / 32.73 %** (two replicates, spread 1.2 %, under the 2 % re-run rule)
 against the **≥ 30 %** rule. Numbers, all three readings:

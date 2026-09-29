@@ -94,7 +94,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
 | **S10b** ✅ | ~~**refuse `compression` where it cannot work, and correct its false decline reason** (= lead L-S10a) — live path, not "overridden"; bnb raises on every non-float dtype, so the split likely crashes on 4 of 5 on-device targets and writes into the model dir~~ **CLOSED 2026-09-28, FIXED: `resolve_compression` refuses it (WARNING, nothing written) on a quantized / MoE / originals-deleted checkpoint; 4bit now loads on bf16 (it crashed on every checkpoint); `check_space` 4bit inversion fixed; decline reason corrected in 4 places. Tied-head bug split out as S10c. MERGED to `main` 2026-09-28 (`ff34de7`).** | exception: (d), but hours + context warm + S10 made the false claim explicit (user) | hours | [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md) |
 | **S10c** ✅ | ~~**fresh split of a TIED-embedding checkpoint crashes on the first forward** — D4 writes no head shard; the pin and prefetch paths handle only an EMPTY head shard, not an ABSENT one (server-default `prefetching=True`)~~ **CLOSED 2026-09-28, FIXED: server reach CONFIRMED first (fresh-split 1B → HTTP 500 on the first chat request); `load_from_strategy_or_tied_head` gives the pin and prefetch paths both shapes; fresh == old split 16/16 ids on Llama-3.2-1B and Qwen2.5-Coder-1.5B; server gate 9/9; suite 3112; accumulator gates 8/8 + 8/8; final review ready-to-merge, minors fixed. MERGED to `main` 2026-09-28 (`6b4e203`).** | exception: found by S10b, predicted server-reachable (user) | hours | [`…S10c-tied-head-absent-shard-RESULTS.md`](docs/superpowers/plans/2026-09-28-S10c-tied-head-absent-shard-RESULTS.md) |
 | **S11** ✅ | ~~**Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap~~ **CLOSED 2026-09-28, MEASURED (no code): token 57.32 ms in the SERVER's mode (56.64 without gc spikes + 0.68 frozen gc; a library caller, which gets no `gc.freeze()`, pays 62.12) / 55.96 median, HOST-bound (host 60.3 vs device 26.7 ms); TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k (HIT fired 7/7 through the server's re-render); levers ≥ 5 % remain → S12 NOT skipped; L-clean RE-PRICED by the final review under the server's post-load `gc.freeze()`: 5.95 → 0.68 ms = 1.2 %, below the stop line, banked (the first S12 pick was a library-mode number); S12 = the user's pick between the launch-overhead class (≈14.1 ms = 24.6 %, inferred) and the M>1 packed prefill kernel (≤32.8 % HIT@8k, ≤43.1 % cold@8k); row 37 stays closed.** | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | plan [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md); RESULTS [`…S11-qwen3next-census-RESULTS.md`](docs/2026-09-28-S11-qwen3next-census-RESULTS.md) |
-| **S12** | **Qwen3-Next's top remaining lever — the USER picks at the brainstorm: (i) the launch-overhead class (recommended, measure-first) or (ii) the M>1 packed prefill kernel** (S11's pick, re-made 2026-09-28 after the final review re-priced the first pick, L-clean, at 1.2 % in the server's mode; brainstorm → spec → user approval → plan → build) | (a)+(b): (i) every Qwen3-Next decode token at N=1, ≈14.1 ms = 24.6 % of the server-mode token, 3.61 s of a ≈21.3 s agent turn (INFERRED); (ii) every prefill, ≤1.00 s of a HIT@8k turn, ≤11.9 s of a cold 8k — it overtakes (i) once ≥ 24 % of turns are cold 8k | (i) days–weeks; (ii) ≥ a week | none yet — the S12 row below is the brief |
+| **S12** | **Qwen3-Next's top remaining lever — the USER picks at the brainstorm: (i) the launch-overhead class (recommended, measure-first) or (ii) the M>1 packed prefill kernel** (S11's pick, re-made 2026-09-28 after the final review re-priced the first pick, L-clean, at 1.2 % in the server's mode; brainstorm → spec → user approval → plan → build) | (a)+(b): (i) every Qwen3-Next decode token at N=1, ≈14.1 ms = 24.6 % of the server-mode token, 3.61 s of a ≈21.3 s agent turn (INFERRED); (ii) every prefill, ≤1.00 s of a HIT@8k turn, ≤11.9 s of a cold 8k — it overtakes (i) once ≥ 24 % of turns are cold 8k | (i) days–weeks; (ii) ≥ a week | **2026-09-29: user picked (i) after step 0 MEASURED it (14.00–15.23 ms/token, 48/48 layers bitwise); spec APPROVED 2026-09-29; plan next:** [`…S12-decode-cuda-graphs-design.md`](docs/superpowers/specs/2026-09-29-S12-decode-cuda-graphs-design.md); step 0 [`…RESULTS.md`](docs/2026-09-29-S12-step0-launch-probe-RESULTS.md) |
 | **S13** | **gpt-oss greedy decode diverges from stock at token 50 — triage.** Top-2 logit margin at position 50; near-tie → close with evidence; else find the first step whose logits leave ulp distance (the KV-cache path — single-forward logits are bit-identical) | exception: correctness a server user reaches, hours | hours | none yet — the S13 row below is the brief |
 | **S14** | **gpt-oss non-expert stream** — measure its share of the 0.44 s token (≈0.46 s was estimated on the pre-S8 5.8 s token), then residency: CPU gather for the embedding row (1.16 GB/token streamed to read ONE row), pin `lm_head` + attention; stock fits 13.79 GB, 35.7 tok/s vs Vaayu 2.3; 47-m4 (sliding-window KV, 0.813 GB) may free room | (b): served, the biggest remaining gap to stock | ~1 day measure; build TBD | none yet — the S14 row below is the brief |
 | **S15** | **DeepSeek L-e, then L-b** — the expert-read stall S9 exposed (`expert_disk` 0.22 → 0.50 s/token, bytes identical); then whether the 8.03 GiB reserve floor is real (DSA `index_topk` may never materialize S×S scores) | (c): cheap, but a fixture model | hours each | none yet — the S15 row below is the brief |
@@ -434,7 +434,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
           is still live for CPU compute (S5-M-C open). Reproducing that case on CUDA needs the
           `moe_supports_slab_arena` predicate monkeypatched as S5-M's probe did — here back to the pre-fix
           False (no engine edit). Evidence `s11-clean-c1.json`, `s11-clean-c2.json`.
-- [ ] **S12 — build S11's top remaining lever; the USER picks at the brainstorm between (i) the
+- [~] **S12 — build S11's top remaining lever; the USER picks at the brainstorm between (i) the
       launch-overhead class (S11-L1) and (ii) the M>1 packed prefill kernel (S11-L2).** Re-made 2026-09-28:
       the first pick, L-clean, was priced without the server's post-load `gc.freeze()`; frozen it is 0.68
       ms/token = 1.2 %, below the stop line (now S11-L8). **Axis (server mode):** T_U(server) = **57.32 ms**
@@ -468,6 +468,73 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       the server's mode — S11's c1 A/B ran without it and over-priced L-clean 8.8×); for (i) greedy ids
       identical, for (ii) the D6 band; gates (suite floor, Qwen3-Next + MiniMax accumulator, Qwen3-Next
       server smoke); §8 answered.
+      **STARTED 2026-09-29 at HEAD `8522079`.** S11 RESULTS re-verified at HEAD: only docs commits since
+      `a1f9e05`; seams unchanged (`_vram = None` now `moe_patch.py:1751/2315/3083`, `clean_memory`
+      `vaayu_base.py:5638`, `freeze_after_load()` `app.py:434`). **USER DECISION at the brainstorm: measure
+      (i) first, then decide** (neither build picked yet). **Found re-reading:** (i) re-opens backlog #36
+      (CUDA graphs, PARKED 2026-09-20) — its kill was regime-specific (`serial` then 74.8 % GPU-bound on a
+      112 ms token; S3 + S7 made the token host-bound), but two blockers stand: 48 routing D2H syncs/token
+      (per-layer segments only) and `FP8DynamicCache`'s growing KV views (attention core not capturable
+      as-is). `S11_FWD`'s 1,069 launches/token ≈ the 97 `Qwen3NextRMSNorm` calls × ~10 eager ops.
+      - [x] **Step 0 — spike `plans/probes/s12_launch.py` (throwaway, no `vaayu/` edit), server mode
+            (`freeze_after_load()`), 29G FOREGROUND, BALLAST 25:** (1) split `S11_FWD`'s host remainder:
+            Vaayu loop Python vs RMSNorm vs decoder-layer glue; (2) per-segment `torch.cuda.CUDAGraph`
+            micro-bench on real weights + decode state — one GDN layer, one attention layer, one shared
+            expert (segment = input_layernorm → mixer → residual → post_attention_layernorm → router):
+            eager host/wall vs replay host/wall, outputs BITWISE from the same state, every capture failure
+            recorded; (3) fused-norm alternative priced (eager norm host vs one Triton launch); (4) project
+            the per-token saving on the critical path (host − device − replay overhead per segment).
+            **Decision rule:** (ii) is worth (0.997 + f × 10.88) s/turn = **3.9 ms/token at f = 0** (8.1 at
+            f = 10 %, 14.1 at f = 24 %; f = share of cold-8k turns). Projected (i) < 3.9 ms/token → switch
+            to (ii) whatever the mix; ≥ 3.9 → the user picks with the number; capture infeasible on GDN
+            layers → (i) re-priced as fused kernels only. Build after it: spec → user approval → plan.
+            **DONE 2026-09-29 — S11's inferred 14.1 ms HOLDS, MEASURED.** Probe `plans/probes/s12_launch.py`,
+            server mode (frozen, 0 gc spikes), BALLAST 25, 29G FOREGROUND, two full replicates (r1/r2) + a
+            shared-pool run (d5); RESULTS [`…S12-step0-launch-probe-RESULTS.md`](docs/2026-09-29-S12-step0-launch-probe-RESULTS.md).
+            **48/48 layers capture; outputs AND GDN state BITWISE identical to stock eager** from the same state
+            (all three runs). **Projected saving 14.00 / 15.23 ms/token (d5 14.33) = 24.0 / 25.7 % of T_U**
+            (U1 spike-free 58.29 / 59.17 ms; ids identical in every arm): GDN 10.0–10.9 (one graph per layer)
+            + attention 4.0–4.3 (SPLIT: graph A norm→qkv→q/k norm→rotary, EAGER core = `cache.update` + the
+            stock FA2 interface — transformers' `_flash_attention_forward:773` packed-sequence check syncs the
+            host and KV grows — then graph B gate→o_proj→residual→post-norm→router→shared expert; core
+            0.14–0.25 ms/layer kept). Σ eager segment wall (micro) 28.87 / 27.58 vs in-situ host labels
+            28.58 / 27.79 ms (≤ 1 %: representative). Graphed segments are device-bound (Σ device 13.4 ms).
+            NOT an in-situ A/B — the build's ABBA decides. **`S11_FWD` remainder split:** RMSNorms 5.1–5.3
+            (97 calls), decoder glue 1.4, Vaayu loop Python 2.3 (graphs do not remove the last). **Fused
+            Triton RMSNorm alt:** 9.5 vs 35.5 µs host, bitwise on the one input tested; ceiling ≈ 2.5 ms/token
+            — dominated. **Design facts:** (a) `FP8DynamicCache.to_cpu()` puts KV + GDN state in pinned host
+            RAM between turns and `to_device()` (`vaayu_base.py:1860`, called `:5920`) makes NEW GPU tensors
+            → graph addresses stale per request (recapture ≈ 57 ms / 60 graphs, or persistent buffers); (b)
+            graph VRAM 1.26 GB private pools / **0.66 GB one shared pool** — must be charged to the derived
+            VRAM plan; (c) per-token static copies (hidden in, rotary cos/sin, attention out); (d) backlog #36's
+            re-open condition is MET (a graph-capturable dispatch exists; #36's kill was the pre-S3/S7
+            GPU-bound regime). **Decision rule:** (i) 3.58–3.90 s/turn vs (ii) 1.00 s at HIT@8k; break-even
+            f ≈ 24–27 % cold-8k turns. **USER DECISION 2026-09-29: build (i); write the spec.** Suite floor
+            unchanged at 3112 (no code touched).
+      - [x] **Step 1 — spec** (brainstorm → spec → user review → writing-plans). **WRITTEN AND APPROVED BY THE
+            USER 2026-09-29:** [`…S12-decode-cuda-graphs-design.md`](docs/superpowers/specs/2026-09-29-S12-decode-cuda-graphs-design.md).
+            **Durable summary:** approach A = breakpoint capture of the STOCK decoder-layer forward (not the
+            probe's re-implemented segments — attention pre/post is family-specific; not torch.compile — #36/row
+            48). New `vaayu/decode_graphs.py` `DecodeGraphRunner`; two seams — attention core
+            (`FP8DynamicCache.update` → attention interface, eager) and the MoE block (eager; Phase 2 moves
+            router + top-k + shared expert into the graph via a fused-forward `pre`/`post` split). Capture-and-
+            run: each graph replayed right after capture, so the capture token computes real values; first
+            eligible decode token of the process runs eager on the capture stream (warm-up). Static buffers for
+            the hidden state and every tensor kwarg (rotary cos/sin, position_ids). Signature (cache id + GDN
+            state `data_ptr`s + kwarg shapes + decode limits) → per-request recapture (≈ 57 ms); > 2 captures
+            in a request → layer refused. Bitwise self-check vs stock eager on the first two captured tokens
+            per layer per process; any capture error / mismatch → layer eager for the process + WARNING. Graph
+            pool (one shared, 0.66 GB on Qwen3-Next) measured at first capture and CHARGED to the VRAM expert
+            tier (budget shrink + LRU evict); no tier → require free ≥ reserve else refuse. Eligibility: CUDA,
+            q_len 1, N=1, not profiling, no speculator/drafter (v1), `FP8DynamicCache`, layer non-expert
+            weights resident. **§8:** no knob (self-gating, bit-identical, cost charged — S3/S7 precedent);
+            created in `__init__`, called from the layer loop; reachable at N=1 with prefix cache ON. **Done:**
+            ABBA ≥ +2 % under `freeze_after_load()` (stop + investigate if < 7 ms/token), ids identical (64 tok,
+            2k, 8k, HIT turn, ≥ 1,024-tok decode), TTFT flat, 8k prefill no OOM, gates (suite, Qwen3-Next +
+            MiniMax accumulator, Qwen3-Next server smoke, gpt-oss server 9/9, Llama-3.2-1B ids, DeepSeek one
+            prompt), each model recorded engaged/refused. Phases P0 (pure helpers + toy-layer tests) → P1
+            (runner + seams + VRAM charge, Qwen3-Next ABBA) → P2 (MoE pre/post split) → P3 (cross-model gates,
+            docs, review). Expected net ≈ 11–13 ms/token (19–23 %), not a bar.
 - [ ] **S13 — gpt-oss token-50 divergence triage (= the open `[bug]` row under S8 below).** Evidence:
       198-token server-rendered prompt, `NEW_TOK=64`, greedy; ids match stock through position 49, then
       stock `558` vs Vaayu `350`; routed == whole-layer at all 64 positions (not S8-caused); single-forward
