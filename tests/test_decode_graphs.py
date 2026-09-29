@@ -13,7 +13,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 import vaayu.decode_graphs as dg
 from vaayu.persist.expert_cache import ExpertVRAMCache
-from vaayu.vaayu_base import FP8DynamicCache
+from vaayu.vaayu_base import FP8DynamicCache, TurboQuantKVCache
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs are CUDA only")
 
@@ -50,6 +50,24 @@ class ToyAttention(nn.Module):
         k = (self.k(x).view(shape) + sin.unsqueeze(2)).transpose(1, 2)
         v = self.v(x).view(shape).transpose(1, 2)
         k, v = past_key_values.update(k, v, self.layer_idx)
+        attn = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, None)
+        out, _ = attn(self, q, k, v, None, dropout=0.0, scaling=self.scaling, **kwargs)
+        return self.o(out.reshape(b, s, -1))
+
+
+class ToyGapAttention(ToyAttention):
+    """Adds a tensor op between cache.update and the attention interface: the
+    eager core cannot replay that op, so a capture through this layer must raise
+    (I3)."""
+    def forward(self, x, position_embeddings, past_key_values, **kwargs):
+        b, s, _ = x.shape
+        shape = (b, s, HEADS, self.head_dim)
+        cos, sin = position_embeddings
+        q = (self.q(x).view(shape) * cos.unsqueeze(2)).transpose(1, 2)
+        k = (self.k(x).view(shape) + sin.unsqueeze(2)).transpose(1, 2)
+        v = self.v(x).view(shape).transpose(1, 2)
+        k, v = past_key_values.update(k, v, self.layer_idx)
+        v = v + 0                      # work between update and the interface
         attn = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, None)
         out, _ = attn(self, q, k, v, None, dropout=0.0, scaling=self.scaling, **kwargs)
         return self.o(out.reshape(b, s, -1))
@@ -111,7 +129,12 @@ class ToyLayer(nn.Module):
     def __init__(self, idx, mixer, mlp, post_sync=False):
         super().__init__()
         self.input_layernorm, self.post_attention_layernorm = ToyNorm(), ToyNorm()
-        self.mixer = ToyAttention(idx) if mixer == "attn" else ToyStateMixer(idx)
+        if mixer == "attn":
+            self.mixer = ToyAttention(idx)
+        elif mixer == "gap":
+            self.mixer = ToyGapAttention(idx)
+        else:
+            self.mixer = ToyStateMixer(idx)
         self.mlp = _MLPS[mlp]() if isinstance(mlp, str) else mlp
         self.post_sync = post_sync
 
@@ -144,6 +167,12 @@ def _cache(n):
     return cache
 
 
+def _stateless_cache():
+    """No `.layers` override: no conv/recurrent state, so the forward signature is
+    the same `((), limits)` on every request (I1's case)."""
+    return FP8DynamicCache(quantize=False)
+
+
 def _model(layers, **overrides):
     names = {f"l{i}" for i in range(len(layers))}
     base = dict(running_device="cuda", pinned_layer_names=set(), non_expert_pinned_layer_names=names,
@@ -163,7 +192,8 @@ def _inputs(n_tok, seed=1):
     return xs, cos, sin, torch.arange(n_tok, device="cuda")[None]
 
 
-def _decode(layers, cache, runner=None, n_tok=T, extra=False, before_token=None):
+def _decode(layers, cache, runner=None, n_tok=T, extra=False, before_token=None,
+            clone_between=False):
     """One request: a prefill-shaped forward first (a request boundary for the
     runner), then n_tok one-token forwards through every layer."""
     xs, cos, sin, pos = _inputs(n_tok)
@@ -184,6 +214,8 @@ def _decode(layers, cache, runner=None, n_tok=T, extra=False, before_token=None)
             if extra:
                 kw["extra"] = torch.zeros(1, t + 1, device="cuda")
             h = runner.run(f"l{i}", layer, h, kw) if on else layer(h, **kw)
+            if clone_between:          # frees the old address: an allocator can reuse it (I2)
+                h = h.clone()
         outs.append(h.clone())
     return outs
 
@@ -193,9 +225,11 @@ def _same_outputs(a, b):
 
 
 def _same_caches(a, b):
-    kv = all(torch.equal(x[..., :n, :], y[..., :m, :])
-             for x, y, n, m in zip(a.key_cache, b.key_cache, a._seq_len, b._seq_len))
-    return (a._seq_len == b._seq_len and kv
+    def _kv(ak, bk):
+        return all(torch.equal(x[..., :n, :], y[..., :m, :])
+                   for x, y, n, m in zip(ak, bk, a._seq_len, b._seq_len))
+    return (a._seq_len == b._seq_len and _kv(a.key_cache, b.key_cache)
+            and _kv(a.value_cache, b.value_cache)
             and all(torch.equal(x.recurrent_states, y.recurrent_states)
                     for x, y in zip(a.layers, b.layers)))
 
@@ -209,8 +243,15 @@ def test_seams_install_once():
     dg._install_seams(types.SimpleNamespace(_moe_blocks=[]))
     assert getattr(FP8DynamicCache.update, dg._SEAM, False)
     assert not getattr(FP8DynamicCache.update.__wrapped__, dg._SEAM, False)
+    assert getattr(TurboQuantKVCache.update, dg._SEAM, False)
     sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
     assert getattr(sdpa, dg._SEAM, False) and not getattr(sdpa.__wrapped__, dg._SEAM, False)
+    model = types.SimpleNamespace(_moe_blocks=[types.SimpleNamespace(moe_module=ToyMoE())])
+    dg._install_seams(model)
+    dg._install_seams(model)
+    forward = model._moe_blocks[0].moe_module.forward
+    assert getattr(forward, dg._SEAM, False)
+    assert not getattr(forward.__wrapped__, dg._SEAM, False)
 
 
 @cuda
@@ -282,3 +323,58 @@ def test_ineligible_forwards_stay_stock():
                         ("_batch_decode_active", True), ("_chunk_major_lens", [3, 3])):
         other = dg.DecodeGraphRunner(_model(layers, **{attr: value}))
         assert not other.begin_forward(**ok), attr
+
+
+@cuda
+def test_a_stateless_cache_serves_two_requests():
+    """I1: a cache with no linear-attention state signs identically on every
+    request (`((), limits)`), so a replay must write into the CURRENT forward's
+    cache, not the one live when the record was captured."""
+    spec = [("attn", "dense")]
+    layers = _stack(spec)
+    r1, r2 = _stateless_cache(), _stateless_cache()
+    ref = _decode(layers, r1) + _decode(layers, r2)
+    runner = dg.install_decode_graphs(_model(layers))
+    c1, c2 = _stateless_cache(), _stateless_cache()   # c1 stays alive under c2's request
+    got = _decode(layers, c1, runner) + _decode(layers, c2, runner)
+    assert _same_outputs(ref, got)
+    assert c2._seq_len == r2._seq_len
+    assert runner.stats["captures"] == 1, "graphs read addresses, not cache objects: no recapture"
+
+
+@cuda
+def test_a_reused_address_is_copied_again():
+    """I2: cloning between layers frees each hidden state's old buffer, so the
+    allocator is free to reuse its address for the NEXT layer's output within the
+    same token. The dedupe must not mistake that for the same source."""
+    spec = SPECS["hybrid"]
+    layers = _stack(spec)
+    ref_cache = _cache(3)
+    ref = _decode(layers, ref_cache, clone_between=True)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(3)
+    got = _decode(layers, cache, runner, clone_between=True)
+    assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
+    assert runner.stats["input_copies"] == (T - 1) * (3 + 3)
+
+
+@cuda
+def test_work_between_update_and_attention_fails_the_capture():
+    """I3: a tensor op between cache.update and the attention interface (e.g.
+    deepseek_v2/v3 padding V under flash) cannot be replayed -- the capture must
+    raise, not silently drop it."""
+    layers = _stack([("gap", "dense")])
+    cache = _cache(1)
+    runner = dg.install_decode_graphs(_model(layers))
+    _decode(layers, cache, runner, n_tok=1)        # warm the process's first token
+    xs, cos, sin, pos = _inputs(2)
+    t = 1
+    kw = dict(use_cache=True, past_key_values=cache,
+              position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+              position_ids=pos[:, t:t + 1])
+    assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                 output_hidden_states=False)
+    x, kw2, shapes = runner._bind(xs[t], kw)
+    with pytest.raises(RuntimeError, match="between cache.update and the attention interface"):
+        runner._capture("l0", layers[0], x, kw2, (runner._fwd_sig, shapes))
+    assert torch.cuda.current_stream() == torch.cuda.default_stream()

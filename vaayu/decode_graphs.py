@@ -97,14 +97,21 @@ def _install_seams(model):
 
 def _update_seam(orig):
     """Opens the attention core: the KV write lands at a Python-int offset that moves
-    every token, so it must run eagerly."""
+    every token, so it must run eagerly. Never records the cache object itself --
+    the replayed core writes into the CURRENT forward's cache (runner._cache), not
+    the one live when the capture was recorded (I1)."""
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         cap = getattr(_TL, "cap", None)
-        if cap is None or cap.graph is None:   # no capture, or a nested subclass call
+        if cap is None:
+            return orig(self, key_states, value_states, layer_idx, cache_kwargs)
+        if cap.pending is not None:
+            raise RuntimeError("a second cache.update inside one attention core")
+        if cap.graph is None:      # a nested subclass call (e.g. super().update())
             return orig(self, key_states, value_states, layer_idx, cache_kwargs)
         cap.end_graph()
-        cap.pending = (orig, self, key_states, value_states, layer_idx, cache_kwargs)
-        return orig(self, key_states, value_states, layer_idx, cache_kwargs)
+        k, v = orig(self, key_states, value_states, layer_idx, cache_kwargs)
+        cap.pending = (orig, key_states, value_states, layer_idx, cache_kwargs, k, v)
+        return k, v
     update.__wrapped__ = orig
     setattr(update, _SEAM, True)
     return update
@@ -117,13 +124,18 @@ def _attention_seam(orig):
         cap = getattr(_TL, "cap", None)
         if cap is None or cap.pending is None:
             return orig(module, query, key, value, attention_mask, *args, **kwargs)
-        upd, cap.pending = cap.pending, None
+        upd_orig, key_states, value_states, layer_idx, cache_kwargs, k_ret, v_ret = cap.pending
+        cap.pending = None
+        if key is not k_ret or value is not v_ret:
+            raise RuntimeError("the layer changes K/V between cache.update and the attention "
+                                "interface; the eager core cannot replay that")
+        runner = cap.runner
         result = orig(module, query, key, value, attention_mask, *args, **kwargs)
         static = cap.static_for(result, "attn")
         _copy_into(static, result)
 
         def core():
-            k, v = upd[0](*upd[1:])
+            k, v = upd_orig(runner._cache, key_states, value_states, layer_idx, cache_kwargs)
             _copy_into(static, orig(module, query, k, v, attention_mask, *args, **kwargs))
         cap.add_eager(core)
         cap.begin_graph()
@@ -221,7 +233,10 @@ class _Capture:
         self.steps.append(fn)
 
     def static_for(self, result, role):
-        return self.runner._static_out(result, role)
+        # Position of this seam within the capture (how many steps recorded so
+        # far): two same-role seams in one layer (e.g. two MoE blocks) must not
+        # share a buffer, but the same position across layers/tokens still does.
+        return self.runner._static_out(result, role, len(self.steps))
 
     def abort(self):
         g, self.graph = self.graph, None
@@ -257,11 +272,12 @@ class DecodeGraphRunner:
         self._pool = torch.cuda.graph_pool_handle()
         self._records = {}        # layer name -> _Record
         self._bufs = {}           # (path, shape, dtype) -> static input buffer
-        self._stamps = {}         # same key -> (token, source data_ptr) last copied in
-        self._outs = {}           # (role, structure) -> static seam output
+        self._stamps = {}         # same key -> (stamp, source tensor) last copied in
+        self._outs = {}           # (role, position, structure) -> static seam output
         self._token = 0
         self._fwd_sig = None
         self._warming = False
+        self._cache = None        # the CURRENT forward's cache; replays write here (I1)
         self.stats = collections.Counter()
 
     def begin_forward(self, *, batch, past_key_values, output_hidden_states) -> bool:
@@ -279,6 +295,7 @@ class DecodeGraphRunner:
             return False
         self._token += 1
         self._warming = self._token == 1
+        self._cache = past_key_values
         ptrs = tuple(t.data_ptr() for layer in (getattr(past_key_values, "layers", None) or ())
                      for t in (getattr(layer, a, None) for a in _STATE_ATTRS)
                      if isinstance(t, torch.Tensor))
@@ -294,7 +311,8 @@ class DecodeGraphRunner:
         if rec is not None and rec.sig == sig:
             self.stats["replays"] += 1
             return rec.replay()
-        self._records.pop(name, None)      # its graphs' blocks return to the pool first
+        rec = None                         # drop the reference before popping (M1): its
+        self._records.pop(name, None)      # graphs' blocks really return to the pool first
         return self._capture(name, layer, x, kw, sig)
 
     def _warm_up(self, layer, seq, kwargs):
@@ -355,15 +373,22 @@ class DecodeGraphRunner:
         buf = self._bufs.get(key)
         if buf is None:
             buf = self._bufs[key] = torch.empty(src.shape, dtype=src.dtype, device=src.device)
-        stamp = (self._token, src.data_ptr())
-        if self._stamps.get(key) != stamp:      # the same source twice in one token: once
+        stamp = (self._token, src.data_ptr(), src.stride())
+        prev = self._stamps.get(key)
+        if prev is None or prev[0] != stamp:    # the same source twice in one token: once
+            # Holds `src` alive for the rest of this token (stored alongside the stamp),
+            # so an allocator cannot reuse its address while this reference exists --
+            # a bare (token, data_ptr) stamp can otherwise be fooled by a freed
+            # source's address being handed to a DIFFERENT tensor within the same
+            # token (I2). `_version` is not usable here: tensors created under
+            # torch.inference_mode (the engine's forward) carry no version counter.
             buf.copy_(src)
-            self._stamps[key] = stamp
+            self._stamps[key] = (stamp, src)
             self.stats["input_copies"] += 1
         return buf
 
-    def _static_out(self, result, role):
-        key = (role, _structure(result))
+    def _static_out(self, result, role, position):
+        key = (role, position, _structure(result))
         buf = self._outs.get(key)
         if buf is None:
             buf = self._outs[key] = _static_like(result)
