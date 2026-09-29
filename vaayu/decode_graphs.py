@@ -198,9 +198,10 @@ def _copy_into(static, obj):
 
 
 def _snapshot(cache):
-    """What a decoder layer's decode step mutates in Vaayu's cache: the used KV
-    lengths (the slot written past them is dead until the next write) and the
-    linear-attention state tensors, cloned."""
+    """What `_restore` can put back: the used KV lengths and the linear-attention
+    state tensors, cloned. Does NOT cover KV tensor contents -- the self-check
+    relies on stock always running LAST (F1), so any content this snapshot cannot
+    see ends the token as stock's own write, never a possibly-wrong step's."""
     seq_len = list(getattr(cache, "_seq_len", ()))
     states = [(layer, a, getattr(layer, a).clone())
               for layer in (getattr(cache, "layers", None) or ())
@@ -215,10 +216,12 @@ def _restore(cache, snap):
         getattr(layer, a).copy_(saved)
 
 
-def _same_state(cache, snap):
-    seq_len, states = snap
-    return (list(getattr(cache, "_seq_len", ())) == seq_len
-            and all(torch.equal(getattr(layer, a), saved) for layer, a, saved in states))
+def _same_states(a, b):
+    """Two snapshots taken from the same cache (possibly at different times)."""
+    seq_a, states_a = a
+    seq_b, states_b = b
+    return (seq_a == seq_b and len(states_a) == len(states_b)
+            and all(torch.equal(sa[2], sb[2]) for sa, sb in zip(states_a, states_b)))
 
 
 def _same(a, b):
@@ -271,6 +274,7 @@ class _Capture:
         self.pending = None
         self.pool_growth = 0
         self._reserved0 = 0
+        self.pool_broken = False
 
     def begin_graph(self):
         r = self.runner
@@ -307,8 +311,12 @@ class _Capture:
         if g is not None:
             try:
                 g.capture_end()
-            except Exception:       # an invalidated capture raises here too
-                pass
+            except Exception:       # an invalidated capture raises here too, and when
+                # it does, the POOL -- not just this graph -- is left stuck "recording"
+                # at the driver level: confirmed with a standalone repro that even a
+                # brand-new STREAM into the same pool id fails the same way. The runner
+                # must mint (and re-anchor, F2) a fresh pool before its next capture.
+                self.pool_broken = True
         torch.cuda.set_stream(self.cur)
 
 
@@ -339,8 +347,7 @@ class DecodeGraphRunner:
 
     def __init__(self, model):
         self._model = model
-        self._stream = torch.cuda.Stream()
-        self._pool = torch.cuda.graph_pool_handle()
+        self._new_pool()
         self._records = {}        # layer name -> _Record
         self._bufs = {}           # (path, shape, dtype) -> static input buffer
         self._stamps = {}         # same key -> (stamp, source tensor) last copied in
@@ -407,20 +414,11 @@ class DecodeGraphRunner:
             return rec.replay()
         rec = None                         # drop the reference before popping (M1): its
         self._records.pop(name, None)      # graphs' blocks really return to the pool first
-        if not self._records:
-            # Popping the last live record drains the shared pool to zero captured
-            # graphs. CUDA's graph-pool bookkeeping (torch 2.11+cu130, confirmed with
-            # a two-line repro outside this module) cannot recapture into a pool whose
-            # use count already dropped to zero -- capture_begin raises an internal
-            # "use_count > 0" assert. Minting a fresh handle here is cheap (lazy: it
-            # allocates nothing by itself) and harmless when the pool was never used
-            # at all (the model's very first capture).
-            self._pool = torch.cuda.graph_pool_handle()
         self._request_captures[name] += 1
         n = self._request_captures[name]
         if n > _MAX_CAPTURES_PER_REQUEST:
             return self._refuse(name, layer, seq, kwargs,
-                                f"captured {n} times in one request -- an input changes "
+                                f"needed capture #{n} in one request -- an input changes "
                                 f"shape every token")
         capture = functools.partial(self._capture, name, layer, x, kw, sig)
         if checked:
@@ -435,31 +433,34 @@ class DecodeGraphRunner:
                 or name in getattr(m, "non_expert_pinned_layer_names", ()))
 
     def _checked(self, name, layer, seq, kwargs, step):
-        """Run `step` (a capture or a replay) AND the stock forward from the same
-        state; keep the graphs only if output and state agree bitwise. The stock
-        result is what is returned whenever they do not."""
-        cache = kwargs.get("past_key_values")
+        """Run `step` (a capture or a replay) first, then STOCK LAST no matter what
+        (F1): the cache always ends the token in stock's own state, including KV
+        content and anything `_snapshot` cannot see, because stock's write to the
+        same (restored) position always supersedes whatever `step` wrote there.
+        Keep the graphs only if `step`'s output and the state right after it agree
+        bitwise with stock's; the tensor returned is always stock's own output."""
+        cache = self._cache
         before = _snapshot(cache)
-        ref = _clone(layer(seq, **kwargs))
-        after = _snapshot(cache)
-        _restore(cache, before)
         try:
-            out = step()
+            out = _clone(step())
         except Exception as exc:
-            _restore(cache, after)
+            _restore(cache, before)
+            ref = layer(seq, **kwargs)
             self._refuse_only(name, _why(exc))
             return ref
-        if not (_same(ref, out) and _same_state(cache, after)):
-            _restore(cache, after)
+        after_step = _snapshot(cache)
+        _restore(cache, before)
+        ref = layer(seq, **kwargs)
+        if not (_same(ref, out) and _same_states(after_step, _snapshot(cache))):
             self._refuse_only(name, "its graphs disagree bitwise with the stock forward")
             return ref
         self._checks[name] += 1
-        return out
+        return ref
 
     def _guarded(self, name, layer, seq, kwargs, capture):
         """A capture after the self-checks: on failure, undo whatever an eager seam
         already did (a replayed state update, a KV write), then run stock once."""
-        cache = kwargs.get("past_key_values")
+        cache = self._cache
         before = _snapshot(cache)
         try:
             return capture()
@@ -505,6 +506,8 @@ class DecodeGraphRunner:
             cap.end_graph()
         except BaseException:
             cap.abort()
+            if cap.pool_broken:
+                self._new_pool()
             raise
         finally:
             _TL.cap = None
@@ -513,6 +516,23 @@ class DecodeGraphRunner:
         self.stats["pool_bytes"] += max(0, cap.pool_growth)
         self._charge()
         return out
+
+    def _new_pool(self):
+        """A fresh graph pool, anchored (F2) so its use count never drops to zero:
+        called once at construction, and again whenever a capture invalidates the
+        current pool (an in-capture host sync corrupts the POOL itself, not just its
+        own graph -- confirmed with a standalone repro: even a brand-new stream into
+        the same pool id fails the same way afterward)."""
+        self._stream = torch.cuda.Stream()
+        self._pool = torch.cuda.graph_pool_handle()
+        self._anchor_buf = torch.zeros(1, device=torch.cuda.current_device())
+        self._anchor = torch.cuda.CUDAGraph()
+        self._stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
+            self._anchor.capture_begin(pool=self._pool, capture_error_mode="thread_local")
+            self._anchor_buf.add_(0)
+            self._anchor.capture_end()
+        torch.cuda.current_stream().wait_stream(self._stream)
 
     def _charge(self):
         """Charge any pool growth not yet paid for (graph_pool_charge decides where)."""
@@ -558,8 +578,14 @@ class DecodeGraphRunner:
     def _disable(self, why):
         self._disabled = True
         self._records.clear()
+        refund = ""
+        if self._tier_before is not None:
+            tier = self._model._expert_vram_cache
+            tier.set_budget(self._tier_before)
+            refund = (f" the expert VRAM tier's budget is restored to "
+                      f"{self._tier_before / 1e9:.2f} GB.")
         print(f"[Vaayu] WARNING: decode graphs DISABLED for this process: {why}. "
-              f"Decode runs eagerly.")
+              f"Decode runs eagerly.{refund}")
 
     def _bind(self, seq, kwargs):
         """Static copies of the hidden state and every tensor kwarg (tensors inside

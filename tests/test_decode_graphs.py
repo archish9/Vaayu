@@ -73,6 +73,34 @@ class ToyGapAttention(ToyAttention):
         return self.o(out.reshape(b, s, -1))
 
 
+class ToyScaledAttention(ToyAttention):
+    """K scaled by a per-token Python float (`self.k`) BEFORE the KV write -- a
+    stale baked-in scale changes the K a capture/replay writes into the cache. If
+    the self-check ever let that write be the LAST thing to touch the cache (the
+    bug F1 fixes), the wrong K survives the refusal and corrupts every later
+    token; if stock always runs last, its own (correct) write supersedes it."""
+    k = 1.0
+
+    def __init__(self, layer_idx):
+        nn.Module.__init__(self)
+        self.layer_idx, self.head_dim = layer_idx, H // HEADS
+        self.scaling, self.is_causal, self.num_key_value_groups = self.head_dim ** -0.5, True, 1
+        self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+        self.q, self.k_proj, self.v, self.o = (nn.Linear(H, H, bias=False) for _ in range(4))
+
+    def forward(self, x, position_embeddings, past_key_values, **kwargs):
+        b, s, _ = x.shape
+        shape = (b, s, HEADS, self.head_dim)
+        cos, sin = position_embeddings
+        q = (self.q(x).view(shape) * cos.unsqueeze(2)).transpose(1, 2)
+        k = ((self.k_proj(x).view(shape) + sin.unsqueeze(2)) * self.k).transpose(1, 2)
+        v = self.v(x).view(shape).transpose(1, 2)
+        k, v = past_key_values.update(k, v, self.layer_idx)
+        attn = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, None)
+        out, _ = attn(self, q, k, v, None, dropout=0.0, scaling=self.scaling, **kwargs)
+        return self.o(out.reshape(b, s, -1))
+
+
 class ToyStateMixer(nn.Module):
     """A linear-attention-like mixer: fixed-size state in the cache, updated IN PLACE."""
     def __init__(self, layer_idx):
@@ -133,6 +161,8 @@ class ToyLayer(nn.Module):
             self.mixer = ToyAttention(idx)
         elif mixer == "gap":
             self.mixer = ToyGapAttention(idx)
+        elif mixer == "scaled_attn":
+            self.mixer = ToyScaledAttention(idx)
         else:
             self.mixer = ToyStateMixer(idx)
         self.mlp = _MLPS[mlp]() if isinstance(mlp, str) else mlp
@@ -442,7 +472,7 @@ def test_an_input_that_changes_shape_every_token_is_refused(capsys):
     got = _decode(layers, _cache(1), runner, extra=True)
     assert _same_outputs(ref, got)
     assert "l0" in runner._refused and runner.stats["captures"] == dg._MAX_CAPTURES_PER_REQUEST
-    assert "captured 3 times in one request" in capsys.readouterr().out
+    assert "needed capture #3 in one request" in capsys.readouterr().out
 
 
 @cuda
@@ -507,3 +537,100 @@ def test_a_tensor_in_an_unbindable_container_is_refused(capsys):
     assert _same_outputs(ref, got)
     assert "l0" in runner._refused and runner.stats["captures"] == 0
     assert "cannot bind" in capsys.readouterr().out
+
+
+# ---- Fix round 1 (task review findings) ----
+
+
+@cuda
+def test_a_refused_self_check_leaves_stock_kv_in_the_cache():
+    """F1: `_checked` must run STOCK LAST regardless of outcome, so the cache always
+    ends the token in stock's own state -- including KV content `_snapshot` cannot
+    see. If a refused step's write is ever the last thing to touch the cache, the
+    corrupted KV entry survives the refusal and every later token diverges."""
+    spec = [("scaled_attn", "dense")]
+    layers = _stack(spec)
+
+    def bump(t):
+        layers[0].mixer.k = 1.0 + t        # a per-token scale baked into the K write
+
+    ref_cache = _cache(1)
+    ref = _decode(layers, ref_cache, before_token=bump)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(1)
+    got = _decode(layers, cache, runner, before_token=bump)
+    assert "l0" in runner._refused
+    assert _same_outputs(ref, got)
+    assert _same_caches(ref_cache, cache)
+
+
+@cuda
+def test_a_single_layer_pool_is_not_recharged_per_request():
+    """F2: an anchor graph keeps the shared pool's use count above zero for the
+    runner's life, so a drain-then-recapture on a single-layer model reuses the
+    pool's freed blocks instead of abandoning them -- the pool must not grow (and
+    get re-charged to the tier) on every request."""
+    spec = SPECS["attn+dense"]
+    layers = _stack(spec)
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
+    caches = []
+    after_first = None
+    for _ in range(5):
+        c = _cache(1)
+        caches.append(c)               # keep alive: each request's state gets new addresses
+        ref = _decode(layers, _cache(1), n_tok=3)
+        got = _decode(layers, c, runner, n_tok=3)
+        assert _same_outputs(ref, got)
+        if after_first is None:
+            after_first = runner.stats["pool_bytes"]
+    assert after_first > 0
+    assert runner.stats["pool_bytes"] == after_first
+
+
+@cuda
+def test_disabling_refunds_the_tier(capsys):
+    # End-to-end (a budget straddling "layer 0 fits, 0+1 do not") is not
+    # deterministic on this box: probed with SPECS["attn+moe"] * 2 under a 1 GiB
+    # tier, the SECOND layer's OWN incremental pool growth measured 0 bytes (the
+    # allocator's one-time warmup, e.g. cuBLAS workspace, happens on the FIRST
+    # capture and covers the second layer's needs too) -- so the runner's total
+    # pool_bytes is entirely layer 0's charge, and there is no charge boundary to
+    # straddle. Testing `_disable` directly is the fallback the brief sanctions for
+    # exactly this case (task-3-fix-1.md F3).
+    layers = _stack(SPECS["attn+dense"])
+    tier = ExpertVRAMCache(budget_bytes=1 << 20)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
+    budget_before_charge = 1 << 30
+    runner._tier_before = budget_before_charge
+    tier.budget_bytes = budget_before_charge - 10
+    runner._disable("test")
+    assert tier.budget_bytes == budget_before_charge
+    assert "budget is restored to" in capsys.readouterr().out
+
+
+@cuda
+def test_without_a_tier_a_pool_that_eats_the_reserve_disables_graphs(capsys):
+    spec = SPECS["hybrid"]
+    layers = _stack(spec)
+    ref = _decode(layers, _cache(3))
+    plan = types.SimpleNamespace(reserve_bytes=torch.cuda.mem_get_info()[1] * 2)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=None, _vram_plan=plan))
+    got = _decode(layers, _cache(3), runner)
+    assert _same_outputs(ref, got)
+    assert runner._disabled
+    assert "decode graphs DISABLED" in capsys.readouterr().out
+
+
+@cuda
+def test_one_warning_per_reason(capsys):
+    spec = [("state", "sync"), ("state", "sync")]
+    layers = _stack(spec)
+    ref_cache = _cache(2)
+    ref = _decode(layers, ref_cache)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(2)
+    got = _decode(layers, cache, runner)
+    assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
+    assert "l0" in runner._refused and "l1" in runner._refused
+    assert capsys.readouterr().out.count("decode graphs refused for") == 1
