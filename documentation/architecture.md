@@ -248,3 +248,56 @@ the top-k active experts per token via three layers of optimization:
 Implementation uses monkey-patch (`vaayu/moe_patch.py`): replace each MoE block's `forward()` at init time. Generic detection via `detect_moe_blocks()` covers Mixtral, DeepSeek, Kimi, Qwen MoE. Dense models unaffected (`is_moe=False`).
 
 See `documentation/moe_expert_aware_streaming.md` for full technical reference.
+
+## 7. Decode CUDA Graphs
+
+A one-token decode at batch 1 is host-bound on models whose weights stay resident: the
+CPU spends longer issuing eager kernel launches than the GPU spends running them. Vaayu
+therefore replays each resident decoder layer's static work as CUDA graphs
+(`vaayu/decode_graphs.py`).
+
+- **What is captured.** The stock transformers layer forward runs once under capture.
+  The graph is broken at two places that must stay eager: the attention core
+  (`cache.update` plus the attention kernel call — the KV cache grows every token, and
+  flash-attention's wrapper syncs the host) and the MoE block after routing (expert ids
+  must reach the CPU to dispatch). For the fused non-EXL3 MoE forward, routing and the
+  shared expert are inside the graph (`decode_pre`).
+- **When.** Only on eligible forwards: one token, batch 1, CUDA, no speculative decoding,
+  no `profiling_mode`, no `output_hidden_states`. The KV cache must also be one of Vaayu's
+  own seamed cache classes (`FP8DynamicCache` and its subclasses); a model that brings its
+  own cache class — DeepSeek-V4's `DeepseekV4Cache` today — is never eligible, and no
+  decode-graph line appears in its log at all. The same is true with the prefix cache OFF
+  (`enable_prefix_cache=False`, the library default): `generate()` falls through to
+  transformers' own generation, which builds its own plain `DynamicCache` rather than a
+  seamed Vaayu one, so decode graphs are never eligible and nothing is logged either way.
+  Prefill is always eager. The process's first eligible token warms up; each layer is
+  captured on the next and replayed after that. A recapture is triggered only by a change
+  in linear-attention state addresses (a new request's conv/recurrent state tensors), or
+  in input shapes or decode limits — attention-only models keep their graphs across
+  requests, since they have no such state. Per-request recaptures are not re-checked
+  bitwise against the stock forward: only the first two tokens a layer is ever captured
+  for, in the whole process, are.
+- **Correctness.** Graphs replay the same kernels in the same order, so outputs are
+  bit-identical. A layer's first two tokens where its graph is used each run the graph,
+  then run the stock forward last from the same starting state and compare the two
+  bitwise; the stock result is always what is returned (and what the cache holds), so a
+  layer only ever serves a graph result outright once both checks pass. A layer is refused
+  for the process — stock forward from then on — the first time any of these happens: its
+  capture raises (including attention that never reaches transformers' attention-function
+  registry, e.g. `attn_implementation="eager"` as gpt-oss uses — `cache.update` runs but
+  nothing closes the attention core, so every layer of such a model is refused); its
+  checked tokens disagree bitwise with the stock forward; it needs a third capture within
+  one request (an input is changing shape every token); or a forward kwarg hides a tensor
+  inside a container the graphs cannot bind (a list, dict, or mixed tuple). Each distinct
+  reason logs once: `[Vaayu] WARNING: decode graphs refused for <layer> (<reason>); it
+  decodes eagerly.` — other layers refused for the same reason are not logged again.
+- **Memory.** The graphs' memory pool is measured at the first capture and charged to the
+  expert VRAM cache, which shrinks by that amount; the first forward after the first
+  captures prints where it went (`decode graphs: pool X GB charged to the expert VRAM tier
+  (a -> b GB)`). If nothing can pay for it, graphs are disabled for the process at once;
+  the pool itself is released at the start of the next forward, with one WARNING
+  (`decode graphs DISABLED for this process: <reason>. Decode runs eagerly.`). That WARNING
+  also names the restored budget (`... The expert VRAM tier's budget is restored to <b>
+  GB.`) only if the pool had already been charged to the expert VRAM tier; a model with no
+  expert VRAM tier — dense, or disabled before any tier charge succeeded — has nothing to
+  refund, and the WARNING ends without that sentence.

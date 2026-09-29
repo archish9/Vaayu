@@ -3411,6 +3411,12 @@ class VaayuBaseModel(GenerationMixin):
               f"shared_clean={_snap['shared_clean'] / 1e9:.2f}GB swap={_snap['swap'] / 1e9:.2f}GB")
         self._resolve_decode_top_k_auto()
 
+        # S12: replay each resident decoder layer's static one-token decode work as
+        # CUDA graphs -- the N=1 token is host-bound. CUDA only; captures nothing here
+        # (the first eligible decode tokens do). No knob: self-checked, refuses loudly.
+        from .decode_graphs import install_decode_graphs
+        self._decode_graphs = install_decode_graphs(self)
+
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
         # protective on generation config
@@ -3814,7 +3820,8 @@ class VaayuBaseModel(GenerationMixin):
 
     def _resolve_decode_top_k_auto(self) -> None:
         """DECODE_TOP_K="auto": apply this checkpoint's cached pick, or measure it
-        now. Runs as the LAST statement of __init__, once the model is complete."""
+        now. Runs at the end of __init__, once the model is complete; only the
+        decode-graph install follows it."""
         if not getattr(self, "_decode_top_k_auto", False):
             return
         from . import decode_top_k_auto
@@ -5337,6 +5344,13 @@ class VaayuBaseModel(GenerationMixin):
                             future = executor.submit(self._load_from_strategy, _seed_name)
                         break
 
+            # S12: on an eligible forward (one token, N=1) each resident decoder layer
+            # replays as CUDA graphs; every other forward is stock.
+            _dg = getattr(self, "_decode_graphs", None)
+            _dg_on = _dg is not None and _dg.begin_forward(
+                batch=batch, past_key_values=past_key_values,
+                output_hidden_states=output_hidden_states)
+
             try:
                 for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
                                                    desc=f'running layers({self.running_device})',
@@ -5527,7 +5541,8 @@ class VaayuBaseModel(GenerationMixin):
                                     else:
                                         _tl = time.perf_counter()
                                         _t = time.time()
-                                        layer_out = layer(seq, **kwargs)
+                                        layer_out = (_dg.run(layer_name, layer, seq, kwargs) if _dg_on
+                                                     else layer(seq, **kwargs))
                                         _compute_s += time.time() - _t
                                         _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
                                     break
@@ -5630,6 +5645,12 @@ class VaayuBaseModel(GenerationMixin):
                                 for _sidx in _layer_slabs.values():
                                     if _sidx is not None:
                                         _arena.release(_sidx)
+
+                # S12/I1: every forward, eligible or not -- lets a finished request's
+                # cache (its GPU KV / linear-attention state) die with the request
+                # instead of staying pinned in the runner until the next eligible one.
+                if _dg is not None:
+                    _dg.end_forward()
 
         self.telemetry.end_token()
         self._token_count += 1

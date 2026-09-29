@@ -387,3 +387,26 @@ figure from the startup line rather than estimating.
   non-zero if the budget failed to keep sessions resident, so it doubles as a gate.
   Raise `K_SESSIONS`, or the system-prompt size, to push the pool over budget and
   watch the cliff.
+
+## Decode CUDA graphs (no knob)
+
+Decode graphs are always on where they apply (see `architecture.md` §7) and have no
+setting: they change no output bit and refuse themselves, with a WARNING, wherever they
+cannot be trusted. Two log lines can appear once decode starts (not at load): `decode
+graphs: pool … charged to the expert VRAM tier (a -> b GB)`, printed at the first forward
+after the first captures on a model with an expert VRAM tier (engaged; the tier is that
+much smaller), or its no-tier variant `decode graphs: pool … GB, within the free VRAM
+above the load-time reserve` on a dense or otherwise tier-less model; and `WARNING: decode
+graphs refused for …` / `… DISABLED …` (some or all layers decode eagerly, with the
+reason). Two more WARNINGs are printed at load, not once decode starts: `decode graphs not
+installed: model device … is not the current CUDA device …` (a device mismatch) and,
+since the M4 fix, `decode graphs not installed: <ExcType>: <message>; decode runs
+eagerly` (the runner's own construction — e.g. capturing its anchor graph — raised; the
+model load still succeeds). **No line at all is a third, silent outcome, not a bug**: a
+model whose KV cache is not one of Vaayu's own seamed cache classes — DeepSeek-V4's
+`DeepseekV4Cache` today — is never eligible for decode graphs in the first place, and
+nothing is logged either way. The same is true with the prefix cache OFF
+(`enable_prefix_cache=False`, the library default): `generate()` falls through to
+transformers' own generation and its plain `DynamicCache`, never a seamed Vaayu one, so
+decode graphs are never eligible there either. See `architecture.md` §7 for the
+eligibility conditions.

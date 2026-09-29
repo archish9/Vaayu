@@ -12,11 +12,11 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 23 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c)
+## Index — 25 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
-| 1 | Row 36 — CUDA graphs / fused per-layer dispatch | top-level row | PARKED 2026-09-20: every lever killed — `use_torch_compile` crashes (row 48 / S10), 48 blocking D2H routing syncs per token, and compile without cudagraphs measured 24–35 % SLOWER | new evidence that a graph-capturable dispatch exists — S7 (Qwen3-Next per-expert dispatch) may produce it |
+| 1 | Row 36 — CUDA graphs / fused per-layer dispatch — **CLOSED 2026-09-29 by S12** (piecewise decode CUDA graphs shipped: Qwen3-Next decode −12.9 ms/token, +23 %, bit-identical) | top-level row | kept for history | — |
 | 2 | Row 32 — run a lower-bpw EXL3 build of the models on disk | top-level row | BLOCKED 2026-09-23: the user declined the ~81.6 GiB download that is the row's entire cost | the user authorises the download |
 | 3 | Row 35 — a per-model measured gate for `VAAYU_LOOKAHEAD` | top-level row | DEAD 2026-09-20: its prize model (Qwen3-235B) was deleted and its mechanism died when S2 landed | a served model where lookahead measures ≥ +15 % at N=1 |
 | 4 | Row 39 — expert slimming | top-level row | research tier with no build path; its own gate was "rows 31–35 measured" | the user wants research work, or a calibration/re-pack path exists |
@@ -45,7 +45,9 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 <!-- 1. moved from todo.md (top-level row) 2026-09-26 -->
 **Why here:** PARKED 2026-09-20: every lever killed — `use_torch_compile` crashes (row 48 / S10), 48 blocking D2H routing syncs per token, and compile without cudagraphs measured 24–35 % SLOWER. **Re-open when:** new evidence that a graph-capturable dispatch exists — S7 (Qwen3-Next per-expert dispatch) may produce it.
 
-## 36 · [!] CUDA graphs / fused per-layer dispatch — **PARKED 2026-09-20. Its gate fired (32.34 / 32.73 %), then TWO spikes killed every lever: `serial` is 74.8 % GPU-BOUND, its matmul half is at 80–86 % of this card's bandwidth, `use_torch_compile` CRASHES as shipped, and without cudagraphs it is 24–35 % SLOWER.** (added 2026-09-12)
+## 36 · [x] CUDA graphs / fused per-layer dispatch — **PARKED 2026-09-20. Its gate fired (32.34 / 32.73 %), then TWO spikes killed every lever: `serial` is 74.8 % GPU-BOUND, its matmul half is at 80–86 % of this card's bandwidth, `use_torch_compile` CRASHES as shipped, and without cudagraphs it is 24–35 % SLOWER.** (added 2026-09-12)
+
+**CLOSED 2026-09-29 by S12 (branch `s12-decode-graphs`):** piecewise `torch.cuda.CUDAGraph` capture of each resident decoder layer's stock forward, broken at the attention core and the MoE routing sync (`vaayu/decode_graphs.py`). Qwen3-Next decode 57.71 → 44.27 ms/token (−13.4 ms, +23 %), greedy ids identical ON vs OFF. The PARKED verdict below was the pre-S3/S7 GPU-bound regime.
 
 **RE-OPEN CONDITION MET 2026-09-29 (S12 step 0) — being worked in `todo.md` S12, NOT moved back yet.** Piecewise `torch.cuda.CUDAGraph` capture of each decoder layer's static segments (no torch.compile) captured 48/48 Qwen3-Next layers, bitwise identical to stock eager, projecting 14.00–15.23 ms/token (24–26 %). This row's kill was the pre-S3/S7 regime (`serial` 74.8 % GPU-bound on a 112 ms token); the post-S7 token is host-bound. Spec: `docs/superpowers/specs/2026-09-29-S12-decode-cuda-graphs-design.md`.
 
@@ -638,3 +640,29 @@ reports a swapped head.
   unverified, and the trigger needs a hand-written `layer_names`.
 
 ---
+
+## 24. S12-a — a request whose FIRST forward is one token does not reset the give-up count (library only)
+
+*Added 2026-09-29 by S12's final review (M5), parked.* **Why here:** not reachable through the server —
+`/v1/chat/completions` always appends a generation prompt, and a recurrent prefix entry HITs only on a full-entry
+match. **Re-open when:** a library caller (or a future server path) issues back-to-back requests whose first forward is
+a single token on a hybrid (linear-attention) model.
+
+- `DecodeGraphRunner` treats "a request" as the span between two ineligible forwards (`begin_forward` clears
+  `_request_captures` on any ineligible forward). A request whose first forward is already one token (a full-match
+  prefix HIT clamped by `_adopt_prefix_hit`, `vaayu_base.py:~5935`) does not reset the count, so two such requests in a
+  row on a hybrid model can refuse every layer with the misleading reason "needed capture #3 in one request -- an input
+  changes shape every token". **Fix when re-opened:** an explicit request-boundary call from `generate()` /
+  `speculative_generate()` into the runner.
+
+## 25. S12-b — a transient OOM during an unchecked recapture refuses the layer for the process
+
+*Added 2026-09-29 by S12's final review (M6), parked.* **Why here:** costs performance only, never correctness (the
+layer decodes eagerly, bit-identical); the spec allows it. **Re-open when:** a long server session is seen losing
+graph layers to OOM refusals (grep the log for `decode graphs refused for … OutOfMemoryError`).
+
+- `_guarded` (`vaayu/decode_graphs.py`) refuses the layer on ANY capture exception, including a transient
+  `torch.cuda.OutOfMemoryError`; the engine's own OOM retry (`vaayu_base.py`, `_MAX_OOM_RETRIES`) never sees it.
+  **Fix when re-opened:** on `OutOfMemoryError`, restore the snapshot and re-raise instead of refusing, so the engine's
+  retry path handles it and the next token recaptures.
+

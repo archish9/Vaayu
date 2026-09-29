@@ -911,6 +911,23 @@ class ExpertVRAMCache:
             self.current_usage -= self._group_bytes(entry)
             return True
 
+    def set_budget(self, budget_bytes: int) -> int:
+        """Change the budget and evict LRU entries until usage fits it. Returns how
+        many were evicted -- counted in `evictions`, since this IS budget pressure
+        (S12: the decode graphs' pool is charged to this tier)."""
+        with self.lock:
+            self.budget_bytes = int(budget_bytes)
+            n = 0
+            while self.current_usage > self.budget_bytes and self.cache:
+                _ekey, evicted = self.cache.popitem(last=False)
+                self.current_usage -= self._group_bytes(evicted)
+                self.evictions += 1
+                if self.evicted_keys is not None:
+                    self.evicted_keys[_ekey] += 1
+                del evicted  # drop GPU references so the allocator can reuse
+                n += 1
+            return n
+
     def evict_until_free(self, free_target_bytes: int) -> int:
         """Evict LRU entries until free VRAM would reach free_target_bytes, then
         return blocks to the driver. Used reactively during prefill: the resident
