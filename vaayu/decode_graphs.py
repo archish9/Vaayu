@@ -71,7 +71,13 @@ def install_decode_graphs(model):
               f"the current CUDA device ({torch.cuda.current_device()}); decode runs eagerly")
         return None
     _install_seams(model)
-    return DecodeGraphRunner(model)
+    try:
+        return DecodeGraphRunner(model)
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        print(f"[Vaayu] WARNING: decode graphs not installed: {type(e).__name__}: {first_line}; "
+              f"decode runs eagerly")
+        return None
 
 
 def _subclasses(cls):
@@ -90,6 +96,11 @@ def _install_seams(model):
         update = cls.__dict__.get("update")
         if update is not None and not getattr(update, _SEAM, False):
             cls.update = _update_seam(update)
+    # Writing into ALL_ATTENTION_FUNCTIONS's local mapping here shadows any LATER
+    # AttentionInterface.register(...) of the same key, process-wide -- that later
+    # registration would replace our wrapped entry with an unwrapped one. Nothing
+    # in Vaayu re-registers today, so this is dormant; if that ever changes, the
+    # new registration must be wrapped again (re-run _install_seams after it).
     for key in list(ALL_ATTENTION_FUNCTIONS.keys()):
         fn = ALL_ATTENTION_FUNCTIONS[key]
         if not getattr(fn, _SEAM, False):
@@ -469,6 +480,14 @@ class DecodeGraphRunner:
                      if isinstance(t, torch.Tensor))
         self._fwd_sig = (ptrs, _decode_limits(m))
         return True
+
+    def end_forward(self):
+        """Drop the reference `begin_forward` stashed for this forward (I1):
+        replays only read `_cache` from inside a forward (between `begin_forward`
+        and here), so clearing it once the forward is done lets a finished
+        request's cache -- its GPU KV / linear-attention state -- die with the
+        request instead of staying pinned until the next eligible forward."""
+        self._cache = None
 
     def run(self, name, layer, seq, kwargs):
         if self._disabled or name in self._refused or not self._resident(name):

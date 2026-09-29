@@ -4,6 +4,7 @@ matters: the runner's output and cache state are BITWISE the stock forward's, to
 after token, through captures, replays, recaptures and refusals."""
 import gc
 import types
+import weakref
 
 import pytest
 import torch
@@ -290,6 +291,8 @@ def _decode(layers, cache, runner=None, n_tok=T, extra=False, before_token=None,
                 h = runner.run(f"l{i}", layer, h, kw) if on else layer(h, **kw)
                 if clone_between:      # frees the old address: an allocator can reuse it (I2)
                     h = h.clone()
+            if runner is not None:     # mirrors the engine's forward `finally` (I1): every
+                runner.end_forward()   # forward, eligible or not, drops the runner's cache ref
             outs.append(h.clone())
         return outs
 
@@ -331,6 +334,22 @@ def test_seams_install_once():
     forward = model._moe_blocks[0].moe_module.forward
     assert getattr(forward, dg._SEAM, False)
     assert not getattr(forward.__wrapped__, dg._SEAM, False)
+
+
+@cuda
+def test_a_failed_install_never_fails_the_model_load(monkeypatch, capsys):
+    """M4: `_new_pool` captures the anchor graph unguarded inside
+    `DecodeGraphRunner.__init__`, called from `install_decode_graphs` at the end
+    of `VaayuBaseModel.__init__` -- any failure there must not propagate out and
+    fail the whole model load. Graphs are just unavailable for this process."""
+    def boom(self, model):
+        raise RuntimeError("anchor capture failed")
+    monkeypatch.setattr(dg.DecodeGraphRunner, "__init__", boom)
+    model = types.SimpleNamespace(running_device="cuda", _moe_blocks=[])
+    assert dg.install_decode_graphs(model) is None
+    out = capsys.readouterr().out
+    assert "WARNING: decode graphs not installed" in out
+    assert "RuntimeError: anchor capture failed" in out
 
 
 @cuda
@@ -419,6 +438,25 @@ def test_a_stateless_cache_serves_two_requests():
     assert _same_outputs(ref, got)
     assert c2._seq_len == r2._seq_len
     assert runner.stats["captures"] == 1, "graphs read addresses, not cache objects: no recapture"
+
+
+@cuda
+def test_a_finished_request_does_not_keep_its_cache():
+    """I1: `begin_forward` stashes the current forward's cache in `runner._cache`
+    so replays can write into it, but nothing cleared that reference once the
+    request finished -- the cache (and its GPU KV / linear-attention state) stayed
+    alive until the next eligible forward. `end_forward()`, called from the
+    engine's `forward` `finally` after every token (eligible or not), drops it at
+    the end of the request that made it, so the cache can die with the request."""
+    spec = SPECS["state+moe"]
+    layers = _stack(spec)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(len(spec))
+    _decode(layers, cache, runner, n_tok=3)
+    ref = weakref.ref(cache)
+    del cache
+    gc.collect()
+    assert ref() is None
 
 
 @cuda
@@ -779,10 +817,10 @@ def test_disabling_releases_the_pool(capsys):
 
     assert runner._disabled
     tier_while_disabled = tier.budget_bytes    # still shrunk: the refund is deferred too
+    assert _pool_mib(pool) > 0                 # the pool is still allocated at this point
     # One more begin_forward, outside _capture entirely: the deferred release fires here.
     assert not runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=_cache(3),
                                      output_hidden_states=False)
-    torch.cuda.empty_cache()
     assert _pool_mib(pool) == 0
     assert tier.budget_bytes > tier_while_disabled
     assert capsys.readouterr().out.count("DISABLED") == 1
@@ -803,13 +841,12 @@ def test_gc_is_disabled_during_a_capture():
     `gc.collect()`, called EXPLICITLY, always runs a real collection regardless of
     `gc.isenabled()` (verified directly: `gc.disable()` then `gc.collect()` still
     reclaims a manually-built cycle) -- only the AUTOMATIC, threshold-triggered
-    collector honours the enabled/disabled flag, and forcing THAT to land inside
-    one exact narrow capture window via `gc.set_threshold` was not reproducible
-    either way (the lowered threshold fires on the next allocation regardless of
-    where that lands, often well before the capture even begins). So this checks
-    the actual mechanism `_capture` installs -- deterministically, no timing
-    dependency -- rather than the end-to-end crash, which the manual repro still
-    demonstrates but a unit test cannot gate on for the reason above."""
+    collector honours the enabled/disabled flag, and a test cannot time one to
+    land inside the narrow capture window on demand. So this pins the actual
+    mechanism `_capture` installs instead, deterministically and without any
+    timing dependency: gc is disabled for the duration of the capture window
+    (so an automatic collection cannot land inside it, whatever triggers it)
+    and re-enabled once the window ends."""
     seen = {}
 
     class ProbeMLP(ToyMLP):

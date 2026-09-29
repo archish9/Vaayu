@@ -3820,7 +3820,8 @@ class VaayuBaseModel(GenerationMixin):
 
     def _resolve_decode_top_k_auto(self) -> None:
         """DECODE_TOP_K="auto": apply this checkpoint's cached pick, or measure it
-        now. Runs as the LAST statement of __init__, once the model is complete."""
+        now. Runs at the end of __init__, once the model is complete; only the
+        decode-graph install follows it."""
         if not getattr(self, "_decode_top_k_auto", False):
             return
         from . import decode_top_k_auto
@@ -5644,6 +5645,12 @@ class VaayuBaseModel(GenerationMixin):
                                 for _sidx in _layer_slabs.values():
                                     if _sidx is not None:
                                         _arena.release(_sidx)
+
+                # S12/I1: every forward, eligible or not -- lets a finished request's
+                # cache (its GPU KV / linear-attention state) die with the request
+                # instead of staying pinned in the runner until the next eligible one.
+                if _dg is not None:
+                    _dg.end_forward()
 
         self.telemetry.end_token()
         self._token_count += 1

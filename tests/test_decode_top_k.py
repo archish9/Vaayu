@@ -770,7 +770,7 @@ def test_a_cached_pick_leaves_the_usage_telemetry_alone(monkeypatch):
     assert sum(m._expert_vram_cache.evicted_keys.values()) == 1
 
 
-def test_the_hook_is_the_last_statement_of_init():
+def test_the_top_k_hook_runs_at_the_end_of_init():
     """Measurement needs a fully constructed model -- prefix cache, KV persist
     and the post-load RAM ledger included. AutoModel.from_pretrained does no
     setup after construction, so the end of __init__ IS load complete.
