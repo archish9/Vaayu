@@ -773,10 +773,17 @@ def test_a_cached_pick_leaves_the_usage_telemetry_alone(monkeypatch):
 def test_the_hook_is_the_last_statement_of_init():
     """Measurement needs a fully constructed model -- prefix cache, KV persist
     and the post-load RAM ledger included. AutoModel.from_pretrained does no
-    setup after construction, so the end of __init__ IS load complete."""
+    setup after construction, so the end of __init__ IS load complete.
+
+    S12 added `self._decode_graphs = install_decode_graphs(self)` directly after
+    this call, so it is no longer __init__'s last statement -- but it must still
+    run after full model construction, so it must still precede that new line."""
     import inspect
     lines = inspect.getsource(VaayuBaseModel.__init__).rstrip().splitlines()
-    assert lines[-1].strip() == "self._resolve_decode_top_k_auto()"
+    stripped = [l.strip() for l in lines]
+    assert stripped[-1] == "self._decode_graphs = install_decode_graphs(self)"
+    assert stripped.index("self._resolve_decode_top_k_auto()") < stripped.index(
+        "self._decode_graphs = install_decode_graphs(self)")
 
 
 @pytest.mark.parametrize("bad", ["fast", "8", True, 7.5])
