@@ -378,3 +378,132 @@ def test_work_between_update_and_attention_fails_the_capture():
     with pytest.raises(RuntimeError, match="between cache.update and the attention interface"):
         runner._capture("l0", layers[0], x, kw2, (runner._fwd_sig, shapes))
     assert torch.cuda.current_stream() == torch.cuda.default_stream()
+
+
+@cuda
+@pytest.mark.parametrize("checked", [True, False], ids=["self-checked", "unchecked"])
+def test_a_capture_failure_decodes_stock(checked, capsys):
+    spec = [("state", "sync")]
+    layers = _stack(spec)
+    ref_cache = _cache(1)
+    ref = _decode(layers, ref_cache)
+    runner = dg.install_decode_graphs(_model(layers))
+    if not checked:
+        runner._checks["l0"] = dg._CHECK_TOKENS
+    cache = _cache(1)
+    got = _decode(layers, cache, runner)
+    assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
+    assert "l0" in runner._refused
+    assert "WARNING: decode graphs refused for l0 (capture failed" in capsys.readouterr().out
+
+
+@cuda
+@pytest.mark.parametrize("checked", [True, False], ids=["self-checked", "unchecked"])
+def test_a_failure_after_a_seam_restores_state(checked):
+    # The MoE seam already replayed graph A (state updated) when the sync after it
+    # fails graph C: without a restore the stock fallback would update the state twice.
+    torch.manual_seed(0)
+    layers = [ToyLayer(0, "state", "moe", post_sync=True).to("cuda", torch.bfloat16)]
+    ref_cache = _cache(1)
+    ref = _decode(layers, ref_cache)
+    runner = dg.install_decode_graphs(_model(layers))
+    if not checked:
+        runner._checks["l0"] = dg._CHECK_TOKENS
+    cache = _cache(1)
+    got = _decode(layers, cache, runner)
+    assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
+    assert "l0" in runner._refused
+
+
+@cuda
+def test_the_self_check_refuses_a_stale_python_value(capsys):
+    spec = [("state", "scaled")]
+    layers = _stack(spec)
+
+    def bump(t):
+        layers[0].mlp.k = 1.0 + t          # a per-token input no static buffer carries
+
+    ref_cache = _cache(1)
+    ref = _decode(layers, ref_cache, before_token=bump)
+    runner = dg.install_decode_graphs(_model(layers))
+    cache = _cache(1)
+    got = _decode(layers, cache, runner, before_token=bump)
+    assert _same_outputs(ref, got) and _same_caches(ref_cache, cache)
+    assert "l0" in runner._refused
+    assert "disagree bitwise" in capsys.readouterr().out
+
+
+@cuda
+def test_an_input_that_changes_shape_every_token_is_refused(capsys):
+    spec = SPECS["attn+moe"]
+    layers = _stack(spec)
+    ref = _decode(layers, _cache(1), extra=True)
+    runner = dg.install_decode_graphs(_model(layers))
+    got = _decode(layers, _cache(1), runner, extra=True)
+    assert _same_outputs(ref, got)
+    assert "l0" in runner._refused and runner.stats["captures"] == dg._MAX_CAPTURES_PER_REQUEST
+    assert "captured 3 times in one request" in capsys.readouterr().out
+
+
+@cuda
+def test_a_request_boundary_resets_the_capture_count():
+    spec = SPECS["attn+moe"]
+    layers = _stack(spec)
+    runner = dg.install_decode_graphs(_model(layers))
+    # request 1: token 0 warms, tokens 1-2 capture (2, the limit); request 2 starts with a
+    # prefill-shaped forward, so its 2 captures count from zero again
+    _decode(layers, _cache(1), runner, n_tok=3, extra=True)
+    _decode(layers, _cache(1), runner, n_tok=2, extra=True)
+    assert "l0" not in runner._refused and runner.stats["captures"] == 4
+
+
+@cuda
+def test_a_streamed_layer_decodes_stock():
+    spec = SPECS["attn+moe"]
+    layers = _stack(spec)
+    ref = _decode(layers, _cache(1))
+    runner = dg.install_decode_graphs(_model(layers, non_expert_pinned_layer_names=set()))
+    got = _decode(layers, _cache(1), runner)
+    assert _same_outputs(ref, got)
+    assert runner.stats["captures"] == 0 and runner.stats["warm"] == 0
+
+
+@cuda
+def test_the_pool_is_charged_to_the_expert_vram_tier(capsys):
+    spec = SPECS["hybrid"]
+    layers = _stack(spec)
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
+    _decode(layers, _cache(3), runner)
+    assert runner._charged > 0
+    assert tier.budget_bytes == (1 << 30) - runner._charged
+    assert "charged to the expert VRAM tier" in capsys.readouterr().out
+
+
+@cuda
+def test_a_pool_nothing_can_pay_for_disables_graphs(capsys):
+    spec = SPECS["hybrid"]
+    layers = _stack(spec)
+    ref = _decode(layers, _cache(3))
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=ExpertVRAMCache(budget_bytes=1)))
+    got = _decode(layers, _cache(3), runner)
+    assert _same_outputs(ref, got)
+    assert runner._disabled and not runner._records
+    assert "decode graphs DISABLED" in capsys.readouterr().out
+
+
+@cuda
+def test_a_tensor_in_an_unbindable_container_is_refused(capsys):
+    spec = SPECS["attn+moe"]
+    layers = _stack(spec)
+    ref = _decode(layers, _cache(1))
+    runner = dg.install_decode_graphs(_model(layers))
+    real_run = runner.run
+
+    def run_with_list(name, layer, seq, kwargs):
+        return real_run(name, layer, seq, dict(kwargs, rotary_list=[torch.zeros(1, device="cuda")]))
+    runner.run = run_with_list
+    got = _decode(layers, _cache(1), runner)
+    assert _same_outputs(ref, got)
+    assert "l0" in runner._refused and runner.stats["captures"] == 0
+    assert "cannot bind" in capsys.readouterr().out
