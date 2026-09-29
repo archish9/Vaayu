@@ -266,9 +266,17 @@ therefore replays each resident decoder layer's static work as CUDA graphs
   no `profiling_mode`, no `output_hidden_states`. The KV cache must also be one of Vaayu's
   own seamed cache classes (`FP8DynamicCache` and its subclasses); a model that brings its
   own cache class — DeepSeek-V4's `DeepseekV4Cache` today — is never eligible, and no
-  decode-graph line appears in its log at all. Prefill is always eager. The process's
-  first eligible token warms up; each layer is captured on the next and replayed after
-  that, and recaptured when a new request brings new cache tensors.
+  decode-graph line appears in its log at all. The same is true with the prefix cache OFF
+  (`enable_prefix_cache=False`, the library default): `generate()` falls through to
+  transformers' own generation, which builds its own plain `DynamicCache` rather than a
+  seamed Vaayu one, so decode graphs are never eligible and nothing is logged either way.
+  Prefill is always eager. The process's first eligible token warms up; each layer is
+  captured on the next and replayed after that. A recapture is triggered only by a change
+  in linear-attention state addresses (a new request's conv/recurrent state tensors), or
+  in input shapes or decode limits — attention-only models keep their graphs across
+  requests, since they have no such state. Per-request recaptures are not re-checked
+  bitwise against the stock forward: only the first two tokens a layer is ever captured
+  for, in the whole process, are.
 - **Correctness.** Graphs replay the same kernels in the same order, so outputs are
   bit-identical. A layer's first two tokens where its graph is used each run the graph,
   then run the stock forward last from the same starting state and compare the two
