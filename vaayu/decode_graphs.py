@@ -24,6 +24,7 @@ for the process -- it decodes eagerly -- with one WARNING per reason.
 """
 import collections
 import functools
+import gc
 import threading
 
 import torch
@@ -242,9 +243,54 @@ def _clone(obj):
     return obj
 
 
-def _why(exc):
+def _exc_summary(exc):
     first = (str(exc).splitlines() or [""])[0]
-    return f"capture failed: {type(exc).__name__}: {first[:200]}"
+    return f"{type(exc).__name__}: {first[:200]}"
+
+
+def _why(exc):
+    return f"capture failed: {_exc_summary(exc)}"
+
+
+def _cleanup_pool(pool):
+    """Undo a failed `capture_end`'s effect on PyTorch's device caching allocator
+    for `pool` -- but only as far as `capture_end` itself actually got. There is no
+    public API for this; both calls are private, so the empty_cache regression test
+    pins the `_cuda_endAllocateToPool` half against a pytorch upgrade. `_cuda_releasePool`
+    is kept for the SAME reason but is only verified by a manual repro (`stale_uc.py`),
+    not a unit test.
+
+    `capture_end` can raise in two different places, and they need OPPOSITE handling:
+    - it raises AT `cudaStreamEndCapture` (e.g. an invalidated capture: an in-capture
+      host sync, unjoined side-stream work) -- the allocator's `captures_underway`
+      entry for the pool is never cleared, because `cudaStreamEndCapture` failing
+      means `endAllocateToPool` never ran. Ending it here is what makes the pool
+      reusable and lets `empty_cache()` release its memory again.
+    - it raises AFTER `cudaStreamEndCapture` succeeded (e.g. `cudaGraphInstantiate`
+      running out of memory) -- the pool was ALREADY ended, and this failed graph's
+      own reset() will release it once on its way to garbage collection. Calling
+      `_cuda_releasePool` here TOO would drop the pool's use count a second time,
+      below what its still-live graphs hold -- `uc >= 0 INTERNAL ASSERT FAILED`,
+      which aborts the PROCESS, not a catchable Python exception (R1; reproduced
+      with a standalone script forcing an instantiate-time OOM).
+    `_cuda_endAllocateToPool` itself raising is exactly the signal for which case
+    this is: it succeeds only when `capture_end` never got that far, so releasing
+    only follows a successful end."""
+    dev = torch.cuda.current_device()
+    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
+    release = getattr(torch._C, "_cuda_releasePool", None)
+    if end is None:
+        return
+    try:
+        end(dev, pool)
+    except Exception:
+        pass            # capture_end already ended the pool; its own graph releases it
+    else:
+        if release is not None:
+            try:
+                release(dev, pool)
+            except Exception:
+                pass
 
 
 def _unbindable(kwargs):
@@ -313,26 +359,16 @@ class _Capture:
         unjoined side-stream work left open at capture time) -- so `abort` alone,
         which only acts when `self.graph` is still set, would miss them (N1: it
         clears `self.graph` to None before ever seeing this exception).
-        When capture_end raises, the POOL -- not just this graph -- is left stuck
-        "recording": PyTorch's device caching allocator's `captures_underway` entry
-        for it is never cleared, because capture_end raises at cudaStreamEndCapture,
-        BEFORE it would have called endAllocateToPool. That is allocator bookkeeping,
-        not a driver-level fault, and it is why plain torch.cuda.empty_cache() then
-        releases nothing and the failed begin's pool use-count increment leaks (N2).
-        These two calls are PyTorch's own private cleanup for exactly that; there is
-        no public API for it, so a test pins the behavior against a pytorch upgrade."""
+        When capture_end raises this way, the POOL -- not just this graph -- is
+        left stuck "recording" in PyTorch's allocator bookkeeping (not a driver
+        fault; see `_cleanup_pool`), which is why plain torch.cuda.empty_cache()
+        then releases nothing and the failed begin's pool use-count increment
+        leaks (N2)."""
         try:
             g.capture_end()
         except Exception:
             self.pool_broken = True
-            dev, pool = torch.cuda.current_device(), self.runner._pool
-            for name in ("_cuda_endAllocateToPool", "_cuda_releasePool"):
-                fn = getattr(torch._C, name, None)
-                if fn is not None:
-                    try:
-                        fn(dev, pool)
-                    except Exception:
-                        pass
+            _cleanup_pool(self.runner._pool)
             raise
 
     def abort(self):
@@ -391,12 +427,17 @@ class DecodeGraphRunner:
         self._checks = collections.Counter()
         self._request_captures = collections.Counter()
         self._disabled = False
+        self._release_why = None  # set by _disable; the real release runs at the
+                                   # next begin_forward, once _capture's locals are gone (R2)
         self._charged = 0
         self._tier_before = None
         self._announced = False
         self.stats = collections.Counter()
 
     def begin_forward(self, *, batch, past_key_values, output_hidden_states) -> bool:
+        if self._release_why is not None:
+            why, self._release_why = self._release_why, None
+            self._release_pool(why)
         m = self._model
         if not (not self._disabled
                 and len(batch) == 1 and tuple(batch[0].shape) == (1, 1)
@@ -526,6 +567,17 @@ class DecodeGraphRunner:
     def _capture(self, name, layer, x, kw, sig):
         cap = _Capture(self)
         _TL.cap = cap
+        # A GC pass landing INSIDE a capture runs CUDAGraph destructors of any
+        # cyclic garbage (e.g. an earlier, now-dead runner: its _Record -> the
+        # attention seam's `core` closure -> that runner -> its _records, a real
+        # reference cycle only the cycle collector can free) on the CAPTURING
+        # thread, invalidating the capture ("operation not permitted when stream
+        # is capturing (function reset)") -- confirmed flaky 4/15 runs without this
+        # (R3). Disabled only for the capture window, restored right after; never
+        # gc.collect() here instead -- a frozen-server collect costs ~30 ms, times
+        # every layer, times every request.
+        was = gc.isenabled()
+        gc.disable()
         out = None
         try:
             cap.begin_graph()
@@ -544,10 +596,12 @@ class DecodeGraphRunner:
                     # trusted for this process at all. Disable, but never let THIS
                     # (secondary) failure mask the original exception being handled.
                     self._disable(f"minting a fresh graph pool after a capture failure "
-                                  f"itself failed: {_why(anchor_exc)}")
+                                  f"itself failed: {_exc_summary(anchor_exc)}")
             raise
         finally:
             _TL.cap = None
+            if was:
+                gc.enable()
         self._records[name] = _Record(sig, cap, out)
         self.stats["captures"] += 1
         self.stats["pool_bytes"] += max(0, cap.pool_growth)
@@ -572,7 +626,11 @@ class DecodeGraphRunner:
         with torch.cuda.stream(self._stream):
             self._anchor.capture_begin(pool=self._pool, capture_error_mode="thread_local")
             self._anchor_buf.add_(0)
-            self._anchor.capture_end()
+            try:
+                self._anchor.capture_end()
+            except Exception:          # the anchor's own capture_end (R4): the same
+                _cleanup_pool(self._pool)   # cleanup as any other capture, not a duplicate
+                raise
         torch.cuda.current_stream().wait_stream(self._stream)
 
     def _charge(self):
@@ -617,13 +675,26 @@ class DecodeGraphRunner:
                   f"load-time reserve")
 
     def _disable(self, why):
+        """Mark the process disabled; NOTHING else here (R2). Both real callers
+        (`_charge`'s "refuse" branch, and a pool-mint failure) run INSIDE
+        `_capture`, where the just-captured graphs (`cap`) and its output (`out`,
+        itself a tensor living in the pool) are still local variables on that
+        stack -- releasing the pool here would free nothing, silently, and only
+        LOOK like it worked. `begin_forward` is the next point guaranteed to run
+        after `_capture` has returned and those locals are gone, so the actual
+        release (`_release_pool`) is deferred there instead."""
         self._disabled = True
-        # Release the pool BEFORE refunding the tier (N3): the anchor graph keeps
-        # the pool's use count >= 1 forever, and `_stamps` holds the previous
-        # layer's static output tensors (live blocks in that same pool), so
-        # `_records.clear()` alone frees nothing -- refunding the tier first would
-        # let it grow into memory the dead pool still holds.
         self._records.clear()
+        if self._release_why is None:      # first reason wins
+            self._release_why = why
+
+    def _release_pool(self, why):
+        """The deferred half of `_disable` (R2, see its docstring for why): drop
+        the anchor graph and its buffer, clear the static buffers, and only THEN
+        call empty_cache() -- the anchor keeps the pool's use count >= 1 forever,
+        and `_stamps` holds the previous layer's static output tensors (live
+        blocks in that same pool), so skipping either would free nothing (N3).
+        Then refund the tier and print the one WARNING."""
         self._anchor = None
         self._anchor_buf = None
         self._stamps.clear()

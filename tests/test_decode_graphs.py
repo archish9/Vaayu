@@ -2,6 +2,7 @@
 (input norm -> mixer -> residual -> post norm -> mlp -> residual). The property that
 matters: the runner's output and cache state are BITWISE the stock forward's, token
 after token, through captures, replays, recaptures and refusals."""
+import gc
 import types
 
 import pytest
@@ -16,6 +17,18 @@ from vaayu.persist.expert_cache import ExpertVRAMCache
 from vaayu.vaayu_base import FP8DynamicCache, TurboQuantKVCache
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs are CUDA only")
+
+
+@pytest.fixture(autouse=True)
+def _collect_dead_runners_between_tests():
+    """A dead runner from an earlier test can sit in a genuine reference cycle
+    (a captured layer's _Record -> the attention seam's `core` closure -> that
+    runner -> its own _records) that only the cycle collector reclaims. Collecting
+    it here, between tests, keeps a later test's OWN gc.disable() window (R3,
+    `DecodeGraphRunner._capture`) from being the first collection point a dead
+    runner from a DIFFERENT test ever sees."""
+    gc.collect()
+    yield
 
 H, HEADS, T = 64, 4, 12
 
@@ -293,6 +306,11 @@ def _same_caches(a, b):
             and _kv(a.value_cache, b.value_cache)
             and all(torch.equal(x.recurrent_states, y.recurrent_states)
                     for x, y in zip(a.layers, b.layers)))
+
+
+def _pool_mib(pool):
+    return sum(seg["total_size"] for seg in torch.cuda.memory_snapshot()
+               if tuple(seg.get("segment_pool_id", (0, 0))) == tuple(pool)) / 2**20
 
 
 def test_nothing_is_installed_off_cuda():
@@ -635,6 +653,10 @@ def test_disabling_refunds_the_tier(capsys):
     # pool_bytes is entirely layer 0's charge, and there is no charge boundary to
     # straddle. Testing `_disable` directly is the fallback the brief sanctions for
     # exactly this case (task-3-fix-1.md F3).
+    # A direct _disable + begin_forward unit check (R2's fix-round-3 ruling): _disable
+    # itself only MARKS the process disabled now (the real release, including the
+    # tier refund, is deferred to the next begin_forward -- see
+    # test_disabling_releases_the_pool for the full real-_charge-path version).
     layers = _stack(SPECS["attn+dense"])
     tier = ExpertVRAMCache(budget_bytes=1 << 20)
     runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
@@ -642,6 +664,9 @@ def test_disabling_refunds_the_tier(capsys):
     runner._tier_before = budget_before_charge
     tier.budget_bytes = budget_before_charge - 10
     runner._disable("test")
+    assert tier.budget_bytes == budget_before_charge - 10   # not yet refunded
+    assert not runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=_cache(1),
+                                     output_hidden_states=False)
     assert tier.budget_bytes == budget_before_charge
     assert "budget is restored to" in capsys.readouterr().out
 
@@ -712,18 +737,90 @@ def test_empty_cache_still_releases_after_a_failed_capture():
 
 
 @cuda
-def test_disabling_releases_the_pool():
-    """N3: the anchor keeps the pool's use count >= 1 forever and `_stamps` holds
-    live pool tensors (the previous layer's static output), so clearing `_records`
-    alone frees nothing -- `_disable` must drop the anchor and the static buffers
-    too before the freed memory is actually returned to the allocator."""
+def test_disabling_releases_the_pool(capsys):
+    """R2: _disable's two REAL callers (_charge's "refuse" branch, a pool-mint
+    failure) both run INSIDE _capture, where the just-captured graphs (`cap`) and
+    its output (`out`, a pool tensor) are still local variables on that very stack
+    -- releasing the pool right there would free nothing. Drive the real _charge
+    path (like the round-2 re-review's repro), then let the NEXT begin_forward
+    (where those locals are gone) perform the deferred release."""
     spec = SPECS["hybrid"]
     layers = _stack(spec)
     tier = ExpertVRAMCache(budget_bytes=1 << 30)
     runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
-    _decode(layers, _cache(3), runner, n_tok=4)
-    assert runner.stats["pool_bytes"] > 0
-    before = torch.cuda.memory_reserved()
-    runner._disable("test")
-    after = torch.cuda.memory_reserved()
-    assert before - after >= runner.stats["pool_bytes"]
+    pool = runner._pool
+
+    calls = {"n": 0}
+    real_charge = dg.graph_pool_charge
+
+    def fake_charge(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_charge(**kw)      # the first captured layer: charged fine
+        return "refuse", None             # a later layer: no longer fits
+    dg.graph_pool_charge = fake_charge
+    # A second layer's OWN incremental pool growth is usually 0 (the allocator's
+    # one-time warmup happens entirely on the first capture, per fix round 1's own
+    # finding), so _charge's early "extra <= 0: return" would never call
+    # graph_pool_charge a second time on its own. Force the accounting to treat
+    # this capture's growth as unpaid too, so the real _charge path actually runs
+    # graph_pool_charge (and can refuse) on more than one layer.
+    real_charge_method = runner._charge
+
+    def forced_charge():
+        if calls["n"] >= 1:
+            runner._charged = 0
+        real_charge_method()
+    runner._charge = forced_charge
+    try:
+        _decode(layers, _cache(3), runner, n_tok=2)
+    finally:
+        dg.graph_pool_charge = real_charge
+
+    assert runner._disabled
+    tier_while_disabled = tier.budget_bytes    # still shrunk: the refund is deferred too
+    # One more begin_forward, outside _capture entirely: the deferred release fires here.
+    assert not runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=_cache(3),
+                                     output_hidden_states=False)
+    torch.cuda.empty_cache()
+    assert _pool_mib(pool) == 0
+    assert tier.budget_bytes > tier_while_disabled
+    assert capsys.readouterr().out.count("DISABLED") == 1
+
+
+@cuda
+def test_gc_is_disabled_during_a_capture():
+    """R3: a GC pass that lands INSIDE a capture runs CUDAGraph destructors of any
+    cyclic garbage (e.g. an earlier, now-dead runner: its _Record -> the attention
+    seam's `core` closure -> that runner -> its own _records, a genuine reference
+    cycle only the cycle collector reclaims) on the CAPTURING thread and
+    invalidates it -- "operation not permitted when stream is capturing (function
+    reset)"; reproduced directly with the re-reviewer's `gc_in_capture.py`
+    (`gc.collect()` called explicitly right where `dg._TL.cap` is set), which
+    failed 4/15 runs before this fix.
+
+    That repro cannot be turned into a pass/fail regression test as-is: Python's
+    `gc.collect()`, called EXPLICITLY, always runs a real collection regardless of
+    `gc.isenabled()` (verified directly: `gc.disable()` then `gc.collect()` still
+    reclaims a manually-built cycle) -- only the AUTOMATIC, threshold-triggered
+    collector honours the enabled/disabled flag, and forcing THAT to land inside
+    one exact narrow capture window via `gc.set_threshold` was not reproducible
+    either way (the lowered threshold fires on the next allocation regardless of
+    where that lands, often well before the capture even begins). So this checks
+    the actual mechanism `_capture` installs -- deterministically, no timing
+    dependency -- rather than the end-to-end crash, which the manual repro still
+    demonstrates but a unit test cannot gate on for the reason above."""
+    seen = {}
+
+    class ProbeMLP(ToyMLP):
+        def forward(self, x):
+            if dg._TL.__dict__.get("cap") is not None and "inside" not in seen:
+                seen["inside"] = gc.isenabled()
+            return super().forward(x)
+
+    assert gc.isenabled()
+    layers = [ToyLayer(0, "state", ProbeMLP()).to("cuda", torch.bfloat16)]
+    runner = dg.install_decode_graphs(_model(layers))
+    _decode(layers, _cache(1), runner)
+    assert seen.get("inside") is False
+    assert gc.isenabled()
