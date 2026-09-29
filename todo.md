@@ -538,9 +538,9 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       - [x] **Step 2 — plan** [`…S12-decode-cuda-graphs.md`](docs/superpowers/plans/2026-09-29-S12-decode-cuda-graphs.md) (written 2026-09-29; approved by the user, subagent-driven).
       - [~] **Step 3 — build** (branch `s12-decode-graphs`):
         - [x] T0 branch + re-verify + ledger (anchors at HEAD `bb51f5c`: loop call `vaayu_base.py:5530`, end of `__init__` `:3412`, loop header `:5341`, fused `sparse_forward` `moe_patch.py:2252`, `ExpertVRAMCache` `expert_cache.py:813`)
-        - [ ] T1 `graph_pool_charge` + `ExpertVRAMCache.set_budget` (CPU tests, two geometries)
-        - [ ] T2 seams + capture-and-run + replay (`DecodeGraphRunner` core; CUDA toy tests)
-        - [ ] T3 safety: self-check, refusal + state restore, give-up rule, residency, pool charge
+        - [x] T1 `graph_pool_charge` + `ExpertVRAMCache.set_budget` (CPU tests, two geometries) — `98c9ee1`, 9 passed, lint gate green; task review: two plan-mandated findings ruled (see S12 ledger), minors deferred
+        - [x] T2 seams + capture-and-run + replay (`DecodeGraphRunner` core; CUDA toy tests) — `84974a8` + review fix `60f6d30` (review caught: a replayed attention core wrote into the CAPTURE-time cache on stateless caches; static-input dedupe fooled by address reuse; work between update and attention lost at replay — all fixed with tests); 23 passed
+        - [x] T3 safety: self-check, refusal + state restore, give-up rule, residency, pool charge — `f489867` + fix rounds `7721fa3`, `e492628`, `606d296`; 43 passed, file 10/10 stable. Reviews caught and fixed: a refused self-check left the GRAPH's KV write in the cache (now stock runs last); a per-drain pool re-charge ratchet (now a permanent anchor graph); a failed capture poisoning the pool id AND PyTorch's allocator (empty_cache became a no-op process-wide — now cleaned with guarded private torch._C._cuda_endAllocateToPool/_cuda_releasePool, release only after a successful end, else process abort); disable refunding the tier over live pool memory (now released at the next forward); a GC pass inside a capture invalidating it (gc disabled per capture). Rulings in the S12 SDD ledger
         - [ ] T4 engine wiring (`__init__` install, loop call) + source pins + suite + Llama-1B smoke
         - [ ] T5 Qwen3-Next ABBA (P1) + ids at 64 / 2k / 8k / HIT / 1,024 tok + TTFT + 8k no-OOM — STOP RULES
         - [ ] T6 fused-forward `decode_pre` (router + shared expert into the graph, P2) + increment A/B
