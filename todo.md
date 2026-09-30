@@ -96,7 +96,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
 | **S11** ✅ | ~~**Qwen3-Next census at HEAD — decode AND TTFT, measure only.** Split the ~51 ms post-S7 decode token; TTFT at 2k/8k cold and prefix-hit; price S7's banked levers (2 per-layer syncs, M>1 packed kernel for prefill chunks + spec verify, hit/miss-read overlap), S3-B, S3-C, and a prompt-lookup re-gate on MoE (row 37) now verify could be cheap~~ **CLOSED 2026-09-28, MEASURED (no code): token 57.32 ms in the SERVER's mode (56.64 without gc spikes + 0.68 frozen gc; a library caller, which gets no `gc.freeze()`, pays 62.12) / 55.96 median, HOST-bound (host 60.3 vs device 26.7 ms); TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k (HIT fired 7/7 through the server's re-render); levers ≥ 5 % remain → S12 NOT skipped; L-clean RE-PRICED by the final review under the server's post-load `gc.freeze()`: 5.95 → 0.68 ms = 1.2 %, below the stop line, banked (the first S12 pick was a library-mode number); S12 = the user's pick between the launch-overhead class (≈14.1 ms = 24.6 %, inferred) and the M>1 packed prefill kernel (≤32.8 % HIT@8k, ≤43.1 % cold@8k); row 37 stays closed.** | (a): S7 halved decode, the remaining shape is unmeasured; the agent workload is prefill-heavy and no TTFT number exists since S7 | ~½–1 day | plan [`…S11-qwen3next-census.md`](docs/superpowers/plans/2026-09-28-S11-qwen3next-census.md); RESULTS [`…S11-qwen3next-census-RESULTS.md`](docs/2026-09-28-S11-qwen3next-census-RESULTS.md) |
 | **S12** ✅ | ~~**Qwen3-Next's top remaining lever — the USER picked (i) the launch-overhead class**~~ **CLOSED 2026-09-29, A WIN: piecewise decode CUDA graphs (`vaayu/decode_graphs.py`) — Qwen3-Next decode 57.71 → 44.27 ms/token (−13.4 ms, +23 %; phase 1 −10.08 ms / +17.47 % ABBA, phase 2 −2.80 ms / +5.95 %), greedy ids identical ON vs OFF on every arm, TTFT flat, 48/48 layers, pool 23 MB; MiniMax engaged 62/62 (ids identical); gpt-oss refused (eager attention), DeepSeek never eligible (own cache class); suite 3163; MERGED to `main` 2026-09-29 (`b6906d3`), merged suite 3163.** | (a)+(b): (i) every Qwen3-Next decode token at N=1, ≈14.1 ms = 24.6 % of the server-mode token, 3.61 s of a ≈21.3 s agent turn (INFERRED); (ii) every prefill, ≤1.00 s of a HIT@8k turn, ≤11.9 s of a cold 8k — it overtakes (i) once ≥ 24 % of turns are cold 8k | (i) days–weeks; (ii) ≥ a week | **2026-09-29: user picked (i) after step 0 MEASURED it (14.00–15.23 ms/token, 48/48 layers bitwise); spec APPROVED 2026-09-29; plan next:** [`…S12-decode-cuda-graphs-design.md`](docs/superpowers/specs/2026-09-29-S12-decode-cuda-graphs-design.md); step 0 [`…RESULTS.md`](docs/2026-09-29-S12-step0-launch-probe-RESULTS.md) |
 | **S13** ✅ | ~~**gpt-oss greedy decode diverges from stock at token 50 — triage.** Top-2 logit margin at position 50; near-tie → close with evidence; else find the first step whose logits leave ulp distance (the KV-cache path — single-forward logits are bit-identical)~~ **CLOSED 2026-09-30, NOT A DEFECT — an exact bf16 tie: Vaayu decode is bit-identical at every step (64/64, two prompts) to stock transformers with a full-length `DynamicCache()`; stock's default `DynamicCache(config)` truncates sliding layers to the window, which moves the rounding; at step 50 stock's top-2 are 1 ulp apart (21.125 / 21.0), Vaayu's tie (21.125 / 21.125) and argmax takes the lower id. No code change. Also: gpt-oss's template writes TODAY's date into the prompt — pin it in fixtures.** | exception: correctness a server user reaches, hours | hours | RESULTS [`…S13-gptoss-token50-RESULTS.md`](docs/2026-09-30-S13-gptoss-token50-RESULTS.md) |
-| **S14** | **gpt-oss non-expert stream** — ~~steps 1–2 (measure + price) and 3a (CPU embedding + non-expert RAM tier, merged `0327866`): 485 → 174 ms/token~~ **NOW 3b: measure TTFT at eager prefill chunk 256 / context-adaptive vs 512, then the USER decides whether `lm_head` (+ attention) go VRAM-resident (spike: 116 / 77 ms/token) and how that VRAM is paid for — a context knob (33,206 → 29,693 / 28,155 tokens) or a smaller eager chunk (256 frees 4.10 GiB at the same context). Measure only, no engine code.** | (b): served, the biggest remaining gap to stock (Vaayu 5.75 vs stock 35.7 tok/s) | 3b ~½ day measure; build TBD by the user's pick | **3a DONE 2026-09-30: 2.79× decode, bit-identical; 3b next** — the S14 row below is the brief |
+| **S14** | **gpt-oss non-expert stream** — ~~steps 1–2 (measure + price) and 3a (CPU embedding + non-expert RAM tier, merged `0327866`): 485 → 174 ms/token~~ **NOW 3b: measure TTFT at eager prefill chunk 256 / context-adaptive vs 512, then the USER decides whether `lm_head` (+ attention) go VRAM-resident (spike: 116 / 77 ms/token) and how that VRAM is paid for — a context knob (33,206 → 29,693 / 28,155 tokens) or a smaller eager chunk (256 frees 4.10 GiB at the same context). Measure only, no engine code.** | (b): served, the biggest remaining gap to stock (Vaayu 5.75 vs stock 35.7 tok/s) | 3b ~½ day measure; build TBD by the user's pick | **3a DONE 2026-09-30: 2.79× decode, bit-identical. 3b MEASURED 2026-09-30: the eager (past+new)² mask is the VRAM hog; block-only masks are bit-identical, 32.5k peak 12.48 → 8.69 GiB, decode 1.23× at 32k; chunk 256 OOMs at 32.5k. USER PICKED mask fix + planner → 3c (brainstorm in progress)** — RESULTS [`…S14-3b-eager-mask-RESULTS.md`](docs/2026-09-30-S14-3b-eager-mask-RESULTS.md) |
 | **S15** | **DeepSeek L-e, then L-b** — the expert-read stall S9 exposed (`expert_disk` 0.22 → 0.50 s/token, bytes identical); then whether the 8.03 GiB reserve floor is real (DSA `index_topk` may never materialize S×S scores) | (c): cheap, but a fixture model | hours each | none yet — the S15 row below is the brief |
 | **S16** | **(d) sweep** — verify-and-close row 40 (code says "fixed in S8", ledger still `[bug]`); S5-M-C (clone path fragments glibc arenas); gpt-oss + `enable_prefix_cache=False` + >128 tokens crash (server default is ON) | (d): no server user reaches any of them | hours each | none yet — the S16 row below is the brief |
 
@@ -743,9 +743,122 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                     Llama-3.3-70B pins 2.10 GB of embedding in VRAM (19 fully-pinned: 16 transformer + 3 shared);
                     ~4 more transformer layers ~ ~5 % of the ~37 GB/token read. Measure before building
                     (E-everywhere cost Qwen3-Next +1.14 %).
-        - [ ] **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the USER decides H/O**
+        - [x] **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the USER decides H/O** — **CLOSED 2026-09-30: USER PICKED "mask fix + planner" → S14 3c (next bullet after this row's sub-items).**
               (`lm_head` + attention VRAM residency; spike prices: H 115.9 ms, O 77.0 ms; context costs and chunk
-              peaks in the Steps 1-2 block above). Next item.
+              peaks in the Steps 1-2 block above). **MEASURED 2026-09-30 (steps 0 + 1 below): the eager
+              (past+new)² mask, not the chunk, holds the VRAM. Block-only masks are bit-identical: 32.5k peak
+              12.48 → 8.69 GiB, decode 1.23× at 32k, TTFT flat. Chunk 256 is not bit-identical and OOMs at
+              32.5k. AWAITING the USER's H/O decision.** **STARTED 2026-09-30 as a SPIKE (probes only, no engine
+              code; user approved).** Re-verified at HEAD `23930ef`: planner code unchanged since `2a6bb77`,
+              `split-r1.json` matches the RESULTS doc. **Added step 0 (user approved, run first):** gpt-oss's
+              eager score buffer is charged sdpa's fitted 10.9 B/elem (`_UNMEASURED_SCORE_ELEM_BYTES`,
+              `vram_plan.py:131`) — ~10.9 of the 13.86 GiB reserve — and eager was never measured; a static read
+              of `eager_attention_forward` suggests ~6 B/elem, which would free ~5 GiB at chunk 512 with no TTFT
+              or context cost. Step 0 = micro-probe of the real coefficient; step 1 = TTFT arms 512 / 256 /
+              adaptive (only if step 0 does not make the chunk question moot). Also found: `PREFILL_CHUNK_SIZE`
+              is already a server knob, and at 256 the pin planner itself would pin embed + `lm_head` + all 24
+              attention layers (E stops firing, so the embedding takes 1.16 GB VRAM).
+              - [x] **Step 0 — eager VRAM micro-probe, 2026-09-30 (no model load; probe
+                    `plans/probes/s14b_eager_mem.py`, log/json `plans/probes/s14_out/s14b-step0.{log,json}`).**
+                    Replays the engine's per-chunk eager prefill for two real `GptOssAttention` modules (sliding +
+                    full, random weights) with the engine's own mask code, `_windowed_mask` cache and bf16 ring-buffer
+                    KV, to S = 33,206; the whole-model peak is MODELLED from it (KV × 24 layers; MoE transient NOT
+                    modelled). **Found an unmodelled term:** eager builds a full **(past+new)² bf16 causal mask every
+                    forward** (`vaayu_base.py:5319-5322`) plus a windowed copy for the sliding layers
+                    (`_windowed_mask`, cached across forwards with the mask it came from): at 33k, 4.1 GiB retained,
+                    up to 9.2 GiB during the windowed build. The planner charges no mask term.
+                    - Kernel alone: **6.5 B/score-elem at chunk 512, 7.0 at 256** (incl. `repeat_kv` copies) vs the
+                      10.9 charged.
+                    - **Chunk 512: modelled peak 10.58 GiB vs planner 13.86** → ~3.28 GiB reserved and never used
+                      (before any MoE transient).
+                    - **Chunk 256: modelled 9.32 vs planner 9.76.** It really frees only **~1.26 GiB**, not 4.10: the
+                      masks do not shrink with the chunk. The planner's 256 figure has 0.44 GiB of margin, so running
+                      at 256 is at risk of OOM at long context.
+                    - **Decode tax (mask built every token):** 0.14 / 2.8 / 11.3 / **46.4 ms per token** at context
+                      2k / 8k / 16k / 32k, against a 174 ms token.
+                    - Fix candidate (engine code, NOT built): build only the `[q, past+q]` block the layers read —
+                      the same values, so bit-identical. Modelled 512 peak ≈ 8.7 GiB → ~5.1 GiB free at full context,
+                      with no TTFT cost and no decode tax. DeepSeek also runs eager and likely takes the same branch
+                      (unmeasured; see S15 L-b).
+              - [x] **Step 1 — full-model validation, 2026-09-30 (user picked it over the original 512/256/
+                    adaptive arms after step 0).** RESULTS `docs/2026-09-30-S14-3b-eager-mask-RESULTS.md`; probe
+                    `plans/probes/s14b_full.py`, logs/json/.pt `plans/probes/s14_out/s14b-full-*` (gitignored).
+                    **Method:** gpt-oss in the server config + `freeze_after_load()`, one arm per process, 29G,
+                    FOREGROUND, one 2k warm session discarded, one cold session per length, 12 greedy tokens.
+                    Arm `block` = PROBE PATCH: `forward`'s square mask becomes a lazy stand-in, and
+                    `get_attention_mask_args` builds only the `[len_s, len_p+len_s]` block (same causal + window
+                    rule).
+                    **Result, chunk 512, base → block** (ABBA r1/r2 at 8k/16k/30.7k; one pair at 32.5k).
+                    **BIT-IDENTICAL on every length and arm** (prefill-last + 11 decode logits + ids, max|d| 0):
+                    - peak VRAM over a0 at 32.5k: **12.48 → 8.69 GiB** (planner 13.69); at 30.7k 11.60 → 8.27
+                    - decode: 8k 209.1 → 201.0 ms; 16k 240.4 → 225.8; 30.7k **326.9 → 266.9 (1.22×)**; 32.5k
+                      332.9 → 271.1 (1.23×)
+                    - TTFT flat: 30.7k 130.1 → 129.0 s; 32.5k 143.2 → 145.0 s (one pair)
+                    - decode transient at 32.5k: 10.59 → 2.81 GiB
+                    **Headroom:** today's chunk-512 headroom at the served max is 13.86 − 12.48 = 1.38 GiB,
+                    under H/O's 1.62. With block masks it is **5.17 GiB** (≈ 3.7 at the plan's 33,206 design
+                    point, where the KV doubles; INFERRED).
+                    **Chunk 256 (the existing knob, one run):**
+                    - reserve 8.22 GiB, pins embed + `lm_head` + all 24 attention layers
+                    - decode 96.7 ms at 8k (2.16×) and 123.8 at 16k (1.94×)
+                    - TTFT +31 % at 8k, +17 % at 16k
+                    - **NOT bit-identical** (logit max|d| 5.19; ids equal 12/12)
+                    - **OOMs at 32.5k** in `_windowed_mask` (see the bug below)
+                    Chunk cost fit: ~0.8 s fixed per chunk + ~0.09 ms per token of past. Adaptive chunking was
+                    not run: block masks give more VRAM at 512, with no TTFT cost.
+                    **Recommendation (user decides):** build the block-only eager mask (bit-identical) plus an eager
+                    planner calibration (measured score coefficient, no mask term), so the pin planner gets
+                    `lm_head` + attention at 512 and full context. Not the context knob; not chunk 256.
+                    §8: no knob; measured on the served path at N=1; nothing banked.
+                    - [bug] **Retained eager masks refuse long requests (server-reachable, gpt-oss).**
+                          `_windowed_mask_cache` (`vaayu_base.py:5039`) keeps the last forward's full and windowed
+                          `(past+new)²` masks alive after the request ends: 1.00 GiB after a 16k session, 3.52 GiB
+                          after 30.7k. Admission headroom falls to 10.36 GiB. **Observed:** a 30.7k request was
+                          `VramPlanError`-refused right after a 16k session, with `max_seq_len` 33,206. A same-session
+                          long turn is INFERRED to hit it too. Fixed by the block-mask candidate.
+                    - [bug] **`PREFILL_CHUNK_SIZE = 256` OOMs gpt-oss at long context (server-reachable knob).**
+                          At 32.5k (admitted, `max_seq_len` 32,954): `torch.OutOfMemoryError … Tried to allocate
+                          1.95 GiB` in `_windowed_mask`'s `masked_fill` (`vaayu_base.py:5038`). The planner has no
+                          mask term, so it under-reserves. Fixed by the block-mask candidate; otherwise it needs a
+                          mask term in `predict_peak_vram`.
+                    - [ ] (d) `max_seq_len` over-promises by ~200–400 tokens after the first request: the
+                          predicted peak is flat at 13.862 GiB for S ≥ 32,768, and after warm-up the headroom is
+                          13.77–13.79, so 33,000 / 33,012 are refused on a load advertising 33,206.
+                    - [ ] **Lead: gpt-oss's expert VRAM cache is never filled** (`current_usage` 0 in every arm,
+                          incl. a 3.5 GB budget at chunk 256). `routed_fused3d.py` never touches
+                          `_expert_vram_cache`, so freed VRAM helps only non-expert residency. The remaining gap to
+                          stock is routed-expert delivery (1.27 GB/token over PCIe). Unmeasured.
+        - [~] **3c — block-only eager mask + eager planner calibration (USER PICKED 2026-09-30 from 3b's options;
+              not picked: context knob, mask fix only, chunk 256 + quality band).** Build only the
+              `[q, past+q]` block of the eager causal mask, and make `_windowed_mask` rectangular. This is
+              bit-identical, fixes the decode tax and both 3b `[bug]`s, and mirrors `build_sdpa_causal_mask`,
+              which already does this for sdpa. Then calibrate the planner's eager score cost, so the reserve
+              shrinks and the pin planner puts `lm_head` + attention in VRAM at chunk 512 and full context.
+              Architectural path: brainstorm → spec → user review → plan. **Design APPROVED section by section
+              2026-09-30. Spec `docs/superpowers/specs/2026-09-30-S14-3c-eager-mask-planner-design.md`
+              (gitignored) APPROVED by the user 2026-09-30. Plan `docs/superpowers/plans/2026-09-30-S14-3c-eager-mask-planner.md` — 7 tasks, branch `s14c-eager-mask-planner`: T1 block mask + rectangular window; T2 `VramShape.score_bytes_per_key`; T3 `vaayu/eager_attn_cost.py`; T4 hook + DeepSeek override + plan wiring; T5 gpt-oss vs `main` (bit-identity, ABBA, safety, s13, server gate); T6 cross-model gates; T7 docs, ledger, final review. AWAITING the user's plan review.** Durable design summary:
+              - **Decisions (user):** per-model hook, so DeepSeek keeps the 10.9 table value until S15 L-b.
+                Approach A: measure at load (not a per-class table, not one eager constant).
+              - **Measured fact behind approach A** (`plans/probes/s14c_eager_coeff.py`): eager transient =
+                `c·H·q·k + r·k` exactly, with c = 6.0 on gpt-oss and 10.0 on both Llamas, and
+                r = `2·H·D·2` (GQA `repeat_kv`), constant over 8 points per geometry.
+              - **Mask:** `build_eager_causal_mask(q, kv)` mirrors `build_sdpa_causal_mask`. `_windowed_mask`
+                goes rectangular (also closes the latent sdpa + window + chunked-prefill shape mismatch).
+                The overrides are untouched.
+              - **Planner:** `VramShape.score_bytes_per_key` (default 0, so nothing else moves). A hook
+                `attention_score_cost()`: flash/sdpa use the table; eager uses
+                `vaayu/eager_attn_cost.measure_eager_attention_cost` (fresh copy of the model's own attention
+                module, three shapes, solve for c and r, bounds-checked, falls back to the table with a
+                reason). It runs before the free-VRAM snapshot.
+              - **Predicted on gpt-oss:** reserve 13.86 → 9.46 GiB, pin budget 0.66 → 5.06 GiB,
+                `max_seq_len` 33,206 → 33,163. The pin planner holds embed + `lm_head` + 24 layers (= the
+                spike's O, 77 ms/token). E goes dormant and P empties.
+              - **Verify:** bit-identity vs `main` at 2k/8k/16k/30.7k + `s13` 64/64; decode ≥ 2 %; TTFT ≤ 5 %;
+                peak ≤ reserve at max; chunk 256 no OOM; 16k → 30.7k admitted; gpt-oss server 9/9; DeepSeek
+                9/9 with an identical plan line; Qwen3-Next + MiniMax 8/8 with identical plan lines;
+                Llama-1B gates + an eager-load id check.
+              - **Stop rules:** not bit-identical; peak > reserve; any plan change on flash/sdpa or on
+                DeepSeek; decode < 2 % or TTFT > 5 % worse.
 
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM). **AMENDED 2026-09-30 by T2b: only where it would stream** (user rule; applied to every model E cost Qwen3-Next decode +1.14 %, so it now fires only where the VRAM pin budget cannot hold the embedding).
@@ -799,7 +912,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               **Lead, NOT built:** the loader's pinned double buffers `_PINNED_BUFS` stay allocated for the life
               of every MoE load (gpt-oss 2 × 2 GiB, idle after E + P). Releasing them returns 2–4 GiB of pinned
               RAM to the arena on every MoE model — its own row + measurement.
-        - [ ] **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
+        - [~] (duplicate of the 3b row above — status lives there) **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
               H/O.
 - [ ] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** L-e: `expert_disk` rose 0.22 → 0.50
       s/token when S9 removed the CPU fold, bytes and hit/miss identical → exposed stall, hypothesis that the
@@ -1244,7 +1357,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S14 3b** — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the user decides H/O (the S14 row at the top is the brief). ◀◀ (S14 3a CLOSED 2026-09-30, A WIN: gpt-oss decode 485.0 -> 173.8 ms/token, 2.79x, bit-identical.) Was: **S14** — gpt-oss non-expert stream: measure its share of the 0.44 s token, then residency. ◀◀ (S13 CLOSED 2026-09-30, NOT A DEFECT: the token-50 flip is an exact bf16 tie; Vaayu is bit-identical to stock with a full-length `DynamicCache()`; no code change.) Was: **S13** — gpt-oss greedy decode diverges from stock at token 50: triage (the S13 row at the top is the brief). ◀◀ (S12 CLOSED 2026-09-29, A WIN: piecewise decode CUDA graphs, Qwen3-Next decode −13.4 ms/token (+23 %), ids bit-identical; merged `b6906d3`.) Was: **S12** — the user picks at the brainstorm between the launch-overhead class (top decode lever, ≈14.1 ms = 24.6 % of the server-mode token, inferred; recommended, measured first) and the M>1 packed prefill kernel (top TTFT lever; it overtakes the class once ≥ 24 % of turns are cold 8k); the S12 row at the top is the brief. ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 57.32 ms in the server's mode (62.12 for a library caller, which gets no `gc.freeze()`), host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; levers ≥ 5 % remain, so S12 is not skipped; L-clean re-priced frozen at 1.2 % and banked as S11-L8; row 37 stays closed.) Was: **S12** — L-clean, the every-32-forward `gc.collect()` (withdrawn 2026-09-28 by S11's final review: its 5.95 ms = 9.6 % was measured without the server's post-load `gc.freeze()`; frozen it is 0.68 ms = 1.2 %). Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S14 3c** — block-only eager mask + eager planner calibration (USER picked 2026-09-30; brainstorm → spec → plan; RESULTS of 3b `docs/2026-09-30-S14-3b-eager-mask-RESULTS.md`). ◀◀ (S14 3b CLOSED 2026-09-30, MEASURED.) Was: **S14 3b → the USER's H/O pick**. ◀◀ (S14 3b MEASURED 2026-09-30: the eager mask, not the chunk, holds the VRAM; chunk 256 OOMs at 32.5k.) Was: **S14 3b** — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the user decides H/O (the S14 row at the top is the brief). ◀◀ (S14 3a CLOSED 2026-09-30, A WIN: gpt-oss decode 485.0 -> 173.8 ms/token, 2.79x, bit-identical.) Was: **S14** — gpt-oss non-expert stream: measure its share of the 0.44 s token, then residency. ◀◀ (S13 CLOSED 2026-09-30, NOT A DEFECT: the token-50 flip is an exact bf16 tie; Vaayu is bit-identical to stock with a full-length `DynamicCache()`; no code change.) Was: **S13** — gpt-oss greedy decode diverges from stock at token 50: triage (the S13 row at the top is the brief). ◀◀ (S12 CLOSED 2026-09-29, A WIN: piecewise decode CUDA graphs, Qwen3-Next decode −13.4 ms/token (+23 %), ids bit-identical; merged `b6906d3`.) Was: **S12** — the user picks at the brainstorm between the launch-overhead class (top decode lever, ≈14.1 ms = 24.6 % of the server-mode token, inferred; recommended, measured first) and the M>1 packed prefill kernel (top TTFT lever; it overtakes the class once ≥ 24 % of turns are cold 8k); the S12 row at the top is the brief. ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 57.32 ms in the server's mode (62.12 for a library caller, which gets no `gc.freeze()`), host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; levers ≥ 5 % remain, so S12 is not skipped; L-clean re-priced frozen at 1.2 % and banked as S11-L8; row 37 stays closed.) Was: **S12** — L-clean, the every-32-forward `gc.collect()` (withdrawn 2026-09-28 by S11's final review: its 5.95 ms = 9.6 % was measured without the server's post-load `gc.freeze()`; frozen it is 0.68 ms = 1.2 %). Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —
