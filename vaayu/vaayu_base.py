@@ -2570,6 +2570,15 @@ class VaayuBaseModel(GenerationMixin):
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     kv_bytes_per_token, plan_vram,
                                     reserve_floor_bytes, score_elem_bytes)
+            # S14 3c: what one attention forward costs -- measured on this
+            # load's own attention module for eager, the kernel table for
+            # flash/sdpa. BEFORE the free-VRAM snapshot: the measurement's own
+            # transient is released (the hook empties the cache) and never
+            # enters the budget.
+            _score_per_elem, _score_per_key, _score_source = self.attention_score_cost()
+            print(f"[Vaayu-VRAM] attention cost: {_score_per_elem:.2f} B/score-element + "
+                  f"{_score_per_key / 1024:.1f} KiB/key ({_score_source}; kernel table "
+                  f"{score_elem_bytes(self._active_attn_impl):.2f})")
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
             _head_dim = getattr(self.config, "head_dim", None)
@@ -2651,13 +2660,12 @@ class VaayuBaseModel(GenerationMixin):
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
                 elem_bytes=torch.finfo(self.running_dtype).bits // 8,
-                # Kernel property, read off the model init_model() just
-                # built (line ~1421, before this block): sdpa materializes an
-                # S-sized score buffer and flash_attention_2 does not, a gap
-                # that GROWS with S and flips OOM outcomes at large context
-                # (todo row 10). Charging one kernel's number for both
-                # under-reserves batched_generate, which requires sdpa.
-                score_elem_bytes=score_elem_bytes(self._active_attn_impl),
+                # Kernel property for flash/sdpa: sdpa materializes an S-sized
+                # score buffer and flash_attention_2 does not, a gap that GROWS
+                # with S and flips OOM outcomes at large context (todo row 10).
+                # Eager: measured per model at load (attention_score_cost, S14 3c).
+                score_elem_bytes=_score_per_elem,
+                score_bytes_per_key=_score_per_key,
                 resident_expert_bytes=_resident_expert_bytes,
                 head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
@@ -5020,6 +5028,55 @@ class VaayuBaseModel(GenerationMixin):
 
     def get_past_key_value_args(self, past_key_values):
         return {'past_key_values': past_key_values}
+
+    def _attention_modules_by_class(self) -> list:
+        """The first `self_attn` of each distinct attention class, in layer
+        order -- read off the module tree, not an architecture name (§5)."""
+        layers = self.model
+        for name in self.layer_names_dict["layer_prefix"].split("."):
+            layers = getattr(layers, name)
+        seen, found = set(), []
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and type(attn) not in seen:
+                seen.add(type(attn))
+                found.append(attn)
+        return found
+
+    def attention_score_cost(self) -> "tuple[float, float, str]":
+        """(bytes per score element, bytes per key, source) the VRAM plan
+        charges one attention forward (S14 3c).
+
+        flash/sdpa: the kernel table (vram_plan.SCORE_ELEM_BYTES) -- kernel
+        constants, unchanged. Eager (and any unknown kernel): MEASURED on this
+        load's own attention code (vaayu/eager_attn_cost.py), because eager's
+        buffers live in each model's own `eager_attention_forward` and differ
+        by model -- 6.0 B/score-element on gpt-oss-20b against 10.0 on the
+        Llamas, where the table charged every eager load sdpa's 10.9. Any
+        failure falls back to that table value, with the reason, so a failure
+        is exactly the behaviour before 3c. Subclasses whose attention is not
+        transformers' eager (DeepSeek-V4) override this."""
+        from .vram_plan import score_elem_bytes
+        impl = self._active_attn_impl
+        table = score_elem_bytes(impl)
+        if impl in ("flash_attention_2", "sdpa"):
+            return table, 0.0, "kernel table"
+        try:
+            from . import eager_attn_cost
+            per_elem, per_key, measured_on = eager_attn_cost.measure_eager_attention_cost(
+                self._attention_modules_by_class(),
+                rope_fn=self._precompute_rope,
+                make_cache=lambda: FP8DynamicCache(quantize=False),
+                mask_fn=build_eager_causal_mask,
+                device=torch.device(self.running_device),
+                dtype=self.running_dtype)
+            return per_elem, per_key, f"measured on {measured_on}"
+        except Exception as e:
+            # D3: the measurement must never fail the load.
+            return table, 0.0, f"kernel table: measurement failed ({type(e).__name__}: {e})"
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @staticmethod
     def layer_attention_window(layer) -> "int | None":

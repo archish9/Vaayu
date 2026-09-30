@@ -114,3 +114,90 @@ def test_measures_the_models_own_eager_cost(name, expect_c):
     assert c == pytest.approx(expect_c + 2 / H, abs=0.2)
     assert r == pytest.approx(2 * H * D * 2, rel=0.05)
     assert names == type(template).__name__
+
+
+# --- the engine hook (S14 3c) ---------------------------------------------
+from types import SimpleNamespace
+
+import vaayu.eager_attn_cost as eac
+from vaayu.vaayu_base import VaayuBaseModel
+from vaayu.vram_plan import score_elem_bytes
+
+
+class _Stub:
+    attention_score_cost = VaayuBaseModel.attention_score_cost
+    _attention_modules_by_class = VaayuBaseModel._attention_modules_by_class
+
+    def __init__(self, impl, layers=()):
+        self._active_attn_impl = impl
+        self.model = SimpleNamespace(model=SimpleNamespace(layers=list(layers)))
+        self.layer_names_dict = {"layer_prefix": "model.layers"}
+        self.running_device = "cpu"
+        self.running_dtype = torch.bfloat16
+
+    def _precompute_rope(self, position_ids):
+        return None
+
+
+@pytest.mark.parametrize("impl", ["flash_attention_2", "sdpa"])
+def test_flash_and_sdpa_keep_the_kernel_table(impl, monkeypatch):
+    def boom(*a, **kw):
+        raise AssertionError("flash/sdpa must not be measured")
+    monkeypatch.setattr(eac, "measure_eager_attention_cost", boom)
+    assert _Stub(impl).attention_score_cost() == (score_elem_bytes(impl), 0.0, "kernel table")
+
+
+def test_eager_uses_the_measurement(monkeypatch):
+    monkeypatch.setattr(eac, "measure_eager_attention_cost",
+                        lambda *a, **kw: (6.0, 16384.0, "GptOssAttention"))
+    assert _Stub("eager").attention_score_cost() == (
+        6.0, 16384.0, "measured on GptOssAttention")
+
+
+def test_a_failed_measurement_falls_back_to_the_table_with_the_reason(monkeypatch):
+    def fail(*a, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(eac, "measure_eager_attention_cost", fail)
+    per_elem, per_key, source = _Stub("eager").attention_score_cost()
+    assert (per_elem, per_key) == (score_elem_bytes("eager"), 0.0)
+    assert "measurement failed" in source and "boom" in source
+
+
+class _Unrebuildable(torch.nn.Module):
+    """An attention class that cannot be rebuilt from (config, layer_idx)."""
+    def __init__(self, *args, ok=False):
+        super().__init__()
+        if not ok:
+            raise TypeError("custom constructor signature")
+        self.config = SimpleNamespace(num_attention_heads=8)
+        self.layer_idx = 0
+
+
+def test_unrebuildable_attention_falls_back_with_the_reason():
+    layer = SimpleNamespace(self_attn=_Unrebuildable(ok=True))
+    per_elem, per_key, source = _Stub("eager", [layer]).attention_score_cost()
+    assert (per_elem, per_key) == (score_elem_bytes("eager"), 0.0)
+    assert "TypeError" in source and "custom constructor signature" in source
+
+
+class _AttnA:
+    pass
+
+
+class _AttnB:
+    pass
+
+
+def test_attention_modules_by_class_takes_the_first_of_each_class_in_order():
+    a0, a1, b2 = _AttnA(), _AttnA(), _AttnB()
+    layers = [SimpleNamespace(self_attn=a0), SimpleNamespace(self_attn=a1),
+              SimpleNamespace(self_attn=b2), SimpleNamespace()]   # last: no attention
+    assert _Stub("eager", layers)._attention_modules_by_class() == [a0, b2]
+
+
+def test_deepseek_keeps_the_kernel_table_until_S15_measures_it():
+    from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
+    stub = SimpleNamespace(_active_attn_impl="eager")
+    per_elem, per_key, source = VaayuDeepseekV4.attention_score_cost(stub)
+    assert (per_elem, per_key) == (score_elem_bytes("eager"), 0.0)
+    assert "S15" in source

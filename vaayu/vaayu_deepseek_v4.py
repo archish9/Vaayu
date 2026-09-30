@@ -630,6 +630,17 @@ class VaayuDeepseekV4(VaayuBaseModel):
         """
         return {"start_pos": len_p}
 
+    def attention_score_cost(self):
+        """Today's kernel-table charge, deliberately NOT measured (S14 3c, user
+        decision 2026-09-30). This model's attention is its own sparse kernel
+        (`sparse_attn`, DSA `index_topk`), not transformers'
+        eager_attention_forward, so the base class's measurement would price
+        the wrong code. Its real peak is S15 L-b's job; until then it keeps
+        the conservative value it has always been charged."""
+        from .vram_plan import score_elem_bytes
+        return (score_elem_bytes(self._active_attn_impl), 0.0,
+                "kernel table: DeepSeek-V4's sparse attention is unmeasured (S15 L-b)")
+
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s,
                                 layer=None):
         """No mask args -- and the `start_pos` contiguity check, which needs
