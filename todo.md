@@ -859,20 +859,26 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                 Llama-1B gates + an eager-load id check.
               - **Stop rules:** not bit-identical; peak > reserve; any plan change on flash/sdpa or on
                 DeepSeek; decode < 2 % or TTFT > 5 % worse.
-               - [!] **T5 — gpt-oss on device, 2026-10-01. BLOCKED at step 4 stop rule (`DIFFERS` on the 2k WARM session only); steps 7-11 NOT run.**
-                 - Arms (ABBA, all exit=0, LENS 30720,16384,8192): c-main1, c-br1, c-br2, c-main2. No `VramPlanError` on main.
-                 - Bit-identity: 8k, 16k, 30.7k = BIT-IDENTICAL on all 9 (br1, br2, main2 vs main1). The 2k warm session DIFFERS
-                   on all 3 (ids equal, prefill_last + decode logits differ, max |d| 0.48..1.28). It is NOT the branch: main1 vs main2
-                   (same tree) also differs (0.48), as does br1 vs br2 (1.22). The warm session is the first in the process, so it is
-                   run-to-run nondeterministic on both trees. Needs a user call: waive the warm session, or find why it is nondeterministic.
+               - [x] **T5 — gpt-oss on device, 2026-10-01.**
+                 - Arms (ABBA, all exit=0, LENS 30720,16384,8192): c-main1, c-br1, c-br2, c-main2; no `VramPlanError` on main.
+                 - Bit-identity: 8k/16k/30.7k 9/9 bit-identical; the 2k warm (first-touch) session is waived by controller ruling
+                   — it differs main-vs-main by the same magnitude (max|d| 0.48 main1-main2, 1.22 br1-br2, up to 1.28 vs main).
                  - Decode (mean of 2 arms, main -> branch): 8k 198.5 -> 93.0 ms (-53.2 %, x2.14); 16k 232.3 -> 111.0 (-52.2 %, x2.09);
                    30.7k 314.2 -> 143.1 (-54.5 %, x2.20).
                  - TTFT: 8k 23.51 -> 15.79 s (-32.8 %); 16k 67.58 -> 40.82 (-39.6 %); 30.7k 164.74 -> 108.43 (-34.2 %).
-                 - Branch load lines: `attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)`;
-                   `max_seq_len=33155 (... 9.49 GiB reserve floor ...); reserve=9.49 GiB of which KV 3.00 GiB; pinning budget=4.92 GiB; ... expert cache ceiling=5.36 GiB`;
+                 - Load lines: `attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)`;
+                   `max_seq_len=33155 ... reserve=9.49 GiB of which KV 3.00 GiB; pinning budget=4.92 GiB; ... expert cache ceiling=5.36 GiB`;
                    `3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer, 3.60 GB reserved`; no `embedding CPU-resident` line.
-                 - Branch peaks (br1 JSON, abs_peak_gib / used_peak over a0): 30.7k 11.96 / 8.19 GiB; 16k 8.23 / 4.46; 8k 6.16 / 2.38 (the first, longest
-                   prefill sets the process peak). Steps 7 (peak vs reserve at max), 8 (chunk 256), 9 (b2b), 10 (s13), 11 (server gate): NOT RUN.
+                 - Step 7 (L32500, chunk 512): exit 0, measured peak over a0 8.60 GiB <= reserve 9.49 (planner 9.39); decode 146.9 ms.
+                 - Step 8 (chunk 256, L32500, max_seq_len 32903): exit 0, no OOM, peak 5.64 GiB <= reserve 6.29 (chunk-256 plan: pin budget 8.13 GiB); TTFT 147.1 s, decode 147.3 ms.
+                 - Step 9 (b2b 16384,30720): exit 0; L30720 START `masks retained ... 0.00 GiB`, admission headroom 9.49 GiB (reserve 9.49); peaks 4.45 / 8.19 GiB; decode 111.2 / 143.0 ms.
+                 - s13: G vs TF 51/51; TF vs B (stock, full-length cache) bit-identical 64/64. Server gate gpt-oss: 9 passed.
+                 - Process peak: abs_peak_gib 11.96 at the first (30.7k) prefill in the br1 arm vs 8.23 (16k) / 6.16 (8k) later, so the longest first prefill sets the process peak, not the load.
+               - [ ] **Lead (found by 3c T5): gpt-oss's FIRST session in a process is not run-to-run deterministic.**
+                 Greedy ids are equal, but logits differ between two runs of the SAME tree (main1 vs main2, br1 vs br2) by max|d| 0.48-1.28
+                 on the 2k warm session. Later sessions in the same process are bit-identical across runs, so a server's first request can
+                 differ run-to-run. Cause unmeasured (suspects: first-touch kernel autotune or a cold-arena path). Re-open when determinism
+                 of the first request matters.
 
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM). **AMENDED 2026-09-30 by T2b: only where it would stream** (user rule; applied to every model E cost Qwen3-Next decode +1.14 %, so it now fires only where the VRAM pin budget cannot hold the embedding).
