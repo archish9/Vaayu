@@ -675,7 +675,17 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
             Brainstorm in progress (architectural path: spec → plan).
         - [~] **3a — E + P build** (spec, plan, TDD, ABBA vs base, gates). **Design approved section by section
               2026-09-30.** Spec `docs/superpowers/specs/2026-09-30-S14-cpu-embed-nonexpert-tier-design.md`
-              (gitignored) — **APPROVED by the user 2026-09-30**; plan next (writing-plans).
+              (gitignored) — **APPROVED by the user 2026-09-30**. Plan
+              `docs/superpowers/plans/2026-09-30-S14-cpu-embed-nonexpert-tier.md` — 8 tasks, branch
+              `s14-cpu-embed-ne-tier`:
+              - [x] **T1** CPU-embedding unit — 13 tests pass
+              - [ ] **T2** wire E into `_init_pinned_layers`
+              - [ ] **T3** non-expert tier unit
+              - [ ] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract)
+              - [ ] **T5** docs + suite
+              - [ ] **T6** gpt-oss ABBA vs a `main` worktree + `s13_vaayu.py` 64/64 + server gate
+              - [ ] **T7** cross-model gates + Qwen3-Next no-regression ABBA
+              - [ ] **T8** ledger, CLAUDE.md, double-buffer lead row
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM).
               - **P budget = ONLY the arena's row-40 surplus** (0 where the arena binds; DeepSeek unchanged).
