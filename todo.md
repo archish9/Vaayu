@@ -673,7 +673,10 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
             measure TTFT at a smaller / context-adaptive eager prefill chunk before deciding VRAM residency of
             `lm_head` + attention (H/O). Not picked: E + P + `lm_head` in VRAM via a context knob; E only.
             Brainstorm in progress (architectural path: spec → plan).
-        - [x] **3a — E + P build — CLOSED 2026-09-30, A WIN.** (spec, plan, TDD, ABBA vs base, gates). **Design approved section by section
+        - [x] **3a — E + P build — CLOSED 2026-09-30, A WIN. MERGED to `main` 2026-09-30 (`0327866`) after the final
+              whole-branch review (Opus: with fixes → I-1 Gemma buffer-scaled embedding, I-2 gpt-oss prefix-pool cost
+              recorded + accepted, M-1..M-7; all fixed, re-review clean). Merged suite `3215 passed, 0 failed, 20
+              skipped` (221.73 s, FOREGROUND) = new floor.** (spec, plan, TDD, ABBA vs base, gates). **Design approved section by section
               2026-09-30.** Spec `docs/superpowers/specs/2026-09-30-S14-cpu-embed-nonexpert-tier-design.md`
               (gitignored) — **APPROVED by the user 2026-09-30**. Plan
               `docs/superpowers/plans/2026-09-30-S14-cpu-embed-nonexpert-tier.md` — 8 tasks, branch
