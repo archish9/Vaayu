@@ -19,9 +19,13 @@ import torch
 
 # (q, k) samples: three make the three-term model exactly solvable. The first is
 # also run once beforehand and discarded, so one-time allocations (cuBLAS
-# workspace) never land in a sample. Small enough that the measurement's own
-# transient stays ~100 MB on every on-device geometry; large enough that the
-# allocator's 512-byte rounding is noise.
+# workspace) never land in a sample. Large enough that the allocator's 512-byte
+# rounding is noise. NOT free: every transient_bytes call lifts allocations to
+# the previous high-water mark, so consecutive calls stack -- the process peak
+# rises by the SUM of every sample's transient (warm-up + 3; about 0.5 GiB on
+# gpt-oss-20b, measured 2026-10-01: +488 MiB), and the load needs the old
+# high-water mark plus that sum of real VRAM. That is the price of measuring
+# without resetting the peak counter.
 _SHAPES = ((128, 1024), (128, 2048), (256, 2048))
 
 # Kernel-behaviour bounds, not model numbers. 64 B per score element is sixteen
@@ -41,7 +45,11 @@ def transient_bytes(run, device) -> int:
     engine calls with it). The counter only moves on a NEW high-water mark, so
     first lift the allocated level to the current mark with an uninitialised
     ballast tensor; whatever `run` allocates then lands above it. An OOM on
-    the ballast propagates, and the caller falls back."""
+    the ballast propagates, and the caller falls back.
+
+    Each call sets a NEW process high-water mark, so consecutive calls stack
+    (see _SHAPES). Precondition: no other allocation or free may happen on the
+    device during `run()` -- this reads process-global counters."""
     torch.cuda.synchronize(device)
     gap = torch.cuda.max_memory_allocated(device) - torch.cuda.memory_allocated(device)
     ballast = torch.empty(gap, dtype=torch.uint8, device=device) if gap > 0 else None
@@ -108,7 +116,9 @@ def measure_eager_attention_cost(attn_modules, *, rope_fn, make_cache, mask_fn,
     for template in attn_modules:
         with torch.device("meta"):
             attn = type(template)(template.config, template.layer_idx)
-        attn = attn.to_empty(device=device).to(dtype).eval()
+        # Cast on meta, then materialise: no fp32 copy ever exists on the GPU
+        # (it would raise the high-water mark the ballast re-occupies).
+        attn = attn.to(dtype).to_empty(device=device).eval()
         for t in list(attn.parameters()) + list(attn.buffers()):
             if t.is_floating_point():
                 t.normal_(0.0, 0.02)
