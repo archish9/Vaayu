@@ -187,11 +187,12 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
    load prints a WARNING naming the GB per token that still stream.
 4. **The non-expert LRU** (512 MB) and then **disk**, as before.
 
-On gpt-oss-20b (eager attention leaves 0.66–0.77 GiB of pin budget) tiers 2 and 3 took the
-decode token from 482 to 177 ms in the S14 spike, bit-identical. Load lines to look for:
+On gpt-oss-20b (eager attention leaves 0.66–0.77 GiB of pin budget) tiers 2 and 3 take a
+decode token from 485 to 174 ms (2.79x, mean of two off and two on runs), with bit-identical
+output. Load lines to look for:
 
     [Vaayu-Pin] embedding CPU-resident: 1.16 GB host RAM, 0 VRAM
-    [Vaayu-Cache] Non-expert RAM tier: 12 of 12 entries, 1.75 GB (charged 2.69 GB) of 7.14 GB surplus
+    [Vaayu-Cache] Non-expert RAM tier: 12 of 12 entries, 1.74 GB (charged 2.89 GB) of 7.07 GB surplus
 
 ## 5. Speculative Decoding
 
