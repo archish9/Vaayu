@@ -1198,6 +1198,29 @@ def build_sdpa_causal_mask(attn_impl: str, max_q_len: int, kv_total: int,
     return (k_pos <= q_pos)[None, None]               # True == attend
 
 
+def build_eager_causal_mask(q_len: int, kv_total: int, dtype, device):
+    """Additive causal mask for EAGER attention: the [1, 1, q_len, kv_total]
+    block the layers read -- never the (kv_total x kv_total) square.
+
+    Eager adds the mask to the scores (`attn_weights + attention_mask`), so it
+    is additive: `finfo(dtype).min` where a key is AFTER its query, 0.0
+    elsewhere. Row r is query position `kv_total - q_len + r`, the same
+    bottom-right convention as build_sdpa_causal_mask. `triu(diagonal=
+    kv_total - q_len + 1)` keeps (r, c) iff c >= (kv_total - q_len + r) + 1:
+    the same test the square's `triu(diagonal=1)` applied to the same row, on
+    the same values -- so the logits are bit-identical (S14 3b, gpt-oss-20b,
+    4 lengths, prefill-last + 11 decode steps: max|d| 0).
+
+    Why (S14 3b, gpt-oss-20b, chunk 512, measured): the square was rebuilt
+    every forward, decode included, and _windowed_mask cached a second one
+    across requests. 32.5k prefill peak 12.48 GiB square vs 8.69 block; decode
+    at 32k 332.9 vs 271.1 ms/token; up to 3.52 GiB still allocated between
+    requests, which refused the next long request at admission.
+    Model-agnostic: no geometry enters."""
+    return torch.full((q_len, kv_total), torch.finfo(dtype).min, dtype=dtype,
+                      device=device).triu(diagonal=kv_total - q_len + 1)[None, None]
+
+
 def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     """Size of the precomputed RoPE cos/sin cache: must cover every position
     that will be sliced during this forward pass (existing past + ALL new
@@ -5026,13 +5049,17 @@ class VaayuBaseModel(GenerationMixin):
         between requests at identical shape and dtype, and a shape-only key would
         hand request B the overlay built on request A's padding.
         """
-        size = mask.shape[-1]
-        key = (window, size, mask.dtype, str(mask.device))
+        q_len, size = mask.shape[-2], mask.shape[-1]
+        key = (window, q_len, size, mask.dtype, str(mask.device))
         cached = getattr(self, "_windowed_mask_cache", None)
         if cached is not None and cached[0] == key and cached[2] is mask:
             return cached[1]
-        idx = torch.arange(size, device=mask.device)
-        too_old = (idx[None, :] <= (idx[:, None] - window))[None, None]
+        # Rectangular (S14 3c): both mask builders hand over only the bottom
+        # q_len rows, so row r is query position size - q_len + r. A square
+        # (q_len == size) is today's arange on both axes, unchanged.
+        k_idx = torch.arange(size, device=mask.device)
+        q_idx = torch.arange(size - q_len, size, device=mask.device)
+        too_old = (k_idx[None, :] <= (q_idx[:, None] - window))[None, None]
         blocked = (False if mask.dtype == torch.bool
                    else torch.finfo(mask.dtype).min)
         out = mask.masked_fill(too_old, blocked)
@@ -5318,10 +5345,10 @@ class VaayuBaseModel(GenerationMixin):
             # layer-0 attention 26 % off stock, and the model's top-5 came back
             # reordered. dtype is the run dtype, matching the scores it is added
             # to, and the size is past+new (never max_seq_len) as before.
-            attention_mask = torch.full(
-                (_mask_size, _mask_size), torch.finfo(self.running_dtype).min,
-                dtype=self.running_dtype, device=self.running_device)
-            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...]
+            # Only the [_seq_total, _mask_size] block the layers read, never the
+            # square (S14 3c; see build_eager_causal_mask for the measured cost).
+            attention_mask = build_eager_causal_mask(
+                _seq_total, _mask_size, self.running_dtype, self.running_device)
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.
