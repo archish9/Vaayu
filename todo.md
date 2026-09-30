@@ -680,6 +680,11 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               `s14-cpu-embed-ne-tier`:
               - [x] **T1** CPU-embedding unit — 13 tests pass
               - [x] **T2** wire E into `_init_pinned_layers` — 42 pass (6 new wiring + tied-head + T1)
+              - [x] **T2b — E narrowed to "only where it would stream" (USER rule 2026-09-30).** Applied to every model,
+                    E cost Qwen3-Next decode +1.8 % (4 arms) then +1.14 % (8 alternating arms: off 69.40 / on 70.20 ms;
+                    E's own step +0.02 ms, so the cost is the residency shift). E now fires only where phase 1 would
+                    leave the embedding unpinned (budget <= 0, or embedding > budget) on a CUDA load; everywhere else
+                    the embedding is VRAM-pinned exactly as on main. Suite 3213 passed, 20 skipped.
               - [x] **T3** non-expert tier unit — 19 tests pass
               - [x] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract) — 11 wiring tests + 59 neighbours = 70 pass; ruling: `_fill_non_expert_tier` skips a 0-byte candidate (never offered, no spurious WARNING)
               - [x] **T5** docs + suite — 3212 passed, 20 skipped (49 new tests)

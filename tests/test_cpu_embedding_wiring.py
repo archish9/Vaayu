@@ -1,16 +1,19 @@
 """S14 E wired into `_init_pinned_layers`, tested on a bare object (no model load).
 
-On a CUDA load the embedding becomes CPU-resident BEFORE the VRAM budget check (a zero
-budget must not block it) and phase 1 skips it; an ineligible embedding and a CPU run
-keep today's path. The fake strategy records what would have gone to VRAM.
+E fires exactly where phase 1 would leave the embedding unpinned -- a pinning budget
+<= 0, or an embedding larger than the budget -- and only on a CUDA load. Narrowed by
+the user 2026-09-30 (Qwen3-Next decode +1.14 % when applied everywhere): an embedding
+the budget CAN hold stays VRAM-pinned exactly as on main. The fake strategy records
+what would have gone to VRAM.
 """
-import pytest
 import torch
 
 from vaayu.cpu_embedding import CpuResidentEmbedding
 from vaayu.vaayu_base import VaayuBaseModel
 
 EMBED, HEAD, NORM = "model.embed_tokens", "lm_head", "model.norm"
+ROWS = 16      # embedding [16, 4] fp32 = 256 B; head [8, 4] fp32 = 128 B; norm [4] fp32 = 16 B
+TIGHT = 200    # holds norm + head (144 B) but not the embedding (256 B)
 
 
 class _Strategy:
@@ -32,7 +35,7 @@ class _Strategy:
 
 
 class _Model:
-    def __init__(self, strategy, device="cuda:0", budget=1 << 30, weight_dtype=torch.float32):
+    def __init__(self, strategy, device="cuda:0", budget=1 << 30):
         self.layer_names_dict = {"embed": EMBED, "lm_head": HEAD, "norm": NORM,
                                  "layer_prefix": "model.layers"}
         self.loader_strategy = strategy
@@ -46,18 +49,18 @@ class _Model:
         self.is_moe = False
         self.max_pinned_layers = 0              # shared layers only: skips phase 2
         with torch.device("meta"):
-            self.layers = [torch.nn.Embedding(8, 4)]
+            self.layers = [torch.nn.Embedding(ROWS, 4)]
         self._budget = budget
 
     def _get_vram_pinning_budget(self):
         return self._budget
 
-    def _install_cpu_resident_embedding(self):
-        return VaayuBaseModel._install_cpu_resident_embedding(self)
+    def _install_cpu_resident_embedding(self, tensors=None):
+        return VaayuBaseModel._install_cpu_resident_embedding(self, tensors)
 
 
 def _src(dtype=torch.float32):
-    return torch.arange(32, dtype=torch.float32).reshape(8, 4).to(dtype)
+    return torch.arange(ROWS * 4, dtype=torch.float32).reshape(ROWS, 4).to(dtype)
 
 
 def _strategy(src, **kw):
@@ -66,9 +69,9 @@ def _strategy(src, **kw):
                       NORM: {f"{NORM}.weight": torch.ones(4)}}, **kw)
 
 
-def test_cuda_load_makes_the_embedding_cpu_resident():
+def test_an_embedding_over_the_vram_budget_becomes_cpu_resident():
     src = _src()
-    m = _Model(_strategy(src))
+    m = _Model(_strategy(src), budget=TIGHT)
     VaayuBaseModel._init_pinned_layers(m)
     assert isinstance(m.layers[0], CpuResidentEmbedding)
     w = m.layers[0].inner.weight
@@ -79,10 +82,20 @@ def test_cuda_load_makes_the_embedding_cpu_resident():
     assert HEAD in m.loader_strategy.injected and NORM in m.loader_strategy.injected
 
 
+def test_an_embedding_that_fits_the_vram_budget_stays_vram_pinned(capsys):
+    """The narrowing: Qwen3-Next / MiniMax / DeepSeek / Llama keep main's behaviour."""
+    m = _Model(_strategy(_src()))                           # 1 GiB holds all three
+    original = m.layers[0]
+    VaayuBaseModel._init_pinned_layers(m)
+    assert m.layers[0] is original
+    assert EMBED in m.loader_strategy.injected and EMBED in m.pinned_layer_names
+    assert "CPU-resident" not in capsys.readouterr().out
+
+
 def test_the_cpu_copy_is_private():
     """The loader returns views into a rotating pinned buffer the next load overwrites."""
     src = _src()
-    m = _Model(_strategy(src))
+    m = _Model(_strategy(src), budget=TIGHT)
     VaayuBaseModel._init_pinned_layers(m)
     src.fill_(-1.0)
     assert torch.equal(m.layers[0].inner.weight, _src().to(torch.bfloat16))
@@ -92,36 +105,37 @@ def test_a_zero_vram_budget_still_makes_it_cpu_resident():
     m = _Model(_strategy(_src()), budget=0)
     VaayuBaseModel._init_pinned_layers(m)
     assert isinstance(m.layers[0], CpuResidentEmbedding)
+    assert EMBED in m.pinned_layer_names
     assert m.loader_strategy.injected == {}
 
 
-def test_ineligible_embedding_takes_the_vram_path(capsys):
-    m = _Model(_strategy(torch.zeros(8, 4, dtype=torch.int8)))
+def test_an_ineligible_embedding_over_budget_keeps_streaming(capsys):
+    m = _Model(_strategy(torch.zeros(ROWS, 4, dtype=torch.int8)), budget=32)  # 64 B > 32 B
     original = m.layers[0]
     VaayuBaseModel._init_pinned_layers(m)
     assert m.layers[0] is original
-    assert EMBED in m.loader_strategy.injected               # today's VRAM pin
+    assert EMBED not in m.pinned_layer_names and EMBED not in m.loader_strategy.injected
     out = capsys.readouterr().out
     assert "not CPU-resident" in out and "int8" in out
 
 
-def test_a_cpu_run_leaves_the_embedding_alone():
-    m = _Model(_strategy(_src()), device="cpu")
+def test_a_cpu_run_leaves_an_over_budget_embedding_streaming():
+    m = _Model(_strategy(_src()), device="cpu", budget=TIGHT)
     original = m.layers[0]
     VaayuBaseModel._init_pinned_layers(m)
     assert m.layers[0] is original
-    assert EMBED in m.loader_strategy.injected
+    assert EMBED not in m.pinned_layer_names and EMBED not in m.loader_strategy.injected
 
 
-def test_tied_head_still_gets_its_own_copy():
-    """Llama-3.2-1B: the head's shard is ABSENT; the tied fallback must still hand the
-    embedding's bytes to lm_head's VRAM pin after the embedding went to the CPU."""
+def test_tied_head_with_an_over_budget_embedding(capsys):
+    """Llama-3.2-1B shape: the head's shard is ABSENT and resolves to the embedding's
+    bytes through the tied fallback. E must not break that fallback: the head is
+    still loaded (then skipped by the budget, exactly as on main)."""
     src = _src()
     strat = _Strategy({EMBED: {f"{EMBED}.weight": src},
                        NORM: {f"{NORM}.weight": torch.ones(4)}}, absent=(HEAD,))
-    m = _Model(strat)
+    m = _Model(strat, budget=TIGHT)
     VaayuBaseModel._init_pinned_layers(m)
     assert isinstance(m.layers[0], CpuResidentEmbedding)
-    assert HEAD in m.pinned_layer_names
-    assert list(strat.injected[HEAD]) == [f"{HEAD}.weight"]
-    assert torch.equal(strat.injected[HEAD][f"{HEAD}.weight"], src)
+    assert HEAD not in m.pinned_layer_names                 # 16 + 256 B > 200 B
+    assert f"skip {HEAD}: budget exhausted" in capsys.readouterr().out

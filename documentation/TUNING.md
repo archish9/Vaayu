@@ -413,15 +413,17 @@ eligibility conditions.
 
 ## Embedding and non-expert residency (no knob)
 
-Nothing to set. On a CUDA load the embedding table lives in host RAM and only the rows a
-forward needs are uploaded; on a MoE model, non-expert weights the VRAM budget cannot hold
+Nothing to set. On a CUDA load the embedding table moves to host RAM, and only the rows a
+forward needs are uploaded, only when the VRAM pinning budget cannot hold it; on a MoE model, non-expert weights the VRAM budget cannot hold
 are kept in pinned host RAM that the expert cache cannot use anyway. Both are bit-identical
 to the old path.
 
 What the load log tells you:
 
-- `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM` — normal. `embedding not
-  CPU-resident (...)` names why an unusual embedding stayed on the VRAM path.
+- `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM (the pinning budget cannot
+  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. under eager
+  attention's reserve) and is held in host RAM instead of streaming — normal. `embedding
+  not CPU-resident (...)` names why an unusual embedding keeps streaming.
 - `[Vaayu-Cache] Non-expert RAM tier: K of N entries ...` — K entries no longer stream.
 - `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — the expert
   arena needs all the RAM (typical for very large MoE checkpoints). Those weights are read

@@ -4173,33 +4173,40 @@ class VaayuBaseModel(GenerationMixin):
             f"the fp8 cache silently."
         )
 
-    def _install_cpu_resident_embedding(self) -> None:
-        """S14 E: hold the embedding table on the CPU on every CUDA load.
+    def _install_cpu_resident_embedding(self, tensors=None) -> bool:
+        """S14 E: hold the embedding table on the CPU where it would otherwise STREAM.
 
-        A forward reads one row per token, so a VRAM copy spends pin budget for
-        nothing and a streamed one re-reads the whole table every decode token
-        (gpt-oss-20b: 163 of 482 ms, S14 steps 1-2). The HF module keeps running
-        its OWN forward on a private CPU copy -- a scaled subclass still scales --
-        and `self.layers[0]` becomes a wrapper returning its output on the
-        running device. Refused (today's VRAM-pin / stream path, one line naming
-        why) when the module or its weight does not qualify.
+        `_init_pinned_layers` calls this exactly where phase 1 would leave the
+        embedding unpinned -- a pinning budget <= 0, or an embedding larger than
+        the budget -- on a CUDA load. A streamed embedding is re-read and
+        re-uploaded whole every decode token to serve one row (gpt-oss-20b:
+        163 of 482 ms, S14 steps 1-2). Narrowed 2026-09-30 by the user's rule:
+        applied to every model, it cost Qwen3-Next decode +1.14 % (8 ABBA arms)
+        although its own step is +0.02 ms, so an embedding the budget CAN hold
+        stays VRAM-pinned exactly as before.
+
+        The HF module keeps running its OWN forward on a private CPU copy -- a
+        scaled subclass still scales -- and `self.layers[0]` becomes a wrapper
+        returning its output on the running device. `tensors` are phase 1's
+        already-loaded ones (loaded here when None). Returns True when
+        installed; on refusal prints why and the embedding keeps streaming.
         """
         from .cpu_embedding import CpuResidentEmbedding, cpu_embedding_eligibility
         name = self.layer_names_dict["embed"]
         module = self.layers[0]
-        try:
-            tensors = load_from_strategy_or_tied_head(
-                self.loader_strategy, self.checkpoint_path, self.layer_names_dict,
-                name, log_prefix="[Vaayu-Pin] ")
-        except Exception as e:
-            print(f"[Vaayu-Pin] embedding not CPU-resident (load failed: {e!r}); "
-                  f"it takes the VRAM-pin / stream path")
-            return
+        if tensors is None:
+            try:
+                tensors = load_from_strategy_or_tied_head(
+                    self.loader_strategy, self.checkpoint_path, self.layer_names_dict,
+                    name, log_prefix="[Vaayu-Pin] ")
+            except Exception as e:
+                print(f"[Vaayu-Pin] embedding not CPU-resident (load failed: {e!r}); "
+                      f"it streams every token")
+                return False
         ok, why = cpu_embedding_eligibility(module, tensors)
         if not ok:
-            print(f"[Vaayu-Pin] embedding not CPU-resident ({why}); it takes the "
-                  f"VRAM-pin / stream path")
-            return
+            print(f"[Vaayu-Pin] embedding not CPU-resident ({why}); it streams every token")
+            return False
         (src,) = tensors.values()
         # A private copy: the loader hands back views into a rotating pinned
         # buffer that the next load overwrites. running_dtype is exactly what
@@ -4210,24 +4217,24 @@ class VaayuBaseModel(GenerationMixin):
         self.layers[0] = CpuResidentEmbedding(module, self.running_device)
         self.pinned_layer_names.add(name)
         print(f"[Vaayu-Pin] embedding CPU-resident: {weight.nbytes / 1e9:.2f} GB host "
-              f"RAM, 0 VRAM")
+              f"RAM, 0 VRAM (the pinning budget cannot hold it)")
+        return True
 
     def _init_pinned_layers(self) -> None:
         """
         Pre-load layers into VRAM using two-phase asymmetric pinning.
 
         Phase 1 pins shared layers (embed, norm, lm_head) with continue on budget miss.
-        On a CUDA load the embedding is made CPU-resident first (S14 E) and phase 1 skips it.
+        On a CUDA load, an embedding phase 1 cannot pin is made CPU-resident instead of streaming (S14 E).
         Phase 2 pins transformer layers 0…N with break on budget miss; only runs when
         max_pinned_layers != 0 (0 = shared-only, -1 = fill budget, N = first N layers).
         """
-        # S14 E: before the budget check -- the CPU-resident embedding costs no
-        # VRAM, so a zero pinning budget must not leave it on the stream path.
-        if str(self.running_device).startswith("cuda"):
-            self._install_cpu_resident_embedding()
-
         budget = self._get_vram_pinning_budget()
         if budget <= 0:
+            # S14 E: nothing can be VRAM-pinned, so the embedding would stream
+            # every token; hold it on the CPU instead (it costs no VRAM).
+            if str(self.running_device).startswith("cuda"):
+                self._install_cpu_resident_embedding()
             return
 
         layer_prefix = self.layer_names_dict["layer_prefix"]
@@ -4237,8 +4244,6 @@ class VaayuBaseModel(GenerationMixin):
         for layer_name in [self.layer_names_dict["embed"],
                            self.layer_names_dict["norm"],
                            self.layer_names_dict["lm_head"]]:
-            if layer_name in self.pinned_layer_names:
-                continue        # S14 E: already resident (the CPU embedding)
             try:
                 # A tied-weight checkpoint has no lm_head tensor: its shard is
                 # EMPTY (bug D1) or, on a fresh split, ABSENT (S10c). Pinning an
@@ -4256,6 +4261,12 @@ class VaayuBaseModel(GenerationMixin):
                     continue
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
+                    # S14 E: an embedding the budget cannot hold would stream
+                    # every token; hold it on the CPU instead.
+                    if (layer_name == self.layer_names_dict["embed"]
+                            and str(self.running_device).startswith("cuda")
+                            and self._install_cpu_resident_embedding(tensors)):
+                        continue
                     print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
                           f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
                     continue
