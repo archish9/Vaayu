@@ -680,7 +680,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               `s14-cpu-embed-ne-tier`:
               - [x] **T1** CPU-embedding unit — 13 tests pass
               - [x] **T2** wire E into `_init_pinned_layers` — 42 pass (6 new wiring + tied-head + T1)
-              - [ ] **T3** non-expert tier unit
+              - [x] **T3** non-expert tier unit — 19 tests pass
               - [ ] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract)
               - [ ] **T5** docs + suite
               - [ ] **T6** gpt-oss ABBA vs a `main` worktree + `s13_vaayu.py` 64/64 + server gate
