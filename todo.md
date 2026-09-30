@@ -679,7 +679,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               `docs/superpowers/plans/2026-09-30-S14-cpu-embed-nonexpert-tier.md` — 8 tasks, branch
               `s14-cpu-embed-ne-tier`:
               - [x] **T1** CPU-embedding unit — 13 tests pass
-              - [ ] **T2** wire E into `_init_pinned_layers`
+              - [x] **T2** wire E into `_init_pinned_layers` — 42 pass (6 new wiring + tied-head + T1)
               - [ ] **T3** non-expert tier unit
               - [ ] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract)
               - [ ] **T5** docs + suite
