@@ -413,10 +413,10 @@ eligibility conditions.
 
 ## Embedding and non-expert residency (no knob)
 
-Nothing to set. On a CUDA load the embedding table moves to host RAM, and only the rows a
-forward needs are uploaded, only when the VRAM pinning budget cannot hold it; on a MoE model, non-expert weights the VRAM budget cannot hold
-are kept in pinned host RAM that the expert cache cannot use anyway. Both are bit-identical
-to the old path.
+Nothing to set. On a CUDA load the embedding table moves to host RAM only when the VRAM
+pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
+model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
+expert cache cannot use anyway. Both are bit-identical to the old path.
 
 What the load log tells you:
 

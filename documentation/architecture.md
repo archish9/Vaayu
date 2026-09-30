@@ -175,13 +175,13 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
 
 1. **VRAM-pinned** — the planner's phase 1 (norm, `lm_head`) and phase 2 (transformer
    layers, or their non-expert tensors on a MoE model), within the pinning budget.
-2. **CPU-resident embedding** — when the VRAM pinning budget cannot hold the embedding
-   (it would otherwise be re-read and re-uploaded whole every token), the table is held in
-   host RAM and never takes VRAM: a forward reads one row per token, so only those rows
+2. **CPU-resident embedding** — only when the VRAM pinning budget cannot hold the embedding
+   (it would otherwise be re-read and re-uploaded whole every token) the table is held in
+   host RAM and takes no VRAM: a forward reads one row per token, so only those rows
    cross PCIe (≈ 0.01–0.04 ms per decode token, ≈ 4.5 ms for an 8k-token prefill). When the
-   budget holds the embedding, it is VRAM-pinned as before. The model's own
-   embedding module runs on the CPU copy, so scaled embeddings keep their scale. An
-   embedding that is not a plain floating-point `nn.Embedding` keeps the VRAM-pin path.
+   budget holds it, the embedding is VRAM-pinned as before. The model's own embedding
+   module runs on the CPU copy, so scaled embeddings keep their scale. An embedding that is
+   not a plain floating-point `nn.Embedding` keeps the VRAM-pin path.
 3. **Non-expert RAM tier (MoE)** — whatever still streams (`lm_head`, streamed layers'
    attention weights) is copied once, at load, into pinned host memory, entry by entry, as
    long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
