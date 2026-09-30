@@ -859,6 +859,20 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                 Llama-1B gates + an eager-load id check.
               - **Stop rules:** not bit-identical; peak > reserve; any plan change on flash/sdpa or on
                 DeepSeek; decode < 2 % or TTFT > 5 % worse.
+               - [!] **T5 — gpt-oss on device, 2026-10-01. BLOCKED at step 4 stop rule (`DIFFERS` on the 2k WARM session only); steps 7-11 NOT run.**
+                 - Arms (ABBA, all exit=0, LENS 30720,16384,8192): c-main1, c-br1, c-br2, c-main2. No `VramPlanError` on main.
+                 - Bit-identity: 8k, 16k, 30.7k = BIT-IDENTICAL on all 9 (br1, br2, main2 vs main1). The 2k warm session DIFFERS
+                   on all 3 (ids equal, prefill_last + decode logits differ, max |d| 0.48..1.28). It is NOT the branch: main1 vs main2
+                   (same tree) also differs (0.48), as does br1 vs br2 (1.22). The warm session is the first in the process, so it is
+                   run-to-run nondeterministic on both trees. Needs a user call: waive the warm session, or find why it is nondeterministic.
+                 - Decode (mean of 2 arms, main -> branch): 8k 198.5 -> 93.0 ms (-53.2 %, x2.14); 16k 232.3 -> 111.0 (-52.2 %, x2.09);
+                   30.7k 314.2 -> 143.1 (-54.5 %, x2.20).
+                 - TTFT: 8k 23.51 -> 15.79 s (-32.8 %); 16k 67.58 -> 40.82 (-39.6 %); 30.7k 164.74 -> 108.43 (-34.2 %).
+                 - Branch load lines: `attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)`;
+                   `max_seq_len=33155 (... 9.49 GiB reserve floor ...); reserve=9.49 GiB of which KV 3.00 GiB; pinning budget=4.92 GiB; ... expert cache ceiling=5.36 GiB`;
+                   `3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer, 3.60 GB reserved`; no `embedding CPU-resident` line.
+                 - Branch peaks (br1 JSON, abs_peak_gib / used_peak over a0): 30.7k 11.96 / 8.19 GiB; 16k 8.23 / 4.46; 8k 6.16 / 2.38 (the first, longest
+                   prefill sets the process peak). Steps 7 (peak vs reserve at max), 8 (chunk 256), 9 (b2b), 10 (s13), 11 (server gate): NOT RUN.
 
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM). **AMENDED 2026-09-30 by T2b: only where it would stream** (user rule; applied to every model E cost Qwen3-Next decode +1.14 %, so it now fires only where the VRAM pin budget cannot hold the embedding).
