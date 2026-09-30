@@ -2576,7 +2576,9 @@ class VaayuBaseModel(GenerationMixin):
             # transient is released (the hook empties the cache) and never
             # enters the budget.
             _score_per_elem, _score_per_key, _score_source = self.attention_score_cost()
-            print(f"[Vaayu-VRAM] attention cost: {_score_per_elem:.2f} B/score-element + "
+            _cost_warn = ("WARNING: " if _score_source.startswith(
+                "kernel table: measurement failed") else "")
+            print(f"[Vaayu-VRAM] {_cost_warn}attention cost: {_score_per_elem:.2f} B/score-element + "
                   f"{_score_per_key / 1024:.1f} KiB/key ({_score_source}; kernel table "
                   f"{score_elem_bytes(self._active_attn_impl):.2f})")
             _free_vram, _ = torch.cuda.mem_get_info()
@@ -5073,7 +5075,9 @@ class VaayuBaseModel(GenerationMixin):
             return per_elem, per_key, f"measured on {measured_on}"
         except Exception as e:
             # D3: the measurement must never fail the load.
-            return table, 0.0, f"kernel table: measurement failed ({type(e).__name__}: {e})"
+            # One line: CUDA OOM / solver errors are multi-line.
+            _reason = (str(e).splitlines() or [""])[0][:200]
+            return table, 0.0, f"kernel table: measurement failed ({type(e).__name__}: {_reason})"
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

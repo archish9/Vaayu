@@ -186,9 +186,11 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
 3. **Non-expert RAM tier (MoE)** — whatever still streams (`lm_head`, streamed layers'
    attention weights) is copied once, at load, into pinned host memory, entry by entry, as
    long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
-   model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool: on
-   gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4
-   full-length sessions; the guaranteed number of sessions still fits). Where the arena needs all the RAM the tier is empty and the
+   model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool, but only
+   while non-expert weights still stream: on gpt-oss-20b before S14 3c the tier held
+   2.95 GB and the pool was 8.06 GB. Since 3c gpt-oss streams nothing (`lm_head` and all
+   attention layers sit in VRAM), the tier is empty and the pool keeps its full
+   12.81 GB (measured). Where the arena needs all the RAM the tier is empty and the
    load prints a WARNING naming the GB per token that still stream.
 4. **The non-expert LRU** (512 MB) and then **disk**, as before.
 

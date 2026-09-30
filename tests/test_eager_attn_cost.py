@@ -163,6 +163,15 @@ def test_a_failed_measurement_falls_back_to_the_table_with_the_reason(monkeypatc
     assert "measurement failed" in source and "boom" in source
 
 
+def test_a_failed_measurement_reason_is_one_short_line(monkeypatch):
+    def fail(*a, **kw):
+        raise RuntimeError("line one\nline two " + "x" * 500)
+    monkeypatch.setattr(eac, "measure_eager_attention_cost", fail)
+    _, _, source = _Stub("eager").attention_score_cost()
+    assert "line one" in source and "line two" not in source
+    assert "\n" not in source and len(source) < 300
+
+
 class _Unrebuildable(torch.nn.Module):
     """An attention class that cannot be rebuilt from (config, layer_idx)."""
     def __init__(self, *args, ok=False):

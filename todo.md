@@ -668,11 +668,11 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
             a smaller or context-adaptive eager chunk.
             **§8 (spike):** (1) no knob, no code; (2) n/a; (3) measured on the served path at N=1; (4) nothing
             banked.
-      - [~] **Step 3 — brainstorm → the USER picks → build. USER PICKED 2026-09-30: "E + P, then measure a
+      - [x] **Step 3 — brainstorm → the USER picks → build. USER PICKED 2026-09-30: "E + P, then measure a
             smaller eager chunk"** — build the CPU-resident embedding (E) + the pinned-RAM tier (P) now; THEN
             measure TTFT at a smaller / context-adaptive eager prefill chunk before deciding VRAM residency of
             `lm_head` + attention (H/O). Not picked: E + P + `lm_head` in VRAM via a context knob; E only.
-            Brainstorm in progress (architectural path: spec → plan).
+            Closed 2026-10-01: 3a, 3b, 3c all closed (see the S14 row at the top).
         - [x] **3a — E + P build — CLOSED 2026-09-30, A WIN. MERGED to `main` 2026-09-30 (`0327866`) after the final
               whole-branch review (Opus: with fixes → I-1 Gemma buffer-scaled embedding, I-2 gpt-oss prefix-pool cost
               recorded + accepted, M-1..M-7; all fixed, re-review clean). Merged suite `3215 passed, 0 failed, 20
@@ -824,11 +824,12 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                     - [ ] (d) **UPDATE 2026-10-01 (S14 3c T5 step 7): after 3c a 32,500-token request was ADMITTED on a load advertising `max_seq_len` 33,155 with headroom = reserve 9.49 GiB (measured peak 8.60 GiB <= reserve 9.49; planner 9.39), so the 3b-era refusal did not recur at 32.5k. The over-promise was NOT re-tested at the new 33,155 (nothing between 32.5k and 33,155 was run), so this stays open.** `max_seq_len` over-promises by ~200–400 tokens after the first request: the
                           predicted peak is flat at 13.862 GiB for S ≥ 32,768, and after warm-up the headroom is
                           13.77–13.79, so 33,000 / 33,012 are refused on a load advertising 33,206.
+                    - [ ] Follow-up (S14 3c final review): run one gpt-oss request at ~33.1k tokens (the KV-doubled regime the plan charges at its advertised 33,155 -- never run; step 7 was 32.5k with KV cap 32,768); record peak vs reserve. Planner margin over measured peak shrinks with length: 1.09 / 1.03 / 0.90 / 0.79 GiB at 8k / 16k / 30.7k / 32.5k.
                     - [ ] **Lead: gpt-oss's expert VRAM cache is never filled** (`current_usage` 0 in every arm,
                           incl. a 3.5 GB budget at chunk 256). `routed_fused3d.py` never touches
                           `_expert_vram_cache`, so freed VRAM helps only non-expert residency. The remaining gap to
                           stock is routed-expert delivery (1.27 GB/token over PCIe). Unmeasured.
-        - [x] **3c — block-only eager mask + eager planner calibration. CLOSED 2026-10-01, A WIN (branch `s14c-eager-mask-planner`; mask fix `6b7ef90`; RESULTS `docs/2026-09-30-S14-3c-RESULTS.md`, gitignored). DURABLE SUMMARY: gpt-oss decode main -> branch 8k 198.5 -> 93.0 ms (x2.14), 16k 232.3 -> 111.0 (x2.09), 30.7k 314.2 -> 143.1 (x2.20); TTFT -32.8 / -39.6 / -34.2 %; bit-identical 8k/16k/30.7k 9/9 (the 2k warm first-session is waived: main vs main differs too, see the Lead below). Load: `attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)`, reserve 13.86 -> 9.49 GiB, pinning budget 4.92 GiB, max_seq_len 33,155, `3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer`, no CPU-resident embedding. Safety: peak 8.60 vs reserve 9.49 GiB at 32.5k; chunk 256 at 32.5k no OOM (5.64 vs 6.29); 16k -> 30.7k back-to-back admitted with 0.00 GiB masks retained; s13 64/64 + 51/51; gpt-oss server gate 9/9. Cross-model plans identical to 3a: DeepSeek 9/9, Qwen3-Next 8/8, MiniMax 8/8, Llama-1B 9/9 + 3/3 + 1/1; eager Llama-1B ids identical (10.06 B + 8.0 KiB/key). Suite 3353 passed, 20 skipped. The remaining gap to stock is routed-expert delivery. §8: (1) no knob; (2) plumbed at load; (3) reachable at N=1 through the server (the gpt-oss server gate is the proof); (4) nothing banked.** (USER PICKED 2026-09-30 from 3b's options;
+        - [x] **3c — block-only eager mask + eager planner calibration. CLOSED 2026-10-01, A WIN (branch `s14c-eager-mask-planner`; mask fix `6b7ef90`; RESULTS `docs/2026-09-30-S14-3c-RESULTS.md`, gitignored). DURABLE SUMMARY: gpt-oss decode main -> branch 8k 198.5 -> 93.0 ms (x2.14), 16k 232.3 -> 111.0 (x2.09), 30.7k 314.2 -> 143.1 (x2.20); TTFT -32.8 / -39.6 / -34.2 %; bit-identical 8k/16k/30.7k 9/9 (the 2k warm first-session is waived: main vs main differs too, see the Lead below). Load: `attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)`, reserve 13.86 -> 9.49 GiB, pinning budget 4.92 GiB, max_seq_len 33,155, `3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer`, no CPU-resident embedding. Prefix pool: nothing streams on gpt-oss after 3c, so the non-expert RAM tier is empty and the pool keeps its full size (`s14c-br1.log`: `prefix cache ENABLED: 12.81 GB budget (free RAM 16.57 GB - 3.76 GB reserve)`, expert RAM cache budget trimmed 18.38 -> 10.19 GB; 3a-era `s14c-main1.log`: tier `13 of 13 entries, 1.80 GB (charged 2.95 GB)`, pool 8.06 GB, budget trimmed 16.24 -> 10.19 GB). Safety: peak 8.60 vs reserve 9.49 GiB at 32.5k; chunk 256 at 32.5k no OOM (5.64 vs 6.29); 16k -> 30.7k back-to-back admitted with 0.00 GiB masks retained; s13 64/64 + 51/51; gpt-oss server gate 9/9. Cross-model plans identical to 3a: DeepSeek 9/9, Qwen3-Next 8/8, MiniMax 8/8, Llama-1B 9/9 + 3/3 + 1/1; eager Llama-1B ids identical (10.06 B + 8.0 KiB/key). Suite 3353 passed, 20 skipped. The remaining gap to stock is routed-expert delivery. §8: (1) no knob; (2) plumbed at load; (3) reachable at N=1 through the server (the gpt-oss server gate is the proof); (4) nothing banked.** (USER PICKED 2026-09-30 from 3b's options;
               not picked: context knob, mask fix only, chunk 256 + quality band).** Build only the
               `[q, past+q]` block of the eager causal mask, and make `_windowed_mask` rectangular. This is
               bit-identical, fixes the decode tax and both 3b `[bug]`s, and mirrors `build_sdpa_causal_mask`,
@@ -862,7 +863,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                - [x] **T5 — gpt-oss on device, 2026-10-01.**
                  - Arms (ABBA, all exit=0, LENS 30720,16384,8192): c-main1, c-br1, c-br2, c-main2; no `VramPlanError` on main.
                  - Bit-identity: 8k/16k/30.7k 9/9 bit-identical; the 2k warm (first-touch) session is waived by controller ruling
-                   — it differs main-vs-main by the same magnitude (max|d| 0.48 main1-main2, 1.22 br1-br2, up to 1.28 vs main).
+                   — it differs main-vs-main by the same magnitude (max|d| main1-main2: prefill-last 0.48, decode 1.09; branch-vs-branch 1.22; up to 1.28 vs main).
                  - Decode (mean of 2 arms, main -> branch): 8k 198.5 -> 93.0 ms (-53.2 %, x2.14); 16k 232.3 -> 111.0 (-52.2 %, x2.09);
                    30.7k 314.2 -> 143.1 (-54.5 %, x2.20).
                  - TTFT: 8k 23.51 -> 15.79 s (-32.8 %); 16k 67.58 -> 40.82 (-39.6 %); 30.7k 164.74 -> 108.43 (-34.2 %).
@@ -875,7 +876,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                  - s13: G vs TF 51/51; TF vs B (stock, full-length cache) bit-identical 64/64. Server gate gpt-oss: 9 passed.
                  - Process peak: abs_peak_gib 11.96 at the first (30.7k) prefill in the br1 arm vs 8.23 (16k) / 6.16 (8k) later, so the longest first prefill sets the process peak, not the load.
                - [ ] **Lead (found by 3c T5): gpt-oss's FIRST session in a process is not run-to-run deterministic.**
-                 Greedy ids are equal, but logits differ between two runs of the SAME tree (main1 vs main2, br1 vs br2) by max|d| 0.48-1.28
+                 Greedy ids are equal, but logits differ between two runs of the SAME tree (main1 vs main2, br1 vs br2) by max|d| 0.48-1.28 (main1 vs main2: prefill-last 0.48, decode 1.09; br1 vs br2 1.22)
                  on the 2k warm session. Later sessions in the same process are bit-identical across runs, so a server's first request can
                  differ run-to-run. Cause unmeasured (suspects: first-touch kernel autotune or a cold-arena path). Re-open when determinism
                  of the first request matters.
@@ -885,6 +886,8 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                  - MiniMax accumulator: 8 passed (77 s vs 77 s); `10.90 ... + 0.0 KiB/key (kernel table)`; plan 8192 / 4.79 GiB both (pin 7.97 vs 8.03).
                  - Llama-1B: server 9 passed (`0.00 ... + 0.0 KiB/key`, plan 65536 / 3.50 GiB both, pin 11.30 vs 11.35); hidden 3 passed (`10.90`, plan 65953 / 13.63 GiB both, pin 1.16 vs 1.22); prefix 1 passed (no plan line in either log).
                  - Eager Llama-1B, main vs branch: IDS identical (16 ids, `[12366, 13, 578, 469, ...]`). Branch `10.06 B/score-element + 8.0 KiB/key (measured on LlamaAttention; kernel table 10.90)`. Plan main 65953 / 13.63 GiB (pin 1.16) -> branch 65945 / 13.30 GiB (pin 1.45). `main` worktree removed.
+               - [ ] Lead (S14 3c final review): `eager_attn_cost` leaves non-floating params/buffers uninitialised after `to_empty`; a device-side assert from an unknown model's attention could crash the load instead of falling back (theoretical for today's classes; harden by zeroing them or raising if any exist).
+               - [ ] Lead (S14 3c final review): the 3-point solve has no residual check; a constant per-forward term kappa would bias c DOWN by kappa/(H*2^18) (about -0.06 B/elem per MiB at H=64; kappa ~ 0 on the measured models). A 4th sample with a residual bound would close it.
 
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM). **AMENDED 2026-09-30 by T2b: only where it would stream** (user rule; applied to every model E cost Qwen3-Next decode +1.14 %, so it now fires only where the VRAM pin budget cannot hold the embedding).
@@ -938,7 +941,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               **Lead, NOT built:** the loader's pinned double buffers `_PINNED_BUFS` stay allocated for the life
               of every MoE load (gpt-oss 2 × 2 GiB, idle after E + P). Releasing them returns 2–4 GiB of pinned
               RAM to the arena on every MoE model — its own row + measurement.
-        - [~] (duplicate of the 3b row above — status lives there) **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
+        - [x] (duplicate of the 3b row above — status lives there) **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
               H/O.
 - [ ] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** L-e: `expert_disk` rose 0.22 → 0.50
       s/token when S9 removed the CPU fold, bytes and hit/miss identical → exposed stall, hypothesis that the
@@ -1238,7 +1241,7 @@ server user can reach. All four were surfaced by S6's decomposition (2026-09-26)
             `3058 passed, 0 failed, 0 errors, 20 skipped` (+12). **§8:** no knob (load-time internals and a
             warning); nothing new to plumb; reachable at N=1 through the server (the gate is the proof);
             nothing banked. Logs `plans/probes/s8_out/*-fix.log`, `ab-r3.log`.
-      - [ ] **gpt-oss non-expert stream** — embed (1.16 GB/token to read one row), `lm_head` 1.16 GB/token,
+      - [x] **gpt-oss non-expert stream** (closed as S14 (3a + 3c), 2026-10-01 -- see the S14 row at the top) — embed (1.16 GB/token to read one row), `lm_head` 1.16 GB/token,
             12 attention layers 0.64 GB/token, ≈ 0.46 s/token; CPU gather for the embedding, pinned-RAM
             head/attention.
 - [x] **gpt-oss greedy decode diverges from stock transformers at token 50** — **CLOSED 2026-09-30 by S13: NOT A DEFECT, an exact bf16 tie; Vaayu == stock with a full-length `DynamicCache()` bit for bit, see the S13 row at the top.** (found by S8 T6,

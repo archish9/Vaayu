@@ -127,6 +127,7 @@ def probe_stages():
                   for x in fields["seen"].split(";") if x])
     assert "prefill" in stages and "decode" in stages, (
         f"missing PROBE stage line(s) in stdout:\n{proc.stdout}")
+    stages["stdout"] = proc.stdout
     return stages
 
 
@@ -158,3 +159,12 @@ def test_eager_causal_mask_at_decode_is_one_row_not_a_square(probe_stages):
     kv_total = stage["seq_total"]
     assert (kv_total, kv_total) not in stage["seen"], (
         f"decode built the {kv_total}x{kv_total} square again: {stage['seen']}")
+
+
+def test_eager_load_measures_its_attention_cost(probe_stages):
+    """Pins __init__'s wiring (the hook runs and its value reaches the load)
+    against a transformers upgrade that breaks the measurement."""
+    lines = [l for l in probe_stages["stdout"].splitlines()
+             if "[Vaayu-VRAM] attention cost:" in l]
+    assert lines and "measured on LlamaAttention" in lines[0], (
+        f"eager load did not measure its attention cost: {lines}")

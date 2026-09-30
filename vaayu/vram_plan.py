@@ -123,9 +123,12 @@ SCORE_ELEM_BYTES = {
     "sdpa": 10.9,
 }
 
-# Charged for any kernel with no measured coefficient: `eager` materializes
-# scores by construction and BetterTransformer's footprint is unmeasured here,
-# so both take the largest MEASURED cost rather than 0. Over-reserving is the
+# flash/sdpa are kernel constants from the table above. EAGER is measured per
+# load by `attention_score_cost()` (vaayu/eager_attn_cost.py); this value is
+# only its fallback (and DeepSeek-V4's charge). Charged for any kernel with no
+# measured coefficient: `eager` materializes scores by construction and
+# BetterTransformer's footprint is unmeasured here, so both take the largest
+# MEASURED cost rather than 0. Over-reserving is the
 # safe error for a number whose job is "every request up to this length fits";
 # charging 0 for an unmeasured kernel would silently under-reserve.
 _UNMEASURED_SCORE_ELEM_BYTES = max(SCORE_ELEM_BYTES.values())
@@ -217,9 +220,13 @@ class VramShape:
     vocab: int
     elem_bytes: int             # compute dtype width (2 for fp16/bf16)
     # Bytes per score-matrix element for the ATTENTION KERNEL this plan is
-    # sized for -- see SCORE_ELEM_BYTES / score_elem_bytes() above. A kernel
-    # property, so the caller reads it off `model._active_attn_impl`; 0.0 is
-    # flash_attention_2's real value, not a "disabled" sentinel.
+    # sized for -- see SCORE_ELEM_BYTES / score_elem_bytes() above. flash/sdpa
+    # are kernel constants from that table; EAGER is measured per load by
+    # `attention_score_cost()` (vaayu/eager_attn_cost.py) and the table value is
+    # only its fallback. 0.0 is flash_attention_2's real value, not a "disabled"
+    # sentinel. The sliding layers' windowed copy of the eager mask (2 B per
+    # query x key, alive through the forward) is not charged -- about 0.5 % of
+    # the score term on gpt-oss.
     score_elem_bytes: float
     alloc_factor: float
     # kv_growth_factor/kv_capacity_buckets: algorithmic properties of the KV

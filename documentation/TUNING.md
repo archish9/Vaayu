@@ -416,9 +416,10 @@ eligibility conditions.
 Nothing to set. On a CUDA load the embedding table moves to host RAM only when the VRAM
 pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
 model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
-expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool: on
-gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4 full-length
-sessions; the guaranteed number of sessions still fits). Both are bit-identical to the old path.
+expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool, but only
+while non-expert weights still stream (any load whose VRAM budget cannot hold them; gpt-oss-20b
+before S14 3c: pool 8.06 GB). Since 3c gpt-oss streams nothing, keeps the full pool
+(12.81 GB measured vs 8.06 GB before). Both are bit-identical to the old path.
 
 What the load log tells you:
 
