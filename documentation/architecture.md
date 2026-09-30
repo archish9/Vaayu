@@ -169,6 +169,30 @@ With 28 layers pinned, each token saves 28 × ~380 MB = ~10.6 GB of NVMe reads, 
 [Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
 ```
 
+### Residency tiers for the non-expert weights (S14)
+
+Every weight a decode token needs sits in exactly one tier, checked in this order:
+
+1. **VRAM-pinned** — the planner's phase 1 (norm, `lm_head`) and phase 2 (transformer
+   layers, or their non-expert tensors on a MoE model), within the pinning budget.
+2. **CPU-resident embedding** — on every CUDA load the embedding table is held in host RAM
+   and never takes VRAM: a forward reads one row per token, so only those rows cross PCIe
+   (≈ 0.01–0.04 ms per decode token, ≈ 4.5 ms for an 8k-token prefill). The model's own
+   embedding module runs on the CPU copy, so scaled embeddings keep their scale. An
+   embedding that is not a plain floating-point `nn.Embedding` keeps the VRAM-pin path.
+3. **Non-expert RAM tier (MoE)** — whatever still streams (`lm_head`, streamed layers'
+   attention weights) is copied once, at load, into pinned host memory, entry by entry, as
+   long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
+   model-size cap refused). Where the arena needs all the RAM the tier is empty and the
+   load prints a WARNING naming the GB per token that still stream.
+4. **The non-expert LRU** (512 MB) and then **disk**, as before.
+
+On gpt-oss-20b (eager attention leaves 0.66–0.77 GiB of pin budget) tiers 2 and 3 took the
+decode token from 482 to 177 ms in the S14 spike, bit-identical. Load lines to look for:
+
+    [Vaayu-Pin] embedding CPU-resident: 1.16 GB host RAM, 0 VRAM
+    [Vaayu-Cache] Non-expert RAM tier: 12 of 12 entries, 1.75 GB (charged 2.69 GB) of 7.14 GB surplus
+
 ## 5. Speculative Decoding
 
 ### Problem

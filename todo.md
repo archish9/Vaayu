@@ -681,8 +681,8 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               - [x] **T1** CPU-embedding unit — 13 tests pass
               - [x] **T2** wire E into `_init_pinned_layers` — 42 pass (6 new wiring + tied-head + T1)
               - [x] **T3** non-expert tier unit — 19 tests pass
-              - [x] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract) — 12 wiring tests + 58 neighbours = 70 pass; ruling: `_fill_non_expert_tier` skips a 0-byte candidate (never offered, no spurious WARNING)
-              - [ ] **T5** docs + suite
+              - [x] **T4** wire P (surplus capture, fill, 3 loader hooks, `non_expert_ranges` extract) — 11 wiring tests + 59 neighbours = 70 pass; ruling: `_fill_non_expert_tier` skips a 0-byte candidate (never offered, no spurious WARNING)
+              - [x] **T5** docs + suite — 3212 passed, 20 skipped (49 new tests)
               - [ ] **T6** gpt-oss ABBA vs a `main` worktree + `s13_vaayu.py` 64/64 + server gate
               - [ ] **T7** cross-model gates + Qwen3-Next no-regression ABBA
               - [ ] **T8** ledger, CLAUDE.md, double-buffer lead row
