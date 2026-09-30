@@ -416,15 +416,22 @@ eligibility conditions.
 Nothing to set. On a CUDA load the embedding table moves to host RAM only when the VRAM
 pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
 model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
-expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool: on
-gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4 full-length
-sessions; the guaranteed number of sessions still fits). Both are bit-identical to the old path.
+expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool, but only
+while non-expert weights still stream (any load whose VRAM budget cannot hold them; gpt-oss-20b
+before S14 3c: pool 8.06 GB). Since 3c gpt-oss streams nothing, keeps the full pool
+(12.81 GB measured vs 8.06 GB before). Both are bit-identical to the old path.
 
 What the load log tells you:
 
+- `[Vaayu-VRAM] attention cost: X B/score-element + Y KiB/key (source; kernel table Z)` --
+  what the VRAM plan charges one attention forward. flash/sdpa: `kernel table`. Eager:
+  `measured on <AttentionClass>`, the load's own attention code measured at load. If it
+  says `kernel table: measurement failed (...)`, the plan fell back to the conservative
+  table value, and that load's context and pinning are what they were before the
+  measurement existed; the reason is on the line.
 - `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM (the pinning budget cannot
-  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. under eager
-  attention's reserve) and is held in host RAM instead of streaming — normal. `embedding
+  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. when another
+  process holds VRAM) and is held in host RAM instead of streaming — normal. `embedding
   not CPU-resident (...)` names why an unusual embedding keeps streaming.
 - `[Vaayu-Cache] Non-expert RAM tier: K of N entries ...` — K entries no longer stream.
 - `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — some non-expert

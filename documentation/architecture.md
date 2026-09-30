@@ -186,18 +186,26 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
 3. **Non-expert RAM tier (MoE)** — whatever still streams (`lm_head`, streamed layers'
    attention weights) is copied once, at load, into pinned host memory, entry by entry, as
    long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
-   model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool: on
-   gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4
-   full-length sessions; the guaranteed number of sessions still fits). Where the arena needs all the RAM the tier is empty and the
+   model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool, but only
+   while non-expert weights still stream: on gpt-oss-20b before S14 3c the tier held
+   2.95 GB and the pool was 8.06 GB. Since 3c gpt-oss streams nothing (`lm_head` and all
+   attention layers sit in VRAM), the tier is empty and the pool keeps its full
+   12.81 GB (measured). Where the arena needs all the RAM the tier is empty and the
    load prints a WARNING naming the GB per token that still stream.
 4. **The non-expert LRU** (512 MB) and then **disk**, as before.
 
-On gpt-oss-20b (eager attention leaves 0.66–0.77 GiB of pin budget) tiers 2 and 3 take a
-decode token from 485 to 174 ms (2.79x), with bit-identical
-output. Load lines to look for:
+Eager attention's VRAM cost is measured at load, on the model's own attention module
+(`vaayu/eager_attn_cost.py`), rather than charged at sdpa's fitted 10.9 bytes per score
+element. Eager buffers live in each model's own code and differ: 6.0 B/element on
+gpt-oss-20b, 10.0 on the Llamas, each plus the GQA `repeat_kv` copies per key. And eager
+builds only the `[new tokens, past + new]` block of its causal mask, never the square.
+On gpt-oss-20b this frees enough of the reserve (13.86 -> 9.49 GiB) for the
+embedding, `lm_head` and all 24 attention layers to stay in VRAM. Decode goes from
+198.5 to 93.0 ms/token at 8k context, bit-identical, and tiers 2 and 3
+are then idle on that model. Load lines to look for:
 
-    [Vaayu-Pin] embedding CPU-resident: 1.16 GB host RAM, 0 VRAM (the pinning budget cannot hold it)
-    [Vaayu-Cache] Non-expert RAM tier: 12 of 12 entries, 1.74 GB (charged 2.89 GB) of 7.07 GB surplus
+    [Vaayu-VRAM] attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)
+    [Vaayu-Pin] 3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer, 3.60 GB reserved
 
 ## 5. Speculative Decoding
 

@@ -1198,6 +1198,29 @@ def build_sdpa_causal_mask(attn_impl: str, max_q_len: int, kv_total: int,
     return (k_pos <= q_pos)[None, None]               # True == attend
 
 
+def build_eager_causal_mask(q_len: int, kv_total: int, dtype, device):
+    """Additive causal mask for EAGER attention: the [1, 1, q_len, kv_total]
+    block the layers read -- never the (kv_total x kv_total) square.
+
+    Eager adds the mask to the scores (`attn_weights + attention_mask`), so it
+    is additive: `finfo(dtype).min` where a key is AFTER its query, 0.0
+    elsewhere. Row r is query position `kv_total - q_len + r`, the same
+    bottom-right convention as build_sdpa_causal_mask. `triu(diagonal=
+    kv_total - q_len + 1)` keeps (r, c) iff c >= (kv_total - q_len + r) + 1:
+    the same test the square's `triu(diagonal=1)` applied to the same row, on
+    the same values -- so the logits are bit-identical (S14 3b, gpt-oss-20b,
+    4 lengths, prefill-last + 11 decode steps: max|d| 0).
+
+    Why (S14 3b, gpt-oss-20b, chunk 512, measured): the square was rebuilt
+    every forward, decode included, and _windowed_mask cached a second one
+    across requests. 32.5k prefill peak 12.48 GiB square vs 8.69 block; decode
+    at 32k 332.9 vs 271.1 ms/token; up to 3.52 GiB still allocated between
+    requests, which refused the next long request at admission.
+    Model-agnostic: no geometry enters."""
+    return torch.full((q_len, kv_total), torch.finfo(dtype).min, dtype=dtype,
+                      device=device).triu(diagonal=kv_total - q_len + 1)[None, None]
+
+
 def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     """Size of the precomputed RoPE cos/sin cache: must cover every position
     that will be sliced during this forward pass (existing past + ALL new
@@ -2547,6 +2570,17 @@ class VaayuBaseModel(GenerationMixin):
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     kv_bytes_per_token, plan_vram,
                                     reserve_floor_bytes, score_elem_bytes)
+            # S14 3c: what one attention forward costs -- measured on this
+            # load's own attention module for eager, the kernel table for
+            # flash/sdpa. BEFORE the free-VRAM snapshot: the measurement's own
+            # transient is released (the hook empties the cache) and never
+            # enters the budget.
+            _score_per_elem, _score_per_key, _score_source = self.attention_score_cost()
+            _cost_warn = ("WARNING: " if _score_source.startswith(
+                "kernel table: measurement failed") else "")
+            print(f"[Vaayu-VRAM] {_cost_warn}attention cost: {_score_per_elem:.2f} B/score-element + "
+                  f"{_score_per_key / 1024:.1f} KiB/key ({_score_source}; kernel table "
+                  f"{score_elem_bytes(self._active_attn_impl):.2f})")
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
             _head_dim = getattr(self.config, "head_dim", None)
@@ -2628,13 +2662,12 @@ class VaayuBaseModel(GenerationMixin):
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
                 elem_bytes=torch.finfo(self.running_dtype).bits // 8,
-                # Kernel property, read off the model init_model() just
-                # built (line ~1421, before this block): sdpa materializes an
-                # S-sized score buffer and flash_attention_2 does not, a gap
-                # that GROWS with S and flips OOM outcomes at large context
-                # (todo row 10). Charging one kernel's number for both
-                # under-reserves batched_generate, which requires sdpa.
-                score_elem_bytes=score_elem_bytes(self._active_attn_impl),
+                # Kernel property for flash/sdpa: sdpa materializes an S-sized
+                # score buffer and flash_attention_2 does not, a gap that GROWS
+                # with S and flips OOM outcomes at large context (todo row 10).
+                # Eager: measured per model at load (attention_score_cost, S14 3c).
+                score_elem_bytes=_score_per_elem,
+                score_bytes_per_key=_score_per_key,
                 resident_expert_bytes=_resident_expert_bytes,
                 head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
@@ -4998,6 +5031,57 @@ class VaayuBaseModel(GenerationMixin):
     def get_past_key_value_args(self, past_key_values):
         return {'past_key_values': past_key_values}
 
+    def _attention_modules_by_class(self) -> list:
+        """The first `self_attn` of each distinct attention class, in layer
+        order -- read off the module tree, not an architecture name (§5)."""
+        layers = self.model
+        for name in self.layer_names_dict["layer_prefix"].split("."):
+            layers = getattr(layers, name)
+        seen, found = set(), []
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and type(attn) not in seen:
+                seen.add(type(attn))
+                found.append(attn)
+        return found
+
+    def attention_score_cost(self) -> "tuple[float, float, str]":
+        """(bytes per score element, bytes per key, source) the VRAM plan
+        charges one attention forward (S14 3c).
+
+        flash/sdpa: the kernel table (vram_plan.SCORE_ELEM_BYTES) -- kernel
+        constants, unchanged. Eager (and any unknown kernel): MEASURED on this
+        load's own attention code (vaayu/eager_attn_cost.py), because eager's
+        buffers live in each model's own `eager_attention_forward` and differ
+        by model -- 6.0 B/score-element on gpt-oss-20b against 10.0 on the
+        Llamas, where the table charged every eager load sdpa's 10.9. Any
+        failure falls back to that table value, with the reason, so a failure
+        is exactly the behaviour before 3c. Subclasses whose attention is not
+        transformers' eager (DeepSeek-V4) override this."""
+        from .vram_plan import score_elem_bytes
+        impl = self._active_attn_impl
+        table = score_elem_bytes(impl)
+        if impl in ("flash_attention_2", "sdpa"):
+            return table, 0.0, "kernel table"
+        try:
+            from . import eager_attn_cost
+            per_elem, per_key, measured_on = eager_attn_cost.measure_eager_attention_cost(
+                self._attention_modules_by_class(),
+                rope_fn=self._precompute_rope,
+                make_cache=lambda: FP8DynamicCache(quantize=False),
+                mask_fn=build_eager_causal_mask,
+                device=torch.device(self.running_device),
+                dtype=self.running_dtype)
+            return per_elem, per_key, f"measured on {measured_on}"
+        except Exception as e:
+            # D3: the measurement must never fail the load.
+            # One line: CUDA OOM / solver errors are multi-line.
+            _reason = (str(e).splitlines() or [""])[0][:200]
+            return table, 0.0, f"kernel table: measurement failed ({type(e).__name__}: {_reason})"
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     @staticmethod
     def layer_attention_window(layer) -> "int | None":
         """This layer's attention window, or None if it attends everything.
@@ -5026,13 +5110,17 @@ class VaayuBaseModel(GenerationMixin):
         between requests at identical shape and dtype, and a shape-only key would
         hand request B the overlay built on request A's padding.
         """
-        size = mask.shape[-1]
-        key = (window, size, mask.dtype, str(mask.device))
+        q_len, size = mask.shape[-2], mask.shape[-1]
+        key = (window, q_len, size, mask.dtype, str(mask.device))
         cached = getattr(self, "_windowed_mask_cache", None)
         if cached is not None and cached[0] == key and cached[2] is mask:
             return cached[1]
-        idx = torch.arange(size, device=mask.device)
-        too_old = (idx[None, :] <= (idx[:, None] - window))[None, None]
+        # Rectangular (S14 3c): both mask builders hand over only the bottom
+        # q_len rows, so row r is query position size - q_len + r. A square
+        # (q_len == size) is today's arange on both axes, unchanged.
+        k_idx = torch.arange(size, device=mask.device)
+        q_idx = torch.arange(size - q_len, size, device=mask.device)
+        too_old = (k_idx[None, :] <= (q_idx[:, None] - window))[None, None]
         blocked = (False if mask.dtype == torch.bool
                    else torch.finfo(mask.dtype).min)
         out = mask.masked_fill(too_old, blocked)
@@ -5318,10 +5406,10 @@ class VaayuBaseModel(GenerationMixin):
             # layer-0 attention 26 % off stock, and the model's top-5 came back
             # reordered. dtype is the run dtype, matching the scores it is added
             # to, and the size is past+new (never max_seq_len) as before.
-            attention_mask = torch.full(
-                (_mask_size, _mask_size), torch.finfo(self.running_dtype).min,
-                dtype=self.running_dtype, device=self.running_device)
-            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...]
+            # Only the [_seq_total, _mask_size] block the layers read, never the
+            # square (S14 3c; see build_eager_causal_mask for the measured cost).
+            attention_mask = build_eager_causal_mask(
+                _seq_total, _mask_size, self.running_dtype, self.running_device)
         # _pos_range is constant (== max_seq_len) unless the generation outgrows it;
         # allocating a fresh GPU arange every token is pure waste. Cache like the
         # RoPE block below.
