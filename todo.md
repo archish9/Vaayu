@@ -879,6 +879,12 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                  on the 2k warm session. Later sessions in the same process are bit-identical across runs, so a server's first request can
                  differ run-to-run. Cause unmeasured (suspects: first-touch kernel autotune or a cold-arena path). Re-open when determinism
                  of the first request matters.
+               - [x] **T6 — cross-model gates, 2026-10-01.** Every flash/sdpa/DeepSeek load reads `kernel table`; max_seq_len and reserve equal the 3a logs. Only the pinning budget moved, 0.05-0.06 GiB lower on every gate (free VRAM, not the planner).
+                 - DeepSeek server gate: 9 passed (73 s vs 72 s in 3a); `10.90 B/score-element + 0.0 KiB/key (kernel table)`; plan 16766 / 8.03 GiB both (pin 3.31 vs 3.37).
+                 - Qwen3-Next accumulator: 8 passed (45 s vs 40 s); `10.90 ... + 0.0 KiB/key (kernel table)`; plan 65536 / 7.82 GiB both (pin 6.13 vs 6.19).
+                 - MiniMax accumulator: 8 passed (77 s vs 77 s); `10.90 ... + 0.0 KiB/key (kernel table)`; plan 8192 / 4.79 GiB both (pin 7.97 vs 8.03).
+                 - Llama-1B: server 9 passed (`0.00 ... + 0.0 KiB/key`, plan 65536 / 3.50 GiB both, pin 11.30 vs 11.35); hidden 3 passed (`10.90`, plan 65953 / 13.63 GiB both, pin 1.16 vs 1.22); prefix 1 passed (no plan line in either log).
+                 - Eager Llama-1B, main vs branch: IDS identical (16 ids, `[12366, 13, 578, 469, ...]`). Branch `10.06 B/score-element + 8.0 KiB/key (measured on LlamaAttention; kernel table 10.90)`. Plan main 65953 / 13.63 GiB (pin 1.16) -> branch 65945 / 13.30 GiB (pin 1.45). `main` worktree removed.
 
               **USER decisions:**
               - **E scope = EVERY model** (the embedding never takes VRAM). **AMENDED 2026-09-30 by T2b: only where it would stream** (user rule; applied to every model E cost Qwen3-Next decode +1.14 %, so it now fires only where the VRAM pin budget cannot hold the embedding).
