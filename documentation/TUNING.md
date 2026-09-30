@@ -422,9 +422,15 @@ sessions; the guaranteed number of sessions still fits). Both are bit-identical 
 
 What the load log tells you:
 
+- `[Vaayu-VRAM] attention cost: X B/score-element + Y KiB/key (source; kernel table Z)` --
+  what the VRAM plan charges one attention forward. flash/sdpa: `kernel table`. Eager:
+  `measured on <AttentionClass>`, the load's own attention code measured at load. If it
+  says `kernel table: measurement failed (...)`, the plan fell back to the conservative
+  table value, and that load's context and pinning are what they were before the
+  measurement existed; the reason is on the line.
 - `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM (the pinning budget cannot
-  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. under eager
-  attention's reserve) and is held in host RAM instead of streaming — normal. `embedding
+  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. when another
+  process holds VRAM) and is held in host RAM instead of streaming — normal. `embedding
   not CPU-resident (...)` names why an unusual embedding keeps streaming.
 - `[Vaayu-Cache] Non-expert RAM tier: K of N entries ...` — K entries no longer stream.
 - `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — some non-expert
