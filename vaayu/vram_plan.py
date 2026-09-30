@@ -261,6 +261,13 @@ class VramShape:
     # (vaayu_base.py:4581). Which one is charged decides which chunk sets the
     # peak -- see _prefill_chunks and predict_peak_vram (todo row 6a).
     layer_major_prefill: bool = False
+    # Bytes per KEY position one attention forward allocates on top of its
+    # score buffers, whatever its query count (S14 3c) -- today the GQA
+    # `repeat_kv` copies eager makes of K and V, 2 x n_heads x head_dim x
+    # elem_bytes per key. MEASURED per load by the model's
+    # attention_score_cost() hook, never a literal; 0.0 for flash/sdpa and for
+    # every shape built before it, so none of their predictions move.
+    score_bytes_per_key: float = 0.0
 
 
 def _prefill_chunks(shape: VramShape, S: int) -> list[tuple[int, int, int]]:
@@ -303,8 +310,11 @@ def _score_term_bytes(shape: VramShape, q_positions: int, keys: int) -> float:
     whole context; it is charged per chunk now because the peak is a max over
     chunks and a chunk's own query count is what it presents (todo row 6a). The
     activation term that used to live beside it was removed 2026-08-15 as
-    unobservable -- see DEFAULT_ALLOC_FACTOR's comment."""
-    return shape.N * shape.n_heads * int(q_positions) * int(keys) * shape.score_elem_bytes
+    unobservable -- see DEFAULT_ALLOC_FACTOR's comment. Plus score_bytes_per_key
+    per key position (S14 3c: eager's repeat_kv copies), which does not scale with
+    the query count."""
+    return (shape.N * shape.n_heads * int(q_positions) * int(keys) * shape.score_elem_bytes
+            + shape.N * int(keys) * shape.score_bytes_per_key)
 
 
 def _kv_term_bytes(shape: VramShape, S: int) -> int:
@@ -587,7 +597,8 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     if shape.score_elem_bytes <= 0:
         return int(base_floor)
     flash_parity = _largest_s_within_budget(
-        replace(shape, score_elem_bytes=0.0), int(base_floor))
+        replace(shape, score_elem_bytes=0.0, score_bytes_per_key=0.0),
+        int(base_floor))
     if flash_parity <= 0:
         return int(base_floor)
     ceiling = int(free_vram) - int(min_resident) - int(layer_slack)

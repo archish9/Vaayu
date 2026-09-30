@@ -96,6 +96,7 @@ from vaayu.vram_plan import (
     VramShape,
     _kv_term_bytes,
     _peak_intercept_bytes,
+    _score_term_bytes,
     predict_peak_vram,
     score_elem_bytes,
 )
@@ -1264,3 +1265,40 @@ def test_layer_major_prefill_defaults_to_the_per_chunk_loop():
     forward it runs is charged the one that peaks higher."""
     sh = shape_for("qwen3-235b")
     assert sh.layer_major_prefill is False
+
+
+# --- S14 3c: per-key attention term -------------------------------------
+#
+# Eager attention's transient is c*H*q*k + r*k (measured 2026-09-30,
+# plans/probes/s14c_eager_coeff.py): r is the GQA repeat_kv copies of K and V,
+# 2*H*D*elem_bytes per key, whatever q is. VramShape carries it as
+# score_bytes_per_key; 0.0 keeps every older shape's prediction unchanged.
+import dataclasses as _dc
+
+
+def test_score_bytes_per_key_defaults_to_zero():
+    assert shape_for("llama-1b").score_bytes_per_key == 0.0
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_per_key_term_is_keys_times_bytes_per_key(name):
+    geo = GEOMETRIES[name]
+    per_key = float(2 * geo["n_heads"] * geo["head_dim"] * 2)
+    base = shape_for(name, score_elem_bytes=6.0)
+    keyed = _dc.replace(base, score_bytes_per_key=per_key)
+    for q, k in ((512, 8192), (1, 33000), (256, 4096)):
+        assert _score_term_bytes(keyed, q, k) == _score_term_bytes(base, q, k) + k * per_key
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_flash_parity_floor_ignores_the_per_key_term(name):
+    """The floor buys back the context FLASH would derive; flash has neither
+    term, so flash parity must be solved with both zeroed."""
+    base_floor = int(3.5 * GB)
+    free = int(15.0 * GB)
+    plain = shape_for(name, score_elem_bytes=6.0)
+    keyed = _dc.replace(plain, score_bytes_per_key=16384.0)
+    parity = _largest_s_within_budget(_dc.replace(plain, score_elem_bytes=0.0), base_floor)
+    got = reserve_floor_bytes(shape=keyed, base_floor=base_floor, free_vram=free,
+                              min_resident=0, layer_slack=0)
+    assert got == max(base_floor, min(predict_peak_vram(keyed, parity), free))
