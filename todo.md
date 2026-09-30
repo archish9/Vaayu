@@ -581,7 +581,15 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
         decode bits — hypothesis, unmeasured: keeping exactly the last `window − 1` keys in order would make it match
         stock's default cache instead. **§8:** (1) no knob, no code; (2) n/a; (3) measured ON the served path — it is
         what a server user gets; (4) n/a. Suite not re-run: nothing under `vaayu/` or `tests/` touched (floor 3163).
-- [ ] **S14 — gpt-oss non-expert stream (= the `[ ]` sub-bullet under S8 below).** Evidence: embed
+- [~] **S14 — gpt-oss non-expert stream (= the `[ ]` sub-bullet under S8 below).** **STARTED 2026-09-30 —
+      steps 1–2 run as a SPIKE (measure + price, probes only, no engine code; user approved). Re-verified at
+      HEAD `2a6bb77` from S8's post-fix `ab-r3.log` + a static read: embed AND `lm_head` (1.16 GB each) are
+      re-read EVERY decode token (0.108 / 0.112 s at ~10 GB/s = page cache, not the drive) and re-uploaded —
+      skipped by the pin planner (budget 0.77 GiB under the 13.86 GiB eager floor) and never RAM-cacheable
+      (MoE forces the loader cache to 0; the non-expert LRU is `min(512 MB, avail/8)`, `vaayu_base.py:405`).
+      STALE in the evidence below: "12 attention layers 0.64 GB/token" — the pin budget varies load to load
+      with free VRAM: S8 r3 0.77 GiB → 15 non-expert-pinned / 9 streamed; S14's two loads 0.66 GiB → 13 / 11
+      streamed (0.586 GB, 53.3 MB each), their reads hidden by the prefetch (`io_wait` ≤ 0.6 ms).** Evidence: embed
       1.16 GB/token (streamed to read ONE row), `lm_head` 1.16 GB/token, 12 attention layers 0.64 GB/token;
       ≈ 0.46 s/token was estimated on the pre-S8 5.8 s token, and the post-S8 token is 0.44 s — so its share
       NOW is unmeasured. Stock fits the card (13.79 GB peak) at 35.7 tok/s; Vaayu 2.3. **Steps:** (1) split the
@@ -590,6 +598,138 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       and 47-m4; (3) brainstorm → user picks → build. **Done:** ABBA ≥ 2 %, logits bit-identical to stock
       (multi-step decode: against stock with `DynamicCache()`, not its default window-truncating cache — S13),
       gpt-oss server gate 9/9, Qwen3-Next + MiniMax accumulator 8/8 if shared infra is touched.
+      - [x] **Steps 1–2 — split + priced, 2026-09-30 (SPIKE, no engine code).** RESULTS
+            `docs/2026-09-30-S14-gptoss-nonexpert-split-RESULTS.md`; probe `plans/probes/s14_split.py`, logs
+            `plans/probes/s14_out/split-r{1,2}.{log,json}` (gitignored). **Method:** one load per replicate in the
+            SERVER's config + `freeze_after_load()`, 29G, FOREGROUND, no ballast. Each arm = one served request
+            (`stream_generate` + `session_id`, prefix cache ON, greedy, S8's 198-token prompt with the date
+            pinned), 32 decode tokens, medians. Each option is simulated by monkeypatching the model's own hooks
+            (`_load_from_strategy` / `_load_non_expert_strategy` → private pinned copies; `run_embed` → CPU
+            gather; `inject_to_gpu` once + the pinned sets), so the real loop / inject / routed experts all run.
+            Split = the engine's `LayerTiming`.
+            **The non-expert stream is 417.3 / 418.3 ms of the 484.1 / 482.4 ms served token (86 %):**
+
+            | part (r1/r2, ms/token) | ms |
+            |---|---|
+            | embed read (page cache) | 107.3 / 107.4 |
+            | embed H2D (pinned) | 55.5 / 55.5 |
+            | `lm_head` read | 109.1 / 109.0 |
+            | `lm_head` H2D | 54.6 / 54.5 |
+            | 11 streamed layers' inject | 90.8 / 91.9 |
+            | compute: 11 streamed / 13 pinned layers | 28.3 + 38.2 / 26.8 + 37.9 |
+
+            The inject costs 8.3 ms/layer against a raw copy of 3.7 ms (pageable) / 2.7 ms (pinned): per-tensor
+            overhead.
+            **Measured ladder, EVERY option arm bit-identical to base (32/32 logits, max|d| 0, both replicates):**
+            - B1 base **482.4 ms (2.07 tok/s)**
+            - E CPU embedding only **323.5 (1.49×)**
+            - P pinned-RAM tier (embed + head + streamed layers, no reads) **235.2 (2.05×)**
+            - C = P + CPU embedding **176.8 (2.73×)**
+            - H = C + `lm_head` in VRAM **115.9 (4.16×, 8.63 tok/s)**
+            - O = H + the 11 layers in VRAM, zero non-expert stream **77.0 (6.26×, 12.99 tok/s)**
+            - r1 replicates B1/P/C/O within 0.5 %; B2 drift 0.3 % (r1)
+
+            O's floor is expert delivery (arena hits 96/96, ~1.27 GB/token uploaded minus VRAM-cache hits) +
+            ~28 ms compute; stock does 28.0 ms.
+            **Micro-prices:**
+            - pinned H2D 1.158 GB 58.2 ms (19.9 GB/s), pageable 76–78 ms
+            - `lm_head` GEMV: GPU 2.91 ms; CPU bf16 20.6 ms at 14 threads but NOT bit-identical (max|d|
+              1.95e-3) → fails the done bar
+            - CPU embedding gather + H2D: 1 row 0.013–0.040 ms, 8,118 rows 4.3–4.5 ms
+
+            **Context cost of VRAM residency** (planner, reserve 13.86 GiB clamped eager floor, free 14.96 GiB):
+            - attention +0.586 GB → `max_seq_len` 31,230 (−6.0 %)
+            - `lm_head` +1.158 GB → 29,693 (−10.6 %)
+            - both +1.745 GB → 28,155 (−15.2 %)
+            - + embed +2.903 GB → 25,079 (−24.5 %)
+
+            **Eager prefill chunk at 33,206:**
+            - 512 → peak 13.86 GiB
+            - 256 → 9.76 GiB (**frees 4.10 GiB**, enough for head + attention with no context loss)
+            - 128 → 6.93 GiB
+            - 64 → 5.51 GiB
+
+            TTFT cost UNMEASURED: eager prefill is per-chunk and each chunk routes ~all experts, so halving the
+            chunk plausibly ~doubles a cold long prefill (inferred).
+            **47-m4:** KV 3.00 → 1.50 GiB but predicted peak only 13.86 → 13.11 (frees 0.75 GiB; the score term
+            dominates) → poor value here.
+            **Page-cache FRAGILITY found:** in r2 the probe's own ~4 GB of pinned copies pushed the embed/head files
+            out of the page cache (29G cgroup). The base arm then read them from the drive at ~4.9 GB/s
+            (`io_wait` 107 → 234 ms each, token 482 → **738 ms**; r2's B2 is contaminated, r1's B2 is the drift
+            check). Today's speed depends on the OS caching 2.3 GB of embed + head.
+            **Cross-model (effect unmeasured):** Qwen3-Next / MiniMax / DeepSeek VRAM-pin their embedding
+            (0.62 / 1.23 / 1.06 GB), so a CPU embedding frees that VRAM. On DeepSeek that is ≈ +6 of its 33
+            streamed layers made resident, ≈ −0.1 s of 1.58 s (INFERRED from S9's `gpu_load`). A real build must
+            run the embedding MODULE's forward on CPU (Gemma scales inside it; DeepSeek's `run_embed` expands
+            `hc_mult`), and a pinned tier competes with the expert arena where the arena binds (MiniMax,
+            DeepSeek).
+            **Recommendation:** build E + P (2.73×, bit-exact, no VRAM/context cost, removes the page-cache
+            fragility); decide H/O separately, measuring TTFT before choosing between a context knob (§8(1)) and
+            a smaller or context-adaptive eager chunk.
+            **§8 (spike):** (1) no knob, no code; (2) n/a; (3) measured on the served path at N=1; (4) nothing
+            banked.
+      - [~] **Step 3 — brainstorm → the USER picks → build. USER PICKED 2026-09-30: "E + P, then measure a
+            smaller eager chunk"** — build the CPU-resident embedding (E) + the pinned-RAM tier (P) now; THEN
+            measure TTFT at a smaller / context-adaptive eager prefill chunk before deciding VRAM residency of
+            `lm_head` + attention (H/O). Not picked: E + P + `lm_head` in VRAM via a context knob; E only.
+            Brainstorm in progress (architectural path: spec → plan).
+        - [~] **3a — E + P build** (spec, plan, TDD, ABBA vs base, gates). **Design approved section by section
+              2026-09-30.** Spec `docs/superpowers/specs/2026-09-30-S14-cpu-embed-nonexpert-tier-design.md`
+              (gitignored) — **APPROVED by the user 2026-09-30**; plan next (writing-plans).
+              **USER decisions:**
+              - **E scope = EVERY model** (the embedding never takes VRAM).
+              - **P budget = ONLY the arena's row-40 surplus** (0 where the arena binds; DeepSeek unchanged).
+              - **Approach A** (CPU wrapper + fixed tier), over B (grow the LRU: 0 % hits below a cyclic scan)
+                and C (a memory-mapped embedding).
+
+              **Durable design summary:**
+              - **E:** in `_init_pinned_layers` phase 1, before the `budget <= 0` return.
+                - Eligible only when: `isinstance(nn.Embedding)`, floating tensors, `max_norm is None`; else
+                  today's path + one reason line.
+                - Load: private CPU copy in `running_dtype` (the loaders return views into the rotating pinned
+                  double buffer) → set into the HF module → `self.layers[0]` = `CpuResidentEmbedding`
+                  (`inner(ids.cpu()).to(dev)`) → embed joins `pinned_layer_names`.
+                - The summary-line format stays (server-gate regex); new line
+                  `embedding CPU-resident: X GB host RAM, 0 VRAM`.
+              - **P** (MoE only): `vaayu/non_expert_tier.py` `NonExpertRamTier`.
+                - Storage: one pinned allocation per entry, tensors packed at 16 B, charged at the next power
+                  of two, a refused offer allocates nothing.
+                - Budget = `tier_budget(...)`: uncapped − capped slabs × slab bytes; the whole expert budget
+                  when the arena is skipped (whole-layer fallback); else 0.
+                - Candidates in order, skip-not-stop: non-resident shared layers (`lm_head`, `norm`, embed only
+                  if E refused), then streamed layers' non-expert dicts in layer order. Stored in the
+                  checkpoint dtype.
+                - Checked first in `_load_from_strategy` / `_load_non_expert_strategy`; the LRU is unchanged
+                  behind it.
+                - Log line + a WARNING naming the GB/token that still stream (will fire on DeepSeek).
+                - gpt-oss expected: 2.69 GiB charged for 1.745 GB of data, out of ~7 GB of surplus.
+
+              **Verification:**
+              - Unit tests over contrasting geometries (§5), including the aliasing trap.
+              - gpt-oss decode ABBA vs a `main` worktree ≥ 2 % (expect ~2.7×), ids identical, prefill
+                regression ≤ 5 %.
+              - `s13_vaayu.py` teacher-forced == stock `DynamicCache()` 64/64.
+              - gpt-oss server gate 9/9.
+              - Qwen3-Next accumulator gate 8/8 + no-regression ABBA (stop at ≥ 1 %).
+              - MiniMax accumulator gate 8/8.
+              - DeepSeek server gate.
+              - Llama-3.2-1B server + hidden-states + prefix-reuse gates.
+              - Llama-3.3-70B load + decode reported.
+              - Full suite (floor 3163).
+              - Final review.
+
+              **Stop rules:**
+              - gpt-oss < 2 %, or anything not bit-identical → stop and record.
+              - Qwen3-Next ≥ 1 % or MiniMax/DeepSeek ≥ 2 % regression → stop and ask (fallback: narrow E to
+                "only where it streams").
+
+              **§8:** no knob (E is bit-exact at ≤ 0.04 ms/token with its RAM charged before the arena; P uses
+              only RAM no expert can fill); plumbed at load in `__init__`; reachable at N=1; nothing banked.
+              **Lead, NOT built:** the loader's pinned double buffers `_PINNED_BUFS` stay allocated for the life
+              of every MoE load (gpt-oss 2 × 2 GiB, idle after E + P). Releasing them returns 2–4 GiB of pinned
+              RAM to the arena on every MoE model — its own row + measurement.
+        - [ ] **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
+              H/O.
 - [ ] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** L-e: `expert_disk` rose 0.22 → 0.50
       s/token when S9 removed the CPU fold, bytes and hit/miss identical → exposed stall, hypothesis that the
       33 ms/layer fold had hidden read latency; verify with per-layer read-submit vs read-need timestamps
