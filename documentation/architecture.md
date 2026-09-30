@@ -169,28 +169,31 @@ With 28 layers pinned, each token saves 28 × ~380 MB = ~10.6 GB of NVMe reads, 
 [Vaayu-Pin] 31 layers pinned (28 transformer + 3 shared), 11.64 GB reserved
 ```
 
-### Residency tiers for the non-expert weights (S14)
+### Residency tiers for the non-expert weights
 
 Every weight a decode token needs sits in exactly one tier, checked in this order:
 
-1. **VRAM-pinned** — the planner's phase 1 (norm, `lm_head`) and phase 2 (transformer
-   layers, or their non-expert tensors on a MoE model), within the pinning budget.
+1. **VRAM-pinned** — the planner's phase 1 (norm, `lm_head`, and the embedding when it fits
+   the budget: every on-device target except gpt-oss) and phase 2 (transformer layers, or
+   their non-expert tensors on a MoE model), within the pinning budget.
 2. **CPU-resident embedding** — only when the VRAM pinning budget cannot hold the embedding
    (it would otherwise be re-read and re-uploaded whole every token) the table is held in
    host RAM and takes no VRAM: a forward reads one row per token, so only those rows
    cross PCIe (≈ 0.01–0.04 ms per decode token, ≈ 4.5 ms for an 8k-token prefill). When the
    budget holds it, the embedding is VRAM-pinned as before. The model's own embedding
    module runs on the CPU copy, so scaled embeddings keep their scale. An embedding that is
-   not a plain floating-point `nn.Embedding` keeps the VRAM-pin path.
+   not a plain floating-point `nn.Embedding` streams every token.
 3. **Non-expert RAM tier (MoE)** — whatever still streams (`lm_head`, streamed layers'
    attention weights) is copied once, at load, into pinned host memory, entry by entry, as
    long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
-   model-size cap refused). Where the arena needs all the RAM the tier is empty and the
+   model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool: on
+   gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4
+   full-length sessions; the guaranteed number of sessions still fits). Where the arena needs all the RAM the tier is empty and the
    load prints a WARNING naming the GB per token that still stream.
 4. **The non-expert LRU** (512 MB) and then **disk**, as before.
 
 On gpt-oss-20b (eager attention leaves 0.66–0.77 GiB of pin budget) tiers 2 and 3 take a
-decode token from 485 to 174 ms (2.79x, mean of two off and two on runs), with bit-identical
+decode token from 485 to 174 ms (2.79x), with bit-identical
 output. Load lines to look for:
 
     [Vaayu-Pin] embedding CPU-resident: 1.16 GB host RAM, 0 VRAM (the pinning budget cannot hold it)

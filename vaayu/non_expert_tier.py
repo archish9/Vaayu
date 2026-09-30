@@ -90,7 +90,7 @@ class NonExpertRamTier:
               load: Callable[[], dict]) -> bool:
         """Hold `name` whole if it fits, else refuse WITHOUT calling `load`.
 
-        `nbytes`/`n_tensors` come from the shard header, so a refused entry is
+        `nbytes`/`n_tensors` come from the shard header, so an entry refused for BUDGET is
         never read. The charge covers per-tensor alignment padding (< 16 B each);
         an entry that loads larger than that is refused, never overrun.
         """
@@ -144,7 +144,8 @@ def tier_log_lines(s: dict) -> list[str]:
         lines.append(
             f"[Vaayu-Cache] WARNING: {s['refused']} of {s['offered']} streamed non-expert "
             f"entries do not fit the RAM tier -- {s['refused_bytes'] / 1e9:.2f} GB/token of "
-            f"non-expert weights still stream. The tier only uses RAM the expert arena "
-            f"cannot ({s['budget_bytes'] / 1e9:.2f} GB here); a real limit on this box, "
-            f"not a bug.")
+            f"non-expert weights still stream (non-expert weights stream when the VRAM "
+            f"pinning budget or `max_pinned_layers` leaves layers unpinned; the tier only "
+            f"holds what fits in RAM the expert arena cannot use: "
+            f"{s['budget_bytes'] / 1e9:.2f} GB here).")
     return lines

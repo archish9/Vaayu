@@ -85,6 +85,22 @@ def test_wrapper_keeps_a_scaled_subclass_scaling():
     assert torch.equal(got, torch.nn.functional.embedding(ids, inner.weight) * 3.0)
 
 
+def test_wrapper_matches_a_real_gemma3_scaled_embedding():
+    import pytest
+    mod = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
+    cls = getattr(mod, "Gemma3TextScaledWordEmbedding", None)
+    if cls is None:
+        pytest.skip("Gemma3TextScaledWordEmbedding absent")
+    inner = cls(16, 4, padding_idx=0, embed_scale=2.0).to(torch.bfloat16)
+    with torch.no_grad():
+        inner.weight.copy_(torch.arange(64, dtype=torch.float32).reshape(16, 4))
+    ids = torch.tensor([[5, 0, 15]])
+    got = CpuResidentEmbedding(inner, "cpu")(ids)
+    want = (torch.nn.functional.embedding(ids, inner.weight, padding_idx=inner.padding_idx)
+            * inner.embed_scale.to(inner.weight.dtype))
+    assert torch.equal(got, want)
+
+
 def test_a_deepseek_style_repeat_works_on_the_output():
     """DeepSeek-V4's run_embed does layer(seq).unsqueeze(2).repeat(1, 1, hc_mult, 1)."""
     out = CpuResidentEmbedding(_cpu(), "cpu")(torch.tensor([[1, 2]]))

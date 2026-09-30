@@ -714,6 +714,32 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               **Remaining gap to stock (35.7 tok/s):** expert delivery (~1.27 GB of routed experts per token from
               the RAM arena over PCIe) plus `lm_head`/attention uploaded from pinned RAM each token. Lead filed:
               idle loader double buffers (STILL OPEN).
+              **Final-review fix wave, 2026-09-30.** I-1 FIXED: E moves the module's own buffers to the CPU
+              (Gemma3/4 `embed_scale` no longer mixes CPU rows with a CUDA scalar; tests added, RED then GREEN).
+              M-2: the tier WARNING now lists the causes (VRAM pin budget / `max_pinned_layers` / arena using the
+              RAM) instead of "a real limit on this box". **M-5 (dense, on device):** Llama-3.2-1B with
+              `attn_implementation="sdpa"`, `max_pinned_layers=-1`, prefix cache on gives `pinning_budget=1.41
+              GiB` (NOT 0), so E does NOT fire (no `embedding CPU-resident` line on either tree; embedding
+              VRAM-pinned); 16 greedy ids identical on the branch and on `main` (`[8586, 527, 2380, ..., 96618]`).
+              E on a dense model stays unexercised on device; no other config hunted.
+              **I-2 — cost of P to the gpt-oss prefix-cache pool (measured from the branch's logs):** pool budget
+              main (`off1`, `off2`) 12.43 / 12.79 GB vs branch (`on1`..`on3`, gates) 6.79-7.26 GB. RAM taken: the
+              tier itself 2.89 GB charged, plus ~2.15 GB from the loader's second 2 GiB pinned double buffer
+              (`_PINNED_BUFS[1]`), which the tier fill's `lm_head` read now allocates at load (main allocated it
+              lazily at the first token, after the pool was sized, so main's pool figure was partly optimistic).
+              Net capacity loss ~3.5 GB, about 7 -> 4 full-length (1.63 GB) sessions; the guaranteed
+              `prefix_sessions = 3` (4.89 GB) still fits. **Ruling: accepted 2026-09-30 by the controller under
+              SDD rulings: 2.79x decode against ~3 fewer resident full-length gpt-oss sessions, the guaranteed 3
+              kept; the user can reverse.** This is also the measured cost in the §8(1) "no knob" answer above.
+              Lead filed: "Protect the prefix pool from the non-expert RAM tier" (STILL OPEN).
+              - [ ] Tier WARNING's GB/token counts everything not in the tier, ignoring what the 512 MB non-expert
+                    LRU may hold -- accurate today (cyclic scan -> ~0 % LRU hits, S6), could overstate for a small MoE.
+              - [ ] Budget-0 MoE loads still parse every streamed shard's header at load to size the WARNING --
+                    load-time cost unmeasured (one grep of a DeepSeek load log would price it).
+              - [ ] **(M-6) Lead:** E for DENSE models to free the embedding's VRAM for transformer layers --
+                    Llama-3.3-70B pins 2.10 GB of embedding in VRAM (19 fully-pinned: 16 transformer + 3 shared);
+                    ~4 more transformer layers ~ ~5 % of the ~37 GB/token read. Measure before building
+                    (E-everywhere cost Qwen3-Next +1.14 %).
         - [ ] **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the USER decides H/O**
               (`lm_head` + attention VRAM residency; spike prices: H 115.9 ms, O 77.0 ms; context costs and chunk
               peaks in the Steps 1-2 block above). Next item.
@@ -2934,10 +2960,19 @@ Known-open minors (none blocking):
       `safetensor_model_persister._load_pinned` are sized `pinned_alloc_size(largest whole-shard read)` and
       stay allocated for the life of every load (gpt-oss: 2 × 2 GiB pinned). After S14 3a nothing streams
       through them on gpt-oss, and on any MoE model whose embedding/head are resident they serve only the
-      load. Releasing them once no shard streams through `_load_pinned` would return 2-4 GiB of pinned RAM to
-      the expert arena on every MoE model — behaviour change on every model, so: measure arena growth + decode
-      on Qwen3-Next / MiniMax / DeepSeek before building. Unreached by users today only in the sense that no
-      one has measured it; not N>1-only.
+      load. Releasing them once no shard streams through `_load_pinned` would return 2-4 GiB of pinned RAM,
+      but the consumer differs by model: where the expert arena is uncapped (MiniMax, DeepSeek) it grows the
+      arena; on gpt-oss the arena is capped (row 40), so the RAM would go to the cross-turn prefix pool, and
+      on the S14 branch the tier fill itself allocates the second buffer at load (~2.15 GB of the pool's
+      ~3.5 GB net loss, see the S14 3a row). Behaviour change on every model, so: measure arena growth +
+      decode on Qwen3-Next / MiniMax / DeepSeek, and pool size on gpt-oss, before building. Still a lead;
+      not N>1-only.
+
+- [ ] **Protect the prefix pool from the non-expert RAM tier (lead from S14 3a, 2026-09-30).** The tier is
+      filled before the prefix pool is sized, and on gpt-oss it cost the pool ~3.5 GB net (12.4 -> ~7 GB,
+      about 7 -> 4 full-length sessions; the guaranteed 3 still fit). Options: (a) cap the tier so the
+      post-fill pool keeps at least N sessions; (b) release the idle loader double buffers (the row above)
+      after the fill, which returns ~2 GiB on gpt-oss. It is the user's call whether the pool or decode wins.
 
 ---
 

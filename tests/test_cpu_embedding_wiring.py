@@ -6,6 +6,7 @@ the user 2026-09-30 (Qwen3-Next decode +1.14 % when applied everywhere): an embe
 the budget CAN hold stays VRAM-pinned exactly as on main. The fake strategy records
 what would have gone to VRAM.
 """
+import pytest
 import torch
 
 from vaayu.cpu_embedding import CpuResidentEmbedding
@@ -139,3 +140,17 @@ def test_tied_head_with_an_over_budget_embedding(capsys):
     assert isinstance(m.layers[0], CpuResidentEmbedding)
     assert HEAD not in m.pinned_layer_names                 # 16 + 256 B > 200 B
     assert f"skip {HEAD}: budget exhausted" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a real non-CPU buffer")
+def test_install_moves_the_modules_buffers_to_cpu():
+    """A buffer-scaled embedding (Gemma3/4 `embed_scale`) had its buffer moved to the
+    running device by init_model; it must follow the weight to the CPU."""
+    m = _Model(_strategy(_src()), budget=TIGHT)
+    with torch.device("meta"):
+        emb = torch.nn.Embedding(ROWS, 4)
+    emb.register_buffer("embed_scale", torch.tensor(2.0, device="cuda"), persistent=False)
+    m.layers[0] = emb
+    VaayuBaseModel._init_pinned_layers(m)
+    assert isinstance(m.layers[0], CpuResidentEmbedding)
+    assert m.layers[0].inner._buffers["embed_scale"].device.type == "cpu"

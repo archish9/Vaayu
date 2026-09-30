@@ -416,7 +416,9 @@ eligibility conditions.
 Nothing to set. On a CUDA load the embedding table moves to host RAM only when the VRAM
 pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
 model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
-expert cache cannot use anyway. Both are bit-identical to the old path.
+expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool: on
+gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4 full-length
+sessions; the guaranteed number of sessions still fits). Both are bit-identical to the old path.
 
 What the load log tells you:
 
@@ -425,6 +427,8 @@ What the load log tells you:
   attention's reserve) and is held in host RAM instead of streaming — normal. `embedding
   not CPU-resident (...)` names why an unusual embedding keeps streaming.
 - `[Vaayu-Cache] Non-expert RAM tier: K of N entries ...` — K entries no longer stream.
-- `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — the expert
-  arena needs all the RAM (typical for very large MoE checkpoints). Those weights are read
-  from disk every token; this is a hardware limit on the box, not a misconfiguration.
+- `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — some non-expert
+  weights still stream every token. Causes: the VRAM pinning budget or `max_pinned_layers`
+  leaves layers unpinned, and the tier only holds what fits in RAM the expert arena cannot
+  use (an arena that takes all the RAM, typical for very large MoE checkpoints, leaves it
+  empty). Those weights are read from disk every token.

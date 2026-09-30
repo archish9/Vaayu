@@ -4214,6 +4214,12 @@ class VaayuBaseModel(GenerationMixin):
         weight = torch.empty(tuple(src.shape), dtype=self.running_dtype)
         weight.copy_(src)
         module.weight = torch.nn.Parameter(weight, requires_grad=False)
+        # The module's own BUFFERS were moved to the running device by init_model;
+        # a buffer-scaled embedding (Gemma3/4 `embed_scale`) would otherwise mix
+        # CPU rows with a CUDA scalar and raise on the first forward.
+        for _k, _b in list(module._buffers.items()):
+            if _b is not None:
+                module._buffers[_k] = _b.to("cpu")
         self.layers[0] = CpuResidentEmbedding(module, self.running_device)
         self.pinned_layer_names.add(name)
         print(f"[Vaayu-Pin] embedding CPU-resident: {weight.nbytes / 1e9:.2f} GB host "
