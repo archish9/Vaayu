@@ -951,6 +951,21 @@ def load_from_strategy_or_tied_head(loader_strategy, checkpoint_path,
     return tensors
 
 
+def _non_expert_tier_hit(owner, layer_name):
+    """S14 P: `owner`'s resident tier copy of `layer_name`, or None.
+
+    A hit reads nothing from NVMe, so it is billed as a cache hit
+    (LayerTiming.cache_hit) exactly like the LRU's. Module-level and getattr-
+    guarded so the bare objects older tests build still reach every loader."""
+    tier = getattr(owner, "_non_expert_tier", None)
+    held = tier.get(layer_name) if tier is not None else None
+    if held is not None:
+        if getattr(owner, "_layer_from_cache", None) is None:
+            owner._layer_from_cache = {}
+        owner._layer_from_cache[layer_name] = True
+    return held
+
+
 def compute_rope_inv_freq(config, device=None) -> "torch.Tensor":
     """RoPE inverse frequencies for `config`, honouring PARTIAL rotary.
 
@@ -2835,6 +2850,7 @@ class VaayuBaseModel(GenerationMixin):
         # non-pinned MoE layer per token. Capped to prevent unbounded RAM growth
         # on large models (e.g. Qwen3-235B with 94 layers).
         self._non_expert_tensor_cache = None  # initialized below for MoE
+        self._non_expert_tier = None  # S14 P: filled below for MoE, after the arena
         self._layer_from_cache = {}  # records whether each layer's last load was a cache hit
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
         # Expert usage histogram (measurement only, ships dark). Default None
@@ -2969,6 +2985,7 @@ class VaayuBaseModel(GenerationMixin):
             # the budget the cache occupied anyway, but WARN for visibility.
             from .persist.safetensor_model_persister import compute_slab_bytes
             self._expert_slab_arena = None
+            _tier_n_uncapped = _tier_n_capped = 0     # S14 P: the row-40 cap's refused slabs
             if not self._moe_slab_capable:
                 # This layout's forward never reads the arena — it populates the
                 # cache via ExpertRAMCache.put() (clone path). Allocating anyway
@@ -3020,6 +3037,7 @@ class VaayuBaseModel(GenerationMixin):
                 _n_indexed = count_indexed_experts(self._expert_offset_index)
                 _n_capped = cap_slabs_at_indexed_experts(
                     _n_slabs, _n_indexed, _withheld)
+                _tier_n_uncapped, _tier_n_capped = _n_slabs, _n_capped
                 if _n_capped < _n_slabs:
                     print(f"[Vaayu-MoE] Expert slab arena capped {_n_slabs} -> "
                           f"{_n_capped} slabs: the model indexes only {_n_indexed} "
@@ -3129,6 +3147,16 @@ class VaayuBaseModel(GenerationMixin):
                 _expert_budget, max_per_layer=_max_per_layer,
                 arena=self._expert_slab_arena,
             )
+            # S14 P: RAM the arena cannot use -- the row-40 cap's refused slabs, or
+            # the whole budget when every block streams whole -- funds a fixed
+            # pinned tier for the non-expert weights that stream every token. 0
+            # where the arena binds: those models stream exactly as before.
+            from .non_expert_tier import tier_budget
+            self._fill_non_expert_tier(tier_budget(
+                n_slabs_uncapped=_tier_n_uncapped, n_slabs_capped=_tier_n_capped,
+                slab_bytes=_slab_bytes,
+                arena_skipped_whole_layer=bool(getattr(self, "_moe_whole_layer_only", False)),
+                expert_budget=_expert_budget))
 
             # Fix #9 (REPORT §2.4): a verify pass routes (draft_tokens+1) positions
             # at once — per-layer unique experts ≈ positions × top_k, so the working
@@ -4145,16 +4173,74 @@ class VaayuBaseModel(GenerationMixin):
             f"the fp8 cache silently."
         )
 
+    def _install_cpu_resident_embedding(self, tensors=None) -> bool:
+        """S14 E: hold the embedding table on the CPU where it would otherwise STREAM.
+
+        `_init_pinned_layers` calls this exactly where phase 1 would leave the
+        embedding unpinned -- a pinning budget <= 0, or an embedding larger than
+        the budget -- on a CUDA load. A streamed embedding is re-read and
+        re-uploaded whole every decode token to serve one row (gpt-oss-20b:
+        163 of 482 ms, S14 steps 1-2). Narrowed 2026-09-30 by the user's rule:
+        applied to every model, it cost Qwen3-Next decode +1.14 % (8 ABBA arms)
+        although its own step is +0.02 ms, so an embedding the budget CAN hold
+        stays VRAM-pinned exactly as before.
+
+        The HF module keeps running its OWN forward on a private CPU copy -- a
+        scaled subclass still scales -- and `self.layers[0]` becomes a wrapper
+        returning its output on the running device. `tensors` are phase 1's
+        already-loaded ones (loaded here when None). Returns True when
+        installed; on refusal prints why and the embedding keeps streaming.
+        """
+        from .cpu_embedding import CpuResidentEmbedding, cpu_embedding_eligibility
+        name = self.layer_names_dict["embed"]
+        module = self.layers[0]
+        if tensors is None:
+            try:
+                tensors = load_from_strategy_or_tied_head(
+                    self.loader_strategy, self.checkpoint_path, self.layer_names_dict,
+                    name, log_prefix="[Vaayu-Pin] ")
+            except Exception as e:
+                print(f"[Vaayu-Pin] embedding not CPU-resident (load failed: {e!r}); "
+                      f"it streams every token")
+                return False
+        ok, why = cpu_embedding_eligibility(module, tensors)
+        if not ok:
+            print(f"[Vaayu-Pin] embedding not CPU-resident ({why}); it streams every token")
+            return False
+        (src,) = tensors.values()
+        # A private copy: the loader hands back views into a rotating pinned
+        # buffer that the next load overwrites. running_dtype is exactly what
+        # inject_to_gpu would have produced, so the rows are bit-identical.
+        weight = torch.empty(tuple(src.shape), dtype=self.running_dtype)
+        weight.copy_(src)
+        module.weight = torch.nn.Parameter(weight, requires_grad=False)
+        # The module's own BUFFERS were moved to the running device by init_model;
+        # a buffer-scaled embedding (Gemma3/4 `embed_scale`) would otherwise mix
+        # CPU rows with a CUDA scalar and raise on the first forward.
+        for _k, _b in list(module._buffers.items()):
+            if _b is not None:
+                module._buffers[_k] = _b.to("cpu")
+        self.layers[0] = CpuResidentEmbedding(module, self.running_device)
+        self.pinned_layer_names.add(name)
+        print(f"[Vaayu-Pin] embedding CPU-resident: {weight.nbytes / 1e9:.2f} GB host "
+              f"RAM, 0 VRAM (the pinning budget cannot hold it)")
+        return True
+
     def _init_pinned_layers(self) -> None:
         """
         Pre-load layers into VRAM using two-phase asymmetric pinning.
 
         Phase 1 pins shared layers (embed, norm, lm_head) with continue on budget miss.
+        On a CUDA load, an embedding phase 1 cannot pin is made CPU-resident instead of streaming (S14 E).
         Phase 2 pins transformer layers 0…N with break on budget miss; only runs when
         max_pinned_layers != 0 (0 = shared-only, -1 = fill budget, N = first N layers).
         """
         budget = self._get_vram_pinning_budget()
         if budget <= 0:
+            # S14 E: nothing can be VRAM-pinned, so the embedding would stream
+            # every token; hold it on the CPU instead (it costs no VRAM).
+            if str(self.running_device).startswith("cuda"):
+                self._install_cpu_resident_embedding()
             return
 
         layer_prefix = self.layer_names_dict["layer_prefix"]
@@ -4181,6 +4267,12 @@ class VaayuBaseModel(GenerationMixin):
                     continue
                 size = sum(t.nbytes for t in tensors.values())
                 if used + size > budget:
+                    # S14 E: an embedding the budget cannot hold would stream
+                    # every token; hold it on the CPU instead.
+                    if (layer_name == self.layer_names_dict["embed"]
+                            and str(self.running_device).startswith("cuda")
+                            and self._install_cpu_resident_embedding(tensors)):
+                        continue
                     print(f"[Vaayu-Pin] skip {layer_name}: budget exhausted "
                           f"({used / 1e9:.2f}/{budget / 1e9:.2f} GB)")
                     continue
@@ -4501,6 +4593,9 @@ class VaayuBaseModel(GenerationMixin):
         correct 2.21 (uniform noise), while the same checkpoint under
         flash_attention_2 was correct.
         """
+        held = _non_expert_tier_hit(self, layer_name)
+        if held is not None:
+            return held
         tensors = load_from_strategy_or_tied_head(
             self.loader_strategy, self.checkpoint_path, self.layer_names_dict, layer_name)
         # The strategy has a RAM cache of its own (loader_strategy._cache, live on
@@ -4520,6 +4615,9 @@ class VaayuBaseModel(GenerationMixin):
         After the first token, most non-expert reads are cache hits with no disk I/O.
         On RAM-constrained machines, LRU eviction keeps the working set warm.
         """
+        held = _non_expert_tier_hit(self, layer_name)
+        if held is not None:
+            return held
         # Whether THIS layer's last fetch came from the cache, keyed by layer
         # name so the prefetch thread (which fetches layer i+1 while layer i
         # computes) cannot mis-attribute it. Read by the layer loop below to
@@ -4543,6 +4641,52 @@ class VaayuBaseModel(GenerationMixin):
         if cache is not None:
             cache.put(layer_name, result)
         return result
+
+    def _fill_non_expert_tier(self, budget_bytes: int) -> None:
+        """S14 P: copy what would stream every token into a fixed pinned tier.
+
+        Candidates and order come from tier_candidates; each entry is sized from
+        its shard header, so one that does not fit is never read. A tied head
+        whose shard is absent or empty is sized from the embedding's header (the
+        tied fallback loads the embedding's bytes under the head's name).
+        """
+        from .non_expert_tier import (NonExpertRamTier, header_tensor_bytes,
+                                      tier_candidates, tier_log_lines)
+        from .persist.safetensor_model_persister import (load_non_expert_tensors,
+                                                         non_expert_ranges)
+        names = self.layer_names_dict
+        offset_index = getattr(self, "_expert_offset_index", None)
+        moe_layers = ({b.layer_name for b in (getattr(self, "_detected_moe_blocks", None) or ())}
+                      if offset_index is not None else set())
+        resident = set(self.pinned_layer_names) | set(self.non_expert_pinned_layer_names)
+        tier = NonExpertRamTier(budget_bytes, pin=torch.cuda.is_available())
+        ckpt = Path(self.checkpoint_path)
+        for name, kind in tier_candidates(
+                self.layer_names, embed=names["embed"], norm=names.get("norm"),
+                lm_head=names.get("lm_head"), resident=resident, moe_layer_names=moe_layers):
+            path = str(ckpt / (name + ".safetensors"))
+            if kind == "non_expert":
+                ranges = non_expert_ranges(path, name, offset_index)
+                nbytes, count = sum(r[3] for r in ranges), len(ranges)
+
+                def load(p=path, n=name):
+                    return load_non_expert_tensors(p, n, offset_index)
+            else:
+                nbytes, count = header_tensor_bytes(path)
+                if count == 0 and name == names.get("lm_head"):
+                    nbytes, count = header_tensor_bytes(ckpt / (names["embed"] + ".safetensors"))
+
+                def load(n=name):
+                    return load_from_strategy_or_tied_head(
+                        self.loader_strategy, self.checkpoint_path, names, n)
+            if nbytes <= 0:
+                # Nothing to stream and nothing to hold: offering it would print a
+                # spurious "0.00 GB/token still stream" warning.
+                continue
+            tier.offer(name, nbytes, count, load)
+        self._non_expert_tier = tier
+        for line in tier_log_lines(tier.summary()):
+            print(line)
 
     def _load_tied_lm_head_from_embed(self, layer_name):
         """Load the embedding shard and re-key its tensors as lm_head's."""
@@ -4577,6 +4721,9 @@ class VaayuBaseModel(GenerationMixin):
         return new_state_dict
 
     def load_layer_to_cpu(self, layer_name):
+        held = _non_expert_tier_hit(self, layer_name)
+        if held is not None:
+            return held
 
         t = time.time()
 

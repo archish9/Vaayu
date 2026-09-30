@@ -561,6 +561,33 @@ def _load_pinned(file_path: str) -> dict:
     return result
 
 
+def non_expert_ranges(file_path: str, layer_name: str, offset_index) -> list[tuple]:
+    """[(key, hdr_meta, abs_file_offset, byte_len)] for a MoE layer shard's
+    NON-expert tensors -- exactly the set `load_non_expert_tensors` reads, from
+    the header alone (S14 P sizes a tier entry with it before deciding to read)."""
+    with open(file_path, 'rb') as f:
+        hdr_len = struct.unpack('<Q', f.read(8))[0]
+        hdr = json.loads(f.read(hdr_len))
+    data_start = 8 + hdr_len
+
+    # Collect disk-format expert tensor keys from offset_index
+    expert_keys: set[str] = set()
+    layer_experts = offset_index.index.get(layer_name, {})
+    for _eidx, expert_metas in layer_experts.items():
+        expert_keys.update(expert_metas.keys())
+
+    # Build list of non-expert (key, hdr_meta, abs_file_offset, byte_len)
+    non_expert: list[tuple] = []
+    for key, meta in hdr.items():
+        if key == '__metadata__':
+            continue
+        if key in expert_keys:
+            continue
+        start, end = meta['data_offsets']
+        non_expert.append((key, meta, data_start + start, end - start))
+    return non_expert
+
+
 def load_non_expert_tensors(
     file_path: str,
     layer_name: str,
@@ -583,26 +610,7 @@ def load_non_expert_tensors(
     if offset_index is None:
         return _load_pinned(file_path)
 
-    with open(file_path, 'rb') as f:
-        hdr_len = struct.unpack('<Q', f.read(8))[0]
-        hdr = json.loads(f.read(hdr_len))
-    data_start = 8 + hdr_len
-
-    # Collect disk-format expert tensor keys from offset_index
-    expert_keys: set[str] = set()
-    layer_experts = offset_index.index.get(layer_name, {})
-    for _eidx, expert_metas in layer_experts.items():
-        expert_keys.update(expert_metas.keys())
-
-    # Build list of non-expert (key, hdr_meta, abs_file_offset, byte_len)
-    non_expert: list[tuple] = []
-    for key, meta in hdr.items():
-        if key == '__metadata__':
-            continue
-        if key in expert_keys:
-            continue
-        start, end = meta['data_offsets']
-        non_expert.append((key, meta, data_start + start, end - start))
+    non_expert = non_expert_ranges(file_path, layer_name, offset_index)
 
     if not non_expert:
         return {}

@@ -410,3 +410,25 @@ nothing is logged either way. The same is true with the prefix cache OFF
 transformers' own generation and its plain `DynamicCache`, never a seamed Vaayu one, so
 decode graphs are never eligible there either. See `architecture.md` §7 for the
 eligibility conditions.
+
+## Embedding and non-expert residency (no knob)
+
+Nothing to set. On a CUDA load the embedding table moves to host RAM only when the VRAM
+pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
+model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
+expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool: on
+gpt-oss-20b the pool shrinks from about 12.4 GB to about 7 GB (roughly 7 to 4 full-length
+sessions; the guaranteed number of sessions still fits). Both are bit-identical to the old path.
+
+What the load log tells you:
+
+- `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM (the pinning budget cannot
+  hold it)` — the embedding did not fit the VRAM pinning budget (e.g. under eager
+  attention's reserve) and is held in host RAM instead of streaming — normal. `embedding
+  not CPU-resident (...)` names why an unusual embedding keeps streaming.
+- `[Vaayu-Cache] Non-expert RAM tier: K of N entries ...` — K entries no longer stream.
+- `[Vaayu-Cache] WARNING: ... GB/token of non-expert weights still stream` — some non-expert
+  weights still stream every token. Causes: the VRAM pinning budget or `max_pinned_layers`
+  leaves layers unpinned, and the tier only holds what fits in RAM the expert arena cannot
+  use (an arena that takes all the RAM, typical for very large MoE checkpoints, leaves it
+  empty). Those weights are read from disk every token.
