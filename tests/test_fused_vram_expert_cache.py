@@ -130,8 +130,9 @@ def test_a_resident_expert_is_not_read_off_disk_again(tmp_path, monkeypatch):
 
 
 def test_prefill_does_not_touch_the_vram_cache(tmp_path):
-    """Prefill routes ~every expert once; churning the GPU LRU with a whole-model
-    sweep is what the other two forwards gate off, and so must this one."""
+    """Prefill routes ~every expert once, so it must never FILL the tier or move
+    the decode hit/miss counters. It does read the tier (S17) -- that is
+    tests/test_prefill_reads_vram_tier.py; here the tier is empty."""
     model, vaayu_ref, _ram = _patch(tmp_path, prefill=True)
 
     model.layers[0].mlp.forward(torch.randn(1, 4, HIDDEN))

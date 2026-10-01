@@ -829,6 +829,7 @@ class ExpertVRAMCache:
         self.misses = 0
         self.evictions = 0
         self.prefill_evictions = 0   # reactive prefill-headroom evictions
+        self.prefill_hits = 0        # prefill lookups served from the tier (peek)
         # Per-(layer, expert) attribution of BUDGET-PRESSURE evictions only, for
         # the expert usage histogram. None unless explicitly enabled (ships dark).
         #
@@ -869,6 +870,19 @@ class ExpertVRAMCache:
     def has(self, layer_idx: int, expert_idx: int) -> bool:
         with self.lock:
             return (layer_idx, expert_idx) in self.cache
+
+    def peek(self, layer_idx: int, expert_idx: int):
+        """A PREFILL pass's lookup (S17): the entry or None, read-only.
+
+        No LRU promotion and no hit/miss count. Prefill routes ~every expert
+        once, so promoting what it touches would re-order the tier by one
+        prompt's sweep, and counting it would bury the decode hit rate that
+        `hits`/`misses` report. `prefill_hits` is its own counter."""
+        with self.lock:
+            entry = self.cache.get((layer_idx, expert_idx))
+            if entry is not None:
+                self.prefill_hits += 1
+            return entry
 
     def resident_set(self, layer_idx: int) -> set:
         """Experts resident on GPU for `layer_idx`. Non-mutating — for
@@ -930,9 +944,10 @@ class ExpertVRAMCache:
 
     def evict_until_free(self, free_target_bytes: int) -> int:
         """Evict LRU entries until free VRAM would reach free_target_bytes, then
-        return blocks to the driver. Used reactively during prefill: the resident
-        cache is not consulted during a prefill pass, so evicting here has no
-        correctness impact, and the evicted experts re-warm during decode.
+        return blocks to the driver. Used reactively during prefill: a prefill pass
+        only reads the tier (peek), and a layer visit holds the entries it took,
+        so evicting here has no correctness impact -- an evicted expert is simply
+        uploaded again, and re-warms during decode.
 
         Reads free VRAM once, evicts enough BYTES to cover the deficit, then calls
         empty_cache() ONCE — dropping Python refs alone leaves blocks in PyTorch's
@@ -974,6 +989,7 @@ class ExpertVRAMCache:
             return (f"{self.hits}hit/{self.misses}miss/{self.evictions}evict "
                     f"hit_rate={rate} "
                     f"prefill_evict={self.prefill_evictions} "
+                    f"prefill_hit={self.prefill_hits} "
                     f"usage={self.current_usage / 1e9:.2f}GB/{self.budget_bytes / 1e9:.2f}GB")
 
     def delta_stats(self) -> str:

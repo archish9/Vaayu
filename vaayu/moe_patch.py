@@ -1553,7 +1553,7 @@ def _make_sparse_moe_forward(
 
 
 # Hardware constant: free VRAM to guarantee before each MoE layer DURING PREFILL,
-# by evicting the (prefill-idle) VRAM expert cache. A property of the card, not
+# by evicting the VRAM expert cache (prefill reads it, never fills it). A property of the card, not
 # the model (CLAUDE.md §5) — same CLASS of constant as vaayu_base._VRAM_RESERVE_FLOOR_BYTES
 # (both are hardware headroom reserves), but a deliberately DIFFERENT value (2 GB
 # here vs 3.5 GB there): this one only needs to exceed one layer's prefill-chunk
@@ -1564,7 +1564,7 @@ _PREFILL_VRAM_HEADROOM = 2 * 1024 ** 3
 
 
 def _format_vram_diag(layer_idx, free, alloc, reserved,
-                      cache_usage, cache_budget, prefill_evict):
+                      cache_usage, cache_budget, prefill_evict, prefill_hit):
     """One grep-able diagnostic line for the VRAM prefill trajectory. All byte
     inputs; emits GB. Pure — no torch/CUDA calls, so it is unit-testable."""
     g = 1024 ** 3
@@ -1572,17 +1572,16 @@ def _format_vram_diag(layer_idx, free, alloc, reserved,
             f"free={free / g:.2f}GB alloc={alloc / g:.2f}GB "
             f"reserved={reserved / g:.2f}GB "
             f"cache={cache_usage / g:.2f}/{cache_budget / g:.2f}GB "
-            f"prefill_evict={prefill_evict}")
+            f"prefill_evict={prefill_evict} prefill_hit={prefill_hit}")
 
 
 def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
     """During a prefill pass, evict the VRAM expert cache until free VRAM meets
-    _PREFILL_VRAM_HEADROOM. The cache is not read during prefill — the two
-    forwards that consult it (module-list and fused-EXL3) set their local
-    _vram = None when _moe_prefill_pass is set, and the non-EXL3 fused forward
-    never touches it at all — so its residency gives prefill no benefit while
-    starving activations. Evicting here is therefore free for prefill; the
-    evicted experts re-warm during the decode that follows.
+    _PREFILL_VRAM_HEADROOM. Activations come first. A prefill pass reads the
+    tier but never fills it (S17, _vram_tier_visit), so an entry evicted here
+    costs that prefill one upload it would otherwise have skipped, and re-warms
+    during the decode that follows. This runs at forward entry, before the visit
+    takes its entries, so it never evicts one the visit is computing with.
     A no-op during decode, without a VRAM cache, or without CUDA.
 
     When VAAYU_VRAM_DIAG is set, emits one grep-able [VRAM-DIAG] line per MoE
@@ -1600,16 +1599,49 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
         print(_format_vram_diag(
             layer_idx, free_now,
             torch.cuda.memory_allocated(), torch.cuda.memory_reserved(),
-            _vram.current_usage, _vram.budget_bytes, _vram.prefill_evictions),
+            _vram.current_usage, _vram.budget_bytes, _vram.prefill_evictions,
+            _vram.prefill_hits),
             flush=True)
+
+
+def _vram_tier_visit(vaayu_ref, layer_idx, unique_experts):
+    """One layer visit's view of the VRAM expert tier: (held, vram).
+
+    `held` maps each routed expert that is resident to its entry. The visit keeps
+    these references for its whole compute loop: eviction only pops the dict and
+    drops the cache's reference, so a held entry stays valid even if a later
+    put() in the same visit evicts it. ONE lookup per expert, not has()-then-get().
+
+    `vram` is the cache this visit may put() its misses into, or None.
+
+    Two gates, shared by all three per-expert forwards so they cannot drift:
+    _vram_cacheable_layers restricts the tier to the layer prefix that fits when
+    the budget cannot hold a whole token's working set (None = no restriction);
+    and a PREFILL pass is read-only (S17) -- it routes ~every expert once, so
+    filling the tier from it would only churn the LRU, but an expert already
+    resident needs no second upload. Prefill reads through peek(), which leaves
+    the LRU order and the decode hit/miss counters alone.
+    """
+    vram = getattr(vaayu_ref, "_expert_vram_cache", None)
+    layers = getattr(vaayu_ref, "_vram_cacheable_layers", None)
+    if vram is None or (layers is not None and layer_idx not in layers):
+        return {}, None
+    prefill = getattr(vaayu_ref, "_moe_prefill_pass", False)
+    lookup = vram.peek if prefill else vram.get
+    held = {}
+    for eidx in unique_experts:
+        entry = lookup(layer_idx, eidx)
+        if entry is not None:
+            held[eidx] = entry
+    return held, (None if prefill else vram)
 
 
 def _maybe_record_usage(vaayu_ref, layer_idx, expert_indices) -> None:
     """Count DECODE-time expert routes when the usage histogram is enabled.
 
     A no-op when the feature is off (the common case — one getattr). Skipped
-    during prefill on purpose: the VRAM expert cache is not consulted in a
-    prefill pass, so there are no budget-pressure evictions then, and counting
+    during prefill on purpose: a prefill pass never fills the VRAM expert cache
+    (it only reads it), so there are no budget-pressure evictions then, and counting
     prefill routes would make the report compare decode-side evictions against
     prefill+decode routes. See the measurement design spec.
     """
@@ -1742,16 +1774,10 @@ def _make_modulelist_sparse_forward(
         _contribs: list = []
         _flat_routing = routing_weights.reshape(-1, routing_weights.shape[-1])
 
-        # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
-        # prefill routes ~every expert once, so caching there only churns the LRU;
-        # and _vram_cacheable_layers restricts to the layer prefix that fits when
-        # the budget can't hold a whole token's working set (None = no restriction).
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            _vram = None
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
+        # VRAM expert cache (Fix #7, ported from the fused path). Experts already
+        # VRAM-resident need no RAM lookup and no disk read at all. Prefill reads
+        # the tier and does not fill it (_vram is None then) -- see _vram_tier_visit.
+        _vram_resident, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         # Chunk-major retention (row 45, the module-list half of row 44's F2). The
         # layer-major chunked prefill calls this layer once per chunk, back to
@@ -1762,8 +1788,8 @@ def _make_modulelist_sparse_forward(
         # detach was 63 % of a 113.9 s wall. An expert uploaded by an earlier chunk
         # call is kept as the same entry the VRAM cache would store and served
         # through the hit branch below; the dict is dropped at the layer's last
-        # chunk call and bounded by the VRAM cache budget, which is idle during
-        # prefill (_vram is None above). _chunked_prefill's finally clears
+        # chunk call and bounded by the VRAM cache budget; prefill
+        # puts nothing in that cache. _chunked_prefill's finally clears
         # _chunk_major_gpu, which is why a missing dict always starts a fresh count.
         _cm = None
         _cm_last_call = False
@@ -1782,20 +1808,9 @@ def _make_modulelist_sparse_forward(
             _cm_budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
                                  "budget_bytes", 0)
 
-        # Experts already VRAM-resident need no RAM lookup and no disk read at all.
-        # ONE get() per expert, entry held for the compute loop below — not
-        # has()-then-get(), which would take the lock twice and leave a window
-        # where an expert could vanish between the two calls.
-        _vram_resident: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _entry = _vram.get(layer_idx, _e)
-                if _entry is not None:
-                    _vram_resident[_e] = _entry
         if _cm is not None:
-            # Mutually exclusive with the branch above in practice (_vram is None
-            # during prefill), but the lookup is written as its own pass so
-            # neither gate depends on the other's state.
+            # An expert the tier lacked on an earlier chunk call was uploaded then
+            # and retained here; tier residents never enter this dict.
             for _e in unique_experts:
                 _entry = _cm.get(_e)
                 if _entry is not None:
@@ -1970,12 +1985,13 @@ def _make_modulelist_sparse_forward(
                         # failed attach must not silently drop this expert's
                         # contribution to final_hidden — fall through to a real
                         # disk load below instead of skipping compute.
-                        # The entry came from whichever tier is live: the VRAM
-                        # cache at decode, the chunk-major dict during a
-                        # layer-major prefill (where _vram is None, so the drop
-                        # must not go through it).
-                        if _vram is not None:
-                            _vram.drop(layer_idx, eidx)
+                        # The entry came from the VRAM cache (decode, or a
+                        # prefill read) or from the chunk-major dict. _vram is
+                        # None in prefill, so the drop goes to the cache itself;
+                        # drop() on a key it does not hold is a no-op.
+                        _tier = getattr(vaayu_ref, "_expert_vram_cache", None)
+                        if _tier is not None:
+                            _tier.drop(layer_idx, eidx)
                         if _cm is not None and eidx in _cm:
                             vaayu_ref._chunk_major_gpu_bytes -= (
                                 ExpertVRAMCache._group_bytes(_cm.pop(eidx)))
@@ -2324,25 +2340,9 @@ def _make_fused_sparse_forward(
         # VRAM expert cache (S2b (iii)). Until 2026-09-13 this forward reached it
         # through ZERO code paths while its budget sat reserved and idle — the
         # VAAYU_CACHE_BIAS failure mode (CLAUDE.md §0) in a fourth place. Same
-        # two gates the other two forwards apply.
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            # Prefill routes ~every expert once; don't churn the GPU LRU with a
-            # whole-model sweep.
-            _vram = None
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
-
-        # Held for the whole compute loop, as the other two forwards hold theirs:
-        # eviction only pops the dict and drops its reference, so a held entry
-        # stays valid even if a later put() in this same visit evicts it.
-        _vram_hold: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _held = _vram.get(layer_idx, _e)
-                if _held is not None:
-                    _vram_hold[_e] = _held
+        # two gates and the same hold as the other two forwards. Prefill reads
+        # the tier and does not fill it (_vram is None then) -- see _vram_tier_visit.
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         # Chunk-major retention (row 44 F2). The layer-major chunked prefill calls
         # this layer once per chunk, back to back; without this, each call re-read
@@ -2352,8 +2352,8 @@ def _make_fused_sparse_forward(
         # and served through the hit branch below; the dict is dropped at the
         # layer's last chunk call. Same mechanism as the fused-EXL3 forward's
         # _chunk_major_gpu, with its own call counter since that one rides the
-        # EXL3-only prefill stager. Bounded by the VRAM cache budget, idle during
-        # prefill. _chunked_prefill's finally clears the dict on an exception,
+        # EXL3-only prefill stager. Bounded by the VRAM cache budget, which prefill
+        # does not fill. _chunked_prefill's finally clears the dict on an exception,
         # which is why a missing dict always starts a fresh count.
         _cm = None
         _cm_last_call = False
@@ -3096,28 +3096,11 @@ def _make_fused_sparse_forward_exl3(
                 if _staged_layer is not None and _is_last_call:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        # Prefill: don't churn the GPU LRU with a whole-model sweep.
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            _vram = None
-        # Layer-range restriction (Fix #7 follow-up): only layers in the
-        # cacheable prefix use the VRAM cache; None means no restriction.
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
-
         # Check GPU residency BEFORE dispatching, so a resident expert that has
         # fallen out of the RAM cache is not read off NVMe for nothing (P8).
-        # The entry is HELD for the whole compute loop, exactly as the
-        # module-list forward holds its _vram_resident entries: eviction only
-        # pops the dict and drops its reference, so a held entry stays valid
-        # even if a later put() in this same layer-visit evicts it.
-        _vram_hold: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _held = _vram.get(layer_idx, _e)
-                if _held is not None:
-                    _vram_hold[_e] = _held
+        # Prefill reads the tier and does not fill it (_vram is None then), and
+        # the layer-range restriction covers both -- see _vram_tier_visit.
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
             unique_experts,
@@ -3195,7 +3178,8 @@ def _make_fused_sparse_forward_exl3(
                     current_state = current_state.to(torch.float16)
 
                 # Held since before dispatch (one LRU promotion per expert per
-                # visit, as before — the lookup simply moved earlier).
+                # visit at decode; a prefill visit looks up through peek() and
+                # promotes nothing).
                 _cached_gpu = _vram_hold.get(eidx)
                 _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
                 if _cached_gpu is None and _cm_gpu is not None:
@@ -3272,7 +3256,7 @@ def _make_fused_sparse_forward_exl3(
                         if not _owned_by_cache:
                             _entry = None
                     elif _cm_gpu is not None:
-                        # Chunk-major retention (prefill: _vram is gated off). Budget
+                        # Chunk-major retention (prefill: nothing is put in the tier). Budget
                         # bound is the same hardware-derived VRAM cache budget; overflow
                         # experts simply re-upload on later chunks.
                         _sz = sum(t.nbytes for d in (gpu_gate, gpu_up, gpu_down)
@@ -3306,8 +3290,9 @@ def _make_fused_sparse_forward_exl3(
                             # Cache the BC objects with the entry: they wrap the SAME
                             # resident GPU tensors, so their lifetime matches; eviction
                             # drops the tuple and the pybind destructors free the C++
-                            # heap. Mutation outside the cache lock is safe — the decode
-                            # compute loop is the sole consumer of VRAM-cache entries.
+                            # heap. Mutation outside the cache lock is safe — every consumer
+                            # of VRAM-cache entries (decode or prefill) runs on the forward
+                            # thread, one layer visit at a time.
                             _entry["bc"] = (bc_gate, bc_up, bc_down)
 
                     if _prof:
