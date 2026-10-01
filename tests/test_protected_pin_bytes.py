@@ -35,8 +35,9 @@ def ckpt(tmp_path):
     return tmp_path, sizes
 
 
-def _stub(path, *, moe=True, max_pinned=-1):
+def _stub(path, *, moe=True, max_pinned=-1, tied=False):
     s = SimpleNamespace(
+        config=SimpleNamespace(tie_word_embeddings=tied),
         is_moe=moe, checkpoint_path=str(path), max_pinned_layers=max_pinned,
         layer_names_dict={"embed": "model.embed_tokens", "norm": "model.norm",
                           "lm_head": "lm_head", "layer_prefix": "model.layers"},
@@ -77,3 +78,58 @@ def test_absent_or_empty_head_shard_counts_zero(ckpt):
     assert _stub(path)._protected_pin_bytes() == want
     save_file({}, str(path / "lm_head.safetensors"))  # the EMPTY head shard (D1)
     assert _stub(path)._protected_pin_bytes() == want
+
+
+def test_tied_checkpoint_counts_the_head_at_embedding_size(ckpt):
+    """F3: phase 1 pins a SECOND VRAM copy of the embedding as the tied head
+    (load_from_strategy_or_tied_head -> rekey_embed_as_lm_head), and the plan's
+    own _head_bytes charges it at embedding size -- so the head shard being
+    absent must not make it count 0."""
+    path, sz = ckpt
+    (path / "lm_head.safetensors").unlink()
+    want = 2 * sz["embed"] + sz["norm"] + sz["non_expert_layers"]
+    assert _stub(path, tied=True)._protected_pin_bytes() == want
+    assert _stub(path, tied=True, max_pinned=0)._protected_pin_bytes() == 2 * sz["embed"] + sz["norm"]
+
+
+def _layout_gptoss(tmp_path):
+    t = lambda *s: torch.zeros(*s, dtype=torch.bfloat16)
+    ne = 0
+    for i in range(2):
+        p = f"model.layers.{i}"
+        non_expert = {f"{p}.self_attn.q_proj.weight": t(8, 8), f"{p}.mlp.router.weight": t(4, 8)}
+        routed = {f"{p}.mlp.experts.gate_up_proj_blocks": t(4, 16, 8),
+                  f"{p}.mlp.experts.gate_up_proj_scales": t(4, 16),
+                  f"{p}.mlp.experts.gate_up_proj_bias": t(4, 16),
+                  f"{p}.mlp.experts.down_proj_blocks": t(4, 8, 8)}
+        _write(tmp_path / f"{p}.safetensors", {**non_expert, **routed})
+        ne += sum(v.nbytes for v in non_expert.values())
+    return ne
+
+
+def _layout_qwen3_next(tmp_path):
+    t = lambda *s: torch.zeros(*s, dtype=torch.bfloat16)
+    ne = 0
+    for i in range(2):
+        p = f"model.layers.{i}"
+        non_expert = {f"{p}.mlp.shared_expert.gate_proj.weight": t(16, 8),   # SINGULAR: non-expert
+                      f"{p}.mlp.shared_expert_gate.weight": t(1, 8),
+                      f"{p}.mlp.gate.weight": t(4, 8),
+                      f"{p}.linear_attn.in_proj_qkvz.weight": t(8, 8)}
+        routed = {f"{p}.mlp.experts.{e}.gate_proj.weight": t(16, 8) for e in range(4)}
+        _write(tmp_path / f"{p}.safetensors", {**non_expert, **routed})
+        ne += sum(v.nbytes for v in non_expert.values())
+    return ne
+
+
+@pytest.mark.parametrize("layout", [_layout_gptoss, _layout_qwen3_next],
+                         ids=["gpt-oss-fused-3d", "qwen3-next"])
+def test_routed_experts_excluded_and_everything_else_counted_across_layouts(tmp_path, layout):
+    """F4 (section 5): one key layout is not a detection rule. Each layout must
+    drop exactly the routed experts and keep every other tensor."""
+    t = lambda *s: torch.zeros(*s, dtype=torch.bfloat16)
+    embed = _write(tmp_path / "model.embed_tokens.safetensors", {"model.embed_tokens.weight": t(64, 8)})
+    norm = _write(tmp_path / "model.norm.safetensors", {"model.norm.weight": t(8)})
+    head = _write(tmp_path / "lm_head.safetensors", {"lm_head.weight": t(64, 8)})
+    ne = layout(tmp_path)
+    assert _stub(tmp_path)._protected_pin_bytes() == embed + norm + head + ne

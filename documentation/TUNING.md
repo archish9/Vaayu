@@ -231,6 +231,12 @@ attention implementation:
   difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
   flash parity it changes nothing. The floor is also never allowed to take the pin budget
   an MoE load's non-expert weights need (`protected pin demand` in the load log).
+  gpt-oss is the eager example: its floor really is the 9.49 GiB parity floor (protection
+  does not bind, 3.35 vs 4.78 GiB), so a shorter request returns VRAM. A MoE load whose
+  floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
+  a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
+  above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,
+  reserve 3.50, pin 7.80 GiB).
 
 What a shorter context *does* do is shrink the same RAM reservation `prefix_sessions` scales —
 and only as the product. `prefix_sessions=1 × 8192` and `prefix_sessions=2 × 4096` are

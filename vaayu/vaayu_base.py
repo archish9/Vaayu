@@ -5079,7 +5079,10 @@ class VaayuBaseModel(GenerationMixin):
         (max_pinned_layers != 0), every layer's non-expert tensors. Read off the
         safetensors headers with the forward's own routed-expert filter
         (r'\\.experts\\.'), so a shared expert counts as non-expert, as the loader
-        streams it. File bytes, like the pin planner's own accounting.
+        streams it. File bytes, like the pin planner's own accounting. A TIED
+        checkpoint's head is counted at the embedding's bytes (its head shard is
+        empty or absent): phase 1 pins a second VRAM copy of the embedding as
+        the head, and the plan's own _head_bytes charges it the same.
         DeepSeek-V4: 8.24 GiB."""
         if not getattr(self, "is_moe", False):
             return 0
@@ -5088,6 +5091,9 @@ class VaayuBaseModel(GenerationMixin):
         d = self.layer_names_dict
         total = sum(_safetensors_tensor_bytes(ckpt / f"{d[k]}.safetensors")
                     for k in ("embed", "norm", "lm_head"))
+        if getattr(self.config, "tie_word_embeddings", False):
+            total += (_safetensors_tensor_bytes(ckpt / f"{d['embed']}.safetensors")
+                      - _safetensors_tensor_bytes(ckpt / f"{d['lm_head']}.safetensors"))
         if self.max_pinned_layers != 0:
             routed = re.compile(r"\.experts\.")
             prefix = d["layer_prefix"] + "."

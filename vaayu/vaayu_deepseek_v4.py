@@ -11,6 +11,7 @@ The durable copy is row 28b's A5.7a bullet in `todo.md`.
 """
 
 import sys
+import weakref
 
 import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
@@ -593,8 +594,10 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return layer(self.model.model.hc_head(seq))
 
     def get_past_key_value_args(self, past_key_values):
-        """Pass the cache through, and keep a reference for the contiguity
-        check that `get_attention_mask_args` performs a moment later.
+        """Pass the cache through, and keep a WEAK reference for the contiguity
+        check that `get_attention_mask_args` performs a moment later (weak, so
+        the previous request's preallocated cache is not held alive until the
+        next request's first forward -- S15 final review F2).
 
         This hook does NOT read a sequence length any more, and that is the
         whole point. `DeepseekV4Cache` gives every layer an INDEPENDENT
@@ -613,7 +616,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
         own, and this hook is not told which layer it is -- `get_attention_mask_args`
         is.
         """
-        self._cache_for_start_pos_check = past_key_values
+        self._cache_for_start_pos_check = (
+            None if past_key_values is None else weakref.ref(past_key_values))
         return {"past_key_values": past_key_values}
 
     def get_pos_emb_args(self, len_p, len_s):
@@ -663,7 +667,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
         compressed latent per `compress_ratio` positions (+ the indexer's keys),
         so the config formula's 88 KB/token over-charged it ~13x. Built twice on the
         meta device (no memory), at S1 = 1024 x the coarsest ratio and S2 = 2 x
-        S1, so every ratio divides both; the slope of its unique tensors' nbytes
+        S1, so every ratio divides both (true when every ratio divides the
+        coarsest, as 4 | 128 does on DeepSeek-V4-Flash); the slope of its unique tensors' nbytes
         is the per-token cost (6,880 B on DeepSeek-V4-Flash), with no doubling --
         it is preallocated exactly at max_seq_len. The constant window/state part
         (17.8 MB) is not charged: the derived attention cost's 2x margin covers it.
@@ -721,7 +726,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
         right count to compare against, and guessing an index is the defect
         this replaced.
         """
-        cache = getattr(self, "_cache_for_start_pos_check", None)
+        ref = getattr(self, "_cache_for_start_pos_check", None)
+        cache = ref() if ref is not None else None
         layer_idx = getattr(layer, "layer_idx", None)
         if cache is not None and layer_idx is not None:
             counted = cache.get_seq_length(layer_idx)

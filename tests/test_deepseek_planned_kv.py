@@ -3,17 +3,17 @@
 Default: today's config-derived figure. DeepSeek-V4: measured from its own
 preallocated cache built on the meta device (compressed latents: 6,880 B/token
 against the 88 KB the config formula charged)."""
-import os
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import vaayu.vaayu_base as vb
 from vaayu.vaayu_base import VaayuBaseModel
 from vaayu.vram_plan import kv_bytes_per_token
 
-DS = "/home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731"
+FIXTURE = Path(__file__).parent / "fixtures" / "deepseek_v4_config.json"
 
 
 def test_default_hook_is_todays_config_figure(monkeypatch):
@@ -28,12 +28,11 @@ def test_default_hook_is_todays_config_figure(monkeypatch):
                                       head_dim=64, kv_cache_mode="bf16"), True, "config")
 
 
-@pytest.mark.skipif(not os.path.isdir(DS), reason=f"DeepSeek config not at {DS}")
 def test_deepseek_kv_is_measured_from_its_own_cache_on_meta():
     from vaayu.model_code.deepseek_v4 import modeling_deepseek_v4 as modeling
     from vaayu.model_code.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
-    cfg = DeepseekV4Config.from_pretrained(DS)
+    cfg = DeepseekV4Config(**json.loads(FIXTURE.read_text()))   # vendored: runs on a fresh clone
     stub = SimpleNamespace(config=cfg, running_dtype=torch.bfloat16,
                            _running_symbol=lambda name: getattr(modeling, name))
     per_token, bucketed, source = VaayuDeepseekV4.planned_kv_bytes_per_token(stub)

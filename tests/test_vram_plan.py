@@ -1357,3 +1357,31 @@ def test_requested_context_caps_the_floors_parity(name):
     assert _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0,
                   layer_slack=0, requested_max_seq_len=parity * 2) == \
         _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0, layer_slack=0)
+
+
+# --- S15 L-b trap guard ----------------------------------------------------
+# A geometry with a tiny KV (DeepSeek-V4: 6,880 B/token) turns flash parity into an
+# enormous context, and the unprotected floor then eats the pin budget (reserve
+# ~11.3 GiB, pinning 0.01 GiB, every streamed layer re-read each token).
+# `protected_bytes` is the guard. Fixture geometry: DeepSeek-V4-Flash on this box.
+
+def _deepseek_like():
+    shape = VramShape(kv_per_token=6880, N=1, chunk=512, hidden=4096, n_heads=64,
+                      vocab=129280, elem_bytes=2, score_elem_bytes=1.0,
+                      alloc_factor=1.0, kv_growth_factor=2, kv_capacity_buckets=False,
+                      head_bytes=1_059_061_856)
+    return dict(shape=shape, base_floor=int(3.5 * GB), free_vram=int(15.73e9),
+                min_resident=13_369_344, layer_slack=int(3.32 * GB))
+
+
+def test_protected_floor_defeats_the_tiny_kv_trap():
+    kw = _deepseek_like()
+    protected = int(8.24 * GB)
+    assert _rfb15(**kw) >= 11 * GB                       # (a) the trap, unprotected
+    floor = _rfb15(**kw, protected_bytes=protected)
+    assert floor == kw["base_floor"]                     # (b) held at the base
+    plan = plan_vram(free_vram=kw["free_vram"], shape=kw["shape"],
+                     min_resident=kw["min_resident"], requested_max_seq_len=None,
+                     position_limit=1_000_000, layer_slack=kw["layer_slack"],
+                     reserve_floor=floor)
+    assert plan.pinning_budget >= 7.5 * GB               # (c) the pin budget survives

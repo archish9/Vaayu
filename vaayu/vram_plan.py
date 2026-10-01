@@ -603,8 +603,8 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     2026-10-01). Row 8 meant the cost to land on the expert VRAM cache (MoE),
     but a geometry with a tiny KV turns flash parity into an enormous context:
     DeepSeek-V4 with its real 6,880 B/token derived 266,239 tokens, and the clamp
-    gave the reserve 11.32 GiB and pinning 0.01 GiB, so all 33 of its
-    streamed layers kept reading ~5.2 GB/token. `protected_bytes` (the caller's
+    gave the reserve 11.32 GiB and pinning 0.01 GiB, so at that 0.01 GiB
+    pin budget ALL 43 of its layers streamed their non-expert weights (~5.2 GB/token). `protected_bytes` (the caller's
     `_protected_pin_bytes()`: 0 for dense, so the row-8 ruling stands; for MoE the
     shared + non-expert bytes the pin planner would place) is subtracted from the
     ceiling, so the raise stops where the pin budget could no longer hold them.
