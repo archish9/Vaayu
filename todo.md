@@ -125,7 +125,7 @@ ms/token), S11-L6 (HIT-diff disk re-reads, ≤12.3 % of a HIT@8k TTFT, build unp
       (`plans/probes/s17_out/prompt_src.py`), because the probe used to tokenize the live `moe_patch.py`,
       which this change edits.
       - [x] T0 branch `s17-prefill-reads-vram-tier`, commit this ledger edit
-      - [ ] T1 `ExpertVRAMCache.peek()` + `prefill_hits` (RED → GREEN)
+      - [x] T1 `ExpertVRAMCache.peek()` + `prefill_hits` (RED → GREEN)
       - [ ] T2 `_vram_tier_visit` + fused non-EXL3 forward (12 RED + 2 guards → GREEN)
       - [ ] T3 module-list forward, incl. attach-failure drop (6 RED → GREEN)
       - [ ] T4 fused-EXL3 forward (2 RED → GREEN; UNIT-LEVEL ONLY, no checkpoint) + fixture fix + full suite
