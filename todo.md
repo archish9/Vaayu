@@ -1035,6 +1035,13 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
                 L=32000 (32004 < max_seq_len 61439) measured 0.90 GiB (planner 2.41), exit 0; no OOM. Decode peak 0.28 GiB.
                 (10k TTFT 389 s, 32k TTFT 1318 s: expert-disk-bound prefill, not changed here.)
               - Server gate `tests/test_server_smoke.py` on DeepSeek: **9 passed** (39.55 s).
+            - [x] **T6 — other models, 2026-10-01.** Server config (`max_pinned_layers=-1`), `main` worktree vs branch, one pair per model (each arm printed its own `vaayu.__file__`). All `max_seq_len`/reserve/pinning budget IDENTICAL; stop rule clear. Logs `plans/probes/s15_out/plan-*`, `gate-*` (gitignored).
+              - Qwen3-Next: main = branch: `max_seq_len=65536`, reserve 3.50 GiB (KV 1.50), pinning budget 10.31 GiB. Branch: KV cost 24.0 KiB/token (bucketed; config); protected pin demand 4.41 GiB.
+              - MiniMax: main = branch: `max_seq_len=8192`, reserve 3.50 GiB (KV 1.94), pinning budget 9.13 GiB. Branch: KV cost 248.0 KiB/token (bucketed; config); protected pin demand 3.26 GiB.
+              - gpt-oss-20b: main = branch: `max_seq_len=33155`, reserve 9.49 GiB (KV 3.00), pinning budget 4.78 GiB. Branch: KV cost 48.0 KiB/token (bucketed; config); protected pin demand 3.35 GiB.
+              - Gate `test_moe_accumulator_determinism.py` Qwen3-Next: 8 passed (41.9 s); MiniMax: 8 passed (74.6 s).
+              - Gate `test_server_smoke.py` gpt-oss-20b: 9 passed (22.5 s); Llama-3.2-1B: 9 passed (6.5 s).
+              - Gate Llama-3.2-1B `test_output_hidden_states.py`: 3 passed; `test_batch_prefix_equivalence.py`: 1 passed.
 - [ ] **S16 — (d) sweep.** (i) **Row 40:** `cap_slabs_at_indexed_experts` (`vaayu_base.py:456`, called
       ~`:2893`, S8 T4 `2b34fa5`) says "Row 40 (fixed in S8)" but row 40 still reads `[bug]` / "not started" —
       verify it against row 40's own done rule (a test over Qwen-like, MiniMax-like and small-model geometries;
