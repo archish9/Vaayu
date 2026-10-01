@@ -129,7 +129,16 @@ ms/token), S11-L6 (HIT-diff disk re-reads, ≤12.3 % of a HIT@8k TTFT, build unp
       - [x] T2 `_vram_tier_visit` + fused non-EXL3 forward (12 RED + 2 guards → GREEN)
       - [x] T3 module-list forward, incl. attach-failure drop (6 RED → GREEN)
       - [x] T4 fused-EXL3 forward (2 RED → GREEN; UNIT-LEVEL ONLY, no checkpoint) + fixture fix + full suite
-      - [ ] T5 Qwen3-Next ABBA (off, on, on, off) HIT@2k / HIT@8k / cold, ids, peak VRAM → stop-rule decision
+      - [x] T5 Qwen3-Next ABBA (off, on, on, off) HIT@2k / HIT@8k / cold, ids, peak VRAM → stop-rule decision
+        - 2026-10-01, HEAD `2c17a2c`, arm order off1, on1, on2, off2; BALLAST_GB=25; 2 reps per arm after a discarded warm session; all four arms exit=0, every `-h` turn hit=1, every pair reproduces=True HIT_FIRED=True.
+        - L=2048 cold: OFF 10.630s, ON 10.248s, delta +0.381s = +3.59 % of OFF; OFF reps [10.455, 10.387, 10.764, 10.913], ON reps [10.184, 10.121, 10.286, 10.403].
+        - L=2048 hit: OFF 3.238s, ON 3.000s, delta +0.238s = +7.35 % of OFF; OFF reps [3.262, 3.055, 3.365, 3.269], ON reps [3.055, 2.896, 3.072, 2.977].
+        - L=8192 cold: OFF 27.794s, ON 27.580s, delta +0.215s = +0.77 % of OFF; OFF reps [27.157, 27.19, 28.333, 28.497], ON reps [27.105, 27.053, 28.154, 28.006].
+        - L=8192 hit: OFF 3.169s, ON 2.942s, delta +0.228s = +7.18 % of OFF; OFF reps [3.14, 3.1, 3.219, 3.218], ON reps [2.903, 2.934, 2.854, 3.074]. OFF arms differ by 0.098s (off1 3.120 vs off2 3.218), under the 0.228s delta, so no extra pair.
+        - overlap vs phits (ON, hit cells): L=2048 overlap [2573, 2592, 2557, 2576] phits [2573, 2592, 2557, 2576]; L=8192 overlap [2751, 2735, 2734, 2720] phits [2605, 2573, 2614, 2558]. Cold ON phits 54797-57753 at 8k, 15182-15296 at 2k (above overlap, chunked); OFF arms phits=0.
+        - peak VRAM GB, cold, OFF vs ON: L=2048 OFF [13.17, 12.99, 13.13, 12.98] ON [12.93, 12.85, 12.87, 12.85]; L=8192 OFF [13.2, 13.07, 13.15, 12.93] ON [12.91, 12.92, 12.87, 12.87].
+        - ids identical across 4 arms on 8/8 turns
+        - Stop rule: ids PASS; L=8192 hit delta +7.18 % vs 5.00 % line = PASS; peak VRAM cold ON below OFF = PASS. Verdict PASS.
       - [ ] T6 MiniMax (2k) and DeepSeek (1k) OFF/ON: ids + TTFT
       - [ ] T7 suite + accumulator gates ×2 + Qwen3-Next server gate + docs check + RESULTS + ledger close +
             final review
