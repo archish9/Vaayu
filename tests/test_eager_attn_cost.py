@@ -204,9 +204,30 @@ def test_attention_modules_by_class_takes_the_first_of_each_class_in_order():
     assert _Stub("eager", layers)._attention_modules_by_class() == [a0, b2]
 
 
-def test_deepseek_keeps_the_kernel_table_until_S15_measures_it():
+def _ds_stub(**cfg):
+    return SimpleNamespace(_active_attn_impl="eager", running_dtype=torch.bfloat16,
+                           config=SimpleNamespace(**cfg))
+
+
+@pytest.mark.parametrize("cfg,expect", [
+    # DeepSeek-V4-Flash: 2 x 64 x 2 B / (64 x 4) = 1.0 B per score element
+    (dict(num_hidden_layers=5, compress_ratios=[0, 4, 128, 4, 0, 0], index_n_heads=64,
+          num_attention_heads=64), 1.0),
+    # a contrasting geometry: fewer indexer heads, coarser compression
+    (dict(num_hidden_layers=3, compress_ratios=[8, 16, 8], index_n_heads=32,
+          num_attention_heads=128), 2 * 32 * 2 / (128 * 8)),
+])
+def test_deepseek_attention_cost_is_derived_from_its_config(cfg, expect):
     from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
-    stub = SimpleNamespace(_active_attn_impl="eager")
-    per_elem, per_key, source = VaayuDeepseekV4.attention_score_cost(stub)
+    per_elem, per_key, source = VaayuDeepseekV4.attention_score_cost(_ds_stub(**cfg))
+    assert per_elem == pytest.approx(expect)
+    assert per_key == 0.0
+    assert source.startswith("derived from config")
+
+
+def test_deepseek_attention_cost_falls_back_without_indexer_fields():
+    from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
+    per_elem, per_key, source = VaayuDeepseekV4.attention_score_cost(
+        _ds_stub(num_hidden_layers=2, compress_ratios=[0, 0], num_attention_heads=64))
     assert (per_elem, per_key) == (score_elem_bytes("eager"), 0.0)
-    assert "S15" in source
+    assert source.startswith("kernel table") and "DSA" in source

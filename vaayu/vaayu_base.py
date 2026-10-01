@@ -4114,6 +4114,25 @@ class VaayuBaseModel(GenerationMixin):
             free_vram=free_vram, shape=shape,
             min_resident=_min_resident, headroom=headroom))
 
+    def planned_kv_bytes_per_token(self) -> "tuple[int, bool, str]":
+        """(bytes per token, bucketed, source) the VRAM plan charges for the KV
+        cache (S15 L-b). Default: the config-derived figure the plan has always
+        used -- KV-bearing layers x KV heads x head_dim x the mode's bytes, against
+        a capacity that doubles when the cache is one of Vaayu's ring buffers
+        (_kv_cache_is_bucketed). A model whose cache is neither (DeepSeek-V4's
+        preallocated compressed cache) overrides this."""
+        from .batch import kv_bearing_layer_count
+        from .vram_plan import kv_bytes_per_token
+        n_heads = self.config.num_attention_heads
+        head_dim = getattr(self.config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = self.config.hidden_size // n_heads
+        return (kv_bytes_per_token(
+                    num_hidden_layers=kv_bearing_layer_count(self),
+                    num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
+                    head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
+                self._kv_cache_is_bucketed(), "config")
+
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
         ring buffer -- FP8DynamicCache or its TurboQuantKVCache subclass --
