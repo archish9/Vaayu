@@ -1221,6 +1221,21 @@ def build_eager_causal_mask(q_len: int, kv_total: int, dtype, device):
                       device=device).triu(diagonal=kv_total - q_len + 1)[None, None]
 
 
+def _safetensors_tensor_bytes(path, skip=None) -> int:
+    """Total tensor bytes recorded in a safetensors file's header, or 0 when the
+    file is absent (a fresh split of a tied checkpoint has no head shard, S10c).
+    Reads the header only. `skip`: a compiled regex; matching keys are not
+    counted."""
+    try:
+        with open(path, "rb") as f:
+            header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+    except FileNotFoundError:
+        return 0
+    return sum(int(v["data_offsets"][1]) - int(v["data_offsets"][0])
+               for k, v in header.items()
+               if k != "__metadata__" and not (skip is not None and skip.search(k)))
+
+
 def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     """Size of the precomputed RoPE cos/sin cache: must cover every position
     that will be sliced during this forward pass (existing past + ALL new
@@ -5030,6 +5045,34 @@ class VaayuBaseModel(GenerationMixin):
 
     def get_past_key_value_args(self, past_key_values):
         return {'past_key_values': past_key_values}
+
+    def _protected_pin_bytes(self) -> int:
+        """Bytes of weights the reserve floor may not take from the pin budget
+        (S15 L-b, user decision 2026-10-01) -- see reserve_floor_bytes.
+
+        0 on a dense load: its floor may still buy context out of pinning (row 8's
+        ruling: Llama-3.2-1B context over 19 % decode). On a MoE load the raise
+        was meant to land on the expert VRAM cache, never on the weights that
+        otherwise stream every token: the shared layers (phase 1 of
+        _init_pinned_layers always pins them) plus, when phase 2 runs
+        (max_pinned_layers != 0), every layer's non-expert tensors. Read off the
+        safetensors headers with the forward's own routed-expert filter
+        (r'\\.experts\\.'), so a shared expert counts as non-expert, as the loader
+        streams it. File bytes, like the pin planner's own accounting.
+        DeepSeek-V4: 8.24 GiB."""
+        if not getattr(self, "is_moe", False):
+            return 0
+        import re
+        ckpt = Path(self.checkpoint_path)
+        d = self.layer_names_dict
+        total = sum(_safetensors_tensor_bytes(ckpt / f"{d[k]}.safetensors")
+                    for k in ("embed", "norm", "lm_head"))
+        if self.max_pinned_layers != 0:
+            routed = re.compile(r"\.experts\.")
+            prefix = d["layer_prefix"] + "."
+            total += sum(_safetensors_tensor_bytes(ckpt / f"{n}.safetensors", skip=routed)
+                         for n in self.layer_names if n.startswith(prefix))
+        return total
 
     def _attention_modules_by_class(self) -> list:
         """The first `self_attn` of each distinct attention class, in layer
