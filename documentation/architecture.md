@@ -207,6 +207,18 @@ are then idle on that model. Load lines to look for:
     [Vaayu-VRAM] attention cost: 6.03 B/score-element + 16.0 KiB/key (measured on GptOssAttention; kernel table 10.90)
     [Vaayu-Pin] 3 fully-pinned (0 transformer + 3 shared), 24 non-expert-pinned transformer, 3.60 GB reserved
 
+The reserve floor (eager and sdpa loads, where it buys flash-parity context) may not take
+the pin budget an MoE load's non-expert weights need: `_protected_pin_bytes()` (shared
+layers plus, unless `max_pinned_layers` is 0, every layer's non-expert bytes, read from
+the safetensors headers) is subtracted from the ceiling (free VRAM less one expert and one layer), and a requested
+`max_seq_len` caps the parity the floor buys. A model can also supply its own costs.
+DeepSeek-V4 derives its attention charge from config (1.00 B per score element, the DSA
+indexer scoring compressed keys, instead of 10.9) and measures its own KV cache on the
+meta device (6.7 KiB/token instead of 86). Measured on DeepSeek-V4, server config: reserve
+8.03 -> 3.50 GiB, pinning budget 3.30 -> 7.80 GiB, `max_seq_len` 16,766 -> 61,439,
+non-expert-pinned layers 8 -> 39, decode 1.6476 -> 0.5604 s/token (0.607 -> 1.784 tok/s,
+greedy ids identical). Qwen3-Next, MiniMax and gpt-oss plan identically before and after.
+
 ## 5. Speculative Decoding
 
 ### Problem

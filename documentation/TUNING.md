@@ -215,13 +215,28 @@ after that hand-off, so under parallel fan-out this behaves as entry hand-off
 between sessions rather than sharing. Both `enable_kv_persist` and
 `prefix_compress` are ignored on it, with a warning at load.
 
-## 3c. `max_seq_len` — lowering it does NOT buy VRAM
+## 3c. `max_seq_len` — what lowering it buys
 
-**Default:** `None` (derive). It is tempting to ask for a shorter context to free VRAM. It
-does not work: the VRAM reserve is `max(predicted peak, 3.5 GiB floor)` and on both on-device
-MoE models it already sits **on the floor** at the derived 8192, so requesting 4096 returns
-**zero** VRAM and does not lift the `Restricting VRAM cache to the first 65/94 MoE layers`
-warning.
+**Default:** `None` (derive). Whether a shorter context returns VRAM depends on what sets the
+reserve. The reserve is `max(predicted peak, reserve floor)`, and the floor depends on the
+attention implementation:
+
+- **Flash loads (flash_attention_2):** the floor is the 3.5 GiB base floor, and on the
+  on-device MoE models the reserve already sits **on it** at the derived context. Requesting
+  4096 returns **zero** VRAM and does not lift the `Restricting VRAM cache to the first
+  65/94 MoE layers` warning (row 31, 2026-09-12; that was measured on flash loads).
+- **Score-materializing loads (sdpa, and eager: gpt-oss and DeepSeek-V4 on the server
+  default; dense included):** the floor is the reserve that gives flash-parity context. A
+  requested `max_seq_len` below flash parity caps that parity, so the floor falls and the
+  difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
+  flash parity it changes nothing. The floor is also never allowed to take the pin budget
+  an MoE load's non-expert weights need (`protected pin demand` in the load log).
+  gpt-oss is the eager example: its floor really is the 9.49 GiB parity floor (protection
+  does not bind, 3.35 vs 4.78 GiB), so a shorter request returns VRAM. A MoE load whose
+  floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
+  a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
+  above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,
+  reserve 3.50, pin 7.80 GiB).
 
 What a shorter context *does* do is shrink the same RAM reservation `prefix_sessions` scales —
 and only as the product. `prefix_sessions=1 × 8192` and `prefix_sessions=2 × 4096` are
@@ -428,7 +443,14 @@ What the load log tells you:
   `measured on <AttentionClass>`, the load's own attention code measured at load. If it
   says `kernel table: measurement failed (...)`, the plan fell back to the conservative
   table value, and that load's context and pinning are what they were before the
-  measurement existed; the reason is on the line.
+  measurement existed; the reason is on the line. A model may charge its own derived cost
+  instead (DeepSeek-V4: `1.00 B/score-element + 0.0 KiB/key (DSA indexer)`, from its config).
+- `[Vaayu-VRAM] KV cost: X KiB/token (bucketed|exact; source)` -- what the plan charges one
+  token of KV. The config figure, or a model's own measurement of its cache (DeepSeek-V4:
+  6.7 KiB/token, exact, measured on the meta device).
+- `[Vaayu-VRAM] protected pin demand: X GiB (...)` -- the MoE non-expert weights the reserve
+  floor may not take. It prints on flash MoE loads too, where the floor is the base floor
+  and the line changes nothing.
 - `[Vaayu-Pin] embedding CPU-resident: X GB host RAM, 0 VRAM (the pinning budget cannot
   hold it)` — the embedding did not fit the VRAM pinning budget (e.g. when another
   process holds VRAM) and is held in host RAM instead of streaming — normal. `embedding

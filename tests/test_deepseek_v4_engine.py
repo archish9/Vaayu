@@ -458,6 +458,7 @@ def _hooks_for(cache):
     model = VaayuDeepseekV4.__new__(VaayuDeepseekV4)
     model.config = shipped_config()
     model.get_past_key_value_args(cache)
+    model._strong_cache = cache   # the hook holds only a weak ref (F2); the caller owns the cache
     return model
 
 
@@ -1285,3 +1286,35 @@ def test_move_layer_to_device_raises_naming_the_parameter_on_injection_failure(
     with pytest.raises(RuntimeError, match="linear.weight") as excinfo:
         model.move_layer_to_device({"linear.weight": torch.zeros(4, 4, dtype=torch.bfloat16)})
     assert "simulated injection failure" in str(excinfo.value)
+
+
+class _Weakable:
+    """Stands in for a DeepseekV4Cache: any plain object supports weakref."""
+
+
+def test_the_start_pos_hook_does_not_keep_the_previous_cache_alive():
+    """S15 final review F2: a strong ref held the previous request's
+    PREALLOCATED cache (~0.41 GiB at 61,439 tokens) alive until the next
+    request's first forward, after the new cache already existed -- so warm
+    admission headroom read 3.13 GiB against a 3.50 GiB reserve."""
+    import gc
+    stub = SimpleNamespace()
+    cache = _Weakable()
+    VaayuDeepseekV4.get_past_key_value_args(stub, cache)
+    del cache
+    gc.collect()
+    assert stub._cache_for_start_pos_check() is None
+    assert VaayuDeepseekV4.get_attention_mask_args(
+        stub, None, 3, 1, layer=SimpleNamespace(layer_idx=0)) == {}
+
+
+def test_the_start_pos_check_still_fires_while_the_cache_is_alive():
+    class FakeCache:
+        def get_seq_length(self, layer_idx):
+            return 5
+    stub = SimpleNamespace()
+    cache = FakeCache()
+    VaayuDeepseekV4.get_past_key_value_args(stub, cache)
+    with pytest.raises(RuntimeError, match="start_pos"):
+        VaayuDeepseekV4.get_attention_mask_args(
+            stub, None, 3, 1, layer=SimpleNamespace(layer_idx=0))

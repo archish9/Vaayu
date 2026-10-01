@@ -11,6 +11,7 @@ The durable copy is row 28b's A5.7a bullet in `todo.md`.
 """
 
 import sys
+import weakref
 
 import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
@@ -593,8 +594,10 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return layer(self.model.model.hc_head(seq))
 
     def get_past_key_value_args(self, past_key_values):
-        """Pass the cache through, and keep a reference for the contiguity
-        check that `get_attention_mask_args` performs a moment later.
+        """Pass the cache through, and keep a WEAK reference for the contiguity
+        check that `get_attention_mask_args` performs a moment later (weak, so
+        the previous request's preallocated cache is not held alive until the
+        next request's first forward -- S15 final review F2).
 
         This hook does NOT read a sequence length any more, and that is the
         whole point. `DeepseekV4Cache` gives every layer an INDEPENDENT
@@ -613,7 +616,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
         own, and this hook is not told which layer it is -- `get_attention_mask_args`
         is.
         """
-        self._cache_for_start_pos_check = past_key_values
+        self._cache_for_start_pos_check = (
+            None if past_key_values is None else weakref.ref(past_key_values))
         return {"past_key_values": past_key_values}
 
     def get_pos_emb_args(self, len_p, len_s):
@@ -631,15 +635,67 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return {"start_pos": len_p}
 
     def attention_score_cost(self):
-        """Today's kernel-table charge, deliberately NOT measured (S14 3c, user
-        decision 2026-09-30). This model's attention is its own sparse kernel
-        (`sparse_attn`, DSA `index_topk`), not transformers'
-        eager_attention_forward, so the base class's measurement would price
-        the wrong code. Its real peak is S15 L-b's job; until then it keeps
-        the conservative value it has always been charged."""
+        """(bytes per score element, bytes per key, source) for DeepSeek-V4's DSA
+        attention, derived from its own config (S15 L-b, user decision
+        2026-10-01). The table's 10.9 B prices a dense S x S score buffer this
+        model never builds: `sparse_attn` reads a fixed `index_topk` +
+        `sliding_window` keys, and the indexer (`DeepseekV4Indexer.forward`)
+        scores only the COMPRESSED keys, `index_n_heads` heads over keys /
+        compress_ratio, as a bf16 tensor plus its `relu_ * weights` product --
+        hence 2 x index_n_heads x elem / (num_attention_heads x the finest
+        ratio), in the planner's per-(attention head x query x key) units.
+        Measured (L-b, 2k-10k tokens): 0.49 B against the 1.0 this charges.
+        Missing DSA fields fall back to the table, with the reason."""
         from .vram_plan import score_elem_bytes
-        return (score_elem_bytes(self._active_attn_impl), 0.0,
-                "kernel table: DeepSeek-V4's sparse attention is unmeasured (S15 L-b)")
+        cfg = self.config
+        try:
+            ratios = [int(r) for r in list(cfg.compress_ratios)[:cfg.num_hidden_layers]
+                      if int(r) > 0]
+            elem = torch.finfo(self.running_dtype).bits // 8
+            per_elem = (2 * int(cfg.index_n_heads) * elem
+                        / (int(cfg.num_attention_heads) * min(ratios)))
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError) as e:
+            return (score_elem_bytes(self._active_attn_impl), 0.0,
+                    f"kernel table: DeepSeek-V4 config lacks the DSA indexer fields "
+                    f"({type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''})")
+        return (per_elem, 0.0,
+                f"derived from config: DSA indexer, {cfg.index_n_heads} heads over keys/{min(ratios)}")
+
+    def planned_kv_bytes_per_token(self):
+        """KV bytes per token MEASURED from this model's own preallocated cache
+        (S15 L-b, user decision 2026-10-01). `DeepseekV4Cache` stores one
+        compressed latent per `compress_ratio` positions (+ the indexer's keys),
+        so the config formula's 88 KB/token over-charged it ~13x. Built twice on the
+        meta device (no memory), at S1 = 1024 x the coarsest ratio and S2 = 2 x
+        S1, so every ratio divides both (true when every ratio divides the
+        coarsest, as 4 | 128 does on DeepSeek-V4-Flash); the slope of its unique tensors' nbytes
+        is the per-token cost (6,880 B on DeepSeek-V4-Flash), with no doubling --
+        it is preallocated exactly at max_seq_len. The constant window/state part
+        (17.8 MB) is not charged: the derived attention cost's 2x margin covers it.
+        Any failure falls back to the default figure, with the reason."""
+        try:
+            cache_cls = self._running_symbol("DeepseekV4Cache")
+            cfg = self.config
+            s1 = 1024 * max(int(r) for r in list(cfg.compress_ratios)[:cfg.num_hidden_layers])
+            s2 = 2 * s1
+
+            def _nbytes(s):
+                cache = cache_cls(cfg, max_seq_len=s, max_batch_size=1, device="meta",
+                                  dtype=self.running_dtype)
+                seen, total = set(), 0
+                for layer in cache.layers:
+                    for t in vars(layer).values():
+                        if isinstance(t, torch.Tensor) and id(t) not in seen:
+                            seen.add(id(t))
+                            total += t.nbytes
+                return total
+            per_token = (_nbytes(s2) - _nbytes(s1)) // (s2 - s1)
+        except Exception as e:
+            base = VaayuBaseModel.planned_kv_bytes_per_token(self)
+            return (base[0], base[1],
+                    f"config (DeepseekV4Cache measurement failed: {type(e).__name__}: "
+                    f"{str(e).splitlines()[0][:200] if str(e) else ''})")
+        return (per_token, False, "measured from DeepseekV4Cache on meta")
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s,
                                 layer=None):
@@ -670,7 +726,8 @@ class VaayuDeepseekV4(VaayuBaseModel):
         right count to compare against, and guessing an index is the defect
         this replaced.
         """
-        cache = getattr(self, "_cache_for_start_pos_check", None)
+        ref = getattr(self, "_cache_for_start_pos_check", None)
+        cache = ref() if ref is not None else None
         layer_idx = getattr(layer, "layer_idx", None)
         if cache is not None and layer_idx is not None:
             counted = cache.get_seq_length(layer_idx)

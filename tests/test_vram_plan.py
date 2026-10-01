@@ -1302,3 +1302,86 @@ def test_flash_parity_floor_ignores_the_per_key_term(name):
     got = reserve_floor_bytes(shape=keyed, base_floor=base_floor, free_vram=free,
                               min_resident=0, layer_slack=0)
     assert got == max(base_floor, min(predict_peak_vram(keyed, parity), free))
+
+
+# --- S15 L-b: the floor protects MoE streamed weights; a requested context caps parity ---
+import dataclasses as _dc15
+
+from vaayu.vram_plan import _largest_s_within_budget as _lswb15
+from vaayu.vram_plan import reserve_floor_bytes as _rfb15
+
+_BASE15 = int(3.5 * GB)
+_FREE15 = int(15.0 * GB)
+
+
+def _parity15(sh):
+    return _lswb15(_dc15.replace(sh, score_elem_bytes=0.0, score_bytes_per_key=0.0), _BASE15)
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_floor_defaults_reproduce_todays_formula(name):
+    sh = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    want = max(_BASE15, min(predict_peak_vram(sh, _parity15(sh)), _FREE15))
+    assert _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15,
+                  min_resident=0, layer_slack=0) == want
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_protected_bytes_cap_the_raise(name):
+    sh = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    raised = min(predict_peak_vram(sh, _parity15(sh)), _FREE15)
+    assert raised > _BASE15, "premise: this geometry's floor is raised above the base"
+    protected = _FREE15 - (_BASE15 + raised) // 2      # leaves room for a floor half-way up
+    got = _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0,
+                 layer_slack=0, protected_bytes=protected)
+    assert got == max(_BASE15, _FREE15 - protected)
+    assert _BASE15 < got < raised
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_protected_bytes_never_push_below_the_base_floor(name):
+    sh = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    assert _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0,
+                  layer_slack=0, protected_bytes=_FREE15) == _BASE15
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "llama-70b"])
+def test_requested_context_caps_the_floors_parity(name):
+    sh = shape_for(name, score_elem_bytes=score_elem_bytes("sdpa"))
+    parity = _parity15(sh)
+    req = max(1, parity // 4)
+    want = max(_BASE15, min(predict_peak_vram(sh, req), _FREE15))
+    assert _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0,
+                  layer_slack=0, requested_max_seq_len=req) == want
+    # a request above parity changes nothing
+    assert _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0,
+                  layer_slack=0, requested_max_seq_len=parity * 2) == \
+        _rfb15(shape=sh, base_floor=_BASE15, free_vram=_FREE15, min_resident=0, layer_slack=0)
+
+
+# --- S15 L-b trap guard ----------------------------------------------------
+# A geometry with a tiny KV (DeepSeek-V4: 6,880 B/token) turns flash parity into an
+# enormous context, and the unprotected floor then eats the pin budget (reserve
+# ~11.3 GiB, pinning 0.01 GiB, every streamed layer re-read each token).
+# `protected_bytes` is the guard. Fixture geometry: DeepSeek-V4-Flash on this box.
+
+def _deepseek_like():
+    shape = VramShape(kv_per_token=6880, N=1, chunk=512, hidden=4096, n_heads=64,
+                      vocab=129280, elem_bytes=2, score_elem_bytes=1.0,
+                      alloc_factor=1.0, kv_growth_factor=2, kv_capacity_buckets=False,
+                      head_bytes=1_059_061_856)
+    return dict(shape=shape, base_floor=int(3.5 * GB), free_vram=int(15.73e9),
+                min_resident=13_369_344, layer_slack=int(3.32 * GB))
+
+
+def test_protected_floor_defeats_the_tiny_kv_trap():
+    kw = _deepseek_like()
+    protected = int(8.24 * GB)
+    assert _rfb15(**kw) >= 11 * GB                       # (a) the trap, unprotected
+    floor = _rfb15(**kw, protected_bytes=protected)
+    assert floor == kw["base_floor"]                     # (b) held at the base
+    plan = plan_vram(free_vram=kw["free_vram"], shape=kw["shape"],
+                     min_resident=kw["min_resident"], requested_max_seq_len=None,
+                     position_limit=1_000_000, layer_slack=kw["layer_slack"],
+                     reserve_floor=floor)
+    assert plan.pinning_budget >= 7.5 * GB               # (c) the pin budget survives

@@ -1221,6 +1221,21 @@ def build_eager_causal_mask(q_len: int, kv_total: int, dtype, device):
                       device=device).triu(diagonal=kv_total - q_len + 1)[None, None]
 
 
+def _safetensors_tensor_bytes(path, skip=None) -> int:
+    """Total tensor bytes recorded in a safetensors file's header, or 0 when the
+    file is absent (a fresh split of a tied checkpoint has no head shard, S10c).
+    Reads the header only. `skip`: a compiled regex; matching keys are not
+    counted."""
+    try:
+        with open(path, "rb") as f:
+            header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+    except FileNotFoundError:
+        return 0
+    return sum(int(v["data_offsets"][1]) - int(v["data_offsets"][0])
+               for k, v in header.items()
+               if k != "__metadata__" and not (skip is not None and skip.search(k)))
+
+
 def compute_pos_range(max_seq_len: int, past_len: int, seq_total: int) -> int:
     """Size of the precomputed RoPE cos/sin cache: must cover every position
     that will be sliced during this forward pass (existing past + ALL new
@@ -2568,8 +2583,8 @@ class VaayuBaseModel(GenerationMixin):
         self._vram_plan = None
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
-                                    kv_bytes_per_token, plan_vram,
-                                    reserve_floor_bytes, score_elem_bytes)
+                                    plan_vram, reserve_floor_bytes,
+                                    score_elem_bytes)
             # S14 3c: what one attention forward costs -- measured on this
             # load's own attention module for eager, the kernel table for
             # flash/sdpa. BEFORE the free-VRAM snapshot: the measurement's own
@@ -2583,9 +2598,6 @@ class VaayuBaseModel(GenerationMixin):
                   f"{score_elem_bytes(self._active_attn_impl):.2f})")
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
-            _head_dim = getattr(self.config, "head_dim", None)
-            if not isinstance(_head_dim, int):
-                _head_dim = self.config.hidden_size // _n_heads
             _layer0 = Path(self.checkpoint_path) / \
                 f"{self.layer_names_dict['layer_prefix']}.0.safetensors"
             try:
@@ -2647,17 +2659,14 @@ class VaayuBaseModel(GenerationMixin):
                     _resident_expert_bytes = int(
                         self._moe_geometry["num_experts"]
                         * self._moe_geometry["expert_bytes"])
-            from .batch import kv_bearing_layer_count
-            # Only the layers that actually store KV (RC4 (c)). Uniform models
-            # get their full depth back, so nothing on device today moves.
-            _kv_layers = kv_bearing_layer_count(self)
+            # KV bytes per token: the config figure (only the layers that store
+            # KV, RC4 (c)), or a model's own measurement of its cache (S15 L-b:
+            # DeepSeek-V4's preallocated compressed cache).
+            _kv_per_token, _kv_bucketed, _kv_source = self.planned_kv_bytes_per_token()
+            print(f"[Vaayu-VRAM] KV cost: {_kv_per_token / 1024:.1f} KiB/token "
+                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})")
             _shape = VramShape(
-                kv_per_token=kv_bytes_per_token(
-                    num_hidden_layers=_kv_layers,
-                    num_key_value_heads=getattr(self.config, "num_key_value_heads",
-                                                _n_heads),
-                    head_dim=_head_dim,
-                    kv_cache_mode=self.kv_cache_mode),
+                kv_per_token=_kv_per_token,
                 N=1, chunk=max(1, self.prefill_chunk_size),
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
@@ -2672,7 +2681,7 @@ class VaayuBaseModel(GenerationMixin):
                 head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
-                kv_capacity_buckets=self._kv_cache_is_bucketed(),
+                kv_capacity_buckets=_kv_bucketed,
                 # Which prefill forward this load will run -- mirrors
                 # _chunked_prefill's own branch (is_moe AND a kernel that takes
                 # an implicit/self-built mask), read off the module tree rather
@@ -2702,10 +2711,18 @@ class VaayuBaseModel(GenerationMixin):
             # sdpa load derives what flash would have, paid out of the expert
             # VRAM cache / pinning budget. flash loads keep the base floor
             # unchanged. Derived per geometry -- see reserve_floor_bytes.
+            # S15 L-b: on a MoE load the raise may not take the bytes the pin
+            # planner needs for the weights that otherwise stream every token;
+            # a requested max_seq_len caps the parity it buys.
+            _protected = self._protected_pin_bytes()
+            if _protected:
+                print(f"[Vaayu-VRAM] protected pin demand: {_protected / 1024 ** 3:.2f} GiB "
+                      f"(MoE non-expert weights the reserve floor may not take)")
             _reserve_floor = reserve_floor_bytes(
                 shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
                 free_vram=_free_vram, min_resident=_min_resident,
-                layer_slack=_layer_slack)
+                layer_slack=_layer_slack, protected_bytes=_protected,
+                requested_max_seq_len=max_seq_len)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
                 min_resident=_min_resident,
@@ -4099,6 +4116,25 @@ class VaayuBaseModel(GenerationMixin):
             free_vram=free_vram, shape=shape,
             min_resident=_min_resident, headroom=headroom))
 
+    def planned_kv_bytes_per_token(self) -> "tuple[int, bool, str]":
+        """(bytes per token, bucketed, source) the VRAM plan charges for the KV
+        cache (S15 L-b). Default: the config-derived figure the plan has always
+        used -- KV-bearing layers x KV heads x head_dim x the mode's bytes, against
+        a capacity that doubles when the cache is one of Vaayu's ring buffers
+        (_kv_cache_is_bucketed). A model whose cache is neither (DeepSeek-V4's
+        preallocated compressed cache) overrides this."""
+        from .batch import kv_bearing_layer_count
+        from .vram_plan import kv_bytes_per_token
+        n_heads = self.config.num_attention_heads
+        head_dim = getattr(self.config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = self.config.hidden_size // n_heads
+        return (kv_bytes_per_token(
+                    num_hidden_layers=kv_bearing_layer_count(self),
+                    num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
+                    head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
+                self._kv_cache_is_bucketed(), "config")
+
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
         ring buffer -- FP8DynamicCache or its TurboQuantKVCache subclass --
@@ -5030,6 +5066,40 @@ class VaayuBaseModel(GenerationMixin):
 
     def get_past_key_value_args(self, past_key_values):
         return {'past_key_values': past_key_values}
+
+    def _protected_pin_bytes(self) -> int:
+        """Bytes of weights the reserve floor may not take from the pin budget
+        (S15 L-b, user decision 2026-10-01) -- see reserve_floor_bytes.
+
+        0 on a dense load: its floor may still buy context out of pinning (row 8's
+        ruling: Llama-3.2-1B context over 19 % decode). On a MoE load the raise
+        was meant to land on the expert VRAM cache, never on the weights that
+        otherwise stream every token: the shared layers (phase 1 of
+        _init_pinned_layers always pins them) plus, when phase 2 runs
+        (max_pinned_layers != 0), every layer's non-expert tensors. Read off the
+        safetensors headers with the forward's own routed-expert filter
+        (r'\\.experts\\.'), so a shared expert counts as non-expert, as the loader
+        streams it. File bytes, like the pin planner's own accounting. A TIED
+        checkpoint's head is counted at the embedding's bytes (its head shard is
+        empty or absent): phase 1 pins a second VRAM copy of the embedding as
+        the head, and the plan's own _head_bytes charges it the same.
+        DeepSeek-V4: 8.24 GiB."""
+        if not getattr(self, "is_moe", False):
+            return 0
+        import re
+        ckpt = Path(self.checkpoint_path)
+        d = self.layer_names_dict
+        total = sum(_safetensors_tensor_bytes(ckpt / f"{d[k]}.safetensors")
+                    for k in ("embed", "norm", "lm_head"))
+        if getattr(self.config, "tie_word_embeddings", False):
+            total += (_safetensors_tensor_bytes(ckpt / f"{d['embed']}.safetensors")
+                      - _safetensors_tensor_bytes(ckpt / f"{d['lm_head']}.safetensors"))
+        if self.max_pinned_layers != 0:
+            routed = re.compile(r"\.experts\.")
+            prefix = d["layer_prefix"] + "."
+            total += sum(_safetensors_tensor_bytes(ckpt / f"{n}.safetensors", skip=routed)
+                         for n in self.layer_names if n.startswith(prefix))
+        return total
 
     def _attention_modules_by_class(self) -> list:
         """The first `self_attn` of each distinct attention class, in layer

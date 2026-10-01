@@ -114,10 +114,15 @@ AUTO_PREFIX_MATCH = True
 #
 # The only reason to set it: asking for a SHORTER context hands the difference
 # back to the expert cache, which is the decode bottleneck on both MoE targets.
-# It does NOT buy VRAM (row 31, 2026-09-12): the reserve is max(predicted peak,
-# 3.5 GiB floor) and already sits ON the floor at the derived 8192 on both MoE
-# models, so 4096 returns zero VRAM and does not lift the "Restricting VRAM cache
-# to the first 65/94 MoE layers" warning. On the RAM side it is the SAME knob as
+# On a FLASH load it buys no VRAM (row 31, 2026-09-12): the reserve is
+# max(predicted peak, 3.5 GiB floor) and already sits ON the floor at the derived
+# 8192 on both MoE models, so 4096 returns zero VRAM and does not lift the
+# "Restricting VRAM cache to the first 65/94 MoE layers" warning. On a
+# score-materializing load (sdpa, or eager: gpt-oss on the server default; dense
+# too) the floor is the flash-parity reserve, and a requested value below flash
+# parity lowers it (S15 L-b, 2026-10-01), returning VRAM to pinning and the expert
+# cache. A MoE load whose floor the protected-weights guard already holds at the
+# 3.5 GiB base (DeepSeek-V4 today) gets nothing back from a shorter context. On the RAM side it is the SAME knob as
 # PREFIX_SESSIONS -- only the product `sessions x max_seq_len` is visible
 # downstream, so 1 x 8192 and 2 x 4096 are literally one configuration.
 # The cost of getting it wrong is two-sided and both sides are loud, not silent:

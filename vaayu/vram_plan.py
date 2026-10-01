@@ -553,7 +553,9 @@ def _largest_s_within_budget(shape: VramShape, budget: int) -> int:
 
 
 def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
-                        min_resident: int, layer_slack: int) -> int:
+                        min_resident: int, layer_slack: int,
+                        protected_bytes: int = 0,
+                        requested_max_seq_len: int | None = None) -> int:
     """The reserve floor for THIS load, raised when the kernel materializes
     attention scores (todo row 8, decided 2026-08-15).
 
@@ -597,6 +599,21 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     was chosen over the 19%. The three EXL3 geometries are unaffected either
     way: their parity floors (5.60 / 4.79 / 6.20 GiB) are far below both clamps.
 
+    The raise may not take what MoE streamed weights need (S15 L-b, user decision
+    2026-10-01). Row 8 meant the cost to land on the expert VRAM cache (MoE),
+    but a geometry with a tiny KV turns flash parity into an enormous context:
+    DeepSeek-V4 with its real 6,880 B/token derived 266,239 tokens, and the clamp
+    gave the reserve 11.32 GiB and pinning 0.01 GiB, so at that 0.01 GiB
+    pin budget ALL 43 of its layers streamed their non-expert weights (~5.2 GB/token). `protected_bytes` (the caller's
+    `_protected_pin_bytes()`: 0 for dense, so the row-8 ruling stands; for MoE the
+    shared + non-expert bytes the pin planner would place) is subtracted from the
+    ceiling, so the raise stops where the pin budget could no longer hold them.
+    0 reproduces the old result exactly.
+
+    A caller-requested `max_seq_len` caps the parity: the floor never buys
+    context the caller has capped away (before S15 a 16,766 request still got the
+    11.32 GiB floor).
+
     Never returns less than `base_floor`, which is itself measured (2026-07-24:
     2 GB covered prefill but not the prefill->decode boundary; 3.5 GB fixed it
     4/4).
@@ -606,11 +623,14 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     flash_parity = _largest_s_within_budget(
         replace(shape, score_elem_bytes=0.0, score_bytes_per_key=0.0),
         int(base_floor))
+    if requested_max_seq_len is not None:
+        flash_parity = min(flash_parity, int(requested_max_seq_len))
     if flash_parity <= 0:
         return int(base_floor)
     ceiling = int(free_vram) - int(min_resident) - int(layer_slack)
     return max(int(base_floor),
-               min(predict_peak_vram(shape, flash_parity), ceiling))
+               min(predict_peak_vram(shape, flash_parity), ceiling,
+                   ceiling - max(0, int(protected_bytes))))
 
 
 def _too_big_message(*, requested: int, s_max: int, free_vram: int,
