@@ -943,7 +943,80 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               RAM to the arena on every MoE model — its own row + measurement.
         - [x] (duplicate of the 3b row above — status lives there) **3b — measure TTFT at eager chunk 256 / context-adaptive vs 512** (after 3a), then the user decides
               H/O.
-- [ ] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** L-e: `expert_disk` rose 0.22 → 0.50
+- [~] **S15 — DeepSeek L-e, then L-b (the leads under S6 below).** **L-e ROOT CAUSE FOUND 2026-10-01 (systematic
+      debugging; probes only, no engine code).** Probe: `plans/probes/row26_decode.py` gained non-expert read timing
+      (`rust_ne`) and an `S15_FOLD=cpu|gpu|sleep` instance patch. Logs: `plans/probes/s15_out/`, JSON
+      `row26_out/decode-deepseek-s15-*.json` (gitignored). Each arm: one process, server config, BALLAST 15, W + U1,
+      24 tokens, FOREGROUND, 29G, ids identical.
+      - **Same code, same day, one variable** (what runs where the CPU fold sat):
+        - cpu (pre-S9): token 2.721 s, expert stall **0.236 s**, expert read mean 6.01 ms, 3 % of expert reads
+          overlap a non-expert read;
+        - gpu (HEAD): 1.565 s, stall **0.521 s**, read mean 7.43 ms, 22 % overlap;
+        - gpu + 33 ms SLEEP (no CPU work): 2.287 s, stall **0.235 s**, read mean 5.98 ms, 3 % overlap.
+      - **Root cause:** timing, not CPU activity. The layer loop submits the NEXT layer's non-expert prefetch before the
+        current layer's H2D (`vaayu_base.py:~5643`, "BEFORE GPU transfer"). The 33 ms CPU fold (or a sleep) delayed the
+        current layer's expert misses until that ~160 MB prefetch read had finished. With the 3.75 ms GPU fold, the
+        misses are dispatched while the prefetch is still reading through the same 2-ring io_uring pool (O_DIRECT), so
+        they share the drive.
+      - **Refuted on the way:**
+        - expert reads queueing ONLY while overlapped — 74-78 % of expert reads never overlap a non-expert read call
+          and are still slower;
+        - deep CPU idle states — `Uspin` (spinners on every CPU) moved read latency 7.42 → 7.25 ms only.
+      - **Prize:** ≤ 0.29 s/token (stall 0.521 → 0.235) of a 1.565 s token, from a schedule that keeps the expert misses
+        clear of the prefetch read (defer or chunk/pause the prefetch while misses are outstanding).
+      - **L-b removes the bytes that collide:** 33 streamed layers × ~160 MB = ~5.2 GB/token of the 6.95 GB read. If
+        L-b's attention measurement frees the pin budget it predicts (up to 4.53 GiB ≈ 30 more resident layers), most of
+        that stream, and with it most of this stall, goes away.
+      - **USER PICKED 2026-10-01: L-b first** (an L-e scheduling fix only for what L-b leaves). L-e fix not built.
+      - [x] **L-b MEASURED 2026-10-01 (spike; probe `plans/probes/s15_peaks.py`, logs `plans/probes/s15_out/peaks-r{1,2}.log`).**
+            DeepSeek-V4 in the server config, one process per run, FOREGROUND, 29G, plain-token prompts, per-chunk VRAM peak
+            over the session's starting allocation vs the planner's own per-chunk prediction:
+            - 2,000 tokens: **0.76 GiB** measured vs 1.98 planner
+            - 6,000 tokens: **0.76** vs 3.78
+            - 10,000 tokens: **0.82** vs 5.81
+            S×S scores NEVER materialise. Sparse attention reads a fixed `index_topk` 512 + window 128. The DSA indexer
+            scores COMPRESSED keys only (k/4 on ratio-4 layers, k/128 on ratio-128 layers;
+            `modeling_deepseek_v4.py` `DeepseekV4Indexer.forward`). The real transient grows ~0.015 GiB per 1k tokens, so
+            it is ≈ 0.9 GiB at `max_seq_len` 16,766 (extrapolated), against the 8.03 GiB reserve. The plan charges eager
+            10.9 B × 64 heads × q × k; the measured slope is ~0.4 % of that.
+            **Prize (predicted, not built):**
+            - the reserve can fall to the 3.5 GiB base floor → +4.53 GiB pin budget;
+            - ≈ 28-30 more non-expert-resident layers (of 33 streamed, ~160 MB each);
+            - ≈ −0.55 s/token `gpu_load`, plus most of L-e's −0.29 s stall;
+            - token ≈ 1.56 → ~0.8 s.
+            Other numbers: warm session a0 3.52 → 6.82 GiB after it is the expert VRAM cache filling (3.22 GiB); DeepSeek has
+            no prefix cache object (`_prefix_cache` None); TTFT 69 / 217 / 365 s at 2k / 6k / 10k (~18 s per 512-token chunk,
+            the eager per-chunk loop re-reads the experts every chunk).
+      - [~] **L-b build — USER PICKED 2026-10-01: config-derived DeepSeek attention cost AND fix the floor logic** (widened from
+            the bounded design). Offline plan simulation from DeepSeek's real plan inputs
+            (free 14.65 GiB, base floor 3.5, `position_limit` 1,048,576):
+            - today: `max_seq_len` 16,766, reserve 8.03 GiB, pin budget 3.30 GiB;
+            - **A: score 1.0 B/elem only (KV charge unchanged):** 16,384 / **3.50** / **7.83 GiB**;
+            - **B: + real KV:** 266,239 / 11.32 / **0.01 GiB** — the eager floor (flash parity) chases 266k context and
+              the clamp hands the whole card to the reserve.
+            Real DeepSeek cache at 16,766 is **133 MB** (`_create_kv_cache` tensors summed) vs the plan's 88 KB/token ×
+            32,768 = 2.69 GiB. A requested `max_seq_len` does not help: `reserve_floor_bytes` ignores it.
+            Architectural path (shared infra: every eager/sdpa load's floor): brainstorm → spec → plan.
+            **Design APPROVED section by section 2026-10-01. Spec
+            `docs/superpowers/specs/2026-10-01-S15-Lb-deepseek-real-cost-floor-design.md` (gitignored) APPROVED by the user 2026-10-01. Plan
+            `docs/superpowers/plans/2026-10-01-S15-Lb-deepseek-real-cost-floor.md` — 7 tasks, branch
+            `s15-lb-deepseek-real-cost`: T1 floor cap; T2 `_protected_pin_bytes`; T3 KV hook + DeepSeek overrides; T4 plan
+            wiring; T5 DeepSeek on device; T6 other models; T7 docs. AWAITING the user's plan review.** Durable summary:
+            - **Floor:** `reserve_floor_bytes(..., protected_bytes=0, requested_max_seq_len=None)` returns
+              `max(base, min(peak(parity), ceiling, ceiling − protected))`, with parity capped at a requested context.
+              `_protected_pin_bytes()` is 0 for dense; for MoE it is shared-layer bytes + (if `max_pinned_layers != 0`)
+              every layer's non-expert bytes, read from the safetensors headers.
+            - **DeepSeek attention:** cost derived from config, `c = 2 × index_n_heads × elem / (num_attention_heads ×
+              min nonzero compress_ratio)` = 1.0 B/elem (measured 0.49).
+            - **KV hook:** new `planned_kv_bytes_per_token()` (default = today). DeepSeek measures its own
+              `DeepseekV4Cache` on meta at two sizes → 6,880 B/token, non-bucketed.
+            - **Predicted for DeepSeek (corrected while planning):** shared experts count as non-expert (the engine's
+              `\.experts\.` filter), so the demand is 8.24 GiB > the 7.82 GiB above the base floor. Hence reserve 8.03 →
+              3.50 GiB, pin 3.30 → 7.83 GiB (≈ 40 of 43 layers resident), `max_seq_len` 16,766 → 61,439; KV slope 6,880
+              B/token exactly (analytic count = measured on meta), constant 17.8 MB uncharged. Non-expert stream ~5.2 →
+              ~0.5 GB/token. Other models unchanged by construction; verified on device.
+            - **Verify:** DeepSeek ABBA + ids; peak ≤ reserve at 10k and at ~32k (detached systemd unit); server gate;
+              server-config plan identity for Qwen3-Next / MiniMax / gpt-oss. L-e: `expert_disk` rose 0.22 → 0.50
       s/token when S9 removed the CPU fold, bytes and hit/miss identical → exposed stall, hypothesis that the
       33 ms/layer fold had hidden read latency; verify with per-layer read-submit vs read-need timestamps
       (`row26_decode.py` `rust_durs`); ceiling ≤ 0.50 s of a 1.58 s token. L-b: measure the real `eager`
