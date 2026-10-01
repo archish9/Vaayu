@@ -1022,6 +1022,19 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
       (`row26_decode.py` `rust_durs`); ceiling ≤ 0.50 s of a 1.58 s token. L-b: measure the real `eager`
       attention peak under DSA `index_topk 512`; if S×S scores never materialize, up to 4.53 GiB of pin budget
       ≈ 30 more resident layers ≈ −0.55 s/token of `gpu_load` (S9's re-price). Fixture model: say so in §8.
+            - [x] **T5 — DeepSeek on device, 2026-10-01.** All stop rules clear. Logs `plans/probes/s15_out/` (gitignored).
+              - ABBA decode (U1+U2, 48 tok, ballast 15 GB; off=`main` worktree, on=branch): off1 1.6364 s/token (stall 0.524 s),
+                on1 0.5610 (0.259), on2 0.5597 (0.259), off2 1.6587 (0.517). Code effect **-65.99 %** (1.6476 -> 0.5604
+                s/token, **x2.940**); expert stall 0.52 -> 0.26 s.
+              - Greedy U1 ids identical across all four processes: True.
+              - Branch load lines: attention cost 1.00 B/score-element + 0.0 KiB/key (DSA indexer); KV cost 6.7 KiB/token (exact,
+                measured on meta); protected pin demand 8.24 GiB; `max_seq_len=61439`, reserve 3.50 GiB (KV 0.39), pinning
+                budget 7.80 GiB, expert cache ceiling 11.12 GiB; pin: 3 fully-pinned (3 shared), 39 non-expert-pinned,
+                8.31 GB reserved; Expert VRAM cache 2.0 GB (~149 experts).
+              - Peak vs reserve 3.50 GiB (`s15_peaks.py`, base, chunk 512): L=10000 measured 0.72 GiB (planner 1.59), exit 0;
+                L=32000 (32004 < max_seq_len 61439) measured 0.90 GiB (planner 2.41), exit 0; no OOM. Decode peak 0.28 GiB.
+                (10k TTFT 389 s, 32k TTFT 1318 s: expert-disk-bound prefill, not changed here.)
+              - Server gate `tests/test_server_smoke.py` on DeepSeek: **9 passed** (39.55 s).
 - [ ] **S16 — (d) sweep.** (i) **Row 40:** `cap_slabs_at_indexed_experts` (`vaayu_base.py:456`, called
       ~`:2893`, S8 T4 `2b34fa5`) says "Row 40 (fixed in S8)" but row 40 still reads `[bug]` / "not started" —
       verify it against row 40's own done rule (a test over Qwen-like, MiniMax-like and small-model geometries;
