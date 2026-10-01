@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 25 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12)
+## Index — 26 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii))
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -39,6 +39,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 21 | S10b-b — `check_space` crashes on a not-yet-existing `layer_shards_saving_path` | S10b row (added 2026-09-28) | `layer_shards_saving_path` is library-only (declined by the server) | the server exposes `layer_shards_saving_path`, or a library user reports it |
 | 22 | S10c-a — `load_layer_to_cpu` treats ANY head load failure as a tied head | S10c row (added 2026-09-28) | only the prefetching-OFF route, which the server never takes (`prefetching` not exposed, `compression` declined) | the server can run with `prefetching=False` or `compression`, or a library user reports a swapped head |
 | 23 | S10c-b — the absent-head fallback trusts that the splitter and the runtime agree on the head's NAME | S10c final review (added 2026-09-28) | needs a user-supplied `layer_names` without an `lm_head` entry on an untied model whose head is not `lm_head`; no on-device model qualifies | a supported model's head is named other than `lm_head` and is untied, or a user reports a tied-looking head on an untied model |
+| 26 | S5-M-C — the expert CLONE path fragments glibc arenas (mechanism confirmed, fix banked unwired) | S5-M row (moved 2026-10-01 by S16 (ii)) | unreachable on any model here: CPU compute builds no expert cache, every on-device MoE takes the arena on CUDA | a mixed fused + module-list model appears, or `slab_arena_exhausted_warning` shows in a load log |
 
 ---
 
@@ -666,3 +667,73 @@ graph layers to OOM refusals (grep the log for `decode graphs refused for … Ou
   **Fix when re-opened:** on `OutOfMemoryError`, restore the snapshot and re-raise instead of refusing, so the engine's
   retry path handles it and the next token recaptures.
 
+## 26. S5-M-C — the expert CLONE path fragments glibc arenas
+
+*Moved from `todo.md` (S5-M row) 2026-10-01 by S16 (ii), at the USER's call.* **Why here:** no model on this box
+reaches it — every on-device MoE takes the slab arena on CUDA, and CPU compute builds no expert cache at all.
+**Re-open when:** a MIXED fused + module-list MoE appears (`moe_supports_slab_arena` answers False for it), or
+`slab_arena_exhausted_warning` shows in a load log (pinned AND pageable arena allocation both failed).
+
+**Original row (2026-09-26), kept in full — its reach claim is CORRECTED below:**
+
+  - [bug] **S5-M-C — the CLONE path itself still fragments glibc arenas** (found by S5-M, NOT fixed by
+    it). Any cache with `arena is None` stores `load_expert_sparse`'s clones cloned a SECOND time by
+    `ExpertRAMCache.put()` (`persist/expert_cache.py:577`), on executor threads; evictions free them
+    and glibc keeps the pages. Measured on DeepSeek at an 8 GB cache: +5.4 GB of RSS held as malloc
+    free space (~0.68× the cache). After S5-M no on-device model reaches it on CUDA, but CPU compute
+    (every layout — `moe_supports_slab_arena` answers False without CUDA) and the arena-exhausted
+    fallback still do — and so does a MIXED or UNKNOWN expert layout on CUDA (the predicate answers
+    False for both). Candidates, unmeasured: set glibc's `M_MMAP_THRESHOLD` (`mallopt` or
+    `MALLOC_MMAP_THRESHOLD_`) at or below the expert component size, DERIVED not literal — it turns off
+    the dynamic threshold, so each clone gets its own mmap and returns to the OS on free, which fits
+    probe 1's flat `m_mmap`; drop `put()`'s redundant second clone (halves the churn, does not end it);
+    or a pageable `SlabArena` for arena-less layouts. Unblocks when a CPU-compute model is run here,
+    or the fallback is seen in a log.
+
+**S16 (ii), 2026-10-01 — what was measured, built and banked.** The user first picked the FULL fix (pin glibc's
+`M_MMAP_THRESHOLD`, derived from the expert component size), then banked it once the reach was corrected.
+
+- **Mechanism CONFIRMED on device (no engine code).** glibc's mmap threshold is DYNAMIC: it starts at 128 KiB and the
+  first `free()` of an mmapped block raises it to that block's size, so every later expert clone of that size comes
+  from the heap, where evicted clones stay as free chunks. DeepSeek-V4-Flash, clone path forced
+  (`plans/probes/s5m_rss_probe.py` with `NO_ARENA=1`, cache 8 GB, 64 greedy tokens, ABBA, logs
+  `plans/probes/s16_out/mm-*.log`):
+
+  | arm | peak RSS | malloc free | `m_mmap` | decode s/token (tokens ≥ 9) |
+  |---|---|---|---|---|
+  | default | 18.86 / 18.88 GB | 1.58 → 6.02 GB | 0.81–0.85 GB, flat | 0.844 / 0.851 |
+  | `MALLOC_MMAP_THRESHOLD_=262144` | **12.85 / 12.85 GB, flat from token 8 to 64** | **0.02 GB** | 9.60 GB (= the cache) | 0.926 / 0.924 |
+
+  −6.0 GB peak RSS for **+9.2 % decode** (page faults on fresh mmaps, two clones per miss). Greedy ids identical 64/64
+  over all four arms. The engine's own every-32-token `malloc_trim` has nothing left to return.
+- **Model-free reproduction** (8-thread pool feeding an LRU of twice-cloned tensors, `mallinfo2`): DeepSeek-like
+  components (3 × 4 MiB + 3 × 256 KiB) keep 0.56× the live bytes as malloc free space, 0.01× pinned;
+  Qwen3-Next-like (3 × 512 KiB + 3 × 64 KiB + 3 × 16 B) 0.25× → 0.08× at 512 KiB, 0.01× at 64 KiB.
+- **REACH CORRECTED — the original row's "CPU compute (every layout)" is WRONG.** The whole expert-cache block is
+  `if self.running_device.startswith("cuda") and self.is_moe` (`vaayu_base.py:2976`); on any other device the engine
+  prints "expert-aware streaming disabled, falling back to full-layer loading" (`:3473`), builds no offset index
+  (`:2637`) and no `ExpertRAMCache` (its only construction, `:3262`, is inside that block). So
+  `moe_supports_slab_arena(cuda=False)` never runs in production, and `expert_style` is only ever `fused` or
+  `module_list` — there is no "unknown" layout. **What still reaches an arena-less cache:** a mixed-layout MoE on
+  CUDA (none known), and a slab arena whose pinned and pageable allocations both fail. The arena-exhausted fallback
+  (`moe_patch.py:2872`) also clones, into a cache that HAS an arena, and **logs and counts nothing** — so the
+  original "seen in a log" condition could never fire for it.
+- **The fix, designed, built test-first and BANKED unwired** (`docs/evidence/2026-10-01-S16-ii-mmap-pin-banked.patch`
+  and `…-test_clone_path_mmap_threshold.py`, this disk only; plan
+  `docs/superpowers/plans/2026-10-01-S16-ii-clone-path-mmap-threshold.md`):
+  - threshold = the smallest expert component at or above glibc's own 128 KiB starting threshold (DeepSeek 256 KiB,
+    Qwen3-Next 512 KiB, MiniMax 2,949,120 B), capped at 32 MiB; none when no component reaches the floor;
+  - `mallopt(M_MMAP_THRESHOLD, T)` through ctypes, PROCESS-WIDE and one-way; a user-set `MALLOC_MMAP_THRESHOLD_` or
+    `GLIBC_TUNABLES` threshold wins; glibc 2.39 on this box accepts ANY value (the 32 MiB limit is older glibc);
+  - **a guard the pin needs:** each mmapped clone can be one kernel mapping. glibc holds at most 65,536 mmapped
+    chunks, and a kernel's default `vm.max_map_count` is 65,530 (this box: 1,048,576) — a process that runs out fails
+    every later mmap. Refuse the pin when a full cache would exceed min(65,536, `max_map_count` / 2): Qwen3-Next-like
+    at 22 GB is 37,299 clones, DeepSeek-like 9,874;
+  - 19 tests green, incl. a subprocess churn test over two geometries that FAILS on a no-op mutant (403 MB malloc
+    free for 214 MB live). Left to do if re-opened: wire into `init_model` after `ExpertRAMCache` is built (arena
+    None, not whole-layer-only, budget > 0), verify on device with the predicate forced, then consider dropping
+    `put()`'s redundant second clone to halve the +9.2 %.
+- **Cheaper alternative if a mixed-layout model is what re-opens this:** both MoE forwards read the arena since
+  S5-M, so the predicate's "mixed → False, a partially-usable arena" reason is stale; letting a mixed model take the
+  arena removes the clone path for it without touching malloc. Unverified: no such model exists.
+- **§8:** (1) no knob; (2) nothing plumbed; (3) unreachable on any model here; (4) banked — this entry.

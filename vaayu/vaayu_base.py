@@ -6143,6 +6143,13 @@ class VaayuBaseModel(GenerationMixin):
 
             pc = getattr(self, "_prefix_cache", None)
             if pc is None:
+                # S16: seed Vaayu's own cache here too. Called bare, transformers'
+                # generate() manufactured a stock DynamicCache that forward used
+                # as-is -- kv_cache_mode went inert for every model, and gpt-oss
+                # crashed past its 128-token window (HF truncates the sliding
+                # layers; Vaayu's eager mask is full length). A caller's cache wins.
+                if kwargs.get("past_key_values") is None:
+                    kwargs["past_key_values"] = self._create_kv_cache()
                 result = super().generate(*args, **kwargs)
                 self.telemetry.dump_json("vaayu_telemetry.json")
                 return result

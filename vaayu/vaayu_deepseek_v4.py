@@ -542,6 +542,11 @@ class VaayuDeepseekV4(VaayuBaseModel):
         """Seed a real `DeepseekV4Cache` before delegating, so the ordinary
         (non-prefix-cache) `generate()` path does not crash.
 
+        Since S16 the base `generate()` seeds `self._create_kv_cache()` on the
+        prefix-off path for EVERY model, so this override is now belt and braces;
+        it is kept because this model's forward accepts nothing else. The history
+        below describes the gap as it was before S16.
+
         `VaayuBaseModel.generate` (`vaayu_base.py:5548`) only seeds
         `past_key_values` on the prefix-cache path; when `self._prefix_cache`
         is `None` -- always true here, since `_refuse_unsupported_prefix_cache`
