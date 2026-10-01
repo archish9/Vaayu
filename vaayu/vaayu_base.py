@@ -2583,8 +2583,8 @@ class VaayuBaseModel(GenerationMixin):
         self._vram_plan = None
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
-                                    kv_bytes_per_token, plan_vram,
-                                    reserve_floor_bytes, score_elem_bytes)
+                                    plan_vram, reserve_floor_bytes,
+                                    score_elem_bytes)
             # S14 3c: what one attention forward costs -- measured on this
             # load's own attention module for eager, the kernel table for
             # flash/sdpa. BEFORE the free-VRAM snapshot: the measurement's own
@@ -2598,9 +2598,6 @@ class VaayuBaseModel(GenerationMixin):
                   f"{score_elem_bytes(self._active_attn_impl):.2f})")
             _free_vram, _ = torch.cuda.mem_get_info()
             _n_heads = self.config.num_attention_heads
-            _head_dim = getattr(self.config, "head_dim", None)
-            if not isinstance(_head_dim, int):
-                _head_dim = self.config.hidden_size // _n_heads
             _layer0 = Path(self.checkpoint_path) / \
                 f"{self.layer_names_dict['layer_prefix']}.0.safetensors"
             try:
@@ -2662,17 +2659,14 @@ class VaayuBaseModel(GenerationMixin):
                     _resident_expert_bytes = int(
                         self._moe_geometry["num_experts"]
                         * self._moe_geometry["expert_bytes"])
-            from .batch import kv_bearing_layer_count
-            # Only the layers that actually store KV (RC4 (c)). Uniform models
-            # get their full depth back, so nothing on device today moves.
-            _kv_layers = kv_bearing_layer_count(self)
+            # KV bytes per token: the config figure (only the layers that store
+            # KV, RC4 (c)), or a model's own measurement of its cache (S15 L-b:
+            # DeepSeek-V4's preallocated compressed cache).
+            _kv_per_token, _kv_bucketed, _kv_source = self.planned_kv_bytes_per_token()
+            print(f"[Vaayu-VRAM] KV cost: {_kv_per_token / 1024:.1f} KiB/token "
+                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})")
             _shape = VramShape(
-                kv_per_token=kv_bytes_per_token(
-                    num_hidden_layers=_kv_layers,
-                    num_key_value_heads=getattr(self.config, "num_key_value_heads",
-                                                _n_heads),
-                    head_dim=_head_dim,
-                    kv_cache_mode=self.kv_cache_mode),
+                kv_per_token=_kv_per_token,
                 N=1, chunk=max(1, self.prefill_chunk_size),
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
@@ -2687,7 +2681,7 @@ class VaayuBaseModel(GenerationMixin):
                 head_bytes=_head_bytes,
                 alloc_factor=DEFAULT_ALLOC_FACTOR,
                 kv_growth_factor=FP8DynamicCache._GROWTH,
-                kv_capacity_buckets=self._kv_cache_is_bucketed(),
+                kv_capacity_buckets=_kv_bucketed,
                 # Which prefill forward this load will run -- mirrors
                 # _chunked_prefill's own branch (is_moe AND a kernel that takes
                 # an implicit/self-built mask), read off the module tree rather
@@ -2717,10 +2711,18 @@ class VaayuBaseModel(GenerationMixin):
             # sdpa load derives what flash would have, paid out of the expert
             # VRAM cache / pinning budget. flash loads keep the base floor
             # unchanged. Derived per geometry -- see reserve_floor_bytes.
+            # S15 L-b: on a MoE load the raise may not take the bytes the pin
+            # planner needs for the weights that otherwise stream every token;
+            # a requested max_seq_len caps the parity it buys.
+            _protected = self._protected_pin_bytes()
+            if _protected:
+                print(f"[Vaayu-VRAM] protected pin demand: {_protected / 1024 ** 3:.2f} GiB "
+                      f"(MoE non-expert weights the reserve floor may not take)")
             _reserve_floor = reserve_floor_bytes(
                 shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
                 free_vram=_free_vram, min_resident=_min_resident,
-                layer_slack=_layer_slack)
+                layer_slack=_layer_slack, protected_bytes=_protected,
+                requested_max_seq_len=max_seq_len)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
                 min_resident=_min_resident,
