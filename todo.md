@@ -105,7 +105,53 @@ ms/token), S11-L6 (HIT-diff disk re-reads, ≤12.3 % of a HIT@8k TTFT, build unp
 `batched_generate` not wired into the server (every N>1 win stays banked).
 
 **Durable rows** (`docs/` is gitignored — the conclusion lives HERE):
-- [ ] **S17 — S11-L4: prefill reads the expert VRAM tier.** Today every MoE forward sets `_vram = None` on a
+- [~] **S17 — S11-L4: prefill reads the expert VRAM tier.** **IN PROGRESS 2026-10-01 — steps (0) and (1) DONE,
+      plan APPROVED by the user 2026-10-01 (shared helper, subagent-driven); executing on branch
+      `s17-prefill-reads-vram-tier`
+      (plan: `docs/superpowers/plans/2026-10-01-S17-prefill-reads-vram-tier.md`; its verified test file and code
+      diff: `docs/superpowers/plans/2026-10-01-S17-assets/`).** **Design, in one line each (so the row stands
+      without the plan):** one helper `_vram_tier_visit(vaayu_ref, layer_idx, unique_experts) -> (held, vram)`
+      replaces the three copies of "handle + two gates + lookup"; in prefill it looks up through a new read-only
+      `ExpertVRAMCache.peek()` (no LRU promotion, no `hits`/`misses`, own `prefill_hits` counter) and returns
+      `vram=None`, so the existing hit branches run and every `put()` site stays dark; the module-list
+      attach-failure `drop()` goes to the cache itself, since `_vram` is None in prefill. No knob. **Dry-run on a
+      throwaway worktree of `3d0493c`:** 23 new tests RED at HEAD for the intended reasons, GREEN with the change;
+      full suite with the change breaks exactly ONE existing test
+      (`test_layer_major_prefill.py::test_staged_layer_survives_all_chunks_and_retains_gpu`, a `SimpleNamespace`
+      fake cache with no `peek` — fixture fix in the plan); expected final suite 3381 + 23 = 3404. The two
+      "prefill does not touch the tier" tests still PASS (tier empty, decode counters unmoved) — only their
+      docstrings go false. **A/B method:** same tree, `S17_OFF=1` makes the probe replace `peek` with a
+      function returning None (= the pre-S17 behaviour); probe prompt body is a FIXED snapshot
+      (`plans/probes/s17_out/prompt_src.py`), because the probe used to tokenize the live `moe_patch.py`,
+      which this change edits.
+      - [x] T0 branch `s17-prefill-reads-vram-tier`, commit this ledger edit
+      - [ ] T1 `ExpertVRAMCache.peek()` + `prefill_hits` (RED → GREEN)
+      - [ ] T2 `_vram_tier_visit` + fused non-EXL3 forward (12 RED + 2 guards → GREEN)
+      - [ ] T3 module-list forward, incl. attach-failure drop (6 RED → GREEN)
+      - [ ] T4 fused-EXL3 forward (2 RED → GREEN; UNIT-LEVEL ONLY, no checkpoint) + fixture fix + full suite
+      - [ ] T5 Qwen3-Next ABBA (off, on, on, off) HIT@2k / HIT@8k / cold, ids, peak VRAM → stop-rule decision
+      - [ ] T6 MiniMax (2k) and DeepSeek (1k) OFF/ON: ids + TTFT
+      - [ ] T7 suite + accumulator gates ×2 + Qwen3-Next server gate + docs check + RESULTS + ledger close +
+            final review
+      **(0) re-verified at HEAD `3d0493c`:** the three gates sit at `moe_patch.py:1750-1751` (module-list),
+      `:2329-2332` (fused non-EXL3), `:3101-3102` (fused EXL3). **Why the gate exists:** `10a8629` (2026-07-11,
+      "skip expert-cache puts during prefill") — it was written to stop `put()` churn; the read went dark only
+      because one `_vram` handle serves both `get()` and `put()`. No commit, test or doc records a reason against
+      a prefill READ. The one thing that leans on "not read in prefill" is `_ensure_prefill_headroom` /
+      `evict_until_free` (they evict the tier for activation headroom): still safe, it runs at forward entry,
+      before a visit takes its entries, and a held entry outlives its eviction. Two tests pin today's behaviour
+      and must be rewritten, not deleted: `test_fused_vram_expert_cache.py::test_prefill_does_not_touch_the_vram_cache`,
+      `test_moe_patch.py::test_modulelist_skips_vram_cache_during_prefill`.
+      **(1) baseline at HEAD, server mode (frozen), warm session discarded, BALLAST_GB=25, 2 reps**
+      (`plans/probes/s17_ttft.py` = `s11_ttft.py` + `freeze_after_load()`; `plans/probes/s17_out/s11-ttft-base1.json`):
+      **HIT@8k 3.225 s** (3.220, 3.229), overlap 2,754 / 2,738 of 9,329 / 9,354 routed pairs; **HIT@2k 3.322 s**
+      (3.400, 3.244), overlap 2,575 / 2,595; cold@2k 10.732 s, cold@8k 27.765 s, overlap 4,157–4,185; the tier
+      holds 4,205 entries (S11: 4,158), so **the overlap survived S12.** **Re-priced by uploads** (overlap ×
+      1,769,520 B ÷ 19.7 GB/s pinned H2D): **0.247 s = 7.6 % of HIT@8k, 0.232 s = 7.0 % of HIT@2k** — above the
+      5 % stop line (0.161 s at 8k), not by a wide margin. **New, not chased:** a COLD prefill now evicts the tier
+      for headroom (4,205 → 3,532 / 1,989 / 3,252 / 4,006 entries; S11 saw 4,158 → 4,158), so decode after a cold
+      prefill re-warms more than it did — unpriced.
+      Original brief: Today every MoE forward sets `_vram = None` on a
       prefill pass, so a prefix-HIT's diff re-uploads experts that are already resident in VRAM. **Priced by S11
       (2026-09-28, Qwen3-Next, fused non-EXL3 forward ONLY):** 0.24–0.43 s = **8.0–14.0 % of a HIT@8k TTFT**
       (3.04 s); ≈0.22–0.24 s counted by uploads — the upper figure divides h2d by disk loads and is ~2× high;
