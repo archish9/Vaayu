@@ -283,3 +283,52 @@ def test_modulelist_prefill_drops_a_tier_entry_that_will_not_attach(
 
     assert (0, victim) not in vram.cache, "the unusable entry was left in the tier"
     assert torch.equal(cold, warm), f"max|d| = {(cold - warm).abs().max().item():.3e}"
+
+
+# ── fused EXL3 (no on-device model since 2026-09-20: unit-level proof only) ──
+
+# (hidden, num_experts, top_k)
+EXL3_GEOMETRIES = [(8, 8, 4), (16, 16, 2)]
+
+
+@pytest.mark.parametrize("hidden,num_experts,top_k", EXL3_GEOMETRIES)
+def test_exl3_prefill_serves_resident_experts_from_the_tier(
+        tmp_path, hidden, num_experts, top_k):
+    model = MockFusedModel(num_layers=1, hidden=hidden)
+    model.layers[0].mlp = MockFusedMoEBlock(hidden, num_experts)
+    model.layers[0].mlp.gate = _LogitsRouter(hidden, num_experts)
+    _make_fused_checkpoint(tmp_path, num_layers=1, hidden=hidden,
+                           intermediate=hidden * 2, num_experts=num_experts)
+    idx = ExpertOffsetIndex(str(tmp_path))
+    idx.build()
+    ram = ExpertRAMCache(budget_bytes=BIG)
+    for eidx in range(num_experts):
+        ram.put(0, eidx, _make_mock_exl3_raw("layers.0", eidx, in_dim=hidden,
+                                             out_dim=hidden * 2))
+    ref = MockVaayuRef()
+    ref._moe_prefill_pass = False
+    vram = ref._expert_vram_cache = ExpertVRAMCache(budget_bytes=BIG)
+    ref._vram_cacheable_layers = None
+
+    block_info = detect_moe_blocks(model)[0]
+    mock_bc = MagicMock()
+    mock_bc.run_alloc.side_effect = (
+        lambda x, out_feats, _: torch.zeros(x.shape[0], out_feats, dtype=torch.float16))
+    with mock_patch("vaayu.moe_patch._make_bc_linear_exl3",
+                    return_value=mock_bc) as make_bc:
+        fwd = block_info.moe_module.forward = _make_fused_sparse_forward_exl3(
+            block_info=block_info, expert_cache=ram, offset_index=idx,
+            checkpoint_path=Path(str(tmp_path)), top_k=top_k, device="cpu",
+            dtype=torch.float32, vaayu_ref=ref)
+        x = torch.randn(1, 1, hidden)
+        fwd(x)                               # a decode visit fills the tier
+        before = _tier_state(vram)
+        assert len(before[0]) == top_k, "premise: the decode visit filled the tier"
+        built = make_bc.call_count
+
+        ref._moe_prefill_pass = True
+        fwd(x)                               # the same routing, as a prefill pass
+
+        assert make_bc.call_count == built, "a resident expert was rebuilt from host"
+    assert vram.prefill_hits == top_k
+    assert _tier_state(vram) == before, "prefill changed the tier it may only read"

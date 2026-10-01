@@ -3095,28 +3095,11 @@ def _make_fused_sparse_forward_exl3(
                 if _staged_layer is not None and _is_last_call:
                     vaayu_ref._prefill_stage_sem.release()  # free a stage slot
 
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        # Prefill: don't churn the GPU LRU with a whole-model sweep.
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            _vram = None
-        # Layer-range restriction (Fix #7 follow-up): only layers in the
-        # cacheable prefix use the VRAM cache; None means no restriction.
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
-
         # Check GPU residency BEFORE dispatching, so a resident expert that has
         # fallen out of the RAM cache is not read off NVMe for nothing (P8).
-        # The entry is HELD for the whole compute loop, exactly as the
-        # module-list forward holds its _vram_resident entries: eviction only
-        # pops the dict and drops its reference, so a held entry stays valid
-        # even if a later put() in this same layer-visit evicts it.
-        _vram_hold: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _held = _vram.get(layer_idx, _e)
-                if _held is not None:
-                    _vram_hold[_e] = _held
+        # Prefill reads the tier and does not fill it (_vram is None then), and
+        # the layer-range restriction covers both -- see _vram_tier_visit.
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
             unique_experts,
@@ -3271,7 +3254,7 @@ def _make_fused_sparse_forward_exl3(
                         if not _owned_by_cache:
                             _entry = None
                     elif _cm_gpu is not None:
-                        # Chunk-major retention (prefill: _vram is gated off). Budget
+                        # Chunk-major retention (prefill: nothing is put in the tier). Budget
                         # bound is the same hardware-derived VRAM cache budget; overflow
                         # experts simply re-upload on later chunks.
                         _sz = sum(t.nbytes for d in (gpu_gate, gpu_up, gpu_down)

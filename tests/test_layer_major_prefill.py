@@ -60,7 +60,7 @@ def test_staged_layer_survives_all_chunks_and_retains_gpu(tmp_path):
     from vaayu.moe_patch import (
         _make_fused_sparse_forward_exl3, detect_moe_blocks,
     )
-    from vaayu.persist.expert_cache import ExpertRAMCache
+    from vaayu.persist.expert_cache import ExpertRAMCache, ExpertVRAMCache
     from vaayu.persist.expert_offset_index import ExpertOffsetIndex
 
     hidden, out_dim, num_experts = 8, 16, 8
@@ -88,9 +88,9 @@ def test_staged_layer_survives_all_chunks_and_retains_gpu(tmp_path):
     sem = threading.Semaphore(1)
     assert sem.acquire(blocking=False) is True          # hold the one slot
     vaayu_ref._prefill_stage_sem = sem
-    # budget for chunk-major GPU retention (prefill gates the real VRAM cache off,
-    # so this is only read for its budget_bytes bound).
-    vaayu_ref._expert_vram_cache = types.SimpleNamespace(budget_bytes=10 ** 9)
+    # budget for chunk-major GPU retention. A real, empty cache: prefill reads
+    # the VRAM tier (S17) and never fills it, so only budget_bytes matters here.
+    vaayu_ref._expert_vram_cache = ExpertVRAMCache(budget_bytes=10 ** 9)
 
     mock_bc = MagicMock()
     mock_bc.run_alloc.side_effect = (
