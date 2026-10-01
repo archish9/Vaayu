@@ -1063,7 +1063,9 @@ def test_modulelist_vram_byte_accounting_matches_tensors(tmp_path, num_experts, 
 
 @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 8)])
 def test_modulelist_skips_vram_cache_during_prefill(tmp_path, num_experts, top_k):
-    """Prefill sweeps ~every expert once; caching there only churns the LRU."""
+    """Prefill sweeps ~every expert once; FILLING the tier there only churns the
+    LRU. It does read the tier (S17, tests/test_prefill_reads_vram_tier.py) --
+    here the tier is empty, and the decode counters must not move."""
     model, vaayu_ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
     vaayu_ref._moe_prefill_pass = True
 

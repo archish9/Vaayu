@@ -212,3 +212,74 @@ def test_fused_chunked_prefill_retains_only_what_the_tier_lacks(
     assert len(uploads) == 1, "the miss should upload once across both chunks"
     assert ref._chunk_major_gpu is None
     assert _tier_state(vram)[:2] == before[:2]
+
+
+# ── module-list (MiniMax's and DeepSeek's forward) ───────────────────────────
+
+@pytest.mark.parametrize("num_experts,top_k", MODULELIST_GEOMETRIES)
+def test_modulelist_prefill_serves_resident_experts_from_the_tier(
+        tmp_path, monkeypatch, num_experts, top_k):
+    model, ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    fwd = model.layers[0].block_sparse_moe.forward
+    x = torch.randn(1, 4, 8)
+    fwd(x)
+    before = _tier_state(vram)
+    assert before[0], "premise: the decode visit put its experts in the tier"
+
+    uploads = _spy(monkeypatch, "_inject_expert_weights")
+    ref._moe_prefill_pass = True
+    fwd(x)
+
+    assert uploads == [], f"{len(uploads)} resident experts were uploaded again"
+    assert vram.prefill_hits == len(before[0])
+    assert _tier_state(vram) == before, "prefill changed the tier it may only read"
+
+
+@pytest.mark.parametrize("num_experts,top_k", MODULELIST_GEOMETRIES)
+def test_modulelist_prefill_mixing_residents_and_misses_is_bit_identical(
+        tmp_path, monkeypatch, num_experts, top_k):
+    model, ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    fwd = model.layers[0].block_sparse_moe.forward
+    x = torch.randn(1, 4, 8)
+
+    ref._moe_prefill_pass = True
+    cold, _ = fwd(x)
+    assert len(vram.cache) == 0, "a prefill pass filled the tier"
+
+    ref._moe_prefill_pass = False
+    fwd(x)
+    victim = next(iter(vram.cache))[1]
+    vram.drop(0, victim)
+
+    uploads = _spy(monkeypatch, "_inject_expert_weights")
+    ref._moe_prefill_pass = True
+    warm, _ = fwd(x)
+
+    assert len(uploads) == 1, "exactly the dropped expert should upload"
+    assert vram.prefill_hits > 0, "premise: the rest came from the tier"
+    assert (0, victim) not in vram.cache, "prefill put its miss into the tier"
+    assert torch.equal(cold, warm), f"max|d| = {(cold - warm).abs().max().item():.3e}"
+
+
+@pytest.mark.parametrize("num_experts,top_k", MODULELIST_GEOMETRIES)
+def test_modulelist_prefill_drops_a_tier_entry_that_will_not_attach(
+        tmp_path, num_experts, top_k):
+    """A structurally broken entry must not be re-tried on every prefill visit, and
+    its expert must still be computed -- from disk."""
+    model, ref, vram = _patch_modulelist_with_vram(tmp_path, num_experts, top_k)
+    fwd = model.layers[0].block_sparse_moe.forward
+    x = torch.randn(1, 4, 8)
+
+    ref._moe_prefill_pass = True
+    cold, _ = fwd(x)
+    ref._moe_prefill_pass = False
+    fwd(x)
+    victim = next(iter(vram.cache))[1]
+    with vram.lock:
+        vram.cache[(0, victim)] = {"nonexistent": {"weight": torch.randn(8, 8)}}
+
+    ref._moe_prefill_pass = True
+    warm, _ = fwd(x)
+
+    assert (0, victim) not in vram.cache, "the unusable entry was left in the tier"
+    assert torch.equal(cold, warm), f"max|d| = {(cold - warm).abs().max().item():.3e}"

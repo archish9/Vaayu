@@ -127,7 +127,7 @@ ms/token), S11-L6 (HIT-diff disk re-reads, ≤12.3 % of a HIT@8k TTFT, build unp
       - [x] T0 branch `s17-prefill-reads-vram-tier`, commit this ledger edit
       - [x] T1 `ExpertVRAMCache.peek()` + `prefill_hits` (RED → GREEN)
       - [x] T2 `_vram_tier_visit` + fused non-EXL3 forward (12 RED + 2 guards → GREEN)
-      - [ ] T3 module-list forward, incl. attach-failure drop (6 RED → GREEN)
+      - [x] T3 module-list forward, incl. attach-failure drop (6 RED → GREEN)
       - [ ] T4 fused-EXL3 forward (2 RED → GREEN; UNIT-LEVEL ONLY, no checkpoint) + fixture fix + full suite
       - [ ] T5 Qwen3-Next ABBA (off, on, on, off) HIT@2k / HIT@8k / cold, ids, peak VRAM → stop-rule decision
       - [ ] T6 MiniMax (2k) and DeepSeek (1k) OFF/ON: ids + TTFT

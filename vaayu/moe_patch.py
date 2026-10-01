@@ -1773,16 +1773,10 @@ def _make_modulelist_sparse_forward(
         _contribs: list = []
         _flat_routing = routing_weights.reshape(-1, routing_weights.shape[-1])
 
-        # VRAM expert cache (Fix #7, ported from the fused path). Same two gates:
-        # prefill routes ~every expert once, so caching there only churns the LRU;
-        # and _vram_cacheable_layers restricts to the layer prefix that fits when
-        # the budget can't hold a whole token's working set (None = no restriction).
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            _vram = None
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
+        # VRAM expert cache (Fix #7, ported from the fused path). Experts already
+        # VRAM-resident need no RAM lookup and no disk read at all. Prefill reads
+        # the tier and does not fill it (_vram is None then) -- see _vram_tier_visit.
+        _vram_resident, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         # Chunk-major retention (row 45, the module-list half of row 44's F2). The
         # layer-major chunked prefill calls this layer once per chunk, back to
@@ -1794,7 +1788,7 @@ def _make_modulelist_sparse_forward(
         # call is kept as the same entry the VRAM cache would store and served
         # through the hit branch below; the dict is dropped at the layer's last
         # chunk call and bounded by the VRAM cache budget, which is idle during
-        # prefill (_vram is None above). _chunked_prefill's finally clears
+        # prefill (nothing is put there then). _chunked_prefill's finally clears
         # _chunk_major_gpu, which is why a missing dict always starts a fresh count.
         _cm = None
         _cm_last_call = False
@@ -1813,20 +1807,9 @@ def _make_modulelist_sparse_forward(
             _cm_budget = getattr(getattr(vaayu_ref, "_expert_vram_cache", None),
                                  "budget_bytes", 0)
 
-        # Experts already VRAM-resident need no RAM lookup and no disk read at all.
-        # ONE get() per expert, entry held for the compute loop below — not
-        # has()-then-get(), which would take the lock twice and leave a window
-        # where an expert could vanish between the two calls.
-        _vram_resident: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _entry = _vram.get(layer_idx, _e)
-                if _entry is not None:
-                    _vram_resident[_e] = _entry
         if _cm is not None:
-            # Mutually exclusive with the branch above in practice (_vram is None
-            # during prefill), but the lookup is written as its own pass so
-            # neither gate depends on the other's state.
+            # An expert the tier lacked on an earlier chunk call was uploaded then
+            # and retained here; tier residents never enter this dict.
             for _e in unique_experts:
                 _entry = _cm.get(_e)
                 if _entry is not None:
@@ -2001,12 +1984,13 @@ def _make_modulelist_sparse_forward(
                         # failed attach must not silently drop this expert's
                         # contribution to final_hidden — fall through to a real
                         # disk load below instead of skipping compute.
-                        # The entry came from whichever tier is live: the VRAM
-                        # cache at decode, the chunk-major dict during a
-                        # layer-major prefill (where _vram is None, so the drop
-                        # must not go through it).
-                        if _vram is not None:
-                            _vram.drop(layer_idx, eidx)
+                        # The entry came from the VRAM cache (decode, or a
+                        # prefill read) or from the chunk-major dict. _vram is
+                        # None in prefill, so the drop goes to the cache itself;
+                        # drop() on a key it does not hold is a no-op.
+                        _tier = getattr(vaayu_ref, "_expert_vram_cache", None)
+                        if _tier is not None:
+                            _tier.drop(layer_idx, eidx)
                         if _cm is not None and eidx in _cm:
                             vaayu_ref._chunk_major_gpu_bytes -= (
                                 ExpertVRAMCache._group_bytes(_cm.pop(eidx)))
