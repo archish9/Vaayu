@@ -1553,7 +1553,7 @@ def _make_sparse_moe_forward(
 
 
 # Hardware constant: free VRAM to guarantee before each MoE layer DURING PREFILL,
-# by evicting the (prefill-idle) VRAM expert cache. A property of the card, not
+# by evicting the VRAM expert cache (prefill reads it, never fills it). A property of the card, not
 # the model (CLAUDE.md §5) — same CLASS of constant as vaayu_base._VRAM_RESERVE_FLOOR_BYTES
 # (both are hardware headroom reserves), but a deliberately DIFFERENT value (2 GB
 # here vs 3.5 GB there): this one only needs to exceed one layer's prefill-chunk
@@ -1564,7 +1564,7 @@ _PREFILL_VRAM_HEADROOM = 2 * 1024 ** 3
 
 
 def _format_vram_diag(layer_idx, free, alloc, reserved,
-                      cache_usage, cache_budget, prefill_evict):
+                      cache_usage, cache_budget, prefill_evict, prefill_hit):
     """One grep-able diagnostic line for the VRAM prefill trajectory. All byte
     inputs; emits GB. Pure — no torch/CUDA calls, so it is unit-testable."""
     g = 1024 ** 3
@@ -1572,7 +1572,7 @@ def _format_vram_diag(layer_idx, free, alloc, reserved,
             f"free={free / g:.2f}GB alloc={alloc / g:.2f}GB "
             f"reserved={reserved / g:.2f}GB "
             f"cache={cache_usage / g:.2f}/{cache_budget / g:.2f}GB "
-            f"prefill_evict={prefill_evict}")
+            f"prefill_evict={prefill_evict} prefill_hit={prefill_hit}")
 
 
 def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
@@ -1599,7 +1599,8 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
         print(_format_vram_diag(
             layer_idx, free_now,
             torch.cuda.memory_allocated(), torch.cuda.memory_reserved(),
-            _vram.current_usage, _vram.budget_bytes, _vram.prefill_evictions),
+            _vram.current_usage, _vram.budget_bytes, _vram.prefill_evictions,
+            _vram.prefill_hits),
             flush=True)
 
 
@@ -1787,8 +1788,8 @@ def _make_modulelist_sparse_forward(
         # detach was 63 % of a 113.9 s wall. An expert uploaded by an earlier chunk
         # call is kept as the same entry the VRAM cache would store and served
         # through the hit branch below; the dict is dropped at the layer's last
-        # chunk call and bounded by the VRAM cache budget, which is idle during
-        # prefill (nothing is put there then). _chunked_prefill's finally clears
+        # chunk call and bounded by the VRAM cache budget; prefill
+        # puts nothing in that cache. _chunked_prefill's finally clears
         # _chunk_major_gpu, which is why a missing dict always starts a fresh count.
         _cm = None
         _cm_last_call = False
@@ -3177,7 +3178,8 @@ def _make_fused_sparse_forward_exl3(
                     current_state = current_state.to(torch.float16)
 
                 # Held since before dispatch (one LRU promotion per expert per
-                # visit, as before — the lookup simply moved earlier).
+                # visit at decode; a prefill visit looks up through peek() and
+                # promotes nothing).
                 _cached_gpu = _vram_hold.get(eidx)
                 _cm_gpu = getattr(vaayu_ref, "_chunk_major_gpu", None)
                 if _cached_gpu is None and _cm_gpu is not None:
@@ -3288,8 +3290,9 @@ def _make_fused_sparse_forward_exl3(
                             # Cache the BC objects with the entry: they wrap the SAME
                             # resident GPU tensors, so their lifetime matches; eviction
                             # drops the tuple and the pybind destructors free the C++
-                            # heap. Mutation outside the cache lock is safe — the decode
-                            # compute loop is the sole consumer of VRAM-cache entries.
+                            # heap. Mutation outside the cache lock is safe — every consumer
+                            # of VRAM-cache entries (decode or prefill) runs on the forward
+                            # thread, one layer visit at a time.
                             _entry["bc"] = (bc_gate, bc_up, bc_down)
 
                     if _prof:

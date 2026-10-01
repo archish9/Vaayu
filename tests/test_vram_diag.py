@@ -10,7 +10,7 @@ GB = 1024 ** 3
 def test_diag_line_reports_all_components_in_gb():
     line = _format_vram_diag(
         layer_idx=7, free=2 * GB, alloc=13 * GB, reserved=int(13.5 * GB),
-        cache_usage=8 * GB, cache_budget=9 * GB, prefill_evict=42,
+        cache_usage=8 * GB, cache_budget=9 * GB, prefill_evict=42, prefill_hit=7,
     )
     # One grep-able line naming the layer and every component in GB.
     assert "[VRAM-DIAG]" in line
@@ -20,10 +20,11 @@ def test_diag_line_reports_all_components_in_gb():
     assert "reserved=13.50GB" in line
     assert "cache=8.00/9.00GB" in line
     assert "prefill_evict=42" in line
+    assert "prefill_hit=7" in line
 
 
 def test_diag_line_is_single_line():
-    line = _format_vram_diag(1, GB, GB, GB, GB, GB, 0)
+    line = _format_vram_diag(1, GB, GB, GB, GB, GB, 0, 0)
     assert "\n" not in line
 
 
