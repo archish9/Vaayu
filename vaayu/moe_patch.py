@@ -1577,12 +1577,11 @@ def _format_vram_diag(layer_idx, free, alloc, reserved,
 
 def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
     """During a prefill pass, evict the VRAM expert cache until free VRAM meets
-    _PREFILL_VRAM_HEADROOM. The cache is not read during prefill — the two
-    forwards that consult it (module-list and fused-EXL3) set their local
-    _vram = None when _moe_prefill_pass is set, and the non-EXL3 fused forward
-    never touches it at all — so its residency gives prefill no benefit while
-    starving activations. Evicting here is therefore free for prefill; the
-    evicted experts re-warm during the decode that follows.
+    _PREFILL_VRAM_HEADROOM. Activations come first. A prefill pass reads the
+    tier but never fills it (S17, _vram_tier_visit), so an entry evicted here
+    costs that prefill one upload it would otherwise have skipped, and re-warms
+    during the decode that follows. This runs at forward entry, before the visit
+    takes its entries, so it never evicts one the visit is computing with.
     A no-op during decode, without a VRAM cache, or without CUDA.
 
     When VAAYU_VRAM_DIAG is set, emits one grep-able [VRAM-DIAG] line per MoE
@@ -1604,12 +1603,44 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
             flush=True)
 
 
+def _vram_tier_visit(vaayu_ref, layer_idx, unique_experts):
+    """One layer visit's view of the VRAM expert tier: (held, vram).
+
+    `held` maps each routed expert that is resident to its entry. The visit keeps
+    these references for its whole compute loop: eviction only pops the dict and
+    drops the cache's reference, so a held entry stays valid even if a later
+    put() in the same visit evicts it. ONE lookup per expert, not has()-then-get().
+
+    `vram` is the cache this visit may put() its misses into, or None.
+
+    Two gates, shared by all three per-expert forwards so they cannot drift:
+    _vram_cacheable_layers restricts the tier to the layer prefix that fits when
+    the budget cannot hold a whole token's working set (None = no restriction);
+    and a PREFILL pass is read-only (S17) -- it routes ~every expert once, so
+    filling the tier from it would only churn the LRU, but an expert already
+    resident needs no second upload. Prefill reads through peek(), which leaves
+    the LRU order and the decode hit/miss counters alone.
+    """
+    vram = getattr(vaayu_ref, "_expert_vram_cache", None)
+    layers = getattr(vaayu_ref, "_vram_cacheable_layers", None)
+    if vram is None or (layers is not None and layer_idx not in layers):
+        return {}, None
+    prefill = getattr(vaayu_ref, "_moe_prefill_pass", False)
+    lookup = vram.peek if prefill else vram.get
+    held = {}
+    for eidx in unique_experts:
+        entry = lookup(layer_idx, eidx)
+        if entry is not None:
+            held[eidx] = entry
+    return held, (None if prefill else vram)
+
+
 def _maybe_record_usage(vaayu_ref, layer_idx, expert_indices) -> None:
     """Count DECODE-time expert routes when the usage histogram is enabled.
 
     A no-op when the feature is off (the common case — one getattr). Skipped
-    during prefill on purpose: the VRAM expert cache is not consulted in a
-    prefill pass, so there are no budget-pressure evictions then, and counting
+    during prefill on purpose: a prefill pass never fills the VRAM expert cache
+    (it only reads it), so there are no budget-pressure evictions then, and counting
     prefill routes would make the report compare decode-side evictions against
     prefill+decode routes. See the measurement design spec.
     """
@@ -2324,25 +2355,9 @@ def _make_fused_sparse_forward(
         # VRAM expert cache (S2b (iii)). Until 2026-09-13 this forward reached it
         # through ZERO code paths while its budget sat reserved and idle — the
         # VAAYU_CACHE_BIAS failure mode (CLAUDE.md §0) in a fourth place. Same
-        # two gates the other two forwards apply.
-        _vram = getattr(vaayu_ref, '_expert_vram_cache', None)
-        if _vram is not None and getattr(vaayu_ref, "_moe_prefill_pass", False):
-            # Prefill routes ~every expert once; don't churn the GPU LRU with a
-            # whole-model sweep.
-            _vram = None
-        _vram_layers = getattr(vaayu_ref, '_vram_cacheable_layers', None)
-        if _vram is not None and _vram_layers is not None and layer_idx not in _vram_layers:
-            _vram = None
-
-        # Held for the whole compute loop, as the other two forwards hold theirs:
-        # eviction only pops the dict and drops its reference, so a held entry
-        # stays valid even if a later put() in this same visit evicts it.
-        _vram_hold: dict = {}
-        if _vram is not None:
-            for _e in unique_experts:
-                _held = _vram.get(layer_idx, _e)
-                if _held is not None:
-                    _vram_hold[_e] = _held
+        # two gates and the same hold as the other two forwards. Prefill reads
+        # the tier and does not fill it (_vram is None then) -- see _vram_tier_visit.
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
 
         # Chunk-major retention (row 44 F2). The layer-major chunked prefill calls
         # this layer once per chunk, back to back; without this, each call re-read
@@ -2352,8 +2367,8 @@ def _make_fused_sparse_forward(
         # and served through the hit branch below; the dict is dropped at the
         # layer's last chunk call. Same mechanism as the fused-EXL3 forward's
         # _chunk_major_gpu, with its own call counter since that one rides the
-        # EXL3-only prefill stager. Bounded by the VRAM cache budget, idle during
-        # prefill. _chunked_prefill's finally clears the dict on an exception,
+        # EXL3-only prefill stager. Bounded by the VRAM cache budget, which prefill
+        # does not fill. _chunked_prefill's finally clears the dict on an exception,
         # which is why a missing dict always starts a fresh count.
         _cm = None
         _cm_last_call = False
