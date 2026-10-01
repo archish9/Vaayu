@@ -1042,7 +1042,7 @@ can reach. **Two deliberate exceptions, reasons stated so they are not re-litiga
               - Gate `test_moe_accumulator_determinism.py` Qwen3-Next: 8 passed (41.9 s); MiniMax: 8 passed (74.6 s).
               - Gate `test_server_smoke.py` gpt-oss-20b: 9 passed (22.5 s); Llama-3.2-1B: 9 passed (6.5 s).
               - Gate Llama-3.2-1B `test_output_hidden_states.py`: 3 passed; `test_batch_prefix_equivalence.py`: 1 passed.
-- [ ] **S16 — (d) sweep.** (i) **Row 40:** `cap_slabs_at_indexed_experts` (`vaayu_base.py:456`, called
+- [~] **S16 — (d) sweep.** **2026-10-01: (i) row 40 CLOSED — verified fixed by S8, no code. (iii) FIXED (`6e32fbb`) — `generate()` seeds Vaayu's cache when prefix caching is off; closes the gpt-oss >128-token crash AND the `kv_cache_mode` INERT row. (ii) S5-M-C: awaiting the user's call (record why not vs a cheap partial fix).** (i) **Row 40:** `cap_slabs_at_indexed_experts` (`vaayu_base.py:456`, called
       ~`:2893`, S8 T4 `2b34fa5`) says "Row 40 (fixed in S8)" but row 40 still reads `[bug]` / "not started" —
       verify it against row 40's own done rule (a test over Qwen-like, MiniMax-like and small-model geometries;
       unchanged arena lines on the accumulator gates) and close it, or record what is missing. (ii) **S5-M-C:**
@@ -3071,7 +3071,7 @@ test — none can make Vaayu faster.** No §0 P-row is open.
   **Cheap first check when picked up:** does gpt-oss-20b's config name its expert count in a field
   this gate knows? If not, row 47's G1 work has the same hole waiting.
 
-- **[bug] `kv_cache_mode` is INERT for EVERY model whenever prefix caching is OFF** (found by
+- **[x] `kv_cache_mode` is INERT for EVERY model whenever prefix caching is OFF — FIXED 2026-10-01 by S16 (iii) (`6e32fbb`): `VaayuBaseModel.generate` now seeds `self._create_kv_cache()` on the prefix-off path when the caller passed no cache (a caller's cache wins). Reproduced first at `7483205`: gpt-oss, library defaults, 200-token prompt → `RuntimeError: The size of tensor a (128) must match the size of tensor b (201)`, HF `DynamicCache` in forward. After: no crash, `FP8DynamicCache` in forward; gpt-oss prefix-off ids == prefix-on ids at 200 and 700 tokens (8 tokens each); Llama-3.2-1B prefix-off greedy scores bit-identical main (`DynamicCache`) vs branch (24 steps, max|d| 0). Gates: accumulator Qwen3-Next 8/8 + MiniMax 8/8 (library default = prefix off, so the new path), Llama-1B server 9/9 + hidden 3/3 + prefix 1/1, gpt-oss server 9/9, DeepSeek server 9/9; suite 3381 passed. Tests `tests/test_generate_seeds_vaayu_cache.py` (RED first); `test_keepawake_wiring.py`'s bare stub gained a placeholder `_create_kv_cache`. DeepSeek's own `generate` override (A5.7b) is now belt and braces, kept. The explicit fp8/turboquant modes now apply in library mode too; their cost was never measured and is moot as a bug.** (found by
   A5.7b Task 6d, 2026-09-25, while porting DeepSeek-V4). **Measured, not inferred.**
   `VaayuBaseModel.generate` seeds `kwargs["past_key_values"] = self._create_kv_cache()` **only on
   the prefix-cache path** (`vaayu_base.py:5562`, `:5825`). When `self._prefix_cache is None` it
@@ -5519,7 +5519,7 @@ the step-boundary mismatch is not model-specific.
 
 ---
 
-# 40 · [bug] The expert slab arena is never capped at the model's own expert bytes (added 2026-09-18, split out of row 30)
+# 40 · [x] The expert slab arena is never capped at the model's own expert bytes (added 2026-09-18, split out of row 30) — **CLOSED 2026-10-01 by S16 (i): VERIFIED FIXED (by S8 T4 `2b34fa5`), no code change.** Done rule met: `cap_slabs_at_indexed_experts` (`vaayu_base.py:458`, called `:3088`) caps the arena at indexed experts + withheld slabs, and the RAM budget follows ("Expert RAM cache budget trimmed … to match the slab arena's cache share"). `tests/test_slab_arena.py::test_the_arena_is_capped_only_where_the_experts_are_smaller` is parametrized over qwen3next_like / minimax_like / gptoss_like (the small-model case). On device (`plans/probes/s14_out/s14c-br1.log`, gpt-oss): `Expert slab arena capped 1403 -> 786 slabs: the model indexes only 768 experts (+18 in-flight/staging)` + `budget trimmed 18.38 -> 10.19 GB`. Qwen3-Next / MiniMax accumulator gates (`plans/probes/s15_out/gate-det-*.log`): no `capped` line — arena untouched, as the done rule requires (Qwen3-235B retired).
 
 **Split out of row 30 on 2026-09-18 at the user's request.** The 30-P final review found it, and it was filed as a
 bullet under row 30. It is not part of row 30's goal (S1–S3), and its own text asked for a separate row. The bullet
