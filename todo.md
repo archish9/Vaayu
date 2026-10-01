@@ -140,6 +140,8 @@ ms/token), S11-L6 (HIT-diff disk re-reads, ≤12.3 % of a HIT@8k TTFT, build unp
         - ids identical across 4 arms on 8/8 turns
         - Stop rule: ids PASS; L=8192 hit delta +7.18 % vs 5.00 % line = PASS; peak VRAM cold ON below OFF = PASS. Verdict PASS.
       - [ ] T6 MiniMax (2k) and DeepSeek (1k) OFF/ON: ids + TTFT
+        - T6 MiniMax-M2.7 (EXL3, module-list), L=2048, BALLAST_GB=25, HEAD 9d90267, ONE rep per arm (no ABBA), so TTFT deltas are observations, not a resolved A/B: cold TTFT OFF 30.630 s vs ON 30.747 s (ON 0.117 s slower, +0.38 % of OFF); hit TTFT OFF 14.449 s vs ON 14.236 s (ON 0.213 s faster, -1.47 % of OFF); ON arm cold overlap=88 phits=3498, hit overlap=60 phits=829; tier at start of hit turn vram 975->908 (ON) vs 974->904 (OFF); peak VRAM cold OFF 13.74 / ON 13.69 GB, hit OFF 13.23 / ON 13.24 GB; ids: "ids identical across 2 arms on 2/2 turns".
+        - T6 DeepSeek-V4-Flash (1k, BALLAST_GB=15): BLOCKED, no arm ran. The OFF arm exited 1 after load at the probe's assert (plans/probes/s17_ttft.py:106) "prefix cache is ON by server default -- this load has none"; DeepSeek loads with no prefix cache in the probe. ON arm skipped, no TTFT or ids measured. Model dir untouched (check printed no files).
       - [ ] T7 suite + accumulator gates ×2 + Qwen3-Next server gate + docs check + RESULTS + ledger close +
             final review
       **(0) re-verified at HEAD `3d0493c`:** the three gates sit at `moe_patch.py:1750-1751` (module-list),
