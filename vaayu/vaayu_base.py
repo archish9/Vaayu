@@ -3388,6 +3388,13 @@ class VaayuBaseModel(GenerationMixin):
 
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
 
+            # S18: the routed fused-3D buffers patch_moe_blocks just allocated came
+            # out of the bytes the VRAM tier was sized on. Charge them, before the
+            # tier's layer range is derived from its budget below. A no-op for a
+            # model with no routed buffer.
+            from .routed_fused3d import charge_routed_buffers_to_vram_tier
+            charge_routed_buffers_to_vram_tier(self, self._moe_geometry["expert_bytes"])
+
             # Fix #7 follow-up: when the VRAM budget can't hold one token's
             # full working set, an unrestricted LRU deterministically hits 0%
             # (single-token self-eviction). Restrict to a layer prefix that

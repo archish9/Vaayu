@@ -91,6 +91,43 @@ def routed_delivery_enabled(block_info, offset_index, vaayu_ref) -> bool:
     return bool(verdicts.get(fused3d_geometry_key(metas)))
 
 
+def charge_routed_buffers_to_vram_tier(vaayu_ref, expert_bytes: int) -> int:
+    """Take the routed buffers' bytes out of the VRAM expert tier's budget; returns
+    the bytes charged (0 with no tier or no routed buffer -- nothing printed).
+
+    The tier is sized as free VRAM minus the reserve BEFORE patch_moe_blocks
+    allocates the routed buffers, so its budget includes their bytes: plan_vram
+    holds layer_slack out of the pinning budget, and `free - reserve` then hands
+    that slack to the tier. Left uncharged, a full tier plus the reserve plus the
+    resident weights exceed the card by one fused layer. Call it once, after
+    patch_moe_blocks and before _vram_cacheable_layers is derived from the budget.
+
+    A charged budget under one expert cannot hold anything: the tier is dropped,
+    with the WARNING the load prints when the budget it sizes is that small
+    (CLAUDE.md §5: a real limit, not a bug to hide).
+    """
+    vram = getattr(vaayu_ref, "_expert_vram_cache", None)
+    buffers = getattr(vaayu_ref, "_fused3d_buffers", None) or {}
+    charge = sum(t.nbytes for bufs in buffers.values() for t in bufs.values())
+    if vram is None or charge == 0:
+        return 0
+    before = int(vram.budget_bytes)
+    after = max(0, before - charge)
+    if after < int(expert_bytes):
+        vaayu_ref._expert_vram_cache = None
+        print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled -- its {before / 1e9:.2f}GB "
+              f"budget leaves {after / 1e9:.2f}GB once the routed fused-3D buffers "
+              f"({charge} B) are charged to it, under one {int(expert_bytes) / 1e6:.1f}MB "
+              f"expert. Every routed expert is uploaded per token (a real hardware limit, "
+              f"not a bug).")
+        return charge
+    vram.set_budget(after)
+    print(f"[Vaayu-MoE] Expert VRAM cache budget {before / 1e9:.2f} -> {after / 1e9:.2f} GB "
+          f"(~{after // int(expert_bytes)} experts): the routed fused-3D buffers ({charge} B) "
+          f"were allocated from it after it was sized.")
+    return charge
+
+
 def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str,
                                 layer_idx: int, layer_name: str, shard_file: str,
                                 offset_index, expert_cache, vaayu_ref, buffers: dict,
