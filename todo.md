@@ -671,7 +671,7 @@ line under the S17 row).
       - [~] **Step 2 — build (plan `docs/superpowers/plans/2026-10-02-S20-packed-prefill-kernel.md`, APPROVED by the USER
         2026-10-03 with spec amendments A1–A6; subagent-driven; assets `docs/superpowers/plans/2026-10-02-S20-assets/`).**
         - [x] T1 the grouped kernels + host tables + reference/fallback + verdict — `d0590ec` (29 RED → GREEN, diff == the dry-run assets) + review fix `e96bb3d`: a strided `out` and a top-1 strided `routing_weights` were raw-indexed (reproduced by the reviewer, relL2 0.607) → guarded, 2 tests, mutants M20/M21; S7's `_dot_rows` now calls the one `_deq`; one verdict body `_agrees` for decode and prefill. Covering run `72 passed` (31 new + S7's 41); mutants: M10 the only survivor (equivalent). Suite target is now 3614.
-        - [ ] T2 the prefill branch in `_make_fused_sparse_forward` (5 RED + 5 guards → GREEN; mutants in T3)
+        - [x] T2 the prefill branch in `_make_fused_sparse_forward` — `6129e2f` (5 RED + 5 guards → GREEN `23 passed`; diff == the dry-run assets; review clean; mutants in T3)
         - [ ] T3 the installer's prefill verdict + the one-call VRAM guard (4 RED + 1 guard → GREEN), mutants,
               suite 3612, product doc §3.4c
         - [ ] T4 Qwen3-Next TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k, profiled ON arm, 40,960-token run
