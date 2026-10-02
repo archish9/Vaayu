@@ -3985,18 +3985,18 @@ class VaayuBaseModel(GenerationMixin):
     def _detect_moe(self) -> None:
         """Detect Mixture-of-Experts architecture from model config."""
         arch = (getattr(self.config, "architectures", None) or [""])[0]
+        # The offset index's field list, not a second one kept here: the two
+        # disagreed about `n_routed_experts` and the load went dense, silently (S19 iv).
+        from .persist.expert_offset_index import ExpertOffsetIndex
+        _count = ExpertOffsetIndex.expert_count_in(self.config)
         self.is_moe = (
-            hasattr(self.config, "num_local_experts")
-            or hasattr(self.config, "num_experts")
+            _count is not None
             or "Moe" in arch
             or "MoE" in arch
             or "Mixtral" in arch
         )
         if self.is_moe:
-            self.moe_num_experts = getattr(
-                self.config, "num_local_experts",
-                getattr(self.config, "num_experts", 8)
-            )
+            self.moe_num_experts = _count if _count is not None else 8
             self.moe_top_k = getattr(
                 self.config, "num_experts_per_tok",
                 getattr(self.config, "top_k", 2)
@@ -4161,7 +4161,9 @@ class VaayuBaseModel(GenerationMixin):
         _tier = getattr(self, "_expert_vram_cache", None)
         _short = need - (int(free_vram) + max(0, int(reusable_pool)))
         _cap = int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes))
-        if need <= _cap and 0 < _short <= int(getattr(_tier, "current_usage", 0) or 0):
+        _evictable = int(getattr(_tier, "current_usage", 0) or 0)
+        if need <= _cap and 0 < _short <= _evictable:
+            _evictable = 0          # tried here: what is left did not come free
             _freed, _capped = 0, None
             try:
                 _freed = _tier.evict_until_free(int(free_vram) + _short)
@@ -4195,10 +4197,17 @@ class VaayuBaseModel(GenerationMixin):
         # prints "min_resident=0.00 GiB" even though one expert is resident.
         _moe_geo = getattr(self, "_moe_geometry", None)
         _min_resident = _moe_geo["expert_bytes"] if _moe_geo else 0
+        # The budget the message solves its ceiling against is what a request could
+        # be admitted on right now: with a tier, the headroom plus what admission
+        # would evict for it (above), never past the cap. The bare headroom would
+        # understate the ceiling by exactly the bytes the tier gives up (S19 vii).
+        _budget = headroom
+        if _tier is not None:
+            _budget = min(_cap, int(free_vram) + max(0, int(reusable_pool)) + _evictable)
         raise VramPlanError(_too_big_message(
             requested=int(n_tokens), s_max=plan.s_max,
             free_vram=free_vram, shape=shape,
-            min_resident=_min_resident, headroom=headroom))
+            min_resident=_min_resident, headroom=_budget))
 
     def planned_kv_bytes_per_token(self) -> "tuple[int, bool, str]":
         """(bytes per token, bucketed, source) the VRAM plan charges for the KV

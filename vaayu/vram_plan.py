@@ -651,16 +651,20 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
     # not fit either: N multiplies the request but not the reserve.
     ceiling = (f"max_seq_len={int(s_max)} at a batch width of 1"
                if int(shape.N) > 1 else f"max_seq_len={int(s_max)}")
-    if headroom is not None and int(headroom) < int(free_vram):
+    lever_max, runtime_ceiling = int(s_max), None
+    if headroom is not None:
         # The ceiling must be solved against the budget actually refused on.
         # This used to print the caller's `s_max` -- solved at LOAD against full
         # free VRAM -- so a warm-cache refusal read as a contradiction: "does
         # not fit in 5.59 GiB ... the largest context that fits is
         # max_seq_len=23415", at an advertised max_seq_len of 8192 (bug 11a).
-        runtime_max = _largest_s_within_budget(shape, int(headroom))
+        # Never above s_max: the position limit can cap that below the bytes.
+        runtime_max = min(int(s_max), _largest_s_within_budget(shape, int(headroom)))
         runtime_ceiling = (f"max_seq_len={runtime_max} at a batch width of "
                            f"{int(shape.N)}" if int(shape.N) > 1
                            else f"max_seq_len={runtime_max}")
+        lever_max = runtime_max
+    if headroom is not None and int(headroom) < int(free_vram):
         opening = (
             f"Context of {int(requested)} tokens does not fit in the "
             f"{float(headroom) / gb:.2f} GiB this request may use. "
@@ -670,11 +674,36 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
             f"entitlement the caller surrenders for its own lifetime. "
             f"The largest context that fits RIGHT NOW is "
             f"{runtime_ceiling}.\n")
+    elif headroom is not None and int(headroom) > int(free_vram):
+        # The other side of the same bug (S19 vii): with memory this process holds
+        # and can reuse, the request may spend MORE than the driver reports free.
+        # Printing free_vram as the budget and s_max as the ceiling read "does not
+        # fit in 6.63 GiB ... the largest context that fits is max_seq_len=52222"
+        # while refusing 33156 tokens on a load that advertises 33155.
+        opening = (
+            f"Context of {int(requested)} tokens does not fit in the "
+            f"{float(headroom) / gb:.2f} GiB this request may use: "
+            f"{float(free_vram) / gb:.2f} GiB is free on the device, and the rest is "
+            f"memory this process already holds and can reuse or release for it. "
+            f"The largest context that fits RIGHT NOW is "
+            f"{runtime_ceiling}.\n")
+    elif runtime_ceiling is not None:
+        opening = (
+            f"Context of {int(requested)} tokens does not fit in "
+            f"{float(free_vram) / gb:.2f} GiB of free VRAM. The largest context "
+            f"that fits RIGHT NOW is {runtime_ceiling}.\n")
     else:
         opening = (
             f"Context of {int(requested)} tokens does not fit in "
             f"{float(free_vram) / gb:.2f} GiB of free VRAM. The largest context "
             f"that fits at this configuration is {ceiling}.\n")
+    # The runtime ceiling is solved AT this batch width; s_max is solved at N=1.
+    if int(shape.N) <= 1:
+        lever_note = ""
+    elif runtime_ceiling is not None:
+        lever_note = f" (at a batch width of {int(shape.N)})"
+    else:
+        lever_note = " (that ceiling assumes N=1)"
     return (
         opening +
         f"  predicted peak at {int(requested)} tokens: "
@@ -683,8 +712,8 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
         f"batch width N={shape.N}, prefill_chunk_size={shape.chunk})\n"
         f"  floor that must stay resident beside it: {float(min_resident) / gb:.2f} GiB\n"
         f"Real levers, in the order they usually pay:\n"
-        f"  - shorten the context, or lower max_seq_len to {int(s_max)} or less"
-        f"{' (that ceiling assumes N=1)' if int(shape.N) > 1 else ''}\n"
+        f"  - shorten the context, or lower max_seq_len to {lever_max} or less"
+        f"{lever_note}\n"
         f"  - reduce prefill_chunk_size (currently {shape.chunk}) to shrink the "
         f"logits and score transients\n"
         f"  - reduce the batch width N (currently {shape.N})\n"

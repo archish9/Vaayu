@@ -17,8 +17,8 @@ import torch
 
 from vaayu.persist.expert_cache import ExpertVRAMCache
 from vaayu.vaayu_base import VaayuBaseModel, cap_tier_after_admission_eviction
-from vaayu.vram_plan import (VramPlanError, VramShape, kv_bytes_per_token,
-                             predict_peak_vram, score_elem_bytes)
+from vaayu.vram_plan import (VramPlanError, VramShape, _largest_s_within_budget,
+                             kv_bytes_per_token, predict_peak_vram, score_elem_bytes)
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -406,6 +406,33 @@ def test_a_cap_on_a_model_without_moe_geometry_only_lowers_the_budget():
 
 
 @requires_cuda
+@pytest.mark.parametrize("name", list(MOE_GEOMETRIES))
+def test_an_admission_eviction_re_derives_the_layer_range(name, gpu, monkeypatch, capsys):
+    """N5: the cap helper is pinned on its own above; this pins that ADMISSION hands it
+    the model, so a tier evicted to under one token's working set gets the layer range
+    the load would have derived -- not the old one, under which it thrashes at 0 %."""
+    geo = dict(MOE_GEOMETRIES[name])
+    geo["working_set_bytes"] = geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"]
+    need = need_for(name)
+    held = 3 * geo["top_k"] + 2                        # three layers' worth, and two
+    tier = ExpertVRAMCache(10 * geo["working_set_bytes"])
+    _fill(tier, held, geo["expert_bytes"])
+    full = tier.current_usage
+    base_free = need - geo["expert_bytes"] // 2        # half an expert short -> 1 evicted
+    monkeypatch.setattr(torch.cuda, "mem_get_info",
+                        lambda *a, **k: (base_free + full - tier.current_usage, 16 * GB))
+    model = model_for(name, reserve=need, tier=tier)
+    model._moe_geometry = geo
+    model._moe_blocks = [types.SimpleNamespace(layer_idx=i)
+                         for i in range(geo["num_moe_layers"])]
+    model._vram_cacheable_layers = None
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.budget_bytes == tier.current_usage == (held - 1) * geo["expert_bytes"]
+    assert model._vram_cacheable_layers == {0, 1, 2}
+    assert f"first 3/{geo['num_moe_layers']}" in capsys.readouterr().out
+
+
+@requires_cuda
 @pytest.mark.parametrize("name", ALL)
 @pytest.mark.parametrize("tier", [None, object()])
 def test_no_tier_or_one_with_nothing_to_read_refuses_as_before(name, tier, gpu):
@@ -415,3 +442,42 @@ def test_no_tier_or_one_with_nothing_to_read_refuses_as_before(name, tier, gpu):
     with pytest.raises(VramPlanError):
         VaayuBaseModel._assert_context_fits(model, N_TOKENS)
 
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_refusal_over_the_cap_names_what_admission_would_have_served(name, gpu):
+    """S19 (vii): refused for being over the reserve, with a full tier and reusable
+    pool. The ceiling the message names is the largest context admission WOULD serve
+    right now -- the reserve, since it evicts the tier to get there -- not the
+    load-time s_max, and not less than that by the bytes the tier would give up."""
+    need = need_for(name)
+    gpu["free"], gpu["pool"] = need // 2, need // 4    # a quarter short without the tier
+    tier = FakeTier(need, gpu)
+    model = model_for(name, reserve=need, tier=tier)
+    served = _largest_s_within_budget(shape_for(name), need)
+    assert N_TOKENS <= served < model._vram_plan.s_max
+    with pytest.raises(VramPlanError) as e:
+        VaayuBaseModel._assert_context_fits(model, served + 1)
+    msg = str(e.value)
+    assert f"max_seq_len={served}" in msg
+    assert str(model._vram_plan.s_max) not in msg
+    assert tier.calls == [], "over the cap: nothing is evicted for it"
+    assert VaayuBaseModel._assert_context_fits(model, served) > 0, "and that length IS served"
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_refusal_after_a_failed_eviction_does_not_count_the_tier_again(name, gpu):
+    """The eviction freed too little. What is left in the tier did not come free, so
+    the message must not offer a ceiling that includes it -- it would name a length at
+    or above the one just refused."""
+    need = need_for(name)
+    gpu["free"] = need - 256 * MB
+    tier = FakeTier(2 * GB, gpu, fraction=0.5)
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError) as e:
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+    offered = _largest_s_within_budget(shape_for(name), gpu["free"] + gpu["pool"])
+    assert offered < N_TOKENS
+    assert f"max_seq_len={offered}" in str(e.value)

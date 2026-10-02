@@ -194,7 +194,9 @@ PREFIX_COMPRESS = None
 # capacity it goes to ZERO (each re-store cascade-evicts the rest), and at 7.4k the
 # turn-2 match fell 7422/7517 -> 44/7517, TTFT 25.0 s -> 51.3 s. The engine warns
 # ("prefix pool over capacity") when that happens -- `prefix_hit` in requests.jsonl
-# does NOT: it is True on a 1-token match. See documentation/TUNING.md section 3b.
+# does NOT: it is True on a 1-token match. `prefix_match_tokens` beside `prompt_tokens`
+# in requests.jsonl shows the match length (the same X). See documentation/TUNING.md
+# section 3b.
 PREFIX_SESSIONS = 3
 
 # "auto" picks bf16 on every checkpoint (row 3, 2026-09-11: it was fp16 off EXL3,

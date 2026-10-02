@@ -700,6 +700,7 @@ def test_disabling_refunds_the_tier(capsys):
     runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
     budget_before_charge = 1 << 30
     runner._tier_before = budget_before_charge
+    runner._charged = 10                               # what the tier gave up to the pool
     tier.budget_bytes = budget_before_charge - 10
     runner._disable("test")
     assert tier.budget_bytes == budget_before_charge - 10   # not yet refunded
@@ -707,6 +708,63 @@ def test_disabling_refunds_the_tier(capsys):
                                      output_hidden_states=False)
     assert tier.budget_bytes == budget_before_charge
     assert "budget is restored to" in capsys.readouterr().out
+
+
+@cuda
+@pytest.mark.parametrize("held", [0, 3])
+def test_a_refund_after_an_admission_cap_gives_back_only_the_pool(held):
+    """S19 (vi): an admission eviction caps the tier at what it still holds
+    (cap_tier_after_admission_eviction). A later graph disable must hand back the
+    pool's bytes and nothing else -- restoring the budget saved at the first charge
+    lets the tier regrow into VRAM the card no longer has. `held` = 0 is a tier the
+    eviction emptied; 3 is one that was not full (the cap is its usage)."""
+    from vaayu.vaayu_base import cap_tier_after_admission_eviction
+    layers = _stack(SPECS["hybrid"])
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    model = _model(layers, _expert_vram_cache=tier)
+    runner = dg.install_decode_graphs(model)
+    _decode(layers, _cache(3), runner)                 # a real pool charge to the tier
+    charged = runner._charged
+    assert charged > 0 and tier.budget_bytes == (1 << 30) - charged
+    for e in range(held):
+        assert tier.put(0, e, {"w": {"t": types.SimpleNamespace(nbytes=8 << 20)}})
+    _before, capped = cap_tier_after_admission_eviction(model, tier)
+    assert capped == held * (8 << 20) == tier.budget_bytes
+    runner._disable("a later pool charge was refused")
+    assert not runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=_cache(3),
+                                     output_hidden_states=False)
+    assert tier.budget_bytes == capped + charged, "the refund undid the admission cap"
+
+
+@cuda
+def test_the_pool_refund_is_idempotent():
+    """S19 final review F3: the refund is relative to the budget as it stands, so a
+    second `_release_pool` must not refund again."""
+    layers = _stack(SPECS["hybrid"])
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    model = _model(layers, _expert_vram_cache=tier)
+    runner = dg.install_decode_graphs(model)
+    _decode(layers, _cache(3), runner)
+    assert runner._charged > 0
+    runner._disable("x")
+    runner._release_pool("x")
+    first = tier.budget_bytes
+    runner._release_pool("x")
+    assert tier.budget_bytes == first == 1 << 30
+
+
+@cuda
+def test_a_disable_with_nothing_charged_to_the_tier_leaves_its_budget_alone():
+    """The pool was never charged to the tier (no capture ran): a disable has
+    nothing to give back."""
+    layers = _stack(SPECS["attn+dense"])
+    tier = ExpertVRAMCache(budget_bytes=1 << 20)
+    runner = dg.install_decode_graphs(_model(layers, _expert_vram_cache=tier))
+    assert runner._tier_before is None and runner._charged == 0
+    runner._disable("test")
+    assert not runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=_cache(1),
+                                     output_hidden_states=False)
+    assert tier.budget_bytes == 1 << 20
 
 
 @cuda
@@ -806,9 +864,13 @@ def test_disabling_releases_the_pool(capsys):
     real_charge_method = runner._charge
 
     def forced_charge():
+        paid = runner._charged
         if calls["n"] >= 1:
             runner._charged = 0
         real_charge_method()
+        if runner._disabled:
+            runner._charged = paid     # the refused charge took nothing: what the
+                                       # tier already gave up is still what it is owed
     runner._charge = forced_charge
     try:
         _decode(layers, _cache(3), runner, n_tok=2)

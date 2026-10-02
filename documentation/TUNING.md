@@ -197,7 +197,8 @@ worth about +6 %.
 If that WARNING appears, your reuse is gone, not reduced. **Do not trust `prefix_hit` in
 `requests.jsonl` for this** — it is `True` even for a 1-token match, so it reads as a HIT in
 exactly the runs where reuse has collapsed. Read the `[Vaayu-Prefix] HIT … match_len=X/Y`
-line instead: what matters is X, not that it says HIT.
+line instead: what matters is X, not that it says HIT. `prefix_match_tokens`, beside
+`prompt_tokens` in `requests.jsonl`, shows the same X.
 
 **Hybrid-attention models (e.g. Qwen3-Next).** Since 42-B these reuse prefixes
 too, with one restriction that follows from how they work: their

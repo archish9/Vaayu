@@ -206,6 +206,8 @@ def test_a_held_entry_is_read_after_the_visit_evicted_it(tmp_path, name):
     ref._vram_cacheable_layers = None
     assert tier.resident_set(0) == held, "the setup visit touched the tier"
     lowest_held = min(held)
+    for buf in _buffers(ref).values():                 # a visit that skips a held
+        buf.fill_(float("nan"))                        # entry's copy leaves NaN rows
     routed = _run(blocks[0], both)
     assert lowest_held not in tier.resident_set(0), \
         "the visit was meant to evict a held entry before reading it"

@@ -226,7 +226,7 @@ files differ on a cancelled request, this is why.
 An `error`/`refused` row also carries an `error` object (`type`, `message`,
 `traceback`). A `refused` row has the **same keys** as every other row — the
 fields that are unknowable before generation starts (`prompt_tokens`, `cap`,
-`prefix_hit`, `ttft_s`, `decode_tok_s`, `decode`) are `null` rather than absent,
+`prefix_hit`, `prefix_match_tokens`, `ttft_s`, `decode_tok_s`, `decode`) are `null` rather than absent,
 so a script can index any field on any row without checking which kind of row it
 is.
 
@@ -248,6 +248,18 @@ genuinely per-stream, but `wall_s` and `decode_tok_s` are also batch-wide: a
 stream that retires early is still charged the batch's full wall time and its
 own `decode_tok_s` understates. `prefix_hit` is batch-wide too — it reads
 `true` on every row in the batch if any one member hit the prefix cache.
+
+`prefix_match_tokens` is how many of the prompt's tokens the prefix cache already
+held — read it against `prompt_tokens`. `prefix_hit` alone is `true` for a
+one-token match, so a session whose reuse has collapsed (a changed system prompt,
+a re-ordered file) still reads as a hit; `prefix_match_tokens: 44` beside
+`prompt_tokens: 7517` is what shows it. It is `0` on a miss and on a model with no
+prefix cache, and batch-wide in the same way `prefix_hit` is. Under a batch (`batch.n` > 1) each row
+carries the SUM of every member's matched tokens, which can exceed that row's own
+`prompt_tokens`, so rows must not be summed (the reason `decode` is flagged
+`"shared": true`). The engine always
+re-runs at least the last prompt token, so a full match reads `prompt_tokens`
+while `prompt_tokens - 1` positions were actually reused.
 
 `expert_misses`, `expert_ram_hit_rate` and `expert_vram_hit_rate` are **not**
 diffs — they are the engine's counters read once, at the end of the request.

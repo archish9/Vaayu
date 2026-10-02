@@ -729,9 +729,15 @@ class DecodeGraphRunner:
         refund = ""
         if self._tier_before is not None:
             tier = self._model._expert_vram_cache
-            tier.set_budget(self._tier_before)
+            # What the pool took, on top of the budget as it stands NOW -- not the
+            # budget saved at the first charge. An admission eviction may have capped
+            # the tier since (cap_tier_after_admission_eviction); an absolute restore
+            # would hand it back bytes the card no longer has (S19 vi).
+            tier.set_budget(tier.budget_bytes + self._charged)
             refund = (f" The expert VRAM tier's budget is restored to "
-                      f"{self._tier_before / 1e9:.2f} GB.")
+                      f"{tier.budget_bytes / 1e9:.2f} GB.")
+            self._charged = 0          # consumed: a second release refunds nothing
+            self._tier_before = None
         print(f"[Vaayu] WARNING: decode graphs DISABLED for this process: {why}. "
               f"Decode runs eagerly.{refund}")
 
