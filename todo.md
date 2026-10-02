@@ -645,8 +645,30 @@ line under the S17 row).
         through admission), both test-only.
 - [~] **S20 — S11-L2: M>1 packed prefill kernel.** **STARTED 2026-10-02 at HEAD `1c8f122`, branch
       `s20-packed-prefill-kernel`. Step 0 DONE (below); design APPROVED by the USER section by section 2026-10-02;
-      spec written, awaiting the USER's review before the plan.**
-      - [~] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
+      spec approved 2026-10-02; PLAN WRITTEN and dry-run, awaiting the USER's review and execution choice.**
+      - [ ] **Plan `docs/superpowers/plans/2026-10-02-S20-packed-prefill-kernel.md` + verified assets
+        `docs/superpowers/plans/2026-10-02-S20-assets/` (both gitignored; summary here).** Every line of code and
+        test was DRY-RUN on a throwaway worktree of `4716d21`: three task commits RED → GREEN (29 / 5 + 5 guards /
+        4 + 1 guard), suite `3612 passed, 20 skipped`, 0 failed (224.21 s); 20 mutants, 18 killed, M10 equivalent
+        (the bf16 store already rounds), M16 a margin choice; the patches replayed on a second fresh worktree land
+        byte-identical. **Dry-run on Qwen3-Next (one rep per arm, same tree, OFF = flag cleared — an observation,
+        T4's ABBA is the measurement):** cold@2k 10.10 → 7.01 s (30.6 %), HIT@2k 3.00 → 2.69 s (10.3 %), cold@8k
+        27.23 → 12.29 s (54.9 %), HIT@8k 2.87 → 2.50 s (12.8 %); greedy ids identical 8/8; peak VRAM equal on three
+        cells, +0.13 GB at HIT@2k; ON profile `construct` 0, `scatter` 0; HIT@8k disk stall 0.45 → 1.53 s (prefill
+        is disk-bound now → S11-L6 becomes the top HIT lever). **Prefill-ppl band dry-run: PASS** — kernel − stock
+        +0.0103 % (code) / +0.0124 % (prose), pooled sd 0.0069 / 0.0071 ppl. **Spec amendments found by the dry-run
+        (spec §9; need the USER's approval with the plan):** A1 cuBLAS's bf16 GEMM is NOT correctly rounded at
+        hidden 2048 → intermediate 512 for 2…32 rows (~58 % of outputs; 1 row and ≥ 64 rows 100 %) — exactly
+        prefill's regime — so the kernels (99.72–99.86 % gate/up, 99.89–99.97 % down, vs a correctly rounded
+        replay) are the MORE accurate side, the stage tests are held to that replay and not to stock, and the
+        load verdict checks against the loop with fp32-summed GEMMs (margin ≥ 13× instead of 2×); A2 a token's
+        MoE output no longer depends on which tokens share its call; A3 one call holds every blob it uploaded
+        (worst case a layer's expert set, 0.84 GiB on Qwen3-Next) → installer guard at half of
+        `_PREFILL_VRAM_HEADROOM`, WARNING, decode kernel kept, plus a 40,960-token run in T4; A4 the quality bar
+        stands as approved; A5 tiles BLOCK_M 16 / BLOCK_N 64 / BLOCK_K 256 / 2 warps / 1 stage: one 512-token call
+        over 511 experts 4.0 ms against the loop's 48 ms. Probes (gitignored): `plans/probes/s20_ttft.py`
+        (`S20_OFF=1`, `REPO=`), `s20_cmp.py`, `s20_quality.py`; dry-run outputs `plans/probes/s20_out/*-dry*`.
+      - [x] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
         (gitignored; the summary is here). **USER decisions:** quality bar = PREFILL-mode perplexity band (D6
         method: ≥ 2-chunk teacher-forced prompt per calibration text, stock vs kernel alternating in one load, null
         draws n ∈ {0, ±1, ±2, 4} on the routing weights, PASS per text |Δmean| ≤ pooled sd), greedy ids recorded
