@@ -94,7 +94,7 @@ S12 and are used as-is — re-measure a baseline at HEAD before any A/B.
 | # | item | why here | cost | handoff |
 |---|---|---|---|---|
 | **S17** ✅ | ~~**S11-L4 — prefill reads the expert VRAM tier** (no `put()`): 0.24–0.43 s = 8.0–14.0 % of a HIT@8k TTFT on Qwen3-Next (≈0.22–0.24 s by uploads; the upper figure is ~2× high), 7.3–12.0 % HIT@2k~~ **CLOSED 2026-10-01, A WIN, MERGED to `main` (`26e3a2f`): Qwen3-Next ABBA HIT@8k TTFT 3.169 → 2.942 s (0.228 s, 7.18 %), HIT@2k 3.238 → 3.000 s (7.35 %), cold@2k 3.59 %, cold@8k 0.77 % (inside the spread); greedy ids identical 8/8, decode unchanged, peak VRAM no higher; MiniMax and DeepSeek ids identical (one rep each; DeepSeek no measurable effect); fused-EXL3 unit-level only; final review clean after one fix wave; suite 3413.** | (a)+(c): every prefix-HIT turn of the agent model, server default (prefix cache ON) | hours | none yet — the S17 row below is the brief |
-| **S18** | **gpt-oss routed-expert delivery — measure, then build.** `routed_fused3d.py` never fills `_expert_vram_cache`; 96 × 13.24 MB = 1.27 GB of routed experts cross PCIe every token | (b): 93.0 / 111.0 / 143.1 ms/token at 8k / 16k / 30.7k against stock's 28 ms (35.7 tok/s) | measure: hours; build: unknown until measured | none yet — the S18 row below is the brief |
+| **S18** ✅ | **CLOSED 2026-10-02, A WIN: gpt-oss decode 80.7 → 67.1 / 93.9 → 79.1 / 144.7 → 129.1 ms/token at 2k / 8k / 30.7k (16.8 / 15.7–15.9 / 10.8 %), cold TTFT@8k 14.94 → 13.85 s, logits bit-identical OFF vs ON and vs stock; routed delivery now reads and fills the expert VRAM tier (111–133 experts, 37–41 % hits); admission evicts from the tier and caps it instead of refusing; suite 3525.** Was: **gpt-oss routed-expert delivery — measure, then build.** `routed_fused3d.py` never fills `_expert_vram_cache`; 96 × 13.24 MB = 1.27 GB of routed experts cross PCIe every token. **STEP 1 DONE 2026-10-02: delivery = 49.6 ms/token flat in context (52.6 % of the 8k token); a tier at the real 2.19 GB budget projects 15.9 ms = 16.8 % (94.3 → 78.5); stop rule not met → step 2 (build) is next, brainstorm with the user** | (b): 93.0 / 111.0 / 143.1 ms/token at 8k / 16k / 30.7k against stock's 28 ms (35.7 tok/s) | measure: hours; build: unknown until measured | none yet — the S18 row below is the brief |
 | **S19** | **server-reachable reliability sweep** — gpt-oss at its advertised `max_seq_len`; `prefix_hit` cannot show a reuse collapse; S5-M-HR host-RAM margin; `_detect_moe` field-name gate; prefix pool vs the non-expert RAM tier | reliability a server user reaches; each hours | hours each | none yet — the S19 row below is the brief |
 | **S20** | **S11-L2 — M>1 packed prefill kernel**: ≤0.997 s = 32.8 % of a HIT@8k TTFT, ≤11.88 s = 43.1 % of cold@8k, ≈4.0 s = 38.4 % of cold@2k; starts with a fresh Qwen3-Next census | (a)+(b): the top TTFT lever on a prefill-heavy workload | a week or more | none yet — the S20 row below is the brief; brainstorm → spec → plan |
 
@@ -227,7 +227,244 @@ line under the S17 row).
       Qwen3-Next, or any id change → revert and record. **§8 (expected):** (1) no knob; (2) nothing to plumb —
       the forwards run on every server request; (3) reachable at N=1 on every prefix HIT, the server default;
       (4) n/a.
-- [ ] **S18 — gpt-oss routed-expert delivery: measure, then build.** gpt-oss-20b decodes at **93.0 / 111.0 /
+- [~] **S18 — gpt-oss routed-expert delivery: measure, then build.** **STARTED 2026-10-02 at HEAD `a00ada4`,
+      step 1 (measure only, no engine code). Row re-verified against HEAD:** routed delivery never touches
+      the VRAM tier — TRUE (`routed_fused3d.py:137-140` passes `entry=None, vram=None`; `_settle_miss_upload`
+      returns at `moe_patch.py:2707` before any `put()`, and the wrapper never calls `_vram_tier_visit`);
+      reach TRUE through every guard (`moe_patch.py:2221-2230`: no transformer layer is fully pinned, so
+      all 24 take the routed branch; `routed` needs a CUDA expert cache + the self-check verdict). **Sharper
+      than the row's "likely trap":** ONE `[num_experts, ...]` device buffer per geometry is SHARED by all
+      24 layers (`moe_patch.py:2186-2190`), so a tier needs its own per-expert device tensors (copied D2D
+      into the shared buffer) or per-layer buffers. **Read off the code, to be measured:** the per-visit
+      quantizer conversion in `_populate_fused_experts` is views, not a copy, on this GPU (CUDA capability
+      ≥ 10 → `StridedLayout`, identity swizzle) — on a capability-9 GPU it would re-layout 423.6 MB per
+      visit; the routed forward has no phase profile, so the split needs probe-side timers; decode graphs
+      (S12) are refused on gpt-oss. Plan
+      `docs/superpowers/plans/2026-10-02-S18-gptoss-routed-delivery-measure.md` (gitignored); probe
+      `plans/probes/s18_split.py`. **Method in one line each:** one load, server mode, fixed prompt
+      snapshot; arms per context = cold (routing trace) / base / synchronized phase timers (proportions
+      only) / ORACLE (per-layer device buffers holding every expert, decode skips delivery = the ceiling of
+      a VRAM tier, must be bit-identical) / half-oracle (linearity) / base again; then the trace replayed
+      through the real `ExpertVRAMCache` at the load's real budget and a what-if ladder.
+      - [x] T1 probe + smoke at 2k (oracle bit-identical, phase arm reconciles)
+      - [x] T2 8k ×2, 30.7k ×1 (FOREGROUND, 29G scope)
+      - [x] T3 hit rate vs budget (tier persisted / empty per request) → projected ms and % of the token
+      - [x] T4 RESULTS + durable numbers here + stop-rule call (< 5 % of the 8k token at the real budget
+            → record and close; else step 2: brainstorm → spec → plan with the user)
+      **STEP 1 DONE 2026-10-02 — the inference HOLDS; stop rule NOT met → step 2.** RESULTS
+      `docs/2026-10-02-S18-step1-RESULTS.md` (gitignored); raw `plans/probes/s18_out/` (`split-*.log/json`,
+      `project.log/json`). No file under `vaayu/` changed; suite not re-run. **DURABLE SUMMARY:**
+      - **Delivery = 49.6 ms of every decode token, flat in context**: 59.0 % at 2k, **52.6 % at 8k**,
+        34.0 % at 30.7k. Clean arms, base → oracle (zero delivery): 2k 80.4 → 32.7 ms; 8k 94.3 → 44.9
+        (r2 94.2 → 44.7); 30.7k 145.9 → 113.1 with 16 layers resident (24 do not fit beside the request:
+        OOM with 0.95 GiB free; the 24-layer figure is 24 × the per-layer saving). Linear in layers
+        (12 layers = half, to 0.4 ms), 1.96–2.09 ms/layer at every context = **0.516 ms per routed
+        expert**. Every oracle arm bit-identical to base, 31/31 forwards, three contexts. Zero-delivery
+        floor 33.0 / 44.8 / 96.3 ms at 2k / 8k / 30.7k (stock 28.0 at short context). First
+        short-context figure since 3c: **80.4 ms/token at 2k**.
+      - **It is the upload, nothing else** (synchronized phase arm, proportions): upload 60.0 ms, attention
+        9.8 / 24.1 / **75.3** ms at 2k / 8k / 30.7k, kernel 10.0, router + routing 7.2, per-visit
+        conversion 4.5 (Python objects — the re-layout hypothesis is refuted on this GPU), RAM-tier
+        lookups 0.29; the RAM arena served 3,069–3,072 of 3,072 lookups (no disk in decode). Micro: one
+        token's 96 experts 59.5 ms = 21.4 GB/s; D2D copy 0.07 ms/expert.
+      - **Tier at the budget that exists (2.19 GB = 165 of 768 experts, 7 loads): LRU hit rate 46.1 %**
+        (replayed through the real `ExpertVRAMCache`, 939 decode tokens, 5 sessions incl. two code-writing
+        ones; tier empty per request: 46.3 %) → **15.9 ms = 16.8 % of the 8k token (94.3 → 78.5)**, 18.9 %
+        at 2k, 11.1 % at 30.7k. (First pass read 19.6 ms = 20.8 %; corrected the same day: with one kernel
+        buffer shared by all layers EVERY routed expert pays a D2D copy, a miss as well as a hit — saving =
+        96 × (hit rate × 0.516 − 0.073) ms.) Curve: 81 experts **0.0 %, a net LOSS of 7.0 ms** (an LRU
+        under one token's 96 routed experts thrashes; `_vram_cacheable_layers` already guards the
+        per-expert forwards against it), 243 → 65.1 %, 324 → 79.0 %, 405 → 88.1 %, 486 → 93.7 %, all →
+        100 % (8k token 51.8 ms per-expert + D2D, 44.8 ms whole-layer zero-copy). Per-expert LRU beats
+        whole-layer residency from the real budget up to ~8 GiB (real budget: 15.9 vs 10.3 ms). Budget above the real one costs context:
+        +1 GiB → 28,152, +2 GiB → 23,033 (planner's inverse).
+      - **Second correction (found designing step 2, same day): the budget that exists is 133 experts,
+        not 165.** The 2.039 GiB entitlement includes the 0.394 GiB shared kernel buffer, allocated AFTER
+        the tier is sized (`plan_vram` holds `layer_slack` out of pinning, `free − reserve` hands it to the
+        tier, `patch_moe_blocks` allocates the buffer from it). Charged: 1.645 GiB = 133 experts, LRU
+        **39.0 %** (38.5 % across the whole 100–130 plateau) → **12.3 ms = 13.0 % of the 8k token
+        (94.3 → 82.0)**, 14.7 % at 2k, 8.7 % at 30.7k — still over the 5 % line. And 0.09 GiB the process
+        allocates for good in its first request (free + pool 11.11 → 11.02 GiB) is in nobody's budget, so a
+        FULL tier would make admission refuse requests near `max_seq_len` that it admits with the tier
+        empty (9.375 GiB left against a 9.494 GiB reserve). Both defects are latent today only because the
+        tier stays empty on gpt-oss.
+      - **INFERRED:** the per-hit saving (the oracle removed whole layers; partial hits inside a visit were
+        not run — 15.9 ms on the clean figure, up to ~20 ms on the synchronized upload rate); the 30.7k
+        24-layer figure; tier survival across a long cold prefill (bounded by the empty-per-request case).
+      - **§8 (spike):** no knob, no code; measured in the server's mode at N=1; nothing banked.
+      - [x] **Step 2 — build: BUILT, MEASURED, FINAL-REVIEWED (opus: ready with fixes → one fix wave `fac7f91` → scoped re-review: all addressed, ready to merge) and CLOSED 2026-10-02, branch `s18-gptoss-vram-tier`; durable summaries after the task list (the measurement block, then the final-review block).** (brainstorm → spec → plan with the USER) **Approach A APPROVED by the
+            USER 2026-10-02 (per-expert LRU through the existing `ExpertVRAMCache` + `_vram_tier_visit`,
+            D2D into the shared buffer; subagent-driven execution). Spec
+            `docs/superpowers/specs/2026-10-02-S18-gptoss-vram-tier-design.md` (gitignored; approved by the
+            user, §3.2 AMENDED after the final review).**
+            Design in one line each, so the row stands without the file: (1) tier wiring in
+            `make_routed_experts_forward` only — held experts copy tier → buffer, misses upload as today
+            then clone their rows into a private entry and `put()`; prefill reads (`peek`), never fills;
+            (2) after `patch_moe_blocks`, charge the routed buffers' bytes to the tier budget
+            (`set_budget`, derived, zero for every model without a routed buffer); (3) admission: before
+            refusing, evict from the tier what covers the shortfall and decide again — the reserve clamp
+            stays, so nothing over the reserve is admitted (AMENDED by the final review: the tier is then
+            CAPPED at what it still holds — see the final-review block below); (4) no knob; (5) stop rule: under 5 % of the
+            8k token on an ABBA, or any logit change → revert. Not in this build: elastic tier,
+            frequency-aware policy, whole-layer buffers.
+            **SPEC APPROVED by the USER 2026-10-02. PLAN WRITTEN, awaiting the user's review:
+            `docs/superpowers/plans/2026-10-02-S18-gptoss-vram-tier.md` (gitignored), branch
+            `s18-gptoss-vram-tier` in the MAIN checkout, subagent-driven.** Dry-run on a throwaway worktree
+            of `a00ada4` (removed afterwards; verified test files and diffs in
+            `docs/superpowers/plans/2026-10-02-S18-assets/`): 71 new tests (30 tier visit, 14 budget charge
+            + load wiring, 27 admission), RED for the intended reasons before the change (20 / import error /
+            9), GREEN after; mutation-checked; **full suite `3484 passed, 20 skipped` (3413 + 71), no
+            existing test broken.** Probe `plans/probes/s18_ab.py` (OFF = `_vram_cacheable_layers = set()`
+            in the same tree). **Probe SMOKE on the dry-run tree, 2k, 40 tokens, off,on,on,off — NOT the
+            verdict, the branch ABBA is Task 5:** load prints `Expert VRAM cache budget 2.19 -> 1.77 GB
+            (~133 experts)`; decode median 80.6 → 66.2 ms (−14.5 ms, 18.0 %); ON hit rate 38.0–39.6 %
+            (replay said 39.0 %); logits bit-identical 39/39 in every arm; cold TTFT 2.994 → 2.772 s.
+            - [x] T0 branch `s18-gptoss-vram-tier`, ledger edit committed (`cb66bd2`)
+            - [x] T1 tier in the routed visit (`routed_fused3d.py`; `fe76cfe`): 30 tests in `tests/test_routed_fused3d_tier.py`; 4 mutants killed; task review clean
+            - [x] T2 charge the routed buffers to the tier budget + load wiring (`ff6559b`): 14 tests in `tests/test_routed_fused3d_tier_budget.py`; load line `budget 2.19 -> 1.77 GB (~133 experts)`; task review clean
+            - [x] T3 admission evicts from the tier before refusing (`1b2966e`, fix round `a34b228`): 39 tests in `tests/test_admission_tier_eviction.py` (plan said 27; the fix round added 12); 3 mutants killed, plus `evict_until_free(need)` after the fix; opus review found the eviction outside the guard, fixed
+            - [x] T4 full suite FOREGROUND: `3496 passed, 20 skipped` in 228.53 s at `a34b228` (plan expected 3484; floor before the branch 3413, new tests 83)
+            - [x] T5 gpt-oss on device: load line, 2k, 8k ABBA ×2 (STOP RULE not tripped: 15.74 / 15.91 %), 30.7k (10.75 %), 256-token churn check (219 forwards, 8.00 GiB reserved in all arms), SAFETY at 32.5k and at 33,108 with the tier full (both completed), `s13` stock check 51/51 and 64/64, server gate 9 passed
+            - [x] T6 cross-model: Qwen3-Next accumulator 8 passed + server gate 9 passed; MiniMax accumulator 8 passed (and again with `-s`: no budget-charge line, 0 admission evictions)
+            - [x] T7 RESULTS (`docs/2026-10-02-S18-step2-RESULTS.md`), CLAUDE.md §0/§5 rows, product docs checked (nothing made false), ledger; the controller's final review and the merge (USER's word) remain
+            Design questions as they stood: (a) **DECIDED by the USER 2026-10-02: fixed tier at the real budget now
+            (×1.20 at 8k, no context cost, no knob); the elastic tier — occupy idle reserve, give it back
+            under prefill headroom, the 6–8 GiB rows at 8k, safety unproven — is a LATER, separately
+            measured row; the context-for-speed knob was not picked;** (b) layout — per-expert device
+            tensors copied D2D into the shared buffer vs per-layer buffers vs both; (c) policy — plain LRU
+            (46 %) vs frequency-aware (a hindsight-static hottest 21 % carries 51–61 %, unpriced).
+      **STEP 2 BUILT AND MEASURED 2026-10-02 (branch `s18-gptoss-vram-tier`, measured at HEAD `a34b228`; final
+      review and fix wave in the block that follows this one).** RESULTS `docs/2026-10-02-S18-step2-RESULTS.md` (gitignored); raw `plans/probes/s18_out/`
+      (`ab-*.log`, `safety-s1/s2.log`, `s13.log`, `gate-*.log`); probe `plans/probes/s18_ab.py` (OFF =
+      `_vram_cacheable_layers = set()` in the same tree, arms off,on,on,off, 63 decode forwards, median after
+      8 warm tokens). **DURABLE SUMMARY:**
+      - **Verdict: WIN against the 5 % stop rule.** Decode OFF → ON (ms/token, median): 2k 80.682 → 67.098
+        (16.84 %); **8k r1 93.887 → 79.106 (15.74 %), r2 94.119 → 79.147 (15.91 %)**; 30.7k 144.683 → 129.124
+        (10.75 %). All-token mean 8k 94.148 → 76.133 (19.13 %). Step 1 projected 12.3 ms = 13.0 % at 8k for 133
+        experts; measured 14.8–15.0 ms at 121 experts. ON tier hit rate 37.1–40.5 % (replay: 39.0 % at 133).
+      - **Load:** `Expert VRAM cache budget 2.19 -> 1.77 GB (~133 experts): the routed fused-3D buffers
+        (423567360 B) were allocated from it after it was sized.` The pre-charge budget varied per load with
+        free VRAM (2.19 → 1.91 GB; 111–133 experts charged) because the desktop's VRAM use moved 328 → 536 MiB;
+        step 1's seven loads all read 2.19 GB.
+      - **Bit-identity:** OFF vs ON `63/63; max|d| 0`, ids identical, at 2k, 8k ×2, 30.7k; 219/219 on the
+        220-token run. Stock with a pinned date and full-length `DynamicCache()` (`s13`): G vs TF 51/51, TF vs
+        B 64/64.
+      - **TTFT:** 8k cold 14.935 → 13.846 s (7.29 %; r2 7.26 %), 2k cold 2.954 → 2.718 s (7.99 %); 8k HIT
+        0.180 vs 0.178 s (no difference beyond spread). 30.7k HIT: ON 0.052 s slower with a 0.173 s spread
+        between its arms — unexplained, not investigated.
+      - **Safety with the tier full:** s1 (32,500 tokens) `ADMITTED AND COMPLETED`, peak over a0 7.18 GiB vs
+        reserve 9.49 GiB, admitted without the new path (predicted 9.44 fit), 115 prefill evictions. **s2
+        (33,100 + 8 = 33,108 of max_seq_len 33,155):** free 6.67 + pool 2.77 = 9.44 vs reserve 9.49 →
+        `admission: evicted 0.06 GiB of the expert VRAM tier to admit 33108 tokens (predicted peak 9.49 GiB)`;
+        `ADMITTED AND COMPLETED`, peak over a0 7.27 GiB, TTFT 123.8 s, 116 prefill evictions, no OOM. Without the
+        admission change it would have been refused. Long run: `reserved at end` 8.00 GiB in all arms.
+      - **Gates:** suite `3496 passed, 20 skipped` (floor was 3413; **new floor 3496**); gpt-oss server gate
+        9 passed (load `budget 1.97 -> 1.55 GB (~116 experts)`); Qwen3-Next accumulator 8 + server gate 9 passed
+        (no budget-charge line, 0 admission evictions); MiniMax accumulator 8 passed (no charge line, 0
+        evictions, seen with `-s`).
+      - **NOT verified / not run:** fused-EXL3 (no checkpoint; its code untouched); dense (no code touched, no
+        gate exists); DeepSeek-V4 (shares the admission code; gate not in the plan's bars, not run);
+        capability-9 GPUs (none here); N>1 (unreachable through the server; the batch giveback arm is
+        unit-reviewed only); requests above 33,108 tokens.
+      - **§8:** (1) no knob — the budget is derived and charged at load, admission eviction is automatic; (2)
+        plumbed at load and in the forward every gpt-oss request runs; (3) reachable at N=1 in the server's
+        default mode on every gpt-oss decode token — the server gate is the proof; (4) nothing banked.
+      **FINAL WHOLE-BRANCH REVIEW AND FIX WAVE, 2026-10-02 (opus; `a00ada4..c11d489`, then `fac7f91`).**
+      Verdict READY WITH FIXES, no Critical. Confirmed sound, with repros against the real `ExpertVRAMCache`:
+      the routed wrapper under 7,160 randomized visits (0 mismatches, exact accounting, no leaked pin, slab or
+      staging slab); held entries survive eviction; prefill cannot `put()`; stream ordering; every reader of
+      `_expert_vram_cache` copes with a tier dropped at load; nothing derived from the pre-charge budget is
+      left stale; the new entry shape breaks no consumer.
+      - **I1 (Important, shared admission) — FIXED `fac7f91`, the USER approved the ruling.** The admission
+        eviction left the tier's budget untouched, so the tier refilled during decode into bytes the card no
+        longer had. Harmless for the 0.06–0.12 GiB of unbudgeted bytes it was built for; under EXTERNAL VRAM
+        pressure (another process taking ~1 GiB or more while warm) a clean refusal became an admission whose
+        decode overcommits (repro on a fake card: MiniMax-like evicted 1.82 GiB, 1.44 GiB over; the decode OOM
+        was inferred, not run). **As built:** after an evict-admit the tier is capped at what it still holds
+        (`cap_tier_after_admission_eviction`: `min(budget, current_usage)` — not `budget − evicted`, too
+        generous when the tier was not full), its layer range is re-derived from the new budget as the load
+        derives it (a tier under one token's working set thrashes; a budget of 0 must switch entry-building
+        off), and a tier that cannot be capped is refused as before. The cap lasts for the process: under
+        transient external pressure the tier stays smaller until restart (speed, never correctness).
+      - **I2 (Important, test) — FIXED `fac7f91`.** `test_an_eviction_inside_the_visit_keeps_the_held_entry_usable`
+        could not fail (every held copy ran before the first `put()` evicted; a re-lookup mutant passed 30/30).
+        Replaced by `test_a_held_entry_is_read_after_the_visit_evicted_it` (the mutant now fails 2/2).
+      - Also in `fac7f91`: an arena test for a failed load with tier entries held (decode + prefill); five
+        stale statements in `moe_patch.py` / `expert_cache.py` (comments only); one paragraph in
+        `documentation/moe_expert_aware_streaming.md`; two `CLAUDE.md` clauses.
+      - **On the fixed code (HEAD `fac7f91`, controller, FOREGROUND, all exit 0):** suite `3525 passed,
+        20 skipped` (223.93 s); gpt-oss tier full + 33,108 tokens (`safety-s3.log`): `admission: evicted
+        0.07 GiB … and capped its budget 1.59 -> 1.51 GB`, admitted and completed, tier afterwards
+        1.41/1.41 GiB, no OOM; Qwen3-Next server gate `9 passed`; MiniMax accumulator (`-s`) `8 passed`; no
+        charge line and no admission line on either. **MiniMax with its tier full (7.96 GiB, 963 experts)
+        and a request at 8,158 of 8,192 tokens (`safety-minimax.log`): admitted and completed WITHOUT the
+        eviction path** — free + pool was 3.44 GiB against a 3.50 GiB reserve (the same ~0.06 GiB of
+        unbudgeted bytes as gpt-oss) and the request's predicted peak is below that. **So the evict-and-cap
+        path has on-device evidence on gpt-oss only; on the large-tier models it fires only under external
+        VRAM pressure, which was not staged — there it rests on unit tests against the real cache class.**
+      - Scoped re-review of `fac7f91` (opus): I1, I2 and the three minors ADDRESSED; the invariant
+        `need + tier budget <= free + pool + tier usage` held in every evict-admit it built (tier full, tier
+        not full, evicted bytes landing in the pool, the batch giveback arm); no new Critical or Important.
+        **Residue it found, all Minor, recorded not fixed (no second fix wave):**
+        - [bug] **N1 — the decode-graphs refund can undo the cap** (`vaayu/decode_graphs.py:732`,
+          `tier.set_budget(self._tier_before)` restores an ABSOLUTE budget saved at the first pool charge).
+          Repro on fakes, Qwen3-Next-like: a graph-pool charge, then an evict-admit under 6.9 GiB of external
+          pressure caps the tier at 2.88 GiB, then a refused later charge disables the graphs and the refund
+          puts the budget back at 7.30 GiB → 4.4 GiB overcommitted. Triggers are narrow (pool growth larger
+          than a capped budget, or a pool re-mint failing). One-line fix: refund relative to the current
+          budget (`tier.set_budget(tier.budget_bytes + self._charged)`). → S19 (vi).
+        - N2 — the cap assigns the N=1 layer range unconditionally, so on the speculative path (which
+          installs a tighter verify range BEFORE admission) it can widen that range for the one call; the
+          path's own `finally` restores it. Stale range only (budget stays capped): no wrong result, no OOM;
+          needs a drafter on an MoE model (not the server default). The batch path saves its range after
+          admission and is not affected.
+        - N3 — N>1 only (not server-reachable): the cap plus the batch's own giveback spend can take the
+          budget below zero for that batch (`vaayu_base.py:6803-6806`), where `compute_vram_layer_range`
+          returns a near-full range while `put()` refuses everything — wasted entry-building, no OOM.
+        - N4 — the rewritten I2 test kills the re-lookup mutant by a crash, not by data: a mutant that
+          re-looks up and skips the copy when the entry is gone passes. NaN-filling the shared buffer before
+          the final visit closes it.
+        - N5 — no test pins that ADMISSION re-derives the layer range (only the helper called directly).
+        - N6 — when the cap itself fails, the line "still does not fit; refusing it" is printed although
+          the request did fit (the real class cannot raise there).
+        - Deferred from the task reviews, triaged CAN STAND: the batch-giveback arm of admission is unpinned
+          by tests (N>1 only); FakeTier frees exactly the deficit; the admission tests skip without CUDA;
+          the load-wiring test pins order by source text; the second-geometry WARNING in
+          `_make_whole_layer_sparse_forward` still says the extra buffer "is not charged" (it now is, to the
+          tier; no model on this box has two geometries); the new admission/refusal/WARNING lines are
+          documented only under the gpt-oss routed section; a request that FITS on the first reading is
+          admitted with no cap even under external pressure with a part-full tier (identical before S18).
+      - **Rulings the controller made during execution** (the user approved the I1 ruling; the rest stand
+        unless overturned): T0 and T4 run by the controller; implementers/reviewers on sonnet, T3's review
+        and the final reviews on opus; T3's plan code left the eviction call outside the guard → fixed in
+        `a34b228`; the suite expectation 3484 superseded by 3496 then 3525; Task 5 Step 6b added (33,100
+        tokens) because the 32.5k run never fired the admission path; Task 6's "charge line absent" check
+        was vacuous on captured logs → MiniMax re-run with `-s`; N1–N6 recorded, not fixed.
+      - [ ] **Elastic tier (the USER's "later, separately measured" row).** Step 1's curve: 243 experts 65.1 %,
+            324 → 79.0 %, 405 → 88.1 %, 486 → 93.7 %, all 768 → 100 %; budget above the real one costs context
+            (+1 GiB → 28,152, +2 GiB → 23,033 by the planner's inverse) unless the tier borrows idle reserve and
+            gives it back under prefill headroom (safety unproven). Today's tier is 111–133 experts.
+      - [ ] **Known gap (S18 step 2): `ENABLE_EXPERT_USAGE=True` (server default False) records no routes on
+            gpt-oss** — the routed forward never calls `_maybe_record_usage` while its tier evictions are now
+            attributed, so the usage report is not meaningful on this model.
+      - [ ] **Open (S18 step 2):** the tier budget moves with whatever else holds VRAM at load (111–133 experts
+            this session); 30.7k HIT TTFT ON 0.052 s slower, unexplained. Deferred review minors for the final
+            review: admission's batch-giveback arm unpinned by tests (N>1 only); an eviction followed by a
+            refusal prints nothing about the tier having been cut; the load-wiring test pins order by source
+            text only; FakeTier frees exactly the deficit while the real method frees whole entries; the
+            admission tests skip without CUDA; two cosmetic items in the tier test file / the clone's leaf-name
+            source.
+      - [ ] **Lead (S18 step 1): eager attention is the larger cost at long context on gpt-oss** — 75.3 ms
+            of the synchronized 30.7k token (45 %) against 60.2 ms of upload; after a full tier the 30.7k
+            floor is 96.3 ms. Unpriced as a lever.
+      - [ ] **Lead (S18 step 1): decode graphs (S12) are refused on gpt-oss** (`capture failed: ... no
+            seamed attention interface followed it`); ≈19 ms/token of host-paced work sits in the 33.0 ms
+            2k floor. Unpriced.
+      - [ ] **Lead (S18 step 1): a cold request's decode logits differ from a prefix-HIT request's on the
+            same prompt** (ids identical, 0/31 bit-identical, max|d| 2.35 / 0.70 / 1.25 at 2k / 8k /
+            30.7k; HIT-vs-HIT is bit-identical). Hypothesis, not investigated: the M>1-vs-M=1 rounding
+            class (the HIT recomputes the last prompt token alone).
+      Original brief: gpt-oss-20b decodes at **93.0 / 111.0 /
       143.1 ms/token at 8k / 16k / 30.7k** (S14 3c); stock transformers, which fits it in 13.79 GB of VRAM, does
       35.7 tok/s = 28 ms. Since S8 each layer visit moves only the routed experts (`vaayu/routed_fused3d.py`,
       through the per-expert RAM arena, 10.17 GB of experts) — **96 × 13.24 MB = 1.27 GB per token over PCIe** —
@@ -246,7 +483,7 @@ line under the S17 row).
       kernel's index expects it. **§8 (expected):** no knob; reachable on every gpt-oss decode token at N=1.
 - [ ] **S19 — server-reachable reliability sweep.** Each: reproduce, TDD, fix or record why not; one decision per
       item, split an item out if it grows.
-      - (i) **gpt-oss at its advertised limit.** A load advertises `max_seq_len` 33,155; nothing above 32,500
+      - (i) **gpt-oss at its advertised limit.** *[2026-10-02, S18 step 2: a 33,108-token request (33,100 + 8 new, max_seq_len 33,155) was admitted and completed with the tier full — peak over a0 7.27 GiB vs reserve 9.49 GiB, TTFT 123.8 s, no OOM; `safety-s2.log`.]* A load advertises `max_seq_len` 33,155; nothing above 32,500
         has been run. At 32.5k the request was admitted with peak 8.60 GiB against a 9.49 GiB reserve (planner
         9.39), but the planner's margin over the measured peak shrinks with length: 1.09 / 1.03 / 0.90 / 0.79 GiB
         at 8k / 16k / 30.7k / 32.5k, and ~33.1k is the KV-doubled regime the plan charges but never ran. Run one
@@ -271,6 +508,15 @@ line under the S17 row).
         Options on record: cap the tier so the pool keeps N sessions, or release the idle loader double buffers
         after the fill (~2 GiB on gpt-oss; changes arena size on MiniMax / DeepSeek, so measure there first).
         **Pool or decode is the USER's call** — measure both options, then ask.
+      - (vi) **[bug] The decode-graphs refund can undo an admission cap (S18 final re-review, N1).**
+        `vaayu/decode_graphs.py:732` restores `self._tier_before`, an absolute tier budget saved at the first
+        pool charge; after `cap_tier_after_admission_eviction` lowered the budget, a later graph disable puts
+        it back and the tier can regrow into bytes the card no longer has (repro on fakes: 4.4 GiB
+        overcommitted on a Qwen3-Next-like shape under 6.9 GiB of external pressure). Reachable only on a
+        model that uses decode graphs (Qwen3-Next) AND under external VRAM pressure AND a later pool refusal
+        or re-mint failure. Fix candidate: `tier.set_budget(tier.budget_bytes + self._charged)`. RED first.
+        Same sweep: N4 (NaN-fill the buffer in the held-entry test) and N5 (pin the range re-derivation
+        through admission), both test-only.
 - [ ] **S20 — S11-L2: M>1 packed prefill kernel.** The top TTFT lever on Qwen3-Next: S7 built the packed
       expert kernel for M=1 (decode) and BANKED M>1, so prefill chunks and speculative verify still take the
       unpacked path — priced by S11 as `moe_profile.construct` + `scatter`.
@@ -1678,7 +1924,7 @@ its two remaining gaps (S4, S5) sit BELOW the production-path work, and that is 
 | **S5-P** ✅ | ~~**S5's deferred minors**~~ **CLOSED 2026-09-26, FIXED — an unloadable encoder now WARNs + 400s instead of stopping the load; the hook answers None before `init_model`; `documentation/server.md` has the §9 row, the §6.6 sentence, and §3's `refused` list corrected (user-approved). Suite `2955 passed, 0 failed, 0 errors, 20 skipped`. MERGED (`5fbb5c6`). See the S5-P row below** — was: an encoder that fails to IMPORT crashes the model load instead of refusing with a 400; `get_prompt_renderer()` raises AttributeError before `init_model`; `documentation/server.md` has no troubleshooting row / §6.6 note for the new 400 | cheap hardening of code S5 just shipped, and the user docs for its refusal | hours, no GPU | [`…S5-P-renderer-polish-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S5-P-renderer-polish-HANDOFF.md) |
 | **S6** ✅ | ~~**row 28's reach-projection METHOD does not hold**~~ **CLOSED 2026-09-26, METHOD CORRECTED — one MISSING term, not a mis-sized one: row 28 never checked whether the non-expert weights fit the VRAM pin budget. On DeepSeek, 35 of 43 layers streamed 5.496 GB/token of non-expert weights through `inject_to_gpu` = `gpu_load` 2.20 s of the 3.06 s token (72 %), and 1.42 s of that is the CPU re-running `dequantize_at_load(wo_a)` on every streamed layer, every token. The handoff's three explanations did NOT reproduce: the expert bytes were HALVED by the caches (1.786 of 3.449 GB), not inflated by re-reads; row 28's 54 % miss assumption was right (51.8 %); and "2.7 s of 3.9–4.0" was the Uspin diagnostic arm, not GPU work. Corrected method cross-predicts DeepSeek 0.440 tok/s (+35 %; old 5.3–7.0×), Llama-70B +9 %, MiniMax −17 %, spec-decoding bound −4.8 %; Qwen3-Next misses 0.43× cross-forward (its dispatch constant has no donor) — the stated blind spot. gpt-oss-20b (already serving at 0.17 tok/s since A3): regime R like DeepSeek — whole model streamed per token + a per-visit MXFP4 swizzle; A6's per-expert streaming could take it to ~20 tok/s dispatch-bound. See the S6 row below** — was: it under-predicted DeepSeek's cost **5.4–6.4×** and got the binding resource wrong (GPU-bound, not NVMe-bound). Every future "can this checkpoint reach?" call uses it | ~half a day, no new runs needed | [`…S6-reach-projection-method-HANDOFF.md`](docs/superpowers/specs/2026-09-25-S6-reach-projection-method-HANDOFF.md) |
 
-**Suite floor: `3413 passed, 0 failed, 0 errors, 20 skipped` (221.79 s, FOREGROUND; set 2026-10-01 by S17's merge `26e3a2f` — run on the branch tip `2d034ea`, whose tree is identical to merged `main`; the +32 over 3381 are `tests/test_prefill_reads_vram_tier.py`: 23 from the plan, 9 from the final review's fix wave) — was `3404 passed, 0 failed, 0 errors, 20 skipped` (228.74 s, FOREGROUND; S17 before its final-review fix wave, tip `e3d40fa`) — was `3381 passed, 0 failed, 0 errors, 20 skipped` (229.12 s, FOREGROUND; set 2026-10-01 by S16's merge `2a2f288` — run on the branch tip `0d5f9d3`, whose tree is identical to merged `main`; the +2 are S16 (iii)'s `tests/test_generate_seeds_vaayu_cache.py`) — was `3379 passed, 0 failed, 0 errors, 20 skipped` (223.53 s, FOREGROUND; set 2026-10-01 by S15's merge `4a28531`, confirmed on merged `main`; 229.53 s on the branch) — was `3373 passed, 0 failed, 0 errors, 20 skipped` (231.18 s, FOREGROUND; set 2026-10-01 by S15 L-b Task 7, on the branch, PRE-MERGE) — was `3355 passed, 0 failed, 0 errors, 20 skipped` (223.35 s, FOREGROUND; set 2026-10-01 by S14 3c's merge `19a031e`, confirmed on merged `main`) — was `3353 passed` (S14 3c Task 7, on the branch, pre-merge) — was `3163 passed, 0 failed, 0 errors, 20 skipped` (227.66 s, FOREGROUND; set 2026-09-29 by S12's merge `b6906d3` (S12, +51 tests; confirmed on merged `main`, 222.89 s) — was `3112 passed, 0 failed, 0 errors, 20 skipped` (217.49 s, FOREGROUND; set 2026-09-28 by S10c's merge `6b4e203`, +10 tests) — was `3102 passed, 0 failed, 0 errors, 20 skipped` (216.38 s, FOREGROUND; set 2026-09-28 by S10b's merge `ff34de7`, +35 tests) — was `3067 passed, 0 failed, 0 errors, 20 skipped` (216.87 s, FOREGROUND; set 2026-09-28 by S10's merge `5cbbc14`, +6 tests) — was `3061 passed, 0 failed, 0 errors, 20 skipped` (224.43 s, FOREGROUND; set 2026-09-28 by S9's merge `10a34b9`, +3 tests) — was `3058 passed, 0 failed, 0 errors, 20 skipped` (211.81 s, FOREGROUND; set 2026-09-28 by S8's merge `4580053`, +57 tests) — was `3001 passed, 0 failed, 0 errors, 20 skipped` (212.27 s, FOREGROUND; set 2026-09-27 by S7's merge `9e6f81d`, +46 tests) — was `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
+**Suite floor: `3525 passed, 0 failed, 0 errors, 20 skipped` (223.93 s, FOREGROUND; set 2026-10-02 by S18 at the branch tip `fac7f91`; the +112 over 3413 are `tests/test_routed_fused3d_tier.py` 34, `tests/test_routed_fused3d_tier_budget.py` 14, `tests/test_admission_tier_eviction.py` 64) — was `3413 passed, 0 failed, 0 errors, 20 skipped` (221.79 s, FOREGROUND; set 2026-10-01 by S17's merge `26e3a2f` — run on the branch tip `2d034ea`, whose tree is identical to merged `main`; the +32 over 3381 are `tests/test_prefill_reads_vram_tier.py`: 23 from the plan, 9 from the final review's fix wave) — was `3404 passed, 0 failed, 0 errors, 20 skipped` (228.74 s, FOREGROUND; S17 before its final-review fix wave, tip `e3d40fa`) — was `3381 passed, 0 failed, 0 errors, 20 skipped` (229.12 s, FOREGROUND; set 2026-10-01 by S16's merge `2a2f288` — run on the branch tip `0d5f9d3`, whose tree is identical to merged `main`; the +2 are S16 (iii)'s `tests/test_generate_seeds_vaayu_cache.py`) — was `3379 passed, 0 failed, 0 errors, 20 skipped` (223.53 s, FOREGROUND; set 2026-10-01 by S15's merge `4a28531`, confirmed on merged `main`; 229.53 s on the branch) — was `3373 passed, 0 failed, 0 errors, 20 skipped` (231.18 s, FOREGROUND; set 2026-10-01 by S15 L-b Task 7, on the branch, PRE-MERGE) — was `3355 passed, 0 failed, 0 errors, 20 skipped` (223.35 s, FOREGROUND; set 2026-10-01 by S14 3c's merge `19a031e`, confirmed on merged `main`) — was `3353 passed` (S14 3c Task 7, on the branch, pre-merge) — was `3163 passed, 0 failed, 0 errors, 20 skipped` (227.66 s, FOREGROUND; set 2026-09-29 by S12's merge `b6906d3` (S12, +51 tests; confirmed on merged `main`, 222.89 s) — was `3112 passed, 0 failed, 0 errors, 20 skipped` (217.49 s, FOREGROUND; set 2026-09-28 by S10c's merge `6b4e203`, +10 tests) — was `3102 passed, 0 failed, 0 errors, 20 skipped` (216.38 s, FOREGROUND; set 2026-09-28 by S10b's merge `ff34de7`, +35 tests) — was `3067 passed, 0 failed, 0 errors, 20 skipped` (216.87 s, FOREGROUND; set 2026-09-28 by S10's merge `5cbbc14`, +6 tests) — was `3061 passed, 0 failed, 0 errors, 20 skipped` (224.43 s, FOREGROUND; set 2026-09-28 by S9's merge `10a34b9`, +3 tests) — was `3058 passed, 0 failed, 0 errors, 20 skipped` (211.81 s, FOREGROUND; set 2026-09-28 by S8's merge `4580053`, +57 tests) — was `3001 passed, 0 failed, 0 errors, 20 skipped` (212.27 s, FOREGROUND; set 2026-09-27 by S7's merge `9e6f81d`, +46 tests) — was `2955 passed, 0 failed, 0 errors, 20 skipped` (216.68 s,
 FOREGROUND; set 2026-09-26 by S5-P's +3 tests) — was `2952 passed, 0 failed, 0 errors, 20 skipped` (209.57 s,
 FOREGROUND; set 2026-09-26 by S5-W's +4 tests and S5-R's restore, which turned the 4 DeepSeek
 stale-copy guards from passes into SKIPS — any other skip count means the DeepSeek folder changed) — was
@@ -1700,7 +1946,7 @@ on 2026-09-25. Re-prioritise then, not now.
 
 ---
 
-## ▶▶ PICK THIS NEXT: **S18** — gpt-oss routed-expert delivery: measure, then build (the S18 row at the top is the brief; the first row of the S17…S20 table that is not ✅). ◀◀ (S17 CLOSED 2026-10-01, A WIN: Qwen3-Next HIT@8k TTFT 3.169 → 2.942 s, 7.18 %, HIT@2k 3.238 → 3.000 s, 7.35 %, ids identical; MERGED to `main` `26e3a2f`.) Was: **S17** — S11-L4, prefill reads the expert VRAM tier (the S17 row at the top is the brief; the first row of the S17…S20 table that is not ✅). ◀◀ (New sequence S17…S20 set by the USER 2026-10-01: S17 S11-L4, S18 gpt-oss routed-expert delivery, S19 server-reachable reliability sweep, S20 S11-L2 packed prefill kernel.) Was: **the S10b, S11…S16 sequence is COMPLETE — re-prioritise with the USER before picking**. ◀◀ (S16 CLOSED 2026-10-01: row 40 verified fixed; prefix-off KV seed FIXED `6e32fbb`; S5-M-C measured and BANKED to backlog #26.) Was: **S16** — (d) sweep: row 40 verify-and-close, S5-M-C, gpt-oss + `enable_prefix_cache=False` + >128 tokens crash. ◀◀ (S15 CLOSED 2026-10-01, A WIN: DeepSeek decode 1.6476 → 0.5604 s/token, ×2.94, ids identical; branch `s15-lb-deepseek-real-cost`.) Was: **S15** — DeepSeek L-e, then L-b (the S15 row at the top is the brief). ◀◀ (S14 CLOSED 2026-10-01, A WIN: gpt-oss decode 198.5 → 93.0 / 232.3 → 111.0 / 314.2 → 143.1 ms/token at 8k / 16k / 30.7k, bit-identical; 3c on branch `s14c-eager-mask-planner`.) Was: **S14 3c** — block-only eager mask + eager planner calibration (USER picked 2026-09-30; brainstorm → spec → plan; RESULTS of 3b `docs/2026-09-30-S14-3b-eager-mask-RESULTS.md`). ◀◀ (S14 3b CLOSED 2026-09-30, MEASURED.) Was: **S14 3b → the USER's H/O pick**. ◀◀ (S14 3b MEASURED 2026-09-30: the eager mask, not the chunk, holds the VRAM; chunk 256 OOMs at 32.5k.) Was: **S14 3b** — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the user decides H/O (the S14 row at the top is the brief). ◀◀ (S14 3a CLOSED 2026-09-30, A WIN: gpt-oss decode 485.0 -> 173.8 ms/token, 2.79x, bit-identical.) Was: **S14** — gpt-oss non-expert stream: measure its share of the 0.44 s token, then residency. ◀◀ (S13 CLOSED 2026-09-30, NOT A DEFECT: the token-50 flip is an exact bf16 tie; Vaayu is bit-identical to stock with a full-length `DynamicCache()`; no code change.) Was: **S13** — gpt-oss greedy decode diverges from stock at token 50: triage (the S13 row at the top is the brief). ◀◀ (S12 CLOSED 2026-09-29, A WIN: piecewise decode CUDA graphs, Qwen3-Next decode −13.4 ms/token (+23 %), ids bit-identical; merged `b6906d3`.) Was: **S12** — the user picks at the brainstorm between the launch-overhead class (top decode lever, ≈14.1 ms = 24.6 % of the server-mode token, inferred; recommended, measured first) and the M>1 packed prefill kernel (top TTFT lever; it overtakes the class once ≥ 24 % of turns are cold 8k); the S12 row at the top is the brief. ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 57.32 ms in the server's mode (62.12 for a library caller, which gets no `gc.freeze()`), host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; levers ≥ 5 % remain, so S12 is not skipped; L-clean re-priced frozen at 1.2 % and banked as S11-L8; row 37 stays closed.) Was: **S12** — L-clean, the every-32-forward `gc.collect()` (withdrawn 2026-09-28 by S11's final review: its 5.95 ms = 9.6 % was measured without the server's post-load `gc.freeze()`; frozen it is 0.68 ms = 1.2 %). Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
+## ▶▶ PICK THIS NEXT: **S19** — server-reachable reliability sweep (the S19 row at the top is the brief; it now also carries item (vi), the decode-graphs refund that can undo S18's admission cap, and gpt-oss evidence at 33,108 tokens for item (i)). ◀◀ (S18 CLOSED 2026-10-02, A WIN: gpt-oss decode 93.9 → 79.1 ms/token at 8k (15.7–15.9 %), 80.7 → 67.1 at 2k, 144.7 → 129.1 at 30.7k, bit-identical; the elastic tier is the open follow-up in the S18 row.) Was: **S18 step 2** — build the gpt-oss expert VRAM tier (brainstorm → spec → plan with the USER; the S18 row at the top carries step 1's numbers and the three open design questions). ◀◀ (S18 step 1 DONE 2026-10-02, MEASURED: delivery 49.6 ms/token = 52.6 % of the 8k token; real-budget tier projects 16.8 %.) Was: **S18** — gpt-oss routed-expert delivery: measure, then build (the S18 row at the top is the brief; the first row of the S17…S20 table that is not ✅). ◀◀ (S17 CLOSED 2026-10-01, A WIN: Qwen3-Next HIT@8k TTFT 3.169 → 2.942 s, 7.18 %, HIT@2k 3.238 → 3.000 s, 7.35 %, ids identical; MERGED to `main` `26e3a2f`.) Was: **S17** — S11-L4, prefill reads the expert VRAM tier (the S17 row at the top is the brief; the first row of the S17…S20 table that is not ✅). ◀◀ (New sequence S17…S20 set by the USER 2026-10-01: S17 S11-L4, S18 gpt-oss routed-expert delivery, S19 server-reachable reliability sweep, S20 S11-L2 packed prefill kernel.) Was: **the S10b, S11…S16 sequence is COMPLETE — re-prioritise with the USER before picking**. ◀◀ (S16 CLOSED 2026-10-01: row 40 verified fixed; prefix-off KV seed FIXED `6e32fbb`; S5-M-C measured and BANKED to backlog #26.) Was: **S16** — (d) sweep: row 40 verify-and-close, S5-M-C, gpt-oss + `enable_prefix_cache=False` + >128 tokens crash. ◀◀ (S15 CLOSED 2026-10-01, A WIN: DeepSeek decode 1.6476 → 0.5604 s/token, ×2.94, ids identical; branch `s15-lb-deepseek-real-cost`.) Was: **S15** — DeepSeek L-e, then L-b (the S15 row at the top is the brief). ◀◀ (S14 CLOSED 2026-10-01, A WIN: gpt-oss decode 198.5 → 93.0 / 232.3 → 111.0 / 314.2 → 143.1 ms/token at 8k / 16k / 30.7k, bit-identical; 3c on branch `s14c-eager-mask-planner`.) Was: **S14 3c** — block-only eager mask + eager planner calibration (USER picked 2026-09-30; brainstorm → spec → plan; RESULTS of 3b `docs/2026-09-30-S14-3b-eager-mask-RESULTS.md`). ◀◀ (S14 3b CLOSED 2026-09-30, MEASURED.) Was: **S14 3b → the USER's H/O pick**. ◀◀ (S14 3b MEASURED 2026-09-30: the eager mask, not the chunk, holds the VRAM; chunk 256 OOMs at 32.5k.) Was: **S14 3b** — measure TTFT at eager chunk 256 / context-adaptive vs 512, then the user decides H/O (the S14 row at the top is the brief). ◀◀ (S14 3a CLOSED 2026-09-30, A WIN: gpt-oss decode 485.0 -> 173.8 ms/token, 2.79x, bit-identical.) Was: **S14** — gpt-oss non-expert stream: measure its share of the 0.44 s token, then residency. ◀◀ (S13 CLOSED 2026-09-30, NOT A DEFECT: the token-50 flip is an exact bf16 tie; Vaayu is bit-identical to stock with a full-length `DynamicCache()`; no code change.) Was: **S13** — gpt-oss greedy decode diverges from stock at token 50: triage (the S13 row at the top is the brief). ◀◀ (S12 CLOSED 2026-09-29, A WIN: piecewise decode CUDA graphs, Qwen3-Next decode −13.4 ms/token (+23 %), ids bit-identical; merged `b6906d3`.) Was: **S12** — the user picks at the brainstorm between the launch-overhead class (top decode lever, ≈14.1 ms = 24.6 % of the server-mode token, inferred; recommended, measured first) and the M>1 packed prefill kernel (top TTFT lever; it overtakes the class once ≥ 24 % of turns are cold 8k); the S12 row at the top is the brief. ◀◀ (S11 CLOSED 2026-09-28, MEASURED: Qwen3-Next token 57.32 ms in the server's mode (62.12 for a library caller, which gets no `gc.freeze()`), host-bound; TTFT cold 10.41 / 27.58 s, HIT 3.12 / 3.04 s at 2k / 8k; levers ≥ 5 % remain, so S12 is not skipped; L-clean re-priced frozen at 1.2 % and banked as S11-L8; row 37 stays closed.) Was: **S12** — L-clean, the every-32-forward `gc.collect()` (withdrawn 2026-09-28 by S11's final review: its 5.95 ms = 9.6 % was measured without the server's post-load `gc.freeze()`; frozen it is 0.68 ms = 1.2 %). Was: **S11** — Qwen3-Next census at HEAD, decode AND TTFT, measure only (the S11 row at the top is the brief). (S10c CLOSED 2026-09-28, FIXED: a fresh split of a tied-embedding checkpoint no longer crashes the first forward; server reach confirmed before the fix, server gate 9/9 after.) Was: **S10c** — fresh split of a tied-embedding checkpoint crashes on the first forward (found by S10b; the S10c row at the top is the brief). (S10b CLOSED 2026-09-28, FIXED: `compression` refused with a warning where it cannot work, 4bit loads on bf16, decline reason corrected.) Was: **S10b** — refuse `compression` where it cannot work and correct its false decline reason (= lead L-S10a); handoff [`…S10b-refuse-compression-HANDOFF.md`](docs/superpowers/specs/2026-09-28-S10b-refuse-compression-HANDOFF.md). (New sequence S10b, S11…S16 set by the USER 2026-09-28, S10b placed first by the user.) Was: **the S7…S10 sequence is COMPLETE — re-prioritise with the USER before picking** (the rule at the top: "After S10: re-prioritise with the user"). (S10 CLOSED 2026-09-28, FIXED: `use_torch_compile=True` is refused with a warning instead of crashing; row 48 closed.) Was: **S10** — refuse `use_torch_compile=True` instead of crashing (= row 48, fix (b)), handoff [`…S10-refuse-torch-compile-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S10-refuse-torch-compile-HANDOFF.md). (S9 CLOSED 2026-09-28, A WIN: DeepSeek `wo_a` folded on the GPU, decode −42.20 % / 1.73×.) Was: **S9** — DeepSeek `wo_a` folded on the CPU every token, handoff [`…S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S9-deepseek-wo_a-fold-on-gpu-HANDOFF.md). (S8 CLOSED 2026-09-27, A WIN: gpt-oss routed fused-3D delivery, decode 9.61×/9.69×.) Was: **S8** — gpt-oss-20b at 0.17 tok/s on a model that fits the GPU, handoff [`…S8-gptoss-streamed-transform-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S8-gptoss-streamed-transform-HANDOFF.md). (S7 CLOSED 2026-09-27, A WIN: Qwen3-Next decode 1.94×.) Was: **S7** — Qwen3-Next per-expert dispatch, handoff [`…S7-qwen3next-expert-dispatch-HANDOFF.md`](docs/superpowers/specs/2026-09-26-S7-qwen3next-expert-dispatch-HANDOFF.md). (Rule: the first row of the S7…S10 table at the top that is not ✅. S1…S6 COMPLETE 2026-09-26. S6's leads L-b/L-c/L-d stay unsequenced; L-a = S9.) Was: **S6** (user, 2026-09-26). (S5-P closed 2026-09-26, FIXED — the S5 bug-fix run is complete; S5-M closed 2026-09-26, FIXED; S5-M-H closed 2026-09-26, PASS — no prefill reserve needed up to 8k; S5-W closed 2026-09-26, FIXED; S5-R closed 2026-09-26 — this box's DeepSeek folder now matches a plain download)
 
 **Set by the user 2026-09-26: fix S5's bugs before S6.** Each has a self-contained handoff (links in
 the sequence table and in the S5 rows below). ~~Every session in this run starts with the S5-R check~~ —

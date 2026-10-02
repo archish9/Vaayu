@@ -808,6 +808,40 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     return set(sorted(moe_layer_ids)[:n_fit])
 
 
+def cap_tier_after_admission_eviction(model, tier) -> "tuple[int, int]":
+    """Keep the promise an admission eviction makes (S18); returns (budget before,
+    budget after).
+
+    Evicting to admit a request spends bytes the tier no longer owns: left at its
+    old budget it refills during decode into VRAM the card does not have, which
+    "moves the OOM from prefill to decode" (admission_headroom's docstring). So the
+    tier keeps what it holds now and no more. `min(budget, usage)`, not
+    `budget - evicted`: with the tier not full, only the usage left after the
+    eviction satisfies budget <= free + usage - need.
+
+    The layer range is re-derived from the new budget exactly as the load derives
+    it: a tier under one token's working set self-evicts to 0 % hits while every
+    miss still pays for its entry, and a budget of zero must switch that off
+    (compute_vram_layer_range returns an empty set, which _vram_tier_visit reads as
+    "no tier for any layer"). Raises if the tier cannot be capped; the caller then
+    refuses instead of admitting on a promise it cannot keep.
+    """
+    before = int(tier.budget_bytes)
+    after = min(before, int(tier.current_usage))
+    tier.set_budget(after)
+    geometry = getattr(model, "_moe_geometry", None)
+    blocks = getattr(model, "_moe_blocks", None)
+    if geometry and blocks:
+        layers = compute_vram_layer_range(after, geometry, [b.layer_idx for b in blocks])
+        if layers is not None and layers != getattr(model, "_vram_cacheable_layers", None):
+            print(f"[Vaayu-MoE] WARNING: VRAM cache budget {after / 1e9:.2f}GB is now under "
+                  f"the per-token working set {geometry['working_set_bytes'] / 1e9:.2f}GB -- "
+                  f"restricting the VRAM cache to the first {len(layers)}/{len(blocks)} MoE "
+                  f"layers (partial caching).")
+        model._vram_cacheable_layers = layers
+    return before, after
+
+
 def moe_supports_slab_arena(expert_styles, is_exl3: bool, cuda: bool = False) -> bool:
     """True iff this model's MoE forward reads expert weights through the
     pinned slab arena on its decode miss path.
@@ -3388,6 +3422,13 @@ class VaayuBaseModel(GenerationMixin):
 
             print(f"[Vaayu-MoE] {len(self._moe_blocks)} MoE blocks patched for sparse streaming")
 
+            # S18: the routed fused-3D buffers patch_moe_blocks just allocated came
+            # out of the bytes the VRAM tier was sized on. Charge them, before the
+            # tier's layer range is derived from its budget below. A no-op for a
+            # model with no routed buffer.
+            from .routed_fused3d import charge_routed_buffers_to_vram_tier
+            charge_routed_buffers_to_vram_tier(self, self._moe_geometry["expert_bytes"])
+
             # Fix #7 follow-up: when the VRAM budget can't hold one token's
             # full working set, an unrestricted LRU deterministically hits 0%
             # (single-token self-eviction). Restrict to a layer prefix that
@@ -4106,6 +4147,49 @@ class VaayuBaseModel(GenerationMixin):
         need = predict_peak_vram(shape, int(n_tokens))
         if need <= headroom:
             return need
+        # S18: a full VRAM expert tier is not a reason to refuse. The tier fills
+        # lazily to its budget, and bytes that became unavailable after it was
+        # sized -- this process's own later allocations, or another process's --
+        # are in nobody's budget. So with the tier full, free + pool can sit under
+        # the reserve and a request the plan advertises would be refused, though it
+        # is admitted with the tier empty. The tier is a cache: evict what covers
+        # the shortfall, then CAP the tier at what it still holds, so it cannot
+        # refill during decode into the bytes just spent (eviction alone would move
+        # the OOM from prefill to decode). The reserve clamp in admission_headroom
+        # is untouched, so nothing over the reserve is admitted, and a prefill pass
+        # cannot refill the tier (it only reads it).
+        _tier = getattr(self, "_expert_vram_cache", None)
+        _short = need - (int(free_vram) + max(0, int(reusable_pool)))
+        _cap = int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes))
+        if need <= _cap and 0 < _short <= int(getattr(_tier, "current_usage", 0) or 0):
+            _freed, _capped = 0, None
+            try:
+                _freed = _tier.evict_until_free(int(free_vram) + _short)
+                _free_now, _ = torch.cuda.mem_get_info()
+                _pool_now = (torch.cuda.memory_reserved()
+                             - torch.cuda.memory_allocated())
+                # Both or neither: after empty_cache() the old pool is inside the
+                # new free figure, so a new free with the old pool counts it twice.
+                free_vram, reusable_pool = _free_now, _pool_now
+                headroom = admission_headroom(
+                    free_vram=free_vram, plan=plan, expert_cache_active=True,
+                    reusable_pool=reusable_pool,
+                    expert_giveback_bytes=expert_giveback_bytes)
+                if need <= headroom:
+                    _capped = cap_tier_after_admission_eviction(self, _tier)
+            except Exception:
+                pass                # D3: refuse on the readings in hand
+            if _capped is not None:
+                print(f"[Vaayu-VRAM] admission: evicted {_freed / 1024 ** 3:.2f} GiB of the "
+                      f"expert VRAM tier to admit {int(n_tokens)} tokens (predicted peak "
+                      f"{need / 1024 ** 3:.2f} GiB) and capped its budget "
+                      f"{_capped[0] / 1e9:.2f} -> {_capped[1] / 1e9:.2f} GB: those bytes "
+                      f"are no longer free above the reserve.")
+                return need
+            if _freed:
+                print(f"[Vaayu-VRAM] admission: evicted {_freed / 1024 ** 3:.2f} GiB of the "
+                      f"expert VRAM tier, and the {int(n_tokens)}-token request still does "
+                      f"not fit; refusing it.")
         # The floor the load-time plan actually reserved one of (an expert,
         # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
         # prints "min_resident=0.00 GiB" even though one expert is resident.

@@ -828,7 +828,7 @@ class ExpertVRAMCache:
         self.hits = 0
         self.misses = 0
         self.evictions = 0
-        self.prefill_evictions = 0   # reactive prefill-headroom evictions
+        self.prefill_evictions = 0   # evict_until_free: prefill headroom, admission (S18)
         self.prefill_hits = 0        # prefill lookups served from the tier (peek)
         # Per-(layer, expert) attribution of BUDGET-PRESSURE evictions only, for
         # the expert usage histogram. None unless explicitly enabled (ships dark).
@@ -944,10 +944,11 @@ class ExpertVRAMCache:
 
     def evict_until_free(self, free_target_bytes: int) -> int:
         """Evict LRU entries until free VRAM would reach free_target_bytes, then
-        return blocks to the driver. Used reactively during prefill: a prefill pass
-        only reads the tier (peek), and a layer visit holds the entries it took,
-        so evicting here has no correctness impact -- an evicted expert is simply
-        uploaded again, and re-warms during decode.
+        return blocks to the driver. Used reactively during prefill, and by request
+        admission before it refuses (S18): a prefill pass only reads the tier (peek),
+        and a layer visit holds the entries it took, so evicting here has no
+        correctness impact -- an evicted expert is simply uploaded again, and re-warms
+        during decode. Both callers are counted in `prefill_evictions`.
 
         Reads free VRAM once, evicts enough BYTES to cover the deficit, then calls
         empty_cache() ONCE — dropping Python refs alone leaves blocks in PyTorch's

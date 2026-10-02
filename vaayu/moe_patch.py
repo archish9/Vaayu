@@ -1614,7 +1614,8 @@ def _vram_tier_visit(vaayu_ref, layer_idx, unique_experts):
 
     `vram` is the cache this visit may put() its misses into, or None.
 
-    Two gates, shared by all three per-expert forwards so they cannot drift:
+    Two gates, shared by all three per-expert forwards and, since S18, the routed
+    fused-3D wrapper (vaayu/routed_fused3d.py), so they cannot drift:
     _vram_cacheable_layers restricts the tier to the layer prefix that fits when
     the budget cannot hold a whole token's working set (None = no restriction);
     and a PREFILL pass is read-only (S17) -- it routes ~every expert once, so
@@ -2685,9 +2686,10 @@ def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,
 
     Shared by the non-EXL3 fused forward's per-slot loop, its S7 kernel branch, and
     the routed fused-3D wrapper (S8, vaayu/routed_fused3d.py) so the order below
-    cannot drift between them. The routed wrapper settles every RAM-tier expert, HITS
-    as well as misses, with `entry=None`: its rows go into a shared device buffer, not
-    a cache entry. If the copies read from a pinned slab,
+    cannot drift between them. The routed wrapper settles every expert it UPLOADS, RAM
+    hit or miss: its rows go into a shared device buffer, and `entry` is the private
+    copy of them the VRAM tier takes (S18) or None when nothing will keep one (prefill,
+    no tier, a layer outside the cacheable range). If the copies read from a pinned slab,
     arm the arena's read event so acquire() cannot recycle the slab under the in-flight
     DMA, then release the forward's pin on the key -- the same order as
     _make_fused_sparse_forward_exl3. A legacy clone is in no slab (slab_index_of ->
@@ -2743,7 +2745,8 @@ def _dispatch_expert_misses(
     that key's eviction (a slow cache-capacity leak).
 
     `vram_resident` (both fused forwards pass it -- fused-EXL3, and since row
-    30-P the non-EXL3 fused forward) is the set of routed experts the caller
+    30-P the non-EXL3 fused forward -- and since S18 the routed fused-3D wrapper)
+    is the set of routed experts the caller
     already holds a VRAM cache entry for. Their RAM lookup still runs —
     that LRU refresh is the residency invariant P1 measured, and dropping it is
     the change P1 refuted — but on a MISS no disk read is issued: the caller

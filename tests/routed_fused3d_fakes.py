@@ -97,24 +97,25 @@ class Ref:
 
 
 def build(tmp_path, n_layers=1, *, seed=0, read_all_rows=False, pass_hist=True,
-          top_k=TOP_K):
+          top_k=TOP_K, num_experts=NUM_EXPERTS, width=WIDTH):
     """Write a fused-3D checkpoint (one file per layer), build the meta model with
     REAL routers, index it. Returns (model, idx, weights); weights[i] = (w, b)."""
     torch.manual_seed(seed)
-    (tmp_path / "config.json").write_text(json.dumps({"num_experts": NUM_EXPERTS}))
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts": num_experts}))
     weights = []
     for i in range(n_layers):
-        w = torch.randn(NUM_EXPERTS, WIDTH, WIDTH)
-        b = torch.randn(NUM_EXPERTS, WIDTH)
+        w = torch.randn(num_experts, width, width)
+        b = torch.randn(num_experts, width)
         save_file({f"layers.{i}.mlp.experts.gate_up_proj": w.contiguous(),
                    f"layers.{i}.mlp.experts.gate_up_proj_bias": b.contiguous()},
                   str(tmp_path / f"layers.{i}.safetensors"))
         weights.append((w, b))
     with torch.device("meta"):
-        model = Model([RoutedBlock(top_k=top_k, read_all_rows=read_all_rows,
+        model = Model([RoutedBlock(num_experts, width, top_k=top_k,
+                                   read_all_rows=read_all_rows,
                                    pass_hist=pass_hist) for _ in range(n_layers)])
     for layer in model.layers:
-        layer.mlp.router = nn.Linear(WIDTH, NUM_EXPERTS)      # real, CPU, seeded above
+        layer.mlp.router = nn.Linear(width, num_experts)      # real, CPU, seeded above
         layer.mlp.router.requires_grad_(False)
     idx = ExpertOffsetIndex(str(tmp_path))
     idx.build()

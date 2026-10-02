@@ -191,9 +191,17 @@ you got:
   keeps whole-layer delivery: correct, and slow — every token moves every expert (10.17 GB per
   token on gpt-oss-20b).
 
-On gpt-oss-20b routed delivery moves top_k × layers = 96 experts (1.27 GB) per token instead of
+On gpt-oss-20b routed delivery routes top_k × layers = 96 experts (1.27 GB) per token instead of
 10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
-the disk. The output is bit-identical to stock transformers. There is no setting for it.
+the disk. The routed experts that are already in the VRAM expert cache are not uploaded again:
+about 40 % of them on this model, whose cache holds 111-133 of its 768 experts beside the
+context reserve. The output is bit-identical to stock transformers. There is no setting for it.
+
+Two log lines belong to this path. `Expert VRAM cache budget A -> B GB (~N experts): the routed
+fused-3D buffers (… B) were allocated from it after it was sized` — the kernel buffer's bytes are
+taken out of the cache's budget. And, when a request arrives: `admission: evicted X GiB of the expert VRAM
+tier to admit N tokens … and capped its budget A -> B GB` — a full cache had left less than the
+context reserve free, so part of it was given up for the request and stays given up.
 
 **Attention note for this family:** a model whose attention carries *sinks* cannot use the
 flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux is currently
