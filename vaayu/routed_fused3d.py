@@ -25,6 +25,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+# The role a routed fused-3D expert's rows are stored under in the VRAM expert tier
+# (S18): {TIER_ROLE: {leaf: rows}}, one tensor per fused projection, which is the
+# shape ExpertVRAMCache._group_bytes sizes.
+TIER_ROLE = "fused3d"
+
 
 def routed_experts_from_call(args, kwargs, num_experts: int) -> list[int] | None:
     """The experts an experts-module call will actually process, or None.
@@ -103,12 +108,21 @@ def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str
     buffer AFTER the upload (so a layout conversion that copies rather than views
     still sees the fresh rows); call the stock forward; release.
 
+    VRAM expert tier (S18): an expert resident in the tier is not uploaded -- its
+    rows are copied device-to-device from the tier's own copy -- and a decode miss
+    leaves a private copy of its rows there. Both sides copy because the buffer is
+    shared by every layer of the geometry and the kernel indexes it by expert id:
+    the next layer overwrites these rows. Gates and prefill behaviour are
+    _vram_tier_visit's (no tier / layer outside the cacheable range -> today's path;
+    prefill reads, never fills).
+
     `snapshot` holds `meta_params` / `base_attrs`, taken by the factory AFTER this
     wrapper was installed, so a release restores the wrapper with everything else.
     """
     from .moe_patch import (_dispatch_expert_misses, _iter_expert_loads,
                             _populate_fused_experts, _release_fused_experts,
-                            _release_prefill_staged, _settle_miss_upload)
+                            _release_prefill_staged, _settle_miss_upload,
+                            _vram_tier_visit)
     num_experts = int(experts_mod.num_experts)
     as_raw = {f"{experts_path}.{leaf}": buf for leaf, buf in buffers.items()}
 
@@ -124,19 +138,39 @@ def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str
                 f"call shape; running on would leave the kernel reading rows nobody "
                 f"uploaded.")
         vaayu_ref._expert_history[layer_idx] = used
+        held, vram = _vram_tier_visit(vaayu_ref, layer_idx, used)
         expert_tensors, miss_futures, pinned_keys = _dispatch_expert_misses(
             used, layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,
-            offset_index=offset_index, expert_cache=expert_cache, vaayu_ref=vaayu_ref)
+            offset_index=offset_index, expert_cache=expert_cache, vaayu_ref=vaayu_ref,
+            # On the GPU already: a RAM miss on these reads nothing off NVMe. Their
+            # RAM lookup still runs inside the helper (LRU refresh).
+            vram_resident=set(held) or None)
         uploaded: set = set()
         try:
             for eidx, raw in _iter_expert_loads(expert_tensors, miss_futures, vaayu_ref):
+                resident = held.get(eidx)
+                if resident is not None:
+                    # No upload. `raw` is the RAM tier's entry or the no-raw
+                    # placeholder and is not read; a pin it holds is released by
+                    # the finally below.
+                    for leaf, rows in resident[TIER_ROLE].items():
+                        buffers[leaf][eidx].copy_(rows)
+                    uploaded.add(eidx)
+                    continue
                 for key, view in raw.items():
                     buffers[key.rsplit(".", 1)[-1]][eidx].copy_(view, non_blocking=True)
-                # Every RAM-tier expert, hit or miss, owes this once its copies are
-                # ISSUED: arm the slab's read event, unpin, return a staging slab.
+                # A decode miss leaves the tier its OWN copy of the rows just written
+                # (issued after the upload on the same stream, so it reads them).
+                entry = None
+                if vram is not None:
+                    entry = {TIER_ROLE: {leaf: buffers[leaf][eidx].clone()
+                                         for leaf in (k.rsplit(".", 1)[-1] for k in raw)}}
+                # Every uploaded expert, RAM hit or miss, owes this once its copies
+                # are ISSUED: arm the slab's read event, unpin, return a staging slab;
+                # then the tier takes the entry, if there is one.
                 _settle_miss_upload(
-                    eidx, raw, None, layer_idx=layer_idx, expert_cache=expert_cache,
-                    vaayu_ref=vaayu_ref, pinned_keys=pinned_keys, vram=None, cm=None,
+                    eidx, raw, entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                    vaayu_ref=vaayu_ref, pinned_keys=pinned_keys, vram=vram, cm=None,
                     cm_last_call=False, cm_budget=0)
                 uploaded.add(eidx)
             missing = sorted(set(used) - uploaded)
