@@ -645,8 +645,8 @@ line under the S17 row).
         through admission), both test-only.
 - [~] **S20 — S11-L2: M>1 packed prefill kernel.** **STARTED 2026-10-02 at HEAD `1c8f122`, branch
       `s20-packed-prefill-kernel`. Step 0 DONE (below); design APPROVED by the USER section by section 2026-10-02;
-      spec approved 2026-10-02; PLAN WRITTEN and dry-run, awaiting the USER's review and execution choice.**
-      - [ ] **Plan `docs/superpowers/plans/2026-10-02-S20-packed-prefill-kernel.md` + verified assets
+      spec approved 2026-10-02; plan APPROVED 2026-10-03, executing.**
+      - [x] **Plan `docs/superpowers/plans/2026-10-02-S20-packed-prefill-kernel.md` + verified assets
         `docs/superpowers/plans/2026-10-02-S20-assets/` (both gitignored; summary here).** Every line of code and
         test was DRY-RUN on a throwaway worktree of `4716d21`: three task commits RED → GREEN (29 / 5 + 5 guards /
         4 + 1 guard), suite `3612 passed, 20 skipped`, 0 failed (224.21 s); 20 mutants, 18 killed, M10 equivalent
@@ -668,6 +668,16 @@ line under the S17 row).
         stands as approved; A5 tiles BLOCK_M 16 / BLOCK_N 64 / BLOCK_K 256 / 2 warps / 1 stage: one 512-token call
         over 511 experts 4.0 ms against the loop's 48 ms. Probes (gitignored): `plans/probes/s20_ttft.py`
         (`S20_OFF=1`, `REPO=`), `s20_cmp.py`, `s20_quality.py`; dry-run outputs `plans/probes/s20_out/*-dry*`.
+      - [~] **Step 2 — build (plan `docs/superpowers/plans/2026-10-02-S20-packed-prefill-kernel.md`, APPROVED by the USER
+        2026-10-03 with spec amendments A1–A6; subagent-driven; assets `docs/superpowers/plans/2026-10-02-S20-assets/`).**
+        - [ ] T1 the grouped kernels + host tables + reference/fallback + verdict (29 RED → GREEN, mutants)
+        - [ ] T2 the prefill branch in `_make_fused_sparse_forward` (5 RED + 5 guards → GREEN; mutants in T3)
+        - [ ] T3 the installer's prefill verdict + the one-call VRAM guard (4 RED + 1 guard → GREEN), mutants,
+              suite 3612, product doc §3.4c
+        - [ ] T4 Qwen3-Next TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k, profiled ON arm, 40,960-token run
+              → stop-rule decision
+        - [ ] T5 prefill-ppl band
+        - [ ] T6 gates (suite, accumulator ×2, server, prefix-reuse), RESULTS, ledger close, final review
       - [x] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
         (gitignored; the summary is here). **USER decisions:** quality bar = PREFILL-mode perplexity band (D6
         method: ≥ 2-chunk teacher-forced prompt per calibration text, stock vs kernel alternating in one load, null
