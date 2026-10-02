@@ -481,8 +481,96 @@ line under the S17 row).
       whole-layer fallback keep working; context-length cost of any VRAM taken from the reserve stated. Likely
       trap (verify in step 1): the kernel reads rows of a fused-3D tensor, so a cached expert must land where the
       kernel's index expects it. **§8 (expected):** no knob; reachable on every gpt-oss decode token at N=1.
-- [ ] **S19 — server-reachable reliability sweep.** Each: reproduce, TDD, fix or record why not; one decision per
+- [~] **S19 — server-reachable reliability sweep.** Each: reproduce, TDD, fix or record why not; one decision per
       item, split an item out if it grows.
+      **STARTED 2026-10-02. Evidence re-verified at HEAD `a99a911` (no `vaayu/` or `tests/` change since
+      `fac7f91`); plan `docs/superpowers/plans/2026-10-02-S19-reliability-sweep.md`. USER decisions 2026-10-02:
+      (iii) accept the margin; (vii) fold into S19; (iv) keep the arch-substring clause (only the shared field
+      list is added); execution subagent-driven on branch `s19-reliability-sweep`. Per item:**
+      - **(i) `[x]` CLOSED 2026-10-02 — the advertised limit is served; no code change.** On device at HEAD
+        `a99a911` (`plans/probes/s19_out/limit.log`, `over-by-one.log`; probe `s18_ab.py` `SAFETY=1`, server
+        config, tier filled first): a request ending ON `max_seq_len` (prompt 33,148 + 7 new = **33,155**) was
+        ADMITTED AND COMPLETED — `admission: evicted 0.07 GiB … and capped its budget 1.71 -> 1.63 GB`,
+        predicted peak 9.49 GiB (= the reserve), measured peak over a0 **7.11 GiB** (≈ 8.6 GiB with the tier
+        prefill evicted, ≈ 0.9 GiB under the reserve — the tier term inferred), TTFT 124.2 s, no OOM; and
+        **33,156 was refused** cleanly (`VramPlanError`, nothing allocated). Before it, S18's `safety-s2.log` /
+        `safety-s3.log` had served 33,108. The refusal's TEXT is wrong → (vii).
+      - **(ii) LIVE.** `engine.py:374` writes `prefix_hit` as `hits > hits_before`, nothing else.
+        `PrefixCacheStore.matched_tokens` already accumulates the match length per hit (`prefix_cache.py:121`),
+        so the row can carry the delta with no engine-core change.
+      - **(iii) `[x]` CLOSED 2026-10-02 — MEASURED on five models; the USER ACCEPTED the margin ("go with your
+        recommendations"): S5-M-HR closes, no reserve change, no code.** Probe `plans/probes/s19_warmup.py` (S5-M-H's probe + a census; server path,
+        one run per model at HEAD `a99a911`, logs `plans/probes/s19_out/warmup-*.log`). **`RssAnon` loaded →
+        after the first request → after the second:** DeepSeek 1.03 → 2.80 → 2.79 GB (**+1.77**), MiniMax
+        1.20 → 2.30 → 2.31 (**+1.10**), Qwen3-Next 1.47 → 2.12 → 2.14 (**+0.65**), gpt-oss 1.30 → 1.61 → 1.58
+        (**+0.31**), Llama-3.2-1B 1.33 → 1.67 → 1.55 (+0.34). **Findings:** (1) a ONE-TIME cost of the first
+        request on every model — a second request with twice the prompt adds ≤ 0.02 GB; (2) it is glibc
+        malloc (in-use +0.32 … +1.25 GB, unnamed anonymous mappings), not pinned memory (`RssShmem` moves only
+        with the prefix pool's stored sessions) and not a leak; (3) **Vaayu owns 0.48 GB of it on DeepSeek
+        (the non-expert tensor LRU, which only DeepSeek uses — 4 of its 43 layers still stream non-expert
+        weights) and none elsewhere**; the rest is native first-use allocation no Vaayu tensor accounts for —
+        a bare `torch` process shows the same class (`RssAnon` 0.32 → 0.91 GB across the first matmul, conv,
+        `norm`/`topk`, fp32 matmul; attribution to CUDA's lazy kernel loading is an inference from that ladder,
+        not a per-library measurement); (4) **host `MemAvailable` trough: DeepSeek 1.48 GB** (S5-M-H: 1.63) —
+        thin on that model only: no pool, the largest warm-up, ~0.5 GB of page cache on top. With a pool the
+        margin once the pool is FULL projects to load-time available − pool − warm-up = Qwen3-Next 2.98,
+        MiniMax 2.57, gpt-oss 3.39 GB (projected; the pool was not filled). No run swapped, all exit 0.
+        Refuted before any run: the warm-up is not a lazily allocated pinned loader buffer (`RssShmem` flat,
+        no `[VAAYU-IO] alloc buf=` after load). **Recommendation: write the margin down as ACCEPTED and close
+        S5-M-HR — no reserve change.** A derived term would have to model per-model native allocation that
+        nothing at load can read; a blind raise is forbidden by the row. Not measured: the pool-full margin,
+        a second replicate, which library holds the bytes.
+      - **(iv) LIVE for a new architecture.** `_detect_moe` (`vaayu_base.py:3985`) still reads
+        `num_local_experts` / `num_experts` / an arch substring. DeepSeek works only through its own override
+        (`vaayu_deepseek_v4.py:240`, which aliases `n_routed_experts` onto `num_experts`). All four MoE models
+        on disk name a field in `ExpertOffsetIndex._EXPERT_COUNT_FIELDS`; none relies on the arch substring.
+      - **(v) `[x]` CLOSED 2026-10-02 — VERIFIED STALE, no code change, no user decision left.** S14 3c made
+        every gpt-oss non-expert weight VRAM-resident (`24 non-expert-pinned transformer` + 3 shared), so
+        `tier_candidates` is empty, the tier prints nothing and holds nothing, and the pool is back at
+        **12.62 / 12.69 GB** on two fresh loads at HEAD (`plans/probes/s19_out/over-by-one.log:172`,
+        `limit.log:172`; 12.30 GB in S18's `safety-s2.log`), against 12.43 / 12.79 before the tier existed and
+        6.79–7.26 with it filled. No `Non-expert RAM tier` line in either load. On Qwen3-Next / MiniMax /
+        DeepSeek the tier budget is 0 by construction (the arena binds). Still open elsewhere, not this item:
+        the loader's pinned double buffers stay allocated for the life of a MoE load (S14 3a's lead).
+      - **(vi) REPRODUCED at HEAD on the real classes** (scratch test, real `DecodeGraphRunner` +
+        `ExpertVRAMCache` + `cap_tier_after_admission_eviction`): charge 2 MiB to a 1 GiB tier, cap to 0, disable
+        → budget back at 1,073,741,824. `decode_graphs.py:732` is the ONLY server-reachable absolute restore
+        (`set_budget` has four callers; the batch path's `budget_bytes = _saved_budget` at
+        `vaayu_base.py:7118` saves after admission and is N>1 only). With a tier present `graph_pool_charge`
+        returns only "tier" or "refuse", so `_charged` is exactly what the tier gave up and the row's fix
+        candidate is sound; `test_disabling_refunds_the_tier` sets `_tier_before` by hand with `_charged` 0
+        and must be updated with the fix.
+      - **(vii) `[bug]` NEW 2026-10-02, found by (i)'s over-by-one run — the over-limit refusal names the wrong
+        ceiling.** On a load whose `max_seq_len` is 33,155, a 33,156-token request is refused with `Context of
+        33156 tokens does not fit in 6.63 GiB of free VRAM. The largest context that fits at this configuration
+        is max_seq_len=52222.` (and "lower max_seq_len to 52222 or less"). `_assert_context_fits` passes
+        `s_max=plan.s_max` (`vaayu_base.py:4199`), the uncapped solve; `_too_big_message` (`vram_plan.py:636`)
+        corrects the ceiling only when `headroom < free_vram` (bug 11a's fix) — with reusable pool, headroom
+        (9.43 GiB) ≥ free (6.63 GiB) and the other branch prints `s_max` unqualified. Cause read, not tested.
+        Text only: the refusal is correct. Reach: the server clamps `max_tokens` to the window, so this exact
+        request cannot be sent through it; the same branch runs for any engine refusal with reusable pool
+        (tier cannot cover the shortfall, external pressure). **FOLDED INTO S19 by the user 2026-10-02 as plan
+        Task 7.** Dry-run found the same wrong ceiling in a third case (headroom EQUAL to free VRAM: expert
+        cache, no pool) and in the levers line of every case; and that admission hands the message the bare
+        headroom, which omits what it would evict from the tier. Task 7's dry-run: RED 11 failed, GREEN 214
+        passed, two mutants killed, suite 3536 (floor + 11).
+      - **Plan code DRY-RUN 2026-10-02 (throwaway detached worktree at `a99a911`, removed; NOTHING applied to
+        the repo yet):** tests only → `17 failed, 179 passed` over the six touched test files, exactly the
+        predicted failures; with the fixes → `330 passed`; N4 mutant `2 failed` (and `2 passed` against the old
+        test, confirming the gap), N5 mutant `3 failed, 64 passed`; full suite `3554 passed, 20 skipped`
+        (235.24 s; floor 3525 + 29). **Remaining:** apply Tasks 1–3 on branch `s19-reliability-sweep`, Task 5
+        ((iii): measured, decision pending), Task 6 (gates, ledger). RESULTS so far:
+        `docs/2026-10-02-S19-reliability-sweep-RESULTS.md`.
+      - **Plan tasks** (`docs/superpowers/plans/2026-10-02-S19-reliability-sweep.md`):
+        - [ ] Task 0 — branch `s19-reliability-sweep`, baseline suite
+        - [ ] Task 1 — (vi) refund relative to the current budget; N4 NaN-fill; N5 admission range pin
+        - [ ] Task 2 — (ii) `prefix_match_tokens` in `requests.jsonl` + docs
+        - [ ] Task 3 — (iv) `_detect_moe` reads `ExpertOffsetIndex.expert_count_in`
+        - [x] Task 4 — (i) + (v) on device (done at HEAD, above)
+        - [x] Task 5 — (iii) warm-up census: MEASURED on DeepSeek / Qwen3-Next / MiniMax / gpt-oss / Llama-1B
+              (above); decision taken by the user: ACCEPT
+        - [ ] Task 7 — (vii) the refusal names the ceiling it was refused on (runs before Task 6)
+        - [ ] Task 6 — suite, six on-device gates, RESULTS, ledger, final review
       - (i) **gpt-oss at its advertised limit.** *[2026-10-02, S18 step 2: a 33,108-token request (33,100 + 8 new, max_seq_len 33,155) was admitted and completed with the tier full — peak over a0 7.27 GiB vs reserve 9.49 GiB, TTFT 123.8 s, no OOM; `safety-s2.log`.]* A load advertises `max_seq_len` 33,155; nothing above 32,500
         has been run. At 32.5k the request was admitted with peak 8.60 GiB against a 9.49 GiB reserve (planner
         9.39), but the planner's margin over the measured peak shrinks with length: 1.09 / 1.03 / 0.90 / 0.79 GiB
