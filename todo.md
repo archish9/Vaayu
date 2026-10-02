@@ -292,7 +292,7 @@ line under the S17 row).
         not run — 15.9 ms on the clean figure, up to ~20 ms on the synchronized upload rate); the 30.7k
         24-layer figure; tier survival across a long cold prefill (bounded by the empty-per-request case).
       - **§8 (spike):** no knob, no code; measured in the server's mode at N=1; nothing banked.
-      - [~] **Step 2 — build (brainstorm → spec → plan with the USER).** **Approach A APPROVED by the
+      - [x] **Step 2 — build: BUILT, MEASURED, awaiting the final review and merge (2026-10-02, branch `s18-gptoss-vram-tier`, HEAD `a34b228`); durable summary after the task list.** (brainstorm → spec → plan with the USER) **Approach A APPROVED by the
             USER 2026-10-02 (per-expert LRU through the existing `ExpertVRAMCache` + `_vram_tier_visit`,
             D2D into the shared buffer; subagent-driven execution). Spec WRITTEN, awaiting the user's
             review: `docs/superpowers/specs/2026-10-02-S18-gptoss-vram-tier-design.md` (gitignored).**
@@ -317,22 +317,70 @@ line under the S17 row).
             verdict, the branch ABBA is Task 5:** load prints `Expert VRAM cache budget 2.19 -> 1.77 GB
             (~133 experts)`; decode median 80.6 → 66.2 ms (−14.5 ms, 18.0 %); ON hit rate 38.0–39.6 %
             (replay said 39.0 %); logits bit-identical 39/39 in every arm; cold TTFT 2.994 → 2.772 s.
-            - [ ] T0 branch `s18-gptoss-vram-tier`, commit this ledger edit
-            - [ ] T1 tier in the routed visit (`routed_fused3d.py`; 20 RED → 30 GREEN; 4 mutants)
-            - [ ] T2 charge the routed buffers to the tier budget + load wiring (14 tests)
-            - [ ] T3 admission evicts from the tier before refusing (9 RED → 27 GREEN; 3 mutants)
-            - [ ] T4 full suite FOREGROUND (expected 3484)
-            - [ ] T5 gpt-oss on device: load line, 2k, 8k ABBA ×2 (STOP RULE), 30.7k, 256-token churn
-                  check, SAFETY at 32.5k with the tier full, `s13` stock check, server gate
-            - [ ] T6 cross-model: Qwen3-Next accumulator + server gate, MiniMax accumulator
-            - [ ] T7 RESULTS, CLAUDE.md §0/§5 rows, product docs, ledger close; then the controller's
-                  final review and the merge (USER's word)
+            - [x] T0 branch `s18-gptoss-vram-tier`, ledger edit committed (`cb66bd2`)
+            - [x] T1 tier in the routed visit (`routed_fused3d.py`; `fe76cfe`): 30 tests in `tests/test_routed_fused3d_tier.py`; 4 mutants killed; task review clean
+            - [x] T2 charge the routed buffers to the tier budget + load wiring (`ff6559b`): 14 tests in `tests/test_routed_fused3d_tier_budget.py`; load line `budget 2.19 -> 1.77 GB (~133 experts)`; task review clean
+            - [x] T3 admission evicts from the tier before refusing (`1b2966e`, fix round `a34b228`): 39 tests in `tests/test_admission_tier_eviction.py` (plan said 27; the fix round added 12); 3 mutants killed, plus `evict_until_free(need)` after the fix; opus review found the eviction outside the guard, fixed
+            - [x] T4 full suite FOREGROUND: `3496 passed, 20 skipped` in 228.53 s at `a34b228` (plan expected 3484; floor before the branch 3413, new tests 83)
+            - [x] T5 gpt-oss on device: load line, 2k, 8k ABBA ×2 (STOP RULE not tripped: 15.74 / 15.91 %), 30.7k (10.75 %), 256-token churn check (219 forwards, 8.00 GiB reserved in all arms), SAFETY at 32.5k and at 33,108 with the tier full (both completed), `s13` stock check 51/51 and 64/64, server gate 9 passed
+            - [x] T6 cross-model: Qwen3-Next accumulator 8 passed + server gate 9 passed; MiniMax accumulator 8 passed (and again with `-s`: no budget-charge line, 0 admission evictions)
+            - [x] T7 RESULTS (`docs/2026-10-02-S18-step2-RESULTS.md`), CLAUDE.md §0/§5 rows, product docs checked (nothing made false), ledger; the controller's final review and the merge (USER's word) remain
             Design questions as they stood: (a) **DECIDED by the USER 2026-10-02: fixed tier at the real budget now
             (×1.20 at 8k, no context cost, no knob); the elastic tier — occupy idle reserve, give it back
             under prefill headroom, the 6–8 GiB rows at 8k, safety unproven — is a LATER, separately
             measured row; the context-for-speed knob was not picked;** (b) layout — per-expert device
             tensors copied D2D into the shared buffer vs per-layer buffers vs both; (c) policy — plain LRU
             (46 %) vs frequency-aware (a hindsight-static hottest 21 % carries 51–61 %, unpriced).
+      **STEP 2 BUILT AND MEASURED 2026-10-02 (branch `s18-gptoss-vram-tier`, HEAD `a34b228`, NOT yet reviewed
+      or merged).** RESULTS `docs/2026-10-02-S18-step2-RESULTS.md` (gitignored); raw `plans/probes/s18_out/`
+      (`ab-*.log`, `safety-s1/s2.log`, `s13.log`, `gate-*.log`); probe `plans/probes/s18_ab.py` (OFF =
+      `_vram_cacheable_layers = set()` in the same tree, arms off,on,on,off, 63 decode forwards, median after
+      8 warm tokens). **DURABLE SUMMARY:**
+      - **Verdict: WIN against the 5 % stop rule.** Decode OFF → ON (ms/token, median): 2k 80.682 → 67.098
+        (16.84 %); **8k r1 93.887 → 79.106 (15.74 %), r2 94.119 → 79.147 (15.91 %)**; 30.7k 144.683 → 129.124
+        (10.75 %). All-token mean 8k 94.148 → 76.133 (19.13 %). Step 1 projected 12.3 ms = 13.0 % at 8k for 133
+        experts; measured 14.8–15.0 ms at 121 experts. ON tier hit rate 37.1–40.5 % (replay: 39.0 % at 133).
+      - **Load:** `Expert VRAM cache budget 2.19 -> 1.77 GB (~133 experts): the routed fused-3D buffers
+        (423567360 B) were allocated from it after it was sized.` The pre-charge budget varied per load with
+        free VRAM (2.19 → 1.91 GB; 111–133 experts charged) because the desktop's VRAM use moved 328 → 536 MiB;
+        step 1's seven loads all read 2.19 GB.
+      - **Bit-identity:** OFF vs ON `63/63; max|d| 0`, ids identical, at 2k, 8k ×2, 30.7k; 219/219 on the
+        220-token run. Stock with a pinned date and full-length `DynamicCache()` (`s13`): G vs TF 51/51, TF vs
+        B 64/64.
+      - **TTFT:** 8k cold 14.935 → 13.846 s (7.29 %; r2 7.26 %), 2k cold 2.954 → 2.718 s (7.99 %); 8k HIT
+        0.180 vs 0.178 s (no difference beyond spread). 30.7k HIT: ON 0.052 s slower with a 0.173 s spread
+        between its arms — unexplained, not investigated.
+      - **Safety with the tier full:** s1 (32,500 tokens) `ADMITTED AND COMPLETED`, peak over a0 7.18 GiB vs
+        reserve 9.49 GiB, admitted without the new path (predicted 9.44 fit), 115 prefill evictions. **s2
+        (33,100 + 8 = 33,108 of max_seq_len 33,155):** free 6.67 + pool 2.77 = 9.44 vs reserve 9.49 →
+        `admission: evicted 0.06 GiB of the expert VRAM tier to admit 33108 tokens (predicted peak 9.49 GiB)`;
+        `ADMITTED AND COMPLETED`, peak over a0 7.27 GiB, TTFT 123.8 s, 116 prefill evictions, no OOM. Without the
+        admission change it would have been refused. Long run: `reserved at end` 8.00 GiB in all arms.
+      - **Gates:** suite `3496 passed, 20 skipped` (floor was 3413; **new floor 3496**); gpt-oss server gate
+        9 passed (load `budget 1.97 -> 1.55 GB (~116 experts)`); Qwen3-Next accumulator 8 + server gate 9 passed
+        (no budget-charge line, 0 admission evictions); MiniMax accumulator 8 passed (no charge line, 0
+        evictions, seen with `-s`).
+      - **NOT verified / not run:** fused-EXL3 (no checkpoint; its code untouched); dense (no code touched, no
+        gate exists); DeepSeek-V4 (shares the admission code; gate not in the plan's bars, not run);
+        capability-9 GPUs (none here); N>1 (unreachable through the server; the batch giveback arm is
+        unit-reviewed only); requests above 33,108 tokens.
+      - **§8:** (1) no knob — the budget is derived and charged at load, admission eviction is automatic; (2)
+        plumbed at load and in the forward every gpt-oss request runs; (3) reachable at N=1 in the server's
+        default mode on every gpt-oss decode token — the server gate is the proof; (4) nothing banked.
+      - [ ] **Elastic tier (the USER's "later, separately measured" row).** Step 1's curve: 243 experts 65.1 %,
+            324 → 79.0 %, 405 → 88.1 %, 486 → 93.7 %, all 768 → 100 %; budget above the real one costs context
+            (+1 GiB → 28,152, +2 GiB → 23,033 by the planner's inverse) unless the tier borrows idle reserve and
+            gives it back under prefill headroom (safety unproven). Today's tier is 111–133 experts.
+      - [ ] **Known gap (S18 step 2): `ENABLE_EXPERT_USAGE=True` (server default False) records no routes on
+            gpt-oss** — the routed forward never calls `_maybe_record_usage` while its tier evictions are now
+            attributed, so the usage report is not meaningful on this model.
+      - [ ] **Open (S18 step 2):** the tier budget moves with whatever else holds VRAM at load (111–133 experts
+            this session); 30.7k HIT TTFT ON 0.052 s slower, unexplained. Deferred review minors for the final
+            review: admission's batch-giveback arm unpinned by tests (N>1 only); an eviction followed by a
+            refusal prints nothing about the tier having been cut; the load-wiring test pins order by source
+            text only; FakeTier frees exactly the deficit while the real method frees whole entries; the
+            admission tests skip without CUDA; two cosmetic items in the tier test file / the clone's leaf-name
+            source.
       - [ ] **Lead (S18 step 1): eager attention is the larger cost at long context on gpt-oss** — 75.3 ms
             of the synchronized 30.7k token (45 %) against 60.2 ms of upload; after a full tier the 30.7k
             floor is 96.3 ms. Unpriced as a lever.
@@ -362,7 +410,7 @@ line under the S17 row).
       kernel's index expects it. **§8 (expected):** no knob; reachable on every gpt-oss decode token at N=1.
 - [ ] **S19 — server-reachable reliability sweep.** Each: reproduce, TDD, fix or record why not; one decision per
       item, split an item out if it grows.
-      - (i) **gpt-oss at its advertised limit.** A load advertises `max_seq_len` 33,155; nothing above 32,500
+      - (i) **gpt-oss at its advertised limit.** *[2026-10-02, S18 step 2: a 33,108-token request (33,100 + 8 new, max_seq_len 33,155) was admitted and completed with the tier full — peak over a0 7.27 GiB vs reserve 9.49 GiB, TTFT 123.8 s, no OOM; `safety-s2.log`.]* A load advertises `max_seq_len` 33,155; nothing above 32,500
         has been run. At 32.5k the request was admitted with peak 8.60 GiB against a 9.49 GiB reserve (planner
         9.39), but the planner's margin over the measured peak shrinks with length: 1.09 / 1.03 / 0.90 / 0.79 GiB
         at 8k / 16k / 30.7k / 32.5k, and ~33.1k is the KV-doubled regime the plan charges but never ran. Run one
