@@ -4113,6 +4113,34 @@ class VaayuBaseModel(GenerationMixin):
         need = predict_peak_vram(shape, int(n_tokens))
         if need <= headroom:
             return need
+        # S18: a full VRAM expert tier is not a reason to refuse. The tier fills
+        # lazily to its budget, and bytes the process allocates for good after the
+        # tier was sized are in nobody's budget -- so with the tier full, free +
+        # pool can sit under the reserve and a request the plan advertises would be
+        # refused, though it is admitted with the tier empty. The tier is a cache:
+        # evict what covers the shortfall and decide again. The reserve clamp in
+        # admission_headroom is untouched, so nothing over the reserve is admitted,
+        # and a prefill pass cannot refill the tier (it only reads it).
+        _tier = getattr(self, "_expert_vram_cache", None)
+        _short = need - (int(free_vram) + max(0, int(reusable_pool)))
+        _cap = int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes))
+        if need <= _cap and 0 < _short <= int(getattr(_tier, "current_usage", 0) or 0):
+            _freed = _tier.evict_until_free(int(free_vram) + _short)
+            try:
+                free_vram, _ = torch.cuda.mem_get_info()
+                reusable_pool = (torch.cuda.memory_reserved()
+                                 - torch.cuda.memory_allocated())
+            except Exception:
+                pass                # D3: keep the pre-eviction readings and refuse
+            headroom = admission_headroom(
+                free_vram=free_vram, plan=plan, expert_cache_active=True,
+                reusable_pool=reusable_pool,
+                expert_giveback_bytes=expert_giveback_bytes)
+            if need <= headroom:
+                print(f"[Vaayu-VRAM] admission: evicted {_freed / 1024 ** 3:.2f} GiB of the "
+                      f"expert VRAM tier to admit {int(n_tokens)} tokens (predicted peak "
+                      f"{need / 1024 ** 3:.2f} GiB); it refills during decode.")
+                return need
         # The floor the load-time plan actually reserved one of (an expert,
         # for MoE; nothing, for dense) -- NOT a literal 0, or a MoE refusal
         # prints "min_resident=0.00 GiB" even though one expert is resident.
