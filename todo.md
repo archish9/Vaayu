@@ -643,7 +643,50 @@ line under the S17 row).
         or re-mint failure. Fix candidate: `tier.set_budget(tier.budget_bytes + self._charged)`. RED first.
         Same sweep: N4 (NaN-fill the buffer in the held-entry test) and N5 (pin the range re-derivation
         through admission), both test-only.
-- [ ] **S20 — S11-L2: M>1 packed prefill kernel.** The top TTFT lever on Qwen3-Next: S7 built the packed
+- [~] **S20 — S11-L2: M>1 packed prefill kernel.** **STARTED 2026-10-02 at HEAD `1c8f122`, branch
+      `s20-packed-prefill-kernel`. Step 0 DONE (below); design APPROVED by the USER section by section 2026-10-02;
+      spec written, awaiting the USER's review before the plan.**
+      - [~] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
+        (gitignored; the summary is here). **USER decisions:** quality bar = PREFILL-mode perplexity band (D6
+        method: ≥ 2-chunk teacher-forced prompt per calibration text, stock vs kernel alternating in one load, null
+        draws n ∈ {0, ±1, ±2, 4} on the routing weights, PASS per text |Δmean| ≤ pooled sd), greedy ids recorded
+        not required; approach A = tensor-core grouped GEMM over S7's packed blobs (rejected: B multi-token GEMV,
+        CUDA-core-bound, ≈ 2–3 s worse at cold@8k; C batched dequant + cuBLAS, saves only part of construct).
+        **Design in one line each:** new branch in `_make_fused_sparse_forward` for every `_moe_prefill_pass` call,
+        after S7's unchanged blob collection; host builds expert-grouped rows padded to BLOCK_M = 16 from
+        `compute_expert_dispatch`, a per-block blob pointer table and a per-token expert-id slot order (one pinned
+        H2D, no new sync); three Triton launches — `gate_up` (in-register int4 → bf16 exactly as stock, `tl.dot`,
+        bf16 rounds, SiLU · up), `down` (`tl.dot`, bf16, `mul_rn` × routing weight → fp32 contribution per (token,
+        slot)), `reduce` (fp32 sum in ascending expert id = `accumulate_expert_outputs`, bit-exact); the ONLY
+        difference from stock is the fp32 dot order inside the GEMMs; output independent of arrival order and
+        residency; own install verdict + flag `_packed_moe_prefill_kernel` (a refusal keeps S7's decode kernel);
+        per-call fallback to the per-slot loop for mixed geometries; geometry from the blob (§5), tiles from an
+        sm_120 sweep; VRAM scratch ≈ today's `_contribs` (≈ 42 MB / 512-token chunk), plan unchanged; one launch
+        after the layer-call's loads (kernel ≈ 1–3 ms, so the lost overlap is bounded). Expected kernel cost ≈ 45 ms
+        of MoE over a HIT@8k, ≈ 1.3 s over a cold@8k. **Bars:** TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k,
+        OFF = clear `_packed_moe_prefill_kernel` after load; the prefill-ppl band; suite (3568), accumulator ×2,
+        Qwen3-Next server gate, Qwen3-Next prefix-reuse gate. **Stop rules:** saving < 5 % HIT@8k AND < 10 % cold@8k
+        → revert, REFUTED; band FAIL → do not ship. **§8 (expected):** no knob; plumbed at S7's install site;
+        reachable on every Qwen3-Next prefill at N=1 (cold + HIT diff); M>1 non-prefill stays stock (unreachable).
+      - [x] **Step 0 — TTFT census at HEAD `1c8f122`, server mode (2026-10-02).** Probe `plans/probes/s17_ttft.py`
+        (`freeze_after_load()`, fixed prompt snapshot), `BALLAST_GB=25`, out `plans/probes/s20_out/`
+        (`s11-ttft-u1.json` REPS=2 unprofiled, `s11-ttft-p1.json` one profiled session per L); both exit 0, every HIT
+        fired and reproduced. **TTFT (S11 in brackets): cold 10.27 (10.41) / 28.04 (27.58) s, HIT 2.99 (3.12) / 2.92
+        (3.04) s at 2k / 8k.** Profiled MoE share of prefill 92.6–96.1 %; inside moe, construct / gemm / scatter / h2d =
+        HIT@8k 0.256 / 0.184 / 0.106 / 0.224, cold@8k 0.303 / 0.267 / 0.166 / 0.046. **L2 re-priced (S11's formula,
+        construct + scatter): HIT@8k 1.004 s = 34.4 %, HIT@2k 1.038 s = 34.7 %, cold@2k 4.09 s = 39.8 %, cold@8k
+        12.18 s = 43.4 % — stop rule (< 5 % HIT@8k AND < 10 % cold@8k) NOT met → build.** Upper figure if the kernel
+        also removes the per-expert GEMM launches: 1.52 s = 51.9 % HIT@8k, 19.1 s = 68.2 % cold@8k. **Disk floor (read
+        GB / 7.1 GB/s): HIT@8k 1.23 s, cold@8k 3.28 s** — a HIT@8k cannot go below ≈1.2–1.3 s without S11-L6. L6
+        re-priced: HIT@8k stall 0.408 s = 14.0 %, HIT@2k 0.490 s = 16.4 %. **Decode half (L3, L7) NOT re-measured:**
+        `s11_decode.py` predates S12's decode graphs (it wraps module forwards the graphs now capture) and does not
+        freeze; L3 / L7's seams were not edited since S11 (`git log a1f9e05..HEAD -- vaayu/moe_patch.py`: S12 graph
+        pre-routing, S17 prefill, S18 admission only), so their S11 ms are carried, re-expressed against S12's 44.27 ms
+        token: L3 4.81–5.50 ms = 10.9–12.4 %, L7 ≤ 7.08 ms = ≤ 16.0 % (perfect prediction). Per HIT@8k turn + 256
+        tokens: L2 1.0–1.5 s, L3 1.2–1.4 s, L7 ≤ 1.8 s; every cold turn adds 4–19 s to L2 only → **L2 still leads.**
+        **Ruled out on device:** `torch._grouped_mm` (bf16, sm_120) is a per-group loop here — 3.13 vs 3.27 ms for the
+        F.linear loop on 370 experts / 5,591 rows, bit-equal to it — so no bit-identical fast grouped GEMM exists.
+      The top TTFT lever on Qwen3-Next: S7 built the packed
       expert kernel for M=1 (decode) and BANKED M>1, so prefill chunks and speculative verify still take the
       unpacked path — priced by S11 as `moe_profile.construct` + `scatter`.
       **Ceilings (S11, 2026-09-28):** ≤0.997 s = **32.8 % of a HIT@8k TTFT**, ≤11.88 s = **43.1 % of cold@8k**,
