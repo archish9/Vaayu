@@ -1385,3 +1385,50 @@ def test_protected_floor_defeats_the_tiny_kv_trap():
                      position_limit=1_000_000, layer_slack=kw["layer_slack"],
                      reserve_floor=floor)
     assert plan.pinning_budget >= 7.5 * GB               # (c) the pin budget survives
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "qwen3-235b"])
+def test_a_refusal_with_reusable_pool_names_the_ceiling_it_was_refused_on(name):
+    """S19 (vii): with memory the process already holds and can reuse, a request may
+    spend MORE than the driver reports free. The message then printed the driver's
+    figure as the budget and the load-time s_max as the ceiling: "does not fit in
+    6.63 GiB of free VRAM. The largest context that fits ... is max_seq_len=52222",
+    refusing 33156 tokens on a load that advertises 33155."""
+    sh = shape_for(name)
+    p = _plan(name, reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    budget = p.reserve_bytes - 64 * MB
+    free = budget - 2 * GB                              # the rest is reusable pool
+    ceiling = _largest_s_within_budget(sh, budget)
+    assert 0 < ceiling < p.s_max, "premise: the budget binds below the load-time solve"
+    msg = _too_big_message(requested=ceiling + 1, s_max=p.s_max, free_vram=free,
+                           shape=sh, min_resident=EXPERT_BYTES, headroom=budget)
+    assert f"max_seq_len={ceiling}" in msg
+    assert str(p.s_max) not in msg, "the load-time ceiling is not what was refused on"
+    assert f"{budget / GB:.2f} GiB" in msg, "must name the budget the request had"
+    assert f"{free / GB:.2f} GiB" in msg, "must still report what the driver says is free"
+
+
+@pytest.mark.parametrize("name", ["minimax-m2.7", "qwen3-235b"])
+def test_the_lever_names_the_same_ceiling_as_the_opening(name):
+    """ "Lower max_seq_len to <load-time s_max> or less" under an opening that names a
+    smaller runtime ceiling is advice that does not fix the refusal."""
+    sh = shape_for(name)
+    p = _plan(name, reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    for free in (int(14 * GB), p.reserve_bytes - 2 * GB):       # budget under / over free
+        ceiling = _largest_s_within_budget(sh, p.reserve_bytes)
+        assert 0 < ceiling < p.s_max
+        msg = _too_big_message(requested=ceiling + 1, s_max=p.s_max, free_vram=free,
+                               shape=sh, min_resident=EXPERT_BYTES,
+                               headroom=p.reserve_bytes)
+        assert f"lower max_seq_len to {ceiling} or less" in msg
+
+
+def test_a_ceiling_is_never_offered_above_the_load_time_one():
+    """s_max can be capped by the model's position limit, below what the bytes allow."""
+    sh = shape_for("minimax-m2.7")
+    budget = int(12 * GB)
+    assert _largest_s_within_budget(sh, budget) > 2048, "premise"
+    for free in (int(14 * GB), int(8 * GB)):
+        msg = _too_big_message(requested=4096, s_max=2048, free_vram=free, shape=sh,
+                               min_resident=EXPERT_BYTES, headroom=budget)
+        assert "max_seq_len=2048" in msg
