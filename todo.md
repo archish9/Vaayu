@@ -689,7 +689,13 @@ line under the S17 row).
               - Profiled ON arm (`s11-ttft-p-on.json`, exit 0), share of sec.moe: construct 0 and scatter 0 on all four P turns. P-2048-c moe 6.842s: h2d 24.07 %, gemm 11.67 %, disk_load 43.07 %. P-2048-h moe 2.826s: h2d 27.88 %, gemm 3.92 %, disk_load 46.72 %. P-8192-c moe 10.600s: h2d 17.23 %, gemm 29.25 %, disk_load 34.48 %. P-8192-h moe 2.605s: h2d 30.93 %, gemm 4.32 %, disk_load 41.75 %.
               - Long-context 40,960 (both exit 0, 0 "out of memory"): OFF cold TTFT 127.112s, peak 14.02GB; ON cold TTFT 41.887s, peak 14.02GB; HIT OFF 3.663s / ON 3.132s, peak 13.44GB both; out_ids identical OFF vs ON on both U0 turns. 65,536 NOT covered (the fixed prompt builds 40,960 at most).
               - Stop rule (HIT@8k < 5.00 % AND cold@8k < 10.00 %): 16.67 % and 55.09 % -> PASS, proceed to T5.
-        - [ ] T5 prefill-ppl band
+        - [x] T5 prefill-ppl band
+              - Measured at commit 4b5f307, `plans/probes/s20_quality.py` (exit 0, 450 s wall, 36 draw lines, every one chunks=3; calls: kernel arm {'kernel': 144, 'precise': 0} x12, precise arm {'kernel': 0, 'precise': 144} x12, stock arm {'kernel': 0, 'precise': 0} x12). Raw: `plans/probes/s20_out/quality.log`, `s20-quality.json` (gitignored; recomputed from the json, matches the log).
+              - Scope: 1,536-token prompts (3 chunks), 6 null draws, prefix cache as the server sets it, Qwen3-Next only.
+              - Delta sign convention: kernel - stock. Bar (USER's): per text |mean(kernel) - mean(stock)| <= pooled sd(kernel, stock), pooled sd = sqrt((sd_kernel^2 + sd_stock^2)/2).
+              - code: stock 5.464848 (sd 0.003966), kernel 5.465410 (sd 0.008951), delta +0.000562 ppl (+0.0103 %), pooled sd 0.006923 -> PASS. Context precise 5.460360 (sd 0.005596), |kernel-precise| 0.005051, |stock-precise| 0.004489.
+              - prose: stock 5.800255 (sd 0.006385), kernel 5.800973 (sd 0.007771), delta +0.000718 ppl (+0.0124 %), pooled sd 0.007112 -> PASS. Context precise 5.800009 (sd 0.009240), |kernel-precise| 0.000964, |stock-precise| 0.000246.
+              - `[s20q] VERDICT PASS`. The `precise` arm is context, not a gate.
         - [ ] T6 gates (suite, accumulator ×2, server, prefix-reuse), RESULTS, ledger close, final review
       - [x] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
         (gitignored; the summary is here). **USER decisions:** quality bar = PREFILL-mode perplexity band (D6
