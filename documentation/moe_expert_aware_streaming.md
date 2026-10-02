@@ -208,7 +208,7 @@ flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux
 only supported for Hopper GPUs"* at the first token — so Vaayu skips flash for it and runs
 eager attention, which is what stock transformers picks for it too.
 
-### 3.4c Fused decode kernel for pack-quantized experts — `vaayu/packed_expert_kernels.py`
+### 3.4c Fused kernels for pack-quantized experts — `vaayu/packed_expert_kernels.py`
 
 A pack-quantized checkpoint (compressed-tensors `pack-quantized`, e.g. an AWQ/GPTQ int4
 build) whose experts take the non-EXL3 fused forward is served, for every **one-token**
@@ -219,14 +219,39 @@ bytes (the same entries the VRAM expert cache holds), so nothing extra is stored
 - **When it is on:** CUDA with Triton, experts whose activation is SiLU, and a load-time
   check on one real expert that the kernels agree with the per-expert path. The load log
   says `[Vaayu] fused packed-expert decode kernel on N MoE layers (B-bit, group G)`.
-- **When it is off:** CPU compute, no Triton, EXL3 or dense-expert checkpoints, any
-  multi-token call (prompt prefill, speculative verify) — these use the per-expert path,
-  unchanged. A refusal that points at a real problem prints a `WARNING`.
+- **When it is off:** CPU compute, no Triton, EXL3 or dense-expert checkpoints, and
+  multi-token calls outside prompt prefill (speculative verify, batched decode) — these
+  use the per-expert path, unchanged. A refusal that points at a real problem prints a
+  `WARNING`.
 - **Numerics:** every intermediate is rounded where the per-expert path rounds; outputs
   differ from it only in the last bit of rare elements (measured 99.87 % identical on
   Qwen3-Next). Expert contributions are summed in expert-id order either way, so decoding
   stays deterministic regardless of which experts were cached.
 - There is no setting for it: it is on wherever it passes its check.
+
+**Prompt prefill** — every multi-token prefill call, a cold prompt and a prefix-reuse diff
+alike — is served by three grouped kernels per MoE layer call instead of a dequantize,
+three small matrix products and a scatter per routed expert. The call's (token, expert)
+pairs are grouped by expert into 16-row blocks; two kernels compute the gated MLP for
+every block straight from the packed bytes, and a third sums each token's experts in
+expert-id order.
+
+- **When it is on:** as above, plus its own load-time check. The load log says
+  `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)`.
+- **When it is off:** when the model's dimensions leave no tile a tensor-core product can
+  take, or when one layer's whole expert set would not fit beside the prefill's working
+  memory (the kernels hold every expert a call uploaded until they launch). Both print a
+  `WARNING` with the reason; the one-token decode kernel is unaffected and prefill keeps
+  the per-expert path. A layer the kernels cannot take (unquantized experts, mixed
+  formats) runs the per-expert arithmetic for that call.
+- **Numerics:** every intermediate is rounded where the per-expert path rounds. The
+  results still differ from it, because the per-expert path's half-precision matrix
+  product is not correctly rounded at every size (at Qwen3-Next's shape, 2 to 32 rows give
+  about 58 % correctly rounded outputs); the kernels measure 99.7–99.9 % and are the more
+  accurate side. A token's result no longer depends on which other tokens share its call,
+  and expert contributions are summed in expert-id order, so prefill stays deterministic
+  regardless of which experts were cached.
+- There is no setting for it.
 
 ### 3.5 Router Gate Pinning — `vaayu/vaayu_base.py`
 
@@ -273,6 +298,8 @@ Dense models (is_moe=False): steps 2 (Phase 1.5), 3, 4, 5 are skipped entirely.
 | `[Vaayu-MoE] N MoE blocks patched for sparse streaming` | Patching complete |
 | `[Vaayu] fused packed-expert decode kernel on N MoE layers (B-bit, group G)` | One-token decode uses the fused kernels (§3.4c) |
 | `[Vaayu] WARNING: fused packed-expert decode kernel refused (…)` / `not installed: …` | That geometry/model stays on the per-expert path; the reason is in the line |
+| `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)` | Prompt prefill uses the grouped kernels (§3.4c) |
+| `[Vaayu] WARNING: fused packed-expert prefill kernel refused (…)` / `not installed: …` | Prefill stays on the per-expert path; the decode kernel is unaffected; the reason is in the line |
 | `[VAAYU-IO] ... expert_cache=Nhit/Mmiss hit_rate=X%` | Per-token cache stats |
 | `[Vaayu-MoE] warn: no offset for layer=... expert=N` | Expert not in index |
 | `[Vaayu-MoE] prefetch failed ...` | Background prefetch error (non-fatal) |

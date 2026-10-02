@@ -751,4 +751,32 @@ def install_packed_expert_kernels(vaayu_ref) -> bool:
     bits, gs, _roles = blob["geom"]
     print(f"[Vaayu] fused packed-expert decode kernel on {len(blocks)} MoE layers "
           f"({bits}-bit, group {gs})")
+    # S20: the grouped prefill kernels, on their own verdict -- a refusal here leaves the
+    # decode kernel installed.
+    # They launch once per call, so every blob the call uploaded is alive at once: at
+    # worst a layer's whole expert set (the per-slot loop held one). That must fit beside
+    # the call's own scratch inside the headroom prefill keeps free.
+    from .moe_patch import _PREFILL_VRAM_HEADROOM
+    n_experts = int(getattr(getattr(block.moe_module, block.experts_attr), "num_experts", 0))
+    held = n_experts * sum(t.numel() * t.element_size() for t in blob["flat"].values())
+    if not n_experts or held > _PREFILL_VRAM_HEADROOM // 2:
+        print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not installed: one call "
+              f"can hold a layer's {n_experts} experts on the GPU at once "
+              f"({held / 2**30:.2f} GiB), over half the "
+              f"{_PREFILL_VRAM_HEADROOM / 2**30:.2f} GiB prefill headroom; prefill keeps the "
+              f"per-expert path")
+        return True
+    # k "experts" sharing the one real blob, each routed by every token, so each has a
+    # full block and a partial one.
+    tokens = _PF_BLOCK_M + _PF_BLOCK_M // 2
+    eidx = torch.stack([torch.roll(torch.arange(k), t) for t in range(tokens)])
+    xs = (torch.randn(tokens, x.shape[1], generator=gen, device=device) * 0.5).to(dtype)
+    ws = torch.rand(tokens, k, generator=gen, device=device) + 0.1
+    ws = ws / ws.sum(-1, keepdim=True)
+    blobs = {e: blob for e in range(k)}
+    plan = _prefill_plan(eidx)
+    if all(_prefill_checked(xs, eidx, rw, blobs, act_fn, plan) for rw in (ws, ws.to(dtype))):
+        vaayu_ref._packed_moe_prefill_kernel = blob["geom"]
+        print(f"[Vaayu] fused packed-expert prefill kernel on {len(blocks)} MoE layers "
+              f"({bits}-bit, group {gs})")
     return True
