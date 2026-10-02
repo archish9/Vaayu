@@ -235,6 +235,10 @@ three small matrix products and a scatter per routed expert. The call's (token, 
 pairs are grouped by expert into 16-row blocks; two kernels compute the gated MLP for
 every block straight from the packed bytes, and a third sums each token's experts in
 expert-id order.
+Measured on Qwen3-Next-80B int4 (2026-10-02, one stream): time to first token on a cold
+8k-token prompt 27.65 s → 12.42 s, on a cold 2k-token prompt 10.29 s → 6.97 s, and on a
+prefix-reuse turn at 8k 2.99 s → 2.49 s; the remaining time is mostly reading experts
+off disk.
 
 - **When it is on:** as above, plus its own load-time check. The load log says
   `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)`.
