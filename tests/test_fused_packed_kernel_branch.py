@@ -24,14 +24,15 @@ HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K = 64, 64, 8, 2
 BIG = 64 * 1024 * 1024
 
 
-def _cuda_model(tmp_path, *, packed=True, vram_budget=BIG, kernel=True):
+def _cuda_model(tmp_path, *, packed=True, vram_budget=BIG, kernel=True, hidden=HIDDEN,
+                intermediate=INTERMEDIATE):
     if packed:
-        _write_packed_fused_checkpoint(tmp_path, hidden=HIDDEN, intermediate=INTERMEDIATE,
+        _write_packed_fused_checkpoint(tmp_path, hidden=hidden, intermediate=intermediate,
                                        num_experts=NUM_EXPERTS)
     else:
-        _make_fused_checkpoint(tmp_path, num_layers=1, hidden=HIDDEN,
-                               intermediate=INTERMEDIATE, num_experts=NUM_EXPERTS)
-    model = MockFusedModel(num_layers=1, hidden=HIDDEN).to("cuda", torch.bfloat16)
+        _make_fused_checkpoint(tmp_path, num_layers=1, hidden=hidden,
+                               intermediate=intermediate, num_experts=NUM_EXPERTS)
+    model = MockFusedModel(num_layers=1, hidden=hidden).to("cuda", torch.bfloat16)
     idx = ExpertOffsetIndex(str(tmp_path))
     idx.build()
     ref = MockVaayuRef()
