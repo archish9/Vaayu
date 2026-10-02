@@ -173,6 +173,74 @@ def test_an_eviction_that_frees_too_little_still_refuses(name, gpu):
 
 @requires_cuda
 @pytest.mark.parametrize("name", ALL)
+def test_an_eviction_that_raises_is_a_clean_refusal(name, gpu):
+    """D3: the admission guard must never itself be the thing that crashes. The real
+    evict_until_free calls torch.cuda.mem_get_info() and empty_cache() unguarded."""
+    need = need_for(name)
+    gpu["free"] = need - 256 * MB
+    tier = FakeTier(2 * GB, gpu)
+
+    def boom(_free_target_bytes):
+        raise RuntimeError("CUDA error: device lost")
+    tier.evict_until_free = boom
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError):
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_tier_that_cannot_evict_is_a_clean_refusal(name, gpu):
+    need = need_for(name)
+    gpu["free"] = need - 256 * MB
+    tier = types.SimpleNamespace(current_usage=2 * GB)          # no evict_until_free
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError):
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_half_failed_reread_does_not_count_the_pool_twice(name, gpu, monkeypatch):
+    """After the eviction's empty_cache() the old pool is inside the new free figure.
+    If the pool re-read fails, admitting on new-free + old-pool would count it twice."""
+    need = need_for(name)
+    gpu["free"], gpu["pool"] = need - 512 * MB, 256 * MB
+    tier = FakeTier(2 * GB, gpu, lands="driver", fraction=0.5)   # frees half the shortfall
+
+    real_evict = tier.evict_until_free
+
+    def evict_then_break_the_pool_reading(free_target_bytes):
+        freed = real_evict(free_target_bytes)
+        gpu["free"] += gpu["pool"]                              # empty_cache(): pool -> driver
+
+        def reserved_fails(*a, **k):
+            raise RuntimeError("CUDA error")
+        monkeypatch.setattr(torch.cuda, "memory_reserved", reserved_fails)
+        return freed
+    tier.evict_until_free = evict_then_break_the_pool_reading
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError):
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_the_eviction_target_discounts_the_pool(name, gpu):
+    """The shortfall is measured against free + pool, but evict_until_free measures its
+    deficit against driver-free alone -- so the target is free + shortfall, not `need`."""
+    need = need_for(name)
+    pool, short = 256 * MB, 256 * MB
+    gpu["free"], gpu["pool"] = need - pool - short, pool
+    tier = FakeTier(2 * GB, gpu)
+    model = model_for(name, reserve=need, tier=tier)
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.calls == [need - pool], "the eviction target ignored the reusable pool"
+    assert tier.current_usage == 2 * GB - short, "evicted the pool's worth on top"
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
 @pytest.mark.parametrize("tier", [None, object()])
 def test_no_tier_or_one_with_nothing_to_read_refuses_as_before(name, tier, gpu):
     need = need_for(name)

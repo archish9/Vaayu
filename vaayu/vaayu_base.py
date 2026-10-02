@@ -4125,11 +4125,15 @@ class VaayuBaseModel(GenerationMixin):
         _short = need - (int(free_vram) + max(0, int(reusable_pool)))
         _cap = int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes))
         if need <= _cap and 0 < _short <= int(getattr(_tier, "current_usage", 0) or 0):
-            _freed = _tier.evict_until_free(int(free_vram) + _short)
+            _freed = 0
             try:
-                free_vram, _ = torch.cuda.mem_get_info()
-                reusable_pool = (torch.cuda.memory_reserved()
-                                 - torch.cuda.memory_allocated())
+                _freed = _tier.evict_until_free(int(free_vram) + _short)
+                _free_now, _ = torch.cuda.mem_get_info()
+                _pool_now = (torch.cuda.memory_reserved()
+                             - torch.cuda.memory_allocated())
+                # Both or neither: after empty_cache() the old pool is inside the
+                # new free figure, so a new free with the old pool counts it twice.
+                free_vram, reusable_pool = _free_now, _pool_now
             except Exception:
                 pass                # D3: keep the pre-eviction readings and refuse
             headroom = admission_headroom(
