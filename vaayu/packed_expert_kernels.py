@@ -80,6 +80,15 @@ if triton is not None:
             return p.to(tl.pointer_type(tl.float32))
 
     @triton.jit
+    def _deq(words, s, j, BITS: tl.constexpr, ACT: tl.constexpr):
+        """Codes at position `j` of each word, as dequantized weights rounded to the
+        activation dtype (fp32 holding that value): (code - 2^(BITS-1)) * scale."""
+        c = (words >> (j * BITS)) & ((1 << BITS) - 1)
+        # code -> float without an int->float convert: bits of 2^23 + c, minus 2^23.
+        f = (c | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + (1 << (BITS - 1)))
+        return _round(f * s, ACT)
+
+    @triton.jit
     def _dot_rows(pk, sc, rows, v_ptr, k0, K: tl.constexpr, BITS: tl.constexpr,
                   GS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                   ACT: tl.constexpr):
@@ -97,11 +106,8 @@ if triton is not None:
         s = _round(s.to(tl.float32), ACT)
         acc = tl.zeros([BLOCK_N, BKW], tl.float32)
         for j in tl.static_range(PER):
-            c = (words >> (j * BITS)) & ((1 << BITS) - 1)
-            # code -> float without an int->float convert: bits of 2^23 + c, minus 2^23.
-            f = (c | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + (1 << (BITS - 1)))
             v = tl.load(v_ptr + wi * PER + j).to(tl.float32)
-            acc += _round(f * s, ACT) * v[None, :]
+            acc += _deq(words, s, j, BITS, ACT) * v[None, :]
         return tl.sum(acc, axis=1)
 
     @triton.jit
@@ -151,14 +157,6 @@ if triton is not None:
                 c = _round(c, ACT)
             out += c
         tl.store(out_ptr + rows, out)
-
-    @triton.jit
-    def _deq(words, s, j, BITS: tl.constexpr, ACT: tl.constexpr):
-        """Codes at position `j` of each word, as dequantized weights rounded to the
-        activation dtype (fp32 holding that value) -- `_dot_rows`' arithmetic."""
-        c = (words >> (j * BITS)) & ((1 << BITS) - 1)
-        f = (c | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + (1 << (BITS - 1)))
-        return _round(f * s, ACT)
 
     @triton.jit
     def _gate_up_grouped(x_ptr, rows_ptr, tbl_ptr, h_ptr,
@@ -393,28 +391,41 @@ def stock_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
         out += (y * rw[slot:slot + 1]).to(out.dtype)
 
 
-def _verdict(x, pairs, routing_weights, act_fn) -> bool:
-    """Run the kernels AND the stock arithmetic on this call's data; True if they agree."""
-    blob = pairs[0][0]
-    why = _unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
-                       routing_weights.dtype)
+def _agrees(why, x, run_stock, run_kernel, what) -> bool:
+    """True if the kernel agrees with its reference on this call's data. `why` is the
+    caller's unsupported-reason (or None); `run_stock(ref)` / `run_kernel(got)` fill an fp32
+    buffer of `x.shape`. A refusal prints a WARNING naming `what` ("decode" / "prefill")."""
     if why is None:
         try:
             ref = torch.empty(x.shape, dtype=torch.float32, device=x.device)
             got = torch.empty_like(ref)
-            stock_experts_decode(x, pairs, routing_weights, ref, act_fn)
-            _launch(x, pairs, routing_weights, got)
+            run_stock(ref)
+            run_kernel(got)
             err = ((got - ref).norm() / ref.norm().clamp_min(1e-30)).item()
             if not err <= _CHECK_TOL:
-                why = (f"relL2 {err:.2e} vs the stock per-expert loop, "
+                why = (f"relL2 {err:.2e} vs {_REFERENCE[what]}, "
                        f"tolerance {_CHECK_TOL:.0e}")
         except Exception as exc:  # a Triton compile/launch failure
             why = f"{type(exc).__name__}: {exc}"
     if why is None:
         return True
-    print(f"[Vaayu] WARNING: fused packed-expert decode kernel refused ({why}); "
+    print(f"[Vaayu] WARNING: fused packed-expert {what} kernel refused ({why}); "
           f"these experts stay on the stock per-expert path")
     return False
+
+
+_REFERENCE = {"decode": "the stock per-expert loop",
+              "prefill": "the per-expert loop with fp32-summed GEMMs"}
+
+
+def _verdict(x, pairs, routing_weights, act_fn) -> bool:
+    """Run the kernels AND the stock arithmetic on this call's data; True if they agree."""
+    blob = pairs[0][0]
+    why = _unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
+                       routing_weights.dtype)
+    return _agrees(why, x,
+                   lambda ref: stock_experts_decode(x, pairs, routing_weights, ref, act_fn),
+                   lambda got: _launch(x, pairs, routing_weights, got), "decode")
 
 
 def _checked(x, pairs, routing_weights, act_fn) -> bool:
@@ -533,7 +544,7 @@ def _down_g(h, tbl, rows, n_blocks, routing_weights, geom, sc, y=None):
     bits, gs, _roles = geom
     lay = _layout(geom)
     inter, hid = lay["gate"][2], lay["gate"][3]
-    rw = routing_weights.reshape(-1)
+    rw = routing_weights.reshape(-1).contiguous()
     if y is None:
         y = torch.empty(h.shape[0], hid, dtype=torch.float32, device=h.device)
     bn = _pow2_divisor(hid, _PF_DN_BLOCK_N)
@@ -565,7 +576,12 @@ def _prefill_launch(x, eidx_cpu, routing_weights, blobs, out, plan=None) -> None
     tbl, rows, order, n_blocks = _prefill_tables(eidx_cpu, plan, blobs, x.device)
     h = _gate_up_g(x, tbl, rows, n_blocks, top_k, geom, sc)
     y = _down_g(h, tbl, rows, n_blocks, routing_weights, geom, sc)
-    _reduce(y, order, out, top_k)
+    if out.is_contiguous():
+        _reduce(y, order, out, top_k)
+    else:
+        dense = torch.empty(out.shape, dtype=torch.float32, device=out.device)
+        _reduce(y, order, dense, top_k)
+        out.copy_(dense)
 
 
 def _linear_fp32(a, w):
@@ -610,24 +626,11 @@ def _prefill_verdict(x, eidx_cpu, routing_weights, blobs, act_fn, plan) -> bool:
     blob = blobs[int(plan[1][0])]
     why = _prefill_unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
                                routing_weights.dtype)
-    if why is None:
-        try:
-            ref = torch.empty(x.shape, dtype=torch.float32, device=x.device)
-            got = torch.empty_like(ref)
-            stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, ref, act_fn,
-                                  linear=_linear_fp32)
-            _prefill_launch(x, eidx_cpu, routing_weights, blobs, got, plan)
-            err = ((got - ref).norm() / ref.norm().clamp_min(1e-30)).item()
-            if not err <= _CHECK_TOL:
-                why = (f"relL2 {err:.2e} vs the stock per-expert loop, "
-                       f"tolerance {_CHECK_TOL:.0e}")
-        except Exception as exc:  # a Triton compile/launch failure
-            why = f"{type(exc).__name__}: {exc}"
-    if why is None:
-        return True
-    print(f"[Vaayu] WARNING: fused packed-expert prefill kernel refused ({why}); "
-          f"these experts stay on the stock per-expert path")
-    return False
+    return _agrees(
+        why, x,
+        lambda ref: stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, ref, act_fn,
+                                          linear=_linear_fp32),
+        lambda got: _prefill_launch(x, eidx_cpu, routing_weights, blobs, got, plan), "prefill")
 
 
 def _prefill_checked(x, eidx_cpu, routing_weights, blobs, act_fn, plan) -> bool:
@@ -642,13 +645,14 @@ def _prefill_checked(x, eidx_cpu, routing_weights, blobs, act_fn, plan) -> bool:
 def packed_experts_prefill(x, eidx_cpu, routing_weights, blobs, out, act_fn) -> None:
     """A multi-token call's routed-expert sum for one MoE layer, written into `out`.
 
-    x               [tokens, hidden], activation dtype, contiguous, on the current CUDA device
+    x               [tokens, hidden], activation dtype, on the current CUDA device (a strided view is fine)
     eidx_cpu        [tokens, top_k] int64 on the CPU: the routed expert ids
-    routing_weights [tokens, top_k] on x's device; row t * top_k + s weighs slot s of token t
+    routing_weights [tokens, top_k] on x's device (a strided view is fine); row t * top_k + s
+                    weighs slot s of token t
     blobs           {expert id: entry} for the routed experts -- `build_expert_blob` blobs
                     for the kernels; anything else (a dense entry, mixed geometries, a routed
                     expert with no entry) sends the whole call to the stock arithmetic
-    out             [tokens, hidden] float32, overwritten
+    out             [tokens, hidden] float32, overwritten (a strided view is fine)
     act_fn          the experts' activation; only the stock fallback calls it
 
     The result is a function of (x, routing, weights) alone: the tables are built in expert-id

@@ -408,3 +408,29 @@ def test_tables_group_rows_by_expert_and_order_slots_by_expert_id():
     assert order.tolist() == [1, 2, 0, 5, 3, 4]                         # expert 2, 5, 9
     slot_order = torch.argsort(eidx, dim=1, stable=True) + (torch.arange(3) * 2)[:, None]
     assert slot_order.tolist() == [[1, 0], [2, 3], [5, 4]]
+
+
+@cuda
+def test_a_strided_view_of_the_output_is_written_as_what_it_holds():
+    """`out` may be every other row of a wider buffer: the view equals the dense result and
+    the rows it does not own are untouched."""
+    x, eidx, w, blobs = _case(*QWEN)
+    dense = _launch(x, eidx, w, blobs)
+    wide = torch.full((2 * x.shape[0], x.shape[1]), 7.0, device="cuda")
+    view = wide[::2]
+    assert not view.is_contiguous(), "premise"
+    pk._prefill_launch(x, eidx, w, blobs, view)
+    torch.cuda.synchronize()
+    assert torch.equal(view, dense)
+    assert (wide[1::2] == 7.0).all(), "a row the view does not own was written"
+
+
+@cuda
+def test_a_strided_view_of_the_routing_weights_is_read_as_what_it_holds():
+    """top_k == 1: `reshape(-1)` of a column slice of a wider tensor is still strided."""
+    x, eidx, w, blobs = _case(*QWEN, top_k=1, tokens=20)
+    wide = torch.zeros(w.shape[0], 3, device="cuda")
+    wide[:, 1:2] = w
+    view = wide[:, 1:2]
+    assert not view.is_contiguous() and not view.reshape(-1).is_contiguous(), "premise"
+    assert torch.equal(_launch(x, eidx, view, blobs), _launch(x, eidx, w, blobs))
