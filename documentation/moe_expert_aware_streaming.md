@@ -229,7 +229,7 @@ bytes (the same entries the VRAM expert cache holds), so nothing extra is stored
   stays deterministic regardless of which experts were cached.
 - There is no setting for it: it is on wherever it passes its check.
 
-**Prompt prefill** — every multi-token prefill call, a cold prompt and a prefix-reuse diff
+**Prompt prefill** — every prefill call, a cold prompt and a prefix-reuse diff
 alike — is served by three grouped kernels per MoE layer call instead of a dequantize,
 three small matrix products and a scatter per routed expert. The call's (token, expert)
 pairs are grouped by expert into 16-row blocks; two kernels compute the gated MLP for
@@ -243,18 +243,24 @@ off disk.
 - **When it is on:** as above, plus its own load-time check. The load log says
   `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)`.
 - **When it is off:** when the model's dimensions leave no tile a tensor-core product can
-  take, or when one layer's whole expert set would not fit beside the prefill's working
-  memory (the kernels hold every expert a call uploaded until they launch). Both print a
-  `WARNING` with the reason; the one-token decode kernel is unaffected and prefill keeps
-  the per-expert path. A layer the kernels cannot take (unquantized experts, mixed
-  formats) runs the per-expert arithmetic for that call.
+  take: that prints a `WARNING` with the reason, the one-token decode kernel is unaffected
+  and prefill keeps the per-expert path. Beyond that, the kernels are decided per MoE
+  layer at load, from one real expert of each layer. A layer whose experts are not
+  pack-quantized in the checked format, or whose whole expert set is too large to hold at
+  once beside the prefill's working memory (the kernels hold every expert a call uploaded
+  until they launch), keeps the per-expert path. The load log names those layers and the
+  reason (`[Vaayu] WARNING: fused packed-expert prefill kernel not used on M of N MoE
+  layers (layer indices …): …`), and the `on N MoE layers` line counts only the layers
+  that use the kernels; when no layer qualifies the line reads `… prefill kernel not
+  installed: …` instead. A call the kernels cannot take in a layer that does use them (a
+  stray unquantized expert, mixed formats) runs the per-expert arithmetic for that call.
 - **Numerics:** every intermediate is rounded where the per-expert path rounds. The
   results still differ from it, because the per-expert path's half-precision matrix
   product is not correctly rounded at every size (at Qwen3-Next's shape, 2 to 32 rows give
   about 58 % correctly rounded outputs); the kernels measure 99.7–99.9 % and are the more
-  accurate side. A token's result no longer depends on which other tokens share its call,
-  and expert contributions are summed in expert-id order, so prefill stays deterministic
-  regardless of which experts were cached.
+  accurate side. A token's expert output no longer depends on which other tokens share
+  its call, and expert contributions are summed in expert-id order, so prefill stays
+  deterministic regardless of which experts were cached.
 - There is no setting for it.
 
 ### 3.5 Router Gate Pinning — `vaayu/vaayu_base.py`

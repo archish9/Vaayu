@@ -1,23 +1,38 @@
-"""Fused packed-expert decode kernels for the non-EXL3 fused MoE forward (S7, 2026-09-27).
+"""Fused packed-expert kernels for the non-EXL3 fused MoE forward: one-token decode (S7,
+2026-09-27) and prompt prefill (S20, 2026-10-03).
 
 `_make_fused_sparse_forward` serves a pack-quantized checkpoint (compressed-tensors
 `pack-quantized`; Qwen3-Next-80B-A3B AWQ int4 on this box) one routed expert at a time:
-dequantize the packed blob to dense weights, three M=1 `F.linear`, activation, routing weight,
-accumulate -- ~14 launches and ~135 us of host per expert for ~33 us of GPU work. On Qwen3-Next
-that was 62 % of a decode token (docs/2026-09-27-S7-dispatch-census-RESULTS.md).
+dequantize the packed blob to dense weights, three `F.linear`, activation, routing weight,
+accumulate -- ~14 launches and ~135 us of host per expert for ~33 us of GPU work at one token.
+On Qwen3-Next that was 62 % of a decode token
+(docs/2026-09-27-S7-dispatch-census-RESULTS.md) and 48 ms of a 512-token prefill chunk's
+layer call.
 
-For ONE token this module does the whole layer in two Triton launches that read the packed
-blobs directly through a pointer table: `_gate_up_kernel` (gate and up GEMVs, SiLU, product)
-and `_down_kernel` (down GEMV, routing weight, and the fp32 sum over the table's pairs in
-order -- expert id, then slot -- the order `accumulate_expert_outputs` sums in). Every weight
-and intermediate is rounded where the stock path rounds, so the output differs from stock only
-by fp32 summation order inside each dot product (measured: 99.87 % of outputs bit-identical
-over 48 layers x 8 draws). Nothing depends on whether an expert was a VRAM hit or a miss --
-the table is the same either way -- which keeps the MoE output a deterministic function of its
-input (row 44 F6).
+Decode: for ONE token the whole layer is two Triton launches that read the packed blobs
+directly through a pointer table: `_gate_up_kernel` (gate and up GEMVs, SiLU, product) and
+`_down_kernel` (down GEMV, routing weight, and the fp32 sum over the table's pairs in order --
+expert id, then slot -- the order `accumulate_expert_outputs` sums in). Every weight and
+intermediate is rounded where the stock path rounds, so the output differs from stock only by
+fp32 summation order inside each dot product (measured: 99.87 % of outputs bit-identical over
+48 layers x 8 draws).
 
-CUDA + triton only. Each new (geometry, dtype) key is held to `stock_experts_decode` on its
-first call; a disagreement or an unsupported geometry stays on the stock arithmetic, loudly.
+Prefill: a call of any length is three launches. Its (token, slot) rows are grouped by expert
+into `_PF_BLOCK_M`-row blocks; `_gate_up_grouped` and `_down_grouped` run each block as
+tensor-core dots over its expert's packed blob, and `_reduce_kernel` sums each token's
+contributions in expert-id order. The rounding points are stock's again. What differs is the
+fp32 sum inside each product, and there cuBLAS's half-precision GEMM is not correctly rounded
+at every shape, so these kernels are held to the per-expert loop with fp32-summed GEMMs
+(`stock_experts_prefill(linear=_linear_fp32)`). A token's output does not depend on the tokens
+it shares a call with.
+
+Nothing depends on whether an expert was a VRAM hit or a miss -- the tables are the same
+either way -- which keeps the MoE output a deterministic function of its input (row 44 F6).
+
+CUDA + triton only. Each new (geometry, dtype) key is held to its stock reference on its first
+call; a disagreement or an unsupported geometry stays on the stock arithmetic, loudly.
+`install_packed_expert_kernels` takes both verdicts at load and decides, per MoE layer, whose
+prefill calls take the grouped kernels.
 """
 from pathlib import Path
 
@@ -253,7 +268,7 @@ class _TableRing:
         self._slots: list = [None] * n_slots
         self._next = 0
 
-    def put(self, values: list, device) -> "torch.Tensor":
+    def put(self, values: "list | torch.Tensor", device) -> "torch.Tensor":
         i = self._next
         self._next = (i + 1) % len(self._slots)
         n = len(values)
@@ -679,10 +694,11 @@ def _is_silu(act_fn, device, dtype) -> bool:
         return False
 
 
-def _one_real_blob(vaayu_ref, block, device):
+def _one_real_blob(vaayu_ref, block, device, quiet=False):
     """The VRAM-tier entry of `block`'s lowest-numbered expert, read off the checkpoint (one
     expert's bytes), or None when its experts are not pack-quantized. A packed expert
-    `build_expert_blob` refuses is reported, not hidden."""
+    `build_expert_blob` refuses is reported, not hidden -- unless `quiet`: the caller
+    reports that block itself."""
     from .moe_patch import (_group_packed_tensors_by_weight, _packed_roles_complete,
                             _upload_packed_expert, build_expert_blob)
     from .persist.safetensor_model_persister import load_expert_sparse
@@ -700,22 +716,31 @@ def _one_real_blob(vaayu_ref, block, device):
         blob = build_expert_blob(_upload_packed_expert(packed, device))
     except NotImplementedError as exc:   # zero point / act-order: refused everywhere
         blob, why = None, str(exc)
-    if blob is None:
+    if blob is None and not quiet:
         print(f"[Vaayu] WARNING: fused packed-expert decode kernel not installed: {why}")
     return blob
 
 
 def install_packed_expert_kernels(vaayu_ref) -> bool:
-    """Route one-token decode of every fused non-EXL3 pack-quantized MoE block through the
-    kernels -- if they agree with the stock per-expert loop on one real expert of this
+    """Route the fused non-EXL3 pack-quantized MoE blocks through the kernels -- one-token
+    decode of every such block, and the prefill calls of each block found eligible -- if
+    the kernels agree with the stock per-expert arithmetic on one real expert of this
     model, on this device. Called once at load, after `patch_moe_blocks` (it reads each
-    block's `forward_name`). Seeds the verdict cache for fp32 and activation-dtype routing
-    weights, so the Triton JIT and the check are paid here, not at the first token.
+    block's `forward_name`). Seeds both verdict caches for fp32 and activation-dtype routing
+    weights, so the Triton JIT and the checks are paid here, not at the first token.
+
+    Decode sets `vaayu_ref._packed_moe_kernel` (the checked geometry). Prefill sets
+    `vaayu_ref._packed_moe_prefill_kernel`, a frozenset of the eligible blocks'
+    `layer_idx`: a block is eligible when one real expert of it is a blob of the checked
+    geometry and scale dtype, and its whole expert set at that size is at most half of
+    `_PREFILL_VRAM_HEADROOM`. The attribute stays absent when no block is eligible or the
+    prefill verdict is refused; neither removes the decode kernel.
 
     Nothing is installed off CUDA, without triton, or with no block on the non-EXL3 fused
     forward; a non-current CUDA device (Triton launches on the CURRENT device), a packed
-    expert that cannot be fused, or a disagreeing kernel is refused with a WARNING. The
-    stock path stays in every refused case."""
+    expert that cannot be fused, a disagreeing kernel, or a block left out of prefill is
+    reported with a WARNING. The stock path stays in every refused case. Returns whether
+    the decode kernel was installed."""
     device = str(vaayu_ref.running_device)
     if triton is None or torch.device(device).type != "cuda":
         return False
@@ -752,19 +777,37 @@ def install_packed_expert_kernels(vaayu_ref) -> bool:
     print(f"[Vaayu] fused packed-expert decode kernel on {len(blocks)} MoE layers "
           f"({bits}-bit, group {gs})")
     # S20: the grouped prefill kernels, on their own verdict -- a refusal here leaves the
-    # decode kernel installed.
-    # They launch once per call, so every blob the call uploaded is alive at once: at
-    # worst a layer's whole expert set (the per-slot loop held one). That must fit beside
-    # the call's own scratch inside the headroom prefill keeps free.
+    # decode kernel installed. Which layers take them is decided here, from one real
+    # expert of each.
+    # They launch once per call, so every entry the call uploaded is alive at once: at
+    # worst a layer's whole expert set (the per-slot loop holds one). Nothing reserves
+    # room for that: the VRAM plan does not count these blobs, and
+    # _ensure_prefill_headroom can only make room by evicting the expert VRAM tier. Half
+    # the headroom is a judgement about what one MoE layer call may hold beside its own
+    # scratch, not a measured bound. A layer whose experts are not blobs of the checked
+    # format would hold their dense weights instead, so it stays on the per-slot loop too.
     from .moe_patch import _PREFILL_VRAM_HEADROOM
-    n_experts = int(getattr(getattr(block.moe_module, block.experts_attr), "num_experts", 0))
-    held = n_experts * sum(t.numel() * t.element_size() for t in blob["flat"].values())
-    if not n_experts or held > _PREFILL_VRAM_HEADROOM // 2:
-        print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not installed: one call "
-              f"can hold a layer's {n_experts} experts on the GPU at once "
-              f"({held / 2**30:.2f} GiB), over half the "
-              f"{_PREFILL_VRAM_HEADROOM / 2**30:.2f} GiB prefill headroom; prefill keeps the "
-              f"per-expert path")
+    checked = (blob["geom"], blob["flat"]["scale"].dtype)
+    eligible, skipped = [], {}           # skipped: {reason: [layer_idx, ...]}
+    for b in blocks:
+        one = blob if b is block else _one_real_blob(vaayu_ref, b, device, quiet=True)
+        if one is None:
+            why = "experts not pack-quantized, or packed with no fused pass"
+        elif (one["geom"], one["flat"]["scale"].dtype) != checked:
+            why = "a different geometry or scale dtype than the checked layer"
+        else:
+            n_experts = int(getattr(getattr(b.moe_module, b.experts_attr), "num_experts", 0))
+            held = n_experts * sum(t.numel() * t.element_size() for t in one["flat"].values())
+            if n_experts and held <= _PREFILL_VRAM_HEADROOM // 2:
+                eligible.append(b.layer_idx)
+                continue
+            why = (f"one call can hold a layer's {n_experts} experts on the GPU at once "
+                   f"({held / 2**30:.2f} GiB), over half the "
+                   f"{_PREFILL_VRAM_HEADROOM / 2**30:.2f} GiB prefill headroom")
+        skipped.setdefault(why, []).append(b.layer_idx)
+    if not eligible:
+        print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not installed: "
+              f"{'; '.join(skipped)}; prefill keeps the per-expert path")
         return True
     # k "experts" sharing the one real blob, each routed by every token, so each has a
     # full block and a partial one.
@@ -776,7 +819,16 @@ def install_packed_expert_kernels(vaayu_ref) -> bool:
     blobs = {e: blob for e in range(k)}
     plan = _prefill_plan(eidx)
     if all(_prefill_checked(xs, eidx, rw, blobs, act_fn, plan) for rw in (ws, ws.to(dtype))):
-        vaayu_ref._packed_moe_prefill_kernel = blob["geom"]
-        print(f"[Vaayu] fused packed-expert prefill kernel on {len(blocks)} MoE layers "
+        vaayu_ref._packed_moe_prefill_kernel = frozenset(eligible)
+        print(f"[Vaayu] fused packed-expert prefill kernel on {len(eligible)} MoE layers "
               f"({bits}-bit, group {gs})")
+        if skipped:
+            left_out = sorted(i for idxs in skipped.values() for i in idxs)
+            whys = "; ".join(
+                why if len(skipped) == 1 else f"{why} (layers {', '.join(map(str, idxs))})"
+                for why, idxs in skipped.items())
+            print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not used on "
+                  f"{len(left_out)} of {len(blocks)} MoE layers (layer indices "
+                  f"{', '.join(map(str, left_out))}): {whys}; prefill keeps the per-expert "
+                  f"path there")
     return True

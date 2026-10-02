@@ -1,5 +1,5 @@
 """S20: every prefill call through the grouped packed-expert kernels, inside the real
-non-EXL3 fused forward, on a one-layer mock model over a real packed checkpoint.
+non-EXL3 fused forward, on a mock model over a real packed checkpoint.
 
 Three properties carry the weight. Residency must not reach the arithmetic: a cold
 prefill, one over a warm VRAM tier and one served from chunk-major retention give the
@@ -17,17 +17,18 @@ from tests.test_packed_expert_dequant import _BLANK_PROFILE
 HIDDEN, INTERMEDIATE = 256, 128
 
 
-def _model(tmp_path, *, prefill_kernel=True, **kw):
-    model, ref, ram = _cuda_model(tmp_path, hidden=HIDDEN, intermediate=INTERMEDIATE, **kw)
+def _model(tmp_path, *, prefill_kernel=True, hidden=HIDDEN, intermediate=INTERMEDIATE, **kw):
+    model, ref, ram = _cuda_model(tmp_path, hidden=hidden, intermediate=intermediate, **kw)
     ref._moe_prefill_pass = True
     if prefill_kernel:
-        ref._packed_moe_prefill_kernel = "test"      # any non-None value selects the branch
+        # What the installer leaves: the layers whose prefill calls take the branch.
+        ref._packed_moe_prefill_kernel = frozenset(b.layer_idx for b in ref._moe_blocks)
     return model, ref, ram
 
 
-def _x(tokens=40, seed=0):
+def _x(tokens=40, seed=0, hidden=HIDDEN):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.randn(1, tokens, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    return torch.randn(1, tokens, hidden, generator=g, device="cuda").to(torch.bfloat16)
 
 
 def _spies(monkeypatch):
@@ -137,10 +138,78 @@ def test_a_packed_expert_without_a_blob_is_computed_like_the_per_slot_loop(tmp_p
 
 @cuda
 def test_an_unpacked_expert_is_computed_like_the_per_slot_loop(tmp_path):
-    """A checkpoint that leaves experts unquantized in a layer the installer never read."""
+    """Unquantized experts in a layer the set names (the installer read ONE expert of it)."""
     model, ref, _ = _model(tmp_path, packed=False)
     x = _x()
     assert torch.equal(model.layers[0].mlp.forward(x), _loop(model, ref, x))
+
+
+@cuda
+def test_a_layer_outside_the_set_keeps_the_per_slot_loop(tmp_path, monkeypatch):
+    """The kernels are decided per layer: a prefill call on a layer the set does not name
+    runs the per-slot loop, with the bits it gives when no prefill kernel is installed.
+    (At 1024 -> 512 the kernels and the loop differ in bits; at the 256-wide mock they
+    do not, and the comparison would be empty.)"""
+    hidden = 1024
+    model, ref, _ = _model(tmp_path, hidden=hidden, intermediate=512, more_layers=({},))
+    named, other = ref._moe_blocks
+    x = _x(hidden=hidden)
+    ref._packed_moe_prefill_kernel = frozenset({other.layer_idx})
+    grouped = other.moe_module.forward(x)
+    ref._packed_moe_prefill_kernel = frozenset({named.layer_idx})
+    prefill, decode = _spies(monkeypatch)
+    got = other.moe_module.forward(x)
+    assert prefill == [] and decode == []
+    named.moe_module.forward(x)
+    assert len(prefill) == 1, "premise: the set does select the layer it names"
+    del ref._packed_moe_prefill_kernel
+    absent = other.moe_module.forward(x)
+    assert not torch.equal(grouped, absent), "premise: the two paths differ in bits here"
+    assert torch.equal(got, absent)
+
+
+@cuda
+def test_an_unquantized_layer_outside_the_set_holds_one_expert_at_a_time(tmp_path, monkeypatch):
+    """The grouped branch keeps every entry a call uploaded until it launches; for dense
+    weights that is the whole routed set at once. A layer outside the set peaks where it
+    peaks with no prefill kernel installed."""
+    hidden, intermediate = 512, 1024
+    model, ref, _ = _model(tmp_path, prefill_kernel=False, hidden=hidden,
+                           intermediate=intermediate, more_layers=(None,))
+    packed, dense = ref._moe_blocks
+    x = _x(hidden=hidden)
+    uploads = []
+    real = mp._expert_dense_weights
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        uploads.append(sum(w.numel() * w.element_size() for w in out[:3]))
+        return out
+    monkeypatch.setattr(mp, "_expert_dense_weights", spy)
+
+    def peak():
+        del uploads[:]
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        dense.moe_module.forward(x)
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - before
+
+    peak()      # the process's first GEMM allocates cuBLAS's workspace, which then stays
+    absent = peak()
+    ref._packed_moe_prefill_kernel = frozenset({packed.layer_idx})
+    named_elsewhere = peak()
+    one, at_once = max(uploads), sum(uploads)
+    assert len(uploads) == len(ref._expert_history[dense.layer_idx]) >= 4, "premise"
+    assert one == 3 * hidden * intermediate * x.element_size(), "premise: dense weights"
+    assert absent < at_once / 2, "premise: the per-slot loop never holds the routed set"
+    # Same code both times. The reads finish in any order, so the expert in flight at the
+    # peak sits beside a different share of the buffered per-expert outputs: activation-
+    # sized, far under one expert's weights -- and the grouped branch holds len(uploads) - 1
+    # more experts than the loop.
+    assert abs(named_elsewhere - absent) <= one
+    assert named_elsewhere < at_once / 2
 
 
 @cuda

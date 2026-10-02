@@ -2396,10 +2396,14 @@ def _make_fused_sparse_forward(
             vram_resident=set(_vram_hold),
         )
         # S7: a one-token decode call runs the fused packed-expert kernels (installed at
-        # load by install_packed_expert_kernels). S20: every prefill call runs the grouped
-        # ones. A multi-token call outside prefill and every checkpoint the installer
-        # did not accept keep the per-slot loop below.
-        _use_pf = (getattr(vaayu_ref, "_packed_moe_prefill_kernel", None) is not None
+        # load by install_packed_expert_kernels). S20: every prefill call of a layer the
+        # installer found eligible runs the grouped ones -- the flag is the set of those
+        # layers' indices; absent or None means no layer. A multi-token call outside
+        # prefill, a layer outside the set and every checkpoint the installer did not
+        # accept keep the per-slot loop below, which holds one expert's dense weights
+        # at a time.
+        _pf_layers = getattr(vaayu_ref, "_packed_moe_prefill_kernel", None) or ()
+        _use_pf = (layer_idx in _pf_layers
                    and getattr(vaayu_ref, "_moe_prefill_pass", False))
         _use_pk = _use_pf or (getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
                               and flat_hidden.shape[0] == 1

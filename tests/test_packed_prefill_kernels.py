@@ -355,7 +355,8 @@ def test_a_geometry_with_no_tensor_core_tile_stays_on_the_stock_loop(monkeypatch
     monkeypatch.setattr(pk, "_PF_VERDICTS", {})
     x, eidx, w, blobs = _case(64, 64, 4, 32, n_exp=8, top_k=2)
     got = _prefill(x, eidx, w, blobs)
-    assert "WARNING" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "K tile" in out
     assert torch.equal(got, _stock(x, eidx, w, blobs))
 
 

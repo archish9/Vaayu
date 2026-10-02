@@ -7,8 +7,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vaayu.moe_patch as mp
 import vaayu.packed_expert_kernels as pk
-from tests.test_fused_packed_kernel_branch import _cuda_model, cuda
+from tests.test_fused_packed_kernel_branch import NUM_EXPERTS, _cuda_model, cuda
 
 
 def _ref(**kw):
@@ -95,9 +96,9 @@ def test_the_engine_installs_after_patching():
 
 # ---- S20: the grouped prefill kernels ride the same installer, on their own verdict ----
 
-def _prefill_model(tmp_path):
+def _prefill_model(tmp_path, **kw):
     """A geometry the prefill kernels can tile (the 64-wide default cannot)."""
-    return _cuda_model(tmp_path, kernel=False, hidden=256, intermediate=128)
+    return _cuda_model(tmp_path, kernel=False, hidden=256, intermediate=128, **kw)
 
 
 def _fresh(monkeypatch):
@@ -110,7 +111,7 @@ def test_installs_the_prefill_kernels_too(tmp_path, capsys, monkeypatch):
     _fresh(monkeypatch)
     _model, ref, _ = _prefill_model(tmp_path)
     assert pk.install_packed_expert_kernels(ref) is True
-    assert ref._packed_moe_prefill_kernel == ref._packed_moe_kernel
+    assert ref._packed_moe_prefill_kernel == frozenset({ref._moe_blocks[0].layer_idx})
     out = capsys.readouterr().out
     assert "fused packed-expert prefill kernel on 1 MoE layers (4-bit, group 32)" in out
     assert "WARNING" not in out
@@ -137,7 +138,8 @@ def test_a_geometry_the_prefill_kernels_cannot_tile_keeps_the_decode_kernel(tmp_
     _model, ref, _ = _cuda_model(tmp_path, kernel=False)
     assert pk.install_packed_expert_kernels(ref) is True
     assert not hasattr(ref, "_packed_moe_prefill_kernel")
-    assert "prefill kernel refused" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "prefill kernel refused" in out and "K tile" in out
 
 
 @cuda
@@ -150,18 +152,97 @@ def test_a_refused_decode_kernel_installs_no_prefill_kernel(tmp_path, monkeypatc
 
 
 @cuda
-def test_a_layer_too_large_to_hold_at_once_keeps_the_per_expert_prefill(tmp_path, capsys,
-                                                                         monkeypatch):
+def test_layers_too_large_to_hold_at_once_keep_the_per_expert_prefill(tmp_path, capsys,
+                                                                      monkeypatch):
     """The grouped kernels hold every blob a call uploaded until they launch -- at worst a
     layer's whole expert set. Over half the prefill headroom that is refused, loudly, with
-    the derived size; the decode kernel (ten experts a token) is unaffected."""
-    import vaayu.moe_patch as mp
+    the derived size; the decode kernel (ten experts a token) is unaffected. Here every
+    layer is too large, so no prefill kernel is installed at all."""
     _fresh(monkeypatch)
-    _model, ref, _ = _prefill_model(tmp_path)
+    _model, ref, _ = _prefill_model(tmp_path, more_layers=({},))
     monkeypatch.setattr(mp, "_PREFILL_VRAM_HEADROOM", 64 * 1024)
     assert pk.install_packed_expert_kernels(ref) is True
     assert ref._packed_moe_kernel is not None
     assert not hasattr(ref, "_packed_moe_prefill_kernel")
-    out = capsys.readouterr().out
-    assert "WARNING" in out and "a layer's 8 experts" in out
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert "prefill kernel not installed: one call can hold a layer's 8 experts" in warnings[0]
+    assert warnings[0].endswith("prefill headroom; prefill keeps the per-expert path")
     assert pk._PF_VERDICTS == {}, "refused before the kernels are compiled"
+
+
+def _no_fused_pass_after_the_first(monkeypatch):
+    """`build_expert_blob` refuses every expert after the first it is handed: the second
+    layer's roles read as packed at different widths."""
+    real, calls = mp.build_expert_blob, []
+
+    def build(by_role):
+        calls.append(1)
+        return real(by_role) if len(calls) == 1 else None
+    monkeypatch.setattr(mp, "build_expert_blob", build)
+
+
+@cuda
+@pytest.mark.parametrize("second, why", [
+    (None, "not pack-quantized"),
+    ("no-fused-pass", "no fused pass"),
+    ({"group_size": 64}, "a different geometry or scale dtype"),
+], ids=["unquantized", "no-fused-pass", "another-group-size"])
+def test_a_layer_the_prefill_kernels_cannot_take_is_left_out_and_named(tmp_path, capsys,
+                                                                       monkeypatch, second, why):
+    """Eligibility is per MoE layer, from one real expert of each: the layer that is not
+    packed like the checked one keeps the per-expert prefill, named in ONE WARNING."""
+    _fresh(monkeypatch)
+    if second == "no-fused-pass":
+        second = {}
+        _no_fused_pass_after_the_first(monkeypatch)
+    _model, ref, _ = _prefill_model(tmp_path, more_layers=(second,))
+    first, other = (b.layer_idx for b in ref._moe_blocks)
+    assert first != other, "premise: two MoE layers"
+    assert pk.install_packed_expert_kernels(ref) is True
+    assert ref._packed_moe_prefill_kernel == frozenset({first})
+    assert ref._packed_moe_kernel is not None
+    out = capsys.readouterr().out
+    assert "fused packed-expert prefill kernel on 1 MoE layers (4-bit, group 32)" in out
+    warnings = [line for line in out.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert (f"prefill kernel not used on 1 of 2 MoE layers (layer indices {other}): "
+            in warnings[0]) and why in warnings[0]
+    assert warnings[0].endswith("prefill keeps the per-expert path there")
+    assert "decode kernel not installed" not in out, "the probe of the other layer is quiet"
+
+
+@cuda
+def test_layers_left_out_for_different_reasons_share_one_warning(tmp_path, capsys, monkeypatch):
+    _fresh(monkeypatch)
+    _model, ref, _ = _prefill_model(tmp_path, more_layers=(None, {"group_size": 64}))
+    first, dense, other = (b.layer_idx for b in ref._moe_blocks)
+    assert pk.install_packed_expert_kernels(ref) is True
+    assert ref._packed_moe_prefill_kernel == frozenset({first})
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert warnings[0].endswith(
+        f"not used on 2 of 3 MoE layers (layer indices {dense}, {other}): experts not "
+        f"pack-quantized, or packed with no fused pass (layers {dense}); a different geometry "
+        f"or scale dtype than the checked layer (layers {other}); prefill keeps the "
+        f"per-expert path there")
+
+
+@cuda
+def test_a_layer_with_more_experts_than_fit_is_left_out_with_its_size(tmp_path, capsys,
+                                                                      monkeypatch):
+    """The size guard is each layer's own: twice the experts, twice the bytes."""
+    _fresh(monkeypatch)
+    _model, ref, _ = _prefill_model(tmp_path, more_layers=({},))
+    small, large = ref._moe_blocks
+    blob = pk._one_real_blob(ref, small, "cuda")
+    held = NUM_EXPERTS * sum(t.numel() * t.element_size() for t in blob["flat"].values())
+    large.moe_module.experts.num_experts = 2 * NUM_EXPERTS
+    monkeypatch.setattr(mp, "_PREFILL_VRAM_HEADROOM", 3 * held)     # half: 1.5x one layer
+    assert pk.install_packed_expert_kernels(ref) is True
+    assert ref._packed_moe_prefill_kernel == frozenset({small.layer_idx})
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert (f"not used on 1 of 2 MoE layers (layer indices {large.layer_idx}): one call can "
+            f"hold a layer's {2 * NUM_EXPERTS} experts on the GPU at once "
+            f"({2 * held / 2**30:.2f} GiB)") in warnings[0]
