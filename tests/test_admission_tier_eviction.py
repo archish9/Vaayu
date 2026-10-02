@@ -406,6 +406,33 @@ def test_a_cap_on_a_model_without_moe_geometry_only_lowers_the_budget():
 
 
 @requires_cuda
+@pytest.mark.parametrize("name", list(MOE_GEOMETRIES))
+def test_an_admission_eviction_re_derives_the_layer_range(name, gpu, monkeypatch, capsys):
+    """N5: the cap helper is pinned on its own above; this pins that ADMISSION hands it
+    the model, so a tier evicted to under one token's working set gets the layer range
+    the load would have derived -- not the old one, under which it thrashes at 0 %."""
+    geo = dict(MOE_GEOMETRIES[name])
+    geo["working_set_bytes"] = geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"]
+    need = need_for(name)
+    held = 3 * geo["top_k"] + 2                        # three layers' worth, and two
+    tier = ExpertVRAMCache(10 * geo["working_set_bytes"])
+    _fill(tier, held, geo["expert_bytes"])
+    full = tier.current_usage
+    base_free = need - geo["expert_bytes"] // 2        # half an expert short -> 1 evicted
+    monkeypatch.setattr(torch.cuda, "mem_get_info",
+                        lambda *a, **k: (base_free + full - tier.current_usage, 16 * GB))
+    model = model_for(name, reserve=need, tier=tier)
+    model._moe_geometry = geo
+    model._moe_blocks = [types.SimpleNamespace(layer_idx=i)
+                         for i in range(geo["num_moe_layers"])]
+    model._vram_cacheable_layers = None
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.budget_bytes == tier.current_usage == (held - 1) * geo["expert_bytes"]
+    assert model._vram_cacheable_layers == {0, 1, 2}
+    assert f"first 3/{geo['num_moe_layers']}" in capsys.readouterr().out
+
+
+@requires_cuda
 @pytest.mark.parametrize("name", ALL)
 @pytest.mark.parametrize("tier", [None, object()])
 def test_no_tier_or_one_with_nothing_to_read_refuses_as_before(name, tier, gpu):
