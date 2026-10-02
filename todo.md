@@ -679,7 +679,8 @@ line under the S17 row).
         - [x] T4 Qwen3-Next TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k, profiled ON arm, 40,960-token run
               → stop-rule decision
               - Measured commit 401651c; arm order off1, on1, on2, off2 (all exit 0; load line present in all four; HIT_FIRED=True 20/20). Raw truth: `plans/probes/s20_out/s11-ttft-{off1,on1,on2,off2}.json` (gitignored).
-              - ids identical across 4 arms on 6/8 turns; DIFFERENT: U1-2048-h, U1-8192-h (recorded, not required).
+              - ids identical across the four arms on 6/8 turns; OFF1 == OFF2 and ON1 == ON2 on 8/8 (each arm class reproduces itself); the two differing turns (U1-2048-h, U1-8192-h) differ OFF vs ON only: first differing generated-token index 15 of 16 for U1-2048-h, 6 of 16 for U1-8192-h (recorded, not required).
+              - Scope: Qwen3-Next only, N=1, BALLAST_GB=25, REPS=2 per arm = 4 reps per cell, the WARM session discarded, measured at 401651c.
               - cold@2k OFF 10.290s [10.061, 9.844, 10.606, 10.648] ON 6.967s [7.092, 6.686, 7.273, 6.817] delta +3.322s = +32.29 % of OFF; peak GB OFF [13.03, 13.01, 13.02, 12.98] ON [13.06, 13.05, 13.06, 13.03].
               - HIT@2k OFF 3.073s [2.997, 2.855, 3.269, 3.17] ON 2.667s [2.752, 2.5, 2.813, 2.603] delta +0.406s = +13.22 % of OFF; peak OFF 12.71 ON 12.84.
               - cold@8k OFF 27.650s [26.938, 26.926, 28.309, 28.428] ON 12.417s [12.412, 12.149, 12.681, 12.425] delta +15.233s = +55.09 % of OFF; peak OFF [13.01, 13.04, 12.98, 13.04] ON [13.02, 13.07, 13.02, 13.05].
