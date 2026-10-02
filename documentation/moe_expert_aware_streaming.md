@@ -310,6 +310,7 @@ Dense models (is_moe=False): steps 2 (Phase 1.5), 3, 4, 5 are skipped entirely.
 | `[Vaayu] WARNING: fused packed-expert decode kernel refused (…)` / `not installed: …` | That geometry/model stays on the per-expert path; the reason is in the line |
 | `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)` | Prompt prefill uses the grouped kernels (§3.4c) |
 | `[Vaayu] WARNING: fused packed-expert prefill kernel refused (…)` / `not installed: …` | Prefill stays on the per-expert path; the decode kernel is unaffected; the reason is in the line |
+| `[Vaayu] WARNING: fused packed-expert prefill kernel not used on M of N MoE layers (layer indices …): …` | Those layers keep the per-expert path during prefill; the other layers use the grouped kernels; the reason is in the line |
 | `[VAAYU-IO] ... expert_cache=Nhit/Mmiss hit_rate=X%` | Per-token cache stats |
 | `[Vaayu-MoE] warn: no offset for layer=... expert=N` | Expert not in index |
 | `[Vaayu-MoE] prefetch failed ...` | Background prefetch error (non-fatal) |
