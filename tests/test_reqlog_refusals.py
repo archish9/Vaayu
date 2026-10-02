@@ -377,8 +377,8 @@ def test_a_refusal_row_has_the_same_keys_as_an_engine_row(client_requiring_sessi
     assert refusal["finish"] == "refused"
     assert set(refusal) == set(engine_row), (
         f"only in one: {set(refusal) ^ set(engine_row)}")
-    for k in ("prefix_hit", "ttft_s", "decode_tok_s", "prompt_tokens", "cap",
-              "decode"):
+    for k in ("prefix_hit", "prefix_match_tokens", "ttft_s", "decode_tok_s",
+              "prompt_tokens", "cap", "decode"):
         assert refusal[k] is None
 
 

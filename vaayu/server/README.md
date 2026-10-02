@@ -165,6 +165,10 @@ Streaming requests add a `TTFT at=…` line between the two. `prefix_hit` is the
 watch across turns of the same session: `False` on turn 2 means the prefix cache is not
 being reused and TTFT is paying full prefill.
 
+`True` is not enough on its own: it is true for a one-token match. `requests.jsonl`
+carries `prefix_match_tokens` beside `prompt_tokens` — a turn that matched 44 of
+7,517 tokens is paying nearly a full prefill and still logs `prefix_hit=True`.
+
 At boot, `[Vaayu] WARNING: N persistent buffer(s) have no tensor in this checkpoint` means the
 checkpoint dropped part of the model — MiniMax-M2.7's EXL3 build ships no MoE routing bias, so it
 routes with zeros. There is no knob: fetch the missing tensors with

@@ -323,7 +323,8 @@ class EngineHandle:
     def _write_request_row(self, req, *, stream: bool, started: float,
                            prompt_tokens: int, cap: int, snap_before: dict,
                            tokens: int = 0, finish: str = "error",
-                           ttft_s=None, hits_before: int = 0, error=None,
+                           ttft_s=None, hits_before: int = 0,
+                           matched_before: int = 0, error=None,
                            batch=None) -> None:
         """One `requests.jsonl` row. Called from a `finally`, so it runs on the
         success path, the raise path, and the client-disconnect path alike --
@@ -372,6 +373,9 @@ class EngineHandle:
                 "temperature": getattr(req, "temperature", None),
                 "tools": len(getattr(req, "tools", None) or []),
                 "prefix_hit": self._prefix_hits() > hits_before,
+                # How much of the prompt the hit covered: `prefix_hit` alone reads
+                # True for a 1-token match (S19 ii). Batch-wide under N>1, like it.
+                "prefix_match_tokens": self._prefix_matched() - matched_before,
                 "ttft_s": ttft_s,
                 "wall_s": wall,
                 "tokens": tokens,
@@ -387,6 +391,11 @@ class EngineHandle:
     def _prefix_hits(self) -> int:
         pc = getattr(self.model, "_prefix_cache", None)
         return getattr(pc, "hits", 0) if pc is not None else 0
+
+    def _prefix_matched(self) -> int:
+        """Prompt tokens the prefix cache has matched, summed over every hit."""
+        pc = getattr(self.model, "_prefix_cache", None)
+        return getattr(pc, "matched_tokens", 0) if pc is not None else 0
 
     def resolve_thinking(self, req) -> bool:
         """The request's choice if it made one, else the server's."""
@@ -535,6 +544,7 @@ class EngineHandle:
             # waits for the worker (B16).
             cancel = CancelToken()
         started, hits_before = time.time(), self._prefix_hits()
+        matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None}
         # Same defaults, and for the same reason, as stream()'s below: prepare()
@@ -636,7 +646,7 @@ class EngineHandle:
                 req, stream=False, started=started,
                 prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
                 tokens=row["tokens"], finish=row["finish"],
-                hits_before=hits_before, error=row["error"])
+                hits_before=hits_before, matched_before=matched_before, error=row["error"])
 
     async def stream(self, req, cancel=None, prepared=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
@@ -662,6 +672,7 @@ class EngineHandle:
             cancel = CancelToken()
 
         started, hits_before = time.time(), self._prefix_hits()
+        matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None, "ttft_s": None}
         # Defaults for the `finally` below, in case `prepare()` itself raises
@@ -829,7 +840,7 @@ class EngineHandle:
                 req, stream=True, started=started,
                 prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
                 tokens=row["tokens"], finish=row["finish"], ttft_s=row["ttft_s"],
-                hits_before=hits_before, error=row["error"])
+                hits_before=hits_before, matched_before=matched_before, error=row["error"])
 
     async def run_batch(self, jobs):
         """Drive ONE batched_generate over `jobs`, fanning tokens to each queue.
@@ -871,6 +882,7 @@ class EngineHandle:
         loop = asyncio.get_running_loop()
         started = time.time()
         hits_before = self._prefix_hits()
+        matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         n = len(jobs)
         members = [getattr(j, "session_key", None) for j in jobs]
@@ -1085,7 +1097,7 @@ class EngineHandle:
                         prompt_tokens=len(j.prompt_ids), cap=j.cap,
                         snap_before=snap_before, tokens=row["tokens"],
                         finish=row["finish"], ttft_s=ttft[i],
-                        hits_before=hits_before, error=row["error"],
+                        hits_before=hits_before, matched_before=matched_before, error=row["error"],
                         batch=batch_note)
             if pending_base_exc is not None:
                 # Every job has its item and its sentinel by now (the loop

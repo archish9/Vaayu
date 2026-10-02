@@ -270,3 +270,80 @@ def test_a_cancelled_non_streaming_request_records_finish_cancelled(tmp_path):
     r = rows(tmp_path)
     assert len(r) == 1
     assert r[0]["finish"] == "cancelled"
+
+
+class _Pool:
+    """The two counters the request row reads off PrefixCacheStore."""
+    def __init__(self):
+        self.hits = 0
+        self.matched_tokens = 0
+
+
+class PM(M):
+    """M plus a prefix pool. Each generate() plays one lookup: the next entry of
+    `matches` is how many prompt tokens it matched (0 = a miss)."""
+    def __init__(self, matches, **kw):
+        super().__init__(**kw)
+        self._prefix_cache = _Pool()
+        self._matches = list(matches)
+
+    def generate(self, **kw):
+        m = self._matches.pop(0)
+        if m:
+            self._prefix_cache.hits += 1
+            self._prefix_cache.matched_tokens += m
+        return super().generate(**kw)
+
+
+def test_a_hit_row_says_how_many_prompt_tokens_matched(tmp_path):
+    """S19 (ii): `prefix_hit: true` for a 44-token match on a 7.5k prompt hid a reuse
+    collapse (row 31). The row carries the match length next to prompt_tokens."""
+    e = EngineHandle(PM([44]), log_dir=tmp_path)
+    asyncio.run(e.generate(_req()))
+    r = rows(tmp_path)[0]
+    assert r["prefix_hit"] is True
+    assert r["prefix_match_tokens"] == 44
+    assert r["prompt_tokens"] > 0
+
+
+def test_a_miss_row_reports_zero_matched_tokens(tmp_path):
+    e = EngineHandle(PM([0]), log_dir=tmp_path)
+    asyncio.run(e.generate(_req()))
+    r = rows(tmp_path)[0]
+    assert r["prefix_hit"] is False and r["prefix_match_tokens"] == 0
+
+
+def test_the_match_is_this_requests_own_not_the_pools_running_total(tmp_path):
+    e = EngineHandle(PM([44, 7, 0]), log_dir=tmp_path)
+    for _ in range(3):
+        asyncio.run(e.generate(_req()))
+    assert [r["prefix_match_tokens"] for r in rows(tmp_path)] == [44, 7, 0]
+
+
+def test_a_streamed_hit_row_carries_the_match_too(tmp_path):
+    e = EngineHandle(PM([31]), log_dir=tmp_path)
+
+    async def main():
+        async for _kind, _payload in e.stream(_req()):
+            pass
+
+    asyncio.run(main())
+    r = rows(tmp_path)[0]
+    assert r["stream"] is True and r["prefix_match_tokens"] == 31
+
+
+def test_a_model_with_no_prefix_pool_reports_zero_not_null(tmp_path):
+    """DeepSeek-V4 has no prefix cache; a dense load with it off has none either.
+    An engine row is never null here -- null means "refused before generation"."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    asyncio.run(e.generate(_req()))
+    r = rows(tmp_path)[0]
+    assert r["prefix_hit"] is False and r["prefix_match_tokens"] == 0
+
+
+def test_a_failed_request_still_records_what_it_matched(tmp_path):
+    e = EngineHandle(PM([12], raise_on_generate=RuntimeError("CUDA OOM")), log_dir=tmp_path)
+    with pytest.raises(RuntimeError):
+        asyncio.run(e.generate(_req()))
+    r = rows(tmp_path)[0]
+    assert r["finish"] == "error" and r["prefix_match_tokens"] == 12
