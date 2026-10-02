@@ -15,7 +15,8 @@ import types
 import pytest
 import torch
 
-from vaayu.vaayu_base import VaayuBaseModel
+from vaayu.persist.expert_cache import ExpertVRAMCache
+from vaayu.vaayu_base import VaayuBaseModel, cap_tier_after_admission_eviction
 from vaayu.vram_plan import (VramPlanError, VramShape, kv_bytes_per_token,
                              predict_peak_vram, score_elem_bytes)
 
@@ -54,15 +55,22 @@ def shape_for(name):
 
 
 class FakeTier:
-    """What admission reads off ExpertVRAMCache: current_usage and evict_until_free.
-    `lands` says where evicted bytes show up -- the driver, or PyTorch's pool (blocks
-    inside a segment a live tensor still pins never reach the driver). `fraction` < 1
-    models an eviction that frees less than it was asked for."""
+    """What admission reads off ExpertVRAMCache: current_usage, budget_bytes,
+    evict_until_free and set_budget. `lands` says where evicted bytes show up -- the
+    driver, or PyTorch's pool (blocks inside a segment a live tensor still pins never
+    reach the driver). `fraction` < 1 models an eviction that frees less than it was
+    asked for. The tier is full (budget == usage) unless `budget` says otherwise."""
 
-    def __init__(self, usage, gpu, lands="driver", fraction=1.0):
+    def __init__(self, usage, gpu, lands="driver", fraction=1.0, budget=None):
         self.current_usage = int(usage)
+        self.budget_bytes = int(usage if budget is None else budget)
         self.gpu, self.lands, self.fraction = gpu, lands, fraction
         self.calls: list = []
+
+    def set_budget(self, budget_bytes):
+        assert int(budget_bytes) >= self.current_usage, "the fake does not model eviction here"
+        self.budget_bytes = int(budget_bytes)
+        return 0
 
     def evict_until_free(self, free_target_bytes):
         self.calls.append(int(free_target_bytes))
@@ -237,6 +245,164 @@ def test_the_eviction_target_discounts_the_pool(name, gpu):
     assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
     assert tier.calls == [need - pool], "the eviction target ignored the reusable pool"
     assert tier.current_usage == 2 * GB - short, "evicted the pool's worth on top"
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_an_admission_eviction_caps_the_tier_at_what_it_still_holds(name, gpu, capsys):
+    """Eviction alone moves the OOM from prefill to decode: left at its old budget the
+    tier refills into the bytes just spent. After an evict-admit it keeps what it holds."""
+    need = need_for(name)
+    short = 256 * MB
+    gpu["free"] = need - short
+    tier = FakeTier(2 * GB, gpu)
+    model = model_for(name, reserve=need, tier=tier)
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.current_usage == 2 * GB - short
+    assert tier.budget_bytes == tier.current_usage, "the tier may regrow into spent bytes"
+    assert "capped its budget" in capsys.readouterr().out
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_tier_that_was_not_full_is_capped_at_its_usage(name, gpu):
+    """`budget - evicted` is not enough when the tier was not full: the room it had left
+    to grow is gone too. Only usage-after satisfies budget <= free + usage - need."""
+    need = need_for(name)
+    short = 256 * MB
+    gpu["free"] = need - short
+    tier = FakeTier(1 * GB, gpu, budget=3 * GB)
+    model = model_for(name, reserve=need, tier=tier)
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.budget_bytes == 1 * GB - short
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_external_pressure_leaves_the_tier_no_room_to_overcommit(name, gpu):
+    """The final review's repro: another process takes VRAM while the server is warm, so
+    the shortfall is far above this process's own unbudgeted bytes. The request may be
+    admitted only if request + tier-at-its-budget still fit what the card has."""
+    need = need_for(name)
+    gpu["free"] = need - 1536 * MB
+    tier = FakeTier(2 * GB, gpu)
+    model = model_for(name, reserve=need, tier=tier)
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    have = gpu["free"] + gpu["pool"] + tier.current_usage      # everything not held elsewhere
+    assert need + tier.budget_bytes <= have, "decode would overcommit the card"
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_a_tier_that_cannot_be_capped_is_a_clean_refusal(name, gpu, capsys):
+    """No admission on a promise that cannot be kept, and no crash either (D3)."""
+    need = need_for(name)
+    gpu["free"] = need - 256 * MB
+    tier = FakeTier(2 * GB, gpu)
+
+    def boom(_budget_bytes):
+        raise RuntimeError("cannot cap")
+    tier.set_budget = boom
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError):
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+    out = capsys.readouterr().out
+    assert "still does not fit" in out and "capped" not in out
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_the_real_tier_is_evicted_by_whole_entries_and_capped(name, gpu, monkeypatch):
+    """The same path through the real ExpertVRAMCache: it frees whole entries (so a
+    little more than the shortfall) and its budget ends at exactly what it holds."""
+    need = need_for(name)
+    entry_bytes, n_entries = 8 * MB, 64
+    tier = ExpertVRAMCache(n_entries * entry_bytes)
+    for e in range(n_entries):
+        assert tier.put(0, e, {"w": {"t": types.SimpleNamespace(nbytes=entry_bytes)}})
+    full = tier.current_usage
+    short = 20 * MB                                             # 2.5 entries -> 3 evicted
+    base_free = need - short
+    # The card gets back exactly what the tier gives up.
+    monkeypatch.setattr(torch.cuda, "mem_get_info",
+                        lambda *a, **k: (base_free + full - tier.current_usage, 16 * GB))
+    model = model_for(name, reserve=need, tier=tier)
+    assert VaayuBaseModel._assert_context_fits(model, N_TOKENS) == need
+    assert tier.current_usage == full - 3 * entry_bytes
+    assert tier.budget_bytes == tier.current_usage
+    assert tier.put(0, 999, {"w": {"t": types.SimpleNamespace(nbytes=entry_bytes)}})
+    assert tier.current_usage == full - 3 * entry_bytes, "a put past the cap must evict, not grow"
+
+
+# One token's routed experts per layer, layers, expert bytes: derived shapes, as
+# compute_moe_geometry builds them (CLAUDE.md §5: contrasting geometries).
+MOE_GEOMETRIES = {
+    "qwen3next_like": dict(top_k=10, num_moe_layers=48, expert_bytes=1_769_520),
+    "minimax_like": dict(top_k=8, num_moe_layers=62, expert_bytes=8 * MB),
+    "gptoss_like": dict(top_k=4, num_moe_layers=24, expert_bytes=13_236_480),
+}
+
+
+def _moe_model(name, tier):
+    geo = dict(MOE_GEOMETRIES[name])
+    geo["working_set_bytes"] = geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"]
+    blocks = [types.SimpleNamespace(layer_idx=i) for i in range(geo["num_moe_layers"])]
+    return types.SimpleNamespace(_moe_geometry=geo, _moe_blocks=blocks,
+                                 _vram_cacheable_layers=None, _expert_vram_cache=tier), geo
+
+
+def _fill(tier, n, expert_bytes):
+    for e in range(n):
+        assert tier.put(0, e, {"w": {"t": types.SimpleNamespace(nbytes=expert_bytes)}})
+
+
+@pytest.mark.parametrize("name", list(MOE_GEOMETRIES))
+def test_a_cap_above_one_tokens_working_set_leaves_the_layer_range_alone(name, capsys):
+    geo = MOE_GEOMETRIES[name]
+    per_token = geo["top_k"] * geo["num_moe_layers"]
+    tier = ExpertVRAMCache(4 * per_token * geo["expert_bytes"])
+    _fill(tier, per_token + 3, geo["expert_bytes"])
+    model, _ = _moe_model(name, tier)
+    before, after = cap_tier_after_admission_eviction(model, tier)
+    assert (before, after) == (4 * per_token * geo["expert_bytes"], tier.current_usage)
+    assert tier.budget_bytes == tier.current_usage
+    assert model._vram_cacheable_layers is None
+    assert "WARNING" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", list(MOE_GEOMETRIES))
+def test_a_cap_under_one_tokens_working_set_restricts_the_layer_range(name, capsys):
+    """Under the working set an unrestricted LRU hits 0 % and every miss still pays for
+    its entry: the range the load would have derived for this budget must apply."""
+    geo = MOE_GEOMETRIES[name]
+    held = 3 * geo["top_k"] + 1                                 # three layers' worth, and a bit
+    tier = ExpertVRAMCache(10 * geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"])
+    _fill(tier, held, geo["expert_bytes"])
+    model, _ = _moe_model(name, tier)
+    cap_tier_after_admission_eviction(model, tier)
+    assert tier.budget_bytes == held * geo["expert_bytes"]
+    assert model._vram_cacheable_layers == {0, 1, 2}
+    out = capsys.readouterr().out
+    assert "WARNING" in out and f"first 3/{geo['num_moe_layers']}" in out
+
+
+@pytest.mark.parametrize("name", list(MOE_GEOMETRIES))
+def test_a_cap_at_zero_switches_the_tier_off_for_every_layer(name):
+    """An emptied tier keeps budget 0: put() refuses everything, so a visit must not
+    build entries for it. The empty set is what _vram_tier_visit reads as "no tier"."""
+    geo = MOE_GEOMETRIES[name]
+    tier = ExpertVRAMCache(64 * geo["expert_bytes"])
+    model, _ = _moe_model(name, tier)
+    assert cap_tier_after_admission_eviction(model, tier) == (64 * geo["expert_bytes"], 0)
+    assert tier.budget_bytes == 0 and model._vram_cacheable_layers == set()
+
+
+def test_a_cap_on_a_model_without_moe_geometry_only_lowers_the_budget():
+    tier = ExpertVRAMCache(64 * MB)
+    _fill(tier, 2, 8 * MB)
+    model = types.SimpleNamespace(_expert_vram_cache=tier)
+    assert cap_tier_after_admission_eviction(model, tier) == (64 * MB, 16 * MB)
+    assert not hasattr(model, "_vram_cacheable_layers")
 
 
 @requires_cuda

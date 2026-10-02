@@ -6,6 +6,8 @@ layer of a geometry. With a tier, a resident expert's rows come from the tier's 
 delivery run the same module forward over the same bytes, so every output here must be
 torch.equal to the whole-layer one -- not close.
 """
+import threading
+
 import pytest
 import torch
 
@@ -165,20 +167,48 @@ def test_prefill_reads_the_tier_and_never_fills_it(tmp_path, name):
     assert torch.equal(routed, whole)
 
 
+def _miss_before_hit(block, g):
+    """Two one-token inputs (first, second): `second` routes an expert with a LOWER id
+    than every expert `first` routes, and does not route `first`'s lowest expert. A visit
+    walks its experts in id order, so on the two together a miss is settled -- and put()
+    into the tier -- before `first`'s lowest expert is read."""
+    for seed_a in range(7, 207):
+        first = _hidden(g, seed_a)
+        base = set(_routed(block, g, first))
+        if min(base) == 0:
+            continue
+        for seed_b in range(300, 600):
+            second = _hidden(g, seed_b)
+            got = set(_routed(block, g, second))
+            if min(got) < min(base) and min(base) not in got:
+                return first, second
+    raise AssertionError("no such pair of routings found")
+
+
 @pytest.mark.parametrize("name", BOTH)
-def test_an_eviction_inside_the_visit_keeps_the_held_entry_usable(tmp_path, name):
+def test_a_held_entry_is_read_after_the_visit_evicted_it(tmp_path, name):
+    """The tier holds exactly one token's experts. A miss with a lower id is settled
+    first and its put() evicts the tier's LRU entry -- a HELD one the visit has not
+    read yet. The visit must read it from the reference it took, not look it up again:
+    it is a RAM miss too, so there is nothing else to read it from."""
     g = GEOMETRIES[name]
-    # The tier holds exactly one token's routed experts: any miss evicts a held entry.
-    g, ref, blocks, _ram, _ = _setup(tmp_path, name, tier_experts=g["top_k"])
+    g, ref, blocks, ram, _ = _setup(tmp_path, name, tier_experts=g["top_k"])
     tier = ref._expert_vram_cache
-    first = _hidden(g, 7)
-    _run(blocks[0], first)
-    second = _other_hidden(blocks[0], g, first)
+    first, second = _miss_before_hit(blocks[0], g)
     both = torch.cat([first, second])
     whole = _whole(ref, blocks[0], both)
-    evictions = tier.evictions
+    _run(blocks[0], first)                             # the tier = first's experts, full
+    held = tier.resident_set(0)
+    assert held == set(_routed(blocks[0], g, first))
+    ram.clear()                                        # held experts: no RAM copy either
+    ref._vram_cacheable_layers = set()                 # tier gate off for one visit...
+    _run(blocks[0], second)                            # ...so RAM holds second's experts
+    ref._vram_cacheable_layers = None
+    assert tier.resident_set(0) == held, "the setup visit touched the tier"
+    lowest_held = min(held)
     routed = _run(blocks[0], both)
-    assert tier.evictions > evictions, "the budget was meant to force an eviction mid-visit"
+    assert lowest_held not in tier.resident_set(0), \
+        "the visit was meant to evict a held entry before reading it"
     assert torch.equal(routed, whole)
 
 
@@ -270,6 +300,56 @@ def test_without_a_tier_a_visit_is_what_it_was(tmp_path, name):
     hits = ram.hits
     assert torch.equal(_run(blocks[0], hidden), whole)
     assert ram.hits > hits
+
+
+@pytest.mark.parametrize("name", BOTH)
+@pytest.mark.parametrize("prefill", [False, True])
+def test_a_load_failure_with_tier_hits_held_leaks_nothing(tmp_path, name, prefill, monkeypatch):
+    """Spec: an exception mid-visit leaves no leaked pin and no leaked staging slab --
+    on the arena path, with entries held from the tier, in decode and in prefill."""
+    g = GEOMETRIES[name]
+    model, idx, _ = build(tmp_path, g["n_layers"], top_k=g["top_k"],
+                          num_experts=g["num_experts"], width=g["width"])
+    general, staging = 2 * g["num_experts"], 2
+    arena = SlabArena(n_slabs=general + staging, slab_bytes=compute_slab_bytes(idx), pin=False)
+    assert arena.reserve_staging(staging) == staging
+    ram = ExpertRAMCache(budget_bytes=general * compute_slab_bytes(idx), arena=arena)
+    ref = Ref(model, routed_ok(idx))
+    blocks, _ = patch(tmp_path, model, idx, ref, cache=ram)
+    tier = ref._expert_vram_cache = ExpertVRAMCache(64 * _expert_bytes(g))
+    one = _hidden(g, 11)
+    _run(blocks[0], one)                               # decode: fills both tiers
+    resident = tier.resident_set(0)
+    many = torch.cat([one, _hidden(g, 12, tokens=6)])
+    assert len(set(_routed(blocks[0], g, many)) - resident) >= 2, "needs two loads to fail one"
+    whole = _whole(ref, blocks[0], many)
+    ref._moe_prefill_pass = prefill
+    real_load = smp.load_expert_into_slab
+    lock, calls = threading.Lock(), [0]
+
+    def first_ok_then_fail(*a, **k):
+        with lock:
+            calls[0] += 1
+            first = calls[0] == 1
+        if first:
+            return real_load(*a, **k)
+        raise RuntimeError("disk gone mid-visit")
+    with monkeypatch.context() as m:
+        m.setattr(smp, "load_expert_into_slab", first_ok_then_fail)
+        with pytest.raises(RuntimeError, match="disk gone mid-visit"):
+            _run(blocks[0], many)
+        # A raising visit does not wait for its other loads; let them land first.
+        ref._moe_fallback_executor.shutdown(wait=True)
+    del ref._moe_fallback_executor                     # the next visit builds a new pool
+    assert ram._pinned == {}, f"leaked pins {ram._pinned}"
+    assert ram._orphan_slabs == {}
+    assert arena.staging_free == arena.staging_slabs, "a staging slab leaked"
+    assert len(arena._free) + len(ram._slab_of) == general, "a general slab leaked"
+    assert getattr(ref, "_prefill_staged", {}) == {}
+    assert resident <= tier.resident_set(0), "the failed visit dropped tier entries"
+    experts = blocks[0].moe_module.experts
+    assert experts.gate_up_proj.is_meta and "forward" in experts.__dict__
+    assert torch.equal(_run(blocks[0], many), whole)   # and the next visit is whole
 
 
 @pytest.mark.parametrize("name", BOTH)
