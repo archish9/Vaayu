@@ -676,8 +676,18 @@ line under the S17 row).
               `14 passed`; hunks == the dry-run assets; mutants M11–M15, M17, M18 killed, M16 survives = the
               margin choice); product doc §3.4c corrected in the same commit; review clean. **Suite at `1842eb9`
               (controller's run): `3614 passed, 20 skipped, 537 warnings in 225.05s (0:03:45)`, 0 failed.**
-        - [ ] T4 Qwen3-Next TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k, profiled ON arm, 40,960-token run
+        - [x] T4 Qwen3-Next TTFT ABBA (off, on, on, off) cold + HIT at 2k / 8k, profiled ON arm, 40,960-token run
               → stop-rule decision
+              - Measured commit 401651c; arm order off1, on1, on2, off2 (all exit 0; load line present in all four; HIT_FIRED=True 20/20). Raw truth: `plans/probes/s20_out/s11-ttft-{off1,on1,on2,off2}.json` (gitignored).
+              - ids identical across 4 arms on 6/8 turns; DIFFERENT: U1-2048-h, U1-8192-h (recorded, not required).
+              - cold@2k OFF 10.290s [10.061, 9.844, 10.606, 10.648] ON 6.967s [7.092, 6.686, 7.273, 6.817] delta +3.322s = +32.29 % of OFF; peak GB OFF [13.03, 13.01, 13.02, 12.98] ON [13.06, 13.05, 13.06, 13.03].
+              - HIT@2k OFF 3.073s [2.997, 2.855, 3.269, 3.17] ON 2.667s [2.752, 2.5, 2.813, 2.603] delta +0.406s = +13.22 % of OFF; peak OFF 12.71 ON 12.84.
+              - cold@8k OFF 27.650s [26.938, 26.926, 28.309, 28.428] ON 12.417s [12.412, 12.149, 12.681, 12.425] delta +15.233s = +55.09 % of OFF; peak OFF [13.01, 13.04, 12.98, 13.04] ON [13.02, 13.07, 13.02, 13.05].
+              - HIT@8k OFF 2.993s [2.881, 2.861, 3.102, 3.13] ON 2.494s [2.411, 2.441, 2.605, 2.52] delta +0.499s = +16.67 % of OFF; peak 12.81 both.
+              - Mean stall_s OFF -> ON: cold@2k 1.062 -> 3.745, HIT@2k 0.558 -> 1.695, cold@8k 0.939 -> 4.411, HIT@8k 0.503 -> 1.504 (read_gb unchanged: 20.195/20.121, 9.232/9.132, 23.217/23.048, 8.695/8.647).
+              - Profiled ON arm (`s11-ttft-p-on.json`, exit 0), share of sec.moe: construct 0 and scatter 0 on all four P turns. P-2048-c moe 6.842s: h2d 24.07 %, gemm 11.67 %, disk_load 43.07 %. P-2048-h moe 2.826s: h2d 27.88 %, gemm 3.92 %, disk_load 46.72 %. P-8192-c moe 10.600s: h2d 17.23 %, gemm 29.25 %, disk_load 34.48 %. P-8192-h moe 2.605s: h2d 30.93 %, gemm 4.32 %, disk_load 41.75 %.
+              - Long-context 40,960 (both exit 0, 0 "out of memory"): OFF cold TTFT 127.112s, peak 14.02GB; ON cold TTFT 41.887s, peak 14.02GB; HIT OFF 3.663s / ON 3.132s, peak 13.44GB both; out_ids identical OFF vs ON on both U0 turns. 65,536 NOT covered (the fixed prompt builds 40,960 at most).
+              - Stop rule (HIT@8k < 5.00 % AND cold@8k < 10.00 %): 16.67 % and 55.09 % -> PASS, proceed to T5.
         - [ ] T5 prefill-ppl band
         - [ ] T6 gates (suite, accumulator ×2, server, prefix-reuse), RESULTS, ledger close, final review
       - [x] **Step 1 — design.** Spec `docs/superpowers/specs/2026-10-02-S20-packed-prefill-kernel-design.md`
