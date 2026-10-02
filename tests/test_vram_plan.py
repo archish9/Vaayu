@@ -703,6 +703,29 @@ def test_the_refusal_does_not_offer_s_max_as_a_fix_for_a_wide_batch():
     assert "at a batch width of 1" not in single
 
 
+@pytest.mark.parametrize("name", ["minimax-m2.7", "qwen3-235b"])
+def test_the_lever_line_qualifies_the_ceiling_by_the_batch_width_it_was_solved_at(name):
+    """S19 final review F1: with a headroom the lever is the runtime ceiling, solved
+    AT N -- it must not claim "assumes N=1". Without a headroom the lever is s_max,
+    which IS solved at N=1, and keeps that caveat."""
+    p = _plan(name, reserve_floor=_VRAM_RESERVE_FLOOR_BYTES)
+    shape = shape_for(name, N=2)
+    free = int(14 * GB)
+    n2 = min(p.s_max, _largest_s_within_budget(shape, p.reserve_bytes))
+
+    def lever(headroom):
+        msg = _too_big_message(requested=n2 + 1, s_max=p.s_max, free_vram=free,
+                               shape=shape, min_resident=EXPERT_BYTES,
+                               headroom=headroom)
+        return next(l for l in msg.splitlines() if "lower max_seq_len to" in l)
+
+    line = lever(p.reserve_bytes)
+    assert f"lower max_seq_len to {n2} or less" in line
+    assert "assumes N=1" not in line
+    assert "at a batch width of 2" in line
+    assert "(that ceiling assumes N=1)" in lever(None)
+
+
 def test_the_refusal_explains_why_the_budget_is_smaller_than_free_vram():
     """D3's lesson: a diagnostic must not mislead. Refusing a 7.5 GiB request
     with "does not fit in 14.21 GiB of free VRAM" reads as a contradiction and

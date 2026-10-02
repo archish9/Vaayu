@@ -254,7 +254,10 @@ held — read it against `prompt_tokens`. `prefix_hit` alone is `true` for a
 one-token match, so a session whose reuse has collapsed (a changed system prompt,
 a re-ordered file) still reads as a hit; `prefix_match_tokens: 44` beside
 `prompt_tokens: 7517` is what shows it. It is `0` on a miss and on a model with no
-prefix cache, and batch-wide in the same way `prefix_hit` is. The engine always
+prefix cache, and batch-wide in the same way `prefix_hit` is. Under a batch (`batch.n` > 1) each row
+carries the SUM of every member's matched tokens, which can exceed that row's own
+`prompt_tokens`, so rows must not be summed (the reason `decode` is flagged
+`"shared": true`). The engine always
 re-runs at least the last prompt token, so a full match reads `prompt_tokens`
 while `prompt_tokens - 1` positions were actually reused.
 

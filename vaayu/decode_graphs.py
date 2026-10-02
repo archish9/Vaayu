@@ -736,6 +736,8 @@ class DecodeGraphRunner:
             tier.set_budget(tier.budget_bytes + self._charged)
             refund = (f" The expert VRAM tier's budget is restored to "
                       f"{tier.budget_bytes / 1e9:.2f} GB.")
+            self._charged = 0          # consumed: a second release refunds nothing
+            self._tier_before = None
         print(f"[Vaayu] WARNING: decode graphs DISABLED for this process: {why}. "
               f"Decode runs eagerly.{refund}")
 

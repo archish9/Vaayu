@@ -737,6 +737,23 @@ def test_a_refund_after_an_admission_cap_gives_back_only_the_pool(held):
 
 
 @cuda
+def test_the_pool_refund_is_idempotent():
+    """S19 final review F3: the refund is relative to the budget as it stands, so a
+    second `_release_pool` must not refund again."""
+    layers = _stack(SPECS["hybrid"])
+    tier = ExpertVRAMCache(budget_bytes=1 << 30)
+    model = _model(layers, _expert_vram_cache=tier)
+    runner = dg.install_decode_graphs(model)
+    _decode(layers, _cache(3), runner)
+    assert runner._charged > 0
+    runner._disable("x")
+    runner._release_pool("x")
+    first = tier.budget_bytes
+    runner._release_pool("x")
+    assert tier.budget_bytes == first == 1 << 30
+
+
+@cuda
 def test_a_disable_with_nothing_charged_to_the_tier_leaves_its_budget_alone():
     """The pool was never charged to the tier (no capture ran): a disable has
     nothing to give back."""

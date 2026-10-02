@@ -697,6 +697,13 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
             f"Context of {int(requested)} tokens does not fit in "
             f"{float(free_vram) / gb:.2f} GiB of free VRAM. The largest context "
             f"that fits at this configuration is {ceiling}.\n")
+    # The runtime ceiling is solved AT this batch width; s_max is solved at N=1.
+    if int(shape.N) <= 1:
+        lever_note = ""
+    elif runtime_ceiling is not None:
+        lever_note = f" (at a batch width of {int(shape.N)})"
+    else:
+        lever_note = " (that ceiling assumes N=1)"
     return (
         opening +
         f"  predicted peak at {int(requested)} tokens: "
@@ -706,7 +713,7 @@ def _too_big_message(*, requested: int, s_max: int, free_vram: int,
         f"  floor that must stay resident beside it: {float(min_resident) / gb:.2f} GiB\n"
         f"Real levers, in the order they usually pay:\n"
         f"  - shorten the context, or lower max_seq_len to {lever_max} or less"
-        f"{' (that ceiling assumes N=1)' if int(shape.N) > 1 else ''}\n"
+        f"{lever_note}\n"
         f"  - reduce prefill_chunk_size (currently {shape.chunk}) to shrink the "
         f"logits and score transients\n"
         f"  - reduce the batch width N (currently {shape.N})\n"
