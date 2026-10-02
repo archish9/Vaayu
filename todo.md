@@ -651,8 +651,10 @@ line under the S17 row).
       *TTFT ABBA (off, on, on, off), Qwen3-Next, OFF → ON, saved = OFF − ON:* cold@2k 10.290 → 6.967 s (3.322 s,
       32.29 %); HIT@2k 3.073 → 2.667 s (0.406 s, 13.22 %); cold@8k 27.650 → 12.417 s (15.233 s, 55.09 %); HIT@8k
       2.993 → 2.494 s (0.499 s, 16.67 %). Scope: Qwen3-Next only, N=1, `BALLAST_GB=25`, 4 reps per cell, warm
-      session discarded, measured at `401651c`; every ON rep below every OFF rep. *Greedy ids:* identical across
-      the four arms on 6/8 turns; OFF1 == OFF2 and ON1 == ON2 on 8/8; the two differing turns differ OFF vs ON only.
+      session discarded, TTFT measured at `401651c` and the quality band at `4b5f307` (both differ from the code commit `1842eb9` only in `todo.md`); every ON rep below every OFF rep. *Greedy ids:* identical across
+      the four arms on 6/8 turns; OFF1 == OFF2 and ON1 == ON2 on 8/8; the two differing turns (`U1-2048-h`,
+      `U1-8192-h`) differ OFF vs ON only, first differing generated token at 0-based index 15 of 16 and 6 of 16
+      respectively.
       *Quality band (prefill-ppl, kernel − stock, 1,536-token prompts, 6 null draws):* code +0.0103 % (delta
       +0.000562 ppl, pooled sd 0.006923), prose +0.0124 % (+0.000718, pooled sd 0.007112), `VERDICT PASS`.
       *Long context:* 40,960-token cold prompt runs, TTFT 127.112 → 41.887 s, peak VRAM 14.02 GB both, ids identical
@@ -663,8 +665,8 @@ line under the S17 row).
       must HIT` — identically on `main` (`1c8f122`, no S20 code): `batched_generate` skips the prefix cache on a
       model with recurrent (linear-attention) state by design (rows 41/43), so the gate cannot pass here and cannot
       tell S20 from `main`; ruled out of S20's gate list, single-stream prefix reuse covered by the server gate and
-      the ABBA's 20/20 HIT turns.** *Suite floor 3614 passed, 20 skipped* (225.05 s, at `1842eb9`). *Mutants:* 22
-      defined, all killed except M10 (equivalent: the bf16 store already rounds) and M16 (a safety-margin choice,
+      the ABBA's HIT turns (20 of 20 HIT turns fired across the four ABBA arms: 16 measured + the 4 discarded warm sessions).** *Suite floor 3614 passed, 20 skipped* (225.05 s, at `1842eb9`). *Mutants:* 21
+      distinct (M1–M21; M11 is run by both scripts), 19 killed, 2 survive: M10 (equivalent: the bf16 store already rounds) and M16 (a safety-margin choice,
       ≥ 13× instead of 2× against cuBLAS, no test can observe it at these shapes). *Review fix (T1):* a strided
       `out` and, at top_k == 1, strided `routing_weights` were raw-indexed by the kernels (relL2 0.607) → guarded,
       2 tests, mutants M20/M21; `_dot_rows` shares one `_deq`, one verdict body `_agrees`. *CLAUDE.md §8:* (1) knob:
