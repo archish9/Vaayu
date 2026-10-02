@@ -91,6 +91,19 @@ class ExpertOffsetIndex:
     # four checkpoints on this box.
     _EXPERT_COUNT_FIELDS = ("num_experts", "num_local_experts", "n_routed_experts")
 
+    @classmethod
+    def expert_count_in(cls, config) -> int | None:
+        """The routed-expert count `config` names, or None. `config` is a parsed
+        config.json (a dict) or a transformers config object -- the load's own MoE
+        gate (`VaayuBaseModel._detect_moe`) asks this same question of the latter,
+        so there is one field list, not two that can disagree (S19 iv)."""
+        get = config.get if isinstance(config, dict) else (lambda f: getattr(config, f, None))
+        for field in cls._EXPERT_COUNT_FIELDS:
+            value = get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
     def expected_expert_count(self) -> int | None:
         """How many routed experts this checkpoint's config implies, or None.
 
@@ -107,11 +120,7 @@ class ExpertOffsetIndex:
                 config = json.load(f)
         except (OSError, ValueError):
             return None
-        for field in self._EXPERT_COUNT_FIELDS:
-            value = config.get(field)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-        return None
+        return self.expert_count_in(config)
 
     @staticmethod
     def _fused_expert_axis(key: str, shape: list, expected: int | None) -> bool:

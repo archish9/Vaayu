@@ -3985,18 +3985,18 @@ class VaayuBaseModel(GenerationMixin):
     def _detect_moe(self) -> None:
         """Detect Mixture-of-Experts architecture from model config."""
         arch = (getattr(self.config, "architectures", None) or [""])[0]
+        # The offset index's field list, not a second one kept here: the two
+        # disagreed about `n_routed_experts` and the load went dense, silently (S19 iv).
+        from .persist.expert_offset_index import ExpertOffsetIndex
+        _count = ExpertOffsetIndex.expert_count_in(self.config)
         self.is_moe = (
-            hasattr(self.config, "num_local_experts")
-            or hasattr(self.config, "num_experts")
+            _count is not None
             or "Moe" in arch
             or "MoE" in arch
             or "Mixtral" in arch
         )
         if self.is_moe:
-            self.moe_num_experts = getattr(
-                self.config, "num_local_experts",
-                getattr(self.config, "num_experts", 8)
-            )
+            self.moe_num_experts = _count if _count is not None else 8
             self.moe_top_k = getattr(
                 self.config, "num_experts_per_tok",
                 getattr(self.config, "top_k", 2)
