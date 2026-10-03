@@ -7650,3 +7650,49 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   84 HtoD and fully synchronous. Belongs with S3's routing-sync item; S1's handoff §5 forbade
   chasing DtoH inside S1.
   **CLOSED 2026-10-03 by S21: ≤ 1 % of the token** — 97 pageable DtoH/token at 7–10 µs host each = ≤ 0.8 ms/token.
+
+<!-- moved from todo.md 2026-10-03 (S23 closed) -->
+- [x] **S23 — restore an on-device dense gate.** ✅ **CLOSED 2026-10-03.** *(Branch `s23-dense-gate`. Design approved by
+      the USER in chat (bounded path): `tests/test_dense_gate.py`, `DENSE_CKPT=`, boots the real server app, generic
+      perplexity band only — no per-checkpoint reference. Mid-task the USER approved replacing the planned ppl FLOOR
+      with a causality test and adding a bitwise decode-logit test, after mutation M1 refuted the floor.)*
+      `test_batched_dense_smoke.py` (repo root) was deleted 2026-09-03 in `7d806e7` ("remove unwanted files") and never
+      replaced; `CLAUDE.md` §0 and the gates table both pointed at the gap. The old file (`git show
+      7d806e7^:test_batched_dense_smoke.py`) loaded the LIBRARY way (sdpa forced, `max_pinned_layers=0` -> every layer
+      streamed), asserted ppl < 25 and ran `batched_generate`. Its last numbers: **8.78** on Llama-3.3-70B-exl3 and
+      **11.94** on Llama-3.2-1B, both sdpa.
+      **Brief (as written):** a committed on-device test under `tests/` (skips without its env var) that loads a dense
+      checkpoint the way the server does and asserts `is_moe` False, teacher-forced perplexity inside a stated band, and
+      greedy ids reproducible across two short generations; prove it can fail; run it on Llama-3.2-1B and
+      Llama-3.3-70B; add its row to the gates table; propose the corrected `CLAUDE.md` sentence to the USER.
+      **Delivered `tests/test_dense_gate.py`** (5 tests, all skip without `DENSE_CKPT`). One module fixture boots
+      `create_app(ServerConfig(model_path=CKPT, delete_original=False, capture_stdio=False, auto_prefix_match=False))`
+      under `TestClient` — the server's own `from_pretrained(...)` + `freeze_after_load`; `ServerConfig`'s dataclass
+      defaults equal `config.py`'s shipped values (every field compared 2026-10-03). Tests: (1) `is_moe is False` and
+      `_moe_geometry is None`; (2) teacher-forced ppl < 25 on the old gate's 80-token English text; (3) causality —
+      flip the tokens after k = n//2, the logits before k must be BITWISE equal; (4) three prefill + one-decode-step
+      runs give bitwise-equal logits; (5) two cold greedy HTTP requests (temperature 0, 8 tokens, different session
+      ids) return identical text, with premises asserted (no prefix hit, both ran the full cap).
+      **Numbers (server default attention = flash_attention_2):** Llama-3.2-1B ppl **11.90**, 5.6 s (load 1.5 s);
+      Llama-3.3-70B-exl3 ppl **8.85**, 119 s (load 9.1 s; 16 of 80 layers pinned, the rest streamed, RAM layer cache
+      16.2 GB); causality and decode max|d| **0.0** on both. Prompt-lookup speculation engaged on the HTTP requests,
+      so the M>1 verify forward is on the gate's path.
+      **Seen to fail (Llama-3.2-1B, scratch worktree, each mutation reverted):** RoPE frozen at position 0 -> ppl
+      141.99 (test 2); final norm skipped -> 2094.17 (test 2); `is_causal=False` on prefill -> causality max|d| 9.75
+      (test 3) while ppl was **6.60, inside any band** — which is why there is NO floor; unseeded decode-logit noise sd
+      2.0 -> decode max|d| 13.4 (test 4) while the 8-token text stayed identical; sd 50 -> tests 4 and 5 red;
+      `_detect_moe` forced True -> test 1 red. Clean: 5/5.
+      **Findings:** (a) a perplexity floor cannot detect a causal-mask leak — a model never trained bidirectionally
+      cannot exploit the leaked token (6.60 vs healthy 11.90), and a healthy 70B scores 8.85; test causality directly.
+      (b) Two identical requests under DIFFERENT session ids are not both cold: `PrefixCacheStore.lookup` falls back to
+      the best prefix in the pool when a named session misses, so the second HITs; the gate sets
+      `auto_prefix_match=False` (read only by that lookup, `vaayu_base.py:6303`; load unchanged). Any probe wanting
+      two cold requests has the same trap. (c) A token comparison sleeps through small nondeterminism (the accumulator
+      gate's lesson, reproduced on dense). (d) The dense forward is bitwise deterministic and bitwise causal on both
+      checkpoints, EXL3 kernels and flash included.
+      **Procedure:** `DENSE_CKPT=<ckpt> systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0 ./venv/bin/python
+      -m pytest tests/test_dense_gate.py -q`, FOREGROUND, no `-s`. Mandatory (on both Llama checkpoints) for any change
+      to shared infra — staging, prefix cache, NVMe warmup, io_uring — per `CLAUDE.md` §0; the Qwen3-Next and MiniMax
+      gates stay mandatory for MoE changes. **§8:** a test, no knob; loads exactly in server mode, N=1.
+      Suite **3621 passed, 0 failed, 25 skipped** (+5 skipped = this gate). `CLAUDE.md` corrections proposed to the
+      USER (§0 x2, §5 x1), not edited. RESULTS `docs/2026-10-03-S23-dense-gate-RESULTS.md`.

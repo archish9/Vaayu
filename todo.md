@@ -10,8 +10,8 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3621 passed, 0 failed, 0 errors, 20 skipped`** (227.63 s, FOREGROUND, on merged `main` `4eeab9b`,
-2026-10-03, S20).
+**Suite floor: `3621 passed, 0 failed, 0 errors, 25 skipped`** (234.86 s, FOREGROUND, on branch `s23-dense-gate`,
+2026-10-03, S23 — the +5 skipped are `tests/test_dense_gate.py` without `DENSE_CKPT`).
 
 **Before proposing any perf work, read "SETTLED — DO NOT RE-OPEN" in the archive in `todo-backlog.md`** — ideas
 already built and refuted, each with the number that killed it.
@@ -62,7 +62,7 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
 | # | item | why here | cost |
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
-| **S23** | **Restore an on-device dense gate** (Llama-3.2-1B in seconds, Llama-3.3-70B as the streamed case) | (c)+(d), and now a PREREQUISITE of S22 (above) | hours |
+| **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
 | **S22** | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's three byte groups together, (B0) price S11-L7's predictor offline | (a)+(b): the decode stall is 26 % of the agent's turn; A1+A2 measured/estimated at ~1.6–2.3 s of a 20.1 s turn | days |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
@@ -71,7 +71,9 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
 - [x] **S21 — Qwen3-Next census at HEAD — ✅ CLOSED 2026-10-03.** The decode expert-miss stall (latency-bound, 5.3 s of a 20.1 s representative turn) is the top cost; S11-L6 REFUTED (real-class replay, every policy loses); S3-B / S1-L2 closed; S3-C below the bars; G5 answered. Full row + ranked table: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-03-S21-qwen3next-census-RESULTS.md`.
 
 - [ ] **S22 — Qwen3-Next expert-miss latency (S21's top cost). RUNS AFTER S23** (it changes the io_uring read path,
-      which dense streaming shares — see the reorder note above). Brief written by S21 (2026-10-03); evidence
+      which dense streaming shares — see the reorder note above). **S23 closed 2026-10-03: the dense gate exists —
+      `tests/test_dense_gate.py`, invocation in the gates table below; take its baseline on `main` before the change.**
+      Brief written by S21 (2026-10-03); evidence
       `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` §4, raw `plans/probes/s21_out/{miss-m1,g5-qwen-*,trace-t0}`.
       **Facts (server budget 18.30 GB, agent session):** decode stall 18–26 ms/token = 26 % of the 20.1 s
       representative turn; ~20 layers/token have a disk miss, mostly ONE expert; stall per missing layer 0.87 ms (1
@@ -102,7 +104,8 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
       worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
       choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
-      **Gates (io_uring is shared infra):** suite; **S23's dense gate on Llama-3.2-1B and Llama-3.3-70B**; `MOE_CKPT=`
+      **Gates (io_uring is shared infra):** suite; **S23's dense gate (`DENSE_CKPT=`, `tests/test_dense_gate.py`) on
+      Llama-3.2-1B and Llama-3.3-70B**; `MOE_CKPT=`
       accumulator gate on Qwen3-Next AND MiniMax; `SERVER_CKPT=` server gate on Qwen3-Next (`-s`, grep the load line);
       a DeepSeek-V4 decode run (12.75 MiB experts through the same loader). **Do NOT name the prefix-reuse gate for
       Qwen3-Next** (recurrent state; fails identically on `main`).
@@ -112,21 +115,11 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       above). **§8:** A1 is a derived value — a knob only if a measurement shows a per-box need (say which); reached at
       load in server mode, N=1.
 
-- [ ] **S23 — restore an on-device dense gate.** `test_batched_dense_smoke.py` (repo root) was deleted 2026-09-03 in
-      `7d806e7` ("remove unwanted files") and never replaced; `CLAUDE.md` §0 and the gates table below both point at
-      the gap. Recover the old file with `git show 7d806e7^:test_batched_dense_smoke.py` for reference. Last known
-      numbers: teacher-forced perplexity **8.78** on Llama-3.3-70B-exl3 (streamed-dense, ~37 GB read per token, read
-      via `DENSE_CKPT=`), **11.94** on Llama-3.2-1B (tied `lm_head`, fixed 2026-08-09).
-      **Deliver:** a committed on-device test under `tests/` (skips without its env var, like `MOE_CKPT=` /
-      `SERVER_CKPT=`) that loads a dense checkpoint the way the server does and asserts: `is_moe` False (no
-      `MoE detected` line), teacher-forced perplexity inside a stated band, and greedy ids reproducible across two
-      generations (dense: token-identity holds — row 3's note: a long generation CAN flip at an exact bf16 tie, so
-      keep it short). Prove it can fail (break something in the dense path in a scratch worktree, watch it go red).
-      Run it on Llama-3.2-1B and Llama-3.3-70B; add its row to the gates table; propose the corrected `CLAUDE.md`
-      sentence to the USER (do not edit `CLAUDE.md` unasked). Note: the Qwen3-Next and MiniMax gates stay
-      mandatory for MoE changes; this gate becomes mandatory for any change to shared infra (staging, prefix cache,
-      NVMe warmup, io_uring) per `CLAUDE.md` §0. **§8:** a test, no knob.
-      **S22 waits on this gate** (S21 made S22 an io_uring change — see the reorder note in the sequence section).
+- [x] **S23 — restore an on-device dense gate — ✅ CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`) boots
+      the real server app and asserts dense detection, ppl < 25, causality (bitwise), decode logits (bitwise) and two
+      cold greedy HTTP requests identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); seen
+      red under 6 mutations. No ppl floor: a broken causal mask scored 6.60. Full row: `todo-backlog.md` "Closed after
+      the 2026-10-03 cleanup"; RESULTS `docs/2026-10-03-S23-dense-gate-RESULTS.md`.
 
 - [ ] **S24 — re-prioritise with the USER.** Inputs: S21's ranked table (backlog archive, S21 row; RESULTS §6),
       S22's result (incl. B0's predictor number), the OPEN list below. Decisions owed by the USER: **(1) wire
@@ -316,7 +309,7 @@ arithmetic, not the repack.**
 
 ## Dense (Llama)
 
-*From the S14 row's 3a sub-item (gpt-oss non-expert residency, closed 2026-09-30). Dense perf is on the roadmap (CLAUDE.md §0); S23 restores the dense gate first.*
+*From the S14 row's 3a sub-item (gpt-oss non-expert residency, closed 2026-09-30). Dense perf is on the roadmap (CLAUDE.md §0); S23 restored the dense gate 2026-10-03 (`tests/test_dense_gate.py`).*
 
 - [ ] **(M-6) Lead:** E for DENSE models to free the embedding's VRAM for transformer layers --
       Llama-3.3-70B pins 2.10 GB of embedding in VRAM (19 fully-pinned: 16 transformer + 3 shared);
@@ -547,7 +540,7 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 
 | gate | invoke | ~time | catches |
 |---|---|---|---|
-| dense smoke (CLAUDE.md §0's named guard) | **DELETED** 2026-09-03 (`7d806e7`) — `test_batched_dense_smoke.py` no longer exists. No committed replacement | -- | *was:* dense path broken by MoE work. Teacher-forced perplexity, **8.78** on Llama-3.3-70B — unchanged as of its last real run |
+| dense (CLAUDE.md §0's named guard; **restored 2026-10-03 by S23** — the old root script `test_batched_dense_smoke.py` was deleted 2026-09-03 in `7d806e7`) | `DENSE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_dense_gate.py -q` (no `-s`; boots the real server app) | 6 s (Llama-3.2-1B) / 120 s (Llama-3.3-70B) | dense path broken by MoE or shared-infra work: a dense load detected as MoE; teacher-forced ppl ≥ 25 (1B **11.90**, 70B **8.85** under flash; the old 8.78 / 11.94 were sdpa); a logit before position k moving when only tokens after k change (bitwise — catches a causal-mask leak, which ppl CANNOT: 6.60 in band); decode-step logits not bitwise reproducible; two cold greedy HTTP requests differing. Seen to fail under 6 mutations (S23 row, archive). **Run on BOTH Llama checkpoints for any change to staging, prefix cache, NVMe warmup or io_uring** |
 | MoE accumulation order | `MOE_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_moe_accumulator_determinism.py -q` | ~80 s | order-dependent expert accumulation. **×2 since 2026-09-20 (Qwen3-Next + MiniMax); the Qwen3-235B arm is gone with its checkpoint** |
 | prefix-reuse behaviour | `PREFIX_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_batch_prefix_equivalence.py -q` | 95–145 s | dense: token-identity (8 tokens — a long generation CAN flip at an exact bf16 tie, row 3). MoE: first token + warm reproducibility. Runs on any checkpoint under `auto` since row 3 (2026-09-11); **Llama-3.2-1B passes in ~7 s**. Before row 3 a non-EXL3 checkpoint failed its premise assert. **2026-10-03 (S20): it cannot pass on a model with recurrent (linear-attention) state — `batched_generate` skips the prefix cache there by design — measured on Qwen3-Next: `round 2 must HIT` fails identically on `main` and on the S20 branch** |
 | HTTP server | `SERVER_CKPT=<ckpt> ./venv/bin/python -m pytest tests/test_server_smoke.py -q -s` (**`-s` is enforced** — without it the module fails every test with a message naming the flag, before loading anything; G1) | 1–8 min | server broken end-to-end: load, non-stream, SSE stream incl. finish_reason and completion_tokens, oversized-prompt refusal, prefix reuse firing, env.json clean, requests.jsonl complete, gb_tok consistent with the run's own pinning (nonzero if it streams, zero if every layer is VRAM-pinned) |
@@ -560,7 +553,8 @@ not under `tests/`. Verified 2026-08-15 against the day's committed work.
 **MiniMax-M2.7, which needs 29G: at 22G its LOAD is OOM-killed (exit 137) at the pinning stage, measured twice
 2026-09-11 (row 18); every recent MiniMax arm already runs at 29–30G** — and except
 the dense smoke gate directly after another checkpoint's run, which needs **26G**: freed pinned host
-blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 2026-08-16.
+blocks are cached rather than returned, and 22G was OOM-killed (exit 137) on 2026-08-16. (That was the OLD
+script; S23's `tests/test_dense_gate.py` ran green at **29G** on both Llama checkpoints, 2026-10-03 — use 29G.)
 
 **The server gate had been dead for two commits — repaired 2026-08-23.** It failed at its FIRST
 call and had done so since `b124320`, so nothing it claims to cover was actually covered in between.
