@@ -63,14 +63,14 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
-| **S22** | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's three byte groups together, (B0) price S11-L7's predictor offline | (a)+(b): the decode stall is 26 % of the agent's turn; A1+A2 measured/estimated at ~1.6–2.3 s of a 20.1 s turn | days |
+| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's three byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0** (reason in the row below; brainstorm started 2026-10-03, no spec yet) | (a)+(b): the decode stall is 26 % of the agent's turn; A1+A2 measured/estimated at ~1.6–2.3 s of a 20.1 s turn | days |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
 ## Durable rows (the briefs)
 
 - [x] **S21 — Qwen3-Next census at HEAD — ✅ CLOSED 2026-10-03.** The decode expert-miss stall (latency-bound, 5.3 s of a 20.1 s representative turn) is the top cost; S11-L6 REFUTED (real-class replay, every policy loses); S3-B / S1-L2 closed; S3-C below the bars; G5 answered. Full row + ranked table: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-03-S21-qwen3next-census-RESULTS.md`.
 
-- [ ] **S22 — Qwen3-Next expert-miss latency (S21's top cost). RUNS AFTER S23** (it changes the io_uring read path,
+- [~] **S22 — Qwen3-Next expert-miss latency (S21's top cost). RUNS AFTER S23** (it changes the io_uring read path,
       which dense streaming shares — see the reorder note above). **S23 closed 2026-10-03: the dense gate exists —
       `tests/test_dense_gate.py`, invocation in the gates table below; take its baseline on `main` before the change.**
       Brief written by S21 (2026-10-03); evidence
@@ -101,6 +101,31 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
         waits). Convert with the post-A1/A2 stall per missing layer. Ceiling today 5.3 s/turn (26 %) at perfect
         prediction; re-open bar for a build ≥ +15 % tok/s at N=1 (backlog #35). SETTLED keeps `VAAYU_LOOKAHEAD`
         blocked — this is a different forward and a fresh measurement, not that flag.
+      **STARTED 2026-10-03 (session 1: brainstorm only — no spec, no code yet). Evidence re-verified at HEAD
+      `f3bad2b`; the row holds, plus four new facts (read-only probe of each checkpoint's offset index):**
+      1. `_NVME_READ_CONCURRENCY = 2` is at `safetensor_model_persister.py:223` (G5's `:181` is stale).
+         `load_expert_into_slab` loops groups one after another (`:1129-1161`); each `io_uring_read_into` takes a
+         ring ROUND-ROBIN (`vaayu_rust/src/lib.rs:826`, `fetch_add % n` — not first-free, so k callers on n rings can
+         queue behind a busy ring while another idles), splits the read into qd=32 chunks, one `submit_and_wait`.
+      2. **The multi-group layout is NOT Qwen-only — A2 reaches every per-expert MoE model**, all through
+         `load_expert_into_slab` (decode misses, prefill staging, gpt-oss routed delivery): Qwen3-Next 3 groups (4 KB
+         aligned + 1,576,960 + 200,704 B); MiniMax 3 (4 KB `mcg` + 32 KB `suh/svh` + 8,851,456 B trellis); DeepSeek-V4
+         2 (790,528 B scales + 12,587,008 B weights); gpt-oss **6** (two biases ~6–12 KB, blocks 4.1 + 8.3 MB, scales
+         0.26 + 0.52 MB). Gates therefore need decode not-slower + ids identical on all four, not just Qwen + MiniMax.
+      3. Qwen's scale group sits ~873 MB from its packed group (gaps 24 KB … 871 MB) → no gap-coalescing; issuing
+         the groups concurrently is the only lever.
+      4. `weight_shape` IS consumed (`moe_patch.py:714`, `:805` — rows/cols for dequant and the blob geometry), so the
+         48 B must still land in the slab; if all groups go out in one wave its read overlaps the bulk read, so a RAM
+         table for tiny groups buys ~nothing extra — not planned unless A2 step 0 says otherwise.
+      **ORDER WITHIN S22 CHANGED to A2 → A1 → B0** (the reason, as the sequence section requires): after A2 one ring
+      call carries a WHOLE expert (~1.77 MB Qwen, ~8.9 MB MiniMax, ~13.4 MB DeepSeek, ~13.6 MB gpt-oss), so A1's
+      ring-count knee must be measured on that read shape — measured first it would describe a shape that no longer
+      exists. B0 already depends on the post-A stall. **A2's candidate mechanism** (to be designed in the spec, not
+      approved): a Rust multi-segment read — all of one expert's groups chunked into ONE ring wave, one
+      `submit_and_wait`, reusing `persistent_read`'s short-read/drain logic — over Python-side concurrent submits
+      (more threads, and one expert would occupy several rings, fighting A1). Toolchain present (`cargo`, `maturin`
+      1.13.1 in venv). Also note: `p8_samepath.py` times BULK (≥ 1 MB) groups only — A1's knee re-measure needs it
+      extended to whole-expert reads. **Next session: resume at "propose approaches → design → spec" for A2.**
       **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
       worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
       choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
