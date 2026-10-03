@@ -235,8 +235,9 @@ The reference doc is `docs/superpowers/plans/2026-07-09-vaayu-moe-perf-REPORT.md
 
 ## 6. Task Ledger — `todo.md` (NON-NEGOTIABLE)
 
-**`todo.md` at the repo root is the living source of truth for what is done and what is
-pending. Both the user and Claude read and update it. Keep it current AS work happens —
+**`todo.md` at the repo root is the living source of truth for what is pending — and, since
+2026-10-03, ONLY what is pending; finished work lives in `todo-backlog.md`'s archive. Both the
+user and Claude read and update it. Keep it current AS work happens —
 not after.** It exists because plans get forgotten, and because a bug found in Task 2's
 review can spawn another bug whose fix stalls Task 3 — and that dropped work must never
 vanish silently.
@@ -246,8 +247,11 @@ vanish silently.
 - **When a plan is written or accepted:** add it with every task AND subtask as checkboxes.
 - **When you start a task:** mark it `[~]`. **When it is done and verified:** `[x]` (verified
   per §4 — evidence, not assertion).
-- **Never silently drop work.** If review finds a bug you do not fix on the spot, add it
-  under **Pending bugs** with its location and what is wrong. If fixing one bug spawns
+- **When a row closes:** keep only its one-line verdict in `todo.md` and move its full text to
+  `todo-backlog.md`, section "Closed after the 2026-10-03 cleanup". Closed rows never pile up in
+  `todo.md` again.
+- **Never silently drop work.** If review finds a bug you do not fix on the spot, add it to
+  `todo.md`'s OPEN list as a `[bug]` item with its location and what is wrong. If fixing one bug spawns
   another and a later task stalls, record BOTH the new bug and the stalled task — this is
   the exact failure mode this ledger prevents.
 - **Blocked ≠ gone.** A task waiting on something gets `[!]` + a one-line reason and what
@@ -256,6 +260,11 @@ vanish silently.
   N>1-only, internal tooling, cosmetic) live in `todo-backlog.md`. Each keeps its full text, its
   marker and a re-open condition, and a pointer line marks its old spot in `todo.md`. Pick work
   from `todo.md` only; re-open a backlog item by moving it back.
+- **History lives in `todo-backlog.md` too.** Its ARCHIVE section is a verbatim copy of `todo.md`
+  as of 2026-10-03 — every closed row with its numbers, the sequences S1…S20, and the **SETTLED —
+  DO NOT RE-OPEN** list (refuted ideas with the number that killed each; read it before proposing
+  perf work) — followed by every row closed since. Its markers are historical: the live state of
+  any item is `todo.md` (pending) or the backlog's numbered list (parked).
 - Separate from any harness/session TODO tool: `todo.md` is on disk and survives across
   sessions. Write it there.
 
@@ -274,7 +283,7 @@ deliberate choice, not an oversight to route around.
 | `docs/` | plans, specs, investigations, RESULTS, verdicts, handoffs, probe notes | **no** (`.gitignore:28`) |
 | `documentation/` | Vaayu's own product documentation — what the engine is and how to use it (`architecture.md`, `server.md`, `TUNING.md`, …) | yes |
 | `todo.md` | the task ledger (§6) | yes |
-| `todo-backlog.md` | the ledger's backlog (§6): open items parked with a re-open condition. Part of the ledger, not a new doc | yes |
+| `todo-backlog.md` | the ledger's backlog (§6): open items parked with a re-open condition, plus the ARCHIVE of every closed row and the SETTLED list. Part of the ledger, not a new doc | yes |
 
 **`documentation/` is user-facing product docs only.** Do not put a plan, an investigation, a
 review verdict or a task list there because it "should ship" — that is the exact mistake this
@@ -282,11 +291,12 @@ section exists to stop. If a finding must reach users, the finding gets folded i
 `documentation/` page as documentation; the working document that produced it still lives in
 `docs/`.
 
-**Because `docs/` does not survive a fresh clone, `todo.md` is the durable record.** A row in
-`todo.md` must carry enough of its own summary — the numbers, the verdict, the stop rule — that
-the row is still actionable when its `docs/` file is missing. The linked document is the detail,
-never the only copy of the conclusion. The durable history of everything ever moved out is
-`git log -p -- todo.md`.
+**Because `docs/` does not survive a fresh clone, `todo.md` and `todo-backlog.md` are the durable
+record.** A row in `todo.md` must carry enough of its own summary — the numbers, the verdict, the
+stop rule — that the row is still actionable when its `docs/` file is missing, and it keeps that
+summary when it moves to the backlog's archive on closing. The linked document is the detail,
+never the only copy of the conclusion. The durable history of everything ever moved out is the
+backlog's archive and `git log -p -- todo.md`.
 
 Repo-root `.md` files (`HANDOFF-*.md`, `speed-up-vaayu.md`, `notes.md`) are grandfathered where
 they already exist; do not add new ones — new work goes in `docs/`.
