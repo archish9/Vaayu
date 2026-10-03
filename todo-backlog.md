@@ -7521,4 +7521,132 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
 
 # Closed after the 2026-10-03 cleanup
 
-*(empty — rows that close in `todo.md` are moved here)*
+<!-- moved from todo.md 2026-10-03 (S21 closed) -->
+- [x] **S21 — Qwen3-Next census at HEAD, MEASURE ONLY (no engine code).** ✅ **CLOSED 2026-10-03.** *(Started 2026-10-03; design approved by
+      the USER, both RAM budgets for Part B. Design note `docs/superpowers/specs/2026-10-03-s21-census-design.md`. Brief
+      corrections found at HEAD: the S11-L6 sites are now `moe_patch.py:2812` / `:2844-2853`; the RAM tier is 13.33 GB /
+      7,472 slabs ≈ 30 % of experts under `BALLAST_GB=25` (18.2–18.7 GB ≈ 42 % only on a no-ballast server load); under
+      S12's graphs a wrapper on `moe_module.forward` / GDN / attention `.forward` never runs on replay tokens — time at
+      `decode_graphs._Record.replay` steps instead.)* Goal: re-price every open Qwen3-Next lever
+      at HEAD in the server's mode and decide S22 by **seconds saved per turn**. Write the RESULTS to
+      `docs/YYYY-MM-DD-S21-qwen3next-census-RESULTS.md` and the ranked table into this row.
+      **Axis:** (1) the representative turn = HIT@8k TTFT + 256 generated tokens at an 8k context; (2) a cold-8k turn
+      = cold@8k TTFT + 256 tokens. Report every lever in s/turn for both, and as % of each.
+      **Part A — decode census at an 8k context, server mode.** The S11 decode probe `plans/probes/s11_decode.py`
+      **cannot be reused as is**: it predates S12's decode CUDA graphs (it wraps module forwards — GDN mixers,
+      attention, the shared expert, routing — that the graphs now capture and replay without Python) and it never
+      calls `freeze_after_load()` (the server does, `vaayu/server/app.py`; without it every gen-2 GC scan costs
+      ~179 ms — memory `probe-gc-freeze-server-mode`). Build `plans/probes/s21_decode.py` from it:
+      - load with every server knob (copy the `from_pretrained(...)` call of `plans/probes/s20_ttft.py`), then
+        `vaayu.utils.freeze_after_load()`; prefill an ~8k-token prompt from the fixed snapshot
+        `plans/probes/s17_out/prompt_src.py` (never a live source file — memory `ttft-probe-ab-traps`), discard a warm
+        session, then decode ≥ 64 tokens per arm;
+      - time host per label ONLY for code that still runs eagerly per decode token — the expert path
+        (`_dispatch_expert_misses` = DISP, each `next()` of `_iter_expert_loads` = LOADWAIT, `_upload_packed_expert`
+        = UPLOAD, `build_expert_blob` = BLOB, `_settle_miss_upload` = SETTLE, `packed_experts_decode` = KERNEL, the MoE
+        remainder) — and time each graph replay as ONE block (`vaayu/decode_graphs.py`); keep S11's exclusive-time
+        self-test (labels must sum to the forward);
+      - a CUPTI arm (S11's `U_CNT`) for device time per forward, and the count of `Memcpy DtoH (Device -> Pageable)`
+        per token (prices S1-L2);
+      - a graphs-OFF arm for reference (`plans/probes/s12_ab.py`'s `GRAPHS=0` stubs `install_decode_graphs` BEFORE
+        the load);
+      - deliver: T_token at 8k (mean, median, spread), host vs device, per-label host ms, disk stall ms/token, VRAM
+        tier hit rate, DtoH count. Then re-price **S11-L3** (DISP + SETTLE + BLOB + UPLOAD + MOE remainder − their
+        device time), **S11-L7** (LOADWAIT at perfect prediction), **S3-B** (is any GDN host overhead left after the
+        graphs? — likely subsumed by S12), **S1-L2**.
+      **Part B — price S11-L6 by REPLAY through the real cache class** (memory `replay-real-class-not-model`: row 13's
+      brief was priced against a ratio-only model of a gate and was wrong; replay through the real class).
+      - Facts: a HIT@8k turn reads ≈ 4,900 experts / ≈ 8.6–8.8 GB from disk (S20 ON arms, `read_gb`), the
+        disk stall is 1.50 s = 60 % of its 2.49 s TTFT, the byte floor is 1.23 s at 7.1 GB/s. Prefill consults the
+        RAM tier but its misses are TRANSIENT loads, never admitted (see S11-L6 below for the code sites — re-verify
+        the line numbers at HEAD); admitting them naively churns the LRU, because a prefill routes ~every expert.
+        Qwen3-Next's experts total 48 × 512 × 1.77 MB = 43.5 GB; the derived expert RAM budget is ~18.6 GB (load log
+        `Expert cache ceiling 18.60 GB`) → ~43 % of all experts fit.
+      - Method: run an agent-shaped session (one cold 8k turn, then ≥ 5 HIT turns, each adding a different
+        ~200–2,000-token tool-output diff — `s20_ttft.py` has `HITS=` for consecutive HIT turns), recording every
+        routed (layer, expert) set per forward, prefill and decode, and the RAM tier's real budget. Replay the trace
+        through `ExpertRAMCache` (the real class, the real budget) under candidate policies: today's (prefill loads
+        transient); admit all prefill loads; admit only the diff's loads up to a cap; a separate prefill-retained
+        pool. For each: disk loads saved per HIT turn → seconds (at the measured delivered rate), AND the decode
+        side (does the decode RAM hit rate drop?).
+      - Deliver: per policy, s saved per HIT turn and % of HIT TTFT, decode cost, host-RAM margin (S19 (iii)
+        measured first-request warm-up growth per model), a build-cost estimate.
+      **Part C — re-price S3-C (`fla` chunk kernel, a NEW DEPENDENCY):** after S20 the GDN `chunk_gated_delta_rule`
+      is **12.2 % of a cold@8k prefill** (S20 profiled ON arm `plans/probes/s20_out/s11-ttft-p-on.json`, turn
+      `P-8192-c`: 1.671 s of 13.71 s profiled) and ~3 % of a HIT. A ~10× kernel would save ≈ 1.5 s ≈ 11 % of a
+      cold 8k — it was ≤ 3.7 % before S20 shrank the MoE part. Arithmetic only here; installing `fla` is a USER
+      decision (backlog #19 S1-L3).
+      **Stop rule:** if no lever clears 5 % of the representative turn AND none clears 10 % of the cold-8k turn,
+      record that and make S22 = S23's dense gate, then S24.
+      **Output:** the ranked table (lever · s/turn representative · s/turn cold-8k · evidence file · cost · reach at
+      N=1) in this row; **S22's row rewritten as the brief for the winner**; S21 → ✅.
+      **Rules:** every GPU arm under `systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0`, `BALLAST_GB=25`,
+      FOREGROUND, one GPU job at a time, stdout to a file, read with `grep -a`; never attach py-spy; discard the
+      first (warm) session; ABBA order for any A/B (memory `abba-ordering-disk-bound-ab`). **§8:** measurement only —
+      no knob, nothing to plumb; the census runs in the server's mode (freeze + server knobs, N=1).
+
+      **RESULT (2026-10-03, `main` `0339594`, no engine line changed, suite floor unchanged at 3621).** RESULTS
+      `docs/2026-10-03-S21-qwen3next-census-RESULTS.md`; probes `plans/probes/s21_{decode,trace,replay,miss}.py` +
+      `p8_samepath.py`; raw `plans/probes/s21_out/`.
+      - **Part A (8k, fresh content per arm, 256 tokens, BALLAST 25):** graphs ON **67.8 ms/token**, OFF 82.1 (ABBA by
+        process on,off,off,on; greedy ids bit-identical in all four). U_HOST (61.17 ms, 38.4 disk reads/token):
+        LOADWAIT 19.38, SYNC@MOE 13.83 (GPU wait), MOE 5.63, KERNEL 4.62, FWD 3.14, ATTNCORE 2.96, UPLOAD 2.52, BLOB
+        2.11, SETTLE 1.94, GRRUN 1.36, DISP 1.22, GRAPH 0.64, VTIER 0.47 ms; labels sum to the forward (59.877 vs
+        59.878). Device busy 23.3 ms/token (CUPTI; graph kernels attribute via `cudaGraphLaunch`). 0 eager GDN calls.
+        97 pageable DtoH/token at 7–10 µs host each. Per-request graph capture ≈ 70 ms.
+      - **Probe-shape finding:** every earlier Qwen3-Next decode census (s7/row26/r36/s11) repeated ONE request per
+        arm; S21's dry run of that shape got 480/480 VRAM-tier hits and 0 disk reads. Row 36's 0.42 % disk and S11's
+        15 reads/token come from it. Fresh content: 38–62 reads/token at 13.2 GB, 26–39 at 18.3 GB.
+      - **Part B:** agent session traced twice (13.23 GB and the server's no-ballast 18.30 GB; routing 100 %
+        identical, ids identical). Replay through the REAL `ExpertRAMCache` (stub arena) calibrated to 111,781 /
+        111,936 calls and ±0.05 % per turn. **S11-L6 REFUTED:** HIT-turn net per policy −0.08 (hottest-500) to −2.5 s
+        (6 GB pool) — admission evicts the previous reply's experts, which the next HIT's diff re-reads and decode
+        needs. On-device RAM elasticity (+5.07 GB): decode −6.0 ms/token (−7.4 %), reads −42 %, HIT TTFT unchanged
+        → returning the prefix reservation ≈ 0.4 s/turn per 1.61 GB: SETTLED row 46 stands.
+      - **The miss (`s21_miss.py`, server budget):** ~20 missing layer-visits/token, stall 0.87 ms (1 miss) … 2.36
+        ms (4+); read 1.10 ms median; hand-off 0.06, wake 0.05 ms. **Each expert = 3 byte groups (48 B shape, 1.57
+        MB packed, 0.20 MB scales) read one after another.** **G5:** one isolated 1.58 MB read = 0.60–0.70 ms at any
+        qd; 2 rings plateau ~4.3 GB/s, **3 rings 6.6 GB/s at unchanged latency**, flat to k=8 with 8 rings — P8's
+        knee does not transfer to small experts.
+      - **Part C:** S3-C saves ≈ 1.36 s per cold 8k (4.7 % of a cold-8k turn) and 0.08 s per HIT (0.4 %).
+      - **Ranked table** (server budget; representative = 2.69 s TTFT + 255 × 68.3 ms = 20.1 s; cold-8k = 12.76 +
+        255 × 63.0 ms = 28.8 s):
+        | # | lever | rep s (%) | cold-8k s (%) | cost | reach N=1 |
+        |---|---|---|---|---|---|
+        | 1 | S11-L7 decode prefetch, CEILING at perfect prediction | 5.30 (26.4) | 4.49 (15.6) | ≥ 1 wk + predictor | yes |
+        | 2 | post-S12 eager residue (ATTNCORE/KERNEL excess, FWD, GRRUN, GRAPH = 9.1 ms), CEILING | 2.32 (11.5) | 2.32 (8.0) | several seams | yes |
+        | 3 | S11-L3 expert-path host trim (8.1 ms formula; 6–8 after overlap) | 1.5–2.1 (7.6–10.2) | 1.5–2.1 (5.3–7.1) | days | yes |
+        | 4 | read concurrency derived from expert size (G5) | 0.8–1.0 (4–5) | 1.9–2.1 (6.6–7.3) | hours–days | yes |
+        | 5 | one expert's 3 byte groups issued together (estimate) | 0.8–1.3 (4–6.5) | 0.7–1.1 (2.4–3.8) | days | yes |
+        | 6 | expert RAM ← prefix reservation (SETTLED row 46) | 0.4 per 1.61 GB (2) | ~0.3 | knob | stays closed |
+        | 7 | S3-C `fla` | 0.08 (0.4) | 1.36 (4.7) | new dependency | cold prefill |
+        | 8 | S1-L2 pageable DtoH | ≤ 0.21 (1.0) | ≤ 0.21 (0.7) | — | closed |
+        | 9 | per-request graph capture | 0.07 (0.35) | 0.07 (0.2) | — | note |
+        | — | S11-L6 prefill admission | REFUTED | — | — | closed |
+        | — | S3-B | 0 (subsumed by S12) | 0 | — | closed |
+        Stop rule not met (rows 1–3 clear 5 %). **S22 = rows 4 + 5 + a B0 pricing of row 1's predictor** (row 1 is
+        a ceiling on an unmeasured predictor; 4 and 5 attack the same stall with measured physics and change what a
+        prefetcher would hide). S23 moved ahead of S22: S22 touches io_uring, shared with dense (CLAUDE.md §0).
+
+<!-- moved from todo.md OPEN 2026-10-03 (closed by S21) -->
+- [x] **S11-L6 — HIT-diff disk re-reads.** Prefill consults the RAM tier (`moe_patch.py:2769`) but its
+  misses are transient loads, never admitted (`:2801`), so every HIT re-reads the diff's cold experts:
+  4,880 loads / 8.70 GB at HIT@8k. Ceiling = the exposed stall, 0.374 s = **12.3 % of a HIT@8k TTFT**,
+  0.461 s = 14.8 % HIT@2k (0.37–0.46 s/turn); byte floor 1.22 s at 7.1 GB/s; build unpriced (prefill
+  routes ~every expert once, so admitting its loads churns the tier — why they are transient); reach:
+  every HIT at N=1. Evidence `s11-ttft-u1.json` `stall_s`, `loads_slab`, `read_gb`.
+  **Re-priced 2026-10-03 by S20 (ON arms, ABBA means, `s11-ttft-{on1,on2}.json`): mean `stall_s` 1.695 s = 63.50 % of the HIT@2k TTFT (2.667 s) and 1.504 s = 60.28 % of the HIT@8k TTFT (2.494 s) — against 0.558 s = 18.18 % / 0.503 s = 16.78 % with the kernels OFF. Now the top HIT lever: with the kernels the prefill is disk-bound.**
+  **CLOSED 2026-10-03 by S21: REFUTED as a RAM-tier policy** — real-class replay, every admission policy loses at both budgets (net −0.08 to −2.5 s per HIT turn; prefill reads themselves rise, because a HIT's diff starts with the previous reply whose experts decode left RAM-resident). +5.07 GB of RAM measured on device: HIT TTFT unchanged. See the S21 row above.
+
+- [x] **S3-B** — the 18 forward-body ops per mixer (gating, `repeat_interleave`, cat, reshape copies);
+  reaching them means replacing the stock forward body — price against what remains of the 11.15 ms
+  ceiling after this build (`serial` fell 4.3 ms of it). **S11 re-price (2026-09-28):** `S11_GDN` host
+  10.58 − device 7.04 = **3.54 ms = 6.2 % of the server-mode token** (57.32 ms; 5.7 % of the 62.12
+  library token), 0.91 s per ≈21.3 s agent turn; part of S11-L1's launch-overhead class.
+  **CLOSED 2026-10-03 by S21: subsumed by S12** — 0 eager GDN calls per decode token under the graphs.
+
+- **[x] S1-L2 — 96.5 `Memcpy DtoH (Device -> Pageable)` per real decode forward.** Never counted
+  before: the row 36 spike's top-25 only ever showed the 25.4 *pinned* DtoH. More numerous than the
+  84 HtoD and fully synchronous. Belongs with S3's routing-sync item; S1's handoff §5 forbade
+  chasing DtoH inside S1.
+  **CLOSED 2026-10-03 by S21: ≤ 1 % of the token** — 97 pageable DtoH/token at 7–10 µs host each = ≤ 0.8 ms/token.
