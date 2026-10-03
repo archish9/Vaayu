@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from .packed_expert_kernels import packed_experts_decode
+from .packed_expert_kernels import packed_experts_decode, packed_experts_prefill
 
 if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
@@ -2395,12 +2395,19 @@ def _make_fused_sparse_forward(
             # Their RAM lookup still runs inside the helper (LRU refresh).
             vram_resident=set(_vram_hold),
         )
-        # S7: a one-token call runs the fused packed-expert kernels (installed at load
-        # by install_packed_expert_kernels). Prefill, multi-token calls and every
-        # checkpoint the installer did not accept keep the per-slot loop below.
-        _use_pk = (getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
-                   and flat_hidden.shape[0] == 1
-                   and not getattr(vaayu_ref, "_moe_prefill_pass", False))
+        # S7: a one-token decode call runs the fused packed-expert kernels (installed at
+        # load by install_packed_expert_kernels). S20: every prefill call of a layer the
+        # installer found eligible runs the grouped ones -- the flag is the set of those
+        # layers' indices; absent or None means no layer. A multi-token call outside
+        # prefill, a layer outside the set and every checkpoint the installer did not
+        # accept keep the per-slot loop below, which holds one expert's dense weights
+        # at a time.
+        _pf_layers = getattr(vaayu_ref, "_packed_moe_prefill_kernel", None) or ()
+        _use_pf = (layer_idx in _pf_layers
+                   and getattr(vaayu_ref, "_moe_prefill_pass", False))
+        _use_pk = _use_pf or (getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
+                              and flat_hidden.shape[0] == 1
+                              and not getattr(vaayu_ref, "_moe_prefill_pass", False))
         try:
             # fp32 accumulator, cast back at the return. Experts are CONSUMED in
             # arrival order (that is what overlaps the reads with compute, row 44
@@ -2438,10 +2445,11 @@ def _make_fused_sparse_forward(
             _loads = _iter_expert_loads(
                 expert_tensors, _miss_futures, vaayu_ref, _mp if _prof else None)
             if _use_pk:
-                # One token: every routed expert, VRAM hit or miss alike, goes through
-                # ONE fused kernel pair over the layer's packed blobs instead of ~14
-                # launches each in the loop below (~135 us of host per expert for
-                # ~33 us of GPU work, measured -- S7). Hits and misses MUST share it:
+                # Every routed expert, VRAM hit or miss alike, goes through fused
+                # kernels over the layer's packed blobs instead of ~14 launches each in
+                # the loop below (~135 us of host per expert for ~33 us of GPU work at
+                # one token, measured -- S7; a 512-token prefill chunk: 48 ms of loop
+                # against 4 ms of kernels -- S20). Hits and misses MUST share them:
                 # the accumulator gate compares logits across different residency,
                 # so residency may not change an expert's arithmetic.
                 _blobs: dict = {}
@@ -2478,18 +2486,31 @@ def _make_fused_sparse_forward(
                         _blobs[eidx] = _math
                         if _prof:
                             _mp['slots_miss'] += 1
-                # The per-slot loop's order -- expert id, then slot -- which is the
-                # order the fp32 sum runs in (row 44 F6).
-                _eids = expert_indices_cpu.view(-1).tolist()
-                _pairs = [(_blobs[_eids[s]], s)
-                          for s in sorted(range(len(_eids)), key=_eids.__getitem__)
-                          if _eids[s] in _blobs]
-                if _pairs:
-                    _t_gemm = _mark() if _prof else 0.0
-                    packed_experts_decode(flat_hidden, _pairs, routing_weights,
-                                          final_hidden, act_fn)
-                    if _prof:
-                        _mp['gemm'] += _mark() - _t_gemm
+                if _use_pf:
+                    # One launch set for the whole call, after its last load arrived:
+                    # the kernels group the rows by expert themselves and sum each
+                    # token's experts in expert-id order (row 44 F6).
+                    if _blobs:
+                        _t_gemm = _mark() if _prof else 0.0
+                        packed_experts_prefill(
+                            flat_hidden,
+                            expert_indices_cpu.view(-1, expert_indices_cpu.shape[-1]),
+                            routing_weights, _blobs, final_hidden, act_fn)
+                        if _prof:
+                            _mp['gemm'] += _mark() - _t_gemm
+                else:
+                    # The per-slot loop's order -- expert id, then slot -- which is the
+                    # order the fp32 sum runs in (row 44 F6).
+                    _eids = expert_indices_cpu.view(-1).tolist()
+                    _pairs = [(_blobs[_eids[s]], s)
+                              for s in sorted(range(len(_eids)), key=_eids.__getitem__)
+                              if _eids[s] in _blobs]
+                    if _pairs:
+                        _t_gemm = _mark() if _prof else 0.0
+                        packed_experts_decode(flat_hidden, _pairs, routing_weights,
+                                              final_hidden, act_fn)
+                        if _prof:
+                            _mp['gemm'] += _mark() - _t_gemm
                 _loads = ()      # every expert was consumed above
             for eidx, raw in _loads:
                 _s, _c = _starts[eidx], _counts_l[eidx]

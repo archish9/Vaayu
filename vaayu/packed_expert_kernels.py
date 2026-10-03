@@ -1,23 +1,38 @@
-"""Fused packed-expert decode kernels for the non-EXL3 fused MoE forward (S7, 2026-09-27).
+"""Fused packed-expert kernels for the non-EXL3 fused MoE forward: one-token decode (S7,
+2026-09-27) and prompt prefill (S20, 2026-10-03).
 
 `_make_fused_sparse_forward` serves a pack-quantized checkpoint (compressed-tensors
 `pack-quantized`; Qwen3-Next-80B-A3B AWQ int4 on this box) one routed expert at a time:
-dequantize the packed blob to dense weights, three M=1 `F.linear`, activation, routing weight,
-accumulate -- ~14 launches and ~135 us of host per expert for ~33 us of GPU work. On Qwen3-Next
-that was 62 % of a decode token (docs/2026-09-27-S7-dispatch-census-RESULTS.md).
+dequantize the packed blob to dense weights, three `F.linear`, activation, routing weight,
+accumulate -- ~14 launches and ~135 us of host per expert for ~33 us of GPU work at one token.
+On Qwen3-Next that was 62 % of a decode token
+(docs/2026-09-27-S7-dispatch-census-RESULTS.md) and 48 ms of a 512-token prefill chunk's
+layer call.
 
-For ONE token this module does the whole layer in two Triton launches that read the packed
-blobs directly through a pointer table: `_gate_up_kernel` (gate and up GEMVs, SiLU, product)
-and `_down_kernel` (down GEMV, routing weight, and the fp32 sum over the table's pairs in
-order -- expert id, then slot -- the order `accumulate_expert_outputs` sums in). Every weight
-and intermediate is rounded where the stock path rounds, so the output differs from stock only
-by fp32 summation order inside each dot product (measured: 99.87 % of outputs bit-identical
-over 48 layers x 8 draws). Nothing depends on whether an expert was a VRAM hit or a miss --
-the table is the same either way -- which keeps the MoE output a deterministic function of its
-input (row 44 F6).
+Decode: for ONE token the whole layer is two Triton launches that read the packed blobs
+directly through a pointer table: `_gate_up_kernel` (gate and up GEMVs, SiLU, product) and
+`_down_kernel` (down GEMV, routing weight, and the fp32 sum over the table's pairs in order --
+expert id, then slot -- the order `accumulate_expert_outputs` sums in). Every weight and
+intermediate is rounded where the stock path rounds, so the output differs from stock only by
+fp32 summation order inside each dot product (measured: 99.87 % of outputs bit-identical over
+48 layers x 8 draws).
 
-CUDA + triton only. Each new (geometry, dtype) key is held to `stock_experts_decode` on its
-first call; a disagreement or an unsupported geometry stays on the stock arithmetic, loudly.
+Prefill: a call of any length is three launches. Its (token, slot) rows are grouped by expert
+into `_PF_BLOCK_M`-row blocks; `_gate_up_grouped` and `_down_grouped` run each block as
+tensor-core dots over its expert's packed blob, and `_reduce_kernel` sums each token's
+contributions in expert-id order. The rounding points are stock's again. What differs is the
+fp32 sum inside each product, and there cuBLAS's half-precision GEMM is not correctly rounded
+at every shape, so these kernels are held to the per-expert loop with fp32-summed GEMMs
+(`stock_experts_prefill(linear=_linear_fp32)`). A token's output does not depend on the tokens
+it shares a call with.
+
+Nothing depends on whether an expert was a VRAM hit or a miss -- the tables are the same
+either way -- which keeps the MoE output a deterministic function of its input (row 44 F6).
+
+CUDA + triton only. Each new (geometry, dtype) key is held to its stock reference on its first
+call; a disagreement or an unsupported geometry stays on the stock arithmetic, loudly.
+`install_packed_expert_kernels` takes both verdicts at load and decides, per MoE layer, whose
+prefill calls take the grouped kernels.
 """
 from pathlib import Path
 
@@ -40,6 +55,15 @@ _CHECK_TOL = 1e-2
 _GU_BLOCK_N, _GU_WARPS, _GU_STAGES = 1, 1, 1
 _DN_BLOCK_N, _DN_WARPS, _DN_STAGES = 4, 1, 3
 _BK_MAX = 512
+# Prefill (S20): rows of one expert per block. 16 is the smallest tile a tensor-core dot
+# takes; a prefill chunk gives each routed expert ~10-14 rows, so a larger block would be
+# mostly padding. The other shapes are the S20 sweep winners on the same GPU.
+_PF_BLOCK_M = 16
+_PF_GU_BLOCK_N, _PF_GU_WARPS, _PF_GU_STAGES = 64, 2, 1
+_PF_DN_BLOCK_N, _PF_DN_WARPS, _PF_DN_STAGES = 64, 2, 1
+_PF_RD_BLOCK_N = 256
+_PF_MIN_TILE = 16           # tl.dot's smallest operand dimension
+_PF_GU_BK_MAX, _PF_DN_BK_MAX = 256, 256
 # The dtypes the kernels specialise on (rounding mode, scale pointer type).
 _DTYPE_CODE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
 _ROLES = ("gate", "down", "up")
@@ -71,6 +95,15 @@ if triton is not None:
             return p.to(tl.pointer_type(tl.float32))
 
     @triton.jit
+    def _deq(words, s, j, BITS: tl.constexpr, ACT: tl.constexpr):
+        """Codes at position `j` of each word, as dequantized weights rounded to the
+        activation dtype (fp32 holding that value): (code - 2^(BITS-1)) * scale."""
+        c = (words >> (j * BITS)) & ((1 << BITS) - 1)
+        # code -> float without an int->float convert: bits of 2^23 + c, minus 2^23.
+        f = (c | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + (1 << (BITS - 1)))
+        return _round(f * s, ACT)
+
+    @triton.jit
     def _dot_rows(pk, sc, rows, v_ptr, k0, K: tl.constexpr, BITS: tl.constexpr,
                   GS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                   ACT: tl.constexpr):
@@ -88,11 +121,8 @@ if triton is not None:
         s = _round(s.to(tl.float32), ACT)
         acc = tl.zeros([BLOCK_N, BKW], tl.float32)
         for j in tl.static_range(PER):
-            c = (words >> (j * BITS)) & ((1 << BITS) - 1)
-            # code -> float without an int->float convert: bits of 2^23 + c, minus 2^23.
-            f = (c | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + (1 << (BITS - 1)))
             v = tl.load(v_ptr + wi * PER + j).to(tl.float32)
-            acc += _round(f * s, ACT) * v[None, :]
+            acc += _deq(words, s, j, BITS, ACT) * v[None, :]
         return tl.sum(acc, axis=1)
 
     @triton.jit
@@ -143,6 +173,90 @@ if triton is not None:
             out += c
         tl.store(out_ptr + rows, out)
 
+    @triton.jit
+    def _gate_up_grouped(x_ptr, rows_ptr, tbl_ptr, h_ptr,
+                         TOPK: tl.constexpr, HID: tl.constexpr, INTER: tl.constexpr,
+                         BITS: tl.constexpr, GS: tl.constexpr, GATE_W: tl.constexpr,
+                         GATE_S: tl.constexpr, UP_W: tl.constexpr, UP_S: tl.constexpr,
+                         ACT: tl.constexpr, SC: tl.constexpr, BLOCK_M: tl.constexpr,
+                         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        """One block = BLOCK_M (token, slot) rows of ONE expert (-1 pads the last block).
+        h[row] = SiLU(x W_gate^T) * (x W_up^T), every stage rounded where stock rounds."""
+        PER: tl.constexpr = 32 // BITS
+        BKW: tl.constexpr = BLOCK_K // PER
+        b = tl.program_id(0)
+        wrows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        rows = tl.load(rows_ptr + b * BLOCK_M + tl.arange(0, BLOCK_M))
+        live = rows >= 0
+        tok = tl.where(live, rows // TOPK, 0)
+        pk = tl.load(tbl_ptr + b * 2).to(tl.pointer_type(tl.int32))
+        sc = _scale_ptr(tl.load(tbl_ptr + b * 2 + 1), SC)
+        ag = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        au = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for k0 in range(0, HID, BLOCK_K):
+            wi = k0 // PER + tl.arange(0, BKW)
+            gi = wi // (GS // PER)
+            gw = tl.load(pk + GATE_W + wrows[:, None] * (HID // PER) + wi[None, :])
+            uw = tl.load(pk + UP_W + wrows[:, None] * (HID // PER) + wi[None, :])
+            gs_ = _round(tl.load(sc + GATE_S + wrows[:, None] * (HID // GS)
+                                 + gi[None, :]).to(tl.float32), ACT)
+            us_ = _round(tl.load(sc + UP_S + wrows[:, None] * (HID // GS)
+                                 + gi[None, :]).to(tl.float32), ACT)
+            for j in tl.static_range(PER):
+                v = tl.load(x_ptr + tok[:, None] * HID + (wi * PER + j)[None, :])
+                ag = tl.dot(v, tl.trans(_deq(gw, gs_, j, BITS, ACT).to(v.dtype)), ag)
+                au = tl.dot(v, tl.trans(_deq(uw, us_, j, BITS, ACT).to(v.dtype)), au)
+        g = _round(ag, ACT)
+        u = _round(au, ACT)
+        a = _round(g / (1.0 + tl.exp(-g)), ACT)
+        tl.store(h_ptr + rows[:, None] * INTER + wrows[None, :],
+                 _round(a * u, ACT).to(h_ptr.dtype.element_ty), mask=live[:, None])
+
+    @triton.jit
+    def _down_grouped(h_ptr, rows_ptr, tbl_ptr, w_ptr, y_ptr,
+                      HID: tl.constexpr, INTER: tl.constexpr, BITS: tl.constexpr,
+                      GS: tl.constexpr, DN_W: tl.constexpr, DN_S: tl.constexpr,
+                      ACT: tl.constexpr, SC: tl.constexpr, W_ROUND: tl.constexpr,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        """y[row] = round(h[row] W_down^T) * routing_weight[row], fp32 -- one expert's
+        contribution to its token, not yet summed."""
+        PER: tl.constexpr = 32 // BITS
+        BKW: tl.constexpr = BLOCK_K // PER
+        b = tl.program_id(0)
+        wrows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        rows = tl.load(rows_ptr + b * BLOCK_M + tl.arange(0, BLOCK_M))
+        live = rows >= 0
+        hr = tl.where(live, rows, 0)
+        pk = tl.load(tbl_ptr + b * 2).to(tl.pointer_type(tl.int32)) + DN_W
+        sc = _scale_ptr(tl.load(tbl_ptr + b * 2 + 1), SC) + DN_S
+        acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for k0 in range(0, INTER, BLOCK_K):
+            wi = k0 // PER + tl.arange(0, BKW)
+            words = tl.load(pk + wrows[:, None] * (INTER // PER) + wi[None, :])
+            s = _round(tl.load(sc + wrows[:, None] * (INTER // GS)
+                               + (wi // (GS // PER))[None, :]).to(tl.float32), ACT)
+            for j in tl.static_range(PER):
+                v = tl.load(h_ptr + hr[:, None] * INTER + (wi * PER + j)[None, :])
+                acc = tl.dot(v, tl.trans(_deq(words, s, j, BITS, ACT).to(v.dtype)), acc)
+        w = tl.load(w_ptr + hr).to(tl.float32)
+        c = libdevice.mul_rn(_round(acc, ACT), w[:, None])
+        if W_ROUND:
+            c = _round(c, ACT)
+        tl.store(y_ptr + rows[:, None] * HID + wrows[None, :], c, mask=live[:, None])
+
+    @triton.jit
+    def _reduce_kernel(y_ptr, ord_ptr, out_ptr, TOPK: tl.constexpr, HID: tl.constexpr,
+                       BLOCK_N: tl.constexpr):
+        """out[t] = the fp32 sum of token t's contributions in `ord`'s order -- ascending
+        expert id, the order accumulate_expert_outputs sums in (row 44 F6)."""
+        t = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        acc = tl.zeros([BLOCK_N], tl.float32)
+        for k in tl.static_range(TOPK):
+            r = tl.load(ord_ptr + t * TOPK + k)
+            acc += tl.load(y_ptr + r * HID + cols)
+        tl.store(out_ptr + t * HID + cols, acc)
+
 
 class _TableRing:
     """Pinned staging for the per-call pointer table, reused round-robin. A slot's host
@@ -154,19 +268,22 @@ class _TableRing:
         self._slots: list = [None] * n_slots
         self._next = 0
 
-    def put(self, values: list, device) -> "torch.Tensor":
+    def put(self, values: "list | torch.Tensor", device) -> "torch.Tensor":
         i = self._next
         self._next = (i + 1) % len(self._slots)
         n = len(values)
         slot = self._slots[i]
         if slot is None or slot[0].numel() < n or slot[1].device != device:
-            host = torch.empty(max(n, 64), dtype=torch.int64, pin_memory=True)
+            # Power-of-two capacity: prefill tables differ in length call to call, and a
+            # pinned reallocation per growth step would cost more than the table.
+            host = torch.empty(max(64, 1 << (n - 1).bit_length()), dtype=torch.int64,
+                               pin_memory=True)
             slot = self._slots[i] = [host, torch.empty(host.shape, dtype=torch.int64,
                                                        device=device), torch.cuda.Event(), False]
         host, dev, done, used = slot
         if used:
             done.synchronize()
-        host[:n] = torch.tensor(values, dtype=torch.int64)
+        host[:n] = torch.as_tensor(values, dtype=torch.int64)
         dev[:n].copy_(host[:n], non_blocking=True)
         done.record()
         slot[3] = True
@@ -175,6 +292,8 @@ class _TableRing:
 
 _TABLES = _TableRing()
 _VERDICTS: dict = {}
+_PF_TABLES = _TableRing()
+_PF_VERDICTS: dict = {}
 
 
 def _layout(geom) -> dict:
@@ -188,10 +307,10 @@ def _layout(geom) -> dict:
     return out
 
 
-def _block_k(k: int, gs: int):
-    """Largest power-of-two multiple of the group size, at most max(_BK_MAX, gs), dividing k."""
+def _block_k(k: int, gs: int, cap: int = _BK_MAX):
+    """Largest power-of-two multiple of the group size, at most max(cap, gs), dividing k."""
     best, b = None, gs
-    while b <= max(_BK_MAX, gs):
+    while b <= max(cap, gs):
         if k % b == 0:
             best = b
         b *= 2
@@ -287,28 +406,41 @@ def stock_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
         out += (y * rw[slot:slot + 1]).to(out.dtype)
 
 
-def _verdict(x, pairs, routing_weights, act_fn) -> bool:
-    """Run the kernels AND the stock arithmetic on this call's data; True if they agree."""
-    blob = pairs[0][0]
-    why = _unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
-                       routing_weights.dtype)
+def _agrees(why, x, run_stock, run_kernel, what) -> bool:
+    """True if the kernel agrees with its reference on this call's data. `why` is the
+    caller's unsupported-reason (or None); `run_stock(ref)` / `run_kernel(got)` fill an fp32
+    buffer of `x.shape`. A refusal prints a WARNING naming `what` ("decode" / "prefill")."""
     if why is None:
         try:
             ref = torch.empty(x.shape, dtype=torch.float32, device=x.device)
             got = torch.empty_like(ref)
-            stock_experts_decode(x, pairs, routing_weights, ref, act_fn)
-            _launch(x, pairs, routing_weights, got)
+            run_stock(ref)
+            run_kernel(got)
             err = ((got - ref).norm() / ref.norm().clamp_min(1e-30)).item()
             if not err <= _CHECK_TOL:
-                why = (f"relL2 {err:.2e} vs the stock per-expert loop, "
+                why = (f"relL2 {err:.2e} vs {_REFERENCE[what]}, "
                        f"tolerance {_CHECK_TOL:.0e}")
         except Exception as exc:  # a Triton compile/launch failure
             why = f"{type(exc).__name__}: {exc}"
     if why is None:
         return True
-    print(f"[Vaayu] WARNING: fused packed-expert decode kernel refused ({why}); "
+    print(f"[Vaayu] WARNING: fused packed-expert {what} kernel refused ({why}); "
           f"these experts stay on the stock per-expert path")
     return False
+
+
+_REFERENCE = {"decode": "the stock per-expert loop",
+              "prefill": "the per-expert loop with fp32-summed GEMMs"}
+
+
+def _verdict(x, pairs, routing_weights, act_fn) -> bool:
+    """Run the kernels AND the stock arithmetic on this call's data; True if they agree."""
+    blob = pairs[0][0]
+    why = _unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
+                       routing_weights.dtype)
+    return _agrees(why, x,
+                   lambda ref: stock_experts_decode(x, pairs, routing_weights, ref, act_fn),
+                   lambda got: _launch(x, pairs, routing_weights, got), "decode")
 
 
 def _checked(x, pairs, routing_weights, act_fn) -> bool:
@@ -344,6 +476,213 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
         stock_experts_decode(x, pairs, routing_weights, out, act_fn)
 
 
+def _prefill_unsupported(geom, act_dtype, scale_dtype, w_dtype):
+    """Why the grouped prefill kernels cannot run this geometry, or None. Everything the
+    decode kernels need, plus tiles a tensor-core dot can take."""
+    why = _unsupported(geom, act_dtype, scale_dtype, w_dtype)
+    if why is not None:
+        return why
+    bits, gs, _roles = geom
+    lay = _layout(geom)
+    inter, hid = lay["gate"][2], lay["gate"][3]
+    if act_dtype == torch.float32:
+        return "fp32 activations (the tensor-core dot would run them at reduced precision)"
+    for what, k in (("hidden", hid), ("intermediate", inter)):
+        if _block_k(k, gs, min(_PF_GU_BK_MAX, _PF_DN_BK_MAX)) // (32 // bits) < _PF_MIN_TILE:
+            return f"{what} {k} at group size {gs} leaves a K tile under {_PF_MIN_TILE} words"
+        if _pow2_divisor(k, _PF_MIN_TILE) < _PF_MIN_TILE:
+            return f"{what} {k} is not a multiple of {_PF_MIN_TILE}"
+    return None
+
+
+def _prefill_plan(eidx_cpu):
+    """Host-side grouping of one call's routing: (order, live, counts).
+
+    order   row ids (token * top_k + slot) sorted by expert id, stable -- each expert's
+            rows are a contiguous run, in row order
+    live    the routed expert ids, ascending
+    counts  rows per live expert
+    """
+    eids = eidx_cpu.reshape(-1)
+    order = torch.argsort(eids, stable=True)
+    per_expert = torch.bincount(eids)
+    live = per_expert.nonzero().reshape(-1)
+    return order, live, per_expert[live]
+
+
+def _prefill_tables(eidx_cpu, plan, blobs, device):
+    """The call's three tables on the device, from ONE pinned copy: (tbl, rows, ord, n_blocks).
+
+    tbl   [n_blocks, 2] (packed address, scale address) -- the expert each block belongs to
+    rows  [n_blocks, BLOCK_M] row ids, each expert's run padded to whole blocks with -1
+    ord   [tokens, top_k] row ids of each token's slots in ascending expert id: the order
+          the fp32 sum runs in (row 44 F6)
+    """
+    order, live, counts = plan
+    n, top_k = eidx_cpu.shape
+    nblk = (counts + _PF_BLOCK_M - 1) // _PF_BLOCK_M
+    blk_end = nblk.cumsum(0)
+    n_blocks = int(blk_end[-1])
+    which = torch.repeat_interleave(torch.arange(live.numel()), counts)
+    src_start = counts.cumsum(0) - counts
+    dest = ((blk_end - nblk) * _PF_BLOCK_M)[which] + torch.arange(order.numel()) - src_start[which]
+    rows = torch.full((n_blocks * _PF_BLOCK_M,), -1, dtype=torch.int64)
+    rows[dest] = order
+    ptrs = torch.tensor([(blobs[e]["flat"]["packed"].data_ptr(),
+                          blobs[e]["flat"]["scale"].data_ptr()) for e in live.tolist()],
+                        dtype=torch.int64)
+    tbl = ptrs[torch.repeat_interleave(torch.arange(live.numel()), nblk)].reshape(-1)
+    slot_order = (torch.argsort(eidx_cpu, dim=1, stable=True)
+                  + (torch.arange(n) * top_k)[:, None]).reshape(-1)
+    dev = _PF_TABLES.put(torch.cat([tbl, rows, slot_order]), device)
+    a, b = tbl.numel(), tbl.numel() + rows.numel()
+    return dev[:a], dev[a:b], dev[b:b + slot_order.numel()], n_blocks
+
+
+def _gate_up_g(x, tbl, rows, n_blocks, top_k, geom, sc, h=None):
+    """h [tokens * top_k, intermediate], activation dtype: SiLU(gate) * up per live row."""
+    bits, gs, _roles = geom
+    lay = _layout(geom)
+    inter, hid = lay["gate"][2], lay["gate"][3]
+    if h is None:
+        h = torch.empty(x.shape[0] * top_k, inter, dtype=x.dtype, device=x.device)
+    bn = _pow2_divisor(inter, _PF_GU_BLOCK_N)
+    _gate_up_grouped[(n_blocks, inter // bn)](  # pylint: disable=possibly-used-before-assignment
+        x, rows, tbl, h, top_k, hid, inter, bits, gs, lay["gate"][0], lay["gate"][1],
+        lay["up"][0], lay["up"][1], _DTYPE_CODE[x.dtype], sc, _PF_BLOCK_M, bn,
+        _block_k(hid, gs, _PF_GU_BK_MAX), num_warps=_PF_GU_WARPS, num_stages=_PF_GU_STAGES)
+    return h
+
+
+def _down_g(h, tbl, rows, n_blocks, routing_weights, geom, sc, y=None):
+    """y [tokens * top_k, hidden] fp32: each live row's down projection times its weight."""
+    bits, gs, _roles = geom
+    lay = _layout(geom)
+    inter, hid = lay["gate"][2], lay["gate"][3]
+    rw = routing_weights.reshape(-1).contiguous()
+    if y is None:
+        y = torch.empty(h.shape[0], hid, dtype=torch.float32, device=h.device)
+    bn = _pow2_divisor(hid, _PF_DN_BLOCK_N)
+    w_round = rw.dtype == h.dtype and h.dtype != torch.float32
+    _down_grouped[(n_blocks, hid // bn)](  # pylint: disable=possibly-used-before-assignment
+        h, rows, tbl, rw, y, hid, inter, bits, gs, lay["down"][0], lay["down"][1],
+        _DTYPE_CODE[h.dtype], sc, w_round, _PF_BLOCK_M, bn,
+        _block_k(inter, gs, _PF_DN_BK_MAX), num_warps=_PF_DN_WARPS, num_stages=_PF_DN_STAGES)
+    return y
+
+
+def _reduce(y, order, out, top_k) -> None:
+    """`out` [tokens, hidden] fp32 = each token's contributions summed in `order`."""
+    hid = y.shape[1]
+    bn = _pow2_divisor(hid, _PF_RD_BLOCK_N)
+    _reduce_kernel[(out.shape[0], hid // bn)](  # pylint: disable=possibly-used-before-assignment
+        y, order, out, top_k, hid, bn)
+
+
+def _prefill_launch(x, eidx_cpu, routing_weights, blobs, out, plan=None) -> None:
+    """The three kernels over one call. No checks: `_prefill_checked` gates this."""
+    plan = plan or _prefill_plan(eidx_cpu)
+    blob = blobs[int(plan[1][0])]
+    geom, sc = blob["geom"], _DTYPE_CODE[blob["flat"]["scale"].dtype]
+    top_k = eidx_cpu.shape[1]
+    # The kernels index raw memory: a strided view (a slice of a wider batch) would be
+    # read as if it were dense. A no-op on the contiguous tensors the forward passes.
+    x = x.contiguous()
+    tbl, rows, order, n_blocks = _prefill_tables(eidx_cpu, plan, blobs, x.device)
+    h = _gate_up_g(x, tbl, rows, n_blocks, top_k, geom, sc)
+    y = _down_g(h, tbl, rows, n_blocks, routing_weights, geom, sc)
+    if out.is_contiguous():
+        _reduce(y, order, out, top_k)
+    else:
+        dense = torch.empty(out.shape, dtype=torch.float32, device=out.device)
+        _reduce(y, order, dense, top_k)
+        out.copy_(dense)
+
+
+def _linear_fp32(a, w):
+    """`F.linear` with the product summed in fp32 and rounded ONCE to the activation dtype."""
+    return F.linear(a.float(), w.float()).to(a.dtype)
+
+
+def stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, out, act_fn,
+                          linear=F.linear) -> None:
+    """The per-slot loop's arithmetic for a multi-token call, into `out`: the grouped
+    kernels' fallback. Same ops as `_make_fused_sparse_forward`'s loop -- per expert, in
+    expert-id order: gather its rows, `expert_weights_from_entry`, three `F.linear`,
+    `act_fn`, the routing-weight product (torch's promotion), `index_add_`. A routed expert
+    with no entry is skipped, as the loop skips it.
+
+    `linear=_linear_fp32` is the reference the kernels are CHECKED against. cuBLAS's
+    half-precision GEMM is not correctly rounded at every shape: measured on this box at
+    hidden 2048 -> intermediate 512, 2 to 32 rows give ~58 % correctly rounded outputs (1 row
+    and 64+ rows give 100 %), so a check against it would measure cuBLAS, not the kernels."""
+    from .moe_patch import expert_weights_from_entry
+    order, live, counts = _prefill_plan(eidx_cpu)
+    top_k = eidx_cpu.shape[1]
+    rw = routing_weights.reshape(-1)
+    order = order.to(x.device)
+    out.zero_()
+    at = 0
+    for e, c in zip(live.tolist(), counts.tolist()):
+        rows = order[at:at + c]
+        at += c
+        entry = blobs.get(e)
+        if entry is None:
+            continue
+        w_gate, w_down, w_up = expert_weights_from_entry(entry, x.dtype)
+        tok = rows // top_k
+        xs = x[tok]
+        y = linear(act_fn(linear(xs, w_gate)) * linear(xs, w_up), w_down)
+        out.index_add_(0, tok, (y * rw[rows, None]).to(out.dtype))
+
+
+def _prefill_verdict(x, eidx_cpu, routing_weights, blobs, act_fn, plan) -> bool:
+    """Run the grouped kernels AND the stock arithmetic on this call's data; True if they agree."""
+    blob = blobs[int(plan[1][0])]
+    why = _prefill_unsupported(blob["geom"], x.dtype, blob["flat"]["scale"].dtype,
+                               routing_weights.dtype)
+    return _agrees(
+        why, x,
+        lambda ref: stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, ref, act_fn,
+                                          linear=_linear_fp32),
+        lambda got: _prefill_launch(x, eidx_cpu, routing_weights, blobs, got, plan), "prefill")
+
+
+def _prefill_checked(x, eidx_cpu, routing_weights, blobs, act_fn, plan) -> bool:
+    """The cached verdict for this call's (geometry, dtypes) key, taken on first sight."""
+    blob = blobs[int(plan[1][0])]
+    key = (blob["geom"], x.dtype, routing_weights.dtype, blob["flat"]["scale"].dtype)
+    if key not in _PF_VERDICTS:
+        _PF_VERDICTS[key] = _prefill_verdict(x, eidx_cpu, routing_weights, blobs, act_fn, plan)
+    return _PF_VERDICTS[key]
+
+
+def packed_experts_prefill(x, eidx_cpu, routing_weights, blobs, out, act_fn) -> None:
+    """A multi-token call's routed-expert sum for one MoE layer, written into `out`.
+
+    x               [tokens, hidden], activation dtype, on the current CUDA device (a strided view is fine)
+    eidx_cpu        [tokens, top_k] int64 on the CPU: the routed expert ids
+    routing_weights [tokens, top_k] on x's device (a strided view is fine); row t * top_k + s
+                    weighs slot s of token t
+    blobs           {expert id: entry} for the routed experts -- `build_expert_blob` blobs
+                    for the kernels; anything else (a dense entry, mixed geometries, a routed
+                    expert with no entry) sends the whole call to the stock arithmetic
+    out             [tokens, hidden] float32, overwritten (a strided view is fine)
+    act_fn          the experts' activation; only the stock fallback calls it
+
+    The result is a function of (x, routing, weights) alone: the tables are built in expert-id
+    order, so neither the order experts arrived in nor where their blobs live can reach it.
+    """
+    plan = _prefill_plan(eidx_cpu)
+    geoms = {blobs[e].get("geom") if e in blobs else None for e in plan[1].tolist()}
+    if len(geoms) != 1 or None in geoms:
+        stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, out, act_fn)
+    elif _prefill_checked(x, eidx_cpu, routing_weights, blobs, act_fn, plan):
+        _prefill_launch(x, eidx_cpu, routing_weights, blobs, out, plan)
+    else:
+        stock_experts_prefill(x, eidx_cpu, routing_weights, blobs, out, act_fn)
+
+
 def _is_silu(act_fn, device, dtype) -> bool:
     """Behavioural: does the experts' activation compute SiLU? (the kernels hardcode it)"""
     if act_fn is None:
@@ -355,10 +694,11 @@ def _is_silu(act_fn, device, dtype) -> bool:
         return False
 
 
-def _one_real_blob(vaayu_ref, block, device):
+def _one_real_blob(vaayu_ref, block, device, quiet=False):
     """The VRAM-tier entry of `block`'s lowest-numbered expert, read off the checkpoint (one
     expert's bytes), or None when its experts are not pack-quantized. A packed expert
-    `build_expert_blob` refuses is reported, not hidden."""
+    `build_expert_blob` refuses is reported, not hidden -- unless `quiet`: the caller
+    reports that block itself."""
     from .moe_patch import (_group_packed_tensors_by_weight, _packed_roles_complete,
                             _upload_packed_expert, build_expert_blob)
     from .persist.safetensor_model_persister import load_expert_sparse
@@ -376,22 +716,31 @@ def _one_real_blob(vaayu_ref, block, device):
         blob = build_expert_blob(_upload_packed_expert(packed, device))
     except NotImplementedError as exc:   # zero point / act-order: refused everywhere
         blob, why = None, str(exc)
-    if blob is None:
+    if blob is None and not quiet:
         print(f"[Vaayu] WARNING: fused packed-expert decode kernel not installed: {why}")
     return blob
 
 
 def install_packed_expert_kernels(vaayu_ref) -> bool:
-    """Route one-token decode of every fused non-EXL3 pack-quantized MoE block through the
-    kernels -- if they agree with the stock per-expert loop on one real expert of this
+    """Route the fused non-EXL3 pack-quantized MoE blocks through the kernels -- one-token
+    decode of every such block, and the prefill calls of each block found eligible -- if
+    the kernels agree with the stock per-expert arithmetic on one real expert of this
     model, on this device. Called once at load, after `patch_moe_blocks` (it reads each
-    block's `forward_name`). Seeds the verdict cache for fp32 and activation-dtype routing
-    weights, so the Triton JIT and the check are paid here, not at the first token.
+    block's `forward_name`). Seeds both verdict caches for fp32 and activation-dtype routing
+    weights, so the Triton JIT and the checks are paid here, not at the first token.
+
+    Decode sets `vaayu_ref._packed_moe_kernel` (the checked geometry). Prefill sets
+    `vaayu_ref._packed_moe_prefill_kernel`, a frozenset of the eligible blocks'
+    `layer_idx`: a block is eligible when one real expert of it is a blob of the checked
+    geometry and scale dtype, and its whole expert set at that size is at most half of
+    `_PREFILL_VRAM_HEADROOM`. The attribute stays absent when no block is eligible or the
+    prefill verdict is refused; neither removes the decode kernel.
 
     Nothing is installed off CUDA, without triton, or with no block on the non-EXL3 fused
     forward; a non-current CUDA device (Triton launches on the CURRENT device), a packed
-    expert that cannot be fused, or a disagreeing kernel is refused with a WARNING. The
-    stock path stays in every refused case."""
+    expert that cannot be fused, a disagreeing kernel, or a block left out of prefill is
+    reported with a WARNING. The stock path stays in every refused case. Returns whether
+    the decode kernel was installed."""
     device = str(vaayu_ref.running_device)
     if triton is None or torch.device(device).type != "cuda":
         return False
@@ -427,4 +776,59 @@ def install_packed_expert_kernels(vaayu_ref) -> bool:
     bits, gs, _roles = blob["geom"]
     print(f"[Vaayu] fused packed-expert decode kernel on {len(blocks)} MoE layers "
           f"({bits}-bit, group {gs})")
+    # S20: the grouped prefill kernels, on their own verdict -- a refusal here leaves the
+    # decode kernel installed. Which layers take them is decided here, from one real
+    # expert of each.
+    # They launch once per call, so every entry the call uploaded is alive at once: at
+    # worst a layer's whole expert set (the per-slot loop holds one). Nothing reserves
+    # room for that: the VRAM plan does not count these blobs, and
+    # _ensure_prefill_headroom can only make room by evicting the expert VRAM tier. Half
+    # the headroom is a judgement about what one MoE layer call may hold beside its own
+    # scratch, not a measured bound. A layer whose experts are not blobs of the checked
+    # format would hold their dense weights instead, so it stays on the per-slot loop too.
+    from .moe_patch import _PREFILL_VRAM_HEADROOM
+    checked = (blob["geom"], blob["flat"]["scale"].dtype)
+    eligible, skipped = [], {}           # skipped: {reason: [layer_idx, ...]}
+    for b in blocks:
+        one = blob if b is block else _one_real_blob(vaayu_ref, b, device, quiet=True)
+        if one is None:
+            why = "experts not pack-quantized, or packed with no fused pass"
+        elif (one["geom"], one["flat"]["scale"].dtype) != checked:
+            why = "a different geometry or scale dtype than the checked layer"
+        else:
+            n_experts = int(getattr(getattr(b.moe_module, b.experts_attr), "num_experts", 0))
+            held = n_experts * sum(t.numel() * t.element_size() for t in one["flat"].values())
+            if n_experts and held <= _PREFILL_VRAM_HEADROOM // 2:
+                eligible.append(b.layer_idx)
+                continue
+            why = (f"one call can hold a layer's {n_experts} experts on the GPU at once "
+                   f"({held / 2**30:.2f} GiB), over half the "
+                   f"{_PREFILL_VRAM_HEADROOM / 2**30:.2f} GiB prefill headroom")
+        skipped.setdefault(why, []).append(b.layer_idx)
+    if not eligible:
+        print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not installed: "
+              f"{'; '.join(skipped)}; prefill keeps the per-expert path")
+        return True
+    # k "experts" sharing the one real blob, each routed by every token, so each has a
+    # full block and a partial one.
+    tokens = _PF_BLOCK_M + _PF_BLOCK_M // 2
+    eidx = torch.stack([torch.roll(torch.arange(k), t) for t in range(tokens)])
+    xs = (torch.randn(tokens, x.shape[1], generator=gen, device=device) * 0.5).to(dtype)
+    ws = torch.rand(tokens, k, generator=gen, device=device) + 0.1
+    ws = ws / ws.sum(-1, keepdim=True)
+    blobs = {e: blob for e in range(k)}
+    plan = _prefill_plan(eidx)
+    if all(_prefill_checked(xs, eidx, rw, blobs, act_fn, plan) for rw in (ws, ws.to(dtype))):
+        vaayu_ref._packed_moe_prefill_kernel = frozenset(eligible)
+        print(f"[Vaayu] fused packed-expert prefill kernel on {len(eligible)} MoE layers "
+              f"({bits}-bit, group {gs})")
+        if skipped:
+            left_out = sorted(i for idxs in skipped.values() for i in idxs)
+            whys = "; ".join(
+                why if len(skipped) == 1 else f"{why} (layers {', '.join(map(str, idxs))})"
+                for why, idxs in skipped.items())
+            print(f"[Vaayu] WARNING: fused packed-expert prefill kernel not used on "
+                  f"{len(left_out)} of {len(blocks)} MoE layers (layer indices "
+                  f"{', '.join(map(str, left_out))}): {whys}; prefill keeps the per-expert "
+                  f"path there")
     return True
