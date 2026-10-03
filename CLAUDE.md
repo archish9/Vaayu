@@ -38,16 +38,16 @@ and **12b** no drafter/target vocabulary check (`086d43d`), both fixed
 dense WITHOUT regressing MoE — the paths are separated (`is_moe` guards); keep
 the MoE tests green, and treat any change to shared infra (staging, prefix
 cache, NVMe warmup, io_uring) as touching both paths. MoE changes still must not
-silently break dense — the dense smoke gate used to guard that
-(`test_batched_dense_smoke.py`, deleted 2026-09-03; see `todo.md`'s on-device
-gates section, no committed replacement).
+silently break dense — `tests/test_dense_gate.py` guards that (`DENSE_CKPT=`,
+restored 2026-10-03 by S23; see `todo.md`'s on-device gates section). Run it on
+both Llama checkpoints for any change to shared infra.
 
 **Dense reference checkpoint (on-device):**
 `/home/a/code/ai-ml/models/archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` —
 Llama-3.3-70B-Instruct, EXL3 4.5 bpw (head 6 bits), 80 layers, 39 GB on disk, so
-it exercises the real streamed-dense path (~37 GB read per token). This was
-`test_batched_dense_smoke.py`'s default (script deleted 2026-09-03, see
-`todo.md`), read via `DENSE_CKPT=`.
+it exercises the real streamed-dense path (~37 GB read per token). This is the
+streamed case of `tests/test_dense_gate.py` (read via `DENSE_CKPT=`; ppl 8.85
+under flash_attention_2, 2026-10-03).
 `models/Llama-3.2-1B-Instruct` is the small unquantized dense checkpoint (and the
 README's suggested speculative-decoding drafter) — use it when you need a dense
 run in seconds rather than minutes.
@@ -181,8 +181,8 @@ deleted — do not test it, do not add it back to a gate):**
 Four MoE forwards therefore have a model, and **the fused-EXL3 forward is the only one that does not** —
 that is a real coverage loss, not an oversight; say so rather than claiming a change
 there is verified.
-The dense gate that covered Llama-3.3-70B (`test_batched_dense_smoke.py`) was
-deleted 2026-09-03 and has no committed replacement — see `todo.md`. **Non-EXL3 is
+The dense gate is `tests/test_dense_gate.py` (`DENSE_CKPT=`, S23, 2026-10-03):
+Llama-3.2-1B in 6 s, Llama-3.3-70B in 2 min — see `todo.md`. **Non-EXL3 is
 now the most-tested path, not an untested one** (Qwen3-Next); CPU compute remains
 architecturally supported (`compute_device`) but has never run a model here. Any
 code, plan, or fix you produce MUST work for all of them without edits — never
