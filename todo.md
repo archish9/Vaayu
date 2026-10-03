@@ -10,7 +10,7 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3621 passed, 0 failed, 0 errors, 25 skipped`** (234.86 s, FOREGROUND, on branch `s23-dense-gate`,
+**Suite floor: `3621 passed, 0 failed, 0 errors, 25 skipped`** (226.31 s, FOREGROUND, on merged `main` `e38bae3`,
 2026-10-03, S23 — the +5 skipped are `tests/test_dense_gate.py` without `DENSE_CKPT`).
 
 **Before proposing any perf work, read "SETTLED — DO NOT RE-OPEN" in the archive in `todo-backlog.md`** — ideas

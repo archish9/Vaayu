@@ -7652,7 +7652,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   **CLOSED 2026-10-03 by S21: ≤ 1 % of the token** — 97 pageable DtoH/token at 7–10 µs host each = ≤ 0.8 ms/token.
 
 <!-- moved from todo.md 2026-10-03 (S23 closed) -->
-- [x] **S23 — restore an on-device dense gate.** ✅ **CLOSED 2026-10-03.** *(Branch `s23-dense-gate`. Design approved by
+- [x] **S23 — restore an on-device dense gate.** ✅ **CLOSED 2026-10-03.** *(Branch `s23-dense-gate`, MERGED to `main` 2026-10-03 as `e38bae3`. Design approved by
       the USER in chat (bounded path): `tests/test_dense_gate.py`, `DENSE_CKPT=`, boots the real server app, generic
       perplexity band only — no per-checkpoint reference. Mid-task the USER approved replacing the planned ppl FLOOR
       with a causality test and adding a bitwise decode-logit test, after mutation M1 refuted the floor.)*
