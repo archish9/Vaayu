@@ -39,6 +39,10 @@ closed accumulates in this file again.
   19.21 s without the wave on the same day); over the session's six HIT turns (8.7k → 15.4k context) the mean turn is
   **20.94 s** (22.54 before), HIT TTFT **4.07 s** (4.62), HIT decode **66.2 ms/token** (70.3); cold 8k TTFT
   **11.56 s** (12.58), cold-8k turn 26.07 s (27.81). Stall per missing layer-visit 0.93 → 0.75 ms (1 miss).
+- **⚠ Every server-budget Qwen3-Next figure above was taken with BUFFERED I/O** (found 2026-10-04, S22-A1's dry
+  run): the engine's O_DIRECT heuristic flips at 26.0 GiB free RAM for this checkpoint and an idle box sits just
+  above it. Same budget, same code, O_DIRECT forced: HIT turn 23.55 → 19.44 s (−17.4 %), decode 74.5 → 63.2
+  ms/token, ids identical. The `[bug]` at the top of the OPEN list; PROPOSED as the next item.
 - **Earlier Qwen3-Next decode censuses (s7/row26/r36/s11 probes) repeated ONE request per arm** — that re-decodes
   what the warm arm loaded (S21 dry run: 480/480 VRAM-tier hits, 0 disk reads). Row 36's "disk = 0.42 % of a decode
   token" and S11's 15 reads/token come from that shape. **Any decode probe: a different prompt per arm.**
@@ -68,11 +72,18 @@ carries dense streaming (Llama-3.3-70B reads ~37 GB per token through it), and `
 mandatory for any io_uring change — and there has been none since 2026-09-03. So **S23 (hours) runs before S22**; S22
 then has the gate it needs. (The week-rule did not fire: S22 as defined is days.)
 
+**REORDERED 2026-10-04 at the USER's word ("go"), proposed by S22-A1's session:** the buffered-I/O `[bug]`
+(OPEN list, Qwen3-Next) runs before S22-B0. **Its fix is BUILT AND VERIFIED on branch `s22-odirect-heuristic`
+(uncommitted — awaiting the USER's go to commit and merge); then B0.** The reason, by the ordering rule: *(a)* it is the agent's
+model, *(b)* 17.4 % of the HIT turn at N=1 on the server default — more than A2 and A1 together, *(c)* a few lines.
+B0 converts with "the post-A stall per missing layer", and that stall is 0.45 ms buffered against 0.29 ms O_DIRECT,
+so B0 measured first would be priced in the mode about to change.
+
 | # | item | why here | cost |
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
-| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (merged `86b62fb`; row below). **NEXT: A1**, then B0 | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
+| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (merged `86b62fb`; row below). **A1 ✗ CLOSED 2026-10-04 by its own stop rule, no product code:** 3 rings on Qwen3-Next = −2.8 % of the HIT turn under buffered I/O but only −1.6 % (inside the base arms' 1.9 % spread) under O_DIRECT; first-free ring selection +3.5 % standalone, under its +5 % bar. **A1's dry run found a bigger thing: the server loaded Qwen3-Next with BUFFERED I/O, costing 17–20 % of the HIT turn — `[bug]` at the top of the OPEN list; the USER said go; FIX BUILT AND VERIFIED 2026-10-04 on branch `s22-odirect-heuristic` (HIT turn 22.41 → 17.86 s), not yet committed.** Then B0 | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
 ## Durable rows (the briefs)
@@ -215,6 +226,85 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       four checkpoints (today, 2 rings: Qwen3-Next 4.6–4.85 GB/s at k ≥ 2 — G5 saw 6.6 at 3 rings on bulk reads;
       MiniMax / DeepSeek-V4 / gpt-oss already at the ~7.1 GB/s plateau), and decide ring selection (round-robin can
       queue behind a busy ring). With A1's Rust edit also land the two deferred items in the OPEN list below.
+      **A1 — SESSION 3 (2026-10-04, HEAD `8577595`; brainstorm + measurement only — no spec, no product code).**
+      Evidence re-verified: `_NVME_READ_CONCURRENCY = 2` is now at `safetensor_model_persister.py:228`; both Rust
+      entry points take a ring round-robin (`lib.rs:862`, `:894`); the ring count is decided in `_ring_pool_size()`
+      (Python only), called from `init_model_io`, where the whole-expert size is already in hand
+      (`expert_read_buffer_bytes` → `_EXPERT_PINNED_SIZE`; 0 = no per-expert tensors); `VAAYU_RING_POOL_N` already
+      overrides it, so the ring count was priced IN PATH with no code. Callers: `_moe_executor` 8 workers and 16
+      staging slabs on Qwen3-Next — neither caps below 4 rings. The pool is a process-wide `OnceLock`: the FIRST
+      load in a process fixes it (server default `DRAFTER_MODEL_PATH = None`, so that is the served model).
+      *Standalone knee, whole experts, one wave per expert (`plans/probes/s22_rings.py`, raw
+      `plans/probes/s22_out/a1-rings-*`), aggregate GB/s at 1 / 2 / 3 / 4 / 8 reads in flight:* Qwen3-Next (1.78 MB)
+      2.9 / 4.4–4.6 / 5.9–6.0 / 6.55 / 6.57 — plateau at 4, flat to 8; MiniMax (8.89 MB) 5.8 / 7.0–7.1 / 7.0 / 7.0 /
+      5.2; DeepSeek-V4 (13.38 MB) 6.1 / 7.1 / 7.1 / 6.5 / 5.3; gpt-oss (13.26 MB) 6.1 / 7.1 / 7.1 / 6.7 / 5.2. So the
+      three large-expert models are at the plateau on 2 rings already, and their fall starts at 4 in flight (~53 MB
+      in flight falls, ~40 MB does not). 8 callers on n rings (the loader's shape), Qwen3-Next: 4.33 GB/s (2 rings) /
+      5.48 (3) / 6.53 (4). A lone read costs the same at any ring count (0.59–0.61 ms on Qwen3-Next) and fits
+      `0.37 ms + bytes / 7.6 GB/s` on all four models. Round-robin's cost when callers outnumber rings: 4.64 → 4.33
+      GB/s at 2 rings, 5.89 → 5.48 at 3 (−7 %), nothing at 4 (drive-bound) — the ceiling for a first-free selector.
+      *In path — Qwen3-Next agent session (`s22_session.py`, server mode, **`BALLAST_GB=29.5` so every arm gets the
+      same 17.7–17.8 GB expert RAM budget**; six processes at 2, 4, 3, 3, 4, 2 rings via `VAAYU_RING_POOL_N`; raw
+      `s22_out/s22-session-a1b-r*.json`):* mean HIT turn **22.29 s at 2 rings (its two arms differ by 1.04 %) →
+      21.67 s at 3 (−2.82 %) → 21.64 s at 4 (−2.94 %)**; HIT TTFT 4.319 → 3.915 (−9.3 %) → 3.777 s (−12.5 %); HIT
+      decode 70.49 → 69.61 → 70.04 ms/token (inside the spread: a decode miss is mostly ONE read, which no ring
+      count shortens); cold-8k turn 27.07 → 26.94 → 26.58 s; cold-8k TTFT 11.77 → 11.32 → 11.20 s; stall per load
+      0.449 → 0.399 → 0.377 ms; **greedy ids identical on all 9 turns × 6 arms.** So the ring count is worth
+      **0.63–0.66 s per HIT turn, all of it prefill** — under this row's 0.8–1.0 s estimate — and 3 and 4 rings tie
+      on the turn.
+      **TRAP found on the way (cost two arms):** with `BALLAST_GB=0` the expert RAM budget follows the free RAM at
+      load and moved 18.01 → 18.89 GB between two consecutive processes; that pair read −7.4 % for 4 rings, most of
+      it the budget (12,005 vs 10,816 expert loads on the same turn). A2's keep-bar arms were checked: OFF 18.6 /
+      18.6 GB, ON 18.8 / 18.5 GB — balanced, the A2 verdict stands. **Pin the budget (`BALLAST_GB`) in every
+      `s22_session.py` comparison.** (What looked like a budget sensitivity here turned out to be the buffered-I/O
+      `[bug]` in the OPEN list: these arms were all buffered, where free RAM is page cache.)
+      **APPROACH CHOSEN by the USER 2026-10-04: option (1), with first-free ring selection priced in the dry run
+      under a stop rule. SPEC WRITTEN — `docs/superpowers/specs/2026-10-04-S22-A1-ring-count-design.md` (awaiting
+      the USER's review; no product code, no dry run yet).** The spec's rule: `read_concurrency_for(expert bytes)`
+      in `safetensor_model_persister.py`, fed by `expert_read_buffer_bytes` inside `init_model_io`;
+      `_NVME_READ_CONCURRENCY = 2` stays as the floor, a new ceiling of 4; `VAAYU_RING_POOL_N` and the caller-pool
+      cap unchanged; `env.json` reports it with no edit; a "(no knob)" section in `documentation/TUNING.md`.
+      Thresholds: 3 rings below 2.46 MB per expert, 4 below 1.27 MB. Ring-selection stop rule: standalone ≥ +5 %
+      GB/s at 3 rings with 8 callers, then in path ≥ 1 % of the HIT turn and above the spread — expected verdict
+      DROP (ceiling ≈ 0.16 s/turn); if dropped A1 has no Rust edit and the two deferred Rust items stay in OPEN.
+      A1's stop rule (dry run, built code, budget pinned, ABBA): under 2 % of the mean HIT turn, or inside the
+      base spread, or any id differs → A1 closes refuted, go to B0. **One deviation from this row's bars awaits
+      the USER's yes or no:** with no Rust change, MiniMax and Llama-3.3-70B keep the same ring count and the same
+      extension, so the spec replaces their decode ABBAs with a load-line proof (`n=2`); if ring selection is
+      kept, both ABBAs run in full. (Superseded the same day by the dry-run verdict below: A1 closed, not built.)
+      *The options as put:* (1) *recommended* —
+      derive the count from the drive's latency model, `ceil(plateau × (t0 + bytes / bw) / bytes)` clamped to
+      [2, 4] and to the caller pool, three HARDWARE constants (7.1 GB/s plateau, 0.37 ms per-read latency, 7.6 GB/s
+      single-read rate): Qwen3-Next → 3, MiniMax / DeepSeek-V4 / gpt-oss → 2, no per-expert tensors (dense) → 2, so
+      four of five models keep today's count by construction; Python only. (2) target the standalone plateau (4 on
+      Qwen3-Next) — ties (1) on the turn, 0.14 s better HIT TTFT inside the spread, needs a second fitted term.
+      (3) calibrate at load — rejected: row 49 showed a standalone knee is not the in-path optimum, and it would
+      move between loads. Ring selection (first-free, a Rust edit): ceiling 7 % of read rate only where rings
+      bind → ≤ ~0.2 s/turn; proposed as a dry-run arm with a stop rule, not as a commitment.
+      **A1 — SPEC APPROVED by the USER 2026-10-04 ("continue"); DRY RUN DONE the same day; VERDICT: ✗ CLOSED BY
+      ITS STOP RULE — NOT BUILT, no product code changed.** Throwaway worktree at `8577595`, since removed; the
+      whole verified change is `plans/probes/s22_out/a1-dryrun.diff` (persister + 16 tests), the first-free Rust
+      helper `a1-dryrun-firstfree.diff`.
+      *What passed:* the derivation applied cleanly; `tests/test_ring_pool_sizing.py` + buffer-sizing + envinfo
+      80 passed; **10 of 10 mutants caught**; full suite on the worktree **`3691 passed, 25 skipped`** (floor + 16);
+      the real `init_model_io` on all six checkpoints, `main` → dry-run tree: Qwen3-Next 2 → 3 rings, MiniMax 2 → 2,
+      DeepSeek-V4 2 → 2, gpt-oss 2 → 2, Llama-3.3-70B 2 → 2, Llama-3.2-1B **1 → 1** (its one 512 MiB buffer caps
+      the pool — the spec's table said 2).
+      *Ring selection (first-free, scratch extension, Qwen3-Next, 3 rings, mirrored base / ff / ff / base):* 8
+      callers 5.89 → 6.10 GB/s (**+3.5 %, under the +5 % continue bar → DROPPED**, no in-path step); 6 callers
+      +6.6 %, 4 callers −0.3 %. The two deferred Rust items stay in the OPEN list.
+      *A1's own stop rule (agent session on the BUILT code, no env var on the derived arms — load line `n=3`;
+      `VAAYU_RING_POOL_N=2` on the base arms; `BALLAST_GB=28`, budget 16.0–16.3 GB; order 2, 3, 3, 2):* mean HIT
+      turn **19.09 s (base arms 18.92 / 19.27, spread 1.87 %) → 18.79 s (−1.60 %)**; HIT TTFT 3.176 → 3.010 s
+      (−5.2 %, base spread 6.8 %); decode 62.42 → 61.87 ms/token; cold-8k turn 23.30 → 23.08 s; ids identical on
+      all 9 turns × 4 arms and equal to the earlier arms'. **Under 2 % and inside the base spread → the rule
+      fires: A1 closes.** (A third 2-ring arm taken later, 19.44 s, would make it −2.2 % against a 2.7 % spread —
+      still inside.) **Why it differs from session 3's −2.82 %:** those six arms ran with BUFFERED I/O and these
+      four with O_DIRECT (the engine's own heuristic flipped between them — the `[bug]` at the top of the OPEN
+      list). Under O_DIRECT a read is faster (stall per load 0.29 ms against 0.45), prefill is less read-bound,
+      and a third ring has less to give. `VAAYU_RING_POOL_N=3` remains available by hand; nothing is banked in
+      code. **Re-open A1 only if** the O_DIRECT fix does not land (the server then stays buffered, where 3 rings
+      measured −2.8 % with a 1.0 % spread) — the diff above applies as is.
       **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
       worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
       choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
@@ -290,6 +380,79 @@ at HEAD before acting.
   2.84; the packed decode kernel's pointer table + launches), FWD 3.14 (the forward outside the layers), GRRUN 1.36
   (graph bind/signature), GRAPH 0.64 (108 replays) = **≤ 9.1 ms/token = ≤ 2.3 s/turn (11.5 %) as a ceiling**; several
   seams, unpriced build; reach every decode token, N=1. Evidence `s21_out/decode-on1.log` U_HOST + U_CNT.
+
+- **[~] [bug] The server loads Qwen3-Next with BUFFERED I/O, and buffered costs 17.4 % of the agent's HIT turn** (found
+  2026-10-04 by S22-A1's dry run; the USER said go the same day). **FIX BUILT AND VERIFIED on branch
+  `s22-odirect-heuristic` — NOT COMMITTED, awaiting the USER's go to commit and merge** (when merged: close this
+  item, move its text to the backlog archive, raise the suite floor to 3684, refresh "Where things stand").
+  *The fix (one line + a helper, `vaayu/persist/safetensor_model_persister.py`):* `_should_use_direct_io` subtracts
+  from its cacheable RAM what the engine's own expert cache will pin — `expert_arena_bytes(model_dir)` = indexed
+  experts × slab size, read off the expert offset index (never written), at most all the RAM there is. The 8 GiB
+  reserve and the 40 % threshold are unchanged; a checkpoint with no per-expert tensors gets the old rule exactly.
+  *Root cause, with kernel-side evidence (`s22_session.py` now records `/sys/block/nvme0n1/stat`, `/proc/vmstat`
+  and `/proc/meminfo` per turn; raw `s22-session-a1e-{buf,dir}.json`):* the rule dates from 2026-06-09 (`e3e1823`),
+  before the pinned expert arena existed. Buffered, one HIT turn: 25.73 GB requested, 25.03 GB delivered by the
+  DRIVE (the page cache served 2.7 %; 1–3 % on every turn), 6.09 million pages reclaimed (≈ every byte read was
+  cached and then evicted), MemFree 0.30 GB. O_DIRECT, the same turn: 25.75 / 25.75 GB, 0 pages reclaimed.
+  *Verified:* `tests/test_direct_io_choice.py` (9 tests, two expert layouts) — **4 RED on the unfixed code**
+  (`assert False is True`), green after; **7 of 7 mutants caught**; suite **`3684 passed, 25 skipped`** (floor + 9).
+  The real function on six checkpoints at 27.3 GiB free, `main` → fix: **Qwen3-Next buffered → O_DIRECT**;
+  MiniMax and DeepSeek-V4 O_DIRECT → O_DIRECT; gpt-oss buffered → buffered (77 % left after its 10.2 GB of
+  experts); Llama-3.3-70B and Llama-3.2-1B buffered → buffered. Nothing written under DeepSeek's model dir.
+  *Tree against tree, the engine's own choice, natural RAM (no ballast, no forcing), `main` / fix / fix / `main`,
+  raw `s22-session-fix-*.json`:* `main` printed `Sufficient RAM (26.4 / 27.2 GB free). Disabling O_DIRECT`, the
+  fix `Limited RAM (27.3 GB free). Using O_DIRECT`; mean HIT turn **22.41 → 17.86 s (−20.3 %)**, HIT TTFT 4.314 →
+  3.011 s (−30.2 %), HIT decode 70.97 → 58.21 ms/token (−18.0 %), cold-8k turn 27.19 → 22.31 s (−17.9 %), cold-8k
+  TTFT 11.77 → 9.26 s (−21.3 %); **greedy ids identical on 9 turns × 4 arms** and equal to the morning's arms.
+  Budgets were NOT pinned in that run (fix arms 18.7 / 18.8 GB, `main` arms 17.5 / 18.3 GB); the budget-pinned
+  figure is the controlled one below, **−17.4 %** (five arms: buffered 23.47 / 23.62 / 22.70, O_DIRECT 19.44 /
+  18.98). *Gates on the branch:* dense gate 5 passed on Llama-3.2-1B and on Llama-3.3-70B; accumulator gate 8
+  passed on Qwen3-Next (load line now O_DIRECT at 27.2 GiB free) and on MiniMax; server gate 9 passed on
+  Qwen3-Next, the real server app printing `Limited RAM (27.0 GB free). Using O_DIRECT`.
+  *§8:* (1) no knob — the choice is derived, `env.json` records it as `storage.o_direct`, and
+  `documentation/TUNING.md` has a new "(no knob)" section with the cost of the wrong mode; (2) plumbed at
+  `vaayu_base.py:2521`, every CUDA load; (3) reachable at N=1 on the server default — proven by the server gate's
+  load line; (4) nothing banked. **Cost:** one more read of the expert offset index at load (+0.5 s Qwen3-Next,
+  +0.45 s MiniMax, +0.2 s DeepSeek-V4). **Not covered:** CPU compute never takes this path (`_use_direct_io =
+  False` there); a whole-layer-only MoE fallback caches no experts yet is charged for them (it then errs toward
+  O_DIRECT, the safe side; no on-device model is in that state); dense and gpt-oss keep buffered and remain
+  UNMEASURED against O_DIRECT (lead below).
+  *The record as found:* Location:
+  `_should_use_direct_io` (`vaayu/persist/safetensor_model_persister.py:284`), called at `vaayu_base.py:2521` on
+  every CUDA load. Its rule: buffered when `(free RAM − 8 GiB) / checkpoint bytes ≥ 0.40` ("the page cache can
+  hold 40 % of the model"). **What is wrong:** it counts as page-cache room the RAM the engine itself pins a moment
+  later — on an MoE model the expert RAM arena takes 16–19 GB of it — so the page cache it "leverages" barely
+  exists, and what it does hold duplicates experts the arena already holds. Qwen3-Next's checkpoint is 48.24 GB,
+  so the rule flips at **26.0 GiB free**; an idle box has 26.5–27.6 GiB free at that line, so the server goes
+  buffered, while a box with a browser open (25.0 GiB) goes O_DIRECT. **Reach proven on the real server app:**
+  `plans/probes/s22_out/final-server-qwen.log` and `gate-server-qwen.log` (the `SERVER_CKPT=` gate) both print
+  `Sufficient RAM detected (27.2 / 27.5 GB free). Disabling O_DIRECT to leverage page cache for 43% of model`.
+  **Measured, controlled** (`plans/probes/s22_session.py` with the new `DIRECT=on|off` switch, `main` tree, 2
+  rings, `BALLAST_GB=28` → 16.1–16.3 GB budget on every arm, order buffered / O_DIRECT / buffered, raw
+  `s22_out/s22-session-a1d-*.json`): mean HIT turn **23.55 s buffered (arms 23.47 / 23.62) → 19.44 s O_DIRECT
+  (−17.4 %)**; HIT TTFT 4.560 → 3.331 s (−26.9 %); HIT decode 74.46 → 63.17 ms/token (−15.2 %); cold-8k turn 27.93
+  → 24.09 s (−13.8 %); cold-8k TTFT 11.94 → 10.11 s (−15.3 %); stall per expert load 0.45 → 0.29 ms; **greedy ids
+  identical on 9 turns × 3 arms.** Two more O_DIRECT arms from A1's run agree (18.92 / 19.27 s). One O_DIRECT arm
+  only in the controlled trio — repeat as a full ABBA when fixing.
+  **What it means for the record:** every server-budget Qwen3-Next number in this file — S21's census, S22-A2's
+  keep bar (all four arms buffered, 27.3–27.6 GiB free, so A2's −7.1 % stands as a buffered-mode result), the
+  "Where things stand" turn times — was taken buffered. `BALLAST_GB=25` runs were O_DIRECT. **Any probe: grep the
+  `O_DIRECT` line of every arm.** The "budget sensitivity" seen in session 3 (17.7 GB → 22.29 s, 18.9 GB → 20.35 s)
+  was inside buffered mode, where free RAM is page cache; it is this bug, not a separate lead.
+  **Other models on this box today:** MiniMax and DeepSeek-V4 → O_DIRECT already (flip at 61.8 GiB and above);
+  gpt-oss → buffered (the whole 13 GB checkpoint fits, 150 %) — unmeasured, and it holds its experts in RAM;
+  Llama-3.3-70B → buffered at 50 % — the heuristic's own design case (no arena), unmeasured here; do not change
+  dense without the mirrored dense A/B.
+  **Follow-up lead, unmeasured:** is buffered still right for Llama-3.3-70B (50 % "cacheable", but its own RAM
+  tensor cache competes for the same RAM) and for gpt-oss? `DIRECT=on|off` in a dense probe, mirrored 8 arms.
+  **Fix candidates as first written (the fix built is (b), with the arena estimated from the index):** (a) a
+  checkpoint with per-expert tensors → O_DIRECT (the arena is the cache);
+  (b) subtract the planned expert RAM budget from the "available for cache" term. Either is a few lines; the
+  decision point runs before MoE detection, but `expert_read_buffer_bytes` (the offset index) is available one line
+  later in `init_model_io`. **§8:** no knob today (the choice is not reachable from `vaayu/server/config.py`) —
+  say in the fix whether one is needed; plumbed at load; reachable at N=1 on the server default, every turn.
+  **Gates when fixing:** suite; dense gate on both Llamas (dense must keep its mode unless measured); accumulator
+  gate on Qwen3-Next + MiniMax; server gate on Qwen3-Next with the load line showing O_DIRECT; ids identical.
 
 *From the S3 row (closed 2026-09-25).*
 
@@ -610,6 +773,12 @@ arithmetic, not the repack.**
   through `io_uring_read_segments`, so the older probes that wrap the Rust call (`p1_trace`, `p4_trace`, `p8_trace`,
   `probe_arm`, `row26_decode`, `s8_split`) no longer see them. The OFF arm of the wave is one assignment:
   `smp._READ_SEGMENTS = None`.
+- **Probes: the I/O MODE and the RAM budget are arm variables (S22-A1, 2026-10-04).** The engine chooses buffered
+  or O_DIRECT from the free RAM at load, and on Qwen3-Next that choice flips at 26.0 GiB free and moves the turn
+  17 %; the expert RAM budget follows the same free RAM (18.0 vs 18.9 GB between two consecutive processes).
+  `plans/probes/s22_session.py`: pin the budget with `BALLAST_GB`, force the mode with `DIRECT=on|off`, and grep
+  `O_DIRECT` and `Expert RAM cache:` in every arm's log before comparing. Ring-count knee probe:
+  `plans/probes/s22_rings.py --rings N` (whole-expert waves, one ring count per process).
 - Full suite: `./venv/bin/python -m pytest tests/ -q`. The current baseline is the one stated once
   at the top of this file — do not duplicate it here; it went stale four times that way.
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and

@@ -293,6 +293,14 @@ def _should_use_direct_io(model_dir: str) -> bool:
 
         # Reserve 8GB for OS + PyTorch + pinned buffers
         available_for_cache = max(0, mem.available - (8 * 1024**3))
+        # The engine's own expert RAM cache is sized from this same free RAM a
+        # moment later and PINS it -- up to every expert on disk -- so only what
+        # is left can ever be page cache. Counting it twice sent Qwen3-Next
+        # (48 GB, 44 GB of it experts, 27 GiB free) buffered at "43 % cacheable":
+        # the page cache then served 1-3 % of the bytes read, the kernel
+        # reclaimed 6-9 million pages per turn, and the agent's prefix-HIT turn
+        # took 23.55 s against 19.44 s with O_DIRECT (2026-10-04, ids identical).
+        available_for_cache -= min(available_for_cache, expert_arena_bytes(model_dir))
         cacheable_fraction = available_for_cache / max(1, model_total_bytes)
 
         use_direct = cacheable_fraction < 0.40
@@ -1040,6 +1048,20 @@ def expert_read_buffer_bytes(model_dir: str) -> int:
     if not idx.load_cached():
         idx.build(write_cache=False)
     return compute_slab_bytes(idx) if idx.index else 0
+
+
+def expert_arena_bytes(model_dir: str) -> int:
+    """Pinned RAM that would hold EVERY expert of this checkpoint (indexed
+    experts x the slab size) -- the most the engine's own expert cache can
+    take. 0 when the checkpoint has no per-expert tensors. Like
+    expert_read_buffer_bytes, never writes a cache file."""
+    from .expert_offset_index import ExpertOffsetIndex
+    idx = ExpertOffsetIndex(model_dir)
+    if not idx.load_cached():
+        idx.build(write_cache=False)
+    if not idx.index:
+        return 0
+    return compute_slab_bytes(idx) * sum(len(experts) for experts in idx.index.values())
 
 
 def compute_slab_bytes(offset_index) -> int:

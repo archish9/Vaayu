@@ -462,3 +462,25 @@ What the load log tells you:
   leaves layers unpinned, and the tier only holds what fits in RAM the expert arena cannot
   use (an arena that takes all the RAM, typical for very large MoE checkpoints, leaves it
   empty). Those weights are read from disk every token.
+
+## Buffered or direct disk reads (no knob)
+
+Nothing to set. At load the engine chooses between reading the checkpoint through the
+kernel's page cache (buffered) and bypassing it (O_DIRECT), and prints which:
+
+- `[Vaayu] Limited RAM (X GB free). Using O_DIRECT to avoid wasteful page cache copies.`
+- `[Vaayu] Sufficient RAM detected (X GB free). Disabling O_DIRECT to leverage page cache for N% of model.`
+
+Buffered is chosen only when the page cache could hold 40 % of the checkpoint in the RAM
+that is really left for it: the free RAM, minus 8 GiB for the OS and the engine's own
+buffers, minus what the expert RAM cache will pin (on a MoE checkpoint that is every expert
+on disk, or all the remaining RAM if they do not fit). `env.json` records the result as
+`storage.o_direct`.
+
+Why it matters: before 2026-10-04 the expert cache was not subtracted, so a MoE checkpoint a
+little over twice the free RAM was read buffered although the expert cache then left the
+page cache almost nothing. Measured on Qwen3-Next-80B (48 GB checkpoint, 27 GiB free, 16 GB
+VRAM): the page cache served 1-3 % of the bytes read, and a prefix-HIT agent turn took
+22.4 s against 17.9 s with O_DIRECT (-20 %; -17 % with the RAM budget held equal), same
+output tokens. If a load of a large MoE model prints the `Sufficient RAM` line and decode
+feels slow, check the free RAM at load: the choice is made once, from that number.
