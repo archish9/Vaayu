@@ -130,6 +130,8 @@ maturin develop --release
 cd ..
 ```
 
+Rebuild it the same way after pulling changes to `vaayu_rust/`. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
+
 ### Step 3: Relocate Your GPU to the CPU-Direct PCIe x16 Slot
 *If your `gpu_load` times are hovering around ~20 seconds in your logs, your GPU is installed in the wrong slot.*
 * **The Fix**: Open your PC chassis and move your GPU to the **topmost metal-armored PCIe slot (labeled PCI_E1 on your motherboard)**. This slot is wired directly to the CPU, increasing lane width to the maximum **x16** (PCIe 5.0/4.0), and dropping your PCIe transfer time from **20.4 seconds to ~2 seconds**!

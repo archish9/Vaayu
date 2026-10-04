@@ -67,6 +67,8 @@ cd ..
 python3 -c "import vaayu_rust; print('✅ vaayu_rust extension compiled & loaded successfully!')"
 ```
 
+Rebuild it the same way after pulling changes to `vaayu_rust/`. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
+
 ---
 
 ## Part 3: The Critical PCIe Motherboard Relocation
