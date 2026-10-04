@@ -10,8 +10,8 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3675 passed, 0 failed, 0 errors, 25 skipped`** (233.60 s, FOREGROUND, branch
-`s22-a2-expert-read-wave` `707059a`, 2026-10-04, S22-A2: +54 = `tests/test_expert_read_wave.py` 48 +
+**Suite floor: `3675 passed, 0 failed, 0 errors, 25 skipped`** (227.93 s, FOREGROUND, on merged `main` `86b62fb`,
+2026-10-04, S22-A2: +54 = `tests/test_expert_read_wave.py` 48 +
 `tests/test_rust_read_segments.py` 6; the 25 skipped include the 5 of `tests/test_dense_gate.py` without
 `DENSE_CKPT`). `cargo test` in `vaayu_rust/`: `37 passed, 0 failed, 1 ignored`.
 **The suite now needs a CURRENT `vaayu_rust` build** (`maturin develop --release` in `vaayu_rust/`): with an older
@@ -72,7 +72,7 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
-| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (branch `s22-a2-expert-read-wave`; row below). **NEXT: A1**, then B0 | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
+| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (merged `86b62fb`; row below). **NEXT: A1**, then B0 | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
 ## Durable rows (the briefs)
@@ -180,7 +180,7 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       HITs, 3 min 50 s per process. Other-model A/B probe `s22_miss.py DETAIL=0`, verified on `main`: gpt-oss
       73–76 ms/token, MiniMax 446–452, DeepSeek-V4 376–380 (their decode loads: `load_expert_sparse` 0 calls on all
       three). Dense: `s22_dense.py`, arm = extension (the plan's Task 0 saves the old one to `plans/probes/s22_out/pyext-base`).
-      **A2 — ✅ DONE 2026-10-04, VERDICT KEEP** (branch `s22-a2-expert-read-wave`, 4 commits `14af82b` Rust core,
+      **A2 — ✅ DONE AND MERGED 2026-10-04 (`main` `86b62fb`), VERDICT KEEP** (4 commits `14af82b` Rust core,
       `5a2f66e` Python entry point, `365cd66` loader fast path, `707059a` final-review fix wave; subagent-driven,
       every task reviewed; RESULTS `docs/2026-10-04-S22-A2-expert-read-wave-RESULTS.md`, raw `plans/probes/s22_out/`).
       *What shipped:* `vaayu_rust.io_uring_read_segments(path, [(off, len, ptr)], qd, direct)` — all of one expert's
@@ -209,7 +209,8 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       every slab expert read goes through `load_expert_into_slab`; (3) reachable at N=1 on the server default, every
       decode token with a disk miss and every prefill that reads experts, on all four per-expert MoE models; (4)
       nothing banked. **The fused-EXL3 forward inherits the wave with no on-device model to verify it.**
-      *Not merged yet at the time of writing — see the branch.* **NEXT: A1** on the read shape A2 left: one expert =
+      *Merged to `main` `86b62fb`; suite on the merged tree `3675 passed, 25 skipped`, `cargo test` 37 passed; the
+      installed `vaayu_rust` is the build of `707059a`.* **NEXT: A1** on the read shape A2 left: one expert =
       one ring acquisition, so measure the knee on WHOLE experts with `plans/probes/s22_wave.py --rings N` on all
       four checkpoints (today, 2 rings: Qwen3-Next 4.6–4.85 GB/s at k ≥ 2 — G5 saw 6.6 at 3 rings on bulk reads;
       MiniMax / DeepSeek-V4 / gpt-oss already at the ~7.1 GB/s plateau), and decide ring selection (round-robin can
