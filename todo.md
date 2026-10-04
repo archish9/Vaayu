@@ -126,6 +126,53 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       (more threads, and one expert would occupy several rings, fighting A1). Toolchain present (`cargo`, `maturin`
       1.13.1 in venv). Also note: `p8_samepath.py` times BULK (≥ 1 MB) groups only — A1's knee re-measure needs it
       extended to whole-expert reads. **Next session: resume at "propose approaches → design → spec" for A2.**
+      **SESSION 2 (2026-10-04, HEAD `73bdfe4` — only `todo.md` changed since `f3bad2b`, so the row holds). Three more
+      facts, all read-only:** (5) S21's own `s21-miss-m1.json` already answers most of A2's step 0 in path: ONE
+      `load_expert_into_slab` call costs **1.018 ms median when it is the visit's only miss** (n 2,911), 1.33 / 1.95 /
+      2.58 ms at 2 / 3 / 4+ misses, against G5's 0.60–0.70 ms bulk-only floor — so the two small groups + three serial
+      round trips cost **≤ 0.32–0.42 ms per expert**, above this row's 0.15–0.25 ms estimate (a ceiling until a wave
+      is timed). (6) **One wave fits every expert on disk at qd=32** with `chunk = align4k(ceil(total / (qd − nseg +
+      1)))` (Σ chunks ≤ qd; identical to today's chunking at nseg = 1): Qwen3-Next 31 SQEs, MiniMax 32, DeepSeek 31,
+      gpt-oss 31; every segment's slab offset is 4096-aligned on all 52,224 experts. Aligned group tuples: Qwen
+      (4096|8192, 1,576,960, 200,704); MiniMax (4096|8192, 28,672|32,768, 8,851,456); DeepSeek (790,528, 12,587,008);
+      gpt-oss 6 groups, 19 tuples, ~12.65 MiB. (7) `cargo test` at HEAD: 21 passed, 0 failed, 1 ignored; the installed
+      `vaayu_rust` .so is 2026-08-30 = the last `lib.rs` commit (current).
+      **A2 DESIGN APPROVED by the USER 2026-10-04; spec `docs/superpowers/specs/2026-10-04-S22-A2-expert-read-wave-design.md`
+      (awaiting the USER's review); DRY RUN DONE, stop rule PASSED; no product code yet.** Design: a new Rust
+      `io_uring_read_segments(path, [(off, len, ptr)], qd, direct)` — every byte group of one expert in ONE wave on
+      ONE ring, sharing `persistent_read`'s core (one-segment chunking unchanged, so dense streaming issues the same
+      SQEs) — and a fast path in `load_expert_into_slab` (`tensor_align=False`); the existing per-group loop stays
+      as the fallback (preadv, stale extension → load-time WARNING). No knob. Out of scope: `load_expert_sparse`
+      (0 calls on Qwen3-Next in the dry run), ring count/selection (A1). **A2's own keep bar (USER, 2026-10-04):
+      ≥ 2 % of the representative turn by ABBA and no model slower, else revert.**
+      **Dry-run numbers** (throwaway worktree, since removed; code kept as `plans/probes/s22_out/dryrun.diff`, raw
+      in `plans/probes/s22_out/`, probes `plans/probes/s22_wave.py` / `s22_miss.py`):
+      *standalone, whole experts, 2 rings qd 32, median ms per expert serial → wave (GB/s):* Qwen3-Next k=1 0.934 →
+      0.611 (1.91 → 2.78), k=2 1.430 → 0.706 (2.51 → 4.85), k=4 2.363 → 1.469 (2.70 → 4.60); MiniMax k=1 1.599 →
+      1.468, k=2 5.88 → 7.11 GB/s; DeepSeek-V4 k=1 2.213 → 2.074, k=2 6.42 → 7.12 GB/s; gpt-oss k=1 2.625 → 2.096,
+      k=2 5.77 → 7.08 GB/s — faster on all four at every k, bytes equal. (Today's WHOLE-expert rate on Qwen3-Next
+      is 2.5–2.7 GB/s at k ≥ 2, not G5's bulk-only 4.3.) *In the forward, Qwen3-Next, server mode, cold 8k prompts,
+      a different slice per arm (2 OFF, 3 ON):* stall per missing layer-visit 1.148 → 0.944 ms (−17.8 %); by misses
+      1 / 2 / 3 / 4+: 0.937 → 0.751, 1.242 → 0.994, 1.796 → 1.466, 2.531 → 2.039 ms. Same prompt, same history, two
+      processes: **decode 54.95 → 51.64 ms/token (−6.0 %), prefill + first token 13.12 → 11.80 s (−10.1 %), 256
+      greedy ids identical.** Projected onto S21's agent-session miss mix: 4.68 ms/token ≈ **1.19 s of the 20.1 s
+      turn (5.9 %)**, decode only — a projection (one or two arms each, cold prompts not an agent session); the
+      ABBA on an agent session decides. A1's knee probe is ready: `s22_wave.py` reads whole experts (`--rings N`).
+      **SPEC APPROVED by the USER 2026-10-04; PLAN WRITTEN — `docs/superpowers/plans/2026-10-04-S22-A2-expert-read-wave.md`
+      (7 tasks + pre-flight), assets `docs/superpowers/plans/2026-10-04-S22-A2-assets/` (four `apply_*.py` scripts,
+      the Rust test block, two pytest files) — awaiting the USER's review and choice of execution method.** The
+      plan's code was applied to a scratch worktree at `73bdfe4` and run: `cargo test` 31 passed / 0 failed / 1
+      ignored (21 + 10 new), 40 new pytest tests, **full suite `3661 passed, 25 skipped, 0 failed`**, 3 Rust + 4
+      Python mutants each caught; the whole verified diff is `plans/probes/s22_out/plan-verified.diff`. Final
+      design detail added by the plan: a pure `plan_chunks(segs, qd, buf_index_of)` shared by both Rust read paths.
+      **Keep-bar probe, run once on `main` (old extension, 2026-10-04) as the reference:** `s22_session.py` — one
+      agent session per process (S21's: warm, cold 8k, 6 HIT turns, 256 tokens each), arm = process, compared by
+      `s22_cmp.py`: **mean HIT turn 22.40 s, HIT TTFT 4.593 s, HIT decode 69.81 ms/token, cold turn 27.47 s**, 6/6
+      HITs, 3 min 50 s per process. Other-model A/B probe `s22_miss.py DETAIL=0`, verified on `main`: gpt-oss
+      73–76 ms/token, MiniMax 446–452, DeepSeek-V4 376–380 (their decode loads: `load_expert_sparse` 0 calls on all
+      three). Dense: `s22_dense.py`, arm = extension (the plan's Task 0 saves the old one to `plans/probes/s22_out/pyext-base`).
+      **Not yet done: any product code; `maturin develop` (it replaces the shared venv's extension — the plan's
+      Task 2); the pending `todo.md` notes are uncommitted (the plan's Task 0 commits them).**
       **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
       worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
       choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
