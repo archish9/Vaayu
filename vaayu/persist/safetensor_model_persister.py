@@ -162,9 +162,14 @@ else:
 try:
     import vaayu_rust
     _USE_IOURING = True
+    # One io_uring wave for all of an expert's byte groups (S22-A2). None on an
+    # extension built before it existed: load_expert_into_slab then issues one
+    # round trip per group, and init_model_io says so.
+    _READ_SEGMENTS = getattr(vaayu_rust, "io_uring_read_segments", None)
     print(">>>> Rust io_uring reader loaded — O_DIRECT page-cache bypass active (QD32)")
 except ImportError:
     _USE_IOURING = False
+    _READ_SEGMENTS = None
     print(">>>> Rust io_uring NOT available — preadv QD16 fallback active")
 
 # ── Global state for the loader ──────────────────────────────────────
@@ -341,6 +346,16 @@ def _register_iouring_files(model_dir: str, use_direct_io: bool = True) -> bool:
         return False
 
 
+def _warn_if_stale_extension() -> None:
+    """Say so, once per load, when the installed vaayu_rust predates the
+    one-wave expert read: nothing breaks, but every expert costs one disk round
+    trip per byte group instead of one in total."""
+    if _USE_IOURING and _READ_SEGMENTS is None:
+        print("[VAAYU-IO] WARNING: the installed vaayu_rust has no io_uring_read_segments — "
+              "expert reads issue one round trip per byte group. Rebuild it: "
+              "`maturin develop --release` in vaayu_rust/.")
+
+
 def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     """Called once at model load. Initializes ring pool and registers files explicitly.
 
@@ -351,6 +366,7 @@ def init_model_io(model_dir: str, use_direct_io: bool) -> None:
     """
     global _RING_INITIALIZED, _FILES_REGISTERED, _USE_DIRECT_IO
     _USE_DIRECT_IO = use_direct_io
+    _warn_if_stale_extension()
 
     global _EXPERT_PINNED_SIZE, _EXPERT_POOL_ACTUAL_N
     if _USE_PINNED and _EXPERT_BUF_POOL.empty():
@@ -1053,7 +1069,11 @@ def load_expert_into_slab(
     {tensor_key: view-into-slab}. No clone in the cache (see
     ExpertRAMCache.put_slab). Expert tensors are NOT assumed file-contiguous
     (see _group_contiguous_ranges) — this issues ONE read per contiguous
-    group; the slab's layout does not mirror the file's layout (slab_bytes
+    group. With io_uring and a current extension (tensor_align=False) all of
+    those group reads are issued together in ONE read call (`_READ_SEGMENTS`,
+    one wave on one ring); the per-group loop below is the fallback (preadv,
+    tensor_align=True, or a stale extension without that symbol). The
+    slab's layout does not mirror the file's layout (slab_bytes
     equals the sum of each group's own slab_span, per expert_span_bytes /
     compute_slab_bytes / _group_layout).
 
@@ -1126,6 +1146,35 @@ def load_expert_into_slab(
     use_direct = _USE_DIRECT_IO and allow_direct
     out: dict = {}
     slab_off = 0
+    read_segments = _READ_SEGMENTS  # bound once: a mid-load OFF flip must not null the call
+    if not tensor_align and _USE_IOURING and read_segments is not None:
+        # One io_uring wave for the whole expert: every group's read is issued
+        # together, on one ring, instead of one round trip per group. Same slab
+        # layout, same views, same bytes counted as the loop below.
+        base = slab.data_ptr()
+        segments = []
+        layouts = []
+        for group in _group_contiguous_ranges(expert_metas):
+            aligned_offset, prefix_pad, raw_aligned_length, _packed_span, slab_span = _group_layout(group)
+            if slab_off + slab_span > slab.nbytes:
+                raise RuntimeError(
+                    f"expert span {slab_off + slab_span}B exceeds slab {slab.nbytes}B "
+                    f"(compute_slab_bytes undersized?)"
+                )
+            segments.append((aligned_offset, raw_aligned_length, base + slab_off))
+            layouts.append((group, slab_off, prefix_pad, raw_aligned_length))
+            slab_off += slab_span
+        for _aligned_offset, raw_aligned_length, _dst in segments:
+            note_read_bytes(raw_aligned_length)
+        read_segments(file_path, segments, 8, use_direct)
+        for group, group_off, prefix_pad, raw_aligned_length in layouts:
+            group_start = group[0][1].file_offset
+            data = slab[group_off:group_off + raw_aligned_length][prefix_pad:]
+            for key, meta in group:
+                rel = meta.file_offset - group_start
+                dt = _resolve_dtype(meta.dtype, key, file_path)
+                out[key] = data[rel:rel + meta.byte_length].view(dt).view(meta.shape)
+        return out
     for group in _group_contiguous_ranges(expert_metas):
         group_start = group[0][1].file_offset
         aligned_offset, prefix_pad, raw_aligned_length, packed_span, slab_span = _group_layout(group)

@@ -10,8 +10,12 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3621 passed, 0 failed, 0 errors, 25 skipped`** (226.31 s, FOREGROUND, on merged `main` `e38bae3`,
-2026-10-03, S23 — the +5 skipped are `tests/test_dense_gate.py` without `DENSE_CKPT`).
+**Suite floor: `3675 passed, 0 failed, 0 errors, 25 skipped`** (233.60 s, FOREGROUND, branch
+`s22-a2-expert-read-wave` `707059a`, 2026-10-04, S22-A2: +54 = `tests/test_expert_read_wave.py` 48 +
+`tests/test_rust_read_segments.py` 6; the 25 skipped include the 5 of `tests/test_dense_gate.py` without
+`DENSE_CKPT`). `cargo test` in `vaayu_rust/`: `37 passed, 0 failed, 1 ignored`.
+**The suite now needs a CURRENT `vaayu_rust` build** (`maturin develop --release` in `vaayu_rust/`): with an older
+extension `tests/test_rust_read_segments.py` and `tests/test_expert_read_wave.py` fail by design.
 
 **Before proposing any perf work, read "SETTLED — DO NOT RE-OPEN" in the archive in `todo-backlog.md`** — ideas
 already built and refuted, each with the number that killed it.
@@ -30,6 +34,11 @@ closed accumulates in this file again.
   **On a HIT turn 58–64 % of TTFT is waiting on NVMe** (S20; S21 at the server budget: 1.55 s of 2.69 s).
 - **The representative agent turn** (HIT at ~8.7k + 255 generated tokens, server budget, S21) = 2.69 s TTFT + 255 ×
   68.3 ms = **20.1 s, generation ≈ 87 %**; a cold-8k turn = 12.76 + 255 × 63.0 ms = **28.8 s**.
+- **Since S22-A2 (2026-10-04, one io_uring wave per expert; timed at the stream, `plans/probes/s22_session.py`,
+  one agent session per process, ABBA):** the same HIT turn (8,675 tokens + 256 generated) takes **17.8 s** (18.76 /
+  19.21 s without the wave on the same day); over the session's six HIT turns (8.7k → 15.4k context) the mean turn is
+  **20.94 s** (22.54 before), HIT TTFT **4.07 s** (4.62), HIT decode **66.2 ms/token** (70.3); cold 8k TTFT
+  **11.56 s** (12.58), cold-8k turn 26.07 s (27.81). Stall per missing layer-visit 0.93 → 0.75 ms (1 miss).
 - **Earlier Qwen3-Next decode censuses (s7/row26/r36/s11 probes) repeated ONE request per arm** — that re-decodes
   what the warm arm loaded (S21 dry run: 480/480 VRAM-tier hits, 0 disk reads). Row 36's "disk = 0.42 % of a decode
   token" and S11's 15 reads/token come from that shape. **Any decode probe: a different prompt per arm.**
@@ -63,7 +72,7 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
-| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's three byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0** (reason in the row below; brainstorm started 2026-10-03, no spec yet) | (a)+(b): the decode stall is 26 % of the agent's turn; A1+A2 measured/estimated at ~1.6–2.3 s of a 20.1 s turn | days |
+| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (branch `s22-a2-expert-read-wave`; row below). **NEXT: A1**, then B0 | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
 ## Durable rows (the briefs)
@@ -171,8 +180,40 @@ then has the gate it needs. (The week-rule did not fire: S22 as defined is days.
       HITs, 3 min 50 s per process. Other-model A/B probe `s22_miss.py DETAIL=0`, verified on `main`: gpt-oss
       73–76 ms/token, MiniMax 446–452, DeepSeek-V4 376–380 (their decode loads: `load_expert_sparse` 0 calls on all
       three). Dense: `s22_dense.py`, arm = extension (the plan's Task 0 saves the old one to `plans/probes/s22_out/pyext-base`).
-      **Not yet done: any product code; `maturin develop` (it replaces the shared venv's extension — the plan's
-      Task 2); the pending `todo.md` notes are uncommitted (the plan's Task 0 commits them).**
+      **A2 — ✅ DONE 2026-10-04, VERDICT KEEP** (branch `s22-a2-expert-read-wave`, 4 commits `14af82b` Rust core,
+      `5a2f66e` Python entry point, `365cd66` loader fast path, `707059a` final-review fix wave; subagent-driven,
+      every task reviewed; RESULTS `docs/2026-10-04-S22-A2-expert-read-wave-RESULTS.md`, raw `plans/probes/s22_out/`).
+      *What shipped:* `vaayu_rust.io_uring_read_segments(path, [(off, len, ptr)], qd, direct)` — all of one expert's
+      byte groups in ONE `submit_and_wait` on ONE ring (`persistent_read_segments`; chunks from a pure `plan_chunks`,
+      `chunk = align4k(ceil(total / (qd − nseg + 1)))`; `io_uring_read_into` is now a one-segment call with the same
+      SQEs as before) — and a fast path in `load_expert_into_slab` (`_READ_SEGMENTS`); the per-group loop is
+      untouched and is the fallback (preadv, `tensor_align=True`, an old extension → `[VAAYU-IO] WARNING` at load).
+      *Keep bar (≥ 2 % of the agent turn, ABBA, ids identical) — Qwen3-Next agent session, 4 processes off/on/on/off,
+      server mode and budget:* mean HIT turn **22.541 → 20.936 s (−7.12 %; the two OFF arms differ by 1.98 %)**, HIT
+      TTFT 4.623 → 4.067 s (−12.0 %), HIT decode 70.27 → 66.15 ms/token (−5.9 %), cold-8k turn 27.81 → 26.07 s
+      (−6.3 %), cold-8k TTFT 12.575 → 11.555 s (−8.1 %); **greedy ids identical on all 9 turns × 4 arms.** A2 alone
+      clears this row's joint 5 % bar. Stall per missing layer-visit, OFF → ON: 1 miss 0.928 → 0.750 ms, 2: 1.210 →
+      0.975, 3: 1.745 → 1.380, 4+: 2.383 → 1.895 (≈ −20 % at every count).
+      *Other models (ids identical on all):* MiniMax decode 462.7 → 426.7 ms/token (−7.8 %, OFF spread 4.8 %);
+      DeepSeek-V4 387.2 → 379.6 (−2.0 %, spread 6.7 %); gpt-oss 74.10 → 74.43 (+0.4 %, spread 1.8 % — it holds its
+      experts in RAM, nothing to shorten); Llama-3.3-70B, old vs new extension, 8 arms in two mirrored orders: 4.163
+      vs 4.170 s/token (+0.17 %, spread 1.4 %; the first 4-arm block alone read +1.18 % and the mirrored block
+      −0.84 % — **back-to-back dense arms have a ~1 % position effect; mirror the order**).
+      *Gates at `707059a` / `365cd66`:* suite `3675 passed, 25 skipped`; `cargo test` 37 passed; dense gate 5 passed on
+      Llama-3.2-1B and Llama-3.3-70B; accumulator gate 8 passed on Qwen3-Next and MiniMax; server gate 9 passed on
+      Qwen3-Next with no stale-extension WARNING. Final whole-branch review (opus): no Critical, no product defect;
+      its test-only fix wave pinned the resubmit target with a REAL kernel short read (a destination with a
+      `PROT_NONE` tail — the plan's "cannot be provoked" was wrong), the nseg == qd boundary, the fallback's error
+      propagation and `init_model_io`'s warning call.
+      *§8:* (1) no knob — the same bytes in a different issue order, ids identical; (2) plumbed by construction:
+      every slab expert read goes through `load_expert_into_slab`; (3) reachable at N=1 on the server default, every
+      decode token with a disk miss and every prefill that reads experts, on all four per-expert MoE models; (4)
+      nothing banked. **The fused-EXL3 forward inherits the wave with no on-device model to verify it.**
+      *Not merged yet at the time of writing — see the branch.* **NEXT: A1** on the read shape A2 left: one expert =
+      one ring acquisition, so measure the knee on WHOLE experts with `plans/probes/s22_wave.py --rings N` on all
+      four checkpoints (today, 2 rings: Qwen3-Next 4.6–4.85 GB/s at k ≥ 2 — G5 saw 6.6 at 3 rings on bulk reads;
+      MiniMax / DeepSeek-V4 / gpt-oss already at the ~7.1 GB/s plateau), and decide ring selection (round-robin can
+      queue behind a busy ring). With A1's Rust edit also land the two deferred items in the OPEN list below.
       **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
       worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
       choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
@@ -454,6 +495,28 @@ arithmetic, not the repack.**
 
 ## Engine-wide — reliability and minors
 
+*From the S22-A2 final whole-branch review (2026-10-04). File: `vaayu_rust/src/lib.rs` unless named.*
+
+- [ ] **Land with S22-A1's Rust edit (deferred so A2's measured extension stayed untouched):** (a)
+      `assert!(segs.len() <= qd)` as the first line of `plan_chunks` — its precondition is a comment only; a release
+      build would wrap `slots` and loop. Unreachable today (`persistent_read_segments` guards it; `legacy_read`
+      passes one segment). (b) clamp a chunk's submitted length to `0x7fff_f000`: `this_len as u32` truncates a
+      chunk ≥ 4 GiB to 0 and the read fails with a clean short-read error (not wrong bytes); with many segments the
+      threshold is lower than the old 4 GiB × qd. Not reachable from the loader (≤ 6 groups, ≤ 13.4 MB per expert).
+- [ ] **Lead (pre-existing contract, unchanged by A2): if `drain_ring` itself fails** (e.g. a signal during its
+      wait), `persistent_read_segments` returns with the ring marked dirty and reads possibly still in flight into a
+      slab the caller then releases. No repro built (needs a signal on the reading thread during two consecutive
+      waits). py-spy is the known way to get there — never attach it.
+- [ ] **Lead (pre-existing, both read paths):** when a group's `packed_span` exceeds its 4096-rounded read (many
+      tiny tensors), the NEXT group's slab destination is not sector-aligned, so O_DIRECT would return EINVAL. No
+      expert on disk has this (all 52,224 checked 2026-10-04: every segment offset 4096-aligned).
+- [ ] Minor (pre-existing): `queue_depth=0` with no ring pool panics in Rust; pyo3's `PanicException` is a
+      `BaseException`, so the callers' `except Exception` slab release is skipped. No caller passes 0.
+- [ ] Minor (A2 test gaps left by ruling): the length passed to the registered-buffer lookup is unpinned (buffer
+      registration is dead on this hardware); a pooled missing-file → good-read pair is not tested from Python (pinned
+      in Rust); the trace lines lost `buf_index=` / `chunk=`; two comments still say `buf_ptr` (`:441`, `:571`); the
+      fast path repeats the serial loop's view-building lines (the serial loop was to stay unedited).
+
 *From the old STILL OPEN section.*
 
 - **[bug] Vaayu assumes the CURRENT CUDA device in ~35 places** (no-device `torch.cuda.synchronize()`
@@ -537,6 +600,15 @@ arithmetic, not the repack.**
 
 - `python` is NOT on PATH → `./venv/bin/python`. `vaayu` is not pip-installed → scripts need
   `PYTHONPATH=/home/a/code/ai-ml/Vaayu`.
+- **`vaayu_rust` is built by hand and not tracked** — after pulling a change to `vaayu_rust/`, run
+  `maturin develop --release` there. An older build still loads: the engine prints a `[VAAYU-IO] WARNING` and reads
+  experts one byte group at a time (S22-A2). To try a Rust change WITHOUT replacing the shared extension: `cargo
+  build --release --features pyo3/extension-module`, copy `target/release/libvaayu_rust.so` to
+  `<dir>/vaayu_rust/vaayu_rust.abi3.so` beside the installed `__init__.py`, and run with `PYTHONPATH=<dir>`.
+- **Probes: wrap `load_expert_into_slab`, not `vaayu_rust.io_uring_read_into`** — since S22-A2 slab expert reads go
+  through `io_uring_read_segments`, so the older probes that wrap the Rust call (`p1_trace`, `p4_trace`, `p8_trace`,
+  `probe_arm`, `row26_decode`, `s8_split`) no longer see them. The OFF arm of the wave is one assignment:
+  `smp._READ_SEGMENTS = None`.
 - Full suite: `./venv/bin/python -m pytest tests/ -q`. The current baseline is the one stated once
   at the top of this file — do not duplicate it here; it went stale four times that way.
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and
