@@ -7696,3 +7696,74 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       gates stay mandatory for MoE changes. **§8:** a test, no knob; loads exactly in server mode, N=1.
       Suite **3621 passed, 0 failed, 25 skipped** (+5 skipped = this gate). `CLAUDE.md` corrections proposed to the
       USER (§0 x2, §5 x1), not edited. RESULTS `docs/2026-10-03-S23-dense-gate-RESULTS.md`.
+
+- [x] **[bug] The server loaded Qwen3-Next with BUFFERED I/O, and buffered cost 17.4 % of the agent's HIT turn — ✅ CLOSED 2026-10-04, FIXED AND MERGED (`main` `a588ff4`; commits `6b90c3b` fix + tests + TUNING.md, `d16a010` ledger; suite on merged `main` `3684 passed, 25 skipped`).** (Found
+  2026-10-04 by S22-A1's dry run; the USER said go the same day). The fix was built and verified on branch `s22-odirect-heuristic` and merged at the USER's word ("Merge").
+  *The fix (one line + a helper, `vaayu/persist/safetensor_model_persister.py`):* `_should_use_direct_io` subtracts
+  from its cacheable RAM what the engine's own expert cache will pin — `expert_arena_bytes(model_dir)` = indexed
+  experts × slab size, read off the expert offset index (never written), at most all the RAM there is. The 8 GiB
+  reserve and the 40 % threshold are unchanged; a checkpoint with no per-expert tensors gets the old rule exactly.
+  *Root cause, with kernel-side evidence (`s22_session.py` now records `/sys/block/nvme0n1/stat`, `/proc/vmstat`
+  and `/proc/meminfo` per turn; raw `s22-session-a1e-{buf,dir}.json`):* the rule dates from 2026-06-09 (`e3e1823`),
+  before the pinned expert arena existed. Buffered, one HIT turn: 25.73 GB requested, 25.03 GB delivered by the
+  DRIVE (the page cache served 2.7 %; 1–3 % on every turn), 6.09 million pages reclaimed (≈ every byte read was
+  cached and then evicted), MemFree 0.30 GB. O_DIRECT, the same turn: 25.75 / 25.75 GB, 0 pages reclaimed.
+  *Verified:* `tests/test_direct_io_choice.py` (9 tests, two expert layouts) — **4 RED on the unfixed code**
+  (`assert False is True`), green after; **7 of 7 mutants caught**; suite **`3684 passed, 25 skipped`** (floor + 9).
+  The real function on six checkpoints at 27.3 GiB free, `main` → fix: **Qwen3-Next buffered → O_DIRECT**;
+  MiniMax and DeepSeek-V4 O_DIRECT → O_DIRECT; gpt-oss buffered → buffered (77 % left after its 10.2 GB of
+  experts); Llama-3.3-70B and Llama-3.2-1B buffered → buffered. Nothing written under DeepSeek's model dir.
+  *Tree against tree, the engine's own choice, natural RAM (no ballast, no forcing), `main` / fix / fix / `main`,
+  raw `s22-session-fix-*.json`:* `main` printed `Sufficient RAM (26.4 / 27.2 GB free). Disabling O_DIRECT`, the
+  fix `Limited RAM (27.3 GB free). Using O_DIRECT`; mean HIT turn **22.41 → 17.86 s (−20.3 %)**, HIT TTFT 4.314 →
+  3.011 s (−30.2 %), HIT decode 70.97 → 58.21 ms/token (−18.0 %), cold-8k turn 27.19 → 22.31 s (−17.9 %), cold-8k
+  TTFT 11.77 → 9.26 s (−21.3 %); **greedy ids identical on 9 turns × 4 arms** and equal to the morning's arms.
+  Budgets were NOT pinned in that run (fix arms 18.7 / 18.8 GB, `main` arms 17.5 / 18.3 GB); the budget-pinned
+  figure is the controlled one below, **−17.4 %** (five arms: buffered 23.47 / 23.62 / 22.70, O_DIRECT 19.44 /
+  18.98). *Gates on the branch:* dense gate 5 passed on Llama-3.2-1B and on Llama-3.3-70B; accumulator gate 8
+  passed on Qwen3-Next (load line now O_DIRECT at 27.2 GiB free) and on MiniMax; server gate 9 passed on
+  Qwen3-Next, the real server app printing `Limited RAM (27.0 GB free). Using O_DIRECT`.
+  *§8:* (1) no knob — the choice is derived, `env.json` records it as `storage.o_direct`, and
+  `documentation/TUNING.md` has a new "(no knob)" section with the cost of the wrong mode; (2) plumbed at
+  `vaayu_base.py:2521`, every CUDA load; (3) reachable at N=1 on the server default — proven by the server gate's
+  load line; (4) nothing banked. **Cost:** one more read of the expert offset index at load (+0.5 s Qwen3-Next,
+  +0.45 s MiniMax, +0.2 s DeepSeek-V4). **Not covered:** CPU compute never takes this path (`_use_direct_io =
+  False` there); a whole-layer-only MoE fallback caches no experts yet is charged for them (it then errs toward
+  O_DIRECT, the safe side; no on-device model is in that state); dense and gpt-oss keep buffered and remain
+  UNMEASURED against O_DIRECT (lead below).
+  *The record as found:* Location:
+  `_should_use_direct_io` (`vaayu/persist/safetensor_model_persister.py:284`), called at `vaayu_base.py:2521` on
+  every CUDA load. Its rule: buffered when `(free RAM − 8 GiB) / checkpoint bytes ≥ 0.40` ("the page cache can
+  hold 40 % of the model"). **What is wrong:** it counts as page-cache room the RAM the engine itself pins a moment
+  later — on an MoE model the expert RAM arena takes 16–19 GB of it — so the page cache it "leverages" barely
+  exists, and what it does hold duplicates experts the arena already holds. Qwen3-Next's checkpoint is 48.24 GB,
+  so the rule flips at **26.0 GiB free**; an idle box has 26.5–27.6 GiB free at that line, so the server goes
+  buffered, while a box with a browser open (25.0 GiB) goes O_DIRECT. **Reach proven on the real server app:**
+  `plans/probes/s22_out/final-server-qwen.log` and `gate-server-qwen.log` (the `SERVER_CKPT=` gate) both print
+  `Sufficient RAM detected (27.2 / 27.5 GB free). Disabling O_DIRECT to leverage page cache for 43% of model`.
+  **Measured, controlled** (`plans/probes/s22_session.py` with the new `DIRECT=on|off` switch, `main` tree, 2
+  rings, `BALLAST_GB=28` → 16.1–16.3 GB budget on every arm, order buffered / O_DIRECT / buffered, raw
+  `s22_out/s22-session-a1d-*.json`): mean HIT turn **23.55 s buffered (arms 23.47 / 23.62) → 19.44 s O_DIRECT
+  (−17.4 %)**; HIT TTFT 4.560 → 3.331 s (−26.9 %); HIT decode 74.46 → 63.17 ms/token (−15.2 %); cold-8k turn 27.93
+  → 24.09 s (−13.8 %); cold-8k TTFT 11.94 → 10.11 s (−15.3 %); stall per expert load 0.45 → 0.29 ms; **greedy ids
+  identical on 9 turns × 3 arms.** Two more O_DIRECT arms from A1's run agree (18.92 / 19.27 s). One O_DIRECT arm
+  only in the controlled trio — repeat as a full ABBA when fixing.
+  **What it means for the record:** every server-budget Qwen3-Next number in this file — S21's census, S22-A2's
+  keep bar (all four arms buffered, 27.3–27.6 GiB free, so A2's −7.1 % stands as a buffered-mode result), the
+  "Where things stand" turn times — was taken buffered. `BALLAST_GB=25` runs were O_DIRECT. **Any probe: grep the
+  `O_DIRECT` line of every arm.** The "budget sensitivity" seen in session 3 (17.7 GB → 22.29 s, 18.9 GB → 20.35 s)
+  was inside buffered mode, where free RAM is page cache; it is this bug, not a separate lead.
+  **Other models on this box today:** MiniMax and DeepSeek-V4 → O_DIRECT already (flip at 61.8 GiB and above);
+  gpt-oss → buffered (the whole 13 GB checkpoint fits, 150 %) — unmeasured, and it holds its experts in RAM;
+  Llama-3.3-70B → buffered at 50 % — the heuristic's own design case (no arena), unmeasured here; do not change
+  dense without the mirrored dense A/B.
+  **Follow-up lead, unmeasured:** is buffered still right for Llama-3.3-70B (50 % "cacheable", but its own RAM
+  tensor cache competes for the same RAM) and for gpt-oss? `DIRECT=on|off` in a dense probe, mirrored 8 arms.
+  **Fix candidates as first written (the fix built is (b), with the arena estimated from the index):** (a) a
+  checkpoint with per-expert tensors → O_DIRECT (the arena is the cache);
+  (b) subtract the planned expert RAM budget from the "available for cache" term. Either is a few lines; the
+  decision point runs before MoE detection, but `expert_read_buffer_bytes` (the offset index) is available one line
+  later in `init_model_io`. **§8:** no knob today (the choice is not reachable from `vaayu/server/config.py`) —
+  say in the fix whether one is needed; plumbed at load; reachable at N=1 on the server default, every turn.
+  **Gates when fixing:** suite; dense gate on both Llamas (dense must keep its mode unless measured); accumulator
+  gate on Qwen3-Next + MiniMax; server gate on Qwen3-Next with the load line showing O_DIRECT; ids identical.
