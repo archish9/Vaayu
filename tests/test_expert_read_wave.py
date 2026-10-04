@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("vaayu_rust")  # without the extension there is no wave to test
+
 import vaayu.persist.safetensor_model_persister as smp
 from vaayu.persist.expert_offset_index import ExpertTensorMeta
 
@@ -41,6 +43,12 @@ GEOMETRIES = {
         [("down_proj_scales", "U8", [2880, 90])],
         [("gate_up_proj_blocks", "U8", [5760, 90, 16])],
         [("gate_up_proj_scales", "U8", [5760, 90])],
+    ],
+    # 400 one-byte tensors in one group: its packed span exceeds its raw read, so
+    # slab_span != raw_aligned_length and the per-group slab advance is exercised.
+    "many_tiny": [
+        [(f"t{i:03d}.w", "U8", [1]) for i in range(400)],
+        [("bulk.a", "I32", [4096]), ("bulk.b", "F16", [1000])],
     ],
     "single_group": [
         [("gate.weight", "F16", [4096]), ("up.weight", "F16", [1024])],
@@ -203,3 +211,29 @@ def test_stale_extension_warning(monkeypatch, capsys, use_iouring, symbol, warns
     assert ("io_uring_read_segments" in out and "WARNING" in out and "maturin develop --release" in out) is warns
     if not warns:
         assert out == ""
+
+
+@pytest.mark.parametrize("symbol,warns", [(None, True), (object(), False)])
+def test_init_model_io_prints_the_stale_extension_warning(monkeypatch, capsys, tmp_path, symbol, warns):
+    monkeypatch.setattr(smp, "_USE_IOURING", True)
+    monkeypatch.setattr(smp, "_READ_SEGMENTS", symbol)
+    monkeypatch.setattr(smp, "_USE_PINNED", False)          # no buffer-pool allocation
+    monkeypatch.setattr(smp, "_RING_INITIALIZED", True)     # no ring init (process-global)
+    monkeypatch.setattr(smp, "_FILES_REGISTERED", True)     # no file registration
+    monkeypatch.setattr(smp, "_USE_DIRECT_IO", smp._USE_DIRECT_IO)  # restored after the call
+    smp.init_model_io(str(tmp_path), use_direct_io=False)
+    out = capsys.readouterr().out
+    assert ("WARNING" in out and "io_uring_read_segments" in out) is warns
+
+
+def test_io_uring_off_takes_the_preadv_path_even_with_the_symbol(expert, monkeypatch):
+    path, metas, payloads, _n = expert
+
+    def boom(*a, **kw):
+        raise AssertionError("_USE_IOURING is False: the Rust wave must not be issued")
+
+    monkeypatch.setattr(smp, "_USE_IOURING", False)
+    monkeypatch.setattr(smp, "_READ_SEGMENTS", boom)
+    views = smp.load_expert_into_slab(path, metas, _slab(metas), allow_direct=False, tensor_align=False)
+    for key in metas:
+        assert _raw(views[key]) == payloads[key], key

@@ -1069,7 +1069,11 @@ def load_expert_into_slab(
     {tensor_key: view-into-slab}. No clone in the cache (see
     ExpertRAMCache.put_slab). Expert tensors are NOT assumed file-contiguous
     (see _group_contiguous_ranges) — this issues ONE read per contiguous
-    group; the slab's layout does not mirror the file's layout (slab_bytes
+    group. With io_uring and a current extension (tensor_align=False) all of
+    those group reads are issued together in ONE read call (`_READ_SEGMENTS`,
+    one wave on one ring); the per-group loop below is the fallback (preadv,
+    tensor_align=True, or a stale extension without that symbol). The
+    slab's layout does not mirror the file's layout (slab_bytes
     equals the sum of each group's own slab_span, per expert_span_bytes /
     compute_slab_bytes / _group_layout).
 
@@ -1142,7 +1146,8 @@ def load_expert_into_slab(
     use_direct = _USE_DIRECT_IO and allow_direct
     out: dict = {}
     slab_off = 0
-    if not tensor_align and _READ_SEGMENTS is not None:
+    read_segments = _READ_SEGMENTS  # bound once: a mid-load OFF flip must not null the call
+    if not tensor_align and _USE_IOURING and read_segments is not None:
         # One io_uring wave for the whole expert: every group's read is issued
         # together, on one ring, instead of one round trip per group. Same slab
         # layout, same views, same bytes counted as the loop below.
@@ -1161,7 +1166,7 @@ def load_expert_into_slab(
             slab_off += slab_span
         for _aligned_offset, raw_aligned_length, _dst in segments:
             note_read_bytes(raw_aligned_length)
-        _READ_SEGMENTS(file_path, segments, 8, use_direct)
+        read_segments(file_path, segments, 8, use_direct)
         for group, group_off, prefix_pad, raw_aligned_length in layouts:
             group_start = group[0][1].file_offset
             data = slab[group_off:group_off + raw_aligned_length][prefix_pad:]
