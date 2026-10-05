@@ -118,7 +118,45 @@ its answer decides a ≥ 1-week build either way. **NEXT: S25, in a fresh sessio
 - [x] **S24 — re-prioritise with the USER — ✅ DECIDED 2026-10-05.** The USER chose the S11-L7 prototype next (S25);
       the other decisions move to S26. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
-- [ ] **S25 — S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next (set by the USER at S24, 2026-10-05).** Handoff (read it
+- [~] **S25 — S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next (set by the USER at S24, 2026-10-05).**
+      **[~] 2026-10-05: handoff re-verified at `main` `0637cde`.** Every code pointer holds. Reach: `engine.py:711`
+      stream_generate → `vaayu_base.py:5942` `_dg.run` (only when `begin_forward` admits it: one token, N=1) →
+      `_moe_seam` → captured `decode_pre` → eager `sparse_forward(_pre=…)` → sync `:2333` → `_dispatch_expert_misses`
+      `:2389`. The executors and `_moe_block_by_idx` are created unconditionally inside the CUDA+MoE block (`:2944`).
+      The B0 load log shows pool n=8, so the stager has 2 workers and there are 2 rings. Server `DECODE_TOP_K=None`,
+      so 10 experts are routed and the predictor stages top-12.
+      Design inputs found:
+      (a) the router's logits are bf16 (`F.linear` on bf16), while B0 scored in1n in fp32. The top-12 sets can
+      differ, so check that offline on B0's saved `s22-b0-r-tensors-t*.pt`.
+      (b) A stager insert that lands between the split-loop `get` and `_load_one`'s claim makes demand read the
+      expert again (the second insert is declined, so it is correct but wastes a read).
+      (c) The `_checked` tokens and the warm-up token run with `_pre=None`, so the prediction needs an eager twin
+      too.
+      **SPEC APPROVED BY THE USER 2026-10-05 ("continue"; the three proposed answers taken):**
+      `docs/superpowers/specs/2026-10-05-S25-prefetch-prototype-design.md`.
+      - **What it builds:** the predictor inside `decode_pre`, with its ids in the same `.tolist()` as the
+        routing ids, plus an eager twin for calls that arrive with `_pre=None`. The per-layer map (norm
+        ratio, next router, k = top_k + 2) is built by the probe (Qwen3-Next only).
+      - **What it pre-registers:** dry run D1 (bf16 vs fp32 predictor, ≤ 0.5 pp in B0's metric (i)) and D2,
+        then the ABBA rule as this row states it.
+      - **Open USER decisions:** the follow-up configuration (proposed: `in1n` + demand priority); gain
+        ≥ 15 % with a side condition failing (proposed: replicate ABBA); branch not merged in S25.
+      **DRY RUN DONE 2026-10-05 (throwaway worktree; spec §10):**
+      - Tests: 9 new tests pass and all 9 mutants are killed.
+      - **D1:** the bf16 device predictor scores HIT (i) 71.05 % against B0's fp32 70.95 % → bf16 kept.
+      - **D2 (short 2k/64-token session, ON/OFF/ON):** greedy ids identical on 5/5 turns; graphs 48/48, 0
+        refused; ~37 prefetches per token, 87 % used; decode disk stall 3.17 → 1.59 ms/token. HIT decode is
+        +1.2 / +1.8 %, which is NOT a verdict: this session has little stall.
+      - **Budget drift:** 15.6–16.0 GB across consecutive processes, i.e. > 0.2 GB → the ABBA likely needs
+        `BALLAST_GB` pinned.
+      **PLAN WRITTEN 2026-10-05:** `docs/superpowers/plans/2026-10-05-S25-prefetch-prototype.md`; its verified
+      assets are in `…/2026-10-05-S25-assets/` (prototype diff and follow-up diff, mutants 9 + 5, probes).
+      - Tasks: T1 the branch `s25-prefetch-prototype` in the worktree `../Vaayu-s25`, never merged in S25;
+        T2 the gates; T3 ABBA 1 + `s25_cmp.py` verdict; T4 the one second set (follow-up or replicate);
+        T5 close.
+      - **APPROVED by the USER 2026-10-05: `BALLAST_GB` option (A), pinned from the start; execution
+        subagent-driven.**
+      Handoff (read it
       first): `docs/superpowers/specs/2026-10-05-S25-prefetch-prototype-HANDOFF.md`; evidence
       `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`. Process: brainstorm → spec → USER approval → dry run →
       plan → subagent-driven execution → final review (the USER's standing choice).
