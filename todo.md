@@ -78,7 +78,7 @@ mandatory for any io_uring change — and there has been none since 2026-09-03. 
 then has the gate it needs. (The week-rule did not fire: S22 as defined is days.)
 
 **REORDERED 2026-10-04 at the USER's word ("go"), proposed by S22-A1's session:** the buffered-I/O `[bug]`
-ran before S22-B0. **✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`). NEXT: S22-B0, in a fresh session.** The
+ran before S22-B0. **✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`). S22-B0 then ran and closed S22 (2026-10-05). NEXT: S24.** The
 reason for the reorder, by the ordering rule: *(a)* it is the agent's
 model, *(b)* 17.4 % of the HIT turn at N=1 on the server default — more than A2 and A1 together, *(c)* a few lines.
 B0 converts with "the post-A stall per missing layer", and that stall is 0.45 ms buffered against 0.29 ms O_DIRECT,
@@ -88,249 +88,14 @@ so B0 measured first would be priced in the mode about to change.
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
-| **S22** `[~]` | **Qwen3-Next expert-miss latency:** (A1) derive read concurrency from the expert read size, (A2) issue one expert's byte groups together, (B0) price S11-L7's predictor offline. **Run as A2 → A1 → B0.** **A2 ✅ DONE 2026-10-04 — KEEP: agent HIT turn −7.1 % (22.54 → 20.94 s), ids identical on five models** (merged `86b62fb`; row below). **A1 ✗ CLOSED 2026-10-04 by its own stop rule, no product code:** 3 rings on Qwen3-Next = −2.8 % of the HIT turn under buffered I/O but only −1.6 % (inside the base arms' 1.9 % spread) under O_DIRECT; first-free ring selection +3.5 % standalone, under its +5 % bar. **A1's dry run found a bigger thing: the server loaded Qwen3-Next with BUFFERED I/O — ✅ FIXED AND MERGED 2026-10-04 (`a588ff4`): mean HIT turn 22.41 → 17.86 s (−20.3 %; −17.4 % at equal budget), ids identical.** **NEXT: B0** — under O_DIRECT, against the post-fix figures in "Where things stand" | (a)+(b): the decode stall is 26 % of the agent's turn; A2 alone took 1.6 s off the mean HIT turn | days |
+| **S22** ✅ | ~~Qwen3-Next expert-miss latency~~ — **CLOSED 2026-10-05.** A2 KEPT (HIT turn −7.1 %); A1 refuted; buffered-I/O `[bug]` fixed (HIT turn −20.3 %); **B0: S11-L7 headline +16.18 % decode tok/s clears the +15 % bar by 1.2 pp only with a demand-priority queue at a 16.4 GB budget; pre-registered range +9.8 … +16.2 % (FIFO, today's stager order, all BELOW); server budget lowers it; host cost unpriced → prototype-gated.** Full record: the S22 row in the backlog archive | — | done |
 | **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
 
 ## Durable rows (the briefs)
 
 - [x] **S21 — Qwen3-Next census at HEAD — ✅ CLOSED 2026-10-03.** The decode expert-miss stall (latency-bound, 5.3 s of a 20.1 s representative turn) is the top cost; S11-L6 REFUTED (real-class replay, every policy loses); S3-B / S1-L2 closed; S3-C below the bars; G5 answered. Full row + ranked table: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-03-S21-qwen3next-census-RESULTS.md`.
 
-- [~] **S22 — Qwen3-Next expert-miss latency (S21's top cost). RUNS AFTER S23** (it changes the io_uring read path,
-      which dense streaming shares — see the reorder note above). **S23 closed 2026-10-03: the dense gate exists —
-      `tests/test_dense_gate.py`, invocation in the gates table below; take its baseline on `main` before the change.**
-      Brief written by S21 (2026-10-03); evidence
-      `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` §4, raw `plans/probes/s21_out/{miss-m1,g5-qwen-*,trace-t0}`.
-      **Facts (server budget 18.30 GB, agent session):** decode stall 18–26 ms/token = 26 % of the 20.1 s
-      representative turn; ~20 layers/token have a disk miss, mostly ONE expert; stall per missing layer 0.87 ms (1
-      miss) … 2.36 ms (4+); hand-off 0.06 ms and wake 0.05 ms, so **the stall is the read, and the read is
-      latency-bound**: one isolated 1.58 MB read costs 0.60–0.70 ms at any queue depth (2.2–2.6 GB/s at one reader).
-      **Every expert is THREE byte groups — 48 B (`*.weight_shape`), 1,572,864 B (`*.weight_packed`), 196,608 B
-      (`*.weight_scale`) — and `load_expert_into_slab` reads them one after the other** (three O_DIRECT round trips,
-      one of them for 48 bytes). Prefill at a HIT reads ~3,700–8,200 experts at ~4.2 GB/s effective = **the 2-ring
-      plateau**: G5 (`p8_samepath.py`) measured 2 rings ≈ 4.3 GB/s, **3 rings 6.6 GB/s with per-read latency
-      unchanged (0.71 ms)**, flat to k=8 with enough rings; P8's knee (2, falling past ~4) was 8–11 MiB reads.
-      - **A1 — derive the read concurrency (`_NVME_READ_CONCURRENCY`, `safetensor_model_persister.py:223`, a literal
-        2 since row 49) from the model's expert read size, never per model (CLAUDE.md §5).** Before choosing the
-        derivation, measure the knee on MiniMax (8 MiB) and DeepSeek-V4 (12.75 MiB) with `p8_samepath.py` the same way
-        — the ring pool is process-wide and also carries dense whole-shard streaming and the module-list experts.
-        Also check what else caps prefill's in-flight reads (8 executor workers, 16 staging slabs). Price: HIT prefill
-        stall 1.55 → ~1.0 s (−0.5 s TTFT, ~20 % of a HIT), cold-8k −1.6 s, decode layers with ≥ 3 misses −0.3–0.5
-        s/turn → **0.8–1.0 s of the representative turn, 1.9–2.1 s of a cold-8k turn.**
-      - **A2 — issue one expert's three groups together** (one io_uring batch, or concurrent submits), and decide
-        whether the 48-byte shape tensors need a disk read per miss at all. **Step 0:** time the 48 B and 0.20 MB reads
-        inside the forward (extend `s21_miss.py`). Estimate 0.15–0.25 ms per missing layer × ~20 → **0.8–1.3 s/turn**.
-      - **B0 — price S11-L7 (cross-layer decode prefetch) for S24, offline, no build.** Record per decode token and
-        layer the routed set and the hidden state entering the layer; score candidate predictors (e.g. layer L+1's
-        router on layer L's input or output) by (i) the share of layer L+1's DISK misses predicted and (ii) the share
-        of missing layers whose misses are ALL predicted (the stall is per layer, so a half-predicted layer still
-        waits). Convert with the post-A1/A2 stall per missing layer. Ceiling today 5.3 s/turn (26 %) at perfect
-        prediction; re-open bar for a build ≥ +15 % tok/s at N=1 (backlog #35). SETTLED keeps `VAAYU_LOOKAHEAD`
-        blocked — this is a different forward and a fresh measurement, not that flag.
-        **READ BEFORE STARTING B0 (added 2026-10-04):** every stall figure in this row — the 18–26 ms/token, the
-        5.3 s/turn ceiling, 0.75 … 1.895 ms per missing layer-visit — was measured with BUFFERED I/O, which the
-        engine no longer chooses for this model (fixed, `a588ff4`). Under O_DIRECT a HIT turn is 17.86 s, the
-        expert-load stall 4.0–4.2 s of it (prefill + decode together, 0.28–0.29 ms per load) and decode 58.2
-        ms/token. **So B0's first step is to re-measure, on `main`, the DECODE stall per token and per missing
-        layer-visit by miss count** (`plans/probes/s22_miss.py`; check the `O_DIRECT` line of every arm) — the
-        ceiling and the conversion both come from that, not from the numbers above. A1 is closed (no ring-count
-        change), so "the post-A1/A2 stall" means the post-A2, O_DIRECT stall.
-      **STARTED 2026-10-03 (session 1: brainstorm only — no spec, no code yet). Evidence re-verified at HEAD
-      `f3bad2b`; the row holds, plus four new facts (read-only probe of each checkpoint's offset index):**
-      1. `_NVME_READ_CONCURRENCY = 2` is at `safetensor_model_persister.py:223` (G5's `:181` is stale).
-         `load_expert_into_slab` loops groups one after another (`:1129-1161`); each `io_uring_read_into` takes a
-         ring ROUND-ROBIN (`vaayu_rust/src/lib.rs:826`, `fetch_add % n` — not first-free, so k callers on n rings can
-         queue behind a busy ring while another idles), splits the read into qd=32 chunks, one `submit_and_wait`.
-      2. **The multi-group layout is NOT Qwen-only — A2 reaches every per-expert MoE model**, all through
-         `load_expert_into_slab` (decode misses, prefill staging, gpt-oss routed delivery): Qwen3-Next 3 groups (4 KB
-         aligned + 1,576,960 + 200,704 B); MiniMax 3 (4 KB `mcg` + 32 KB `suh/svh` + 8,851,456 B trellis); DeepSeek-V4
-         2 (790,528 B scales + 12,587,008 B weights); gpt-oss **6** (two biases ~6–12 KB, blocks 4.1 + 8.3 MB, scales
-         0.26 + 0.52 MB). Gates therefore need decode not-slower + ids identical on all four, not just Qwen + MiniMax.
-      3. Qwen's scale group sits ~873 MB from its packed group (gaps 24 KB … 871 MB) → no gap-coalescing; issuing
-         the groups concurrently is the only lever.
-      4. `weight_shape` IS consumed (`moe_patch.py:714`, `:805` — rows/cols for dequant and the blob geometry), so the
-         48 B must still land in the slab; if all groups go out in one wave its read overlaps the bulk read, so a RAM
-         table for tiny groups buys ~nothing extra — not planned unless A2 step 0 says otherwise.
-      **ORDER WITHIN S22 CHANGED to A2 → A1 → B0** (the reason, as the sequence section requires): after A2 one ring
-      call carries a WHOLE expert (~1.77 MB Qwen, ~8.9 MB MiniMax, ~13.4 MB DeepSeek, ~13.6 MB gpt-oss), so A1's
-      ring-count knee must be measured on that read shape — measured first it would describe a shape that no longer
-      exists. B0 already depends on the post-A stall. **A2's candidate mechanism** (to be designed in the spec, not
-      approved): a Rust multi-segment read — all of one expert's groups chunked into ONE ring wave, one
-      `submit_and_wait`, reusing `persistent_read`'s short-read/drain logic — over Python-side concurrent submits
-      (more threads, and one expert would occupy several rings, fighting A1). Toolchain present (`cargo`, `maturin`
-      1.13.1 in venv). Also note: `p8_samepath.py` times BULK (≥ 1 MB) groups only — A1's knee re-measure needs it
-      extended to whole-expert reads. **Next session: resume at "propose approaches → design → spec" for A2.**
-      **SESSION 2 (2026-10-04, HEAD `73bdfe4` — only `todo.md` changed since `f3bad2b`, so the row holds). Three more
-      facts, all read-only:** (5) S21's own `s21-miss-m1.json` already answers most of A2's step 0 in path: ONE
-      `load_expert_into_slab` call costs **1.018 ms median when it is the visit's only miss** (n 2,911), 1.33 / 1.95 /
-      2.58 ms at 2 / 3 / 4+ misses, against G5's 0.60–0.70 ms bulk-only floor — so the two small groups + three serial
-      round trips cost **≤ 0.32–0.42 ms per expert**, above this row's 0.15–0.25 ms estimate (a ceiling until a wave
-      is timed). (6) **One wave fits every expert on disk at qd=32** with `chunk = align4k(ceil(total / (qd − nseg +
-      1)))` (Σ chunks ≤ qd; identical to today's chunking at nseg = 1): Qwen3-Next 31 SQEs, MiniMax 32, DeepSeek 31,
-      gpt-oss 31; every segment's slab offset is 4096-aligned on all 52,224 experts. Aligned group tuples: Qwen
-      (4096|8192, 1,576,960, 200,704); MiniMax (4096|8192, 28,672|32,768, 8,851,456); DeepSeek (790,528, 12,587,008);
-      gpt-oss 6 groups, 19 tuples, ~12.65 MiB. (7) `cargo test` at HEAD: 21 passed, 0 failed, 1 ignored; the installed
-      `vaayu_rust` .so is 2026-08-30 = the last `lib.rs` commit (current).
-      **A2 DESIGN APPROVED by the USER 2026-10-04; spec `docs/superpowers/specs/2026-10-04-S22-A2-expert-read-wave-design.md`
-      (awaiting the USER's review); DRY RUN DONE, stop rule PASSED; no product code yet.** Design: a new Rust
-      `io_uring_read_segments(path, [(off, len, ptr)], qd, direct)` — every byte group of one expert in ONE wave on
-      ONE ring, sharing `persistent_read`'s core (one-segment chunking unchanged, so dense streaming issues the same
-      SQEs) — and a fast path in `load_expert_into_slab` (`tensor_align=False`); the existing per-group loop stays
-      as the fallback (preadv, stale extension → load-time WARNING). No knob. Out of scope: `load_expert_sparse`
-      (0 calls on Qwen3-Next in the dry run), ring count/selection (A1). **A2's own keep bar (USER, 2026-10-04):
-      ≥ 2 % of the representative turn by ABBA and no model slower, else revert.**
-      **Dry-run numbers** (throwaway worktree, since removed; code kept as `plans/probes/s22_out/dryrun.diff`, raw
-      in `plans/probes/s22_out/`, probes `plans/probes/s22_wave.py` / `s22_miss.py`):
-      *standalone, whole experts, 2 rings qd 32, median ms per expert serial → wave (GB/s):* Qwen3-Next k=1 0.934 →
-      0.611 (1.91 → 2.78), k=2 1.430 → 0.706 (2.51 → 4.85), k=4 2.363 → 1.469 (2.70 → 4.60); MiniMax k=1 1.599 →
-      1.468, k=2 5.88 → 7.11 GB/s; DeepSeek-V4 k=1 2.213 → 2.074, k=2 6.42 → 7.12 GB/s; gpt-oss k=1 2.625 → 2.096,
-      k=2 5.77 → 7.08 GB/s — faster on all four at every k, bytes equal. (Today's WHOLE-expert rate on Qwen3-Next
-      is 2.5–2.7 GB/s at k ≥ 2, not G5's bulk-only 4.3.) *In the forward, Qwen3-Next, server mode, cold 8k prompts,
-      a different slice per arm (2 OFF, 3 ON):* stall per missing layer-visit 1.148 → 0.944 ms (−17.8 %); by misses
-      1 / 2 / 3 / 4+: 0.937 → 0.751, 1.242 → 0.994, 1.796 → 1.466, 2.531 → 2.039 ms. Same prompt, same history, two
-      processes: **decode 54.95 → 51.64 ms/token (−6.0 %), prefill + first token 13.12 → 11.80 s (−10.1 %), 256
-      greedy ids identical.** Projected onto S21's agent-session miss mix: 4.68 ms/token ≈ **1.19 s of the 20.1 s
-      turn (5.9 %)**, decode only — a projection (one or two arms each, cold prompts not an agent session); the
-      ABBA on an agent session decides. A1's knee probe is ready: `s22_wave.py` reads whole experts (`--rings N`).
-      **SPEC APPROVED by the USER 2026-10-04; PLAN WRITTEN — `docs/superpowers/plans/2026-10-04-S22-A2-expert-read-wave.md`
-      (7 tasks + pre-flight), assets `docs/superpowers/plans/2026-10-04-S22-A2-assets/` (four `apply_*.py` scripts,
-      the Rust test block, two pytest files) — awaiting the USER's review and choice of execution method.** The
-      plan's code was applied to a scratch worktree at `73bdfe4` and run: `cargo test` 31 passed / 0 failed / 1
-      ignored (21 + 10 new), 40 new pytest tests, **full suite `3661 passed, 25 skipped, 0 failed`**, 3 Rust + 4
-      Python mutants each caught; the whole verified diff is `plans/probes/s22_out/plan-verified.diff`. Final
-      design detail added by the plan: a pure `plan_chunks(segs, qd, buf_index_of)` shared by both Rust read paths.
-      **Keep-bar probe, run once on `main` (old extension, 2026-10-04) as the reference:** `s22_session.py` — one
-      agent session per process (S21's: warm, cold 8k, 6 HIT turns, 256 tokens each), arm = process, compared by
-      `s22_cmp.py`: **mean HIT turn 22.40 s, HIT TTFT 4.593 s, HIT decode 69.81 ms/token, cold turn 27.47 s**, 6/6
-      HITs, 3 min 50 s per process. Other-model A/B probe `s22_miss.py DETAIL=0`, verified on `main`: gpt-oss
-      73–76 ms/token, MiniMax 446–452, DeepSeek-V4 376–380 (their decode loads: `load_expert_sparse` 0 calls on all
-      three). Dense: `s22_dense.py`, arm = extension (the plan's Task 0 saves the old one to `plans/probes/s22_out/pyext-base`).
-      **A2 — ✅ DONE AND MERGED 2026-10-04 (`main` `86b62fb`), VERDICT KEEP** (4 commits `14af82b` Rust core,
-      `5a2f66e` Python entry point, `365cd66` loader fast path, `707059a` final-review fix wave; subagent-driven,
-      every task reviewed; RESULTS `docs/2026-10-04-S22-A2-expert-read-wave-RESULTS.md`, raw `plans/probes/s22_out/`).
-      *What shipped:* `vaayu_rust.io_uring_read_segments(path, [(off, len, ptr)], qd, direct)` — all of one expert's
-      byte groups in ONE `submit_and_wait` on ONE ring (`persistent_read_segments`; chunks from a pure `plan_chunks`,
-      `chunk = align4k(ceil(total / (qd − nseg + 1)))`; `io_uring_read_into` is now a one-segment call with the same
-      SQEs as before) — and a fast path in `load_expert_into_slab` (`_READ_SEGMENTS`); the per-group loop is
-      untouched and is the fallback (preadv, `tensor_align=True`, an old extension → `[VAAYU-IO] WARNING` at load).
-      *Keep bar (≥ 2 % of the agent turn, ABBA, ids identical) — Qwen3-Next agent session, 4 processes off/on/on/off,
-      server mode and budget:* mean HIT turn **22.541 → 20.936 s (−7.12 %; the two OFF arms differ by 1.98 %)**, HIT
-      TTFT 4.623 → 4.067 s (−12.0 %), HIT decode 70.27 → 66.15 ms/token (−5.9 %), cold-8k turn 27.81 → 26.07 s
-      (−6.3 %), cold-8k TTFT 12.575 → 11.555 s (−8.1 %); **greedy ids identical on all 9 turns × 4 arms.** A2 alone
-      clears this row's joint 5 % bar. Stall per missing layer-visit, OFF → ON: 1 miss 0.928 → 0.750 ms, 2: 1.210 →
-      0.975, 3: 1.745 → 1.380, 4+: 2.383 → 1.895 (≈ −20 % at every count).
-      *Other models (ids identical on all):* MiniMax decode 462.7 → 426.7 ms/token (−7.8 %, OFF spread 4.8 %);
-      DeepSeek-V4 387.2 → 379.6 (−2.0 %, spread 6.7 %); gpt-oss 74.10 → 74.43 (+0.4 %, spread 1.8 % — it holds its
-      experts in RAM, nothing to shorten); Llama-3.3-70B, old vs new extension, 8 arms in two mirrored orders: 4.163
-      vs 4.170 s/token (+0.17 %, spread 1.4 %; the first 4-arm block alone read +1.18 % and the mirrored block
-      −0.84 % — **back-to-back dense arms have a ~1 % position effect; mirror the order**).
-      *Gates at `707059a` / `365cd66`:* suite `3675 passed, 25 skipped`; `cargo test` 37 passed; dense gate 5 passed on
-      Llama-3.2-1B and Llama-3.3-70B; accumulator gate 8 passed on Qwen3-Next and MiniMax; server gate 9 passed on
-      Qwen3-Next with no stale-extension WARNING. Final whole-branch review (opus): no Critical, no product defect;
-      its test-only fix wave pinned the resubmit target with a REAL kernel short read (a destination with a
-      `PROT_NONE` tail — the plan's "cannot be provoked" was wrong), the nseg == qd boundary, the fallback's error
-      propagation and `init_model_io`'s warning call.
-      *§8:* (1) no knob — the same bytes in a different issue order, ids identical; (2) plumbed by construction:
-      every slab expert read goes through `load_expert_into_slab`; (3) reachable at N=1 on the server default, every
-      decode token with a disk miss and every prefill that reads experts, on all four per-expert MoE models; (4)
-      nothing banked. **The fused-EXL3 forward inherits the wave with no on-device model to verify it.**
-      *Merged to `main` `86b62fb`; suite on the merged tree `3675 passed, 25 skipped`, `cargo test` 37 passed; the
-      installed `vaayu_rust` is the build of `707059a`.* **NEXT: A1** on the read shape A2 left: one expert =
-      one ring acquisition, so measure the knee on WHOLE experts with `plans/probes/s22_wave.py --rings N` on all
-      four checkpoints (today, 2 rings: Qwen3-Next 4.6–4.85 GB/s at k ≥ 2 — G5 saw 6.6 at 3 rings on bulk reads;
-      MiniMax / DeepSeek-V4 / gpt-oss already at the ~7.1 GB/s plateau), and decide ring selection (round-robin can
-      queue behind a busy ring). With A1's Rust edit also land the two deferred items in the OPEN list below.
-      **A1 — SESSION 3 (2026-10-04, HEAD `8577595`; brainstorm + measurement only — no spec, no product code).**
-      Evidence re-verified: `_NVME_READ_CONCURRENCY = 2` is now at `safetensor_model_persister.py:228`; both Rust
-      entry points take a ring round-robin (`lib.rs:862`, `:894`); the ring count is decided in `_ring_pool_size()`
-      (Python only), called from `init_model_io`, where the whole-expert size is already in hand
-      (`expert_read_buffer_bytes` → `_EXPERT_PINNED_SIZE`; 0 = no per-expert tensors); `VAAYU_RING_POOL_N` already
-      overrides it, so the ring count was priced IN PATH with no code. Callers: `_moe_executor` 8 workers and 16
-      staging slabs on Qwen3-Next — neither caps below 4 rings. The pool is a process-wide `OnceLock`: the FIRST
-      load in a process fixes it (server default `DRAFTER_MODEL_PATH = None`, so that is the served model).
-      *Standalone knee, whole experts, one wave per expert (`plans/probes/s22_rings.py`, raw
-      `plans/probes/s22_out/a1-rings-*`), aggregate GB/s at 1 / 2 / 3 / 4 / 8 reads in flight:* Qwen3-Next (1.78 MB)
-      2.9 / 4.4–4.6 / 5.9–6.0 / 6.55 / 6.57 — plateau at 4, flat to 8; MiniMax (8.89 MB) 5.8 / 7.0–7.1 / 7.0 / 7.0 /
-      5.2; DeepSeek-V4 (13.38 MB) 6.1 / 7.1 / 7.1 / 6.5 / 5.3; gpt-oss (13.26 MB) 6.1 / 7.1 / 7.1 / 6.7 / 5.2. So the
-      three large-expert models are at the plateau on 2 rings already, and their fall starts at 4 in flight (~53 MB
-      in flight falls, ~40 MB does not). 8 callers on n rings (the loader's shape), Qwen3-Next: 4.33 GB/s (2 rings) /
-      5.48 (3) / 6.53 (4). A lone read costs the same at any ring count (0.59–0.61 ms on Qwen3-Next) and fits
-      `0.37 ms + bytes / 7.6 GB/s` on all four models. Round-robin's cost when callers outnumber rings: 4.64 → 4.33
-      GB/s at 2 rings, 5.89 → 5.48 at 3 (−7 %), nothing at 4 (drive-bound) — the ceiling for a first-free selector.
-      *In path — Qwen3-Next agent session (`s22_session.py`, server mode, **`BALLAST_GB=29.5` so every arm gets the
-      same 17.7–17.8 GB expert RAM budget**; six processes at 2, 4, 3, 3, 4, 2 rings via `VAAYU_RING_POOL_N`; raw
-      `s22_out/s22-session-a1b-r*.json`):* mean HIT turn **22.29 s at 2 rings (its two arms differ by 1.04 %) →
-      21.67 s at 3 (−2.82 %) → 21.64 s at 4 (−2.94 %)**; HIT TTFT 4.319 → 3.915 (−9.3 %) → 3.777 s (−12.5 %); HIT
-      decode 70.49 → 69.61 → 70.04 ms/token (inside the spread: a decode miss is mostly ONE read, which no ring
-      count shortens); cold-8k turn 27.07 → 26.94 → 26.58 s; cold-8k TTFT 11.77 → 11.32 → 11.20 s; stall per load
-      0.449 → 0.399 → 0.377 ms; **greedy ids identical on all 9 turns × 6 arms.** So the ring count is worth
-      **0.63–0.66 s per HIT turn, all of it prefill** — under this row's 0.8–1.0 s estimate — and 3 and 4 rings tie
-      on the turn.
-      **TRAP found on the way (cost two arms):** with `BALLAST_GB=0` the expert RAM budget follows the free RAM at
-      load and moved 18.01 → 18.89 GB between two consecutive processes; that pair read −7.4 % for 4 rings, most of
-      it the budget (12,005 vs 10,816 expert loads on the same turn). A2's keep-bar arms were checked: OFF 18.6 /
-      18.6 GB, ON 18.8 / 18.5 GB — balanced, the A2 verdict stands. **Pin the budget (`BALLAST_GB`) in every
-      `s22_session.py` comparison.** (What looked like a budget sensitivity here turned out to be the buffered-I/O
-      `[bug]` in the OPEN list: these arms were all buffered, where free RAM is page cache.)
-      **APPROACH CHOSEN by the USER 2026-10-04: option (1), with first-free ring selection priced in the dry run
-      under a stop rule. SPEC WRITTEN — `docs/superpowers/specs/2026-10-04-S22-A1-ring-count-design.md` (awaiting
-      the USER's review; no product code, no dry run yet).** The spec's rule: `read_concurrency_for(expert bytes)`
-      in `safetensor_model_persister.py`, fed by `expert_read_buffer_bytes` inside `init_model_io`;
-      `_NVME_READ_CONCURRENCY = 2` stays as the floor, a new ceiling of 4; `VAAYU_RING_POOL_N` and the caller-pool
-      cap unchanged; `env.json` reports it with no edit; a "(no knob)" section in `documentation/TUNING.md`.
-      Thresholds: 3 rings below 2.46 MB per expert, 4 below 1.27 MB. Ring-selection stop rule: standalone ≥ +5 %
-      GB/s at 3 rings with 8 callers, then in path ≥ 1 % of the HIT turn and above the spread — expected verdict
-      DROP (ceiling ≈ 0.16 s/turn); if dropped A1 has no Rust edit and the two deferred Rust items stay in OPEN.
-      A1's stop rule (dry run, built code, budget pinned, ABBA): under 2 % of the mean HIT turn, or inside the
-      base spread, or any id differs → A1 closes refuted, go to B0. **One deviation from this row's bars awaits
-      the USER's yes or no:** with no Rust change, MiniMax and Llama-3.3-70B keep the same ring count and the same
-      extension, so the spec replaces their decode ABBAs with a load-line proof (`n=2`); if ring selection is
-      kept, both ABBAs run in full. (Superseded the same day by the dry-run verdict below: A1 closed, not built.)
-      *The options as put:* (1) *recommended* —
-      derive the count from the drive's latency model, `ceil(plateau × (t0 + bytes / bw) / bytes)` clamped to
-      [2, 4] and to the caller pool, three HARDWARE constants (7.1 GB/s plateau, 0.37 ms per-read latency, 7.6 GB/s
-      single-read rate): Qwen3-Next → 3, MiniMax / DeepSeek-V4 / gpt-oss → 2, no per-expert tensors (dense) → 2, so
-      four of five models keep today's count by construction; Python only. (2) target the standalone plateau (4 on
-      Qwen3-Next) — ties (1) on the turn, 0.14 s better HIT TTFT inside the spread, needs a second fitted term.
-      (3) calibrate at load — rejected: row 49 showed a standalone knee is not the in-path optimum, and it would
-      move between loads. Ring selection (first-free, a Rust edit): ceiling 7 % of read rate only where rings
-      bind → ≤ ~0.2 s/turn; proposed as a dry-run arm with a stop rule, not as a commitment.
-      **A1 — SPEC APPROVED by the USER 2026-10-04 ("continue"); DRY RUN DONE the same day; VERDICT: ✗ CLOSED BY
-      ITS STOP RULE — NOT BUILT, no product code changed.** Throwaway worktree at `8577595`, since removed; the
-      whole verified change is `plans/probes/s22_out/a1-dryrun.diff` (persister + 16 tests), the first-free Rust
-      helper `a1-dryrun-firstfree.diff`.
-      *What passed:* the derivation applied cleanly; `tests/test_ring_pool_sizing.py` + buffer-sizing + envinfo
-      80 passed; **10 of 10 mutants caught**; full suite on the worktree **`3691 passed, 25 skipped`** (floor + 16);
-      the real `init_model_io` on all six checkpoints, `main` → dry-run tree: Qwen3-Next 2 → 3 rings, MiniMax 2 → 2,
-      DeepSeek-V4 2 → 2, gpt-oss 2 → 2, Llama-3.3-70B 2 → 2, Llama-3.2-1B **1 → 1** (its one 512 MiB buffer caps
-      the pool — the spec's table said 2).
-      *Ring selection (first-free, scratch extension, Qwen3-Next, 3 rings, mirrored base / ff / ff / base):* 8
-      callers 5.89 → 6.10 GB/s (**+3.5 %, under the +5 % continue bar → DROPPED**, no in-path step); 6 callers
-      +6.6 %, 4 callers −0.3 %. The two deferred Rust items stay in the OPEN list.
-      *A1's own stop rule (agent session on the BUILT code, no env var on the derived arms — load line `n=3`;
-      `VAAYU_RING_POOL_N=2` on the base arms; `BALLAST_GB=28`, budget 16.0–16.3 GB; order 2, 3, 3, 2):* mean HIT
-      turn **19.09 s (base arms 18.92 / 19.27, spread 1.87 %) → 18.79 s (−1.60 %)**; HIT TTFT 3.176 → 3.010 s
-      (−5.2 %, base spread 6.8 %); decode 62.42 → 61.87 ms/token; cold-8k turn 23.30 → 23.08 s; ids identical on
-      all 9 turns × 4 arms and equal to the earlier arms'. **Under 2 % and inside the base spread → the rule
-      fires: A1 closes.** (A third 2-ring arm taken later, 19.44 s, would make it −2.2 % against a 2.7 % spread —
-      still inside.) **Why it differs from session 3's −2.82 %:** those six arms ran with BUFFERED I/O and these
-      four with O_DIRECT (the engine's own heuristic flipped between them — the `[bug]` at the top of the OPEN
-      list). Under O_DIRECT a read is faster (stall per load 0.29 ms against 0.45), prefill is less read-bound,
-      and a third ring has less to give. `VAAYU_RING_POOL_N=3` remains available by hand; nothing is banked in
-      code. **Re-open A1 only if** the O_DIRECT fix does not land (the server then stays buffered, where 3 rings
-      measured −2.8 % with a 1.0 % spread) — the diff above applies as is.
-      **Process (what worked on S20):** brainstorm → spec → USER approval → **dry-run the whole design on a throwaway
-      worktree before writing the plan** → plan with verified assets → subagent-driven execution (the USER's standing
-      choice) → final whole-branch review on the most capable model with named risk areas and "give a concrete repro".
-      **Gates (io_uring is shared infra):** suite; **S23's dense gate (`DENSE_CKPT=`, `tests/test_dense_gate.py`) on
-      Llama-3.2-1B and Llama-3.3-70B**; `MOE_CKPT=`
-      accumulator gate on Qwen3-Next AND MiniMax; `SERVER_CKPT=` server gate on Qwen3-Next (`-s`, grep the load line);
-      a DeepSeek-V4 decode run (12.75 MiB experts through the same loader). **Do NOT name the prefix-reuse gate for
-      Qwen3-Next** (recurrent state; fails identically on `main`).
-      **Bars:** A1 + A2 together save ≥ 5 % of the representative turn (≈ 1 s) by ABBA on an agent session (any part
-      that does not pay is reverted); greedy ids identical (an I/O change must not change arithmetic); MiniMax decode
-      and Llama-3.3-70B decode not slower (ABBA); any probe uses a DIFFERENT prompt per arm (the repeated-request trap
-      above). **§8:** A1 is a derived value — a knob only if a measurement shows a per-box need (say which); reached at
-      load in server mode, N=1.
+- [x] **S22 — Qwen3-Next expert-miss latency — ✅ CLOSED 2026-10-05.** A2 KEPT (one io_uring wave per expert, agent HIT turn −7.1 %, merged `86b62fb`); A1 refuted by its stop rule (3 rings −1.6 % under O_DIRECT); its dry run's buffered-I/O `[bug]` fixed (HIT turn −20.3 %, `a588ff4`); **B0: S11-L7 headline +16.18 % decode tok/s (demand-priority queue, 16.4 GB budget) clears the +15 % bar by 1.2 pp; its pre-registered twins are BELOW (drive +13.08 %, FIFO = today's stager order +14.36 / +9.80 %), and the server's 18.7 GB budget lowers the gain; host cost unpriced → S24: prototype-gated, ABBA at the server's own budget.** Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-04-S22-A2-expert-read-wave-RESULTS.md`, `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.
 
 - [x] **S23 — restore an on-device dense gate — ✅ CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`) boots
       the real server app and asserts dense detection, ppl < 25, causality (bitwise), decode logits (bitwise) and two
@@ -344,8 +109,14 @@ so B0 measured first would be priced in the mode about to change.
       first-class workload, yet the server runs N=1 and every N>1 win (P8's +3.21 %, the batch admission work) is
       banked at 0 %; a week-class design. Before batching reaches DeepSeek-V4, guard its hash routing: the routed
       layers read the ids stashed on the model for the WHOLE batch, so row j>0 would route on row 0's ids, silently
-      (A5.7b record, archive). **(2) the S11-L7 decode-prefetch build** (≥ 1 week; ceiling 5.3 s = 26 % of the
-      representative turn at perfect prediction) — decide on B0's measured predictor, not the ceiling. **(3) the
+      (A5.7b record, archive). **(2) the S11-L7 decode-prefetch build** (≥ 1 week) — **B0 priced it (2026-10-05): best predictor `u12n` m=2
+      +16.18 % decode tok/s at N=1 with a demand-priority read queue at a 16.4 GB budget — above the +15 % bar by
+      1.2 pp; its pre-registered twins are BELOW (drive model +13.08 %; FIFO, today's stager order, +14.36 / +9.80 %);
+      at the server's 18.7 GB budget the gain is expected lower (rough ≈ +12.7 %); host cost of 52–68 prefetch
+      reads/token unpriced. Not pre-registered: refits that reproduce today's stall give +19.19 % priority /
+      +18.09 % FIFO. A full build must derive the target layer's norm and pass CLAUDE.md §5 on every per-expert forward.
+      B0 recommends a prototype gate (days; `in1n` or `u12n` m=2, ABBA on the agent session at the server's own
+      budget, ≥ +15 %, ids identical) before any week-class build.** **(3) the
       host-side levers:** the post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s,
       days) — together they are the 26.7 ms/token of host CPU work S21 measured. **(4)** S3-C's new dependency
       (`fla`): S21 priced it at 4.7 % of a cold-8k turn and 0.4 % of the representative one — below both bars; the
@@ -387,6 +158,12 @@ at HEAD before acting.
   the stall is 18–26 ms/token at the server budget = 5.3 s of the 20.1 s representative turn (26 %) at perfect
   prediction — ABOVE the +15 % bar as a ceiling.** The stall is per missing LAYER (latency-bound), so a predictor
   must catch all of a layer's misses to hide it. S22-B0 measures the predictor; the build is S24's decision.
+  **PRICED by S22-B0 (2026-10-05), O_DIRECT, agent session at N=1, 16.4 GB budget: stall 14.7–14.9 ms of a 62.76 ms
+  token; best predictor (`u12n` m=2) +16.18 % decode tok/s with demand priority (CLEARS by 1.2 pp); pre-registered
+  twins BELOW (drive +13.08 %, FIFO +14.36 / +9.80 %); not-pre-registered refits +19.19 % / FIFO +18.09 %. One-ahead
+  alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype-gated at S24; a
+  build must pass CLAUDE.md §5 on every per-expert forward (the predictor's re-norm is Qwen3-Next's norm form).
+  RESULTS `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.**
 
 - [ ] **Lead (S21): the post-S12 eager residue** — after the graphs, a decode token still spends on the host
   ATTNCORE 2.96 ms (device 0.78; the eager attention core of the 12 full-attention layers), KERNEL 4.62 (device
