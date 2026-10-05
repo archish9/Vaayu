@@ -94,6 +94,11 @@ follow-up — move to **S26**, taken with S25's measured number. The reason, by 
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
 its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). NEXT: S26, in a fresh session.**
 
+**USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
+session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
+its fresh session re-checks the inputs pre-gathered in its durable row at HEAD, presents them, and WAITS for the
+USER's pick. It decides nothing alone, then writes the chosen rows (S27…) into this table, one row per fresh session.
+
 | # | item | why here | cost |
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
@@ -101,7 +106,7 @@ its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUT
 | **S22** ✅ | ~~Qwen3-Next expert-miss latency~~ — **CLOSED 2026-10-05.** A2 KEPT (HIT turn −7.1 %); A1 refuted; buffered-I/O `[bug]` fixed (HIT turn −20.3 %); **B0: S11-L7 headline +16.18 % decode tok/s clears the +15 % bar by 1.2 pp only with a demand-priority queue at a 16.4 GB budget; pre-registered range +9.8 … +16.2 % (FIFO, today's stager order, all BELOW); server budget lowers it; host cost unpriced → prototype-gated.** Full record: the S22 row in the backlog archive | — | done |
 | **S24** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-05 by the USER:** the S11-L7 prototype runs next (S25); decisions (1) `batched_generate`, (3) host-side levers, (4) `fla`, (5) the S20 VRAM-plan follow-up move to S26. Full text: the S24 row in the backlog archive | — | done |
 | **S25** ✅ | ~~S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next~~ — **CLOSED 2026-10-05, REFUTED: +5.56 % decode tok/s on device (in1n m=2, FIFO; ids identical; B0 projected +13 … +15 %), below the +12 % stop line → SETTLED; prototype deleted.** Full row: the S25 row in the backlog archive; `docs/2026-10-05-S25-prefetch-prototype-RESULTS.md` | — | done |
-| **S26** | **Re-prioritise with the USER (S24's remainder + S25's number)** — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan follow-up | — | a conversation |
+| **S26** | **Re-prioritise with the USER (S24's remainder + S25's number)** — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan follow-up. **The inputs were pre-gathered at `main` `74853c6`** (see the durable row); the fresh session re-checks them, presents them and waits for the USER | — | a conversation (fresh session) |
 
 ## Durable rows (the briefs)
 
@@ -130,6 +135,37 @@ its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUT
       the representative one — below both bars; recommendation no. **(e)** the S20 VRAM-plan follow-up, if its trigger
       fired. Inputs: S21's ranked table (backlog archive, S21 row), S22's and S25's results, the OPEN list. Then set the
       next sequence here.
+      **INPUTS PRE-GATHERED at `main` `74853c6` (end of the S25 session, 2026-10-05). Re-verify them at HEAD, present
+      them, and wait for the USER:**
+      - **What S25 taught:** HOST work is the binding constraint at N=1.
+        - Prefetch cut the decode stall by 1.77 s per HIT turn, but only about half of that reached decode
+          (3.13 ms/token saved): the host cost of ~45 extra reads per token ate the rest.
+        - S21 measured **26.7 ms/token of host CPU work in a ~58 ms Qwen3-Next decode token**.
+      - **(c) host-side levers:** the agent's model, N=1, reachable today.
+        - The post-S12 eager residue (OPEN-list "Lead (S21)"): ≤ 9.1 ms/token = ≤ 2.3 s/turn as a ceiling. Several
+          separate pieces, and the build is unpriced.
+        - S11-L3 (expert-path host trim): 8.1 ms/token host − overlap = 6–8 ms, 1.5–2.1 s/turn; days.
+        - **Recommendation (the S25 controller's, not a measurement):** start measure-only. Price each piece at the
+          server's settings, then build the single best piece in its own row.
+      - **(b) batching:** the machinery exists from P10.
+        - `vaayu/server/scheduler.py` and `EngineHandle.run_batch()` drive `batched_generate`. But
+          `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`), and the config says it is inert on flash
+          (`config.py:212`). So the work is making N>1 reachable, a week-class design.
+        - **Catch on the agent's model:** `batched_generate` skips the prefix cache on recurrent-state (hybrid)
+          models by design (S20), so batching Qwen3-Next gives up its top TTFT lever.
+        - Its value also depends on a client that fans out: Rudra does not depend on Vaayu yet.
+        - Also keep the DeepSeek-V4 hash-routing guard above.
+      - **(d) `fla`:** no. It is 0.4 % of the representative turn, below both bars.
+      - **(e) the S20 VRAM-plan follow-up:** its trigger has NOT fired (no prefill OOM; Qwen3-Next's
+        `num_experts × blob` is 0.84 of 2 GiB headroom). It stays parked in the OPEN list.
+      - **Cheap side candidate (hours):** the OPEN-list lead "is buffered still right where the engine still chooses
+        it?". Llama-3.3-70B and gpt-oss still pick buffered I/O and were never measured against O_DIRECT; on
+        Qwen3-Next the wrong mode cost 17 % of the turn. Reach: every streamed dense token, server default.
+      - **A possible order, for the USER to accept or change (NOT decided), one fresh session each:**
+        - S27 = price the host levers (measure-only);
+        - S28 = build the best one;
+        - the buffered-I/O check as a short row wherever the USER wants it;
+        - batching as its own design row after that.
 
 ---
 
