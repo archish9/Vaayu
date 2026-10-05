@@ -157,22 +157,7 @@ at HEAD before acting.
   BLOB 2.11, UPLOAD 2.52, MOE 5.63) − device 5.35 = 8.1 ms/token (6–8 after the overlap with in-flight reads) =
   1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S26 decides it with the eager residue below.
 
-- [ ] **S11-L7 — cross-layer expert prefetch** (the only way to remove the stall itself, not overlap
-  it): ceiling = `S11_LOADWAIT` 7.08 ms = **12.3 %** (11.4 % of the library token), 1.81 s/turn, at
-  PERFECT prediction = +14.1 % tok/s (+12.9 % library) — below backlog #35's ≥ +15 % re-open bar even
-  then; no predictor accuracy data; days+; reach: every decode token with a disk miss, N=1. Evidence
-  `arms.U_HOST.host_ms_per_tok.S11_LOADWAIT`; U1 `per_tok.stall_s` 6.89 ms, `disk_reads` 15.0.
-  Backlog #35's kill premise (Qwen3-Next `disk_load` 0.42 %) is stale — annotated there, not moved.
-  **Re-priced by S21: S11's 15 reads/token came from a probe that repeated one request per arm. With fresh content
-  the stall is 18–26 ms/token at the server budget = 5.3 s of the 20.1 s representative turn (26 %) at perfect
-  prediction — ABOVE the +15 % bar as a ceiling.** The stall is per missing LAYER (latency-bound), so a predictor
-  must catch all of a layer's misses to hide it. S22-B0 measured the predictor (below); the prototype is S25, the build S26's decision.
-  **PRICED by S22-B0 (2026-10-05), O_DIRECT, agent session at N=1, 16.4 GB budget: stall 14.7–14.9 ms of a 62.76 ms
-  token; best predictor (`u12n` m=2) +16.18 % decode tok/s with demand priority (CLEARS by 1.2 pp); pre-registered
-  twins BELOW (drive +13.08 %, FIFO +14.36 / +9.80 %); not-pre-registered refits +19.19 % / FIFO +18.09 %. One-ahead
-  alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype = **S25** (USER, 2026-10-05); a
-  build must pass CLAUDE.md §5 on every per-expert forward (the predictor's re-norm is Qwen3-Next's norm form).
-  RESULTS `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.**
+- [x] **S11-L7 — cross-layer expert prefetch — ✅ CLOSED 2026-10-05, REFUTED by S25: +5.56 % decode tok/s on device (B0 projected +13 … +15 %) → SETTLED.** Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 - [ ] **Lead (S21): the post-S12 eager residue** — after the graphs, a decode token still spends on the host
   ATTNCORE 2.96 ms (device 0.78; the eager attention core of the 12 full-attention layers), KERNEL 4.62 (device

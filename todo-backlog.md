@@ -5159,7 +5159,7 @@ then refuted. A refutation closes its row; it is not re-scoped. Full text in
 
 **Expert caching and prefetch.**
 - **S11-L7 cross-layer decode prefetch (`in1n` m=2, FIFO stager)** — BUILT as a prototype and MEASURED 2026-10-05 (S25):
-  **+5.56 % decode tok/s** at N=1, server mode (agent session, ABBA, O_DIRECT, graphs ON; second set +4.55 %), greedy ids identical;
+  **+5.56 % decode tok/s** at N=1, server mode (agent session, ABBA, O_DIRECT, graphs ON; set 1 +4.55 %; both sets failed only the 0.2 GB budget-span check and set 2 was accepted by the pre-registered correction band +3.32 … +7.89 %), greedy ids identical;
   below the +12 % stop line and the +15 % bar. B0's +13 … +15 % projection (+16.18 % headline) did not hold on device. Mechanism: stall
   per HIT turn fell 4.44/4.54 → 2.64/2.80 s, but decode saved only 3.13 ms/token — about half is spent again on host CPU (~45 prefetch
   reads/token, predictor, evictions); 84 % of prefetches used, 50–56 orphan re-reads/turn. Not priced: demand priority, two-ahead
@@ -8196,3 +8196,21 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       again on host CPU (~45 prefetch reads/token on the 2-worker stager, predictor, evictions); 84 % of prefetches used; 50–56 orphan
       re-reads per turn. Gates (switch OFF): suite 3693 / 0 / 25; MOE_CKPT 8; SERVER_CKPT 9. Not priced: budget 17.5–18.2 GB, one session
       shape, Qwen3-Next only, FIFO only (no demand priority), no two-ahead. §8: no knob; server mode N=1; banked by design, not merged.
+
+- [x] **S11-L7 — ✅ CLOSED 2026-10-05, REFUTED by S25 (+5.56 %). Row as it stood at close:**
+**S11-L7 — cross-layer expert prefetch** (the only way to remove the stall itself, not overlap
+  it): ceiling = `S11_LOADWAIT` 7.08 ms = **12.3 %** (11.4 % of the library token), 1.81 s/turn, at
+  PERFECT prediction = +14.1 % tok/s (+12.9 % library) — below backlog #35's ≥ +15 % re-open bar even
+  then; no predictor accuracy data; days+; reach: every decode token with a disk miss, N=1. Evidence
+  `arms.U_HOST.host_ms_per_tok.S11_LOADWAIT`; U1 `per_tok.stall_s` 6.89 ms, `disk_reads` 15.0.
+  Backlog #35's kill premise (Qwen3-Next `disk_load` 0.42 %) is stale — annotated there, not moved.
+  **Re-priced by S21: S11's 15 reads/token came from a probe that repeated one request per arm. With fresh content
+  the stall is 18–26 ms/token at the server budget = 5.3 s of the 20.1 s representative turn (26 %) at perfect
+  prediction — ABOVE the +15 % bar as a ceiling.** The stall is per missing LAYER (latency-bound), so a predictor
+  must catch all of a layer's misses to hide it. S22-B0 measured the predictor (below); the prototype is S25, the build S26's decision.
+  **PRICED by S22-B0 (2026-10-05), O_DIRECT, agent session at N=1, 16.4 GB budget: stall 14.7–14.9 ms of a 62.76 ms
+  token; best predictor (`u12n` m=2) +16.18 % decode tok/s with demand priority (CLEARS by 1.2 pp); pre-registered
+  twins BELOW (drive +13.08 %, FIFO +14.36 / +9.80 %); not-pre-registered refits +19.19 % / FIFO +18.09 %. One-ahead
+  alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype = **S25** (USER, 2026-10-05); a
+  build must pass CLAUDE.md §5 on every per-expert forward (the predictor's re-norm is Qwen3-Next's norm form).
+  RESULTS `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.**
