@@ -48,6 +48,10 @@ closed accumulates in this file again.
   ms/token. Expert-load stall is 4.0–4.2 s of a HIT turn (0.28–0.29 ms per load, 14,400 loads) — 23 % of the turn,
   prefill and decode together. Budgets were not pinned in that comparison; with the budget held equal the saving is
   −17.4 %. **Compare a new measurement only with these, never with the buffered figures above.**
+- **S22-B0 (2026-10-05), O_DIRECT, agent session at a PINNED 16.4 GB budget (`BALLAST_GB=28`):** HIT decode 62.76
+  ms/token, mean HIT turn 19.11 s; decode expert-miss stall **14.7 ms/token = 23 % of the token, 3.75 s of the turn**;
+  24 missing layer-visits and 45 reads per token; stall per missing visit 0.43 / 0.63 / 0.85 / 1.12 ms at 1 / 2 / 3 / 4
+  misses. S11-L7 (cross-layer prefetch) priced +16.18 % decode tok/s on the most favourable model → prototype = **S25**.
 - **Earlier Qwen3-Next decode censuses (s7/row26/r36/s11 probes) repeated ONE request per arm** — that re-decodes
   what the warm arm loaded (S21 dry run: 480/480 VRAM-tier hits, 0 disk reads). Row 36's "disk = 0.42 % of a decode
   token" and S11's 15 reads/token come from that shape. **Any decode probe: a different prompt per arm.**
@@ -58,7 +62,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S24, set 2026-10-03 at the USER's request. One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S26 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05). One per fresh session, in order. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -78,18 +82,26 @@ mandatory for any io_uring change — and there has been none since 2026-09-03. 
 then has the gate it needs. (The week-rule did not fire: S22 as defined is days.)
 
 **REORDERED 2026-10-04 at the USER's word ("go"), proposed by S22-A1's session:** the buffered-I/O `[bug]`
-ran before S22-B0. **✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`). S22-B0 then ran and closed S22 (2026-10-05). NEXT: S24.** The
+ran before S22-B0. **✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`). S22-B0 then ran and closed S22 (2026-10-05).** The
 reason for the reorder, by the ordering rule: *(a)* it is the agent's
 model, *(b)* 17.4 % of the HIT turn at N=1 on the server default — more than A2 and A1 together, *(c)* a few lines.
 B0 converts with "the post-A stall per missing layer", and that stall is 0.45 ms buffered against 0.29 ms O_DIRECT,
 so B0 measured first would be priced in the mode about to change.
+
+**S24 DECIDED 2026-10-05 by the USER (end of the S22-B0 session): run the S11-L7 decode-prefetch PROTOTYPE next, as
+S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
+follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
+agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
+its answer decides a ≥ 1-week build either way. **NEXT: S25, in a fresh session.**
 
 | # | item | why here | cost |
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
 | **S23** ✅ | ~~Restore an on-device dense gate~~ — **CLOSED 2026-10-03.** `tests/test_dense_gate.py` (`DENSE_CKPT=`): boots the real server app; dense detection, ppl < 25, causality and decode logits bitwise, cold greedy ×2 identical. Green on Llama-3.2-1B (ppl 11.90, 6 s) and Llama-3.3-70B (8.85, 120 s); red under 6 mutations. Full record: the S23 row in the backlog archive | — | done |
 | **S22** ✅ | ~~Qwen3-Next expert-miss latency~~ — **CLOSED 2026-10-05.** A2 KEPT (HIT turn −7.1 %); A1 refuted; buffered-I/O `[bug]` fixed (HIT turn −20.3 %); **B0: S11-L7 headline +16.18 % decode tok/s clears the +15 % bar by 1.2 pp only with a demand-priority queue at a 16.4 GB budget; pre-registered range +9.8 … +16.2 % (FIFO, today's stager order, all BELOW); server budget lowers it; host cost unpriced → prototype-gated.** Full record: the S22 row in the backlog archive | — | done |
-| **S24** | **Re-prioritise with the USER** — S21's ranked table + S22's result + the OPEN list; decisions owed: wiring `batched_generate`, the S11-L7 prefetch build (with B0's number), the host-side levers | — | a conversation |
+| **S24** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-05 by the USER:** the S11-L7 prototype runs next (S25); decisions (1) `batched_generate`, (3) host-side levers, (4) `fla`, (5) the S20 VRAM-plan follow-up move to S26. Full text: the S24 row in the backlog archive | — | done |
+| **S25** | **S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next** — wire the predictor B0 priced (`in1n` m=2: layer j+1's router on layer j's router input, re-normed with layer j+1's norm, top-12) into `_make_fused_sparse_forward`, default OFF behind a private switch; ABBA on the agent session at the server's own budget. **KEEP at ≥ +15 % decode tok/s with greedy ids identical; STOP below +12 % (one follow-up arm at +12 … +15 %) → S11-L7 refuted, into SETTLED.** Handoff `docs/superpowers/specs/2026-10-05-S25-prefetch-prototype-HANDOFF.md` | (a)+(b): the decode stall is 23 % of the agent's token; B0 projects +13 … +16 % | days |
+| **S26** | **Re-prioritise with the USER (S24's remainder + S25's number)** — the S11-L7 full build (only if S25 kept), wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan follow-up | — | a conversation |
 
 ## Durable rows (the briefs)
 
@@ -103,28 +115,60 @@ so B0 measured first would be priced in the mode about to change.
       red under 6 mutations. No ppl floor: a broken causal mask scored 6.60. Full row: `todo-backlog.md` "Closed after
       the 2026-10-03 cleanup"; RESULTS `docs/2026-10-03-S23-dense-gate-RESULTS.md`.
 
-- [ ] **S24 — re-prioritise with the USER.** Inputs: S21's ranked table (backlog archive, S21 row; RESULTS §6),
-      S22's result (incl. B0's predictor number), the OPEN list below. Decisions owed by the USER: **(1) wire
-      `batched_generate` into the server** — the strategic one: `CLAUDE.md` §0 names parallel fan-out (sub-agents) a
-      first-class workload, yet the server runs N=1 and every N>1 win (P8's +3.21 %, the batch admission work) is
-      banked at 0 %; a week-class design. Before batching reaches DeepSeek-V4, guard its hash routing: the routed
-      layers read the ids stashed on the model for the WHOLE batch, so row j>0 would route on row 0's ids, silently
-      (A5.7b record, archive). **(2) the S11-L7 decode-prefetch build** (≥ 1 week) — **B0 priced it (2026-10-05): best predictor `u12n` m=2
-      +16.18 % decode tok/s at N=1 with a demand-priority read queue at a 16.4 GB budget — above the +15 % bar by
-      1.2 pp; its pre-registered twins are BELOW (drive model +13.08 %; FIFO, today's stager order, +14.36 / +9.80 %);
-      at the server's 18.7 GB budget the gain is expected lower (rough ≈ +12.7 %); host cost of 52–68 prefetch
-      reads/token unpriced. Not pre-registered: refits that reproduce today's stall give +19.19 % priority /
-      +18.09 % FIFO. A full build must derive the target layer's norm and pass CLAUDE.md §5 on every per-expert forward.
-      B0 recommends a prototype gate (days; `in1n` or `u12n` m=2, ABBA on the agent session at the server's own
-      budget, ≥ +15 %, ids identical) before any week-class build.** **(3) the
-      host-side levers:** the post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s,
-      days) — together they are the 26.7 ms/token of host CPU work S21 measured. **(4)** S3-C's new dependency
-      (`fla`): S21 priced it at 4.7 % of a cold-8k turn and 0.4 % of the representative one — below both bars; the
-      recommendation is no. **(5)** the S20 VRAM-plan follow-up, if its trigger fired. Then set the next sequence here.
+- [x] **S24 — re-prioritise with the USER — ✅ DECIDED 2026-10-05.** The USER chose the S11-L7 prototype next (S25);
+      the other decisions move to S26. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
+
+- [ ] **S25 — S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next (set by the USER at S24, 2026-10-05).** Handoff (read it
+      first): `docs/superpowers/specs/2026-10-05-S25-prefetch-prototype-HANDOFF.md`; evidence
+      `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`. Process: brainstorm → spec → USER approval → dry run →
+      plan → subagent-driven execution → final review (the USER's standing choice).
+      **Question:** does cross-layer decode prefetch deliver ≥ +15 % decode tok/s at N=1 through the server's own
+      configuration, ids identical? B0 projected +16.18 % only with a demand-priority queue at a pinned 16.4 GB budget;
+      the pre-registered twins were below (drive +13.08 %; arrival-order queue — today's stager — +14.36 / +9.80 %);
+      the server's 18.7 GB budget lowers the gain (rough ≈ +12.7 %); host CPU of the extra reads unpriced.
+      **What to build (prototype, default OFF, a private attribute set by the probe — NOT `VAAYU_LOOKAHEAD`, which stays
+      hard-blocked and SETTLED):** the `in1n` m=2 predictor B0 found most robust (+13.0 … +15.4 % across B0's four
+      variants, 65 reads/token, 10.9 never used): for MoE layer j, layer j+1's router on layer j's router input
+      re-normed by `(1 + w_{j+1}) / (1 + w_j)` (`Qwen3NextRMSNorm`'s form; 0 where `1 + w_j == 0` — dim 1572 on 8
+      layers), top-(top_k + 2), skipping experts already in RAM or the VRAM tier. **Recommended placement:** inside
+      `decode_pre` (`moe_patch.py:2282`, captured by the S12 graph) with the predicted ids moved to the host in the SAME
+      transfer as the routed ids (`:2333`) — no extra sync, the shape B0 priced; reads issued through the existing
+      `_stage_predicted_expert` (`:378`) on `_stager_executor` (2 workers, `vaayu_base.py:3355`) after
+      `_dispatch_expert_misses` (`:2389`). Fallback: an adapted `_lookahead_step` (`:440`) called from `sparse_forward`
+      (48 extra host syncs per token — biases the result down). Today `_lookahead_step` reaches only the module-list
+      (`:1753`) and fused-EXL3 (`:3071`) forwards, and `predict_next_experts` (`:323`) scores without the norm and
+      stages top-9, the opposite of B0's top-12.
+      **Measure:** `plans/probes/s25_session.py` from `s22_session.py`, `MODE=off|on`, four processes off/on/on/off,
+      server knobs, `freeze_after_load()`, graphs ON, the engine's own I/O choice (grep `Using O_DIRECT`), NO ballast —
+      but if two arms' `Expert RAM cache:` budgets differ by > 0.2 GB, re-run with `BALLAST_GB` pinned. Per turn: TTFT,
+      decode ms/token, stall, slab loads, `prefetch_inserts` / `prefetch_hits`.
+      **KEEP:** mean HIT decode of the ON arms ≤ OFF / 1.15 (≥ +15 % tok/s), larger than the OFF spread; greedy ids
+      identical on all 9 turns × 4 arms; HIT TTFT not worse beyond the OFF spread → S26 decides the full build (≥ 1 week;
+      every per-expert MoE forward, the norm form derived from the module tree, CLAUDE.md §5). **ONE follow-up ABBA** if
+      +12 … +15 %: demand priority on the read path (B0: +1 … +3 pp) and/or `u12n` m=2 (adds the two-ahead source).
+      **STOP** below +12 %, or the follow-up below +15 %: S11-L7 closes REFUTED, recorded in SETTLED (`todo-backlog.md`)
+      with the number; the prototype is reverted.
+      **Gates:** full suite (+ a unit test that the switch ON never changes a layer's output); `MOE_CKPT=` accumulator
+      gate on Qwen3-Next; `SERVER_CKPT=` server gate on Qwen3-Next. Dense and MiniMax are untouched by a default-off,
+      Qwen3-Next-only switch — state that in the spec, do not skip silently.
+      **§8:** (1) no knob for the prototype; (2)/(3) measured in server mode at N=1; (4) BANKED by design (default off,
+      unreachable from the server) — a measurement; the build, if any, gets its knob decision at S26.
+
+- [ ] **S26 — re-prioritise with the USER (S24's remainder + S25's number).** Decisions owed: **(a) the S11-L7 full
+      build** — only if S25 KEPT, priced by S25's measured gain. **(b) wire `batched_generate` into the server** — the
+      strategic one: `CLAUDE.md` §0 names parallel fan-out (sub-agents) a first-class workload, yet the server runs N=1
+      and every N>1 win (P8's +3.21 %, the batch admission work) is banked at 0 %; a week-class design. Before batching
+      reaches DeepSeek-V4, guard its hash routing: the routed layers read the ids stashed on the model for the WHOLE
+      batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive). **(c) the host-side levers:** the
+      post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s, days) — together the 26.7
+      ms/token of host CPU work S21 measured. **(d)** S3-C's new dependency (`fla`): 4.7 % of a cold-8k turn, 0.4 % of
+      the representative one — below both bars; recommendation no. **(e)** the S20 VRAM-plan follow-up, if its trigger
+      fired. Inputs: S21's ranked table (backlog archive, S21 row), S22's and S25's results, the OPEN list. Then set the
+      next sequence here.
 
 ---
 
-# OPEN — not sequenced (re-rank at S24)
+# OPEN — not sequenced (re-rank at S26)
 
 Each item below is copied verbatim from the pre-cleanup `todo.md` (its origin is named in italics; the row it came
 from is in the archive in `todo-backlog.md`). Line numbers inside the text are as of when it was written — re-verify
@@ -146,7 +190,7 @@ at HEAD before acting.
   UPLOAD,MOE}` − `U_CNT` device of MOE / BLOB / UPLOAD.
   **Re-priced by S21 (U_HOST, 8k, BALLAST 25, `s21_out/decode-on1.log`): host 13.43 ms (DISP 1.22, SETTLE 1.94,
   BLOB 2.11, UPLOAD 2.52, MOE 5.63) − device 5.35 = 8.1 ms/token (6–8 after the overlap with in-flight reads) =
-  1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S24 decides it with the eager residue below.
+  1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S26 decides it with the eager residue below.
 
 - [ ] **S11-L7 — cross-layer expert prefetch** (the only way to remove the stall itself, not overlap
   it): ceiling = `S11_LOADWAIT` 7.08 ms = **12.3 %** (11.4 % of the library token), 1.81 s/turn, at
@@ -157,11 +201,11 @@ at HEAD before acting.
   **Re-priced by S21: S11's 15 reads/token came from a probe that repeated one request per arm. With fresh content
   the stall is 18–26 ms/token at the server budget = 5.3 s of the 20.1 s representative turn (26 %) at perfect
   prediction — ABOVE the +15 % bar as a ceiling.** The stall is per missing LAYER (latency-bound), so a predictor
-  must catch all of a layer's misses to hide it. S22-B0 measures the predictor; the build is S24's decision.
+  must catch all of a layer's misses to hide it. S22-B0 measured the predictor (below); the prototype is S25, the build S26's decision.
   **PRICED by S22-B0 (2026-10-05), O_DIRECT, agent session at N=1, 16.4 GB budget: stall 14.7–14.9 ms of a 62.76 ms
   token; best predictor (`u12n` m=2) +16.18 % decode tok/s with demand priority (CLEARS by 1.2 pp); pre-registered
   twins BELOW (drive +13.08 %, FIFO +14.36 / +9.80 %); not-pre-registered refits +19.19 % / FIFO +18.09 %. One-ahead
-  alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype-gated at S24; a
+  alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype = **S25** (USER, 2026-10-05); a
   build must pass CLAUDE.md §5 on every per-expert forward (the predictor's re-norm is Qwen3-Next's norm form).
   RESULTS `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.**
 
@@ -195,7 +239,7 @@ at HEAD before acting.
   prompt, ~2 % TTFT); a new-dependency decision. **S11 re-price (2026-09-28):** ≤1.02 s = **≤3.7 % of a
   cold@8k TTFT** (0.28 s = 2.7 % cold@2k, 0.06 s = 2.0 % of a HIT) — below 5 % everywhere.
   **S21 re-price (after S20): ≈ 1.36 s per cold 8k = 4.7 % of a cold-8k TURN, 0.08 s = 0.4 % of the
-  representative turn — below both S21 bars. Recommendation at S24: no.**
+  representative turn — below both S21 bars. Recommendation at S26: no.**
 
 *From the S1 row (closed 2026-09-25).*
 
@@ -254,7 +298,7 @@ at HEAD before acting.
       learn this cache before it can be stored. Cost today (S17 T6, one rep, 1k-token prompt): turn 2 is a full
       1,280-token prefill, **47.1 s** TTFT, where a prefix HIT would prefill only the diff. Reach: every DeepSeek
       turn after the first, N=1, server default. Unpriced build (a cache-format design, both prefix paths, the
-      prefix and server gates on DeepSeek). Re-rank at S24 with the DeepSeek levers above.
+      prefix and server gates on DeepSeek). Re-rank at S26 with the DeepSeek levers above.
 
 ## MiniMax-M2.7
 

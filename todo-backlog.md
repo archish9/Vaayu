@@ -8086,3 +8086,22 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       alone.**
       *§8:* (1) no knob — nothing shipped; (2)/(3) every number in server mode at N=1 (server knobs,
       `freeze_after_load()`, graphs ON, the engine's own I/O choice); (4) nothing banked — the output is S24's number.
+
+- [x] **S24 — re-prioritise with the USER. ✅ DECIDED 2026-10-05 by the USER, at the end of the S22-B0 session: decision (2) — run the S11-L7 decode-prefetch PROTOTYPE next, as S25 (B0's recommendation: prototype before any week-class build); decisions (1), (3), (4), (5) were not taken and move unchanged to S26, to be taken with S25's number.** Inputs: S21's ranked table (backlog archive, S21 row; RESULTS §6),
+      S22's result (incl. B0's predictor number), the OPEN list below. Decisions owed by the USER: **(1) wire
+      `batched_generate` into the server** — the strategic one: `CLAUDE.md` §0 names parallel fan-out (sub-agents) a
+      first-class workload, yet the server runs N=1 and every N>1 win (P8's +3.21 %, the batch admission work) is
+      banked at 0 %; a week-class design. Before batching reaches DeepSeek-V4, guard its hash routing: the routed
+      layers read the ids stashed on the model for the WHOLE batch, so row j>0 would route on row 0's ids, silently
+      (A5.7b record, archive). **(2) the S11-L7 decode-prefetch build** (≥ 1 week) — **B0 priced it (2026-10-05): best predictor `u12n` m=2
+      +16.18 % decode tok/s at N=1 with a demand-priority read queue at a 16.4 GB budget — above the +15 % bar by
+      1.2 pp; its pre-registered twins are BELOW (drive model +13.08 %; FIFO, today's stager order, +14.36 / +9.80 %);
+      at the server's 18.7 GB budget the gain is expected lower (rough ≈ +12.7 %); host cost of 52–68 prefetch
+      reads/token unpriced. Not pre-registered: refits that reproduce today's stall give +19.19 % priority /
+      +18.09 % FIFO. A full build must derive the target layer's norm and pass CLAUDE.md §5 on every per-expert forward.
+      B0 recommends a prototype gate (days; `in1n` or `u12n` m=2, ABBA on the agent session at the server's own
+      budget, ≥ +15 %, ids identical) before any week-class build.** **(3) the
+      host-side levers:** the post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s,
+      days) — together they are the 26.7 ms/token of host CPU work S21 measured. **(4)** S3-C's new dependency
+      (`fla`): S21 priced it at 4.7 % of a cold-8k turn and 0.4 % of the representative one — below both bars; the
+      recommendation is no. **(5)** the S20 VRAM-plan follow-up, if its trigger fired. Then set the next sequence here.
