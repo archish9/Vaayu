@@ -487,10 +487,8 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
 # tensors every token (static graph memory), so the table upload, both launches and the
 # forward's epilogue are recorded once per layer and replayed; only the table's contents
 # change. Same kernels, same arguments: each capture is held bitwise to the eager launch.
-_GRAPH_CHURN_LIMIT = 2          # CONSECUTIVE graphs replaced before their first replay: inputs move per call
 _GRAPHS: dict = {}              # layer -> _LayerGraph
 _GRAPH_REFUSED: dict = {}       # layer -> why
-_GRAPH_CHURN: collections.Counter = collections.Counter()
 _GRAPH_WARNED: set = set()
 _GRAPH_STREAMS: dict = {}       # device -> the capture stream (a capture cannot use the legacy one)
 GRAPH_STATS: collections.Counter = collections.Counter()
@@ -521,6 +519,15 @@ def _refuse_graph(layer, why) -> None:
               f"not listed.")
 
 
+def _warn_skip(why) -> None:
+    """A call the graph cannot take: it launches eagerly. Said once per reason, never
+    silently (spec §4.5); the layer is not refused -- the next call may qualify."""
+    if why not in _GRAPH_WARNED:
+        _GRAPH_WARNED.add(why)
+        print(f"[Vaayu] WARNING: packed-expert decode graph not used ({why}); those calls "
+              f"launch the kernels eagerly. Shown once per reason.")
+
+
 def packed_experts_decode_graphed(layer, x, pairs, routing_weights, shared, act_fn, tail):
     """`packed_experts_decode` (and, `tail` True, the forward's epilogue) through one CUDA
     graph per MoE layer -- or None: this call is not the graph's, run the eager path.
@@ -537,8 +544,10 @@ def packed_experts_decode_graphed(layer, x, pairs, routing_weights, shared, act_
     if geom is None or any(blob.get("geom") != geom for blob, _slot in pairs[1:]):
         return None
     if not (x.is_contiguous() and routing_weights.is_contiguous()):
+        _warn_skip("a non-contiguous expert input or routing-weight tensor")
         return None
     if tail and shared is not None and shared.dtype != x.dtype:
+        _warn_skip(f"the shared expert's output is {shared.dtype}, the activations {x.dtype}")
         return None
     if not _checked(x, pairs, routing_weights, act_fn):
         return None
@@ -552,18 +561,16 @@ def packed_experts_decode_graphed(layer, x, pairs, routing_weights, shared, act_
         g.host_np[:] = vals
         g.graph.replay()
         g.done.record()
-        if not g.replays:               # the graph's inputs held: restart the churn count
-            _GRAPH_CHURN.pop(layer, None)
         g.replays += 1
         GRAPH_STATS["replays"] += 1
         return g.result if tail else g.out
     if g is not None:
         del _GRAPHS[layer]
         if g.replays == 0:
-            _GRAPH_CHURN[layer] += 1
-            if _GRAPH_CHURN[layer] > _GRAPH_CHURN_LIMIT:
-                _refuse_graph(layer, "its inputs move between calls")
-                return None
+            # Replaced before its first replay: a request with one decode step (S12 hands
+            # every request new static inputs). Never a refusal -- S12 already bounds how
+            # often a layer's inputs move (decode_graphs._MAX_CAPTURES_PER_REQUEST).
+            GRAPH_STATS["replaced_unreplayed"] += 1
         del g
     return _capture(layer, key, x, pairs, routing_weights, shared, tail, vals, act_fn)
 
@@ -580,29 +587,31 @@ def _capture(layer, key, x, pairs, rw, shared, tail, vals, act_fn):
     _launch(x, pairs, rw, ref_out)
     ref = _tail(ref_out, x.dtype, shared) if tail else ref_out
     g = _LayerGraph()
-    g.key, g.replays = key, 0
-    g.host = torch.empty(len(vals), dtype=torch.int64, pin_memory=True)
-    g.host_np = g.host.numpy()
-    g.host_np[:] = vals
-    g.tbl = torch.empty(len(vals), dtype=torch.int64, device=dev)
-    g.h = torch.empty(n, inter, dtype=x.dtype, device=dev)
-    g.out = torch.empty(x.shape, dtype=torch.float32, device=dev)
-    g.tmp = torch.empty(x.shape, dtype=x.dtype, device=dev) if tail else None
-    g.result = (torch.empty(x.shape, dtype=x.dtype, device=dev)
-                if tail and shared is not None else g.tmp)
-    g.done = torch.cuda.Event()
-    side = _GRAPH_STREAMS.get(dev)
-    if side is None:
-        side = _GRAPH_STREAMS[dev] = torch.cuda.Stream(device=dev)
     graph = torch.cuda.CUDAGraph()
     pool = torch.cuda.graph_pool_handle()
-    cur = torch.cuda.current_stream(dev)
-    side.wait_stream(cur)
     # A cyclic-GC pass inside a capture can run a dead graph's destructor on this thread
     # and invalidate the capture (S12, decode_graphs._capture).
     was = gc.isenabled()
     gc.disable()
     try:
+        # Allocations, the capture, its first replay and the bitwise check all fall back to
+        # the eager result on failure (spec §4.5: nothing here raises into the request).
+        g.key, g.replays = key, 0
+        g.host = torch.empty(len(vals), dtype=torch.int64, pin_memory=True)
+        g.host_np = g.host.numpy()
+        g.host_np[:] = vals
+        g.tbl = torch.empty(len(vals), dtype=torch.int64, device=dev)
+        g.h = torch.empty(n, inter, dtype=x.dtype, device=dev)
+        g.out = torch.empty(x.shape, dtype=torch.float32, device=dev)
+        g.tmp = torch.empty(x.shape, dtype=x.dtype, device=dev) if tail else None
+        g.result = (torch.empty(x.shape, dtype=x.dtype, device=dev)
+                    if tail and shared is not None else g.tmp)
+        g.done = torch.cuda.Event()
+        side = _GRAPH_STREAMS.get(dev)
+        if side is None:
+            side = _GRAPH_STREAMS[dev] = torch.cuda.Stream(device=dev)
+        cur = torch.cuda.current_stream(dev)
+        side.wait_stream(cur)
         # no_grad: the graph's buffers are inference-only (an out= op refuses an input that
         # requires grad, which a caller outside no_grad could pass).
         with torch.cuda.stream(side), torch.no_grad():
@@ -624,6 +633,11 @@ def _capture(layer, key, x, pairs, rw, shared, tail, vals, act_fn):
                     from .decode_graphs import _cleanup_pool
                     _cleanup_pool(pool)
                     raise
+        cur.wait_stream(side)
+        g.graph = graph
+        graph.replay()
+        got = g.result if tail else g.out
+        same = torch.equal(got, ref)
     except Exception as exc:
         first = (str(exc).splitlines() or [""])[0][:200]
         _refuse_graph(layer, f"capture failed: {type(exc).__name__}: {first}")
@@ -631,11 +645,7 @@ def _capture(layer, key, x, pairs, rw, shared, tail, vals, act_fn):
     finally:
         if was:
             gc.enable()
-    cur.wait_stream(side)
-    g.graph = graph
-    graph.replay()
-    got = g.result if tail else g.out
-    if not torch.equal(got, ref):
+    if not same:
         _refuse_graph(layer, "its replay disagrees bitwise with the eager launch")
         return ref
     g.done.record()

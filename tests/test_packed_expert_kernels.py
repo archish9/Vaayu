@@ -304,7 +304,6 @@ def fresh_graphs(monkeypatch):
     """Each test starts with no graph, no refusal and zeroed counters."""
     import collections
     for name, fresh in (("_GRAPHS", {}), ("_GRAPH_REFUSED", {}), ("_GRAPH_WARNED", set()),
-                        ("_GRAPH_CHURN", collections.Counter()),
                         ("GRAPH_STATS", collections.Counter())):
         monkeypatch.setattr(pk, name, fresh)
 
@@ -371,13 +370,20 @@ def test_a_new_input_tensor_recaptures(monkeypatch):
 
 
 @cuda
-def test_inputs_that_move_every_call_refuse_the_layer(monkeypatch, capsys):
+def test_inputs_that_move_every_call_keep_working(monkeypatch, capsys):
+    """No refusal for moving inputs: S12, the only caller with static inputs, already bounds
+    how often they move (`decode_graphs._MAX_CAPTURES_PER_REQUEST`), so a run of graphs that
+    never replayed here is a run of short requests. Each call recaptures and returns the
+    eager bits."""
     fresh_graphs(monkeypatch)
     x, pairs, w = _case(*QWEN)
-    xs = [x * (i + 1) for i in range(pk._GRAPH_CHURN_LIMIT + 2)]
-    outs = [pk.packed_experts_decode_graphed(0, xi, pairs, w, None, F.silu, False) for xi in xs]
-    assert all(o is not None for o in outs[:-1]) and outs[-1] is None
-    assert 0 in pk._GRAPH_REFUSED and "WARNING" in capsys.readouterr().out
+    xs = [x * (i + 1) for i in range(5)]
+    outs = [pk.packed_experts_decode_graphed(0, xi, pairs, w, None, F.silu, False).clone()
+            for xi in xs]
+    torch.cuda.synchronize()
+    assert 0 not in pk._GRAPH_REFUSED and "WARNING" not in capsys.readouterr().out
+    assert all(torch.equal(o, _eager(xi, pairs, w, None, False)) for o, xi in zip(outs, xs))
+    assert pk.GRAPH_STATS["captures"] == 5 and pk.GRAPH_STATS["replaced_unreplayed"] == 4
 
 
 @cuda
@@ -536,11 +542,10 @@ def test_a_pair_count_that_changes_now_and_then_is_not_churn(monkeypatch):
 @cuda
 def test_one_token_pair_count_dips_do_not_accumulate_into_a_refusal(monkeypatch):
     """Task 2 review: one token whose pair count dips captures a graph that never replays.
-    Such tokens, spread over a long session with replays in between, must not add up to a
-    refusal -- churn counts CONSECUTIVE graphs that never replayed."""
+    Such tokens, spread over a long session with replays in between, never refuse the layer."""
     fresh_graphs(monkeypatch)
     x, pairs, w = _case(*QWEN)
-    for _ in range(pk._GRAPH_CHURN_LIMIT + 3):
+    for _ in range(5):
         for _ in range(3):
             got = pk.packed_experts_decode_graphed(0, x, pairs, w, None, F.silu, False)
         pk.packed_experts_decode_graphed(0, x, pairs[:-1], w, None, F.silu, False)   # one token
@@ -566,14 +571,106 @@ def test_short_requests_between_long_ones_do_not_refuse_the_layer(monkeypatch):
 
 
 @cuda
-def test_churn_counts_only_graphs_that_never_replayed(monkeypatch):
-    """Exactly `_GRAPH_CHURN_LIMIT` never-replayed graphs after one that replayed stay within
-    the limit: the replayed graph is not churn."""
+def test_replaced_unreplayed_counts_only_graphs_that_never_replayed(monkeypatch):
+    """The statistic counts graphs dropped before their first replay; a graph that replayed is
+    not counted when it is replaced."""
     fresh_graphs(monkeypatch)
     x, pairs, w = _case(*QWEN)
-    xs = [x * (i + 2) for i in range(pk._GRAPH_CHURN_LIMIT + 2)]
+    xs = [x * (i + 2) for i in range(4)]
     pk.packed_experts_decode_graphed(0, xs[0], pairs, w, None, F.silu, False)
     pk.packed_experts_decode_graphed(0, xs[0], pairs, w, None, F.silu, False)       # replays
-    for xi in xs[1:]:                     # LIMIT + 1 captures, each replacing the previous graph
+    for xi in xs[1:]:                     # 3 captures, each replacing the previous graph
         out = pk.packed_experts_decode_graphed(0, xi, pairs, w, None, F.silu, False)
     assert out is not None and 0 not in pk._GRAPH_REFUSED
+    assert pk.GRAPH_STATS["replaced_unreplayed"] == 2
+
+
+@cuda
+def test_four_short_requests_in_a_row_leave_the_layer_graphed(monkeypatch):
+    """Final review F1: four one-decode-step requests in a row (each a new S12 static input
+    that never replays), then a long request -- the long request replays its graph."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    xs = [x * (r + 2) for r in range(5)]           # held: every request gets its own address
+    for xr in xs[:4]:
+        pk.packed_experts_decode_graphed(0, xr, pairs, w, None, F.silu, False)
+    for _ in range(40):
+        got = pk.packed_experts_decode_graphed(0, xs[4], pairs, w, None, F.silu, False)
+    torch.cuda.synchronize()
+    assert 0 not in pk._GRAPH_REFUSED
+    assert pk.GRAPH_STATS["replays"] == 39
+    assert torch.equal(got, _eager(xs[4], pairs, w, None, False))
+
+
+@cuda
+def test_a_failure_around_the_capture_falls_back_to_eager(monkeypatch):
+    """Spec §4.5: nothing in C5 raises into the request. A failure before the capture (here
+    the pinned host table cannot be allocated) returns the eager result and refuses the layer."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    for _ in range(len(pk._TABLES._slots)):         # the eager ring's pinned slots exist already
+        want = _eager(x, pairs, w, None, False)
+    assert pk._checked(x, pairs, w, F.silu)
+    real = torch.empty
+
+    def no_pinned(*a, **kw):
+        if kw.get("pin_memory"):
+            raise RuntimeError("CUDA error: out of memory (cudaHostAlloc)")
+        return real(*a, **kw)
+    monkeypatch.setattr(torch, "empty", no_pinned)
+    got = pk.packed_experts_decode_graphed(0, x, pairs, w, None, F.silu, False)
+    monkeypatch.setattr(torch, "empty", real)
+    assert got is not None and torch.equal(got, want)
+    assert "capture failed" in pk._GRAPH_REFUSED.get(0, "")
+
+
+@cuda
+def test_an_input_the_graph_cannot_take_warns_once(monkeypatch, capsys):
+    """Spec §4.5 / CLAUDE.md §5: a non-contiguous input stays eager (None), with ONE WARNING
+    per reason per process -- not silently, and not on every call."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    w_strided = torch.cat([w, w], dim=1)[:, ::2]          # same values, not contiguous
+    assert not w_strided.is_contiguous()
+    for _ in range(3):
+        assert pk.packed_experts_decode_graphed(0, x, pairs, w_strided, None, F.silu, False) is None
+    out = capsys.readouterr().out
+    assert out.count("WARNING") == 1 and "not used" in out
+    assert 0 not in pk._GRAPH_REFUSED
+
+
+@cuda
+def test_a_capture_whose_end_fails_releases_its_pool(monkeypatch):
+    """capture_end itself raising (a host sync inside the capture invalidates it) leaves
+    PyTorch's allocator believing the pool still records unless `_cleanup_pool` runs
+    (cuda_graph_capture_traps): the eager result comes back, empty_cache releases the 16 MiB the
+    capture took, and a later capture on another layer works."""
+    import gc
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    want = _eager(x, pairs, w, None, False)
+    assert pk._checked(x, pairs, w, F.silu)
+    real_down = pk._down
+
+    def bad_down(h, tbl, rw, out, n, geom, sc):
+        real_down(h, tbl, rw, out, n, geom, sc)
+        if torch.cuda.is_current_stream_capturing():
+            junk = torch.empty(4 << 20, device="cuda")     # 16 MiB INTO the capture's pool
+            junk.fill_(1)
+            junk.sum().item()                              # a host sync: invalidates the capture
+    monkeypatch.setattr(pk, "_down", bad_down)
+    got = pk.packed_experts_decode_graphed(0, x, pairs, w, None, F.silu, False)
+    monkeypatch.setattr(pk, "_down", real_down)
+    assert got is not None and torch.equal(got, want)
+    assert "capture failed" in pk._GRAPH_REFUSED.get(0, "")
+    gc.collect()
+    torch.cuda.synchronize()
+    r0 = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    assert torch.cuda.memory_reserved() <= r0 - (16 << 20), "the failed capture's pool was not released"
+    x2 = x * 2
+    pk.packed_experts_decode_graphed(1, x2, pairs, w, None, F.silu, False)
+    again = pk.packed_experts_decode_graphed(1, x2, pairs, w, None, F.silu, False)
+    torch.cuda.synchronize()
+    assert pk.GRAPH_STATS["replays"] == 1
+    assert torch.equal(again, _eager(x2, pairs, w, None, False))

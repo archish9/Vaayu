@@ -1697,11 +1697,11 @@ def _make_modulelist_sparse_forward(
 
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         # 'route' brackets the router forward + route_experts + the
-        # unique().tolist() sync below. Sync BEFORE starting the clock so any
-        # GPU work still in flight from the previous layer isn't misattributed
-        # to routing; no sync is needed at the end — .tolist() below already
-        # forces a blocking D2H copy, so the window it closes is truthful
-        # without an extra synchronize() call.
+        # routing sync below (_routing_to_host). Sync BEFORE starting the clock
+        # so any GPU work still in flight from the previous layer isn't
+        # misattributed to routing; no sync is needed at the end — its .cpu()
+        # already forces a blocking D2H copy, so the window it closes is
+        # truthful without an extra synchronize() call.
         if _prof:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
