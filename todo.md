@@ -214,6 +214,7 @@ and S26 did.
         BLOB 0.31, KERNEL 0.78, ATTNCORE 0.36, GRRUN 0.89, SETTLE 0.95, DISP 1.00. **Early signal: C1 looks
         mostly hidden behind GPU work (≈ 1.5 ms exposed, under the 1.744 ms band floor).** The census at HEAD
         decides.
+      - **Census done 2026-10-06 (p1/p2 at 5e7e530):** U1/U2 mean 54.76 ms/token over both processes (p1 56.27/51.42, p2 63.10/48.26), expert RAM budget 16.96 GB, O_DIRECT on, checks pass (c1, partition, c2 true; align_min_us +3.27; MICRO equal 256/256, old 59.3/56.6 us, new 30.6/29.0 us), ids identical across processes on all 4 shared arms.
 
 - [ ] **S28 — build the single best host lever from S27 (set by the USER at S26, 2026-10-06).** S27's verdict is the
       brief.
