@@ -227,6 +227,26 @@ def _decode_limits(vaayu_ref):
             getattr(vaayu_ref, "_decode_top_p", None))
 
 
+# S28 prototype switch: the pieces of the MoE-visit host fast path a probe turned on
+# (`vaayu_ref._s28_pieces`, any of "c11", "c5", "c4"). Empty -- every piece OFF -- unless
+# a probe sets it; nothing in the engine or the server does.
+_NO_PIECES = frozenset()
+
+
+def _routing_to_host(expert_indices):
+    """S28 C11: a MoE visit's routing on the host through ONE device-to-host sync.
+
+    Returns (the ids' CPU copy, the routed experts ascending) -- the same list
+    `expert_indices.flatten().unique().tolist()` gives, which costs a device sort (3 cub
+    kernels) and two syncs (its output's size, then the copy) before the dispatch's own
+    `.cpu()` adds a third. One token's ids are a handful, where a Python set beats a CPU
+    `torch.unique` call; a prefill chunk's are thousands, where the reverse holds."""
+    cpu = expert_indices.cpu()
+    if cpu.numel() <= cpu.shape[-1]:
+        return cpu, sorted(set(cpu.reshape(-1).tolist()))
+    return cpu, cpu.unique().tolist()
+
+
 def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
     """Bias top-k SELECTION toward resident experts; take combination WEIGHTS
     from the ORIGINAL logits (selection changes, weighting stays faithful —
@@ -1706,7 +1726,11 @@ def _make_modulelist_sparse_forward(
             routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        if "c11" in getattr(vaayu_ref, "_s28_pieces", _NO_PIECES):
+            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
+        else:
+            expert_indices_cpu = None
+            unique_experts: list[int] = expert_indices.flatten().unique().tolist()
         if _prof:
             _mp['route'] += time.perf_counter() - _t0
 
@@ -1753,8 +1777,10 @@ def _make_modulelist_sparse_forward(
         _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path,
                         layer_idx, hidden_states, top_k, unique_experts)
         B, S, H = hidden_states.shape
+        if expert_indices_cpu is None:
+            expert_indices_cpu = expert_indices.cpu()
         _pair, _starts, _counts_l = compute_expert_dispatch(
-            expert_indices.cpu().reshape(-1, expert_indices.shape[-1]),
+            expert_indices_cpu.reshape(-1, expert_indices.shape[-1]),
             len(experts_list))
         _pair_gpu = _pair.to(hidden_states.device, non_blocking=True)
         if _prof:
@@ -2292,6 +2318,7 @@ def _make_fused_sparse_forward(
                 _shared_expert_output(block_info.moe_module, flat_hidden))
 
     def sparse_forward(hidden_states, _pre=None, **kwargs):
+        _pieces = getattr(vaayu_ref, "_s28_pieces", _NO_PIECES)
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
@@ -2330,7 +2357,11 @@ def _make_fused_sparse_forward(
                        "cache-aware routing")
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        if "c11" in _pieces:
+            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
+        else:
+            expert_indices_cpu = None
+            unique_experts: list[int] = expert_indices.flatten().unique().tolist()
         if _prof:
             _mp['route'] += time.perf_counter() - _t_route
 
@@ -2424,7 +2455,8 @@ def _make_fused_sparse_forward(
             # plus two tiny per-expert copies. Each expert's positions are a
             # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
-            expert_indices_cpu = expert_indices.cpu()
+            if expert_indices_cpu is None:
+                expert_indices_cpu = expert_indices.cpu()
             if _use_pk:
                 # The per-slot loop below never runs on this branch: the kernel branch
                 # consumes every load first. Bound anyway, so no name in that loop is
