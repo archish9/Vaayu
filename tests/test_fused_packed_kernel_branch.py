@@ -208,3 +208,45 @@ def test_an_unpacked_expert_is_computed_like_the_per_slot_loop(tmp_path):
     ref._packed_moe_kernel = None
     stock = model.layers[0].mlp.forward(x)
     assert torch.equal(cold, stock) and torch.equal(warm, stock)
+
+
+# ── S28: shared helpers, and C5 through the full path ─────────────────────────────────────
+
+def _with_shared_expert(model):
+    """Qwen3-Next's block shape: a gated shared expert beside the router."""
+    torch.manual_seed(7)
+    mlp = model.layers[0].mlp
+    mlp.shared_expert = torch.nn.Linear(HIDDEN, HIDDEN, bias=False).to("cuda", torch.bfloat16)
+    mlp.shared_expert_gate = torch.nn.Linear(HIDDEN, 1, bias=False).to("cuda", torch.bfloat16)
+
+
+def _headroom_calls(monkeypatch):
+    """The full path calls `_ensure_prefill_headroom` at entry; the lean branch never does."""
+    calls = []
+    real = mp._ensure_prefill_headroom
+    monkeypatch.setattr(mp, "_ensure_prefill_headroom",
+                        lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    return calls
+
+
+@cuda
+@pytest.mark.parametrize("pieces", [("c5",), ("c11", "c5")], ids="+".join)
+def test_c5_without_c4_graphs_the_full_paths_kernels(tmp_path, monkeypatch, pieces):
+    """The attribution arm `c11c5`: the full path's kernel call through the graph (no
+    epilogue in it), same bits as OFF; a call without `_pre` never reaches the graph."""
+    from tests.test_packed_expert_kernels import fresh_graphs
+    fresh_graphs(monkeypatch)
+    model, ref, _ = _cuda_model(tmp_path)
+    _with_shared_expert(model)
+    fwd = model.layers[0].mlp.forward
+    x = _x()
+    pre_t = fwd.decode_pre(x)
+    off = fwd(x, _pre=pre_t).clone()
+    calls = _headroom_calls(monkeypatch)
+    ref._s28_pieces = frozenset(pieces)
+    no_pre = fwd(x).clone()
+    assert pk.GRAPH_STATS["captures"] == 0, "no _pre, no graph"
+    got = [fwd(x, _pre=pre_t).clone() for _ in range(3)]
+    assert len(calls) == 4, "premise: every call took the full path"
+    assert (pk.GRAPH_STATS["captures"], pk.GRAPH_STATS["replays"]) == (1, 2)
+    assert torch.equal(no_pre, off) and all(torch.equal(g, off) for g in got)

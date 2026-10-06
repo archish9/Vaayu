@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from .packed_expert_kernels import packed_experts_decode, packed_experts_prefill
+from .packed_expert_kernels import (packed_experts_decode, packed_experts_decode_graphed,
+                                    packed_experts_prefill)
 
 if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
@@ -2539,8 +2540,15 @@ def _make_fused_sparse_forward(
                               if _eids[s] in _blobs]
                     if _pairs:
                         _t_gemm = _mark() if _prof else 0.0
-                        packed_experts_decode(flat_hidden, _pairs, routing_weights,
-                                              final_hidden, act_fn)
+                        _g = (packed_experts_decode_graphed(
+                                  layer_idx, flat_hidden, _pairs, routing_weights, None,
+                                  act_fn, tail=False)
+                              if "c5" in _pieces and _pre is not None else None)
+                        if _g is not None:
+                            final_hidden = _g        # static: consumed by the cast below
+                        else:
+                            packed_experts_decode(flat_hidden, _pairs, routing_weights,
+                                                  final_hidden, act_fn)
                         if _prof:
                             _mp['gemm'] += _mark() - _t_gemm
                 _loads = ()      # every expert was consumed above
