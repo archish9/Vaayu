@@ -62,7 +62,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S26 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05). One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S30 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06). One per fresh session, in order. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -99,6 +99,19 @@ session that finishes its row updates this file and stops; it does not start the
 its fresh session re-checks the inputs pre-gathered in its durable row at HEAD, presents them, and WAITS for the
 USER's pick. It decides nothing alone, then writes the chosen rows (S27…) into this table, one row per fresh session.
 
+**S26 DECIDED 2026-10-06 by the USER ("host levers first", the order S26 recommended):**
+- **S27** — price the host levers at HEAD, MEASURE ONLY.
+- **S28** — build the single best piece S27 finds.
+- **S29** — buffered vs O_DIRECT on the models that still choose buffered.
+- **S30** — the batching design row.
+- (d) `fla` (S3-C): **no** (closed).
+- (e) the S20 VRAM-plan follow-up: stays parked (its trigger has not fired).
+
+The reason, by the ordering rule: S27/S28 are *(a)* the agent's model and *(b)* the largest N=1 saving left after S25,
+whose prefetch lost half its win to host CPU. S29 is *(c)* cheap, but not the agent's model. S30 is week-class and is
+worth 0 % until a client fans out. **When S30 closes, the next fresh session re-prioritises with the USER**, as S24
+and S26 did.
+
 | # | item | why here | cost |
 |---|---|---|---|
 | **S21** ✅ | ~~Qwen3-Next census at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-03.** Representative turn 20.1 s (decode ≈ 87 %); the top cost inside it is the decode expert-miss STALL (5.3 s/turn, latency-bound); S11-L6 REFUTED by real-class replay; S3-B, S1-L2 closed; S3-C below the bars; G5 answered (2 rings cap 1.58 MB reads at ~4.3 GB/s, 3 reach 6.6). Ranked table + full record: the S21 row in the backlog archive (and RESULTS §6); `docs/2026-10-03-S21-qwen3next-census-RESULTS.md` | — | done |
@@ -106,7 +119,11 @@ USER's pick. It decides nothing alone, then writes the chosen rows (S27…) into
 | **S22** ✅ | ~~Qwen3-Next expert-miss latency~~ — **CLOSED 2026-10-05.** A2 KEPT (HIT turn −7.1 %); A1 refuted; buffered-I/O `[bug]` fixed (HIT turn −20.3 %); **B0: S11-L7 headline +16.18 % decode tok/s clears the +15 % bar by 1.2 pp only with a demand-priority queue at a 16.4 GB budget; pre-registered range +9.8 … +16.2 % (FIFO, today's stager order, all BELOW); server budget lowers it; host cost unpriced → prototype-gated.** Full record: the S22 row in the backlog archive | — | done |
 | **S24** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-05 by the USER:** the S11-L7 prototype runs next (S25); decisions (1) `batched_generate`, (3) host-side levers, (4) `fla`, (5) the S20 VRAM-plan follow-up move to S26. Full text: the S24 row in the backlog archive | — | done |
 | **S25** ✅ | ~~S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next~~ — **CLOSED 2026-10-05, REFUTED: +5.56 % decode tok/s on device (in1n m=2, FIFO; ids identical; B0 projected +13 … +15 %), below the +12 % stop line → SETTLED; prototype deleted.** Full row: the S25 row in the backlog archive; `docs/2026-10-05-S25-prefetch-prototype-RESULTS.md` | — | done |
-| **S26** | **Re-prioritise with the USER (S24's remainder + S25's number)** — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan follow-up. **The inputs were pre-gathered at `main` `74853c6`** (see the durable row); the fresh session re-checks them, presents them and waits for the USER | — | a conversation (fresh session) |
+| **S26** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-06 by the USER: host levers first.** S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no; the S20 VRAM follow-up stays parked. Full text: the S26 row in the backlog archive | — | done |
+| **S27** | **Price the Qwen3-Next host levers at HEAD — MEASURE ONLY.** Covers S11-L3's five seams and the post-S12 eager residue's five pieces, at server settings with O_DIRECT. Each piece gets the saving a concrete change would deliver, not a ceiling. Inputs pre-gathered in the durable row | the agent's model; S25 showed host CPU is the binding constraint at N=1; S21's numbers predate A2 and the O_DIRECT fix | 1–2 days |
+| **S28** | **Build the single best host lever from S27**, ABBA at the server's own settings, ids identical. If S27 finds no piece that clears its bar, this row closes unbuilt and S29 is next | S27's number | days (set by S27) |
+| **S29** | **Buffered vs O_DIRECT where the engine still chooses buffered** (Llama-3.3-70B, gpt-oss-20b), measure, then fix the choice if it is wrong | cheap; it reaches every streamed dense token at N=1; the wrong mode cost Qwen3-Next 17 % | hours |
+| **S30** | **Batching design row: make N>1 reachable through the server.** Opens by asking the USER whether to design now or park until Rudra fans out | strategic (CLAUDE.md §0 fan-out), but worth 0 % at N=1; week-class | a conversation, then ≥ 1 week |
 
 ## Durable rows (the briefs)
 
@@ -125,51 +142,111 @@ USER's pick. It decides nothing alone, then writes the chosen rows (S27…) into
 
 - [x] **S25 — S11-L7 decode-prefetch prototype — ✅ CLOSED 2026-10-05, REFUTED: +5.56 % decode tok/s on device (in1n m=2, FIFO; ids identical; B0 projected +13 … +15 %), below the +12 % stop line → SETTLED; prototype deleted.** Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-05-S25-prefetch-prototype-RESULTS.md`.
 
-- [ ] **S26 — re-prioritise with the USER (S24's remainder + S25's number).** Decisions owed: **(a) is gone: S11-L7 was refuted by S25 (+5.56 % decode tok/s on device, SETTLED), so the decisions are (b)…(e).** **(b) wire `batched_generate` into the server** — the
-      strategic one: `CLAUDE.md` §0 names parallel fan-out (sub-agents) a first-class workload, yet the server runs N=1
-      and every N>1 win (P8's +3.21 %, the batch admission work) is banked at 0 %; a week-class design. Before batching
-      reaches DeepSeek-V4, guard its hash routing: the routed layers read the ids stashed on the model for the WHOLE
-      batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive). **(c) the host-side levers:** the
-      post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s, days) — together the 26.7
-      ms/token of host CPU work S21 measured. **(d)** S3-C's new dependency (`fla`): 4.7 % of a cold-8k turn, 0.4 % of
-      the representative one — below both bars; recommendation no. **(e)** the S20 VRAM-plan follow-up, if its trigger
-      fired. Inputs: S21's ranked table (backlog archive, S21 row), S22's and S25's results, the OPEN list. Then set the
-      next sequence here.
-      **INPUTS PRE-GATHERED at `main` `74853c6` (end of the S25 session, 2026-10-05). Re-verify them at HEAD, present
-      them, and wait for the USER:**
-      - **What S25 taught:** HOST work is the binding constraint at N=1.
-        - Prefetch cut the decode stall by 1.77 s per HIT turn, but only about half of that reached decode
-          (3.13 ms/token saved): the host cost of ~45 extra reads per token ate the rest.
-        - S21 measured **26.7 ms/token of host CPU work in a ~58 ms Qwen3-Next decode token**.
-      - **(c) host-side levers:** the agent's model, N=1, reachable today.
-        - The post-S12 eager residue (OPEN-list "Lead (S21)"): ≤ 9.1 ms/token = ≤ 2.3 s/turn as a ceiling. Several
-          separate pieces, and the build is unpriced.
-        - S11-L3 (expert-path host trim): 8.1 ms/token host − overlap = 6–8 ms, 1.5–2.1 s/turn; days.
-        - **Recommendation (the S25 controller's, not a measurement):** start measure-only. Price each piece at the
-          server's settings, then build the single best piece in its own row.
-      - **(b) batching:** the machinery exists from P10.
-        - `vaayu/server/scheduler.py` and `EngineHandle.run_batch()` drive `batched_generate`. But
-          `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`), and the config says it is inert on flash
-          (`config.py:212`). So the work is making N>1 reachable, a week-class design.
-        - **Catch on the agent's model:** `batched_generate` skips the prefix cache on recurrent-state (hybrid)
-          models by design (S20), so batching Qwen3-Next gives up its top TTFT lever.
-        - Its value also depends on a client that fans out: Rudra does not depend on Vaayu yet.
-        - Also keep the DeepSeek-V4 hash-routing guard above.
-      - **(d) `fla`:** no. It is 0.4 % of the representative turn, below both bars.
-      - **(e) the S20 VRAM-plan follow-up:** its trigger has NOT fired (no prefill OOM; Qwen3-Next's
-        `num_experts × blob` is 0.84 of 2 GiB headroom). It stays parked in the OPEN list.
-      - **Cheap side candidate (hours):** the OPEN-list lead "is buffered still right where the engine still chooses
-        it?". Llama-3.3-70B and gpt-oss still pick buffered I/O and were never measured against O_DIRECT; on
-        Qwen3-Next the wrong mode cost 17 % of the turn. Reach: every streamed dense token, server default.
-      - **A possible order, for the USER to accept or change (NOT decided), one fresh session each:**
-        - S27 = price the host levers (measure-only);
-        - S28 = build the best one;
-        - the buffered-I/O check as a short row wherever the USER wants it;
-        - batching as its own design row after that.
+- [x] **S26 — re-prioritise with the USER — ✅ DECIDED 2026-10-06.** The USER chose host levers first: S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no (S3-C closed); the S20 VRAM follow-up stays parked (trigger not fired). Inputs re-verified at `a561d95` (code unchanged since `74853c6`); S21's host figures flagged stale (pre-A2, pre-O_DIRECT fix). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
+
+- [ ] **S27 — price the Qwen3-Next host levers at HEAD, MEASURE ONLY (set by the USER at S26, 2026-10-06).**
+      **Question:** for each host-side piece of a Qwen3-Next decode token, how many ms would ONE concrete change
+      remove, at the server's own settings? Which single piece, if any, is worth building as S28?
+      **Why now:** S25 refuted S11-L7 because host CPU ate half its win. The stall it removed was 1.77 s per HIT turn,
+      but decode saved only 3.13 ms/token. S21 found ~44 % of a decode token is host CPU work: 26.7 ms/token, with the
+      GPU idle ~62 %.
+      **INPUTS PRE-GATHERED at `main` `a561d95` (S26 session, 2026-10-06). Re-verify at HEAD:**
+      - **The pieces, with S21's numbers** (U_HOST arm, 8k, `BALLAST_GB=25`, `plans/probes/s21_out/decode-on1.log`;
+        exclusive host ms/token):
+        - S11-L3, the expert path: DISP 1.22, SETTLE 1.94, BLOB 2.11, UPLOAD 2.52, MOE 5.63. That is 13.43 ms of host,
+          minus 5.35 ms of device time = 8.1 ms (6–8 after the overlap with in-flight reads).
+        - The post-S12 eager residue: ATTNCORE 2.96 (device 0.78), KERNEL 4.62 (device 2.84), FWD 3.14, GRRUN 1.36,
+          GRAPH 0.64 (108 replays) = ≤ 9.1 ms.
+        - Not host levers: LOADWAIT 19.38 (the host is blocked on expert reads, i.e. the stall) and SYNC@S21_MOE
+          13.83 (the host is blocked on the GPU at the routing syncs).
+      - **S21's numbers are STALE.** They were taken before A2 (`86b62fb`, one io_uring wave per expert) and before
+        the O_DIRECT fix (`a588ff4`). HIT decode today is 53.9–58.2 ms/token; S21's U_HOST token was 61.17 ms. So
+        re-measure both ceilings before pricing anything.
+      - **Code at `a561d95`:**
+        - `vaayu/moe_patch.py`: `_upload_packed_expert` :581, `_make_fused_sparse_forward` :2252, `decode_pre`
+          :2282, `sparse_forward` :2294, `_settle_miss_upload` :2704, `_dispatch_expert_misses` :2747
+          (`_load_one` :2838).
+        - `vaayu/decode_graphs.py`: `_Record.replay` :408, `DecodeGraphRunner.run` :492.
+      - **Probe base: `plans/probes/s21_decode.py`.**
+        - It attributes host time exclusively, per thread, and self-tests that the labels sum to the timed forward.
+          A CUPTI arm (U_CNT) gives the device time.
+        - It wraps moe_patch helpers by name (:210–219), and `_iter_expert_loads` for LOADWAIT.
+        - Re-check that every wrapped name still exists AND fires. A2 moved slab reads to `io_uring_read_segments`,
+          so wrap `load_expert_into_slab`, not the Rust call (REFERENCE).
+      - **Traps** (memories and REFERENCE):
+        - Use a DIFFERENT prompt per arm. A repeated request re-decodes a warm tier: 0 disk reads.
+        - Call `freeze_after_load()`, as the server does.
+        - Graphs ON.
+        - Let the engine choose its own I/O mode, and grep `O_DIRECT` and `Expert RAM cache:` in every arm's log.
+          Pin `BALLAST_GB` if two arms' budgets differ by more than 0.2 GB.
+        - Run FOREGROUND, under a 29G cgroup. Never attach py-spy.
+        - An idle package costs Qwen decode ~21 %, so a probe that synchronizes runs FASTER than the real thing.
+          Profiled ms are for attribution; take tok/s from an unprofiled arm.
+      **Method (a proposal; the S27 session settles it with the USER before measuring):**
+      1. Re-run the census at HEAD.
+      2. For each piece, name the concrete change and price it. Use a cheap, bit-safe in-probe arm where one exists;
+         otherwise use census arithmetic and state the overlap assumed.
+      3. Rank the pieces in s/turn on today's representative HIT turn. That turn is 8,675 tokens + 256 generated, at
+         the server's own budget with O_DIRECT: 15.5 s (the six-turn mean is 17.86 s).
+      **Bar for S28 (proposed; this is S21's stop rule):** build a piece only if its priced saving is ≥ 5 % of the
+      representative HIT turn, ≈ 0.8–0.9 s/turn ≈ 3–3.5 ms/token. If no piece clears the bar, S28 closes unbuilt.
+      **§8:** (1) no knob, measure only; (2)/(3) server mode, N=1; (4) nothing banked: the output is S28's choice.
+
+- [ ] **S28 — build the single best host lever from S27 (set by the USER at S26, 2026-10-06).** S27's verdict is the
+      brief.
+      - **Process:** brainstorm → spec → USER approval → dry run → plan → subagent-driven execution → final review
+        (the USER's standing choice).
+      - **KEEP rule, pre-registered in the spec:** ABBA (off, on, on, off) on the agent session at the server's own
+        settings; greedy ids identical; saving at or above the bar S27 set.
+      - **Gates:**
+        - Always: the full suite, the `MOE_CKPT=` accumulator gate on Qwen3-Next, and the `SERVER_CKPT=` server gate.
+        - If the change touches shared infra (staging, io_uring, prefix cache, decode graphs): also the dense gate on
+          both Llama checkpoints and the MiniMax accumulator gate.
+        - If the change is in a helper that other forwards call: it must hold on every forward that calls it
+          (CLAUDE.md §5).
+      - **§8:** the spec answers all four.
+      - **If S27 finds nothing that clears the bar,** this row closes unbuilt with S27's number, and S29 is next.
+
+- [ ] **S29 — buffered vs O_DIRECT where the engine still chooses buffered (set by the USER at S26, 2026-10-06).**
+      The brief is the OPEN-list lead "is buffered still right where the engine still chooses it?" (Qwen3-Next
+      section below): the method, 8 mirrored Llama-3.3-70B arms plus one gpt-oss pair, and per turn the delivered vs
+      requested bytes and `pgsteal`.
+      - **Pre-gathered at `a561d95`:** `_should_use_direct_io` (`vaayu/persist/safetensor_model_persister.py:284`)
+        subtracts only `expert_arena_bytes`. A dense model has no expert arena, so Llama-3.3-70B (39 GB) with
+        ~27 GiB free comes out ~52 % cacheable and goes buffered.
+      - **The dense RAM tensor cache is not subtracted either.** `RAM_CACHE_BUDGET_GB = None` derives it from TOTAL
+        RAM, and it competes for the same free RAM.
+      - **Stop rule:**
+        - If O_DIRECT beats buffered by more than the arm spread on a model, fix the choice. The design is that
+          session's, e.g. charge the dense RAM cache the way the expert arena is charged. Then run the dense gate on
+          both Llama checkpoints.
+        - Otherwise close the row with the numbers.
+      - **Reach:** every token of a streamed dense model, and gpt-oss, at N=1, server default. Hours.
+
+- [ ] **S30 — batching design: make N>1 reachable through the server (set by the USER at S26, 2026-10-06).**
+      **Opens with one USER question:** design now, or park it in `todo-backlog.md` until Rudra depends on Vaayu and
+      fans out? Its value is 0 % at N=1 (CLAUDE.md §8).
+      **INPUTS PRE-GATHERED at `a561d95`. Re-verify at HEAD:**
+      - **The machinery exists, from P10.** `vaayu/server/scheduler.py` (a dispatcher; it calls `run_batch` at
+        :492) and `EngineHandle.run_batch()` (`vaayu/server/engine.py:845`) drive `batched_generate`
+        (`vaayu_base.py:6728`).
+      - **What makes it unreachable today:**
+        - `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`).
+        - Batching needs sdpa, but `ATTN_IMPLEMENTATION = None` prefers flash (`config.py:212`). On flash the knob is
+          inert. sdpa costs −2.3 % MiniMax / −4.1 % Qwen end to end.
+      - **Catches:**
+        - **Qwen3-Next loses its prefix cache.** `batched_generate` refuses the prefix cache on recurrent-state
+          models (`vaayu_base.py:6846`), so batching the agent's model gives up its top TTFT lever.
+        - **DeepSeek-V4 routing must be guarded first.** Its hash-routed layers read the ids stashed for the WHOLE
+          batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive).
+        - **MiniMax OOMs at N=3.** The config comment's record: N=2 is +1.606× on MiniMax-M2.7, and N=3 OOMs at
+          `model.layers.22`.
+      - **Backlog items that re-open with it:** #5 (stager re-runs per batched chunk), #6 (`head_bytes`), #33 (P10
+        batching minors and the sentinel-only cancel `[bug]`).
 
 ---
 
-# OPEN — not sequenced (re-rank at S26)
+# OPEN — not sequenced (re-rank at the next re-prioritise row, after S30)
 
 Each item below is copied verbatim from the pre-cleanup `todo.md` (its origin is named in italics; the row it came
 from is in the archive in `todo-backlog.md`). Line numbers inside the text are as of when it was written — re-verify
@@ -185,17 +262,17 @@ at HEAD before acting.
   either. The HIT prefill stall (58 % of TTFT) is now S22-A1's target (read concurrency). Full text in the backlog
   archive.
 
-- [ ] **S11-L3 — expert-path host trim** (DISP + SETTLE + BLOB + UPLOAD issue + MOE remainder):
+- [ ] **S11-L3 — expert-path host trim — = S27 (priced) / S28 (built if best)** (DISP + SETTLE + BLOB + UPLOAD issue + MOE remainder):
   4.81–5.50 ms = **8.4–9.6 %**, 1.23–1.41 s/turn; days (five seams, no single change covers them);
   reach: every decode token at N=1. Evidence `arms.U_HOST.host_ms_per_tok.S11_{DISP,SETTLE,BLOB,
   UPLOAD,MOE}` − `U_CNT` device of MOE / BLOB / UPLOAD.
   **Re-priced by S21 (U_HOST, 8k, BALLAST 25, `s21_out/decode-on1.log`): host 13.43 ms (DISP 1.22, SETTLE 1.94,
   BLOB 2.11, UPLOAD 2.52, MOE 5.63) − device 5.35 = 8.1 ms/token (6–8 after the overlap with in-flight reads) =
-  1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S26 decides it with the eager residue below.
+  1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S26 (2026-10-06): priced by S27 with the eager residue below.
 
 - [x] **S11-L7 — cross-layer expert prefetch — ✅ CLOSED 2026-10-05, REFUTED by S25: +5.56 % decode tok/s on device (B0 projected +13 … +15 %) → SETTLED.** Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
-- [ ] **Lead (S21): the post-S12 eager residue** — after the graphs, a decode token still spends on the host
+- [ ] **Lead (S21): the post-S12 eager residue — = S27 (priced) / S28 (built if best)** — after the graphs, a decode token still spends on the host
   ATTNCORE 2.96 ms (device 0.78; the eager attention core of the 12 full-attention layers), KERNEL 4.62 (device
   2.84; the packed decode kernel's pointer table + launches), FWD 3.14 (the forward outside the layers), GRRUN 1.36
   (graph bind/signature), GRAPH 0.64 (108 replays) = **≤ 9.1 ms/token = ≤ 2.3 s/turn (11.5 %) as a ceiling**; several
@@ -207,7 +284,7 @@ at HEAD before acting.
   **22.41 → 17.86 s (−20.3 %; −17.4 % with the RAM budget held equal)**, ids identical; only Qwen3-Next's choice
   changes among the six on-device checkpoints. Suite 3684; dense, accumulator and server gates green. Full text:
   `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
-- [ ] **Lead (from the fix above, 2026-10-04): is buffered still right where the engine still chooses it?**
+- [ ] **Lead (from the fix above, 2026-10-04): is buffered still right where the engine still chooses it? — = S29 (USER, S26 2026-10-06)**
   Llama-3.3-70B goes buffered at "50 % cacheable" and gpt-oss at 77 %; neither was measured against O_DIRECT, and
   on Qwen3-Next the page cache served 1–3 % of the bytes read while costing 17 % of the turn. Dense has no expert
   arena, but its own RAM tensor cache competes for the same free RAM. Measure with the mode forced
@@ -221,11 +298,7 @@ at HEAD before acting.
 - [x] **S3-B — ✅ CLOSED 2026-10-03 by S21: subsumed by S12.** Under the decode graphs all 36 GDN mixers replay
   inside the captured segments — 0 eager GDN calls per token (U_HOST, `s21_out/decode-on1.log`). Full text in the
   backlog archive.
-- [ ] **S3-C** — `fla`'s prefill chunk kernel, ~10× the torch chunk fallback (0.36 → 0.03 s per 2k
-  prompt, ~2 % TTFT); a new-dependency decision. **S11 re-price (2026-09-28):** ≤1.02 s = **≤3.7 % of a
-  cold@8k TTFT** (0.28 s = 2.7 % cold@2k, 0.06 s = 2.0 % of a HIT) — below 5 % everywhere.
-  **S21 re-price (after S20): ≈ 1.36 s per cold 8k = 4.7 % of a cold-8k TURN, 0.08 s = 0.4 % of the
-  representative turn — below both S21 bars. Recommendation at S26: no.**
+- [x] **S3-C — `fla` prefill chunk kernel — ✅ CLOSED 2026-10-06 by the USER at S26: no.** A new dependency for ≈ 1.36 s per cold 8k (4.7 % of a cold-8k turn) and 0.08 s (0.4 %) of the representative turn, below both S21 bars. Full text: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 *From the S1 row (closed 2026-09-25).*
 
@@ -235,7 +308,7 @@ at HEAD before acting.
 
 *From the S20 row (closed and merged 2026-10-03, `4eeab9b`). Conditional — not for building now.*
 
-- [ ] **OPEN FOLLOW-UP, NOT BUILT (from the final review's I2):** charge `resident_expert_bytes = num_experts × expert_bytes` in the VRAM plan for the fused non-EXL3 forward too (today fused-EXL3 only), so the plan knows what a prefill call (and chunk-major retention, which predates S20) holds. Cost on Qwen3-Next ≤ ~0.26 GiB of reserve (the term is a `max()` with the logits transient) → re-measure decode and TTFT. **Re-open when:** a model on this forward whose `num_experts × blob bytes` is a larger share of its headroom than Qwen3-Next's 0.84 GiB of 2 GiB, or any prefill OOM on this forward. (Pre-existing, noted by the re-review: `_is_silu` and the load-time verdicts use block 0 only.)
+- [ ] **OPEN FOLLOW-UP, NOT BUILT (from the final review's I2):** charge `resident_expert_bytes = num_experts × expert_bytes` in the VRAM plan for the fused non-EXL3 forward too (today fused-EXL3 only), so the plan knows what a prefill call (and chunk-major retention, which predates S20) holds. Cost on Qwen3-Next ≤ ~0.26 GiB of reserve (the term is a `max()` with the logits transient) → re-measure decode and TTFT. **Re-open when:** a model on this forward whose `num_experts × blob bytes` is a larger share of its headroom than Qwen3-Next's 0.84 GiB of 2 GiB, or any prefill OOM on this forward. **S26 (2026-10-06): trigger not fired; stays parked.** (Pre-existing, noted by the re-review: `_is_silu` and the load-time verdicts use block 0 only.)
 
 ## gpt-oss-20b
 

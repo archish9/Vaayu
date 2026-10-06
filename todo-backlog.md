@@ -34,7 +34,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 16 | `vaayu/expert_sim.py`'s anchor gap | STILL OPEN | internal simulator with no user path | before anyone quotes its small-budget absolutes |
 | 17 | `test_slab_arena` order-dependent full-suite failure | STILL OPEN | not reproduced in three full-suite runs (2026-09-25 ×2, 2026-09-26) | the next full-suite failure of this test — record the run order |
 | 18 | Row 44's F3 remnant (pinned-H2D half of prefill) | STILL OPEN | recorded as NOT recommended: prefill is compute-bound since F6 | Qwen3-Next prefill turns disk- or H2D-bound again |
-| 19 | S1-L3 — `fla` / `causal_conv1d` not installed | S1 row | answered by S3: `fla` measured and REJECTED for decode; its prefill use is S3-C, still in `todo.md` | with S3-C |
+| 19 | S1-L3 — `fla` / `causal_conv1d` not installed | S1 row | answered by S3: `fla` measured and REJECTED for decode; its prefill use, S3-C, was closed "no" by the USER at S26 (2026-10-06) | with S3-C |
 | 20 | S10b-a — VRAM reserve sizes a compressed layer from its FILE bytes | S10b row (added 2026-09-28) | `compression` is library-only (declined by the server) and every production model refuses it | a bf16 dense checkpoint too big for VRAM is run with `compression`, or compression reaches the server |
 | 21 | S10b-b — `check_space` crashes on a not-yet-existing `layer_shards_saving_path` | S10b row (added 2026-09-28) | `layer_shards_saving_path` is library-only (declined by the server) | the server exposes `layer_shards_saving_path`, or a library user reports it |
 | 22 | S10c-a — `load_layer_to_cpu` treats ANY head load failure as a tied head | S10c row (added 2026-09-28) | only the prefetching-OFF route, which the server never takes (`prefetching` not exposed, `compression` declined) | the server can run with `prefetching=False` or `compression`, or a library user reports a swapped head |
@@ -577,7 +577,7 @@ prefix-reused turn, or a task score), not another score-error number.
 
 ## 19. S1-L3 — `fla` / `causal_conv1d` not installed
 
-*Moved from `todo.md` (S1 row) 2026-09-26.* **Why here:** answered by S3: `fla` measured and REJECTED for decode; its prefill use is S3-C, still in `todo.md`. **Re-open when:** with S3-C.
+*Moved from `todo.md` (S1 row) 2026-09-26.* **Why here:** answered by S3: `fla` measured and REJECTED for decode; its prefill use, S3-C, was closed "no" by the USER at S26 (2026-10-06). **Re-open when:** with S3-C.
 
 - **[ ] S1-L3 — neither `fla` nor `causal_conv1d` is installed**, which is *why*
   `self.recurrent_gated_delta_rule` is the pure-torch fallback at all
@@ -8214,3 +8214,51 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   alone (`in1n` m=2) +13.0 … +15.4 % pre-registered. Server budget lowers the gain. Prototype = **S25** (USER, 2026-10-05); a
   build must pass CLAUDE.md §5 on every per-expert forward (the predictor's re-norm is Qwen3-Next's norm form).
   RESULTS `docs/2026-10-05-S22-B0-predictor-pricing-RESULTS.md`.**
+
+- [x] **S26 — ✅ DECIDED 2026-10-06 by the USER: host levers first. S27 prices them (measure-only), S28 builds the best piece, S29 is the buffered-vs-O_DIRECT check (Llama-3.3-70B, gpt-oss), S30 is the batching design row; (d) `fla` no (S3-C closed); (e) the S20 VRAM-plan follow-up stays parked (trigger not fired). Inputs re-verified at `main` `a561d95`: code unchanged since `74853c6`, every pointer held; S21's host figures predate A2 (`86b62fb`) and the O_DIRECT fix (`a588ff4`), so S27 re-measures them. Row as it stood at close:** **S26 — re-prioritise with the USER (S24's remainder + S25's number).** Decisions owed: **(a) is gone: S11-L7 was refuted by S25 (+5.56 % decode tok/s on device, SETTLED), so the decisions are (b)…(e).** **(b) wire `batched_generate` into the server** — the
+      strategic one: `CLAUDE.md` §0 names parallel fan-out (sub-agents) a first-class workload, yet the server runs N=1
+      and every N>1 win (P8's +3.21 %, the batch admission work) is banked at 0 %; a week-class design. Before batching
+      reaches DeepSeek-V4, guard its hash routing: the routed layers read the ids stashed on the model for the WHOLE
+      batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive). **(c) the host-side levers:** the
+      post-S12 eager residue (≤ 2.3 s/turn ceiling, several seams) and S11-L3 (1.5–2.1 s, days) — together the 26.7
+      ms/token of host CPU work S21 measured. **(d)** S3-C's new dependency (`fla`): 4.7 % of a cold-8k turn, 0.4 % of
+      the representative one — below both bars; recommendation no. **(e)** the S20 VRAM-plan follow-up, if its trigger
+      fired. Inputs: S21's ranked table (backlog archive, S21 row), S22's and S25's results, the OPEN list. Then set the
+      next sequence here.
+      **INPUTS PRE-GATHERED at `main` `74853c6` (end of the S25 session, 2026-10-05). Re-verify them at HEAD, present
+      them, and wait for the USER:**
+      - **What S25 taught:** HOST work is the binding constraint at N=1.
+        - Prefetch cut the decode stall by 1.77 s per HIT turn, but only about half of that reached decode
+          (3.13 ms/token saved): the host cost of ~45 extra reads per token ate the rest.
+        - S21 measured **26.7 ms/token of host CPU work in a ~58 ms Qwen3-Next decode token**.
+      - **(c) host-side levers:** the agent's model, N=1, reachable today.
+        - The post-S12 eager residue (OPEN-list "Lead (S21)"): ≤ 9.1 ms/token = ≤ 2.3 s/turn as a ceiling. Several
+          separate pieces, and the build is unpriced.
+        - S11-L3 (expert-path host trim): 8.1 ms/token host − overlap = 6–8 ms, 1.5–2.1 s/turn; days.
+        - **Recommendation (the S25 controller's, not a measurement):** start measure-only. Price each piece at the
+          server's settings, then build the single best piece in its own row.
+      - **(b) batching:** the machinery exists from P10.
+        - `vaayu/server/scheduler.py` and `EngineHandle.run_batch()` drive `batched_generate`. But
+          `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`), and the config says it is inert on flash
+          (`config.py:212`). So the work is making N>1 reachable, a week-class design.
+        - **Catch on the agent's model:** `batched_generate` skips the prefix cache on recurrent-state (hybrid)
+          models by design (S20), so batching Qwen3-Next gives up its top TTFT lever.
+        - Its value also depends on a client that fans out: Rudra does not depend on Vaayu yet.
+        - Also keep the DeepSeek-V4 hash-routing guard above.
+      - **(d) `fla`:** no. It is 0.4 % of the representative turn, below both bars.
+      - **(e) the S20 VRAM-plan follow-up:** its trigger has NOT fired (no prefill OOM; Qwen3-Next's
+        `num_experts × blob` is 0.84 of 2 GiB headroom). It stays parked in the OPEN list.
+      - **Cheap side candidate (hours):** the OPEN-list lead "is buffered still right where the engine still chooses
+        it?". Llama-3.3-70B and gpt-oss still pick buffered I/O and were never measured against O_DIRECT; on
+        Qwen3-Next the wrong mode cost 17 % of the turn. Reach: every streamed dense token, server default.
+      - **A possible order, for the USER to accept or change (NOT decided), one fresh session each:**
+        - S27 = price the host levers (measure-only);
+        - S28 = build the best one;
+        - the buffered-I/O check as a short row wherever the USER wants it;
+        - batching as its own design row after that.
+
+- [x] **S3-C — ✅ CLOSED 2026-10-06 by the USER at S26: no (new dependency, below both S21 bars). Row as it stood at close:** **S3-C** — `fla`'s prefill chunk kernel, ~10× the torch chunk fallback (0.36 → 0.03 s per 2k
+  prompt, ~2 % TTFT); a new-dependency decision. **S11 re-price (2026-09-28):** ≤1.02 s = **≤3.7 % of a
+  cold@8k TTFT** (0.28 s = 2.7 % cold@2k, 0.06 s = 2.0 % of a HIT) — below 5 % everywhere.
+  **S21 re-price (after S20): ≈ 1.36 s per cold 8k = 4.7 % of a cold-8k TURN, 0.08 s = 0.4 % of the
+  representative turn — below both S21 bars. Recommendation at S26: no.**
