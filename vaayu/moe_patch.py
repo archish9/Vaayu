@@ -2339,21 +2339,10 @@ def _make_fused_sparse_forward(
                 if _held is not None:
                     _blobs[eidx] = _held
                     continue
-                _packed = _group_packed_tensors_by_weight(raw)
-                if not _packed["gate"]:
-                    _wg, _wd, _wu, _entry = _expert_dense_weights(raw, device, dtype)
-                    _math = _entry if _wg is not None else None
-                elif _packed_roles_complete(_packed):
-                    _on_dev = _upload_packed_expert(_packed, device)
-                    _entry = build_expert_blob(_on_dev)
-                    _math = (_entry if _entry is not None
-                             else {"dense": dequantize_expert_weights(_on_dev, dtype)})
-                else:
-                    _entry = _math = None
-                _settle_miss_upload(
-                    eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
-                    vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=None,
-                    cm_last_call=False, cm_budget=0)
+                _math = _packed_miss_entry(
+                    eidx, raw, device=device, dtype=dtype, timing=None, layer_idx=layer_idx,
+                    expert_cache=expert_cache, vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys,
+                    vram=_vram, cm=None, cm_last_call=False, cm_budget=0)
                 if _math is not None:
                     _blobs[eidx] = _math
             _pairs = [(_blobs[_eids[s]], s)
@@ -2560,27 +2549,12 @@ def _make_fused_sparse_forward(
                         if _prof:
                             _mp['slots_hit'] += 1
                         continue
-                    # `_entry` is what the VRAM tier stores, exactly as the loop below
-                    # stores it; `_math` is what this call computes with. They differ
-                    # only for packed roles at different widths (no fused pass): stock
-                    # dequantizes those role by role and caches nothing, and so does this.
                     # The installer read ONE expert, so a later layer may be unpacked or
                     # mixed; packed_experts_decode runs any such call the stock way.
-                    _packed = _group_packed_tensors_by_weight(raw)
-                    if not _packed["gate"]:
-                        _wg, _wd, _wu, _entry = _expert_dense_weights(
-                            raw, device, dtype, timing=_mp)
-                        _math = _entry if _wg is not None else None
-                    elif _packed_roles_complete(_packed):
-                        _on_dev = _upload_packed_expert(_packed, device, _mp)
-                        _entry = build_expert_blob(_on_dev)
-                        _math = (_entry if _entry is not None
-                                 else {"dense": dequantize_expert_weights(_on_dev, dtype)})
-                    else:
-                        _entry = _math = None      # a missing role: stock skips it too
-                    _settle_miss_upload(
-                        eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
-                        vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
+                    _math = _packed_miss_entry(
+                        eidx, raw, device=device, dtype=dtype, timing=_mp,
+                        layer_idx=layer_idx, expert_cache=expert_cache, vaayu_ref=vaayu_ref,
+                        pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
                         cm_last_call=_cm_last_call, cm_budget=_cm_budget)
                     if _math is not None:
                         _blobs[eidx] = _math
@@ -2799,6 +2773,33 @@ def _release_prefill_staged(expert_cache, vaayu_ref, pred) -> None:
         slab_idx = staged.pop(key, None)
         if slab_idx is not None:
             arena.release_staging(slab_idx)
+
+
+def _packed_miss_entry(eidx, raw, *, device, dtype, timing, layer_idx, expert_cache, vaayu_ref,
+                       pinned_keys, vram, cm, cm_last_call, cm_budget):
+    """What a missed expert computes with on the fused forward's packed-kernel decode paths
+    (its lean branch and its `_use_pk` branch -- one copy, S28, so they cannot drift): the
+    entry is uploaded and settled, and the tensors this call computes with are returned --
+    None when stock skips the expert (a missing role).
+
+    The entry is what the VRAM tier stores; the return value is what this call computes with.
+    They differ only for packed roles at different widths (no fused pass): stock dequantizes
+    those role by role and caches nothing, and so does this."""
+    packed = _group_packed_tensors_by_weight(raw)
+    if not packed["gate"]:
+        wg, _wd, _wu, entry = _expert_dense_weights(raw, device, dtype, timing=timing)
+        math = entry if wg is not None else None
+    elif _packed_roles_complete(packed):
+        on_dev = _upload_packed_expert(packed, device, timing)
+        entry = build_expert_blob(on_dev)
+        math = (entry if entry is not None
+                else {"dense": dequantize_expert_weights(on_dev, dtype)})
+    else:
+        entry = math = None      # a missing role: stock skips it too
+    _settle_miss_upload(eidx, raw, entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                        vaayu_ref=vaayu_ref, pinned_keys=pinned_keys, vram=vram, cm=cm,
+                        cm_last_call=cm_last_call, cm_budget=cm_budget)
+    return math
 
 
 def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,
