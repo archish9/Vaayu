@@ -228,11 +228,6 @@ def _decode_limits(vaayu_ref):
             getattr(vaayu_ref, "_decode_top_p", None))
 
 
-# S28 prototype switch: the pieces of the MoE-visit host fast path a probe turned on
-# (`vaayu_ref._s28_pieces`, any of "c11", "c5", "c4"). Empty -- every piece OFF -- unless
-# a probe sets it; nothing in the engine or the server does.
-_NO_PIECES = frozenset()
-
 
 def _routing_to_host(expert_indices):
     """S28 C11: a MoE visit's routing on the host through ONE device-to-host sync.
@@ -1727,11 +1722,7 @@ def _make_modulelist_sparse_forward(
             routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        if "c11" in getattr(vaayu_ref, "_s28_pieces", _NO_PIECES):
-            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
-        else:
-            expert_indices_cpu = None
-            unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
         if _prof:
             _mp['route'] += time.perf_counter() - _t0
 
@@ -1778,8 +1769,6 @@ def _make_modulelist_sparse_forward(
         _lookahead_step(vaayu_ref, expert_cache, offset_index, checkpoint_path,
                         layer_idx, hidden_states, top_k, unique_experts)
         B, S, H = hidden_states.shape
-        if expert_indices_cpu is None:
-            expert_indices_cpu = expert_indices.cpu()
         _pair, _starts, _counts_l = compute_expert_dispatch(
             expert_indices_cpu.reshape(-1, expert_indices.shape[-1]),
             len(experts_list))
@@ -2321,7 +2310,7 @@ def _make_fused_sparse_forward(
     _shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
     _moe_mod = block_info.moe_module
 
-    def _lean_decode(hidden_states, _pre, pieces):
+    def _lean_decode(hidden_states, _pre):
         """S28 C4: a one-token decode visit on the packed kernels, with nothing a decode
         never needs -- no prefill headroom, chunk-major retention, prefill-kernel lookup,
         profile marks or per-call path join, and no zeroed accumulator (the kernel
@@ -2336,11 +2325,7 @@ def _make_fused_sparse_forward(
         else:
             routing_weights, expert_indices, _shared = _pre
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        if "c11" in pieces:
-            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
-        else:
-            unique_experts = expert_indices.flatten().unique().tolist()
-            expert_indices_cpu = expert_indices.cpu()
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
         _eids = expert_indices_cpu.view(-1).tolist()
         _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
         expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
@@ -2377,7 +2362,7 @@ def _make_fused_sparse_forward(
             if _pre is None:
                 _shared = _shared_expert_output(_moe_mod, flat_hidden)
             result = None
-            if _pairs and _pre is not None and "c5" in pieces:
+            if _pairs and _pre is not None:
                 result = packed_experts_decode_graphed(
                     layer_idx, flat_hidden, _pairs, routing_weights, _shared, _act_fn,
                     tail=True)
@@ -2401,14 +2386,13 @@ def _make_fused_sparse_forward(
         return result.view(B, S, H)
 
     def sparse_forward(hidden_states, _pre=None, **kwargs):
-        _pieces = getattr(vaayu_ref, "_s28_pieces", _NO_PIECES)
-        if ("c4" in _pieces and hidden_states.shape[0] * hidden_states.shape[1] == 1
+        if (hidden_states.shape[0] * hidden_states.shape[1] == 1
                 and not getattr(vaayu_ref, "_moe_prefill_pass", False)
                 and getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
                 and not getattr(vaayu_ref, "profiling_mode", False)
                 and getattr(vaayu_ref, "_batch_n", 1) == 1
                 and layer_name not in vaayu_ref.pinned_layer_names):
-            return _lean_decode(hidden_states, _pre, _pieces)
+            return _lean_decode(hidden_states, _pre)
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
@@ -2432,9 +2416,9 @@ def _make_fused_sparse_forward(
         B, S, H = hidden_states.shape
         flat_hidden = hidden_states.view(-1, H)
 
-        # 'route' brackets the router forward, the top-k and the
-        # unique().tolist() sync below -- the same window the other two forwards
-        # call route.
+        # 'route' brackets the router forward, the top-k and the routing
+        # sync below (_routing_to_host) -- the same window the other two
+        # forwards call route.
         _t_route = _mark()
         if _pre is None:
             routing_weights, expert_indices = _route(flat_hidden)
@@ -2447,11 +2431,7 @@ def _make_fused_sparse_forward(
                        "cache-aware routing")
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        if "c11" in _pieces:
-            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
-        else:
-            expert_indices_cpu = None
-            unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
         if _prof:
             _mp['route'] += time.perf_counter() - _t_route
 
@@ -2545,8 +2525,6 @@ def _make_fused_sparse_forward(
             # plus two tiny per-expert copies. Each expert's positions are a
             # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
-            if expert_indices_cpu is None:
-                expert_indices_cpu = expert_indices.cpu()
             if _use_pk:
                 # The per-slot loop below never runs on this branch: the kernel branch
                 # consumes every load first. Bound anyway, so no name in that loop is
@@ -2629,15 +2607,8 @@ def _make_fused_sparse_forward(
                               if _eids[s] in _blobs]
                     if _pairs:
                         _t_gemm = _mark() if _prof else 0.0
-                        _g = (packed_experts_decode_graphed(
-                                  layer_idx, flat_hidden, _pairs, routing_weights, None,
-                                  act_fn, tail=False)
-                              if "c5" in _pieces and _pre is not None else None)
-                        if _g is not None:
-                            final_hidden = _g        # static: consumed by the cast below
-                        else:
-                            packed_experts_decode(flat_hidden, _pairs, routing_weights,
-                                                  final_hidden, act_fn)
+                        packed_experts_decode(flat_hidden, _pairs, routing_weights,
+                                              final_hidden, act_fn)
                         if _prof:
                             _mp['gemm'] += _mark() - _t_gemm
                 _loads = ()      # every expert was consumed above

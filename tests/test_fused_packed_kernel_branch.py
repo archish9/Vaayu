@@ -218,7 +218,7 @@ def test_an_unpacked_expert_is_computed_like_the_per_slot_loop(tmp_path):
     assert torch.equal(cold, stock) and torch.equal(warm, stock)
 
 
-# ── S28: shared helpers, and C5 through the full path ─────────────────────────────────────
+# ── S28: shared helpers ───────────────────────────────────────────────────────────────────
 
 def _with_shared_expert(model):
     """Qwen3-Next's block shape: a gated shared expert beside the router."""
@@ -237,39 +237,15 @@ def _headroom_calls(monkeypatch):
     return calls
 
 
-@cuda
-@pytest.mark.parametrize("pieces", [("c5",), ("c11", "c5")], ids="+".join)
-def test_c5_without_c4_graphs_the_full_paths_kernels(tmp_path, monkeypatch, pieces):
-    """The attribution arm `c11c5`: the full path's kernel call through the graph (no
-    epilogue in it), same bits as OFF; a call without `_pre` never reaches the graph."""
-    from tests.test_packed_expert_kernels import fresh_graphs
-    fresh_graphs(monkeypatch)
-    model, ref, _ = _cuda_model(tmp_path)
-    _with_shared_expert(model)
-    fwd = model.layers[0].mlp.forward
-    x = _x()
-    pre_t = fwd.decode_pre(x)
-    off = fwd(x, _pre=pre_t).clone()
-    calls = _headroom_calls(monkeypatch)
-    ref._s28_pieces = frozenset(pieces)
-    no_pre = fwd(x).clone()
-    assert pk.GRAPH_STATS["captures"] == 0, "no _pre, no graph"
-    got = [fwd(x, _pre=pre_t).clone() for _ in range(3)]
-    assert len(calls) == 4, "premise: every call took the full path"
-    assert (pk.GRAPH_STATS["captures"], pk.GRAPH_STATS["replays"]) == (1, 2)
-    assert torch.equal(no_pre, off) and all(torch.equal(g, off) for g in got)
-
-
 # ── S28 C4: the lean one-token decode branch ──────────────────────────────────────────────
 
 @cuda
-@pytest.mark.parametrize("pieces", [("c4",), ("c4", "c11"), ("c4", "c5"), ("c4", "c11", "c5")],
-                         ids="+".join)
 @pytest.mark.parametrize("pre", [False, True], ids=["no-pre", "s12-pre"])
-def test_the_lean_branch_gives_the_full_paths_bits(tmp_path, monkeypatch, pieces, pre):
+def test_the_lean_branch_gives_the_full_paths_bits(tmp_path, monkeypatch, pre):
     """Cold, warm and re-cold visits through the lean branch against the full path's cold one.
-    With `pre`, ONE decode_pre tuple serves every call -- the static inputs of an S12 replay,
-    so C5 captures and then replays."""
+    The full path is reached with `profiling_mode` (the lean branch excludes it; without a
+    `_moe_profile` dict nothing is timed). With `pre`, ONE decode_pre tuple serves every call --
+    the static inputs of an S12 replay, so C5 captures and then replays."""
     from tests.test_packed_expert_kernels import fresh_graphs
     fresh_graphs(monkeypatch)
     model, ref, _ = _cuda_model(tmp_path)
@@ -278,9 +254,10 @@ def test_the_lean_branch_gives_the_full_paths_bits(tmp_path, monkeypatch, pieces
     x = _x()
     pre_t = fwd.decode_pre(x) if pre else None
     call = (lambda: fwd(x, _pre=pre_t)) if pre else (lambda: fwd(x))
-    full = call().clone()                                   # pieces OFF, every expert a miss
+    ref.profiling_mode = True
+    full = call().clone()                                   # the full path, every expert a miss
+    ref.profiling_mode = False
     calls = _headroom_calls(monkeypatch)
-    ref._s28_pieces = frozenset(pieces)
     warm = call().clone()                                   # VRAM hits
     assert ref._expert_vram_cache.hits > 0, "premise: a warm visit"
     again = call().clone()
@@ -288,9 +265,8 @@ def test_the_lean_branch_gives_the_full_paths_bits(tmp_path, monkeypatch, pieces
     cold = call().clone()                                   # misses again
     assert calls == [], "premise: every call took the lean branch"
     assert torch.equal(warm, full) and torch.equal(again, full) and torch.equal(cold, full)
-    graphed = "c5" in pieces and pre
-    assert (pk.GRAPH_STATS["captures"] > 0) == graphed
-    assert (pk.GRAPH_STATS["replays"] > 0) == graphed
+    assert (pk.GRAPH_STATS["captures"] > 0) == pre
+    assert (pk.GRAPH_STATS["replays"] > 0) == pre
 
 
 @cuda
@@ -299,7 +275,6 @@ def test_the_lean_branch_gives_the_full_paths_bits(tmp_path, monkeypatch, pieces
 def test_the_lean_branch_is_one_token_decode_only(tmp_path, monkeypatch, state):
     import types
     model, ref, _ = _cuda_model(tmp_path, kernel=state != "no-kernel")
-    ref._s28_pieces = frozenset({"c4"})
     tokens = 3 if state == "multi-token" else 1
     if state == "prefill":
         ref._moe_prefill_pass = True
@@ -324,8 +299,9 @@ def test_a_visit_with_every_expert_skipped_returns_only_the_shared_expert(tmp_pa
     monkeypatch.setattr(mp, "_packed_roles_complete", lambda packed: False)  # stock skips too
     fwd = model.layers[0].mlp.forward
     x = _x()
+    ref.profiling_mode = True                   # the full path (see the lean-bits test)
     full = fwd(x).clone()
-    ref._s28_pieces = frozenset({"c4"})
+    ref.profiling_mode = False
     real_empty = torch.empty
 
     def poisoned(*a, **kw):
@@ -341,7 +317,6 @@ def test_a_visit_with_every_expert_skipped_returns_only_the_shared_expert(tmp_pa
 @cuda
 def test_an_exception_mid_visit_releases_every_pin(tmp_path, monkeypatch):
     model, ref, ram = _cuda_model(tmp_path, arena=True)
-    ref._s28_pieces = frozenset({"c4"})
     pins = []
     real_pin = ram.pin
     monkeypatch.setattr(ram, "pin", lambda *a: pins.append(a) or real_pin(*a))
@@ -360,7 +335,6 @@ def test_a_pinned_layer_never_takes_the_lean_branch(tmp_path):
     """A fully VRAM-pinned layer runs its ORIGINAL forward (the mock block has none, so
     reaching it raises); the lean branch must not intercept it."""
     model, ref, _ = _cuda_model(tmp_path)
-    ref._s28_pieces = frozenset({"c4"})
     ref.pinned_layer_names = {"layers.0"}
     with pytest.raises(NotImplementedError):
         model.layers[0].mlp.forward(_x())

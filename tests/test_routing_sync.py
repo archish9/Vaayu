@@ -13,6 +13,7 @@ import warnings
 import pytest
 import torch
 
+import vaayu.moe_patch as mp
 from vaayu.moe_patch import _routing_to_host, patch_moe_blocks
 from vaayu.persist.expert_cache import ExpertRAMCache, ExpertVRAMCache
 from vaayu.persist.expert_offset_index import ExpertOffsetIndex
@@ -62,28 +63,23 @@ def _syncs(fn) -> int:
     return sum("synchronizing" in str(w.message) for w in seen)
 
 
-def _warm_counts(forward, ref, x):
-    """(OFF, ON) syncs of one fully warm visit: every routed expert a VRAM hit, so no
-    upload (a pageable one would count) and no first-call verdict."""
+def _warm_syncs(forward, ref, x):
+    """Syncs of one fully warm visit: every routed expert a VRAM hit, so no upload (a
+    pageable one would count) and no first-call verdict. Before C11 this was 3."""
     forward(x)
     forward(x)
     assert ref._expert_vram_cache.hits > 0, "premise: the visit is served from the VRAM tier"
-    ref._s28_pieces = frozenset()
-    off = _syncs(lambda: forward(x))
-    ref._s28_pieces = frozenset({"c11"})
-    on = _syncs(lambda: forward(x))
-    return off, on
+    return _syncs(lambda: forward(x))
 
 
 @cuda
 def test_the_fused_forward_syncs_once_per_decode_visit(tmp_path):
     model, ref, _ = _cuda_model(tmp_path)
-    off, on = _warm_counts(model.layers[0].mlp.forward, ref, _x())
-    assert (off, on) == (3, 1)
+    assert _warm_syncs(model.layers[0].mlp.forward, ref, _x()) == 1
 
 
 @cuda
-def test_the_module_list_forward_drops_two_syncs(tmp_path):
+def test_the_module_list_forward_syncs_once_per_decode_visit(tmp_path):
     torch.manual_seed(0)
     model = MockModel(num_layers=1, hidden=8, num_experts=8)
     _make_checkpoint(tmp_path, model)
@@ -99,20 +95,23 @@ def test_the_module_list_forward_drops_two_syncs(tmp_path):
                      dtype=torch.float32, vaayu_ref=ref)
     torch.manual_seed(1)
     x = torch.randn(1, 1, 8, device="cuda")
-    off, on = _warm_counts(model.layers[0].block_sparse_moe.forward, ref, x)
-    assert on == off - 2 and on >= 1
+    assert _warm_syncs(model.layers[0].block_sparse_moe.forward, ref, x) == 1
+
+
+def _device_unique(expert_indices):
+    """C11's predecessor, as a drop-in: the routed set from a device sort (two syncs)."""
+    return expert_indices.cpu(), expert_indices.flatten().unique().tolist()
 
 
 @cuda
-def test_c11_changes_no_output_bit(tmp_path):
+def test_c11_changes_no_output_bit(tmp_path, monkeypatch):
     model, ref, _ = _cuda_model(tmp_path)
-    x = _x()
     fwd = model.layers[0].mlp.forward
-    off = fwd(x)
-    ref._s28_pieces = frozenset({"c11"})
-    assert torch.equal(fwd(x), off)
+    x, many = _x(), _x(tokens=7, seed=3)
+    on = fwd(x)
     ref._moe_prefill_pass = True                 # a multi-token prefill call: the CPU unique
-    many = _x(tokens=7, seed=3)
     on_pf = fwd(many)
-    ref._s28_pieces = frozenset()
+    monkeypatch.setattr(mp, "_routing_to_host", _device_unique)
     assert torch.equal(fwd(many), on_pf)
+    ref._moe_prefill_pass = False
+    assert torch.equal(fwd(x), on)
