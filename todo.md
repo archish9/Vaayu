@@ -92,7 +92,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. NEXT: S28, a USER decision (build the bundled MoE-visit host fast path, or close unbuilt), in its own fresh session.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. NEXT: S28, a USER decision (the full MoE-visit host fast-path bundle (a), the smaller bundle (a'), or close unbuilt (b)), in its own fresh session.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -120,8 +120,8 @@ and S26 did.
 | **S24** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-05 by the USER:** the S11-L7 prototype runs next (S25); decisions (1) `batched_generate`, (3) host-side levers, (4) `fla`, (5) the S20 VRAM-plan follow-up move to S26. Full text: the S24 row in the backlog archive | — | done |
 | **S25** ✅ | ~~S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next~~ — **CLOSED 2026-10-05, REFUTED: +5.56 % decode tok/s on device (in1n m=2, FIFO; ids identical; B0 projected +13 … +15 %), below the +12 % stop line → SETTLED; prototype deleted.** Full row: the S25 row in the backlog archive; `docs/2026-10-05-S25-prefetch-prototype-RESULTS.md` | — | done |
 | **S26** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-06 by the USER: host levers first.** S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no; the S20 VRAM follow-up stays parked. Full text: the S26 row in the backlog archive | — | done |
-| **S27** ✅ | ~~Price the Qwen3-Next host levers at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Only C4 MoE decode fast path (upper bound 4.264 exposed ms/token) and C5 cached Triton launch (3.723) are above the bar, and the ESTIMATES for their concrete changes are below it (~1.0–1.4, ~2.8). C9 FWD 3.310 and C8 segment merge 2.538 priced, unverified; C11 one routing sync 3.130 and C2 1.799 beyond the cap. C1 blob-from-slab FAILS (P 1.702 < 1.744); C3, C6, C7, C10 FAIL. USER decisions 2026-10-06: c2 → clock alignment + C11 added; close without prototype arms, S28 = bundle decision. Suite floor unchanged. Full row: the S27 row in the backlog archive; `docs/2026-10-06-S27-host-levers-RESULTS.md` | — | done |
-| **S28** | **USER DECISION, in S28's own fresh session:** (a) build one bundled **"MoE-visit host fast path"** = C5 (graph-captured decode kernels) + C4 (decode fast path through `sparse_forward`) + C11 (one routing sync per MoE visit). Upper bounds 3.723 + 4.264 + 3.130 = 11.12 ms/token = 2.85 s/turn = 16 % of the 17.86 s turn; realistic ESTIMATE ≈ 6 ms/token ≈ 1.5 s/turn ≈ 8–9 %, not measured. Prototype-gated like S25, KEEP at the 3.488 ms/token bar on the whole bundle. Or (b) close unbuilt, and S29 is next | S27: nothing clears alone; only C4 and C5 have an upper bound above the bar | a conversation; (a) week-class |
+| **S27** ✅ | ~~Price the Qwen3-Next host levers at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Pre-registered upper bounds in exposed ms/token, with the final review's closure calibration in brackets (the exposed fractions run 1.15–1.23 × high): C4 MoE decode fast path 4.264 [3.15–3.60]; C5 cached Triton launch 3.723 [3.14–3.44]; C11 one routing sync 3.130, or 3.86 with `unique`'s device time [3.13–3.37]; C9 FWD 3.310 [2.79–3.27] and C8 segment merge 2.538 [2.13–2.34], priced, unverified; C2 1.799 [1.52–1.53, FAIL once calibrated]. C1 blob-from-slab FAILS (P 1.702 < 1.744, not robust); C3, C6, C7, C10 FAIL. Calibrated, only C4's top end reaches the bar. USER decisions 2026-10-06: c2 → clock alignment + C11 added; close without prototype arms, S28 = bundle decision. Suite floor unchanged. Full row: the S27 row in the backlog archive; `docs/2026-10-06-S27-host-levers-RESULTS.md` | — | done |
+| **S28** | **USER DECISION, in S28's own fresh session.** Calibrated realistic ESTIMATES, not measured: (a) the full bundle **"MoE-visit host fast path"** = C5 (graph-captured decode kernels) + C4 (decode fast path through `sparse_forward`) + C11 (one routing sync per MoE visit), 4.8–6.8 ms/token = 1.2–1.7 s/turn = 6.8–9.7 % of the 17.86 s turn (upper bounds 11.12 pre-registered, 11.85 with C11 restated); (a') the smaller bundle C11 + C5, 4.0–5.6 ms/token = 1.0–1.4 s/turn = 5.8–8.0 %; (b) close unbuilt, and S29 is next. Rank C11 ≈ C5 > C4 (C4 0.7–1.2, below the band floor on its own). (a)/(a') are prototype-gated like S25, with KEEP at the 3.488 ms/token bar on the whole bundle | S27: nothing clears alone; calibrated, only C4's top end reaches the bar | a conversation; (a)/(a') week-class |
 | **S29** | **Buffered vs O_DIRECT where the engine still chooses buffered** (Llama-3.3-70B, gpt-oss-20b), measure, then fix the choice if it is wrong | cheap; it reaches every streamed dense token at N=1; the wrong mode cost Qwen3-Next 17 % | hours |
 | **S30** | **Batching design row: make N>1 reachable through the server.** Opens by asking the USER whether to design now or park until Rudra fans out | strategic (CLAUDE.md §0 fan-out), but worth 0 % at N=1; week-class | a conversation, then ≥ 1 week |
 
@@ -144,34 +144,55 @@ and S26 did.
 
 - [x] **S26 — re-prioritise with the USER — ✅ DECIDED 2026-10-06.** The USER chose host levers first: S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no (S3-C closed); the S20 VRAM follow-up stays parked (trigger not fired). Inputs re-verified at `a561d95` (code unchanged since `74853c6`); S21's host figures flagged stale (pre-A2, pre-O_DIRECT fix). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
-- [x] **S27 — price the Qwen3-Next host levers at HEAD — ✅ CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Only C4 MoE decode fast path (upper bound 4.264 exposed ms/token) and C5 cached Triton launch (3.723) are above the bar, and the ESTIMATES for their concrete changes are below it (~1.0–1.4, ~2.8; not measured). C9 FWD 3.310 and C8 segment merge 2.538 priced, unverified; C11 one routing sync 3.130 and C2 1.799 beyond the cap; C1 blob-from-slab FAILS (P 1.702 < 1.744); C3, C6, C7, C10 FAIL. USER decisions 2026-10-06: (1) c2 → clock alignment, C11 added; (2) close without prototype arms, S28 = bundle decision. Suite floor unchanged (no engine code). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-06-S27-host-levers-RESULTS.md`.
+- [x] **S27 — price the Qwen3-Next host levers at HEAD — ✅ CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Pre-registered upper bounds in exposed ms/token, with the final review's closure calibration in brackets (applied to the unprofiled arm, the exposed fractions give 1.23 / 1.15 × the real GPU idle): C4 MoE decode fast path 4.264 [3.15–3.60]; C5 cached Triton launch 3.723 [3.14–3.44]; C11 one routing sync 3.130, or 3.86 with `unique`'s 0.73 ms of device time [3.13–3.37]; C9 FWD 3.310 [2.79–3.27] and C8 segment merge 2.538 [2.13–2.34], priced, unverified; C2 1.799 [1.52–1.53, FAIL once calibrated]. C1 blob-from-slab FAILS (P 1.702 < 1.744; likely but not robust); C3, C6, C7, C10 FAIL. Calibrated, only C4's top end reaches the bar. Realistic ESTIMATES (calibrated, not measured): C11 2.2–3.0, C5 1.9–2.6, C4 0.7–1.2. USER decisions 2026-10-06: (1) c2 → clock alignment, C11 added; (2) close without prototype arms, S28 = bundle decision. Suite floor unchanged (no engine code). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-06-S27-host-levers-RESULTS.md`.
 
-- [ ] **S28 — USER DECISION: build the bundled "MoE-visit host fast path", or close unbuilt (USER, 2026-10-06, at S27's
-      close; set at S26 as "build the single best host lever from S27").** Decided in S28's own fresh session: re-check
-      the numbers below at HEAD, present them, and WAIT for the USER's pick. S27 found nothing that clears the bar alone
-      (full S27 row in the backlog archive; RESULTS `docs/2026-10-06-S27-host-levers-RESULTS.md`).
-      - **Option (a): build one bundled "MoE-visit host fast path"** = C5 (graph-captured decode kernels) + C4 (decode
-        fast path through `sparse_forward`) + C11 (one routing sync per MoE visit).
-        - Upper bounds (S27, exposed ms/token): 3.723 + 4.264 + 3.130 = **11.12 ms/token = 2.85 s/turn = 16 % of the
-          17.86 s turn.**
-        - **Realistic ESTIMATE (the S27 controller's, NOT measured):** ~2.8 + ~1.2 + ~2.0 ≈ **6 ms/token ≈ 1.5 s/turn ≈
-          8–9 %.**
-        - Week-class. Prototype-gated like S25, with a **KEEP rule at the 3.488 ms/token bar on the whole bundle**;
-          ABBA on the agent session; greedy ids identical; gates per the list below (MOE_CKPT, SERVER_CKPT, dense if
-          shared infra).
-        - What S27 measured behind each piece (U_HOST host ms/token, census p1/p2):
-          - C5 = KERNEL: 4.81 ms, 100 µs/call = table put 28 + gate_up launch 28 + down launch 19 + table values 8 +
-            rest. The best concrete change is both kernels in one per-layer CUDA graph with a static pinned table,
-            estimated ~25 µs/call.
-          - C4 = MOE remainder: 6.09 ms, of which the sub-labels explain ~1.1. No sub-label covers the rest. The
-            controller reads it as inline `sparse_forward` Python plus small launches; the device census shows 480
-            eager kernels per token under MOE.
-          - C11 = the 3 routing syncs per MoE visit (`unique`, `.tolist()`, `.cpu()`): 13.44 ms, 23 % exposed.
+- [ ] **S28 — USER DECISION: build a bundled "MoE-visit host fast path", full (a) or smaller (a'), or close unbuilt (b)
+      (USER, 2026-10-06, at S27's close; set at S26 as "build the single best host lever from S27").** Decided in S28's
+      own fresh session: re-check the numbers below at HEAD, present them, and WAIT for the USER's pick. S27 found
+      nothing that clears the bar alone. See the full S27 row in the backlog archive, and the RESULTS
+      `docs/2026-10-06-S27-host-levers-RESULTS.md`, including its "Calibration: closure test".
+      - **The pieces, ranked C11 ≈ C5 > C4** (exposed ms/token):
+        - U = the pre-registered upper bound.
+        - calibrated = the final review's closure test (the exposed fractions run 1.15–1.23 × high).
+        - realistic = a calibrated ESTIMATE, NOT measured.
+        - **C11, one routing sync per MoE visit.** Today there are 3 syncs per visit (`unique`, `.tolist()`, `.cpu()`):
+          13.44 ms of host, 23 % exposed. `unique` also launches 3 cub kernels per visit, 0.73 ms of device time,
+          serial. U 3.130 (3.86 with those kernels); calibrated 3.13–3.37; realistic ≈ 2.5 (2.2–3.0).
+        - **C5, graph-captured decode kernels.** KERNEL is 4.81 ms of host, 100 µs/call = table put 28 + gate_up launch
+          28 + down launch 19 + table values 8 + rest. The change puts both kernels in one per-layer CUDA graph, with a
+          static pinned table. U 3.723 (the table prices it as "cached Triton launch"; same label); calibrated
+          3.14–3.44; realistic 1.9–2.6. The controller's ~25 µs/call after the change holds only for a raw replay: a
+          replay cost 5.8 / 16.9 µs between the processes, and `_bind` adds 15.8 µs through the runner.
+        - **C4, decode fast path through `sparse_forward`.** The MOE remainder is 6.09 ms of host, of which the
+          sub-labels explain ~1.1. The controller reads the rest as inline Python plus small launches (480 eager
+          kernels per token). U 4.264; calibrated 3.15–3.60 (still including the probe's own timer cost); realistic
+          0.7–1.2. **That is below the 1.744 band floor on its own estimate**, the gate C1 failed at 1.702.
+      - **Option (a): the full bundle, C5 + C4 + C11.**
+        - Upper bounds 3.723 + 4.264 + 3.130 = 11.12 ms/token = 2.85 s/turn = 16 %; 11.85 with C11 restated.
+        - **Calibrated realistic ESTIMATE: 4.8–6.8 ms/token = 1.2–1.7 s/turn = 6.8–9.7 %.**
+        - For comparison: the reviewer's arithmetic gives 4.8–6.6 = 7–9.5 %, and the controller's pre-calibration
+          estimate was ≈ 6 ms/token ≈ 1.5 s/turn ≈ 8–9 %.
+      - **Option (a'): the smaller bundle, C11 + C5.** Calibrated realistic ESTIMATE **4.0–5.6 ms/token = 1.0–1.4
+        s/turn = 5.8–8.0 %**; upper bounds 7.59.
+      - **For (a) or (a'):**
+        - Week-class.
+        - Prototype-gated like S25, with a **KEEP rule at the 3.488 ms/token bar on the whole bundle**.
+        - ABBA on the agent session; greedy ids identical.
+        - Gates per the list below (MOE_CKPT, SERVER_CKPT, dense if shared infra).
+        - Every sum assumes the pieces add up, which is not measured.
       - **Option (b): close S28 unbuilt** with S27's number; S29 is next.
-      - Also the USER's to decide here (plan Task 6 Step 6): the PRICED-UNVERIFIED pieces C9 FWD (3.310 ms/token, no
-        concrete change named) and C8 segment merge (2.538, not probe-prototypable). Both are listed in the OPEN item
-        "Lead (S21): the post-S12 eager residue".
-      - **If (a): process and gates** (the row's text as set at S26, unchanged; it applies to option (a)):
+      - **The baseline has moved.** Today's agent-session baseline is 18.64 s per HIT turn at a 17.01 GB budget (S27,
+        `PROTO=off`). The bar is set on 17.86 s, measured at 18.7–18.8 GB (2026-10-04). S28's own OFF arms are its
+        baseline.
+      - **For information, C1 blob-from-slab.** It FAILED narrowly: P 1.702 against 1.744, a margin of 0.042. Its P is
+        not robust: it omits ~0.27 ms/token of deleted `torch.cat` device time, and its prefill bound assumes exposure
+        1. Its prototype exists (`s27_proto.py`, in `docs/superpowers/plans/2026-10-06-S27-assets/`) and is
+        byte-verified 256/256. The USER picks.
+      - **Also the USER's to decide here** (plan Task 6 Step 6): the PRICED-UNVERIFIED pieces.
+        - C9 FWD: 3.310, calibrated 2.79–3.27; no concrete change named.
+        - C8 segment merge: 2.538, calibrated 2.13–2.34; not probe-prototypable.
+        - Both are in the OPEN item "Lead (S21): the post-S12 eager residue".
+      - **If (a) or (a'): process and gates** (the row's text as set at S26, unchanged; it applies to options (a) and (a')):
         - **Process:** brainstorm → spec → USER approval → dry run → plan → subagent-driven execution → final review
           (the USER's standing choice).
         - **KEEP rule, pre-registered in the spec:** ABBA (off, on, on, off) on the agent session at the server's own

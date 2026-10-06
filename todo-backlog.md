@@ -8370,3 +8370,33 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       - **Baseline agent session (`PROTO=off`, 17.01 GB, O_DIRECT):** HIT wall 18.64 s, +4.4 % over the 17.86 s the bar
         uses (on 18.64 s only C2 would move, to FAIL). TTFT 3.160 s, decode 60.69 ms/token, stall 4.83 s/turn.
       - **§8:** no knob; server mode, N=1; nothing banked. Suite floor unchanged (no engine code).
+      - **Final-review calibration (2026-10-06; a caveat layer, the verdicts above stand as pre-registered).**
+        - **Closure test.** The test checks wall = GPU busy + Σ exposed on the UNPROFILED arm (U_HOST). U_HOST's busy
+          is estimated from U_EXP's 27.87 / 27.89 ms, with the UPLOAD + BLOB device time scaled by the VRAM-miss
+          ratio 0.752 / 0.729.
+          - Applied, the exposed fractions give 31.16 / 32.23 ms against a real idle of 25.39 / 28.04 ms (wall
+            51.04 / 53.50): 1.23 / 1.15 × too much.
+          - The cause: profiling inflates host time, not device time (MOE 1.70 / 1.54 ×, KERNEL 1.34 / 1.19 ×,
+            SYNC 1.07 ×).
+          - c1 is near-tautological given the partition, and c2 only checks clock skew, one-sided. Neither caught
+            this.
+        - **Calibrated U ranges** (two models: proportional, and fixed hidden ms):
+          - C5 3.14–3.44; C4 3.15–3.60, still including the probe's timer cost.
+          - C11 restated with `unique`'s 3 cub kernels (0.73 ms/token of device time, serial): 3.86 uncalibrated,
+            3.13–3.37 calibrated.
+          - C9 2.79–3.27; C8 2.13–2.34.
+          - **C2 1.52–1.53: FAIL once calibrated**, on decode alone. Its unpriced prefill term is ≤ 1.14 at exposure 1.
+          - Only C4's top end still reaches the bar. The bias only overstates U and P, so no FAIL is wrong.
+        - **The timer itself:** 2.18 / 2.45 µs per timed call × ~1,240 timed calls per token ≈ 2.7 / 3.0 ms/token of
+          U_HOST's host ms.
+        - **C1's P is not robust.** It omits ~0.27 ms/token of deleted `torch.cat` device time (6.5 × the 0.042
+          margin), and its prefill bound assumes exposure 1. The FAIL is likely, not robust.
+        - **The disk is an unmodelled third resource.** It biases C1, C2 and C3 upward (inferred).
+        - **S28 re-ranked C11 ≈ C5 > C4.** Calibrated realistic ESTIMATES, not measured: C11 2.2–3.0, C5 1.9–2.6, C4
+          0.7–1.2 (below the band floor alone). The options:
+          - (a) C5 + C4 + C11: 4.8–6.8 ms/token = 1.2–1.7 s/turn = 6.8–9.7 % (the reviewer's arithmetic: 4.8–6.6);
+          - (a') C11 + C5: 4.0–5.6 ms/token = 1.0–1.4 s/turn = 5.8–8.0 %;
+          - (b) close unbuilt.
+        - USER DECISION 2 is unchanged.
+        - Not reproduced (reviewer's arithmetic): the share of the timer cost inside MOE's exclusive time (0.5–1.2
+          ms), and C4 ≈ 2.6–3.2 after removing it.
