@@ -230,6 +230,7 @@ and S26 did.
         Execution: subagent-driven (the USER's standing choice).
       - **Ledger:** branch `s28-host-fast-path`; Task 1 (5acbe51); Task 2 (5514d25 + fix 7c429c8); Task 3 (32f5c17). Step 2: `87 passed`; Step 3: mutants 16/16 all KILLED; Step 4: suite `3739 passed, 25 skipped`.
       - **Prototype gates (switches OFF, branch 32f5c17), 2026-10-06:** MOE_CKPT Qwen3-Next 8 passed, 16 warnings in 32.13s; MOE_CKPT MiniMax 8 passed, 16 warnings in 69.37s; SERVER_CKPT Qwen3-Next 9 passed, 17 warnings in 19.81s; DENSE_CKPT Llama-3.2-1B 5 passed, 17 warnings in 5.82s; bitwise branch Qwen3-Next all pieces: VERDICT BITWISE IDENTICAL (three differing=0), C5 entry 48.00 per token, S12 refused []. Logs: plans/probes/s28_out/gate-*.log, bitwise-branch-qwen.log.
+      - **KEEP set (off, all, all, off), 2026-10-06:** S = 5.938 ms/token (bar 3.488), HIT decode OFF 56.88 / 58.16 vs ON 51.70 / 51.47 ms/token, OFF spread 1.287, budget span 0.47 GB (band -1: 7.544, +0: 5.938, +1: 4.332); HIT TTFT ON 2.883 s vs OFF 2.939 s (OFF spread 0.161) -> ok, ids identical on every turn; HIT turn wall saving 1.57 s of 17.61 s (8.9 %); VERDICT KEEP. JSONs: plans/probes/s28_out/s28-session-keep-{1off,2all,3all,4off}.json, s28-keep-verdict.json.
       - **The pieces, ranked C11 ≈ C5 > C4** (exposed ms/token):
         - U = the pre-registered upper bound.
         - calibrated = the final review's closure test (the exposed fractions run 1.15–1.23 × high).
