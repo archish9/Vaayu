@@ -487,7 +487,7 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
 # tensors every token (static graph memory), so the table upload, both launches and the
 # forward's epilogue are recorded once per layer and replayed; only the table's contents
 # change. Same kernels, same arguments: each capture is held bitwise to the eager launch.
-_GRAPH_CHURN_LIMIT = 2          # graphs replaced before their first replay: inputs move per call
+_GRAPH_CHURN_LIMIT = 2          # CONSECUTIVE graphs replaced before their first replay: inputs move per call
 _GRAPHS: dict = {}              # layer -> _LayerGraph
 _GRAPH_REFUSED: dict = {}       # layer -> why
 _GRAPH_CHURN: collections.Counter = collections.Counter()
@@ -552,6 +552,8 @@ def packed_experts_decode_graphed(layer, x, pairs, routing_weights, shared, act_
         g.host_np[:] = vals
         g.graph.replay()
         g.done.record()
+        if not g.replays:               # the graph's inputs held: restart the churn count
+            _GRAPH_CHURN.pop(layer, None)
         g.replays += 1
         GRAPH_STATS["replays"] += 1
         return g.result if tail else g.out

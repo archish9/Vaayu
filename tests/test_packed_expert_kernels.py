@@ -531,3 +531,49 @@ def test_a_pair_count_that_changes_now_and_then_is_not_churn(monkeypatch):
     torch.cuda.synchronize()
     assert 0 not in pk._GRAPH_REFUSED and pk.GRAPH_STATS["captures"] == 6
     assert torch.equal(got, _eager(x, pairs[:-1], w, None, False))
+
+
+@cuda
+def test_one_token_pair_count_dips_do_not_accumulate_into_a_refusal(monkeypatch):
+    """Task 2 review: one token whose pair count dips captures a graph that never replays.
+    Such tokens, spread over a long session with replays in between, must not add up to a
+    refusal -- churn counts CONSECUTIVE graphs that never replayed."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    for _ in range(pk._GRAPH_CHURN_LIMIT + 3):
+        for _ in range(3):
+            got = pk.packed_experts_decode_graphed(0, x, pairs, w, None, F.silu, False)
+        pk.packed_experts_decode_graphed(0, x, pairs[:-1], w, None, F.silu, False)   # one token
+    got = pk.packed_experts_decode_graphed(0, x, pairs, w, None, F.silu, False)
+    torch.cuda.synchronize()
+    assert 0 not in pk._GRAPH_REFUSED and got is not None
+    assert torch.equal(got, _eager(x, pairs, w, None, False))
+
+
+@cuda
+def test_short_requests_between_long_ones_do_not_refuse_the_layer(monkeypatch):
+    """Task 2 review: S12 hands every request new static inputs, and a request with a single
+    decode step captures a graph that never replays. A few of them among normal requests must
+    not refuse the layer."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    xs = [x * (r + 2) for r in range(12)]          # held: every request gets its own address
+    for r, xr in enumerate(xs):
+        for _ in range(1 if r % 4 == 1 else 5):
+            pk.packed_experts_decode_graphed(0, xr, pairs, w, None, F.silu, False)
+    assert 0 not in pk._GRAPH_REFUSED
+    assert pk.GRAPH_STATS["captures"] == 12, "premise: every request recaptured"
+
+
+@cuda
+def test_churn_counts_only_graphs_that_never_replayed(monkeypatch):
+    """Exactly `_GRAPH_CHURN_LIMIT` never-replayed graphs after one that replayed stay within
+    the limit: the replayed graph is not churn."""
+    fresh_graphs(monkeypatch)
+    x, pairs, w = _case(*QWEN)
+    xs = [x * (i + 2) for i in range(pk._GRAPH_CHURN_LIMIT + 2)]
+    pk.packed_experts_decode_graphed(0, xs[0], pairs, w, None, F.silu, False)
+    pk.packed_experts_decode_graphed(0, xs[0], pairs, w, None, F.silu, False)       # replays
+    for xi in xs[1:]:                     # LIMIT + 1 captures, each replacing the previous graph
+        out = pk.packed_experts_decode_graphed(0, xi, pairs, w, None, F.silu, False)
+    assert out is not None and 0 not in pk._GRAPH_REFUSED
