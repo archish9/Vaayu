@@ -206,6 +206,14 @@ and S26 did.
         (verified in the split file), so 2 H2D copies replace 6 `.to()` + 2 `torch.cat` (UPLOAD+BLOB, 4.63 ms at
         S21). Other candidates: C2 per-layer settle, C3 batched dispatch, C4 MoE decode fast path, C5 cached Triton
         launch, C6 attention core in the graph, C7 bind fast path, C8 segment merge, C9 FWD, C10 GIL.
+      **Plan written 2026-10-06:** `docs/superpowers/plans/2026-10-06-S27-host-levers.md`, 9 tasks.
+      - T1–T3: the analyser, the C1 prototype and the census probe. T4: the census. T5: the session probe
+        and its baseline. T6: price and gate. T7–T8: the C1 dry run and ABBA, only if C1 is queued. T9: close.
+      - The CPU code blocks were run while planning (9 + 7 + 2 tests pass).
+      - The analyser on S21's real trace: partition and c1 hold. Leaf exposed fractions: UPLOAD 0.33,
+        BLOB 0.31, KERNEL 0.78, ATTNCORE 0.36, GRRUN 0.89, SETTLE 0.95, DISP 1.00. **Early signal: C1 looks
+        mostly hidden behind GPU work (≈ 1.5 ms exposed, under the 1.744 ms band floor).** The census at HEAD
+        decides.
 
 - [ ] **S28 — build the single best host lever from S27 (set by the USER at S26, 2026-10-06).** S27's verdict is the
       brief.
