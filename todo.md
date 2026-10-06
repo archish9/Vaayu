@@ -120,7 +120,7 @@ and S26 did.
 | **S24** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-05 by the USER:** the S11-L7 prototype runs next (S25); decisions (1) `batched_generate`, (3) host-side levers, (4) `fla`, (5) the S20 VRAM-plan follow-up move to S26. Full text: the S24 row in the backlog archive | — | done |
 | **S25** ✅ | ~~S11-L7 decode-prefetch PROTOTYPE on Qwen3-Next~~ — **CLOSED 2026-10-05, REFUTED: +5.56 % decode tok/s on device (in1n m=2, FIFO; ids identical; B0 projected +13 … +15 %), below the +12 % stop line → SETTLED; prototype deleted.** Full row: the S25 row in the backlog archive; `docs/2026-10-05-S25-prefetch-prototype-RESULTS.md` | — | done |
 | **S26** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-06 by the USER: host levers first.** S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no; the S20 VRAM follow-up stays parked. Full text: the S26 row in the backlog archive | — | done |
-| **S27** | **Price the Qwen3-Next host levers at HEAD — MEASURE ONLY.** Covers S11-L3's five seams and the post-S12 eager residue's five pieces, at server settings with O_DIRECT. Each piece gets the saving a concrete change would deliver, not a ceiling. Inputs pre-gathered in the durable row | the agent's model; S25 showed host CPU is the binding constraint at N=1; S21's numbers predate A2 and the O_DIRECT fix | 1–2 days |
+| **S27** [~] | **Price the Qwen3-Next host levers at HEAD — MEASURE ONLY.** Covers S11-L3's five seams and the post-S12 eager residue's five pieces, at server settings with O_DIRECT. Each piece gets the saving a concrete change would deliver, not a ceiling. Inputs pre-gathered in the durable row | the agent's model; S25 showed host CPU is the binding constraint at N=1; S21's numbers predate A2 and the O_DIRECT fix | 1–2 days |
 | **S28** | **Build the single best host lever from S27**, ABBA at the server's own settings, ids identical. If S27 finds no piece that clears its bar, this row closes unbuilt and S29 is next | S27's number | days (set by S27) |
 | **S29** | **Buffered vs O_DIRECT where the engine still chooses buffered** (Llama-3.3-70B, gpt-oss-20b), measure, then fix the choice if it is wrong | cheap; it reaches every streamed dense token at N=1; the wrong mode cost Qwen3-Next 17 % | hours |
 | **S30** | **Batching design row: make N>1 reachable through the server.** Opens by asking the USER whether to design now or park until Rudra fans out | strategic (CLAUDE.md §0 fan-out), but worth 0 % at N=1; week-class | a conversation, then ≥ 1 week |
@@ -144,7 +144,7 @@ and S26 did.
 
 - [x] **S26 — re-prioritise with the USER — ✅ DECIDED 2026-10-06.** The USER chose host levers first: S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no (S3-C closed); the S20 VRAM follow-up stays parked (trigger not fired). Inputs re-verified at `a561d95` (code unchanged since `74853c6`); S21's host figures flagged stale (pre-A2, pre-O_DIRECT fix). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
-- [ ] **S27 — price the Qwen3-Next host levers at HEAD, MEASURE ONLY (set by the USER at S26, 2026-10-06).**
+- [~] **S27 — price the Qwen3-Next host levers at HEAD, MEASURE ONLY (set by the USER at S26, 2026-10-06).**
       **Question:** for each host-side piece of a Qwen3-Next decode token, how many ms would ONE concrete change
       remove, at the server's own settings? Which single piece, if any, is worth building as S28?
       **Why now:** S25 refuted S11-L7 because host CPU ate half its win. The stall it removed was 1.77 s per HIT turn,
@@ -191,6 +191,21 @@ and S26 did.
       **Bar for S28 (proposed; this is S21's stop rule):** build a piece only if its priced saving is ≥ 5 % of the
       representative HIT turn, ≈ 0.8–0.9 s/turn ≈ 3–3.5 ms/token. If no piece clears the bar, S28 closes unbuilt.
       **§8:** (1) no knob, measure only; (2)/(3) server mode, N=1; (4) nothing banked: the output is S28's choice.
+      **[~] 2026-10-06: method SETTLED with the USER; spec written** (`docs/superpowers/specs/2026-10-06-S27-host-levers-design.md`).
+      Re-verified at `ee0f638`: no engine code changed since `74853c6`, all cited lines and every probe wrap point hold.
+      - **D1 pricing:** exposed-host attribution. From an annotated CUPTI trace, a label's exposed time = its
+        exclusive main-thread host time ∩ GPU idle. Its exposed FRACTION is applied to the unprofiled host ms.
+        Cross-checks: Σ exposed + GPU busy = the forward window ±5 %, and SYNC exposed ≤ 10 %. If either fails,
+        stop and ask. Probe-side prototype arms run only for pieces priced 1.75–7 ms/token, at most 2 of them.
+      - **D2 workload:** the census runs on `s21_decode`'s shape (8k, slice per arm, server budget, 2 mirrored
+        processes). The prototype arms run as an ABBA on the agent session (`s25_session` shape, pinned ballast,
+        S25's ±7 ms/GB band rule), ids identical.
+      - **D3 bar:** 5 % of the six-HIT-turn mean = 0.89 s/turn ≈ 3.5 ms/token. A piece is ONE mechanism. It may
+        clear several labels, and its prefill saving counts. Near-miss pairs are reported, not promoted.
+      - **Lead candidate C1, blob-from-slab:** each expert's packed run and scale run are contiguous in the slab
+        (verified in the split file), so 2 H2D copies replace 6 `.to()` + 2 `torch.cat` (UPLOAD+BLOB, 4.63 ms at
+        S21). Other candidates: C2 per-layer settle, C3 batched dispatch, C4 MoE decode fast path, C5 cached Triton
+        launch, C6 attention core in the graph, C7 bind fast path, C8 segment merge, C9 FWD, C10 GIL.
 
 - [ ] **S28 — build the single best host lever from S27 (set by the USER at S26, 2026-10-06).** S27's verdict is the
       brief.
