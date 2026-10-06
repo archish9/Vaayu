@@ -308,6 +308,7 @@ Dense models (is_moe=False): steps 2 (Phase 1.5), 3, 4, 5 are skipped entirely.
 | `[Vaayu-MoE] N MoE blocks patched for sparse streaming` | Patching complete |
 | `[Vaayu] fused packed-expert decode kernel on N MoE layers (B-bit, group G)` | One-token decode uses the fused kernels (§3.4c) |
 | `[Vaayu] WARNING: fused packed-expert decode kernel refused (…)` / `not installed: …` | That geometry/model stays on the per-expert path; the reason is in the line |
+| `[Vaayu] WARNING: packed-expert decode graph refused for MoE layer N (…)` / `[Vaayu] WARNING: packed-expert decode graph not used (…)` | That layer's (or those calls') one-token decode launches the fused kernels eagerly instead of through its per-layer CUDA graph (S28); the output bits are the same, only the host cost differs; the reason is in the line |
 | `[Vaayu] fused packed-expert prefill kernel on N MoE layers (B-bit, group G)` | Prompt prefill uses the grouped kernels (§3.4c) |
 | `[Vaayu] WARNING: fused packed-expert prefill kernel refused (…)` / `not installed: …` | Prefill stays on the per-expert path; the decode kernel is unaffected; the reason is in the line |
 | `[Vaayu] WARNING: fused packed-expert prefill kernel not used on M of N MoE layers (layer indices …): …` | Those layers keep the per-expert path during prefill; the other layers use the grouped kernels; the reason is in the line |
