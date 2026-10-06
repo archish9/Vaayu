@@ -2318,8 +2318,97 @@ def _make_fused_sparse_forward(
         return (routing_weights, expert_indices,
                 _shared_expert_output(block_info.moe_module, flat_hidden))
 
+    _shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+    _moe_mod = block_info.moe_module
+
+    def _lean_decode(hidden_states, _pre, pieces):
+        """S28 C4: a one-token decode visit on the packed kernels, with nothing a decode
+        never needs -- no prefill headroom, chunk-major retention, prefill-kernel lookup,
+        profile marks or per-call path join, and no zeroed accumulator (the kernel
+        overwrites it). The same helpers, ops and order as the `_use_pk` branch below,
+        so the same bits."""
+        _act_fn = getattr(_moe_mod, block_info.experts_attr).act_fn
+        B, S, H = hidden_states.shape
+        flat_hidden = hidden_states.view(-1, H)
+        if _pre is None:
+            routing_weights, expert_indices = _route(flat_hidden)
+            _shared = None
+        else:
+            routing_weights, expert_indices, _shared = _pre
+        _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
+        if "c11" in pieces:
+            expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
+        else:
+            unique_experts = expert_indices.flatten().unique().tolist()
+            expert_indices_cpu = expert_indices.cpu()
+        _eids = expert_indices_cpu.view(-1).tolist()
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
+        expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
+            unique_experts, layer_idx=layer_idx, layer_name=layer_name,
+            shard_file=_shard_file, offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref, vram_resident=set(_vram_hold))
+        try:
+            _blobs: dict = {}
+            for eidx, raw in _iter_expert_loads(expert_tensors, _miss_futures, vaayu_ref):
+                _held = _vram_hold.get(eidx)
+                if _held is not None:
+                    _blobs[eidx] = _held
+                    continue
+                _packed = _group_packed_tensors_by_weight(raw)
+                if not _packed["gate"]:
+                    _wg, _wd, _wu, _entry = _expert_dense_weights(raw, device, dtype)
+                    _math = _entry if _wg is not None else None
+                elif _packed_roles_complete(_packed):
+                    _on_dev = _upload_packed_expert(_packed, device)
+                    _entry = build_expert_blob(_on_dev)
+                    _math = (_entry if _entry is not None
+                             else {"dense": dequantize_expert_weights(_on_dev, dtype)})
+                else:
+                    _entry = _math = None
+                _settle_miss_upload(
+                    eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                    vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=None,
+                    cm_last_call=False, cm_budget=0)
+                if _math is not None:
+                    _blobs[eidx] = _math
+            _pairs = [(_blobs[_eids[s]], s)
+                      for s in sorted(range(len(_eids)), key=_eids.__getitem__)
+                      if _eids[s] in _blobs]
+            if _pre is None:
+                _shared = _shared_expert_output(_moe_mod, flat_hidden)
+            result = None
+            if _pairs and _pre is not None and "c5" in pieces:
+                result = packed_experts_decode_graphed(
+                    layer_idx, flat_hidden, _pairs, routing_weights, _shared, _act_fn,
+                    tail=True)
+            if result is None:
+                out = torch.empty(flat_hidden.shape, dtype=torch.float32,
+                                  device=flat_hidden.device)
+                if _pairs:
+                    packed_experts_decode(flat_hidden, _pairs, routing_weights, out, _act_fn)
+                else:
+                    out.zero_()
+                result = out.to(flat_hidden.dtype)
+                if _shared is not None:
+                    result = result + _shared.to(result.dtype)
+        finally:
+            for _pk in _pinned_keys:
+                expert_cache.unpin(*_pk)
+            if getattr(vaayu_ref, "_prefill_staged", None):
+                vaayu_ref._prefill_staging_closed = layer_idx
+                _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
+        vaayu_ref._expert_history[layer_idx] = unique_experts
+        return result.view(B, S, H)
+
     def sparse_forward(hidden_states, _pre=None, **kwargs):
         _pieces = getattr(vaayu_ref, "_s28_pieces", _NO_PIECES)
+        if ("c4" in _pieces and hidden_states.shape[0] * hidden_states.shape[1] == 1
+                and not getattr(vaayu_ref, "_moe_prefill_pass", False)
+                and getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
+                and not getattr(vaayu_ref, "profiling_mode", False)
+                and getattr(vaayu_ref, "_batch_n", 1) == 1
+                and layer_name not in vaayu_ref.pinned_layer_names):
+            return _lean_decode(hidden_states, _pre, _pieces)
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
