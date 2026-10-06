@@ -8262,3 +8262,111 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   cold@8k TTFT** (0.28 s = 2.7 % cold@2k, 0.06 s = 2.0 % of a HIT) — below 5 % everywhere.
   **S21 re-price (after S20): ≈ 1.36 s per cold 8k = 4.7 % of a cold-8k TURN, 0.08 s = 0.4 % of the
   representative turn — below both S21 bars. Recommendation at S26: no.**
+
+- [x] **S27 — ✅ CLOSED 2026-10-06, NOTHING CLEARS ALONE (bar 3.488 ms/token; top upper bounds C4 4.264, C5 3.723 exposed ms/token; USER: S28 = bundle decision; RESULTS `docs/2026-10-06-S27-host-levers-RESULTS.md`). Row as it stood at close:** **S27 — price the Qwen3-Next host levers at HEAD, MEASURE ONLY (set by the USER at S26, 2026-10-06).**
+      **Question:** for each host-side piece of a Qwen3-Next decode token, how many ms would ONE concrete change
+      remove, at the server's own settings? Which single piece, if any, is worth building as S28?
+      **Why now:** S25 refuted S11-L7 because host CPU ate half its win. The stall it removed was 1.77 s per HIT turn,
+      but decode saved only 3.13 ms/token. S21 found ~44 % of a decode token is host CPU work: 26.7 ms/token, with the
+      GPU idle ~62 %.
+      **INPUTS PRE-GATHERED at `main` `a561d95` (S26 session, 2026-10-06). Re-verify at HEAD:**
+      - **The pieces, with S21's numbers** (U_HOST arm, 8k, `BALLAST_GB=25`, `plans/probes/s21_out/decode-on1.log`;
+        exclusive host ms/token):
+        - S11-L3, the expert path: DISP 1.22, SETTLE 1.94, BLOB 2.11, UPLOAD 2.52, MOE 5.63. That is 13.43 ms of host,
+          minus 5.35 ms of device time = 8.1 ms (6–8 after the overlap with in-flight reads).
+        - The post-S12 eager residue: ATTNCORE 2.96 (device 0.78), KERNEL 4.62 (device 2.84), FWD 3.14, GRRUN 1.36,
+          GRAPH 0.64 (108 replays) = ≤ 9.1 ms.
+        - Not host levers: LOADWAIT 19.38 (the host is blocked on expert reads, i.e. the stall) and SYNC@S21_MOE
+          13.83 (the host is blocked on the GPU at the routing syncs).
+      - **S21's numbers are STALE.** They were taken before A2 (`86b62fb`, one io_uring wave per expert) and before
+        the O_DIRECT fix (`a588ff4`). HIT decode today is 53.9–58.2 ms/token; S21's U_HOST token was 61.17 ms. So
+        re-measure both ceilings before pricing anything.
+      - **Code at `a561d95`:**
+        - `vaayu/moe_patch.py`: `_upload_packed_expert` :581, `_make_fused_sparse_forward` :2252, `decode_pre`
+          :2282, `sparse_forward` :2294, `_settle_miss_upload` :2704, `_dispatch_expert_misses` :2747
+          (`_load_one` :2838).
+        - `vaayu/decode_graphs.py`: `_Record.replay` :408, `DecodeGraphRunner.run` :492.
+      - **Probe base: `plans/probes/s21_decode.py`.**
+        - It attributes host time exclusively, per thread, and self-tests that the labels sum to the timed forward.
+          A CUPTI arm (U_CNT) gives the device time.
+        - It wraps moe_patch helpers by name (:210–219), and `_iter_expert_loads` for LOADWAIT.
+        - Re-check that every wrapped name still exists AND fires. A2 moved slab reads to `io_uring_read_segments`,
+          so wrap `load_expert_into_slab`, not the Rust call (REFERENCE).
+      - **Traps** (memories and REFERENCE):
+        - Use a DIFFERENT prompt per arm. A repeated request re-decodes a warm tier: 0 disk reads.
+        - Call `freeze_after_load()`, as the server does.
+        - Graphs ON.
+        - Let the engine choose its own I/O mode, and grep `O_DIRECT` and `Expert RAM cache:` in every arm's log.
+          Pin `BALLAST_GB` if two arms' budgets differ by more than 0.2 GB.
+        - Run FOREGROUND, under a 29G cgroup. Never attach py-spy.
+        - An idle package costs Qwen decode ~21 %, so a probe that synchronizes runs FASTER than the real thing.
+          Profiled ms are for attribution; take tok/s from an unprofiled arm.
+      **Method (a proposal; the S27 session settles it with the USER before measuring):**
+      1. Re-run the census at HEAD.
+      2. For each piece, name the concrete change and price it. Use a cheap, bit-safe in-probe arm where one exists;
+         otherwise use census arithmetic and state the overlap assumed.
+      3. Rank the pieces in s/turn on today's representative HIT turn. That turn is 8,675 tokens + 256 generated, at
+         the server's own budget with O_DIRECT: 15.5 s (the six-turn mean is 17.86 s).
+      **Bar for S28 (proposed; this is S21's stop rule):** build a piece only if its priced saving is ≥ 5 % of the
+      representative HIT turn, ≈ 0.8–0.9 s/turn ≈ 3–3.5 ms/token. If no piece clears the bar, S28 closes unbuilt.
+      **§8:** (1) no knob, measure only; (2)/(3) server mode, N=1; (4) nothing banked: the output is S28's choice.
+      **[~] 2026-10-06: method SETTLED with the USER; spec written** (`docs/superpowers/specs/2026-10-06-S27-host-levers-design.md`).
+      Re-verified at `ee0f638`: no engine code changed since `74853c6`, all cited lines and every probe wrap point hold.
+      - **D1 pricing:** exposed-host attribution. From an annotated CUPTI trace, a label's exposed time = its
+        exclusive main-thread host time ∩ GPU idle. Its exposed FRACTION is applied to the unprofiled host ms.
+        Cross-checks: Σ exposed + GPU busy = the forward window ±5 %, and SYNC exposed ≤ 10 %. If either fails,
+        stop and ask. Probe-side prototype arms run only for pieces priced 1.75–7 ms/token, at most 2 of them.
+      - **D2 workload:** the census runs on `s21_decode`'s shape (8k, slice per arm, server budget, 2 mirrored
+        processes). The prototype arms run as an ABBA on the agent session (`s25_session` shape, pinned ballast,
+        S25's ±7 ms/GB band rule), ids identical.
+      - **D3 bar:** 5 % of the six-HIT-turn mean = 0.89 s/turn ≈ 3.5 ms/token. A piece is ONE mechanism. It may
+        clear several labels, and its prefill saving counts. Near-miss pairs are reported, not promoted.
+      - **Lead candidate C1, blob-from-slab:** each expert's packed run and scale run are contiguous in the slab
+        (verified in the split file), so 2 H2D copies replace 6 `.to()` + 2 `torch.cat` (UPLOAD+BLOB, 4.63 ms at
+        S21). Other candidates: C2 per-layer settle, C3 batched dispatch, C4 MoE decode fast path, C5 cached Triton
+        launch, C6 attention core in the graph, C7 bind fast path, C8 segment merge, C9 FWD, C10 GIL.
+      **Plan written 2026-10-06:** `docs/superpowers/plans/2026-10-06-S27-host-levers.md`, 9 tasks.
+      - T1–T3: the analyser, the C1 prototype and the census probe. T4: the census. T5: the session probe
+        and its baseline. T6: price and gate. T7–T8: the C1 dry run and ABBA, only if C1 is queued. T9: close.
+      - The CPU code blocks were run while planning (9 + 7 + 2 tests pass).
+      - The analyser on S21's real trace: partition and c1 hold. Leaf exposed fractions: UPLOAD 0.33,
+        BLOB 0.31, KERNEL 0.78, ATTNCORE 0.36, GRRUN 0.89, SETTLE 0.95, DISP 1.00. **Early signal: C1 looks
+        mostly hidden behind GPU work (≈ 1.5 ms exposed, under the 1.744 ms band floor).** The census at HEAD
+        decides.
+      - **Census done 2026-10-06 (p1/p2 at 5e7e530):** U1/U2 mean 54.76 ms/token over both processes (p1 56.27/51.42, p2 63.10/48.26), expert RAM budget 16.96 GB, O_DIRECT on, checks pass (c1, partition, c2 true; align_min_us +3.27; MICRO equal 256/256, old 59.3/56.6 us, new 30.6/29.0 us), ids identical across processes on all 4 shared arms.
+      **CLOSED 2026-10-06 — NOTHING CLEARS ALONE** (appended at close; RESULTS `docs/2026-10-06-S27-host-levers-RESULTS.md`;
+      probes `docs/superpowers/plans/2026-10-06-S27-assets/`; raw `plans/probes/s27_out/`).
+      - **USER DECISION 1 (2026-10-06, Task 3 dry run): "Swap c2, add C11".** c2 ("SYNC exposed ≤ 10 %") failed at 23 %
+        (26.8 of 115.4 ms over 8 forwards). The clocks were aligned (all 5,057 kernels ≥ +3.2 µs after their launch call),
+        but the 3 routing syncs per MoE visit (`unique`, `.tolist()`, `.cpu()`) hold real host dispatch and conversion
+        work (41 % head / 39 % tail / 19 % between `unique`'s kernels; median 19.8 µs per sync). c2 became CPU/GPU clock
+        alignment; sync exposure is information, priced as the new candidate C11.
+      - **Census (p1/p2 at 5e7e530; 8k; server budget 16.96 / 16.95 GB; O_DIRECT; graphs ON; no ballast):** c1 = 99.46 /
+        99.45 % of the window, partition exact, c2 min +3.27 µs over 124,362 kernels; greedy ids identical across the
+        processes on all 6 arms. U1 56.27 / 63.10 and U2 51.42 / 48.26 ms/token (content and arm position, not drift).
+        GPU busy 41 % of a profiled forward. Host-work labels (all but LOADWAIT and SYNC) 28.08 ms/token, 19.11 of it
+        exposed; SYNC@S27_MOE 13.44 host / 3.13 exposed; LOADWAIT 9.46 (8.66 off-CPU). MICRO 256/256 byte-equal, stock
+        58.0 vs C1 29.8 µs/call.
+      - **Ranked (exposed ms/token; U = upper bound; bar 3.488, band [1.744, 6.977)):**
+        - C4 MoE decode fast path: U 4.264 (1.09 s/turn, 6.1 %), PROTOTYPE, queued 1st.
+        - C5 cached Triton launch: U 3.723 (0.95 s/turn, 5.3 %), PROTOTYPE, queued 2nd.
+        - C9 FWD: 3.310, PRICED-UNVERIFIED (no concrete change named).
+        - C11 one routing sync per MoE visit: 3.130, PROTOTYPE beyond the cap.
+        - C8 segment merge: 2.538, PRICED-UNVERIFIED (not probe-prototypable).
+        - C2 per-layer settle: 1.799, PROTOTYPE beyond the cap.
+        - C1 blob-from-slab: U 2.248 / P 1.702 (decode 0.518 + prefill bound 1.184), FAIL.
+        - C7 bind 1.318, C3 dispatch 1.257, C6 attention core 0.914, C10 GIL 0.229: FAIL.
+        - CLEARED ON PRICE: none.
+      - **Controller ESTIMATES, not measured:** C4 ~1.0–1.4 ms/token (the MOE remainder is 6.09 ms of host time; its
+        sub-labels explain ~1.1). C5 ~2.8 ms/token (KERNEL 100 µs/call → ~25 with both kernels in one per-layer CUDA graph
+        and a static pinned table).
+      - **USER DECISION 2 (2026-10-06, plan Task 6 Step 6): "Close; S28 = bundle decision".** No prototype arms ran
+        (Tasks 7–8 skipped), so there is no calibration. S28 = (a) the bundle C5 + C4 + C11 (upper bounds 11.12 ms/token
+        = 2.85 s/turn = 16 %; estimate ≈ 6 ms/token ≈ 1.5 s/turn ≈ 8–9 %) or (b) close unbuilt.
+      - **FLAG:** S27_GRAPH host 0.63 vs 1.82 ms/token between processes. Its cause was not measured; C8 stays
+        PRICED-UNVERIFIED at either value.
+      - **Caveats:** prefill is unpriced for C2–C11; C1's P mixes a measured estimate with an upper-bound prefill term
+        (FAIL margin 2.4 %); C6's U omits the graph breaks it would remove; the fine-table ms are host, not exposed.
+      - **Baseline agent session (`PROTO=off`, 17.01 GB, O_DIRECT):** HIT wall 18.64 s, +4.4 % over the 17.86 s the bar
+        uses (on 18.64 s only C2 would move, to FAIL). TTFT 3.160 s, decode 60.69 ms/token, stall 4.83 s/turn.
+      - **§8:** no knob; server mode, N=1; nothing banked. Suite floor unchanged (no engine code).
