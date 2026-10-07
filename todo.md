@@ -296,7 +296,36 @@ the clean 0.45–0.56 ms/token before any build.
       long request on five models (stop rule: E5 arm grows > 0.25 GB more than off → valve options to the USER), D3
       bitwise + reach. KEEP set off, all, all, off on S28's metric unchanged (stream-timed, tail included), bar
       3.133; attribution off, e7, loop (+E1, E2, E6), tele (+E3, E4), all (+E5), mirrored, 10 processes, E7 first so
-      E3 is not credited with the dump it shrinks. Probe `plans/probes/s33_session.py` (to be written).
+      E3 is not credited with the dump it shrinks. Probe `plans/probes/s33_session.py`.
+      **(5) Spec approved by the USER 2026-10-07; DRY RUN DONE the same day (scratch worktree at `8544722`, nothing
+      merged; no stop rule fired; spec section 12; raw output `plans/probes/s33_out/`; code and tests in
+      `docs/superpowers/plans/2026-10-07-S33-assets/`).**
+      - *Tests:* `tests/test_s33_host_edits.py`, 36 tests on a CPU stand-in that runs the REAL `forward`; 7 fail with
+        the pieces off; **29 of 29 mutants killed**; suite in the worktree `3775 passed, 25 skipped` (244.11 s).
+      - *D0, HEAD, Qwen3-Next, pieces off, 16.57 GB budget:* **the dump costs 0.277 ms per ring token** (0.071 s at 256
+        tokens, 0.648 s at 2,304; 1.14 s per request at the 4,096 cap, extrapolated); mean HIT tail 0.502 s (dump
+        0.460 + `pc.store` 0.041), i.e. 1.97 of the 56.32 ms/token stream-timed HIT decode. **The hygiene is all
+        `gc.collect`:** 0.647 s per HIT turn (8 calls, 77–89 ms each once warm) against 0.0028 s of `malloc_trim`
+        (0.28–0.38 ms per call). Automatic collections per HIT turn: gen-0 509 × 0.131 s, gen-1 40 × 0.011 s, gen-2
+        0.83 × 0.065 s.
+      - *D1, every piece on, 17.41 GB:* ids identical to D0 on all 9 turns; tail 0.502 → 0.041 s; explicit hygiene
+        inside a turn 8 → 0; the deferred hygiene takes 62–82 ms once per turn (the wait a client meets if it answers
+        at once); automatic gen-2 1.33 per turn, 0.087 s. Raw HIT decode 56.32 → 49.73 ms/token is NOT a verdict (the
+        budgets are 0.84 GB apart).
+      - *D2, RssAnon growth over one long request, today / deferred:* Qwen3-Next (1,024 tokens) +0.048 / +0.040 GB;
+        gpt-oss (1,024) +0.007 / +0.003; MiniMax (256) +0.004 / +0.003; DeepSeek-V4 (256) +0.029 / +0.031;
+        Llama-3.3-70B (96) +0.001 / +0.001. **The 0.25 GB rule fired on no model: no in-request valve.** Ids
+        identical in every pair.
+      - *D3:* **decode scores bitwise identical, pieces on against off, on Qwen3-Next (64 steps), MiniMax-M2.7 (40),
+        DeepSeek-V4 (24, with its 4 streamed layers through E2's table) and gpt-oss-20b (64, a per-window mask on
+        every layer through E1's merge).** Reach on Qwen3-Next per forward: each hoisted hook 49.5 → 1.03 calls, the
+        mask hook 49.5 → 49.5, layer records 50.2 → 0.78, `/proc` reads 64 → 2 per 64 tokens, dumps 1 → 0.
+      - *Corrections:* E3 never fires on DeepSeek-V4 (no decode-graph seam) or Llama-3.3-70B (graphs disabled at
+        load); on gpt-oss it also drops the records of the 24 layers S12 refuses. E3 does NOT explain the hygiene's
+        cost: the collector scans 271,704 objects on Qwen3-Next after 1,024 tokens, 184,270 of them `Tensor` (the
+        expert cache's live entries) and 52,224 `LayerTiming`.
+      **NEXT in this session: the implementation plan (per-task patch assets from the dry-run diff), then the USER's
+      review of it and choice of execution method.**
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
@@ -686,6 +715,16 @@ arithmetic, not the repack.**
       fast path repeats the serial loop's view-building lines (the serial loop was to stay unedited).
 
 *From the old STILL OPEN section.*
+
+- [ ] **Lead (S33 dry run, 2026-10-07): a full gc collection re-scans the expert cache's live tensors.** After
+  `freeze_after_load()` the collector still scans everything created since: on Qwen3-Next after one 1,024-token
+  request 271,704 objects, 184,270 of them `Tensor` (`plans/probes/s33_out/s33-rss-qwen-off.json`). A full
+  collection therefore costs 62–89 ms. S33's E5 moves the explicit one out of the turn, but an automatic gen-2
+  collection still runs inside a HIT turn about 1.3 times (0.087 s per turn, about 0.34 ms/token; automatic gen-0:
+  0.11 s per turn, timed through `gc.callbacks`, which adds its own cost), and the deferred one makes a client that
+  answers at once wait 62–82 ms. Idea, NOT designed: freeze again after each deferred collection. Open question: a
+  frozen object that later becomes cyclic garbage is never freed (the dead decode-graph runner cycle, S12's R3, is
+  one such). Price it with a census arm before any build; N=1, the server default, Qwen3-Next (ordering rule *(a)*).
 
 - **[bug] `VaayuQWen` and `VaayuChatGLM` cannot run a forward** (found 2026-10-07 by S33's re-verification; not
   touched by S33). Their `get_attention_mask_args(self, full_attention_mask, len_p, len_s)` overrides
