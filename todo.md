@@ -103,7 +103,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. NEXT: S33-A0, in its own fresh session.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. S33-A0 CLOSED 2026-10-07: CONFIRMED, a probe artefact (one Kineto window makes every later graph replay 4.58× slower on the host; the server never profiles), so S32's clean price stands. NEXT: S33 (stage 1, E1–E6), in its own fresh session.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -162,7 +162,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S30** ✅ | ~~Batching design row: make N>1 reachable through the server~~ — **CLOSED 2026-10-07: PARKED by the USER** (asked "design now, or park until Rudra fans out?"; chose park). No client fans out to Vaayu: RudraAnvil has no Vaayu reference and runs its subagents one at a time. The design is backlog **#37**, inputs re-verified at `fc06d8b`. Suite floor unchanged (no code). Full row: the S30 row in the backlog archive | — | done |
 | **S31** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-07 by the USER:** S32 re-price C8 + C9, S33 build them (only if S32 clears), S34 DeepSeek prefix cache, S35 gpt-oss 47-m4 + elastic tier, S36 cheap sweep + 47-m6. Inputs re-verified at `5118a65` (code unchanged since `b3404d3`). Full row: the S31 row in the backlog archive | — | done |
 | **S32** ✅ | ~~Re-price C8 (segment merge) + C9 (FWD) on Qwen3-Next at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-07:** re-priced at HEAD: unflagged FAILS 1.39–1.58; USER admitted E3/E4/E5 (D2); flagged bundle-b STRADDLES 3.07–3.70 over 3 processes (bar 3.133); **final review: clean processes (p1 + p3): flagged 2.71–3.19, STRADDLES; the p2 slow-replay state is very likely a post-CUPTI probe artefact (final review); USER: S33-A0 = ≤1 h CUPTI confirmation; S33 staged (E1–E6, then decide C8b)**. Full row: the S32 row in the backlog archive; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` | — | done |
-| **S33-A0** | **Confirm the post-CUPTI replay penalty (≤ 1 h)** | *(a)*; decides whether C8b is priced at the clean 0.45–0.56 ms/token before S33 | ≤ 1 hour |
+| **S33-A0** ✅ | ~~Confirm the post-CUPTI replay penalty~~ — **CLOSED 2026-10-07: CONFIRMED, a probe artefact.** One process: head.lin replay host 5.65 us/call before one 16-token Kineto window, 5.64 in the control, 25.93 after (4.58× ≥ 3×). Kineto leaves CUPTI attached after `profile.stop()`; `TEARDOWN_CUPTI=1` removes it (micro only). Server unaffected (the engine never profiles). C8b's clean 0.45–0.56 ms/token stands. PROBE RULE added. Full row: the S33-A0 row in the backlog archive; `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md` | — | done |
 | **S33** | **Build E1–E6, then decide C8b (STAGED; USER, 2026-10-07)** | *(a)*; the S27 → S28 pattern | week-class |
 | **S34** | **DeepSeek-V4 cross-turn prefix cache** | *(b)* up to 47.1 s of TTFT on every turn after the first, minus the diff's own prefill (S34 prices it first) | week-class (brainstorm → spec → plan) |
 | **S35** | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
@@ -215,33 +215,15 @@ the clean 0.45–0.56 ms/token before any build.
 
 - [x] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD — ✅ CLOSED 2026-10-07: unflagged FAILS 1.39–1.58; flagged bundle-b STRADDLES 3.07–3.70 ms/token over 3 processes (bar 3.133).** USER admitted E3/E4/E5 (D2), then ruled: investigate the slow-replay state (S33-A0), then S33 builds the full flagged bundle incl. C8b; **corrected at the final review: clean processes (p1 + p3) flagged 2.71–3.19 STRADDLES, the p2 slow state is very likely a post-CUPTI probe artefact, USER's third ruling: S33-A0 = ≤1 h CUPTI confirmation, S33 staged (E1–E6, then decide C8b)**. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md`.
 
-- [ ] **S33-A0 — confirm the post-CUPTI replay penalty (≤ 1 hour; set by the USER's third ruling at S32's final review, 2026-10-07; runs BEFORE S33, in its own fresh session).**
-      **Question:** is the ~5x graph-replay host penalty (S32 p2: unprofiled `S27_GRAPH@head.lin` 26.08 us/call in U_HOST,
-      25.12 in U_SEG, vs 5.27 / 5.25 in p1 and 5.67 / 5.40 in p3) caused by a CUPTI/Kineto window run earlier in the same
-      process? Evidence that says yes: p1 and p3 ran W,U1,U_HOST,U_SEG,U_EXP,U2 (replay normal before U_EXP); p2 ran
-      W,U2,U_EXP,U_SEG,U_HOST,U1 (slow in every arm after U_EXP; U1 54.53 vs 48.48 / 48.42, U2 46.01 before U_EXP vs
-      48.42 / 48.20); under profiling the three processes do not differ (GRAPH 3.53 / 3.38 / 3.50 ms/forward); the dry run
-      (p1 order) was normal at 5.53 us; S27's mirrored p2 showed the same (U_SUB, 4th in both orders: GRAPH 0.622 vs 1.841
-      ms/token). Tally 2 of 2 mirrored processes slow, 0 of 4 p1-order processes. The mechanism is unconfirmed.
-      **Discriminating test:** ONE process, server mode, graphs ON; any decode prompt will do (replay host time does not
-      depend on content). Three arms: **A**, unprofiled: time `S27_GRAPH@<cls>` host per call with the S27/S32 timer;
-      then ONE 16-token Kineto CUPTI window, exactly as `s32_decode.py`'s U_EXP; then **B**, unprofiled: the same timer
-      again. Alternatively a model-free 61-node CUDA graph micro-test before and after a profiler window.
-      **Stop rule:** B's head-graph replay host per call >= 3x A's -> the penalty is CONFIRMED: close as a probe artefact
-      and add a PROBE RULE to this file's REFERENCE section (never time an unprofiled arm after a CUPTI arm in the same
-      process; put U_EXP last in both orders, or give it its own process). Not >= 3x -> fall back to the original
-      investigation (find what differs per process at load: graph pool / instantiation, CPU frequency or affinity,
-      other GPU tenants, driver state) and present it to the USER first.
-      **Evidence and inputs:** the numbers above (`plans/probes/s32_out/decode-p{1,2,3}.log` `U_HOST/U_SEG
-      S27_GRAPH@head.lin` lines, `s32-decode-p{1,2,3}.json`); `plans/probes/s32_decode.py` (U_EXP block; the replay
-      counter); `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` ("The p2 anomaly is a probe artefact (final review)");
-      S27's FLAG (`docs/2026-10-06-S27-host-levers-RESULTS.md`), now invalidated. NEVER py-spy (it corrupts io_uring).
-      **§8:** measure only; nothing built, nothing banked.
+- [x] **S33-A0 — confirm the post-CUPTI replay penalty — ✅ CLOSED 2026-10-07: CONFIRMED, a probe artefact.** One process on Qwen3-Next (server mode, graphs ON, O_DIRECT, 17.86 GB budget): unprofiled `S27_GRAPH@head.lin` 5.65 us/call (A), 5.64 (control C, before CUPTI), **25.93 after ONE 16-token Kineto window (B): B/A 4.58× ≥ 3× stop rule**; per-node ≈ +0.33 us (S32 p2's fit 6.30 + 0.323 vs 4.00 + 0.015); eager host work rises too (UPLOAD 35.6 → 64.1 us/call). Mechanism (model-free micro, torch 2.11 + cu130): Kineto leaves CUPTI attached after `profile.stop()` — a 61-node replay 1.62 → 12.25 us (≈ 1.0 + 0.157 us/node), eager launch +1 us, for the rest of the process, CPU-only profiler too; **`TEARDOWN_CUPTI=1` removes it** (micro only, two windows, no crash). The engine never starts a profiler: the server is unaffected. S32's clean price stands (C8b +0.45–0.56 ms/token); S33 proceeds as staged. PROBE RULE added to the Environment section. §8: measure only, nothing built, nothing banked. Suite floor unchanged (no engine code). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md`.
 
 - [ ] **S33 — build E1–E6, then decide C8b (STAGED; set by the USER's third ruling at S32's final review, 2026-10-07).**
       **USER rulings:** "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
       session", then, after the clean re-price: **"Staged: E1–E6, then decide C8b (Recommended)"**. Runs AFTER S33-A0, in its
       own fresh session. NOT closed unrun: S32's flagged bundle-b STRADDLES (clean 2.710–3.190; pre-registered 3.072–3.699).
+      **S33-A0 (2026-10-07) CONFIRMED the p2 slow state as a post-CUPTI probe artefact**, so the clean p1 + p3 prices
+      below are the prices. S33's KEEP arms (`s28_session.py`) run no profiler. Any S33 arm that profiles follows the
+      PROBE RULE in the Environment section.
       **Price (S32, ms/token, bar 3.133):** clean (p1 + p3) unflagged bundle-b 1.154–1.157 FAILS, flagged bundle-b
       2.710–3.190 STRADDLES (p1 2.563–3.066, p3 2.857–3.313); calibration robust (zero-label 3.034–3.511, bench
       2.747–3.226). E1–E6 alone ≈ 2.11–2.61 (p1) / 2.30–2.76 (p3); E5 alone 1.46–2.27 and near its high end (1.95 / 2.07;
@@ -774,6 +756,14 @@ arithmetic, not the repack.**
   `plans/probes/s22_session.py`: pin the budget with `BALLAST_GB`, force the mode with `DIRECT=on|off`, and grep
   `O_DIRECT` and `Expert RAM cache:` in every arm's log before comparing. Ring-count knee probe:
   `plans/probes/s22_rings.py --rings N` (whole-expert waves, one ring count per process).
+- **PROBE RULE — never time an unprofiled arm after a Kineto/CUPTI arm in the same process (S33-A0, 2026-10-07).**
+  Kineto leaves CUPTI attached after `profile.stop()`, for the rest of the process, even with a CPU-only profiler.
+  Measured on Qwen3-Next: every later CUDA-graph replay costs ≈ +0.33 us per node on the host (head.lin 5.65 → 25.93
+  us/call, 4.58×), and every eager launch costs ≈ +1 us (micro-test). Put the profiled arm LAST in EVERY arm order, mirrored
+  ones included, or give it its own process. Mirroring the arm order does NOT protect against it: this is what
+  made S27's and S32's "slow p2". `TEARDOWN_CUPTI=1`, set before the first profiler starts, removed the penalty in
+  a model-free micro-test (two windows, no crash). It is unverified on a model: run an A / C / CUPTI / B check like
+  `plans/probes/s33a0_decode.py` before relying on it. The engine never profiles, so this is a probe-only trap.
 - Full suite: `./venv/bin/python -m pytest tests/ -q`. The current baseline is the one stated once
   at the top of this file — do not duplicate it here; it went stale four times that way.
 - The server needs `fastapi` and `uvicorn` (in `requirements.txt` from 2026-08-16). `httpx` and

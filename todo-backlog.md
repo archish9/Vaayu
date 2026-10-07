@@ -8830,3 +8830,57 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       median is 27.0 us; net the clean full flagged bundle is ≈ 2.95–3.2, AT the bar. **Third USER ruling (2026-10-07):**
       S33-A0 "≤1-hour CUPTI confirmation (Recommended)"; S33 "Staged: E1–E6, then decide C8b (Recommended)" — the rows in
       `todo.md` now read so. RESULTS corrected the same day (section "The p2 anomaly is a probe artefact (final review)").
+
+- [x] **S33-A0 — confirm the post-CUPTI replay penalty (≤ 1 hour; set by the USER's third ruling at S32's final review, 2026-10-07; runs BEFORE S33, in its own fresh session).**
+      **Question:** is the ~5x graph-replay host penalty (S32 p2: unprofiled `S27_GRAPH@head.lin` 26.08 us/call in U_HOST,
+      25.12 in U_SEG, vs 5.27 / 5.25 in p1 and 5.67 / 5.40 in p3) caused by a CUPTI/Kineto window run earlier in the same
+      process? Evidence that says yes: p1 and p3 ran W,U1,U_HOST,U_SEG,U_EXP,U2 (replay normal before U_EXP); p2 ran
+      W,U2,U_EXP,U_SEG,U_HOST,U1 (slow in every arm after U_EXP; U1 54.53 vs 48.48 / 48.42, U2 46.01 before U_EXP vs
+      48.42 / 48.20); under profiling the three processes do not differ (GRAPH 3.53 / 3.38 / 3.50 ms/forward); the dry run
+      (p1 order) was normal at 5.53 us; S27's mirrored p2 showed the same (U_SUB, 4th in both orders: GRAPH 0.622 vs 1.841
+      ms/token). Tally 2 of 2 mirrored processes slow, 0 of 4 p1-order processes. The mechanism is unconfirmed.
+      **Discriminating test:** ONE process, server mode, graphs ON; any decode prompt will do (replay host time does not
+      depend on content). Three arms: **A**, unprofiled: time `S27_GRAPH@<cls>` host per call with the S27/S32 timer;
+      then ONE 16-token Kineto CUPTI window, exactly as `s32_decode.py`'s U_EXP; then **B**, unprofiled: the same timer
+      again. Alternatively a model-free 61-node CUDA graph micro-test before and after a profiler window.
+      **Stop rule:** B's head-graph replay host per call >= 3x A's -> the penalty is CONFIRMED: close as a probe artefact
+      and add a PROBE RULE to this file's REFERENCE section (never time an unprofiled arm after a CUPTI arm in the same
+      process; put U_EXP last in both orders, or give it its own process). Not >= 3x -> fall back to the original
+      investigation (find what differs per process at load: graph pool / instantiation, CPU frequency or affinity,
+      other GPU tenants, driver state) and present it to the USER first.
+      **Evidence and inputs:** the numbers above (`plans/probes/s32_out/decode-p{1,2,3}.log` `U_HOST/U_SEG
+      S27_GRAPH@head.lin` lines, `s32-decode-p{1,2,3}.json`); `plans/probes/s32_decode.py` (U_EXP block; the replay
+      counter); `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` ("The p2 anomaly is a probe artefact (final review)");
+      S27's FLAG (`docs/2026-10-06-S27-host-levers-RESULTS.md`), now invalidated. NEVER py-spy (it corrupts io_uring).
+      **§8:** measure only; nothing built, nothing banked.
+      **✅ CLOSED 2026-10-07: CONFIRMED, a probe artefact.** HEAD `6ddd945`; the engine is unchanged since S32's p1 and p2
+      (`3682664`). **On device** (`plans/probes/s33a0_decode.py`, a copy of `s32_decode.py` with U_HOST-mode arm aliases):
+      - Setup: Qwen3-Next, one process, server mode, graphs ON, O_DIRECT, budget 17.86 GB, no ballast, 8k prompts, a
+        different slice per arm.
+      - Arms: W, A = U_HOST, C = U_HOSTC (control, before CUPTI), ONE 16-token U_EXP window at step 60, B = U_HOSTB.
+      - Unprofiled `S27_GRAPH@head.lin`: **5.65 / 5.64 / 25.93 us/call (B/A 4.58×, stop rule ≥ 3× → CONFIRMED)**.
+      - Other graph classes: head.full 5.38 → 20.85; mid.full 6.48 → 18.82; tail.lin 4.60 → 6.36; tail.full
+        4.69 → 6.47. That fits ≈ +1.8 + 0.33 us/node (S32 p2's fit: 6.30 + 0.323, against p1's 4.00 + 0.015).
+      - All graph replays: 0.569 → 1.717 ms/token.
+      - Eager host work per call rises too: UPLOAD 35.6 → 64.1, BLOB 24.2 → 38.8, SETTLE 23.4 → 34.9, KERNEL
+        40.7 → 47.3 us; gen gap 0.388 → 0.441 ms.
+      - A ≈ C within 1.3 % on every class, so neither position nor content causes it. Replays 108 + 48 per token in
+        every arm.
+      **Mechanism** (model-free micro, `s33a0_micro.py` / `s33a0_teardown2.py`, torch 2.11.0 + cu130): Kineto leaves
+      CUPTI attached after `profile.stop()`.
+      - A 61-node replay goes 1.62 → 12.25 us (7.6×); the sham window gives 0.98×.
+      - Penalty vs nodes: +1.20 / +10.63 / +32.37 us at 1 / 61 / 200 nodes, ≈ 1.0 + 0.157 us/node.
+      - Eager launch: 2.71 → 3.66 us. It persists for the rest of the process. A CPU-only profiler does it too (7.51×).
+      - **`TEARDOWN_CUPTI=1` removes it (0.99×), across two windows with a graph captured between, no crash.** On a
+        model this is unverified.
+      **Reach and consequences:**
+      - The engine never starts a profiler (no `torch.profiler` in `vaayu/`), so the server is unaffected.
+      - S32's clean price stands: C8b +0.45–0.56 ms/token, flagged bundle-b 2.71–3.19.
+      - S27's GRAPH FLAG and its p2 M7 C5 estimate stay invalidated. S28 is unaffected.
+      - Of the older probes, only `s7_dispatch.py`'s default order times an unprofiled arm (U2) after its CUPTI arm
+        (U_CNT). It ran before S12, so the eager penalty was ≈ +1 us per launch. Not re-examined.
+      **PROBE RULE** added to `todo.md`'s Environment section. §8: measure only, nothing built, nothing banked. Suite
+      floor unchanged.
+      - RESULTS: `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md`.
+      - Assets: `docs/superpowers/plans/2026-10-07-S33-A0-assets/`.
+      - Raw: `plans/probes/s33a0_out/`.
