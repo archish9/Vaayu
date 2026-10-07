@@ -245,6 +245,7 @@ order; if that was deliberate, flip the table — the rows are independent.)
         `vaayu/moe_patch.py` `_make_fused_sparse_forward` :2268, `_lean_decode` :2313.
       - **Baseline to compare with (S28 KEEP set):** server mode, graphs ON, O_DIRECT, the server's own budget
         18.4–18.9 GB, no ballast: HIT decode 51.59 ms/token, HIT turn 16.04 s.
+      **Dry run done (b04c326):** ident COPY IS THE ENGINE; recount S12 108.00/token, C5 48.00/token; self-check rel -0.0055; frozen 24 anchors, edits E1-E6.
       **Stop rule:** bundle (calibrated, named changes only) < 3.13 ms/token → close S32 AND S33 with the number.
       Clears → the USER confirms the bundle at S32's close (S27 → S28 precedent), S33 builds it.
       **§8:** measure only, nothing to wire.
