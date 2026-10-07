@@ -202,7 +202,18 @@ order; if that was deliberate, flip the table — the rows are independent.)
       held except 47-m4's `FP8DynamicCache`, now `vaayu_base.py:1672`, was :1382). Full row: `todo-backlog.md` "Closed
       after the 2026-10-03 cleanup".
 
-- [ ] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD, MEASURE ONLY (set by the USER at S31, 2026-10-07).**
+- [~] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD, MEASURE ONLY (set by the USER at S31, 2026-10-07).**
+      **IN PROGRESS 2026-10-07: design approved by the USER**, spec
+      `docs/superpowers/specs/2026-10-07-S32-c8-c9-reprice-design.md`, plan
+      `docs/superpowers/plans/2026-10-07-S32-c8-c9-reprice.md` (8 tasks; CPU code verified while planning, 22 tests;
+      the window simulator's self-check passes on S27's real dry-run trace, −0.54 %). Planning refined the window
+      model: a graph's launch cost grows with its node count (≈ 5.5 µs fixed + 0.56 µs/node, profiled), so a merged
+      graph saves only the fixed part, and C8a ≈ one fixed launch per boundary. Inputs re-verified at `612a0ed` (engine
+      unchanged since `5118a65`). Method: S27's census ported to the post-S28 path; FWD split by an AST-marked copy of
+      `forward` (arm U_SEG); C8 priced in two forms, **C8a** narrow tail+head merge and **C8b** whole-forward replay,
+      by a per-boundary timeline simulator on U_EXP's traces, with a self-check against the trace; C9 named pieces
+      only; log-line / gc-cadence pieces flagged for the USER; 2 mirrored processes, a 3rd on STRADDLE; no
+      prototype arms.
       **Question:** after S28, how many exposed ms/token would C8 and C9 remove, each and as a bundle? Does the bundle
       clear the bar?
       - **C8 = segment merge:** replay the MoE tail and the next layer's pre-MoE part as ONE decode graph, so a token
