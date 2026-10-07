@@ -218,7 +218,11 @@ ATTN_IMPLEMENTATION = None
 # GB of PAGEABLE RAM for the dense layer cache. None derives it from TOTAL RAM
 # so throughput is reproducible across restarts (keying off momentary free RAM
 # swung Llama-3.3-70B decode 38% run to run). 0 disables it. No effect on MoE,
-# whose experts live in the pinned expert RAM cache instead.
+# whose experts live in the pinned expert RAM cache instead. On dense it also
+# steers buffered vs O_DIRECT: the load charges this cache against free RAM
+# before asking whether the page cache can hold 40 % of the checkpoint. Left
+# uncharged, Llama-3.3-70B went buffered and decoded 21 % slower (S29,
+# 2.48 vs 1.96 s/token); 0 brings that choice back.
 RAM_CACHE_BUDGET_GB = None
 
 # Persist prefix KV to disk so reuse survives a restart.

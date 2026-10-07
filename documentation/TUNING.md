@@ -473,14 +473,20 @@ kernel's page cache (buffered) and bypassing it (O_DIRECT), and prints which:
 
 Buffered is chosen only when the page cache could hold 40 % of the checkpoint in the RAM
 that is really left for it: the free RAM, minus 8 GiB for the OS and the engine's own
-buffers, minus what the expert RAM cache will pin (on a MoE checkpoint that is every expert
-on disk, or all the remaining RAM if they do not fit). `env.json` records the result as
-`storage.o_direct`.
+buffers, minus what the engine's own RAM cache will take — on a MoE checkpoint the expert
+RAM cache (every expert on disk, or all the remaining RAM if they do not fit), on a dense
+checkpoint the RAM layer cache (`RAM_CACHE_BUDGET_GB`; by default total RAM minus 16 GiB).
+`env.json` records the result as `storage.o_direct`.
 
 Why it matters: before 2026-10-04 the expert cache was not subtracted, so a MoE checkpoint a
 little over twice the free RAM was read buffered although the expert cache then left the
 page cache almost nothing. Measured on Qwen3-Next-80B (48 GB checkpoint, 27 GiB free, 16 GB
 VRAM): the page cache served 1-3 % of the bytes read, and a prefix-HIT agent turn took
 22.4 s against 17.9 s with O_DIRECT (-20 %; -17 % with the RAM budget held equal), same
-output tokens. If a load of a large MoE model prints the `Sufficient RAM` line and decode
-feels slow, check the free RAM at load: the choice is made once, from that number.
+output tokens. The dense layer cache was not subtracted either until 2026-10-07: on
+Llama-3.3-70B (41 GB checkpoint, 27 GiB free) the rule said "50 % cacheable" and went
+buffered, but the layer cache then took 16 GB and ~17 GB of layers streamed per token through
+what was left; the page cache served at most 0.6 % of the bytes read, and decode took 2.48
+s/token against 1.96 with O_DIRECT (-21 %, TTFT -21 %), same output tokens. If a load of a
+large model prints the `Sufficient RAM` line and decode feels slow, check the free RAM at
+load: the choice is made once, from that number.

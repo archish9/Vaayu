@@ -281,10 +281,12 @@ def read_bytes() -> int:
         return _read_bytes
 
 
-def _should_use_direct_io(model_dir: str) -> bool:
+def _should_use_direct_io(model_dir: str, ram_cache_budget: int | None = None) -> bool:
     """
     O_DIRECT wins when the page cache can't meaningfully cache the model.
     The crossover point is ~40% cacheable (empirically validated).
+    `ram_cache_budget` is the dense RAM layer cache override in bytes, exactly as
+    the engine is given it (None = derived from total RAM, 0 = off).
     """
     try:
         paths = list(Path(model_dir).glob("*.safetensors"))
@@ -300,7 +302,23 @@ def _should_use_direct_io(model_dir: str) -> bool:
         # the page cache then served 1-3 % of the bytes read, the kernel
         # reclaimed 6-9 million pages per turn, and the agent's prefix-HIT turn
         # took 23.55 s against 19.44 s with O_DIRECT (2026-10-04, ids identical).
-        available_for_cache -= min(available_for_cache, expert_arena_bytes(model_dir))
+        arena = expert_arena_bytes(model_dir)
+        if arena:
+            available_for_cache -= min(available_for_cache, arena)
+        else:
+            # No per-expert tensors, so no expert cache: a dense load, whose RAM
+            # layer cache is sized the same way a moment later (vaayu_base) and
+            # keeps its layers as clones. Uncharged, it sent Llama-3.3-70B (41 GB,
+            # 27 GiB free) buffered at "50 % cacheable": ~16.7 GB streamed per token
+            # through what was left, the page cache served <= 0.6 % of it while the
+            # kernel reclaimed ~34 M pages per request, and decode took 2.48 s/token
+            # against 1.96 with O_DIRECT (S29, 2026-10-07, ids identical). A MoE whose
+            # experts are not indexed gets no layer cache but is charged one here,
+            # which only leans it to O_DIRECT, the safe default.
+            from .ram_cache import auto_detect_cache_budget
+            available_for_cache -= min(available_for_cache, auto_detect_cache_budget(
+                total_bytes=mem.total, available_bytes=mem.available,
+                override_bytes=ram_cache_budget))
         cacheable_fraction = available_for_cache / max(1, model_total_bytes)
 
         use_direct = cacheable_fraction < 0.40
