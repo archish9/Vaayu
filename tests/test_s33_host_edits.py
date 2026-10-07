@@ -540,3 +540,29 @@ def test_the_server_turns_deferral_on_for_the_model_it_loads(monkeypatch):
     assert model.defer_decode_hygiene is True
 
 
+# ── E6: shard names cached on the model ─────────────────────────────────────
+
+def test_the_shard_name_set_is_built_once_and_rebuilt_when_the_blocks_change():
+    pinned = {"embed", "layers.0", "norm", "lm_head"}
+    m = make(n_dec=3, pinned=pinned, moe_shards=("layers.1",))
+    run(m)
+    first = m._moe_shard_names_cache
+    run(m)
+    assert m._moe_shard_names_cache is first
+    assert first[1] == frozenset({"layers.1"})
+    m._moe_blocks = [types.SimpleNamespace(layer_name="layers.2")]
+    m.loads.clear()
+    run(m)
+    assert m._moe_shard_names_cache[1] == frozenset({"layers.2"})
+    assert m.loads == [("full", "layers.1"), ("non_expert", "layers.2")]
+
+
+def test_expert_tensors_are_still_filtered_out_of_a_streamed_moe_shard():
+    pinned = {"embed", "layers.0", "norm", "lm_head"}
+    m = make(n_dec=2, pinned=pinned, moe_shards=("layers.1",))
+    m._expert_offset_index = None            # the shard then loads whole, and the filter must drop experts
+    run(m)
+    assert m.loads == [("full", "layers.1")]
+    assert m.loader_strategy.injected == [("layers.1", ["w"])]
+
+

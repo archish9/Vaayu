@@ -3,6 +3,7 @@ import contextlib
 import gc
 import json
 import os
+import re
 import struct
 import subprocess
 from typing import List, Optional, Tuple, Union
@@ -62,6 +63,10 @@ except ImportError:
 
 # S33 prototype switch: the pieces a probe turned on (model._s33_pieces). Empty = today's code.
 _NO_S33 = frozenset()
+
+# Routed-expert tensors inside a MoE shard: the layer loop filters them out of
+# inject_to_gpu (sparse_forward loads experts itself).
+_EXPERT_TENSOR_RE = re.compile(r'\.experts\.')
 
 
 def next_unpinned_table(layer_names, pinned) -> list:
@@ -5683,14 +5688,23 @@ class VaayuBaseModel(GenerationMixin):
 
         # MoE: precompute set of shard names that contain MoE experts so we can
         # filter expert tensors out of inject_to_gpu. sparse_forward handles experts.
-        _moe_shard_names: set[str] = (
-            {b.layer_name for b in self._moe_blocks} if self._moe_blocks else set()
-        )
-        if _moe_shard_names:
-            import re as _re_fwd
-            _expert_tensor_re = _re_fwd.compile(r'\.experts\.')
+        if "e6" in _s33:
+            _shards = getattr(self, "_moe_shard_names_cache", None)
+            if _shards is None or _shards[0] is not self._moe_blocks:
+                _shards = self._moe_shard_names_cache = (
+                    self._moe_blocks,
+                    frozenset(b.layer_name for b in self._moe_blocks) if self._moe_blocks else frozenset())
+            _moe_shard_names = _shards[1]
+            _expert_tensor_re = _EXPERT_TENSOR_RE if _moe_shard_names else None
         else:
-            _expert_tensor_re = None
+            _moe_shard_names: set[str] = (
+                {b.layer_name for b in self._moe_blocks} if self._moe_blocks else set()
+            )
+            if _moe_shard_names:
+                import re as _re_fwd
+                _expert_tensor_re = _re_fwd.compile(r'\.experts\.')
+            else:
+                _expert_tensor_re = None
 
         # Persistent executor: created once, reused every token. The old per-token
         # `with ThreadPoolExecutor(...)` paid thread create/join on every forward.
