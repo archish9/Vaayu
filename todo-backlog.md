@@ -8594,7 +8594,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
           both Llama checkpoints.
         - Otherwise close the row with the numbers.
       - **Reach:** every token of a streamed dense model, and gpt-oss, at N=1, server default. Hours.
-      - **CLOSED 2026-10-07 (S29 session, inline, systematic-debugging): FIXED for dense; gpt-oss stays buffered.**
+      - **CLOSED 2026-10-07 (S29 session, inline, systematic-debugging): FIXED for dense; gpt-oss stays buffered.** Branch `s29-dense-odirect` (fix `43eb862`, ledger `f4f5828`), merged to `main` `b3404d3`.
         - **Llama-3.3-70B, 8 arms `off,on,on,off,on,off,off,on`** (`plans/probes/s29_dense.py`, mode forced, server knobs,
           prompt lookup on, checkpoint evicted from the page cache before each arm, 4-token warm then a 16-token timed
           request): buffered 2.486 / 2.474 / 2.478 / 2.493 s/token (mean 2.483, spread 0.78 %), O_DIRECT 1.959 / 1.965 /
