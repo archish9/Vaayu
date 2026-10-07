@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .chat import NoChatTemplate, TemplateLacksToolSupport
 from . import envinfo, reqlog
@@ -140,6 +141,16 @@ class ServerConfig:
 # not a model number: a token costs ~0.65 s on the slowest target here, so this
 # adds nothing measurable and still frees the slot within a token or two.
 DISCONNECT_POLL_S = 1.0
+
+
+def _after_response(engine):
+    """The engine's after-response work as a background task, or None.
+
+    Starlette runs a response's background task once the body has been sent.
+    An injected engine (tests, embedded use) may not have the hook.
+    """
+    hook = getattr(engine, "after_response", None)
+    return BackgroundTask(hook) if hook is not None else None
 
 
 async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
@@ -432,6 +443,10 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # belongs to a caller that keeps using this process, and
                 # freezing its objects would retain them for the process's life.
                 freeze_after_load()
+                # S33 E5: this process answers requests, so the every-32-token
+                # host hygiene moves off the token path -- the routes run it
+                # after each response (EngineHandle.after_response).
+                model.defer_decode_hygiene = True
             else:
                 app.state.engine = engine
             # An injected engine (tests, embedded use) may carry no ServerConfig
@@ -669,7 +684,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                      scheduler=app.state.scheduler),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                         **_session_header(req)})
+                         **_session_header(req)},
+                background=_after_response(e))
 
         cancel = CancelToken()
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
@@ -806,7 +822,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         ).model_dump(exclude_none=True)
         if warning:
             body["warnings"] = [warning]
-        return JSONResponse(content=body, headers=_session_header(req))
+        return JSONResponse(content=body, headers=_session_header(req),
+                            background=_after_response(e))
 
     return app
 

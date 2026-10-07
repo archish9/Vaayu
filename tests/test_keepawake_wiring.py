@@ -69,7 +69,7 @@ def test_generate_runs_with_the_spinners_up_and_drops_them_after(monkeypatch, hy
     # S16: the prefix-off path now seeds Vaayu's own KV cache; this test is
     # about the keep-awake, so the stub's cache is a placeholder.
     obj._create_kv_cache = lambda: None
-    obj.telemetry = type("T", (), {"dump_json": lambda self, p: None})()
+    obj.telemetry = type("T", (), {})()
     before = os.sched_getaffinity(0)
 
     VaayuBaseModel.generate(obj)

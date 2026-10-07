@@ -313,6 +313,33 @@ class EngineHandle:
         finally:
             self._inflight -= 1
 
+    async def after_response(self) -> None:
+        """Run the host-memory hygiene the engine deferred, once a response is out.
+
+        The routes attach this as the response's background task, so it runs
+        after the body has been sent. It takes the engine lock: the hygiene is
+        a gc.collect(), an explicit collection ignores gc.disable(), and the
+        decode-graph captures rely on gc.disable() to keep a collection out of
+        a capture -- so it must never overlap a generation. A request that
+        arrives meanwhile waits for it; the line below says how long that was.
+        (If this task is cancelled while the collection runs, the lock is
+        released before the pool thread has finished; nothing cancels it
+        while serving.)
+        """
+        model = self.model
+        run = getattr(model, "run_deferred_hygiene", None)
+        if not callable(run) or not getattr(model, "_decode_hygiene_due", False):
+            return
+        import time
+        async with self._lock:
+            t0 = time.time()
+            ran = await asyncio.get_running_loop().run_in_executor(None, run)
+        if ran:
+            # flush: this is the last line a response prints, and stdout is a
+            # pipe here -- unflushed it would sit in the buffer until the next
+            # request printed something.
+            print(f"[Vaayu-Server] deferred hygiene: {1e3 * (time.time() - t0):.0f} ms", flush=True)
+
     # ── request mapping ──────────────────────────────────────────────────────
 
     def _log(self, req, event, **fields) -> None:

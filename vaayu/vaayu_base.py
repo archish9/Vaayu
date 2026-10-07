@@ -3,6 +3,7 @@ import contextlib
 import gc
 import json
 import os
+import re
 import struct
 import subprocess
 from typing import List, Optional, Tuple, Union
@@ -58,6 +59,25 @@ try:
     print('>>>> cache_utils installed')
 except ImportError:
     cache_utils_installed = False
+
+
+# Routed-expert tensors inside a MoE shard: the layer loop filters them out of
+# inject_to_gpu (sparse_forward loads experts itself).
+_EXPERT_TENSOR_RE = re.compile(r'\.experts\.')
+
+
+def next_unpinned_table(layer_names, pinned) -> list:
+    """table[i] is the smallest k >= i whose layer is NOT in `pinned`, or None.
+
+    One entry more than there are layers, so `table[i + 1]` ("the next layer
+    to prefetch after layer i") is always in range. Built once per forward:
+    the layer loop used to rescan `layer_names[i + 1:]` at every layer, which
+    on a fully pinned model walks the whole remaining list every time.
+    """
+    table = [None] * (len(layer_names) + 1)
+    for k in range(len(layer_names) - 1, -1, -1):
+        table[k] = k if layer_names[k] not in pinned else table[k + 1]
+    return table
 
 
 def _disk_timings_for_layer(file_path: str, cache_hit: bool,
@@ -2331,6 +2351,11 @@ class VaayuBaseModel(GenerationMixin):
         self.profiler = LayeredProfiler()
         self.telemetry = VaayuTelemetry()
         self._token_count = 0
+        # S33 E5: a server sets `defer_decode_hygiene`; forward then only marks
+        # the every-32-token host hygiene as due, and `run_deferred_hygiene`
+        # runs it once the response has been sent.
+        self.defer_decode_hygiene = False
+        self._decode_hygiene_due = False
         # Monotonic expert-disk stall, folded from the per-token
         # `_expert_disk_s` at the END of each forward pass. The server diffs it
         # per request (requests.jsonl); left uninitialised, the first request of
@@ -5658,14 +5683,14 @@ class VaayuBaseModel(GenerationMixin):
 
         # MoE: precompute set of shard names that contain MoE experts so we can
         # filter expert tensors out of inject_to_gpu. sparse_forward handles experts.
-        _moe_shard_names: set[str] = (
-            {b.layer_name for b in self._moe_blocks} if self._moe_blocks else set()
-        )
-        if _moe_shard_names:
-            import re as _re_fwd
-            _expert_tensor_re = _re_fwd.compile(r'\.experts\.')
-        else:
-            _expert_tensor_re = None
+        # Built once and kept on the model: the blocks are assigned at load.
+        _shards = getattr(self, "_moe_shard_names_cache", None)
+        if _shards is None or _shards[0] is not self._moe_blocks:
+            _shards = self._moe_shard_names_cache = (
+                self._moe_blocks,
+                frozenset(b.layer_name for b in self._moe_blocks) if self._moe_blocks else frozenset())
+        _moe_shard_names = _shards[1]
+        _expert_tensor_re = _EXPERT_TENSOR_RE if _moe_shard_names else None
 
         # Persistent executor: created once, reused every token. The old per-token
         # `with ThreadPoolExecutor(...)` paid thread create/join on every forward.
@@ -5733,15 +5758,27 @@ class VaayuBaseModel(GenerationMixin):
 
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
+
+            def _submit_load(_n):
+                # A MoE shard with an expert index loads only its non-expert
+                # tensors; sparse_forward reads the routed experts itself.
+                if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                    return executor.submit(self._load_non_expert_strategy, _n)
+                return executor.submit(self._load_from_strategy, _n)
+
             if self.prefetching:
-                _all_pinned = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                for _seed_name in self.layer_names:
-                    if _seed_name not in _all_pinned:
-                        if _seed_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                            future = executor.submit(self._load_non_expert_strategy, _seed_name)
-                        else:
-                            future = executor.submit(self._load_from_strategy, _seed_name)
-                        break
+                # Once per forward: which layer to prefetch after each layer. Built
+                # only under `self.prefetching`, as both readers in the loop are.
+                _next_unpinned = next_unpinned_table(
+                    self.layer_names,
+                    self.pinned_layer_names | self.non_expert_pinned_layer_names)
+                _k = _next_unpinned[0]
+                if _k is not None:
+                    future = _submit_load(self.layer_names[_k])
+
+            # (len_p, len_s) -> this forward's layer-independent kwargs. A layer may
+            # be handed this very dict: never mutate a layer's kwargs in place.
+            _kw_base = {}
 
             # S12: on an eligible forward (one token, N=1) each resident decoder layer
             # replays as CUDA graphs; every other forward is stock.
@@ -5766,21 +5803,17 @@ class VaayuBaseModel(GenerationMixin):
                     _lt_compute_us = 0
 
                     _non_expert_pinned = self.non_expert_pinned_layer_names
-                    if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
+                    _layer_pinned = layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned
+                    if _layer_pinned:
                         # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
                         _lt_cache_hit = True
                         moved_layers = []
                         # If no future is outstanding, kick off the next non-pinned load
                         # so disk read overlaps with this layer's GPU compute.
                         if self.prefetching and future is None:
-                            _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
-                            for _n in self.layer_names[i + 1:]:
-                                if _n not in _all_pinned_fwd:
-                                    if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                        future = executor.submit(self._load_non_expert_strategy, _n)
-                                    else:
-                                        future = executor.submit(self._load_from_strategy, _n)
-                                    break
+                            _k = _next_unpinned[i + 1]
+                            if _k is not None:
+                                future = _submit_load(self.layer_names[_k])
 
                     elif self.prefetching:
                         # ── Non-pinned, prefetching ──────────────────────────────
@@ -5811,14 +5844,9 @@ class VaayuBaseModel(GenerationMixin):
                         future = None
                         if self.profiling_mode:
                             t = time.time()
-                        _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                        for _n in self.layer_names[i + 1:]:
-                            if _n not in _all_pinned_elif:
-                                if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                    future = executor.submit(self._load_non_expert_strategy, _n)
-                                else:
-                                    future = executor.submit(self._load_from_strategy, _n)
-                                break
+                        _k = _next_unpinned[i + 1]
+                        if _k is not None:
+                            future = _submit_load(self.layer_names[_k])
                         if self.profiling_mode:
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
@@ -5913,14 +5941,22 @@ class VaayuBaseModel(GenerationMixin):
                             len_s = self.get_sequence_len(seq)
                             _lp = _past_lens[j] if _past_lens is not None else _len_p
 
-                            kwargs = {
-                                'use_cache': use_cache,
-                                **self.get_past_key_value_args(past_key_values),
-                                **self.get_pos_emb_args(_lp, len_s),
-                                **self.get_attention_mask_args(attention_mask, _lp, len_s,
-                                                               layer=layer),
-                                **self.get_position_ids_args(position_ids, _lp, len_s),
-                            }
+                            # Three of the four hooks do not depend on the layer:
+                            # build their part once per (past length, new length)
+                            # and reuse it. The mask hook is still called for every
+                            # layer -- it is the one that is told which layer runs
+                            # (per-layer windows; DeepSeek-V4's start_pos check).
+                            _base = _kw_base.get((_lp, len_s))
+                            if _base is None:
+                                _base = _kw_base[(_lp, len_s)] = {
+                                    'use_cache': use_cache,
+                                    **self.get_past_key_value_args(past_key_values),
+                                    **self.get_pos_emb_args(_lp, len_s),
+                                    **self.get_position_ids_args(position_ids, _lp, len_s),
+                                }
+                            _mask_args = self.get_attention_mask_args(attention_mask, _lp, len_s,
+                                                                      layer=layer)
+                            kwargs = {**_base, **_mask_args} if _mask_args else _base
 
                             _MAX_OOM_RETRIES = 2
                             layer_out = None
@@ -6001,17 +6037,25 @@ class VaayuBaseModel(GenerationMixin):
                             self.model, layer, moved_layers, self.hf_quantizer
                         )
 
-                    self.telemetry.record_layer(LayerTiming(
-                        layer_name=layer_name,
-                        file_bytes=_lt_file_bytes,
-                        header_parse_us=_lt_header_parse_us,
-                        io_submit_us=_lt_io_submit_us,
-                        io_wait_us=_lt_io_wait_us,
-                        tensor_reconstruct_us=_lt_tensor_reconstruct_us,
-                        gpu_transfer_us=_lt_gpu_transfer_us,
-                        compute_us=_lt_compute_us,
-                        cache_hit=_lt_cache_hit,
-                    ))
+                    # No per-layer record for a VRAM-resident layer on a forward
+                    # that is ELIGIBLE for decode graphs (one token, N=1): every
+                    # disk field of such a record is zero. Eligible is not
+                    # replayed: a layer the graphs refused, the warm-up token and
+                    # the embedding / norm / lm_head run eagerly and lose their
+                    # compute_us with it. A streamed layer always records -- its
+                    # fields are real disk timings.
+                    if not (_dg_on and _layer_pinned):
+                        self.telemetry.record_layer(LayerTiming(
+                            layer_name=layer_name,
+                            file_bytes=_lt_file_bytes,
+                            header_parse_us=_lt_header_parse_us,
+                            io_submit_us=_lt_io_submit_us,
+                            io_wait_us=_lt_io_wait_us,
+                            tensor_reconstruct_us=_lt_tensor_reconstruct_us,
+                            gpu_transfer_us=_lt_gpu_transfer_us,
+                            compute_us=_lt_compute_us,
+                            cache_hit=_lt_cache_hit,
+                        ))
 
                     # Prefill only: decode calls this every 32 tokens instead (below) —
                     # per-token empty_cache() defeats the CUDA caching allocator.
@@ -6056,7 +6100,12 @@ class VaayuBaseModel(GenerationMixin):
         # Decode-phase memory hygiene, throttled: every 32 tokens, host-only —
         # empty_cache() would defeat the CUDA caching allocator (Task 2).
         if self._token_count % 32 == 0:
-            clean_memory(cuda=False)
+            if getattr(self, "defer_decode_hygiene", False):
+                # A server runs it after the response has been sent
+                # (run_deferred_hygiene): ~all of its cost is gc.collect().
+                self._decode_hygiene_due = True
+            else:
+                clean_memory(cuda=False)
         # Chunk-major elements have unequal lengths — only the last chunk's
         # logits exist/matter (see lm_head skip above).
         logits = batch[-1] if _chunk_lens is not None else torch.cat(batch, 0)
@@ -6092,11 +6141,19 @@ class VaayuBaseModel(GenerationMixin):
         _la = getattr(self, "_lookahead_state", None)
         _la_str = (f"  lookahead_acc={_la['hits']}/{_la['total']}"
                    f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
-        try:
-            with open("/proc/self/status") as _rf:
-                _rss_kb = next((int(_l.split()[1]) for _l in _rf if _l.startswith("VmRSS:")), 0)
-        except OSError:
-            _rss_kb = 0
+        if self._token_count % 32 != 0 and getattr(self, "_rss_kb_last", None) is not None:
+            # rss= is sampled: read on the first pass and on every 32nd, the
+            # last value is repeated in between. On a 32nd pass a library
+            # caller's hygiene (above) has just trimmed the heap, so its sample
+            # is the trough; a probe after the sawtooth reads /proc itself.
+            _rss_kb = self._rss_kb_last
+        else:
+            try:
+                with open("/proc/self/status") as _rf:
+                    _rss_kb = next((int(_l.split()[1]) for _l in _rf if _l.startswith("VmRSS:")), 0)
+            except OSError:
+                _rss_kb = 0
+            self._rss_kb_last = _rss_kb
         _rss_str = f"  rss={_rss_kb / 1e6:.2f}GB"
         from .persist.safetensor_model_persister import read_bytes as _read_bytes
         _bytes_str = format_byte_fields(
@@ -6193,6 +6250,22 @@ class VaayuBaseModel(GenerationMixin):
                     cache.key_cache[i]   = cache.key_cache[i][:, :, -target_seq_len:, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 
+    def run_deferred_hygiene(self) -> bool:
+        """Run the host-memory hygiene that `forward` deferred. True if it ran.
+
+        With `defer_decode_hygiene` set, forward only marks the every-32-token
+        `clean_memory(cuda=False)` as due. The owner of the request loop calls
+        this once the response is out (the server: after the body is sent,
+        under the engine lock). It must not run while a forward is in flight:
+        an explicit gc.collect() ignores gc.disable(), which is what keeps a
+        collection out of a CUDA-graph capture.
+        """
+        if not getattr(self, "_decode_hygiene_due", False):
+            return False
+        self._decode_hygiene_due = False
+        clean_memory(cuda=False)
+        return True
+
     # A1 cross-turn prefix cache concurrency invariant: one in-flight request
     # per session id. Two concurrent generate() calls with the SAME session_id
     # would both check out / mutate the same cache object and corrupt each
@@ -6245,7 +6318,6 @@ class VaayuBaseModel(GenerationMixin):
                 if kwargs.get("past_key_values") is None:
                     kwargs["past_key_values"] = self._create_kv_cache()
                 result = super().generate(*args, **kwargs)
-                self.telemetry.dump_json("vaayu_telemetry.json")
                 return result
 
             # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
@@ -6323,7 +6395,6 @@ class VaayuBaseModel(GenerationMixin):
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
         pc.store(resolved_sid, token_ids, kv)
-        self.telemetry.dump_json("vaayu_telemetry.json")
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:
@@ -6719,7 +6790,6 @@ class VaayuBaseModel(GenerationMixin):
                 if pc is not None:
                     resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
-                self.telemetry.dump_json("vaayu_telemetry.json")
                 return generated
             finally:
                 if _resized_vram_prefix:
@@ -7128,4 +7198,3 @@ class VaayuBaseModel(GenerationMixin):
                     _vram_cache.budget_bytes = _saved_budget
                 self._batch_decode_active = False
                 self._batch_n = 1
-                self.telemetry.dump_json("vaayu_telemetry.json")

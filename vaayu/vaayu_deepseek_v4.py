@@ -607,9 +607,10 @@ class VaayuDeepseekV4(VaayuBaseModel):
         This hook does NOT read a sequence length any more, and that is the
         whole point. `DeepseekV4Cache` gives every layer an INDEPENDENT
         `cumulative_length`, bumped only when that layer's own `update()` runs,
-        and the engine builds kwargs once per DECODER LAYER -- and, above
-        `prefill_chunk_size`, once per (layer, chunk) pair
-        (`vaayu_base.py:5222-5241`, `_past_lens` from `compute_chunk_past_lens`).
+        and the engine calls this hook only once per forward for each (past
+        length, new length) pair -- one pair per chunk above
+        `prefill_chunk_size` (`_past_lens` from `compute_chunk_past_lens`) --
+        while `get_attention_mask_args` still runs for every DECODER LAYER.
         Mid-step the layers that already ran are post-write and the rest are
         pre-write, so NO fixed index is correct for every layer's kwargs: the
         executing layer needs `past0 + sum(earlier chunks)`, finished layers
@@ -722,9 +723,10 @@ class VaayuDeepseekV4(VaayuBaseModel):
         computed against the wrong history. And it has to be THIS hook because
         the engine passes `layer=` only here (`vaayu_base.py:5241`), while
         every layer of `DeepseekV4Cache` counts independently -- see
-        `get_past_key_value_args`. The loop builds this hook's args after
-        `get_pos_emb_args` and before `layer(**kwargs)`, so raising here still
-        stops the bad call.
+        `get_past_key_value_args`. The loop calls this hook after the three
+        layer-independent ones (`get_past_key_value_args` among them, which
+        stores the reference read below) and before `layer(**kwargs)`, so
+        raising here still stops the bad call.
 
         `layer=None` (the base signature's default, and what a caller that
         names no layer sends) SKIPS the check: without a layer there is no

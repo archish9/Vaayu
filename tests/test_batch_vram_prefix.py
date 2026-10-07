@@ -55,9 +55,6 @@ class _FakeMoEModel:
         def reset_batch_overlap(self):
             pass
 
-        def dump_json(self, path):
-            pass
-
     def __init__(self, geo, budget, layer_ids, load_time_range):
         self._moe_geometry = geo
         self._moe_blocks = [SimpleNamespace(layer_idx=i) for i in layer_ids]

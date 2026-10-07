@@ -32,8 +32,7 @@ class _Recorder:
         self.tokenizer = type("T", (), {"pad_token_id": 0})()
         self.config = type("C", (), {"eos_token_id": -1})()
         self.telemetry = type("Tel", (), {
-            "reset_batch_overlap": lambda s: None,
-            "dump_json": lambda s, *a, **k: None})()
+            "reset_batch_overlap": lambda s: None})()
         self.forwards = 0
 
     def _assert_context_fits(self, n_tokens, N=1, expert_giveback_bytes=0,

@@ -20,8 +20,7 @@ from vaayu.vaayu_base import VaayuBaseModel
 
 
 class _Telemetry:
-    def dump_json(self, *a, **k):
-        pass
+    pass
 
 
 @pytest.fixture

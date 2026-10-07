@@ -241,9 +241,6 @@ class _FakeBatchedModel:
         def reset_batch_overlap(self):
             pass
 
-        def dump_json(self, path):
-            pass
-
     def __init__(self, pc):
         self._prefix_cache = pc
         self.tokenizer = self._Tok()
