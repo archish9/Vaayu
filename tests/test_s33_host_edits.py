@@ -339,3 +339,41 @@ def test_rss_is_read_on_the_first_pass_and_every_32nd_and_every_line_still_carri
     assert "rss=0.00GB" not in lines[1], "a pass between two reads must repeat the last value, not zero"
 
 
+# ── E5: host hygiene deferred to after the response ─────────────────────────
+
+@pytest.fixture
+def cleans(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vb, "clean_memory", lambda cuda=True: calls.append(cuda))
+    return calls
+
+
+def test_without_the_flag_the_hygiene_runs_inside_the_32nd_forward(cleans):
+    m = make(n_dec=2)
+    m._token_count = 31
+    run(m)
+    assert cleans == [False]
+    assert vb.VaayuBaseModel.run_deferred_hygiene(m) is False
+    assert cleans == [False]
+
+
+def test_with_the_flag_forward_only_marks_it_due_and_the_owner_runs_it_once(cleans):
+    m = make(n_dec=2)
+    m.defer_decode_hygiene = True
+    m._token_count = 31
+    run(m)
+    assert cleans == [] and m._decode_hygiene_due is True
+    assert m.run_deferred_hygiene() is True
+    assert cleans == [False]
+    assert m.run_deferred_hygiene() is False
+    assert cleans == [False]
+
+
+def test_nothing_is_due_before_a_32_token_mark(cleans):
+    m = make(n_dec=2)
+    m.defer_decode_hygiene = True
+    for _ in range(10):
+        run(m)
+    assert m.run_deferred_hygiene() is False and cleans == []
+
+

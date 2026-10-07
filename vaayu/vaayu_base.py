@@ -2349,6 +2349,11 @@ class VaayuBaseModel(GenerationMixin):
         self.profiler = LayeredProfiler()
         self.telemetry = VaayuTelemetry()
         self._token_count = 0
+        # S33 E5: a server sets `defer_decode_hygiene`; forward then only marks
+        # the every-32-token host hygiene as due, and `run_deferred_hygiene`
+        # runs it once the response has been sent.
+        self.defer_decode_hygiene = False
+        self._decode_hygiene_due = False
         # Monotonic expert-disk stall, folded from the per-token
         # `_expert_disk_s` at the END of each forward pass. The server diffs it
         # per request (requests.jsonl); left uninitialised, the first request of
@@ -6129,7 +6134,12 @@ class VaayuBaseModel(GenerationMixin):
         # Decode-phase memory hygiene, throttled: every 32 tokens, host-only —
         # empty_cache() would defeat the CUDA caching allocator (Task 2).
         if self._token_count % 32 == 0:
-            clean_memory(cuda=False)
+            if getattr(self, "defer_decode_hygiene", False):
+                # A server runs it after the response has been sent
+                # (run_deferred_hygiene): ~all of its cost is gc.collect().
+                self._decode_hygiene_due = True
+            else:
+                clean_memory(cuda=False)
         # Chunk-major elements have unequal lengths — only the last chunk's
         # logits exist/matter (see lm_head skip above).
         logits = batch[-1] if _chunk_lens is not None else torch.cat(batch, 0)
@@ -6279,6 +6289,22 @@ class VaayuBaseModel(GenerationMixin):
     # .lookup()'s checkout (Task 4) makes a second concurrent same-id call a
     # miss (full prefill) rather than a corruption, so the failure mode is a
     # perf loss, not wrong output.
+    def run_deferred_hygiene(self) -> bool:
+        """Run the host-memory hygiene that `forward` deferred. True if it ran.
+
+        With `defer_decode_hygiene` set, forward only marks the every-32-token
+        `clean_memory(cuda=False)` as due. The owner of the request loop calls
+        this once the response is out (the server: after the body is sent,
+        under the engine lock). It must not run while a forward is in flight:
+        an explicit gc.collect() ignores gc.disable(), which is what keeps a
+        collection out of a CUDA-graph capture.
+        """
+        if not getattr(self, "_decode_hygiene_due", False):
+            return False
+        self._decode_hygiene_due = False
+        clean_memory(cuda=False)
+        return True
+
     def _keepawake_ctx(self):
         """The keep-awake for one generation (row 27), built once per model.
 
