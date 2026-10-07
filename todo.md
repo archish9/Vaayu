@@ -365,6 +365,24 @@ the clean 0.45–0.56 ms/token before any build.
       0.69, E5 1.63) and are corroboration only. **T12 VERDICT: KEEP, no group negative → every piece kept; resolved
       by the measurement: E7 and E5; kept on reach, tests and S32's price alone: E1 + E2 + E6 and E3 + E4.** Raw:
       `plans/probes/s33_out/attrib.txt`, `s33-session-b-*.json` (first attempt `s33-session-a-*.json`).
+      **(8) FINALIZED, REVIEWED AND GATED 2026-10-07 — AWAITING THE USER'S WORD TO MERGE.** Branch `s33-host-edits` at
+      `b106d66` (12 commits on `1427a38`): `952139b` removes the prototype switch (final sha256 = the dry-run chain's;
+      33 of 33 final-tree mutants killed), `fd8468f` documents the three output changes in `documentation/server.md`,
+      `b106d66` is the final review's fix wave. **Final whole-branch review (most capable model): ready to merge with
+      fixes; 0 Critical; 1 Important, test-only** (the new on-device gate test counted tokens where the mark is per
+      forward pass, and accepted a hygiene line left by an earlier request); no runtime defect (no reference cycle
+      found that held GPU or pinned memory and relied on the in-request collection; disconnect and queueing clean on a
+      real uvicorn). The fix wave changed tests, comments, docstrings and docs only (executed code of the three
+      touched `vaayu/` files identical by AST); scoped re-review: all addressed, no new breakage.
+      **Gates on `b106d66`:** suite `3777 passed, 26 skipped` (230.75 s); dense gate `5 passed` on Llama-3.2-1B and on
+      Llama-3.3-70B; accumulator gate `8 passed` on Qwen3-Next and on MiniMax-M2.7; server gate `10 passed` on
+      Qwen3-Next (`deferred hygiene: 18 ms` in `server.log`) and on Llama-3.2-1B, and `1 failed, 9 passed` with the
+      non-streaming route's background task removed (the test can fail); gpt-oss-20b against stock 64/64 bit-identical;
+      the final tree against the attribution set's `all` arms: ids identical, HIT decode 51.65 against 50.86–50.94
+      ms/token. Fused-EXL3 forward: unit tests only (no checkpoint). **§8:** no knob; plumbed in `app.py` in the same
+      commit as the hook; reachable at N=1, the server default; nothing banked. RESULTS
+      `docs/2026-10-07-S33-host-edits-e1-e7-RESULTS.md`. Not built, for the USER: keeping `malloc_trim` in the request
+      (the lead above the gc lead in this file).
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
