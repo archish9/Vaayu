@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from .packed_expert_kernels import packed_experts_decode, packed_experts_prefill
+from .packed_expert_kernels import (packed_experts_decode, packed_experts_decode_graphed,
+                                    packed_experts_prefill)
 
 if TYPE_CHECKING:
     from .persist.expert_cache import ExpertRAMCache
@@ -225,6 +226,21 @@ def _decode_limits(vaayu_ref):
         return None, None
     return (getattr(vaayu_ref, "_decode_top_k", None),
             getattr(vaayu_ref, "_decode_top_p", None))
+
+
+
+def _routing_to_host(expert_indices):
+    """S28 C11: a MoE visit's routing on the host through ONE device-to-host sync.
+
+    Returns (the ids' CPU copy, the routed experts ascending) -- the same list
+    `expert_indices.flatten().unique().tolist()` gives, which costs a device sort (3 cub
+    kernels) and two syncs (its output's size, then the copy) before the dispatch's own
+    `.cpu()` adds a third. One token's ids are a handful, where a Python set beats a CPU
+    `torch.unique` call; a prefill chunk's are thousands, where the reverse holds."""
+    cpu = expert_indices.cpu()
+    if cpu.numel() <= cpu.shape[-1]:
+        return cpu, sorted(set(cpu.reshape(-1).tolist()))
+    return cpu, cpu.unique().tolist()
 
 
 def cache_aware_topk(logits, resident_mask, top_k: int, base_bias: float):
@@ -1681,11 +1697,11 @@ def _make_modulelist_sparse_forward(
 
         # 1. Run router gate (permanently pinned in VRAM by _init_pinned_layers)
         # 'route' brackets the router forward + route_experts + the
-        # unique().tolist() sync below. Sync BEFORE starting the clock so any
-        # GPU work still in flight from the previous layer isn't misattributed
-        # to routing; no sync is needed at the end — .tolist() below already
-        # forces a blocking D2H copy, so the window it closes is truthful
-        # without an extra synchronize() call.
+        # routing sync below (_routing_to_host). Sync BEFORE starting the clock
+        # so any GPU work still in flight from the previous layer isn't
+        # misattributed to routing; no sync is needed at the end — its .cpu()
+        # already forces a blocking D2H copy, so the window it closes is
+        # truthful without an extra synchronize() call.
         if _prof:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -1706,7 +1722,7 @@ def _make_modulelist_sparse_forward(
             routing_weights, expert_indices, *_decode_limits(vaayu_ref))
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
         if _prof:
             _mp['route'] += time.perf_counter() - _t0
 
@@ -1754,7 +1770,7 @@ def _make_modulelist_sparse_forward(
                         layer_idx, hidden_states, top_k, unique_experts)
         B, S, H = hidden_states.shape
         _pair, _starts, _counts_l = compute_expert_dispatch(
-            expert_indices.cpu().reshape(-1, expert_indices.shape[-1]),
+            expert_indices_cpu.reshape(-1, expert_indices.shape[-1]),
             len(experts_list))
         _pair_gpu = _pair.to(hidden_states.device, non_blocking=True)
         if _prof:
@@ -2291,7 +2307,81 @@ def _make_fused_sparse_forward(
         return (routing_weights, expert_indices,
                 _shared_expert_output(block_info.moe_module, flat_hidden))
 
+    _shard_file = str(checkpoint_path / f"{layer_name}.safetensors")
+    _moe_mod = block_info.moe_module
+
+    def _lean_decode(hidden_states, _pre):
+        """S28 C4: a one-token decode visit on the packed kernels, with nothing a decode
+        never needs -- no prefill headroom, chunk-major retention, prefill-kernel lookup,
+        profile marks or per-call path join, and no zeroed accumulator (the kernel
+        overwrites it). The same helpers, ops and order as the `_use_pk` branch below,
+        so the same bits."""
+        _act_fn = getattr(_moe_mod, block_info.experts_attr).act_fn
+        B, S, H = hidden_states.shape
+        flat_hidden = hidden_states.view(-1, H)
+        if _pre is None:
+            routing_weights, expert_indices = _route(flat_hidden)
+            _shared = None
+        else:
+            routing_weights, expert_indices, _shared = _pre
+        _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
+        _eids = expert_indices_cpu.view(-1).tolist()
+        _vram_hold, _vram = _vram_tier_visit(vaayu_ref, layer_idx, unique_experts)
+        expert_tensors, _miss_futures, _pinned_keys = _dispatch_expert_misses(
+            unique_experts, layer_idx=layer_idx, layer_name=layer_name,
+            shard_file=_shard_file, offset_index=offset_index, expert_cache=expert_cache,
+            vaayu_ref=vaayu_ref, vram_resident=set(_vram_hold))
+        try:
+            _blobs: dict = {}
+            for eidx, raw in _iter_expert_loads(expert_tensors, _miss_futures, vaayu_ref):
+                _held = _vram_hold.get(eidx)
+                if _held is not None:
+                    _blobs[eidx] = _held
+                    continue
+                _math = _packed_miss_entry(
+                    eidx, raw, device=device, dtype=dtype, timing=None, layer_idx=layer_idx,
+                    expert_cache=expert_cache, vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys,
+                    vram=_vram, cm=None, cm_last_call=False, cm_budget=0)
+                if _math is not None:
+                    _blobs[eidx] = _math
+            _pairs = [(_blobs[_eids[s]], s)
+                      for s in sorted(range(len(_eids)), key=_eids.__getitem__)
+                      if _eids[s] in _blobs]
+            if _pre is None:
+                _shared = _shared_expert_output(_moe_mod, flat_hidden)
+            result = None
+            if _pairs and _pre is not None:
+                result = packed_experts_decode_graphed(
+                    layer_idx, flat_hidden, _pairs, routing_weights, _shared, _act_fn,
+                    tail=True)
+            if result is None:
+                out = torch.empty(flat_hidden.shape, dtype=torch.float32,
+                                  device=flat_hidden.device)
+                if _pairs:
+                    packed_experts_decode(flat_hidden, _pairs, routing_weights, out, _act_fn)
+                else:
+                    out.zero_()
+                result = out.to(flat_hidden.dtype)
+                if _shared is not None:
+                    result = result + _shared.to(result.dtype)
+        finally:
+            for _pk in _pinned_keys:
+                expert_cache.unpin(*_pk)
+            if getattr(vaayu_ref, "_prefill_staged", None):
+                vaayu_ref._prefill_staging_closed = layer_idx
+                _release_prefill_staged(expert_cache, vaayu_ref, lambda k: k[0] == layer_idx)
+        vaayu_ref._expert_history[layer_idx] = unique_experts
+        return result.view(B, S, H)
+
     def sparse_forward(hidden_states, _pre=None, **kwargs):
+        if (hidden_states.shape[0] * hidden_states.shape[1] == 1
+                and not getattr(vaayu_ref, "_moe_prefill_pass", False)
+                and getattr(vaayu_ref, "_packed_moe_kernel", None) is not None
+                and not getattr(vaayu_ref, "profiling_mode", False)
+                and getattr(vaayu_ref, "_batch_n", 1) == 1
+                and layer_name not in vaayu_ref.pinned_layer_names):
+            return _lean_decode(hidden_states, _pre)
         _ensure_prefill_headroom(vaayu_ref, layer_idx)
         if layer_name in vaayu_ref.pinned_layer_names:
             return original_forward(hidden_states, **kwargs)
@@ -2315,9 +2405,9 @@ def _make_fused_sparse_forward(
         B, S, H = hidden_states.shape
         flat_hidden = hidden_states.view(-1, H)
 
-        # 'route' brackets the router forward, the top-k and the
-        # unique().tolist() sync below -- the same window the other two forwards
-        # call route.
+        # 'route' brackets the router forward, the top-k and the routing
+        # sync below (_routing_to_host) -- the same window the other two
+        # forwards call route.
         _t_route = _mark()
         if _pre is None:
             routing_weights, expert_indices = _route(flat_hidden)
@@ -2330,7 +2420,7 @@ def _make_fused_sparse_forward(
                        "cache-aware routing")
 
         _maybe_record_usage(vaayu_ref, layer_idx, expert_indices)
-        unique_experts: list[int] = expert_indices.flatten().unique().tolist()
+        expert_indices_cpu, unique_experts = _routing_to_host(expert_indices)
         if _prof:
             _mp['route'] += time.perf_counter() - _t_route
 
@@ -2424,7 +2514,6 @@ def _make_fused_sparse_forward(
             # plus two tiny per-expert copies. Each expert's positions are a
             # contiguous slice of `_pair_gpu`, so slicing them is free.
             _t_mask = _mark() if _prof else 0.0
-            expert_indices_cpu = expert_indices.cpu()
             if _use_pk:
                 # The per-slot loop below never runs on this branch: the kernel branch
                 # consumes every load first. Bound anyway, so no name in that loop is
@@ -2460,27 +2549,12 @@ def _make_fused_sparse_forward(
                         if _prof:
                             _mp['slots_hit'] += 1
                         continue
-                    # `_entry` is what the VRAM tier stores, exactly as the loop below
-                    # stores it; `_math` is what this call computes with. They differ
-                    # only for packed roles at different widths (no fused pass): stock
-                    # dequantizes those role by role and caches nothing, and so does this.
                     # The installer read ONE expert, so a later layer may be unpacked or
                     # mixed; packed_experts_decode runs any such call the stock way.
-                    _packed = _group_packed_tensors_by_weight(raw)
-                    if not _packed["gate"]:
-                        _wg, _wd, _wu, _entry = _expert_dense_weights(
-                            raw, device, dtype, timing=_mp)
-                        _math = _entry if _wg is not None else None
-                    elif _packed_roles_complete(_packed):
-                        _on_dev = _upload_packed_expert(_packed, device, _mp)
-                        _entry = build_expert_blob(_on_dev)
-                        _math = (_entry if _entry is not None
-                                 else {"dense": dequantize_expert_weights(_on_dev, dtype)})
-                    else:
-                        _entry = _math = None      # a missing role: stock skips it too
-                    _settle_miss_upload(
-                        eidx, raw, _entry, layer_idx=layer_idx, expert_cache=expert_cache,
-                        vaayu_ref=vaayu_ref, pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
+                    _math = _packed_miss_entry(
+                        eidx, raw, device=device, dtype=dtype, timing=_mp,
+                        layer_idx=layer_idx, expert_cache=expert_cache, vaayu_ref=vaayu_ref,
+                        pinned_keys=_pinned_keys, vram=_vram, cm=_cm,
                         cm_last_call=_cm_last_call, cm_budget=_cm_budget)
                     if _math is not None:
                         _blobs[eidx] = _math
@@ -2699,6 +2773,33 @@ def _release_prefill_staged(expert_cache, vaayu_ref, pred) -> None:
         slab_idx = staged.pop(key, None)
         if slab_idx is not None:
             arena.release_staging(slab_idx)
+
+
+def _packed_miss_entry(eidx, raw, *, device, dtype, timing, layer_idx, expert_cache, vaayu_ref,
+                       pinned_keys, vram, cm, cm_last_call, cm_budget):
+    """What a missed expert computes with on the fused forward's packed-kernel decode paths
+    (its lean branch and its `_use_pk` branch -- one copy, S28, so they cannot drift): the
+    entry is uploaded and settled, and the tensors this call computes with are returned --
+    None when stock skips the expert (a missing role).
+
+    The entry is what the VRAM tier stores; the return value is what this call computes with.
+    They differ only for packed roles at different widths (no fused pass): stock dequantizes
+    those role by role and caches nothing, and so does this."""
+    packed = _group_packed_tensors_by_weight(raw)
+    if not packed["gate"]:
+        wg, _wd, _wu, entry = _expert_dense_weights(raw, device, dtype, timing=timing)
+        math = entry if wg is not None else None
+    elif _packed_roles_complete(packed):
+        on_dev = _upload_packed_expert(packed, device, timing)
+        entry = build_expert_blob(on_dev)
+        math = (entry if entry is not None
+                else {"dense": dequantize_expert_weights(on_dev, dtype)})
+    else:
+        entry = math = None      # a missing role: stock skips it too
+    _settle_miss_upload(eidx, raw, entry, layer_idx=layer_idx, expert_cache=expert_cache,
+                        vaayu_ref=vaayu_ref, pinned_keys=pinned_keys, vram=vram, cm=cm,
+                        cm_last_call=cm_last_call, cm_budget=cm_budget)
+    return math
 
 
 def _settle_miss_upload(eidx, raw, entry, *, layer_idx, expert_cache, vaayu_ref,

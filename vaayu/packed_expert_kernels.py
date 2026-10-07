@@ -34,6 +34,8 @@ call; a disagreement or an unsupported geometry stays on the stock arithmetic, l
 `install_packed_expert_kernels` takes both verdicts at load and decides, per MoE layer, whose
 prefill calls take the grouped kernels.
 """
+import collections
+import gc
 from pathlib import Path
 
 import torch
@@ -350,12 +352,14 @@ def _table_values(pairs) -> list:
             for v in (blob["flat"]["packed"].data_ptr(), blob["flat"]["scale"].data_ptr(), slot)]
 
 
-def _gate_up(x, tbl, n, geom, sc):
-    """h [n, intermediate] in the activation dtype: SiLU(gate) * up for each table row."""
+def _gate_up(x, tbl, n, geom, sc, h=None):
+    """h [n, intermediate] in the activation dtype: SiLU(gate) * up for each table row.
+    `h` given: written in place (a graph capture must allocate nothing)."""
     bits, gs, _roles = geom
     lay = _layout(geom)
     inter, hid = lay["gate"][2], lay["gate"][3]
-    h = torch.empty(n, inter, dtype=x.dtype, device=x.device)
+    if h is None:
+        h = torch.empty(n, inter, dtype=x.dtype, device=x.device)
     # pylint's possibly-used-before-assignment is a false positive on both kernel launches
     # (here and in _down): the kernels are bound under the module-level `if triton is not
     # None:` guard, and nothing reaches a launch without install_packed_expert_kernels,
@@ -474,6 +478,180 @@ def packed_experts_decode(x, pairs, routing_weights, out, act_fn) -> None:
         _launch(x, pairs, routing_weights, out)
     else:
         stock_experts_decode(x, pairs, routing_weights, out, act_fn)
+
+
+# ── S28 C5: the decode kernels of one MoE layer as ONE CUDA graph ─────────────────────────
+# A decode visit's kernel call cost ~100 us of host for ~two small kernels (S27: table put
+# 28, gate_up launch 28, down launch 19, table values 8, the rest 15). Under an S12 replay a
+# visit's inputs -- x, the routing weights, the shared expert's output -- are the SAME
+# tensors every token (static graph memory), so the table upload, both launches and the
+# forward's epilogue are recorded once per layer and replayed; only the table's contents
+# change. Same kernels, same arguments: each capture is held bitwise to the eager launch.
+_GRAPHS: dict = {}              # layer -> _LayerGraph
+_GRAPH_REFUSED: dict = {}       # layer -> why
+_GRAPH_WARNED: set = set()
+_GRAPH_STREAMS: dict = {}       # device -> the capture stream (a capture cannot use the legacy one)
+GRAPH_STATS: collections.Counter = collections.Counter()
+
+
+class _LayerGraph:
+    __slots__ = ("key", "graph", "host", "host_np", "tbl", "h", "out", "tmp", "result",
+                 "done", "replays")
+
+
+def _tail(out, dtype, shared):
+    """`_make_fused_sparse_forward`'s epilogue, op for op: the fp32 sum cast back, plus the
+    shared expert's output."""
+    result = out.to(dtype)
+    if shared is not None:
+        result = result + shared.to(result.dtype)
+    return result
+
+
+def _refuse_graph(layer, why) -> None:
+    _GRAPH_REFUSED[layer] = why
+    _GRAPHS.pop(layer, None)
+    GRAPH_STATS["refused"] += 1
+    if why not in _GRAPH_WARNED:
+        _GRAPH_WARNED.add(why)
+        print(f"[Vaayu] WARNING: packed-expert decode graph refused for MoE layer {layer} "
+              f"({why}); it launches eagerly. Later layers refused for the same reason are "
+              f"not listed.")
+
+
+def _warn_skip(why) -> None:
+    """A call the graph cannot take: it launches eagerly. Said once per reason, never
+    silently (spec §4.5); the layer is not refused -- the next call may qualify."""
+    if why not in _GRAPH_WARNED:
+        _GRAPH_WARNED.add(why)
+        print(f"[Vaayu] WARNING: packed-expert decode graph not used ({why}); those calls "
+              f"launch the kernels eagerly. Shown once per reason.")
+
+
+def packed_experts_decode_graphed(layer, x, pairs, routing_weights, shared, act_fn, tail):
+    """`packed_experts_decode` (and, `tail` True, the forward's epilogue) through one CUDA
+    graph per MoE layer -- or None: this call is not the graph's, run the eager path.
+
+    The caller passes it only inputs whose addresses hold from call to call (an S12
+    replay's). Returns a STATIC tensor the layer's next call overwrites: the fp32 sum
+    [1, hidden] (`tail` False) or `_tail(sum, x.dtype, shared)` (`tail` True). Every pair
+    must be a blob of one geometry whose kernel verdict is True -- anything else is None.
+    """
+    if layer in _GRAPH_REFUSED:
+        return None
+    blob0 = pairs[0][0]
+    geom = blob0.get("geom")
+    if geom is None or any(blob.get("geom") != geom for blob, _slot in pairs[1:]):
+        return None
+    if not (x.is_contiguous() and routing_weights.is_contiguous()):
+        _warn_skip("a non-contiguous expert input or routing-weight tensor")
+        return None
+    if tail and shared is not None and shared.dtype != x.dtype:
+        _warn_skip(f"the shared expert's output is {shared.dtype}, the activations {x.dtype}")
+        return None
+    if not _checked(x, pairs, routing_weights, act_fn):
+        return None
+    vals = _table_values(pairs)
+    key = (len(pairs), x.data_ptr(), routing_weights.data_ptr(), routing_weights.dtype,
+           0 if shared is None else shared.data_ptr(), tail, geom, x.dtype,
+           blob0["flat"]["scale"].dtype)
+    g = _GRAPHS.get(layer)
+    if g is not None and g.key == key:
+        g.done.synchronize()            # this layer's last replay has read the table
+        g.host_np[:] = vals
+        g.graph.replay()
+        g.done.record()
+        g.replays += 1
+        GRAPH_STATS["replays"] += 1
+        return g.result if tail else g.out
+    if g is not None:
+        del _GRAPHS[layer]
+        if g.replays == 0:
+            # Replaced before its first replay: a request with one decode step (S12 hands
+            # every request new static inputs). Never a refusal -- S12 already bounds how
+            # often a layer's inputs move (decode_graphs._MAX_CAPTURES_PER_REQUEST).
+            GRAPH_STATS["replaced_unreplayed"] += 1
+        del g
+    return _capture(layer, key, x, pairs, routing_weights, shared, tail, vals, act_fn)
+
+
+def _capture(layer, key, x, pairs, rw, shared, tail, vals, act_fn):
+    geom = pairs[0][0]["geom"]
+    sc = _DTYPE_CODE[pairs[0][0]["flat"]["scale"].dtype]
+    n = len(pairs)
+    lay = _layout(geom)
+    inter = lay["gate"][2]
+    dev = x.device
+    # The eager reference FIRST: it also builds any kernel specialisation the capture needs.
+    ref_out = torch.empty(x.shape, dtype=torch.float32, device=dev)
+    _launch(x, pairs, rw, ref_out)
+    ref = _tail(ref_out, x.dtype, shared) if tail else ref_out
+    g = _LayerGraph()
+    graph = torch.cuda.CUDAGraph()
+    pool = torch.cuda.graph_pool_handle()
+    # A cyclic-GC pass inside a capture can run a dead graph's destructor on this thread
+    # and invalidate the capture (S12, decode_graphs._capture).
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        # Allocations, the capture, its first replay and the bitwise check all fall back to
+        # the eager result on failure (spec §4.5: nothing here raises into the request).
+        g.key, g.replays = key, 0
+        g.host = torch.empty(len(vals), dtype=torch.int64, pin_memory=True)
+        g.host_np = g.host.numpy()
+        g.host_np[:] = vals
+        g.tbl = torch.empty(len(vals), dtype=torch.int64, device=dev)
+        g.h = torch.empty(n, inter, dtype=x.dtype, device=dev)
+        g.out = torch.empty(x.shape, dtype=torch.float32, device=dev)
+        g.tmp = torch.empty(x.shape, dtype=x.dtype, device=dev) if tail else None
+        g.result = (torch.empty(x.shape, dtype=x.dtype, device=dev)
+                    if tail and shared is not None else g.tmp)
+        g.done = torch.cuda.Event()
+        side = _GRAPH_STREAMS.get(dev)
+        if side is None:
+            side = _GRAPH_STREAMS[dev] = torch.cuda.Stream(device=dev)
+        cur = torch.cuda.current_stream(dev)
+        side.wait_stream(cur)
+        # no_grad: the graph's buffers are inference-only (an out= op refuses an input that
+        # requires grad, which a caller outside no_grad could pass).
+        with torch.cuda.stream(side), torch.no_grad():
+            graph.capture_begin(pool=pool, capture_error_mode="thread_local")
+            try:
+                g.tbl.copy_(g.host, non_blocking=True)
+                _gate_up(x, g.tbl, n, geom, sc, h=g.h)
+                _down(g.h, g.tbl, rw, g.out, n, geom, sc)
+                if tail:
+                    g.tmp.copy_(g.out)
+                    if shared is not None:
+                        torch.add(g.tmp, shared, out=g.result)
+            finally:
+                try:
+                    graph.capture_end()
+                except Exception:
+                    # A failed capture_end leaves the allocator believing a capture is still
+                    # open on `pool` (cuda_graph_capture_traps); undo it as S12 does.
+                    from .decode_graphs import _cleanup_pool
+                    _cleanup_pool(pool)
+                    raise
+        cur.wait_stream(side)
+        g.graph = graph
+        graph.replay()
+        got = g.result if tail else g.out
+        same = torch.equal(got, ref)
+    except Exception as exc:
+        first = (str(exc).splitlines() or [""])[0][:200]
+        _refuse_graph(layer, f"capture failed: {type(exc).__name__}: {first}")
+        return ref
+    finally:
+        if was:
+            gc.enable()
+    if not same:
+        _refuse_graph(layer, "its replay disagrees bitwise with the eager launch")
+        return ref
+    g.done.record()
+    _GRAPHS[layer] = g
+    GRAPH_STATS["captures"] += 1
+    return got
 
 
 def _prefill_unsupported(geom, act_dtype, scale_dtype, w_dtype):
