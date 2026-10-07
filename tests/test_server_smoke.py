@@ -294,6 +294,41 @@ def test_the_token_summary_reports_nvme_bytes_consistent_with_pinning(client):
              f"zero: {values[:8]}")
 
 
+def test_the_host_hygiene_runs_after_a_response(client):
+    """S33 E5 through the real server. In server mode the engine no longer runs
+    its every-32-token gc + malloc_trim between tokens: `forward` marks it due
+    and the chat routes run it as the response's background task, which prints
+    one line with how long it took. A fake-engine test cannot show this: it
+    takes the real model's `forward` to set the mark and the real scheduler to
+    have released the engine lock.
+
+    The request is this test's own, and its length is ASSERTED: the mark falls
+    on every 32nd forward pass of the process, so only an answer of 32 tokens
+    or more is certain to cross one. The requests above stop far short of that
+    on some checkpoints (24 passes in total on Qwen3-Next), and a check that
+    leaned on them could not tell "the hook is gone" from "nothing was due".
+    """
+    import time
+    body = dict(BODY, session_id="smoke-hygiene", stream=False, max_tokens=40,
+                messages=[{"role": "user", "content":
+                           "Write the numbers from 1 to 100 in order, separated by spaces."}])
+    r = client.post("/v1/chat/completions", json=body)
+    assert r.status_code == 200, r.text[:200]
+    produced = r.json()["usage"]["completion_tokens"]
+    assert produced >= 32, (
+        f"only {produced} tokens came back, so no 32-token mark is certain to "
+        f"have been crossed and this check would prove nothing")
+    # The line reaches server.log through capture_stdio's fd-level pump.
+    deadline = time.time() + 10
+    while "[Vaayu-Server] deferred hygiene:" not in (
+            _run_dir() / "server.log").read_text(errors="replace"):
+        assert time.time() < deadline, (
+            "no deferred-hygiene line after a response that crossed a 32-token "
+            "mark: either forward still collects inside the request, or the "
+            "chat routes lost their background task")
+        time.sleep(0.2)
+
+
 def test_no_absolute_paths_leaked_into_the_bundle(client):
     """`env.json` ONLY. It is the one artifact that promises scrubbed paths.
     `requests.jsonl` writes raw and its `error` block embeds a full

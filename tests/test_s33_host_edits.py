@@ -377,3 +377,166 @@ def test_nothing_is_due_before_a_32_token_mark(cleans):
     assert m.run_deferred_hygiene() is False and cleans == []
 
 
+def _handle(model):
+    from vaayu.server.engine import EngineHandle
+    model._vram_plan = object()
+    model.max_seq_len = 64
+    return EngineHandle(model)
+
+
+class _Stdout(io.StringIO):
+    """Stands in for a block-buffered stdout: remembers what was written at each flush."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushed = ""
+
+    def flush(self):
+        self.flushed = self.getvalue()
+
+
+def test_the_server_hook_runs_the_deferred_hygiene_and_says_how_long_it_took(monkeypatch):
+    ran = []
+    model = types.SimpleNamespace(_decode_hygiene_due=True,
+                                  run_deferred_hygiene=lambda: ran.append(1) or True)
+    handle = _handle(model)
+    out = _Stdout()
+    monkeypatch.setattr(sys, "stdout", out)
+    asyncio.run(handle.after_response())
+    assert ran == [1]
+    # FLUSHED, not merely written: it is the last line a response prints, and
+    # behind a pipe an unflushed line stays in the buffer until the next
+    # request prints something (the server gate caught exactly that).
+    assert "[Vaayu-Server] deferred hygiene:" in out.flushed
+
+
+def test_the_server_hook_never_overlaps_a_generation():
+    """It takes the engine lock: a gc.collect() must not land inside a decode-graph capture."""
+    ran = []
+    model = types.SimpleNamespace(_decode_hygiene_due=True,
+                                  run_deferred_hygiene=lambda: ran.append(1) or True)
+
+    async def scenario():
+        h = _handle(model)
+        await h._lock.acquire()                 # a request is generating
+        task = asyncio.ensure_future(h.after_response())
+        await asyncio.sleep(0.05)
+        held = list(ran)
+        h._lock.release()
+        await task
+        return held
+    assert asyncio.run(scenario()) == []
+    assert ran == [1]
+
+
+def test_the_server_hook_does_nothing_when_nothing_is_due_or_the_model_has_no_hygiene(capsys):
+    ran = []
+    idle = types.SimpleNamespace(_decode_hygiene_due=False,
+                                 run_deferred_hygiene=lambda: ran.append(1) or True)
+    bare = types.SimpleNamespace()
+
+    async def scenario():
+        for model in (idle, bare):
+            h = _handle(model)
+            await h._lock.acquire()             # must return without waiting for the lock
+            await asyncio.wait_for(h.after_response(), timeout=1.0)
+    asyncio.run(scenario())
+    assert ran == []
+    assert "deferred hygiene" not in capsys.readouterr().out
+
+
+class _RouteEngine:
+    """The engine surface the chat route touches, with an `after_response` hook that logs."""
+
+    def __init__(self, events, raises=None):
+        from vaayu.server.engine import GenerationResult
+        self.events = events
+        self.max_seq_len = 8192
+        self.queue_depth = 8
+        self.depth = 0
+        self.model = type("M", (), {"name_or_path": "fake", "speculative_status": {
+            "requested": None, "draft_tokens": 5, "active": False, "refused_because": None}})()
+        self.tool_format = None
+        self._lock = asyncio.Lock()
+        self._raises = raises
+        self._result = GenerationResult(text="hello", prompt_tokens=3, completion_tokens=2,
+                                        finish_reason="stop")
+
+    def notice_if_speculation_skipped(self, req):
+        return None
+
+    def prepare(self, req):
+        if self._raises is not None:
+            raise self._raises
+        return [1, 2, 3], 16
+
+    async def generate(self, req, cancel=None, prepared=None):
+        self.events.append("final")
+        return self._result
+
+    async def stream(self, req, cancel=None, prepared=None):
+        yield ("delta", "hello")
+        self.events.append("final")
+        yield ("final", self._result)
+
+    def cancel_all(self):
+        pass
+
+    def prefix_stats(self):
+        return "disabled"
+
+    async def after_response(self):
+        self.events.append("after")
+
+
+_BODY = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_both_chat_routes_run_the_engine_hook_once_after_the_answer(stream):
+    from fastapi.testclient import TestClient
+    from vaayu.server.app import create_app
+    events = []
+    with TestClient(create_app(engine=_RouteEngine(events))) as client:
+        r = client.post("/v1/chat/completions", json={**_BODY, "stream": stream})
+        assert r.status_code == 200
+        if stream:
+            assert "data: [DONE]" in r.text
+    assert events == ["final", "after"]
+
+
+def test_a_refused_request_does_not_run_the_hook():
+    from fastapi.testclient import TestClient
+    from vaayu.server.app import create_app
+    from vaayu.server.stopping import ContextTooLong
+    events = []
+    engine = _RouteEngine(events, raises=ContextTooLong("too long"))
+    with TestClient(create_app(engine=engine)) as client:
+        assert client.post("/v1/chat/completions", json=_BODY).status_code == 400
+    assert events == []
+
+
+def test_the_server_turns_deferral_on_for_the_model_it_loads(monkeypatch):
+    from fastapi.testclient import TestClient
+    import vaayu.auto_model as am
+    import vaayu.gpu_audit as ga
+    import vaayu.server.app as app_mod
+    loaded = []
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            loaded.append(type("M", (), {
+                "max_seq_len": 8192, "tokenizer": type("T", (), {"chat_template": None})(),
+                "speculator": None, "_vram_plan": object(), "running_device": "cpu",
+                "defer_decode_hygiene": False})())
+            return loaded[-1]
+    monkeypatch.setattr(am, "AutoModel", FakeAutoModel)
+    monkeypatch.setattr(ga, "audit", lambda **kw: [])
+    monkeypatch.setattr(app_mod, "freeze_after_load", lambda: None)
+    with TestClient(app_mod.create_app(app_mod.ServerConfig(model_path="/ckpt"))):
+        pass
+    (model,) = loaded
+    assert model.defer_decode_hygiene is True
+
+
