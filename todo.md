@@ -755,6 +755,17 @@ arithmetic, not the repack.**
 
 *From the old STILL OPEN section.*
 
+- [ ] **Lead (S33 final review M-5, 2026-10-07; PARKED for the USER's ruling): keep `malloc_trim` in the request and
+  defer only `gc.collect()`.** S33's E5 defers both halves of the every-32-pass hygiene in server mode, as the USER
+  ruled, and the pre-registered valve rule (RSS growth > 0.25 GB over one long request) fired on none of five
+  models. All five are on the slab arena or have no expert cache. An ARENA-LESS expert cache (a mixed fused +
+  module-list MoE, or both arena allocations failing at load; no on-device model) is where the in-request trim
+  measurably returned memory (S5-M: 18.06 → 12.56 GB; S16 (ii): 8.64 → 2.81 GB), and a server response now runs no
+  trim at all. `malloc_trim` costs 0.28–0.38 ms per call against 77–89 ms for `gc.collect()` (S33 D0), so keeping it
+  on the 32-pass cadence costs about 0.01 ms/token. Build = one branch in `forward` (`vaayu_base.py`, the `% 32`
+  mark) + its test + one confirmation arm. In both measured arena-less cases the process was OOM-killed or the
+  retention saturated before pass 32, so the valve would not have saved them: ordering rule *(d)* today.
+
 - [ ] **Lead (S33 dry run, 2026-10-07): a full gc collection re-scans the expert cache's live tensors.** After
   `freeze_after_load()` the collector still scans everything created since: on Qwen3-Next after one 1,024-token
   request 271,704 objects, 184,270 of them `Tensor` (`plans/probes/s33_out/s33-rss-qwen-off.json`). A full
@@ -874,6 +885,10 @@ arithmetic, not the repack.**
   `plans/probes/s22_session.py`: pin the budget with `BALLAST_GB`, force the mode with `DIRECT=on|off`, and grep
   `O_DIRECT` and `Expert RAM cache:` in every arm's log before comparing. Ring-count knee probe:
   `plans/probes/s22_rings.py --rings N` (whole-expert waves, one ring count per process).
+- **PROBE NOTE — `rss=` on the `[VAAYU-IO] token summary` line is SAMPLED since S33 (2026-10-07):** read on the
+  first forward pass and every 32nd, repeated in between; in library mode the 32nd-pass sample is taken right after
+  the trim, so it shows only the trough (S5-M's 18.06 → 12.56 GB sawtooth would read 12.56 throughout). A probe that
+  needs RSS per token reads `/proc/self/status` itself (`plans/probes/s33_rss.py` does).
 - **PROBE RULE — never time an unprofiled arm after a Kineto/CUPTI arm in the same process (S33-A0, 2026-10-07).**
   Kineto leaves CUPTI attached after `profile.stop()`, for the rest of the process, even with a CPU-only profiler.
   Measured on Qwen3-Next: every later CUDA-graph replay costs ≈ +0.33 us per node on the host (head.lin 5.65 → 25.93
