@@ -8742,3 +8742,69 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       - ***(d)* Unreachable today:**
         - The current-CUDA-device `[bug]` (single-GPU box).
         - The batching design, backlog #37 (parked by the USER at S30).
+
+<!-- moved from todo.md 2026-10-07 (S32 closed) -->
+- [x] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD, MEASURE ONLY (set by the USER at S31, 2026-10-07).**
+      **IN PROGRESS 2026-10-07: design approved by the USER**, spec
+      `docs/superpowers/specs/2026-10-07-S32-c8-c9-reprice-design.md`, plan
+      `docs/superpowers/plans/2026-10-07-S32-c8-c9-reprice.md` (8 tasks; CPU code verified while planning, 22 tests;
+      the window simulator's self-check passes on S27's real dry-run trace, −0.54 %). Planning refined the window
+      model: a graph's launch cost grows with its node count (≈ 5.5 µs fixed + 0.56 µs/node, profiled), so a merged
+      graph saves only the fixed part, and C8a ≈ one fixed launch per boundary. Inputs re-verified at `612a0ed` (engine
+      unchanged since `5118a65`). Method: S27's census ported to the post-S28 path; FWD split by an AST-marked copy of
+      `forward` (arm U_SEG); C8 priced in two forms, **C8a** narrow tail+head merge and **C8b** whole-forward replay,
+      by a per-boundary timeline simulator on U_EXP's traces, with a self-check against the trace; C9 named pieces
+      only; log-line / gc-cadence pieces flagged for the USER; 2 mirrored processes, a 3rd on STRADDLE; no
+      prototype arms.
+      **Question:** after S28, how many exposed ms/token would C8 and C9 remove, each and as a bundle? Does the bundle
+      clear the bar?
+      - **C8 = segment merge:** replay the MoE tail and the next layer's pre-MoE part as ONE decode graph, so a token
+        binds and replays fewer graphs (labels `S27_GRAPH` + `S27_GRRUN`; 108 replays/token at S21). S28's C5 added a
+        per-layer CUDA graph for the packed kernel, so recount the replays per token before pricing.
+      - **C9 = FWD:** host time in the forward OUTSIDE the decoder layers (label `S27_FWD`; top sub-label
+        `F27_W_GET_POS_EMB_ARGS` 0.283 ms).
+      - **Read first:** `docs/superpowers/specs/2026-10-06-S27-host-levers-design.md` (the levers' definitions),
+        `docs/2026-10-06-S27-host-levers-RESULTS.md` (ranked table, "Calibration: closure test", FLAGS, caveats),
+        `docs/2026-10-06-S28-host-fast-path-RESULTS.md` (what S28 changed; its KEEP set).
+      **Bar:** 5 % of S28's HIT turn (16.04 s) = 0.80 s/turn = **3.13 ms/token** at 256 tokens (S27's was 3.488, on
+      17.86 s). Calibrate as S27's final review did: the exposed fractions ran 1.15–1.23 × high (closure test).
+      **INPUTS PRE-GATHERED at `5118a65`. Re-verify at HEAD:**
+      - **S27's prices, taken BEFORE S28:** C8 U 2.538 exposed ms/token (host 2.710, joint fraction 0.937;
+        calibrated 2.13–2.34; not probe-prototypable). C9 U 3.310 (host 3.488; calibrated 2.79–3.27). Calibrated
+        bundle 4.92–5.61, which would clear 3.13 — but S28 removed ~6 ms/token of host (C11 one routing sync, C5
+        per-layer CUDA graph of the packed kernel, C4 lean decode branch), so the exposure of what is left may have
+        moved either way.
+      - **C9 names no concrete change.** Its sub-labels explained 0.67 of its 3.49 ms of host. S32's first job is to
+        split FWD into finer labels and name one; with no named change C9 stays PRICED-UNVERIFIED and does NOT count
+        toward the bundle.
+      - **S27 FLAG:** GRAPH host 0.63 vs 1.82 ms/token between processes (per process, not per arm; cause never
+        measured), so C8 was 1.89 or 3.18 depending on the process. Measure at least two processes and report both.
+      - **Method:** S27's Kineto exposed time on the UNPROFILED path (memory `exposed_host_attribution_method`; run the
+        closure test). `profiling_mode` no longer describes server decode (S28). Probes: `plans/probes/s27_decode.py`,
+        `s27_exposed.py`, `s27_price.py` (+ `test_s27_*.py`); session baseline `plans/probes/s28_session.py`.
+        A different prompt per arm (S21 trap).
+      - **Code:** `vaayu/decode_graphs.py` `_Capture` :326, `_Record.replay` :408, `DecodeGraphRunner.run` :492;
+        `vaayu/moe_patch.py` `_make_fused_sparse_forward` :2268, `_lean_decode` :2313.
+      - **Baseline to compare with (S28 KEEP set):** server mode, graphs ON, O_DIRECT, the server's own budget
+        18.4–18.9 GB, no ballast: HIT decode 51.59 ms/token, HIT turn 16.04 s.
+      **Dry run done (b04c326):** ident COPY IS THE ENGINE; recount S12 108.00/token, C5 48.00/token; self-check rel -0.0055; frozen 24 anchors, edits E1-E6.
+      **Census done (p1/p2):** U1 48.48 / 54.53 ms/token, budget 18.07 / 17.97 GB, checks pass (c1/partition/c2 true, ids identical across processes, S12 108 / C5 48 per token).
+      **Stop rule:** bundle (calibrated, named changes only) < 3.13 ms/token → close S32 AND S33 with the number.
+      Clears → the USER confirms the bundle at S32's close (S27 → S28 precedent), S33 builds it.
+      **§8:** measure only, nothing to wire.
+      **CLOSED 2026-10-07 (closing summary).** Re-priced at HEAD over 3 processes (p1, p2 `3682664`, p3 `45b7d64`;
+      budgets 18.07 / 17.97 / 18.18 GB), bar 3.133 ms/token. **Unflagged: bundle-a 0.769–0.912, bundle-b 1.391–1.577
+      pooled FAILS** (p1 1.090–1.094, p2 1.865–2.416, p3 1.217–1.220). **Flagged (deciding, USER admitted E3+E4+E5):
+      bundle-b+flagged 3.072–3.699 STRADDLES** (p1 2.563–3.066, p2 3.797–4.718, p3 2.857–3.313); bundle-a+flagged
+      2.535–3.116 DISAGREE; the two-process verdict had been DISAGREE (3.180–3.892). Pieces p1/p2/p3: C8a 0.137–0.265 /
+      0.223–0.387 / 0.155–0.287; C8b 1.084 / 1.856–2.406 / 1.210; C9-loop (E1+E2) 0.550 / 0.654 / 0.567; E3 0.079 / 0.092 /
+      0.087; E4 0.016–0.024 / 0.029–0.031 / 0.019–0.026; **E5 1.457–1.948 / 1.903–2.271 / 1.620–2.067**; E6 <= 0.011.
+      Controller arithmetic: E1–E6 alone ≈ 2.37–2.81 pooled (3.8–4.5 % of the turn); C8b's increment ≈ 0.45 / 1.1–1.7 /
+      0.56. **Slow-replay state:** p2's unprofiled GRAPH host per replay head.lin 25.46 us vs 4.57 / 5.09 (launch fit
+      6.30 us + 0.323 us/node vs 4.00 + 0.015 / 4.41 + 0.016) — S27's 0.63-vs-1.82 FLAG, 1 of 3 processes here, cause
+      never measured. Closure k 1.337 / 1.193 / 1.276; self-check rel −0.31 / −0.09 / −0.57 %; replays 108 + 48 per token.
+      Caveat: r0 comes from the profiled trace, so every C8 saving is biased UP. **USER rulings:** "Yes: admit E3+E4+E5,
+      run p3"; then "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
+      session" -> S33-A0, then S33 (full flagged bundle-b). Suite floor unchanged (no engine code). RESULTS:
+      `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md`; assets `docs/superpowers/plans/2026-10-07-S32-assets/`; raw
+      `plans/probes/s32_out/`.
