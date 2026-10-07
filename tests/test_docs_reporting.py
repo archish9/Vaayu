@@ -36,6 +36,19 @@ def test_server_doc_says_gb_tok_is_nvme_bytes():
     assert "NVMe" in window or "disk" in window
 
 
+def test_server_doc_says_what_changed_in_the_log_and_the_telemetry_file():
+    """Three things a reader of server.log, or of the working directory, would
+    otherwise misread: `rss=` is sampled, the host-memory hygiene runs after
+    the response and logs how long it took, and `vaayu_telemetry.json` is no
+    longer written."""
+    text = (REPO / "documentation" / "server.md").read_text()
+    assert "deferred hygiene" in text
+    i = text.index("`rss=`")
+    assert "32nd" in text[i:i + 400]
+    j = text.index("vaayu_telemetry.json")
+    assert "dump_json" in text[j:j + 700]
+
+
 def test_readme_says_requests_jsonl_is_not_filtered_either():
     """It already said this about `server.log`. `requests.jsonl` writes raw,
     and its `error` block embeds a full traceback whose frames name absolute

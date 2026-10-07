@@ -297,6 +297,28 @@ reaches. Do not confuse `gb_tok` with `expert_disk` on the same line:
 `expert_disk` is a **stall duration** (seconds spent waiting on those reads),
 not a byte count.
 
+**The `rss=` field on the same line is sampled.** The engine reads the
+process's resident size on its first forward pass and then on every 32nd; the
+passes in between repeat the last value. A tool that needs the resident size
+per token must read `/proc/<pid>/status` itself.
+
+**Host-memory hygiene runs after the response, not between tokens.** Inside
+the server the engine no longer runs its garbage collection and `malloc_trim`
+every 32 tokens in the middle of a request. It marks them due, and the server
+runs them once the response body has been sent, holding the engine lock, and
+prints `[Vaayu-Server] deferred hygiene: <N> ms` to `server.log`. A request
+that arrives during those N milliseconds waits for them: 75–99 ms on
+Qwen3-Next-80B with a warm expert cache, under 40 ms on the other checkpoints
+measured (2026-10-07). A library caller (`AutoModel` without the server) keeps
+the every-32-token cadence.
+
+**`vaayu_telemetry.json` is no longer written.** The engine used to rewrite
+that file in the working directory at the end of every request, which cost up
+to about 1.1 s per request once its 4,096-token ring was full. The per-layer
+timing ring is still kept in memory, and `model.telemetry.dump_json(path)`
+writes it on demand. On a decode pass that replays CUDA graphs, a layer that
+is resident in VRAM records no per-layer entry; a streamed layer always does.
+
 ### Speed
 
 These are the knobs that change throughput. Defaults are already the fast ones —
