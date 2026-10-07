@@ -313,3 +313,29 @@ def test_a_forward_that_replays_no_graphs_records_every_layer(graphs):
     assert [l.layer_name for l in token.layers] == m.layer_names
 
 
+# ── E4: the RSS read is sampled ─────────────────────────────────────────────
+
+def test_rss_is_read_on_the_first_pass_and_every_32nd_and_every_line_still_carries_it(monkeypatch, capsys):
+    opened = []
+    real_open = open
+
+    def counting_open(path, *a, **kw):
+        if path == "/proc/self/status":
+            opened.append(path)
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr(vb, "open", counting_open, raising=False)
+    monkeypatch.setattr(vb, "clean_memory", lambda cuda=True: None)
+    m = make(n_dec=2)
+    reads_at = []
+    for k in range(1, 65):
+        before = len(opened)
+        run(m)
+        if len(opened) > before:
+            reads_at.append(m._token_count)
+    assert reads_at == [2, 32, 64]            # the first pass, then every 32nd token
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[VAAYU-IO] token summary")]
+    assert len(lines) == 64
+    assert all("rss=" in l and "gb_tok=" in l for l in lines)
+    assert "rss=0.00GB" not in lines[1], "a pass between two reads must repeat the last value, not zero"
+
+

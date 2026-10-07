@@ -6165,11 +6165,17 @@ class VaayuBaseModel(GenerationMixin):
         _la = getattr(self, "_lookahead_state", None)
         _la_str = (f"  lookahead_acc={_la['hits']}/{_la['total']}"
                    f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
-        try:
-            with open("/proc/self/status") as _rf:
-                _rss_kb = next((int(_l.split()[1]) for _l in _rf if _l.startswith("VmRSS:")), 0)
-        except OSError:
-            _rss_kb = 0
+        if _e4 and self._token_count % 32 != 0 and getattr(self, "_rss_kb_last", None) is not None:
+            # rss= is sampled: read on the first pass and on every 32nd, the
+            # last value is repeated in between.
+            _rss_kb = self._rss_kb_last
+        else:
+            try:
+                with open("/proc/self/status") as _rf:
+                    _rss_kb = next((int(_l.split()[1]) for _l in _rf if _l.startswith("VmRSS:")), 0)
+            except OSError:
+                _rss_kb = 0
+            self._rss_kb_last = _rss_kb
         _rss_str = f"  rss={_rss_kb / 1e6:.2f}GB"
         from .persist.safetensor_model_persister import read_bytes as _read_bytes
         _bytes_str = format_byte_fields(
