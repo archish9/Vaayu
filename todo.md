@@ -343,6 +343,19 @@ the clean 0.45–0.56 ms/token before any build.
       suite `3775 passed, 26 skipped`); T14 docs (`3776 passed, 26 skipped` measured on that tree, 237.21 s); T15
       gates on the final tree; T16 RESULTS, ledger, review, merge on the USER's word. gpt-oss-20b against stock on
       the finalized scratch tree: `TF vs B (stock, full-length cache): bit-identical 64/64`.
+      **(7) EXECUTION 2026-10-07 (subagent-driven; plan approved by the USER).** Branch `s33-host-edits` in
+      `/home/a/code/ai-ml/Vaayu-s33`, base `1427a38`. T1–T8 committed (`9287638` E2, `7ec25d6` E1, `6be4200` E3,
+      `62b845a` E4, `cd386da` E5 engine, `ed56746` E5 server, `9be04ba` E6, `9ae446a` E7); the five files' sha256 equal
+      the dry-run tree's. Three task reviews (one on opus for the lock / gc half): all eight tasks approved, 0
+      Critical, 0 Important; the opus review confirmed with CPU repros that the deferred collection cannot overlap a
+      generation or a capture and cannot deadlock. T9 on the branch: suite `3775 passed, 26 skipped` (238.26 s); server
+      gate `10 passed` with `[Vaayu-Server] deferred hygiene: 20 ms`; Qwen3-Next bitwise ON vs OFF, 64 steps.
+      **T10 KEEP SET (off, all, all, off; `BALLAST_GB=29.4`; budgets 17.66 / 17.74 / 17.70 / 17.52 GB; O_DIRECT):
+      VERDICT KEEP. S = 4.727 ms/token (OFF 53.88 → ON 49.15; bar 3.133; OFF spread 1.039; budget band 3.820–5.633);
+      greedy ids identical on 7 turns × 4 arms; TTFT ON − OFF +0.012 s (spread 0.223 s); HIT turn 16.84 → 15.65 s
+      (−7.1 %).** Of S, decode-only is 2.873 ms/token and the tail 0.473 s per turn; the deferred hygiene takes 75–78
+      ms per turn (max 98.7). OFF tail against ring size: 0.288 ms per ring token, 1.22 s per request at the 4,096 cap
+      (extrapolated). Raw: `plans/probes/s33_out/keep.txt`, `s33-session-k-*.json`. T11 (attribution, 10 arms) running.
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
