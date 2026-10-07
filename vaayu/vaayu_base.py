@@ -5805,7 +5805,8 @@ class VaayuBaseModel(GenerationMixin):
                     _lt_compute_us = 0
 
                     _non_expert_pinned = self.non_expert_pinned_layer_names
-                    if layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned:
+                    _layer_pinned = layer_name in self.pinned_layer_names or layer_name in _non_expert_pinned
+                    if _layer_pinned:
                         # ── Pinned (full or non-expert): already in VRAM — zero disk/transfer cost ──
                         _lt_cache_hit = True
                         moved_layers = []
@@ -6068,17 +6069,22 @@ class VaayuBaseModel(GenerationMixin):
                             self.model, layer, moved_layers, self.hf_quantizer
                         )
 
-                    self.telemetry.record_layer(LayerTiming(
-                        layer_name=layer_name,
-                        file_bytes=_lt_file_bytes,
-                        header_parse_us=_lt_header_parse_us,
-                        io_submit_us=_lt_io_submit_us,
-                        io_wait_us=_lt_io_wait_us,
-                        tensor_reconstruct_us=_lt_tensor_reconstruct_us,
-                        gpu_transfer_us=_lt_gpu_transfer_us,
-                        compute_us=_lt_compute_us,
-                        cache_hit=_lt_cache_hit,
-                    ))
+                    # No per-layer record for a VRAM-resident layer on a forward
+                    # that replays decode graphs: every disk field is zero and
+                    # compute_us is only the time to launch a graph. A streamed
+                    # layer always records -- its fields are real disk timings.
+                    if not (_e3 and _dg_on and _layer_pinned):
+                        self.telemetry.record_layer(LayerTiming(
+                            layer_name=layer_name,
+                            file_bytes=_lt_file_bytes,
+                            header_parse_us=_lt_header_parse_us,
+                            io_submit_us=_lt_io_submit_us,
+                            io_wait_us=_lt_io_wait_us,
+                            tensor_reconstruct_us=_lt_tensor_reconstruct_us,
+                            gpu_transfer_us=_lt_gpu_transfer_us,
+                            compute_us=_lt_compute_us,
+                            cache_hit=_lt_cache_hit,
+                        ))
 
                     # Prefill only: decode calls this every 32 tokens instead (below) —
                     # per-token empty_cache() defeats the CUDA caching allocator.

@@ -288,3 +288,28 @@ def test_chunk_major_elements_each_get_their_own_past_length():
         assert same(third, old_kwargs(m, layer, cache, 8, 3))
 
 
+# ── E3: no per-layer record for a pinned layer on a graph-eligible forward ──
+
+def test_a_graph_eligible_forward_records_no_pinned_layer():
+    m = make(n_dec=4, graphs=_Graphs(eligible=True))
+    run(m)
+    (token,) = m.telemetry.tokens
+    assert token.layers == []
+
+
+def test_a_streamed_layer_keeps_its_record_on_a_graph_eligible_forward():
+    pinned = {"embed", "layers.0", "layers.2", "layers.3", "norm", "lm_head"}
+    m = make(n_dec=4, pinned=pinned, graphs=_Graphs(eligible=True))
+    run(m)
+    (token,) = m.telemetry.tokens
+    assert [l.layer_name for l in token.layers] == ["layers.1"]
+
+
+@pytest.mark.parametrize("graphs", [None, _Graphs(eligible=False)])
+def test_a_forward_that_replays_no_graphs_records_every_layer(graphs):
+    m = make(n_dec=4, graphs=graphs)
+    run(m)
+    (token,) = m.telemetry.tokens
+    assert [l.layer_name for l in token.layers] == m.layer_names
+
+
