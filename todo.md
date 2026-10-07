@@ -324,8 +324,25 @@ the clean 0.45–0.56 ms/token before any build.
         load); on gpt-oss it also drops the records of the 24 layers S12 refuses. E3 does NOT explain the hygiene's
         cost: the collector scans 271,704 objects on Qwen3-Next after 1,024 tokens, 184,270 of them `Tensor` (the
         expert cache's live entries) and 52,224 `LayerTiming`.
-      **NEXT in this session: the implementation plan (per-task patch assets from the dry-run diff), then the USER's
-      review of it and choice of execution method.**
+      - *The server gate found a defect in the dry-run code:* the new on-device test
+        (`tests/test_server_smoke.py::test_the_host_hygiene_runs_after_a_response`) showed the hygiene ran through the
+        real server but its log line was NOT flushed (stdout is a pipe there; the line sat in the buffer until later
+        output). Fixed with `flush=True`, pinned by a unit test and a mutant. My first version of that gate test was
+        vacuous (it assumed the gate's earlier requests cross a 32-token mark; they make 24 forward passes on
+        Qwen3-Next); it now sends its own request and asserts `completion_tokens >= 32`. On `main` the gate is `1 failed,
+        9 passed`, on the prototype `10 passed`.
+      - *Budget float:* the two dry-run session processes got 16.57 and 17.41 GB (free RAM at load 25.4–26.7 GB, a
+        browser is open), which is +-5.9 ms/token by the budget rule. Spec amended: every arm of both sets runs with
+        one `BALLAST_GB` target; absolute figures are then not comparable with S28's.
+      **(6) PLAN WRITTEN 2026-10-07: `docs/superpowers/plans/2026-10-07-S33-host-edits-e1-e7.md`** (awaiting the USER's
+      review and choice of execution method). 17 tasks: T0 worktree `/home/a/code/ai-ml/Vaayu-s33`, branch
+      `s33-host-edits`; T1–T8 one prototype piece each (E2, E1, E3, E4, E5 engine, E5 server, E6, E7) as verified patch
+      assets (`t<k>-tests.patch` RED, `t<k>-code.patch` GREEN, its mutants; 30 of 30 killed; the chain's end equals the
+      dry-run tree byte for byte and every patch replays on a clean tree); T9 prototype checks; T10 KEEP set; T11
+      attribution set; T12 verdict; T13 finalization (`final-keep-all.patch`, 33 of 33 final-tree mutants killed,
+      suite `3775 passed, 26 skipped`); T14 docs (`3776 passed, 26 skipped` measured on that tree, 237.21 s); T15
+      gates on the final tree; T16 RESULTS, ledger, review, merge on the USER's word. gpt-oss-20b against stock on
+      the finalized scratch tree: `TF vs B (stock, full-length cache): bit-identical 64/64`.
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
