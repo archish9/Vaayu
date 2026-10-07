@@ -355,7 +355,16 @@ the clean 0.45–0.56 ms/token before any build.
       greedy ids identical on 7 turns × 4 arms; TTFT ON − OFF +0.012 s (spread 0.223 s); HIT turn 16.84 → 15.65 s
       (−7.1 %).** Of S, decode-only is 2.873 ms/token and the tail 0.473 s per turn; the deferred hygiene takes 75–78
       ms per turn (max 98.7). OFF tail against ring size: 0.288 ms per ring token, 1.22 s per request at the 4,096 cap
-      (extrapolated). Raw: `plans/probes/s33_out/keep.txt`, `s33-session-k-*.json`. T11 (attribution, 10 arms) running.
+      (extrapolated). Raw: `plans/probes/s33_out/keep.txt`, `s33-session-k-*.json`.
+      **T11 ATTRIBUTION SET (off, e7, loop, tele, all, mirrored; `BALLAST_GB=28.4`; budgets 16.33–16.85 GB; OFF
+      spread 0.966; ids identical on 7 turns × 10 arms): E7 +2.005 ms/token (tail +0.474 s per turn) RESOLVED;
+      E1 + E2 + E6 +0.426, inside the spread; E3 + E4 +0.313, inside the spread; E5 +1.896 RESOLVED; off − all 4.640.**
+      So E1–E6 measure 2.635 ms/token, inside S32's priced 2.11–2.76. The set ran twice: at 29.4 arm 8 exited
+      `BALLAST UNREACHABLE` twice (available RAM drifted 29.92 → 29.38 GB in ~70 min), so by the pre-registered rule
+      the whole set was restarted at 28.4; the first attempt's seven arms agree (E7 1.57, E1 + E2 + E6 0.58, E3 + E4
+      0.69, E5 1.63) and are corroboration only. **T12 VERDICT: KEEP, no group negative → every piece kept; resolved
+      by the measurement: E7 and E5; kept on reach, tests and S32's price alone: E1 + E2 + E6 and E3 + E4.** Raw:
+      `plans/probes/s33_out/attrib.txt`, `s33-session-b-*.json` (first attempt `s33-session-a-*.json`).
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
