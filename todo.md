@@ -217,7 +217,7 @@ the clean 0.45–0.56 ms/token before any build.
 
 - [x] **S33-A0 — confirm the post-CUPTI replay penalty — ✅ CLOSED 2026-10-07: CONFIRMED, a probe artefact.** One process on Qwen3-Next (server mode, graphs ON, O_DIRECT, 17.86 GB budget): unprofiled `S27_GRAPH@head.lin` 5.65 us/call (A), 5.64 (control C, before CUPTI), **25.93 after ONE 16-token Kineto window (B): B/A 4.58× ≥ 3× stop rule**; per-node ≈ +0.33 us (S32 p2's fit 6.30 + 0.323 vs 4.00 + 0.015); eager host work rises too (UPLOAD 35.6 → 64.1 us/call). Mechanism (model-free micro, torch 2.11 + cu130): Kineto leaves CUPTI attached after `profile.stop()` — a 61-node replay 1.62 → 12.25 us (≈ 1.0 + 0.157 us/node), eager launch +1 us, for the rest of the process, CPU-only profiler too; **`TEARDOWN_CUPTI=1` removes it** (micro only, two windows, no crash). The engine never starts a profiler: the server is unaffected. S32's clean price stands (C8b +0.45–0.56 ms/token); S33 proceeds as staged. PROBE RULE added to the Environment section. §8: measure only, nothing built, nothing banked. Suite floor unchanged (no engine code). Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md`.
 
-- [ ] **S33 — build E1–E6, then decide C8b (STAGED; set by the USER's third ruling at S32's final review, 2026-10-07).**
+- [~] **S33 — build E1–E6, then decide C8b (STAGED; set by the USER's third ruling at S32's final review, 2026-10-07).**
       **USER rulings:** "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
       session", then, after the clean re-price: **"Staged: E1–E6, then decide C8b (Recommended)"**. Runs AFTER S33-A0, in its
       own fresh session. NOT closed unrun: S32's flagged bundle-b STRADDLES (clean 2.710–3.190; pre-registered 3.072–3.699).
@@ -265,6 +265,38 @@ the clean 0.45–0.56 ms/token before any build.
       request's TTFT if the client answers fast: measure it.
       **§8:** answer all four at close; E3 and E4 change `vaayu_telemetry.json` and `server.log` output — document them in
       `documentation/`; say whether any knob is needed.
+      **IN PROGRESS 2026-10-07 (fresh session, HEAD `58dff7f`; engine unchanged since `43eb862`).** Re-verified at HEAD:
+      E1 kwargs `vaayu_base.py:5916-5923`; E2 scans `:5736-5744`, `:5775-5783`, `:5814-5821`; E3 `:6004-6014`; E4
+      `:6076-6104`; E5 `:6058-6059` (`clean_memory(cuda=False)`, `utils.py:89`); E6 `:5661-5668`. The pinned sets and
+      `_moe_blocks` are written only at load.
+      **FINDING (unpriced by S27 / S32; scope pending the USER's ruling): `generate()` rewrites `vaayu_telemetry.json`
+      at the end of EVERY request** (`vaayu_base.py:6248`, `:6326` through `_persist_and_store`, `:6722`, `:7131`). That
+      is before the server's final SSE chunk (`engine.py:709-720`: DONE follows `generate()`'s return) and inside
+      `s28_session.py`'s `wall_s` and `dec_ms_per_tok` (`t_end` follows the generator's `thread.join()`). CPU-only
+      timing of the file on disk (1,102 tokens x 51 layers, 16.1 MB): **282 ms per dump**; the ring caps at 4,096
+      tokens, so about 1.05 s per request on a server past ~16 turns (about 6.5 % of a 16.04 s turn; arithmetic, NOT
+      yet measured on device). No reader in `vaayu/`, `tests/` or `documentation/`. Consequences: E3 is worth more
+      than its in-loop 0.08 ms/token, and S33's probe must time the post-stream tail separately from decode.
+      **USER rulings in S33's session (2026-10-07):** (1) the dump: **"Add as E7"** — stage 1 is E1–E7; E7 = stop
+      writing `vaayu_telemetry.json` on every request (`dump_json` stays callable), with its own attribution arm.
+      (2) E4: **"Cheapen the line"** — the per-token `[VAAYU-IO]` line stays; only the `/proc` RSS read moves to
+      every 32nd token (`rss=` repeats the last value); no consumer breaks. (3) E5: **"Server background task"** — in
+      server mode `forward` only marks hygiene due and the server runs it after the response is fully sent; library
+      mode keeps today's cadence; the dry run checks RSS over one long request per model, and an in-request valve is
+      shown to the USER first if RSS grows.
+      **(4) Design approved 2026-10-07; spec `docs/superpowers/specs/2026-10-07-S33-host-edits-e1-e7-design.md`**
+      (awaiting the USER's review of the written spec; then the dry run, then the plan). What the spec fixes, so the
+      row stands without it: switch `model._s33_pieces` during the prototype (S28's pattern), E5 behind the permanent
+      attribute `model.defer_decode_hygiene` (the server sets it). E1 hoists the three layer-independent hooks per
+      `(len_p, len_s)` and still calls the mask hook per layer. E3 skips a record only for a VRAM-pinned layer on a
+      graph-eligible forward (streamed layers keep theirs). **E5's deferred hygiene runs as a Starlette background
+      task UNDER `engine._lock`: an explicit `gc.collect()` ignores `gc.disable()`, which is what keeps a collection
+      out of a CUDA-graph capture (S12), so hygiene and generation must be mutually exclusive.** Dry run: D0 tail
+      census (prices E7 on device), D1 `gc.collect` vs `malloc_trim` split + automatic gen-2 count, D2 RSS over one
+      long request on five models (stop rule: E5 arm grows > 0.25 GB more than off → valve options to the USER), D3
+      bitwise + reach. KEEP set off, all, all, off on S28's metric unchanged (stream-timed, tail included), bar
+      3.133; attribution off, e7, loop (+E1, E2, E6), tele (+E3, E4), all (+E5), mirrored, 10 processes, E7 first so
+      E3 is not credited with the dump it shrinks. Probe `plans/probes/s33_session.py` (to be written).
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
@@ -654,6 +686,14 @@ arithmetic, not the repack.**
       fast path repeats the serial loop's view-building lines (the serial loop was to stay unedited).
 
 *From the old STILL OPEN section.*
+
+- **[bug] `VaayuQWen` and `VaayuChatGLM` cannot run a forward** (found 2026-10-07 by S33's re-verification; not
+  touched by S33). Their `get_attention_mask_args(self, full_attention_mask, len_p, len_s)` overrides
+  (`vaayu/vaayu_qwen.py:54`, `vaayu/vaayu_chatglm.py:50`) lack the `layer=` parameter the layer loop passes
+  (`vaayu/vaayu_base.py:5920`), so the first decoder layer raises `TypeError: ... unexpected keyword argument
+  'layer'` (reproduced by calling both methods with `layer=None`). `auto_model.py:112` / `:116` still dispatch to
+  them. No checkpoint of either family is on this box, so no server user reaches it today (ordering rule *(d)*).
+  Fix = add `layer=None` to both signatures, with a test that calls every subclass's hook the way the loop does.
 
 - **[bug] Vaayu assumes the CURRENT CUDA device in ~35 places** (no-device `torch.cuda.synchronize()`
   / `mem_get_info()` / `torch.cuda.Stream()`, and Triton launches) — a model on `cuda:N≠current` is
