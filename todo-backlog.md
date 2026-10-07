@@ -8884,3 +8884,178 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       - RESULTS: `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md`.
       - Assets: `docs/superpowers/plans/2026-10-07-S33-A0-assets/`.
       - Raw: `plans/probes/s33a0_out/`.
+
+- [x] **S33 — build E1–E6, then decide C8b (STAGED; set by the USER's third ruling at S32's final review, 2026-10-07).**
+      **USER rulings:** "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
+      session", then, after the clean re-price: **"Staged: E1–E6, then decide C8b (Recommended)"**. Runs AFTER S33-A0, in its
+      own fresh session. NOT closed unrun: S32's flagged bundle-b STRADDLES (clean 2.710–3.190; pre-registered 3.072–3.699).
+      **S33-A0 (2026-10-07) CONFIRMED the p2 slow state as a post-CUPTI probe artefact**, so the clean p1 + p3 prices
+      below are the prices. S33's KEEP arms (`s28_session.py`) run no profiler. Any S33 arm that profiles follows the
+      PROBE RULE in the Environment section.
+      **Price (S32, ms/token, bar 3.133):** clean (p1 + p3) unflagged bundle-b 1.154–1.157 FAILS, flagged bundle-b
+      2.710–3.190 STRADDLES (p1 2.563–3.066, p3 2.857–3.313); calibration robust (zero-label 3.034–3.511, bench
+      2.747–3.226). E1–E6 alone ≈ 2.11–2.61 (p1) / 2.30–2.76 (p3); E5 alone 1.46–2.27 and near its high end (1.95 / 2.07;
+      gc ≈ 64 ms CPU-only behind ≈ 1.5 ms of queued GPU work, final review arithmetic). C8b's increment 0.45 (p1) / 0.56
+      (p3) ms/token ≈ 0.8 % of a turn, biased up ≈ 0.1 by the profiled r0 (final reviewer, one trace: p1 w0, 752 windows;
+      E1–E3 carry the same bias). Net, the clean full flagged bundle is ≈ 2.95–3.2: AT the bar.
+      **Stage 1 — build E1–E6** (E3, E4 and E5 admitted by the USER; definitions from `C9_EDITS` in
+      `plans/probes/s32_price.py`):
+      - E1 decoder kwargs built once per forward and reused by every decoder layer;
+      - E2 prefetch scan replaced by a once-per-forward 'next unpinned layer' index;
+      - E3 FLAGGED per-layer LayerTiming record skipped on graph-replay forwards (`vaayu_telemetry.json`);
+      - E4 FLAGGED per-token stats strings, RSS read and [VAAYU-IO] line built once per request (`server.log`);
+      - E5 FLAGGED every-32-token gc.collect + malloc_trim moved after the response is sent;
+      - E6 `_moe_shard_names` + expert-tensor regex cached on the model at load.
+      **KEEP rule (THIS row's bar, not S28's 3.488):** **3.133 ms/token** of mean HIT decode (5 % of 16.04 s). Mirrored arms
+      (off, E, E, off), server mode, graphs ON, O_DIRECT, at the server's own budget held equal across arms (S28's ±7
+      ms/GB band rule), using `plans/probes/s28_session.py`. Cumulative attribution arms as S28 did: off / E1+E2+E6 /
+      + E3+E4 / + E5 (separates each admitted behaviour change). Greedy ids identical. **If the measured saving is below
+      3.133, the USER rules: keep the edits that clear the OFF spread, or revert (pre-registered).**
+      **Stage 2 — C8b**, built ONLY on the USER's word, given stage 1's measured number and C8b's priced increment
+      (≈ 0.45–0.56 ms/token on clean processes). If built: it touches `vaayu/vaayu_base.py` `forward` and
+      `vaayu/decode_graphs.py`; it needs a per-forward eligibility check with an eager fallback for streamed layers
+      (Llama-3.3-70B; DeepSeek's 4 streamed non-expert layers); it gets its own attribution arm and its own KEEP.
+      **Gates:** decode logits bitwise on Qwen3-Next, MiniMax-M2.7, DeepSeek-V4 **and gpt-oss-20b**
+      (`plans/probes/s28_bitwise.py`; gpt-oss compared against stock with `DynamicCache()` and a pinned date — memory
+      "gpt-oss Stock-Reference Traps"); the dense gate `DENSE_CKPT=` on BOTH Llama checkpoints
+      (`tests/test_dense_gate.py`); the server gate; the accumulator gates `MOE_CKPT=` on Qwen3-Next AND MiniMax-M2.7.
+      **Model-agnostic constraint on E1:** `get_attention_mask_args` takes `layer=` and builds a per-layer mask from that
+      layer's window (`vaayu/vaayu_base.py:5294-5303`, called at `:5920`; gpt-oss alternates sliding and full layers);
+      DeepSeek-V4 overrides it with a per-layer `start_pos` check (`vaayu/vaayu_deepseek_v4.py:705-750`). So E1 must key
+      its cached kwargs per window kind and keep any per-layer hook. "Mask is None at decode" holds for Qwen3-Next only.
+      **E4 consumers:** `tests/test_server_smoke.py:265-267` asserts on `gb_tok=` values parsed from the per-token
+      `[VAAYU-IO]` lines; `tests/test_token_summary_bytes.py`, `plans/probes/s6_reach_method.py` and
+      `plans/probes/s9_ab_report.py` parse them too. E4 is worth only 0.016–0.031 ms/token, so S33 must keep those
+      consumers working (an aggregate line per request with the same fields) or update them, and show the USER the trade.
+      **E5 notes:** gc stays enabled, so automatic gen-2 collections may take back part of the saving on the token path:
+      count collections with `gc.callbacks` in the E5 arm. The RSS check runs over ONE long single request per model, not
+      "a long session" (memory "Clone-Path Malloc Retention"). The gc that now runs per request can delay the next
+      request's TTFT if the client answers fast: measure it.
+      **§8:** answer all four at close; E3 and E4 change `vaayu_telemetry.json` and `server.log` output — document them in
+      `documentation/`; say whether any knob is needed.
+      **IN PROGRESS 2026-10-07 (fresh session, HEAD `58dff7f`; engine unchanged since `43eb862`).** Re-verified at HEAD:
+      E1 kwargs `vaayu_base.py:5916-5923`; E2 scans `:5736-5744`, `:5775-5783`, `:5814-5821`; E3 `:6004-6014`; E4
+      `:6076-6104`; E5 `:6058-6059` (`clean_memory(cuda=False)`, `utils.py:89`); E6 `:5661-5668`. The pinned sets and
+      `_moe_blocks` are written only at load.
+      **FINDING (unpriced by S27 / S32; scope pending the USER's ruling): `generate()` rewrites `vaayu_telemetry.json`
+      at the end of EVERY request** (`vaayu_base.py:6248`, `:6326` through `_persist_and_store`, `:6722`, `:7131`). That
+      is before the server's final SSE chunk (`engine.py:709-720`: DONE follows `generate()`'s return) and inside
+      `s28_session.py`'s `wall_s` and `dec_ms_per_tok` (`t_end` follows the generator's `thread.join()`). CPU-only
+      timing of the file on disk (1,102 tokens x 51 layers, 16.1 MB): **282 ms per dump**; the ring caps at 4,096
+      tokens, so about 1.05 s per request on a server past ~16 turns (about 6.5 % of a 16.04 s turn; arithmetic, NOT
+      yet measured on device). No reader in `vaayu/`, `tests/` or `documentation/`. Consequences: E3 is worth more
+      than its in-loop 0.08 ms/token, and S33's probe must time the post-stream tail separately from decode.
+      **USER rulings in S33's session (2026-10-07):** (1) the dump: **"Add as E7"** — stage 1 is E1–E7; E7 = stop
+      writing `vaayu_telemetry.json` on every request (`dump_json` stays callable), with its own attribution arm.
+      (2) E4: **"Cheapen the line"** — the per-token `[VAAYU-IO]` line stays; only the `/proc` RSS read moves to
+      every 32nd token (`rss=` repeats the last value); no consumer breaks. (3) E5: **"Server background task"** — in
+      server mode `forward` only marks hygiene due and the server runs it after the response is fully sent; library
+      mode keeps today's cadence; the dry run checks RSS over one long request per model, and an in-request valve is
+      shown to the USER first if RSS grows.
+      **(4) Design approved 2026-10-07; spec `docs/superpowers/specs/2026-10-07-S33-host-edits-e1-e7-design.md`**
+      (awaiting the USER's review of the written spec; then the dry run, then the plan). What the spec fixes, so the
+      row stands without it: switch `model._s33_pieces` during the prototype (S28's pattern), E5 behind the permanent
+      attribute `model.defer_decode_hygiene` (the server sets it). E1 hoists the three layer-independent hooks per
+      `(len_p, len_s)` and still calls the mask hook per layer. E3 skips a record only for a VRAM-pinned layer on a
+      graph-eligible forward (streamed layers keep theirs). **E5's deferred hygiene runs as a Starlette background
+      task UNDER `engine._lock`: an explicit `gc.collect()` ignores `gc.disable()`, which is what keeps a collection
+      out of a CUDA-graph capture (S12), so hygiene and generation must be mutually exclusive.** Dry run: D0 tail
+      census (prices E7 on device), D1 `gc.collect` vs `malloc_trim` split + automatic gen-2 count, D2 RSS over one
+      long request on five models (stop rule: E5 arm grows > 0.25 GB more than off → valve options to the USER), D3
+      bitwise + reach. KEEP set off, all, all, off on S28's metric unchanged (stream-timed, tail included), bar
+      3.133; attribution off, e7, loop (+E1, E2, E6), tele (+E3, E4), all (+E5), mirrored, 10 processes, E7 first so
+      E3 is not credited with the dump it shrinks. Probe `plans/probes/s33_session.py`.
+      **(5) Spec approved by the USER 2026-10-07; DRY RUN DONE the same day (scratch worktree at `8544722`, nothing
+      merged; no stop rule fired; spec section 12; raw output `plans/probes/s33_out/`; code and tests in
+      `docs/superpowers/plans/2026-10-07-S33-assets/`).**
+      - *Tests:* `tests/test_s33_host_edits.py`, 36 tests on a CPU stand-in that runs the REAL `forward`; 7 fail with
+        the pieces off; **29 of 29 mutants killed**; suite in the worktree `3775 passed, 25 skipped` (244.11 s).
+      - *D0, HEAD, Qwen3-Next, pieces off, 16.57 GB budget:* **the dump costs 0.277 ms per ring token** (0.071 s at 256
+        tokens, 0.648 s at 2,304; 1.14 s per request at the 4,096 cap, extrapolated); mean HIT tail 0.502 s (dump
+        0.460 + `pc.store` 0.041), i.e. 1.97 of the 56.32 ms/token stream-timed HIT decode. **The hygiene is all
+        `gc.collect`:** 0.647 s per HIT turn (8 calls, 77–89 ms each once warm) against 0.0028 s of `malloc_trim`
+        (0.28–0.38 ms per call). Automatic collections per HIT turn: gen-0 509 × 0.131 s, gen-1 40 × 0.011 s, gen-2
+        0.83 × 0.065 s.
+      - *D1, every piece on, 17.41 GB:* ids identical to D0 on all 9 turns; tail 0.502 → 0.041 s; explicit hygiene
+        inside a turn 8 → 0; the deferred hygiene takes 62–82 ms once per turn (the wait a client meets if it answers
+        at once); automatic gen-2 1.33 per turn, 0.087 s. Raw HIT decode 56.32 → 49.73 ms/token is NOT a verdict (the
+        budgets are 0.84 GB apart).
+      - *D2, RssAnon growth over one long request, today / deferred:* Qwen3-Next (1,024 tokens) +0.048 / +0.040 GB;
+        gpt-oss (1,024) +0.007 / +0.003; MiniMax (256) +0.004 / +0.003; DeepSeek-V4 (256) +0.029 / +0.031;
+        Llama-3.3-70B (96) +0.001 / +0.001. **The 0.25 GB rule fired on no model: no in-request valve.** Ids
+        identical in every pair.
+      - *D3:* **decode scores bitwise identical, pieces on against off, on Qwen3-Next (64 steps), MiniMax-M2.7 (40),
+        DeepSeek-V4 (24, with its 4 streamed layers through E2's table) and gpt-oss-20b (64, a per-window mask on
+        every layer through E1's merge).** Reach on Qwen3-Next per forward: each hoisted hook 49.5 → 1.03 calls, the
+        mask hook 49.5 → 49.5, layer records 50.2 → 0.78, `/proc` reads 64 → 2 per 64 tokens, dumps 1 → 0.
+      - *Corrections:* E3 never fires on DeepSeek-V4 (no decode-graph seam) or Llama-3.3-70B (graphs disabled at
+        load); on gpt-oss it also drops the records of the 24 layers S12 refuses. E3 does NOT explain the hygiene's
+        cost: the collector scans 271,704 objects on Qwen3-Next after 1,024 tokens, 184,270 of them `Tensor` (the
+        expert cache's live entries) and 52,224 `LayerTiming`.
+      - *The server gate found a defect in the dry-run code:* the new on-device test
+        (`tests/test_server_smoke.py::test_the_host_hygiene_runs_after_a_response`) showed the hygiene ran through the
+        real server but its log line was NOT flushed (stdout is a pipe there; the line sat in the buffer until later
+        output). Fixed with `flush=True`, pinned by a unit test and a mutant. My first version of that gate test was
+        vacuous (it assumed the gate's earlier requests cross a 32-token mark; they make 24 forward passes on
+        Qwen3-Next); it now sends its own request and asserts `completion_tokens >= 32`. On `main` the gate is `1 failed,
+        9 passed`, on the prototype `10 passed`.
+      - *Budget float:* the two dry-run session processes got 16.57 and 17.41 GB (free RAM at load 25.4–26.7 GB, a
+        browser is open), which is +-5.9 ms/token by the budget rule. Spec amended: every arm of both sets runs with
+        one `BALLAST_GB` target; absolute figures are then not comparable with S28's.
+      **(6) PLAN WRITTEN 2026-10-07: `docs/superpowers/plans/2026-10-07-S33-host-edits-e1-e7.md`** (awaiting the USER's
+      review and choice of execution method). 17 tasks: T0 worktree `/home/a/code/ai-ml/Vaayu-s33`, branch
+      `s33-host-edits`; T1–T8 one prototype piece each (E2, E1, E3, E4, E5 engine, E5 server, E6, E7) as verified patch
+      assets (`t<k>-tests.patch` RED, `t<k>-code.patch` GREEN, its mutants; 30 of 30 killed; the chain's end equals the
+      dry-run tree byte for byte and every patch replays on a clean tree); T9 prototype checks; T10 KEEP set; T11
+      attribution set; T12 verdict; T13 finalization (`final-keep-all.patch`, 33 of 33 final-tree mutants killed,
+      suite `3775 passed, 26 skipped`); T14 docs (`3776 passed, 26 skipped` measured on that tree, 237.21 s); T15
+      gates on the final tree; T16 RESULTS, ledger, review, merge on the USER's word. gpt-oss-20b against stock on
+      the finalized scratch tree: `TF vs B (stock, full-length cache): bit-identical 64/64`.
+      **(7) EXECUTION 2026-10-07 (subagent-driven; plan approved by the USER).** Branch `s33-host-edits` in
+      `/home/a/code/ai-ml/Vaayu-s33`, base `1427a38`. T1–T8 committed (`9287638` E2, `7ec25d6` E1, `6be4200` E3,
+      `62b845a` E4, `cd386da` E5 engine, `ed56746` E5 server, `9be04ba` E6, `9ae446a` E7); the five files' sha256 equal
+      the dry-run tree's. Three task reviews (one on opus for the lock / gc half): all eight tasks approved, 0
+      Critical, 0 Important; the opus review confirmed with CPU repros that the deferred collection cannot overlap a
+      generation or a capture and cannot deadlock. T9 on the branch: suite `3775 passed, 26 skipped` (238.26 s); server
+      gate `10 passed` with `[Vaayu-Server] deferred hygiene: 20 ms`; Qwen3-Next bitwise ON vs OFF, 64 steps.
+      **T10 KEEP SET (off, all, all, off; `BALLAST_GB=29.4`; budgets 17.66 / 17.74 / 17.70 / 17.52 GB; O_DIRECT):
+      VERDICT KEEP. S = 4.727 ms/token (OFF 53.88 → ON 49.15; bar 3.133; OFF spread 1.039; budget band 3.820–5.633);
+      greedy ids identical on 7 turns × 4 arms; TTFT ON − OFF +0.012 s (spread 0.223 s); HIT turn 16.84 → 15.65 s
+      (−7.1 %).** Of S, decode-only is 2.873 ms/token and the tail 0.473 s per turn; the deferred hygiene takes 75–78
+      ms per turn (max 98.7). OFF tail against ring size: 0.288 ms per ring token, 1.22 s per request at the 4,096 cap
+      (extrapolated). Raw: `plans/probes/s33_out/keep.txt`, `s33-session-k-*.json`.
+      **T11 ATTRIBUTION SET (off, e7, loop, tele, all, mirrored; `BALLAST_GB=28.4`; budgets 16.33–16.85 GB; OFF
+      spread 0.966; ids identical on 7 turns × 10 arms): E7 +2.005 ms/token (tail +0.474 s per turn) RESOLVED;
+      E1 + E2 + E6 +0.426, inside the spread; E3 + E4 +0.313, inside the spread; E5 +1.896 RESOLVED; off − all 4.640.**
+      So E1–E6 measure 2.635 ms/token, inside S32's priced 2.11–2.76. The set ran twice: at 29.4 arm 8 exited
+      `BALLAST UNREACHABLE` twice (available RAM drifted 29.92 → 29.38 GB in ~70 min), so by the pre-registered rule
+      the whole set was restarted at 28.4; the first attempt's seven arms agree (E7 1.57, E1 + E2 + E6 0.58, E3 + E4
+      0.69, E5 1.63) and are corroboration only. **T12 VERDICT: KEEP, no group negative → every piece kept; resolved
+      by the measurement: E7 and E5; kept on reach, tests and S32's price alone: E1 + E2 + E6 and E3 + E4.** Raw:
+      `plans/probes/s33_out/attrib.txt`, `s33-session-b-*.json` (first attempt `s33-session-a-*.json`).
+      **(8) FINALIZED, REVIEWED AND GATED 2026-10-07 — AWAITING THE USER'S WORD TO MERGE.** Branch `s33-host-edits` at
+      `b106d66` (11 commits on `1427a38`): `952139b` removes the prototype switch (final sha256 = the dry-run chain's;
+      33 of 33 final-tree mutants killed), `fd8468f` documents the three output changes in `documentation/server.md`,
+      `b106d66` is the final review's fix wave. **Final whole-branch review (most capable model): ready to merge with
+      fixes; 0 Critical; 1 Important, test-only** (the new on-device gate test counted tokens where the mark is per
+      forward pass, and accepted a hygiene line left by an earlier request); no runtime defect (no reference cycle
+      found that held GPU or pinned memory and relied on the in-request collection; disconnect and queueing clean on a
+      real uvicorn). The fix wave changed tests, comments, docstrings and docs only (executed code of the three
+      touched `vaayu/` files identical by AST); scoped re-review: all addressed, no new breakage.
+      **Gates on `b106d66`:** suite `3777 passed, 26 skipped` (230.75 s); dense gate `5 passed` on Llama-3.2-1B and on
+      Llama-3.3-70B; accumulator gate `8 passed` on Qwen3-Next and on MiniMax-M2.7; server gate `10 passed` on
+      Qwen3-Next (`deferred hygiene: 18 ms` in `server.log`) and on Llama-3.2-1B, and `1 failed, 9 passed` with the
+      non-streaming route's background task removed (the test can fail); gpt-oss-20b against stock 64/64 bit-identical;
+      the final tree against the attribution set's `all` arms: ids identical, HIT decode 51.65 against 50.86–50.94
+      ms/token. Fused-EXL3 forward: unit tests only (no checkpoint). **§8:** no knob; plumbed in `app.py` in the same
+      commit as the hook; reachable at N=1, the server default; nothing banked. RESULTS
+      `docs/2026-10-07-S33-host-edits-e1-e7-RESULTS.md`. Not built, for the USER: keeping `malloc_trim` in the request
+      (the lead above the gc lead in this file).
+      **✅ STAGE 1 CLOSED 2026-10-07: KEEP, merged into `main` as `6c9a31f` at the USER's word ("1" = merge back to `main`
+      locally).** Merged `main`: suite `3777 passed, 26 skipped` (240.05 s). Branch and worktree removed; the SDD ledger,
+      the final review and the task reports are in `docs/superpowers/plans/2026-10-07-S33-assets/sdd/`. **§8, final:**
+      no knob (`defer_decode_hygiene` is a mode the server always sets); plumbed in `vaayu/server/app.py` in the same
+      commit as the hook; reachable at N=1, the server default, proven by the server gate through the real server;
+      nothing banked; documented in `documentation/server.md`. Stage 2 (C8b) stays the USER's call (row `S33-C8b`).
+      Left for the USER: the in-request `malloc_trim` lead and the gc re-freeze lead in `todo.md`'s OPEN list; the
+      stale 16 MB `vaayu_telemetry.json` at the repo root (no longer rewritten; delete at will).
