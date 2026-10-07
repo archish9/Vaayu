@@ -2518,7 +2518,8 @@ class VaayuBaseModel(GenerationMixin):
 
         if device.startswith("cuda"):
             from .persist.safetensor_model_persister import _should_use_direct_io, init_model_io
-            self._use_direct_io = _should_use_direct_io(str(self.checkpoint_path))
+            self._use_direct_io = _should_use_direct_io(str(self.checkpoint_path),
+                                                        ram_cache_budget=ram_cache_budget)
             init_model_io(str(self.checkpoint_path), use_direct_io=self._use_direct_io)
         else:
             self._use_direct_io = False
