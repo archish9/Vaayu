@@ -8400,3 +8400,163 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
         - USER DECISION 2 is unchanged.
         - Not reproduced (reviewer's arithmetic): the share of the timer cost inside MOE's exclusive time (0.5–1.2
           ms), and C4 ≈ 2.6–3.2 after removing it.
+
+- [x] **S28 — ✅ CLOSED 2026-10-07: KEEP, merged `6fd79fa` (S = 5.94 ms/token; HIT turn −8.9 %; C11 +1.69, C5 +2.56, C4 +2.01; bitwise; suite 3735; RESULTS `docs/2026-10-06-S28-host-fast-path-RESULTS.md`). Row as it stood at close:**
+  **S28 — USER DECISION: build a bundled "MoE-visit host fast path", full (a) or smaller (a'), or close unbuilt (b)
+      (USER, 2026-10-06, at S27's close; set at S26 as "build the single best host lever from S27").** Decided in S28's
+      own fresh session: re-check the numbers below at HEAD, present them, and WAIT for the USER's pick. S27 found
+      nothing that clears the bar alone. See the full S27 row in the backlog archive, and the RESULTS
+      `docs/2026-10-06-S27-host-levers-RESULTS.md`, including its "Calibration: closure test".
+      - **▶ DECIDED 2026-10-06 by the USER (S28's session): option (a), the full bundle C5 + C4 + C11.** Re-checked at
+        HEAD `f5f2786` first: no engine code changed since S27 measured (`a588ff4..HEAD` touches only the ledger), so
+        S27's numbers stand un-re-priced; the anchors hold (C11 = `moe_patch.py:2333` `unique().tolist()` + `:2427`
+        `.cpu()`, C5 = `packed_expert_kernels.py` `_TableRing`/`_gate_up`/`_down`, C4 = `sparse_forward` at
+        `moe_patch.py:2294`). The session recommended (a') staged (C11 first, C4 dropped); the USER chose (a). C1 stays
+        FAILED; C9/C8 stay in the OPEN "post-S12 eager residue" item.
+      - **SPEC WRITTEN 2026-10-06 (design approved section by section by the USER; the written spec now waits for the
+        USER's review):** `docs/superpowers/specs/2026-10-06-S28-moe-visit-host-fast-path-design.md`. USER decisions:
+        - measure with a bundle ABBA (off, all, all, off; KEEP) plus a mirrored attribution set (off, c11, c11c5,
+          all ×2), with one private switch per piece (`vaayu_ref._s28_pieces`, set only by the probe);
+        - **C11 goes into BOTH forwards**, fused non-EXL3 and module-list (MiniMax, DeepSeek); fused-EXL3 is untouched
+          (no model on disk);
+        - **C5 = approach A**, a per-layer CUDA graph in `packed_expert_kernels.py` (table H2D + `_gate_up` +
+          `_down`, plus the cast + shared add when C4 is on), used only under an S12 replay. Pre-registered MICRO
+          fallback to approach C (direct `CompiledKernel` launch) if A's per-call host median is above 45 µs in either
+          process;
+        - **C4 = a lean decode branch** in `_make_fused_sparse_forward`; the shared helpers and `decode_graphs.py`
+          stay untouched.
+
+        Rules:
+        - **KEEP:** S ≥ 3.488 ms/token mean HIT decode (OFF − ON) and S > the OFF spread; ids identical on 7 turns ×
+          4 arms; HIT TTFT no worse beyond the spread.
+        - **Drop rule:** a piece whose attribution increment is below the OFF spread is dropped, if the rest still
+          clears.
+        - **STOP:** REFUTED, with per-piece numbers in SETTLED. Ids differing is a defect, not a verdict.
+
+        Gates: suite; `MOE_CKPT` Qwen3-Next + MiniMax; `SERVER_CKPT` Qwen3-Next; DeepSeek bitwise check; dense 1B.
+        Llama-3.3-70B and gpt-oss are not required (no shared infra touched), and the spec says why.
+        §8: no knob; banked until KEEP.
+      - **SPEC APPROVED BY THE USER 2026-10-06 ("spec approved, start the dry run").**
+      - **DRY RUN DONE 2026-10-06** (throwaway worktree at `f5f2786`). Spec §12; diff and probes in
+        `docs/superpowers/plans/2026-10-06-S28-assets/`.
+        - **Tests:** 46 new; suite with every switch OFF **3730 passed / 0 failed / 25 skipped**.
+        - **Mutants:** 11/11 killed (M6 needed a deterministic NaN `torch.empty` in its test).
+        - **D1 bitwise ON vs OFF, every decode step:**
+          - Qwen3-Next, all pieces, 64 steps: identical.
+          - MiniMax-M2.7, c11, 24 steps, HIT vs HIT: identical.
+          - DeepSeek-V4, c11, 16 steps: identical.
+        - **D0 reach:** C5 entry 48.00 per Qwen3-Next decode token; the lean branch took 100 % of decode visits;
+          C11 ran in both forwards (MiniMax 2976 calls / 0 OFF; DeepSeek 688 per arm).
+        - **D2 MICRO:** graph 17.7–17.9 µs/call against eager 56.1–56.4 (65.4–65.8 with the tail); raw replay
+          2.35–2.45 µs. The 45 µs rule holds, so C5 = approach A.
+        - **D3 short session (2k / 64, ON / OFF / ON):** ids identical 5/5 × 3; S12 48/48 with 0 refused; C5 0
+          refused; HIT decode ON 44.86 / 44.41 against OFF 49.70 ms/token (NOT a verdict). Budgets 18.17–18.55 GB
+          (span 0.38 > 0.2), so expect the §7.2 correction band.
+        - **Spec amendments from the dry run:**
+          - a churn rule (graph replaced before its first replay, more than 2 times) replaces "recaptures per
+            request", because S12 recaptures every layer at every request;
+          - the capture runs under `no_grad`;
+          - the eager `out` comes from `torch.empty` per call;
+          - the lean branch calls `_routing_to_host`.
+
+      - **PLAN WRITTEN 2026-10-06:** `docs/superpowers/plans/2026-10-06-S28-host-fast-path.md`. Assets in
+        `docs/superpowers/plans/2026-10-06-S28-assets/`.
+        - **Patches:** the dry-run diff re-split per piece into tests + code patches. Each was verified on a scratch
+          chain: RED against its parent's code, GREEN with its own (45 / 67 / 84 tests), all mutants killed, and a
+          byte-exact replay onto `f5f2786`.
+        - **Finalization patches for KEEP:** all three kept (76 tests, full suite 3722 + 6 Review Focus = 3728), C11 +
+          C5 (66), C11 alone (45). Each has its own mutant set (`mutants_final.py`), and all are killed.
+        - **Review Focus:** 5 new tests with mutants M11–M13: reserved VRAM flat over 100 per-request recaptures;
+          duplicate expert slots through the graph; gc handed back inside S12's capture window; a changing pair count
+          is not churn; pinned layers skip the lean branch.
+        - **Verdict script:** `s28_cmp.py` (KEEP rule + budget band + drop rule), checked on the D3 JSONs and on
+          synthetic drop cases.
+        - **Final-tree DeepSeek check:** `s28_bitwise.py FINAL=1` (OFF arms monkeypatch C11's predecessor), proven on
+          the scratch final tree (bitwise; 2064 old-routing calls OFF).
+
+        Tasks:
+        1. Branch + C11.
+        2. C5.
+        3. C4 + suite (3736).
+        4. Gates with the switches OFF + branch bitwise.
+        5. The KEEP set.
+        6. The attribution set.
+        7. KEEP: finalize, gate, review, merge, close. **Or** 8. STOP: close REFUTED.
+
+        Execution: subagent-driven (the USER's standing choice).
+      - **Ledger:** branch `s28-host-fast-path`; Task 1 (5acbe51); Task 2 (5514d25 + fix 7c429c8); Task 3 (32f5c17). Step 2: `87 passed`; Step 3: mutants 16/16 all KILLED; Step 4: suite `3739 passed, 25 skipped`.
+      - **Prototype gates (switches OFF, branch 32f5c17), 2026-10-06:** MOE_CKPT Qwen3-Next 8 passed, 16 warnings in 32.13s; MOE_CKPT MiniMax 8 passed, 16 warnings in 69.37s; SERVER_CKPT Qwen3-Next 9 passed, 17 warnings in 19.81s; DENSE_CKPT Llama-3.2-1B 5 passed, 17 warnings in 5.82s; bitwise branch Qwen3-Next all pieces: VERDICT BITWISE IDENTICAL (three differing=0), C5 entry 48.00 per token, S12 refused []. Logs: plans/probes/s28_out/gate-*.log, bitwise-branch-qwen.log.
+      - **KEEP set (off, all, all, off), 2026-10-06:** S = 5.938 ms/token (bar 3.488), HIT decode OFF 56.88 / 58.16 vs ON 51.70 / 51.47 ms/token, OFF spread 1.287, budget span 0.47 GB (band -1: 7.544, +0: 5.938, +1: 4.332); HIT TTFT ON 2.883 s vs OFF 2.939 s (OFF spread 0.161) -> ok, ids identical on every turn; HIT turn wall saving 1.57 s of 17.61 s (8.9 %); VERDICT KEEP. JSONs: plans/probes/s28_out/s28-session-keep-{1off,2all,3all,4off}.json, s28-keep-verdict.json.
+      - **Attribution set (off, c11, c11c5, all, all, c11c5, c11, off), 2026-10-06:** ATTR set: HIT decode per config off 58.29, c11 56.60, c11c5 54.04, all 52.03 ms/token; OFF spread 0.189; budget span 0.42 GB; increments: C11 +1.687, C5 +2.563, C4 +2.006 | savings vs off: c11 1.687, c11c5 4.251, all 6.257; KEPT: ['C11', 'C5', 'C4']. JSONs: plans/probes/s28_out/s28-session-attr-*.json, s28-attr-verdict.json.
+      - **The pieces, ranked C11 ≈ C5 > C4** (exposed ms/token):
+        - U = the pre-registered upper bound.
+        - calibrated = the final review's closure test (the exposed fractions run 1.15–1.23 × high).
+        - realistic = a calibrated ESTIMATE, NOT measured.
+        - **C11, one routing sync per MoE visit.** Today there are 3 syncs per visit (`unique`, `.tolist()`, `.cpu()`):
+          13.44 ms of host, 23 % exposed. `unique` also launches 3 cub kernels per visit, 0.73 ms of device time,
+          serial. U 3.130 (3.86 with those kernels); calibrated 3.13–3.37; realistic ≈ 2.5 (2.2–3.0).
+        - **C5, graph-captured decode kernels.** KERNEL is 4.81 ms of host, 100 µs/call = table put 28 + gate_up launch
+          28 + down launch 19 + table values 8 + rest. The change puts both kernels in one per-layer CUDA graph, with a
+          static pinned table. U 3.723 (the table prices it as "cached Triton launch"; same label); calibrated
+          3.14–3.44; realistic 1.9–2.6. The controller's ~25 µs/call after the change holds only for a raw replay: a
+          replay cost 5.8 / 16.9 µs between the processes, and `_bind` adds 15.8 µs through the runner.
+        - **C4, decode fast path through `sparse_forward`.** The MOE remainder is 6.09 ms of host, of which the
+          sub-labels explain ~1.1. The controller reads the rest as inline Python plus small launches (480 eager
+          kernels per token). U 4.264; calibrated 3.15–3.60 (still including the probe's own timer cost); realistic
+          0.7–1.2. **That is below the 1.744 band floor on its own estimate**, the gate C1 failed at 1.702.
+      - **Option (a): the full bundle, C5 + C4 + C11.**
+        - Upper bounds 3.723 + 4.264 + 3.130 = 11.12 ms/token = 2.85 s/turn = 16 %; 11.85 with C11 restated.
+        - **Calibrated realistic ESTIMATE: 4.8–6.8 ms/token = 1.2–1.7 s/turn = 6.8–9.7 %.**
+        - For comparison: the reviewer's arithmetic gives 4.8–6.6 = 7–9.5 %, and the controller's pre-calibration
+          estimate was ≈ 6 ms/token ≈ 1.5 s/turn ≈ 8–9 %.
+      - **Option (a'): the smaller bundle, C11 + C5.** Calibrated realistic ESTIMATE **4.0–5.6 ms/token = 1.0–1.4
+        s/turn = 5.8–8.0 %**; upper bounds 7.59.
+      - **For (a) or (a'):**
+        - Week-class.
+        - Prototype-gated like S25, with a **KEEP rule at the 3.488 ms/token bar on the whole bundle**.
+        - ABBA on the agent session; greedy ids identical.
+        - Gates per the list below (MOE_CKPT, SERVER_CKPT, dense if shared infra).
+        - Every sum assumes the pieces add up, which is not measured.
+      - **Option (b): close S28 unbuilt** with S27's number; S29 is next.
+      - **The baseline has moved.** Today's agent-session baseline is 18.64 s per HIT turn at a 17.01 GB budget (S27,
+        `PROTO=off`). The bar is set on 17.86 s, measured at 18.7–18.8 GB (2026-10-04). S28's own OFF arms are its
+        baseline.
+      - **For information, C1 blob-from-slab.** It FAILED narrowly: P 1.702 against 1.744, a margin of 0.042. Its P is
+        not robust: it omits ~0.27 ms/token of deleted `torch.cat` device time, and its prefill bound assumes exposure
+        1. Its prototype exists (`s27_proto.py`, in `docs/superpowers/plans/2026-10-06-S27-assets/`) and is
+        byte-verified 256/256. The USER picks.
+      - **Also the USER's to decide here** (plan Task 6 Step 6): the PRICED-UNVERIFIED pieces.
+        - C9 FWD: 3.310, calibrated 2.79–3.27; no concrete change named.
+        - C8 segment merge: 2.538, calibrated 2.13–2.34; not probe-prototypable.
+        - Both are in the OPEN item "Lead (S21): the post-S12 eager residue".
+      - **If (a) or (a'): process and gates** (the row's text as set at S26, unchanged; it applies to options (a) and (a')):
+        - **Process:** brainstorm → spec → USER approval → dry run → plan → subagent-driven execution → final review
+          (the USER's standing choice).
+        - **KEEP rule, pre-registered in the spec:** ABBA (off, on, on, off) on the agent session at the server's own
+          settings; greedy ids identical; saving at or above the bar S27 set.
+        - **Gates:**
+          - Always: the full suite, the `MOE_CKPT=` accumulator gate on Qwen3-Next, and the `SERVER_CKPT=` server gate.
+          - If the change touches shared infra (staging, io_uring, prefix cache, decode graphs): also the dense gate on
+            both Llama checkpoints and the MiniMax accumulator gate.
+          - If the change is in a helper that other forwards call: it must hold on every forward that calls it
+            (CLAUDE.md §5).
+        - **§8:** the spec answers all four.
+      - ~~If S27 finds nothing that clears the bar, this row closes unbuilt with S27's number, and S29 is next.~~
+        Superseded by the USER at S27's close (2026-10-06): S28 is this decision instead; option (b) is that path.
+      - **CLOSED 2026-10-07 (S28 session, subagent-driven):** branch `s28-host-fast-path` (C11 `5acbe51`, C5 `5514d25` + review fix `7c429c8`, C4 `32f5c17`, finalization `8f67df0`, helper extraction `c401f6a`, final-review fixes `507812a` + docs `eba95e9`) merged as `6fd79fa`. KEEP set: OFF 56.88 / 58.16, ON 51.70 / 51.47 ms/token → S = 5.938 (budget 18.4–18.9 GB, band −1: 7.544 / +1: 4.332); HIT TTFT ON 2.883 vs OFF 2.939 s; HIT turn 17.61 → 16.04 s. Attribution: off 58.29, c11 56.60, c11c5 54.04, all 52.03 → C11 +1.687, C5 +2.563, C4 +2.006 (OFF spread 0.189), all kept. Gates on the final tree: MOE Qwen 8, MOE MiniMax 8, SERVER Qwen 9, DENSE 1B 5 passed; FINAL bitwise DeepSeek + Qwen identical. Reviews: Task 2 (churn counter never reset → consecutive-only), final review F1 (churn refusal removed: S12 already bounds input movement; four one-step requests had switched C5 off for the process) + F2 (failures around the capture fall back) + warn-once + `_cleanup_pool` test + docs; Task 3 plan-mandated duplicate → `_packed_miss_entry`. Open lead filed: `capture_begin` failure pool state (not reproduced). Logs/JSONs: `plans/probes/s28_out/`.
+
+- [x] **S11-L3 — ✅ CLOSED 2026-10-07 by S27 + S28 (C4 built, +2.01 ms/token; C1/C2/C3 FAIL in S27). Row as it stood at close:**
+  **S11-L3 — expert-path host trim — = S27 (priced) / S28 (built if best)** (DISP + SETTLE + BLOB + UPLOAD issue + MOE remainder):
+  4.81–5.50 ms = **8.4–9.6 %**, 1.23–1.41 s/turn; days (five seams, no single change covers them);
+  reach: every decode token at N=1. Evidence `arms.U_HOST.host_ms_per_tok.S11_{DISP,SETTLE,BLOB,
+  UPLOAD,MOE}` − `U_CNT` device of MOE / BLOB / UPLOAD.
+  **Re-priced by S21 (U_HOST, 8k, BALLAST 25, `s21_out/decode-on1.log`): host 13.43 ms (DISP 1.22, SETTLE 1.94,
+  BLOB 2.11, UPLOAD 2.52, MOE 5.63) − device 5.35 = 8.1 ms/token (6–8 after the overlap with in-flight reads) =
+  1.5–2.1 s of the 20.1 s representative turn (7.6–10.2 %).** S26 (2026-10-06): priced by S27 with the eager residue below.
+  **Priced by S27 (2026-10-06; census at HEAD `5e7e530`, O_DIRECT, server budget; upper bounds in exposed ms/token; bar
+  3.488).** Host 13.57 ms, exposed 8.15. By seam:
+  - DISP → C3 batched dispatch: 1.257, FAIL.
+  - SETTLE → C2 per-layer settle: 1.799, PROTOTYPE beyond the cap.
+  - UPLOAD + BLOB → C1 blob-from-slab: U 2.248 / P 1.702, FAIL (exposed fraction 0.24).
+  - MOE remainder → C4 MoE decode fast path: 4.264, above the bar (ESTIMATE ~1.0–1.4, not measured).
+  - Nothing clears alone. **Not closed: S28's USER decision covers it** (C4 is in option (a)'s bundle).
