@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 36 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29)
+## Index — 37 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -50,6 +50,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 34 | gpt-oss's FIRST session in a process is not run-to-run deterministic | S14 3c record | greedy ids equal; logits differ run to run on the first session only; later sessions are bit-identical | determinism of the first request matters (its own text) |
 | 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | an offline install is required, or the Hub dependency breaks a load |
 | 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
+| 37 | S30 — batching design: make N>1 reachable through the server | S30 row (PARKED by the USER 2026-10-07) | N>1 only: the server runs `MAX_BATCH_SIZE = 1`, and no client sends Vaayu concurrent requests (RudraAnvil has no Vaayu reference and runs its subagents one at a time) — worth 0 % to users today (CLAUDE.md §8) | a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the USER asks |
 
 ---
 
@@ -1004,6 +1005,41 @@ cache whole, or a user serves a streamed dense model with `RAM_CACHE_BUDGET_GB=0
   reclaimed in a 2-token request). Not measured against O_DIRECT in that config. A better rule would compare the
   page-cache room with the bytes that STREAM per token (checkpoint − VRAM-pinned − RAM-cached), not with the
   checkpoint.
+
+## 37. S30 — batching design: make N>1 reachable through the server
+
+*Added 2026-10-07 by S30. The USER chose to park it, at S30's opening question ("design now, or park until Rudra fans
+out?"). The S30 row as it stood is in the archive below.*
+**Why here:** N>1 only. The server runs `MAX_BATCH_SIZE = 1` and no client sends Vaayu concurrent requests. RudraAnvil
+(`/home/a/code/ai-ml/agent/RudraAnvil`, last commit 2026-08-19) has no reference to Vaayu, and its loop awaits
+coder → verify → tester → reviewer one at a time. The only concurrency it could produce is deepagents' `task` tool
+fanning out inside one turn.
+**Re-open when:** a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the
+USER asks for it. Re-opening it re-opens #5, #6 and #33 too.
+
+- [ ] **Design server batching (S30's brief; inputs re-verified at `fc06d8b`, 2026-10-07; line anchors as of then).**
+  - **The machinery exists, from P10.** `vaayu/server/scheduler.py:492` (a dispatcher) calls `run_batch`.
+    `EngineHandle.run_batch()` (`vaayu/server/engine.py:845`) drives `batched_generate` (`vaayu_base.py:6729`).
+  - **What makes it unreachable today:**
+    - `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`).
+    - Batching needs sdpa, but `ATTN_IMPLEMENTATION = None` prefers flash (`config.py:216`). On flash the knob is
+      inert, and a non-sdpa load serializes with a startup warning. sdpa costs −2.3 % MiniMax / −4.1 % Qwen end to
+      end.
+  - **Catches the design must solve:**
+    - **Qwen3-Next loses its prefix cache.** `batched_generate` refuses the prefix cache on recurrent-state models
+      (`vaayu_base.py:6847`; `batch.cache_holds_recurrent_state` at `batch.py:500`). Batching the agent's model
+      therefore gives up its top TTFT lever. A per-row recurrent-state splice is the missing piece.
+    - **DeepSeek-V4 refuses N>1 loudly now (changed since S30's inputs were gathered at `a561d95`).**
+      `VaayuDeepseekV4.forward` raises `NotImplementedError` when `input_ids.shape[0] > 1`
+      (`vaayu_deepseek_v4.py:787`). The hash-routed layers read the ids from a per-REQUEST ContextVar, so batching
+      it needs per-element scoping. It also forces eager attention, so batching is inert on it today anyway.
+    - **MiniMax OOMs at N=3.** The config comment records N=2 at +1.606× on MiniMax-M2.7, and N=3 OOMs at
+      `model.layers.22`.
+    - **Admission between turns.** `BATCH_WAIT_MS` (50 ms) only meets clients that arrive together. An agent that
+      runs a tool between turns comes back seconds later, and admitting a latecomer into a RUNNING batch is
+      continuous batching, which Vaayu does not do.
+  - **Backlog items that re-open with it:** #5 (the stager re-runs per batched chunk), #6 (`head_bytes`), #33 (the P10
+    batching minors and the sentinel-only cancel `[bug]`).
 ---
 
 # ARCHIVE — todo.md as of 2026-10-03 (`main` `8310e11`), verbatim
@@ -8644,3 +8680,28 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   Llama-3.3-70B mirrored, 8 arms (`s22_dense.py`; back-to-back dense arms have a ~1 % position effect), and one
   gpt-oss pair. Record per turn the drive's delivered bytes against the requested ones and `pgsteal` — that is
   what showed the mechanism here. Reach: every token of a streamed dense model, N=1, server default. Hours.
+
+- [x] **S30 — ✅ CLOSED 2026-10-07: PARKED by the USER. The design is backlog #37, with its inputs re-verified at `fc06d8b`. Nothing was built, and the suite floor is unchanged. Row as it stood at close:** **S30 — batching design: make N>1 reachable through the server (set by the USER at S26, 2026-10-06).**
+      **Opens with one USER question:** design now, or park it in `todo-backlog.md` until Rudra depends on Vaayu and
+      fans out? Its value is 0 % at N=1 (CLAUDE.md §8).
+      **INPUTS PRE-GATHERED at `a561d95`. Re-verify at HEAD:**
+      - **The machinery exists, from P10.** `vaayu/server/scheduler.py` (a dispatcher; it calls `run_batch` at
+        :492) and `EngineHandle.run_batch()` (`vaayu/server/engine.py:845`) drive `batched_generate`
+        (`vaayu_base.py:6728`).
+      - **What makes it unreachable today:**
+        - `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`).
+        - Batching needs sdpa, but `ATTN_IMPLEMENTATION = None` prefers flash (`config.py:212`). On flash the knob is
+          inert. sdpa costs −2.3 % MiniMax / −4.1 % Qwen end to end.
+      - **Catches:**
+        - **Qwen3-Next loses its prefix cache.** `batched_generate` refuses the prefix cache on recurrent-state
+          models (`vaayu_base.py:6846`), so batching the agent's model gives up its top TTFT lever.
+        - **DeepSeek-V4 routing must be guarded first.** Its hash-routed layers read the ids stashed for the WHOLE
+          batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive).
+        - **MiniMax OOMs at N=3.** The config comment's record: N=2 is +1.606× on MiniMax-M2.7, and N=3 OOMs at
+          `model.layers.22`.
+      - **Backlog items that re-open with it:** #5 (stager re-runs per batched chunk), #6 (`head_bytes`), #33 (P10
+        batching minors and the sentinel-only cancel `[bug]`).
+      **Re-verified at `fc06d8b` (2026-10-07):** the anchors had drifted by a line or four (`batched_generate` :6729,
+      the prefix refusal :6847, `ATTN_IMPLEMENTATION` :216). The DeepSeek catch had changed: it now raises
+      `NotImplementedError` on N>1 (`vaayu_deepseek_v4.py:787`) rather than routing silently, and it forces eager, so
+      batching is inert on it.

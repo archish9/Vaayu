@@ -73,7 +73,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S30 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06). One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S31 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07). One per fresh session, in order. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -103,7 +103,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. NEXT: S30 (the batching design row — it opens with one USER question), in its own fresh session.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). NEXT: S31 (re-prioritise with the USER), in its own fresh session.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -134,7 +134,8 @@ and S26 did.
 | **S27** ✅ | ~~Price the Qwen3-Next host levers at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Pre-registered upper bounds in exposed ms/token, with the final review's closure calibration in brackets (the exposed fractions run 1.15–1.23 × high): C4 MoE decode fast path 4.264 [3.15–3.60]; C5 cached Triton launch 3.723 [3.14–3.44]; C11 one routing sync 3.130, or 3.86 with `unique`'s device time [3.13–3.37]; C9 FWD 3.310 [2.79–3.27] and C8 segment merge 2.538 [2.13–2.34], priced, unverified; C2 1.799 [1.52–1.53, FAIL once calibrated]. C1 blob-from-slab FAILS (P 1.702 < 1.744, not robust); C3, C6, C7, C10 FAIL. Calibrated, only C4's top end reaches the bar. USER decisions 2026-10-06: c2 → clock alignment + C11 added; close without prototype arms, S28 = bundle decision. Suite floor unchanged. Full row: the S27 row in the backlog archive; `docs/2026-10-06-S27-host-levers-RESULTS.md` | — | done |
 | **S28** ✅ | ~~MoE-visit host fast path (C11 + C5 + C4)~~ — **CLOSED 2026-10-07: KEEP, merged `6fd79fa`.** USER chose (a), the full bundle. KEEP set (off, all, all, off): S = **5.94 ms/token** (bar 3.488; OFF spread 1.29; budget band 4.33–7.54), HIT decode 57.52 → 51.59 ms/token, HIT turn 17.61 → 16.04 s (−8.9 %), ids identical, TTFT ok. Attribution: C11 +1.69, C5 +2.56, C4 +2.01 ms/token, all kept. Bitwise on Qwen3-Next, MiniMax-M2.7, DeepSeek-V4. Suite 3735. Full row: the S28 row in the backlog archive; `docs/2026-10-06-S28-host-fast-path-RESULTS.md` | — | done |
 | **S29** ✅ | ~~Buffered vs O_DIRECT where the engine still chooses buffered~~ — **CLOSED 2026-10-07: FIXED for dense, merged `b3404d3`; gpt-oss stays buffered.** Llama-3.3-70B O_DIRECT decode 2.483 → 1.961 s/token (−21.0 %), TTFT −20.9 %, 8 mirrored arms, ids identical; the choice now charges the dense RAM layer cache. gpt-oss HIT turn −0.17 % (a tie), buffered kept. Suite 3739. Full row: the S29 row in the backlog archive; `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md` | — | done |
-| **S30** | **Batching design row: make N>1 reachable through the server.** Opens by asking the USER whether to design now or park until Rudra fans out | strategic (CLAUDE.md §0 fan-out), but worth 0 % at N=1; week-class | a conversation, then ≥ 1 week |
+| **S30** ✅ | ~~Batching design row: make N>1 reachable through the server~~ — **CLOSED 2026-10-07: PARKED by the USER** (asked "design now, or park until Rudra fans out?"; chose park). No client fans out to Vaayu: RudraAnvil has no Vaayu reference and runs its subagents one at a time. The design is backlog **#37**, inputs re-verified at `fc06d8b`. Suite floor unchanged (no code). Full row: the S30 row in the backlog archive | — | done |
+| **S31** | **Re-prioritise with the USER** (the rule S26 set: "when S30 closes, the next fresh session re-prioritises with the USER") | every row S26 sequenced is closed | a conversation |
 
 ## Durable rows (the briefs)
 
@@ -166,30 +167,55 @@ and S26 did.
 
 - [x] **S29 — buffered vs O_DIRECT where the engine still chose buffered — ✅ CLOSED 2026-10-07: FIXED for dense, merged `b3404d3`; gpt-oss stays buffered.** Llama-3.3-70B: O_DIRECT decode 2.483 → 1.961 s/token (−21.0 %, 0.403 → 0.510 tok/s), TTFT 4.23 → 3.34 s (−20.9 %), 8 mirrored arms (both blocks −20.9 / −21.1 %), spread ≤ 0.78 %, ids identical; buffered, the page cache served ≤ 0.6 % of 138.6 GB per request while the kernel reclaimed ~34 M pages. Cause: the choice ran before the dense RAM layer cache (16.2 GB) was sized and counted its RAM as page-cache room. Fix: `_should_use_direct_io` charges `auto_detect_cache_budget(override=RAM_CACHE_BUDGET_GB)` when the checkpoint has no expert arena; only Llama-3.3-70B's choice changes; the engine's own choice now decodes 1.964 / 1.961. gpt-oss: HIT turn 24.01 vs 23.97 s, buffered kept (it wins the process's first cold turn, 5.46 vs 6.95 s). §8: no new knob (`RAM_CACHE_BUDGET_GB` now feeds the choice, documented), plumbed and verified on device, reachable at N=1 server default — SHIPPED. Suite 3739; dense gate green on both Llama. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md`.
 
-- [ ] **S30 — batching design: make N>1 reachable through the server (set by the USER at S26, 2026-10-06).**
-      **Opens with one USER question:** design now, or park it in `todo-backlog.md` until Rudra depends on Vaayu and
-      fans out? Its value is 0 % at N=1 (CLAUDE.md §8).
-      **INPUTS PRE-GATHERED at `a561d95`. Re-verify at HEAD:**
-      - **The machinery exists, from P10.** `vaayu/server/scheduler.py` (a dispatcher; it calls `run_batch` at
-        :492) and `EngineHandle.run_batch()` (`vaayu/server/engine.py:845`) drive `batched_generate`
-        (`vaayu_base.py:6728`).
-      - **What makes it unreachable today:**
-        - `MAX_BATCH_SIZE = 1` (`vaayu/server/config.py:155`).
-        - Batching needs sdpa, but `ATTN_IMPLEMENTATION = None` prefers flash (`config.py:212`). On flash the knob is
-          inert. sdpa costs −2.3 % MiniMax / −4.1 % Qwen end to end.
-      - **Catches:**
-        - **Qwen3-Next loses its prefix cache.** `batched_generate` refuses the prefix cache on recurrent-state
-          models (`vaayu_base.py:6846`), so batching the agent's model gives up its top TTFT lever.
-        - **DeepSeek-V4 routing must be guarded first.** Its hash-routed layers read the ids stashed for the WHOLE
-          batch, so row j>0 would route on row 0's ids, silently (A5.7b record, archive).
-        - **MiniMax OOMs at N=3.** The config comment's record: N=2 is +1.606× on MiniMax-M2.7, and N=3 OOMs at
-          `model.layers.22`.
-      - **Backlog items that re-open with it:** #5 (stager re-runs per batched chunk), #6 (`head_bytes`), #33 (P10
-        batching minors and the sentinel-only cancel `[bug]`).
+- [x] **S30 — batching design — ✅ CLOSED 2026-10-07: PARKED by the USER.** Asked "design now, or park until Rudra
+      depends on Vaayu and fans out?", the USER chose park. Facts behind it (checked 2026-10-07): RudraAnvil
+      (`/home/a/code/ai-ml/agent/RudraAnvil`, last commit 2026-08-19) has no reference to Vaayu. Its loop awaits
+      coder → verify → tester → reviewer one at a time, so the only concurrency it could produce is deepagents' `task`
+      tool fanning out inside one turn. Batching the agent's model would also give up Qwen3-Next's prefix cache (its
+      top TTFT lever), and sdpa costs −4.1 %. The design, with inputs re-verified at `fc06d8b`, is backlog **#37**
+      (re-open when a client that sends concurrent requests targets Vaayu). Backlog #5, #6 and #33 re-open with it.
+      §8: nothing built, so nothing banked. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
+
+- [ ] **S31 — re-prioritise with the USER (S26's rule: "when S30 closes, the next fresh session re-prioritises with
+      the USER", as S24 and S26 did).** A conversation. It re-checks the inputs below at HEAD, presents them ranked by
+      the ordering rule, and WAITS for the USER's pick. It decides nothing alone, then writes the chosen rows (S32…)
+      into the table above, one row per fresh session.
+      **INPUTS PRE-GATHERED at `fc06d8b` (2026-10-07, read from this file and the backlog, nothing re-measured).
+      Re-verify at HEAD.** Today's Qwen3-Next baseline is S28's: HIT turn **16.04 s**, HIT decode 51.59 ms/token, HIT
+      TTFT 2.88 s, decode stall ~4.1 s/turn. A 5 % bar on that turn is **0.80 s/turn**.
+      - ***(a)* The agent's model (Qwen3-Next):**
+        - **C8 segment merge**: 2.13–2.34 ms/token (calibrated).
+        - **C9 FWD**: 2.79–3.27 ms/token, but no concrete change has been named for it.
+        - Both were priced BEFORE S28 removed ~6 ms/token of host time. **Re-price before building.**
+        - The decode miss stall (~4.1 s/turn) is what is left of S21's top cost. S11-L6 and S11-L7 are SETTLED, and
+          A1 is refuted, so no lever is priced against it.
+      - ***(b)* The biggest N=1 savings on the other models, all reachable at the server default:**
+        - **DeepSeek-V4 has no prefix cache.** Turn 2 is a full prefill: **47.1 s** TTFT at 1.28k tokens (S17 T6,
+          one rep), on every turn after the first. The build is unpriced: a cache-format design across both prefix
+          paths.
+        - **DeepSeek L-c**: the planner's VRAM priority is unpriced. The expert tier hits 34.9 %, while the streamed
+          non-expert layers are used on 100 % of tokens.
+        - **DeepSeek L-d**: the MTP draft would amortise 72 % per-forward bytes (row 37's re-gate, backlog #28).
+        - **gpt-oss elastic tier**: hit rate is 65.1 % at 243 experts and 93.7 % at 486, against today's 111–133.
+          The cost is context, unless the tier can borrow reserve safely.
+        - **gpt-oss eager attention**: 45 % of the 30.7k token (75.3 ms).
+        - **gpt-oss decode graphs are refused**: ~19 ms/token of host-paced work in the 33.0 ms 2k floor.
+        - **47-m4**: sliding-window KV is stored at full length. On gpt-oss that wastes 0.813 GB (49.8 %) and halves
+          the derived `max_seq_len`.
+        - **MiniMax row 49**: its drive-idle gap headline is in doubt. `VAAYU_LOOKAHEAD` is +2.5 % at N=1 against
+          +18.0 % bytes/token.
+        - **Dense M-6**: ~5 % of Llama-3.3-70B's ~37 GB/token read. Measure it first.
+      - ***(c)* Cheap:**
+        - The S28 `capture_begin` pool lead (a repro first).
+        - The S22-A2 Rust asserts and minors.
+        - gpt-oss's `ENABLE_EXPERT_USAGE` gap.
+      - ***(d)* Unreachable today:**
+        - The current-CUDA-device `[bug]` (single-GPU box).
+        - The batching design, backlog #37 (parked by the USER at S30).
 
 ---
 
-# OPEN — not sequenced (re-rank at the next re-prioritise row, after S30)
+# OPEN — not sequenced (re-rank at S31)
 
 Each item below is copied verbatim from the pre-cleanup `todo.md` (its origin is named in italics; the row it came
 from is in the archive in `todo-backlog.md`). Line numbers inside the text are as of when it was written — re-verify
