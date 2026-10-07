@@ -566,3 +566,41 @@ def test_expert_tensors_are_still_filtered_out_of_a_streamed_moe_shard():
     assert m.loader_strategy.injected == [("layers.1", ["w"])]
 
 
+# ── E7: no automatic telemetry dump ─────────────────────────────────────────
+
+class _CountingTelemetry(VaayuTelemetry):
+    def __init__(self):
+        super().__init__()
+        self.dumps = []
+
+    def dump_json(self, path):
+        self.dumps.append(path)
+
+
+def test_storing_a_finished_request_does_not_write_the_telemetry_file():
+    m = make()
+    m.telemetry = _CountingTelemetry()
+    m._kv_writer = None
+    stored = []
+    pool = types.SimpleNamespace(store=lambda sid, ids, kv: stored.append(sid))
+    vb.VaayuBaseModel._persist_and_store(m, pool, "s", object(), [1, 2])
+    assert stored == ["s"]
+    assert m.telemetry.dumps == []
+
+
+def test_no_generate_path_dumps_the_telemetry_ring_unasked():
+    src = inspect.getsource(vb)
+    calls = [i for i in range(len(src)) if src.startswith(".dump_json(", i)]
+    for i in calls:
+        guard = src[src.rfind("\n", 0, src.rfind("\n", 0, i)) + 1:i]
+        assert '"e7" not in' in guard, src[max(0, i - 200):i + 40]
+
+
+def test_the_ring_can_still_be_dumped_on_demand(tmp_path):
+    m = make(n_dec=2, pieces=("e1", "e2", "e4", "e6", "e7"))
+    m.telemetry = VaayuTelemetry(output_dir=str(tmp_path))
+    run(m)
+    m.telemetry.dump_json("t.json")
+    import json
+    (token,) = json.loads((tmp_path / "t.json").read_text())
+    assert [l["layer_name"] for l in token["layers"]] == m.layer_names

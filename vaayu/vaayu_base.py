@@ -6364,7 +6364,8 @@ class VaayuBaseModel(GenerationMixin):
                 if kwargs.get("past_key_values") is None:
                     kwargs["past_key_values"] = self._create_kv_cache()
                 result = super().generate(*args, **kwargs)
-                self.telemetry.dump_json("vaayu_telemetry.json")
+                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
+                    self.telemetry.dump_json("vaayu_telemetry.json")
                 return result
 
             # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
@@ -6442,7 +6443,8 @@ class VaayuBaseModel(GenerationMixin):
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
         pc.store(resolved_sid, token_ids, kv)
-        self.telemetry.dump_json("vaayu_telemetry.json")
+        if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
+            self.telemetry.dump_json("vaayu_telemetry.json")
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:
@@ -6838,7 +6840,8 @@ class VaayuBaseModel(GenerationMixin):
                 if pc is not None:
                     resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
-                self.telemetry.dump_json("vaayu_telemetry.json")
+                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
+                    self.telemetry.dump_json("vaayu_telemetry.json")
                 return generated
             finally:
                 if _resized_vram_prefix:
@@ -7247,4 +7250,5 @@ class VaayuBaseModel(GenerationMixin):
                     _vram_cache.budget_bytes = _saved_budget
                 self._batch_decode_active = False
                 self._batch_n = 1
-                self.telemetry.dump_json("vaayu_telemetry.json")
+                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
+                    self.telemetry.dump_json("vaayu_telemetry.json")
