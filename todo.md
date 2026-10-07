@@ -10,9 +10,10 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3735 passed, 0 failed, 0 errors, 25 skipped`** (228.79 s, FOREGROUND, on merged `main` `6fd79fa`,
-2026-10-07, S28: +51 = `tests/test_routing_sync.py` 13 + `tests/test_packed_expert_kernels.py` 27 +
-`tests/test_fused_packed_kernel_branch.py` 11 net; before it 3684 at `a588ff4`, the O_DIRECT-choice fix;
+**Suite floor: `3739 passed, 0 failed, 0 errors, 25 skipped`** (238.12 s, FOREGROUND, 2026-10-07, S29: +4 net in
+`tests/test_direct_io_choice.py`; before it 3735 at `6fd79fa`, S28: +51 = `tests/test_routing_sync.py` 13 +
+`tests/test_packed_expert_kernels.py` 27 + `tests/test_fused_packed_kernel_branch.py` 11 net; 3684 at `a588ff4`, the
+O_DIRECT-choice fix;
 the 25 skipped include the 5 of `tests/test_dense_gate.py` without `DENSE_CKPT`). `cargo test` in `vaayu_rust/`: `37 passed, 0 failed, 1 ignored`.
 **The suite now needs a CURRENT `vaayu_rust` build** (`maturin develop --release` in `vaayu_rust/`): with an older
 extension `tests/test_rust_read_segments.py` and `tests/test_expert_read_wave.py` fail by design.
@@ -64,7 +65,9 @@ closed accumulates in this file again.
   what the warm arm loaded (S21 dry run: 480/480 VRAM-tier hits, 0 disk reads). Row 36's "disk = 0.42 % of a decode
   token" and S11's 15 reads/token come from that shape. **Any decode probe: a different prompt per arm.**
 - **gpt-oss-20b** 67.1 / 79.1 / 129.1 ms/token at 2k / 8k / 30.7k (S18); **DeepSeek-V4-Flash** 1.78 tok/s (S15);
-  **MiniMax-M2.7** (module-list, EXL3); **Llama-3.3-70B** (dense, streamed), **Llama-3.2-1B** (dense, small).
+  **MiniMax-M2.7** (module-list, EXL3); **Llama-3.3-70B** (dense, streamed): **1.96 s/token** decode, TTFT 3.34 s on a
+  short prompt (S29, 2026-10-07: O_DIRECT, the engine's own choice since S29; server knobs, prompt lookup on, 16
+  tokens; it was 2.48 s/token buffered); **Llama-3.2-1B** (dense, small).
 - The server runs **one request at a time** (`MAX_BATCH_SIZE = 1`; `batched_generate` not wired) — any win measured
   only at N>1 is worth 0 % to users today (CLAUDE.md §8).
 
@@ -100,7 +103,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). NEXT: S29 (buffered vs O_DIRECT where the engine still chooses buffered), in its own fresh session.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. NEXT: S30 (the batching design row — it opens with one USER question), in its own fresh session.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -130,7 +133,7 @@ and S26 did.
 | **S26** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-06 by the USER: host levers first.** S27 prices them, S28 builds the best piece, S29 is the buffered-I/O check, S30 is the batching design. `fla` no; the S20 VRAM follow-up stays parked. Full text: the S26 row in the backlog archive | — | done |
 | **S27** ✅ | ~~Price the Qwen3-Next host levers at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-06: NOTHING CLEARS ALONE.** Bar 3.488 ms/token (5 % of 17.86 s); nothing clears on price. Pre-registered upper bounds in exposed ms/token, with the final review's closure calibration in brackets (the exposed fractions run 1.15–1.23 × high): C4 MoE decode fast path 4.264 [3.15–3.60]; C5 cached Triton launch 3.723 [3.14–3.44]; C11 one routing sync 3.130, or 3.86 with `unique`'s device time [3.13–3.37]; C9 FWD 3.310 [2.79–3.27] and C8 segment merge 2.538 [2.13–2.34], priced, unverified; C2 1.799 [1.52–1.53, FAIL once calibrated]. C1 blob-from-slab FAILS (P 1.702 < 1.744, not robust); C3, C6, C7, C10 FAIL. Calibrated, only C4's top end reaches the bar. USER decisions 2026-10-06: c2 → clock alignment + C11 added; close without prototype arms, S28 = bundle decision. Suite floor unchanged. Full row: the S27 row in the backlog archive; `docs/2026-10-06-S27-host-levers-RESULTS.md` | — | done |
 | **S28** ✅ | ~~MoE-visit host fast path (C11 + C5 + C4)~~ — **CLOSED 2026-10-07: KEEP, merged `6fd79fa`.** USER chose (a), the full bundle. KEEP set (off, all, all, off): S = **5.94 ms/token** (bar 3.488; OFF spread 1.29; budget band 4.33–7.54), HIT decode 57.52 → 51.59 ms/token, HIT turn 17.61 → 16.04 s (−8.9 %), ids identical, TTFT ok. Attribution: C11 +1.69, C5 +2.56, C4 +2.01 ms/token, all kept. Bitwise on Qwen3-Next, MiniMax-M2.7, DeepSeek-V4. Suite 3735. Full row: the S28 row in the backlog archive; `docs/2026-10-06-S28-host-fast-path-RESULTS.md` | — | done |
-| **S29** | **Buffered vs O_DIRECT where the engine still chooses buffered** (Llama-3.3-70B, gpt-oss-20b), measure, then fix the choice if it is wrong | cheap; it reaches every streamed dense token at N=1; the wrong mode cost Qwen3-Next 17 % | hours |
+| **S29** ✅ | ~~Buffered vs O_DIRECT where the engine still chooses buffered~~ — **CLOSED 2026-10-07: FIXED for dense; gpt-oss stays buffered.** Llama-3.3-70B O_DIRECT decode 2.483 → 1.961 s/token (−21.0 %), TTFT −20.9 %, 8 mirrored arms, ids identical; the choice now charges the dense RAM layer cache. gpt-oss HIT turn −0.17 % (a tie), buffered kept. Suite 3739. Full row: the S29 row in the backlog archive; `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md` | — | done |
 | **S30** | **Batching design row: make N>1 reachable through the server.** Opens by asking the USER whether to design now or park until Rudra fans out | strategic (CLAUDE.md §0 fan-out), but worth 0 % at N=1; week-class | a conversation, then ≥ 1 week |
 
 ## Durable rows (the briefs)
@@ -161,21 +164,7 @@ and S26 did.
       for the server's life). §8: no knob; reachable at N=1, server default. Full row: `todo-backlog.md` "Closed after
       the 2026-10-03 cleanup"; RESULTS `docs/2026-10-06-S28-host-fast-path-RESULTS.md`.
 
-- [ ] **S29 — buffered vs O_DIRECT where the engine still chooses buffered (set by the USER at S26, 2026-10-06).**
-      The brief is the OPEN-list lead "is buffered still right where the engine still chooses it?" (Qwen3-Next
-      section below): the method, 8 mirrored Llama-3.3-70B arms plus one gpt-oss pair, and per turn the delivered vs
-      requested bytes and `pgsteal`.
-      - **Pre-gathered at `a561d95`:** `_should_use_direct_io` (`vaayu/persist/safetensor_model_persister.py:284`)
-        subtracts only `expert_arena_bytes`. A dense model has no expert arena, so Llama-3.3-70B (39 GB) with
-        ~27 GiB free comes out ~52 % cacheable and goes buffered.
-      - **The dense RAM tensor cache is not subtracted either.** `RAM_CACHE_BUDGET_GB = None` derives it from TOTAL
-        RAM, and it competes for the same free RAM.
-      - **Stop rule:**
-        - If O_DIRECT beats buffered by more than the arm spread on a model, fix the choice. The design is that
-          session's, e.g. charge the dense RAM cache the way the expert arena is charged. Then run the dense gate on
-          both Llama checkpoints.
-        - Otherwise close the row with the numbers.
-      - **Reach:** every token of a streamed dense model, and gpt-oss, at N=1, server default. Hours.
+- [x] **S29 — buffered vs O_DIRECT where the engine still chose buffered — ✅ CLOSED 2026-10-07: FIXED for dense; gpt-oss stays buffered.** Llama-3.3-70B: O_DIRECT decode 2.483 → 1.961 s/token (−21.0 %, 0.403 → 0.510 tok/s), TTFT 4.23 → 3.34 s (−20.9 %), 8 mirrored arms (both blocks −20.9 / −21.1 %), spread ≤ 0.78 %, ids identical; buffered, the page cache served ≤ 0.6 % of 138.6 GB per request while the kernel reclaimed ~34 M pages. Cause: the choice ran before the dense RAM layer cache (16.2 GB) was sized and counted its RAM as page-cache room. Fix: `_should_use_direct_io` charges `auto_detect_cache_budget(override=RAM_CACHE_BUDGET_GB)` when the checkpoint has no expert arena; only Llama-3.3-70B's choice changes; the engine's own choice now decodes 1.964 / 1.961. gpt-oss: HIT turn 24.01 vs 23.97 s, buffered kept (it wins the process's first cold turn, 5.46 vs 6.95 s). §8: no new knob (`RAM_CACHE_BUDGET_GB` now feeds the choice, documented), plumbed and verified on device, reachable at N=1 server default — SHIPPED. Suite 3739; dense gate green on both Llama. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md`.
 
 - [ ] **S30 — batching design: make N>1 reachable through the server (set by the USER at S26, 2026-10-06).**
       **Opens with one USER question:** design now, or park it in `todo-backlog.md` until Rudra depends on Vaayu and
@@ -248,14 +237,7 @@ at HEAD before acting.
   **22.41 → 17.86 s (−20.3 %; −17.4 % with the RAM budget held equal)**, ids identical; only Qwen3-Next's choice
   changes among the six on-device checkpoints. Suite 3684; dense, accumulator and server gates green. Full text:
   `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
-- [ ] **Lead (from the fix above, 2026-10-04): is buffered still right where the engine still chooses it? — = S29 (USER, S26 2026-10-06)**
-  Llama-3.3-70B goes buffered at "50 % cacheable" and gpt-oss at 77 %; neither was measured against O_DIRECT, and
-  on Qwen3-Next the page cache served 1–3 % of the bytes read while costing 17 % of the turn. Dense has no expert
-  arena, but its own RAM tensor cache competes for the same free RAM. Measure with the mode forced
-  (`smp._should_use_direct_io` patched before the load, as `plans/probes/s22_session.py` `DIRECT=on|off` does):
-  Llama-3.3-70B mirrored, 8 arms (`s22_dense.py`; back-to-back dense arms have a ~1 % position effect), and one
-  gpt-oss pair. Record per turn the drive's delivered bytes against the requested ones and `pgsteal` — that is
-  what showed the mechanism here. Reach: every token of a streamed dense model, N=1, server default. Hours.
+- [x] **Lead (from the fix above, 2026-10-04): is buffered still right where the engine still chooses it? — ✅ CLOSED 2026-10-07 by S29:** no for Llama-3.3-70B (O_DIRECT −21.0 %, fixed), yes for gpt-oss (a tie; buffered kept). Full text with the S29 row in `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 *From the S3 row (closed 2026-09-25).*
 
@@ -583,8 +565,11 @@ arithmetic, not the repack.**
   `smp._READ_SEGMENTS = None`.
 - **Probes: the I/O MODE and the RAM budget are arm variables (S22-A1, 2026-10-04).** The engine chooses buffered
   or O_DIRECT from the free RAM at load. Before `a588ff4` that choice flipped at 26.0 GiB free on Qwen3-Next and
-  moved the turn 17 %; since the fix Qwen3-Next is O_DIRECT on this box, but dense and gpt-oss still go buffered,
-  and any number taken before the fix may be either mode. The expert RAM budget follows the same free RAM (18.0
+  moved the turn 17 %; since the fix Qwen3-Next is O_DIRECT on this box, and since S29 (2026-10-07) Llama-3.3-70B
+  too (the choice charges the dense RAM layer cache); gpt-oss and Llama-3.2-1B still go buffered (gpt-oss measured:
+  a tie), and any number taken before a fix may be either mode. Since S29 a `DIRECT=` monkeypatch must accept
+  keywords (`lambda model_dir, **_kw:`); `plans/probes/s29_evict.py <dir>` drops a checkpoint from the page cache
+  without root (`posix_fadvise DONTNEED`) — run it before every arm that can read buffered. The expert RAM budget follows the same free RAM (18.0
   vs 18.9 GB between two consecutive processes).
   `plans/probes/s22_session.py`: pin the budget with `BALLAST_GB`, force the mode with `DIRECT=on|off`, and grep
   `O_DIRECT` and `Expert RAM cache:` in every arm's log before comparing. Ring-count knee probe:

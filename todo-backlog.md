@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 35 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup)
+## Index — 36 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -49,6 +49,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 33 | P10 batching — the sentinel-only cancel test `[bug]` and the known-open batching minors | Carried out of row 15 | N>1 only: the server runs `MAX_BATCH_SIZE = 1` (CLAUDE.md §8) | `batched_generate` is wired into the server |
 | 34 | gpt-oss's FIRST session in a process is not run-to-run deterministic | S14 3c record | greedy ids equal; logits differ run to run on the first session only; later sessions are bit-identical | determinism of the first request matters (its own text) |
 | 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | an offline install is required, or the Hub dependency breaks a load |
+| 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
 
 ---
 
@@ -986,6 +987,23 @@ Full original text, as it stood in `todo.md`:
 
 | A6 | per-expert MXFP4 streaming | 1.27 GB working set instead of 10.17 GB; drops the Hub kernel dependency. **Perf, not reach** | A3 | A3's tok/s exists to beat | ~3 days | plan when A3 lands |
 
+
+## 36. S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream
+
+*Added 2026-10-07 by S29 (no `todo.md` row: parked on creation).*
+**Why here:** no default load on this box lands in the case. After S29 the buffered choices left are gpt-oss (measured:
+a tie, buffered kept) and Llama-3.2-1B (fully resident, nothing streams).
+**Re-open when:** a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page
+cache whole, or a user serves a streamed dense model with `RAM_CACHE_BUDGET_GB=0`.
+
+- [ ] `_should_use_direct_io` goes buffered when the page cache could hold 40 % of the checkpoint ("empirically
+  validated", no record of how). A stream that reads the same ~X GB cyclically every token gets ~nothing from a page
+  cache smaller than X under LRU, whatever the fraction. Evidence: Qwen3-Next at "43 %" (S22-A1, before `a588ff4`)
+  served 1–3 % of the bytes; Llama-3.3-70B with the layer cache off (`RAM_CACHE_BUDGET_GB=0`, S29 2026-10-07,
+  `plans/probes/s29_out/dense-rcb0.log`) at "50 %" served ~5.5 % (56.6 of 59.9 GB from the drive, 13.9 M pages
+  reclaimed in a 2-token request). Not measured against O_DIRECT in that config. A better rule would compare the
+  page-cache room with the bytes that STREAM per token (checkpoint − VRAM-pinned − RAM-cached), not with the
+  checkpoint.
 ---
 
 # ARCHIVE — todo.md as of 2026-10-03 (`main` `8310e11`), verbatim
@@ -8560,3 +8578,69 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   - UPLOAD + BLOB → C1 blob-from-slab: U 2.248 / P 1.702, FAIL (exposed fraction 0.24).
   - MOE remainder → C4 MoE decode fast path: 4.264, above the bar (ESTIMATE ~1.0–1.4, not measured).
   - Nothing clears alone. **Not closed: S28's USER decision covers it** (C4 is in option (a)'s bundle).
+
+- [x] **S29 — buffered vs O_DIRECT where the engine still chooses buffered (set by the USER at S26, 2026-10-06).** **IN PROGRESS 2026-10-07** (plan `docs/superpowers/plans/2026-10-07-S29-buffered-vs-odirect.md`; evidence re-verified at `1713896`: Llama-3.3-70B 50 % → buffered, gpt-oss 76 % → buffered; the mode is chosen at `vaayu_base.py:2521`, BEFORE the dense RAM layer cache (16.2 GB) is sized).
+      The brief is the OPEN-list lead "is buffered still right where the engine still chooses it?" (Qwen3-Next
+      section below): the method, 8 mirrored Llama-3.3-70B arms plus one gpt-oss pair, and per turn the delivered vs
+      requested bytes and `pgsteal`.
+      - **Pre-gathered at `a561d95`:** `_should_use_direct_io` (`vaayu/persist/safetensor_model_persister.py:284`)
+        subtracts only `expert_arena_bytes`. A dense model has no expert arena, so Llama-3.3-70B (39 GB) with
+        ~27 GiB free comes out ~52 % cacheable and goes buffered.
+      - **The dense RAM tensor cache is not subtracted either.** `RAM_CACHE_BUDGET_GB = None` derives it from TOTAL
+        RAM, and it competes for the same free RAM.
+      - **Stop rule:**
+        - If O_DIRECT beats buffered by more than the arm spread on a model, fix the choice. The design is that
+          session's, e.g. charge the dense RAM cache the way the expert arena is charged. Then run the dense gate on
+          both Llama checkpoints.
+        - Otherwise close the row with the numbers.
+      - **Reach:** every token of a streamed dense model, and gpt-oss, at N=1, server default. Hours.
+      - **CLOSED 2026-10-07 (S29 session, inline, systematic-debugging): FIXED for dense; gpt-oss stays buffered.**
+        - **Llama-3.3-70B, 8 arms `off,on,on,off,on,off,off,on`** (`plans/probes/s29_dense.py`, mode forced, server knobs,
+          prompt lookup on, checkpoint evicted from the page cache before each arm, 4-token warm then a 16-token timed
+          request): buffered 2.486 / 2.474 / 2.478 / 2.493 s/token (mean 2.483, spread 0.78 %), O_DIRECT 1.959 / 1.965 /
+          1.960 / 1.961 (mean 1.961, spread 0.32 %) → **−21.0 %** (×1.266 tok/s); blocks −20.87 / −21.11 %; TTFT 4.230 →
+          3.344 s (−20.9 %); greedy ids identical in all 8. Per timed request 138.6 GB requested: buffered delivered
+          137.8–138.6 GB from the drive (page cache ≤ 0.6 %), ~33.8 M pages reclaimed, MemFree 0.25–0.31 GB; O_DIRECT 0
+          reclaim. Delivered rate over the request 3.33 vs 4.23 GB/s.
+        - **Cause:** `_should_use_direct_io` runs at `vaayu_base.py:2521`, before `LayerRAMCache` is sized (`:2816`,
+          total RAM − 16 GiB = 16.2 GB) and pre-populated (33 layers); it counted that RAM as page-cache room ("50 %
+          cacheable"). ~31 layers (~16.7 GB) then stream per forward through what is left.
+        - **Fix:** `_should_use_direct_io(model_dir, ram_cache_budget=None)`; with no expert arena it subtracts
+          `auto_detect_cache_budget(total, available, override=ram_cache_budget)`, the engine's own sizing and override;
+          `vaayu_base` passes `ram_cache_budget`. Choices at 27.7 GiB free: only Llama-3.3-70B changes (→ O_DIRECT);
+          Llama-3.2-1B buffered (fully resident), Qwen3-Next / MiniMax / DeepSeek O_DIRECT, gpt-oss buffered.
+          Re-measured with the engine's own choice: "Limited RAM … Using O_DIRECT", 1.964 / 1.961 s/token.
+          `RAM_CACHE_BUDGET_GB=0` on device → "Sufficient RAM … 50 %" → buffered (the old rule), as designed.
+        - **gpt-oss-20b, one pair** (`plans/probes/s29_session.py`, a copy of `s22_session.py` whose HIT splice accepts
+          `<|end|>`): mean HIT turn 24.01 s buffered vs 23.97 s O_DIRECT (−0.17 %, inside the pre-registered 2 % → no
+          mirrored pair), HIT decode 82.61 vs 82.71 ms/token, ids identical in all 9 turns. Steady state reads 0.1–0.5
+          GB a turn (the arena holds every expert). Buffered wins only the process's first cold turn (TTFT 5.46 vs
+          6.95 s; that prefill requests 46.2 GB for 768 experts, 3484 loads, and the page cache serves 79 %).
+          Buffered KEPT. Observation, not pursued (once per server life): the first prefill reads each expert ~4.5×
+          while the arena is empty.
+        - **Tests:** `tests/test_direct_io_choice.py` 13 (+4 net): the bug case, the buffered case beside the layer
+          cache, the `RAM_CACHE_BUDGET_GB=0` override (40 % rule restored), and both MoE geometries NOT charged the dense
+          cache. RED before the fix; mutants "charge MoE too" and "ignore the override" caught. The fake now carries
+          `total`, and each new test asserts no `Failed to detect RAM` fallback (the rule's blanket `except` returns
+          O_DIRECT and would pass O_DIRECT assertions for the wrong reason).
+        - **Gates:** suite 3739 passed, 0 failed, 25 skipped (238.12 s); dense gate green on Llama-3.2-1B (5.66 s) and
+          Llama-3.3-70B (96.82 s). Probes that force the mode (`s22`/`s25`/`s27`/`s28`/`s29` session, `s29_dense`) now
+          patch with `lambda model_dir, **_kw:`.
+        - **§8:** no new knob — `RAM_CACHE_BUDGET_GB` now also feeds the choice (`config.py`, `vaayu/server/README.md`,
+          `documentation/server.md`, `documentation/TUNING.md` updated with the 21 % cost); plumbed `app.py` →
+          `from_pretrained(ram_cache_budget)` → `_should_use_direct_io`, verified on device; reachable at N=1, server
+          default. SHIPPED.
+        - **Lead parked:** backlog #36 (the 40 % rule on a cyclic stream).
+        - RESULTS `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md`; plan
+          `docs/superpowers/plans/2026-10-07-S29-buffered-vs-odirect.md`; raw `plans/probes/s29_out/`.
+
+  *The OPEN-list lead S29 answered, as it stood:*
+
+- [x] **Lead (from the fix above, 2026-10-04): is buffered still right where the engine still chooses it? — = S29 (USER, S26 2026-10-06)**
+  Llama-3.3-70B goes buffered at "50 % cacheable" and gpt-oss at 77 %; neither was measured against O_DIRECT, and
+  on Qwen3-Next the page cache served 1–3 % of the bytes read while costing 17 % of the turn. Dense has no expert
+  arena, but its own RAM tensor cache competes for the same free RAM. Measure with the mode forced
+  (`smp._should_use_direct_io` patched before the load, as `plans/probes/s22_session.py` `DIRECT=on|off` does):
+  Llama-3.3-70B mirrored, 8 arms (`s22_dense.py`; back-to-back dense arms have a ~1 % position effect), and one
+  gpt-oss pair. Record per turn the drive's delivered bytes against the requested ones and `pgsteal` — that is
+  what showed the mechanism here. Reach: every token of a streamed dense model, N=1, server default. Hours.
