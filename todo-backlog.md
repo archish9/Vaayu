@@ -8705,3 +8705,40 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       the prefix refusal :6847, `ATTN_IMPLEMENTATION` :216). The DeepSeek catch had changed: it now raises
       `NotImplementedError` on N>1 (`vaayu_deepseek_v4.py:787`) rather than routing silently, and it forces eager, so
       batching is inert on it.
+
+- [x] **S31 — ✅ DECIDED 2026-10-07 by the USER: all four offered rows. S32 re-price C8 + C9 (measure only), S33 build them only if S32 clears 3.13 ms/token, S34 DeepSeek-V4 prefix cache, S35 gpt-oss 47-m4 + elastic tier, S36 cheap sweep + 47-m6; ordered by the ordering rule (the USER's answer listed them in reverse; no other order was given). Inputs re-verified at `5118a65`: code unchanged since `b3404d3`; spot checks held (DeepSeek refusal, gpt-oss graph refusal, whole-layer forward records no usage, `kv_bytes_per_token` window-blind, `capture_begin` outside the cleanup); `FP8DynamicCache` moved :1382 → :1672; 47-m6 added (missing from the pre-gather); no backlog re-open condition fired. Nothing built; suite floor unchanged. Row as it stood at close:** **S31 — re-prioritise with the USER (S26's rule: "when S30 closes, the next fresh session re-prioritises with
+      the USER", as S24 and S26 did).** A conversation. It re-checks the inputs below at HEAD, presents them ranked by
+      the ordering rule, and WAITS for the USER's pick. It decides nothing alone, then writes the chosen rows (S32…)
+      into the table above, one row per fresh session.
+      **INPUTS PRE-GATHERED at `fc06d8b` (2026-10-07, read from this file and the backlog, nothing re-measured).
+      Re-verify at HEAD.** Today's Qwen3-Next baseline is S28's: HIT turn **16.04 s**, HIT decode 51.59 ms/token, HIT
+      TTFT 2.88 s, decode stall ~4.1 s/turn. A 5 % bar on that turn is **0.80 s/turn**.
+      - ***(a)* The agent's model (Qwen3-Next):**
+        - **C8 segment merge**: 2.13–2.34 ms/token (calibrated).
+        - **C9 FWD**: 2.79–3.27 ms/token, but no concrete change has been named for it.
+        - Both were priced BEFORE S28 removed ~6 ms/token of host time. **Re-price before building.**
+        - The decode miss stall (~4.1 s/turn) is what is left of S21's top cost. S11-L6 and S11-L7 are SETTLED, and
+          A1 is refuted, so no lever is priced against it.
+      - ***(b)* The biggest N=1 savings on the other models, all reachable at the server default:**
+        - **DeepSeek-V4 has no prefix cache.** Turn 2 is a full prefill: **47.1 s** TTFT at 1.28k tokens (S17 T6,
+          one rep), on every turn after the first. The build is unpriced: a cache-format design across both prefix
+          paths.
+        - **DeepSeek L-c**: the planner's VRAM priority is unpriced. The expert tier hits 34.9 %, while the streamed
+          non-expert layers are used on 100 % of tokens.
+        - **DeepSeek L-d**: the MTP draft would amortise 72 % per-forward bytes (row 37's re-gate, backlog #28).
+        - **gpt-oss elastic tier**: hit rate is 65.1 % at 243 experts and 93.7 % at 486, against today's 111–133.
+          The cost is context, unless the tier can borrow reserve safely.
+        - **gpt-oss eager attention**: 45 % of the 30.7k token (75.3 ms).
+        - **gpt-oss decode graphs are refused**: ~19 ms/token of host-paced work in the 33.0 ms 2k floor.
+        - **47-m4**: sliding-window KV is stored at full length. On gpt-oss that wastes 0.813 GB (49.8 %) and halves
+          the derived `max_seq_len`.
+        - **MiniMax row 49**: its drive-idle gap headline is in doubt. `VAAYU_LOOKAHEAD` is +2.5 % at N=1 against
+          +18.0 % bytes/token.
+        - **Dense M-6**: ~5 % of Llama-3.3-70B's ~37 GB/token read. Measure it first.
+      - ***(c)* Cheap:**
+        - The S28 `capture_begin` pool lead (a repro first).
+        - The S22-A2 Rust asserts and minors.
+        - gpt-oss's `ENABLE_EXPERT_USAGE` gap.
+      - ***(d)* Unreachable today:**
+        - The current-CUDA-device `[bug]` (single-GPU box).
+        - The batching design, backlog #37 (parked by the USER at S30).
