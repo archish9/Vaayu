@@ -225,3 +225,66 @@ def test_a_streamed_moe_shard_loads_only_its_non_expert_tensors():
     assert m.loads == [("non_expert", "layers.1"), ("full", "layers.2")]
 
 
+# ── E1: layer-independent kwargs built once per forward ─────────────────────
+
+def test_the_three_layer_independent_hooks_run_once_per_forward_and_the_mask_hook_per_layer():
+    m = make(n_dec=6)
+    run(m)
+    assert m.hook_calls == {"past": 1, "pos_emb": 1, "position_ids": 1, "mask": 6}
+    assert m.mask_layers == m.dec                       # each call is told its own layer
+
+
+def test_every_layer_still_gets_the_kwargs_the_loop_used_to_build():
+    m = make(n_dec=5)
+    cache = _Cache(7)
+    vb.VaayuBaseModel.forward(m, input_ids=torch.zeros(1, 1, dtype=torch.long),
+                              past_key_values=cache, use_cache=True)
+    for layer in m.dec:
+        (got,) = layer.calls
+        assert same(got, old_kwargs(m, layer, cache, 7, 1))
+        assert got["past_key_values"] is cache
+
+
+def test_a_per_layer_mask_reaches_the_layer_it_was_built_for():
+    """gpt-oss alternates sliding and full layers: the mask hook's answer depends on the layer."""
+    m = make(n_dec=5, windows={0: 128, 2: 64})
+    m.mask_hook = lambda mask, len_p, len_s, layer: (
+        {"attention_mask": ("window", layer.window)} if layer.window else {})
+    cache = _Cache(5)
+    vb.VaayuBaseModel.forward(m, input_ids=torch.zeros(1, 1, dtype=torch.long),
+                              past_key_values=cache, use_cache=True)
+    assert [d.calls[0].get("attention_mask") for d in m.dec] == [
+        ("window", 128), None, ("window", 64), None, None]      # no layer inherits another's mask
+    for layer in m.dec:
+        assert same(layer.calls[0], old_kwargs(m, layer, cache, 5, 1))
+
+
+def test_a_mask_hook_that_refuses_a_layer_still_stops_that_layer():
+    """DeepSeek-V4 raises from this hook when a layer's cache disagrees with start_pos."""
+    m = make(n_dec=4)
+
+    def hook(mask, len_p, len_s, layer):
+        if layer.layer_idx == 2:
+            raise RuntimeError("start_pos disagrees with layer 2's cache")
+        return {}
+    m.mask_hook = hook
+    with pytest.raises(RuntimeError, match="layer 2"):
+        run(m)
+    assert [len(d.calls) for d in m.dec] == [1, 1, 0, 0]
+
+
+def test_chunk_major_elements_each_get_their_own_past_length():
+    m = make(n_dec=3)
+    m._chunk_major_lens = [2, 2, 3]          # two chunks of the SAME length, different pasts
+    cache = _Cache(4)
+    vb.VaayuBaseModel.forward(
+        m, input_ids=[torch.zeros(n, dtype=torch.long) for n in (2, 2, 3)],
+        past_key_values=cache, use_cache=True)
+    assert m.hook_calls == {"past": 3, "pos_emb": 3, "position_ids": 3, "mask": 9}
+    for layer in m.dec:
+        first, second, third = layer.calls
+        assert same(first, old_kwargs(m, layer, cache, 4, 2))
+        assert same(second, old_kwargs(m, layer, cache, 6, 2))
+        assert same(third, old_kwargs(m, layer, cache, 8, 3))
+
+

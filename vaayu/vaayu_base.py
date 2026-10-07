@@ -5780,6 +5780,8 @@ class VaayuBaseModel(GenerationMixin):
                             future = executor.submit(self._load_from_strategy, _seed_name)
                         break
 
+            _kw_base = {}   # E1: (len_p, len_s) -> this forward's layer-independent kwargs
+
             # S12: on an eligible forward (one token, N=1) each resident decoder layer
             # replays as CUDA graphs; every other forward is stock.
             _dg = getattr(self, "_decode_graphs", None)
@@ -5960,14 +5962,32 @@ class VaayuBaseModel(GenerationMixin):
                             len_s = self.get_sequence_len(seq)
                             _lp = _past_lens[j] if _past_lens is not None else _len_p
 
-                            kwargs = {
-                                'use_cache': use_cache,
-                                **self.get_past_key_value_args(past_key_values),
-                                **self.get_pos_emb_args(_lp, len_s),
-                                **self.get_attention_mask_args(attention_mask, _lp, len_s,
-                                                               layer=layer),
-                                **self.get_position_ids_args(position_ids, _lp, len_s),
-                            }
+                            if _e1:
+                                # Three of the four hooks do not depend on the layer:
+                                # build their part once per (past length, new length)
+                                # and reuse it. The mask hook is still called for every
+                                # layer -- it is the one that is told which layer runs
+                                # (per-layer windows; DeepSeek-V4's start_pos check).
+                                _base = _kw_base.get((_lp, len_s))
+                                if _base is None:
+                                    _base = _kw_base[(_lp, len_s)] = {
+                                        'use_cache': use_cache,
+                                        **self.get_past_key_value_args(past_key_values),
+                                        **self.get_pos_emb_args(_lp, len_s),
+                                        **self.get_position_ids_args(position_ids, _lp, len_s),
+                                    }
+                                _mask_args = self.get_attention_mask_args(attention_mask, _lp, len_s,
+                                                                          layer=layer)
+                                kwargs = {**_base, **_mask_args} if _mask_args else _base
+                            else:
+                                kwargs = {
+                                    'use_cache': use_cache,
+                                    **self.get_past_key_value_args(past_key_values),
+                                    **self.get_pos_emb_args(_lp, len_s),
+                                    **self.get_attention_mask_args(attention_mask, _lp, len_s,
+                                                                   layer=layer),
+                                    **self.get_position_ids_args(position_ids, _lp, len_s),
+                                }
 
                             _MAX_OOM_RETRIES = 2
                             layer_out = None
