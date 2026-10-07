@@ -123,7 +123,6 @@ class _FakeSpecModel:
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
         pc.store(resolved_sid, token_ids, kv)
-        self.telemetry.dump_json("vaayu_telemetry.json")
 
     def forward(self, input_ids, past_key_values=None, use_cache=True, return_dict=True):
         self.forward_calls.append(input_ids.shape[1])

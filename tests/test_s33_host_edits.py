@@ -1,8 +1,7 @@
 """S33 stage 1: the host edits E1-E7 on the decode path.
 
 These run the REAL `VaayuBaseModel.forward` over a stand-in model (tiny callables for
-layers, CPU, no checkpoint), so they pin behaviour, not source text. During the prototype
-each piece is switched on by `model._s33_pieces`.
+layers, CPU, no checkpoint), so they pin behaviour, not source text.
 """
 import asyncio
 import inspect
@@ -15,8 +14,6 @@ import torch
 
 import vaayu.vaayu_base as vb
 from vaayu.telemetry import VaayuTelemetry
-
-ALL = ("e1", "e2", "e3", "e4", "e6", "e7")
 
 
 class _Dec:
@@ -108,7 +105,7 @@ class _Model(vb.VaayuBaseModel):
         return {f"__layer__:{name}": torch.zeros(1), "w": torch.zeros(1)}
 
 
-def make(n_dec=4, pinned="all", pieces=ALL, graphs=None, windows=None, moe_shards=()):
+def make(n_dec=4, pinned="all", graphs=None, windows=None, moe_shards=()):
     m = _Model()
     dec_names = [f"layers.{i}" for i in range(n_dec)]
     m.layer_names = ["embed"] + dec_names + ["norm", "lm_head"]
@@ -118,7 +115,6 @@ def make(n_dec=4, pinned="all", pieces=ALL, graphs=None, windows=None, moe_shard
                 + [lambda seq: seq, lambda seq: seq])
     m.pinned_layer_names = set(m.layer_names) if pinned == "all" else set(pinned)
     m.non_expert_pinned_layer_names = set()
-    m._s33_pieces = frozenset(pieces)
     m.hook_calls = {"past": 0, "pos_emb": 0, "position_ids": 0, "mask": 0}
     m.mask_layers = []
     m.mask_hook = lambda mask, len_p, len_s, layer: {}
@@ -589,15 +585,11 @@ def test_storing_a_finished_request_does_not_write_the_telemetry_file():
 
 
 def test_no_generate_path_dumps_the_telemetry_ring_unasked():
-    src = inspect.getsource(vb)
-    calls = [i for i in range(len(src)) if src.startswith(".dump_json(", i)]
-    for i in calls:
-        guard = src[src.rfind("\n", 0, src.rfind("\n", 0, i)) + 1:i]
-        assert '"e7" not in' in guard, src[max(0, i - 200):i + 40]
+    assert ".dump_json(" not in inspect.getsource(vb)
 
 
 def test_the_ring_can_still_be_dumped_on_demand(tmp_path):
-    m = make(n_dec=2, pieces=("e1", "e2", "e4", "e6", "e7"))
+    m = make(n_dec=2)
     m.telemetry = VaayuTelemetry(output_dir=str(tmp_path))
     run(m)
     m.telemetry.dump_json("t.json")

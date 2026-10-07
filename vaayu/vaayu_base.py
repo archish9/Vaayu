@@ -61,9 +61,6 @@ except ImportError:
     cache_utils_installed = False
 
 
-# S33 prototype switch: the pieces a probe turned on (model._s33_pieces). Empty = today's code.
-_NO_S33 = frozenset()
-
 # Routed-expert tensors inside a MoE shard: the layer loop filters them out of
 # inject_to_gpu (sparse_forward loads experts itself).
 _EXPERT_TENSOR_RE = re.compile(r'\.experts\.')
@@ -5481,8 +5478,6 @@ class VaayuBaseModel(GenerationMixin):
 
         _exec_start = time.time()
         self.telemetry.begin_token(self._token_count)
-        _s33 = getattr(self, "_s33_pieces", _NO_S33)
-        _e1, _e2, _e3, _e4 = "e1" in _s33, "e2" in _s33, "e3" in _s33, "e4" in _s33
 
         # Feature B: capture caller-supplied batched mask/positions BEFORE the
         # sdpa branch nulls them. When present, forward builds a per-stream 4D
@@ -5688,23 +5683,14 @@ class VaayuBaseModel(GenerationMixin):
 
         # MoE: precompute set of shard names that contain MoE experts so we can
         # filter expert tensors out of inject_to_gpu. sparse_forward handles experts.
-        if "e6" in _s33:
-            _shards = getattr(self, "_moe_shard_names_cache", None)
-            if _shards is None or _shards[0] is not self._moe_blocks:
-                _shards = self._moe_shard_names_cache = (
-                    self._moe_blocks,
-                    frozenset(b.layer_name for b in self._moe_blocks) if self._moe_blocks else frozenset())
-            _moe_shard_names = _shards[1]
-            _expert_tensor_re = _EXPERT_TENSOR_RE if _moe_shard_names else None
-        else:
-            _moe_shard_names: set[str] = (
-                {b.layer_name for b in self._moe_blocks} if self._moe_blocks else set()
-            )
-            if _moe_shard_names:
-                import re as _re_fwd
-                _expert_tensor_re = _re_fwd.compile(r'\.experts\.')
-            else:
-                _expert_tensor_re = None
+        # Built once and kept on the model: the blocks are assigned at load.
+        _shards = getattr(self, "_moe_shard_names_cache", None)
+        if _shards is None or _shards[0] is not self._moe_blocks:
+            _shards = self._moe_shard_names_cache = (
+                self._moe_blocks,
+                frozenset(b.layer_name for b in self._moe_blocks) if self._moe_blocks else frozenset())
+        _moe_shard_names = _shards[1]
+        _expert_tensor_re = _EXPERT_TENSOR_RE if _moe_shard_names else None
 
         # Persistent executor: created once, reused every token. The old per-token
         # `with ThreadPoolExecutor(...)` paid thread create/join on every forward.
@@ -5780,8 +5766,7 @@ class VaayuBaseModel(GenerationMixin):
                     return executor.submit(self._load_non_expert_strategy, _n)
                 return executor.submit(self._load_from_strategy, _n)
 
-            _next_unpinned = None
-            if self.prefetching and _e2:
+            if self.prefetching:
                 # Once per forward: which layer to prefetch after each layer.
                 _next_unpinned = next_unpinned_table(
                     self.layer_names,
@@ -5789,17 +5774,8 @@ class VaayuBaseModel(GenerationMixin):
                 _k = _next_unpinned[0]
                 if _k is not None:
                     future = _submit_load(self.layer_names[_k])
-            elif self.prefetching:
-                _all_pinned = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                for _seed_name in self.layer_names:
-                    if _seed_name not in _all_pinned:
-                        if _seed_name in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                            future = executor.submit(self._load_non_expert_strategy, _seed_name)
-                        else:
-                            future = executor.submit(self._load_from_strategy, _seed_name)
-                        break
 
-            _kw_base = {}   # E1: (len_p, len_s) -> this forward's layer-independent kwargs
+            _kw_base = {}   # (len_p, len_s) -> this forward's layer-independent kwargs
 
             # S12: on an eligible forward (one token, N=1) each resident decoder layer
             # replays as CUDA graphs; every other forward is stock.
@@ -5831,20 +5807,10 @@ class VaayuBaseModel(GenerationMixin):
                         moved_layers = []
                         # If no future is outstanding, kick off the next non-pinned load
                         # so disk read overlaps with this layer's GPU compute.
-                        if _next_unpinned is not None:
-                            if future is None:
-                                _k = _next_unpinned[i + 1]
-                                if _k is not None:
-                                    future = _submit_load(self.layer_names[_k])
-                        elif self.prefetching and future is None:
-                            _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
-                            for _n in self.layer_names[i + 1:]:
-                                if _n not in _all_pinned_fwd:
-                                    if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                        future = executor.submit(self._load_non_expert_strategy, _n)
-                                    else:
-                                        future = executor.submit(self._load_from_strategy, _n)
-                                    break
+                        if self.prefetching and future is None:
+                            _k = _next_unpinned[i + 1]
+                            if _k is not None:
+                                future = _submit_load(self.layer_names[_k])
 
                     elif self.prefetching:
                         # ── Non-pinned, prefetching ──────────────────────────────
@@ -5875,19 +5841,9 @@ class VaayuBaseModel(GenerationMixin):
                         future = None
                         if self.profiling_mode:
                             t = time.time()
-                        if _next_unpinned is not None:
-                            _k = _next_unpinned[i + 1]
-                            if _k is not None:
-                                future = _submit_load(self.layer_names[_k])
-                        else:
-                            _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                            for _n in self.layer_names[i + 1:]:
-                                if _n not in _all_pinned_elif:
-                                    if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                        future = executor.submit(self._load_non_expert_strategy, _n)
-                                    else:
-                                        future = executor.submit(self._load_from_strategy, _n)
-                                    break
+                        _k = _next_unpinned[i + 1]
+                        if _k is not None:
+                            future = _submit_load(self.layer_names[_k])
                         if self.profiling_mode:
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
@@ -5982,32 +5938,22 @@ class VaayuBaseModel(GenerationMixin):
                             len_s = self.get_sequence_len(seq)
                             _lp = _past_lens[j] if _past_lens is not None else _len_p
 
-                            if _e1:
-                                # Three of the four hooks do not depend on the layer:
-                                # build their part once per (past length, new length)
-                                # and reuse it. The mask hook is still called for every
-                                # layer -- it is the one that is told which layer runs
-                                # (per-layer windows; DeepSeek-V4's start_pos check).
-                                _base = _kw_base.get((_lp, len_s))
-                                if _base is None:
-                                    _base = _kw_base[(_lp, len_s)] = {
-                                        'use_cache': use_cache,
-                                        **self.get_past_key_value_args(past_key_values),
-                                        **self.get_pos_emb_args(_lp, len_s),
-                                        **self.get_position_ids_args(position_ids, _lp, len_s),
-                                    }
-                                _mask_args = self.get_attention_mask_args(attention_mask, _lp, len_s,
-                                                                          layer=layer)
-                                kwargs = {**_base, **_mask_args} if _mask_args else _base
-                            else:
-                                kwargs = {
+                            # Three of the four hooks do not depend on the layer:
+                            # build their part once per (past length, new length)
+                            # and reuse it. The mask hook is still called for every
+                            # layer -- it is the one that is told which layer runs
+                            # (per-layer windows; DeepSeek-V4's start_pos check).
+                            _base = _kw_base.get((_lp, len_s))
+                            if _base is None:
+                                _base = _kw_base[(_lp, len_s)] = {
                                     'use_cache': use_cache,
                                     **self.get_past_key_value_args(past_key_values),
                                     **self.get_pos_emb_args(_lp, len_s),
-                                    **self.get_attention_mask_args(attention_mask, _lp, len_s,
-                                                                   layer=layer),
                                     **self.get_position_ids_args(position_ids, _lp, len_s),
                                 }
+                            _mask_args = self.get_attention_mask_args(attention_mask, _lp, len_s,
+                                                                      layer=layer)
+                            kwargs = {**_base, **_mask_args} if _mask_args else _base
 
                             _MAX_OOM_RETRIES = 2
                             layer_out = None
@@ -6092,7 +6038,7 @@ class VaayuBaseModel(GenerationMixin):
                     # that replays decode graphs: every disk field is zero and
                     # compute_us is only the time to launch a graph. A streamed
                     # layer always records -- its fields are real disk timings.
-                    if not (_e3 and _dg_on and _layer_pinned):
+                    if not (_dg_on and _layer_pinned):
                         self.telemetry.record_layer(LayerTiming(
                             layer_name=layer_name,
                             file_bytes=_lt_file_bytes,
@@ -6189,7 +6135,7 @@ class VaayuBaseModel(GenerationMixin):
         _la = getattr(self, "_lookahead_state", None)
         _la_str = (f"  lookahead_acc={_la['hits']}/{_la['total']}"
                    f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
-        if _e4 and self._token_count % 32 != 0 and getattr(self, "_rss_kb_last", None) is not None:
+        if self._token_count % 32 != 0 and getattr(self, "_rss_kb_last", None) is not None:
             # rss= is sampled: read on the first pass and on every 32nd, the
             # last value is repeated in between.
             _rss_kb = self._rss_kb_last
@@ -6364,8 +6310,6 @@ class VaayuBaseModel(GenerationMixin):
                 if kwargs.get("past_key_values") is None:
                     kwargs["past_key_values"] = self._create_kv_cache()
                 result = super().generate(*args, **kwargs)
-                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
-                    self.telemetry.dump_json("vaayu_telemetry.json")
                 return result
 
             # A1 cross-turn reuse. Batch=1 per call (parallel streams = separate
@@ -6443,8 +6387,6 @@ class VaayuBaseModel(GenerationMixin):
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
         pc.store(resolved_sid, token_ids, kv)
-        if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
-            self.telemetry.dump_json("vaayu_telemetry.json")
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:
@@ -6840,8 +6782,6 @@ class VaayuBaseModel(GenerationMixin):
                 if pc is not None:
                     resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
-                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
-                    self.telemetry.dump_json("vaayu_telemetry.json")
                 return generated
             finally:
                 if _resized_vram_prefix:
@@ -7250,5 +7190,3 @@ class VaayuBaseModel(GenerationMixin):
                     _vram_cache.budget_bytes = _saved_budget
                 self._batch_decode_active = False
                 self._batch_n = 1
-                if "e7" not in getattr(self, "_s33_pieces", _NO_S33):
-                    self.telemetry.dump_json("vaayu_telemetry.json")
