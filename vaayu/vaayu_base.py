@@ -60,6 +60,24 @@ except ImportError:
     cache_utils_installed = False
 
 
+# S33 prototype switch: the pieces a probe turned on (model._s33_pieces). Empty = today's code.
+_NO_S33 = frozenset()
+
+
+def next_unpinned_table(layer_names, pinned) -> list:
+    """table[i] is the smallest k >= i whose layer is NOT in `pinned`, or None.
+
+    One entry more than there are layers, so `table[i + 1]` ("the next layer
+    to prefetch after layer i") is always in range. Built once per forward:
+    the layer loop used to rescan `layer_names[i + 1:]` at every layer, which
+    on a fully pinned model walks the whole remaining list every time.
+    """
+    table = [None] * (len(layer_names) + 1)
+    for k in range(len(layer_names) - 1, -1, -1):
+        table[k] = k if layer_names[k] not in pinned else table[k + 1]
+    return table
+
+
 def _disk_timings_for_layer(file_path: str, cache_hit: bool,
                             wall_io_wait_us: int) -> dict:
     """The four disk-timing fields of one LayerTiming.
@@ -5453,6 +5471,8 @@ class VaayuBaseModel(GenerationMixin):
 
         _exec_start = time.time()
         self.telemetry.begin_token(self._token_count)
+        _s33 = getattr(self, "_s33_pieces", _NO_S33)
+        _e1, _e2, _e3, _e4 = "e1" in _s33, "e2" in _s33, "e3" in _s33, "e4" in _s33
 
         # Feature B: capture caller-supplied batched mask/positions BEFORE the
         # sdpa branch nulls them. When present, forward builds a per-stream 4D
@@ -5733,7 +5753,24 @@ class VaayuBaseModel(GenerationMixin):
 
             # ── Seed prefetch: skip pinned layers (already in VRAM) ──────────
             future = None
-            if self.prefetching:
+
+            def _submit_load(_n):
+                # A MoE shard with an expert index loads only its non-expert
+                # tensors; sparse_forward reads the routed experts itself.
+                if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                    return executor.submit(self._load_non_expert_strategy, _n)
+                return executor.submit(self._load_from_strategy, _n)
+
+            _next_unpinned = None
+            if self.prefetching and _e2:
+                # Once per forward: which layer to prefetch after each layer.
+                _next_unpinned = next_unpinned_table(
+                    self.layer_names,
+                    self.pinned_layer_names | self.non_expert_pinned_layer_names)
+                _k = _next_unpinned[0]
+                if _k is not None:
+                    future = _submit_load(self.layer_names[_k])
+            elif self.prefetching:
                 _all_pinned = self.pinned_layer_names | self.non_expert_pinned_layer_names
                 for _seed_name in self.layer_names:
                     if _seed_name not in _all_pinned:
@@ -5772,7 +5809,12 @@ class VaayuBaseModel(GenerationMixin):
                         moved_layers = []
                         # If no future is outstanding, kick off the next non-pinned load
                         # so disk read overlaps with this layer's GPU compute.
-                        if self.prefetching and future is None:
+                        if _next_unpinned is not None:
+                            if future is None:
+                                _k = _next_unpinned[i + 1]
+                                if _k is not None:
+                                    future = _submit_load(self.layer_names[_k])
+                        elif self.prefetching and future is None:
                             _all_pinned_fwd = self.pinned_layer_names | _non_expert_pinned
                             for _n in self.layer_names[i + 1:]:
                                 if _n not in _all_pinned_fwd:
@@ -5811,14 +5853,19 @@ class VaayuBaseModel(GenerationMixin):
                         future = None
                         if self.profiling_mode:
                             t = time.time()
-                        _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
-                        for _n in self.layer_names[i + 1:]:
-                            if _n not in _all_pinned_elif:
-                                if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
-                                    future = executor.submit(self._load_non_expert_strategy, _n)
-                                else:
-                                    future = executor.submit(self._load_from_strategy, _n)
-                                break
+                        if _next_unpinned is not None:
+                            _k = _next_unpinned[i + 1]
+                            if _k is not None:
+                                future = _submit_load(self.layer_names[_k])
+                        else:
+                            _all_pinned_elif = self.pinned_layer_names | self.non_expert_pinned_layer_names
+                            for _n in self.layer_names[i + 1:]:
+                                if _n not in _all_pinned_elif:
+                                    if _n in _moe_shard_names and getattr(self, '_expert_offset_index', None) is not None:
+                                        future = executor.submit(self._load_non_expert_strategy, _n)
+                                    else:
+                                        future = executor.submit(self._load_from_strategy, _n)
+                                    break
                         if self.profiling_mode:
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
