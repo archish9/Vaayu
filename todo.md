@@ -132,7 +132,8 @@ said they would be, since no other order was given):**
 - **S36** — the cheap sweep + 47-m6 (fp32 rotary quality check).
 
 The reason, by the ordering rule: S32/S33 are *(a)* the agent's model. S34 and S35 are *(b)*: S34 is the largest N=1
-saving on any model (47.1 s of TTFT on every DeepSeek turn after the first), S35 is decode ms and context on gpt-oss.
+saving priced on any model (up to 47.1 s of TTFT on every DeepSeek turn after the first, minus the diff's own
+prefill — unpriced), S35 is decode ms and context on gpt-oss.
 S36 is *(c)* cheap. (d) stays out: the current-CUDA-device `[bug]` and batching (backlog #37). **When S36 closes, the
 next fresh session re-prioritises with the USER.** (The USER's answer listed the four picks in the reverse of this
 order; if that was deliberate, flip the table — the rows are independent.)
@@ -152,7 +153,7 @@ order; if that was deliberate, flip the table — the rows are independent.)
 | **S31** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-07 by the USER:** S32 re-price C8 + C9, S33 build them (only if S32 clears), S34 DeepSeek prefix cache, S35 gpt-oss 47-m4 + elastic tier, S36 cheap sweep + 47-m6. Inputs re-verified at `5118a65` (code unchanged since `b3404d3`). Full row: the S31 row in the backlog archive | — | done |
 | **S32** | **Re-price C8 (segment merge) + C9 (FWD) on Qwen3-Next at HEAD — MEASURE ONLY** | *(a)* the agent's model; both were priced before S28 removed ~6 ms/token of host time | a day |
 | **S33** | **Build the C8 + C9 bundle — only if S32 clears the bar** (else closes unrun with S32's number) | *(a)*; the S27 → S28 pattern | days |
-| **S34** | **DeepSeek-V4 cross-turn prefix cache** | *(b)* largest N=1 saving on any model: 47.1 s TTFT on every turn after the first | week-class (brainstorm → spec → plan) |
+| **S34** | **DeepSeek-V4 cross-turn prefix cache** | *(b)* up to 47.1 s of TTFT on every turn after the first, minus the diff's own prefill (S34 prices it first) | week-class (brainstorm → spec → plan) |
 | **S35** | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
 | **S36** | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
 
@@ -202,8 +203,16 @@ order; if that was deliberate, flip the table — the rows are independent.)
       after the 2026-10-03 cleanup".
 
 - [ ] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD, MEASURE ONLY (set by the USER at S31, 2026-10-07).**
-      **Question:** after S28, how many exposed ms/token would C8 (segment merge: GRAPH + GRRUN) and C9 (FWD, the
-      forward outside the layers) remove, each and as a bundle? Does the bundle clear the bar?
+      **Question:** after S28, how many exposed ms/token would C8 and C9 remove, each and as a bundle? Does the bundle
+      clear the bar?
+      - **C8 = segment merge:** replay the MoE tail and the next layer's pre-MoE part as ONE decode graph, so a token
+        binds and replays fewer graphs (labels `S27_GRAPH` + `S27_GRRUN`; 108 replays/token at S21). S28's C5 added a
+        per-layer CUDA graph for the packed kernel, so recount the replays per token before pricing.
+      - **C9 = FWD:** host time in the forward OUTSIDE the decoder layers (label `S27_FWD`; top sub-label
+        `F27_W_GET_POS_EMB_ARGS` 0.283 ms).
+      - **Read first:** `docs/superpowers/specs/2026-10-06-S27-host-levers-design.md` (the levers' definitions),
+        `docs/2026-10-06-S27-host-levers-RESULTS.md` (ranked table, "Calibration: closure test", FLAGS, caveats),
+        `docs/2026-10-06-S28-host-fast-path-RESULTS.md` (what S28 changed; its KEEP set).
       **Bar:** 5 % of S28's HIT turn (16.04 s) = 0.80 s/turn = **3.13 ms/token** at 256 tokens (S27's was 3.488, on
       17.86 s). Calibrate as S27's final review did: the exposed fractions ran 1.15–1.23 × high (closure test).
       **INPUTS PRE-GATHERED at `5118a65`. Re-verify at HEAD:**
@@ -239,9 +248,15 @@ order; if that was deliberate, flip the table — the rows are independent.)
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
       **Cost today:** the prefix cache is switched off at load, so every turn after the first is a full prefill. S17
-      T6 (ONE rep, ~1k-token prompt): turn 2 = a 1,280-token prefill, **47.1 s TTFT** (~27 tok/s). Decode 1.78 tok/s
-      (S15). Re-measure the cold number first (one rep is one draw). Reach: every DeepSeek turn after the first, N=1,
-      server default (`ENABLE_PREFIX_CACHE = True`).
+      (`docs/2026-10-01-S17-prefill-reads-vram-tier-RESULTS.md` §7; ONE rep per arm, `BALLAST_GB=15`): cold 1k prompt
+      **34.4 s**, turn 2 = a 1,280-token prefill **47.1 s**; **both turns disk-bound (26–36 s of stall each).** Decode
+      1.78 tok/s (S15), so a 256-token turn is ≈ 47 + 256 × 0.560 ≈ 190 s. Reach: every DeepSeek turn after the first,
+      N=1, server default (`ENABLE_PREFIX_CACHE = True`, `vaayu/server/config.py:100`).
+      **STEP 0 — PRICE IT BEFORE ANY DESIGN.** The saving is NOT 47.1 s: it is 47.1 s minus what the diff's own
+      prefill costs, and a disk-bound ~280-token diff may still read most routed experts (256 experts, top-6, 43
+      layers). Measure a cold prefill of a diff-sized prompt over a warm tier (`plans/probes/s17_ttft.py` as the base;
+      `MemoryMax=29G`, FOREGROUND), compute the saving per turn and its share of ≈ 190 s, and present that to the
+      USER before the spec. If it is under ~5 % of the turn, recommend closing.
       **INPUTS PRE-GATHERED at `5118a65`. Re-verify at HEAD:**
       - **The refusal:** `VaayuDeepseekV4._refuse_unsupported_prefix_cache` (`vaayu/vaayu_deepseek_v4.py:471`)
         detects by CLASS, because the base's instance probe (`vaayu_base.py:4247`) would crash: `DeepseekV4Cache` is
@@ -254,9 +269,12 @@ order; if that was deliberate, flip the table — the rows are independent.)
       - **Design lead, NOT verified:** 42-B already serves hybrid recurrent-state entries only "at the one length its
         state describes" (`batch.py` `prefix_cache_refusal_reason` docstring; `PrefixCacheStore.lookup`). That
         exact-length contract fits a cache that cannot crop, and an agent turn's prefix is usually the previous turn's
-        whole context. A diverging turn falls back to cold (or a shorter stored entry).
-      - **Check before designing:** DeepSeek's hash-routed layers read stashed input ids (A5.7b) — a HIT that
-        prefills only the diff must still hand those layers the right ids.
+        whole context. A diverging turn falls back to cold (or a shorter stored entry). `PrefixCacheStore.lookup`
+        (`vaayu/prefix_cache.py:74`), `store` :194. **S35 hits the same problem** (a window-length ring buffer cannot
+        crop back past its window) — design the contract once.
+      - **Check before designing:** DeepSeek's hash-routed layers read stashed input ids (A5.7b; `input_ids_scope`,
+        `vaayu_deepseek_v4.py:768` / :798) — a HIT that prefills only the diff must still hand those layers the right
+        ids.
       - **Size:** real KV 6.7 KiB/token (S15, measured), so a 10k-token entry is ~67 MB of host RAM.
       - **Files:** `vaayu/prefix_cache.py` (lookup / store / abort-path restore), `vaayu/batch.py`,
         `vaayu/kv_persist.py` (keep refusing, or learn the format), the DeepSeek refusal above.
@@ -268,7 +286,7 @@ order; if that was deliberate, flip the table — the rows are independent.)
       **§8:** no new knob expected (`ENABLE_PREFIX_CACHE` exists, default True); reachable at N=1, server default.
 
 - [ ] **S35 — gpt-oss: store sliding-window KV at window length (47-m4), then size the elastic tier (set by the USER
-      at S31, 2026-10-07).**
+      at S31, 2026-10-07).** A subsystem change: brainstorm → spec → plan with the USER.
       **47-m4's numbers:** 12 of gpt-oss-20b's 24 layers are windowed at 128, so 24,576 of 49,152 B/token is stored
       and reserved but unreadable. At the derived `max_seq_len` 33,206 that is 1.632 GB held against 0.819 GB needed:
       **0.813 GB (49.8 %) wasted**, and the derived `max_seq_len` is halved. Correctness is not affected.
@@ -284,7 +302,13 @@ order; if that was deliberate, flip the table — the rows are independent.)
       - The fix touches the cache's per-layer capacity, `get_seq_length` / `_seq_len` bookkeeping, the prefix cache's
         snapshot / crop and the KV persist format.
       - Tier: `ExpertVRAMCache` (`vaayu/persist/expert_cache.py:813`), `cap_tier_after_admission_eviction`
-        (`vaayu_base.py:811`), `graph_pool_charge` (`vaayu/decode_graphs.py:35`).
+        (`vaayu_base.py:811`), `graph_pool_charge` (`vaayu/decode_graphs.py:35`). Planner: `solve_max_seq_len`
+        (`vaayu/vram_plan.py:462`), `_kv_term_bytes` :327, `expert_vram_budget_for` :861.
+      - **Prefix cache:** a window-length ring buffer cannot be cropped back past its window, so a HIT on a shorter
+        stored prefix stops being exact — the same exact-length problem as S34 (42-B's contract). Design it once.
+      - **Read first:** `docs/2026-10-02-S18-step1-RESULTS.md` (the tier curve), `docs/2026-10-02-S18-step2-RESULTS.md`
+        (the tier as built); probes `plans/probes/s18_ab.py`, `s18_project.py`. Memories `gptoss_stock_reference_traps`
+        (compare with `DynamicCache()`, pin the date, compare post-warm sessions only) and `s18_gptoss_vram_tier`.
       - **Close in the same row:** with the mask `None` (sdpa at `q_len == kv_len`) Vaayu does not apply the window;
         sdpa with an implicit causal mask would silently ignore it. No on-device model hits it (gpt-oss refuses sdpa).
       - **Shared infra:** KV cache, prefix cache and VRAM plan serve every model. Dense gate on both Llama, prefix gate
@@ -298,17 +322,26 @@ order; if that was deliberate, flip the table — the rows are independent.)
       1. **47-m6 — fp32 rotary table, quality never measured.** `_precompute_rope` (`vaayu/vaayu_base.py:5092`);
          `inv_freq` went bf16 → fp32 in `cac352e` (A3 task 5). Teacher-forced ppl before (`cac352e^`'s dtype, or stash
          the one-line change) vs after, on Qwen3-Next AND MiniMax, ≥ 4k context, several null-perturbed draws per arm
-         (D6: one draw moves sd 0.5–0.7 pp); record decode tok/s. Stop rule: the OPEN item 47-m6 below.
+         (D6: one draw moves sd 0.5–0.7 pp); record decode tok/s. Stop rule: the OPEN item 47-m6 below. Base probe:
+         `plans/probes/s20_quality.py` (prefill-mode teacher-forced ppl, null-perturbed draws, PASS = |Δ mean| ≤ pooled
+         sd — the USER's quality bar); swap its arms for bf16 vs fp32 `inv_freq`. `MemoryMax=29G`, FOREGROUND.
       2. **`capture_begin` pool lead (from reading, not reproduced).** Build a repro that makes
          `cudaStreamBeginCapture` fail after `beginAllocateToPool`: `vaayu/packed_expert_kernels.py:618` (the `try`
          covers the body only), `vaayu/decode_graphs.py:350` (`_Capture.begin_graph`) and the anchor capture :652. If
-         it reproduces, run `_cleanup_pool` on that path in both places + a test.
+         it reproduces, run `_cleanup_pool` on that path in both places + a test. Untested repro idea: open a capture
+         on the same side stream first, so the inner `cudaStreamBeginCapture` fails with an illegal-state error —
+         first confirm in the installed torch that `capture_begin` calls `beginAllocateToPool` BEFORE it. If no
+         repro exists, close the lead with that reason.
       3. **gpt-oss `ENABLE_EXPERT_USAGE` gap.** `_make_whole_layer_sparse_forward` (`vaayu/moe_patch.py:2148`) never
-         calls `_maybe_record_usage` (:1656; called only at :1724, :2327, :2422, :3162). Server default False.
+         calls `_maybe_record_usage` (:1656; called only at :1724, :2327, :2422, :3162). Server default False. Fix:
+         call it with the routed expert indices where the routed forward has them, + a test that
+         `ENABLE_EXPERT_USAGE=True` records routes on a whole-layer model.
       4. **S22-A2 Rust asserts.** `assert!(segs.len() <= qd)` as the first line of `plan_chunks`
          (`vaayu_rust/src/lib.rs:356`); clamp `this_len` (:607, :756) to `0x7fff_f000`. Rebuild with `maturin develop
          --release` (the suite needs a current build); memory `rust_ext_dry_run_method`.
-      5. **Close backlog #9** (MiniMax prefill pageable H2D) with one MiniMax prefill census if the copies are gone.
+      5. **Close backlog #9** (MiniMax prefill pageable H2D) with one MiniMax prefill census if the copies are gone:
+         `plans/probes/s1l1_attrib.py` (call-site attribution of `.to` / `.cuda` / `.copy_`, cross-checked with
+         CUPTI) on MiniMax, `MemoryMax=29G`; method `docs/2026-09-25-S1-L1-prefill-pageable-h2d-RESULTS.md`.
       6. **Close G5** on the record: its fix was S22-A1, refuted (3 rings −1.6 % under O_DIRECT); the slab-count half
          ran clean at 10,273 slabs. No measurement.
       **§8:** per item, at close.
