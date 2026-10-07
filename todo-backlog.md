@@ -8808,3 +8808,25 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       session" -> S33-A0, then S33 (full flagged bundle-b). Suite floor unchanged (no engine code). RESULTS:
       `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md`; assets `docs/superpowers/plans/2026-10-07-S32-assets/`; raw
       `plans/probes/s32_out/`.
+      **Final-review correction (2026-10-07).** The final whole-run review found the "slow-replay state" above to be very
+      likely a PROBE ARTEFACT: every unprofiled arm timed AFTER the CUPTI (U_EXP) arm in the same process is slow.
+      p1 and p3 ran W,U1,U_HOST,U_SEG,U_EXP,U2; p2 ran W,U2,U_EXP,U_SEG,U_HOST,U1. Unprofiled head.lin replay host per call:
+      U_HOST p1 5.27 / p3 5.67 us (before U_EXP) vs p2 26.08 (after); U_SEG (4th in both orders) 5.25 / 5.40 vs 25.12
+      (`decode-p{1,2,3}.log` `S27_GRAPH@head.lin` lines: 0.190/0.189, 0.939/0.904, 0.204/0.194 ms/tok at 36 calls/tok); the
+      dry run (p1 order) 5.53 us. Under profiling the processes do not differ (GRAPH 3.527 / 3.376 / 3.501 ms/forward).
+      Wall time shows it on the same slice: U1 48.48 / 48.42 before U_EXP, 54.53 after; U2 46.01 before, 48.42 / 48.20
+      after. S27's mirrored p2 (U_SUB 4th in both orders: GRAPH 0.622 vs 1.841 ms/token) shows it too. Tally: 2 of 2
+      mirrored processes slow, 0 of 4 p1-order processes. Mechanism unconfirmed (S33-A0 confirms). **S27's GRAPH FLAG and
+      its M7 C5 estimate for p2 are invalidated; S28 is unaffected** (KEEP and attribution arms ran without a profiler,
+      one process per arm). **Clean re-price (p1 + p3, CPU-only; `plans/probes/s32_out/price-p1p3.txt`,
+      `s32-price-p1p3.json`), bar 3.133:** unflagged bundle-b 1.154–1.157 FAILS; flagged bundle-b 2.710–3.190 STRADDLES
+      (p1 2.563–3.066, p3 2.857–3.313); flagged bundle-a 2.348–2.952 FAILS; calibration robust (zero-label 3.034–3.511,
+      bench 2.747–3.226, both STRADDLE). C8b's increment over E1–E6 is 0.45 (p1) / 0.56 (p3) ms/token ≈ 0.8 % of a turn;
+      E1–E6 alone ≈ 2.11–2.61 / 2.30–2.76. **I1 (review arithmetic):** E5's low end is physically impossible — each gc call
+      is ≈ 64 ms of CPU-only host behind ≤ ≈ 1.5 ms of queued GPU work, so E5 sits near its high end (1.95 / 2.27 / 2.07)
+      and the clean flagged bundle-b is ≈ 3.05–3.31. **I2 (final reviewer, one trace: p1 w0, 752 windows,
+      `docs/superpowers/plans/2026-10-07-S32-assets/s32_r0bias_review.py`):** post-launch MoE host median 4.17 us, MOE
+      inflation 2.09x, so Δr0 ≈ 2.3 us/window ≈ 0.11 ms/token at most off C8b (E1–E3 carry the same bias); the census r0
+      median is 27.0 us; net the clean full flagged bundle is ≈ 2.95–3.2, AT the bar. **Third USER ruling (2026-10-07):**
+      S33-A0 "≤1-hour CUPTI confirmation (Recommended)"; S33 "Staged: E1–E6, then decide C8b (Recommended)" — the rows in
+      `todo.md` now read so. RESULTS corrected the same day (section "The p2 anomaly is a probe artefact (final review)").

@@ -134,18 +134,19 @@ said they would be, since no other order was given):**
 The reason, by the ordering rule: S32/S33 are *(a)* the agent's model. S34 and S35 are *(b)*: S34 is the largest N=1
 saving priced on any model (up to 47.1 s of TTFT on every DeepSeek turn after the first, minus the diff's own
 prefill — unpriced), S35 is decode ms and context on gpt-oss.
-
-**S32 DECIDED 2026-10-07 by the USER (two rulings):**
-1. After the two-process price (unflagged FAILS; flagged DISAGREE): **"Yes: admit E3+E4+E5, run p3"**.
-2. After the three-process price (flagged bundle-b STRADDLES 3.072–3.699 vs 3.133): **"Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh session"**.
-- **S33-A0** — investigate the slow-replay process state (new row, a day), then
-- **S33** — build the FULL flagged bundle-b (C8b + E1–E6), in its own fresh session; NOT closed unrun.
-
-The reason, by the ordering rule: both are *(a)* the agent's model; S33-A0 is a day and sizes C8b (≈ 0.5 ms/token in
-normal processes, 1.1–1.7 in the slow state) before a week-class build.
 S36 is *(c)* cheap. (d) stays out: the current-CUDA-device `[bug]` and batching (backlog #37). **When S36 closes, the
 next fresh session re-prioritises with the USER.** (The USER's answer listed the four picks in the reverse of this
 order; if that was deliberate, flip the table — the rows are independent.)
+
+**S32 DECIDED 2026-10-07 by the USER (three rulings):**
+1. After the two-process price (unflagged FAILS; flagged DISAGREE): **"Yes: admit E3+E4+E5, run p3"**.
+2. After the three-process price (flagged bundle-b STRADDLES 3.072–3.699 vs 3.133): **"Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh session"**. (SUPERSEDED by 3.)
+3. After the final review (third ruling, same day): **S33-A0: "≤1-hour CUPTI confirmation (Recommended)"**; **S33 scope: "Staged: E1–E6, then decide C8b (Recommended)"**. Why: the slow-replay state looks like a probe artefact (every unprofiled arm after the CUPTI arm in a process is slow), and C8b is ≈ 0.5 ms/token on clean processes (p1 0.45, p3 0.56; the clean flagged bundle-b STRADDLES 2.71–3.19).
+- **S33-A0** — confirm the post-CUPTI replay penalty (≤ 1 hour), then
+- **S33** — STAGED: stage 1 builds E1–E6; stage 2 (C8b) only on the USER's word after stage 1's number.
+
+The reason, by the ordering rule: both are *(a)* the agent's model; S33-A0 is ≤ 1 h and decides whether C8b's price is
+the clean 0.45–0.56 ms/token before any build.
 
 | # | item | why here | cost |
 |---|---|---|---|
@@ -160,9 +161,9 @@ order; if that was deliberate, flip the table — the rows are independent.)
 | **S29** ✅ | ~~Buffered vs O_DIRECT where the engine still chooses buffered~~ — **CLOSED 2026-10-07: FIXED for dense, merged `b3404d3`; gpt-oss stays buffered.** Llama-3.3-70B O_DIRECT decode 2.483 → 1.961 s/token (−21.0 %), TTFT −20.9 %, 8 mirrored arms, ids identical; the choice now charges the dense RAM layer cache. gpt-oss HIT turn −0.17 % (a tie), buffered kept. Suite 3739. Full row: the S29 row in the backlog archive; `docs/2026-10-07-S29-buffered-vs-odirect-RESULTS.md` | — | done |
 | **S30** ✅ | ~~Batching design row: make N>1 reachable through the server~~ — **CLOSED 2026-10-07: PARKED by the USER** (asked "design now, or park until Rudra fans out?"; chose park). No client fans out to Vaayu: RudraAnvil has no Vaayu reference and runs its subagents one at a time. The design is backlog **#37**, inputs re-verified at `fc06d8b`. Suite floor unchanged (no code). Full row: the S30 row in the backlog archive | — | done |
 | **S31** ✅ | ~~Re-prioritise with the USER~~ — **DECIDED 2026-10-07 by the USER:** S32 re-price C8 + C9, S33 build them (only if S32 clears), S34 DeepSeek prefix cache, S35 gpt-oss 47-m4 + elastic tier, S36 cheap sweep + 47-m6. Inputs re-verified at `5118a65` (code unchanged since `b3404d3`). Full row: the S31 row in the backlog archive | — | done |
-| **S32** ✅ | ~~Re-price C8 (segment merge) + C9 (FWD) on Qwen3-Next at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-07:** re-priced at HEAD: unflagged FAILS 1.39–1.58; USER admitted E3/E4/E5 (D2); flagged bundle-b STRADDLES 3.07–3.70 over 3 processes (bar 3.133); USER: investigate the slow-replay state (S33-A0), then S33 builds the full bundle incl. C8b. Full row: the S32 row in the backlog archive; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` | — | done |
-| **S33-A0** | **Investigate the slow-replay process state (why some processes pay ~5× host per graph replay)** | *(a)*; its answer sizes C8b inside S33 (≈0.5 ms/token in normal processes, 1.1–1.7 in the slow state) | a day |
-| **S33** | **Build the full flagged bundle: C8b + E1–E6 (USER, 2026-10-07)** | *(a)*; the S27 → S28 pattern | week-class |
+| **S32** ✅ | ~~Re-price C8 (segment merge) + C9 (FWD) on Qwen3-Next at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-07:** re-priced at HEAD: unflagged FAILS 1.39–1.58; USER admitted E3/E4/E5 (D2); flagged bundle-b STRADDLES 3.07–3.70 over 3 processes (bar 3.133); **final review: clean processes (p1 + p3): flagged 2.71–3.19, STRADDLES; the p2 slow-replay state is very likely a post-CUPTI probe artefact (final review); USER: S33-A0 = ≤1 h CUPTI confirmation; S33 staged (E1–E6, then decide C8b)**. Full row: the S32 row in the backlog archive; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` | — | done |
+| **S33-A0** | **Confirm the post-CUPTI replay penalty (≤ 1 h)** | *(a)*; decides whether C8b is priced at the clean 0.45–0.56 ms/token before S33 | ≤ 1 hour |
+| **S33** | **Build E1–E6, then decide C8b (STAGED; USER, 2026-10-07)** | *(a)*; the S27 → S28 pattern | week-class |
 | **S34** | **DeepSeek-V4 cross-turn prefix cache** | *(b)* up to 47.1 s of TTFT on every turn after the first, minus the diff's own prefill (S34 prices it first) | week-class (brainstorm → spec → plan) |
 | **S35** | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
 | **S36** | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
@@ -212,49 +213,76 @@ order; if that was deliberate, flip the table — the rows are independent.)
       held except 47-m4's `FP8DynamicCache`, now `vaayu_base.py:1672`, was :1382). Full row: `todo-backlog.md` "Closed
       after the 2026-10-03 cleanup".
 
-- [x] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD — ✅ CLOSED 2026-10-07: unflagged FAILS 1.39–1.58; flagged bundle-b STRADDLES 3.07–3.70 ms/token over 3 processes (bar 3.133).** USER admitted E3/E4/E5 (D2), then ruled: investigate the slow-replay state (S33-A0), then S33 builds the full flagged bundle incl. C8b. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md`.
+- [x] **S32 — re-price C8 + C9 on Qwen3-Next at HEAD — ✅ CLOSED 2026-10-07: unflagged FAILS 1.39–1.58; flagged bundle-b STRADDLES 3.07–3.70 ms/token over 3 processes (bar 3.133).** USER admitted E3/E4/E5 (D2), then ruled: investigate the slow-replay state (S33-A0), then S33 builds the full flagged bundle incl. C8b; **corrected at the final review: clean processes (p1 + p3) flagged 2.71–3.19 STRADDLES, the p2 slow state is very likely a post-CUPTI probe artefact, USER's third ruling: S33-A0 = ≤1 h CUPTI confirmation, S33 staged (E1–E6, then decide C8b)**. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md`.
 
-- [ ] **S33-A0 — the slow-replay process state: INVESTIGATE (set by the USER at S32's close, 2026-10-07; runs BEFORE S33, in its own fresh session).**
-      **Question:** why does a decode-graph replay cost ~5x host time in some processes (S32 p2: unprofiled GRAPH host
-      head.lin 25.46 us vs 4.57 / 5.09 in p1 / p3; launch fit 6.30 us + 0.323 us/node vs 4.00 + 0.015 / 4.41 + 0.016;
-      S27: 5.8 vs 16.9 us per replay, GRAPH host 0.63 vs 1.82 ms/token)? Is it a fixable cause, how often does it
-      occur, and what is it worth at N=1 server mode? It sizes C8b inside S33: ≈ 0.5 ms/token in normal processes,
-      1.1–1.7 in the slow state (S32 controller arithmetic). Seen in 1 of 3 processes (S32) and 1 of 2 (S27); cause
-      never measured.
-      **Inputs:** `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` ("The windows"); `plans/probes/s32_decode.py` (U_HOST keys
-      `S27_GRAPH@<cls>` per process) and the census JSONs `plans/probes/s32_out/s32-decode-p{1,2,3}.json`; S27's FLAG
-      (`docs/2026-10-06-S27-host-levers-RESULTS.md`); `vaayu/decode_graphs.py` (`_Capture` :326, `_Record.replay` :408),
-      `torch.cuda.CUDAGraph.replay`.
-      **Method hints (design it in its own brainstorm):** measure the per-replay host cost in >= 6 fresh processes (how
-      often is a process slow?); find what differs at load (graph pool / instantiation, CPU frequency or affinity —
-      `PIN_ENGINE_THREADS`, `KEEP_AWAKE`, other GPU tenants such as rustdesk (holds 0.14 GiB), driver state). NEVER py-spy
-      (it corrupts io_uring).
-      **Stop rule:** the slow state not reproduced in 6 fresh processes -> close as rare (report the rate); found -> name
-      the cause and price its fix; either way S33 follows (USER).
+- [ ] **S33-A0 — confirm the post-CUPTI replay penalty (≤ 1 hour; set by the USER's third ruling at S32's final review, 2026-10-07; runs BEFORE S33, in its own fresh session).**
+      **Question:** is the ~5x graph-replay host penalty (S32 p2: unprofiled `S27_GRAPH@head.lin` 26.08 us/call in U_HOST,
+      25.12 in U_SEG, vs 5.27 / 5.25 in p1 and 5.67 / 5.40 in p3) caused by a CUPTI/Kineto window run earlier in the same
+      process? Evidence that says yes: p1 and p3 ran W,U1,U_HOST,U_SEG,U_EXP,U2 (replay normal before U_EXP); p2 ran
+      W,U2,U_EXP,U_SEG,U_HOST,U1 (slow in every arm after U_EXP; U1 54.53 vs 48.48 / 48.42, U2 46.01 before U_EXP vs
+      48.42 / 48.20); under profiling the three processes do not differ (GRAPH 3.53 / 3.38 / 3.50 ms/forward); the dry run
+      (p1 order) was normal at 5.53 us; S27's mirrored p2 showed the same (U_SUB, 4th in both orders: GRAPH 0.622 vs 1.841
+      ms/token). Tally 2 of 2 mirrored processes slow, 0 of 4 p1-order processes. The mechanism is unconfirmed.
+      **Discriminating test:** ONE process, server mode, graphs ON; any decode prompt will do (replay host time does not
+      depend on content). Three arms: **A**, unprofiled: time `S27_GRAPH@<cls>` host per call with the S27/S32 timer;
+      then ONE 16-token Kineto CUPTI window, exactly as `s32_decode.py`'s U_EXP; then **B**, unprofiled: the same timer
+      again. Alternatively a model-free 61-node CUDA graph micro-test before and after a profiler window.
+      **Stop rule:** B's head-graph replay host per call >= 3x A's -> the penalty is CONFIRMED: close as a probe artefact
+      and add a PROBE RULE to this file's REFERENCE section (never time an unprofiled arm after a CUPTI arm in the same
+      process; put U_EXP last in both orders, or give it its own process). Not >= 3x -> fall back to the original
+      investigation (find what differs per process at load: graph pool / instantiation, CPU frequency or affinity,
+      other GPU tenants, driver state) and present it to the USER first.
+      **Evidence and inputs:** the numbers above (`plans/probes/s32_out/decode-p{1,2,3}.log` `U_HOST/U_SEG
+      S27_GRAPH@head.lin` lines, `s32-decode-p{1,2,3}.json`); `plans/probes/s32_decode.py` (U_EXP block; the replay
+      counter); `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` ("The p2 anomaly is a probe artefact (final review)");
+      S27's FLAG (`docs/2026-10-06-S27-host-levers-RESULTS.md`), now invalidated. NEVER py-spy (it corrupts io_uring).
       **§8:** measure only; nothing built, nothing banked.
 
-- [ ] **S33 — build the FULL flagged bundle-b: C8b + E1–E6 (set by the USER at S32's close, 2026-10-07).**
-      **USER ruling:** "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
-      session". Runs AFTER S33-A0, in its own fresh session; S33-A0's answer may change C8b's expected value. NOT closed
-      unrun: S32's flagged bundle-b STRADDLES and the USER's ruling overrode the stop rule, as pre-registered.
-      **The pieces:** C8b whole-forward graph replay (edits `vaayu_base.py` forward, shared infra) + E1 decoder kwargs
-      built once per forward; E2 prefetch scan -> once-per-forward 'next unpinned layer' index; E3 FLAGGED per-layer
-      LayerTiming record skipped on graph-replay forwards (`vaayu_telemetry.json`); E4 FLAGGED per-token stats strings,
-      RSS read and [VAAYU-IO] line built once per request (`server.log`); E5 FLAGGED every-32-token gc.collect +
-      malloc_trim moved after the response is sent; E6 `_moe_shard_names` + expert-tensor regex cached on the model at
-      load (definitions: `C9_EDITS` in `plans/probes/s32_price.py`).
-      **Price (S32, ms/token, bar 3.133):** bundle-b+flagged pooled 3.072–3.699 STRADDLES (p1 2.563–3.066, p2 3.797–4.718,
-      p3 2.857–3.313); unflagged bundle-b 1.391–1.577 FAILS. E1–E6 alone ≈ 2.37–2.81 (controller arithmetic; E5 alone
-      1.46–2.27); C8b's increment ≈ 0.45 / 1.1–1.7 (slow-replay p2) / 0.56. **Caveat:** the priced C8 numbers are biased
-      upward (r0 from the profiled trace); the KEEP ABBA is the real number.
-      **KEEP rule (S28's):** mirrored arms (off, all, all, off), server mode, graphs ON, O_DIRECT, the server's own budget,
-      `plans/probes/s28_session.py`; greedy ids identical; logits bitwise on Qwen3-Next, MiniMax-M2.7 and DeepSeek-V4
-      (`plans/probes/s28_bitwise.py`). **PLUS gates:** C8b touches `vaayu_base.py forward` (shared infra), so the dense gate
-      on BOTH Llama checkpoints (`tests/test_dense_gate.py`, `DENSE_CKPT=`), the server gate and the accumulator gate;
-      and an RSS-over-a-long-session check for E5 (gc + malloc_trim leave the token path; memory "Clone-Path Malloc
-      Retention").
-      **§8:** answer all four at close; E3/E4 change `vaayu_telemetry.json` and `server.log` output — document them; say
-      whether any knob is needed.
+- [ ] **S33 — build E1–E6, then decide C8b (STAGED; set by the USER's third ruling at S32's final review, 2026-10-07).**
+      **USER rulings:** "Investigate slow-replay state first, and than S33 = full bundle incl. C8b but only in fresh
+      session", then, after the clean re-price: **"Staged: E1–E6, then decide C8b (Recommended)"**. Runs AFTER S33-A0, in its
+      own fresh session. NOT closed unrun: S32's flagged bundle-b STRADDLES (clean 2.710–3.190; pre-registered 3.072–3.699).
+      **Price (S32, ms/token, bar 3.133):** clean (p1 + p3) unflagged bundle-b 1.154–1.157 FAILS, flagged bundle-b
+      2.710–3.190 STRADDLES (p1 2.563–3.066, p3 2.857–3.313); calibration robust (zero-label 3.034–3.511, bench
+      2.747–3.226). E1–E6 alone ≈ 2.11–2.61 (p1) / 2.30–2.76 (p3); E5 alone 1.46–2.27 and near its high end (1.95 / 2.07;
+      gc ≈ 64 ms CPU-only behind ≈ 1.5 ms of queued GPU work, final review arithmetic). C8b's increment 0.45 (p1) / 0.56
+      (p3) ms/token ≈ 0.8 % of a turn, biased up ≈ 0.1 by the profiled r0 (final reviewer, one trace: p1 w0, 752 windows;
+      E1–E3 carry the same bias). Net, the clean full flagged bundle is ≈ 2.95–3.2: AT the bar.
+      **Stage 1 — build E1–E6** (E3, E4 and E5 admitted by the USER; definitions from `C9_EDITS` in
+      `plans/probes/s32_price.py`):
+      - E1 decoder kwargs built once per forward and reused by every decoder layer;
+      - E2 prefetch scan replaced by a once-per-forward 'next unpinned layer' index;
+      - E3 FLAGGED per-layer LayerTiming record skipped on graph-replay forwards (`vaayu_telemetry.json`);
+      - E4 FLAGGED per-token stats strings, RSS read and [VAAYU-IO] line built once per request (`server.log`);
+      - E5 FLAGGED every-32-token gc.collect + malloc_trim moved after the response is sent;
+      - E6 `_moe_shard_names` + expert-tensor regex cached on the model at load.
+      **KEEP rule (THIS row's bar, not S28's 3.488):** **3.133 ms/token** of mean HIT decode (5 % of 16.04 s). Mirrored arms
+      (off, E, E, off), server mode, graphs ON, O_DIRECT, at the server's own budget held equal across arms (S28's ±7
+      ms/GB band rule), using `plans/probes/s28_session.py`. Cumulative attribution arms as S28 did: off / E1+E2+E6 /
+      + E3+E4 / + E5 (separates each admitted behaviour change). Greedy ids identical. **If the measured saving is below
+      3.133, the USER rules: keep the edits that clear the OFF spread, or revert (pre-registered).**
+      **Stage 2 — C8b**, built ONLY on the USER's word, given stage 1's measured number and C8b's priced increment
+      (≈ 0.45–0.56 ms/token on clean processes). If built: it touches `vaayu/vaayu_base.py` `forward` and
+      `vaayu/decode_graphs.py`; it needs a per-forward eligibility check with an eager fallback for streamed layers
+      (Llama-3.3-70B; DeepSeek's 4 streamed non-expert layers); it gets its own attribution arm and its own KEEP.
+      **Gates:** decode logits bitwise on Qwen3-Next, MiniMax-M2.7, DeepSeek-V4 **and gpt-oss-20b**
+      (`plans/probes/s28_bitwise.py`; gpt-oss compared against stock with `DynamicCache()` and a pinned date — memory
+      "gpt-oss Stock-Reference Traps"); the dense gate `DENSE_CKPT=` on BOTH Llama checkpoints
+      (`tests/test_dense_gate.py`); the server gate; the accumulator gates `MOE_CKPT=` on Qwen3-Next AND MiniMax-M2.7.
+      **Model-agnostic constraint on E1:** `get_attention_mask_args` takes `layer=` and builds a per-layer mask from that
+      layer's window (`vaayu/vaayu_base.py:5294-5303`, called at `:5920`; gpt-oss alternates sliding and full layers);
+      DeepSeek-V4 overrides it with a per-layer `start_pos` check (`vaayu/vaayu_deepseek_v4.py:705-750`). So E1 must key
+      its cached kwargs per window kind and keep any per-layer hook. "Mask is None at decode" holds for Qwen3-Next only.
+      **E4 consumers:** `tests/test_server_smoke.py:265-267` asserts on `gb_tok=` values parsed from the per-token
+      `[VAAYU-IO]` lines; `tests/test_token_summary_bytes.py`, `plans/probes/s6_reach_method.py` and
+      `plans/probes/s9_ab_report.py` parse them too. E4 is worth only 0.016–0.031 ms/token, so S33 must keep those
+      consumers working (an aggregate line per request with the same fields) or update them, and show the USER the trade.
+      **E5 notes:** gc stays enabled, so automatic gen-2 collections may take back part of the saving on the token path:
+      count collections with `gc.callbacks` in the E5 arm. The RSS check runs over ONE long single request per model, not
+      "a long session" (memory "Clone-Path Malloc Retention"). The gc that now runs per request can delay the next
+      request's TTFT if the client answers fast: measure it.
+      **§8:** answer all four at close; E3 and E4 change `vaayu_telemetry.json` and `server.log` output — document them in
+      `documentation/`; say whether any knob is needed.
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
@@ -392,15 +420,16 @@ at HEAD before acting.
   - KERNEL → C5 cached Triton launch: 3.723, above the bar (ESTIMATE ~2.8, not measured).
   - FWD → C9: 3.310, PRICED-UNVERIFIED (no concrete change named; the sub-labels explain 0.67 of 3.49 ms host).
   - GRAPH + GRRUN → C8 segment merge: 2.538, PRICED-UNVERIFIED (not probe-prototypable; FLAG: GRAPH host 0.63 vs
-    1.82 ms/token between processes).
+    1.82 ms/token between processes — INVALIDATED by S32's final review: very likely a post-CUPTI probe artefact).
   - GRRUN → C7 bind fast path: 1.318, FAIL.
   - ATTNCORE → C6 attention core in the graph: 0.914, FAIL (exposed fraction 0.31; the graph breaks it would remove
     are not counted).
   - **S28 (merged `6fd79fa`, 2026-10-07) built the KERNEL seam as C5** (per-layer CUDA graph, +2.56 ms/token measured).
-    **Re-priced by S32 (2026-10-07, post-S28, 3 processes, ms/token, bar 3.133):** C8a 0.137–0.387, C8b 1.084–2.406
-    (slow-replay process p2 1.856–2.406; normal 1.08–1.21); C9 = named edits E1 + E2 0.550–0.654, E1–E6 incl. flagged
-    E3/E4/E5 ≈ 2.37–2.81 pooled (E5, the gc move, is 1.46–2.27 of it); flagged bundle-b 3.072–3.699 STRADDLES.
-    **= S33-A0 (slow-replay state) / S33 (build the full bundle, USER).**
+    **Re-priced by S32 (2026-10-07, post-S28, clean processes p1 + p3, ms/token, bar 3.133; final review):** C8a
+    0.137–0.287, C8b 1.084–1.210 (the p2 values 1.856–2.406 were post-CUPTI artefact); C9 = named edits E1 + E2
+    0.550–0.567, E1–E6 incl. flagged E3/E4/E5 ≈ 2.11–2.76 (E5, the gc move, is 1.46–2.07 of it); unflagged bundle-b
+    1.154–1.157 FAILS, flagged bundle-b 2.710–3.190 STRADDLES (pre-registered 3 processes: 3.072–3.699).
+    **= S33-A0 (≤ 1 h CUPTI confirmation) / S33 (STAGED: E1–E6, then decide C8b; USER).**
 
 - [x] **[bug] The server loaded Qwen3-Next with BUFFERED I/O — ✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`).**
   `_should_use_direct_io` now subtracts what the expert RAM cache will pin (`expert_arena_bytes`) before asking
