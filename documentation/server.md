@@ -304,20 +304,24 @@ per token must read `/proc/<pid>/status` itself.
 
 **Host-memory hygiene runs after the response, not between tokens.** Inside
 the server the engine no longer runs its garbage collection and `malloc_trim`
-every 32 tokens in the middle of a request. It marks them due, and the server
-runs them once the response body has been sent, holding the engine lock, and
-prints `[Vaayu-Server] deferred hygiene: <N> ms` to `server.log`. A request
-that arrives during those N milliseconds waits for them: 75–99 ms on
-Qwen3-Next-80B with a warm expert cache, under 40 ms on the other checkpoints
-measured (2026-10-07). A library caller (`AutoModel` without the server) keeps
-the every-32-token cadence.
+every 32 forward passes in the middle of a request. It marks them due, and the
+server runs them once the body of a successful (200) response has been sent,
+holding the engine lock, and prints `[Vaayu-Server] deferred hygiene: <N> ms`
+to `server.log`. After a refused or failed request they stay due until the next
+successful one. A request that arrives during those N milliseconds waits for
+them: 75–99 ms on Qwen3-Next-80B with a warm expert cache, under 40 ms on the
+other checkpoints measured (2026-10-07). A library caller (`AutoModel` without
+the server) keeps the every-32-pass cadence.
 
 **`vaayu_telemetry.json` is no longer written.** The engine used to rewrite
-that file in the working directory at the end of every request, which cost up
-to about 1.1 s per request once its 4,096-token ring was full. The per-layer
-timing ring is still kept in memory, and `model.telemetry.dump_json(path)`
-writes it on demand. On a decode pass that replays CUDA graphs, a layer that
-is resident in VRAM records no per-layer entry; a streamed layer always does.
+that file in the working directory at the end of every request, which on
+Qwen3-Next-80B cost about 0.29 ms per token held in its ring: about 1.2 s per
+request once the 4,096-token ring is full (extrapolated). The per-layer timing
+ring is still kept in memory, and a library caller can write it on demand with
+`model.telemetry.dump_json(path)`; the server exposes no endpoint for it. On a
+decode pass that is eligible for CUDA-graph replay (one token, one stream), a
+layer that is resident in VRAM records no per-layer entry, whether or not that
+layer was actually replayed; a streamed layer always does.
 
 ### Speed
 

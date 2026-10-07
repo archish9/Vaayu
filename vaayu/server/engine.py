@@ -322,6 +322,9 @@ class EngineHandle:
         decode-graph captures rely on gc.disable() to keep a collection out of
         a capture -- so it must never overlap a generation. A request that
         arrives meanwhile waits for it; the line below says how long that was.
+        (If this task is cancelled while the collection runs, the lock is
+        released before the pool thread has finished; nothing cancels it
+        while serving.)
         """
         model = self.model
         run = getattr(model, "run_deferred_hygiene", None)

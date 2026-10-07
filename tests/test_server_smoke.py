@@ -296,36 +296,51 @@ def test_the_token_summary_reports_nvme_bytes_consistent_with_pinning(client):
 
 def test_the_host_hygiene_runs_after_a_response(client):
     """S33 E5 through the real server. In server mode the engine no longer runs
-    its every-32-token gc + malloc_trim between tokens: `forward` marks it due
+    its every-32-pass gc + malloc_trim between tokens: `forward` marks it due
     and the chat routes run it as the response's background task, which prints
     one line with how long it took. A fake-engine test cannot show this: it
     takes the real model's `forward` to set the mark and the real scheduler to
     have released the engine lock.
 
-    The request is this test's own, and its length is ASSERTED: the mark falls
-    on every 32nd forward pass of the process, so only an answer of 32 tokens
-    or more is certain to cross one. The requests above stop far short of that
-    on some checkpoints (24 passes in total on Qwen3-Next), and a check that
-    leaned on them could not tell "the hook is gone" from "nothing was due".
+    The premise is ASSERTED, in forward passes, not tokens: the mark falls on
+    every 32nd pass of the process, and with a speculator on (the default on a
+    dense checkpoint) one pass accepts several tokens, so a long answer alone
+    proves nothing. This test sends its own requests until one of them crosses
+    a mark (or finds the hygiene already due), and then requires a NEW line:
+    one left in server.log by an earlier request would also prove nothing.
     """
     import time
-    body = dict(BODY, session_id="smoke-hygiene", stream=False, max_tokens=40,
-                messages=[{"role": "user", "content":
-                           "Write the numbers from 1 to 100 in order, separated by spaces."}])
-    r = client.post("/v1/chat/completions", json=body)
-    assert r.status_code == 200, r.text[:200]
-    produced = r.json()["usage"]["completion_tokens"]
-    assert produced >= 32, (
-        f"only {produced} tokens came back, so no 32-token mark is certain to "
-        f"have been crossed and this check would prove nothing")
+    model = client.app.state.engine.model
+    line = "[Vaayu-Server] deferred hygiene:"
+    log = _run_dir() / "server.log"
+
+    def lines():
+        return log.read_text(errors="replace").count(line)
+
+    crossed = False
+    for attempt in range(8):
+        passes_before = model._token_count
+        due_before = bool(getattr(model, "_decode_hygiene_due", False))
+        lines_before = lines()
+        body = dict(BODY, session_id=f"smoke-hygiene-{attempt}", stream=False, max_tokens=40,
+                    messages=[{"role": "user", "content":
+                               "Write the numbers from 1 to 100 in order, separated by spaces."}])
+        r = client.post("/v1/chat/completions", json=body)
+        assert r.status_code == 200, r.text[:200]
+        if due_before or model._token_count // 32 > passes_before // 32:
+            crossed = True
+            break
+    assert crossed, (
+        f"8 requests made {model._token_count} forward passes in total without "
+        f"crossing a 32-pass mark, so nothing was ever due and this check would "
+        f"prove nothing")
     # The line reaches server.log through capture_stdio's fd-level pump.
     deadline = time.time() + 10
-    while "[Vaayu-Server] deferred hygiene:" not in (
-            _run_dir() / "server.log").read_text(errors="replace"):
+    while lines() <= lines_before:
         assert time.time() < deadline, (
-            "no deferred-hygiene line after a response that crossed a 32-token "
-            "mark: either forward still collects inside the request, or the "
-            "chat routes lost their background task")
+            "no new deferred-hygiene line after a response whose request crossed "
+            "a 32-pass mark: either forward still collects inside the request, or "
+            "the non-streaming chat route lost its background task")
         time.sleep(0.2)
 
 

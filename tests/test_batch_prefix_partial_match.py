@@ -38,8 +38,7 @@ class _Recorder:
         self.tokenizer = type("T", (), {"pad_token_id": 0})()
         self.config = type("C", (), {"eos_token_id": -1})()
         self.telemetry = type("Tel", (), {
-            "reset_batch_overlap": lambda s: None,
-            "dump_json": lambda s, *a, **k: None})()
+            "reset_batch_overlap": lambda s: None})()
         self._prefix_cache = pc
         self.calls = []
 

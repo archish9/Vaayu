@@ -5767,7 +5767,8 @@ class VaayuBaseModel(GenerationMixin):
                 return executor.submit(self._load_from_strategy, _n)
 
             if self.prefetching:
-                # Once per forward: which layer to prefetch after each layer.
+                # Once per forward: which layer to prefetch after each layer. Built
+                # only under `self.prefetching`, as both readers in the loop are.
                 _next_unpinned = next_unpinned_table(
                     self.layer_names,
                     self.pinned_layer_names | self.non_expert_pinned_layer_names)
@@ -5775,7 +5776,9 @@ class VaayuBaseModel(GenerationMixin):
                 if _k is not None:
                     future = _submit_load(self.layer_names[_k])
 
-            _kw_base = {}   # (len_p, len_s) -> this forward's layer-independent kwargs
+            # (len_p, len_s) -> this forward's layer-independent kwargs. A layer may
+            # be handed this very dict: never mutate a layer's kwargs in place.
+            _kw_base = {}
 
             # S12: on an eligible forward (one token, N=1) each resident decoder layer
             # replays as CUDA graphs; every other forward is stock.
@@ -6035,9 +6038,12 @@ class VaayuBaseModel(GenerationMixin):
                         )
 
                     # No per-layer record for a VRAM-resident layer on a forward
-                    # that replays decode graphs: every disk field is zero and
-                    # compute_us is only the time to launch a graph. A streamed
-                    # layer always records -- its fields are real disk timings.
+                    # that is ELIGIBLE for decode graphs (one token, N=1): every
+                    # disk field of such a record is zero. Eligible is not
+                    # replayed: a layer the graphs refused, the warm-up token and
+                    # the embedding / norm / lm_head run eagerly and lose their
+                    # compute_us with it. A streamed layer always records -- its
+                    # fields are real disk timings.
                     if not (_dg_on and _layer_pinned):
                         self.telemetry.record_layer(LayerTiming(
                             layer_name=layer_name,
@@ -6137,7 +6143,9 @@ class VaayuBaseModel(GenerationMixin):
                    f"={_la['hits']/_la['total']:.0%}" if _la and _la["total"] else "")
         if self._token_count % 32 != 0 and getattr(self, "_rss_kb_last", None) is not None:
             # rss= is sampled: read on the first pass and on every 32nd, the
-            # last value is repeated in between.
+            # last value is repeated in between. On a 32nd pass a library
+            # caller's hygiene (above) has just trimmed the heap, so its sample
+            # is the trough; a probe after the sawtooth reads /proc itself.
             _rss_kb = self._rss_kb_last
         else:
             try:
@@ -6242,13 +6250,6 @@ class VaayuBaseModel(GenerationMixin):
                     cache.key_cache[i]   = cache.key_cache[i][:, :, -target_seq_len:, :]
                     cache.value_cache[i] = cache.value_cache[i][:, :, -target_seq_len:, :]
 
-    # A1 cross-turn prefix cache concurrency invariant: one in-flight request
-    # per session id. Two concurrent generate() calls with the SAME session_id
-    # would both check out / mutate the same cache object and corrupt each
-    # other. Parallel fan-out MUST use distinct session ids. PrefixCacheStore
-    # .lookup()'s checkout (Task 4) makes a second concurrent same-id call a
-    # miss (full prefill) rather than a corruption, so the failure mode is a
-    # perf loss, not wrong output.
     def run_deferred_hygiene(self) -> bool:
         """Run the host-memory hygiene that `forward` deferred. True if it ran.
 
@@ -6265,6 +6266,13 @@ class VaayuBaseModel(GenerationMixin):
         clean_memory(cuda=False)
         return True
 
+    # A1 cross-turn prefix cache concurrency invariant: one in-flight request
+    # per session id. Two concurrent generate() calls with the SAME session_id
+    # would both check out / mutate the same cache object and corrupt each
+    # other. Parallel fan-out MUST use distinct session ids. PrefixCacheStore
+    # .lookup()'s checkout (Task 4) makes a second concurrent same-id call a
+    # miss (full prefill) rather than a corruption, so the failure mode is a
+    # perf loss, not wrong output.
     def _keepawake_ctx(self):
         """The keep-awake for one generation (row 27), built once per model.
 

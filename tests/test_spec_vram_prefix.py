@@ -77,8 +77,7 @@ class _FakeMoEModel:
         eos_token_id = -999          # unreachable: the fake never emits it
 
     class _Telemetry:
-        def dump_json(self, path):
-            pass
+        pass
 
     def __init__(self, geo, budget, layer_ids, load_time_range,
                  draft_tokens=DRAFT_TOKENS):

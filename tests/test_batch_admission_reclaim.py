@@ -185,8 +185,7 @@ class _StubEngine:
             "num_key_value_heads": 2, "num_attention_heads": 2,
             "hidden_size": 8})()
         self.telemetry = type("Tel", (), {
-            "reset_batch_overlap": lambda s: None,
-            "dump_json": lambda s, *a, **k: None})()
+            "reset_batch_overlap": lambda s: None})()
         self.kv_cache_mode = "bf16"
         self._expert_vram_cache = vram_cache
         self._moe_geometry = {"working_set_bytes": working_set}

@@ -6,6 +6,7 @@ layers, CPU, no checkpoint), so they pin behaviour, not source text.
 import asyncio
 import inspect
 import io
+import re
 import sys
 import types
 
@@ -79,18 +80,22 @@ class _Model(vb.VaayuBaseModel):
 
     # the four kwargs hooks, counted
     def get_past_key_value_args(self, past_key_values):
+        self.hook_order.append("past")
         self.hook_calls["past"] += 1
         return super().get_past_key_value_args(past_key_values)
 
     def get_pos_emb_args(self, len_p, len_s):
+        self.hook_order.append("pos_emb")
         self.hook_calls["pos_emb"] += 1
         return super().get_pos_emb_args(len_p, len_s)
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
+        self.hook_order.append("position_ids")
         self.hook_calls["position_ids"] += 1
         return super().get_position_ids_args(full_position_ids, len_p, len_s)
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s, layer=None):
+        self.hook_order.append("mask")
         self.hook_calls["mask"] += 1
         self.mask_layers.append(layer)
         return self.mask_hook(full_attention_mask, len_p, len_s, layer)
@@ -116,6 +121,7 @@ def make(n_dec=4, pinned="all", graphs=None, windows=None, moe_shards=()):
     m.pinned_layer_names = set(m.layer_names) if pinned == "all" else set(pinned)
     m.non_expert_pinned_layer_names = set()
     m.hook_calls = {"past": 0, "pos_emb": 0, "position_ids": 0, "mask": 0}
+    m.hook_order = []
     m.mask_layers = []
     m.mask_hook = lambda mask, len_p, len_s, layer: {}
     m.loads = []
@@ -228,6 +234,10 @@ def test_the_three_layer_independent_hooks_run_once_per_forward_and_the_mask_hoo
     run(m)
     assert m.hook_calls == {"past": 1, "pos_emb": 1, "position_ids": 1, "mask": 6}
     assert m.mask_layers == m.dec                       # each call is told its own layer
+    # The mask hook must come AFTER the hoisted ones: DeepSeek-V4's mask hook
+    # reads a reference its past-key-values hook stores.
+    first_mask = m.hook_order.index("mask")
+    assert {"past", "pos_emb", "position_ids"} <= set(m.hook_order[:first_mask])
 
 
 def test_every_layer_still_gets_the_kwargs_the_loop_used_to_build():
@@ -403,7 +413,7 @@ def test_the_server_hook_runs_the_deferred_hygiene_and_says_how_long_it_took(mon
     # FLUSHED, not merely written: it is the last line a response prints, and
     # behind a pipe an unflushed line stays in the buffer until the next
     # request prints something (the server gate caught exactly that).
-    assert "[Vaayu-Server] deferred hygiene:" in out.flushed
+    assert re.search(r"\[Vaayu-Server\] deferred hygiene: \d+ ms", out.flushed)
 
 
 def test_the_server_hook_never_overlaps_a_generation():
@@ -534,6 +544,19 @@ def test_the_server_turns_deferral_on_for_the_model_it_loads(monkeypatch):
         pass
     (model,) = loaded
     assert model.defer_decode_hygiene is True
+
+
+def test_an_injected_engine_keeps_its_own_hygiene_cadence():
+    """Tests and embedded callers inject an engine and keep using the process:
+    the server must not switch their model to deferred hygiene, because nothing
+    is then obliged to run the deferred half for them."""
+    from fastapi.testclient import TestClient
+    from vaayu.server.app import create_app
+    engine = _RouteEngine([])
+    engine.model.defer_decode_hygiene = False
+    with TestClient(create_app(engine=engine)):
+        pass
+    assert engine.model.defer_decode_hygiene is False
 
 
 # ── E6: shard names cached on the model ─────────────────────────────────────

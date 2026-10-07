@@ -62,9 +62,6 @@ class _FakeMoEModel:
         def reset_batch_overlap(self):
             pass
 
-        def dump_json(self, path):
-            pass
-
     def __init__(self, m, need):
         self._moe_geometry = {"working_set_bytes": m["working_set"],
                               "expert_bytes": int(11e6), "top_k": 8,

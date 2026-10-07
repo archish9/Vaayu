@@ -296,7 +296,7 @@ def test_persist_runs_before_store_compresses():
     c = _bf16_cache(seq=4)
     fake = types.SimpleNamespace(
         _kv_writer=_Writer(), config=None,
-        telemetry=types.SimpleNamespace(dump_json=lambda p: None))
+        telemetry=types.SimpleNamespace())
     VaayuBaseModel._persist_and_store(fake, _PC(), "sess", c, [1, 2, 3, 4, 5])
     assert [o[0] for o in order] == ["persist", "store"]
 
