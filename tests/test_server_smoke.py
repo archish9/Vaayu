@@ -18,6 +18,7 @@ cgroup cap (todo.md, "Never load a model twice in one pytest process").
 """
 import json
 import os
+import re
 
 import pytest
 
@@ -200,20 +201,55 @@ def test_oversized_prompt_refused(client):
     assert r.status_code == 400, r.text[:200]
 
 
-def test_prefix_reuse(client):
-    # ── 4. the prefix pool was exercised by the two identical turns ──
+def _prefix_counts(client):
+    """(hits, matched prompt tokens) off /health's prefix line; None when the
+    pool is off."""
     stats = client.get("/health").json()["prefix_cache"]
-    print(f"prefix cache: {stats}")
-    # Assert the PREMISE, not just the field: "stats is non-empty" passes
-    # even when the pool is disabled, which is how the first run of this
-    # gate reported green while prefix reuse was off entirely.
     if stats == "disabled":
+        return None
+    m = re.match(r"(\d+)hit/\d+miss/\d+evict .*saved=(\d+)/\d+ tok", stats)
+    assert m, f"unrecognised prefix stats line: {stats!r}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def test_prefix_reuse(client):
+    # ── 4. a turn that EXTENDS the previous one is served from the prefix pool ──
+    # Until S34 this asserted `"hits=0" not in stats`, a substring the stats
+    # line never contains (it reads `0hit/1miss/...`), so it passed with zero
+    # hits. It also leaned on the two IDENTICAL turns above, which a cache
+    # servable at one length (a hybrid model's, DeepSeek-V4's) cannot serve:
+    # the stored entry is prompt + reply, and the same prompt does not contain
+    # the reply. So this runs its own session, sends a second turn that
+    # APPENDS to the first, and reads the pool's counters before and after.
+    if _prefix_counts(client) is None:
         # Expected only with an explicit KV_CACHE_MODE="fp16": the bare
         # DynamicCache has no to_cpu/to_device/resident_bytes. Since row 3
         # (2026-09-11) "auto" enables the pool on every loader.
         print("  (pool disabled -- expected only with KV_CACHE_MODE='fp16', todo row 3)")
-    else:
-        assert "hits=0" not in stats, stats
+        return
+    first = dict(BODY, session_id="smoke-prefix", stream=False)
+    r = client.post("/v1/chat/completions", json=first)
+    assert r.status_code == 200, r.text[:200]
+    b = r.json()
+    reply = b["choices"][0]["message"].get("content") or ""
+    hits0, matched0 = _prefix_counts(client)
+    second = dict(first, messages=first["messages"] + [
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": "Now add a docstring to it."}])
+    r = client.post("/v1/chat/completions", json=second)
+    assert r.status_code == 200, r.text[:200]
+    hits1, matched1 = _prefix_counts(client)
+    prompt_tokens = b["usage"]["prompt_tokens"]
+    print(f"prefix reuse: hits {hits0} -> {hits1}, matched tokens {matched0} -> "
+          f"{matched1}, first prompt {prompt_tokens} tokens")
+    assert hits1 == hits0 + 1, (
+        f"the appending turn was not served from the pool: hits {hits0} -> {hits1}. "
+        f"{client.get('/health').json()['prefix_cache']}")
+    # A hit alone is not reuse: a named session whose context diverged still
+    # counts one with nothing matched. The whole first prompt must be reused.
+    assert matched1 - matched0 >= prompt_tokens, (
+        f"the appending turn reused {matched1 - matched0} tokens, fewer than the "
+        f"first turn's {prompt_tokens}-token prompt")
 
 
 def _run_dir():
