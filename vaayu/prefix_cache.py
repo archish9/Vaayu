@@ -109,8 +109,12 @@ class PrefixCacheStore:
             # always satisfy L == len(token_ids) - 1 (the last sampled token was
             # never fed), so the second clause is an invariant guard: it fires
             # only if some future store breaks that relationship.
-            from .batch import cache_holds_recurrent_state
-            if cache_holds_recurrent_state(entry.cache):
+            # The same rule serves a cache that DECLARES itself one-length
+            # (DeepSeek-V4's preallocated window, S34): it cannot be cropped
+            # either, for a different reason, and `cache_is_one_length` is true
+            # for both.
+            from .batch import cache_is_one_length
+            if cache_is_one_length(entry.cache):
                 fed = entry.cache.get_seq_length()
                 if (m < len(entry.token_ids)
                         or min(m, len(input_ids) - 1) < fed):
@@ -361,7 +365,17 @@ def restore_on_abort(store, session_id: str, token_ids: list, cache,
         keep = min(int(prefix_len), seq_len)
         if keep <= 0:
             return False
-        from .batch import cache_holds_recurrent_state
+        from .batch import cache_holds_recurrent_state, cache_is_one_length
+        if cache_is_one_length(cache) and not cache_holds_recurrent_state(cache):
+            # A DECLARED one-length cache (S34). DeepSeek-V4's attention writes
+            # its Compressor / Indexer state before it advances the layer's
+            # length, so an interrupted forward can leave the cache changed at
+            # an unchanged length: the length cannot vouch for the state.
+            print(f"[Vaayu-Prefix] WARNING: aborted turn on session "
+                  f"{session_id!r}: its cache is servable at one length only "
+                  f"and cannot vouch for its state after an interrupted "
+                  f"forward; dropping the entry. The next turn prefills in full.")
+            return False
         if keep < seq_len and cache_holds_recurrent_state(cache):
             print(f"[Vaayu-Prefix] WARNING: aborted turn on session "
                   f"{session_id!r} advanced a recurrent (linear-attention) "
