@@ -154,8 +154,8 @@ def test_a_pool_too_small_for_two_declared_sessions_evicts_one_cleanly(capsys):
 # ── an aborted turn ──────────────────────────────────────────────────────────
 
 def test_an_aborted_turn_drops_a_declared_entry_even_at_an_unchanged_length(capsys):
-    """A recurrent cache at its adopted length IS restored (42-B,
-    `tests/test_prefix_restore_on_abort.py`). A declared one is not:
+    """Neither a recurrent cache (I4, `tests/test_prefix_restore_on_abort.py`)
+    nor a declared one is restored at an unchanged length:
     DeepSeek-V4's attention writes its Compressor / Indexer state before it
     advances the layer's length, so an interrupted forward can leave the cache
     changed at an unchanged length."""

@@ -339,49 +339,45 @@ def restore_on_abort(store, session_id: str, token_ids: list, cache,
     Re-storing the mutated cache against the original token list would be
     corruption, which is worse than losing the entry.
 
+    That length is one EVERY KV layer holds. A forward that dies inside layer k
+    has appended this turn's positions to layers 0..k and not to the rest, and
+    the adopted cache can itself be one position short of `prefix_len` (the
+    stored turn's last sampled token is never fed). `get_seq_length()` reads the
+    FIRST KV layer, so cropping to min(prefix_len, it) stored a ragged entry --
+    measured on Llama-3.2-1B through the server (I4, 2026-10-08): layers 0-8 at
+    88, layers 9-15 at 87, and the client's retry answered from it.
+
+    A cache servable at one length only (`cache_is_one_length`) is never
+    restored, whatever its lengths say. A recurrent (linear-attention) state is
+    a fixed-size summary that a forward advances before any KV length moves: on
+    Qwen3-Next an abort inside layer 1 left every KV length at the adopted value
+    while the state had consumed the turn, and restoring it made the client's
+    retry diverge in 95 of 172 cache tensors (I4). DeepSeek-V4's attention
+    writes its Compressor / Indexer state before it advances the layer's length
+    -- the same shape. Dropping costs that session's next turn a full prefill.
+
     Never raises: this runs on an exception path, and a failure here would
     replace the real error the caller is about to re-raise. Returns True only
     when an entry actually went back.
-
-    A recurrent (linear-attention) cache cannot be safely cropped (42-B):
-    `crop` shortens the KV layers' `_seq_len` only, and the conv/recurrent
-    state a gated-delta-net layer keeps is a fixed-size summary that has
-    already consumed every position fed to it -- there is no "first N
-    tokens" of it to roll back to. If some forwards completed before the
-    abort, the state has moved past `prefix_len` while the cropped KV would
-    claim only `prefix_len` positions, and the next turn's lookup() reads
-    `get_seq_length()` (the KV length) to decide what is safely servable --
-    it has no way to see that the state disagrees. Serving that entry would
-    resume generation against a state that already consumed tokens the next
-    turn is about to re-feed it: silently wrong text, no crash. So a
-    recurrent cache that actually needs cropping is dropped instead of
-    stored; the no-crop case (the turn aborted before any forward completed,
-    so KV and state already agree) is unaffected and still restores.
     """
     if store is None or prefix_len <= 0:
         return False
     try:
-        seq_len = int(cache.get_seq_length())
-        keep = min(int(prefix_len), seq_len)
-        if keep <= 0:
-            return False
         from .batch import cache_holds_recurrent_state, cache_is_one_length
-        if cache_is_one_length(cache) and not cache_holds_recurrent_state(cache):
-            # A DECLARED one-length cache (S34). DeepSeek-V4's attention writes
-            # its Compressor / Indexer state before it advances the layer's
-            # length, so an interrupted forward can leave the cache changed at
-            # an unchanged length: the length cannot vouch for the state.
+        if cache_is_one_length(cache):
+            why = ("its recurrent (linear-attention) state advances before any "
+                   "KV length does, so no length can vouch for it"
+                   if cache_holds_recurrent_state(cache) else
+                   "its cache is servable at one length only and cannot vouch "
+                   "for its state after an interrupted forward")
             print(f"[Vaayu-Prefix] WARNING: aborted turn on session "
-                  f"{session_id!r}: its cache is servable at one length only "
-                  f"and cannot vouch for its state after an interrupted "
-                  f"forward; dropping the entry. The next turn prefills in full.")
+                  f"{session_id!r}: {why}; dropping the entry. The next turn "
+                  f"prefills in full.")
             return False
-        if keep < seq_len and cache_holds_recurrent_state(cache):
-            print(f"[Vaayu-Prefix] WARNING: aborted turn on session "
-                  f"{session_id!r} advanced a recurrent (linear-attention) "
-                  f"state past the restorable length; dropping the entry "
-                  f"rather than storing one whose KV and state disagree. "
-                  f"The next turn prefills in full.")
+        lengths = (cache.kv_layer_lengths() if hasattr(cache, "kv_layer_lengths")
+                   else None) or [cache.get_seq_length()]
+        keep = min([int(prefix_len), *(int(n) for n in lengths)])
+        if keep <= 0:
             return False
         cache.crop(keep)
         store.store(session_id, list(token_ids[:keep]), cache)
