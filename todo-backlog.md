@@ -9362,3 +9362,71 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   cannot serve a replay — the stored entry is prompt + generated tokens, which the same prompt does not contain.
   Fix = parse the hit count and assert it rose across a turn that EXTENDS the previous one (system + user +
   assistant reply + new user), then see it fail with the pool off.
+
+- **[bug] [~] I4 — (row as it stood when it closed 2026-10-08; closing verdict in todo.md) IN PROGRESS since 2026-10-08 (fresh session started; systematic-debugging, Phase 1 = reproduce
+  on device before any fix) — NEXT, IN ITS OWN FRESH SESSION (USER 2026-10-08, at S34's merge: "merge and fix bug in fresh
+  session"; S34 itself is merged, `e7c69ea`): a SUCCESSFUL OOM retry in the layer loop pools a
+  silently wrong one-length cache.** `vaayu/vaayu_base.py:5965-6001`: on `torch.cuda.OutOfMemoryError` the layer loop
+  re-calls `layer(seq, **kwargs)`; the `start_pos` check (`:5961`) sits outside the loop and is not re-run. DeepSeek's
+  layer has already written the ring, the Compressor / Indexer state and `cumulative_length`
+  (`vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py:1380-1392`) before the likely OOM sites (`sparse_attn`, the
+  MoE expert transfers). The reviewer's CPU check on a `DeepseekV4CacheLayer`: after a 512-token chunk's write,
+  `history(start_pos)` no longer equals what the first attempt read; a one-token step's ring is idempotent; by
+  reading, the overlap carry at `:1155-1156` is not idempotent on a block flush either. The mechanism PREDATES S34 (it
+  could corrupt the rest of one request); what S34 adds is persistence: the request completes, the cache is stored,
+  and every later appending turn inherits it. **Same hazard for a hybrid's recurrent state** (Qwen3-Next, pooled since
+  42-B). **Reachability UNCONFIRMED:** no `OOM on` line in any S34 log; the only one in all probe logs is a gpt-oss
+  limit run that did not recover. **Two fix shapes, the USER's choice:** (a) do not retry when the cache is
+  one-length — raise, so the abort rule drops the entry; (b) mark the request and skip the store. Not built in the
+  S34 branch: it is outside the approved spec's change list and it edits the layer loop every model runs — SHARED
+  INFRA, so every on-device gate re-runs (dense on both Llama, accumulator, server, prefix). To confirm before
+  building: force one OOM inside a DeepSeek layer on a multi-token chunk, let the retry succeed, and compare the
+  stored cache with a clean run's. Until a guard exists, a recovered mid-layer OOM on DeepSeek-V4 would poison that
+  session's later appending turns silently.
+  **Inputs gathered for that session (2026-10-08, `main` at `e7c69ea`; nothing built):** (1) the retry is the
+  `for _oom_retry in range(_MAX_OOM_RETRIES + 1)` loop at `vaayu_base.py:5965-6001`; a recovered retry prints
+  `[Vaayu] ⚠️ OOM on <layer> (attempt k/2). Clearing cache and retrying...` — grep that line to know one
+  happened. (2) The store is `_persist_and_store`, called at `vaayu_base.py:6358` after `super().generate`
+  returns (and at `:6649` / `:6802` in the speculative loop); the drop-on-error rule is `restore_on_abort`
+  (`vaayu/prefix_cache.py`), reached only from the `except BaseException` at `:6349`. (3) The model's flags are
+  `self._cache_is_one_length` and `self._cache_holds_recurrent_state` (`vaayu_base.py:4294-4302`, set by
+  `_refuse_unsupported_prefix_cache`; DeepSeek's override sets its own); the predicate is
+  `vaayu.batch.cache_is_one_length`. (4) The reviewer's CPU repro of the non-idempotent write is kept at
+  `plans/probes/s34_retry_check.py`; the finding's full text at `docs/2026-10-08-S34-final-review-findings.md`
+  (I4). (5) OPEN QUESTION, not read: is a PLAIN K/V cache safe under the same retry (does `update` append this
+  layer's K/V twice if the first attempt had written it before the OOM)? Answer it before scoping the guard to
+  one-length caches only. (6) Order of work: price reachability first (force one OOM inside a layer on a
+  multi-token chunk), settle (a) raise vs (b) skip-the-store with the USER, then build and re-run every gate —
+  it is the layer loop all models share.
+  **PHASE 1 DONE 2026-10-08 (this session) — CONFIRMED ON DEVICE, AND WIDER THAN THIS ROW SAID: every cache family
+  is hit, not only one-length ones. Open question (5) is answered: a plain K/V cache is NOT safe.** Probe
+  `plans/probes/i4_retry_repro.py` (real server app; ONE injected `torch.cuda.OutOfMemoryError` inside one decoder
+  layer, so the loop's retry runs and succeeds; sessions clean-A / inject-B / clean-C on the same prompt, three
+  appending turns each; the pooled entry is compared bitwise after every turn). Logs `plans/probes/i4_out/`. The
+  premise held in every run: clean-A == clean-C, 0 differing tensors.
+  - **Llama-3.2-1B (plain K/V, `FP8DynamicCache` bf16):** OOM at the end of layer 8, or just before its `mlp`, in
+    turn 1's prefill → the pooled cache differs in 16 of 34 tensors (K and V of layers 8–15, every sequence slot,
+    max|d| 15.14). With 96 generated tokens the reply TEXT differs on all three turns (148 vs 143 positions stored).
+    OOM on a decode step → 14 of 34 (layers 9–15, every slot from the retried token on).
+  - **Negative control** (OOM raised before the layer's forward starts, so before any cache write): 0 of 34. The
+    retry is harmless only there — and a layer's large allocations (attention scores, MLP / expert transfers) all
+    come AFTER its cache write.
+  - **Qwen3-Next (hybrid):** linear-attention layer 24 → 47 of 172 differ (conv / recurrent states and every later
+    K/V); full-attention layer 23 → `_seq_len[23]` is 105 against 56 (the prompt's 49 K/V appended twice), 51 of
+    172; turns 2 and 3 were pool HITs on that entry.
+  - **DeepSeek-V4:** layer 22 (compress ratio 4), turn 2's 16-position diff at `start_pos` 242 → 92 of 237 differ
+    (layer 22's compressed keys and index keys at 2 slots, later layers' rings and states); turn 3 was a HIT on it.
+  - **Root cause:** the handler re-calls `layer(seq, **kwargs)`, and no layer's forward is idempotent — each
+    writes per-sequence state (K/V append at `_seq_len`, `vaayu_base.py:1774`; recurrent state; DeepSeek's ring and
+    Compressor) before the allocation that fails, and nothing rolls it back or notices. It predates the prefix
+    pool; the pool makes it outlive the request.
+  - **Reachability in the wild, unchanged:** every log under `plans/` and `docs/` holds ONE real retry
+    (`plans/probes/s18_out/split-L30720-r1.log`, a gpt-oss limit run) and it failed both attempts. No recovered
+    retry is on record, so the retry has never been seen to help.
+  - **What a raise lands on (read, `vaayu/prefix_cache.py:328`):** `restore_on_abort` crops a plain K/V entry back
+    to its matched length (exact: `crop` lowers every layer's `_seq_len`, and the slots below it were never
+    rewritten), and drops a hybrid's or a one-length entry. So "raise on the first OOM" needs no new pool code.
+  - **Fix shape DECIDED 2026-10-08 by the USER: "Remove the retry"** — the first OOM in a layer raises, for every
+    model. (Offered against: keep the retry for plain K/V with a per-layer rollback; and (b) skip-the-store. The
+    row's (a) as written, one-length caches only, would leave plain K/V models broken; (b) would still return a
+    reply computed from the corrupt cache.) Plan: `docs/superpowers/plans/2026-10-08-i4-remove-oom-retry.md`.
