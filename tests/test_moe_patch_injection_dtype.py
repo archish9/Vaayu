@@ -290,7 +290,7 @@ def test_a_cuda_oom_during_the_device_copy_is_not_relabelled(monkeypatch):
     """I1: `_inject_no_cast`'s blanket `except Exception` used to catch
     `torch.cuda.OutOfMemoryError` (a RuntimeError subclass) off the H2D copy
     and relabel it as `PackedInjectionError` — hiding it from
-    `vaayu_base.py`'s isinstance-based OOM retry and stating the opposite of
+    `vaayu_base.py`'s isinstance-based OOM handler and stating the opposite of
     the truth (a transient VRAM shortage is not a packed-dtype defect). The OOM
     must propagate as itself out of `_inject_no_cast`, where
     `_inject_expert_weights`'s existing (unchanged, out of this fix's scope)

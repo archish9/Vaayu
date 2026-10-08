@@ -34,14 +34,7 @@ def test_oom_handler_does_not_truncate_the_kv_cache():
     assert "_oom_seq_len // 2" not in body
 
 
-def test_oom_handler_still_retries_non_destructively():
-    """empty_cache/gc are free to keep -- they do not change the sequence."""
-    body = _forward_src()
-    body = body[body.index("except torch.cuda.OutOfMemoryError"):]
-    assert "torch.cuda.empty_cache()" in body and "gc.collect()" in body
-
-
-def test_exhausted_oom_raises_and_names_the_levers():
+def test_the_oom_raises_and_names_the_levers():
     body = _forward_src()
     body = body[body.index("except torch.cuda.OutOfMemoryError"):]
     assert "raise RuntimeError(" in body and "from _oom_err" in body, (
