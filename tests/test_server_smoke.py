@@ -222,10 +222,21 @@ def test_prefix_reuse(client):
     # the reply. So this runs its own session, sends a second turn that
     # APPENDS to the first, and reads the pool's counters before and after.
     if _prefix_counts(client) is None:
-        # Expected only with an explicit KV_CACHE_MODE="fp16": the bare
-        # DynamicCache has no to_cpu/to_device/resident_bytes. Since row 3
-        # (2026-09-11) "auto" enables the pool on every loader.
-        print("  (pool disabled -- expected only with KV_CACHE_MODE='fp16', todo row 3)")
+        # A disabled pool passes ONLY when this server's own configuration
+        # asked for one: ENABLE_PREFIX_CACHE off, or an explicit
+        # KV_CACHE_MODE="fp16" (the bare DynamicCache has no
+        # to_cpu/to_device/resident_bytes; since row 3, 2026-09-11, "auto"
+        # enables the pool on every loader). Anything else is the engine
+        # switching the pool off at load by itself, which is a regression --
+        # and printing a note about it was a pass with nothing tested.
+        cfg = client.app.state.config
+        assert not cfg.enable_prefix_cache or cfg.kv_cache_mode == "fp16", (
+            f"the prefix pool is disabled although the server's configuration "
+            f"enables it (enable_prefix_cache={cfg.enable_prefix_cache}, "
+            f"kv_cache_mode={cfg.kv_cache_mode!r}). If the engine refused it at "
+            f"load, server.log has a '[Vaayu-Prefix] WARNING: cross-turn prefix "
+            f"cache DISABLED' line saying why")
+        print("  (pool disabled, as this server's configuration asked)")
         return
     first = dict(BODY, session_id="smoke-prefix", stream=False)
     r = client.post("/v1/chat/completions", json=first)
@@ -246,9 +257,17 @@ def test_prefix_reuse(client):
         f"the appending turn was not served from the pool: hits {hits0} -> {hits1}. "
         f"{client.get('/health').json()['prefix_cache']}")
     # A hit alone is not reuse: a named session whose context diverged still
-    # counts one with nothing matched. The whole first prompt must be reused.
-    assert matched1 - matched0 >= prompt_tokens, (
-        f"the appending turn reused {matched1 - matched0} tokens, fewer than the "
+    # counts one with nothing matched. So the appending turn must also reuse
+    # MORE THAN HALF of the first prompt's tokens. Not the whole first prompt:
+    # a chat template may re-render the previous assistant header differently
+    # from the generation prompt the first turn ended with (MiniMax-M2.7's
+    # does: its generation prompt opens a think block that the history
+    # rendering of the same turn does not carry), so the common prefix can
+    # stop a few tokens short of the first prompt. That diverged session
+    # still fails this bar, because it matches almost nothing.
+    reused = matched1 - matched0
+    assert 2 * reused > prompt_tokens, (
+        f"the appending turn reused {reused} tokens, not more than half of the "
         f"first turn's {prompt_tokens}-token prompt")
 
 
