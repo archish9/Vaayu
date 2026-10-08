@@ -869,14 +869,14 @@ class DeepseekV4CacheLayer(CacheLayerMixin):
     def prefetch(self):
         self._move(self.compute_device)
 
-    def _move(self, device):
-        self.keys = self.keys.to(device, non_blocking=True)
+    def _move(self, device, non_blocking=True):
+        self.keys = self.keys.to(device, non_blocking=non_blocking)
         self.values = self.keys
         for name in ("kv_state", "score_state", "index_keys",
                      "index_kv_state", "index_score_state"):
             tensor = getattr(self, name)
             if tensor is not None:
-                setattr(self, name, tensor.to(device, non_blocking=True))
+                setattr(self, name, tensor.to(device, non_blocking=non_blocking))
 
     def reorder_cache(self, beam_idx):
         raise RuntimeError(
@@ -902,6 +902,12 @@ class DeepseekV4Cache(Cache):
     Nothing below is a literal: `sliding_window`, `head_dim`, `index_head_dim`
     and `compress_ratios` all come off the config (CLAUDE.md §5).
     """
+
+    # Servable at exactly one length (see `_ONE_LENGTH`). Vaayu's prefix store
+    # reads this through `vaayu.batch.cache_is_one_length`: it hands the entry
+    # back only to a prompt that contains every token the cache has seen, and
+    # never crops it, lends it, or re-stores it after an aborted turn.
+    is_one_length = True
 
     def __init__(self, config, max_seq_len: int, max_batch_size: int = 1,
                  device=None, dtype=torch.bfloat16):
@@ -941,6 +947,29 @@ class DeepseekV4Cache(Cache):
 
     def nbytes(self) -> int:
         return sum(layer.nbytes() for layer in self.layers)
+
+    # -- what Vaayu's prefix store drives (`vaayu.batch._PREFIX_STORE_METHODS`) --
+    def to_cpu(self) -> None:
+        """Park the WHOLE preallocated cache in host RAM between turns.
+
+        Nothing is compacted: ring slots are addressed by `pos % window_size`
+        and compressed blocks by index, so the layout IS the state.
+
+        BLOCKING, unlike `offload()`. A CUDA tensor's `.to("cpu",
+        non_blocking=True)` returns before one byte has reached pageable host
+        memory (measured for S34: 220,000,000 of 220,000,000 elements wrong
+        when read at once), and the pool may budget, evict or hand this entry
+        back as soon as `store()` returns.
+        """
+        for layer in self.layers:
+            layer._move("cpu", non_blocking=False)
+
+    def to_device(self, device) -> None:
+        for layer in self.layers:
+            layer._move(device)
+
+    def resident_bytes(self) -> int:
+        return self.nbytes()
 
     def reset(self) -> None:
         for layer in self.layers:
