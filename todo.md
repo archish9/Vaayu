@@ -114,7 +114,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. S33-A0 CLOSED 2026-10-07: CONFIRMED, a probe artefact (one Kineto window makes every later graph replay 4.58× slower on the host; the server never profiles), so S32's clean price stands. S33 STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f` (E1–E7; S = 4.727 ms/token of HIT decode against a bar of 3.133; HIT turn 16.84 → 15.65 s, −7.1 %). NEXT: the USER decides S33 stage 2 (C8b, priced +0.45–0.56 ms/token for a week-class change to the shared loop); a fresh session presents that decision, and S34 follows it.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. S33-A0 CLOSED 2026-10-07: CONFIRMED, a probe artefact (one Kineto window makes every later graph replay 4.58× slower on the host; the server never profiles), so S32's clean price stands. S33 STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f` (E1–E7; S = 4.727 ms/token of HIT decode against a bar of 3.133; HIT turn 16.84 → 15.65 s, −7.1 %). S33-C8b CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price (≤ 0.45–0.56 ms/token over the built E-edits, ≈ 0.8 % of a turn; hard ceiling 1.10–1.21, under the 3.133 bar; week-class on the shared loop). NEXT: S34 (DeepSeek-V4 cross-turn prefix cache), in its own fresh session; its STEP 0 prices it before any design.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -175,7 +175,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S32** ✅ | ~~Re-price C8 (segment merge) + C9 (FWD) on Qwen3-Next at HEAD — MEASURE ONLY~~ — **CLOSED 2026-10-07:** re-priced at HEAD: unflagged FAILS 1.39–1.58; USER admitted E3/E4/E5 (D2); flagged bundle-b STRADDLES 3.07–3.70 over 3 processes (bar 3.133); **final review: clean processes (p1 + p3): flagged 2.71–3.19, STRADDLES; the p2 slow-replay state is very likely a post-CUPTI probe artefact (final review); USER: S33-A0 = ≤1 h CUPTI confirmation; S33 staged (E1–E6, then decide C8b)**. Full row: the S32 row in the backlog archive; `docs/2026-10-07-S32-c8-c9-reprice-RESULTS.md` | — | done |
 | **S33-A0** ✅ | ~~Confirm the post-CUPTI replay penalty~~ — **CLOSED 2026-10-07: CONFIRMED, a probe artefact.** One process: head.lin replay host 5.65 us/call before one 16-token Kineto window, 5.64 in the control, 25.93 after (4.58× ≥ 3×). Kineto leaves CUPTI attached after `profile.stop()`; `TEARDOWN_CUPTI=1` removes it (micro only). Server unaffected (the engine never profiles). C8b's clean 0.45–0.56 ms/token stands. PROBE RULE added. Full row: the S33-A0 row in the backlog archive; `docs/2026-10-07-S33-A0-post-cupti-replay-RESULTS.md` | — | done |
 | **S33** ✅ (stage 1) | ~~Build E1–E6~~ — **STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f`.** Built E1–E7 (E7 = the per-request `vaayu_telemetry.json` dump, found in this row's re-verification and added by the USER). KEEP set (off, all, all, off): **S = 4.727 ms/token** of mean HIT decode (bar 3.133; OFF spread 1.039; budget band 3.82–5.63), HIT turn 16.84 → 15.65 s (−7.1 %), ids identical, TTFT unchanged. Attribution: E7 +2.005 and E5 +1.896 RESOLVED; E1+E2+E6 +0.426 and E3+E4 +0.313 inside the spread, kept on reach, tests and price (E1–E6 = 2.635; S32 priced 2.11–2.76). Bitwise on four MoE models; gpt-oss vs stock 64/64; suite 3777. Full row: the S33 row in the backlog archive; `docs/2026-10-07-S33-host-edits-e1-e7-RESULTS.md` | — | done |
-| **S33-C8b** | **Decide stage 2: C8b, whole-forward graph replay (the USER's word)** | *(a)*; priced +0.45–0.56 ms/token on clean processes (S32) | a conversation, then week-class if built |
+| **S33-C8b** ✅ | ~~Decide stage 2: C8b, whole-forward graph replay (the USER's word)~~ — **CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price.** Re-verified at `5bdb816` (no engine change since `6c9a31f`): increment over the built E-edits ≤ 0.45 (p1) / 0.56 (p3) ms/token, ≈ 0.35–0.45 after the profiled-r0 bias = 0.6–0.9 % of the 15.65 s HIT turn, about 1/6 of the 5 % bar (3.133); hard ceiling 1.10 / 1.21 (all the boundary-window GPU idle S32 found), GPU-bound by S28's C5 kernels; inside the ≈ 1.0 ms/token OFF spread; week-class on the shared loop. Re-open only if the layer boundary stops being GPU-bound. Full row: the S33-C8b row in the backlog archive | — | done |
 | **S34** | **DeepSeek-V4 cross-turn prefix cache** | *(b)* up to 47.1 s of TTFT on every turn after the first, minus the diff's own prefill (S34 prices it first) | week-class (brainstorm → spec → plan) |
 | **S35** | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
 | **S36** | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
@@ -241,19 +241,18 @@ the clean 0.45–0.56 ms/token before any build.
       server default — SHIPPED. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS
       `docs/2026-10-07-S33-host-edits-e1-e7-RESULTS.md`.
 
-- [ ] **S33-C8b — decide stage 2: C8b, whole-forward graph replay (the USER's word; set by the USER's third ruling at
-      S32's final review, 2026-10-07; a fresh session presents it and WAITS).**
-      **What the USER now has:** stage 1 measured S = 4.727 ms/token (bar 3.133), HIT turn 16.84 → 15.65 s; E1–E6 came
-      to 2.635 ms/token, inside S32's 2.11–2.76. **C8b's priced increment over the E-edits is 0.45 (p1) / 0.56 (p3)
-      ms/token** on clean processes (S32), about 0.8 % of a turn, biased up by about 0.1 (profiled r0); it is GPU-bound
-      because S28's C5 kernels are still running at the layer boundary. Stage 1 did not re-price it.
-      **If built:** it touches `vaayu/vaayu_base.py` `forward` and `vaayu/decode_graphs.py`; it needs a per-forward
-      eligibility check with an eager fallback for streamed layers (Llama-3.3-70B; DeepSeek-V4's 4 streamed non-expert
-      layers); its own KEEP against the OFF spread (about 1.0 ms/token in S33's sets, so a 0.5 ms/token effect needs
-      more arms or a tighter budget pin: say so before building); gates as S33's. C8b deletes the loop body, so it
-      also drops what is left of the per-layer telemetry.
-      **Options to put to the USER:** build it (week-class); close it with S32's price (below any bar set so far); or
-      re-price it first at HEAD after stage 1 (measure only, a day). **§8:** N=1, server default if built.
+- [x] **S33-C8b — decide stage 2: C8b, whole-forward graph replay — ✅ CLOSED 2026-10-08 by the USER: NOT BUILT, closed
+      with S32's price.** Re-verified at `5bdb816` (no engine code changed since the merge `6c9a31f`). C8b's increment
+      over the built E-edits is **≤ 0.45 (p1) / 0.56 (p3) ms/token** (S32, clean processes: C8b 1.084 / 1.210 minus
+      E1 + E2 + E3 0.629 / 0.654), ≈ 0.35–0.45 after the profiled-r0 bias = **0.09–0.14 s of the 15.65 s HIT turn,
+      0.6–0.9 %**, about 1/6 of the 5 % bar (3.133 ms/token). Hard ceiling 1.10 / 1.21 ms/token (S32's C8 upper bound:
+      all the boundary-window GPU idle before stage 1 took its share), 2.6–2.8× under the bar, so a re-price at HEAD
+      could not change the verdict; the window is GPU-bound (S28's C5 kernels still run at the layer boundary). The
+      effect sits inside the ≈ 1.0 ms/token OFF spread of S33's sets, and the build is week-class on the shared
+      `forward` loop + `vaayu/decode_graphs.py`, priced on Qwen3-Next only. **Re-open only if** the layer boundary
+      stops being GPU-bound (the C5 kernel time left there shrinks) or the per-layer host loop grows again; re-price
+      before building. §8: nothing built, nothing banked, no knob. Suite floor unchanged (no code). Full row:
+      `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 - [ ] **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER.
@@ -268,6 +267,11 @@ the clean 0.45–0.56 ms/token before any build.
       `MemoryMax=29G`, FOREGROUND), compute the saving per turn and its share of ≈ 190 s, and present that to the
       USER before the spec. If it is under ~5 % of the turn, recommend closing.
       **INPUTS PRE-GATHERED at `5118a65`. Re-verify at HEAD:**
+      - **Pointer spot-check 2026-10-08 at `5bdb816` (by S33-C8b's session; names only, no behaviour re-verified):**
+        S33 stage 1 (`6c9a31f`) changed `vaayu/vaayu_base.py` and `vaayu/vaayu_deepseek_v4.py` after the pre-gather.
+        Moved: the base's instance probe is now `vaayu_base.py:4299` (was :4247); `input_ids_scope` is now
+        `vaayu_deepseek_v4.py:770` / :800 (was :768 / :798). Unchanged: `vaayu_deepseek_v4.py:471` and :459,
+        `vaayu/batch.py:476` and :539, `vaayu/prefix_cache.py:74` and :194, `vaayu/server/config.py:100`.
       - **The refusal:** `VaayuDeepseekV4._refuse_unsupported_prefix_cache` (`vaayu/vaayu_deepseek_v4.py:471`)
         detects by CLASS, because the base's instance probe (`vaayu_base.py:4247`) would crash: `DeepseekV4Cache` is
         preallocated from `max_seq_len`, still `None` at that point. It finds no prefix-store surface
@@ -381,26 +385,12 @@ at HEAD before acting.
 
 - [x] **S11-L7 — cross-layer expert prefetch — ✅ CLOSED 2026-10-05, REFUTED by S25: +5.56 % decode tok/s on device (B0 projected +13 … +15 %) → SETTLED.** Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
-- [ ] **Lead (S21): the post-S12 eager residue — = S27 (priced) / S28 (built if best); C8 + C9 = S32 / S33** — after the graphs, a decode token still spends on the host
-  ATTNCORE 2.96 ms (device 0.78; the eager attention core of the 12 full-attention layers), KERNEL 4.62 (device
-  2.84; the packed decode kernel's pointer table + launches), FWD 3.14 (the forward outside the layers), GRRUN 1.36
-  (graph bind/signature), GRAPH 0.64 (108 replays) = **≤ 9.1 ms/token = ≤ 2.3 s/turn (11.5 %) as a ceiling**; several
-  seams, unpriced build; reach every decode token, N=1. Evidence `s21_out/decode-on1.log` U_HOST + U_CNT.
-  **Priced by S27 (2026-10-06; same census; upper bounds in exposed ms/token; bar 3.488).** Host 13.99 ms, exposed
-  10.45. By piece:
-  - KERNEL → C5 cached Triton launch: 3.723, above the bar (ESTIMATE ~2.8, not measured).
-  - FWD → C9: 3.310, PRICED-UNVERIFIED (no concrete change named; the sub-labels explain 0.67 of 3.49 ms host).
-  - GRAPH + GRRUN → C8 segment merge: 2.538, PRICED-UNVERIFIED (not probe-prototypable; FLAG: GRAPH host 0.63 vs
-    1.82 ms/token between processes — INVALIDATED by S32's final review: very likely a post-CUPTI probe artefact).
-  - GRRUN → C7 bind fast path: 1.318, FAIL.
-  - ATTNCORE → C6 attention core in the graph: 0.914, FAIL (exposed fraction 0.31; the graph breaks it would remove
-    are not counted).
-  - **S28 (merged `6fd79fa`, 2026-10-07) built the KERNEL seam as C5** (per-layer CUDA graph, +2.56 ms/token measured).
-    **Re-priced by S32 (2026-10-07, post-S28, clean processes p1 + p3, ms/token, bar 3.133; final review):** C8a
-    0.137–0.287, C8b 1.084–1.210 (the p2 values 1.856–2.406 were post-CUPTI artefact); C9 = named edits E1 + E2
-    0.550–0.567, E1–E6 incl. flagged E3/E4/E5 ≈ 2.11–2.76 (E5, the gc move, is 1.46–2.07 of it); unflagged bundle-b
-    1.154–1.157 FAILS, flagged bundle-b 2.710–3.190 STRADDLES (pre-registered 3 processes: 3.072–3.699).
-    **= S33-A0 (≤ 1 h CUPTI confirmation) / S33 (STAGED: E1–E6, then decide C8b; USER).**
+- [x] **Lead (S21): the post-S12 eager residue — ✅ CLOSED 2026-10-08 by S27 + S28 + S33 + S33-C8b: every seam has a
+  verdict.** KERNEL → C5 built (S28, +2.56 ms/token measured); FWD → C9 built as E1–E7 (S33 stage 1, S = 4.727
+  ms/token); GRAPH + GRRUN → C8a 0.137–0.287 (S32, never near a bar) and C8b ≤ 0.45–0.56 over the E-edits, closed
+  unbuilt by the USER 2026-10-08 (row S33-C8b, with its re-open condition); GRRUN → C7 1.318 FAIL and ATTNCORE → C6
+  0.914 FAIL (S27, bar 3.488; C6's price does not count the graph breaks it would remove). Full row:
+  `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 - [x] **[bug] The server loaded Qwen3-Next with BUFFERED I/O — ✅ FIXED AND MERGED 2026-10-04 (`main` `a588ff4`).**
   `_should_use_direct_io` now subtracts what the expert RAM cache will pin (`expert_arena_bytes`) before asking

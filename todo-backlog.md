@@ -9059,3 +9059,66 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       nothing banked; documented in `documentation/server.md`. Stage 2 (C8b) stays the USER's call (row `S33-C8b`).
       Left for the USER: the in-request `malloc_trim` lead and the gc re-freeze lead in `todo.md`'s OPEN list; the
       stale 16 MB `vaayu_telemetry.json` at the repo root (no longer rewritten; delete at will).
+
+- [x] **S33-C8b — ✅ CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price (≤ 0.45–0.56 ms/token over the built E-edits, ≈ 0.8 % of a turn; hard ceiling 1.10–1.21, under the 3.133 bar). Row as it stood at close:**
+**S33-C8b — decide stage 2: C8b, whole-forward graph replay (the USER's word; set by the USER's third ruling at
+      S32's final review, 2026-10-07; a fresh session presents it and WAITS).**
+      **What the USER now has:** stage 1 measured S = 4.727 ms/token (bar 3.133), HIT turn 16.84 → 15.65 s; E1–E6 came
+      to 2.635 ms/token, inside S32's 2.11–2.76. **C8b's priced increment over the E-edits is 0.45 (p1) / 0.56 (p3)
+      ms/token** on clean processes (S32), about 0.8 % of a turn, biased up by about 0.1 (profiled r0); it is GPU-bound
+      because S28's C5 kernels are still running at the layer boundary. Stage 1 did not re-price it.
+      **If built:** it touches `vaayu/vaayu_base.py` `forward` and `vaayu/decode_graphs.py`; it needs a per-forward
+      eligibility check with an eager fallback for streamed layers (Llama-3.3-70B; DeepSeek-V4's 4 streamed non-expert
+      layers); its own KEEP against the OFF spread (about 1.0 ms/token in S33's sets, so a 0.5 ms/token effect needs
+      more arms or a tighter budget pin: say so before building); gates as S33's. C8b deletes the loop body, so it
+      also drops what is left of the per-layer telemetry.
+      **Options to put to the USER:** build it (week-class); close it with S32's price (below any bar set so far); or
+      re-price it first at HEAD after stage 1 (measure only, a day). **§8:** N=1, server default if built.
+      **CLOSING RECORD 2026-10-08 (its own fresh session; a conversation — no GPU run, no code).**
+      **Re-verified at `5bdb816`:** no engine code changed since the merge `6c9a31f` (`git diff --stat 6c9a31f HEAD --
+      vaayu vaayu_rust tests` is empty). The row's numbers match their sources: 0.45 / 0.56 = C8b 1.084 / 1.210 minus
+      E1 + E2 + E3 joint 0.629 / 0.654 (`plans/probes/s32_out/price-p1p3.txt`). Code pointers at HEAD: the layer loop
+      `vaayu/vaayu_base.py:5791`, the runner call :5979, `DecodeGraphRunner.run` `vaayu/decode_graphs.py:492`, the
+      per-layer residency check `_resident` :524 (a streamed layer runs stock), `_bind` :744.
+      **One clause of the row was stale:** "C8b deletes the loop body, so it also drops what is left of the per-layer
+      telemetry". E3 (stage 1) already skips the `LayerTiming` record for a VRAM-resident layer on a forward eligible
+      for decode graphs (`vaayu_base.py:6047`), so a whole-forward replay would lose no further record.
+      **Presented to the USER:** price ≤ 0.45–0.56 ms/token, ≈ 0.35–0.45 after the ≈ 0.11 profiled-r0 bias = 0.09–0.14
+      s of the 15.65 s HIT turn (0.6–0.9 %), about 1/6 of the 5 % bar (3.133 ms/token; 3.06 at 15.65 s). Hard ceiling
+      1.10 / 1.21 ms/token: S32's C8 upper bound, i.e. all the boundary-window GPU idle S32 found before stage 1 took
+      its share — 2.6–2.8× under the bar even if the E-edits had gained nothing there, so a re-price at HEAD could
+      not change the verdict unless the bar is lowered. The effect is inside the ≈ 1.0 ms/token OFF spread of S33's
+      sets (stage 1's +0.426 and +0.313 groups both read "inside the spread"), so a KEEP would need more arms or a
+      tighter budget pin. Build: week-class, the shared `forward` loop and the S12 runner, a whole-forward eligibility
+      check with an eager fallback, gates on every on-device model. Priced on Qwen3-Next only; by S33 stage 1's
+      record the decode graphs do not run on Llama-3.3-70B (disabled at load) or DeepSeek-V4 (no decode-graph seam),
+      and gpt-oss's 24 layers are refused.
+      **Options offered:** close with S32's price (recommended); re-price at HEAD first (measure only, a day); build
+      it (week-class). **The USER chose: close with S32's price.**
+      **Re-open only if** the layer boundary stops being GPU-bound (the C5 kernel time S28 left at the boundary
+      shrinks, so host time removed there is no longer hidden) or the per-layer host loop grows again; then re-price
+      before building. **§8:** nothing built, nothing banked, no knob. Suite floor unchanged (no code).
+      The OPEN-list lead "the post-S12 eager residue" (S21) closed with this row: every seam it lists now has a
+      verdict (the entry below). NEXT: S34, in its own fresh session.
+
+- [x] **Lead (S21): the post-S12 eager residue — ✅ CLOSED 2026-10-08 by S27 + S28 + S33 + S33-C8b (every seam has a verdict: C5 and C9 built, C8b closed unbuilt by the USER, C8a / C7 / C6 below the bars). Row as it stood at close:**
+**Lead (S21): the post-S12 eager residue — = S27 (priced) / S28 (built if best); C8 + C9 = S32 / S33** — after the graphs, a decode token still spends on the host
+  ATTNCORE 2.96 ms (device 0.78; the eager attention core of the 12 full-attention layers), KERNEL 4.62 (device
+  2.84; the packed decode kernel's pointer table + launches), FWD 3.14 (the forward outside the layers), GRRUN 1.36
+  (graph bind/signature), GRAPH 0.64 (108 replays) = **≤ 9.1 ms/token = ≤ 2.3 s/turn (11.5 %) as a ceiling**; several
+  seams, unpriced build; reach every decode token, N=1. Evidence `s21_out/decode-on1.log` U_HOST + U_CNT.
+  **Priced by S27 (2026-10-06; same census; upper bounds in exposed ms/token; bar 3.488).** Host 13.99 ms, exposed
+  10.45. By piece:
+  - KERNEL → C5 cached Triton launch: 3.723, above the bar (ESTIMATE ~2.8, not measured).
+  - FWD → C9: 3.310, PRICED-UNVERIFIED (no concrete change named; the sub-labels explain 0.67 of 3.49 ms host).
+  - GRAPH + GRRUN → C8 segment merge: 2.538, PRICED-UNVERIFIED (not probe-prototypable; FLAG: GRAPH host 0.63 vs
+    1.82 ms/token between processes — INVALIDATED by S32's final review: very likely a post-CUPTI probe artefact).
+  - GRRUN → C7 bind fast path: 1.318, FAIL.
+  - ATTNCORE → C6 attention core in the graph: 0.914, FAIL (exposed fraction 0.31; the graph breaks it would remove
+    are not counted).
+  - **S28 (merged `6fd79fa`, 2026-10-07) built the KERNEL seam as C5** (per-layer CUDA graph, +2.56 ms/token measured).
+    **Re-priced by S32 (2026-10-07, post-S28, clean processes p1 + p3, ms/token, bar 3.133; final review):** C8a
+    0.137–0.287, C8b 1.084–1.210 (the p2 values 1.856–2.406 were post-CUPTI artefact); C9 = named edits E1 + E2
+    0.550–0.567, E1–E6 incl. flagged E3/E4/E5 ≈ 2.11–2.76 (E5, the gc move, is 1.46–2.07 of it); unflagged bundle-b
+    1.154–1.157 FAILS, flagged bundle-b 2.710–3.190 STRADDLES (pre-registered 3 processes: 3.072–3.699).
+    **= S33-A0 (≤ 1 h CUPTI confirmation) / S33 (STAGED: E1–E6, then decide C8b; USER).**
