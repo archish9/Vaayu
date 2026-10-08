@@ -9123,7 +9123,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
     1.154–1.157 FAILS, flagged bundle-b 2.710–3.190 STRADDLES (pre-registered 3 processes: 3.072–3.699).
     **= S33-A0 (≤ 1 h CUPTI confirmation) / S33 (STAGED: E1–E6, then decide C8b; USER).**
 
-- [x] **S34 — DeepSeek-V4 cross-turn prefix cache — ✅ CLOSED 2026-10-08: BUILT, MEASURED, GATED and task-reviewed on branch `s34-deepseek-prefix-cache` (head `75c4278`, cut from `05f5bf9`); NOT merged — awaiting the USER's word to merge. 1k appending turns 10.26 s vs 51.08 s to first token pool ON vs OFF (ON/OFF 0.201), 4k 11.33 s vs 165.00 s (OFF is ONE turn; 0.069); decode -0.72 % at the own RAM budget (+0.4 % without one slow first OFF arm) and -0.10 % at BALLAST_GB=15, both inside the 5 % rule; a pool HIT is bitwise identical to handing the live cache over; suite 3815 passed, 26 skipped. Row as it stood at close:**
+- [x] **S34 — DeepSeek-V4 cross-turn prefix cache — ✅ CLOSED 2026-10-08: BUILT, MEASURED, GATED and task-reviewed on branch `s34-deepseek-prefix-cache` (head `75c4278`, cut from `05f5bf9`); NOT merged — awaiting the USER's word to merge. Final whole-branch review 2026-10-08: no Critical issue, ready with fixes; ONE open decision for the USER at the merge gate — `[bug]` I4 in `todo.md` (a successful OOM retry pools a wrong one-length cache). 1k appending turns 10.26 s vs 51.08 s to first token pool ON vs OFF (ON/OFF 0.201), 4k 11.33 s vs 165.00 s (OFF is ONE turn; 0.069); decode -0.72 % at the own RAM budget (+0.4 % without one slow first OFF arm) and -0.10 % at BALLAST_GB=15, both inside the 5 % rule; a pool HIT is bitwise identical to handing the live cache over; suite 3815 passed, 26 skipped. Reach: N=1 on the server default, at `ENABLE_THINKING=False` (the default); none with thinking on. A turn that ends in an ERROR drops the entry; a cancelled / disconnected turn is stored at its partial reply, which a retry of the same request cannot use. Row as it stood at close, then the closing summary and the final review:**
 **S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
       spec → plan with the USER. **IN PROGRESS 2026-10-08.**
       **STEP 0 DONE 2026-10-08 at `826e58b` (measure only; `plans/probes/s34_price.py`, raw in
@@ -9278,12 +9278,66 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       MiniMax 8 passed; dense Llama-3.2-1B 5 passed and Llama-3.3-70B 5 passed; `test_multiturn.py` branch = `main`
       (`2hit/0miss/0evict hit_rate=100% saved=3940/3980`).
       **Reach, §8:** no new knob (`ENABLE_PREFIX_CACHE`, `PREFIX_SESSIONS` exist; `vaayu/server/app.py:417` and `:431` pass
-      them to `from_pretrained(...)`); reachable at N=1 on the server default (the DeepSeek server gate's own appending
+      them to `from_pretrained(...)`); reachable at N=1 on the server default, at `ENABLE_THINKING=False` (the default) —
+      none with thinking on (final review I3, below) (the DeepSeek server gate's own appending
       turn was served from the pool); nothing is banked, but nothing reaches `main` users until the merge. Documented in
       `vaayu/server/README.md` and `documentation/server.md` (§6, §6.2, the three knob rows).
       **Does not do:** reuse a prompt that shares only a prefix (a new task under the same system prompt, an edited
-      history) — those prefill in full; an aborted turn drops the entry; disk persistence and TurboQuant pooling stay
+      history) — those prefill in full; a turn that ends in an ERROR drops the entry (a hybrid's if a forward pass had
+      run, DeepSeek-V4's always), while a cancelled / disconnected turn is stored at its partial reply, which a retry
+      of the same request cannot use (corrected by the final review, I2 below: this line read "an aborted turn drops
+      the entry"); no reuse with thinking on (I3 below); disk persistence and TurboQuant pooling stay
       refused. NEXT: S35, in its own fresh session (after the USER merges S34).
+
+      **FINAL WHOLE-BRANCH REVIEW (2026-10-08, opus, `05f5bf9..9c7381d`) AND ITS FIX WAVE.** Verdict: **ready to
+      merge WITH FIXES, no Critical.** The engine change is correct on the default path, other models are unchanged
+      in the shared code, the length arithmetic holds, exactly one preallocated cache is on the GPU per request, and
+      the expert-ceiling reserve is the same number for every other model. The fix wave changed NO engine file
+      (`vaayu/*.py`, `vaayu/model_code/**` byte-identical to `9c7381d`): only `tests/test_server_smoke.py` (`5a920ee`),
+      the two user docs, this ledger and RESULTS. STATUS: still awaiting the USER's word to merge, with ONE open
+      decision — I4.
+      **Important.** **I1 (fixed, `5a920ee`):** the rewritten server gate failed on MiniMax-M2.7 for a template
+      reason — seen on device before the fix: `1 failed, 9 passed`, `the appending turn reused 50 tokens, fewer than
+      the first turn's 54-token prompt` (`gate-server-minimax-before.log`); the bar is now "more than half of the
+      first prompt's tokens". **I2 (docs, ledger, RESULTS):** a client disconnect only sets the cooperative cancel
+      flag (`vaayu/server/engine.py:65-81`, `:786`), so `generate` returns normally and `_persist_and_store` stores
+      prompt + partial reply (`vaayu/vaayu_base.py:6347-6358`; `restore_on_abort` is reached only from the `except
+      BaseException`). So wherever this row says "an aborted turn drops the entry" (the design's line (c) above
+      included), read: a turn that ends in an ERROR drops it; a cancelled turn is STORED at its partial reply with
+      no WARNING, and a retry of the same request then prefills in full on a one-length model. From reading, the
+      stored partial reply usually runs past what the client received (the streamer holds back the trailing partial
+      word, the in-flight token completes, and a non-streaming client received nothing), so a request built from
+      the text the client saw probably prefills in full too — not measured. Review Focus 4 (a client disconnect) is
+      therefore pinned only for the error path; no cancelled-stream engine test exists. **I3 (docs + OPEN lead,
+      UNPRICED):** with thinking ON DeepSeek-V4 gets no reuse — encoder-only: `mode=thinking …
+      contains_whole_entry=False lcp_chars=60/119` (the wave's own run: 112/202,
+      `plans/probes/s34_out/i3-encoder-thinking-check.log`). **I4 (OPEN `[bug]`, the USER's decision, NOT built):** a
+      successful OOM retry in the layer loop pools a wrong one-length cache; reachability UNCONFIRMED; full text in
+      `todo.md` under "DeepSeek-V4-Flash".
+      **Minor.** M1 the capacity WARNING advises `prefix_compress=9` where it is refused → OPEN `[bug]` (cosmetic).
+      M2 `USE_PROMPT_LOOKUP=True` is not refused on DeepSeek-V4 → OPEN `[bug]`. M3 auto-match hands a one-length
+      entry to another session → doc sentence + OPEN lead. M4 `store()` parks before it pops the stale entry → into
+      lead (c). M5 the server-gate `[bug]` wording (it was seen red with `lookup` forced to miss, not with the pool
+      off) → corrected, and the disabled-pool pass is closed by `5a920ee`. Deferred minors from the task reviews:
+      5 (disabled pool returns green), 7 (run-on sentences), 8 (context labels), 9 (RESULTS §7 mechanism) fixed; 1,
+      2, 3 stay; 4 dropped (not a defect). Other OPEN lines added: a disconnect during a PREFILL is not honoured
+      until the prefill ends (from reading); one cosmetic line (HIT log off by one, stale line numbers, the
+      rewrap); two design inputs on the S35 row. Not done by the wave: `CLAUDE.md` §0 / §5 do not mention
+      DeepSeek's prefix cache (the USER's file; the branch is unmerged).
+      **The wave's gates (raw in `plans/probes/s34_out/`).** RED before the fix, MiniMax-M2.7: `1 failed, 9 passed,
+      17 warnings in 102.60s`. Mutants on Llama-3.2-1B, final test file, scratch worktree: never-hit `1 failed, 9
+      passed` (`hits 0 -> 0`); pool switched off at load `1 failed, 9 passed` (`the prefix pool is disabled although
+      the server's configuration enables it`; the `75c4278` test passed the same mutant, `10 passed`); a hit that
+      reuses 3 tokens `1 failed, 9 passed` (`reused 3 tokens, not more than half of the first turn's 50-token
+      prompt`). GREEN on the final file, `gate-server-final-*.log`: Llama-3.2-1B `10 passed … 7.64s`, `hits 2 -> 3,
+      matched tokens 100 -> 166, first prompt 50 tokens`; Qwen3-Next `10 passed … 27.43s`, `hits 0 -> 1, matched
+      tokens 0 -> 35, first prompt 23 tokens`; MiniMax-M2.7 `10 passed … 102.38s`, `hits 2 -> 3, matched tokens 108
+      -> 158, first prompt 54 tokens`; gpt-oss-20b `10 passed … 28.69s`, `hits 2 -> 3, matched tokens 164 -> 247,
+      first prompt 82 tokens`; DeepSeek-V4 `10 passed, 49 warnings in 93.02s`, `hits 0 -> 1, matched tokens 0 -> 34,
+      first prompt 18 tokens`. Limit of the new reuse bar (tokenizer-only, `i1-header-share.log`): a prompt with a
+      different user message still shares 30 of 50 tokens on Llama-3.2-1B, 31 of 52 on MiniMax-M2.7, 64 of 82 on
+      gpt-oss-20b (template header), so the bar catches a hit that reuses almost nothing, not a divergence after the
+      header. Suite floor unchanged (`tests/test_server_smoke.py` without `SERVER_CKPT`: `10 skipped`).
 
 - [x] **= S34 — DeepSeek-V4 has NO cross-turn prefix cache — ✅ CLOSED 2026-10-08 by S34 (branch `s34-deepseek-prefix-cache`, awaiting the merge). Row as it stood at close:**
 **= S34. DeepSeek-V4 has NO cross-turn prefix cache — every turn is a full prefill** (added 2026-10-03 in the
@@ -9297,7 +9351,7 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
       turn after the first, N=1, server default. Unpriced build (a cache-format design, both prefix paths, the
       prefix and server gates on DeepSeek). Re-rank at S26 with the DeepSeek levers above.
 
-- [x] **[bug] The server gate's prefix-reuse check cannot fail — ✅ FIXED 2026-10-08 by S34 Task 3 (`75c4278`, branch `s34-deepseek-prefix-cache`, awaiting the merge): the check parses the hit count and asserts it rose across a turn that appends; seen failing (`1 failed, 9 passed`, `hits 0 -> 0`) on a pool that never serves, green on DeepSeek-V4 (`hits 0 -> 1`). Row as it stood at close:**
+- [x] **[bug] The server gate's prefix-reuse check cannot fail — ✅ FIXED 2026-10-08 by S34 Task 3 (`75c4278`, branch `s34-deepseek-prefix-cache`, awaiting the merge): the check parses the hit count and asserts it rose across a turn that appends; seen failing (`1 failed, 9 passed`, `hits 0 -> 0`) on a pool that never serves (`lookup` forced to MISS — not "with the pool off": a DISABLED pool still passed at `75c4278`), green on DeepSeek-V4 (`hits 0 -> 1`). Final-review fix wave, `5a920ee`: the appending turn must also reuse more than half of the first prompt's tokens (the whole-first-prompt bar failed on MiniMax-M2.7's template, 50 of 54 reused), and a pool disabled although the server's configuration enables it now FAILS the test (`1 failed, 9 passed` under a mutant that switches the pool off at load, `plans/probes/s34_out/gate-server-1b-mutant2-disabled.log`); green on five checkpoints. Row as it stood at close:**
 **[bug] The server gate's prefix-reuse check cannot fail** (found 2026-10-08 by S34's design reading; S34's
   plan fixes it — if S34 closes without building, this stays open). `tests/test_server_smoke.py::test_prefix_reuse`
   asserts `"hits=0" not in stats`, but `/health` returns `PrefixCacheStore.stats()`, whose format is
